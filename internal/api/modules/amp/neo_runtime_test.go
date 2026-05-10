@@ -990,8 +990,8 @@ func TestNeoActorReasoningEffortDefaultsByMode(t *testing.T) {
 	if got := actor.reasoningEffortForModeLocked("rush"); got != "" {
 		t.Fatalf("rush effort = %q, want empty", got)
 	}
-	if got := actor.reasoningEffortForModeLocked("deep"); got != "medium" {
-		t.Fatalf("deep effort = %q, want medium", got)
+	if got := actor.reasoningEffortForModeLocked("deep"); got != "xhigh" {
+		t.Fatalf("deep effort = %q, want xhigh", got)
 	}
 	if got := actor.reasoningEffortForModeLocked("smart"); got != "high" {
 		t.Fatalf("smart effort = %q, want high", got)
@@ -2537,8 +2537,33 @@ func TestNeoRuntimeThreadImportDerivesModeFromMessages(t *testing.T) {
 
 	actor.mu.Lock()
 	defer actor.mu.Unlock()
-	if actor.currentAgentMode != "deep" || actor.settings["agentMode"] != "deep" {
-		t.Fatalf("imported mode = current:%q settings:%#v", actor.currentAgentMode, actor.settings)
+	if actor.currentAgentMode != "deep" || actor.settings["agentMode"] != "deep" || actor.currentReasoningEffort != "xhigh" || actor.settings["reasoning.effort"] != "xhigh" {
+		t.Fatalf("imported mode/effort = current:%q/%q settings:%#v", actor.currentAgentMode, actor.currentReasoningEffort, actor.settings)
+	}
+}
+
+func TestNeoRuntimeThreadImportResetsSmartEffortForDeepThread(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := rt.store.ensureThreadActor("T-import-effort")
+	actor.currentAgentMode = "smart"
+	actor.currentReasoningEffort = "high"
+	actor.settings = map[string]any{"agentMode": "smart", "reasoning.effort": "high"}
+
+	thread := map[string]any{
+		"id":        "T-import-effort",
+		"agentMode": "deep",
+		"messages": []any{
+			map[string]any{"role": "user", "messageId": "M-user", "agentMode": "deep", "content": []any{map[string]any{"type": "text", "text": "keep deep effort"}}},
+		},
+	}
+	if err := actor.importThreadLocalOnly(thread); err != nil {
+		t.Fatalf("importThreadLocalOnly error: %v", err)
+	}
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.currentAgentMode != "deep" || actor.currentReasoningEffort != "xhigh" || actor.settings["reasoning.effort"] != "xhigh" {
+		t.Fatalf("imported mode/effort = current:%q/%q settings:%#v", actor.currentAgentMode, actor.currentReasoningEffort, actor.settings)
 	}
 }
 
@@ -2564,8 +2589,8 @@ func TestNeoRuntimeThreadActorResumeKeepsImportedMode(t *testing.T) {
 	actor := rt.store.ensureThreadActor(threadID)
 	actor.mu.Lock()
 	defer actor.mu.Unlock()
-	if actor.currentAgentMode != "deep" || actor.settings["agentMode"] != "deep" {
-		t.Fatalf("actor mode = current:%q settings:%#v", actor.currentAgentMode, actor.settings)
+	if actor.currentAgentMode != "deep" || actor.currentReasoningEffort != "xhigh" || actor.settings["agentMode"] != "deep" || actor.settings["reasoning.effort"] != "xhigh" {
+		t.Fatalf("actor mode/effort = current:%q/%q settings:%#v", actor.currentAgentMode, actor.currentReasoningEffort, actor.settings)
 	}
 }
 

@@ -4162,10 +4162,16 @@ func (a *neoActor) importThreadWithSync(thread map[string]any, syncCloud bool) e
 		a.agentState = "idle"
 	}
 	a.currentAgentMode = agentMode
+	a.currentReasoningEffort = neoImportedThreadReasoningEffort(messages, agentMode)
 	if a.settings == nil {
 		a.settings = map[string]any{}
 	}
 	a.settings["agentMode"] = agentMode
+	if a.currentReasoningEffort == "" {
+		delete(a.settings, "reasoning.effort")
+	} else {
+		a.settings["reasoning.effort"] = a.currentReasoningEffort
+	}
 	if env := mapValue(thread["env"]); len(env) > 0 {
 		a.environment = cloneMap(env)
 	}
@@ -4188,6 +4194,22 @@ func neoImportedThreadAgentMode(messages []neoMessage) string {
 		}
 	}
 	return ""
+}
+
+func neoImportedThreadReasoningEffort(messages []neoMessage, agentMode string) string {
+	for i := len(messages) - 1; i >= 0; i-- {
+		message := messages[i]
+		if message.Role != "user" || strings.TrimSpace(message.ReasoningEffort) == "" {
+			continue
+		}
+		if message.AgentMode != "" && !strings.EqualFold(message.AgentMode, agentMode) {
+			continue
+		}
+		if neoReasoningEffortAllowedForMode(agentMode, message.ReasoningEffort) {
+			return strings.ToLower(strings.TrimSpace(message.ReasoningEffort))
+		}
+	}
+	return defaultNeoReasoningEffort(agentMode)
 }
 
 func neoArtifactsMap(raw any) map[string]any {
@@ -5095,7 +5117,7 @@ func defaultNeoReasoningEffort(agentMode string) string {
 	case "smart":
 		return "high"
 	case "deep":
-		return "medium"
+		return "xhigh"
 	default:
 		return ""
 	}
