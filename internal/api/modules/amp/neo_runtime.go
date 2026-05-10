@@ -3047,7 +3047,9 @@ func (rt *neoRuntime) localThreadActorManagementResponse(ctx context.Context, bo
 
 	actor := rt.store.ensureThreadActor(threadID)
 	actor.touch()
+	loadedThread := false
 	if thread, ok := loadNeoThread(ctx, rt.configSnapshot(), threadID); ok {
+		loadedThread = true
 		if err := actor.importThreadLocalOnly(thread); err != nil {
 			log.Debugf("amp neo local runtime thread-actors import failed thread=%s: %v", threadID, err)
 		}
@@ -3056,7 +3058,7 @@ func (rt *neoRuntime) localThreadActorManagementResponse(ctx context.Context, bo
 	agentMode := firstNonEmptyString(body["agentMode"], nestedString(body["threadMeta"], "agentMode"))
 	executorType := firstNonEmptyString(body["executorType"])
 	actor.mu.Lock()
-	if agentMode != "" {
+	if agentMode != "" && (!loadedThread || actor.currentAgentMode == "") {
 		actor.currentAgentMode = agentMode
 		actor.currentReasoningEffort = defaultNeoReasoningEffort(agentMode)
 		if actor.settings == nil {
@@ -4113,7 +4115,7 @@ func (a *neoActor) importThreadWithSync(thread map[string]any, syncCloud bool) e
 		messages = append(messages, message)
 	}
 
-	agentMode := firstNonEmptyString(thread["agentMode"], nestedString(thread["settings"], "agentMode"))
+	agentMode := firstNonEmptyString(thread["agentMode"], nestedString(thread["settings"], "agentMode"), neoImportedThreadAgentMode(messages))
 	if agentMode == "" {
 		agentMode = "smart"
 	}
@@ -4176,6 +4178,16 @@ func (a *neoActor) importThreadWithSync(thread map[string]any, syncCloud bool) e
 		a.syncCloudAsync()
 	}
 	return nil
+}
+
+func neoImportedThreadAgentMode(messages []neoMessage) string {
+	for i := len(messages) - 1; i >= 0; i-- {
+		message := messages[i]
+		if message.Role == "user" && strings.TrimSpace(message.AgentMode) != "" {
+			return message.AgentMode
+		}
+	}
+	return ""
 }
 
 func neoArtifactsMap(raw any) map[string]any {

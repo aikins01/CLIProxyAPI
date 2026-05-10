@@ -2520,6 +2520,54 @@ func TestNeoRuntimeThreadImportHTTP(t *testing.T) {
 	}
 }
 
+func TestNeoRuntimeThreadImportDerivesModeFromMessages(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := rt.store.ensureThreadActor("T-import-mode")
+
+	thread := map[string]any{
+		"id": "T-import-mode",
+		"messages": []any{
+			map[string]any{"role": "user", "messageId": "M-user", "agentMode": "deep", "reasoningEffort": "xhigh", "content": []any{map[string]any{"type": "text", "text": "keep deep"}}},
+		},
+	}
+	if err := actor.importThreadLocalOnly(thread); err != nil {
+		t.Fatalf("importThreadLocalOnly error: %v", err)
+	}
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.currentAgentMode != "deep" || actor.settings["agentMode"] != "deep" {
+		t.Fatalf("imported mode = current:%q settings:%#v", actor.currentAgentMode, actor.settings)
+	}
+}
+
+func TestNeoRuntimeThreadActorResumeKeepsImportedMode(t *testing.T) {
+	dir := t.TempDir()
+	oldStoreDir := neoAmpThreadStoreDir
+	neoAmpThreadStoreDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
+
+	threadID := "T-resume-mode"
+	if err := os.WriteFile(filepath.Join(dir, threadID+".json"), []byte(`{"id":"`+threadID+`","agentMode":"deep","messages":[{"role":"user","messageId":"M-user","agentMode":"deep","reasoningEffort":"xhigh","content":[{"type":"text","text":"keep deep"}]}]}`), 0o600); err != nil {
+		t.Fatalf("write local thread: %v", err)
+	}
+
+	rt := newNeoRuntime(&config.Config{})
+	response, status := rt.localThreadActorManagementResponse(context.Background(), map[string]any{"agentMode": "smart"}, threadID)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d response=%#v", status, response)
+	}
+	if response["agentMode"] != "deep" {
+		t.Fatalf("resume response mode = %#v, want deep", response["agentMode"])
+	}
+	actor := rt.store.ensureThreadActor(threadID)
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.currentAgentMode != "deep" || actor.settings["agentMode"] != "deep" {
+		t.Fatalf("actor mode = current:%q settings:%#v", actor.currentAgentMode, actor.settings)
+	}
+}
+
 func TestNeoActorThreadSnapshotIncludesArtifacts(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
