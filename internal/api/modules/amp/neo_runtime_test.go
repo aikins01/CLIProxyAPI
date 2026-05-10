@@ -2525,7 +2525,8 @@ func TestNeoRuntimeThreadImportDerivesModeFromMessages(t *testing.T) {
 	actor := rt.store.ensureThreadActor("T-import-mode")
 
 	thread := map[string]any{
-		"id": "T-import-mode",
+		"id":        "T-import-mode",
+		"agentMode": "smart",
 		"messages": []any{
 			map[string]any{"role": "user", "messageId": "M-user", "agentMode": "deep", "reasoningEffort": "xhigh", "content": []any{map[string]any{"type": "text", "text": "keep deep"}}},
 		},
@@ -2548,7 +2549,7 @@ func TestNeoRuntimeThreadActorResumeKeepsImportedMode(t *testing.T) {
 	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
 
 	threadID := "T-resume-mode"
-	if err := os.WriteFile(filepath.Join(dir, threadID+".json"), []byte(`{"id":"`+threadID+`","agentMode":"deep","messages":[{"role":"user","messageId":"M-user","agentMode":"deep","reasoningEffort":"xhigh","content":[{"type":"text","text":"keep deep"}]}]}`), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, threadID+".json"), []byte(`{"id":"`+threadID+`","agentMode":"smart","messages":[{"role":"user","messageId":"M-user","agentMode":"deep","reasoningEffort":"xhigh","content":[{"type":"text","text":"keep deep"}]}]}`), 0o600); err != nil {
 		t.Fatalf("write local thread: %v", err)
 	}
 

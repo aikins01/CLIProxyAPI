@@ -4115,7 +4115,7 @@ func (a *neoActor) importThreadWithSync(thread map[string]any, syncCloud bool) e
 		messages = append(messages, message)
 	}
 
-	agentMode := firstNonEmptyString(thread["agentMode"], nestedString(thread["settings"], "agentMode"), neoImportedThreadAgentMode(messages))
+	agentMode := firstNonEmptyString(neoImportedThreadAgentMode(messages), thread["agentMode"], nestedString(thread["settings"], "agentMode"))
 	if agentMode == "" {
 		agentMode = "smart"
 	}
