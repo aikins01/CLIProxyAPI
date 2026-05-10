@@ -117,6 +117,10 @@ func noCORSMiddleware() gin.HandlerFunc {
 func (m *AmpModule) managementAvailabilityMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if m.getProxy() == nil {
+			if m.canServeNeoLocalManagement(c.Request) {
+				c.Next()
+				return
+			}
 			logging.SkipGinRequestLogging(c)
 			c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
 				"error": "amp upstream proxy not available",
@@ -166,6 +170,13 @@ func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *ha
 
 	// Dynamic proxy handler that uses m.getProxy() for hot-reload support
 	proxyHandler := func(c *gin.Context) {
+		if m.tryServeNeoLocalThreadActor(c) {
+			return
+		}
+		if tryServeNeoLocalThread(c, m.neoThreadConfigSnapshot()) {
+			return
+		}
+
 		// Swallow ErrAbortHandler panics from ReverseProxy copyResponse to avoid noisy stack traces
 		defer func() {
 			if rec := recover(); rec != nil {
@@ -200,10 +211,17 @@ func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *ha
 	ampAPI.Any("/threads", proxyHandler)
 	ampAPI.Any("/threads/*path", proxyHandler)
 	ampAPI.Any("/thread-actors", proxyHandler)
+	ampAPI.Any("/thread-actors/*path", proxyHandler)
+	ampAPI.Any("/attachments", proxyHandler)
+	ampAPI.Any("/attachments/*path", proxyHandler)
 	ampAPI.Any("/otel", proxyHandler)
 	ampAPI.Any("/otel/*path", proxyHandler)
 	ampAPI.Any("/tab", proxyHandler)
 	ampAPI.Any("/tab/*path", proxyHandler)
+	ampAPI.Any("/durable-thread-workers", proxyHandler)
+	ampAPI.Any("/durable-thread-workers/*path", proxyHandler)
+	ampAPI.Any("/v2", proxyHandler)
+	ampAPI.Any("/v2/*path", proxyHandler)
 
 	// Root-level routes that AMP CLI expects without /api prefix
 	// These need the same security middleware as the /api/* routes (dynamic for hot-reload)

@@ -1,11 +1,14 @@
 package amp
 
 import (
+	"bytes"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 )
 
@@ -83,6 +86,89 @@ func TestRegisterManagementRoutes(t *testing.T) {
 				t.Fatalf("proxy handler not called for %s", path.path)
 			}
 		})
+	}
+}
+
+func TestRegisterManagementRoutesLocalNeoThreadActorsWithoutProxy(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	enabled := true
+	m := &AmpModule{
+		restrictToLocalhost: false,
+		neoRuntime: newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+			NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled},
+		}}),
+	}
+
+	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, nil)
+
+	body := bytes.NewBufferString(`{"agentMode":"deep","usesThreadActors":true}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/thread-actors", body)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	var response map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("response JSON error: %v", err)
+	}
+	threadID := stringValue(response["threadId"])
+	if !neoThreadIDExactPattern.MatchString(threadID) {
+		t.Fatalf("threadId = %#v", response["threadId"])
+	}
+	if stringValue(response["wsToken"]) == "" || stringValue(response["ownerUserId"]) == "" || numberFrom(response["threadVersion"]) == 0 {
+		t.Fatalf("missing required thread actor fields: %#v", response)
+	}
+	if response["usesDtw"] != true || response["usesThreadActors"] != true || response["agentMode"] != "deep" {
+		t.Fatalf("unexpected thread actor flags: %#v", response)
+	}
+}
+
+func TestRegisterManagementRoutesCanForceLocalNeoThreadActorsWithProxy(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	enabled := true
+	proxyCalled := false
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxyCalled = true
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	defer upstream.Close()
+
+	m := &AmpModule{
+		restrictToLocalhost: false,
+		neoRuntime: newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+			UpstreamURL: upstream.URL,
+			NeoLocalRuntime: config.AmpNeoLocalRuntime{
+				Enabled:           &enabled,
+				ForceThreadActors: true,
+			},
+		}}),
+	}
+	proxy, _ := createReverseProxy(upstream.URL, NewStaticSecretSource(""))
+	m.setProxy(proxy)
+
+	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, nil)
+
+	body := bytes.NewBufferString(`{"agentMode":"rush","usesThreadActors":true}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/thread-actors", body)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if proxyCalled {
+		t.Fatal("thread-actors request should be served locally when force-thread-actors is enabled")
+	}
+	var response map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("response JSON error: %v", err)
+	}
+	if response["agentMode"] != "rush" || stringValue(response["wsToken"]) == "" {
+		t.Fatalf("unexpected local thread actor response: %#v", response)
 	}
 }
 

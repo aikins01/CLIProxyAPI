@@ -80,6 +80,7 @@ var oauthToolsToRemove = map[string]bool{}
 // Anthropic-compatible upstreams may reject or even crash when Claude models
 // omit max_tokens. Prefer registered model metadata before using a fallback.
 const defaultModelMaxTokens = 1024
+const localNeoInferenceHeaderName = "X-CLIProxyAPI-Local-Neo-Inference"
 
 func NewClaudeExecutor(cfg *config.Config) *ClaudeExecutor { return &ClaudeExecutor{cfg: cfg} }
 
@@ -1545,6 +1546,13 @@ func getWorkloadFromContext(ctx context.Context) string {
 	return ""
 }
 
+func isLocalNeoInferenceRequest(ctx context.Context) bool {
+	if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
+		return strings.EqualFold(strings.TrimSpace(ginCtx.GetHeader(localNeoInferenceHeaderName)), "1")
+	}
+	return false
+}
+
 // getCloakConfigFromAuth extracts cloak configuration from auth attributes.
 // Returns (cloakMode, strictMode, sensitiveWords, cacheUserID).
 func getCloakConfigFromAuth(auth *cliproxyauth.Auth) (string, bool, []string, bool) {
@@ -1852,7 +1860,8 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 		billingVersion := helps.DefaultClaudeVersion(cfg)
 		entrypoint := parseEntrypointFromUA(clientUserAgent)
 		workload := getWorkloadFromContext(ctx)
-		payload = checkSystemInstructionsWithSigningMode(payload, strictMode, useCCHSigning, oauthToken, billingVersion, entrypoint, workload)
+		sanitizeOAuthSystem := oauthToken && !isLocalNeoInferenceRequest(ctx)
+		payload = checkSystemInstructionsWithSigningMode(payload, strictMode, useCCHSigning, sanitizeOAuthSystem, billingVersion, entrypoint, workload)
 	}
 
 	// Inject fake user ID

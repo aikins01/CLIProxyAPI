@@ -22,6 +22,8 @@ import (
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 	"golang.org/x/net/context"
 )
 
@@ -538,6 +540,7 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 	if errMsg != nil {
 		return nil, nil, errMsg
 	}
+	logHandlerThinkingConfig("handler auth-manager request", handlerType, normalizedModel, rawJSON)
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = modelName
 	payload := rawJSON
@@ -586,6 +589,7 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 	if errMsg != nil {
 		return nil, nil, errMsg
 	}
+	logHandlerThinkingConfig("handler auth-manager token count request", handlerType, normalizedModel, rawJSON)
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = modelName
 	payload := rawJSON
@@ -638,6 +642,7 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 		close(errChan)
 		return nil, nil, errChan
 	}
+	logHandlerThinkingConfig("handler auth-manager stream request", handlerType, normalizedModel, rawJSON)
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = modelName
 	payload := rawJSON
@@ -908,6 +913,29 @@ func cloneBytes(src []byte) []byte {
 	dst := make([]byte, len(src))
 	copy(dst, src)
 	return dst
+}
+
+func logHandlerThinkingConfig(component, handlerType, model string, body []byte) {
+	if !log.IsLevelEnabled(log.DebugLevel) {
+		return
+	}
+	responsesEffort := gjson.GetBytes(body, "reasoning.effort")
+	chatEffort := gjson.GetBytes(body, "reasoning_effort")
+	if strings.TrimSpace(model) == "" && !responsesEffort.Exists() && !chatEffort.Exists() {
+		return
+	}
+	fields := log.Fields{
+		"component":    component,
+		"handler_type": handlerType,
+		"model":        model,
+	}
+	if responsesEffort.Exists() {
+		fields["reasoning.effort"] = responsesEffort.String()
+	}
+	if chatEffort.Exists() {
+		fields["reasoning_effort"] = chatEffort.String()
+	}
+	log.WithFields(fields).Debug("handler request thinking config")
 }
 
 func cloneHeader(src http.Header) http.Header {

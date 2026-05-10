@@ -2,7 +2,9 @@ package amp
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
+	"net/http"
 	"net/http/httputil"
 	"strings"
 	"time"
@@ -31,6 +33,58 @@ const (
 
 // MappedModelContextKey is the Gin context key for passing mapped model names.
 const MappedModelContextKey = "mapped_model"
+const localNeoInferenceHeader = "X-CLIProxyAPI-Local-Neo-Inference"
+
+func logAmpIngressRequest(c *gin.Context, rawBody []byte) {
+	if !log.IsLevelEnabled(log.DebugLevel) || c == nil || c.Request == nil {
+		return
+	}
+	payload := map[string]any{
+		"component":    "amp-ingress",
+		"method":       c.Request.Method,
+		"path":         c.Request.URL.Path,
+		"raw_query":    util.MaskSensitiveQuery(c.Request.URL.RawQuery),
+		"headers":      maskedHeaders(c.Request.Header),
+		"body_len":     len(rawBody),
+		"body":         string(rawBody),
+		"action_param": c.Param("action"),
+		"path_param":   c.Param("path"),
+	}
+	if clientModel := extractModelFromRequest(rawBody, c); strings.TrimSpace(clientModel) != "" {
+		payload["detected_model"] = clientModel
+	}
+	if responsesEffort := gjson.GetBytes(rawBody, "reasoning.effort"); responsesEffort.Exists() {
+		payload["reasoning.effort"] = responsesEffort.String()
+	}
+	if chatEffort := gjson.GetBytes(rawBody, "reasoning_effort"); chatEffort.Exists() {
+		payload["reasoning_effort"] = chatEffort.String()
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		log.Debug("amp ingress request")
+		return
+	}
+	log.Debugf("amp ingress request %s", encoded)
+}
+
+func maskedHeaders(headers http.Header) map[string][]string {
+	if len(headers) == 0 {
+		return nil
+	}
+	masked := make(map[string][]string, len(headers))
+	for key, values := range headers {
+		if len(values) == 0 {
+			masked[key] = nil
+			continue
+		}
+		maskedValues := make([]string, 0, len(values))
+		for _, value := range values {
+			maskedValues = append(maskedValues, util.MaskSensitiveHeaderValue(key, value))
+		}
+		masked[key] = maskedValues
+	}
+	return masked
+}
 
 // logAmpRouting logs the routing decision for an Amp request with structured fields
 func logAmpRouting(routeType AmpRouteType, requestedModel, resolvedModel, provider, path string) {
@@ -121,6 +175,27 @@ func (fh *FallbackHandler) WrapHandler(handler gin.HandlerFunc) gin.HandlerFunc 
 			log.Errorf("amp fallback: failed to read request body: %v", err)
 			handler(c)
 			return
+		}
+
+		rawBodyBytes := bodyBytes
+		logAmpIngressRequest(c, rawBodyBytes)
+		rawModelName := extractModelFromRequest(rawBodyBytes, c)
+		rawResponsesEffort := gjson.GetBytes(rawBodyBytes, "reasoning.effort")
+		rawChatEffort := gjson.GetBytes(rawBodyBytes, "reasoning_effort")
+		if rawModelName != "" || rawResponsesEffort.Exists() || rawChatEffort.Exists() {
+			fields := log.Fields{
+				"path": requestPath,
+			}
+			if rawModelName != "" {
+				fields["model"] = rawModelName
+			}
+			if rawResponsesEffort.Exists() {
+				fields["reasoning.effort"] = rawResponsesEffort.String()
+			}
+			if rawChatEffort.Exists() {
+				fields["reasoning_effort"] = rawChatEffort.String()
+			}
+			log.WithFields(fields).Debug("amp raw request thinking config")
 		}
 
 		// Sanitize request body: remove thinking blocks with invalid signatures
@@ -225,6 +300,15 @@ func (fh *FallbackHandler) WrapHandler(handler gin.HandlerFunc) gin.HandlerFunc 
 
 		// If no providers available, fallback to ampcode.com
 		if len(providers) == 0 {
+			if c.GetHeader(localNeoInferenceHeader) == "1" {
+				logAmpRouting(RouteTypeNoProvider, modelName, "", "", requestPath)
+				c.AbortWithStatusJSON(http.StatusBadGateway, gin.H{
+					"error":   "local_neo_provider_unavailable",
+					"message": "Amp Neo local inference has no local provider for requested model",
+					"model":   modelName,
+				})
+				return
+			}
 			proxy := fh.getProxy()
 			if proxy != nil {
 				// Log: Forwarding to ampcode.com (uses Amp credits)

@@ -318,6 +318,21 @@ nonstream-keepalive-interval: 0
 #   restrict-management-to-localhost: false
 #   # Force model mappings to run before checking local API keys (default: false)
 #   force-model-mappings: false
+#   # enable the local Rivet/thread-actor runtime used by Amp Neo when amp.url points at this proxy
+#   neo-local-runtime:
+#     enabled: true
+#     host: "127.0.0.1"
+#     port: 6420
+#     # optional: override the Amp binary used when the runtime spawns a local headless executor
+#     executor-command: ""
+#     executor-connect-timeout-seconds: 90
+#     # optional: generate thread titles through the local provider routes
+#     title-generation: true
+#     title-model: "claude-haiku-4-5-20251001"
+#     # optional: poll Amp cloud threads and inject new user messages into the local runtime
+#     remote-control: false
+#     remote-poll-interval-seconds: 5
+#     remote-control-max-threads: 20
 #   # Amp Model Mappings
 #   # Route unavailable Amp models to alternative models available in your local proxy.
 #   # Useful when Amp CLI requests models you don't have access to (e.g., Claude Opus 4.5)

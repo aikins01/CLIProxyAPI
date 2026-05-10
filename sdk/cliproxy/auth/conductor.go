@@ -25,6 +25,7 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 )
 
 // ProviderExecutor defines the contract required by Manager to execute provider calls.
@@ -1363,6 +1364,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			resultModel := m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
 			execReq := req
 			execReq.Model = upstreamModel
+			logExecutionThinkingConfig("auth manager execute request", opts.SourceFormat.String(), routeModel, upstreamModel, execReq.Payload)
 			resp, errExec := executor.Execute(execCtx, auth, execReq, opts)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
 			if errExec != nil {
@@ -1451,6 +1453,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			resultModel := m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
 			execReq := req
 			execReq.Model = upstreamModel
+			logExecutionThinkingConfig("auth manager token count request", opts.SourceFormat.String(), routeModel, upstreamModel, execReq.Payload)
 			resp, errExec := executor.CountTokens(execCtx, auth, execReq, opts)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
 			if errExec != nil {
@@ -3877,6 +3880,30 @@ func logEntryWithRequestID(ctx context.Context) *log.Entry {
 		return log.WithField("request_id", reqID)
 	}
 	return log.NewEntry(log.StandardLogger())
+}
+
+func logExecutionThinkingConfig(component, sourceFormat, routeModel, upstreamModel string, payload []byte) {
+	if !log.IsLevelEnabled(log.DebugLevel) {
+		return
+	}
+	responsesEffort := gjson.GetBytes(payload, "reasoning.effort")
+	chatEffort := gjson.GetBytes(payload, "reasoning_effort")
+	if strings.TrimSpace(routeModel) == "" && strings.TrimSpace(upstreamModel) == "" && !responsesEffort.Exists() && !chatEffort.Exists() {
+		return
+	}
+	fields := log.Fields{
+		"component":     component,
+		"source_format": sourceFormat,
+		"route_model":   routeModel,
+		"upstream_model": upstreamModel,
+	}
+	if responsesEffort.Exists() {
+		fields["reasoning.effort"] = responsesEffort.String()
+	}
+	if chatEffort.Exists() {
+		fields["reasoning_effort"] = chatEffort.String()
+	}
+	log.WithFields(fields).Debug("auth manager request thinking config")
 }
 
 func debugLogAuthSelection(entry *log.Entry, auth *Auth, provider string, model string) {

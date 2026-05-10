@@ -294,6 +294,55 @@ type AmpCode struct {
 	// ForceModelMappings when true, model mappings take precedence over local API keys.
 	// When false (default), local API keys are used first if available.
 	ForceModelMappings bool `yaml:"force-model-mappings" json:"force-model-mappings"`
+
+	// NeoLocalRuntime configures the local Rivet/ThreadActor runtime used by Amp Neo
+	// when amp.url points at this proxy. Amp Neo derives localhost:6420 from a
+	// local amp.url and expects this companion runtime for interactive threads.
+	NeoLocalRuntime AmpNeoLocalRuntime `yaml:"neo-local-runtime,omitempty" json:"neo-local-runtime,omitempty"`
+}
+
+// AmpNeoLocalRuntime controls the local Amp Neo actor/runtime listener.
+type AmpNeoLocalRuntime struct {
+	// Enabled toggles the companion local Neo runtime. Nil means disabled.
+	Enabled *bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+
+	// Host is the listener host for the local Neo runtime. Defaults to 127.0.0.1.
+	Host string `yaml:"host,omitempty" json:"host,omitempty"`
+
+	// Port is the listener port for the local Neo runtime. Defaults to 6420.
+	Port int `yaml:"port,omitempty" json:"port,omitempty"`
+
+	// ExecutorCommand optionally overrides the Amp CLI binary used for local
+	// Neo headless executor spawns. defaults to ~/.amp/bin/amp, then PATH.
+	ExecutorCommand string `yaml:"executor-command,omitempty" json:"executor-command,omitempty"`
+
+	// ExecutorConnectTimeoutSeconds is how long to wait for a spawned Amp
+	// headless executor to connect before reporting a failed spawn.
+	ExecutorConnectTimeoutSeconds int `yaml:"executor-connect-timeout-seconds,omitempty" json:"executor-connect-timeout-seconds,omitempty"`
+
+	// force-thread-actors serves /api/thread-actors locally even when an
+	// upstream Amp control plane proxy is configured.
+	ForceThreadActors bool `yaml:"force-thread-actors,omitempty" json:"force-thread-actors,omitempty"`
+
+	// TitleGeneration toggles background local-provider title generation for
+	// Neo threads. nil means enabled when the local Neo runtime is enabled.
+	TitleGeneration *bool `yaml:"title-generation,omitempty" json:"title-generation,omitempty"`
+
+	// TitleModel optionally overrides the model used for local Neo title
+	// generation. defaults to Amp's title side-call model.
+	TitleModel string `yaml:"title-model,omitempty" json:"title-model,omitempty"`
+
+	// RemoteControl enables polling Amp cloud thread records for new user
+	// messages and injecting them into the local Neo actor.
+	RemoteControl *bool `yaml:"remote-control,omitempty" json:"remote-control,omitempty"`
+
+	// RemotePollIntervalSeconds controls how often remote-control polling checks
+	// Amp cloud for new user messages. defaults to 5 seconds.
+	RemotePollIntervalSeconds int `yaml:"remote-poll-interval-seconds,omitempty" json:"remote-poll-interval-seconds,omitempty"`
+
+	// RemoteControlMaxThreads limits how many locally known threads are watched
+	// by remote-control polling. defaults to 20.
+	RemoteControlMaxThreads int `yaml:"remote-control-max-threads,omitempty" json:"remote-control-max-threads,omitempty"`
 }
 
 // AmpUpstreamAPIKeyEntry maps a set of client API keys to a specific upstream API key.

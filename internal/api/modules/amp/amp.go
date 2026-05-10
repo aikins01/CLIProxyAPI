@@ -3,10 +3,12 @@
 package amp
 
 import (
+	"context"
 	"fmt"
 	"net/http/httputil"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/api/modules"
@@ -31,6 +33,7 @@ type AmpModule struct {
 	accessManager   *sdkaccess.Manager
 	authMiddleware_ gin.HandlerFunc
 	modelMapper     *DefaultModelMapper
+	neoRuntime      *neoRuntime
 	enabled         bool
 	registerOnce    sync.Once
 
@@ -129,6 +132,8 @@ func (m *AmpModule) Register(ctx modules.Context) error {
 		// Store initial config for partial reload comparison
 		m.lastConfig = new(settings)
 
+		m.applyNeoRuntime(ctx.Config)
+
 		// Initialize localhost restriction setting (hot-reloadable)
 		m.setRestrictToLocalhost(settings.RestrictManagementToLocalhost)
 
@@ -188,6 +193,8 @@ func (m *AmpModule) OnConfigUpdated(cfg *config.Config) error {
 	if oldSettings != nil && oldSettings.RestrictManagementToLocalhost != newSettings.RestrictManagementToLocalhost {
 		m.setRestrictToLocalhost(newSettings.RestrictManagementToLocalhost)
 	}
+
+	m.applyNeoRuntime(cfg)
 
 	newUpstreamURL := strings.TrimSpace(newSettings.UpstreamURL)
 	oldUpstreamURL := ""
@@ -255,6 +262,62 @@ func (m *AmpModule) OnConfigUpdated(cfg *config.Config) error {
 	m.configMu.Unlock()
 
 	return nil
+}
+
+func (m *AmpModule) applyNeoRuntime(cfg *config.Config) {
+	if cfg == nil {
+		return
+	}
+	if !neoRuntimeEnabled(cfg) {
+		if m.neoRuntime != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			if err := m.neoRuntime.stop(ctx); err != nil {
+				log.Warnf("amp neo local runtime stop failed: %v", err)
+			}
+			m.neoRuntime = nil
+		}
+		return
+	}
+
+	host, port := neoRuntimeAddress(cfg)
+	if m.neoRuntime != nil {
+		if m.neoRuntime.host == host && m.neoRuntime.port == port {
+			if err := m.neoRuntime.updateConfig(cfg); err != nil {
+				log.Warnf("amp neo local runtime config update failed: %v", err)
+			}
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := m.neoRuntime.stop(ctx); err != nil {
+			log.Warnf("amp neo local runtime restart stop failed: %v", err)
+		}
+		m.neoRuntime = nil
+	}
+
+	rt := newNeoRuntime(cfg)
+	if err := rt.start(); err != nil {
+		log.Warnf("amp neo local runtime start failed: %v", err)
+		return
+	}
+	m.neoRuntime = rt
+}
+
+func (m *AmpModule) neoThreadConfigSnapshot() *config.Config {
+	if m == nil {
+		return nil
+	}
+	if m.neoRuntime != nil {
+		return m.neoRuntime.configSnapshot()
+	}
+	m.configMu.RLock()
+	defer m.configMu.RUnlock()
+	if m.lastConfig == nil {
+		return nil
+	}
+	ampCode := *m.lastConfig
+	return &config.Config{AmpCode: ampCode}
 }
 
 func (m *AmpModule) enableUpstreamProxy(upstreamURL string, settings *config.AmpCode) error {

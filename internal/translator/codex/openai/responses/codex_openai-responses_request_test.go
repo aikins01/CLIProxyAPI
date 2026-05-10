@@ -219,6 +219,27 @@ func TestConvertOpenAIResponsesRequestToCodex_OriginalIssue(t *testing.T) {
 	}
 }
 
+func TestConvertOpenAIResponsesRequestToCodex_DoesNotDefaultReasoningEffort(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "gpt-5.4",
+		"input": [
+			{
+				"type": "message",
+				"role": "user",
+				"content": [{"type": "input_text", "text": "hello"}]
+			}
+		]
+	}`)
+
+	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.4", inputJSON, false)
+	if gjson.GetBytes(output, "reasoning.effort").Exists() {
+		t.Fatalf("reasoning.effort should not be synthesized when absent: %s", output)
+	}
+	if gjson.GetBytes(output, "reasoning_effort").Exists() {
+		t.Fatalf("reasoning_effort should not be synthesized when absent: %s", output)
+	}
+}
+
 // TestConvertSystemRoleToDeveloper_AssistantRole tests that assistant role is preserved
 func TestConvertSystemRoleToDeveloper_AssistantRole(t *testing.T) {
 	inputJSON := []byte(`{
