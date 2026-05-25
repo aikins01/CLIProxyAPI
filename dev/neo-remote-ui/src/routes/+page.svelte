@@ -311,20 +311,42 @@
   async function submitKey() {
     const key = keyDraft.trim();
     if (!key) {
-      lastError = 'Enter the local runtime key to continue.';
+      lastError = 'Enter your access key to continue.';
       return;
     }
     authLoading = true;
     lastError = '';
     apiKey = key;
     persistAPIKey();
-    isAuthenticated = true;
-    const ok = await refreshThreads(threadIdFromURL());
-    authLoading = false;
-    if (!ok) {
-      isAuthenticated = false;
-      apiKey = '';
-      localStorage.removeItem('neo-remote-api-key');
+    // Verify the key. Only promote to authenticated on success.
+    try {
+      const result = await rpc('listThreads', { includeArchived: false, limit: 80 });
+      const rawThreads = Array.isArray(result?.threads) ? result.threads : [];
+      threads = rawThreads.map(threadSummaryFromAPI).filter(Boolean) as ThreadSummary[];
+      isAuthenticated = true;
+      lastError = '';
+      const targetThreadId = threadIdFromURL() || selectedThreadId || threads[0]?.id || '';
+      if (targetThreadId) {
+        void openThread(targetThreadId, { replaceURL: true });
+      }
+    } catch (error) {
+      const status = error instanceof RpcError ? error.status : 0;
+      if (status === 401 || status === 403) {
+        // Bad key — clear it and tell the user.
+        apiKey = '';
+        localStorage.removeItem('neo-remote-api-key');
+        lastError = 'That key was rejected. Double-check and try again.';
+      } else if (status >= 500) {
+        // Server is up but failing. Keep the key, surface a friendly message.
+        lastError = 'Your local runtime returned an error. It might still be starting — try again in a moment.';
+      } else if (status === 0) {
+        // Network/CORS/offline.
+        lastError = "Couldn't reach your local runtime. Make sure it's running and try again.";
+      } else {
+        lastError = error instanceof Error ? error.message : String(error);
+      }
+    } finally {
+      authLoading = false;
     }
   }
 
@@ -350,6 +372,17 @@
     return next;
   }
 
+  class RpcError extends Error {
+    status: number;
+    method: string;
+    constructor(method: string, status: number, message?: string) {
+      super(message || `${method} failed${status ? `: HTTP ${status}` : ''}`);
+      this.name = 'RpcError';
+      this.method = method;
+      this.status = status;
+    }
+  }
+
   async function rpc(method: string, params: Record<string, unknown>) {
     const response = await fetch(`/api/internal?${encodeURIComponent(method)}`, {
       method: 'POST',
@@ -357,11 +390,11 @@
       body: JSON.stringify({ method, params })
     });
     if (!response.ok) {
-      throw new Error(`${method} failed: HTTP ${response.status}`);
+      throw new RpcError(method, response.status);
     }
     const data = await response.json();
     if (data?.ok === false) {
-      throw new Error(`${method} failed`);
+      throw new RpcError(method, 0, `${method} failed`);
     }
     return data?.result ?? data;
   }
@@ -2210,33 +2243,40 @@
 
 {#if !isAuthenticated}
   <main class="auth-shell">
-    <section class="auth-panel" aria-label="Local runtime access">
+    <section class="auth-panel" aria-label="Sign in">
       <div class="auth-panel__brand">
-        <span>amp</span>
-        <small>local remote</small>
+        <svg class="auth-panel__logo" viewBox="0 0 281 144" fill="currentColor" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+          <path d="M236.014 20C260.431 20.0001 280.602 37.4115 280.603 64.7432C280.602 93.5337 260.065 114.166 233.52 114.166C224.158 114.166 215.639 112.422 208.63 108.49C202.886 105.27 198.203 100.605 194.919 94.3379L188.115 141.822L187.946 143.016H174.214L174.448 141.423L191.772 22.4941H205.372L203.937 31.3369C212.143 23.8608 223.2 20.0002 236.014 20ZM47.082 20.1543C56.4435 20.1543 65.0012 21.8991 72.0488 25.8486C77.8222 29.0831 82.5323 33.7713 85.8271 40.085L88.1201 23.6924L88.2861 22.4932H101.863L89.1611 110.633L88.9873 111.826H75.4092L76.7227 102.855C68.5854 110.456 57.3981 114.323 44.5889 114.323C20.1709 114.323 0.000167223 96.9087 0 69.5771C0.000149745 40.7854 20.54 20.1549 47.082 20.1543ZM116.234 110.636L116.061 111.827H102.485L115.351 23.6855L115.521 22.4941H129.083L116.234 110.636ZM140.673 110.636L140.499 111.827H126.924L139.789 23.6855L139.96 22.4941H153.521L140.673 110.636ZM177.958 22.4941L165.108 110.636L164.935 111.827H151.36L164.225 23.6855L164.396 22.4941H177.958ZM48.4854 31.9844C27.8638 31.985 14.0133 48.3799 14.0127 68.9521C14.0127 77.7907 16.8094 86.1771 22.3145 92.334C27.7973 98.4657 36.0631 102.493 47.2402 102.493C67.8534 102.493 81.7122 85.9487 81.7129 65.3682C81.7129 55.4076 78.2493 47.0792 72.4131 41.2441C66.5794 35.4088 58.2871 31.9844 48.4854 31.9844ZM233.362 31.8291C212.749 31.8297 198.89 48.3716 198.89 68.9521C198.89 78.9123 202.356 87.2403 208.189 93.0742C214.023 98.9107 222.315 102.336 232.116 102.336C252.738 102.335 266.589 85.9407 266.59 65.3682C266.59 56.5296 263.795 48.1424 258.29 41.9863C252.807 35.8551 244.542 31.8291 233.362 31.8291Z"/>
+        </svg>
+        <span class="auth-panel__sub">neo remote</span>
       </div>
+
+      <div class="auth-panel__intro">
+        <h1>Connect</h1>
+      </div>
+
       <form class="auth-form" onsubmit={(event) => { event.preventDefault(); void submitKey(); }}>
-        <label>
-          <span>local runtime key</span>
-          <span class="auth-form__field">
-            <KeyRound size={16} />
-            <input
-              bind:value={keyDraft}
-              type="password"
-              autocomplete="off"
-              placeholder="amp-local-key"
-            />
-          </span>
-        </label>
-        <button type="submit" disabled={authLoading}>
+        <label class="auth-form__label" for="auth-key">Access key</label>
+        <div class="auth-form__field">
+          <KeyRound size={14} />
+          <input
+            id="auth-key"
+            bind:value={keyDraft}
+            type="password"
+            autocomplete="off"
+            placeholder="Enter your key"
+          />
+        </div>
+        <button class="auth-form__submit" type="submit" disabled={authLoading || !keyDraft.trim()}>
           {#if authLoading}
-            <Loader2 size={16} class="spin" />
+            <Loader2 size={14} class="spin" />
+            Connecting...
           {:else}
-            <Wifi size={16} />
+            Connect
           {/if}
-          Connect
         </button>
       </form>
+
       {#if lastError}
         <p class="auth-panel__error">{lastError}</p>
       {/if}
@@ -2348,6 +2388,7 @@
     </section>
   {:else}
   <section class:neo-grid--thread-open={Boolean(detail) && mobilePane === 'thread'} class="neo-grid">
+    <div class="neo-grid__spacer" aria-hidden="true"></div>
     <section class="thread-stage">
       {#if detail}
         <div class="thread-head">
@@ -2635,43 +2676,68 @@
 
   .auth-panel {
     display: grid;
-    gap: 22px;
-    width: min(100%, 420px);
-    border: 1px solid var(--neo-border);
-    background: var(--neo-bg);
-    border-radius: 8px;
-    padding: 22px;
-    box-shadow: var(--neo-shadow);
+    gap: 20px;
+    width: min(100%, 400px);
+    border: 1px solid var(--neo-border-strong);
+    background: color-mix(in srgb, var(--neo-ink) 3%, var(--neo-bg));
+    outline: 1px solid color-mix(in srgb, var(--neo-ink) 10%, transparent);
+    outline-offset: -1px;
+    border-radius: 16px;
+    padding: 24px;
+    box-shadow: 0 10px 32px rgba(0, 0, 0, 0.08);
   }
 
   .auth-panel__brand {
     display: flex;
-    align-items: baseline;
+    align-items: center;
     gap: 10px;
+    margin: 0 0 4px;
   }
-  .auth-panel__brand span {
+  .auth-panel__logo {
+    height: 24px;
+    width: auto;
     color: var(--neo-ink);
-    font-size: 22px;
-    font-weight: 700;
+    flex-shrink: 0;
   }
-  .auth-panel__brand small {
+  .auth-panel__sub {
     color: var(--neo-muted);
     font-size: 13px;
+    font-weight: 500;
+    white-space: nowrap;
+    border-left: 1px solid var(--neo-border-strong);
+    padding-left: 10px;
+    line-height: 1;
   }
-  .auth-form { display: grid; gap: 12px; }
-  .auth-form label { display: grid; gap: 7px; color: var(--neo-muted); font-size: 12px; }
+
+  .auth-panel__intro { display: flex; flex-direction: column; gap: 6px; }
+  .auth-panel__intro h1 {
+    margin: 0;
+    font-size: 18px;
+    font-weight: 600;
+    color: var(--neo-ink);
+    letter-spacing: -0.01em;
+  }
+
+  .auth-form { display: flex; flex-direction: column; gap: 8px; }
+  .auth-form__label {
+    color: var(--neo-muted);
+    font-size: 12px;
+    line-height: 16px;
+    font-weight: 500;
+  }
   .auth-form__field {
-    display: grid;
-    grid-template-columns: auto minmax(0, 1fr);
+    display: flex;
     align-items: center;
-    gap: 9px;
-    min-height: 38px;
+    gap: 8px;
+    min-height: 36px;
     border: 1px solid var(--neo-border-strong);
     background: var(--neo-bg);
     border-radius: 6px;
     padding: 0 12px;
     color: var(--neo-muted);
+    transition: border-color 150ms cubic-bezier(0.4, 0, 0.2, 1);
   }
+  .auth-form__field:focus-within { border-color: var(--neo-ink); }
   .auth-form input {
     width: 100%;
     min-width: 0;
@@ -2680,22 +2746,35 @@
     background: transparent;
     color: var(--neo-ink);
     font: inherit;
+    font-size: 13px;
+    line-height: 20px;
+    padding: 0;
   }
-  .auth-form button {
+  .auth-form input::placeholder { color: var(--neo-muted); }
+  .auth-form__submit {
     display: inline-flex;
     align-items: center;
     justify-content: center;
     gap: 8px;
-    min-height: 38px;
+    min-height: 36px;
+    margin-top: 6px;
     border: 0;
-    border-radius: 6px;
+    border-radius: 8px;
     background: var(--neo-accent);
     color: var(--neo-bg);
-    font-weight: 600;
+    font-weight: 500;
+    font-size: 13px;
     cursor: pointer;
+    transition: opacity 150ms cubic-bezier(0.4, 0, 0.2, 1);
   }
-  .auth-form button:disabled { cursor: wait; opacity: 0.6; }
-  .auth-panel__error { margin: 0; color: var(--neo-danger); font-size: 13px; line-height: 1.45; }
+  .auth-form__submit:hover:not(:disabled) { opacity: 0.9; }
+  .auth-form__submit:disabled { cursor: not-allowed; opacity: 0.4; }
+  .auth-panel__error {
+    margin: 0;
+    color: var(--neo-danger);
+    font-size: 12px;
+    line-height: 16px;
+  }
 
   /* === SHELL & HEADER === */
   .neo-shell {
@@ -3082,15 +3161,21 @@
 
   .thread-stage {
     display: grid;
-    flex: 1;
+    flex: 1 1 0;
     min-height: calc(100vh - 110px);
     grid-template-columns: minmax(0, 1fr);
     grid-template-rows: auto 1fr auto;
     min-width: 0;
-    width: 100%;
-    max-width: 1024px;
-    margin: 0 auto;
     padding: 16px;
+  }
+
+  .neo-grid__spacer { display: none; }
+  @media (min-width: 1280px) {
+    .neo-grid__spacer {
+      display: block;
+      flex: 1 1 0;
+      max-width: 21em;
+    }
   }
   @media (max-width: 640px) {
     .thread-stage { padding: 12px; }
@@ -3546,6 +3631,9 @@
     justify-content: center;
   }
   .composer-footer > .composer { pointer-events: auto; }
+  @media (min-width: 1024px) and (max-width: 1279.98px) {
+    .composer-footer { padding-right: calc(8px + 21em); padding-left: 8px; }
+  }
   /* Spacer that reserves vertical space at the end of the transcript so the sticky composer never covers the last message. */
   .composer-dock {
     height: 140px;

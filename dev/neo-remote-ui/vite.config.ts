@@ -2,6 +2,13 @@ import { sveltekit } from '@sveltejs/kit/vite';
 import { defineConfig } from 'vite';
 import { fileURLToPath } from 'node:url';
 
+const runtimeUpstream = process.env.CLIPROXY_UPSTREAM || 'http://127.0.0.1:8317';
+const runtimeProxy = (ws = false) => ({
+  target: runtimeUpstream,
+  changeOrigin: true,
+  ...(ws ? { ws: true } : {})
+});
+
 export default defineConfig({
   plugins: [sveltekit()],
   resolve: {
@@ -17,24 +24,10 @@ export default defineConfig({
   server: {
     port: 5177,
     proxy: {
-      '/api': {
-        target: 'http://127.0.0.1:8317',
-        changeOrigin: true
-      },
-      '/threads': {
-        target: 'http://127.0.0.1:8317',
-        changeOrigin: true
-      },
-      '/gateway': {
-        target: 'http://127.0.0.1:8317',
-        changeOrigin: true,
-        ws: true
-      },
-      '/actors': {
-        target: 'http://127.0.0.1:8317',
-        changeOrigin: true,
-        ws: true
-      }
+      '/api': runtimeProxy(),
+      '/threads': runtimeProxy(),
+      '/gateway': runtimeProxy(true),
+      '/actors': runtimeProxy(true)
     }
   }
 });
