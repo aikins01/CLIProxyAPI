@@ -1251,14 +1251,31 @@
     // 2. Escape the rest
     src = escapeHtml(src);
 
-    // 3. Inline replacements: `code`, **bold**, *italic*, file:// links, bare URLs
+    // 3. Inline replacements.
     src = src
+      // Markdown links FIRST so we can grab the bracketed label whole before backticks rewrite it.
+      // [text](url) — capture trimmed label + url. Strip optional surrounding whitespace inside parens.
+      .replace(/\[([^\]\n]+)\]\(\s*([^)\s]+(?:\s*#[^)]+)?)\s*\)/g, (_match, label, url) => {
+        const trimmedLabel = label.trim();
+        const trimmedUrl = url.trim();
+        const isWebLink = /^https?:\/\//.test(trimmedUrl);
+        // For file-path URLs (anything not http) the label already shows the path nicely — render
+        // as an underlined inline code chip (matches ampcode's "[ `path` ](abs-path)" → underlined code chip).
+        // For web URLs, render as standard external link.
+        if (isWebLink) {
+          return `<a class="md-link" href="${trimmedUrl}" target="_blank" rel="noopener">${trimmedLabel}</a>`;
+        }
+        // Drop surrounding backticks from the label so we can wrap it in our own code chip
+        const inner = trimmedLabel.replace(/^`+|`+$/g, '');
+        const fileHref = /^file:\/\//.test(trimmedUrl) ? trimmedUrl : (trimmedUrl.startsWith('/') ? `file://${trimmedUrl}` : trimmedUrl);
+        return `<a class="md-link md-link--file" href="${fileHref}"><code class="md-code md-code--path">${inner}</code></a>`;
+      })
       .replace(/`([^`\n]+?)`/g, '<code class="md-code">$1</code>')
       .replace(/\*\*([^*\n]+?)\*\*/g, '<strong>$1</strong>')
       .replace(/(^|[\s(])\*([^*\n]+?)\*(?=[\s.,;:!?)]|$)/g, '$1<em>$2</em>')
-      // file:// URIs -> clickable link
-      .replace(/(file:\/\/[^\s<]+)/g, '<a class="md-file-link" href="$1">$1</a>')
-      // bare http(s) URLs -> clickable link
+      // file:// URIs (not already inside a link) render as inline code chips.
+      .replace(/(?<!["=])file:\/\/([^\s<)"]+)/g, '<code class="md-code md-code--path">$1</code>')
+      // Bare http(s) URLs (not already inside a link)
       .replace(/(?<!["'>=\/])\b(https?:\/\/[^\s<)]+)/g, '<a class="md-link" href="$1" target="_blank" rel="noopener">$1</a>');
 
     // 4. Block-level: process line by line
@@ -1315,6 +1332,13 @@
     const head = m ? m[1] : id.slice(0, 6);
     const tail = id.slice(-4);
     return `${head}…${tail}`;
+  }
+
+  // Models prefix thinking blocks with a bold heading ("**Investigating code paths**") followed
+  // by prose. Ampcode hides the heading and renders only the prose; do the same.
+  function stripThinkingTitle(text: string): string {
+    if (!text) return text;
+    return text.replace(/^\s*\*\*[^*\n]+\*\*\s*\n+/, '').trimStart();
   }
 
   function formatTokenCount(n: number): string {
@@ -1711,26 +1735,56 @@
   // Classify a tool_use block into an ampcode-style category for grouping.
   // Normalize by stripping spaces/underscores/dashes so 'Shell command', 'shell_command', 'shellCommand' all match.
   type ToolCategory = 'explore' | 'edit' | 'command' | 'thread' | 'skill' | 'task' | 'web' | 'other';
+  function normalizedToolName(name: string) {
+    return (name || '').toLowerCase().replace(/[\s_-]+/g, '');
+  }
+
   function toolCategory(name: string): ToolCategory {
-    const n = (name || '').toLowerCase().replace(/[\s_-]+/g, '');
+    const n = normalizedToolName(name);
     // Order matters — check most specific first
     if (n.includes('shell') || n.includes('command') || n.includes('bash') || n.includes('terminal') || n === 'exec' || n === 'run') return 'command';
     if (n.includes('editfile') || n.includes('writefile') || n.includes('createfile') || n.includes('patch') || n.includes('edit') || n === 'write' || n === 'modify' || n === 'update') return 'edit';
-    if (n.includes('thread')) return 'thread';
     if (n.includes('subagent') || n === 'task' || n === 'agent' || n.includes('spawn')) return 'task';
     if (n.includes('web')) return 'web';
-    if (n.includes('skill')) return 'explore';
-    if (n.includes('search') || n.includes('grep') || n.includes('ripgrep')) return 'explore';
+    // Thread reads/searches aggregate into the Explored summary (matches ampcode's "Explored N threads/searches")
+    if (n.includes('thread') || n.includes('skill') || n.includes('search') || n.includes('grep') || n.includes('ripgrep')) return 'explore';
     if (n.includes('read') || n.includes('view') || n === 'cat') return 'explore';
     if (n.includes('list') || n.includes('glob') || n.includes('find') || n === 'tree' || n === 'ls' || n.includes('explore') || n.includes('directory')) return 'explore';
     return 'other';
   }
+
+  function shellExploreKind(command: string) {
+    const trimmed = command.trim();
+    if (!trimmed) return '';
+    if (/^(?:env\s+[^=]+=[^\s]+\s+)*(?:rg|grep|ag)\b/.test(trimmed)) return 'grep';
+    if (/^(?:env\s+[^=]+=[^\s]+\s+)*(?:find|fd)\b/.test(trimmed)) return 'list';
+    if (/^(?:cat|bat|less|more|head|tail|nl|sed\s+-n)\b/.test(trimmed)) return 'read';
+    if (/^(?:ls|tree)\b/.test(trimmed)) return 'list';
+    return '';
+  }
+
+  function toolCategoryForBlock(block: ContentBlock): ToolCategory {
+    const category = toolCategory(block.name || '');
+    if (category !== 'command') return category;
+    return shellExploreKind(commandText(block)) ? 'explore' : category;
+  }
+
   function exploreNoun(name: string): string {
-    const n = (name || '').toLowerCase().replace(/[\s_-]+/g, '');
+    const n = normalizedToolName(name);
+    if (n.includes('findthread') || n.includes('searchthread') || n.includes('threadsearch')) return 'search';
+    if (n.includes('readthread')) return 'thread';
+    if (n.includes('thread')) return 'thread';
     if (n.includes('search') || n.includes('grep') || n.includes('ripgrep')) return 'search';
     if (n.includes('list') || n.includes('glob') || n.includes('find') || n === 'tree' || n === 'ls' || n.includes('directory')) return 'list';
     if (n.includes('skill')) return 'skill';
     return 'file';
+  }
+
+  function exploreNounForBlock(block: ContentBlock): string {
+    const shellKind = shellExploreKind(commandText(block));
+    if (shellKind === 'grep') return 'search';
+    if (shellKind === 'list') return 'list';
+    return exploreNoun(block.name || '');
   }
   function pluralize(noun: string, n: number): string {
     if (n === 1) return `1 ${noun}`;
@@ -1755,7 +1809,7 @@
       if (b.type === 'thinking') { flush(); rows.push({ kind: 'thinking', block: b }); }
       else if (b.type === 'text') { flush(); rows.push({ kind: 'progress', block: b }); }
       else if (b.type === 'tool_use') {
-        const cat = toolCategory(b.name || '');
+        const cat = toolCategoryForBlock(b);
         if (cat === 'explore') buf.push(b);
         else if (cat === 'edit') { flush(); rows.push({ kind: 'edit', block: b }); }
         else if (cat === 'command') { flush(); rows.push({ kind: 'command', block: b }); }
@@ -1770,10 +1824,10 @@
   function exploreSummary(tools: ContentBlock[]): string {
     const counts: Record<string, number> = {};
     for (const t of tools) {
-      const noun = exploreNoun(t.name || '');
+      const noun = exploreNounForBlock(t);
       counts[noun] = (counts[noun] || 0) + 1;
     }
-    const order = ['file', 'search', 'list', 'skill'];
+    const order = ['file', 'thread', 'search', 'list', 'skill'];
     const parts: string[] = [];
     for (const k of order) if (counts[k]) parts.push(pluralize(k, counts[k]));
     return parts.join(', ');
@@ -1819,20 +1873,45 @@
     return (name || 'tool').charAt(0).toUpperCase() + (name || '').slice(1).replace(/_/g, ' ');
   }
 
+  function traceActionLabel(block: ContentBlock) {
+    const name = normalizedToolName(block.name || '');
+    const shellKind = shellExploreKind(commandText(block));
+    if (name.includes('findthread') || name.includes('searchthread') || name.includes('threadsearch')) return 'Searched threads:';
+    if (name.includes('readthread')) return 'Read thread:';
+    if (shellKind === 'grep') return 'Grep:';
+    if (shellKind === 'read') return 'Read:';
+    if (shellKind === 'list') return 'Listed:';
+    const label = prettyToolLabel(block.name || '');
+    return label.endsWith(':') ? label : `${label}:`;
+  }
+
   function toolSubtitle(block: ContentBlock) {
     const input = asRecord(block.input);
-    const command = stringFrom(input.command);
-    if (command) return command;
-    const goal = stringFrom(input.goal);
-    if (goal) return goal;
-    const threadID = stringFrom(input.threadID ?? input.threadId);
-    if (threadID) return threadID;
+    // Try a wide net of input fields, in order of usefulness for display.
+    const fields = [
+      input.command, input.cmd, input.script,
+      input.query, input.pattern, input.search, input.q,
+      input.goal, input.prompt, input.request, input.task, input.message,
+      input.path, input.file, input.filename, input.file_path, input.filepath,
+      input.url, input.uri,
+      input.threadID, input.threadId, input.thread_id, input.thread,
+      input.name, input.title, input.description,
+    ];
+    for (const f of fields) {
+      const s = stringFrom(f);
+      if (s) {
+        const trimmed = s.trim();
+        if (trimmed.length > 0) return trimmed.length > 160 ? trimmed.slice(0, 160) + '…' : trimmed;
+      }
+    }
+    // Patch summary if the block carries a diff
     const patch = rawPatchFromBlock(block);
     if (patch) {
       const stats = patchStats(displayPatchFromBlock(block));
       return `${stats.files} ${stats.files === 1 ? 'file' : 'files'} changed`;
     }
-    return block.id ?? '';
+    // Last resort: empty (DON'T leak internal call_XXX IDs to the UI).
+    return '';
   }
 
   function rawPatchFromBlock(block: ContentBlock) {
@@ -2026,11 +2105,11 @@
       {#each groupWorkBlocks(blocks) as row, index (index)}
         {#if row.kind === 'thinking'}
           {#if row.block.thinking}
-            <div class="trace-thinking md">{@html renderMarkdown(row.block.thinking)}</div>
+            <div class="trace-thinking md">{@html renderMarkdown(stripThinkingTitle(row.block.thinking))}</div>
           {/if}
         {:else if row.kind === 'progress'}
           {#if row.block.text}
-            <div class="trace-thinking trace-thinking--progress md">{@html renderMarkdown(row.block.text)}</div>
+            <div class="trace-thinking trace-thinking--progress md">{@html renderMarkdown(stripThinkingTitle(row.block.text))}</div>
           {/if}
         {:else if row.kind === 'explore'}
           <details class="trace-row trace-row--explore">
@@ -2042,7 +2121,7 @@
             <ul class="trace-row__list">
               {#each row.tools as tool, i (tool.id ?? i)}
                 <li>
-                  <span class="trace-row__list-label">{prettyToolLabel(tool.name || '')}</span>
+                  <span class="trace-row__list-label">{traceActionLabel(tool)}</span>
                   <span class="trace-row__list-target">{toolSubtitle(tool)}</span>
                 </li>
               {/each}
@@ -2753,7 +2832,7 @@
     display: flex;
     align-items: center;
     gap: 8px;
-    min-height: 36px;
+    min-height: 40px;
     border: 1px solid var(--neo-border-strong);
     background: var(--neo-bg);
     border-radius: 6px;
@@ -2770,7 +2849,8 @@
     background: transparent;
     color: var(--neo-ink);
     font: inherit;
-    font-size: 13px;
+    /* 16px prevents iOS Safari from zooming in on focus. We bump the field min-height to compensate. */
+    font-size: 16px;
     line-height: 20px;
     padding: 0;
   }
@@ -3390,17 +3470,10 @@
     display: block;
   }
 
-  /* Auto-link file paths (we rewrite plain file: URIs to <a> via renderMarkdown). */
-  .md :global(a.md-file-link) {
-    color: var(--neo-ink);
-    text-decoration: underline;
-    text-underline-offset: 2px;
-    text-decoration-color: color-mix(in srgb, currentColor 30%, transparent);
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-    font-size: 0.9em;
-    word-break: break-all;
-  }
-  .md :global(a.md-file-link:hover) { text-decoration-color: currentColor; }
+  /* File path code chips can wrap inside the message column. */
+  .md :global(code.md-code--path) { word-break: break-all; }
+
+  /* Generic markdown link (http/https) */
   .md :global(a.md-link) {
     color: var(--neo-ink);
     text-decoration: underline;
@@ -3409,6 +3482,18 @@
     word-break: break-all;
   }
   .md :global(a.md-link:hover) { text-decoration-color: currentColor; }
+
+  /* File-link variant: wraps a code chip and gets a tighter underline directly under the chip. */
+  .md :global(a.md-link--file) {
+    text-decoration: underline;
+    text-decoration-color: var(--neo-muted);
+    text-underline-offset: 3px;
+  }
+  .md :global(a.md-link--file:hover) { text-decoration-color: var(--neo-ink); }
+  .md :global(a.md-link--file > code.md-code) {
+    /* The chip becomes the visible label of the link — keep the gray bg from .md-code. */
+    color: var(--neo-ink);
+  }
   .md :global(strong) { font-weight: 600; color: var(--neo-ink); }
   .md :global(em) { font-style: italic; }
 
@@ -3550,6 +3635,10 @@
   .trace-row > summary::-webkit-details-marker { display: none; }
   .trace-row:hover > summary { opacity: 1; }
   .trace-row__label { color: var(--neo-ink); font-weight: 400; white-space: nowrap; }
+  .trace-row--explore > summary .trace-row__label {
+    color: var(--neo-danger);
+    font-weight: 500;
+  }
   .trace-row__sub { color: var(--neo-muted); white-space: nowrap; }
   /* Chevron hidden by default, revealed on row hover (matches ampcode `opacity-0 group-hover/row:opacity-100`). */
   :global(.trace-row__chevron) {
@@ -3570,8 +3659,13 @@
     font-size: 13px;
     line-height: 1.6;
   }
-  .trace-row__list li { display: flex; gap: 6px; padding: 1px 0; }
-  .trace-row__list-label { color: var(--neo-muted); min-width: 64px; flex-shrink: 0; }
+  .trace-row__list li { display: flex; gap: 8px; padding: 1px 0; }
+  .trace-row__list-label {
+    color: var(--neo-muted);
+    min-width: clamp(78px, 16vw, 150px);
+    flex-shrink: 0;
+    white-space: nowrap;
+  }
   .trace-row__list-target {
     color: var(--neo-ink);
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
@@ -3732,8 +3826,9 @@
     background: transparent;
     color: var(--neo-ink);
     font: inherit;
-    font-size: 13px;
-    line-height: 20px;
+    /* 16px prevents iOS Safari from zooming in on focus. */
+    font-size: 16px;
+    line-height: 22px;
     padding: 12px;
     width: 100%;
   }
@@ -3773,7 +3868,8 @@
       flex-shrink: 0;
       align-self: flex-start;
       position: sticky;
-      top: 24px;
+      /* Clear the sticky topbar (47px) + small gap so the inspector doesn't slide under it. */
+      top: 56px;
       margin-top: 24px;
       padding: 16px 24px;
       border: 1px solid var(--neo-border);
@@ -4261,10 +4357,8 @@
     .code-panel { max-height: 300px; font-size: 11px; }
 
     .composer { width: 100%; border-radius: 14px; }
-    .composer textarea { min-height: 56px; padding: 10px 12px; }
+    .composer textarea { min-height: 56px; padding: 10px 12px; /* keep 16px font-size for iOS no-zoom */ }
     .composer-actions { padding: 6px 8px; }
-    .send-button { width: 26px; height: 26px; }
-    .composer textarea { min-height: 36px; font-size: 14px; }
-    .send-button { width: 36px; height: 36px; }
+    .send-button { width: 30px; height: 30px; }
   }
 </style>
