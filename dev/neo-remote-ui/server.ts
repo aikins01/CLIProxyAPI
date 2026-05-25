@@ -27,6 +27,23 @@ function proxyHeaders(headers: IncomingMessage['headers'], targetHost: string) {
   };
 }
 
+function proxyResponseHeaders(headers: IncomingMessage['headers']) {
+  const next = { ...headers };
+  for (const name of [
+    'connection',
+    'keep-alive',
+    'proxy-authenticate',
+    'proxy-authorization',
+    'te',
+    'trailer',
+    'transfer-encoding',
+    'upgrade'
+  ]) {
+    delete next[name];
+  }
+  return next;
+}
+
 function runtimeTarget(requestUrl = '/') {
   return new URL(requestUrl, runtimeUpstream);
 }
@@ -47,7 +64,7 @@ function proxyHttp(req: IncomingMessage, res: ServerResponse) {
       headers: proxyHeaders(req.headers, target.host)
     },
     (proxyRes) => {
-      res.writeHead(proxyRes.statusCode || 502, proxyRes.headers);
+      res.writeHead(proxyRes.statusCode || 502, proxyResponseHeaders(proxyRes.headers));
       proxyRes.pipe(res);
     }
   );
