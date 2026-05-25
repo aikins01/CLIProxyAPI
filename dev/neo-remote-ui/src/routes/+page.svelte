@@ -14,6 +14,7 @@
     Loader2,
     LogOut,
     Moon,
+    Info,
     PanelRight,
     Search,
     Send,
@@ -165,6 +166,7 @@
   let relationships = $state<Relationship[]>([]);
   let executorConnected = $state(false);
   let executorInfo = $state<Record<string, unknown>>({});
+  let observerCount = $state(0);
   let executorStatuses = $state<ExecutorStatus[]>([]);
   let inferenceTools = $state<{ messageId: string; agentMode: string; tools: string[] } | null>(null);
   let toolLeases = $state<ToolLease[]>([]);
@@ -298,6 +300,7 @@
     relationships = [];
     executorConnected = false;
     executorInfo = {};
+    observerCount = 0;
     executorStatuses = [];
     inferenceTools = null;
     toolLeases = [];
@@ -530,7 +533,7 @@
 
   function sendMessage() {
     const text = composer.trim();
-    if (!text || !detail) return;
+    if (!text || !detail || !canSendMessage()) return;
     const messageId = `M-local-${crypto.randomUUID()}`;
     const message: NeoMessage = {
       threadId: detail.id,
@@ -627,6 +630,14 @@
     }
     if (type === 'executor_disconnected') {
       executorConnected = false;
+      return;
+    }
+    if (type === 'observers') {
+      const count = finiteNumberFrom(message.count);
+      observerCount = count ?? (Array.isArray(message.observers) ? message.observers.length : observerCount);
+      if (typeof message.hasExecutor === 'boolean') {
+        executorConnected = message.hasExecutor;
+      }
       return;
     }
     if (type === 'executor_status') {
@@ -952,18 +963,29 @@
   }
 
   function composerStatusMain() {
-    if (connection === 'connected') return 'Connected';
+    if (connection === 'connected' && executorConnected) return agentState === 'idle' ? 'Ready' : agentState;
+    if (connection === 'connected') return 'No local executor';
     if (connection === 'connecting') return 'Connecting…';
     return 'Offline';
   }
 
   function composerStatusParts() {
-    return [runtimeWorkspacePath() || repoFromEnv(environment) || detail?.repo, branchFromEnv(environment) || detail?.branch].filter(Boolean);
+    return [
+      connection === 'connected' && !executorConnected ? 'view-only' : '',
+      observerCount > 0 ? `${observerCount} observer${observerCount === 1 ? '' : 's'}` : '',
+      runtimeWorkspacePath() || repoFromEnv(environment) || detail?.repo,
+      branchFromEnv(environment) || detail?.branch
+    ].filter(Boolean);
+  }
+
+  function canSendMessage() {
+    return connection === 'connected' && executorConnected;
   }
 
   function threadRuntimeLabel(threadId: string) {
     if (threadId !== selectedThreadId) return '';
-    if (connection === 'connected') return 'live';
+    if (connection === 'connected' && executorConnected) return 'live';
+    if (connection === 'connected') return 'viewing';
     if (connection === 'connecting') return 'connecting…';
     return '';
   }
@@ -1287,6 +1309,14 @@
     return html;
   }
 
+  function shortThreadId(id: string): string {
+    if (!id || id.length <= 14) return id;
+    const m = id.match(/^(T-[a-f0-9]{4})/i);
+    const head = m ? m[1] : id.slice(0, 6);
+    const tail = id.slice(-4);
+    return `${head}…${tail}`;
+  }
+
   function formatTokenCount(n: number): string {
     if (n >= 1_000_000) return `${Math.round(n / 100_000) / 10}M`;
     if (n >= 1_000) return `${Math.round(n / 1_000)}k`;
@@ -1457,7 +1487,8 @@
   }
 
   function connectionLabel() {
-    if (connection === 'connected') return agentState === 'idle' ? 'connected' : agentState;
+    if (connection === 'connected' && executorConnected) return agentState === 'idle' ? 'executor connected' : agentState;
+    if (connection === 'connected') return 'thread connected, no executor';
     return connection;
   }
 
@@ -2068,7 +2099,7 @@
       {:else if detail?.repo}
         <div class="inspector-field"><Gauge size={13} /> <span>{detail.repo}{detail.branch ? ':' + detail.branch : ''}</span></div>
       {/if}
-      <div class:status-ok={executorConnected} class="inspector-field"><Wifi size={13} /> <span>{executorConnected ? 'connected' : 'not connected'}</span></div>
+      <div class:status-ok={executorConnected} class="inspector-field"><Wifi size={13} /> <span>{executorConnected ? 'executor connected' : 'no executor attached'}</span></div>
       {#if threadStatus}
         <div class="inspector-field"><span>{threadStatus}</span></div>
       {/if}
@@ -2199,18 +2230,18 @@
   {/if}
 
   {#if relationships.length > 0}
-    <section class="runtime-section">
-      <h2>Relationships</h2>
-      <div class="runtime-list">
+    <section class="runtime-section runtime-section--relationships">
+      <h2>Relationships <span class="runtime-section__count">{relationships.length}</span></h2>
+      <div class="relationships-list">
         {#each relationships as relationship (`${relationship.threadID}-${relationship.type}-${relationship.role}`)}
           <button
-            class="runtime-pill runtime-pill--link"
+            class="relationship-item"
             type="button"
             onclick={() => { void selectThread(relationship.threadID); }}
-            title="Open {relationship.threadID}"
+            title={relationship.comment ? `${relationship.threadID}: ${relationship.comment}` : relationship.threadID}
           >
-            <span>{relationship.type}</span>
-            {relationship.threadID}{relationship.comment ? `: ${relationship.comment}` : ''}
+            <span class="relationship-item__type">{relationship.type}</span>
+            <span class="relationship-item__id">{shortThreadId(relationship.threadID)}</span>
           </button>
         {/each}
       </div>
@@ -2296,7 +2327,7 @@
 
     <div class="neo-topbar__actions">
       <span class="neo-key" title="API key active"><KeyRound size={13} /> key</span>
-      {#if detail && mobilePane === 'thread'}
+      {#if mobilePane === 'thread' && (detail || selectedThreadId)}
         <button
           class="icon-button icon-button--mobile-only"
           type="button"
@@ -2304,7 +2335,7 @@
           aria-label="Open thread info"
           onclick={() => { mobileInspectorOpen = true; }}
         >
-          <PanelRight size={15} />
+          <Info size={15} />
         </button>
       {/if}
       <button class="icon-button" type="button" title="Refresh threads" onclick={() => { void refreshThreads(); }}>
@@ -2352,7 +2383,7 @@
                   <strong>{thread.title}</strong>
                   {#if threadRuntimeLabel(thread.id)}
                     <span
-                      class:thread-card__runtime--live={connection === 'connected'}
+                      class:thread-card__runtime--live={connection === 'connected' && executorConnected}
                       class="thread-card__runtime"
                     >
                       <span class="runtime-dot"></span>
@@ -2398,7 +2429,7 @@
             <span><GitBranch size={14} /> {detail.branch}</span>
           </div>
           <div
-            class:connection-chip--live={connection === 'connected'}
+            class:connection-chip--live={connection === 'connected' && executorConnected}
             class="connection-chip"
             title={connectionLabel()}
             aria-label={connectionLabel()}
@@ -2503,8 +2534,8 @@
         <footer class="composer-footer">
           <form class="composer" onsubmit={(event) => { event.preventDefault(); sendMessage(); }}>
           <div
-            class:composer-status--live={connection === 'connected'}
-            class:composer-status--connecting={connection === 'connecting'}
+            class:composer-status--live={connection === 'connected' && executorConnected}
+            class:composer-status--connecting={connection === 'connecting' || (connection === 'connected' && !executorConnected)}
             class="composer-status"
           >
             <span class="runtime-dot"></span>
@@ -2518,7 +2549,7 @@
             <textarea
               bind:value={composer}
               rows="2"
-              placeholder={connection === 'connected' ? 'Send a message to this thread...' : 'Connect to send a message...'}
+              placeholder={canSendMessage() ? 'Send a message to this thread...' : connection === 'connected' ? 'Open this thread locally to send...' : 'Connect to send a message...'}
               onkeydown={(event) => {
                 if (event.key === 'Enter' && !event.shiftKey) {
                   event.preventDefault();
@@ -2528,7 +2559,7 @@
             ></textarea>
             <div class="composer-actions">
               <div class="composer-actions__left"></div>
-              <button class="send-button" type="submit" disabled={!composer.trim() || connection !== 'connected'} aria-label="Send message">
+              <button class="send-button" type="submit" disabled={!composer.trim() || !canSendMessage()} aria-label="Send message">
                 <ArrowUp size={14} />
               </button>
             </div>
@@ -3890,6 +3921,69 @@
     transition: background-color 150ms cubic-bezier(0.4, 0, 0.2, 1), border-color 150ms cubic-bezier(0.4, 0, 0.2, 1);
   }
   .runtime-pill--link:hover { background: var(--neo-card-hover); border-color: var(--neo-border-strong); }
+
+  /* Compact, scrollable relationships list */
+  .runtime-section--relationships h2 { display: flex; align-items: center; gap: 6px; }
+  .runtime-section__count {
+    color: var(--neo-muted);
+    font-weight: 400;
+    font-size: 11px;
+    background: var(--neo-card-hover);
+    padding: 1px 6px;
+    border-radius: 10px;
+    line-height: 14px;
+  }
+  .relationships-list {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    max-height: 200px;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding-right: 2px;
+    margin: 0 -4px;
+  }
+  .relationships-list::-webkit-scrollbar { width: 4px; }
+  .relationships-list::-webkit-scrollbar-thumb { background: var(--neo-border-strong); border-radius: 2px; }
+  .relationships-list::-webkit-scrollbar-track { background: transparent; }
+  .relationship-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 4px 6px;
+    border: 0;
+    border-radius: 4px;
+    background: transparent;
+    color: var(--neo-ink);
+    font: inherit;
+    font-size: 12px;
+    line-height: 16px;
+    text-align: left;
+    cursor: pointer;
+    transition: background-color 150ms cubic-bezier(0.4, 0, 0.2, 1);
+    min-width: 0;
+  }
+  .relationship-item:hover { background: var(--neo-card-hover); }
+  .relationship-item__type {
+    color: var(--neo-muted);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.02em;
+    flex-shrink: 0;
+    min-width: 52px;
+  }
+  .relationship-item__id {
+    color: var(--neo-ink);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 11.5px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+    flex: 1;
+  }
   .approval-card {
     display: grid;
     gap: 8px;
