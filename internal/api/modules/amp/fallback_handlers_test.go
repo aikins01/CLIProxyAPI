@@ -3,9 +3,13 @@ package amp
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -69,5 +73,190 @@ func TestFallbackHandler_ModelMapping_PreservesThinkingSuffixAndRewritesResponse
 	}
 	if resp.SeenModel != "test/gpt-5.2(xhigh)" {
 		t.Errorf("Expected handler to see test/gpt-5.2(xhigh), got %s", resp.SeenModel)
+	}
+}
+
+func TestFallbackHandler_LocalNeoInferenceFallsBackToAmpProxy(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	type capturedRequest struct {
+		path    string
+		headers http.Header
+		body    []byte
+	}
+	gotRequest := make(chan capturedRequest, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		gotRequest <- capturedRequest{path: r.URL.Path, headers: r.Header.Clone(), body: body}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"amp-upstream"}`))
+	}))
+	defer upstream.Close()
+
+	proxy, err := createReverseProxy(upstream.URL, NewStaticSecretSource("amp-secret"))
+	if err != nil {
+		t.Fatalf("create reverse proxy: %v", err)
+	}
+	fallback := NewFallbackHandlerWithMapper(func() *httputil.ReverseProxy { return proxy }, nil, nil)
+
+	r := gin.New()
+	r.POST("/api/provider/openai/v1/chat/completions", fallback.WrapHandler(func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"unexpected": true})
+	}))
+	server := httptest.NewServer(r)
+	defer server.Close()
+
+	reqBody := []byte(`{"model":"definitely-not-a-local-provider-model","messages":[{"role":"user","content":"hi"}]}`)
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/api/provider/openai/v1/chat/completions", bytes.NewReader(reqBody))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(localNeoInferenceHeader, "1")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request fallback route: %v", err)
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d body=%s", resp.StatusCode, respBody)
+	}
+	if !bytes.Contains(respBody, []byte(`"amp-upstream"`)) {
+		t.Fatalf("expected upstream response, got %s", respBody)
+	}
+
+	got := <-gotRequest
+	if got.path != "/api/provider/openai/v1/chat/completions" {
+		t.Fatalf("upstream path = %q", got.path)
+	}
+	if got.headers.Get(localNeoInferenceHeader) != "" {
+		t.Fatalf("local Neo header leaked upstream: %q", got.headers.Get(localNeoInferenceHeader))
+	}
+	if got.headers.Get("X-Api-Key") != "amp-secret" {
+		t.Fatalf("X-Api-Key = %q", got.headers.Get("X-Api-Key"))
+	}
+	if !bytes.Contains(got.body, []byte(`"definitely-not-a-local-provider-model"`)) {
+		t.Fatalf("upstream body = %s", got.body)
+	}
+}
+
+func TestFallbackHandler_LocalAuthUnavailableDoesNotFallbackToAmpProxy(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient("test-client-local-auth-unavailable", "codex", []*registry.ModelInfo{
+		{ID: "gpt-5.5", OwnedBy: "openai", Type: "codex"},
+	})
+	defer reg.UnregisterClient("test-client-local-auth-unavailable")
+
+	upstreamCalls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"amp-upstream"}`))
+	}))
+	defer upstream.Close()
+
+	proxy, err := createReverseProxy(upstream.URL, NewStaticSecretSource("amp-secret"))
+	if err != nil {
+		t.Fatalf("create reverse proxy: %v", err)
+	}
+	fallback := NewFallbackHandlerWithMapper(func() *httputil.ReverseProxy { return proxy }, nil, nil)
+
+	r := gin.New()
+	r.POST("/api/provider/openai/v1/chat/completions", fallback.WrapHandler(func(c *gin.Context) {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": gin.H{
+			"message": "auth_unavailable: no auth available (providers=codex, model=gpt-5.5)",
+			"type":    "server_error",
+			"code":    "internal_server_error",
+		}})
+	}))
+	server := httptest.NewServer(r)
+	defer server.Close()
+
+	reqBody := []byte(`{"model":"gpt-5.5","messages":[{"role":"user","content":"hi"}]}`)
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/api/provider/openai/v1/chat/completions", bytes.NewReader(reqBody))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(localNeoInferenceHeader, "1")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request fallback route: %v", err)
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d body=%s", resp.StatusCode, respBody)
+	}
+	if !bytes.Contains(respBody, []byte(`auth_unavailable`)) {
+		t.Fatalf("expected local auth_unavailable response, got %s", respBody)
+	}
+	if upstreamCalls != 0 {
+		t.Fatalf("upstream calls = %d, want 0", upstreamCalls)
+	}
+}
+
+func TestFallbackHandlerCapturesAmpCompactionCandidateRequest(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	dir := t.TempDir()
+	t.Setenv("CLIPROXYAPI_AMP_COMPACTION_CAPTURE_DIR", dir)
+
+	fallback := NewFallbackHandlerWithMapper(func() *httputil.ReverseProxy { return nil }, nil, nil)
+	r := gin.New()
+	r.POST("/api/provider/openai/v1/chat/completions", fallback.WrapHandler(func(c *gin.Context) {
+		body, err := io.ReadAll(c.Request.Body)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		c.Data(http.StatusOK, "application/json", body)
+	}))
+
+	reqBody := []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":"You have been working on the task described above. Write a continuation summary. Wrap your summary in <summary></summary> tags."}]}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/provider/openai/v1/chat/completions", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer secret-token")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", w.Code, w.Body.String())
+	}
+
+	matches, err := filepath.Glob(filepath.Join(dir, "amp-compaction-*.json"))
+	if err != nil {
+		t.Fatalf("glob captures: %v", err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("capture files = %v, want exactly one", matches)
+	}
+	capture, err := os.ReadFile(matches[0])
+	if err != nil {
+		t.Fatalf("read capture: %v", err)
+	}
+	text := string(capture)
+	if !strings.Contains(text, "continuation summary") || !strings.Contains(text, "gpt-5.4") {
+		t.Fatalf("capture missing compaction body details: %s", text)
+	}
+	if strings.Contains(text, "secret-token") {
+		t.Fatalf("capture leaked authorization header: %s", text)
+	}
+}
+
+func TestLooksLikeAmpCompactionRequestRejectsStreamingSummaryTurn(t *testing.T) {
+	streamingTurn := []byte(`{"model":"gpt-5.5","stream":true,"messages":[{"role":"user","content":"Wrap your summary in <summary></summary> tags."}]}`)
+	if looksLikeAmpCompactionRequest(streamingTurn) {
+		t.Fatal("streaming turn with summary text was classified as compaction request")
+	}
+
+	compactionTurn := []byte(`{"model":"gpt-5.4","stream":false,"messages":[{"role":"user","content":"You have been working on the task described above. Context to Preserve. Wrap your summary in <summary></summary> tags."}]}`)
+	if !looksLikeAmpCompactionRequest(compactionTurn) {
+		t.Fatal("non-stream final continuation prompt was not classified as compaction request")
 	}
 }

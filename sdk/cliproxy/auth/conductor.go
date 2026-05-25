@@ -3892,9 +3892,9 @@ func logExecutionThinkingConfig(component, sourceFormat, routeModel, upstreamMod
 		return
 	}
 	fields := log.Fields{
-		"component":     component,
-		"source_format": sourceFormat,
-		"route_model":   routeModel,
+		"component":      component,
+		"source_format":  sourceFormat,
+		"route_model":    routeModel,
 		"upstream_model": upstreamModel,
 	}
 	if responsesEffort.Exists() {

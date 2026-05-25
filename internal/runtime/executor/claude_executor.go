@@ -1553,6 +1553,14 @@ func isLocalNeoInferenceRequest(ctx context.Context) bool {
 	return false
 }
 
+func isAmpProviderRequest(ctx context.Context) bool {
+	if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil && ginCtx.Request.URL != nil {
+		path := strings.TrimSpace(ginCtx.Request.URL.Path)
+		return strings.HasPrefix(path, "/api/provider/")
+	}
+	return false
+}
+
 // getCloakConfigFromAuth extracts cloak configuration from auth attributes.
 // Returns (cloakMode, strictMode, sensitiveWords, cacheUserID).
 func getCloakConfigFromAuth(auth *cliproxyauth.Auth) (string, bool, []string, bool) {
@@ -1860,7 +1868,7 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 		billingVersion := helps.DefaultClaudeVersion(cfg)
 		entrypoint := parseEntrypointFromUA(clientUserAgent)
 		workload := getWorkloadFromContext(ctx)
-		sanitizeOAuthSystem := oauthToken && !isLocalNeoInferenceRequest(ctx)
+		sanitizeOAuthSystem := oauthToken && !isLocalNeoInferenceRequest(ctx) && !isAmpProviderRequest(ctx)
 		payload = checkSystemInstructionsWithSigningMode(payload, strictMode, useCCHSigning, sanitizeOAuthSystem, billingVersion, entrypoint, workload)
 	}
 

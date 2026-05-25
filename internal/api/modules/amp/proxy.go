@@ -79,6 +79,7 @@ func createReverseProxy(upstreamURL string, secretSource SecretSource) (*httputi
 
 		// Remove proxy, client identity, and browser fingerprint headers
 		misc.ScrubProxyAndFingerprintHeaders(req)
+		req.Header.Del(localNeoInferenceHeader)
 
 		// Remove query-based credentials if they match the authenticated client API key.
 		// This prevents leaking client auth material to the Amp upstream while avoiding

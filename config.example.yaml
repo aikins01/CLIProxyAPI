@@ -318,6 +318,9 @@ nonstream-keepalive-interval: 0
 #   restrict-management-to-localhost: false
 #   # Force model mappings to run before checking local API keys (default: false)
 #   force-model-mappings: false
+#   # Optional: write candidate Amp compaction provider requests here for parity debugging.
+#   # Leave empty unless you are intentionally capturing compaction payloads.
+#   compaction-capture-dir: ""
 #   # enable the local Rivet/thread-actor runtime used by Amp Neo when amp.url points at this proxy
 #   neo-local-runtime:
 #     enabled: true
@@ -331,10 +334,8 @@ nonstream-keepalive-interval: 0
 #     # optional: generate thread titles through the local provider routes
 #     title-generation: true
 #     title-model: "claude-haiku-4-5-20251001"
-#     # optional: poll Amp cloud threads and inject new user messages into the local runtime
-#     remote-control: false
-#     remote-poll-interval-seconds: 5
-#     remote-control-max-threads: 20
+#     # optional: summarize old thread context when local Neo history gets large
+#     compaction-model: "gpt-5.4"
 #   # Amp Model Mappings
 #   # Route unavailable Amp models to alternative models available in your local proxy.
 #   # Useful when Amp CLI requests models you don't have access to (e.g., Claude Opus 4.5)

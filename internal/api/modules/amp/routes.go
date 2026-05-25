@@ -1,14 +1,20 @@
 package amp
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers/claude"
@@ -170,7 +176,19 @@ func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *ha
 
 	// Dynamic proxy handler that uses m.getProxy() for hot-reload support
 	proxyHandler := func(c *gin.Context) {
+		if m.tryServeNeoLocalInternal(c) {
+			return
+		}
 		if m.tryServeNeoLocalThreadActor(c) {
+			return
+		}
+		if m.tryServeNeoLocalAttachment(c) {
+			return
+		}
+		if m.tryServeNeoLocalThreadUsage(c) {
+			return
+		}
+		if m.tryServeNeoLegacyThreadRun(c) {
 			return
 		}
 		if tryServeNeoLocalThread(c, m.neoThreadConfigSnapshot()) {
@@ -184,7 +202,10 @@ func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *ha
 					// Upstream already wrote the status (often 404) before the client/stream ended.
 					return
 				}
-				panic(rec)
+				log.WithField("panic", rec).Error("amp upstream proxy panic")
+				if !c.Writer.Written() {
+					c.JSON(http.StatusBadGateway, gin.H{"error": "amp upstream proxy failed"})
+				}
 			}
 		}()
 
@@ -241,6 +262,14 @@ func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *ha
 	engine.GET("/threads.rss", append(rootMiddleware, proxyHandler)...)
 	engine.GET("/news.rss", append(rootMiddleware, proxyHandler)...)
 
+	neoRuntimeBridgeHandler := func(c *gin.Context) {
+		m.serveNeoRuntimeBridge(c)
+	}
+	engine.Any("/gateway", append(rootMiddleware, neoRuntimeBridgeHandler)...)
+	engine.Any("/gateway/*path", append(rootMiddleware, neoRuntimeBridgeHandler)...)
+	engine.Any("/actors", append(rootMiddleware, neoRuntimeBridgeHandler)...)
+	engine.Any("/actors/*path", append(rootMiddleware, neoRuntimeBridgeHandler)...)
+
 	// Root-level auth routes for CLI login flow
 	// Amp uses multiple auth routes: /auth/cli-login, /auth/callback, /auth/sign-in, /auth/logout
 	// We proxy all /auth/* to support the complete OAuth flow
@@ -253,9 +282,9 @@ func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *ha
 	// If no local OAuth is available, falls back to ampcode.com proxy.
 	geminiHandlers := gemini.NewGeminiAPIHandler(baseHandler)
 	geminiBridge := createGeminiBridgeHandler(geminiHandlers.GeminiHandler)
-	geminiV1Beta1Fallback := NewFallbackHandlerWithMapper(func() *httputil.ReverseProxy {
+	geminiV1Beta1Fallback := m.registerFallbackHandler(NewFallbackHandlerWithMapper(func() *httputil.ReverseProxy {
 		return m.getProxy()
-	}, m.modelMapper, m.forceModelMappings)
+	}, m.modelMapper, m.forceModelMappings), m.currentCompactionCaptureDir())
 	geminiV1Beta1Handler := geminiV1Beta1Fallback.WrapHandler(geminiBridge)
 
 	// Route POST model calls through Gemini bridge with FallbackHandler.
@@ -275,6 +304,290 @@ func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *ha
 	})
 }
 
+func (m *AmpModule) serveNeoRuntimeBridge(c *gin.Context) {
+	if m == nil || m.neoRuntime == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "amp neo local runtime not available"})
+		return
+	}
+	target := &url.URL{
+		Scheme: "http",
+		Host:   net.JoinHostPort(m.neoRuntime.host, strconv.Itoa(m.neoRuntime.port)),
+	}
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	proxy.Director = func(req *http.Request) {
+		req.URL.Scheme = target.Scheme
+		req.URL.Host = target.Host
+		req.Host = target.Host
+		stripNeoRuntimeBridgeCredentials(req)
+	}
+	proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
+		log.WithError(err).Warn("amp neo local runtime bridge failed")
+		if !strings.EqualFold(req.Header.Get("Upgrade"), "websocket") {
+			rw.Header().Set("Content-Type", "application/json")
+		}
+		rw.WriteHeader(http.StatusBadGateway)
+		_, _ = rw.Write([]byte(`{"error":"amp neo local runtime bridge failed"}`))
+	}
+	proxy.ServeHTTP(c.Writer, c.Request)
+}
+
+func stripNeoRuntimeBridgeCredentials(req *http.Request) {
+	if req == nil {
+		return
+	}
+	req.Header.Del("Authorization")
+	req.Header.Del("X-Api-Key")
+	req.Header.Del("X-Goog-Api-Key")
+	if req.URL == nil {
+		return
+	}
+	query := req.URL.Query()
+	query.Del("auth_token")
+	query.Del("access_token")
+	req.URL.RawQuery = query.Encode()
+}
+
+func (m *AmpModule) tryServeNeoLocalInternal(c *gin.Context) bool {
+	if m == nil || c == nil || c.Request == nil || c.Request.URL == nil || m.neoThreadConfigSnapshot() == nil {
+		return false
+	}
+	method := neoLocalInternalMethod(c.Request)
+	if method == "" {
+		return false
+	}
+	c.JSON(http.StatusOK, neoLocalInternalResponse(c.Request.Context(), m.neoThreadConfigSnapshot(), c.Request, method))
+	return true
+}
+
+func neoLocalInternalMethod(r *http.Request) string {
+	if r == nil || r.URL == nil {
+		return ""
+	}
+	path := strings.TrimPrefix(r.URL.Path, "/api")
+	if "/"+strings.Trim(path, "/") != "/internal" {
+		return ""
+	}
+	query := r.URL.Query()
+	for _, method := range []string{"loadPlugins", "getUserInfo", "getThreadLinkInfo", "threadDisplayCostInfo", "listThreads", "getUserFreeTierStatus", "uploadThread", "getThread", "notices"} {
+		if _, ok := query[method]; ok {
+			return method
+		}
+	}
+	if method := strings.TrimSpace(query.Get("method")); neoLocalInternalMethodSupported(method) {
+		return method
+	}
+	if method := strings.TrimSpace(stringValue(neoLocalInternalPayload(r)["method"])); neoLocalInternalMethodSupported(method) {
+		return method
+	}
+	return ""
+}
+
+func neoLocalInternalMethodSupported(method string) bool {
+	switch strings.TrimSpace(method) {
+	case "loadPlugins", "getUserInfo", "getThreadLinkInfo", "threadDisplayCostInfo", "listThreads", "getUserFreeTierStatus", "uploadThread", "getThread", "notices":
+		return true
+	default:
+		return false
+	}
+}
+
+func neoLocalInternalPayload(r *http.Request) map[string]any {
+	if r == nil || r.Body == nil {
+		return nil
+	}
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		return nil
+	}
+	r.Body = io.NopCloser(bytes.NewReader(raw))
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return nil
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil
+	}
+	return payload
+}
+
+func neoLocalInternalResponse(ctx context.Context, cfg *config.Config, r *http.Request, method string) gin.H {
+	switch method {
+	case "loadPlugins":
+		return gin.H{"ok": true, "result": []any{}}
+	case "getUserInfo":
+		return gin.H{"ok": true, "result": gin.H{
+			"id":                neoLocalOwnerUserID,
+			"username":          neoLocalOwnerUserID,
+			"githubLogin":       neoLocalOwnerUserID,
+			"slackUserID":       nil,
+			"email":             "local@example.com",
+			"firstName":         "Local",
+			"lastName":          "User",
+			"emailVerified":     true,
+			"profilePictureUrl": nil,
+			"lastSignInAt":      nil,
+			"createdAt":         nil,
+			"updatedAt":         nil,
+			"siteAdmin":         false,
+			"features": []any{
+				gin.H{"name": "thread-actors-tui", "enabled": true},
+				gin.H{"name": "thread-actors-k8s-pool", "enabled": true},
+			},
+			"name":              "Local User",
+			"team":              gin.H{"id": "local-workspace", "name": "Local Workspace"},
+			"workspaceID":       "local-workspace",
+			"workspaceId":       "local-workspace",
+			"mysteriousMessage": nil,
+		}}
+	case "getThreadLinkInfo":
+		return gin.H{"ok": true, "result": neoLocalThreadLinkInfoResult(ctx, cfg, r)}
+	case "threadDisplayCostInfo":
+		return gin.H{"ok": true, "result": neoLocalThreadDisplayCostInfoResult(cfg, r)}
+	case "listThreads":
+		return gin.H{"ok": true, "result": gin.H{"threads": neoLocalListThreadsResult(ctx, cfg, r)}}
+	case "getUserFreeTierStatus":
+		return gin.H{"ok": true, "result": gin.H{}}
+	case "uploadThread":
+		return gin.H{"ok": true, "result": gin.H{}}
+	case "getThread":
+		return neoLocalGetThreadResponse(ctx, cfg, r)
+	case "notices":
+		return gin.H{"ok": true, "result": []any{}}
+	default:
+		return gin.H{"ok": true, "result": nil}
+	}
+}
+
+func neoLocalThreadDisplayCostInfoResult(cfg *config.Config, r *http.Request) gin.H {
+	threadID := neoLocalInternalThreadID(r)
+	result := gin.H{"totalCostUSD": nil}
+	if threadID == "" {
+		result["costBreakdownURL"] = nil
+		return result
+	}
+	base := "https://ampcode.com"
+	if cfg != nil && neoRuntimeEnabled(cfg) {
+		base = neoLocalRequestBaseURL(r)
+	} else if cfg != nil && strings.TrimSpace(cfg.AmpCode.UpstreamURL) != "" {
+		base = strings.TrimRight(strings.TrimSpace(cfg.AmpCode.UpstreamURL), "/")
+	}
+	result["costBreakdownURL"] = base + "/threads/" + url.PathEscape(threadID) + "/usage"
+	return result
+}
+
+func neoLocalInternalThreadID(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	if r.URL != nil {
+		query := r.URL.Query()
+		if threadID := firstNonEmptyString(query.Get("threadID"), query.Get("threadId"), query.Get("thread"), query.Get("id")); threadID != "" {
+			return threadID
+		}
+	}
+	if params := neoLocalInternalParams(r); len(params) > 0 {
+		return firstNonEmptyString(params["threadID"], params["threadId"], params["thread"], params["id"])
+	}
+	return ""
+}
+
+func neoLocalInternalParams(r *http.Request) map[string]any {
+	payload := neoLocalInternalPayload(r)
+	if len(payload) == 0 {
+		return nil
+	}
+	return mapValue(payload["params"])
+}
+
+func neoLocalListThreadsResult(ctx context.Context, cfg *config.Config, r *http.Request) []map[string]any {
+	limit := 200
+	includeArchived := false
+	if r != nil && r.URL != nil {
+		limit = neoQueryInt(r.URL.Query().Get("limit"), limit)
+		includeArchived = boolValue(r.URL.Query().Get("includeArchived"))
+	}
+	if payload := neoLocalInternalPayload(r); len(payload) > 0 {
+		if params := mapValue(payload["params"]); len(params) > 0 {
+			switch value := params["limit"].(type) {
+			case string:
+				limit = neoQueryInt(value, limit)
+			case float64:
+				if value > 0 {
+					limit = int(value)
+				}
+			case int:
+				if value > 0 {
+					limit = value
+				}
+			}
+			if value, exists := params["includeArchived"]; exists {
+				includeArchived = boolValue(value)
+			}
+		}
+	}
+	if limit <= 0 {
+		limit = 200
+	}
+	threads := mergeNeoThreadListResults(recentNeoLocalThreads(limit), getNeoCloudThreadList(ctx, cfg, limit, includeArchived))
+	filtered := make([]map[string]any, 0, len(threads))
+	for _, thread := range threads {
+		if !includeArchived && boolValue(thread["archived"]) {
+			continue
+		}
+		normalizeNeoThreadOwnership(thread)
+		filtered = append(filtered, thread)
+		if len(filtered) >= limit {
+			break
+		}
+	}
+	return filtered
+}
+
+func neoLocalGetThreadResponse(ctx context.Context, cfg *config.Config, r *http.Request) gin.H {
+	threadID := neoLocalInternalThreadID(r)
+	if threadID == "" {
+		return gin.H{"ok": false, "error": gin.H{"code": "thread-not-found", "message": "thread not found"}}
+	}
+	thread, ok := loadNeoThread(ctx, cfg, threadID)
+	if !ok {
+		return gin.H{"ok": false, "error": gin.H{"code": "thread-not-found", "message": "thread not found"}}
+	}
+	normalizeNeoThreadOwnership(thread)
+	envelope := gin.H{
+		"id":    firstNonEmptyString(thread["id"], threadID),
+		"title": stringValue(thread["title"]),
+		"data":  thread,
+	}
+	for _, key := range []string{"created", "updatedAt", "creatorUserID", "ownerUserId"} {
+		if value := thread[key]; value != nil {
+			envelope[key] = value
+		}
+	}
+	return gin.H{"ok": true, "result": gin.H{"thread": envelope}}
+}
+
+func neoLocalThreadLinkInfoResult(ctx context.Context, cfg *config.Config, r *http.Request) gin.H {
+	threadID := neoLocalInternalThreadID(r)
+	result := gin.H{
+		"creatorUserID": neoLocalOwnerUserID,
+		"ownerUserId":   neoLocalOwnerUserID,
+	}
+	if threadID == "" {
+		return result
+	}
+	if thread, ok := loadNeoThread(ctx, cfg, threadID); ok {
+		result["id"] = firstNonEmptyString(thread["id"], threadID)
+		result["creatorUserID"] = firstNonEmptyString(thread["creatorUserID"], neoLocalOwnerUserID)
+		result["ownerUserId"] = firstNonEmptyString(thread["ownerUserId"], neoLocalOwnerUserID)
+		if title := stringValue(thread["title"]); title != "" {
+			result["title"] = title
+		}
+		return result
+	}
+	result["id"] = threadID
+	return result
+}
+
 // registerProviderAliases registers /api/provider/{provider}/... routes
 // These allow Amp CLI to route requests like:
 //
@@ -291,9 +604,9 @@ func (m *AmpModule) registerProviderAliases(engine *gin.Engine, baseHandler *han
 	// Create fallback handler wrapper that forwards to ampcode.com when provider not found
 	// Uses m.getProxy() for hot-reload support (proxy can be updated at runtime)
 	// Also includes model mapping support for routing unavailable models to alternatives
-	fallbackHandler := NewFallbackHandlerWithMapper(func() *httputil.ReverseProxy {
+	fallbackHandler := m.registerFallbackHandler(NewFallbackHandlerWithMapper(func() *httputil.ReverseProxy {
 		return m.getProxy()
-	}, m.modelMapper, m.forceModelMappings)
+	}, m.modelMapper, m.forceModelMappings), m.currentCompactionCaptureDir())
 
 	// Provider-specific routes under /api/provider/:provider
 	ampProviders := engine.Group("/api/provider")

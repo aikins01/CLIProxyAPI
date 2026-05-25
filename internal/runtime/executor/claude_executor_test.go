@@ -46,12 +46,16 @@ func newClaudeHeaderTestRequest(t *testing.T, incoming http.Header) *http.Reques
 }
 
 func newClaudeGinContextWithHeaders(t *testing.T, incoming http.Header) context.Context {
+	return newClaudeGinContextWithPath(t, "/v1/messages", incoming)
+}
+
+func newClaudeGinContextWithPath(t *testing.T, path string, incoming http.Header) context.Context {
 	t.Helper()
 
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	ginCtx, _ := gin.CreateTestContext(recorder)
-	ginReq := httptest.NewRequest(http.MethodPost, "http://localhost/v1/messages", nil)
+	ginReq := httptest.NewRequest(http.MethodPost, "http://localhost"+path, nil)
 	ginReq.Header = incoming.Clone()
 	ginCtx.Request = ginReq
 	return context.WithValue(context.Background(), "gin", ginCtx)
@@ -2079,6 +2083,24 @@ func TestApplyCloaking_OAuthSanitizesForwardedSystemByDefault(t *testing.T) {
 	}
 	if !strings.Contains(forwarded, "Use the available tools when needed") {
 		t.Fatalf("ordinary OAuth cloaking should keep neutral reminder, got %q", forwarded)
+	}
+}
+
+func TestApplyCloaking_AmpProviderPreservesForwardedSystem(t *testing.T) {
+	payload := []byte(`{
+		"system":[{"type":"text","text":"## Skills\n<available_skills><skill><name>code-review</name></skill></available_skills>"}],
+		"messages":[{"role":"user","content":[{"type":"text","text":"do you see skills"}]}]
+	}`)
+
+	out := applyCloaking(newClaudeGinContextWithPath(t, "/api/provider/anthropic/v1/messages", http.Header{}), &config.Config{}, &cliproxyauth.Auth{}, payload, "claude-opus-4-7", "sk-ant-oat-test")
+
+	systemText := gjson.GetBytes(out, "system.#.text").String()
+	if strings.Contains(systemText, "<available_skills>") {
+		t.Fatalf("cloaked upstream system prompt should remain Claude Code-shaped, got %q", systemText)
+	}
+	forwarded := gjson.GetBytes(out, "messages.0.content.0.text").String()
+	if !strings.Contains(forwarded, "<available_skills>") || !strings.Contains(forwarded, "<name>code-review</name>") {
+		t.Fatalf("Amp provider cloaking should preserve forwarded skill prompt, got %q", forwarded)
 	}
 }
 

@@ -2,11 +2,17 @@ package amp
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httputil"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -34,6 +40,10 @@ const (
 // MappedModelContextKey is the Gin context key for passing mapped model names.
 const MappedModelContextKey = "mapped_model"
 const localNeoInferenceHeader = "X-CLIProxyAPI-Local-Neo-Inference"
+
+var (
+	ampCompactionCaptureSafeNamePattern = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
+)
 
 func logAmpIngressRequest(c *gin.Context, rawBody []byte) {
 	if !log.IsLevelEnabled(log.DebugLevel) || c == nil || c.Request == nil {
@@ -65,6 +75,126 @@ func logAmpIngressRequest(c *gin.Context, rawBody []byte) {
 		return
 	}
 	log.Debugf("amp ingress request %s", encoded)
+}
+
+func (fh *FallbackHandler) maybeCaptureAmpCompactionRequest(c *gin.Context, rawBody []byte) {
+	dir := fh.ampCompactionCaptureDir()
+	if dir == "" || c == nil || c.Request == nil || len(rawBody) == 0 {
+		return
+	}
+	if !looksLikeAmpCompactionRequest(rawBody) {
+		return
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		log.WithError(err).Warn("amp compaction capture: failed to create capture directory")
+		return
+	}
+	payload := map[string]any{
+		"capturedAt": time.Now().UTC().Format(time.RFC3339Nano),
+		"method":     c.Request.Method,
+		"path":       c.Request.URL.Path,
+		"rawQuery":   util.MaskSensitiveQuery(c.Request.URL.RawQuery),
+		"headers":    maskedHeaders(c.Request.Header),
+		"bodyLength": len(rawBody),
+	}
+	if model := extractModelFromRequest(rawBody, c); strings.TrimSpace(model) != "" {
+		payload["detectedModel"] = model
+	}
+	if effort := firstNonEmptyString(gjson.GetBytes(rawBody, "reasoning_effort").String(), gjson.GetBytes(rawBody, "reasoning.effort").String()); effort != "" {
+		payload["reasoningEffort"] = effort
+	}
+	if json.Valid(rawBody) {
+		payload["body"] = json.RawMessage(rawBody)
+	} else {
+		payload["body"] = string(rawBody)
+	}
+	encoded, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		log.WithError(err).Warn("amp compaction capture: failed to encode capture")
+		return
+	}
+	name := ampCompactionCaptureFilename(stringValue(payload["detectedModel"]))
+	path := filepath.Join(dir, name)
+	if err = os.WriteFile(path, encoded, 0o600); err != nil {
+		log.WithError(err).Warn("amp compaction capture: failed to write capture")
+		return
+	}
+	log.WithField("path", path).Warn("amp compaction capture: wrote candidate provider request")
+}
+
+func (fh *FallbackHandler) ampCompactionCaptureDir() string {
+	if dir := strings.TrimSpace(os.Getenv("CLIPROXYAPI_AMP_COMPACTION_CAPTURE_DIR")); dir != "" {
+		return dir
+	}
+	if fh == nil {
+		return ""
+	}
+	fh.compactionCaptureDirMu.RLock()
+	defer fh.compactionCaptureDirMu.RUnlock()
+	return fh.compactionCaptureDir
+}
+
+func looksLikeAmpCompactionRequest(rawBody []byte) bool {
+	if len(rawBody) == 0 {
+		return false
+	}
+	if stream := gjson.GetBytes(rawBody, "stream"); stream.Exists() && stream.Bool() {
+		return false
+	}
+	if !lastArrayFieldContainsCompactionPrompt(gjson.GetBytes(rawBody, "messages"), "content") && !lastArrayFieldContainsCompactionPrompt(gjson.GetBytes(rawBody, "contents"), "parts") {
+		return false
+	}
+	for _, marker := range [][]byte{
+		[]byte("continuation summary"),
+		[]byte("Wrap your summary in <summary></summary> tags."),
+		[]byte("You have been working on the task described above"),
+		[]byte("Context to Preserve"),
+	} {
+		if bytes.Contains(rawBody, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func lastArrayFieldContainsCompactionPrompt(array gjson.Result, field string) bool {
+	items := array.Array()
+	if len(items) == 0 {
+		return false
+	}
+	return messageContainsCompactionPrompt(items[len(items)-1].Get(field))
+}
+
+func messageContainsCompactionPrompt(value gjson.Result) bool {
+	if !value.Exists() {
+		return false
+	}
+	if strings.Contains(value.String(), "Wrap your summary in <summary></summary> tags.") {
+		return true
+	}
+	return strings.Contains(value.String(), "You have been working on the task described above") && strings.Contains(value.String(), "Context to Preserve")
+}
+
+func ampCompactionCaptureFilename(model string) string {
+	stamp := time.Now().UTC().Format("20060102T150405.000000000Z")
+	model = strings.TrimSpace(model)
+	if model == "" {
+		model = "unknown-model"
+	}
+	model = ampCompactionCaptureSafeNamePattern.ReplaceAllString(model, "_")
+	model = strings.Trim(model, "._-")
+	if model == "" {
+		model = "unknown-model"
+	}
+	return "amp-compaction-" + stamp + "-" + model + "-" + randomCaptureSuffix() + ".json"
+}
+
+func randomCaptureSuffix() string {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "nosuffix"
+	}
+	return hex.EncodeToString(b[:])
 }
 
 func maskedHeaders(headers http.Header) map[string][]string {
@@ -132,9 +262,11 @@ func logAmpRouting(routeType AmpRouteType, requestedModel, resolvedModel, provid
 // FallbackHandler wraps a standard handler with fallback logic to ampcode.com
 // when the model's provider is not available in CLIProxyAPI
 type FallbackHandler struct {
-	getProxy           func() *httputil.ReverseProxy
-	modelMapper        ModelMapper
-	forceModelMappings func() bool
+	getProxy               func() *httputil.ReverseProxy
+	modelMapper            ModelMapper
+	forceModelMappings     func() bool
+	compactionCaptureDirMu sync.RWMutex
+	compactionCaptureDir   string
 }
 
 // NewFallbackHandler creates a new fallback handler wrapper
@@ -163,6 +295,17 @@ func (fh *FallbackHandler) SetModelMapper(mapper ModelMapper) {
 	fh.modelMapper = mapper
 }
 
+// SetCompactionCaptureDir updates the optional directory used to capture Amp
+// compaction provider requests for parity debugging.
+func (fh *FallbackHandler) SetCompactionCaptureDir(dir string) {
+	if fh == nil {
+		return
+	}
+	fh.compactionCaptureDirMu.Lock()
+	fh.compactionCaptureDir = strings.TrimSpace(dir)
+	fh.compactionCaptureDirMu.Unlock()
+}
+
 // WrapHandler wraps a gin.HandlerFunc with fallback logic
 // If the model's provider is not configured in CLIProxyAPI, it forwards to ampcode.com
 func (fh *FallbackHandler) WrapHandler(handler gin.HandlerFunc) gin.HandlerFunc {
@@ -179,6 +322,7 @@ func (fh *FallbackHandler) WrapHandler(handler gin.HandlerFunc) gin.HandlerFunc 
 
 		rawBodyBytes := bodyBytes
 		logAmpIngressRequest(c, rawBodyBytes)
+		fh.maybeCaptureAmpCompactionRequest(c, rawBodyBytes)
 		rawModelName := extractModelFromRequest(rawBodyBytes, c)
 		rawResponsesEffort := gjson.GetBytes(rawBodyBytes, "reasoning.effort")
 		rawChatEffort := gjson.GetBytes(rawBodyBytes, "reasoning_effort")
@@ -201,6 +345,7 @@ func (fh *FallbackHandler) WrapHandler(handler gin.HandlerFunc) gin.HandlerFunc 
 		// Sanitize request body: remove thinking blocks with invalid signatures
 		// to prevent upstream API 400 errors
 		bodyBytes = SanitizeAmpRequestBody(bodyBytes)
+		proxyBodyBytes := append([]byte(nil), bodyBytes...)
 
 		// Restore the body for the handler to read
 		c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
@@ -298,8 +443,28 @@ func (fh *FallbackHandler) WrapHandler(handler gin.HandlerFunc) gin.HandlerFunc 
 			}
 		}
 
+		proxyToAmp := func() bool {
+			proxy := fh.getProxy()
+			if proxy == nil {
+				return false
+			}
+
+			// Log: Forwarding to ampcode.com (uses Amp credits)
+			logAmpRouting(RouteTypeAmpCredits, modelName, "", "", requestPath)
+
+			// Restore body for the proxy path.
+			c.Request.Body = io.NopCloser(bytes.NewReader(proxyBodyBytes))
+
+			// Forward to ampcode.com
+			proxy.ServeHTTP(c.Writer, c.Request)
+			return true
+		}
+
 		// If no providers available, fallback to ampcode.com
 		if len(providers) == 0 {
+			if proxyToAmp() {
+				return
+			}
 			if c.GetHeader(localNeoInferenceHeader) == "1" {
 				logAmpRouting(RouteTypeNoProvider, modelName, "", "", requestPath)
 				c.AbortWithStatusJSON(http.StatusBadGateway, gin.H{
@@ -307,18 +472,6 @@ func (fh *FallbackHandler) WrapHandler(handler gin.HandlerFunc) gin.HandlerFunc 
 					"message": "Amp Neo local inference has no local provider for requested model",
 					"model":   modelName,
 				})
-				return
-			}
-			proxy := fh.getProxy()
-			if proxy != nil {
-				// Log: Forwarding to ampcode.com (uses Amp credits)
-				logAmpRouting(RouteTypeAmpCredits, modelName, "", "", requestPath)
-
-				// Restore body again for the proxy
-				c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-
-				// Forward to ampcode.com
-				proxy.ServeHTTP(c.Writer, c.Request)
 				return
 			}
 

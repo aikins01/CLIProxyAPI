@@ -27,15 +27,17 @@ type Option func(*AmpModule)
 //   - Automatic gzip decompression for misconfigured upstreams
 //   - Model mapping for routing unavailable models to alternatives
 type AmpModule struct {
-	secretSource    SecretSource
-	proxy           *httputil.ReverseProxy
-	proxyMu         sync.RWMutex // protects proxy for hot-reload
-	accessManager   *sdkaccess.Manager
-	authMiddleware_ gin.HandlerFunc
-	modelMapper     *DefaultModelMapper
-	neoRuntime      *neoRuntime
-	enabled         bool
-	registerOnce    sync.Once
+	secretSource     SecretSource
+	proxy            *httputil.ReverseProxy
+	proxyMu          sync.RWMutex // protects proxy for hot-reload
+	accessManager    *sdkaccess.Manager
+	authMiddleware_  gin.HandlerFunc
+	modelMapper      *DefaultModelMapper
+	neoRuntime       *neoRuntime
+	enabled          bool
+	registerOnce     sync.Once
+	fallbackMu       sync.RWMutex
+	fallbackHandlers []*FallbackHandler
 
 	// restrictToLocalhost controls localhost-only access for management routes (hot-reloadable)
 	restrictToLocalhost bool
@@ -64,6 +66,35 @@ func New(opts ...Option) *AmpModule {
 		opt(m)
 	}
 	return m
+}
+
+func (m *AmpModule) registerFallbackHandler(handler *FallbackHandler, captureDir string) *FallbackHandler {
+	if handler == nil {
+		return nil
+	}
+	handler.SetCompactionCaptureDir(captureDir)
+	m.fallbackMu.Lock()
+	m.fallbackHandlers = append(m.fallbackHandlers, handler)
+	m.fallbackMu.Unlock()
+	return handler
+}
+
+func (m *AmpModule) setFallbackHandlersCompactionCaptureDir(dir string) {
+	m.fallbackMu.RLock()
+	handlers := append([]*FallbackHandler(nil), m.fallbackHandlers...)
+	m.fallbackMu.RUnlock()
+	for _, handler := range handlers {
+		handler.SetCompactionCaptureDir(dir)
+	}
+}
+
+func (m *AmpModule) currentCompactionCaptureDir() string {
+	m.configMu.RLock()
+	defer m.configMu.RUnlock()
+	if m.lastConfig == nil {
+		return ""
+	}
+	return m.lastConfig.CompactionCaptureDir
 }
 
 // NewLegacy creates a new Amp routing module using the legacy constructor signature.
@@ -193,6 +224,7 @@ func (m *AmpModule) OnConfigUpdated(cfg *config.Config) error {
 	if oldSettings != nil && oldSettings.RestrictManagementToLocalhost != newSettings.RestrictManagementToLocalhost {
 		m.setRestrictToLocalhost(newSettings.RestrictManagementToLocalhost)
 	}
+	m.setFallbackHandlersCompactionCaptureDir(newSettings.CompactionCaptureDir)
 
 	m.applyNeoRuntime(cfg)
 
@@ -286,6 +318,7 @@ func (m *AmpModule) applyNeoRuntime(cfg *config.Config) {
 			if err := m.neoRuntime.updateConfig(cfg); err != nil {
 				log.Warnf("amp neo local runtime config update failed: %v", err)
 			}
+			m.neoRuntime.setModelMapper(m.modelMapper)
 			return
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -297,6 +330,7 @@ func (m *AmpModule) applyNeoRuntime(cfg *config.Config) {
 	}
 
 	rt := newNeoRuntime(cfg)
+	rt.setModelMapper(m.modelMapper)
 	if err := rt.start(); err != nil {
 		log.Warnf("amp neo local runtime start failed: %v", err)
 		return

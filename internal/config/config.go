@@ -295,6 +295,10 @@ type AmpCode struct {
 	// When false (default), local API keys are used first if available.
 	ForceModelMappings bool `yaml:"force-model-mappings" json:"force-model-mappings"`
 
+	// CompactionCaptureDir writes candidate Amp provider compaction request bodies
+	// to this directory for parity debugging. Empty disables capture.
+	CompactionCaptureDir string `yaml:"compaction-capture-dir,omitempty" json:"compaction-capture-dir,omitempty"`
+
 	// NeoLocalRuntime configures the local Rivet/ThreadActor runtime used by Amp Neo
 	// when amp.url points at this proxy. Amp Neo derives localhost:6420 from a
 	// local amp.url and expects this companion runtime for interactive threads.
@@ -332,17 +336,9 @@ type AmpNeoLocalRuntime struct {
 	// generation. defaults to Amp's title side-call model.
 	TitleModel string `yaml:"title-model,omitempty" json:"title-model,omitempty"`
 
-	// RemoteControl enables polling Amp cloud thread records for new user
-	// messages and injecting them into the local Neo actor.
-	RemoteControl *bool `yaml:"remote-control,omitempty" json:"remote-control,omitempty"`
-
-	// RemotePollIntervalSeconds controls how often remote-control polling checks
-	// Amp cloud for new user messages. defaults to 5 seconds.
-	RemotePollIntervalSeconds int `yaml:"remote-poll-interval-seconds,omitempty" json:"remote-poll-interval-seconds,omitempty"`
-
-	// RemoteControlMaxThreads limits how many locally known threads are watched
-	// by remote-control polling. defaults to 20.
-	RemoteControlMaxThreads int `yaml:"remote-control-max-threads,omitempty" json:"remote-control-max-threads,omitempty"`
+	// compaction model optionally overrides the model used for local Neo summary
+	// compaction. defaults to gpt-5.4.
+	CompactionModel string `yaml:"compaction-model,omitempty" json:"compaction-model,omitempty"`
 }
 
 // AmpUpstreamAPIKeyEntry maps a set of client API keys to a specific upstream API key.

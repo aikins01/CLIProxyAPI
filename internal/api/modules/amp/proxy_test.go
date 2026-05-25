@@ -342,6 +342,7 @@ func TestReverseProxy_StripsClientCredentialsFromHeadersAndQuery(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer client-key")
 	req.Header.Set("X-Api-Key", "client-key")
 	req.Header.Set("X-Goog-Api-Key", "client-key")
+	req.Header.Set(localNeoInferenceHeader, "1")
 
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -354,6 +355,9 @@ func TestReverseProxy_StripsClientCredentialsFromHeadersAndQuery(t *testing.T) {
 	// These are client-provided credentials and must not reach the upstream.
 	if v := c.headers.Get("X-Goog-Api-Key"); v != "" {
 		t.Fatalf("X-Goog-Api-Key should be stripped, got: %q", v)
+	}
+	if v := c.headers.Get(localNeoInferenceHeader); v != "" {
+		t.Fatalf("%s should be stripped, got: %q", localNeoInferenceHeader, v)
 	}
 
 	// We inject upstream Authorization/X-Api-Key, so the client auth must not survive.
