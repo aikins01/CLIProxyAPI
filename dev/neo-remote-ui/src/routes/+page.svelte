@@ -1882,7 +1882,7 @@
     const shellKind = shellExploreKind(commandText(block));
     if (name.includes('findthread') || name.includes('searchthread') || name.includes('threadsearch')) return 'Searched threads:';
     if (name.includes('readthread')) return 'Read thread:';
-    if (shellKind === 'grep') return 'Grep:';
+    if (shellKind === 'grep') return 'Grep';
     if (shellKind === 'read') return 'Read:';
     if (shellKind === 'list') return 'Listed:';
     const label = prettyToolLabel(block.name || '');
@@ -3553,7 +3553,7 @@
     color: var(--neo-muted);
   }
   .work-group__button span {
-    color: var(--neo-ink);
+    color: var(--neo-muted);
     font-weight: 500;
   }
   :global(.work-group__chevron) { transition: transform 140ms ease; }
@@ -3640,7 +3640,7 @@
   .trace-row > summary {
     display: flex;
     align-items: baseline;
-    gap: 6px;
+    gap: 8px;
     padding: 2px 0;
     min-height: 22px;
     cursor: pointer;
@@ -3659,11 +3659,15 @@
     color: var(--neo-danger);
     font-weight: 500;
   }
-  .trace-row__sub { color: var(--neo-muted); white-space: nowrap; }
+  .trace-row__sub {
+    color: var(--neo-muted);
+    font-weight: 500;
+    white-space: nowrap;
+  }
   :global(.trace-row__chevron) {
     color: var(--neo-muted);
-    opacity: 0;
-    margin-left: 4px;
+    opacity: 0.85;
+    margin-left: 0;
     transition: opacity 150ms cubic-bezier(0.4, 0, 0.2, 1), transform 140ms ease;
   }
   .trace-row:hover > summary :global(.trace-row__chevron) { opacity: 1; }
@@ -3671,23 +3675,28 @@
 
   .trace-row__list {
     list-style: none;
-    margin: 4px 0 8px 0;
+    margin: 4px 0 12px 0;
     padding: 0;
     color: var(--neo-muted);
-    font-size: 13px;
-    line-height: 1.6;
+    font-size: 13.25px;
+    line-height: 21px;
   }
-  .trace-row__list li { display: flex; gap: 8px; padding: 1px 0; }
+  .trace-row__list li {
+    display: flex;
+    align-items: baseline;
+    gap: 4px;
+    padding: 0;
+    min-width: 0;
+  }
   .trace-row__list-label {
     color: var(--neo-muted);
-    min-width: clamp(78px, 16vw, 150px);
     flex-shrink: 0;
     white-space: nowrap;
   }
   .trace-row__list-target {
     color: var(--neo-muted);
     font-family: inherit;
-    font-size: 13px;
+    font-size: inherit;
     min-width: 0;
     flex: 1 1 auto;
     overflow: hidden;
@@ -3719,10 +3728,10 @@
   .trace-row__cmd {
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
     font-size: 12.5px;
-    color: var(--neo-ink);
+    color: color-mix(in srgb, var(--neo-ink) 70%, var(--neo-muted));
     background: transparent;
     padding: 0;
-    line-height: 1.55;
+    line-height: 1.6;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
