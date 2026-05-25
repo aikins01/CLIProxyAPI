@@ -1806,15 +1806,21 @@
     let buf: ContentBlock[] = [];
     const flush = () => { if (buf.length) { rows.push({ kind: 'explore', tools: buf }); buf = []; } };
     for (const b of blocks) {
-      if (b.type === 'thinking') { flush(); rows.push({ kind: 'thinking', block: b }); }
-      else if (b.type === 'text') { flush(); rows.push({ kind: 'progress', block: b }); }
+      if (b.type === 'thinking') {
+        continue;
+      }
+      else if (b.type === 'text') {
+        if (!b.text?.trim()) continue;
+        flush();
+        rows.push({ kind: 'progress', block: b });
+      }
       else if (b.type === 'tool_use') {
         const cat = toolCategoryForBlock(b);
         if (cat === 'explore') buf.push(b);
         else if (cat === 'edit') { flush(); rows.push({ kind: 'edit', block: b }); }
         else if (cat === 'command') { flush(); rows.push({ kind: 'command', block: b }); }
         else { flush(); rows.push({ kind: 'tool', block: b }); }
-      } else if (b.type === 'tool_result') { flush(); rows.push({ kind: 'result', block: b }); }
+      } else if (b.type === 'tool_result') { continue; }
       else { flush(); rows.push({ kind: 'tool', block: b }); }
     }
     flush();
@@ -1854,7 +1860,6 @@
     return stringFrom(input.command ?? input.cmd ?? input.script) || '';
   }
 
-  // Map runtime tool names to ampcode-style labels.
   function prettyToolLabel(name: string): string {
     const cat = toolCategory(name);
     if (cat === 'command') return 'Ran';
@@ -1869,7 +1874,6 @@
     if (cat === 'thread') return 'Read thread';
     if (cat === 'skill') return 'Used skill';
     if (cat === 'task') return 'Delegated';
-    // Fallback: capitalize first letter
     return (name || 'tool').charAt(0).toUpperCase() + (name || '').slice(1).replace(/_/g, ' ');
   }
 
@@ -1887,7 +1891,12 @@
 
   function toolSubtitle(block: ContentBlock) {
     const input = asRecord(block.input);
-    // Try a wide net of input fields, in order of usefulness for display.
+    const shellKind = shellExploreKind(commandText(block));
+    if (shellKind === 'grep') {
+      const summary = grepCommandSummary(commandText(block));
+      if (summary) return summary;
+    }
+
     const fields = [
       input.command, input.cmd, input.script,
       input.query, input.pattern, input.search, input.q,
@@ -1904,14 +1913,30 @@
         if (trimmed.length > 0) return trimmed.length > 160 ? trimmed.slice(0, 160) + '…' : trimmed;
       }
     }
-    // Patch summary if the block carries a diff
     const patch = rawPatchFromBlock(block);
     if (patch) {
       const stats = patchStats(displayPatchFromBlock(block));
       return `${stats.files} ${stats.files === 1 ? 'file' : 'files'} changed`;
     }
-    // Last resort: empty (DON'T leak internal call_XXX IDs to the UI).
     return '';
+  }
+
+  function grepCommandSummary(command: string) {
+    const trimmed = command.trim();
+    if (!trimmed) return '';
+    const quoted = trimmed.match(/(["'])(.*?)(?<!\\)\1/);
+    const pattern = quoted && quoted[2] ? quoted[2].trim() : '';
+    if (!quoted || !pattern) return trimmed.length > 160 ? trimmed.slice(0, 160) + '…' : trimmed;
+    const withoutQuoted = trimmed.replace(quoted[0], ' ');
+    const parts = withoutQuoted.split(/\s+/).filter(Boolean);
+    const paths = parts.slice(1).filter((part) => {
+      if (!part || part.startsWith('-')) return false;
+      if (/^[A-Z_][A-Z0-9_]*=/.test(part)) return false;
+      return !part.includes('=');
+    });
+    const target = paths[paths.length - 1] || '.';
+    const summary = `${target} "${pattern}"`;
+    return summary.length > 160 ? summary.slice(0, 160) + '…' : summary;
   }
 
   function rawPatchFromBlock(block: ContentBlock) {
@@ -3535,7 +3560,6 @@
   .work-group[open] :global(.work-group__chevron) { transform: rotate(90deg); }
   .work-group__body { display: grid; gap: 6px; margin-top: 8px; }
 
-  /* Compact, flat trace blocks (ampcode-style): no card border, just inline label rows */
   .trace-block {
     margin: 4px 0;
     border: 0;
@@ -3572,7 +3596,6 @@
   }
   .trace-block summary small { margin-left: auto; }
   .trace-block summary b { color: var(--neo-success); }
-  /* Tool-call command line: shown as $ ... in monospace */
   .trace-block__subline {
     overflow: hidden;
     padding: 4px 0 4px 16px;
@@ -3583,7 +3606,6 @@
     line-height: 1.5;
     overflow-wrap: anywhere;
   }
-  /* Italic thinking / narrative paragraphs */
   .trace-block p {
     margin: 4px 0 4px 16px;
     padding: 0;
@@ -3597,16 +3619,14 @@
     padding: 0 0 0 16px;
   }
 
-  /* === Compact trace rows (ampcode-style grouping) === */
   .trace-thinking {
-    margin: 8px 0;
-    font-size: 13px;
-    line-height: 20px;
+    margin: 10px 0;
+    font-size: 13.5px;
+    line-height: 21px;
     color: var(--neo-ink);
   }
-  /* Inherit base sizes for markdown inside thinking so it matches surrounding prose */
-  .trace-thinking.md { font-size: 13px; line-height: 20px; }
-  .trace-thinking--progress { color: var(--neo-muted); }
+  .trace-thinking.md { font-size: 13.5px; line-height: 21px; }
+  .trace-thinking--progress { color: color-mix(in srgb, var(--neo-ink) 82%, var(--neo-muted)); }
   .trace-row {
     margin: 2px 0;
     border: 0;
@@ -3640,7 +3660,6 @@
     font-weight: 500;
   }
   .trace-row__sub { color: var(--neo-muted); white-space: nowrap; }
-  /* Chevron hidden by default, revealed on row hover (matches ampcode `opacity-0 group-hover/row:opacity-100`). */
   :global(.trace-row__chevron) {
     color: var(--neo-muted);
     opacity: 0;
@@ -3650,10 +3669,9 @@
   .trace-row:hover > summary :global(.trace-row__chevron) { opacity: 1; }
   .trace-row[open] > summary :global(.trace-row__chevron) { opacity: 1; transform: rotate(90deg); }
 
-  /* Expanded list under an "Explored" row */
   .trace-row__list {
     list-style: none;
-    margin: 4px 0 8px 16px;
+    margin: 4px 0 8px 0;
     padding: 0;
     color: var(--neo-muted);
     font-size: 13px;
@@ -3667,9 +3685,9 @@
     white-space: nowrap;
   }
   .trace-row__list-target {
-    color: var(--neo-ink);
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-    font-size: 12.5px;
+    color: var(--neo-muted);
+    font-family: inherit;
+    font-size: 13px;
     min-width: 0;
     flex: 1 1 auto;
     overflow: hidden;
@@ -3677,7 +3695,6 @@
     white-space: nowrap;
   }
 
-  /* Edit row: filename as link + +N -N */
   .trace-row__file {
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
     font-size: 13.5px;
@@ -3699,7 +3716,6 @@
     margin: 6px 0 10px 16px;
   }
 
-  /* Command row: monospace `$ cmd`. Truncate to one line with ellipsis when collapsed; expand reveals full. */
   .trace-row__cmd {
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
     font-size: 12.5px;
@@ -3715,7 +3731,6 @@
     max-width: 100%;
     display: block;
   }
-  /* When the command row is expanded, allow the cmd text to wrap (full readability) */
   .trace-row--cmd[open] > summary .trace-row__cmd {
     white-space: pre-wrap;
     overflow-wrap: anywhere;
