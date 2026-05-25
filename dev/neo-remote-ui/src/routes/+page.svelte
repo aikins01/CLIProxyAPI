@@ -8,6 +8,7 @@
     FileCode2,
     Gauge,
     GitBranch,
+    ImagePlus,
     KeyRound,
     Laptop,
     List,
@@ -22,7 +23,8 @@
     Sun,
     Wrench,
     Wifi,
-    WifiOff
+    WifiOff,
+    X
   } from 'lucide-svelte';
   import { pushState, replaceState } from '$app/navigation';
   import { onMount } from 'svelte';
@@ -47,6 +49,21 @@
     startTime?: number | string;
     finalTime?: number | string;
     timestamp?: number | string;
+    source?: Record<string, unknown>;
+    image_url?: unknown;
+    url?: string;
+    uri?: string;
+    href?: string;
+    data?: string;
+    base64?: string;
+    mediaType?: string;
+    media_type?: string;
+    mimeType?: string;
+    mime_type?: string;
+    filename?: string;
+    file_name?: string;
+    title?: string;
+    attachmentUrl?: string;
   };
 
   type NeoMessage = {
@@ -137,6 +154,14 @@
     replaceURL?: boolean;
     skipURL?: boolean;
   };
+  type ComposerAttachment = {
+    id: string;
+    file: File;
+    previewUrl: string;
+    name: string;
+    mediaType: string;
+    size: number;
+  };
 
   let theme = $state<Theme>('system');
   let apiKey = $state('');
@@ -153,6 +178,9 @@
   let connection = $state<'offline' | 'connecting' | 'connected'>('offline');
   let agentState = $state<AgentState>('idle');
   let composer = $state('');
+  let composerAttachments = $state<ComposerAttachment[]>([]);
+  let composerUploadActive = $state(false);
+  let attachmentInput = $state<HTMLInputElement | undefined>();
   let socket: WebSocket | null = null;
   let lastError = $state('');
   let queuedCount = $state(0);
@@ -177,6 +205,8 @@
   let mainThreadId = $state('');
   let maxTokensLabel = $state('');
   let retryNotice = $state('');
+  const maxComposerImages = 8;
+  const maxComposerImageBytes = 45 * 1024 * 1024;
 
   // Mobile inspector drawer
   let mobileInspectorOpen = $state(false);
@@ -200,10 +230,10 @@
   // Per-message jump nav: only user turns are anchors (matches ampcode pattern of one mark per turn)
   const userTurnAnchors = $derived(
     activeMessages
-      .filter((m) => m.role === 'user' && userTextFromBlocks(m.content).trim().length > 0)
+      .filter((m) => m.role === 'user' && userPreviewFromBlocks(m.content).trim().length > 0)
       .map((m) => ({
         messageId: m.messageId,
-        preview: userTextFromBlocks(m.content).replace(/\s+/g, ' ').trim().slice(0, 120),
+        preview: userPreviewFromBlocks(m.content).replace(/\s+/g, ' ').trim().slice(0, 120),
       }))
   );
   let msgNavHover = $state(false);
@@ -263,6 +293,7 @@
     return () => {
       removeEventListener('popstate', handlePopState);
       removeEventListener('keydown', handleEscape);
+      clearComposerAttachments();
       disconnect();
     };
   });
@@ -356,6 +387,8 @@
     threads = [];
     selectedThreadId = '';
     detail = null;
+    composer = '';
+    clearComposerAttachments();
     resetRuntimeState();
     localStorage.removeItem('neo-remote-api-key');
     syncThreadURL('', true);
@@ -533,23 +566,180 @@
     return true;
   }
 
-  function sendMessage() {
+  function composerHasDraft() {
+    return composer.trim().length > 0 || composerAttachments.length > 0;
+  }
+
+  function canSubmitComposer() {
+    return composerHasDraft() && canSendMessage() && !composerUploadActive;
+  }
+
+  function mediaTypeForImage(file: File) {
+    if (file.type && file.type.startsWith('image/')) return file.type;
+    const ext = file.name.toLowerCase().split('.').pop() ?? '';
+    const types: Record<string, string> = {
+      avif: 'image/avif',
+      gif: 'image/gif',
+      heic: 'image/heic',
+      jpeg: 'image/jpeg',
+      jpg: 'image/jpeg',
+      png: 'image/png',
+      webp: 'image/webp'
+    };
+    return types[ext] ?? '';
+  }
+
+  function addComposerFiles(files: FileList | File[] | null | undefined) {
+    const incoming = Array.from(files ?? []);
+    if (incoming.length === 0) return;
+    const next: ComposerAttachment[] = [];
+    let rejected = 0;
+    for (const file of incoming) {
+      const mediaType = mediaTypeForImage(file);
+      if (!mediaType) {
+        rejected++;
+        continue;
+      }
+      if (file.size > maxComposerImageBytes) {
+        rejected++;
+        continue;
+      }
+      if (composerAttachments.length + next.length >= maxComposerImages) {
+        rejected++;
+        continue;
+      }
+      next.push({
+        id: crypto.randomUUID(),
+        file,
+        previewUrl: URL.createObjectURL(file),
+        name: file.name || 'image',
+        mediaType,
+        size: file.size
+      });
+    }
+    if (next.length > 0) {
+      composerAttachments = [...composerAttachments, ...next];
+      lastError = '';
+    }
+    if (rejected > 0) {
+      lastError = `Skipped ${rejected} file${rejected === 1 ? '' : 's'}; attach images under ${formatBytes(maxComposerImageBytes)}.`;
+    }
+  }
+
+  function removeComposerAttachment(id: string) {
+    const target = composerAttachments.find((attachment) => attachment.id === id);
+    if (target) URL.revokeObjectURL(target.previewUrl);
+    composerAttachments = composerAttachments.filter((attachment) => attachment.id !== id);
+  }
+
+  function clearComposerAttachments() {
+    for (const attachment of composerAttachments) {
+      URL.revokeObjectURL(attachment.previewUrl);
+    }
+    composerAttachments = [];
+  }
+
+  function handleAttachmentInput(event: Event) {
+    const input = event.currentTarget as HTMLInputElement;
+    addComposerFiles(input.files);
+    input.value = '';
+  }
+
+  function handleComposerPaste(event: ClipboardEvent) {
+    const files = Array.from(event.clipboardData?.files ?? []).filter((file) => Boolean(mediaTypeForImage(file)));
+    if (files.length === 0) return;
+    event.preventDefault();
+    addComposerFiles(files);
+  }
+
+  function handleComposerDrop(event: DragEvent) {
+    event.preventDefault();
+    const files = Array.from(event.dataTransfer?.files ?? []).filter((file) => Boolean(mediaTypeForImage(file)));
+    if (files.length > 0) addComposerFiles(files);
+  }
+
+  function fileToBase64(file: File) {
+    return new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.addEventListener('load', () => {
+        const result = typeof reader.result === 'string' ? reader.result : '';
+        const [, encoded = result] = result.split(',', 2);
+        resolve(encoded);
+      });
+      reader.addEventListener('error', () => reject(reader.error ?? new Error('Failed to read image')));
+      reader.readAsDataURL(file);
+    });
+  }
+
+  async function uploadComposerAttachment(attachment: ComposerAttachment): Promise<ContentBlock> {
+    const data = await fileToBase64(attachment.file);
+    const response = await fetch('/api/attachments', {
+      method: 'POST',
+      headers: headers(),
+      body: JSON.stringify({ data, mediaType: attachment.mediaType, name: attachment.name })
+    });
+    if (!response.ok) {
+      throw new Error(`Image upload failed for ${attachment.name}`);
+    }
+    const uploaded = asRecord(await response.json().catch(() => ({})));
+    return {
+      type: 'image',
+      name: attachment.name,
+      filename: attachment.name,
+      media_type: attachment.mediaType,
+      source: {
+        type: 'base64',
+        media_type: attachment.mediaType,
+        data
+      },
+      attachmentUrl: stringFrom(uploaded.url)
+    };
+  }
+
+  function formatBytes(size: number) {
+    if (size >= 1024 * 1024) return `${Math.round((size / (1024 * 1024)) * 10) / 10} MB`;
+    if (size >= 1024) return `${Math.round(size / 1024)} KB`;
+    return `${size} B`;
+  }
+
+  async function sendMessage() {
     const text = composer.trim();
-    if (!text || !detail || !canSendMessage()) return;
+    const attachments = composerAttachments;
+    const thread = detail;
+    if ((!text && attachments.length === 0) || !thread || !canSendMessage() || composerUploadActive) return;
+    composerUploadActive = true;
+    lastError = '';
+    let imageBlocks: ContentBlock[] = [];
+    try {
+      imageBlocks = await Promise.all(attachments.map(uploadComposerAttachment));
+      if (!detail || detail.id !== thread.id) {
+        throw new Error('Thread changed before the image upload finished.');
+      }
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+      composerUploadActive = false;
+      return;
+    }
     const messageId = `M-local-${crypto.randomUUID()}`;
+    const content: ContentBlock[] = [
+      ...(text ? [{ type: 'text', text }] : []),
+      ...imageBlocks
+    ];
     const message: NeoMessage = {
-      threadId: detail.id,
+      threadId: thread.id,
       messageId,
       role: 'user',
-      content: [{ type: 'text', text }]
+      content
     };
-    detail = { ...detail, messages: [...detail.messages, message] };
+    detail = { ...thread, messages: [...thread.messages, message] };
     composer = '';
+    clearComposerAttachments();
+    composerUploadActive = false;
     sendFrame({
       type: 'client_append_user_msg',
       messageId,
-      agentMode: detail.agentMode || 'smart',
-      content: message.content
+      agentMode: thread.agentMode || 'smart',
+      content
     });
   }
 
@@ -1216,6 +1406,7 @@
         if (block.type === 'text') return block.text ?? '';
         if (block.type === 'thinking') return block.thinking ? `Thinking: ${block.thinking}` : '';
         if (block.type === 'tool_use') return `Using ${block.name ?? 'tool'}`;
+        if (isImageBlock(block)) return imageBlockName(block) ? `[image: ${imageBlockName(block)}]` : '[image]';
         return '';
       })
       .filter(Boolean)
@@ -1227,6 +1418,39 @@
       .map((block) => block.type === 'text' ? block.text ?? '' : '')
       .filter(Boolean)
       .join('');
+  }
+
+  function userPreviewFromBlocks(blocks: ContentBlock[]) {
+    const text = userTextFromBlocks(blocks).trim();
+    const images = imageBlocksFrom(blocks).length;
+    const imageLabel = images > 0 ? `${images} image${images === 1 ? '' : 's'}` : '';
+    return [text, imageLabel].filter(Boolean).join(' ');
+  }
+
+  function isImageBlock(block: ContentBlock) {
+    return block.type === 'image' || block.type === 'input_image' || block.type === 'image_url';
+  }
+
+  function imageBlocksFrom(blocks: ContentBlock[]) {
+    return blocks.filter((block) => isImageBlock(block) && imageBlockSrc(block));
+  }
+
+  function imageBlockName(block: ContentBlock) {
+    return stringFrom(block.name ?? block.filename ?? block.file_name ?? block.title) || 'image';
+  }
+
+  function imageBlockSrc(block: ContentBlock) {
+    const source = asRecord(block.source);
+    const directData = stringFrom(source.data ?? block.data ?? block.base64);
+    const directMediaType = stringFrom(source.media_type ?? source.mediaType ?? block.media_type ?? block.mediaType ?? block.mime_type ?? block.mimeType) || 'image/png';
+    if (directData) {
+      if (directData.startsWith('data:')) return directData;
+      return `data:${directMediaType};base64,${directData}`;
+    }
+    const imageURL = stringFrom(block.image_url);
+    if (imageURL) return imageURL;
+    const nestedURL = stringFrom(asRecord(block.image_url).url);
+    return nestedURL || stringFrom(block.attachmentUrl ?? block.url ?? block.uri ?? block.href);
   }
 
   function escapeHtml(s: string): string {
@@ -1608,7 +1832,7 @@
   }
 
   function isHumanUserMessage(message: NeoMessage) {
-    return message.role === 'user' && userTextFromBlocks(message.content).trim().length > 0;
+    return message.role === 'user' && userPreviewFromBlocks(message.content).trim().length > 0;
   }
 
   function assistantTurnSegments(messages: NeoMessage[]): MessageSegment[] {
@@ -2174,6 +2398,25 @@
   <title>Neo Remote</title>
 </svelte:head>
 
+{#snippet userBubble(blocks: ContentBlock[])}
+  {@const text = userTextFromBlocks(blocks)}
+  {@const images = imageBlocksFrom(blocks)}
+  <div class:message__bubble--media={images.length > 0 && !text.trim()} class="message__bubble">
+    {#if text.trim()}
+      <div class="message__bubble-text">{text}</div>
+    {/if}
+    {#if images.length > 0}
+      <div class="message-images" aria-label="Attached images">
+        {#each images as block, i (`${imageBlockName(block)}-${i}`)}
+          <figure class="message-image">
+            <img src={imageBlockSrc(block)} alt={imageBlockName(block)} />
+          </figure>
+        {/each}
+      </div>
+    {/if}
+  </div>
+{/snippet}
+
 {#snippet traceBlock(block: ContentBlock)}
   {#if block.type === 'thinking' && block.thinking}
     <details class="trace-block trace-block--thinking">
@@ -2295,11 +2538,13 @@
             {/if}
           </details>
         {:else}
+          {@const ranLabel = prettyToolLabel(row.block.name || '')}
+          {@const ranSub = ranLabel === 'Ran tool' ? ranToolName(row.block) : toolSubtitle(row.block)}
           <details class="trace-row trace-row--ran">
             <summary class="trace-time-anchor" data-time={traceTimeLabel(row.block)}>
-              <span class="trace-row__label">{prettyToolLabel(row.block.name || '')}</span>
-              {#if toolSubtitle(row.block)}
-                <span class="trace-row__sub">{toolSubtitle(row.block)}</span>
+              <span class="trace-row__label">{ranLabel}</span>
+              {#if ranSub}
+                <span class="trace-row__sub">{ranSub}</span>
               {/if}
               <ChevronRight size={12} class="trace-row__chevron" />
             </summary>
@@ -2741,7 +2986,7 @@
           {#each transcriptItems as item (item.key)}
             {#if item.kind === 'user'}
               <article class="message message--user" data-message-id={item.message.messageId}>
-                <div class="message__bubble">{userTextFromBlocks(item.message.content)}</div>
+                {@render userBubble(item.message.content)}
               </article>
             {:else if assistantTurnSegments(item.messages).length > 0}
               <article class="message" data-message-id={item.key}>
@@ -2761,9 +3006,9 @@
           {/each}
         </div>
 
-        <div class="composer-dock" aria-hidden="true"></div>
+        <div class:composer-dock--attachments={composerAttachments.length > 0} class="composer-dock" aria-hidden="true"></div>
         <footer class="composer-footer">
-          <form class="composer" onsubmit={(event) => { event.preventDefault(); sendMessage(); }}>
+          <form class="composer" onsubmit={(event) => { event.preventDefault(); void sendMessage(); }}>
           <div
             class:composer-status--live={connection === 'connected' && executorConnected}
             class:composer-status--connecting={connection === 'connecting' || (connection === 'connected' && !executorConnected)}
@@ -2776,22 +3021,76 @@
               <span class="composer-status__part">{part}</span>
             {/each}
           </div>
-          <div class="composer-body">
+          <div
+            class="composer-body"
+            role="group"
+            aria-label="Message composer drop zone"
+            ondragover={(event) => {
+              event.preventDefault();
+              if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy';
+            }}
+            ondrop={handleComposerDrop}
+          >
             <textarea
               bind:value={composer}
               rows="2"
               placeholder={canSendMessage() ? 'Send a message to this thread...' : connection === 'connected' ? 'Open this thread locally to send...' : 'Connect to send a message...'}
+              onpaste={handleComposerPaste}
               onkeydown={(event) => {
                 if (event.key === 'Enter' && !event.shiftKey) {
                   event.preventDefault();
-                  sendMessage();
+                  void sendMessage();
                 }
               }}
             ></textarea>
+            {#if composerAttachments.length > 0}
+              <div class="composer-attachments" aria-label="Attached images">
+                {#each composerAttachments as attachment (attachment.id)}
+                  <div class="composer-attachment">
+                    <img src={attachment.previewUrl} alt={attachment.name} />
+                    <span class="composer-attachment__name" title={attachment.name}>{attachment.name}</span>
+                    <span class="composer-attachment__size">{formatBytes(attachment.size)}</span>
+                    <button
+                      class="composer-attachment__remove"
+                      type="button"
+                      title="Remove image"
+                      aria-label="Remove {attachment.name}"
+                      disabled={composerUploadActive}
+                      onclick={() => removeComposerAttachment(attachment.id)}
+                    >
+                      <X size={12} />
+                    </button>
+                  </div>
+                {/each}
+              </div>
+            {/if}
             <div class="composer-actions">
-              <div class="composer-actions__left"></div>
-              <button class="send-button" type="submit" disabled={!composer.trim() || !canSendMessage()} aria-label="Send message">
-                <ArrowUp size={14} />
+              <div class="composer-actions__left">
+                <input
+                  bind:this={attachmentInput}
+                  class="composer-file-input"
+                  type="file"
+                  accept="image/*"
+                  multiple
+                  onchange={handleAttachmentInput}
+                />
+                <button
+                  class="composer-tool-button"
+                  type="button"
+                  title="Attach image"
+                  aria-label="Attach image"
+                  disabled={!canSendMessage() || composerUploadActive || composerAttachments.length >= maxComposerImages}
+                  onclick={() => attachmentInput?.click()}
+                >
+                  <ImagePlus size={14} />
+                </button>
+              </div>
+              <button class="send-button" type="submit" disabled={!canSubmitComposer()} aria-label="Send message">
+                {#if composerUploadActive}
+                  <Loader2 size={14} class="spin" />
+                {:else}
+                  <ArrowUp size={14} />
+                {/if}
               </button>
             </div>
           </div>
@@ -3564,6 +3863,31 @@
     white-space: pre-wrap;
     word-break: break-word;
   }
+  .message__bubble--media {
+    padding: 6px;
+    background: color-mix(in srgb, var(--neo-ink) 7%, transparent);
+  }
+  .message__bubble-text + .message-images { margin-top: 8px; }
+  .message-images {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+    gap: 6px;
+    width: min(360px, 74vw);
+  }
+  .message-image {
+    margin: 0;
+    overflow: hidden;
+    border: 1px solid var(--neo-border);
+    border-radius: 8px;
+    background: var(--neo-bg);
+    aspect-ratio: 4 / 3;
+  }
+  .message-image img {
+    display: block;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
 
   .message__agent {
     display: block;
@@ -3964,9 +4288,11 @@
     height: 140px;
     flex-shrink: 0;
   }
+  .composer-dock--attachments { height: 196px; }
   @media (max-width: 640px) {
     .composer-footer { padding: 6px; }
     .composer-dock { height: 132px; }
+    .composer-dock--attachments { height: 202px; }
   }
 
   /* Composer: rounded-2xl card with status bar above + body below (matches ampcode `divide-y` pattern). */
@@ -4040,6 +4366,69 @@
     width: 100%;
   }
   .composer textarea::placeholder { color: var(--neo-muted); }
+  .composer-attachments {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 0 8px 8px;
+  }
+  .composer-attachment {
+    display: grid;
+    grid-template-columns: 32px minmax(0, 1fr) auto 20px;
+    align-items: center;
+    gap: 7px;
+    max-width: min(100%, 260px);
+    padding: 4px;
+    border: 1px solid var(--neo-border);
+    border-radius: 8px;
+    background: color-mix(in srgb, var(--neo-ink) 6%, transparent);
+    color: var(--neo-muted);
+    font-size: 11px;
+    line-height: 14px;
+  }
+  .composer-attachment img {
+    width: 32px;
+    height: 32px;
+    border-radius: 5px;
+    object-fit: cover;
+    background: var(--neo-bg);
+  }
+  .composer-attachment__name {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--neo-ink);
+  }
+  .composer-attachment__size {
+    white-space: nowrap;
+    color: var(--neo-soft);
+  }
+  .composer-attachment__remove,
+  .composer-tool-button {
+    display: inline-grid;
+    place-items: center;
+    border: 0;
+    background: transparent;
+    color: var(--neo-muted);
+    cursor: pointer;
+  }
+  .composer-attachment__remove {
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+  }
+  .composer-attachment__remove:hover:not(:disabled),
+  .composer-tool-button:hover:not(:disabled) {
+    background: var(--neo-card-hover);
+    color: var(--neo-ink);
+  }
+  .composer-attachment__remove:disabled,
+  .composer-tool-button:disabled {
+    cursor: not-allowed;
+    opacity: 0.35;
+  }
+  .composer-file-input { display: none; }
   /* Bottom action row: attach (left) + send (right) */
   .composer-actions {
     display: flex;
@@ -4048,6 +4437,11 @@
     padding: 6px 8px;
   }
   .composer-actions__left { display: flex; align-items: center; gap: 4px; }
+  .composer-tool-button {
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+  }
   .send-button {
     display: inline-grid;
     width: 28px;
