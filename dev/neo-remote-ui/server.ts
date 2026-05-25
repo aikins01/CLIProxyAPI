@@ -1,11 +1,9 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import http from 'node:http';
 import https from 'node:https';
-import net, { type Socket } from 'node:net';
-import tls from 'node:tls';
+import type { Socket } from 'node:net';
 
 type AppHandler = (req: IncomingMessage, res: ServerResponse) => void | Promise<void>;
-type HeaderValue = string | number | readonly string[] | undefined;
 
 const host = process.env.HOST || '0.0.0.0';
 const port = Number(process.env.PORT || 3000);
@@ -79,11 +77,12 @@ function proxyHttp(req: IncomingMessage, res: ServerResponse) {
   req.pipe(proxyReq);
 }
 
-function headerLines(headers: Record<string, HeaderValue>) {
-  return Object.entries(headers)
-    .flatMap(([name, value]) => (Array.isArray(value) ? value.map((entry) => [name, entry]) : [[name, value]]))
-    .filter((entry): entry is [string, string | number] => entry[1] !== undefined)
-    .map(([name, value]) => `${name}: ${value}`);
+function writeRawResponse(socket: Socket, message: IncomingMessage) {
+  socket.write(`HTTP/${message.httpVersion} ${message.statusCode || 502} ${message.statusMessage || 'Bad Gateway'}\r\n`);
+  for (let index = 0; index < message.rawHeaders.length; index += 2) {
+    socket.write(`${message.rawHeaders[index]}: ${message.rawHeaders[index + 1]}\r\n`);
+  }
+  socket.write('\r\n');
 }
 
 function proxyUpgrade(req: IncomingMessage, socket: Socket, head: Buffer) {
@@ -93,25 +92,31 @@ function proxyUpgrade(req: IncomingMessage, socket: Socket, head: Buffer) {
   }
 
   const target = runtimeTarget(req.url || '/');
-  const targetPort = Number(target.port || (target.protocol === 'https:' ? 443 : 80));
-  const targetSocket =
-    target.protocol === 'https:'
-      ? tls.connect({ host: target.hostname, port: targetPort, servername: target.hostname })
-      : net.connect({ host: target.hostname, port: targetPort });
-  const readyEvent = target.protocol === 'https:' ? 'secureConnect' : 'connect';
-
-  targetSocket.once(readyEvent, () => {
-    const path = `${target.pathname}${target.search}`;
-    const headers = proxyHeaders(req.headers, target.host);
-    targetSocket.write(`${req.method} ${path} HTTP/${req.httpVersion}\r\n${headerLines(headers).join('\r\n')}\r\n\r\n`);
-    if (head.length > 0) {
-      targetSocket.write(head);
-    }
-    socket.pipe(targetSocket).pipe(socket);
+  const transport = target.protocol === 'https:' ? https : http;
+  const proxyReq = transport.request(target, {
+    method: req.method,
+    headers: proxyHeaders(req.headers, target.host)
   });
 
-  targetSocket.on('error', () => socket.destroy());
-  socket.on('error', () => targetSocket.destroy());
+  proxyReq.on('upgrade', (proxyRes, proxySocket, proxyHead) => {
+    writeRawResponse(socket, proxyRes);
+    if (proxyHead.length > 0) {
+      socket.write(proxyHead);
+    }
+    if (head.length > 0) {
+      proxySocket.write(head);
+    }
+    socket.pipe(proxySocket).pipe(socket);
+  });
+
+  proxyReq.on('response', (proxyRes) => {
+    writeRawResponse(socket, proxyRes);
+    proxyRes.pipe(socket);
+  });
+
+  proxyReq.on('error', () => socket.destroy());
+  socket.on('error', () => proxyReq.destroy());
+  proxyReq.end();
 }
 
 const server = http.createServer((req, res) => {
