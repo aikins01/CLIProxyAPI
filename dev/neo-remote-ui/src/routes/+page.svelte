@@ -41,6 +41,8 @@
     content?: unknown;
     patch?: unknown;
     diff?: unknown;
+    run?: unknown;
+    toolUseID?: string;
     blockState?: string;
     startTime?: number | string;
     finalTime?: number | string;
@@ -1449,6 +1451,11 @@
     return typeof value === 'string' ? value : '';
   }
 
+  function numberFrom(value: unknown) {
+    const n = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : NaN;
+    return Number.isFinite(n) ? n : NaN;
+  }
+
   function cycleTheme() {
     theme = theme === 'system' ? 'dark' : theme === 'dark' ? 'light' : 'system';
   }
@@ -1669,7 +1676,9 @@
   function isRenderableWorkBlock(block: ContentBlock) {
     if (block.type === 'thinking') return Boolean(block.thinking) || plausibleBlockTimeMillis(block.startTime) > 0;
     if (block.type === 'tool_use') return true;
-    if (block.type === 'tool_result') return Boolean(blockContentPreview(block));
+    if (block.type === 'tool_result') {
+      return Boolean(blockContentPreview(block) || toolResultUseID(block) || Object.keys(toolResultRun(block)).length > 0);
+    }
     return false;
   }
 
@@ -1701,11 +1710,11 @@
     const starts = blocks.map((block) => plausibleBlockTimeMillis(block.startTime)).filter((value) => value > 0);
     if (starts.length === 0) return '';
     const start = Math.min(...starts);
-    const ends = blocks.map((block) => plausibleBlockTimeMillis(block.finalTime)).filter((value) => value > 0);
-    const end = ends.length > 0 ? Math.max(...ends) : 0;
-    const startLabel = formatTraceTime(start);
-    if (!end || end <= start + 1000) return startLabel;
-    return `${startLabel} · ${formatTraceDuration(end - start)}`;
+    return formatTraceTime(start);
+  }
+
+  function traceTimeLabelForRow(block: ContentBlock, result?: ContentBlock) {
+    return result ? traceTimeLabelForBlocks([block, result]) : traceTimeLabel(block);
   }
 
   function blockTimeMillis(value: unknown) {
@@ -1740,20 +1749,10 @@
 
   function formatTraceTime(milliseconds: number) {
     return new Intl.DateTimeFormat(undefined, {
-      month: 'short',
-      day: 'numeric',
-      hour: 'numeric',
-      minute: '2-digit'
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false
     }).format(new Date(milliseconds));
-  }
-
-  function formatTraceDuration(milliseconds: number) {
-    const seconds = Math.max(1, Math.round(milliseconds / 1000));
-    if (seconds < 60) return `${seconds}s`;
-    const minutes = Math.max(1, Math.round(seconds / 60));
-    if (minutes < 60) return `${minutes}m`;
-    const hours = Math.max(1, Math.round(minutes / 60));
-    return `${hours}h`;
   }
 
   function blockStatus(block: ContentBlock) {
@@ -1829,15 +1828,16 @@
     | { kind: 'thinking'; block: ContentBlock }
     | { kind: 'progress'; block: ContentBlock }
     | { kind: 'explore'; tools: ContentBlock[] }
-    | { kind: 'edit'; block: ContentBlock }
-    | { kind: 'command'; block: ContentBlock }
-    | { kind: 'tool'; block: ContentBlock }
+    | { kind: 'edit'; block: ContentBlock; result?: ContentBlock }
+    | { kind: 'command'; block: ContentBlock; result?: ContentBlock }
+    | { kind: 'tool'; block: ContentBlock; result?: ContentBlock }
     | { kind: 'result'; block: ContentBlock };
 
   function groupWorkBlocks(blocks: ContentBlock[]): DisplayRow[] {
     const rows: DisplayRow[] = [];
     let buf: ContentBlock[] = [];
     const flush = () => { if (buf.length) { rows.push({ kind: 'explore', tools: buf }); buf = []; } };
+    const results = collectToolResults(blocks);
     for (const b of blocks) {
       if (b.type === 'thinking') {
         continue;
@@ -1849,10 +1849,11 @@
       }
       else if (b.type === 'tool_use') {
         const cat = toolCategoryForBlock(b);
+        const result = toolResultForBlock(results, b);
         if (cat === 'explore') buf.push(b);
-        else if (cat === 'edit') { flush(); rows.push({ kind: 'edit', block: b }); }
-        else if (cat === 'command') { flush(); rows.push({ kind: 'command', block: b }); }
-        else { flush(); rows.push({ kind: 'tool', block: b }); }
+        else if (cat === 'edit') { flush(); rows.push({ kind: 'edit', block: b, result }); }
+        else if (cat === 'command') { flush(); rows.push({ kind: 'command', block: b, result }); }
+        else { flush(); rows.push({ kind: 'tool', block: b, result }); }
       } else if (b.type === 'tool_result') { continue; }
       else { flush(); rows.push({ kind: 'tool', block: b }); }
     }
@@ -1893,7 +1894,88 @@
     return stringFrom(input.command ?? input.cmd ?? input.script) || '';
   }
 
+  function collectToolResults(blocks: ContentBlock[]) {
+    const results = new Map<string, ContentBlock>();
+    for (const block of blocks) {
+      if (block.type !== 'tool_result') continue;
+      const id = toolResultUseID(block);
+      if (id) results.set(id, block);
+    }
+    return results;
+  }
+
+  function toolUseID(block: ContentBlock) {
+    const record = asRecord(block);
+    return stringFrom(block.id ?? record.toolUseID ?? record.tool_use_id ?? record.toolCallID ?? record.toolCallId);
+  }
+
+  function toolResultUseID(block: ContentBlock) {
+    const record = asRecord(block);
+    return stringFrom(block.toolUseID ?? record.toolUseID ?? record.tool_use_id ?? record.toolCallID ?? record.toolCallId ?? block.id);
+  }
+
+  function toolResultForBlock(results: Map<string, ContentBlock>, block: ContentBlock) {
+    const id = toolUseID(block);
+    return id ? results.get(id) : undefined;
+  }
+
+  function toolResultRun(block?: ContentBlock) {
+    return asRecord(block?.run ?? asRecord(block).run);
+  }
+
+  function toolResultResult(block?: ContentBlock) {
+    return asRecord(toolResultRun(block).result);
+  }
+
+  function toolResultExitCode(block?: ContentBlock) {
+    const run = toolResultRun(block);
+    const result = toolResultResult(block);
+    return numberFrom(result.exitCode ?? result.exit_code ?? run.exitCode ?? run.exit_code);
+  }
+
+  function toolResultStatus(block?: ContentBlock) {
+    const run = toolResultRun(block);
+    return stringFrom(run.status ?? asRecord(block).status).toLowerCase();
+  }
+
+  function isFailedToolResult(block?: ContentBlock) {
+    if (!block) return false;
+    const exitCode = toolResultExitCode(block);
+    if (Number.isFinite(exitCode) && exitCode !== 0) return true;
+    return ['error', 'failed', 'cancelled', 'rejected-by-user'].includes(toolResultStatus(block));
+  }
+
+  function toolResultStatusLabel(block?: ContentBlock) {
+    const exitCode = toolResultExitCode(block);
+    if (Number.isFinite(exitCode) && exitCode !== 0) return `exit ${exitCode}`;
+    const status = toolResultStatus(block);
+    if (status === 'rejected-by-user') return 'rejected';
+    if (status === 'cancelled') return 'cancelled';
+    if (status === 'error' || status === 'failed') return 'failed';
+    return '';
+  }
+
+  function toolResultPreview(block?: ContentBlock) {
+    if (!block) return '';
+    const run = toolResultRun(block);
+    const result = toolResultResult(block);
+    return firstString(
+      result.output,
+      result.stderr,
+      result.stdout,
+      result.message,
+      run.output,
+      run.error,
+      blockContentPreview(block)
+    );
+  }
+
   function prettyToolLabel(name: string): string {
+    const n = (name || '').toLowerCase().replace(/[\s_-]+/g, '');
+    if (n.includes('codereview') || n.includes('review')) return 'Reviewed';
+    if (n.includes('handoff') || n.includes('handover')) return 'Handed off';
+    if (n.includes('subagent') || n.includes('spawn') || n === 'task' || n === 'agent') return 'Delegated';
+
     const cat = toolCategory(name);
     if (cat === 'command') return 'Ran';
     if (cat === 'edit') return 'Edited';
@@ -1907,7 +1989,8 @@
     if (cat === 'thread') return 'Read thread';
     if (cat === 'skill') return 'Used skill';
     if (cat === 'task') return 'Delegated';
-    return (name || 'tool').charAt(0).toUpperCase() + (name || '').slice(1).replace(/_/g, ' ');
+    const friendly = (name || 'tool').replace(/[_-]/g, ' ').trim();
+    return friendly ? `Ran ${friendly.toLowerCase()}` : 'Ran tool';
   }
 
   function traceActionLabel(block: ContentBlock) {
@@ -2203,11 +2286,18 @@
             {/if}
           </details>
         {:else if row.kind === 'command'}
-          <details class="trace-row trace-row--cmd">
-            <summary class="trace-time-anchor" data-time={traceTimeLabel(row.block)}>
+          {@const commandFailed = isFailedToolResult(row.result)}
+          {@const commandResultPreview = commandFailed ? toolResultPreview(row.result) : ''}
+          <details class="trace-row trace-row--cmd" class:trace-row--failed={commandFailed}>
+            <summary class="trace-time-anchor" data-time={traceTimeLabelForRow(row.block, row.result)}>
               <code class="trace-row__cmd">$ {commandText(row.block) || prettyToolLabel(row.block.name || 'command')}</code>
+              {#if commandFailed}
+                <span class="trace-row__status">{toolResultStatusLabel(row.result)}</span>
+              {/if}
             </summary>
-            {#if toolInputPreview(row.block)}
+            {#if commandResultPreview}
+              <pre class="code-panel code-panel--error">{commandResultPreview}</pre>
+            {:else if toolInputPreview(row.block)}
               <pre class="code-panel">{toolInputPreview(row.block)}</pre>
             {/if}
           </details>
@@ -3818,6 +3908,36 @@
     word-break: break-word;
   }
   .trace-row--cmd .code-panel { margin: 4px 0 8px 16px; }
+
+  .trace-row--failed > summary { opacity: 1; }
+  .trace-row--failed .trace-row__cmd {
+    color: color-mix(in srgb, var(--neo-danger) 86%, var(--neo-ink));
+  }
+  .trace-row__status {
+    flex: 0 0 auto;
+    color: var(--neo-danger);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 11px;
+    font-weight: 500;
+    line-height: 1;
+    white-space: nowrap;
+  }
+  .trace-row--failed .code-panel--error {
+    border-color: color-mix(in srgb, var(--neo-danger) 28%, transparent);
+    color: color-mix(in srgb, var(--neo-danger) 24%, var(--neo-ink));
+  }
+
+  .trace-row--ran > summary { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
+  .trace-row--ran .trace-row__label { color: var(--neo-ink); }
+  .trace-row--ran .trace-row__sub {
+    color: var(--neo-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+    flex: 1 1 auto;
+  }
+  .trace-row--ran .code-panel { margin: 4px 0 8px 16px; }
 
   @media (max-width: 760px) {
     .trace-time-anchor[data-time]:not([data-time=""])::before {
