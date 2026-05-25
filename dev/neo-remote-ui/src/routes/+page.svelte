@@ -318,7 +318,6 @@
     lastError = '';
     apiKey = key;
     persistAPIKey();
-    // Verify the key. Only promote to authenticated on success.
     try {
       const result = await rpc('listThreads', { includeArchived: false, limit: 80 });
       const rawThreads = Array.isArray(result?.threads) ? result.threads : [];
@@ -332,17 +331,11 @@
     } catch (error) {
       const status = error instanceof RpcError ? error.status : 0;
       if (status === 401 || status === 403) {
-        // Bad key — clear it and tell the user.
         apiKey = '';
         localStorage.removeItem('neo-remote-api-key');
         lastError = 'That key was rejected. Double-check and try again.';
-      } else if (status >= 500) {
-        // Server is up but failing. Keep the key, surface a friendly message.
-        lastError = 'Your local runtime returned an error. It might still be starting — try again in a moment.';
-      } else if (status === 0) {
-        // Network/CORS/offline.
-        lastError = "Couldn't reach your local runtime. Make sure it's running and try again.";
       } else {
+        isAuthenticated = true;
         lastError = error instanceof Error ? error.message : String(error);
       }
     } finally {
