@@ -877,7 +877,7 @@
       type: 'client_tool_approval_response',
       toolCallId: approval.toolCallId,
       accepted: false,
-      denyFeedback: 'Denied from Neo Remote'
+      denyFeedback: 'Denied from the browser'
     });
     toolApprovals = toolApprovals.filter((item) => item.toolCallId !== approval.toolCallId);
   }
