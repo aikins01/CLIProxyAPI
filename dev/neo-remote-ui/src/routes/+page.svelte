@@ -952,9 +952,9 @@
   }
 
   function composerStatusMain() {
-    if (connection === 'connected') return 'Connected Neo runtime';
-    if (connection === 'connecting') return 'Connecting Neo runtime';
-    return 'Neo runtime offline';
+    if (connection === 'connected') return 'Connected';
+    if (connection === 'connecting') return 'Connecting…';
+    return 'Offline';
   }
 
   function composerStatusParts() {
@@ -963,8 +963,8 @@
 
   function threadRuntimeLabel(threadId: string) {
     if (threadId !== selectedThreadId) return '';
-    if (connection === 'connected') return 'Neo active';
-    if (connection === 'connecting') return 'Neo connecting';
+    if (connection === 'connected') return 'live';
+    if (connection === 'connecting') return 'connecting…';
     return '';
   }
 
@@ -984,7 +984,7 @@
     const lastMessage = messages[messages.length - 1] as unknown;
     const preview = previewFromMessage(lastMessage) || stringFrom(data.preview) || stringFrom(data.title);
     const env = asRecord(data.env);
-    const repo = stringFrom(data.repository) || repoFromEnv(env) || 'local/runtime';
+    const repo = stringFrom(data.repository) || repoFromEnv(env) || 'local';
     return {
       id,
       title: stringFrom(data.title) || 'Untitled',
@@ -1007,7 +1007,7 @@
     return {
       id: stringFrom(thread.id) || selectedThreadId,
       title: stringFrom(thread.title) || 'Untitled',
-      repo: repoFromEnv(env) || 'local/runtime',
+      repo: repoFromEnv(env) || 'local',
       branch: branchFromEnv(env) || 'main',
       agentMode: stringFrom(thread.agentMode) || 'smart',
       messages,
@@ -2539,7 +2539,7 @@
         <div class="empty-state">
           <PanelRight size={28} />
           <h1>Select a thread</h1>
-          <p>Load a local Neo thread to start streaming runtime events into the browser.</p>
+          <p>Pick a thread from the list to view it here.</p>
         </div>
       {/if}
     </section>
