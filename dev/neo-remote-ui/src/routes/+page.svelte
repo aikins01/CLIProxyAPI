@@ -1945,16 +1945,6 @@
     return ['error', 'failed', 'cancelled', 'rejected-by-user'].includes(toolResultStatus(block));
   }
 
-  function toolResultStatusLabel(block?: ContentBlock) {
-    const exitCode = toolResultExitCode(block);
-    if (Number.isFinite(exitCode) && exitCode !== 0) return `exit ${exitCode}`;
-    const status = toolResultStatus(block);
-    if (status === 'rejected-by-user') return 'rejected';
-    if (status === 'cancelled') return 'cancelled';
-    if (status === 'error' || status === 'failed') return 'failed';
-    return '';
-  }
-
   function toolResultPreview(block?: ContentBlock) {
     if (!block) return '';
     const run = toolResultRun(block);
@@ -1972,9 +1962,8 @@
 
   function prettyToolLabel(name: string): string {
     const n = (name || '').toLowerCase().replace(/[\s_-]+/g, '');
-    if (n.includes('codereview') || n.includes('review')) return 'Reviewed';
-    if (n.includes('handoff') || n.includes('handover')) return 'Handed off';
-    if (n.includes('subagent') || n.includes('spawn') || n === 'task' || n === 'agent') return 'Delegated';
+    // 'review' tools render as "Reviewed code" (matches ampcode's "Reviewed code code review").
+    if (n.includes('codereview') || n.includes('review')) return 'Reviewed code';
 
     const cat = toolCategory(name);
     if (cat === 'command') return 'Ran';
@@ -1988,9 +1977,16 @@
     if (cat === 'web') return 'Searched the web';
     if (cat === 'thread') return 'Read thread';
     if (cat === 'skill') return 'Used skill';
-    if (cat === 'task') return 'Delegated';
-    const friendly = (name || 'tool').replace(/[_-]/g, ' ').trim();
-    return friendly ? `Ran ${friendly.toLowerCase()}` : 'Ran tool';
+    // Everything else (handoff, subagent, task, custom tools) renders as
+    // "Ran tool <name>" — matches ampcode exactly: "Ran tool" + muted tool name.
+    return 'Ran tool';
+  }
+
+  // Subtitle for "Ran tool X" rows: the tool's literal name, lowercased + spaced.
+  function ranToolName(block: ContentBlock): string {
+    const raw = (block.name || '').trim();
+    if (!raw) return '';
+    return raw.replace(/[_-]+/g, ' ').toLowerCase();
   }
 
   function traceActionLabel(block: ContentBlock) {
@@ -2290,10 +2286,7 @@
           {@const commandResultPreview = commandFailed ? toolResultPreview(row.result) : ''}
           <details class="trace-row trace-row--cmd" class:trace-row--failed={commandFailed}>
             <summary class="trace-time-anchor" data-time={traceTimeLabelForRow(row.block, row.result)}>
-              <code class="trace-row__cmd">$ {commandText(row.block) || prettyToolLabel(row.block.name || 'command')}</code>
-              {#if commandFailed}
-                <span class="trace-row__status">{toolResultStatusLabel(row.result)}</span>
-              {/if}
+              <code class="trace-row__cmd"><span class="trace-row__prompt">$</span> {commandText(row.block) || prettyToolLabel(row.block.name || 'command')}</code>
             </summary>
             {#if commandResultPreview}
               <pre class="code-panel code-panel--error">{commandResultPreview}</pre>
@@ -3909,19 +3902,9 @@
   }
   .trace-row--cmd .code-panel { margin: 4px 0 8px 16px; }
 
+  .trace-row__prompt { color: color-mix(in srgb, var(--neo-ink) 58%, var(--neo-muted)); }
   .trace-row--failed > summary { opacity: 1; }
-  .trace-row--failed .trace-row__cmd {
-    color: color-mix(in srgb, var(--neo-danger) 86%, var(--neo-ink));
-  }
-  .trace-row__status {
-    flex: 0 0 auto;
-    color: var(--neo-danger);
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-    font-size: 11px;
-    font-weight: 500;
-    line-height: 1;
-    white-space: nowrap;
-  }
+  .trace-row--failed .trace-row__prompt { color: var(--neo-danger); }
   .trace-row--failed .code-panel--error {
     border-color: color-mix(in srgb, var(--neo-danger) 28%, transparent);
     color: color-mix(in srgb, var(--neo-danger) 24%, var(--neo-ink));
