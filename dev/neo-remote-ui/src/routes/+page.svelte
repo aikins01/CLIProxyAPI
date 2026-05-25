@@ -1693,6 +1693,21 @@
     return `Worked for ${formatWorkDuration(end - start)}`;
   }
 
+  function traceTimeLabel(block: ContentBlock) {
+    return traceTimeLabelForBlocks([block]);
+  }
+
+  function traceTimeLabelForBlocks(blocks: ContentBlock[]) {
+    const starts = blocks.map((block) => plausibleBlockTimeMillis(block.startTime)).filter((value) => value > 0);
+    if (starts.length === 0) return '';
+    const start = Math.min(...starts);
+    const ends = blocks.map((block) => plausibleBlockTimeMillis(block.finalTime)).filter((value) => value > 0);
+    const end = ends.length > 0 ? Math.max(...ends) : 0;
+    const startLabel = formatTraceTime(start);
+    if (!end || end <= start + 1000) return startLabel;
+    return `${startLabel} · ${formatTraceDuration(end - start)}`;
+  }
+
   function blockTimeMillis(value: unknown) {
     const n = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : NaN;
     if (!Number.isFinite(n) && typeof value === 'string') {
@@ -1721,6 +1736,24 @@
     if (remainingMinutes === 0) return `${hours} ${hourSuffix}`;
     const minuteSuffix = remainingMinutes === 1 ? 'minute' : 'minutes';
     return `${hours} ${hourSuffix} ${remainingMinutes} ${minuteSuffix}`;
+  }
+
+  function formatTraceTime(milliseconds: number) {
+    return new Intl.DateTimeFormat(undefined, {
+      month: 'short',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit'
+    }).format(new Date(milliseconds));
+  }
+
+  function formatTraceDuration(milliseconds: number) {
+    const seconds = Math.max(1, Math.round(milliseconds / 1000));
+    if (seconds < 60) return `${seconds}s`;
+    const minutes = Math.max(1, Math.round(seconds / 60));
+    if (minutes < 60) return `${minutes}m`;
+    const hours = Math.max(1, Math.round(minutes / 60));
+    return `${hours}h`;
   }
 
   function blockStatus(block: ContentBlock) {
@@ -2065,7 +2098,7 @@
 {#snippet traceBlock(block: ContentBlock)}
   {#if block.type === 'thinking' && block.thinking}
     <details class="trace-block trace-block--thinking">
-      <summary>
+      <summary class="trace-time-anchor" data-time={traceTimeLabel(block)}>
         <ChevronRight size={14} class="trace-block__chevron" />
         <Sparkles size={14} />
         <span>thinking</span>
@@ -2075,7 +2108,7 @@
     </details>
   {:else if block.type === 'tool_use'}
     <details class="trace-block trace-block--tool">
-      <summary>
+      <summary class="trace-time-anchor" data-time={traceTimeLabel(block)}>
         <ChevronRight size={14} class="trace-block__chevron" />
         {#if hasPatch(block)}
           <FileCode2 size={14} />
@@ -2100,7 +2133,7 @@
     </details>
   {:else if block.type === 'tool_result'}
     <details class="trace-block trace-block--result">
-      <summary>
+      <summary class="trace-time-anchor" data-time={traceTimeLabel(block)}>
         <ChevronRight size={14} class="trace-block__chevron" />
         <CheckCircle2 size={14} />
         <span>tool result</span>
@@ -2114,7 +2147,7 @@
 {#snippet workGroup(blocks: ContentBlock[], live = false)}
   {@const duration = workDurationLabel(blocks, live)}
   <details class="work-group">
-    <summary>
+    <summary class="trace-time-anchor" data-time={traceTimeLabelForBlocks(blocks)}>
       <span class="work-group__line"></span>
       <span class="work-group__button">
         {#if duration}
@@ -2134,18 +2167,18 @@
           {/if}
         {:else if row.kind === 'progress'}
           {#if row.block.text}
-            <div class="trace-thinking trace-thinking--progress md">{@html renderMarkdown(stripThinkingTitle(row.block.text))}</div>
+            <div class="trace-thinking trace-thinking--progress trace-time-anchor md" data-time={traceTimeLabel(row.block)}>{@html renderMarkdown(stripThinkingTitle(row.block.text))}</div>
           {/if}
         {:else if row.kind === 'explore'}
           <details class="trace-row trace-row--explore">
-            <summary>
+            <summary class="trace-time-anchor" data-time={traceTimeLabelForBlocks(row.tools)}>
               <span class="trace-row__label">Explored</span>
               <span class="trace-row__sub">{exploreSummary(row.tools)}</span>
               <ChevronRight size={12} class="trace-row__chevron" />
             </summary>
             <ul class="trace-row__list">
               {#each row.tools as tool, i (tool.id ?? i)}
-                <li>
+                <li class="trace-time-anchor" data-time={traceTimeLabel(tool)}>
                   <span class="trace-row__list-label">{traceActionLabel(tool)}</span>
                   <span class="trace-row__list-target">{toolSubtitle(tool)}</span>
                 </li>
@@ -2155,7 +2188,7 @@
         {:else if row.kind === 'edit'}
           {@const stats = patchStats(displayPatchFromBlock(row.block))}
           <details class="trace-row trace-row--edit">
-            <summary>
+            <summary class="trace-time-anchor" data-time={traceTimeLabel(row.block)}>
               <span class="trace-row__label">Edited</span>
               <span class="trace-row__file">{editTarget(row.block)}</span>
               {#if stats.additions || stats.deletions}
@@ -2171,7 +2204,7 @@
           </details>
         {:else if row.kind === 'command'}
           <details class="trace-row trace-row--cmd">
-            <summary>
+            <summary class="trace-time-anchor" data-time={traceTimeLabel(row.block)}>
               <code class="trace-row__cmd">$ {commandText(row.block) || prettyToolLabel(row.block.name || 'command')}</code>
             </summary>
             {#if toolInputPreview(row.block)}
@@ -2179,7 +2212,18 @@
             {/if}
           </details>
         {:else}
-          {@render traceBlock(row.block)}
+          <details class="trace-row trace-row--ran">
+            <summary class="trace-time-anchor" data-time={traceTimeLabel(row.block)}>
+              <span class="trace-row__label">{prettyToolLabel(row.block.name || '')}</span>
+              {#if toolSubtitle(row.block)}
+                <span class="trace-row__sub">{toolSubtitle(row.block)}</span>
+              {/if}
+              <ChevronRight size={12} class="trace-row__chevron" />
+            </summary>
+            {#if toolInputPreview(row.block)}
+              <pre class="code-panel">{toolInputPreview(row.block)}</pre>
+            {/if}
+          </details>
         {/if}
       {/each}
     </div>
@@ -3412,10 +3456,16 @@
   .message {
     min-width: 0;
     animation: message-enter 180ms ease-out;
-    padding: 4px 0;
   }
-  /* User row: full-width flex column with items-end (matches ampcode `flex w-full flex-col items-end py-1 mb-4`) */
-  .message--user { display: flex; flex-direction: column; align-items: flex-end; width: 100%; min-width: 0; }
+  .message--user {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    width: 100%;
+    min-width: 0;
+    padding: 4px 0;
+    margin-bottom: 16px;
+  }
 
   .message__bubble {
     max-width: min(85%, 672px);
@@ -3534,6 +3584,28 @@
   }
 
   .work-group { margin: 12px 0; }
+  .trace-time-anchor {
+    position: relative;
+  }
+  .trace-time-anchor[data-time]:not([data-time=""])::before {
+    content: attr(data-time);
+    position: absolute;
+    top: 0.28em;
+    right: calc(100% + 18px);
+    z-index: 2;
+    color: var(--neo-soft);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 10.5px;
+    font-weight: 400;
+    line-height: 1;
+    opacity: 0;
+    pointer-events: none;
+    white-space: nowrap;
+    transition: opacity 140ms cubic-bezier(0.4, 0, 0.2, 1);
+  }
+  .trace-time-anchor[data-time]:not([data-time=""]):hover::before {
+    opacity: 0.82;
+  }
   .work-group > summary {
     display: flex;
     align-items: center;
@@ -3746,6 +3818,14 @@
     word-break: break-word;
   }
   .trace-row--cmd .code-panel { margin: 4px 0 8px 16px; }
+
+  @media (max-width: 760px) {
+    .trace-time-anchor[data-time]:not([data-time=""])::before {
+      top: -16px;
+      right: auto;
+      left: 0;
+    }
+  }
 
   .code-panel {
     overflow: auto;
