@@ -7004,6 +7004,55 @@ func TestNeoActorArtifactUpsertAcceptsBinaryTopLevelWorkspaceSnapshot(t *testing
 	}
 }
 
+func TestNeoThreadMarkdownTruncatesToolResultsLikeAmpBinary(t *testing.T) {
+	longResult := strings.Repeat("x", neoThreadMarkdownToolTextLimit+500) + "tail"
+	thread := map[string]any{
+		"id":      "T-local-store",
+		"created": 1778170000000,
+		"messages": []any{
+			map[string]any{
+				"role": "assistant",
+				"content": []any{map[string]any{
+					"type": "tool_use",
+					"id":   "TU-edit",
+					"name": "edit_file",
+					"input": map[string]any{
+						"path":    "app.go",
+						"old_str": "old body",
+						"new_str": "new body",
+					},
+				}},
+			},
+			map[string]any{
+				"role": "user",
+				"content": []any{map[string]any{
+					"type":      "tool_result",
+					"toolUseID": "TU-read",
+					"run":       map[string]any{"status": "done", "result": longResult},
+				}},
+			},
+		},
+	}
+
+	full := neoThreadMarkdown(thread)
+	if !strings.Contains(full, "tail") {
+		t.Fatalf("full markdown should include untruncated result:\n%s", full)
+	}
+	truncated := neoThreadMarkdown(thread, neoThreadMarkdownOptions{TruncateToolResults: true})
+	for _, want := range []string{
+		neoThreadMarkdownOmittedText,
+		"[... old_str omitted in markdown version ...]",
+		"[... new_str omitted in markdown version ...]",
+	} {
+		if !strings.Contains(truncated, want) {
+			t.Fatalf("truncated markdown missing %q:\n%s", want, truncated)
+		}
+	}
+	if strings.Contains(truncated, "tail") {
+		t.Fatalf("truncated markdown leaked tail content:\n%s", truncated)
+	}
+}
+
 func TestNeoRuntimeServesLocalThreadHTTP(t *testing.T) {
 	dir := t.TempDir()
 	oldStoreDir := neoAmpThreadStoreDir
@@ -7045,6 +7094,51 @@ func TestNeoRuntimeServesLocalThreadHTTP(t *testing.T) {
 	}
 	if thread["id"] != "T-local-store" {
 		t.Fatalf("thread id = %#v", thread["id"])
+	}
+}
+
+func TestNeoRuntimeServesTruncatedLocalThreadMarkdown(t *testing.T) {
+	dir := t.TempDir()
+	oldStoreDir := neoAmpThreadStoreDir
+	neoAmpThreadStoreDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
+
+	threadID := "T-local-truncated"
+	snapshot := neoCloudThreadSnapshot{
+		threadID:  threadID,
+		seq:       2,
+		createdMs: 1778170000000,
+		messages: []neoMessage{
+			{
+				ThreadID:  threadID,
+				MessageID: "M-tool-result",
+				Role:      "user",
+				Content: []any{map[string]any{
+					"type":      "tool_result",
+					"toolUseID": "TU-read",
+					"run":       map[string]any{"status": "done", "result": strings.Repeat("x", neoThreadMarkdownToolTextLimit+500) + "tail"},
+				}},
+				Seq: 1,
+			},
+		},
+	}
+	if err := writeNeoLocalThreadSnapshot(snapshot); err != nil {
+		t.Fatalf("writeNeoLocalThreadSnapshot error: %v", err)
+	}
+
+	rt := newNeoRuntime(&config.Config{})
+	req := httptest.NewRequest(http.MethodGet, "/threads/"+threadID+".md?truncate_tool_results=1", nil)
+	rec := httptest.NewRecorder()
+	rt.handleHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /threads/:id.md status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, neoThreadMarkdownOmittedText) {
+		t.Fatalf("markdown was not truncated:\n%s", body)
+	}
+	if strings.Contains(body, "tail") {
+		t.Fatalf("markdown leaked truncated tail:\n%s", body)
 	}
 }
 

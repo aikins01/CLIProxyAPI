@@ -55,6 +55,9 @@ const (
 	neoCompactionFallbackMaxInput    = 32 * 1024
 	neoCompactionTranscriptMaxBytes  = 240 * 1024
 	neoCompactionApproxCharsPerToken = 4
+	neoThreadMarkdownToolTextLimit   = 2000
+	neoThreadMarkdownToolByteLimit   = 100 * 1024
+	neoThreadMarkdownOmittedText     = "\n[ ... omitted remaining lines to make summarizing use less tokens ... ]"
 )
 
 var (
@@ -424,7 +427,7 @@ func (rt *neoRuntime) serveLocalThreadHTTP(w http.ResponseWriter, r *http.Reques
 	if markdown {
 		w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(neoThreadMarkdown(thread)))
+		_, _ = w.Write([]byte(neoThreadMarkdown(thread, neoThreadMarkdownOptions{TruncateToolResults: neoThreadMarkdownShouldTruncateToolResults(r.URL.Query())})))
 		return true
 	}
 	writeNeoJSON(w, http.StatusOK, thread)
@@ -4537,7 +4540,7 @@ func neoEstimateMessageTokens(messages []neoMessage) int {
 	chars := 0
 	for _, message := range messages {
 		chars += len(message.Role) + len(message.MessageID) + 16
-		chars += len(neoMarkdownTextFromBlocks(message.Content))
+		chars += len(neoMarkdownTextFromBlocks(message.Content, neoThreadMarkdownOptions{}))
 		if message.UserState != nil {
 			chars += len(neoUserStateText(message.UserState))
 		}
@@ -5050,7 +5053,7 @@ func neoThreadToolFallbackMarkdown(threadID string, input map[string]any, thread
 		out.WriteString(goal)
 		out.WriteString("\n\n")
 	}
-	out.WriteString(neoThreadMarkdown(thread))
+	out.WriteString(neoThreadMarkdown(thread, neoThreadMarkdownOptions{TruncateToolResults: true}))
 	return out.String()
 }
 
@@ -5854,7 +5857,7 @@ func tryServeNeoLocalThread(c *gin.Context, cfg *config.Config) bool {
 		return false
 	}
 	if markdown {
-		c.Data(http.StatusOK, "text/markdown; charset=utf-8", []byte(neoThreadMarkdown(thread)))
+		c.Data(http.StatusOK, "text/markdown; charset=utf-8", []byte(neoThreadMarkdown(thread, neoThreadMarkdownOptions{TruncateToolResults: neoThreadMarkdownShouldTruncateToolResults(c.Request.URL.Query())})))
 		return true
 	}
 	c.JSON(http.StatusOK, thread)
@@ -6894,7 +6897,7 @@ func neoLocalThreadSearchRank(thread map[string]any, query string) int {
 	}
 	threadID := strings.ToLower(stringValue(thread["id"]))
 	title := strings.ToLower(stringValue(thread["title"]))
-	markdown := strings.ToLower(neoThreadMarkdown(thread))
+	markdown := strings.ToLower(neoThreadMarkdown(thread, neoThreadMarkdownOptions{TruncateToolResults: true}))
 	best := 0
 	for _, term := range terms {
 		rank := 0
@@ -6986,7 +6989,7 @@ func neoCloudThreadSearchResult(thread map[string]any, query string) map[string]
 
 func neoLocalThreadMatchedText(thread map[string]any, query string) string {
 	for _, term := range neoThreadSearchTerms(query) {
-		markdown := neoThreadMarkdown(thread)
+		markdown := neoThreadMarkdown(thread, neoThreadMarkdownOptions{TruncateToolResults: true})
 		lower := strings.ToLower(markdown)
 		idx := strings.Index(lower, term)
 		if idx < 0 {
@@ -7039,6 +7042,16 @@ func neoThreadRequestPath(path string) (string, bool) {
 		return "", false
 	}
 	return part, markdown
+}
+
+func neoThreadMarkdownShouldTruncateToolResults(values url.Values) bool {
+	for _, key := range []string{"truncate_tool_results", "truncateToolResults"} {
+		value := strings.TrimSpace(strings.ToLower(values.Get(key)))
+		if value == "1" || value == "true" || value == "yes" {
+			return true
+		}
+	}
+	return false
 }
 
 func neoCloudThread(snapshot neoCloudThreadSnapshot) map[string]any {
@@ -7357,7 +7370,15 @@ func neoCloudTitle(messages []neoMessage) string {
 	return ""
 }
 
-func neoThreadMarkdown(thread map[string]any) string {
+type neoThreadMarkdownOptions struct {
+	TruncateToolResults bool
+}
+
+func neoThreadMarkdown(thread map[string]any, options ...neoThreadMarkdownOptions) string {
+	var opts neoThreadMarkdownOptions
+	if len(options) > 0 {
+		opts = options[0]
+	}
 	var out strings.Builder
 	threadID := stringValue(thread["id"])
 	if threadID == "" {
@@ -7379,7 +7400,7 @@ func neoThreadMarkdown(thread map[string]any) string {
 			continue
 		}
 		out.WriteString("## " + strings.Title(role) + "\n\n")
-		text := strings.TrimSpace(neoMarkdownTextFromBlocks(arrayValue(message["content"])))
+		text := strings.TrimSpace(neoMarkdownTextFromBlocks(arrayValue(message["content"]), opts))
 		if text == "" {
 			text = "[no textual content]"
 		}
@@ -7388,7 +7409,7 @@ func neoThreadMarkdown(thread map[string]any) string {
 	return out.String()
 }
 
-func neoMarkdownTextFromBlocks(blocks []any) string {
+func neoMarkdownTextFromBlocks(blocks []any, opts neoThreadMarkdownOptions) string {
 	var out strings.Builder
 	for _, raw := range blocks {
 		block := mapValue(raw)
@@ -7408,7 +7429,7 @@ func neoMarkdownTextFromBlocks(blocks []any) string {
 			if id != "" {
 				out.WriteString(" " + id)
 			}
-			if input := mapValue(block["input"]); len(input) > 0 {
+			if input := neoThreadMarkdownToolInput(mapValue(block["input"])); len(input) > 0 {
 				out.WriteString(" " + clipNeoDebugJSON(input, 4096))
 			}
 			out.WriteString("]\n")
@@ -7417,13 +7438,170 @@ func neoMarkdownTextFromBlocks(blocks []any) string {
 			if toolUseID != "" {
 				out.WriteString("[tool_result " + toolUseID + "]\n")
 			}
-			if text := runToText(block["run"]); text != "" {
+			if text := neoThreadMarkdownRunText(mapValue(block["run"]), opts); text != "" {
 				out.WriteString(text)
 				out.WriteString("\n")
 			}
 		}
 	}
 	return out.String()
+}
+
+func neoThreadMarkdownToolInput(input map[string]any) map[string]any {
+	if len(input) == 0 {
+		return input
+	}
+	cleaned := cloneMap(input)
+	for _, key := range []string{"old_str", "new_str"} {
+		if _, ok := cleaned[key]; ok {
+			cleaned[key] = "[... " + key + " omitted in markdown version ...]"
+		}
+	}
+	return cleaned
+}
+
+func neoThreadMarkdownRunText(run map[string]any, opts neoThreadMarkdownOptions) string {
+	if len(run) == 0 {
+		return ""
+	}
+	status := strings.TrimSpace(stringValue(run["status"]))
+	if status == "" || status == "done" {
+		if result, ok := run["result"]; ok {
+			return neoThreadMarkdownToolResultText(result, opts)
+		}
+	}
+	return runToText(run)
+}
+
+func neoThreadMarkdownToolResultText(result any, opts neoThreadMarkdownOptions) string {
+	value := neoThreadMarkdownToolResultValue(result, opts)
+	switch typed := value.(type) {
+	case string:
+		return typed
+	default:
+		raw, err := json.MarshalIndent(typed, "", "  ")
+		if err != nil {
+			return fmt.Sprint(typed)
+		}
+		return string(raw)
+	}
+}
+
+func neoThreadMarkdownToolResultValue(result any, opts neoThreadMarkdownOptions) any {
+	value := result
+	if items := arrayValue(value); items != nil {
+		filtered := make([]any, 0, len(items))
+		for _, item := range items {
+			if strings.EqualFold(stringValue(mapValue(item)["type"]), "image") {
+				continue
+			}
+			filtered = append(filtered, item)
+		}
+		value = filtered
+	}
+	if opts.TruncateToolResults {
+		value = truncateNeoThreadMarkdownValue(value)
+	}
+	raw, err := json.Marshal(value)
+	if err == nil && len(raw) > neoThreadMarkdownToolByteLimit {
+		sizeKB := (len(raw) + 512) / 1024
+		message := fmt.Sprintf("[Tool result truncated: %dKB exceeds limit of 100KB. Please refine the query.]", sizeKB)
+		if arrayValue(value) != nil {
+			return []any{message}
+		}
+		return message
+	}
+	return value
+}
+
+func truncateNeoThreadMarkdownValue(value any) any {
+	switch typed := value.(type) {
+	case string:
+		return truncateNeoThreadMarkdownString(typed)
+	case []any:
+		total := 0
+		out := make([]any, 0, len(typed))
+		for _, item := range typed {
+			truncated := truncateNeoThreadMarkdownValue(item)
+			truncatedSize := len(neoThreadMarkdownSerialized(truncated))
+			originalSize := len(neoThreadMarkdownSerialized(item))
+			if total+truncatedSize > neoThreadMarkdownToolTextLimit {
+				if total == 0 && originalSize > truncatedSize {
+					out = append(out, truncated)
+				} else {
+					out = append(out, neoThreadMarkdownOmittedText)
+				}
+				break
+			}
+			total += truncatedSize
+			out = append(out, truncated)
+		}
+		return out
+	case map[string]any:
+		return truncateNeoThreadMarkdownMap(typed)
+	default:
+		return value
+	}
+}
+
+func truncateNeoThreadMarkdownMap(value map[string]any) map[string]any {
+	out := cloneMap(value)
+	for _, key := range []string{"text", "diff", "output"} {
+		if text := stringValue(out[key]); text != "" {
+			out[key] = truncateNeoThreadMarkdownString(text)
+		}
+	}
+	if content := arrayValue(out["content"]); content != nil {
+		cleaned := make([]any, 0, len(content))
+		for _, raw := range content {
+			item := mapValue(raw)
+			if len(item) == 0 {
+				cleaned = append(cleaned, raw)
+				continue
+			}
+			next := cloneMap(item)
+			if text := stringValue(next["text"]); text != "" {
+				next["text"] = truncateNeoThreadMarkdownString(text)
+			}
+			cleaned = append(cleaned, next)
+		}
+		out["content"] = cleaned
+	}
+	if files := arrayValue(out["files"]); files != nil {
+		cleaned := make([]any, 0, len(files))
+		for _, raw := range files {
+			item := mapValue(raw)
+			if len(item) == 0 {
+				cleaned = append(cleaned, raw)
+				continue
+			}
+			next := cloneMap(item)
+			if diff := stringValue(next["diff"]); diff != "" {
+				next["diff"] = truncateNeoThreadMarkdownString(diff)
+			}
+			cleaned = append(cleaned, next)
+		}
+		out["files"] = cleaned
+	}
+	return out
+}
+
+func truncateNeoThreadMarkdownString(value string) string {
+	if len(value) <= neoThreadMarkdownToolTextLimit {
+		return value
+	}
+	return value[:neoThreadMarkdownToolTextLimit] + neoThreadMarkdownOmittedText
+}
+
+func neoThreadMarkdownSerialized(value any) string {
+	if text, ok := value.(string); ok {
+		return text
+	}
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return fmt.Sprint(value)
+	}
+	return string(raw)
 }
 
 func neoTitleFromContent(content []any) string {
@@ -11247,7 +11425,7 @@ func neoCompactionTranscript(messages []neoMessage) string {
 			out.WriteString(message.MessageID)
 		}
 		out.WriteString("\n")
-		text := strings.TrimSpace(neoMarkdownTextFromBlocks(message.Content))
+		text := strings.TrimSpace(neoMarkdownTextFromBlocks(message.Content, neoThreadMarkdownOptions{}))
 		if text == "" && message.UserState != nil {
 			text = strings.TrimSpace(neoUserStateText(message.UserState))
 		}
