@@ -6067,6 +6067,14 @@ func TestNeoImageToolResultPreservesImagesAndCompactsHistoryText(t *testing.T) {
 	if got := stringValue(run["prompt"]); got != "draw the mascot" {
 		t.Fatalf("prompt = %q", got)
 	}
+	binaryResults := arrayValue(run["result"])
+	if len(binaryResults) != 1 {
+		t.Fatalf("binary image result = %#v", run["result"])
+	}
+	binaryImage := mapValue(binaryResults[0])
+	if stringValue(binaryImage["type"]) != "image" || stringValue(binaryImage["mimeType"]) != "image/png" || stringValue(binaryImage["data"]) != "abc123" {
+		t.Fatalf("binary image = %#v", binaryImage)
+	}
 	if got := runToText(run); got != "rendered 1 image" {
 		t.Fatalf("runToText = %q, want compact image text", got)
 	}

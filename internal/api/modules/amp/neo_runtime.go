@@ -4833,7 +4833,11 @@ func normalizeNeoImageToolRun(pending neoPendingTool, run map[string]any) map[st
 	normalized := cloneMap(run)
 	normalized["images"] = images
 	normalized["imageCount"] = len(images)
-	if prompt := firstNonEmptyString(normalized["prompt"], nestedValue(normalized["result"], "prompt"), pending.Input["prompt"], pending.Input["description"], pending.Input["message"]); prompt != "" {
+	resultPrompt := nestedValue(normalized["result"], "prompt")
+	if binaryImages := neoBinaryImageToolResults(images); len(binaryImages) > 0 && !neoToolRunResultHasBinaryImages(normalized["result"]) {
+		normalized["result"] = binaryImages
+	}
+	if prompt := firstNonEmptyString(normalized["prompt"], resultPrompt, pending.Input["prompt"], pending.Input["description"], pending.Input["message"]); prompt != "" {
 		normalized["prompt"] = prompt
 	}
 	if firstNonEmptyString(normalized["output"], normalized["displayMessage"], normalized["message"], normalized["text"]) == "" {
@@ -4855,6 +4859,64 @@ func neoImageToolText(toolName string, count int) string {
 		action = "viewed"
 	}
 	return fmt.Sprintf("%s %d %s", action, count, noun)
+}
+
+func neoToolRunResultHasBinaryImages(value any) bool {
+	for _, raw := range arrayValue(value) {
+		image := mapValue(raw)
+		if stringValue(image["type"]) == "image" && firstNonEmptyString(image["mimeType"], image["mime_type"]) != "" && firstNonEmptyString(image["data"], image["url"]) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func neoBinaryImageToolResults(images []any) []any {
+	out := make([]any, 0, len(images))
+	for _, raw := range images {
+		image := mapValue(raw)
+		mimeType := firstNonEmptyString(image["mimeType"], image["mime_type"], image["mediaType"], image["media_type"])
+		data := firstNonEmptyString(image["data"], image["base64"], image["b64_json"], image["contentBase64"])
+		urlValue := firstNonEmptyString(image["url"], image["uri"], image["href"], image["imageURL"], image["imageUrl"], image["image_url"])
+		if parsedMime, parsedData, ok := splitNeoImageDataURL(data); ok {
+			mimeType = firstNonEmptyString(mimeType, parsedMime)
+			data = parsedData
+		}
+		if parsedMime, parsedData, ok := splitNeoImageDataURL(urlValue); ok {
+			mimeType = firstNonEmptyString(mimeType, parsedMime)
+			data = parsedData
+			urlValue = ""
+		}
+		if mimeType == "" || (data == "" && urlValue == "") {
+			continue
+		}
+		result := map[string]any{"type": "image", "mimeType": mimeType}
+		if urlValue != "" {
+			result["url"] = urlValue
+		} else {
+			result["data"] = data
+		}
+		if savedPath := firstNonEmptyString(image["savedPath"], image["saved_path"], image["path"], image["file"], image["filename"], image["filePath"], image["file_path"]); savedPath != "" {
+			result["savedPath"] = savedPath
+		}
+		out = append(out, result)
+	}
+	return out
+}
+
+func splitNeoImageDataURL(value string) (string, string, bool) {
+	if !strings.HasPrefix(value, "data:image/") {
+		return "", "", false
+	}
+	comma := strings.IndexByte(value, ',')
+	if comma < 0 {
+		return "", "", false
+	}
+	mediaType := strings.TrimPrefix(value[:comma], "data:")
+	if semicolon := strings.IndexByte(mediaType, ';'); semicolon >= 0 {
+		mediaType = mediaType[:semicolon]
+	}
+	return mediaType, value[comma+1:], mediaType != "" && comma+1 < len(value)
 }
 
 func normalizedNeoToolName(name string) string {
@@ -4919,6 +4981,9 @@ func normalizeNeoToolRunImage(value any) (map[string]any, bool) {
 	if text := strings.TrimSpace(stringValue(value)); text != "" {
 		switch {
 		case strings.HasPrefix(text, "data:image/"):
+			if mediaType, data, ok := splitNeoImageDataURL(text); ok {
+				return map[string]any{"type": "image", "mimeType": mediaType, "mediaType": mediaType, "data": data}, true
+			}
 			return map[string]any{"data": text}, true
 		case strings.HasPrefix(text, "http://"), strings.HasPrefix(text, "https://"):
 			return map[string]any{"url": text}, true
@@ -4956,6 +5021,7 @@ func normalizeNeoToolRunImage(value any) (map[string]any, bool) {
 	}
 	if mediaType := firstNonEmptyString(m["mediaType"], m["media_type"], m["mimeType"], m["mime_type"], source["media_type"], source["mediaType"], source["mime_type"], source["mimeType"]); mediaType != "" {
 		image["mediaType"] = mediaType
+		image["mimeType"] = mediaType
 	}
 	if name := firstNonEmptyString(m["name"], m["filename"], m["file_name"], m["title"]); name != "" {
 		image["name"] = name
