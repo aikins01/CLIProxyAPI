@@ -2657,12 +2657,13 @@ func (a *neoActor) handleProtocolToolLease(msg map[string]any) {
 		log.Debugf("amp neo local runtime dropped tool_lease without messageId tool=%s call=%s", toolName, toolCallID)
 		return
 	}
+	args := normalizeNeoToolCallInput(toolName, mapValue(msg["args"]))
 	agentMode := firstNonEmptyString(msg["agentMode"], a.currentAgentMode)
 	reasoningEffort := firstNonEmptyString(msg["reasoningEffort"], a.currentReasoningEffort)
 	a.pendingTools[toolCallID] = neoPendingTool{
 		ID:               toolCallID,
 		Name:             toolName,
-		Input:            mapValue(msg["args"]),
+		Input:            args,
 		AgentMode:        agentMode,
 		ReasoningEffort:  reasoningEffort,
 		MessageID:        messageID,
@@ -2675,7 +2676,7 @@ func (a *neoActor) handleProtocolToolLease(msg map[string]any) {
 		"type":       "tool_lease",
 		"toolCallId": toolCallID,
 		"toolName":   toolName,
-		"args":       mapValue(msg["args"]),
+		"args":       args,
 		"messageId":  messageID,
 	}
 	a.broadcast(withNeoParentToolCallID(payload, parentToolCallID))
@@ -10822,9 +10823,44 @@ func normalizeNeoToolCalls(calls []neoToolCall) []neoToolCall {
 		if call.ID == "" || !strings.HasPrefix(call.ID, "TU-") {
 			call.ID = newNeoToolCallID()
 		}
+		call.Input = normalizeNeoToolCallInput(call.Name, call.Input)
 		normalized = append(normalized, call)
 	}
 	return normalized
+}
+
+func normalizeNeoToolCallInput(name string, input map[string]any) map[string]any {
+	if normalizedNeoToolName(name) != "codereview" || len(input) == 0 {
+		return input
+	}
+	normalized := cloneMap(input)
+	for _, key := range []string{"checkFilter", "check_filter"} {
+		if isEmptyNeoStringArray(normalized[key]) {
+			delete(normalized, key)
+		}
+	}
+	for _, key := range []string{"checkScope", "check_scope"} {
+		if value, ok := normalized[key]; ok && strings.TrimSpace(stringValue(value)) == "" {
+			delete(normalized, key)
+		}
+	}
+	for _, key := range []string{"checksOnly", "checks_only"} {
+		if value, ok := normalized[key]; ok && !boolValue(value) {
+			delete(normalized, key)
+		}
+	}
+	return normalized
+}
+
+func isEmptyNeoStringArray(value any) bool {
+	switch typed := value.(type) {
+	case []any:
+		return len(typed) == 0
+	case []string:
+		return len(typed) == 0
+	default:
+		return false
+	}
 }
 
 func neoStableToolCallID(id string) string {

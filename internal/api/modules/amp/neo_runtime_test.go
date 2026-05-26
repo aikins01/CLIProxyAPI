@@ -3996,6 +3996,60 @@ func TestNeoActorFiltersAmpBuiltInToolsByMode(t *testing.T) {
 		[]string{"Grep", "glob", "Glob", "get_diagnostics", "task_list", "todo_write", "file_tree", "code_review", "deferred_custom", "docs_read"})
 }
 
+func TestNormalizeNeoToolCallsOmitsEmptyCodeReviewDefaults(t *testing.T) {
+	calls := normalizeNeoToolCalls([]neoToolCall{{
+		ID:   "TU-codeReviewDefaults",
+		Name: "code_review",
+		Input: map[string]any{
+			"diff_description": "Review the current diff.",
+			"checkFilter":      []any{},
+			"checkScope":       "",
+			"checksOnly":       false,
+			"thinking":         "low",
+		},
+	}})
+	if len(calls) != 1 {
+		t.Fatalf("normalized calls = %d, want 1", len(calls))
+	}
+	input := calls[0].Input
+	for _, key := range []string{"checkFilter", "checkScope", "checksOnly"} {
+		if _, ok := input[key]; ok {
+			t.Fatalf("input unexpectedly kept %s: %#v", key, input)
+		}
+	}
+	if got := input["diff_description"]; got != "Review the current diff." {
+		t.Fatalf("diff_description = %#v", got)
+	}
+	if got := input["thinking"]; got != "low" {
+		t.Fatalf("thinking = %#v", got)
+	}
+}
+
+func TestNormalizeNeoToolCallsPreservesCodeReviewCheckSelection(t *testing.T) {
+	calls := normalizeNeoToolCalls([]neoToolCall{{
+		ID:   "TU-codeReviewFilter",
+		Name: "code_review",
+		Input: map[string]any{
+			"checkFilter": []any{"repo-convention-fit"},
+			"checkScope":  "/tmp/example",
+			"checksOnly":  true,
+		},
+	}})
+	if len(calls) != 1 {
+		t.Fatalf("normalized calls = %d, want 1", len(calls))
+	}
+	input := calls[0].Input
+	if got := input["checkFilter"]; len(arrayValue(got)) != 1 {
+		t.Fatalf("checkFilter = %#v", got)
+	}
+	if got := input["checkScope"]; got != "/tmp/example" {
+		t.Fatalf("checkScope = %#v", got)
+	}
+	if got := input["checksOnly"]; got != true {
+		t.Fatalf("checksOnly = %#v", got)
+	}
+}
+
 func TestNeoActorAppliesToolEnableDisableSettings(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
