@@ -3306,13 +3306,16 @@ func TestNeoModelRegistryMatchesAmpBinaryValues(t *testing.T) {
 	}{
 		{model: "claude-sonnet-4-20250514", context: 1000000, maxOut: 32000, maxInput: 968000},
 		{model: "claude-sonnet-4-6", context: 1000000, maxOut: 64000, maxInput: 936000},
+		{model: "claude-opus-4-6-1m", context: 1000000, maxOut: 32000, maxInput: 968000},
 		{model: "o3", context: 200000, maxOut: 100000, maxInput: 100000},
 		{model: "o3-mini", context: 200000, maxOut: 100000, maxInput: 100000},
 		{model: "openai/gpt-oss-120b", context: 128000, maxOut: 32000, maxInput: 96000},
+		{model: "gemini-3-pro-image", context: 1048576, maxOut: 65535, maxInput: 983041},
 		{model: "gemini-3.5-flash", context: 1048576, maxOut: 65535, maxInput: 983041},
 		{model: "accounts/fireworks/models/qwen3-coder-480b-a35b-instruct", context: 230144, maxOut: 32000, maxInput: 198144},
 		{model: "moonshotai/Kimi-K2.5", context: 262144, maxOut: 32000, maxInput: 230144},
 		{model: "kimi-k2-instruct-0905", context: 1000000, maxOut: 32000, maxInput: 968000},
+		{model: "moonshotai/kimi-k2-instruct-0905", context: 1000000, maxOut: 32000, maxInput: 968000},
 		{model: "z-ai/glm-4.6", context: 131000, maxOut: 40000, maxInput: 91000},
 	} {
 		t.Run(tc.model, func(t *testing.T) {
@@ -3896,6 +3899,7 @@ func TestNeoActorFiltersAmpBuiltInToolsByMode(t *testing.T) {
 		"Bash":                   {Name: "Bash"},
 		"create_file":            {Name: "create_file"},
 		"edit_file":              {Name: "edit_file"},
+		"delete_file":            {Name: "delete_file"},
 		"get_diagnostics":        {Name: "get_diagnostics"},
 		"web_search":             {Name: "web_search"},
 		"read_web_page":          {Name: "read_web_page"},
@@ -3917,6 +3921,8 @@ func TestNeoActorFiltersAmpBuiltInToolsByMode(t *testing.T) {
 		"shell_command":          {Name: "shell_command"},
 		"apply_patch":            {Name: "apply_patch"},
 		"send_message_to_aggman": {Name: "send_message_to_aggman"},
+		"search_documents":       {Name: "search_documents"},
+		"get_document":           {Name: "get_document"},
 		"docs_read":              {Name: "docs_read"},
 		"render_agg_man":         {Name: "render_agg_man"},
 		"diff":                   {Name: "diff"},
@@ -3954,7 +3960,7 @@ func TestNeoActorFiltersAmpBuiltInToolsByMode(t *testing.T) {
 	smartNames := requestNames("smart")
 	assertMode("smart", smartNames,
 		[]string{"Read", "Bash", "create_file", "edit_file", "Task", "view_media", "tb__gemini-oracle", "code_review"},
-		[]string{"Grep", "glob", "Glob", "get_diagnostics", "shell_command", "apply_patch", "chart", "task_list", "todo_write", "file_tree", "deferred_custom", "docs_read"})
+		[]string{"Grep", "glob", "Glob", "delete_file", "get_diagnostics", "shell_command", "apply_patch", "chart", "task_list", "todo_write", "file_tree", "deferred_custom", "search_documents", "get_document", "docs_read"})
 
 	smartPromptNames := map[string]bool{}
 	for _, name := range actor.toolNamesLocked("smart") {
@@ -3977,7 +3983,7 @@ func TestNeoActorFiltersAmpBuiltInToolsByMode(t *testing.T) {
 	aggNames := requestNames("agg-man")
 	assertMode("agg-man", aggNames,
 		[]string{"read_thread", "web_search", "docs_read", "render_agg_man", "diff", "tb__gemini-oracle"},
-		[]string{"Read", "Grep", "glob", "Glob", "Task", "shell_command", "chart", "view_media", "todo_write", "file_tree", "code_review", "deferred_custom"})
+		[]string{"Read", "Grep", "glob", "Glob", "Task", "shell_command", "chart", "view_media", "todo_write", "file_tree", "delete_file", "search_documents", "get_document", "code_review", "deferred_custom"})
 
 	frontierNames := requestNames("frontier")
 	assertMode("frontier", frontierNames,
