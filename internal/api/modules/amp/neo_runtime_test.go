@@ -6572,6 +6572,71 @@ func TestNeoReadThreadToolFallbackUsesCloudThread(t *testing.T) {
 	}
 }
 
+func TestNeoReadThreadToolFallbackBoundsLocalExcerpts(t *testing.T) {
+	dir := t.TempDir()
+	oldStoreDir := neoAmpThreadStoreDir
+	neoAmpThreadStoreDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
+
+	threadID := "T-local-read-thread-excerpts"
+	messages := make([]neoMessage, 0, 64)
+	messages = append(messages, neoMessage{
+		ThreadID:  threadID,
+		MessageID: "M-initial",
+		Role:      "user",
+		Content:   []any{map[string]any{"type": "text", "text": "Initial email request: make onboarding emails clearer and keep the greeting consistent."}},
+		Seq:       1,
+	})
+	for i := 0; i < 58; i++ {
+		messages = append(messages, neoMessage{
+			ThreadID:  threadID,
+			MessageID: fmt.Sprintf("M-noise-%02d", i),
+			Role:      "assistant",
+			Content:   []any{map[string]any{"type": "text", "text": fmt.Sprintf("middle-noise-%02d %s", i, strings.Repeat("noise ", 500))}},
+			Seq:       i + 2,
+		})
+	}
+	messages = append(messages, neoMessage{
+		ThreadID:  threadID,
+		MessageID: "M-final",
+		Role:      "assistant",
+		Content:   []any{map[string]any{"type": "text", "text": "Final changes made: updated frontend/src/routes/emails/+page.svelte, adjusted email copy, and left no unresolved concerns."}},
+		Seq:       61,
+	})
+	if err := writeNeoLocalThreadSnapshot(neoCloudThreadSnapshot{
+		threadID:  threadID,
+		seq:       62,
+		createdMs: 1778170000000,
+		messages:  messages,
+	}); err != nil {
+		t.Fatalf("writeNeoLocalThreadSnapshot error: %v", err)
+	}
+
+	run := normalizeNeoLocalThreadToolRun(context.Background(), &config.Config{}, neoPendingTool{
+		Name: "read_thread",
+		Input: map[string]any{
+			"threadID": threadID,
+			"goal":     "Extract the initial discussion/request about emails and the final changes made at the end of the thread, including intended behavior, files changed, and any unresolved concerns.",
+		},
+	}, map[string]any{
+		"status": "done",
+		"result": "lookup returned no content",
+	}, "T-current")
+
+	got := stringValue(run["result"])
+	for _, want := range []string{"Relevant local excerpts", "Initial email request", "Final changes made", "frontend/src/routes/emails/+page.svelte"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("fallback result missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "middle-noise-30") {
+		t.Fatalf("fallback result included unrelated middle thread content:\n%s", got)
+	}
+	if len(got) > neoThreadToolFallbackMaxBytes+len(neoThreadMarkdownOmittedText) {
+		t.Fatalf("fallback result length = %d, want bounded below %d", len(got), neoThreadToolFallbackMaxBytes)
+	}
+}
+
 func TestRecentNeoLocalThreadsReturnsMetadataOnly(t *testing.T) {
 	dir := t.TempDir()
 	oldStoreDir := neoAmpThreadStoreDir

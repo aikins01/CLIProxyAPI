@@ -58,6 +58,9 @@ const (
 	neoThreadMarkdownToolTextLimit   = 2000
 	neoThreadMarkdownToolByteLimit   = 100 * 1024
 	neoThreadMarkdownOmittedText     = "\n[ ... omitted remaining lines to make summarizing use less tokens ... ]"
+	neoThreadToolFallbackMaxBytes    = 32 * 1024
+	neoThreadToolFallbackTextLimit   = 3500
+	neoThreadToolFallbackMaxExcerpts = 18
 )
 
 var (
@@ -5044,17 +5047,150 @@ func neoToolInputThreadID(input map[string]any) string {
 }
 
 func neoThreadToolFallbackMarkdown(threadID string, input map[string]any, thread map[string]any) string {
+	goal := strings.TrimSpace(stringValue(input["goal"]))
 	var out strings.Builder
 	out.WriteString("Local thread fallback for ")
 	out.WriteString(threadID)
-	out.WriteString(". Amp's thread reader returned an unavailable or wrong-thread result, so CLIProxyAPI supplied the locally stored thread content.\n\n")
-	if goal := strings.TrimSpace(stringValue(input["goal"])); goal != "" {
+	out.WriteString(". Amp's thread reader returned an unavailable or wrong-thread result, so CLIProxyAPI supplied relevant excerpts from the locally stored thread.\n\n")
+	if goal != "" {
 		out.WriteString("Goal: ")
 		out.WriteString(goal)
 		out.WriteString("\n\n")
 	}
-	out.WriteString(neoThreadMarkdown(thread, neoThreadMarkdownOptions{TruncateToolResults: true}))
+	out.WriteString(neoThreadToolFallbackExcerpts(thread, goal))
+	return truncateNeoThreadToolFallbackOutput(out.String())
+}
+
+type neoThreadToolFallbackExcerpt struct {
+	index int
+	role  string
+	text  string
+	score int
+}
+
+func neoThreadToolFallbackExcerpts(thread map[string]any, goal string) string {
+	messages := arrayValue(thread["messages"])
+	if len(messages) == 0 {
+		return "[no textual content]"
+	}
+	terms := neoThreadToolFallbackTerms(goal)
+	includeInitial := goal == "" || neoThreadToolFallbackGoalHasAny(terms, "initial", "start", "started", "first", "request", "discussion", "original")
+	includeFinal := goal == "" || neoThreadToolFallbackGoalHasAny(terms, "final", "end", "ending", "changed", "changes", "unresolved", "concern", "concerns", "summary", "files", "implemented")
+	excerpts := make([]neoThreadToolFallbackExcerpt, 0, len(messages))
+	for idx, raw := range messages {
+		message := mapValue(raw)
+		text := strings.TrimSpace(neoMarkdownTextFromBlocks(arrayValue(message["content"]), neoThreadMarkdownOptions{TruncateToolResults: true}))
+		if text == "" {
+			continue
+		}
+		score := neoThreadToolFallbackScore(text, idx, len(messages), terms)
+		if includeInitial && idx < 4 {
+			score += 12 - idx
+		}
+		if includeFinal && idx >= len(messages)-8 {
+			score += 16 + (idx - (len(messages) - 8))
+		}
+		if score <= 0 && idx != 0 && idx != len(messages)-1 {
+			continue
+		}
+		excerpts = append(excerpts, neoThreadToolFallbackExcerpt{
+			index: idx,
+			role:  stringValue(message["role"]),
+			text:  truncateNeoThreadToolFallbackText(text),
+			score: score,
+		})
+	}
+	if len(excerpts) == 0 {
+		return "[no relevant local excerpts found]"
+	}
+	sort.SliceStable(excerpts, func(i, j int) bool {
+		if excerpts[i].score == excerpts[j].score {
+			return excerpts[i].index < excerpts[j].index
+		}
+		return excerpts[i].score > excerpts[j].score
+	})
+	if len(excerpts) > neoThreadToolFallbackMaxExcerpts {
+		excerpts = excerpts[:neoThreadToolFallbackMaxExcerpts]
+	}
+	sort.SliceStable(excerpts, func(i, j int) bool {
+		return excerpts[i].index < excerpts[j].index
+	})
+	var out strings.Builder
+	out.WriteString("Relevant local excerpts:\n\n")
+	for _, excerpt := range excerpts {
+		role := strings.TrimSpace(excerpt.role)
+		if role == "" {
+			role = "message"
+		}
+		out.WriteString("## ")
+		out.WriteString(strings.Title(role))
+		out.WriteString(" ")
+		out.WriteString(strconv.Itoa(excerpt.index + 1))
+		out.WriteString("\n\n")
+		out.WriteString(excerpt.text)
+		out.WriteString("\n\n")
+	}
 	return out.String()
+}
+
+func neoThreadToolFallbackTerms(goal string) map[string]bool {
+	terms := make(map[string]bool)
+	for _, part := range strings.FieldsFunc(strings.ToLower(goal), func(r rune) bool {
+		return (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '_' && r != '-' && r != '.'
+	}) {
+		part = strings.Trim(part, "._-")
+		if len(part) < 3 {
+			continue
+		}
+		terms[part] = true
+		if strings.HasSuffix(part, "s") && len(part) > 4 {
+			terms[strings.TrimSuffix(part, "s")] = true
+		}
+	}
+	return terms
+}
+
+func neoThreadToolFallbackGoalHasAny(terms map[string]bool, values ...string) bool {
+	for _, value := range values {
+		if terms[value] {
+			return true
+		}
+	}
+	return false
+}
+
+func neoThreadToolFallbackScore(text string, index int, count int, terms map[string]bool) int {
+	lower := strings.ToLower(text)
+	score := 0
+	for term := range terms {
+		if strings.Contains(lower, term) {
+			score += 4
+		}
+	}
+	if strings.Contains(lower, "apply_patch") || strings.Contains(lower, "edit_file") || strings.Contains(lower, "create_file") {
+		score += 3
+	}
+	if strings.Contains(lower, "git diff") || strings.Contains(lower, "changed") || strings.Contains(lower, "implemented") || strings.Contains(lower, "unresolved") {
+		score += 2
+	}
+	if count > 0 && index >= count-3 {
+		score++
+	}
+	return score
+}
+
+func truncateNeoThreadToolFallbackText(text string) string {
+	if len(text) <= neoThreadToolFallbackTextLimit {
+		return text
+	}
+	return strings.TrimSpace(text[:neoThreadToolFallbackTextLimit]) + neoThreadMarkdownOmittedText
+}
+
+func truncateNeoThreadToolFallbackOutput(text string) string {
+	if len(text) <= neoThreadToolFallbackMaxBytes {
+		return text
+	}
+	return strings.TrimSpace(text[:neoThreadToolFallbackMaxBytes]) + neoThreadMarkdownOmittedText
 }
 
 func (a *neoActor) revokeToolLease(msg map[string]any) {
