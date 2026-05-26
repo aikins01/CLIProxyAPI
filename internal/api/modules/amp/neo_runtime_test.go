@@ -5175,7 +5175,25 @@ func TestNeoActorRewritesWrongReadThreadToolResultFromLocalStore(t *testing.T) {
 		t.Fatalf("writeNeoLocalThreadSnapshot error: %v", err)
 	}
 
-	rt := newNeoRuntime(&config.Config{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/provider/google/v1beta/models/gemini-3-flash-preview:generateContent" {
+			t.Fatalf("provider path = %s", r.URL.Path)
+		}
+		payload := readNeoJSON(r.Body)
+		contents := arrayValue(payload["contents"])
+		mentioned := stringValue(mapValue(arrayValue(mapValue(contents[0])["parts"])[0])["text"])
+		if !strings.Contains(mentioned, "target thread details") {
+			t.Fatalf("mentioned markdown = %q", mentioned)
+		}
+		writeNeoJSON(w, http.StatusOK, map[string]any{
+			"candidates": []any{map[string]any{
+				"content": map[string]any{"parts": []any{map[string]any{"text": `{"relevantContent":"target thread details"}`}}},
+			}},
+		})
+	}))
+	defer upstream.Close()
+
+	rt := testNeoRuntimeForServer(t, upstream)
 	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-current-thread", "T-current-thread", neoActorRecord("actor-test", "thread-actor", "T-current-thread"), nil)
 	actor.pendingTools["TU-read"] = neoPendingTool{
 		ID:    "TU-read",
@@ -5198,7 +5216,7 @@ func TestNeoActorRewritesWrongReadThreadToolResultFromLocalStore(t *testing.T) {
 	if len(actor.history) != 1 {
 		t.Fatalf("history = %#v", actor.history)
 	}
-	if !strings.Contains(actor.history[0].Text, "target thread details") || !strings.Contains(actor.history[0].Text, "Local thread fallback for T-target-thread") {
+	if actor.history[0].Text != "target thread details" {
 		t.Fatalf("history text = %q", actor.history[0].Text)
 	}
 	if _, ok := actor.pendingTools["TU-read"]; ok {
@@ -5924,7 +5942,7 @@ func TestNeoActorToolResultAcceptsToolRunAlias(t *testing.T) {
 }
 
 func TestNeoImageToolResultPreservesImagesAndCompactsHistoryText(t *testing.T) {
-	run := normalizeNeoLocalThreadToolRun(context.Background(), &config.Config{}, neoPendingTool{
+	run := normalizeNeoLocalThreadToolRun(context.Background(), nil, neoPendingTool{
 		Name:  "render_agg_man",
 		Input: map[string]any{"prompt": "draw the mascot"},
 	}, map[string]any{
@@ -5952,7 +5970,7 @@ func TestNeoImageToolResultPreservesImagesAndCompactsHistoryText(t *testing.T) {
 		t.Fatalf("runToText = %q, want compact image text", got)
 	}
 
-	viewRun := normalizeNeoLocalThreadToolRun(context.Background(), &config.Config{}, neoPendingTool{Name: "view_media"}, map[string]any{
+	viewRun := normalizeNeoLocalThreadToolRun(context.Background(), nil, neoPendingTool{Name: "view_media"}, map[string]any{
 		"status": "done",
 		"image":  map[string]any{"url": "https://example.test/image.png"},
 	}, "T-current")
@@ -6540,6 +6558,40 @@ func TestNeoReadThreadToolFallbackUsesCloudThread(t *testing.T) {
 
 	threadID := "T-019e0379-5ef4-72e9-9ce6-dc9408a838f5"
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/provider/google/") {
+			payload := readNeoJSON(r.Body)
+			if r.URL.Path != "/api/provider/google/v1beta/models/gemini-3-flash-preview:generateContent" {
+				t.Fatalf("provider path = %s", r.URL.Path)
+			}
+			if got := stringValue(mapValue(payload["generationConfig"])["responseMimeType"]); got != "application/json" {
+				t.Fatalf("responseMimeType = %q", got)
+			}
+			schema := mapValue(mapValue(mapValue(payload["generationConfig"])["responseJsonSchema"])["properties"])
+			if len(mapValue(schema["relevantContent"])) == 0 {
+				t.Fatalf("responseJsonSchema = %#v", payload["generationConfig"])
+			}
+			contents := arrayValue(payload["contents"])
+			if len(contents) != 2 {
+				t.Fatalf("contents = %#v", contents)
+			}
+			mentioned := stringValue(mapValue(arrayValue(mapValue(contents[0])["parts"])[0])["text"])
+			prompt := stringValue(mapValue(arrayValue(mapValue(contents[1])["parts"])[0])["text"])
+			if !strings.Contains(mentioned, "<mentionedThread>") || !strings.Contains(mentioned, "cloud fallback details") {
+				t.Fatalf("mentioned thread prompt = %q", mentioned)
+			}
+			if !strings.Contains(prompt, "## Goal") || !strings.Contains(prompt, "extract task") || !strings.Contains(prompt, "`relevantContent`") {
+				t.Fatalf("extraction prompt = %q", prompt)
+			}
+			writeNeoJSON(w, http.StatusOK, map[string]any{
+				"candidates": []any{map[string]any{
+					"content": map[string]any{"parts": []any{map[string]any{"text": `{"relevantContent":"cloud fallback details"}`}}},
+				}},
+			})
+			return
+		}
+		if r.URL.Path != "/api/internal" || r.URL.RawQuery != "getThread" {
+			t.Fatalf("request path = %s?%s", r.URL.Path, r.URL.RawQuery)
+		}
 		writeNeoJSON(w, http.StatusOK, map[string]any{
 			"ok": true,
 			"result": map[string]any{
@@ -6557,9 +6609,11 @@ func TestNeoReadThreadToolFallbackUsesCloudThread(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	run := normalizeNeoLocalThreadToolRun(context.Background(), &config.Config{
-		AmpCode: config.AmpCode{UpstreamURL: upstream.URL, UpstreamAPIKey: "secret"},
-	}, neoPendingTool{
+	rt := testNeoRuntimeForServer(t, upstream)
+	rt.cfg.AmpCode.UpstreamURL = upstream.URL
+	rt.cfg.AmpCode.UpstreamAPIKey = "secret"
+
+	run := normalizeNeoLocalThreadToolRun(context.Background(), rt, neoPendingTool{
 		Name:  "read_thread",
 		Input: map[string]any{"threadID": threadID, "goal": "extract task"},
 	}, map[string]any{
@@ -6567,73 +6621,81 @@ func TestNeoReadThreadToolFallbackUsesCloudThread(t *testing.T) {
 		"result": "thread lookup returned no useful content-only metadata",
 	}, "T-current")
 
-	if got := stringValue(run["result"]); !strings.Contains(got, "cloud fallback details") || !strings.Contains(got, "Local thread fallback for "+threadID) {
+	if got := stringValue(run["result"]); got != "cloud fallback details" {
 		t.Fatalf("fallback result = %q", got)
 	}
 }
 
-func TestNeoReadThreadToolFallbackBoundsLocalExcerpts(t *testing.T) {
+func TestNeoReadThreadToolFallbackUsesBinaryStyleExtractionForLocalThread(t *testing.T) {
 	dir := t.TempDir()
 	oldStoreDir := neoAmpThreadStoreDir
 	neoAmpThreadStoreDir = func() string { return dir }
 	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
 
-	threadID := "T-local-read-thread-excerpts"
-	messages := make([]neoMessage, 0, 64)
-	messages = append(messages, neoMessage{
-		ThreadID:  threadID,
-		MessageID: "M-initial",
-		Role:      "user",
-		Content:   []any{map[string]any{"type": "text", "text": "Initial email request: make onboarding emails clearer and keep the greeting consistent."}},
-		Seq:       1,
-	})
-	for i := 0; i < 58; i++ {
-		messages = append(messages, neoMessage{
-			ThreadID:  threadID,
-			MessageID: fmt.Sprintf("M-noise-%02d", i),
-			Role:      "assistant",
-			Content:   []any{map[string]any{"type": "text", "text": fmt.Sprintf("middle-noise-%02d %s", i, strings.Repeat("noise ", 500))}},
-			Seq:       i + 2,
-		})
-	}
-	messages = append(messages, neoMessage{
-		ThreadID:  threadID,
-		MessageID: "M-final",
-		Role:      "assistant",
-		Content:   []any{map[string]any{"type": "text", "text": "Final changes made: updated frontend/src/routes/emails/+page.svelte, adjusted email copy, and left no unresolved concerns."}},
-		Seq:       61,
-	})
+	threadID := "T-local-read-thread-extraction"
+	longResult := strings.Repeat("tool-output ", 500) + "tail"
 	if err := writeNeoLocalThreadSnapshot(neoCloudThreadSnapshot{
 		threadID:  threadID,
-		seq:       62,
+		seq:       3,
 		createdMs: 1778170000000,
-		messages:  messages,
+		messages: []neoMessage{
+			{
+				ThreadID:  threadID,
+				MessageID: "M-user",
+				Role:      "user",
+				Content:   []any{map[string]any{"type": "text", "text": "Initial email request: make onboarding emails clearer."}},
+				Seq:       1,
+			},
+			{
+				ThreadID:  threadID,
+				MessageID: "M-tool",
+				Role:      "user",
+				Content: []any{map[string]any{
+					"type":      "tool_result",
+					"toolUseID": "TU-read",
+					"run":       map[string]any{"status": "done", "result": longResult},
+				}},
+				Seq: 2,
+			},
+		},
 	}); err != nil {
 		t.Fatalf("writeNeoLocalThreadSnapshot error: %v", err)
 	}
 
-	run := normalizeNeoLocalThreadToolRun(context.Background(), &config.Config{}, neoPendingTool{
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/provider/google/v1beta/models/gemini-3-flash-preview:generateContent" {
+			t.Fatalf("provider path = %s", r.URL.Path)
+		}
+		payload := readNeoJSON(r.Body)
+		contents := arrayValue(payload["contents"])
+		mentioned := stringValue(mapValue(arrayValue(mapValue(contents[0])["parts"])[0])["text"])
+		if !strings.Contains(mentioned, "Initial email request") || !strings.Contains(mentioned, neoThreadMarkdownOmittedText) {
+			t.Fatalf("mentioned thread markdown was not truncated:\n%s", mentioned)
+		}
+		if strings.Contains(mentioned, "tail") {
+			t.Fatalf("mentioned thread markdown leaked truncated tail:\n%s", mentioned)
+		}
+		writeNeoJSON(w, http.StatusOK, map[string]any{
+			"candidates": []any{map[string]any{
+				"content": map[string]any{"parts": []any{map[string]any{"text": "```json\n{\"relevantContent\":\"extracted exact thread content\"}\n```"}}},
+			}},
+		})
+	}))
+	defer upstream.Close()
+
+	run := normalizeNeoLocalThreadToolRun(context.Background(), testNeoRuntimeForServer(t, upstream), neoPendingTool{
 		Name: "read_thread",
 		Input: map[string]any{
 			"threadID": threadID,
-			"goal":     "Extract the initial discussion/request about emails and the final changes made at the end of the thread, including intended behavior, files changed, and any unresolved concerns.",
+			"goal":     "Extract the initial discussion/request about emails.",
 		},
 	}, map[string]any{
 		"status": "done",
 		"result": "lookup returned no content",
 	}, "T-current")
 
-	got := stringValue(run["result"])
-	for _, want := range []string{"Relevant local excerpts", "Initial email request", "Final changes made", "frontend/src/routes/emails/+page.svelte"} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("fallback result missing %q:\n%s", want, got)
-		}
-	}
-	if strings.Contains(got, "middle-noise-30") {
-		t.Fatalf("fallback result included unrelated middle thread content:\n%s", got)
-	}
-	if len(got) > neoThreadToolFallbackMaxBytes+len(neoThreadMarkdownOmittedText) {
-		t.Fatalf("fallback result length = %d, want bounded below %d", len(got), neoThreadToolFallbackMaxBytes)
+	if got := stringValue(run["result"]); got != "extracted exact thread content" {
+		t.Fatalf("fallback result = %q", got)
 	}
 }
 

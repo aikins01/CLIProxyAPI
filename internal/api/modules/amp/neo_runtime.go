@@ -58,9 +58,7 @@ const (
 	neoThreadMarkdownToolTextLimit   = 2000
 	neoThreadMarkdownToolByteLimit   = 100 * 1024
 	neoThreadMarkdownOmittedText     = "\n[ ... omitted remaining lines to make summarizing use less tokens ... ]"
-	neoThreadToolFallbackMaxBytes    = 32 * 1024
-	neoThreadToolFallbackTextLimit   = 3500
-	neoThreadToolFallbackMaxExcerpts = 18
+	neoThreadExtractionModel         = "gemini-3-flash-preview"
 )
 
 var (
@@ -4772,7 +4770,7 @@ func (a *neoActor) receiveToolResult(msg map[string]any) {
 	}
 	a.mu.Unlock()
 
-	run = normalizeNeoLocalThreadToolRun(context.Background(), a.configSnapshot(), pending, run, a.threadID)
+	run = normalizeNeoLocalThreadToolRun(context.Background(), a.runtime, pending, run, a.threadID)
 
 	a.mu.Lock()
 	_, event := a.storeMessageEventLocked(neoMessage{
@@ -4809,13 +4807,17 @@ func (a *neoActor) receiveToolResult(msg map[string]any) {
 	}
 }
 
-func normalizeNeoLocalThreadToolRun(ctx context.Context, cfg *config.Config, pending neoPendingTool, run map[string]any, currentThreadID string) map[string]any {
+func normalizeNeoLocalThreadToolRun(ctx context.Context, rt *neoRuntime, pending neoPendingTool, run map[string]any, currentThreadID string) map[string]any {
 	run = stripNeoDiscoveredGuidanceFromRun(run)
+	var cfg *config.Config
+	if rt != nil {
+		cfg = rt.configSnapshot()
+	}
 	switch pending.Name {
 	case "painter", "render_agg_man", "view_media", "look_at":
 		return normalizeNeoImageToolRun(pending, run)
 	case "read_thread":
-		return normalizeNeoReadThreadToolRun(ctx, cfg, pending, run, currentThreadID)
+		return normalizeNeoReadThreadToolRun(ctx, rt, cfg, pending, run, currentThreadID)
 	case "find_thread", "thread_search", "search_threads":
 		return normalizeNeoFindThreadToolRun(ctx, cfg, pending, run)
 	default:
@@ -4984,7 +4986,7 @@ func stripNeoDiscoveredGuidanceFromRun(run map[string]any) map[string]any {
 	return cleanedRun
 }
 
-func normalizeNeoReadThreadToolRun(ctx context.Context, cfg *config.Config, pending neoPendingTool, run map[string]any, currentThreadID string) map[string]any {
+func normalizeNeoReadThreadToolRun(ctx context.Context, rt *neoRuntime, cfg *config.Config, pending neoPendingTool, run map[string]any, currentThreadID string) map[string]any {
 	threadID := neoToolInputThreadID(pending.Input)
 	if threadID == "" {
 		return run
@@ -5000,9 +5002,17 @@ func normalizeNeoReadThreadToolRun(ctx context.Context, cfg *config.Config, pend
 		return run
 	}
 
+	extracted, err := inferNeoThreadExtractionLocal(rt, currentThreadID, threadID, pending.Input, thread)
+	if err != nil {
+		rewritten := cloneMap(run)
+		rewritten["status"] = "error"
+		rewritten["error"] = "Reading thread failed: " + err.Error()
+		delete(rewritten, "result")
+		return rewritten
+	}
 	rewritten := cloneMap(run)
 	rewritten["status"] = "done"
-	rewritten["result"] = neoThreadToolFallbackMarkdown(threadID, pending.Input, thread)
+	rewritten["result"] = extracted
 	delete(rewritten, "error")
 	return rewritten
 }
@@ -5046,151 +5056,165 @@ func neoToolInputThreadID(input map[string]any) string {
 	return raw
 }
 
-func neoThreadToolFallbackMarkdown(threadID string, input map[string]any, thread map[string]any) string {
+func inferNeoThreadExtractionLocal(rt *neoRuntime, currentThreadID string, mentionedThreadID string, input map[string]any, thread map[string]any) (string, error) {
+	if rt == nil {
+		return "", errors.New("missing local Neo runtime")
+	}
 	goal := strings.TrimSpace(stringValue(input["goal"]))
-	var out strings.Builder
-	out.WriteString("Local thread fallback for ")
-	out.WriteString(threadID)
-	out.WriteString(". Amp's thread reader returned an unavailable or wrong-thread result, so CLIProxyAPI supplied relevant excerpts from the locally stored thread.\n\n")
-	if goal != "" {
-		out.WriteString("Goal: ")
-		out.WriteString(goal)
-		out.WriteString("\n\n")
+	markdown := neoThreadMarkdown(thread, neoThreadMarkdownOptions{TruncateToolResults: true})
+	body := map[string]any{
+		"contents": []any{
+			map[string]any{
+				"role":  "user",
+				"parts": []any{map[string]any{"text": "Here is the mentioned thread content:\n\n<mentionedThread>\n" + markdown + "\n</mentionedThread>"}},
+			},
+			map[string]any{
+				"role":  "user",
+				"parts": []any{map[string]any{"text": neoThreadExtractionPrompt(goal)}},
+			},
+		},
+		"generationConfig": map[string]any{
+			"responseMimeType":   "application/json",
+			"responseJsonSchema": neoThreadExtractionResponseSchema(),
+		},
 	}
-	out.WriteString(neoThreadToolFallbackExcerpts(thread, goal))
-	return truncateNeoThreadToolFallbackOutput(out.String())
+	sessionThreadID := currentThreadID
+	if sessionThreadID == "" {
+		sessionThreadID = mentionedThreadID
+	}
+	subpath := "/v1beta/models/" + url.PathEscape(neoThreadExtractionModel) + ":generateContent"
+	jsonBody, err := callNeoLocalProvider(rt, "google", subpath, body, sessionThreadID)
+	if err != nil {
+		return "", err
+	}
+	text := strings.TrimSpace(neoGoogleResponseText(jsonBody))
+	parsed, err := parseNeoThreadExtractionJSON(text)
+	if err != nil {
+		return "", err
+	}
+	return stringValue(parsed["relevantContent"]), nil
 }
 
-type neoThreadToolFallbackExcerpt struct {
-	index int
-	role  string
-	text  string
-	score int
+func neoThreadExtractionPrompt(goal string) string {
+	return strings.Join([]string{
+		"You are helping me extract relevant information from the mentioned thread based on a goal.",
+		"",
+		"## Task",
+		"",
+		"I am talking to another user. They mentioned a thread (a conversation) in their message last message. I turned the thread into Markdown and provided it to you, along with a goal of what I want you to extract.",
+		"",
+		"Your job is to:",
+		"1. Analyze the mentioned thread's content",
+		"2. Identify information that is relevant to the goal",
+		"3. Extract and preserve those relevant parts with full fidelity",
+		"4. Omit clearly irrelevant content to keep the context concise",
+		"",
+		"## Guidelines",
+		"",
+		"**Preserve Fidelity**: When content IS relevant, include it completely with all important details, code snippets, explanations, and context.",
+		"**Be Selective**: When content is clearly NOT relevant to the user's query, omit it entirely.",
+		"**Maintain Structure**: Keep the extracted content well-organized and coherent. If multiple parts are relevant, preserve their logical flow.",
+		"**Technical Precision**: Preserve exact technical details like file paths, function names, error messages, and code snippets that are relevant.",
+		"",
+		"## Examples",
+		"",
+		"### Example 1: Extract implementation details",
+		"",
+		"**Goal**: \"Extract the implementation details of the authentication mechanism in the mentioned thread\"",
+		"",
+		"**Good Extraction**:",
+		"- Includes: Authentication logic, security considerations, code examples, relevant files",
+		"- Omits: Unrelated features, general discussion, tangential topics",
+		"",
+		"### Example 2: Referencing a bug fix",
+		"",
+		"**Goal**: \"Extract how the bug was fixed in the mentioned thread\"",
+		"",
+		"**Good Extraction**:",
+		"- Includes: The bug description, root cause, the fix/solution, relevant code changes",
+		"- Omits: Initial troubleshooting steps, unrelated changes, meeting notes",
+		"",
+		"### Example 3: Learning from past work",
+		"",
+		"**Goal**: \"Describe what pattern was used to implemented the widget Foo in the mentioned thread\"",
+		"",
+		"**Good Extraction**:",
+		"- Includes: The design pattern, implementation approach, example code, key decisions",
+		"- Omits: Project-specific details that don't apply, alternative approaches that were rejected",
+		"",
+		"## Goal",
+		"",
+		goal,
+		"",
+		"## Your Response",
+		"",
+		"Format your response as JSON with:",
+		"- `relevantContent`: The extracted relevant information (as markdown text)",
+	}, "\n")
 }
 
-func neoThreadToolFallbackExcerpts(thread map[string]any, goal string) string {
-	messages := arrayValue(thread["messages"])
-	if len(messages) == 0 {
-		return "[no textual content]"
+func neoThreadExtractionResponseSchema() map[string]any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"relevantContent": map[string]any{
+				"type":        "string",
+				"description": "Extracted relevant information from the thread based on the goal. Preserve fidelity and details for relevant parts. Omit irrelevant content.",
+			},
+		},
+		"required": []any{"relevantContent"},
 	}
-	terms := neoThreadToolFallbackTerms(goal)
-	includeInitial := goal == "" || neoThreadToolFallbackGoalHasAny(terms, "initial", "start", "started", "first", "request", "discussion", "original")
-	includeFinal := goal == "" || neoThreadToolFallbackGoalHasAny(terms, "final", "end", "ending", "changed", "changes", "unresolved", "concern", "concerns", "summary", "files", "implemented")
-	excerpts := make([]neoThreadToolFallbackExcerpt, 0, len(messages))
-	for idx, raw := range messages {
-		message := mapValue(raw)
-		text := strings.TrimSpace(neoMarkdownTextFromBlocks(arrayValue(message["content"]), neoThreadMarkdownOptions{TruncateToolResults: true}))
-		if text == "" {
-			continue
-		}
-		score := neoThreadToolFallbackScore(text, idx, len(messages), terms)
-		if includeInitial && idx < 4 {
-			score += 12 - idx
-		}
-		if includeFinal && idx >= len(messages)-8 {
-			score += 16 + (idx - (len(messages) - 8))
-		}
-		if score <= 0 && idx != 0 && idx != len(messages)-1 {
-			continue
-		}
-		excerpts = append(excerpts, neoThreadToolFallbackExcerpt{
-			index: idx,
-			role:  stringValue(message["role"]),
-			text:  truncateNeoThreadToolFallbackText(text),
-			score: score,
-		})
+}
+
+func neoGoogleResponseText(jsonBody map[string]any) string {
+	candidates := arrayValue(jsonBody["candidates"])
+	if len(candidates) == 0 {
+		return ""
 	}
-	if len(excerpts) == 0 {
-		return "[no relevant local excerpts found]"
-	}
-	sort.SliceStable(excerpts, func(i, j int) bool {
-		if excerpts[i].score == excerpts[j].score {
-			return excerpts[i].index < excerpts[j].index
-		}
-		return excerpts[i].score > excerpts[j].score
-	})
-	if len(excerpts) > neoThreadToolFallbackMaxExcerpts {
-		excerpts = excerpts[:neoThreadToolFallbackMaxExcerpts]
-	}
-	sort.SliceStable(excerpts, func(i, j int) bool {
-		return excerpts[i].index < excerpts[j].index
-	})
+	parts := arrayValue(mapValue(mapValue(candidates[0])["content"])["parts"])
 	var out strings.Builder
-	out.WriteString("Relevant local excerpts:\n\n")
-	for _, excerpt := range excerpts {
-		role := strings.TrimSpace(excerpt.role)
-		if role == "" {
-			role = "message"
-		}
-		out.WriteString("## ")
-		out.WriteString(strings.Title(role))
-		out.WriteString(" ")
-		out.WriteString(strconv.Itoa(excerpt.index + 1))
-		out.WriteString("\n\n")
-		out.WriteString(excerpt.text)
-		out.WriteString("\n\n")
+	for _, raw := range parts {
+		out.WriteString(stringValue(mapValue(raw)["text"]))
 	}
 	return out.String()
 }
 
-func neoThreadToolFallbackTerms(goal string) map[string]bool {
-	terms := make(map[string]bool)
-	for _, part := range strings.FieldsFunc(strings.ToLower(goal), func(r rune) bool {
-		return (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '_' && r != '-' && r != '.'
-	}) {
-		part = strings.Trim(part, "._-")
-		if len(part) < 3 {
-			continue
-		}
-		terms[part] = true
-		if strings.HasSuffix(part, "s") && len(part) > 4 {
-			terms[strings.TrimSuffix(part, "s")] = true
-		}
+func parseNeoThreadExtractionJSON(text string) (map[string]any, error) {
+	text = strings.TrimSpace(text)
+	if parsed, ok := parseNeoThreadExtractionJSONObject(text); ok {
+		return parsed, nil
 	}
-	return terms
-}
-
-func neoThreadToolFallbackGoalHasAny(terms map[string]bool, values ...string) bool {
-	for _, value := range values {
-		if terms[value] {
-			return true
+	if start := strings.Index(text, "```"); start >= 0 {
+		rest := text[start+3:]
+		if end := strings.Index(rest, "```"); end >= 0 {
+			fenced := strings.TrimSpace(rest[:end])
+			if newline := strings.IndexAny(fenced, "\r\n"); newline >= 0 && strings.EqualFold(strings.TrimSpace(fenced[:newline]), "json") {
+				fenced = strings.TrimSpace(fenced[newline+1:])
+			}
+			if parsed, ok := parseNeoThreadExtractionJSONObject(fenced); ok {
+				return parsed, nil
+			}
 		}
 	}
-	return false
-}
-
-func neoThreadToolFallbackScore(text string, index int, count int, terms map[string]bool) int {
-	lower := strings.ToLower(text)
-	score := 0
-	for term := range terms {
-		if strings.Contains(lower, term) {
-			score += 4
+	start := strings.Index(text, "{")
+	end := strings.LastIndex(text, "}")
+	if start >= 0 && end > start {
+		if parsed, ok := parseNeoThreadExtractionJSONObject(text[start : end+1]); ok {
+			return parsed, nil
 		}
 	}
-	if strings.Contains(lower, "apply_patch") || strings.Contains(lower, "edit_file") || strings.Contains(lower, "create_file") {
-		score += 3
-	}
-	if strings.Contains(lower, "git diff") || strings.Contains(lower, "changed") || strings.Contains(lower, "implemented") || strings.Contains(lower, "unresolved") {
-		score += 2
-	}
-	if count > 0 && index >= count-3 {
-		score++
-	}
-	return score
+	return nil, errors.New("failed to parse JSON from thread extraction result")
 }
 
-func truncateNeoThreadToolFallbackText(text string) string {
-	if len(text) <= neoThreadToolFallbackTextLimit {
-		return text
+func parseNeoThreadExtractionJSONObject(text string) (map[string]any, bool) {
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(text), &parsed); err != nil {
+		return nil, false
 	}
-	return strings.TrimSpace(text[:neoThreadToolFallbackTextLimit]) + neoThreadMarkdownOmittedText
-}
-
-func truncateNeoThreadToolFallbackOutput(text string) string {
-	if len(text) <= neoThreadToolFallbackMaxBytes {
-		return text
+	if _, ok := parsed["relevantContent"]; !ok {
+		return nil, false
 	}
-	return strings.TrimSpace(text[:neoThreadToolFallbackMaxBytes]) + neoThreadMarkdownOmittedText
+	return parsed, true
 }
 
 func (a *neoActor) revokeToolLease(msg map[string]any) {
