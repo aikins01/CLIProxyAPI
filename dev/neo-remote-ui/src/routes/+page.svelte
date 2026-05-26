@@ -59,6 +59,9 @@
     url?: string;
     uri?: string;
     href?: string;
+    path?: string;
+    savedPath?: string;
+    saved_path?: string;
     data?: string;
     base64?: string;
     mediaType?: string;
@@ -2650,7 +2653,7 @@
 
   // Classify a tool_use block into an ampcode-style category for grouping.
   // Normalize by stripping spaces/underscores/dashes so 'Shell command', 'shell_command', 'shellCommand' all match.
-  type ToolCategory = 'explore' | 'edit' | 'command' | 'thread' | 'skill' | 'task' | 'web' | 'other';
+  type ToolCategory = 'explore' | 'edit' | 'command' | 'thread' | 'skill' | 'task' | 'web' | 'painter' | 'other';
   function normalizedToolName(name: string) {
     return (name || '').toLowerCase().replace(/[\s_-]+/g, '');
   }
@@ -2658,6 +2661,7 @@
   function toolCategory(name: string): ToolCategory {
     const n = normalizedToolName(name);
     // Order matters — check most specific first
+    if (n === 'painter' || n === 'renderaggman' || n === 'viewmedia' || n === 'lookat') return 'painter';
     if (n.includes('shell') || n.includes('command') || n.includes('bash') || n.includes('terminal') || n === 'exec' || n === 'run') return 'command';
     if (n.includes('editfile') || n.includes('writefile') || n.includes('createfile') || n.includes('patch') || n.includes('edit') || n === 'write' || n === 'modify' || n === 'update') return 'edit';
     if (n.includes('subagent') || n === 'task' || n === 'agent' || n.includes('spawn')) return 'task';
@@ -2714,6 +2718,7 @@
     | { kind: 'explore'; tools: ContentBlock[] }
     | { kind: 'edit'; block: ContentBlock; result?: ContentBlock }
     | { kind: 'command'; block: ContentBlock; result?: ContentBlock }
+    | { kind: 'painter'; block: ContentBlock; result?: ContentBlock }
     | { kind: 'tool'; block: ContentBlock; result?: ContentBlock }
     | { kind: 'result'; block: ContentBlock };
 
@@ -2737,6 +2742,7 @@
         if (cat === 'explore') buf.push(b);
         else if (cat === 'edit') { flush(); rows.push({ kind: 'edit', block: b, result }); }
         else if (cat === 'command') { flush(); rows.push({ kind: 'command', block: b, result }); }
+        else if (cat === 'painter') { flush(); rows.push({ kind: 'painter', block: b, result }); }
         else { flush(); rows.push({ kind: 'tool', block: b, result }); }
       } else if (b.type === 'tool_result') { continue; }
       else { flush(); rows.push({ kind: 'tool', block: b }); }
@@ -2842,6 +2848,102 @@
       run.error,
       blockContentPreview(block)
     );
+  }
+
+  type PainterImage = {
+    src: string;
+    name: string;
+    savedPath: string;
+  };
+
+  function painterTitle(block: ContentBlock) {
+    const name = normalizedToolName(block.name || '');
+    if (name === 'renderaggman') return 'Render Agg Man';
+    if (name === 'viewmedia') return 'Viewed media';
+    if (name === 'lookat') return 'Look At';
+    return 'Painter';
+  }
+
+  function painterPrompt(block: ContentBlock, result?: ContentBlock) {
+    const input = asRecord(block.input);
+    const run = toolResultRun(result);
+    const nestedResult = asRecord(run.result);
+    return firstString(
+      input.prompt,
+      input.description,
+      input.message,
+      input.request,
+      run.prompt,
+      nestedResult.prompt,
+      toolSubtitle(block)
+    );
+  }
+
+  function painterImagesFromResult(block?: ContentBlock) {
+    const run = toolResultRun(block);
+    const result = toolResultResult(block);
+    const images: PainterImage[] = [];
+    const primary = [run.images, run.image, result.images, result.image].find((value) => Array.isArray(value) && value.length > 0);
+    const append = (value: unknown) => {
+      if (Array.isArray(value)) {
+        value.forEach(append);
+        return;
+      }
+      const image = painterImageFromAny(value, images.length);
+      if (image) {
+        images.push(image);
+        return;
+      }
+      const record = asRecord(value);
+      for (const key of ['images', 'image', 'outputImages', 'output_images', 'generatedImages', 'generated_images']) {
+        if (record[key] !== undefined) append(record[key]);
+      }
+    };
+
+    if (primary) {
+      append(primary);
+    } else {
+      [run.outputImages, run.output_images, run.generatedImages, run.generated_images, result.outputImages, result.output_images, result.generatedImages, result.generated_images, run].forEach(append);
+    }
+    return images;
+  }
+
+  function painterImageFromAny(raw: unknown, index: number): PainterImage | null {
+    if (typeof raw === 'string') {
+      const value = raw.trim();
+      if (!value) return null;
+      if (value.startsWith('data:image/') || value.startsWith('http://') || value.startsWith('https://')) {
+        return { src: value, name: `image-${index + 1}.png`, savedPath: '' };
+      }
+      if (value.startsWith('file://') || value.startsWith('/')) {
+        return { src: '', name: value.split('/').pop() || `image-${index + 1}.png`, savedPath: value };
+      }
+      return null;
+    }
+
+    const record = asRecord(raw);
+    if (Object.keys(record).length === 0) return null;
+    const source = asRecord(record.source);
+    const imageUrl = asRecord(record.image_url);
+    const mediaType = stringFrom(record.mediaType ?? record.media_type ?? record.mimeType ?? record.mime_type ?? source.mediaType ?? source.media_type ?? source.mimeType ?? source.mime_type) || 'image/png';
+    const data = firstString(record.data, record.base64, record.b64_json, record.contentBase64, source.data, source.base64, source.b64_json);
+    const url = firstString(record.url, record.uri, record.href, record.imageURL, record.imageUrl, record.image_url, source.url, source.uri, imageUrl.url);
+    let savedPath = firstString(record.savedPath, record.saved_path, record.path, record.file, record.filename, record.filePath, record.file_path);
+    const block = {
+      type: 'image',
+      ...record,
+      data: data || record.data,
+      mediaType,
+      url
+    } as ContentBlock;
+    let src = imageBlockSrc(block);
+    if (src.startsWith('file://') || src.startsWith('/')) {
+      savedPath = savedPath || src;
+      src = '';
+    }
+    if (!src && !savedPath) return null;
+    const name = firstString(record.name, record.filename, record.file_name, record.title) || savedPath.split('/').pop() || `image-${index + 1}.png`;
+    return { src, name, savedPath };
   }
 
   function prettyToolLabel(name: string): string {
@@ -3211,6 +3313,45 @@
               </div>
               {#if commandOutput}
                 <pre class="code-panel__out">{commandOutput}</pre>
+              {/if}
+            </div>
+          </details>
+        {:else if row.kind === 'painter'}
+          {@const painterImages = painterImagesFromResult(row.result)}
+          {@const painterText = toolResultPreview(row.result)}
+          {@const prompt = painterPrompt(row.block, row.result)}
+          <details class="trace-row trace-row--painter" open={painterImages.length > 0}>
+            <summary class="trace-time-anchor" data-time={traceTimeLabelForRow(row.block, row.result)}>
+              <span class="trace-row__label">{painterTitle(row.block)}</span>
+              {#if prompt}
+                <span class="trace-row__sub">{prompt}</span>
+              {/if}
+              <ChevronRight size={12} class="trace-row__chevron" />
+            </summary>
+            <div class="painter-panel">
+              {#if painterImages.length > 0}
+                <div class="painter-images" aria-label="Generated images">
+                  {#each painterImages as image, i (`${image.name}-${i}`)}
+                    <figure class="painter-image">
+                      {#if image.src}
+                        <img src={image.src} alt={image.name} />
+                      {:else}
+                        <div class="painter-image__placeholder"><ImagePlus size={18} /></div>
+                      {/if}
+                      <figcaption>
+                        <span title={image.savedPath || image.name}>{image.savedPath || image.name}</span>
+                        {#if image.src}
+                          <a class="painter-image__action" href={image.src} download={image.name} title="Download image" aria-label="Download image"><Download size={12} /></a>
+                        {/if}
+                      </figcaption>
+                    </figure>
+                  {/each}
+                </div>
+              {:else if toolInputPreview(row.block)}
+                <pre class="code-panel">{toolInputPreview(row.block)}</pre>
+              {/if}
+              {#if painterText && painterText !== prompt}
+                <div class="painter-panel__text">{painterText}</div>
               {/if}
             </div>
           </details>
@@ -5190,6 +5331,88 @@
     flex: 1 1 auto;
   }
   .trace-row--ran .code-panel { margin: 4px 0 8px 16px; }
+
+  .trace-row--painter > summary {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    min-width: 0;
+  }
+  .trace-row--painter .trace-row__label { color: var(--neo-ink); }
+  .trace-row--painter .trace-row__sub {
+    min-width: 0;
+    flex: 1 1 auto;
+    overflow: hidden;
+    color: var(--neo-muted);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .painter-panel {
+    display: grid;
+    gap: 8px;
+    margin: 6px 0 10px 16px;
+  }
+  .painter-images {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(148px, 220px));
+    gap: 8px;
+    align-items: start;
+  }
+  .painter-image {
+    min-width: 0;
+    margin: 0;
+  }
+  .painter-image img,
+  .painter-image__placeholder {
+    display: block;
+    width: 100%;
+    aspect-ratio: 1 / 1;
+    border-radius: 6px;
+    background: color-mix(in srgb, var(--neo-ink) 5%, transparent);
+    outline: 1px solid color-mix(in srgb, var(--neo-ink) 12%, transparent);
+    object-fit: cover;
+  }
+  .painter-image__placeholder {
+    display: grid;
+    place-items: center;
+    color: var(--neo-muted);
+  }
+  .painter-image figcaption {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    padding-top: 4px;
+    color: var(--neo-muted);
+    font-size: 12px;
+    line-height: 16px;
+  }
+  .painter-image figcaption span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .painter-image__action {
+    display: inline-flex;
+    flex: 0 0 auto;
+    align-items: center;
+    justify-content: center;
+    width: 20px;
+    height: 20px;
+    border-radius: 4px;
+    color: var(--neo-muted);
+    text-decoration: none;
+  }
+  .painter-image__action:hover {
+    background: color-mix(in srgb, var(--neo-ink) 8%, transparent);
+    color: var(--neo-ink);
+  }
+  .painter-panel__text {
+    color: var(--neo-muted);
+    font-size: 12.5px;
+    line-height: 18px;
+  }
 
   @media (max-width: 760px) {
     .trace-time-anchor[data-time]:not([data-time=""])::before {

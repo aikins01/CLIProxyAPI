@@ -5917,6 +5917,44 @@ func TestNeoActorToolResultAcceptsToolRunAlias(t *testing.T) {
 	}
 }
 
+func TestNeoImageToolResultPreservesImagesAndCompactsHistoryText(t *testing.T) {
+	run := normalizeNeoLocalThreadToolRun(context.Background(), &config.Config{}, neoPendingTool{
+		Name:  "render_agg_man",
+		Input: map[string]any{"prompt": "draw the mascot"},
+	}, map[string]any{
+		"status": "done",
+		"result": map[string]any{
+			"images": []any{map[string]any{"b64_json": "abc123", "mime_type": "image/png", "filename": "agg.png"}},
+		},
+	}, "T-current")
+
+	images := arrayValue(run["images"])
+	if len(images) != 1 {
+		t.Fatalf("images = %#v", run["images"])
+	}
+	image := mapValue(images[0])
+	if got := stringValue(image["data"]); got != "abc123" {
+		t.Fatalf("image data = %q, want abc123", got)
+	}
+	if got := stringValue(image["mediaType"]); got != "image/png" {
+		t.Fatalf("image mediaType = %q, want image/png", got)
+	}
+	if got := stringValue(run["prompt"]); got != "draw the mascot" {
+		t.Fatalf("prompt = %q", got)
+	}
+	if got := runToText(run); got != "rendered 1 image" {
+		t.Fatalf("runToText = %q, want compact image text", got)
+	}
+
+	viewRun := normalizeNeoLocalThreadToolRun(context.Background(), &config.Config{}, neoPendingTool{Name: "view_media"}, map[string]any{
+		"status": "done",
+		"image":  map[string]any{"url": "https://example.test/image.png"},
+	}, "T-current")
+	if got := runToText(viewRun); got != "viewed 1 image" {
+		t.Fatalf("view runToText = %q, want viewed image text", got)
+	}
+}
+
 func TestNeoActorPersistsToolApprovalQueueAndPreservesNestedMetadata(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)

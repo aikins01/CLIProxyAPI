@@ -4806,6 +4806,8 @@ func (a *neoActor) receiveToolResult(msg map[string]any) {
 func normalizeNeoLocalThreadToolRun(ctx context.Context, cfg *config.Config, pending neoPendingTool, run map[string]any, currentThreadID string) map[string]any {
 	run = stripNeoDiscoveredGuidanceFromRun(run)
 	switch pending.Name {
+	case "painter", "render_agg_man", "view_media", "look_at":
+		return normalizeNeoImageToolRun(pending, run)
 	case "read_thread":
 		return normalizeNeoReadThreadToolRun(ctx, cfg, pending, run, currentThreadID)
 	case "find_thread", "thread_search", "search_threads":
@@ -4813,6 +4815,144 @@ func normalizeNeoLocalThreadToolRun(ctx context.Context, cfg *config.Config, pen
 	default:
 		return run
 	}
+}
+
+func normalizeNeoImageToolRun(pending neoPendingTool, run map[string]any) map[string]any {
+	images := neoToolRunImages(run)
+	if len(images) == 0 {
+		return run
+	}
+	normalized := cloneMap(run)
+	normalized["images"] = images
+	normalized["imageCount"] = len(images)
+	if prompt := firstNonEmptyString(normalized["prompt"], nestedValue(normalized["result"], "prompt"), pending.Input["prompt"], pending.Input["description"], pending.Input["message"]); prompt != "" {
+		normalized["prompt"] = prompt
+	}
+	if firstNonEmptyString(normalized["output"], normalized["displayMessage"], normalized["message"], normalized["text"]) == "" {
+		normalized["displayMessage"] = neoImageToolText(pending.Name, len(images))
+	}
+	return normalized
+}
+
+func neoImageToolText(toolName string, count int) string {
+	noun := "image"
+	if count != 1 {
+		noun = "images"
+	}
+	action := "generated"
+	switch normalizedNeoToolName(toolName) {
+	case "renderaggman":
+		action = "rendered"
+	case "viewmedia", "lookat":
+		action = "viewed"
+	}
+	return fmt.Sprintf("%s %d %s", action, count, noun)
+}
+
+func normalizedNeoToolName(name string) string {
+	replacer := strings.NewReplacer(" ", "", "_", "", "-", "")
+	return replacer.Replace(strings.ToLower(strings.TrimSpace(name)))
+}
+
+func neoToolRunImages(run map[string]any) []any {
+	if len(run) == 0 {
+		return nil
+	}
+	for _, value := range []any{run["images"], run["image"], run["outputImages"], run["output_images"], run["generatedImages"], run["generated_images"]} {
+		images := appendNeoToolRunImages(nil, value)
+		if len(images) > 0 {
+			return images
+		}
+	}
+	result := mapValue(run["result"])
+	for _, value := range []any{result["images"], result["image"], result["outputImages"], result["output_images"], result["generatedImages"], result["generated_images"]} {
+		images := appendNeoToolRunImages(nil, value)
+		if len(images) > 0 {
+			return images
+		}
+	}
+	if image, ok := normalizeNeoToolRunImage(run); ok {
+		return []any{image}
+	}
+	return nil
+}
+
+func appendNeoToolRunImages(images []any, value any) []any {
+	switch typed := value.(type) {
+	case nil:
+		return images
+	case []any:
+		for _, item := range typed {
+			images = appendNeoToolRunImages(images, item)
+		}
+		return images
+	case []map[string]any:
+		for _, item := range typed {
+			images = appendNeoToolRunImages(images, item)
+		}
+		return images
+	case map[string]any:
+		if image, ok := normalizeNeoToolRunImage(typed); ok {
+			return append(images, image)
+		}
+		for _, key := range []string{"images", "image", "outputImages", "output_images", "generatedImages", "generated_images"} {
+			images = appendNeoToolRunImages(images, typed[key])
+		}
+		return images
+	default:
+		if image, ok := normalizeNeoToolRunImage(typed); ok {
+			return append(images, image)
+		}
+		return images
+	}
+}
+
+func normalizeNeoToolRunImage(value any) (map[string]any, bool) {
+	if text := strings.TrimSpace(stringValue(value)); text != "" {
+		switch {
+		case strings.HasPrefix(text, "data:image/"):
+			return map[string]any{"data": text}, true
+		case strings.HasPrefix(text, "http://"), strings.HasPrefix(text, "https://"):
+			return map[string]any{"url": text}, true
+		case strings.HasPrefix(text, "file://"), strings.HasPrefix(text, "/"):
+			return map[string]any{"savedPath": text}, true
+		default:
+			return nil, false
+		}
+	}
+	m, ok := asMap(value)
+	if !ok || len(m) == 0 {
+		return nil, false
+	}
+	source := mapValue(m["source"])
+	imageURL := mapValue(m["image_url"])
+	data := firstNonEmptyString(m["data"], m["base64"], m["b64_json"], m["contentBase64"], source["data"], source["base64"], source["b64_json"])
+	urlValue := firstNonEmptyString(m["url"], m["uri"], m["href"], m["imageURL"], m["imageUrl"], m["image_url"], source["url"], source["uri"], imageURL["url"])
+	savedPath := firstNonEmptyString(m["savedPath"], m["saved_path"], m["path"], m["file"], m["filename"], m["filePath"], m["file_path"])
+	if strings.HasPrefix(urlValue, "file://") || strings.HasPrefix(urlValue, "/") {
+		savedPath = firstNonEmptyString(savedPath, urlValue)
+		urlValue = ""
+	}
+	if data == "" && urlValue == "" && savedPath == "" {
+		return nil, false
+	}
+	image := cloneMap(m)
+	if data != "" {
+		image["data"] = data
+	}
+	if urlValue != "" {
+		image["url"] = urlValue
+	}
+	if savedPath != "" {
+		image["savedPath"] = savedPath
+	}
+	if mediaType := firstNonEmptyString(m["mediaType"], m["media_type"], m["mimeType"], m["mime_type"], source["media_type"], source["mediaType"], source["mime_type"], source["mimeType"]); mediaType != "" {
+		image["mediaType"] = mediaType
+	}
+	if name := firstNonEmptyString(m["name"], m["filename"], m["file_name"], m["title"]); name != "" {
+		image["name"] = name
+	}
+	return image, true
 }
 
 // stripNeoDiscoveredGuidanceFromRun removes discoveredGuidanceFiles from a
@@ -14511,6 +14651,9 @@ func runToText(run any) string {
 		if value := stringValue(m[key]); value != "" {
 			return value
 		}
+	}
+	if images := neoToolRunImages(m); len(images) > 0 {
+		return neoImageToolText(stringValue(m["toolName"]), len(images))
 	}
 	if result, ok := m["result"]; ok {
 		return fmt.Sprint(result)
