@@ -194,9 +194,9 @@
   let compactionRecords = $state<Record<string, unknown>[]>([]);
   let artifacts = $state<RuntimeArtifact[]>([]);
   let relationships = $state<Relationship[]>([]);
+  const railRelationships = $derived(relationships.filter(isVisibleRailRelationship));
   let executorConnected = $state(false);
   let executorInfo = $state<Record<string, unknown>>({});
-  let observerCount = $state(0);
   let executorStatuses = $state<ExecutorStatus[]>([]);
   let inferenceTools = $state<{ messageId: string; agentMode: string; tools: string[] } | null>(null);
   let toolLeases = $state<ToolLease[]>([]);
@@ -333,7 +333,6 @@
     relationships = [];
     executorConnected = false;
     executorInfo = {};
-    observerCount = 0;
     executorStatuses = [];
     inferenceTools = null;
     toolLeases = [];
@@ -825,8 +824,6 @@
       return;
     }
     if (type === 'observers') {
-      const count = finiteNumberFrom(message.count);
-      observerCount = count ?? (Array.isArray(message.observers) ? message.observers.length : observerCount);
       if (typeof message.hasExecutor === 'boolean') {
         executorConnected = message.hasExecutor;
       }
@@ -1070,6 +1067,11 @@
     };
   }
 
+  function isVisibleRailRelationship(_relationship: Relationship) {
+    // Amp keeps relationship deltas out of the thread-info rail.
+    return false;
+  }
+
   function approveTool(approval: ToolApproval) {
     sendFrame({ type: 'client_tool_approval_response', toolCallId: approval.toolCallId, accepted: true });
     toolApprovals = toolApprovals.filter((item) => item.toolCallId !== approval.toolCallId);
@@ -1163,8 +1165,6 @@
 
   function composerStatusParts() {
     return [
-      connection === 'connected' && !executorConnected ? 'view-only' : '',
-      observerCount > 0 ? `${observerCount} observer${observerCount === 1 ? '' : 's'}` : '',
       runtimeWorkspacePath() || repoFromEnv(environment) || detail?.repo,
       branchFromEnv(environment) || detail?.branch
     ].filter(Boolean);
@@ -1414,10 +1414,13 @@
   }
 
   function userTextFromBlocks(blocks: ContentBlock[]) {
+    // Trim trailing whitespace so single-word bubbles ("ship", "1", "go on") don't render as 2 lines
+    // due to preserved newlines under white-space: pre-wrap.
     return blocks
       .map((block) => block.type === 'text' ? block.text ?? '' : '')
       .filter(Boolean)
-      .join('');
+      .join('')
+      .replace(/[\s\n]+$/g, '');
   }
 
   function userPreviewFromBlocks(blocks: ContentBlock[]) {
@@ -2311,10 +2314,32 @@
     return { files: Math.max(1, files.size), additions, deletions };
   }
 
+  // Format tool input as ampcode-style key: value lines (strings unquoted, primitives bare,
+  // nested objects/arrays JSON-stringified inline). Falls back to JSON if input isn't a plain object.
   function toolInputPreview(block: ContentBlock) {
     const input = asRecord(block.input);
-    if (Object.keys(input).length === 0) return '';
-    return JSON.stringify(input, null, 2);
+    const keys = Object.keys(input);
+    if (keys.length === 0) return '';
+    const lines: string[] = [];
+    for (const key of keys) {
+      const value = input[key];
+      let rendered: string;
+      if (value == null) {
+        rendered = 'null';
+      } else if (typeof value === 'string') {
+        rendered = value;
+      } else if (typeof value === 'number' || typeof value === 'boolean') {
+        rendered = String(value);
+      } else if (Array.isArray(value)) {
+        rendered = JSON.stringify(value);
+      } else if (typeof value === 'object') {
+        rendered = JSON.stringify(value, null, 2);
+      } else {
+        rendered = String(value);
+      }
+      lines.push(`${key}: ${rendered}`);
+    }
+    return lines.join('\n');
   }
 
   function blockContentPreview(block: ContentBlock) {
@@ -2401,20 +2426,7 @@
 {#snippet userBubble(blocks: ContentBlock[])}
   {@const text = userTextFromBlocks(blocks)}
   {@const images = imageBlocksFrom(blocks)}
-  <div class:message__bubble--media={images.length > 0 && !text.trim()} class="message__bubble">
-    {#if text.trim()}
-      <div class="message__bubble-text">{text}</div>
-    {/if}
-    {#if images.length > 0}
-      <div class="message-images" aria-label="Attached images">
-        {#each images as block, i (`${imageBlockName(block)}-${i}`)}
-          <figure class="message-image">
-            <img src={imageBlockSrc(block)} alt={imageBlockName(block)} />
-          </figure>
-        {/each}
-      </div>
-    {/if}
-  </div>
+  <div class:message__bubble--media={images.length > 0 && !text.trim()} class="message__bubble">{#if text.trim()}<div class="message__bubble-text">{text}</div>{/if}{#if images.length > 0}<div class="message-images" aria-label="Attached images">{#each images as block, i (`${imageBlockName(block)}-${i}`)}<figure class="message-image"><img src={imageBlockSrc(block)} alt={imageBlockName(block)} /></figure>{/each}</div>{/if}</div>
 {/snippet}
 
 {#snippet traceBlock(block: ContentBlock)}
@@ -2469,7 +2481,8 @@
 {#snippet workGroup(blocks: ContentBlock[], live = false)}
   {@const duration = workDurationLabel(blocks, live)}
   <details class="work-group">
-    <summary class="trace-time-anchor" data-time={traceTimeLabelForBlocks(blocks)}>
+    <!-- Ampcode parity: the "Worked for X minutes" header has no hover timestamp. -->
+    <summary>
       <span class="work-group__line"></span>
       <span class="work-group__button">
         {#if duration}
@@ -2526,16 +2539,23 @@
           </details>
         {:else if row.kind === 'command'}
           {@const commandFailed = isFailedToolResult(row.result)}
-          {@const commandResultPreview = commandFailed ? toolResultPreview(row.result) : ''}
+          {@const commandExitCode = toolResultExitCode(row.result)}
+          {@const commandExitLabel = Number.isFinite(commandExitCode) ? `exit code ${commandExitCode}` : 'exit code -1'}
+          {@const commandOutput = toolResultPreview(row.result)}
+          {@const commandFullText = commandText(row.block) || prettyToolLabel(row.block.name || 'command')}
           <details class="trace-row trace-row--cmd" class:trace-row--failed={commandFailed}>
-            <summary class="trace-time-anchor" data-time={traceTimeLabelForRow(row.block, row.result)}>
-              <code class="trace-row__cmd"><span class="trace-row__prompt">$</span> {commandText(row.block) || prettyToolLabel(row.block.name || 'command')}</code>
-            </summary>
-            {#if commandResultPreview}
-              <pre class="code-panel code-panel--error">{commandResultPreview}</pre>
-            {:else if toolInputPreview(row.block)}
-              <pre class="code-panel">{toolInputPreview(row.block)}</pre>
-            {/if}
+            <summary class="trace-time-anchor" data-time={traceTimeLabelForRow(row.block, row.result)}><code class="trace-row__cmd"><span class="trace-row__prompt">$</span><span class="trace-row__cmd-text">{commandFullText}</span></code><ChevronRight size={12} class="trace-row__chevron" /></summary>
+            <div class="code-panel code-panel--cmd">
+              <div class="code-panel__head">
+                <span class="code-panel__cmd">$ {commandFullText}</span>
+                {#if commandFailed}
+                  <span class="code-panel__exit">{commandExitLabel}</span>
+                {/if}
+              </div>
+              {#if commandOutput}
+                <pre class="code-panel__out">{commandOutput}</pre>
+              {/if}
+            </div>
           </details>
         {:else}
           {@const ranLabel = prettyToolLabel(row.block.name || '')}
@@ -2705,11 +2725,11 @@
     </section>
   {/if}
 
-  {#if relationships.length > 0}
+  {#if railRelationships.length > 0}
     <section class="runtime-section runtime-section--relationships">
-      <h2>Relationships <span class="runtime-section__count">{relationships.length}</span></h2>
+      <h2>Relationships <span class="runtime-section__count">{railRelationships.length}</span></h2>
       <div class="relationships-list">
-        {#each relationships as relationship (`${relationship.threadID}-${relationship.type}-${relationship.role}`)}
+        {#each railRelationships as relationship (`${relationship.threadID}-${relationship.type}-${relationship.role}`)}
           <button
             class="relationship-item"
             type="button"
@@ -3136,6 +3156,7 @@
   :global(*) { box-sizing: border-box; }
 
   :global(html) {
+    --neo-mono: "Berkeley Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
     color-scheme: dark light;
     font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
     background: var(--neo-bg);
@@ -3269,7 +3290,7 @@
     font-size: 18px;
     font-weight: 600;
     color: var(--neo-ink);
-    letter-spacing: -0.01em;
+    letter-spacing: 0;
   }
 
   .auth-form { display: flex; flex-direction: column; gap: 8px; }
@@ -3506,7 +3527,7 @@
     background: var(--neo-card);
     border-radius: 4px;
     padding: 8px;
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-family: var(--neo-mono);
     font-size: 12px;
     line-height: 1.45;
     overflow-wrap: anywhere;
@@ -3573,7 +3594,8 @@
     outline: 0;
     background: transparent;
     color: var(--neo-ink);
-    font-size: 13px;
+    font-size: 16px;
+    line-height: 20px;
     padding: 0;
   }
   .search-box input::placeholder { color: var(--neo-muted); }
@@ -3768,7 +3790,7 @@
     margin: 0;
     font-size: 26px;
     font-weight: 600;
-    letter-spacing: -0.01em;
+    letter-spacing: 0;
     color: var(--neo-ink);
   }
 
@@ -3822,6 +3844,9 @@
     border-color: transparent;
   }
 
+  /* Transcript column — ampcode parity:
+   *   mx-auto max-w-2xl px-4 flex flex-col gap-4 pb-4
+   *   max-width 672px, 16px gap between turns, 16px horizontal padding, 16px bottom padding. */
   .transcript {
     display: flex;
     flex-direction: column;
@@ -3829,7 +3854,7 @@
     width: 100%;
     max-width: 672px;
     margin: 0 auto;
-    padding-bottom: 36px;
+    padding-bottom: 16px;
     padding-left: 16px;
     padding-right: 16px;
     box-sizing: border-box;
@@ -3893,6 +3918,14 @@
     display: block;
     color: var(--neo-ink);
   }
+  /* Inner column of assistant segments (work groups, thinking, prose) — matches ampcode's
+   * `flex min-w-0 flex-col gap-2` (gap-2 = 8px between segments within a single turn). */
+  .message__agent > div {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    min-width: 0;
+  }
   .message__agent p { margin: 0; font-size: 13px; line-height: 20px; }
 
   /* === Markdown rendering for assistant messages === */
@@ -3920,7 +3953,7 @@
     background: var(--neo-bubble);
     border-radius: 3px;
     padding: 1px 4px;
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-family: var(--neo-mono);
     font-size: 0.9em;
     color: var(--neo-ink);
     white-space: normal;
@@ -3937,7 +3970,7 @@
     overflow-x: auto;
     overflow-y: hidden;
     max-width: 100%;
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-family: var(--neo-mono);
     font-size: 12.5px;
     line-height: 1.5;
     color: var(--neo-ink);
@@ -3990,10 +4023,14 @@
     animation: caret 900ms steps(2) infinite;
   }
 
-  .work-group { margin: 12px 0; }
+  /* Work group is a segment within a turn; the parent supplies the 8px gap (ampcode parity). */
+  .work-group { margin: 0; }
   .trace-time-anchor {
     position: relative;
   }
+  /* Hover timestamp on tool rows — matches ampcode's transcript-row-timestamp:
+   * absolute top-1.5 left-full ml-2 w-14 text-[10px] leading-4 with
+   * `transition: opacity 600ms ease-in;` and opacity 0 → ~0.6 on hover. */
   .trace-time-anchor[data-time]:not([data-time=""])::before {
     content: attr(data-time);
     position: absolute;
@@ -4001,43 +4038,56 @@
     right: calc(100% + 18px);
     z-index: 2;
     color: var(--neo-soft);
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-    font-size: 10.5px;
+    font-family: var(--neo-mono);
+    font-size: 10px;
     font-weight: 400;
-    line-height: 1;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: 0;
+    line-height: 16px;
     opacity: 0;
     pointer-events: none;
     white-space: nowrap;
-    transition: opacity 140ms cubic-bezier(0.4, 0, 0.2, 1);
+    transition: opacity 600ms ease-in;
   }
   .trace-time-anchor[data-time]:not([data-time=""]):hover::before {
-    opacity: 0.82;
+    opacity: 0.6;
   }
   .work-group > summary {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: 12px;
+    margin: 4px 0;
     cursor: pointer;
     list-style: none;
     color: var(--neo-muted);
-    font-size: 13px;
+    font-size: 12px;
+    line-height: 16px;
   }
   .work-group > summary::-webkit-details-marker { display: none; }
   .work-group__line { flex: 1; height: 1px; background: var(--neo-border); }
   .work-group__button {
     display: inline-flex;
     align-items: center;
-    gap: 6px;
-    min-height: 28px;
+    gap: 4px;
+    min-height: 20px;
+    padding: 2px 6px;
+    border-radius: 6px;
     color: var(--neo-muted);
+    transition: background-color 150ms cubic-bezier(0.4, 0, 0.2, 1), color 150ms cubic-bezier(0.4, 0, 0.2, 1);
+  }
+  .work-group > summary:hover .work-group__button {
+    background: color-mix(in srgb, var(--neo-ink) 4%, transparent);
+    color: var(--neo-ink);
   }
   .work-group__button span {
-    color: var(--neo-muted);
-    font-weight: 500;
+    color: inherit;
+    font-weight: 400;
   }
   :global(.work-group__chevron) { transition: transform 140ms ease; }
   .work-group[open] :global(.work-group__chevron) { transform: rotate(90deg); }
-  .work-group__body { display: grid; gap: 6px; margin-top: 8px; }
+  /* Body of an expanded work group — matches ampcode's inner `flex min-w-0 flex-col gap-2`
+   * (8px between rows: thinking, explored, edited, ran, etc.). */
+  .work-group__body { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
 
   .trace-block {
     margin: 4px 0;
@@ -4080,7 +4130,7 @@
     padding: 4px 0 4px 16px;
     margin-top: 2px;
     color: var(--neo-muted);
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-family: var(--neo-mono);
     font-size: 12.5px;
     line-height: 1.5;
     overflow-wrap: anywhere;
@@ -4099,44 +4149,47 @@
   }
 
   .trace-thinking {
-    margin: 10px 0;
-    font-size: 13.5px;
-    line-height: 21px;
+    margin: 0;
+    font-size: 13px;
+    line-height: 20px;
     color: var(--neo-ink);
   }
-  .trace-thinking.md { font-size: 13.5px; line-height: 21px; }
+  .trace-thinking.md { font-size: 13px; line-height: 20px; }
   .trace-thinking--progress { color: color-mix(in srgb, var(--neo-ink) 82%, var(--neo-muted)); }
+  /* Trace rows — ampcode parity:
+   *   `flex flex-col rounded-sm text-foreground/75 group/row hover:text-foreground`
+   *   13px / 20px, no vertical margin (parent supplies gap), muted by default,
+   *   becomes full ink on hover. */
   .trace-row {
-    margin: 2px 0;
+    margin: 0;
     border: 0;
     background: transparent;
-    font-size: 14px;
-    color: var(--neo-ink);
+    font-size: 13px;
+    line-height: 20px;
+    color: color-mix(in srgb, var(--neo-ink) 75%, transparent);
+    transition: color 150ms cubic-bezier(0.4, 0, 0.2, 1);
     min-width: 0;
     max-width: 100%;
     overflow: hidden;
   }
+  .trace-row:hover { color: var(--neo-ink); }
   .trace-row > summary {
     display: flex;
     align-items: baseline;
-    gap: 8px;
+    gap: 4px;
     padding: 2px 0;
-    min-height: 22px;
     cursor: pointer;
     list-style: none;
-    color: var(--neo-ink);
-    transition: color 150ms cubic-bezier(0.4, 0, 0.2, 1);
-    opacity: 0.85;
+    color: inherit;
     min-width: 0;
     max-width: 100%;
     overflow: hidden;
   }
   .trace-row > summary::-webkit-details-marker { display: none; }
-  .trace-row:hover > summary { opacity: 1; }
-  .trace-row__label { color: var(--neo-ink); font-weight: 400; white-space: nowrap; }
+  .trace-row__label { color: inherit; font-weight: 400; white-space: nowrap; }
   .trace-row--explore > summary .trace-row__label {
-    color: var(--neo-danger);
-    font-weight: 500;
+    color: inherit;
+    font-weight: 400;
   }
   .trace-row__sub {
     color: var(--neo-muted);
@@ -4184,7 +4237,7 @@
   }
 
   .trace-row__file {
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-family: var(--neo-mono);
     font-size: 13.5px;
     color: var(--neo-accent, var(--neo-ink));
     text-decoration: underline;
@@ -4194,7 +4247,7 @@
   }
   .trace-row__file:hover { text-decoration-color: currentColor; }
   .trace-row__diff {
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-family: var(--neo-mono);
     font-size: 12.5px;
     font-weight: 400;
     display: inline-flex;
@@ -4204,35 +4257,40 @@
     margin: 6px 0 10px 16px;
   }
 
+  /* Shell command row — ampcode parity:
+   *   <code> = mono wrapper with `flex items-baseline gap-1.25 font-mono text-[12.5px]`
+   *     <span> = `$` prompt (inherits row color foreground/75)
+   *     <span class="trace-row__cmd-text"> = `min-w-0 truncate text-muted-foreground
+   *       group-hover/row:text-foreground` — single-line ellipsis, muted, swaps to
+   *       full ink when the row is hovered. Stays truncated even when open. */
   .trace-row__cmd {
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    display: flex;
+    align-items: baseline;
+    gap: 5px;
+    flex: 1 1 auto;
+    min-width: 0;
+    max-width: 100%;
+    font-family: var(--neo-mono);
     font-size: 12.5px;
-    color: color-mix(in srgb, var(--neo-ink) 70%, var(--neo-muted));
     background: transparent;
     padding: 0;
     line-height: 1.6;
+    overflow: hidden;
+  }
+  .trace-row__prompt { color: inherit; flex-shrink: 0; }
+  .trace-row__cmd-text {
+    flex: 1 1 auto;
+    min-width: 0;
+    color: var(--neo-muted);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    min-width: 0;
-    flex: 1 1 auto;
-    max-width: 100%;
-    display: block;
+    transition: color 150ms cubic-bezier(0.4, 0, 0.2, 1);
   }
-  .trace-row--cmd[open] > summary .trace-row__cmd {
-    white-space: pre-wrap;
-    overflow-wrap: anywhere;
-    word-break: break-word;
-  }
-  .trace-row--cmd .code-panel { margin: 4px 0 8px 16px; }
-
-  .trace-row__prompt { color: color-mix(in srgb, var(--neo-ink) 58%, var(--neo-muted)); }
+  .trace-row--cmd:hover .trace-row__cmd-text { color: var(--neo-ink); }
+  .trace-row--cmd .code-panel { margin: 4px 0 8px 0; }
   .trace-row--failed > summary { opacity: 1; }
   .trace-row--failed .trace-row__prompt { color: var(--neo-danger); }
-  .trace-row--failed .code-panel--error {
-    border-color: color-mix(in srgb, var(--neo-danger) 28%, transparent);
-    color: color-mix(in srgb, var(--neo-danger) 24%, var(--neo-ink));
-  }
 
   .trace-row--ran > summary { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
   .trace-row--ran .trace-row__label { color: var(--neo-ink); }
@@ -4254,17 +4312,71 @@
     }
   }
 
+  /* Expanded tool body — matches ampcode's
+   * `mb-1 max-h-[min(75vh,300px)] overflow-auto bg-foreground/5 py-2 px-3 rounded-md
+   *  shadow outline-1 outline-black/10` + inner `<pre class="text-[12.5px]
+   *  text-foreground/75 font-mono whitespace-pre-wrap break-all">`. */
   .code-panel {
     overflow: auto;
-    max-height: 360px;
-    margin: 0;
-    border-top: 1px solid var(--neo-border);
-    background: var(--neo-card);
-    color: var(--neo-muted);
-    padding: 10px;
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-    font-size: 12px;
+    max-height: min(75vh, 300px);
+    margin: 0 0 4px;
+    border-radius: 6px;
+    background: color-mix(in srgb, var(--neo-ink) 5%, transparent);
+    outline: 1px solid color-mix(in srgb, #000 60%, transparent);
+    box-shadow: 0 1px 2px 0 color-mix(in srgb, #000 15%, transparent);
+    color: color-mix(in srgb, var(--neo-ink) 75%, transparent);
+    padding: 8px 12px;
+    font-family: var(--neo-mono);
+    font-size: 12.5px;
     line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+  /* Command-panel composition: an outer rounded bubble holding a HEAD that
+   * echoes the full command (wrapped, never truncated), a 1px separator, then
+   * the OUT `<pre>` with the stdout. Matches ampcode's exact structure:
+   *   bubble: `mb-1 max-h-[min(75vh,300px)] overflow-auto bg-foreground/5 py-2 px-3
+   *            rounded-md shadow outline-1 outline-black/60`
+   *   head:  `mb-2 flex flex-wrap items-baseline gap-x-2 gap-y-1 border-b border-border
+   *            pb-2 text-[12.5px] text-foreground`
+   *   inner: `min-w-0 flex-1 font-mono whitespace-pre-wrap break-all`
+   *   out:   `text-[12.5px] text-foreground/75 font-mono whitespace-pre-wrap break-all` */
+  .code-panel--cmd { padding: 0; }
+  .code-panel__head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 4px 8px;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--neo-border);
+    color: var(--neo-ink);
+    font-size: 12.5px;
+  }
+  .code-panel--cmd .code-panel__head:last-child { border-bottom: 0; padding-bottom: 8px; }
+  .code-panel__cmd {
+    flex: 1 1 auto;
+    min-width: 0;
+    font-family: var(--neo-mono);
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+  /* "exit code N" badge in the head row — matches ampcode's
+   * `shrink-0 font-normal text-destructive` (12.5px inherits from head). */
+  .code-panel__exit {
+    flex: 0 0 auto;
+    margin-left: auto;
+    font-weight: 400;
+    color: var(--neo-danger);
+    white-space: nowrap;
+  }
+  .code-panel__out {
+    margin: 0;
+    padding: 8px 12px;
+    font-family: var(--neo-mono);
+    font-size: 12.5px;
+    color: color-mix(in srgb, var(--neo-ink) 75%, transparent);
+    white-space: pre-wrap;
+    word-break: break-all;
   }
 
   /* Footer wrapping the composer, fixed at the bottom of the viewport (matches ampcode `fixed bottom-0 z-30 px-2 pb-2`). */
@@ -4285,14 +4397,14 @@
   }
   /* Spacer that reserves vertical space at the end of the transcript so the sticky composer never covers the last message. */
   .composer-dock {
-    height: 140px;
+    height: 188px;
     flex-shrink: 0;
   }
-  .composer-dock--attachments { height: 196px; }
+  .composer-dock--attachments { height: 252px; }
   @media (max-width: 640px) {
     .composer-footer { padding: 6px; }
-    .composer-dock { height: 132px; }
-    .composer-dock--attachments { height: 202px; }
+    .composer-dock { height: 172px; }
+    .composer-dock--attachments { height: 242px; }
   }
 
   /* Composer: rounded-2xl card with status bar above + body below (matches ampcode `divide-y` pattern). */
@@ -4463,7 +4575,7 @@
     .inspector {
       display: flex;
       flex-direction: column;
-      gap: 16px;
+      gap: 12px;
       width: 100%;
       max-width: 21em;
       flex-shrink: 0;
@@ -4471,7 +4583,7 @@
       position: sticky;
       /* Clear the sticky topbar (47px) + small gap so the inspector doesn't slide under it. */
       top: 56px;
-      margin-top: 24px;
+      margin-top: 8px;
       padding: 16px 24px;
       border: 1px solid var(--neo-border);
       border-right: 0;
@@ -4544,12 +4656,12 @@
     text-underline-offset: 2px;
   }
   .inspector-field--mono > span {
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-family: var(--neo-mono);
   }
 
   /* Sub-section (heading + content) used for "Open in CLI" etc. */
   .inspector-section { display: flex; flex-direction: column; gap: 6px; }
-  .inspector-section__head { color: var(--neo-ink); font-size: 12px; font-weight: 600; }
+  .inspector-section__head { color: var(--neo-ink); font-size: 12px; font-weight: 500; }
   .cli-row {
     display: flex;
     align-items: center;
@@ -4567,17 +4679,17 @@
   .mono-line {
     display: block !important;
     overflow-wrap: anywhere;
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-family: var(--neo-mono);
   }
   .runtime-section {
     border-top: 1px solid var(--neo-border);
-    padding-top: 14px;
+    padding-top: 12px;
   }
   .runtime-section h2 {
     margin: 0 0 8px;
     color: var(--neo-ink);
-    font-size: 13px;
-    font-weight: 600;
+    font-size: 12px;
+    font-weight: 500;
   }
   .runtime-section p {
     margin: 0;
@@ -4601,7 +4713,7 @@
   }
   .runtime-pill span {
     color: var(--neo-soft);
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-family: var(--neo-mono);
     font-size: 10px;
     text-transform: uppercase;
     letter-spacing: 0;
@@ -4609,7 +4721,7 @@
   .runtime-pill--link {
     color: var(--neo-ink);
     font: inherit;
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-family: var(--neo-mono);
     font-size: 12px;
     text-align: left;
     width: 100%;
@@ -4664,7 +4776,7 @@
   .relationship-item:hover { background: var(--neo-card-hover); }
   .relationship-item__type {
     color: var(--neo-muted);
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-family: var(--neo-mono);
     font-size: 10px;
     text-transform: uppercase;
     letter-spacing: 0.02em;
@@ -4673,7 +4785,7 @@
   }
   .relationship-item__id {
     color: var(--neo-ink);
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-family: var(--neo-mono);
     font-size: 11.5px;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -4703,7 +4815,7 @@
     background: var(--neo-bg);
     color: var(--neo-muted);
     padding: 8px;
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-family: var(--neo-mono);
     font-size: 11px;
     line-height: 1.45;
   }
@@ -4726,7 +4838,7 @@
     color: var(--neo-bg);
     border-color: transparent;
   }
-  .diff-stats { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 13px; gap: 6px; }
+  .diff-stats { font-family: var(--neo-mono); font-size: 13px; gap: 6px; }
   :global(.diff-add) { color: var(--neo-success); }
   :global(.diff-del) { color: var(--neo-danger); }
   :global(.diff-mod) { color: #d4a045; }
@@ -4754,7 +4866,7 @@
   .handoff-card__body { min-width: 0; flex: 1; }
   .handoff-card__head { color: var(--neo-ink); font-size: 12px; opacity: 0.7; }
   .handoff-card__id {
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-family: var(--neo-mono);
     font-weight: 600;
     color: var(--neo-ink);
     opacity: 1;
@@ -4896,7 +5008,7 @@
     background: var(--neo-card);
     border-radius: 6px;
     padding: 6px 10px;
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-family: var(--neo-mono);
     font-size: 11.5px;
     line-height: 1.5;
     color: var(--neo-ink);

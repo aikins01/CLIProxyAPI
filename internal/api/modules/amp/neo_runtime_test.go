@@ -3448,7 +3448,7 @@ func TestNeoSystemPromptUsesBinaryPromptFamilies(t *testing.T) {
 			name:    "default",
 			request: neoInferenceRequest{AgentMode: "smart"},
 			route:   neoModelRoute{Provider: "anthropic", Model: "claude-opus-4-7"},
-			want:    []string{"<autonomy_and_persistence>", "<using_subagents>"},
+			want:    []string{"<autonomy_and_persistence>", "<using_subagents>", "fewer than 4 lines of text"},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -3459,6 +3459,23 @@ func TestNeoSystemPromptUsesBinaryPromptFamilies(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestNeoSystemPromptIncludesLocalClientActorFailureGuidance(t *testing.T) {
+	prompt := neoSystemPrompt(neoInferenceRequest{
+		AgentMode:   "smart",
+		Environment: map[string]any{"isLocalClientActorThread": true},
+	}, neoModelRoute{Provider: "openai", Model: "gpt-5.5"})
+
+	for _, want := range []string{
+		"Executor did not acknowledge tool lease",
+		"the user's Amp client went offline",
+		"without repeating the internal error message",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing local client actor guidance %q:\n%s", want, prompt)
+		}
 	}
 }
 
@@ -3669,6 +3686,62 @@ func TestNeoSystemPromptUsesExecutorGuidanceSnapshot(t *testing.T) {
 	}
 	if !strings.Contains(prompt, "### Available skills") || !strings.Contains(prompt, "- code-review: Review code (file: /skills/code-review/SKILL.md)") {
 		t.Fatalf("prompt missing fallback skill names:\n%s", prompt)
+	}
+}
+
+func TestNeoGuidanceBlocksUseBinaryGuidanceLabels(t *testing.T) {
+	blocks := strings.Join(neoGuidanceBlocks(neoInferenceRequest{
+		Guidance: map[string]any{
+			"files": []any{
+				map[string]any{
+					"content": "Project guidance",
+					"uri":     "file:///Users/test/project/AGENTS.md",
+				},
+				map[string]any{
+					"content": "Global guidance",
+					"uri":     "file:///Users/test/.config/AGENTS.md",
+				},
+				map[string]any{
+					"content": "Local guidance",
+					"uri":     "file:///Users/test/project/AGENTS.local.md",
+				},
+				map[string]any{
+					"content": "System guidance",
+					"type":    "system",
+					"uri":     "file:///Library/Application%20Support/Amp/AGENTS.md",
+				},
+				map[string]any{
+					"content": "Subtree guidance",
+					"type":    "subtree",
+					"uri":     "file:///Users/test/project/src/AGENTS.md",
+				},
+			},
+		},
+	}, false), "\n\n")
+
+	for _, want := range []string{
+		"Contents of AGENTS.md (project instructions):\n<instructions>\nProject guidance\n</instructions>",
+		"Contents of AGENTS.md (user's private global instructions for all projects):\n<instructions>\nGlobal guidance\n</instructions>",
+		"Contents of AGENTS.local.md (user's private project instructions, not checked in):\n<instructions>\nLocal guidance\n</instructions>",
+		"Contents of AGENTS.md (system-wide global instructions for all projects):\n<instructions>\nSystem guidance\n</instructions>",
+		"Contents of AGENTS.md (directory-specific instructions for /Users/test/project/src):\n<instructions>\nSubtree guidance\n</instructions>",
+	} {
+		if !strings.Contains(blocks, want) {
+			t.Fatalf("guidance blocks missing %q:\n%s", want, blocks)
+		}
+	}
+}
+
+func TestNeoEnvironmentPlatformTextUsesBinaryHints(t *testing.T) {
+	got := neoPlatformText(map[string]any{
+		"os":              "windows",
+		"osVersion":       "11",
+		"cpuArchitecture": "x64",
+		"webBrowser":      true,
+	})
+	want := "windows (11) on x64 (use Windows file paths with backslashes) (running in web browser)"
+	if got != want {
+		t.Fatalf("platform text = %q, want %q", got, want)
 	}
 }
 

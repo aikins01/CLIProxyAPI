@@ -12390,7 +12390,19 @@ func neoSystemPrompt(request neoInferenceRequest, route neoModelRoute) string {
 	if skills := neoSkillsPrompt(request, deep); skills != "" {
 		blocks = append(blocks, skills)
 	}
+	blocks = append(blocks, neoFinalPromptBlocks(request, route)...)
 	return strings.Join(compactStrings(blocks), "\n\n")
+}
+
+func neoFinalPromptBlocks(request neoInferenceRequest, route neoModelRoute) []string {
+	blocks := make([]string, 0, 2)
+	if boolValue(request.Environment["isLocalClientActorThread"]) || boolValue(request.Settings["isLocalClientActorThread"]) {
+		blocks = append(blocks, "For Amp's own tool connection failures (for example, 'Executor did not acknowledge tool lease' or 'Executor did not reconnect before the tool call expired'), explain that the user's Amp client went offline and they can retry once it reconnects, without repeating the internal error message.")
+	}
+	if neoPromptFamily(request.AgentMode, route) == neoPromptFamilyDefault {
+		blocks = append(blocks, "You MUST answer concisely with fewer than 4 lines of text (not including tool use or code generation), unless the user asks for more detail.")
+	}
+	return blocks
 }
 
 func neoBasePrompt(request neoInferenceRequest, route neoModelRoute) string {
@@ -12512,8 +12524,11 @@ func neoGuidanceBlocks(request neoInferenceRequest, deep bool) []string {
 				continue
 			}
 			name := neoGuidanceName(file.URI)
-			scope := neoGuidanceScope(file.URI)
-			blocks = append(blocks, "Contents of "+name+" (directory-specific instructions for "+scope+"):\n<instructions>\n"+file.Content+"\n</instructions>")
+			label := neoGuidanceClassification(file.URI, file.Kind)
+			if strings.EqualFold(strings.TrimSpace(file.Kind), "subtree") {
+				label = "directory-specific instructions for " + neoGuidanceScope(file.URI)
+			}
+			blocks = append(blocks, "Contents of "+name+" ("+label+"):\n<instructions>\n"+file.Content+"\n</instructions>")
 		}
 		return blocks
 	}
@@ -12521,7 +12536,7 @@ func neoGuidanceBlocks(request neoInferenceRequest, deep bool) []string {
 		if deep {
 			blocks = append(blocks, "# AGENTS.md instructions for /\n<INSTRUCTIONS>\n"+guidance+"\n</INSTRUCTIONS>")
 		} else {
-			blocks = append(blocks, "Contents of AGENTS.md (executor guidance):\n<instructions>\n"+guidance+"\n</instructions>")
+			blocks = append(blocks, "Contents of AGENTS.md ("+neoGuidanceClassification("", "")+"):\n<instructions>\n"+guidance+"\n</instructions>")
 		}
 	}
 	return blocks
@@ -12529,7 +12544,7 @@ func neoGuidanceBlocks(request neoInferenceRequest, deep bool) []string {
 
 func neoGuidanceOverview(deep bool) string {
 	if deep {
-		return "Files called AGENTS.md pass along human guidance to you, the agent. Such guidance can include coding standards, explanations of the project layout, steps for building or testing, and other instructions to be followed.\nEach AGENTS.md governs the entire directory that contains it and every child directory beneath it. Whenever you change a file, you must comply with every AGENTS.md whose scope covers that file. Apply only the parts of these guidance files that are relevant to the current files and task; they define constraints, not extra work to perform by default.\nAGENTS.md instructions are delivered dynamically in the conversation context, you don't have to read or search for them. They appear with a header \"# AGENTS.md instructions for [path]\" followed by <INSTRUCTIONS> tags. The contents of AGENTS.md files at the root and directories up to the CWD are included automatically. When working in subdirectories, check for any additional AGENTS.md files that may apply."
+		return "Files called AGENTS.md pass along human guidance to you, the agent. Such guidance can include coding standards, explanations of the project layout, steps for building or testing, and other instructions to be followed.\nEach AGENTS.md governs the entire directory that contains it and every child directory beneath it. Whenever you change a file, you must comply with every AGENTS.md whose scope covers that file. Naming conventions, stylistic rules, and similar directives are restricted to code within that scope unless the document explicitly states otherwise.\nApply only the parts of these guidance files that are relevant to the current files and task; they define constraints, not extra work to perform by default.\nAGENTS.md instructions are delivered dynamically in the conversation context, you don't have to read or search for them. They appear with a header \"# AGENTS.md instructions for [path]\" followed by <INSTRUCTIONS> tags. The contents of AGENTS.md files at the root and directories up to the CWD are included automatically. When working in subdirectories, check for any additional AGENTS.md files that may apply."
 	}
 	return "AGENTS.md guidance files are delivered dynamically in the conversation context after file operations (Read, create_file) and user file mentions. They appear with a descriptive header like \"Contents of [path] (directory-specific instructions for [scope]):\" followed by <instructions> tags. These guidance files provide directory-specific instructions that take precedence for files in that directory and should be followed carefully. Apply only the parts of these guidance files that are relevant to the current files and task; they define constraints, not extra work to perform by default."
 }
@@ -12537,6 +12552,7 @@ func neoGuidanceOverview(deep bool) string {
 type neoGuidanceFile struct {
 	URI     string
 	Content string
+	Kind    string
 }
 
 func neoGuidanceFiles(guidance map[string]any) []neoGuidanceFile {
@@ -12566,6 +12582,7 @@ func neoGuidanceFileFromAny(value any) neoGuidanceFile {
 	return neoGuidanceFile{
 		URI:     firstNonEmptyString(m["uri"], m["path"], m["name"]),
 		Content: firstNonEmptyString(m["content"], m["text"], m["instructions"], m["body"]),
+		Kind:    firstNonEmptyString(m["type"], m["kind"], m["scopeType"], m["scope_type"]),
 	}
 }
 
@@ -12591,6 +12608,30 @@ func neoGuidanceScope(uri string) string {
 		return path[:idx]
 	}
 	return "/"
+}
+
+func neoGuidanceClassification(uri, kind string) string {
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case "system":
+		return "system-wide global instructions for all projects"
+	case "user":
+		return "user's private global instructions for all projects"
+	}
+	raw := strings.ToLower(strings.TrimSpace(uri))
+	path := strings.ToLower(neoGuidancePath(uri))
+	text := raw + "\n" + path
+	if strings.Contains(text, "/etc/amp/") ||
+		strings.Contains(text, "/usr/local/etc/amp/") ||
+		strings.Contains(text, "/opt/homebrew/etc/amp/") {
+		return "system-wide global instructions for all projects"
+	}
+	if strings.Contains(text, "/.config/") || strings.Contains(text, "\\.config\\") {
+		return "user's private global instructions for all projects"
+	}
+	if strings.Contains(text, ".local.md") || strings.Contains(text, "agents.local.md") {
+		return "user's private project instructions, not checked in"
+	}
+	return "project instructions"
 }
 
 func neoGuidancePath(uri string) string {
@@ -12699,6 +12740,12 @@ func neoPlatformText(value any) string {
 	}
 	if arch := stringValue(m["cpuArchitecture"]); arch != "" {
 		osName += " on " + arch
+	}
+	if strings.EqualFold(stringValue(m["os"]), "windows") {
+		osName += " (use Windows file paths with backslashes)"
+	}
+	if boolValue(m["webBrowser"]) {
+		osName += " (running in web browser)"
 	}
 	return osName
 }
