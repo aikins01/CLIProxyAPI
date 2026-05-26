@@ -5317,6 +5317,58 @@ func TestNeoActorRewritesEmptyFindThreadToolResultFromLocalStore(t *testing.T) {
 	}
 }
 
+func TestNeoFindThreadToolAlwaysUsesLocalSearchResult(t *testing.T) {
+	dir := t.TempDir()
+	oldStoreDir := neoAmpThreadStoreDir
+	neoAmpThreadStoreDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
+
+	snapshot := neoCloudThreadSnapshot{
+		threadID:  "T-search-target",
+		seq:       2,
+		createdMs: 1778170000000,
+		title:     "Search target",
+		messages: []neoMessage{
+			{ThreadID: "T-search-target", MessageID: "M-user", Role: "user", Content: []any{map[string]any{"type": "text", "text": "needle context"}}, Seq: 1},
+		},
+	}
+	if err := writeNeoLocalThreadSnapshot(snapshot); err != nil {
+		t.Fatalf("writeNeoLocalThreadSnapshot error: %v", err)
+	}
+
+	run := normalizeNeoLocalThreadToolRun(context.Background(), nil, neoPendingTool{
+		Name:  "find_thread",
+		Input: map[string]any{"query": "T-search-target", "limit": "5"},
+	}, map[string]any{
+		"status": "done",
+		"result": map[string]any{
+			"hasMore": false,
+			"threads": []any{map[string]any{
+				"id":                "T-wrong-thread",
+				"title":             "Wrong thread",
+				"creatorUserID":     neoLocalOwnerUserID,
+				"created":           float64(1778170000000),
+				"updatedAt":         "2026-05-07T16:06:40Z",
+				"messageCount":      float64(1),
+				"matchedSearchText": "wrong result",
+			}},
+		},
+	}, "T-current-thread")
+
+	result := mapValue(run["result"])
+	threads, ok := result["threads"].([]map[string]any)
+	if !ok || len(threads) != 1 {
+		t.Fatalf("threads = %#v", result["threads"])
+	}
+	thread := threads[0]
+	if thread["id"] != "T-search-target" {
+		t.Fatalf("thread result = %#v", thread)
+	}
+	if _, ok := thread["updatedAt"].(string); !ok || stringValue(thread["updatedAt"]) == "" {
+		t.Fatalf("updatedAt = %#v, want non-empty string", thread["updatedAt"])
+	}
+}
+
 func TestNeoActorHandlesMessageReadState(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
@@ -6540,6 +6592,9 @@ func TestNeoRuntimeServesCloudThreadWhenLocalMissing(t *testing.T) {
 	if got := stringValue(mapValue(threads[0])["creatorUserID"]); got != neoLocalOwnerUserID {
 		t.Fatalf("search creatorUserID = %q, want %q", got, neoLocalOwnerUserID)
 	}
+	if _, ok := mapValue(threads[0])["updatedAt"].(string); !ok {
+		t.Fatalf("search updatedAt = %#v, want string", mapValue(threads[0])["updatedAt"])
+	}
 }
 
 func TestNeoRuntimeSearchesCloudThreadsHTTP(t *testing.T) {
@@ -6562,7 +6617,7 @@ func TestNeoRuntimeSearchesCloudThreadsHTTP(t *testing.T) {
 			"threads": []any{map[string]any{
 				"id":                threadID,
 				"title":             "Cloud search result",
-				"created":           1778229329803,
+				"created":           "2026-05-08T08:35:29.803Z",
 				"updatedAt":         "2026-05-08T08:35:29.803Z",
 				"messageCount":      5,
 				"matchedSearchText": "remote needle context",
@@ -6597,6 +6652,12 @@ func TestNeoRuntimeSearchesCloudThreadsHTTP(t *testing.T) {
 	}
 	if got := stringValue(mapValue(threads[0])["creatorUserID"]); got != neoLocalOwnerUserID {
 		t.Fatalf("creatorUserID = %q, want %q", got, neoLocalOwnerUserID)
+	}
+	if got := mapValue(threads[0])["updatedAt"]; got != "2026-05-08T08:35:29.803Z" {
+		t.Fatalf("updatedAt = %#v", got)
+	}
+	if got := numberFrom(mapValue(threads[0])["created"]); got != 1778229329803 {
+		t.Fatalf("created = %#v", mapValue(threads[0])["created"])
 	}
 }
 func TestNeoReadThreadToolFallbackUsesCloudThread(t *testing.T) {
@@ -7367,6 +7428,9 @@ func TestNeoRuntimeSearchesLocalThreadsHTTP(t *testing.T) {
 	thread := mapValue(threads[0])
 	if thread["id"] != "T-local-search" || thread["messageCount"] != float64(1) {
 		t.Fatalf("thread result = %#v", thread)
+	}
+	if _, ok := thread["updatedAt"].(string); !ok || stringValue(thread["updatedAt"]) == "" {
+		t.Fatalf("updatedAt = %#v, want non-empty string", thread["updatedAt"])
 	}
 	if !strings.Contains(stringValue(thread["matchedSearchText"]), "T-local-search") {
 		t.Fatalf("matchedSearchText = %#v", thread["matchedSearchText"])

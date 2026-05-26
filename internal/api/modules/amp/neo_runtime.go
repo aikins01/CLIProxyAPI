@@ -5015,10 +5015,6 @@ func normalizeNeoFindThreadToolRun(ctx context.Context, cfg *config.Config, pend
 	if query == "" {
 		return run
 	}
-	text := strings.ToLower(runToText(run))
-	if !strings.Contains(text, "threads:[]") && !strings.Contains(text, `"threads":[]`) {
-		return run
-	}
 	values := url.Values{"q": []string{query}}
 	if limit := stringValue(pending.Input["limit"]); limit != "" {
 		values.Set("limit", limit)
@@ -7108,7 +7104,7 @@ func neoLocalThreadSearchResult(thread map[string]any, query string) map[string]
 		"title":             stringValue(thread["title"]),
 		"creatorUserID":     neoLocalOwnerUserID,
 		"created":           created,
-		"updatedAt":         updated,
+		"updatedAt":         neoMillisRFC3339(updated),
 		"messageCount":      len(messages),
 		"matchedSearchText": neoLocalThreadMatchedText(thread, query),
 	}
@@ -7119,25 +7115,29 @@ func neoCloudThreadSearchResult(thread map[string]any, query string) map[string]
 	threadID := stringValue(result["id"])
 	if threadID == "" {
 		threadID = findThreadID(thread)
-		result["id"] = threadID
 	}
-	if _, exists := result["title"]; !exists {
-		result["title"] = ""
-	}
+	result["id"] = threadID
+	result["title"] = stringValue(result["title"])
+	result["created"] = firstNonZero(numberFrom(result["created"], result["createdAt"]), neoTimeStringMillis(stringValue(result["created"])), neoTimeStringMillis(stringValue(result["createdAt"])))
 	result["creatorUserID"] = neoLocalOwnerUserID
 	result["ownerUserId"] = neoLocalOwnerUserID
-	if _, exists := result["messageCount"]; !exists {
-		result["messageCount"] = firstNonZero(numberFrom(mapValue(thread["summaryStats"])["messageCount"]), len(arrayValue(thread["messages"])))
-	}
-	if _, exists := result["updatedAt"]; !exists {
-		if updated := firstNonZero(numberFrom(thread["userLastInteractedAt"], thread["updated"]), neoTimeStringMillis(stringValue(thread["updated"]))); updated > 0 {
-			result["updatedAt"] = updated
-		}
+	result["messageCount"] = firstNonZero(numberFrom(result["messageCount"]), numberFrom(mapValue(thread["summaryStats"])["messageCount"]), len(arrayValue(thread["messages"])))
+	if updated := neoThreadResultUpdatedMillis(result); updated > 0 {
+		result["updatedAt"] = neoMillisRFC3339(updated)
+	} else if _, ok := result["updatedAt"].(string); !ok {
+		result["updatedAt"] = ""
 	}
 	if strings.TrimSpace(stringValue(result["matchedSearchText"])) == "" {
 		result["matchedSearchText"] = neoCloudThreadMatchedText(thread, query)
 	}
 	return result
+}
+
+func neoMillisRFC3339(value int) string {
+	if value <= 0 {
+		return ""
+	}
+	return time.UnixMilli(int64(value)).UTC().Format(time.RFC3339Nano)
 }
 
 func neoLocalThreadMatchedText(thread map[string]any, query string) string {
