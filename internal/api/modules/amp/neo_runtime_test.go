@@ -5615,6 +5615,116 @@ func TestNeoActorBinaryToolDataGroupsResultsAfterAssistant(t *testing.T) {
 	}
 }
 
+func TestNeoActorNormalizesBinaryToolDataResult(t *testing.T) {
+	useTempNeoThreadStore(t)
+	snapshot := neoCloudThreadSnapshot{
+		threadID:  "T-search-target",
+		seq:       2,
+		createdMs: 1778170000000,
+		title:     "Search target",
+		messages: []neoMessage{
+			{ThreadID: "T-search-target", MessageID: "M-user", Role: "user", Content: []any{map[string]any{"type": "text", "text": "needle context"}}, Seq: 1},
+		},
+	}
+	if err := writeNeoLocalThreadSnapshot(snapshot); err != nil {
+		t.Fatalf("writeNeoLocalThreadSnapshot error: %v", err)
+	}
+
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	actor.messages = []neoMessage{{
+		ThreadID:  "T-test",
+		MessageID: "M-assistant",
+		Role:      "assistant",
+		Content: []any{map[string]any{
+			"type":  "tool_use",
+			"id":    "TU-find",
+			"name":  "find_thread",
+			"input": map[string]any{"query": "T-search-target", "limit": "5"},
+		}},
+		State: map[string]any{"type": "complete", "stopReason": "tool_use"},
+		Seq:   1,
+	}}
+	actor.rebuildHistoryLocked()
+
+	actor.handle(map[string]any{
+		"type":    "tool:data",
+		"toolUse": "TU-find",
+		"data": map[string]any{
+			"status": "done",
+			"result": map[string]any{
+				"hasMore": false,
+				"threads": []any{map[string]any{
+					"id":                "T-wrong-thread",
+					"title":             "Wrong thread",
+					"creatorUserID":     neoLocalOwnerUserID,
+					"created":           float64(1778170000000),
+					"updatedAt":         "2026-05-07T16:06:40Z",
+					"messageCount":      float64(1),
+					"matchedSearchText": "wrong result",
+				}},
+			},
+		},
+	})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.messages) != 2 {
+		t.Fatalf("messages = %#v", actor.messages)
+	}
+	run := mapValue(mapValue(actor.messages[1].Content[0])["run"])
+	result := mapValue(run["result"])
+	threads, ok := result["threads"].([]map[string]any)
+	if !ok || len(threads) != 1 {
+		t.Fatalf("threads = %#v", result["threads"])
+	}
+	if threads[0]["id"] != "T-search-target" {
+		t.Fatalf("thread result = %#v", threads[0])
+	}
+	if _, ok := threads[0]["updatedAt"].(string); !ok || stringValue(threads[0]["updatedAt"]) == "" {
+		t.Fatalf("updatedAt = %#v, want non-empty string", threads[0]["updatedAt"])
+	}
+}
+
+func TestNeoActorNormalizesTerminalToolProgressResult(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	actor.pendingTools["TU-image"] = neoPendingTool{
+		ID:    "TU-image",
+		Name:  "render_agg_man",
+		Input: map[string]any{"prompt": "draw the mascot"},
+	}
+
+	actor.handleToolProgress(map[string]any{
+		"type":       "tool_progress",
+		"toolCallId": "TU-image",
+		"progress": map[string]any{
+			"status": "done",
+			"result": map[string]any{
+				"images": []any{map[string]any{"b64_json": "abc123", "mime_type": "image/png"}},
+			},
+		},
+	})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.messages) != 1 {
+		t.Fatalf("messages = %#v", actor.messages)
+	}
+	run := mapValue(mapValue(actor.messages[0].Content[0])["run"])
+	results := arrayValue(run["result"])
+	if len(results) != 1 {
+		t.Fatalf("binary image result = %#v", run["result"])
+	}
+	image := mapValue(results[0])
+	if stringValue(image["type"]) != "image" || stringValue(image["mimeType"]) != "image/png" || stringValue(image["data"]) != "abc123" {
+		t.Fatalf("binary image = %#v", image)
+	}
+	if len(actor.history) != 1 || actor.history[0].Text != "rendered 1 image" {
+		t.Fatalf("history = %#v", actor.history)
+	}
+}
+
 func TestNeoActorHandlesBinaryAssistantAndSettingsDeltas(t *testing.T) {
 	useTempNeoThreadStore(t)
 	rt := newNeoRuntime(&config.Config{})
@@ -6085,6 +6195,20 @@ func TestNeoImageToolResultPreservesImagesAndCompactsHistoryText(t *testing.T) {
 	}, "T-current")
 	if got := runToText(viewRun); got != "viewed 1 image" {
 		t.Fatalf("view runToText = %q, want viewed image text", got)
+	}
+}
+
+func TestNeoToolRunTextResultMatchesBinaryTypedTextBlocks(t *testing.T) {
+	run := map[string]any{
+		"status": "done",
+		"result": []any{
+			map[string]any{"type": "text", "text": "first excerpt"},
+			map[string]any{"type": "text", "text": "second excerpt"},
+		},
+	}
+
+	if got := runToText(run); got != "first excerpt\nsecond excerpt" {
+		t.Fatalf("runToText = %q", got)
 	}
 }
 

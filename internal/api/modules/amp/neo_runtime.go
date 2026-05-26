@@ -1553,6 +1553,17 @@ func (a *neoActor) handleToolProgress(msg map[string]any) {
 		a.broadcast(payload)
 		return
 	}
+	a.mu.Unlock()
+
+	run = a.normalizeToolRunForPending(pending, run)
+
+	a.mu.Lock()
+	existingRun, userInput = a.toolResultRunLocked(toolCallID)
+	if neoToolRunTerminal(existingRun) && !neoToolRunTerminal(run) {
+		a.mu.Unlock()
+		a.broadcast(payload)
+		return
+	}
 	block := map[string]any{"type": "tool_result", "toolUseID": toolCallID, "run": run}
 	if userInput != nil {
 		block["userInput"] = userInput
@@ -1644,6 +1655,26 @@ func (a *neoActor) handleBinaryToolData(msg map[string]any) {
 		a.mu.Unlock()
 		return
 	}
+	a.mu.Unlock()
+
+	run = a.normalizeToolRunForPending(neoPendingTool{
+		ID:               toolCallID,
+		Name:             ref.ToolName,
+		Input:            ref.Input,
+		ParentToolCallID: ref.ParentToolCallID,
+	}, run)
+
+	a.mu.Lock()
+	ref, ok = a.storedToolUseLocked(toolCallID)
+	if !ok {
+		a.mu.Unlock()
+		return
+	}
+	existingRun, userInput = a.toolResultRunLocked(toolCallID)
+	if neoToolRunTerminal(existingRun) && !neoToolRunTerminal(run) {
+		a.mu.Unlock()
+		return
+	}
 	block := map[string]any{"type": "tool_result", "toolUseID": toolCallID, "run": run}
 	if userInput != nil {
 		block["userInput"] = userInput
@@ -1660,6 +1691,13 @@ func (a *neoActor) handleBinaryToolData(msg map[string]any) {
 
 	a.broadcast(event)
 	a.syncCloudAsync()
+}
+
+func (a *neoActor) normalizeToolRunForPending(pending neoPendingTool, run map[string]any) map[string]any {
+	if !neoToolRunTerminal(run) {
+		return run
+	}
+	return normalizeNeoLocalThreadToolRun(context.Background(), a.runtime, pending, run, a.threadID)
 }
 
 func (a *neoActor) storeToolResultEventLocked(ref neoStoredToolUseRef, block map[string]any, completionStatus string) (neoMessage, map[string]any) {
@@ -15059,10 +15097,42 @@ func runToText(run any) string {
 		return neoImageToolText(stringValue(m["toolName"]), len(images))
 	}
 	if result, ok := m["result"]; ok {
+		if text := neoToolRunTextResult(result); text != "" {
+			return text
+		}
 		return fmt.Sprint(result)
 	}
 	raw, _ := json.Marshal(m)
 	return string(raw)
+}
+
+func neoToolRunTextResult(value any) string {
+	texts := make([]string, 0)
+	switch typed := value.(type) {
+	case []any:
+		for _, raw := range typed {
+			if text := neoTypedTextBlockText(mapValue(raw)); text != "" {
+				texts = append(texts, text)
+			}
+		}
+	case []map[string]any:
+		for _, raw := range typed {
+			if text := neoTypedTextBlockText(raw); text != "" {
+				texts = append(texts, text)
+			}
+		}
+	}
+	if len(texts) == 0 {
+		return ""
+	}
+	return strings.Join(texts, "\n")
+}
+
+func neoTypedTextBlockText(block map[string]any) string {
+	if stringValue(block["type"]) != "text" {
+		return ""
+	}
+	return stringValue(block["text"])
 }
 
 func toolResultMessageID(toolCallID string) string {
