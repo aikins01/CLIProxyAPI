@@ -6990,11 +6990,6 @@ func neoThreadRelationships(messages []neoMessage) []any {
 				}
 			}
 		}
-		if message.Role == "user" {
-			for _, threadID := range neoThreadIDPattern.FindAllString(textFromBlocks(message.Content), -1) {
-				threadIDs = append(threadIDs, threadID)
-			}
-		}
 		for _, threadID := range threadIDs {
 			if threadID == "" || threadID == message.ThreadID {
 				continue

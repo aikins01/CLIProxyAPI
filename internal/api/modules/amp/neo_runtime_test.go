@@ -893,11 +893,12 @@ func TestNeoThreadRelationshipsUseOfficialSchema(t *testing.T) {
 	validThreadID := "T-019e1046-656d-7132-879f-390ded941c16"
 	relationships := neoThreadRelationships([]neoMessage{{
 		ThreadID:  "T-current",
-		MessageID: "M-user",
-		Role:      "user",
+		MessageID: "M-assistant",
+		Role:      "assistant",
 		Content: []any{map[string]any{
-			"type": "text",
-			"text": "see T-not-a-cloud-thread and " + validThreadID,
+			"type":  "tool_use",
+			"name":  "read_thread",
+			"input": map[string]any{"threadID": validThreadID},
 		}},
 		CreatedAt: "2026-05-07T21:00:00Z",
 	}})
@@ -910,6 +911,23 @@ func TestNeoThreadRelationshipsUseOfficialSchema(t *testing.T) {
 	}
 	if numberFrom(relationship["createdAt"]) == 0 || numberFrom(relationship["messageIndex"]) != 0 {
 		t.Fatalf("relationship missing createdAt/messageIndex: %#v", relationship)
+	}
+}
+
+func TestNeoThreadRelationshipsIgnoreBareUserThreadID(t *testing.T) {
+	validThreadID := "T-019e1046-656d-7132-879f-390ded941c16"
+	relationships := neoThreadRelationships([]neoMessage{{
+		ThreadID:  "T-current",
+		MessageID: "M-user",
+		Role:      "user",
+		Content: []any{map[string]any{
+			"type": "text",
+			"text": "following: @" + validThreadID,
+		}},
+		CreatedAt: "2026-05-07T21:00:00Z",
+	}})
+	if len(relationships) != 0 {
+		t.Fatalf("relationships = %#v, want no relationship until read_thread is used", relationships)
 	}
 }
 

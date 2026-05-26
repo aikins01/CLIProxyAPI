@@ -4,7 +4,9 @@
     ArrowUp,
     CheckCircle2,
     ChevronRight,
+    CircleStop,
     Copy,
+    Download,
     FileCode2,
     Gauge,
     GitBranch,
@@ -17,10 +19,13 @@
     Moon,
     Info,
     PanelRight,
+    Play,
     Search,
     Send,
     Sparkles,
+    SquarePen,
     Sun,
+    Trash2,
     Wrench,
     Wifi,
     WifiOff,
@@ -93,6 +98,7 @@
     preview: string;
     messageCount: number;
     agentMode: string;
+    reasoningEffort?: string;
     updatedLabel: string;
     diffLabel?: string;
     archived?: boolean;
@@ -104,6 +110,7 @@
     repo: string;
     branch: string;
     agentMode: string;
+    reasoningEffort?: string;
     messages: NeoMessage[];
     contextLabel: string;
     contextUsage?: { used: number; total: number };
@@ -117,6 +124,7 @@
     id: string;
     messageId: string;
     preview: string;
+    content: ContentBlock[];
     steer: boolean;
   };
   type ToolApproval = {
@@ -154,6 +162,13 @@
     replaceURL?: boolean;
     skipURL?: boolean;
   };
+  type ConnectOptions = {
+    bootstrapExecutor?: boolean;
+    agentMode?: string;
+    reasoningEffort?: string;
+    environment?: Record<string, unknown>;
+    workingDirectory?: string;
+  };
   type ComposerAttachment = {
     id: string;
     file: File;
@@ -164,6 +179,7 @@
   };
 
   let theme = $state<Theme>('system');
+  let devMode = $state(false);
   let apiKey = $state('');
   let keyDraft = $state('');
   let isAuthenticated = $state(false);
@@ -175,11 +191,19 @@
   let detail = $state<ThreadDetail | null>(null);
   let loadingThreads = $state(false);
   let loadingThread = $state(false);
+  let newThreadStarting = $state(false);
   let connection = $state<'offline' | 'connecting' | 'connected'>('offline');
   let agentState = $state<AgentState>('idle');
   let composer = $state('');
   let composerAttachments = $state<ComposerAttachment[]>([]);
   let composerUploadActive = $state(false);
+  let composerTextarea = $state<HTMLTextAreaElement | undefined>();
+  let mentionPickerOpen = $state(false);
+  let mentionSearch = $state('');
+  let mentionStart = $state<number | null>(null);
+  let mentionEnd = $state<number | null>(null);
+  let mentionActiveIndex = $state(0);
+  let mentionSearchInput = $state<HTMLInputElement | undefined>();
   let attachmentInput = $state<HTMLInputElement | undefined>();
   let socket: WebSocket | null = null;
   let lastError = $state('');
@@ -195,6 +219,8 @@
   let artifacts = $state<RuntimeArtifact[]>([]);
   let relationships = $state<Relationship[]>([]);
   const railRelationships = $derived(relationships.filter(isVisibleRailRelationship));
+  const previousThreadHint = $derived(previousThreadForReference());
+  const mentionThreadOptions = $derived(threadMentionOptions());
   let executorConnected = $state(false);
   let executorInfo = $state<Record<string, unknown>>({});
   let executorStatuses = $state<ExecutorStatus[]>([]);
@@ -205,8 +231,33 @@
   let mainThreadId = $state('');
   let maxTokensLabel = $state('');
   let retryNotice = $state('');
+  let settingsMenuOpen = $state<'mode' | 'effort' | null>(null);
+  const devSignalCount = $derived.by(() => {
+    let count = artifacts.length + executorStatuses.length + toolLeases.length;
+    if (inferenceTools) count += 1;
+    if (retryNotice) count += 1;
+    return count;
+  });
   const maxComposerImages = 8;
   const maxComposerImageBytes = 45 * 1024 * 1024;
+  const agentModeOptions = ['smart', 'large', 'rush', 'deep', 'frontier', 'nostromo', 'agg-man'];
+  const agentModeLabels: Record<string, string> = {
+    smart: 'Smart',
+    large: 'Large',
+    rush: 'Rush',
+    deep: 'Deep',
+    frontier: 'Frontier',
+    nostromo: 'Nostromo',
+    'agg-man': 'Agg-man'
+  };
+  const reasoningEffortLabels: Record<string, string> = {
+    none: 'None',
+    low: 'Low',
+    medium: 'Medium',
+    high: 'High',
+    xhigh: 'XHigh',
+    max: 'Max'
+  };
 
   // Mobile inspector drawer
   let mobileInspectorOpen = $state(false);
@@ -222,6 +273,7 @@
 
   function handleEscape(event: KeyboardEvent) {
     if (event.key !== 'Escape') return;
+    if (settingsMenuOpen) { settingsMenuOpen = null; return; }
     if (mobileInspectorOpen) { mobileInspectorOpen = false; return; }
   }
 
@@ -265,6 +317,7 @@
     if (savedTheme === 'dark' || savedTheme === 'light' || savedTheme === 'system') {
       theme = savedTheme;
     }
+    devMode = localStorage.getItem('neo-remote-dev-mode') === '1';
     apiKey = localStorage.getItem('neo-remote-api-key') ?? '';
     keyDraft = apiKey;
     const urlThread = threadIdFromURL();
@@ -302,6 +355,12 @@
     if (typeof document !== 'undefined') {
       document.documentElement.dataset.theme = theme;
       localStorage.setItem('neo-remote-theme', theme);
+    }
+  });
+
+  $effect(() => {
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem('neo-remote-dev-mode', devMode ? '1' : '0');
     }
   });
 
@@ -491,6 +550,61 @@
     await openThread(threadId);
   }
 
+  async function startNewThread() {
+    if (!apiKey.trim() || newThreadStarting) return;
+
+    newThreadStarting = true;
+    lastError = '';
+    const threadId = newThreadID();
+    const sourceEnvironment = cloneRecord(environment);
+    const workingDirectory = runtimeWorkspacePath();
+    if (workingDirectory && !stringFrom(sourceEnvironment.workingDirectory) && !stringFrom(sourceEnvironment.cwd)) {
+      sourceEnvironment.workingDirectory = workingDirectory;
+    }
+    const repo = repoFromEnv(sourceEnvironment) || detail?.repo || selectedSummary?.repo || 'local';
+    const branch = branchFromEnv(sourceEnvironment) || detail?.branch || selectedSummary?.branch || 'main';
+    const agentMode = currentComposerMode();
+    const reasoningEffort = currentComposerReasoningEffort();
+    const summary: ThreadSummary = {
+      id: threadId,
+      title: 'Untitled',
+      repo,
+      branch,
+      preview: '',
+      messageCount: 0,
+      agentMode,
+      reasoningEffort,
+      updatedLabel: 'now'
+    };
+
+    try {
+      closeThreadMentionPicker();
+      clearComposerAttachments();
+      composer = '';
+      threads = [summary, ...threads.filter((thread) => thread.id !== threadId)];
+      selectedThreadId = threadId;
+      syncThreadURL(threadId, false);
+      resetRuntimeState();
+      environment = sourceEnvironment;
+      detail = threadDetailFromSummary(summary);
+      mobilePane = 'thread';
+      loadingThread = false;
+      disconnect();
+      connect(threadId, 0, {
+        bootstrapExecutor: true,
+        agentMode,
+        reasoningEffort,
+        environment: sourceEnvironment,
+        workingDirectory
+      });
+      queueMicrotask(() => composerTextarea?.focus());
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+    } finally {
+      newThreadStarting = false;
+    }
+  }
+
   async function openThread(threadId: string, options: OpenThreadOptions = {}) {
     selectedThreadId = threadId;
     if (!options.skipURL) {
@@ -515,7 +629,7 @@
     }
   }
 
-  function connect(threadId: string, version = 0) {
+  function connect(threadId: string, version = 0, options: ConnectOptions = {}) {
     if (!threadId || typeof WebSocket === 'undefined') return;
     disconnect();
     connection = 'connecting';
@@ -527,6 +641,24 @@
     socket.addEventListener('open', () => {
       connection = 'connected';
       sendFrame({ type: 'client_resume', version });
+      if (options.bootstrapExecutor) {
+        sendFrame({
+          type: 'client_update_thread_settings',
+          settings: {
+            agentMode: options.agentMode || 'smart',
+            'reasoning.effort': options.reasoningEffort || ''
+          }
+        });
+        sendFrame({
+          type: 'client_spawn_executor',
+          requestId: `spawn-${crypto.randomUUID()}`,
+          threadId,
+          agentMode: options.agentMode || 'smart',
+          reasoningEffort: options.reasoningEffort || undefined,
+          environment: options.environment ?? {},
+          workingDirectory: options.workingDirectory || undefined
+        });
+      }
     });
     socket.addEventListener('close', () => {
       connection = 'offline';
@@ -571,6 +703,181 @@
 
   function canSubmitComposer() {
     return composerHasDraft() && canSendMessage() && !composerUploadActive;
+  }
+
+  function shouldQueueOutgoingMessage() {
+    if (!canSendMessage()) return false;
+    if (agentState && agentState !== 'idle') return true;
+    if (toolLeases.length > 0 || toolApprovals.length > 0 || compactionActive || retryNotice) return true;
+    return Boolean(liveTranscriptVerb());
+  }
+
+  function canInterruptActor() {
+    if (!canSendMessage()) return false;
+    const normalizedState = agentState.trim().toLowerCase();
+    if (normalizedState && !['idle', 'error'].includes(normalizedState)) return true;
+    return toolLeases.length > 0 || toolApprovals.length > 0 || compactionActive || Boolean(retryNotice) || Boolean(liveTranscriptVerb());
+  }
+
+  function interruptActor() {
+    if (!canInterruptActor()) return;
+    retryNotice = '';
+    sendFrame({ type: 'client_cancel' });
+  }
+
+  function previousThreadForReference(): ThreadSummary | null {
+    const thread = detail;
+    if (!thread || !canSendMessage() || thread.messages.length > 0 || composer.trim().length > 0) return null;
+
+    const currentIndex = threads.findIndex((item) => item.id === thread.id);
+    const usable = (item: ThreadSummary) => item.id !== thread.id && !item.archived;
+    if (currentIndex >= 0) {
+      const nextOlder = threads.slice(currentIndex + 1).find(usable);
+      if (nextOlder) return nextOlder;
+    }
+    return threads.find(usable) ?? null;
+  }
+
+  function acceptPreviousThreadHint() {
+    const previous = previousThreadHint;
+    if (!previous) return;
+    composer = `following: @${previous.id} `;
+    queueMicrotask(() => composerTextarea?.focus());
+  }
+
+  function threadMentionOptions() {
+    const activeThreadId = detail?.id || selectedThreadId;
+    const search = mentionSearch.trim().toLowerCase();
+    const options = threads.filter((thread) => {
+      if (thread.id === activeThreadId || thread.archived) return false;
+      if (!search) return true;
+      const haystack = `${thread.title} ${thread.id} ${thread.repo} ${thread.branch} ${thread.preview}`.toLowerCase();
+      return haystack.includes(search);
+    });
+    return options.slice(0, 12);
+  }
+
+  function openThreadMentionPicker(start: number, end: number) {
+    mentionStart = start;
+    mentionEnd = end;
+    mentionSearch = '';
+    mentionActiveIndex = 0;
+    mentionPickerOpen = true;
+    if (threads.length === 0 && !loadingThreads) void refreshThreads(selectedThreadId);
+    queueMicrotask(() => mentionSearchInput?.focus());
+  }
+
+  function closeThreadMentionPicker() {
+    mentionPickerOpen = false;
+    mentionSearch = '';
+    mentionStart = null;
+    mentionEnd = null;
+    mentionActiveIndex = 0;
+  }
+
+  function mentionTriggerStillExists() {
+    if (mentionStart === null) return false;
+    return composer.slice(mentionStart, mentionStart + 2) === '@@';
+  }
+
+  function detectThreadMentionTrigger() {
+    if (mentionPickerOpen) {
+      if (!mentionTriggerStillExists()) closeThreadMentionPicker();
+      return;
+    }
+    const cursor = composerTextarea?.selectionStart ?? composer.length;
+    if (cursor < 2) return;
+    if (composer.slice(cursor - 2, cursor) === '@@') openThreadMentionPicker(cursor - 2, cursor);
+  }
+
+  function handleComposerKeydown(event: KeyboardEvent) {
+    if (mentionPickerOpen) {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        closeThreadMentionPicker();
+        queueMicrotask(() => composerTextarea?.focus());
+      }
+      return;
+    }
+
+    if (event.key === '@') {
+      const cursor = composerTextarea?.selectionStart ?? composer.length;
+      const selectionEnd = composerTextarea?.selectionEnd ?? cursor;
+      if (cursor === selectionEnd && cursor > 0 && composer[cursor - 1] === '@') {
+        event.preventDefault();
+        const start = cursor - 1;
+        composer = `${composer.slice(0, start)}@@${composer.slice(selectionEnd)}`;
+        openThreadMentionPicker(start, start + 2);
+      }
+      return;
+    }
+
+    if (event.key === 'Enter' && !event.shiftKey) {
+      event.preventDefault();
+      if (previousThreadHint && composer.trim().length === 0) {
+        acceptPreviousThreadHint();
+        return;
+      }
+      void sendMessage();
+    }
+  }
+
+  function handleMentionPickerKeydown(event: KeyboardEvent) {
+    const count = mentionThreadOptions.length;
+    if ((event.key === 'Backspace' || event.key === 'Delete') && mentionSearch.length === 0 && mentionTriggerStillExists()) {
+      event.preventDefault();
+      const start = mentionStart ?? 0;
+      const end = mentionEnd ?? start + 2;
+      composer = `${composer.slice(0, start)}${composer.slice(end)}`;
+      closeThreadMentionPicker();
+      queueMicrotask(() => {
+        composerTextarea?.focus();
+        composerTextarea?.setSelectionRange(start, start);
+      });
+      return;
+    }
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      closeThreadMentionPicker();
+      queueMicrotask(() => composerTextarea?.focus());
+      return;
+    }
+    if (event.key === 'ArrowDown') {
+      event.preventDefault();
+      if (count > 0) mentionActiveIndex = (mentionActiveIndex + 1) % count;
+      return;
+    }
+    if (event.key === 'ArrowUp') {
+      event.preventDefault();
+      if (count > 0) mentionActiveIndex = (mentionActiveIndex - 1 + count) % count;
+      return;
+    }
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      const thread = mentionThreadOptions[Math.min(mentionActiveIndex, Math.max(count - 1, 0))];
+      if (thread) insertThreadMention(thread);
+    }
+  }
+
+  function insertThreadMention(thread: ThreadSummary) {
+    const cursor = composerTextarea?.selectionStart ?? composer.length;
+    const start = mentionStart ?? composer.slice(0, cursor).lastIndexOf('@@');
+    if (start < 0) {
+      composer = `${composer}@${thread.id} `;
+      closeThreadMentionPicker();
+      queueMicrotask(() => composerTextarea?.focus());
+      return;
+    }
+    const end = mentionEnd ?? cursor;
+    const suffix = composer.slice(end);
+    const mention = `@${thread.id}${suffix.length === 0 || !/^\s/.test(suffix) ? ' ' : ''}`;
+    composer = `${composer.slice(0, start)}${mention}${suffix}`;
+    const nextCursor = start + mention.length;
+    closeThreadMentionPicker();
+    queueMicrotask(() => {
+      composerTextarea?.focus();
+      composerTextarea?.setSelectionRange(nextCursor, nextCursor);
+    });
   }
 
   function mediaTypeForImage(file: File) {
@@ -720,26 +1027,59 @@
       return;
     }
     const messageId = `M-local-${crypto.randomUUID()}`;
+    const queueID = `queued-${crypto.randomUUID()}`;
     const content: ContentBlock[] = [
       ...(text ? [{ type: 'text', text }] : []),
       ...imageBlocks
     ];
+    const agentMode = currentComposerMode();
+    const reasoningEffort = currentComposerReasoningEffort();
+    const shouldQueue = shouldQueueOutgoingMessage();
     const message: NeoMessage = {
       threadId: thread.id,
       messageId,
       role: 'user',
-      content
+      content,
+      agentMode,
+      reasoningEffort
     };
-    detail = { ...thread, messages: [...thread.messages, message] };
+    if (shouldQueue) {
+      const queued = queuedMessageFromAny({
+        id: queueID,
+        queuedMessage: {
+          messageId,
+          content,
+          agentMode,
+          reasoningEffort
+        }
+      });
+      queuedMessages = [...queuedMessages.filter((item) => item.id !== queued.id), queued];
+      queuedCount = queuedMessages.length;
+    } else {
+      detail = { ...thread, messages: [...thread.messages, message] };
+    }
     composer = '';
     clearComposerAttachments();
     composerUploadActive = false;
-    sendFrame({
-      type: 'client_append_user_msg',
-      messageId,
-      agentMode: thread.agentMode || 'smart',
-      content
-    });
+    if (shouldQueue) {
+      sendFrame({
+        type: 'user:message-queue:enqueue',
+        id: queueID,
+        message: {
+          content,
+          agentMode,
+          reasoningEffort
+        }
+      });
+    } else {
+      sendFrame({
+        type: 'client_append_user_msg',
+        messageId,
+        agentMode,
+        reasoningEffort,
+        content
+      });
+    }
   }
 
   function applyIncoming(message: Incoming) {
@@ -766,7 +1106,11 @@
       runtimeSettings = asRecord(message.settings);
       if (detail) {
         const nextMode = stringFrom(runtimeSettings.agentMode) || detail.agentMode;
-        detail = { ...detail, agentMode: nextMode };
+        const nextEffort = normalizeReasoningEffortForMode(
+          nextMode,
+          stringFrom(runtimeSettings['reasoning.effort'] ?? runtimeSettings.reasoningEffort) || detail.reasoningEffort || ''
+        );
+        applyLocalThreadSettings(nextMode, nextEffort);
       }
       return;
     }
@@ -1001,12 +1345,104 @@
     const source = Object.keys(queued).length ? queued : item;
     const messageId = stringFrom(source.messageId ?? item.messageId);
     const id = stringFrom(item.id ?? item.queuedMessageId ?? messageId);
+    const content = Array.isArray(source.content) ? source.content.map((part) => asRecord(part) as ContentBlock) : [];
     return {
       id,
       messageId,
-      preview: contentPreview(source.content),
+      content,
+      preview: contentPreview(content.length > 0 ? content : source.content),
       steer: Boolean(item.steer ?? source.steer)
     };
+  }
+
+  function queuedMessageKey(queued: QueuedMessage) {
+    return queued.id || queued.messageId;
+  }
+
+  function queuedMessageComposerText(queued: QueuedMessage) {
+    const text = queued.content
+      .map((block) => block.type === 'text' ? block.text ?? '' : '')
+      .filter(Boolean)
+      .join('');
+    return (text || queued.preview).trim();
+  }
+
+  function composerAttachmentFromImageBlock(block: ContentBlock): ComposerAttachment | null {
+    const source = imageBlockSrc(block);
+    const match = source.match(/^data:([^;,]+);base64,(.+)$/);
+    if (!match || typeof atob === 'undefined') return null;
+    try {
+      const bytes = Uint8Array.from(atob(match[2]), (char) => char.charCodeAt(0));
+      const mediaType = match[1] || 'image/png';
+      const name = imageBlockName(block);
+      const file = new File([bytes], name, { type: mediaType });
+      return {
+        id: crypto.randomUUID(),
+        file,
+        previewUrl: URL.createObjectURL(file),
+        name,
+        mediaType,
+        size: file.size
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  function queuedMessageComposerAttachments() {
+    const attachments: ComposerAttachment[] = [];
+    for (const queued of queuedMessages) {
+      for (const block of queued.content) {
+        if (!isImageBlock(block) || attachments.length >= maxComposerImages) continue;
+        const attachment = composerAttachmentFromImageBlock(block);
+        if (attachment) attachments.push(attachment);
+      }
+    }
+    return attachments;
+  }
+
+  function removeQueuedMessage(queued: QueuedMessage) {
+    const key = queuedMessageKey(queued);
+    if (!key) return;
+    sendFrame({ type: 'client_remove_queued_msg', queuedMessageId: key });
+    queuedMessages = queuedMessages.filter((item) => item.id !== key && item.messageId !== key);
+    queuedCount = queuedMessages.length;
+  }
+
+  function discardQueuedMessages() {
+    if (queuedMessages.length === 0) return;
+    sendFrame({ type: 'user:message-queue:discard' });
+    queuedMessages = [];
+    queuedCount = 0;
+  }
+
+  function dequeueQueuedMessagesToComposer() {
+    if (queuedMessages.length === 0) return;
+    const text = queuedMessages.map(queuedMessageComposerText).filter(Boolean).join('\n\n');
+    const attachments = queuedMessageComposerAttachments();
+    if (text) {
+      composer = composer.trim() ? `${composer.trimEnd()}\n\n${text}` : text;
+    }
+    if (attachments.length > 0) {
+      const slots = Math.max(0, maxComposerImages - composerAttachments.length);
+      composerAttachments = [...composerAttachments, ...attachments.slice(0, slots)];
+      for (const extra of attachments.slice(slots)) {
+        URL.revokeObjectURL(extra.previewUrl);
+      }
+    }
+    for (const queued of queuedMessages) {
+      sendFrame({ type: 'client_remove_queued_msg', queuedMessageId: queuedMessageKey(queued) });
+    }
+    queuedMessages = [];
+    queuedCount = 0;
+    queueMicrotask(() => composerTextarea?.focus());
+  }
+
+  function steerNextQueuedMessage() {
+    const queued = queuedMessages.find((item) => !item.steer) || queuedMessages[0];
+    if (!queued) return;
+    sendFrame({ type: 'client_steer_queued_msg', queuedMessageId: queuedMessageKey(queued) });
+    queuedMessages = queuedMessages.map((item) => item === queued ? { ...item, steer: true } : item);
   }
 
   function approvalFromAny(raw: unknown): ToolApproval {
@@ -1135,43 +1571,247 @@
     const initial = asRecord(environment.initial);
     const trees = Array.isArray(initial.trees) ? initial.trees : Array.isArray(environment.trees) ? environment.trees : [];
     const first = asRecord(trees[0]);
-    return (
+    const candidates = [
       stringFrom(environment.workingDirectory) ||
-      stringFrom(environment.working_directory) ||
-      stringFrom(environment.workspaceRoot) ||
-      stringFrom(environment.cwd) ||
+        stringFrom(environment.working_directory) ||
+        stringFrom(environment.workspaceRoot) ||
+        stringFrom(environment.cwd),
       filePathFromURI(stringFrom(first.uri)) ||
       stringFrom(first.path) ||
       stringFrom(first.root)
-    );
+    ];
+    return candidates.map(filePathFromURI).find(Boolean) || '';
   }
 
   function filePathFromURI(value: string) {
     if (!value) return '';
     if (!value.startsWith('file://')) return value;
     try {
-      return decodeURIComponent(value.replace(/^file:\/\//, ''));
+      const url = new URL(value);
+      if (url.protocol === 'file:') return decodeURIComponent(url.pathname);
     } catch {
-      return value.replace(/^file:\/\//, '');
+      try {
+        return decodeURIComponent(value.replace(/^file:\/\/(?:localhost)?/, ''));
+      } catch {
+        return value.replace(/^file:\/\/(?:localhost)?/, '');
+      }
     }
+    return value.replace(/^file:\/\//, '');
+  }
+
+  function toHomeRelativePath(path: string) {
+    const normalized = path.replace(/\\/g, '/');
+    const match = normalized.match(/^\/(?:Users|home)\/[^/]+(\/.*)?$/);
+    if (!match) return normalized;
+    return `~${match[1] || ''}`;
+  }
+
+  function shortenWorkspacePath(path: string) {
+    if (!path.includes('/')) return path;
+    const rooted = path.startsWith('/') ? '/' : '';
+    const parts = path.split('/').filter(Boolean);
+    if (parts.length <= 5) return path;
+    return `${rooted}${parts.slice(0, 2).join('/')}/…/${parts.slice(-2).join('/')}`;
+  }
+
+  function composerDirectoryLabel() {
+    const path = runtimeWorkspacePath();
+    const repo = repoFromEnv(environment) || detail?.repo || '';
+    const branch = branchFromEnv(environment) || detail?.branch || '';
+    const base = path ? shortenWorkspacePath(toHomeRelativePath(path)) : repo;
+    if (!base && !branch) return '';
+    if (branch) return `${base || 'workspace'} (${branch})`;
+    return base;
+  }
+
+  function composerToolStatusDetail() {
+    if (toolLeases.length > 0) {
+      return toolLeases.map((lease) => lease.toolName).filter(Boolean).slice(0, 3).join(', ');
+    }
+    if (inferenceTools?.tools.length) return inferenceTools.tools.slice(0, 3).join(', ');
+    return '';
+  }
+
+  function binaryVerbForAgentState(state: string) {
+    const normalized = state.trim().toLowerCase();
+    const labels: Record<string, string> = {
+      auto_compacting: 'Auto-compacting',
+      compacting: 'Auto-compacting',
+      sending: 'Sending',
+      waiting_for_executor: 'Starting',
+      starting: 'Starting',
+      working: 'Waiting',
+      thinking: 'Thinking',
+      streaming: 'Streaming',
+      running_tools: 'Running tools',
+      tool_running: 'Running tools',
+      awaiting_approval: 'Waiting for approval',
+      error: 'Error'
+    };
+    return labels[normalized] || '';
+  }
+
+  function liveTranscriptVerb() {
+    if (!detail) return '';
+    const messages = detail.messages;
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (message.role !== 'assistant') continue;
+      const state = message.state?.type ?? '';
+      if (!['generating', 'streaming', 'start'].includes(state)) {
+        const verb = binaryVerbForAgentState(state);
+        if (verb) return verb;
+      }
+      if (message.state?.stopReason === 'tool_use') return 'Running tools';
+
+      const runningTool = message.content.some((block) => {
+        if (block.type !== 'tool_use') return false;
+        return block.blockState !== 'complete' && block.blockState !== 'done';
+      });
+      if (runningTool) return 'Running tools';
+
+      const streamingBlock = message.content.find((block) => block.blockState === 'streaming');
+      if (streamingBlock?.type === 'thinking' || streamingBlock?.thinking) return 'Thinking';
+      if (['generating', 'streaming', 'start'].includes(state)) return 'Streaming';
+      break;
+    }
+    return '';
   }
 
   function composerStatusMain() {
-    if (connection === 'connected' && executorConnected) return agentState === 'idle' ? 'Ready' : agentState;
-    if (connection === 'connected') return 'No local executor';
+    if (activeError) return 'Error';
+    if (toolApprovals.length > 0) return 'Waiting for approval';
+    if (compactionActive) return 'Auto-compacting';
+    if (toolLeases.length > 0) return toolLeases.length > 1 ? `Running ${toolLeases.length} tools` : 'Running tools';
+    if (retryNotice) return 'Retrying';
+    const executorVerb = binaryVerbForAgentState(executorStatuses[0]?.status ?? '');
+    if (executorVerb) return executorVerb;
+    const verb = binaryVerbForAgentState(agentState);
+    if (verb) return verb;
+    const transcriptVerb = liveTranscriptVerb();
+    if (transcriptVerb) return transcriptVerb;
+    if (connection === 'connected' && executorConnected) return 'Ready';
+    if (connection === 'connected') return 'Observer';
     if (connection === 'connecting') return 'Connecting…';
     return 'Offline';
   }
 
   function composerStatusParts() {
-    return [
-      runtimeWorkspacePath() || repoFromEnv(environment) || detail?.repo,
-      branchFromEnv(environment) || detail?.branch
-    ].filter(Boolean);
+    return [composerToolStatusDetail(), composerDirectoryLabel()].filter(Boolean);
   }
 
   function canSendMessage() {
     return connection === 'connected' && executorConnected;
+  }
+
+  function normalizeAgentMode(mode: string) {
+    const normalized = mode.trim().toLowerCase();
+    return agentModeOptions.includes(normalized) ? normalized : 'smart';
+  }
+
+  function reasoningEffortOptionsForMode(mode: string) {
+    switch (normalizeAgentMode(mode)) {
+      case 'smart':
+        return ['high', 'xhigh', 'max'];
+      case 'rush':
+        return ['none'];
+      case 'deep':
+        return ['low', 'medium', 'xhigh'];
+      default:
+        return [];
+    }
+  }
+
+  function defaultReasoningEffortForMode(mode: string) {
+    switch (normalizeAgentMode(mode)) {
+      case 'smart':
+        return 'high';
+      case 'rush':
+        return 'none';
+      case 'deep':
+        return 'xhigh';
+      default:
+        return '';
+    }
+  }
+
+  function normalizeReasoningEffortForMode(mode: string, effort: string) {
+    const normalized = effort.trim().toLowerCase();
+    const options = reasoningEffortOptionsForMode(mode);
+    if (options.includes(normalized)) return normalized;
+    return defaultReasoningEffortForMode(mode);
+  }
+
+  function threadReasoningEffortFrom(raw: Record<string, unknown>, mode: string, messages: NeoMessage[] = []) {
+    const settings = asRecord(raw.settings);
+    const direct = stringFrom(raw.reasoningEffort ?? raw.reasoning_effort ?? settings['reasoning.effort'] ?? settings.reasoningEffort);
+    if (direct) return normalizeReasoningEffortForMode(mode, direct);
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (message.role === 'user' && message.reasoningEffort) {
+        return normalizeReasoningEffortForMode(mode, message.reasoningEffort);
+      }
+    }
+    return defaultReasoningEffortForMode(mode);
+  }
+
+  function currentComposerMode() {
+    return normalizeAgentMode(detail?.agentMode || selectedSummary?.agentMode || 'smart');
+  }
+
+  function currentComposerReasoningEffort() {
+    return normalizeReasoningEffortForMode(
+      currentComposerMode(),
+      detail?.reasoningEffort || selectedSummary?.reasoningEffort || stringFrom(runtimeSettings['reasoning.effort'])
+    );
+  }
+
+  function canEditThreadSettings() {
+    return Boolean(detail && detail.messages.length === 0 && !loadingThread);
+  }
+
+  function applyLocalThreadSettings(mode: string, effort: string) {
+    const agentMode = normalizeAgentMode(mode);
+    const reasoningEffort = normalizeReasoningEffortForMode(agentMode, effort);
+    const threadId = detail?.id || selectedThreadId;
+    if (detail) {
+      detail = { ...detail, agentMode, reasoningEffort };
+    }
+    if (threadId) {
+      threads = threads.map((thread) => thread.id === threadId ? { ...thread, agentMode, reasoningEffort } : thread);
+    }
+    const nextSettings: Record<string, unknown> = { ...runtimeSettings, agentMode };
+    if (reasoningEffort) {
+      nextSettings['reasoning.effort'] = reasoningEffort;
+    } else {
+      delete nextSettings['reasoning.effort'];
+    }
+    runtimeSettings = nextSettings;
+  }
+
+  function updateThreadSettings(mode: string, effort: string) {
+    if (!canEditThreadSettings()) return;
+    const agentMode = normalizeAgentMode(mode);
+    const reasoningEffort = normalizeReasoningEffortForMode(agentMode, effort);
+    applyLocalThreadSettings(agentMode, reasoningEffort);
+    sendFrame({ type: 'agent-mode', value: agentMode });
+    if (reasoningEffort) {
+      sendFrame({ type: 'reasoning-effort', value: reasoningEffort });
+    }
+  }
+
+  function toggleSettingsMenu(menu: 'mode' | 'effort') {
+    settingsMenuOpen = settingsMenuOpen === menu ? null : menu;
+  }
+
+  function chooseAgentMode(mode: string) {
+    updateThreadSettings(mode, defaultReasoningEffortForMode(mode));
+    settingsMenuOpen = null;
+  }
+
+  function chooseReasoningEffort(effort: string) {
+    updateThreadSettings(currentComposerMode(), effort);
+    settingsMenuOpen = null;
   }
 
   function threadRuntimeLabel(threadId: string) {
@@ -1199,6 +1839,7 @@
     const preview = previewFromMessage(lastMessage) || stringFrom(data.preview) || stringFrom(data.title);
     const env = asRecord(data.env);
     const repo = stringFrom(data.repository) || repoFromEnv(env) || 'local';
+    const agentMode = normalizeAgentMode(stringFrom(data.agentMode) || 'smart');
     return {
       id,
       title: stringFrom(data.title) || 'Untitled',
@@ -1206,7 +1847,8 @@
       branch: stringFrom(data.branch) || branchFromEnv(env) || 'main',
       preview,
       messageCount: Number(data.messageCount ?? messages.length ?? 0),
-      agentMode: stringFrom(data.agentMode) || 'smart',
+      agentMode,
+      reasoningEffort: threadReasoningEffortFrom(data, agentMode),
       updatedLabel: relativeLabel(Number(data.updatedAt ?? data.createdAt ?? Date.now())),
       diffLabel: diffLabelFrom(data),
       archived: Boolean(data.archived)
@@ -1218,12 +1860,14 @@
       ? thread.messages.map(normalizeMessage).filter(Boolean) as NeoMessage[]
       : [];
     const env = asRecord(thread.env);
+    const agentMode = normalizeAgentMode(stringFrom(thread.agentMode) || 'smart');
     return {
       id: stringFrom(thread.id) || selectedThreadId,
       title: stringFrom(thread.title) || 'Untitled',
       repo: repoFromEnv(env) || 'local',
       branch: branchFromEnv(env) || 'main',
-      agentMode: stringFrom(thread.agentMode) || 'smart',
+      agentMode,
+      reasoningEffort: threadReasoningEffortFrom(thread, agentMode, messages),
       messages,
       contextLabel: 'local context',
       contextUsage: contextUsageFrom(thread) ?? contextUsageFromMessages(messages),
@@ -1378,6 +2022,7 @@
       repo: summary.repo,
       branch: summary.branch,
       agentMode: summary.agentMode,
+      reasoningEffort: summary.reasoningEffort,
       messages: [],
       contextLabel: 'local context'
     };
@@ -1671,6 +2316,18 @@
 
   function asRecord(value: unknown): Record<string, unknown> {
     return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
+  }
+
+  function cloneRecord(value: Record<string, unknown>) {
+    try {
+      return structuredClone(value);
+    } catch {
+      return { ...value };
+    }
+  }
+
+  function newThreadID() {
+    return `T-${crypto.randomUUID()}`;
   }
 
   function stringFrom(value: unknown) {
@@ -2581,7 +3238,7 @@
 {#snippet threadInspector()}
   <div class="inspector-card">
     <div class="inspector-fields">
-      <div class="inspector-field"><Sparkles size={13} /> <span>{detail?.agentMode ?? selectedSummary?.agentMode ?? 'smart'}</span></div>
+      <div class="inspector-field"><Sparkles size={13} /> <span>{currentComposerMode()}{currentComposerReasoningEffort() ? ` · ${currentComposerReasoningEffort()}` : ''}</span></div>
       {#if inspectorContextUsage}
         <div class="inspector-field inspector-field--usage">
           <Gauge size={13} />
@@ -2636,6 +3293,25 @@
         </button>
       </div>
     </div>
+
+    <div class="inspector-section inspector-section--dev">
+      <button
+        class:dev-toggle--active={devMode}
+        class="dev-toggle"
+        type="button"
+        role="switch"
+        aria-checked={devMode}
+        title="Toggle dev diagnostics"
+        onclick={() => { devMode = !devMode; }}
+      >
+        <Wrench size={13} />
+        <span class="dev-toggle__label">Dev diagnostics</span>
+        {#if devSignalCount > 0}
+          <span class="dev-toggle__count">{devSignalCount}</span>
+        {/if}
+        <span class="dev-toggle__track" aria-hidden="true"><span class="dev-toggle__thumb"></span></span>
+      </button>
+    </div>
   </div>
 
   {#if activeError}
@@ -2672,7 +3348,7 @@
     <section class="runtime-section">
       <h2>Queued messages</h2>
       <div class="runtime-list">
-        {#each queuedMessages as queued (queued.id)}
+        {#each queuedMessages as queued (queuedMessageKey(queued))}
           <p class="runtime-pill">
             <span>{queued.steer ? 'steer' : 'queued'}</span>
             {queued.preview || queued.messageId}
@@ -2682,7 +3358,7 @@
     </section>
   {/if}
 
-  {#if inferenceTools || toolLeases.length > 0 || executorStatuses.length > 0 || retryNotice}
+  {#if devMode && (inferenceTools || toolLeases.length > 0 || executorStatuses.length > 0 || retryNotice)}
     <section class="runtime-section">
       <h2>Runtime activity</h2>
       <div class="runtime-list">
@@ -2711,7 +3387,7 @@
     </section>
   {/if}
 
-  {#if artifacts.length > 0}
+  {#if devMode && artifacts.length > 0}
     <section class="runtime-section">
       <h2>Artifacts</h2>
       <div class="runtime-list">
@@ -2834,6 +3510,20 @@
           <Info size={15} />
         </button>
       {/if}
+      <button
+        class="icon-button"
+        type="button"
+        title="New thread"
+        aria-label="New thread"
+        disabled={newThreadStarting}
+        onclick={() => { void startNewThread(); }}
+      >
+        {#if newThreadStarting}
+          <Loader2 size={15} class="spin" />
+        {:else}
+          <SquarePen size={15} />
+        {/if}
+      </button>
       <button class="icon-button" type="button" title="Refresh threads" onclick={() => { void refreshThreads(); }}>
         {#if loadingThreads}
           <Loader2 size={15} class="spin" />
@@ -3026,7 +3716,12 @@
           {/each}
         </div>
 
-        <div class:composer-dock--attachments={composerAttachments.length > 0} class="composer-dock" aria-hidden="true"></div>
+        <div
+          class:composer-dock--attachments={composerAttachments.length > 0}
+          class:composer-dock--queue={queuedMessages.length > 0}
+          class="composer-dock"
+          aria-hidden="true"
+        ></div>
         <footer class="composer-footer">
           <form class="composer" onsubmit={(event) => { event.preventDefault(); void sendMessage(); }}>
           <div
@@ -3041,6 +3736,60 @@
               <span class="composer-status__part">{part}</span>
             {/each}
           </div>
+          {#if queuedMessages.length > 0}
+            <div class="queue-strip" aria-label="Queued messages">
+              <div class="queue-strip__head">
+                <span class="queue-strip__title">{queuedMessages.length} queued</span>
+                <div class="queue-strip__actions">
+                  <button
+                    class="queue-strip__button"
+                    type="button"
+                    title="Dequeue prompts into the composer"
+                    aria-label="Dequeue prompts into the composer"
+                    onclick={dequeueQueuedMessagesToComposer}
+                  >
+                    <Download size={13} />
+                  </button>
+                  <button
+                    class="queue-strip__button"
+                    type="button"
+                    title="Steer with the next queued prompt"
+                    aria-label="Steer with the next queued prompt"
+                    disabled={!canSendMessage()}
+                    onclick={steerNextQueuedMessage}
+                  >
+                    <Play size={13} />
+                  </button>
+                  <button
+                    class="queue-strip__button"
+                    type="button"
+                    title="Discard queued prompts"
+                    aria-label="Discard queued prompts"
+                    onclick={discardQueuedMessages}
+                  >
+                    <Trash2 size={13} />
+                  </button>
+                </div>
+              </div>
+              <div class="queue-strip__list">
+                {#each queuedMessages as queued (queuedMessageKey(queued))}
+                  <div class:queue-strip__item--steer={queued.steer} class="queue-strip__item">
+                    <span class="queue-strip__kind">{queued.steer ? 'steer' : 'queued'}</span>
+                    <span class="queue-strip__preview">{queued.preview || queued.messageId}</span>
+                    <button
+                      class="queue-strip__remove"
+                      type="button"
+                      title="Remove queued prompt"
+                      aria-label="Remove queued prompt"
+                      onclick={() => removeQueuedMessage(queued)}
+                    >
+                      <X size={12} />
+                    </button>
+                  </div>
+                {/each}
+              </div>
+            </div>
+          {/if}
           <div
             class="composer-body"
             role="group"
@@ -3052,16 +3801,13 @@
             ondrop={handleComposerDrop}
           >
             <textarea
+              bind:this={composerTextarea}
               bind:value={composer}
               rows="2"
-              placeholder={canSendMessage() ? 'Send a message to this thread...' : connection === 'connected' ? 'Open this thread locally to send...' : 'Connect to send a message...'}
+              placeholder={canSendMessage() ? shouldQueueOutgoingMessage() ? 'Queue a message for this thread...' : 'Send a message to this thread...' : connection === 'connected' ? 'Open this thread locally to send...' : 'Connect to send a message...'}
               onpaste={handleComposerPaste}
-              onkeydown={(event) => {
-                if (event.key === 'Enter' && !event.shiftKey) {
-                  event.preventDefault();
-                  void sendMessage();
-                }
-              }}
+              oninput={detectThreadMentionTrigger}
+              onkeydown={handleComposerKeydown}
             ></textarea>
             {#if composerAttachments.length > 0}
               <div class="composer-attachments" aria-label="Attached images">
@@ -3104,16 +3850,156 @@
                 >
                   <ImagePlus size={14} />
                 </button>
-              </div>
-              <button class="send-button" type="submit" disabled={!canSubmitComposer()} aria-label="Send message">
-                {#if composerUploadActive}
-                  <Loader2 size={14} class="spin" />
-                {:else}
-                  <ArrowUp size={14} />
+                {#if shouldQueueOutgoingMessage()}
+                  <span class="composer-queue-mode">queue</span>
                 {/if}
-              </button>
+                {#if canEditThreadSettings()}
+                  <div class="composer-settings" aria-label="New thread settings">
+                    <div class="composer-menu">
+                      <button
+                        class:composer-menu__trigger--active={settingsMenuOpen === 'mode'}
+                        class="composer-menu__trigger"
+                        type="button"
+                        aria-haspopup="menu"
+                        aria-expanded={settingsMenuOpen === 'mode'}
+                        title="Agent mode"
+                        onclick={() => toggleSettingsMenu('mode')}
+                      >
+                        <span class="composer-menu__eyebrow">mode</span>
+                        <span>{agentModeLabels[currentComposerMode()] ?? currentComposerMode()}</span>
+                        <ChevronRight size={12} class="composer-menu__chevron" />
+                      </button>
+                      {#if settingsMenuOpen === 'mode'}
+                        <div class="composer-menu__panel" role="menu" aria-label="Agent mode">
+                          {#each agentModeOptions as mode}
+                            <button
+                              class:composer-menu__item--active={currentComposerMode() === mode}
+                              class="composer-menu__item"
+                              type="button"
+                              role="menuitemradio"
+                              aria-checked={currentComposerMode() === mode}
+                              onclick={() => chooseAgentMode(mode)}
+                            >
+                              <span>{agentModeLabels[mode] ?? mode}</span>
+                            </button>
+                          {/each}
+                        </div>
+                      {/if}
+                    </div>
+                    {#if reasoningEffortOptionsForMode(currentComposerMode()).length > 0}
+                      <div class="composer-menu composer-menu--effort">
+                        <button
+                          class:composer-menu__trigger--active={settingsMenuOpen === 'effort'}
+                          class="composer-menu__trigger"
+                          type="button"
+                          aria-haspopup="menu"
+                          aria-expanded={settingsMenuOpen === 'effort'}
+                          title="Reasoning effort"
+                          onclick={() => toggleSettingsMenu('effort')}
+                        >
+                          <span class="composer-menu__eyebrow">effort</span>
+                          <span>{reasoningEffortLabels[currentComposerReasoningEffort()] ?? currentComposerReasoningEffort()}</span>
+                          <ChevronRight size={12} class="composer-menu__chevron" />
+                        </button>
+                        {#if settingsMenuOpen === 'effort'}
+                          <div class="composer-menu__panel" role="menu" aria-label="Reasoning effort">
+                            {#each reasoningEffortOptionsForMode(currentComposerMode()) as effort}
+                              <button
+                                class:composer-menu__item--active={currentComposerReasoningEffort() === effort}
+                                class="composer-menu__item"
+                                type="button"
+                                role="menuitemradio"
+                                aria-checked={currentComposerReasoningEffort() === effort}
+                                onclick={() => chooseReasoningEffort(effort)}
+                              >
+                                <span>{reasoningEffortLabels[effort] ?? effort}</span>
+                              </button>
+                            {/each}
+                          </div>
+                        {/if}
+                      </div>
+                    {/if}
+                  </div>
+                {/if}
+                {#if previousThreadHint}
+                  <button
+                    class="previous-thread-hint"
+                    type="button"
+                    title={`Reference ${previousThreadHint.title || previousThreadHint.id}`}
+                    onclick={acceptPreviousThreadHint}
+                  >
+                    <span>press</span>
+                    <kbd>enter</kbd>
+                    <span>to reference the previous thread</span>
+                  </button>
+                {/if}
+              </div>
+              <div class="composer-actions__right">
+                {#if canInterruptActor()}
+                  <button
+                    class="interrupt-button"
+                    type="button"
+                    title="Interrupt actor"
+                    aria-label="Interrupt actor"
+                    onclick={interruptActor}
+                  >
+                    <CircleStop size={15} />
+                  </button>
+                {/if}
+                <button
+                  class:send-button--queue={shouldQueueOutgoingMessage()}
+                  class="send-button"
+                  type="submit"
+                  disabled={!canSubmitComposer()}
+                  title={shouldQueueOutgoingMessage() ? 'Queue message' : 'Send message'}
+                  aria-label={shouldQueueOutgoingMessage() ? 'Queue message' : 'Send message'}
+                >
+                  {#if composerUploadActive}
+                    <Loader2 size={14} class="spin" />
+                  {:else}
+                    <ArrowUp size={14} />
+                  {/if}
+                </button>
+              </div>
             </div>
           </div>
+          {#if mentionPickerOpen}
+            <div class="mention-picker" role="dialog" aria-label="Select a thread to mention">
+              <div class="mention-picker__search">
+                <Search size={14} />
+                <input
+                  bind:this={mentionSearchInput}
+                  bind:value={mentionSearch}
+                  placeholder="Search threads..."
+                  oninput={() => { mentionActiveIndex = 0; }}
+                  onkeydown={handleMentionPickerKeydown}
+                />
+              </div>
+              <div class="mention-picker__list" role="listbox" aria-label="Threads">
+                {#if mentionThreadOptions.length > 0}
+                  {#each mentionThreadOptions as thread, index (thread.id)}
+                    <button
+                      class:mention-picker__item--active={index === mentionActiveIndex}
+                      class="mention-picker__item"
+                      type="button"
+                      role="option"
+                      aria-selected={index === mentionActiveIndex}
+                      onmouseenter={() => { mentionActiveIndex = index; }}
+                      onclick={() => insertThreadMention(thread)}
+                    >
+                      <span class="mention-picker__title">{thread.title}</span>
+                      <span class="mention-picker__meta">{thread.repo}:{thread.branch} · {thread.updatedLabel}</span>
+                      <span class="mention-picker__id">@{thread.id}</span>
+                    </button>
+                  {/each}
+                {:else}
+                  <div class="mention-picker__empty">
+                    {loadingThreads ? 'Loading threads...' : 'No matching threads'}
+                  </div>
+                {/if}
+              </div>
+            </div>
+          {/if}
           </form>
         </footer>
       {:else}
@@ -3437,6 +4323,7 @@
     transition: background-color 150ms cubic-bezier(0.4, 0, 0.2, 1), color 150ms cubic-bezier(0.4, 0, 0.2, 1);
   }
   .icon-button:hover { background: var(--neo-card-hover); color: var(--neo-ink); }
+  .icon-button:disabled { cursor: not-allowed; opacity: 0.45; }
   /* Mobile-only icon button: hidden at lg+ where the right sidebar is visible */
   .icon-button--mobile-only { display: none; }
   @media (max-width: 1023.98px) {
@@ -4401,14 +5288,19 @@
     flex-shrink: 0;
   }
   .composer-dock--attachments { height: 252px; }
+  .composer-dock--queue { height: 286px; }
+  .composer-dock--attachments.composer-dock--queue { height: 350px; }
   @media (max-width: 640px) {
     .composer-footer { padding: 6px; }
     .composer-dock { height: 172px; }
     .composer-dock--attachments { height: 242px; }
+    .composer-dock--queue { height: 278px; }
+    .composer-dock--attachments.composer-dock--queue { height: 346px; }
   }
 
   /* Composer: rounded-2xl card with status bar above + body below (matches ampcode `divide-y` pattern). */
   .composer {
+    position: relative;
     display: flex;
     flex-direction: column;
     width: min(100%, 672px);
@@ -4419,7 +5311,7 @@
     background: color-mix(in srgb, var(--neo-ink) 3%, var(--neo-bg));
     outline: 1px solid color-mix(in srgb, var(--neo-ink) 10%, transparent);
     outline-offset: -1px;
-    overflow: clip;
+    overflow: visible;
   }
   /* Status bar: green dot + "Connected" + Amp CLI · /path · branch */
   .composer-status {
@@ -4456,11 +5348,100 @@
     text-overflow: ellipsis;
     color: var(--neo-muted);
   }
+  .queue-strip {
+    display: grid;
+    gap: 5px;
+    padding: 7px 8px;
+    border-bottom: 1px solid var(--neo-border);
+    background: color-mix(in srgb, var(--neo-ink) 4%, var(--neo-bg));
+  }
+  .queue-strip__head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    min-width: 0;
+  }
+  .queue-strip__title {
+    color: var(--neo-muted);
+    font-size: 12px;
+    font-weight: 600;
+    line-height: 16px;
+  }
+  .queue-strip__actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+  }
+  .queue-strip__button,
+  .queue-strip__remove {
+    display: inline-grid;
+    place-items: center;
+    border: 0;
+    background: transparent;
+    color: var(--neo-muted);
+    cursor: pointer;
+  }
+  .queue-strip__button {
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+  }
+  .queue-strip__button:hover:not(:disabled),
+  .queue-strip__remove:hover {
+    background: var(--neo-card-hover);
+    color: var(--neo-ink);
+  }
+  .queue-strip__button:disabled {
+    cursor: not-allowed;
+    opacity: 0.35;
+  }
+  .queue-strip__list {
+    display: grid;
+    gap: 3px;
+    max-height: 82px;
+    overflow: auto;
+  }
+  .queue-strip__item {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) 20px;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    border-radius: 6px;
+    padding: 2px 4px 2px 6px;
+    color: var(--neo-muted);
+    font-size: 12px;
+    line-height: 17px;
+  }
+  .queue-strip__item--steer {
+    color: var(--neo-ink);
+    background: var(--neo-success-soft);
+  }
+  .queue-strip__kind {
+    color: var(--neo-soft);
+    font-family: var(--neo-mono);
+    font-size: 11px;
+    white-space: nowrap;
+  }
+  .queue-strip__preview {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .queue-strip__remove {
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+  }
   /* Body: textarea + actions row. Solid muted overlay so it stands out from the card bg (matches ampcode visually). */
   .composer-body {
     display: flex;
     flex-direction: column;
     background: color-mix(in srgb, var(--neo-ink) 7%, var(--neo-bg));
+    border-bottom-right-radius: 15px;
+    border-bottom-left-radius: 15px;
   }
   .composer textarea {
     min-height: 60px;
@@ -4478,6 +5459,102 @@
     width: 100%;
   }
   .composer textarea::placeholder { color: var(--neo-muted); }
+  .mention-picker {
+    position: absolute;
+    left: 8px;
+    right: 8px;
+    bottom: calc(100% + 8px);
+    z-index: 40;
+    border: 1px solid var(--neo-border);
+    border-radius: 8px;
+    background: color-mix(in srgb, var(--neo-bg) 92%, var(--neo-ink));
+    box-shadow: 0 12px 30px color-mix(in srgb, #000 28%, transparent);
+    overflow: hidden;
+  }
+  .mention-picker__search {
+    position: relative;
+    display: flex;
+    align-items: center;
+    height: 34px;
+    border-bottom: 1px solid var(--neo-border);
+    color: var(--neo-muted);
+  }
+  .mention-picker__search :global(svg) {
+    position: absolute;
+    left: 10px;
+    color: var(--neo-muted);
+  }
+  .mention-picker__search input {
+    width: 100%;
+    height: 100%;
+    border: 0;
+    outline: 0;
+    background: transparent;
+    color: var(--neo-ink);
+    font: inherit;
+    font-size: 16px;
+    line-height: 20px;
+    padding: 0 10px 0 32px;
+  }
+  .mention-picker__search input::placeholder { color: var(--neo-muted); }
+  .mention-picker__list {
+    max-height: min(34vh, 238px);
+    overflow: auto;
+    padding: 4px;
+  }
+  .mention-picker__item {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 1px 10px;
+    width: 100%;
+    border: 0;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--neo-ink);
+    font: inherit;
+    text-align: left;
+    padding: 7px 8px;
+    cursor: pointer;
+  }
+  .mention-picker__item:hover,
+  .mention-picker__item--active {
+    background: var(--neo-card-hover);
+  }
+  .mention-picker__title {
+    grid-column: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-weight: 600;
+  }
+  .mention-picker__meta {
+    grid-column: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--neo-muted);
+    font-size: 11px;
+    line-height: 15px;
+  }
+  .mention-picker__id {
+    grid-column: 2;
+    grid-row: 1 / span 2;
+    align-self: center;
+    max-width: 18ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    color: var(--neo-muted);
+    font-family: var(--neo-mono);
+    font-size: 11px;
+    white-space: nowrap;
+  }
+  .mention-picker__empty {
+    color: var(--neo-muted);
+    padding: 12px;
+    font-size: 12px;
+  }
   .composer-attachments {
     display: flex;
     flex-wrap: wrap;
@@ -4547,12 +5624,155 @@
     align-items: center;
     justify-content: space-between;
     padding: 6px 8px;
+    gap: 8px;
   }
-  .composer-actions__left { display: flex; align-items: center; gap: 4px; }
+  .composer-actions__left {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+    min-width: 0;
+  }
+  .composer-actions__right {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    flex: 0 0 auto;
+  }
   .composer-tool-button {
     width: 28px;
     height: 28px;
     border-radius: 50%;
+    flex: 0 0 auto;
+  }
+  .composer-queue-mode {
+    display: inline-flex;
+    align-items: center;
+    height: 22px;
+    border-radius: 999px;
+    color: var(--neo-muted);
+    font-family: var(--neo-mono);
+    font-size: 10.5px;
+    line-height: 1;
+    padding: 0 3px;
+  }
+  .composer-settings {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    min-width: 0;
+  }
+  .composer-menu {
+    position: relative;
+    flex: 0 0 auto;
+  }
+  .composer-menu__trigger {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    height: 28px;
+    border: 1px solid transparent;
+    border-radius: 999px;
+    background: transparent;
+    color: var(--neo-muted);
+    cursor: pointer;
+    font: inherit;
+    font-size: 12px;
+    line-height: 16px;
+    padding: 0 7px;
+    white-space: nowrap;
+  }
+  .composer-menu__trigger:hover,
+  .composer-menu__trigger--active {
+    border-color: var(--neo-border);
+    background: var(--neo-card-hover);
+    color: var(--neo-ink);
+  }
+  .composer-menu__eyebrow {
+    color: var(--neo-soft);
+    font-family: var(--neo-mono);
+    font-size: 10.5px;
+  }
+  :global(.composer-menu__chevron) {
+    color: var(--neo-soft);
+    transform: rotate(-90deg);
+  }
+  .composer-menu__trigger--active :global(.composer-menu__chevron) {
+    transform: rotate(90deg);
+  }
+  .composer-menu__panel {
+    position: absolute;
+    left: 0;
+    bottom: calc(100% + 8px);
+    z-index: 45;
+    display: grid;
+    gap: 2px;
+    width: 148px;
+    padding: 4px;
+    border: 1px solid var(--neo-border);
+    border-radius: 8px;
+    background: color-mix(in srgb, var(--neo-bg) 92%, var(--neo-ink));
+    box-shadow: 0 12px 30px color-mix(in srgb, #000 28%, transparent);
+  }
+  .composer-menu--effort .composer-menu__panel {
+    width: 124px;
+  }
+  .composer-menu__item {
+    display: flex;
+    align-items: center;
+    width: 100%;
+    min-height: 28px;
+    border: 0;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--neo-ink);
+    font: inherit;
+    font-size: 12px;
+    line-height: 16px;
+    padding: 5px 7px;
+    text-align: left;
+    cursor: pointer;
+  }
+  .composer-menu__item:hover,
+  .composer-menu__item--active {
+    background: var(--neo-card-hover);
+  }
+  .composer-menu__item--active {
+    color: var(--neo-ink);
+    font-weight: 600;
+  }
+  .previous-thread-hint {
+    display: inline-flex;
+    align-items: center;
+    min-width: 0;
+    gap: 5px;
+    border: 0;
+    background: transparent;
+    color: var(--neo-muted);
+    font: inherit;
+    font-size: 12px;
+    line-height: 16px;
+    padding: 3px 4px;
+    cursor: pointer;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .previous-thread-hint:hover { color: var(--neo-ink); }
+  .previous-thread-hint kbd {
+    flex: 0 0 auto;
+    border-radius: 4px;
+    border: 1px solid var(--neo-border-strong);
+    padding: 0 4px;
+    color: var(--neo-ink);
+    font-family: var(--neo-mono);
+    font-size: 11px;
+    font-weight: 600;
+    line-height: 15px;
+  }
+  .previous-thread-hint span:last-child {
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .send-button {
     display: inline-grid;
@@ -4568,6 +5788,26 @@
   }
   .send-button:hover:not(:disabled) { opacity: 0.85; }
   .send-button:disabled { cursor: not-allowed; opacity: 0.3; }
+  .send-button--queue:not(:disabled) {
+    background: var(--neo-success);
+    color: var(--neo-bg);
+  }
+  .interrupt-button {
+    display: inline-grid;
+    width: 28px;
+    height: 28px;
+    place-items: center;
+    border: 0;
+    border-radius: 50%;
+    background: color-mix(in srgb, var(--neo-danger) 16%, transparent);
+    color: var(--neo-danger);
+    cursor: pointer;
+    transition: background-color 150ms cubic-bezier(0.4, 0, 0.2, 1), color 150ms cubic-bezier(0.4, 0, 0.2, 1);
+  }
+  .interrupt-button:hover {
+    background: var(--neo-danger);
+    color: var(--neo-bg);
+  }
 
   /* Hidden on mobile (parity with ampcode `hidden lg:flex`). Shown at lg+ flush to right edge. */
   .inspector { display: none; }
@@ -4662,6 +5902,73 @@
   /* Sub-section (heading + content) used for "Open in CLI" etc. */
   .inspector-section { display: flex; flex-direction: column; gap: 6px; }
   .inspector-section__head { color: var(--neo-ink); font-size: 12px; font-weight: 500; }
+  .inspector-section--dev {
+    padding-top: 2px;
+  }
+  .dev-toggle {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto auto;
+    align-items: center;
+    gap: 6px;
+    width: 100%;
+    border: 0;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--neo-muted);
+    font: inherit;
+    font-size: 12px;
+    line-height: 16px;
+    padding: 4px 0;
+    text-align: left;
+    cursor: pointer;
+  }
+  .dev-toggle:hover,
+  .dev-toggle--active {
+    color: var(--neo-ink);
+  }
+  .dev-toggle > :global(svg) {
+    color: currentColor;
+  }
+  .dev-toggle__label {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .dev-toggle__count {
+    min-width: 16px;
+    border-radius: 999px;
+    background: var(--neo-card-hover);
+    color: var(--neo-muted);
+    font-family: var(--neo-mono);
+    font-size: 10px;
+    line-height: 16px;
+    text-align: center;
+  }
+  .dev-toggle__track {
+    position: relative;
+    width: 26px;
+    height: 14px;
+    border-radius: 999px;
+    background: var(--neo-border-strong);
+    transition: background-color 150ms cubic-bezier(0.4, 0, 0.2, 1);
+  }
+  .dev-toggle__thumb {
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: var(--neo-bg);
+    transition: transform 150ms cubic-bezier(0.4, 0, 0.2, 1);
+  }
+  .dev-toggle--active .dev-toggle__track {
+    background: var(--neo-accent);
+  }
+  .dev-toggle--active .dev-toggle__thumb {
+    transform: translateX(12px);
+  }
   .cli-row {
     display: flex;
     align-items: center;
@@ -5072,6 +6379,7 @@
     .composer { width: 100%; border-radius: 14px; }
     .composer textarea { min-height: 56px; padding: 10px 12px; /* keep 16px font-size for iOS no-zoom */ }
     .composer-actions { padding: 6px 8px; }
-    .send-button { width: 30px; height: 30px; }
+    .send-button,
+    .interrupt-button { width: 30px; height: 30px; }
   }
 </style>
