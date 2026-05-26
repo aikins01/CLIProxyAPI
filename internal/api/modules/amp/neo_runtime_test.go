@@ -4115,6 +4115,9 @@ func TestNeoProviderMessagesPreserveImageBlocks(t *testing.T) {
 	if data := stringValue(mapValue(mapValue(anthropicContent[1])["source"])["data"]); data != "aW1n" {
 		t.Fatalf("anthropic image data = %q", data)
 	}
+	if mediaType := stringValue(mapValue(mapValue(anthropicContent[1])["source"])["media_type"]); mediaType != "image/png" {
+		t.Fatalf("anthropic image media_type = %q", mediaType)
+	}
 
 	openai := openAINeoMessages([]neoHistoryMessage{msg}, "system")
 	openAIContent := arrayValue(mapValue(openai[1])["content"])
@@ -4133,6 +4136,26 @@ func TestNeoProviderMessagesPreserveImageBlocks(t *testing.T) {
 	inlineData := mapValue(mapValue(googleParts[1])["inlineData"])
 	if stringValue(inlineData["data"]) != "aW1n" || stringValue(inlineData["mimeType"]) != "image/png" {
 		t.Fatalf("google inlineData = %#v", inlineData)
+	}
+}
+
+func TestNeoProviderMessagesNormalizeInternalImageMediaType(t *testing.T) {
+	msg := neoHistoryMessage{
+		Role: "user",
+		Text: "see this",
+		Content: []any{
+			map[string]any{"type": "image", "source": map[string]any{"type": "base64", "mediaType": "image/png", "data": "aW1n"}},
+		},
+	}
+
+	anthropic := anthropicNeoMessages([]neoHistoryMessage{msg})
+	anthropicContent := arrayValue(mapValue(anthropic[0])["content"])
+	source := mapValue(mapValue(anthropicContent[0])["source"])
+	if stringValue(source["media_type"]) != "image/png" {
+		t.Fatalf("anthropic image source = %#v", source)
+	}
+	if _, exists := source["mediaType"]; exists {
+		t.Fatalf("anthropic image leaked internal mediaType key: %#v", source)
 	}
 }
 

@@ -13875,9 +13875,6 @@ func googleNeoUserParts(msg neoHistoryMessage) []any {
 }
 
 func anthropicNeoImageBlock(block map[string]any) map[string]any {
-	if source := mapValue(block["source"]); len(source) > 0 {
-		return map[string]any{"type": "image", "source": source}
-	}
 	if data, mediaType := neoImageBase64(block); data != "" {
 		return map[string]any{"type": "image", "source": map[string]any{"type": "base64", "media_type": fallbackString(mediaType, "image/png"), "data": data}}
 	}
@@ -13916,7 +13913,11 @@ func neoImageBase64(block map[string]any) (string, string) {
 	mediaType := firstNonEmptyString(block["media_type"], block["mediaType"], block["mime_type"], block["mimeType"])
 	if data == "" {
 		if source := mapValue(block["source"]); len(source) > 0 {
-			return neoImageBase64(source)
+			sourceData, sourceMediaType := neoImageBase64(source)
+			if sourceMediaType == "" {
+				sourceMediaType = mediaType
+			}
+			return sourceData, sourceMediaType
 		}
 	}
 	if strings.HasPrefix(data, "data:") {
