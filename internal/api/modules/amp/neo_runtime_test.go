@@ -5176,7 +5176,7 @@ func TestNeoActorRewritesWrongReadThreadToolResultFromLocalStore(t *testing.T) {
 	}
 
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/provider/google/v1beta/models/gemini-3-flash-preview:generateContent" {
+		if r.URL.Path != "/api/provider/google/v1beta1/publishers/google/models/gemini-3-flash-preview:generateContent" {
 			t.Fatalf("provider path = %s", r.URL.Path)
 		}
 		payload := readNeoJSON(r.Body)
@@ -6560,7 +6560,7 @@ func TestNeoReadThreadToolFallbackUsesCloudThread(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/api/provider/google/") {
 			payload := readNeoJSON(r.Body)
-			if r.URL.Path != "/api/provider/google/v1beta/models/gemini-3-flash-preview:generateContent" {
+			if r.URL.Path != "/api/provider/google/v1beta1/publishers/google/models/gemini-3-flash-preview:generateContent" {
 				t.Fatalf("provider path = %s", r.URL.Path)
 			}
 			if got := stringValue(mapValue(payload["generationConfig"])["responseMimeType"]); got != "application/json" {
@@ -6663,7 +6663,7 @@ func TestNeoReadThreadToolFallbackUsesBinaryStyleExtractionForLocalThread(t *tes
 	}
 
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/provider/google/v1beta/models/gemini-3-flash-preview:generateContent" {
+		if r.URL.Path != "/api/provider/google/v1beta1/publishers/google/models/gemini-3-flash-preview:generateContent" {
 			t.Fatalf("provider path = %s", r.URL.Path)
 		}
 		payload := readNeoJSON(r.Body)

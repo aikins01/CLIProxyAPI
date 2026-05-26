@@ -5082,7 +5082,7 @@ func inferNeoThreadExtractionLocal(rt *neoRuntime, currentThreadID string, menti
 	if sessionThreadID == "" {
 		sessionThreadID = mentionedThreadID
 	}
-	subpath := "/v1beta/models/" + url.PathEscape(neoThreadExtractionModel) + ":generateContent"
+	subpath := "/v1beta1/publishers/google/models/" + url.PathEscape(neoThreadExtractionModel) + ":generateContent"
 	jsonBody, err := callNeoLocalProvider(rt, "google", subpath, body, sessionThreadID)
 	if err != nil {
 		return "", err
