@@ -5224,6 +5224,55 @@ func TestNeoActorRewritesWrongReadThreadToolResultFromLocalStore(t *testing.T) {
 	}
 }
 
+func TestNeoReadThreadToolAlwaysExtractsLoadedTargetThread(t *testing.T) {
+	dir := t.TempDir()
+	oldStoreDir := neoAmpThreadStoreDir
+	neoAmpThreadStoreDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
+
+	snapshot := neoCloudThreadSnapshot{
+		threadID:  "T-target-thread",
+		seq:       2,
+		createdMs: 1778170000000,
+		messages: []neoMessage{
+			{ThreadID: "T-target-thread", MessageID: "M-user", Role: "user", Content: []any{map[string]any{"type": "text", "text": "target thread email details"}}, Seq: 1},
+		},
+	}
+	if err := writeNeoLocalThreadSnapshot(snapshot); err != nil {
+		t.Fatalf("writeNeoLocalThreadSnapshot error: %v", err)
+	}
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/provider/google/v1beta1/publishers/google/models/gemini-3-flash-preview:generateContent" {
+			t.Fatalf("provider path = %s", r.URL.Path)
+		}
+		payload := readNeoJSON(r.Body)
+		contents := arrayValue(payload["contents"])
+		mentioned := stringValue(mapValue(arrayValue(mapValue(contents[0])["parts"])[0])["text"])
+		if !strings.Contains(mentioned, "threadId: T-target-thread") || !strings.Contains(mentioned, "target thread email details") {
+			t.Fatalf("mentioned markdown = %q", mentioned)
+		}
+		writeNeoJSON(w, http.StatusOK, map[string]any{
+			"candidates": []any{map[string]any{
+				"content": map[string]any{"parts": []any{map[string]any{"text": `{"relevantContent":"target thread extracted details"}`}}},
+			}},
+		})
+	}))
+	defer upstream.Close()
+
+	run := normalizeNeoLocalThreadToolRun(context.Background(), testNeoRuntimeForServer(t, upstream), neoPendingTool{
+		Name:  "read_thread",
+		Input: map[string]any{"threadID": "T-target-thread", "goal": "extract email details"},
+	}, map[string]any{
+		"status": "done",
+		"result": "No relevant content found. The provided thread content for T-current-thread is empty and does not match the requested thread T-target-thread.",
+	}, "T-current-thread")
+
+	if got := stringValue(run["result"]); got != "target thread extracted details" {
+		t.Fatalf("read_thread result = %q", got)
+	}
+}
+
 func TestNeoActorRewritesEmptyFindThreadToolResultFromLocalStore(t *testing.T) {
 	dir := t.TempDir()
 	oldStoreDir := neoAmpThreadStoreDir

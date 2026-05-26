@@ -4995,13 +4995,6 @@ func normalizeNeoReadThreadToolRun(ctx context.Context, rt *neoRuntime, cfg *con
 	if !ok {
 		return run
 	}
-	text := strings.ToLower(runToText(run))
-	wrongThread := currentThreadID != "" && strings.Contains(text, strings.ToLower(currentThreadID)) && !strings.Contains(text, strings.ToLower(threadID))
-	failed := text == "" || stringValue(run["status"]) == "error" || strings.Contains(text, "not found") || strings.Contains(text, "unavailable") || strings.Contains(text, "no actionable content") || strings.Contains(text, "no useful content") || strings.Contains(text, "only metadata") || strings.Contains(text, "lookup returned no content") || strings.Contains(text, "contains no messages") || strings.Contains(text, "contains no message content")
-	if !wrongThread && !failed {
-		return run
-	}
-
 	extracted, err := inferNeoThreadExtractionLocal(rt, currentThreadID, threadID, pending.Input, thread)
 	if err != nil {
 		rewritten := cloneMap(run)
