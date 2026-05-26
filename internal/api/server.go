@@ -138,6 +138,9 @@ type Server struct {
 	// muxBaseListener is the shared TCP listener used to serve both HTTP and Redis protocol traffic.
 	muxBaseListener net.Listener
 
+	// muxBaseListeners are all shared TCP listeners feeding the protocol multiplexer.
+	muxBaseListeners []net.Listener
+
 	// muxHTTPListener receives HTTP connections selected by the multiplexer.
 	muxHTTPListener *muxListener
 
@@ -1019,22 +1022,28 @@ func (s *Server) Start() error {
 	if errListen != nil {
 		return fmt.Errorf("failed to start HTTP server: %v", errListen)
 	}
+	listeners := []net.Listener{listener}
+	for _, companionAddr := range loopbackCompanionListenAddrs(addr) {
+		companionListener, errCompanion := net.Listen("tcp", companionAddr)
+		if errCompanion != nil {
+			log.Warnf("failed to start loopback companion listener on %s: %v", companionAddr, errCompanion)
+			continue
+		}
+		listeners = append(listeners, companionListener)
+		log.Infof("started loopback companion listener on %s for local clients", companionAddr)
+	}
 
 	useTLS := s.cfg != nil && s.cfg.TLS.Enable
 	if useTLS {
 		certPath := strings.TrimSpace(s.cfg.TLS.Cert)
 		keyPath := strings.TrimSpace(s.cfg.TLS.Key)
 		if certPath == "" || keyPath == "" {
-			if errClose := listener.Close(); errClose != nil {
-				log.Errorf("failed to close listener after TLS validation failure: %v", errClose)
-			}
+			closeListeners(listeners, "after TLS validation failure")
 			return fmt.Errorf("failed to start HTTPS server: tls.cert or tls.key is empty")
 		}
 		certPair, errLoad := tls.LoadX509KeyPair(certPath, keyPath)
 		if errLoad != nil {
-			if errClose := listener.Close(); errClose != nil {
-				log.Errorf("failed to close listener after TLS key pair load failure: %v", errClose)
-			}
+			closeListeners(listeners, "after TLS key pair load failure")
 			return fmt.Errorf("failed to start HTTPS server: %v", errLoad)
 		}
 
@@ -1046,37 +1055,38 @@ func (s *Server) Start() error {
 		if errHTTP2 := http2.ConfigureServer(s.server, &http2.Server{}); errHTTP2 != nil {
 			log.Warnf("failed to configure HTTP/2: %v", errHTTP2)
 		}
-		listener = tls.NewListener(listener, tlsConfig)
+		for i, rawListener := range listeners {
+			listeners[i] = tls.NewListener(rawListener, tlsConfig)
+		}
 		log.Debugf("Starting API server on %s with TLS", addr)
 	} else {
 		log.Debugf("Starting API server on %s", addr)
 	}
 
 	httpListener := newMuxListener(listener.Addr(), 1024)
-	s.muxBaseListener = listener
+	s.muxBaseListener = listeners[0]
+	s.muxBaseListeners = listeners
 	s.muxHTTPListener = httpListener
 
 	httpErrCh := make(chan error, 1)
-	acceptErrCh := make(chan error, 1)
+	acceptErrCh := make(chan error, len(listeners))
 
 	go func() {
 		httpErrCh <- s.server.Serve(httpListener)
 	}()
-	go func() {
-		acceptErrCh <- s.acceptMuxConnections(listener, httpListener)
-	}()
+	for _, muxListener := range listeners {
+		go func(l net.Listener) {
+			acceptErrCh <- s.acceptMuxConnections(l, httpListener)
+		}(muxListener)
+	}
 
 	select {
 	case errServe := <-httpErrCh:
-		if s.muxBaseListener != nil {
-			if errClose := s.muxBaseListener.Close(); errClose != nil && !errors.Is(errClose, net.ErrClosed) {
-				log.Debugf("failed to close shared listener after HTTP serve exit: %v", errClose)
-			}
-		}
+		closeListeners(s.muxBaseListeners, "after HTTP serve exit")
 		if s.muxHTTPListener != nil {
 			_ = s.muxHTTPListener.Close()
 		}
-		errAccept := <-acceptErrCh
+		errAccept := firstListenerError(acceptErrCh, len(listeners))
 		errServe = normalizeHTTPServeError(errServe)
 		errAccept = normalizeListenerError(errAccept)
 		if errServe != nil {
@@ -1090,12 +1100,11 @@ func (s *Server) Start() error {
 		if s.muxHTTPListener != nil {
 			_ = s.muxHTTPListener.Close()
 		}
-		if s.muxBaseListener != nil {
-			if errClose := s.muxBaseListener.Close(); errClose != nil && !errors.Is(errClose, net.ErrClosed) {
-				log.Debugf("failed to close shared listener after accept loop exit: %v", errClose)
-			}
-		}
+		closeListeners(s.muxBaseListeners, "after accept loop exit")
 		errServe := <-httpErrCh
+		if errOtherAccept := firstListenerError(acceptErrCh, len(listeners)-1); errAccept == nil {
+			errAccept = errOtherAccept
+		}
 		errServe = normalizeHTTPServeError(errServe)
 		errAccept = normalizeListenerError(errAccept)
 		if errAccept != nil {
@@ -1129,11 +1138,7 @@ func (s *Server) Stop(ctx context.Context) error {
 	if s.muxHTTPListener != nil {
 		_ = s.muxHTTPListener.Close()
 	}
-	if s.muxBaseListener != nil {
-		if errClose := s.muxBaseListener.Close(); errClose != nil && !errors.Is(errClose, net.ErrClosed) {
-			log.Debugf("failed to close shared listener: %v", errClose)
-		}
-	}
+	closeListeners(s.muxBaseListeners, "")
 
 	// Shutdown the HTTP server.
 	if err := s.server.Shutdown(ctx); err != nil {
@@ -1171,6 +1176,59 @@ func (s *Server) applyAccessConfig(oldCfg, newCfg *config.Config) {
 	if _, err := access.ApplyAccessProviders(s.accessManager, oldCfg, newCfg); err != nil {
 		return
 	}
+}
+
+func loopbackCompanionListenAddrs(addr string) []string {
+	host, port, err := net.SplitHostPort(strings.TrimSpace(addr))
+	if err != nil {
+		return nil
+	}
+	host = strings.Trim(host, "[]")
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return nil
+	}
+	if strings.EqualFold(host, "localhost") {
+		return nil
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.IsLoopback() || ip.IsUnspecified() {
+			return nil
+		}
+	} else {
+		return nil
+	}
+
+	return []string{
+		net.JoinHostPort("127.0.0.1", port),
+		net.JoinHostPort("::1", port),
+	}
+}
+
+func closeListeners(listeners []net.Listener, reason string) {
+	for _, listener := range listeners {
+		if listener == nil {
+			continue
+		}
+		if errClose := listener.Close(); errClose != nil && !errors.Is(errClose, net.ErrClosed) {
+			if reason != "" {
+				log.Debugf("failed to close shared listener %s: %v", reason, errClose)
+			} else {
+				log.Debugf("failed to close shared listener: %v", errClose)
+			}
+		}
+	}
+}
+
+func firstListenerError(errCh <-chan error, count int) error {
+	var first error
+	for i := 0; i < count; i++ {
+		err := <-errCh
+		if first == nil {
+			first = err
+		}
+	}
+	return first
 }
 
 // UpdateClients updates the server's client list and configuration.
