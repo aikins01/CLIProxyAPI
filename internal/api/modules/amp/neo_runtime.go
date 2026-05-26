@@ -4171,7 +4171,7 @@ func (a *neoActor) dequeueQueuedMessage() {
 	seq := a.nextSeqLocked()
 	a.mu.Unlock()
 
-	a.broadcast(map[string]any{"type": "queued_message_dequeued", "queuedMessageId": next.queueID(), "seq": seq})
+	a.broadcast(map[string]any{"type": "queued_message_dequeued", "queuedMessageId": next.eventMessageID(), "seq": seq})
 	a.syncCloudAsync()
 	a.startUserMessage(next)
 }
@@ -8901,22 +8901,31 @@ func (a *neoActor) processQueue() {
 	a.queue = append(a.queue[:nextIndex], a.queue[nextIndex+1:]...)
 	seq := a.nextSeqLocked()
 	a.mu.Unlock()
-	a.broadcast(map[string]any{"type": "queued_message_dequeued", "queuedMessageId": next.queueID(), "seq": seq})
+	a.broadcast(map[string]any{"type": "queued_message_dequeued", "queuedMessageId": next.eventMessageID(), "seq": seq})
 	a.startUserMessage(next)
 }
 
 func (a *neoActor) removeQueuedMessage(messageID string) {
 	a.mu.Lock()
 	filtered := a.queue[:0]
+	removedMessageID := ""
 	for _, item := range a.queue {
 		if item.MessageID != messageID && item.queueID() != messageID {
 			filtered = append(filtered, item)
+			continue
+		}
+		if removedMessageID == "" {
+			removedMessageID = item.eventMessageID()
 		}
 	}
 	a.queue = filtered
+	if removedMessageID == "" {
+		a.mu.Unlock()
+		return
+	}
 	seq := a.nextSeqLocked()
 	a.mu.Unlock()
-	a.broadcast(map[string]any{"type": "queued_message_removed", "queuedMessageId": messageID, "seq": seq})
+	a.broadcast(map[string]any{"type": "queued_message_removed", "queuedMessageId": removedMessageID, "seq": seq})
 	a.syncCloudAsync()
 }
 
@@ -10637,6 +10646,13 @@ func (m neoQueuedMessage) queueID() string {
 		return m.ID
 	}
 	return m.MessageID
+}
+
+func (m neoQueuedMessage) eventMessageID() string {
+	if m.MessageID != "" {
+		return m.MessageID
+	}
+	return m.queueID()
 }
 
 func (m neoQueuedMessage) protocol() map[string]any {

@@ -19,7 +19,6 @@
     Moon,
     Info,
     PanelRight,
-    Play,
     Search,
     Send,
     Sparkles,
@@ -722,6 +721,10 @@
     return toolLeases.length > 0 || toolApprovals.length > 0 || compactionActive || Boolean(retryNotice) || Boolean(liveTranscriptVerb());
   }
 
+  function canInterruptQueuedInference() {
+    return queuedMessages.some((item) => !item.steer) && canInterruptActor();
+  }
+
   function interruptActor() {
     if (!canInterruptActor()) return;
     retryNotice = '';
@@ -819,6 +822,10 @@
       event.preventDefault();
       if (previousThreadHint && composer.trim().length === 0) {
         acceptPreviousThreadHint();
+        return;
+      }
+      if (composer.trim().length === 0 && composerAttachments.length === 0 && canInterruptQueuedInference()) {
+        steerNextQueuedMessage();
         return;
       }
       void sendMessage();
@@ -1056,7 +1063,7 @@
           reasoningEffort
         }
       });
-      queuedMessages = [...queuedMessages.filter((item) => item.id !== queued.id), queued];
+      queuedMessages = [...queuedMessages.filter((item) => !sameQueuedMessage(item, queued)), queued];
       queuedCount = queuedMessages.length;
     } else {
       detail = { ...thread, messages: [...thread.messages, message] };
@@ -1124,13 +1131,13 @@
     }
     if (type === 'queued_message_added') {
       const item = queuedMessageFromAny(message.message);
-      queuedMessages = [...queuedMessages.filter((queued) => queued.id !== item.id), item];
+      queuedMessages = [...queuedMessages.filter((queued) => !sameQueuedMessage(queued, item)), item];
       queuedCount = queuedMessages.length;
       return;
     }
     if (type === 'queued_message_removed' || type === 'queued_message_dequeued') {
       const id = stringFrom(message.queuedMessageId ?? message.messageId);
-      queuedMessages = queuedMessages.filter((queued) => queued.id !== id && queued.messageId !== id);
+      queuedMessages = queuedMessages.filter((queued) => !queuedMessageMatches(queued, id));
       queuedCount = queuedMessages.length;
       return;
     }
@@ -1346,7 +1353,7 @@
     const item = asRecord(raw);
     const queued = asRecord(item.queuedMessage);
     const source = Object.keys(queued).length ? queued : item;
-    const messageId = stringFrom(source.messageId ?? item.messageId);
+    const messageId = stringFrom(source.protocolMessageID ?? source.protocolMessageId ?? source.messageId ?? item.protocolMessageID ?? item.protocolMessageId ?? item.messageId);
     const id = stringFrom(item.id ?? item.queuedMessageId ?? messageId);
     const content = Array.isArray(source.content) ? source.content.map((part) => asRecord(part) as ContentBlock) : [];
     return {
@@ -1359,7 +1366,15 @@
   }
 
   function queuedMessageKey(queued: QueuedMessage) {
-    return queued.id || queued.messageId;
+    return queued.messageId || queued.id;
+  }
+
+  function queuedMessageMatches(queued: QueuedMessage, id: string) {
+    return Boolean(id) && (queued.id === id || queued.messageId === id);
+  }
+
+  function sameQueuedMessage(left: QueuedMessage, right: QueuedMessage) {
+    return queuedMessageMatches(left, right.id) || queuedMessageMatches(left, right.messageId);
   }
 
   function queuedMessageComposerText(queued: QueuedMessage) {
@@ -1408,7 +1423,7 @@
     const key = queuedMessageKey(queued);
     if (!key) return;
     sendFrame({ type: 'client_remove_queued_msg', queuedMessageId: key });
-    queuedMessages = queuedMessages.filter((item) => item.id !== key && item.messageId !== key);
+    queuedMessages = queuedMessages.filter((item) => !queuedMessageMatches(item, key));
     queuedCount = queuedMessages.length;
   }
 
@@ -1441,11 +1456,27 @@
     queueMicrotask(() => composerTextarea?.focus());
   }
 
+  function steerQueuedMessage(queued: QueuedMessage) {
+    if (queued.steer) return;
+    const key = queuedMessageKey(queued);
+    if (!key) return;
+    sendFrame({ type: 'client_steer_queued_msg', queuedMessageId: key });
+    queuedMessages = queuedMessages.map((item) => item === queued ? { ...item, steer: true } : item);
+  }
+
+  function canSteerQueuedMessages() {
+    return canSendMessage() && queuedMessages.some((item) => !item.steer);
+  }
+
   function steerNextQueuedMessage() {
     const queued = queuedMessages.find((item) => !item.steer) || queuedMessages[0];
     if (!queued) return;
-    sendFrame({ type: 'client_steer_queued_msg', queuedMessageId: queuedMessageKey(queued) });
-    queuedMessages = queuedMessages.map((item) => item === queued ? { ...item, steer: true } : item);
+    steerQueuedMessage(queued);
+  }
+
+  function steerQueuedMessages() {
+    if (!canSteerQueuedMessages()) return;
+    for (const queued of queuedMessages) steerQueuedMessage(queued);
   }
 
   function approvalFromAny(raw: unknown): ToolApproval {
@@ -2817,6 +2848,11 @@
     return asRecord(toolResultRun(block).result);
   }
 
+  function toolResultResultText(block?: ContentBlock) {
+    const result = toolResultRun(block).result;
+    return typeof result === 'string' ? result : '';
+  }
+
   function toolResultExitCode(block?: ContentBlock) {
     const run = toolResultRun(block);
     const result = toolResultResult(block);
@@ -2840,11 +2876,17 @@
     const run = toolResultRun(block);
     const result = toolResultResult(block);
     return firstString(
+      result.displayMessage,
       result.output,
       result.stderr,
       result.stdout,
       result.message,
+      result.text,
+      toolResultResultText(block),
+      run.displayMessage,
       run.output,
+      run.message,
+      run.text,
       run.error,
       blockContentPreview(block)
     );
@@ -3894,12 +3936,12 @@
                   <button
                     class="queue-strip__button"
                     type="button"
-                    title="Steer with the next queued prompt"
-                    aria-label="Steer with the next queued prompt"
-                    disabled={!canSendMessage()}
-                    onclick={steerNextQueuedMessage}
+                    title="Steer all queued prompts"
+                    aria-label="Steer all queued prompts"
+                    disabled={!canSteerQueuedMessages()}
+                    onclick={steerQueuedMessages}
                   >
-                    <Play size={13} />
+                    <ArrowUp size={13} />
                   </button>
                   <button
                     class="queue-strip__button"
@@ -3915,6 +3957,22 @@
               <div class="queue-strip__list">
                 {#each queuedMessages as queued (queuedMessageKey(queued))}
                   <div class:queue-strip__item--steer={queued.steer} class="queue-strip__item">
+                    {#if queued.steer}
+                      <span class="queue-strip__steer queue-strip__steer--active" title="Queued prompt will steer the actor">
+                        <ArrowUp size={12} />
+                      </span>
+                    {:else}
+                      <button
+                        class="queue-strip__steer"
+                        type="button"
+                        title="Steer with this queued prompt"
+                        aria-label="Steer with this queued prompt"
+                        disabled={!canSendMessage()}
+                        onclick={() => steerQueuedMessage(queued)}
+                      >
+                        <ArrowUp size={12} />
+                      </button>
+                    {/if}
                     <span class="queue-strip__kind">{queued.steer ? 'steer' : 'queued'}</span>
                     <span class="queue-strip__preview">{queued.preview || queued.messageId}</span>
                     <button
@@ -5597,6 +5655,7 @@
     gap: 2px;
   }
   .queue-strip__button,
+  .queue-strip__steer,
   .queue-strip__remove {
     display: inline-grid;
     place-items: center;
@@ -5611,11 +5670,13 @@
     border-radius: 50%;
   }
   .queue-strip__button:hover:not(:disabled),
+  .queue-strip__steer:hover:not(:disabled),
   .queue-strip__remove:hover {
     background: var(--neo-card-hover);
     color: var(--neo-ink);
   }
-  .queue-strip__button:disabled {
+  .queue-strip__button:disabled,
+  .queue-strip__steer:disabled {
     cursor: not-allowed;
     opacity: 0.35;
   }
@@ -5627,7 +5688,7 @@
   }
   .queue-strip__item {
     display: grid;
-    grid-template-columns: auto minmax(0, 1fr) 20px;
+    grid-template-columns: 20px auto minmax(0, 1fr) 20px;
     align-items: center;
     gap: 8px;
     min-width: 0;
@@ -5640,6 +5701,15 @@
   .queue-strip__item--steer {
     color: var(--neo-ink);
     background: var(--neo-success-soft);
+  }
+  .queue-strip__steer {
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+  }
+  .queue-strip__steer--active {
+    color: var(--neo-ink);
+    animation: queue-steer-pulse 900ms ease-in-out infinite alternate;
   }
   .queue-strip__kind {
     color: var(--neo-soft);
@@ -5657,6 +5727,10 @@
     width: 20px;
     height: 20px;
     border-radius: 50%;
+  }
+  @keyframes queue-steer-pulse {
+    from { opacity: 0.45; }
+    to { opacity: 1; }
   }
   /* Body: textarea + actions row. Solid muted overlay so it stands out from the card bg (matches ampcode visually). */
   .composer-body {

@@ -5582,6 +5582,86 @@ func TestNeoActorHandlesBinaryQueueDeltas(t *testing.T) {
 	waitForNeoActorSyncIdle(t, actor)
 }
 
+func TestNeoActorQueuedRemovalEventUsesQueuedMessageID(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	t.Cleanup(server.Close)
+
+	conn := dialNeoActorWebSocket(t, server.URL, "T-queued-remove")
+	defer conn.Close()
+
+	if err := conn.WriteJSON(map[string]any{
+		"type": "user:message-queue:enqueue",
+		"id":   "queued-wrapper",
+		"message": map[string]any{
+			"content": []any{map[string]any{"type": "text", "text": "queued"}},
+		},
+	}); err != nil {
+		t.Fatalf("write queue enqueue: %v", err)
+	}
+
+	added := waitForNeoMessageType(t, conn, "queued_message_added", 2*time.Second)
+	item := mapValue(added["message"])
+	queuedMessage := mapValue(item["queuedMessage"])
+	if got := stringValue(item["id"]); got != "queued-wrapper" {
+		t.Fatalf("queued wrapper id = %q, want queued-wrapper: %#v", got, added)
+	}
+	messageID := stringValue(queuedMessage["messageId"])
+	if messageID == "" || messageID == "queued-wrapper" {
+		t.Fatalf("queued message id = %q, wrapper=%q: %#v", messageID, stringValue(item["id"]), added)
+	}
+
+	if err := conn.WriteJSON(map[string]any{"type": "client_remove_queued_msg", "queuedMessageId": "queued-wrapper"}); err != nil {
+		t.Fatalf("write remove queued: %v", err)
+	}
+	removed := waitForNeoMessageType(t, conn, "queued_message_removed", 2*time.Second)
+	if got := stringValue(removed["queuedMessageId"]); got != messageID {
+		t.Fatalf("removed queuedMessageId = %q, want message id %q: %#v", got, messageID, removed)
+	}
+}
+
+func TestNeoActorQueuedDequeueEventUsesQueuedMessageID(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	t.Cleanup(server.Close)
+
+	conn := dialNeoActorWebSocket(t, server.URL, "T-queued-dequeue")
+	defer conn.Close()
+
+	if err := conn.WriteJSON(map[string]any{"type": "agent_state", "state": "running_tools"}); err != nil {
+		t.Fatalf("write running state: %v", err)
+	}
+	if err := conn.WriteJSON(map[string]any{"type": "executor_connected", "executorId": "executor-test", "registeredToolCount": 0}); err != nil {
+		t.Fatalf("write executor_connected: %v", err)
+	}
+	if err := conn.WriteJSON(map[string]any{
+		"type": "user:message-queue:enqueue",
+		"id":   "queued-wrapper",
+		"message": map[string]any{
+			"content": []any{map[string]any{"type": "text", "text": "queued"}},
+		},
+	}); err != nil {
+		t.Fatalf("write queue enqueue: %v", err)
+	}
+
+	added := waitForNeoMessageType(t, conn, "queued_message_added", 2*time.Second)
+	messageID := stringValue(mapValue(mapValue(added["message"])["queuedMessage"])["messageId"])
+	if messageID == "" || messageID == "queued-wrapper" {
+		t.Fatalf("queued message id = %q: %#v", messageID, added)
+	}
+
+	if err := conn.WriteJSON(map[string]any{"type": "agent_state", "state": "idle"}); err != nil {
+		t.Fatalf("write idle state: %v", err)
+	}
+	if err := conn.WriteJSON(map[string]any{"type": "user:message-queue:dequeue"}); err != nil {
+		t.Fatalf("write queue dequeue: %v", err)
+	}
+	dequeued := waitForNeoMessageType(t, conn, "queued_message_dequeued", 2*time.Second)
+	if got := stringValue(dequeued["queuedMessageId"]); got != messageID {
+		t.Fatalf("dequeued queuedMessageId = %q, want message id %q: %#v", got, messageID, dequeued)
+	}
+}
+
 func TestNeoActorHandlesBinaryToolDeltas(t *testing.T) {
 	useTempNeoThreadStore(t)
 	rt := newNeoRuntime(&config.Config{})
