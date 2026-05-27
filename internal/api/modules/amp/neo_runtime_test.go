@@ -4232,6 +4232,15 @@ func TestNeoProviderMessagesPreserveImageBlocks(t *testing.T) {
 		t.Fatalf("openai image url = %q", url)
 	}
 
+	openAIResponses := openAIResponsesNeoInput([]neoHistoryMessage{msg}, "system")
+	openAIResponsesContent := arrayValue(mapValue(openAIResponses[1])["content"])
+	if len(openAIResponsesContent) != 2 || stringValue(mapValue(openAIResponsesContent[1])["type"]) != "input_image" {
+		t.Fatalf("openai responses content did not preserve image: %#v", openAIResponsesContent)
+	}
+	if url := stringValue(mapValue(openAIResponsesContent[1])["image_url"]); url != "data:image/png;base64,aW1n" {
+		t.Fatalf("openai responses image_url = %q", url)
+	}
+
 	google := googleNeoContents([]neoHistoryMessage{msg}, "system")
 	googleParts := arrayValue(mapValue(google[1])["parts"])
 	if len(googleParts) != 2 {
@@ -4265,7 +4274,7 @@ func TestNeoProviderMessagesNormalizeInternalImageMediaType(t *testing.T) {
 
 func TestInferNeoOpenAIStreamsTextAndToolCalls(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/provider/openai/v1/chat/completions" {
+		if r.URL.Path != "/api/provider/openai/v1/responses" {
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}
 		payload := readNeoJSON(r.Body)
@@ -4275,9 +4284,10 @@ func TestInferNeoOpenAIStreamsTextAndToolCalls(t *testing.T) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		flusher, _ := w.(http.Flusher)
 		for _, chunk := range []string{
-			`data: {"choices":[{"delta":{"content":"hel"}}]}`,
-			`data: {"choices":[{"delta":{"content":"lo"}}]}`,
-			`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"Bash","arguments":"{\"cmd\":\"pwd\"}"}}]}}]}`,
+			`data: {"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"hel"}`,
+			`data: {"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"lo"}`,
+			`data: {"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"call_1","name":"Bash","arguments":"{\"cmd\":\"pwd\"}"}}`,
+			`data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1},"output":[]}}`,
 			`data: [DONE]`,
 		} {
 			_, _ = w.Write([]byte(chunk + "\n\n"))
@@ -4321,7 +4331,7 @@ func TestInferNeoOpenAIStreamEmitsDeltaBeforeUpstreamCompletes(t *testing.T) {
 	firstSent := make(chan struct{})
 	allowFinish := make(chan struct{})
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/provider/openai/v1/chat/completions" {
+		if r.URL.Path != "/api/provider/openai/v1/responses" {
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}
 		payload := readNeoJSON(r.Body)
@@ -4330,7 +4340,7 @@ func TestInferNeoOpenAIStreamEmitsDeltaBeforeUpstreamCompletes(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		flusher, _ := w.(http.Flusher)
-		_, _ = w.Write([]byte(`data: {"choices":[{"delta":{"content":"hel"}}]}` + "\n\n"))
+		_, _ = w.Write([]byte(`data: {"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"hel"}` + "\n\n"))
 		if flusher != nil {
 			flusher.Flush()
 		}
@@ -4340,7 +4350,8 @@ func TestInferNeoOpenAIStreamEmitsDeltaBeforeUpstreamCompletes(t *testing.T) {
 		case <-time.After(2 * time.Second):
 			return
 		}
-		_, _ = w.Write([]byte(`data: {"choices":[{"delta":{"content":"lo"}}]}` + "\n\n"))
+		_, _ = w.Write([]byte(`data: {"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"lo"}` + "\n\n"))
+		_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1},"output":[]}}` + "\n\n"))
 		_, _ = w.Write([]byte("data: [DONE]\n\n"))
 		if flusher != nil {
 			flusher.Flush()
@@ -4412,12 +4423,12 @@ func TestInferNeoOpenAIStreamHandlesCRLFSSESeparatorsBeforeUpstreamCompletes(t *
 	firstSent := make(chan struct{})
 	allowFinish := make(chan struct{})
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/provider/openai/v1/chat/completions" {
+		if r.URL.Path != "/api/provider/openai/v1/responses" {
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		flusher, _ := w.(http.Flusher)
-		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\r\n\r\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"hel\"}\r\n\r\n"))
 		if flusher != nil {
 			flusher.Flush()
 		}
@@ -4427,7 +4438,8 @@ func TestInferNeoOpenAIStreamHandlesCRLFSSESeparatorsBeforeUpstreamCompletes(t *
 		case <-time.After(2 * time.Second):
 			return
 		}
-		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\r\n\r\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"lo\"}\r\n\r\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1},\"output\":[]}}\r\n\r\n"))
 		_, _ = w.Write([]byte("data: [DONE]\r\n\r\n"))
 		if flusher != nil {
 			flusher.Flush()
@@ -4489,30 +4501,34 @@ func TestInferNeoOpenAIStreamHandlesCRLFSSESeparatorsBeforeUpstreamCompletes(t *
 	}
 }
 
-func TestInferNeoOpenAIChatCompletionsSendsReasoningEffortWithTools(t *testing.T) {
+func TestInferNeoOpenAIResponsesSendsReasoningEffortWithTools(t *testing.T) {
 	for _, stream := range []bool{false, true} {
 		t.Run(fmt.Sprintf("stream_%t", stream), func(t *testing.T) {
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.URL.Path != "/api/provider/openai/v1/chat/completions" {
+				if r.URL.Path != "/api/provider/openai/v1/responses" {
 					t.Fatalf("unexpected path %s", r.URL.Path)
 				}
 				payload := readNeoJSON(r.Body)
 				if payload["stream"] != stream {
 					t.Fatalf("stream = %#v, want %v", payload["stream"], stream)
 				}
-				if payload["reasoning_effort"] != "xhigh" {
-					t.Fatalf("reasoning_effort = %#v, want xhigh", payload["reasoning_effort"])
+				reasoning := mapValue(payload["reasoning"])
+				if reasoning["effort"] != "xhigh" || reasoning["summary"] != "auto" {
+					t.Fatalf("reasoning = %#v, want xhigh summary auto", reasoning)
 				}
 				if len(arrayValue(payload["tools"])) == 0 {
 					t.Fatalf("tools missing: %#v", payload)
 				}
+				if numberFrom(payload["max_output_tokens"]) != 128000 {
+					t.Fatalf("max_output_tokens = %#v, want 128000", payload["max_output_tokens"])
+				}
 				if stream {
 					w.Header().Set("Content-Type", "text/event-stream")
-					_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"))
+					_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"ok\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1},\"output\":[]}}\n\ndata: [DONE]\n\n"))
 					return
 				}
 				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+				_, _ = w.Write([]byte(`{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}]}`))
 			}))
 			defer upstream.Close()
 
@@ -4544,11 +4560,50 @@ func TestInferNeoOpenAIChatCompletionsSendsReasoningEffortWithTools(t *testing.T
 	}
 }
 
+func TestInferNeoOpenAIResponsesFallsBackToChatCompletionsWhenUnsupported(t *testing.T) {
+	responsesCalls := 0
+	chatCalls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/provider/openai/v1/responses":
+			responsesCalls++
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":{"message":"responses endpoint not found"}}`))
+		case "/api/provider/openai/v1/chat/completions":
+			chatCalls++
+			payload := readNeoJSON(r.Body)
+			if payload["stream"] != false {
+				t.Fatalf("chat fallback stream = %#v, want false", payload["stream"])
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"chat fallback"}}]}`))
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer upstream.Close()
+
+	result, err := inferNeoLocal(testNeoRuntimeForServer(t, upstream), neoInferenceRequest{
+		ThreadID:        "T-test",
+		AgentMode:       "deep",
+		ReasoningEffort: "xhigh",
+		Settings:        map[string]any{"internal.model": "openai/gpt-test"},
+		History:         []neoHistoryMessage{{Role: "user", Text: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("inferNeoLocal error: %v", err)
+	}
+	if result.Text != "chat fallback" || responsesCalls != 1 || chatCalls != 1 {
+		t.Fatalf("result=%#v responsesCalls=%d chatCalls=%d", result, responsesCalls, chatCalls)
+	}
+}
+
 func TestInferNeoOpenAIStreamFallsBackToNonStreamOnEmptyStream(t *testing.T) {
 	streamCalls := 0
 	nonStreamCalls := 0
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/provider/openai/v1/chat/completions" {
+		if r.URL.Path != "/api/provider/openai/v1/responses" {
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}
 		payload := readNeoJSON(r.Body)
@@ -4562,7 +4617,7 @@ func TestInferNeoOpenAIStreamFallsBackToNonStreamOnEmptyStream(t *testing.T) {
 
 		nonStreamCalls++
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"fallback text","tool_calls":[{"id":"call_1","function":{"name":"Bash","arguments":"{\"cmd\":\"pwd\"}"}}]}}]}`))
+		_, _ = w.Write([]byte(`{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"fallback text"}]},{"type":"function_call","call_id":"call_1","name":"Bash","arguments":"{\"cmd\":\"pwd\"}"}]}`))
 	}))
 	defer upstream.Close()
 
@@ -4609,7 +4664,7 @@ func TestInferNeoOpenAIStreamFallsBackToNonStreamOnEmptyProviderVariants(t *test
 		{
 			name:        "empty_openai_delta",
 			contentType: "text/event-stream",
-			streamBody:  "data: {\"choices\":[{\"delta\":{}}]}\n\ndata: [DONE]\n\n",
+			streamBody:  "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"\"}\n\ndata: [DONE]\n\n",
 		},
 		{
 			name:        "non_sse_empty_error_body",
@@ -4629,7 +4684,7 @@ func TestInferNeoOpenAIStreamFallsBackToNonStreamOnEmptyProviderVariants(t *test
 			streamCalls := 0
 			nonStreamCalls := 0
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.URL.Path != "/api/provider/openai/v1/chat/completions" {
+				if r.URL.Path != "/api/provider/openai/v1/responses" {
 					t.Fatalf("unexpected path %s", r.URL.Path)
 				}
 				payload := readNeoJSON(r.Body)
@@ -4645,7 +4700,7 @@ func TestInferNeoOpenAIStreamFallsBackToNonStreamOnEmptyProviderVariants(t *test
 
 				nonStreamCalls++
 				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"fallback text"}}]}`))
+				_, _ = w.Write([]byte(`{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"fallback text"}]}]}`))
 			}))
 			defer upstream.Close()
 
@@ -5001,7 +5056,7 @@ func TestNeoRuntimeWebSocketKeepsNonThinkingOpenAIBlockIndexes(t *testing.T) {
 func TestNeoRuntimeWebSocketStreamingEventSequenceMatchesAmpActor(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/provider/openai/v1/chat/completions" {
+		if r.URL.Path != "/api/provider/openai/v1/responses" {
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}
 		payload := readNeoJSON(r.Body)
@@ -5011,9 +5066,10 @@ func TestNeoRuntimeWebSocketStreamingEventSequenceMatchesAmpActor(t *testing.T) 
 		w.Header().Set("Content-Type", "text/event-stream")
 		flusher, _ := w.(http.Flusher)
 		for _, chunk := range []string{
-			`data: {"choices":[{"delta":{"content":"hel"}}]}`,
-			`data: {"choices":[{"delta":{"content":"lo"}}]}`,
-			`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"shell_command","arguments":"{\"cmd\":\"pwd\"}"}}]}}]}`,
+			`data: {"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"hel"}`,
+			`data: {"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"lo"}`,
+			`data: {"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"call_1","name":"shell_command","arguments":"{\"cmd\":\"pwd\"}"}}`,
+			`data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1},"output":[]}}`,
 			`data: [DONE]`,
 		} {
 			_, _ = w.Write([]byte(chunk + "\n\n"))
@@ -5199,7 +5255,7 @@ func TestNeoRuntimeWebSocketStreamingEventSequenceMatchesAmpActor(t *testing.T) 
 func TestNeoRuntimeWebSocketStreamingToolArgumentsUseAmpDeltaShape(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/provider/openai/v1/chat/completions" {
+		if r.URL.Path != "/api/provider/openai/v1/responses" {
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}
 		payload := readNeoJSON(r.Body)
@@ -5209,8 +5265,9 @@ func TestNeoRuntimeWebSocketStreamingToolArgumentsUseAmpDeltaShape(t *testing.T)
 		w.Header().Set("Content-Type", "text/event-stream")
 		flusher, _ := w.(http.Flusher)
 		for _, chunk := range []string{
-			`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"shell_command","arguments":"{\"cmd\""}}]}}]}`,
-			`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":":\"pwd\"}"}}]}}]}`,
+			`data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"shell_command","arguments":"{\"cmd\""}}`,
+			`data: {"type":"response.function_call_arguments.delta","output_index":0,"delta":":\"pwd\"}"}`,
+			`data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1},"output":[]}}`,
 			`data: [DONE]`,
 		} {
 			_, _ = w.Write([]byte(chunk + "\n\n"))
@@ -5428,15 +5485,16 @@ func collectNeoOpenAIStreamBlockIndexes(t *testing.T, agentMode, toolName string
 	t.Helper()
 	t.Setenv("HOME", t.TempDir())
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/provider/openai/v1/chat/completions" {
+		if r.URL.Path != "/api/provider/openai/v1/responses" {
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		flusher, _ := w.(http.Flusher)
 		for _, chunk := range []string{
-			`data: {"choices":[{"delta":{"content":"hel"}}]}`,
-			`data: {"choices":[{"delta":{"content":"lo"}}]}`,
-			`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"` + toolName + `","arguments":"{\"cmd\":\"pwd\"}"}}]}}]}`,
+			`data: {"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"hel"}`,
+			`data: {"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"lo"}`,
+			`data: {"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"call_1","name":"` + toolName + `","arguments":"{\"cmd\":\"pwd\"}"}}`,
+			`data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1},"output":[]}}`,
 			`data: [DONE]`,
 		} {
 			_, _ = w.Write([]byte(chunk + "\n\n"))

@@ -11563,6 +11563,26 @@ func inferNeoAnthropic(rt *neoRuntime, request neoInferenceRequest, route neoMod
 }
 
 func inferNeoOpenAI(rt *neoRuntime, request neoInferenceRequest, route neoModelRoute) (neoInferenceResult, error) {
+	result, err := inferNeoOpenAIResponses(rt, request, route)
+	if err == nil {
+		return result, nil
+	}
+	if isNeoOpenAIResponsesUnsupportedError(err) {
+		return inferNeoOpenAIChat(rt, request, route)
+	}
+	return neoInferenceResult{}, err
+}
+
+func inferNeoOpenAIResponses(rt *neoRuntime, request neoInferenceRequest, route neoModelRoute) (neoInferenceResult, error) {
+	body := openAIResponsesNeoBody(request, route, false)
+	jsonBody, err := callNeoLocalProvider(rt, "openai", "/v1/responses", body, request.ThreadID)
+	if err != nil {
+		return neoInferenceResult{}, err
+	}
+	return parseNeoOpenAIResponsesResult(jsonBody, route), nil
+}
+
+func inferNeoOpenAIChat(rt *neoRuntime, request neoInferenceRequest, route neoModelRoute) (neoInferenceResult, error) {
 	body := map[string]any{
 		"model":    route.Model,
 		"stream":   false,
@@ -11842,6 +11862,243 @@ func inferNeoAnthropicStream(rt *neoRuntime, request neoInferenceRequest, route 
 }
 
 func inferNeoOpenAIStream(rt *neoRuntime, request neoInferenceRequest, route neoModelRoute, onDelta neoStreamCallback) (neoInferenceResult, error) {
+	result, err := inferNeoOpenAIResponsesStream(rt, request, route, onDelta)
+	if err == nil {
+		return result, nil
+	}
+	if isNeoOpenAIResponsesUnsupportedError(err) {
+		return inferNeoOpenAIChatStream(rt, request, route, onDelta)
+	}
+	return neoInferenceResult{}, err
+}
+
+func inferNeoOpenAIResponsesStream(rt *neoRuntime, request neoInferenceRequest, route neoModelRoute, onDelta neoStreamCallback) (neoInferenceResult, error) {
+	body := openAIResponsesNeoBody(request, route, true)
+
+	type partialToolCall struct {
+		id      string
+		name    string
+		args    strings.Builder
+		ordinal int
+	}
+
+	type partialThinkingBlock struct {
+		text             strings.Builder
+		signature        string
+		id               string
+		sentDoneNewlines bool
+	}
+
+	var fullText strings.Builder
+	var usage map[string]any
+	streamBlockOffset := neoOpenAIThinkingBlockOffset(request.AgentMode, route.Provider)
+	toolCallsByIndex := map[int]*partialToolCall{}
+	toolIndexes := make([]int, 0)
+	thinkingBlocksByIndex := map[int]*partialThinkingBlock{}
+	thinkingIndexes := make([]int, 0)
+	toolOrdinalByIndex := map[int]int{}
+	completedResponse := map[string]any{}
+	sawContent := false
+
+	ensureToolCall := func(index int) *partialToolCall {
+		if call, ok := toolCallsByIndex[index]; ok {
+			return call
+		}
+		ordinal := len(toolOrdinalByIndex)
+		call := &partialToolCall{ordinal: ordinal}
+		toolCallsByIndex[index] = call
+		toolIndexes = append(toolIndexes, index)
+		toolOrdinalByIndex[index] = ordinal
+		return call
+	}
+	ensureThinkingBlock := func(index int) *partialThinkingBlock {
+		if block, ok := thinkingBlocksByIndex[index]; ok {
+			return block
+		}
+		block := &partialThinkingBlock{}
+		thinkingBlocksByIndex[index] = block
+		thinkingIndexes = append(thinkingIndexes, index)
+		return block
+	}
+	toolBlockIndex := func(call *partialToolCall) int {
+		index := streamBlockOffset + call.ordinal
+		if fullText.Len() > 0 {
+			index++
+		}
+		return index
+	}
+	emitToolDelta := func(call *partialToolCall, partialJSONDelta string) {
+		if onDelta == nil || call == nil || call.name == "" {
+			return
+		}
+		onDelta(neoInferenceDelta{ToolCall: &neoToolCallDelta{
+			ID:               fallbackString(call.id, neoStableToolCallID("")),
+			Name:             call.name,
+			Input:            parseToolArguments(call.args.String()),
+			PartialJSON:      call.args.String(),
+			PartialJSONDelta: partialJSONDelta,
+			BlockIndex:       toolBlockIndex(call),
+		}, Usage: usage})
+	}
+
+	err := callNeoLocalProviderSSE(rt, "openai", "/v1/responses", body, request.ThreadID, func(event, data string) error {
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(data), &payload); err != nil {
+			return err
+		}
+		if errorBody := mapValue(payload["error"]); len(errorBody) > 0 {
+			return fmt.Errorf("local provider stream error: %s", fallbackString(errorBody["message"], data))
+		}
+		switch stringValue(payload["type"]) {
+		case "response.output_text.delta":
+			text := stringValue(payload["delta"])
+			if text != "" {
+				sawContent = true
+				fullText.WriteString(text)
+				if onDelta != nil {
+					onDelta(neoInferenceDelta{Text: text, BlockIndex: streamBlockOffset, Usage: usage})
+				}
+			}
+		case "response.reasoning_summary_text.delta":
+			text := stringValue(payload["delta"])
+			if text != "" {
+				sawContent = true
+				index := numberFrom(payload["output_index"])
+				block := ensureThinkingBlock(index)
+				block.text.WriteString(text)
+				if onDelta != nil {
+					onDelta(neoInferenceDelta{Thinking: text, BlockIndex: 0, Usage: usage})
+				}
+			}
+		case "response.reasoning_summary_text.done":
+			index := numberFrom(payload["output_index"])
+			block := ensureThinkingBlock(index)
+			if text := stringValue(payload["text"]); text != "" && block.text.Len() == 0 {
+				block.text.WriteString(text)
+			}
+			if !block.sentDoneNewlines {
+				block.sentDoneNewlines = true
+				if onDelta != nil {
+					onDelta(neoInferenceDelta{Thinking: "\n\n", BlockIndex: 0, Usage: usage})
+				}
+			}
+		case "response.output_item.added":
+			index := numberFrom(payload["output_index"])
+			item := mapValue(payload["item"])
+			switch stringValue(item["type"]) {
+			case "function_call":
+				call := ensureToolCall(index)
+				if call.id == "" {
+					call.id = neoStableToolCallID(stringValue(item["call_id"]))
+				}
+				if name := stringValue(item["name"]); name != "" {
+					call.name = name
+					sawContent = true
+				}
+				if args := stringValue(item["arguments"]); args != "" {
+					call.args.WriteString(args)
+				}
+				emitToolDelta(call, stringValue(item["arguments"]))
+			case "reasoning":
+				block := ensureThinkingBlock(index)
+				block.signature = stringValue(item["encrypted_content"])
+				block.id = stringValue(item["id"])
+			}
+		case "response.output_item.done":
+			index := numberFrom(payload["output_index"])
+			item := mapValue(payload["item"])
+			switch stringValue(item["type"]) {
+			case "function_call":
+				call := ensureToolCall(index)
+				if call.id == "" {
+					call.id = neoStableToolCallID(stringValue(item["call_id"]))
+				}
+				if name := stringValue(item["name"]); name != "" {
+					call.name = name
+				}
+				if args := stringValue(item["arguments"]); args != "" && call.args.Len() == 0 {
+					call.args.WriteString(args)
+				}
+			case "reasoning":
+				block := ensureThinkingBlock(index)
+				block.signature = stringValue(item["encrypted_content"])
+				block.id = stringValue(item["id"])
+				for _, raw := range arrayValue(item["summary"]) {
+					part := mapValue(raw)
+					if text := stringValue(part["text"]); text != "" && block.text.Len() == 0 {
+						block.text.WriteString(text)
+					}
+				}
+			}
+		case "response.function_call_arguments.delta":
+			index := numberFrom(payload["output_index"])
+			call := ensureToolCall(index)
+			partialJSONDelta := stringValue(payload["delta"])
+			call.args.WriteString(partialJSONDelta)
+			emitToolDelta(call, partialJSONDelta)
+		case "response.function_call_arguments.done":
+			index := numberFrom(payload["output_index"])
+			call := ensureToolCall(index)
+			if name := stringValue(payload["name"]); name != "" {
+				call.name = name
+			}
+			if args := stringValue(payload["arguments"]); args != "" {
+				call.args.Reset()
+				call.args.WriteString(args)
+			}
+		case "response.completed":
+			completedResponse = mapValue(payload["response"])
+			usage = mergeNeoUsage(usage, mapValue(completedResponse["usage"]))
+		case "error":
+			return fmt.Errorf("local provider stream error: %s", data)
+		}
+		return nil
+	})
+	if err != nil {
+		if isNeoLocalEmptyStreamError(err) {
+			return inferNeoOpenAI(rt, request, route)
+		}
+		return neoInferenceResult{}, err
+	}
+	if !sawContent && len(completedResponse) > 0 {
+		result := parseNeoOpenAIResponsesResult(completedResponse, route)
+		if result.Text != "" || len(result.ToolCalls) > 0 || len(result.ThinkingBlocks) > 0 {
+			return result, nil
+		}
+	}
+	if !sawContent {
+		return inferNeoOpenAI(rt, request, route)
+	}
+
+	sort.Ints(toolIndexes)
+	toolCalls := make([]neoToolCall, 0, len(toolIndexes))
+	for _, index := range toolIndexes {
+		call := toolCallsByIndex[index]
+		if call == nil || call.name == "" {
+			continue
+		}
+		toolCalls = append(toolCalls, neoToolCall{
+			ID:    fallbackString(call.id, neoStableToolCallID(fmt.Sprintf("call-%d", index))),
+			Name:  call.name,
+			Input: parseToolArguments(call.args.String()),
+		})
+	}
+	sort.Ints(thinkingIndexes)
+	thinkingBlocks := make([]neoThinkingBlock, 0, len(thinkingIndexes))
+	for _, index := range thinkingIndexes {
+		block := thinkingBlocksByIndex[index]
+		if block == nil {
+			continue
+		}
+		if block.text.Len() == 0 && block.signature == "" {
+			continue
+		}
+		thinkingBlocks = append(thinkingBlocks, neoThinkingBlock{Thinking: block.text.String(), Signature: block.signature})
+	}
+	return neoInferenceResult{Provider: route.Provider, Model: route.Model, Text: fullText.String(), ToolCalls: toolCalls, Usage: usage, ThinkingBlocks: thinkingBlocks}, nil
+}
+
+func inferNeoOpenAIChatStream(rt *neoRuntime, request neoInferenceRequest, route neoModelRoute, onDelta neoStreamCallback) (neoInferenceResult, error) {
 	body := map[string]any{
 		"model":    route.Model,
 		"stream":   true,
@@ -14175,6 +14432,110 @@ func openAINeoMessages(history []neoHistoryMessage, system string) []any {
 	return messages
 }
 
+func openAIResponsesNeoBody(request neoInferenceRequest, route neoModelRoute, stream bool) map[string]any {
+	body := map[string]any{
+		"model":               route.Model,
+		"input":               openAIResponsesNeoInput(request.History, neoSystemPrompt(request, route)),
+		"store":               false,
+		"include":             []any{"reasoning.encrypted_content"},
+		"stream":              stream,
+		"prompt_cache_key":    request.ThreadID,
+		"parallel_tool_calls": true,
+	}
+	if stream {
+		body["stream_options"] = map[string]any{"include_obfuscation": false}
+	}
+	if maxOutput := neoOpenAIResponsesMaxOutputTokens(route.Model); maxOutput > 0 {
+		body["max_output_tokens"] = maxOutput
+	}
+	if len(request.Tools) > 0 {
+		body["tools"] = openAIResponsesNeoTools(request.Tools)
+	}
+	neoApplyOpenAIResponsesReasoning(body, route, request.ReasoningEffort)
+	return body
+}
+
+func openAIResponsesNeoInput(history []neoHistoryMessage, system string) []any {
+	history = sanitizeNeoHistoryToolPairs(history)
+	input := make([]any, 0, len(history)+1)
+	if strings.TrimSpace(system) != "" {
+		input = append(input, map[string]any{"role": "system", "content": system})
+	}
+	for _, msg := range history {
+		switch msg.Role {
+		case "tool":
+			if msg.ToolCallID != "" {
+				input = append(input, map[string]any{"type": "function_call_output", "call_id": msg.ToolCallID, "output": msg.Text})
+			}
+		case "assistant":
+			for _, tb := range msg.ThinkingBlocks {
+				if tb.Thinking == "" && tb.Signature == "" {
+					continue
+				}
+				item := map[string]any{"type": "reasoning"}
+				if tb.Thinking != "" {
+					item["summary"] = []any{map[string]any{"type": "summary_text", "text": tb.Thinking}}
+				} else {
+					item["summary"] = []any{}
+				}
+				if tb.Signature != "" {
+					item["encrypted_content"] = tb.Signature
+				}
+				input = append(input, item)
+			}
+			if msg.Text != "" {
+				input = append(input, map[string]any{"type": "message", "role": "assistant", "content": msg.Text})
+			}
+			for _, call := range msg.ToolCalls {
+				if call.Name == "" {
+					continue
+				}
+				args, _ := json.Marshal(call.Input)
+				input = append(input, map[string]any{"type": "function_call", "name": call.Name, "call_id": call.ID, "arguments": string(args)})
+			}
+		default:
+			content := openAIResponsesNeoUserContent(msg)
+			if len(content) > 0 {
+				input = append(input, map[string]any{"type": "message", "role": "user", "content": content})
+			}
+		}
+	}
+	return input
+}
+
+func openAIResponsesNeoUserContent(msg neoHistoryMessage) []any {
+	if len(msg.Content) == 0 {
+		if strings.TrimSpace(msg.Text) == "" {
+			return nil
+		}
+		return []any{map[string]any{"type": "input_text", "text": msg.Text}}
+	}
+	content := make([]any, 0, len(msg.Content))
+	for _, raw := range msg.Content {
+		block := mapValue(raw)
+		switch stringValue(block["type"]) {
+		case "text":
+			if text := stringValue(block["text"]); text != "" {
+				content = append(content, map[string]any{"type": "input_text", "text": text})
+			}
+		case "image", "input_image", "image_url":
+			if imageURL := neoImageURL(block); imageURL != "" {
+				content = append(content, map[string]any{"type": "input_image", "detail": "auto", "image_url": imageURL})
+			} else if text := neoAttachmentFallbackText(block); text != "" {
+				content = append(content, map[string]any{"type": "input_text", "text": text})
+			}
+		default:
+			if text := neoAttachmentFallbackText(block); text != "" {
+				content = append(content, map[string]any{"type": "input_text", "text": text})
+			}
+		}
+	}
+	if len(content) == 0 && strings.TrimSpace(msg.Text) != "" {
+		content = append(content, map[string]any{"type": "input_text", "text": msg.Text})
+	}
+	return content
+}
+
 func googleNeoContents(history []neoHistoryMessage, system string) []any {
 	history = sanitizeNeoHistoryToolPairs(history)
 	contents := make([]any, 0, len(history)+1)
@@ -14450,6 +14811,24 @@ func openAINeoTools(tools []neoToolSpec) []any {
 	return out
 }
 
+func openAIResponsesNeoTools(tools []neoToolSpec) []any {
+	out := make([]any, 0, len(tools))
+	for _, tool := range tools {
+		schema := tool.InputSchema
+		if len(schema) == 0 {
+			schema = map[string]any{"type": "object"}
+		}
+		out = append(out, map[string]any{
+			"type":        "function",
+			"name":        tool.Name,
+			"description": tool.Description,
+			"parameters":  schema,
+			"strict":      false,
+		})
+	}
+	return out
+}
+
 func googleNeoTools(tools []neoToolSpec) []any {
 	out := make([]any, 0, len(tools))
 	for _, tool := range tools {
@@ -14471,6 +14850,35 @@ func openAIReasoningEffort(effort string) string {
 	default:
 		return "medium"
 	}
+}
+
+func openAIResponsesReasoningEffort(effort string) string {
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case "none", "minimal", "low", "medium", "high", "xhigh":
+		return strings.ToLower(strings.TrimSpace(effort))
+	default:
+		return "medium"
+	}
+}
+
+func neoOpenAIResponsesSupportsReasoning(model string) bool {
+	model = strings.ToLower(strings.TrimSpace(model))
+	if model == "" {
+		return false
+	}
+	return strings.HasPrefix(model, "gpt-5") ||
+		strings.HasPrefix(model, "o1") ||
+		strings.HasPrefix(model, "o3") ||
+		strings.HasPrefix(model, "o4") ||
+		strings.HasPrefix(model, "amp-nostromo")
+}
+
+func neoOpenAIResponsesMaxOutputTokens(model string) int {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return 0
+	}
+	return neoModelMaxOutputTokens[model]
 }
 
 // neoEffectiveThinkingLevel picks the level to apply for an inference call.
@@ -14658,6 +15066,85 @@ func neoApplyOpenAIReasoning(body map[string]any, route neoModelRoute, fallback 
 		return
 	}
 	body["reasoning_effort"] = openAIReasoningEffort(suffix)
+}
+
+func neoApplyOpenAIResponsesReasoning(body map[string]any, route neoModelRoute, fallback string) {
+	suffix := neoEffectiveThinkingLevel(route, fallback)
+	if neoOpenAIResponsesSupportsReasoning(route.Model) {
+		body["reasoning"] = map[string]any{
+			"effort":  openAIResponsesReasoningEffort(firstNonEmptyString(suffix, fallback)),
+			"summary": "auto",
+		}
+		return
+	}
+	body["temperature"] = 0.1
+}
+
+func parseNeoOpenAIResponsesResult(jsonBody map[string]any, route neoModelRoute) neoInferenceResult {
+	var text strings.Builder
+	toolCalls := make([]neoToolCall, 0)
+	thinkingBlocks := make([]neoThinkingBlock, 0)
+	for i, raw := range arrayValue(jsonBody["output"]) {
+		item := mapValue(raw)
+		switch stringValue(item["type"]) {
+		case "message":
+			for _, rawContent := range arrayValue(item["content"]) {
+				content := mapValue(rawContent)
+				switch stringValue(content["type"]) {
+				case "output_text":
+					text.WriteString(stringValue(content["text"]))
+				case "refusal":
+					text.WriteString(stringValue(content["refusal"]))
+				}
+			}
+			if content := stringValue(item["content"]); content != "" {
+				text.WriteString(content)
+			}
+		case "function_call":
+			name := stringValue(item["name"])
+			if name == "" {
+				continue
+			}
+			toolCalls = append(toolCalls, neoToolCall{
+				ID:    fallbackString(item["call_id"], fmt.Sprintf("call-%d", i)),
+				Name:  name,
+				Input: parseToolArguments(item["arguments"]),
+			})
+		case "reasoning":
+			signature := stringValue(item["encrypted_content"])
+			added := false
+			for _, rawSummary := range arrayValue(item["summary"]) {
+				summary := mapValue(rawSummary)
+				if text := stringValue(summary["text"]); text != "" {
+					thinkingBlocks = append(thinkingBlocks, neoThinkingBlock{Thinking: text, Signature: signature})
+					added = true
+				}
+			}
+			if !added && signature != "" {
+				thinkingBlocks = append(thinkingBlocks, neoThinkingBlock{Signature: signature})
+			}
+		}
+	}
+	return neoInferenceResult{Provider: route.Provider, Model: route.Model, Text: text.String(), ToolCalls: toolCalls, Usage: mapValue(jsonBody["usage"]), ThinkingBlocks: thinkingBlocks}
+}
+
+func isNeoOpenAIResponsesUnsupportedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	lower := strings.ToLower(err.Error())
+	if strings.Contains(lower, "local provider returned 404") || strings.Contains(lower, "404 not found") {
+		return true
+	}
+	if strings.Contains(lower, "responses") && (strings.Contains(lower, "not supported") || strings.Contains(lower, "unsupported") || strings.Contains(lower, "not found")) {
+		return true
+	}
+	for _, marker := range []string{"unknown parameter", "unrecognized request argument", "unrecognized field", "unsupported parameter"} {
+		if strings.Contains(lower, marker) && (strings.Contains(lower, "input") || strings.Contains(lower, "reasoning") || strings.Contains(lower, "max_output_tokens") || strings.Contains(lower, "prompt_cache_key") || strings.Contains(lower, "include_obfuscation")) {
+			return true
+		}
+	}
+	return false
 }
 
 func parseToolArguments(value any) map[string]any {
