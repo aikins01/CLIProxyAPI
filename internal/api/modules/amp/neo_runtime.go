@@ -16701,7 +16701,7 @@ func openAINeoMessages(history []neoHistoryMessage, system string) []any {
 	for _, msg := range history {
 		switch msg.Role {
 		case "tool":
-			messages = append(messages, map[string]any{"role": "tool", "tool_call_id": msg.ToolCallID, "content": msg.Text})
+			messages = append(messages, openAIChatNeoToolMessages(msg)...)
 		case "assistant":
 			assistant := map[string]any{"role": "assistant", "content": msg.Text}
 			if len(msg.ToolCalls) > 0 {
@@ -16890,6 +16890,50 @@ func openAIResponsesNeoUserContent(msg neoHistoryMessage) []any {
 	return content
 }
 
+func openAIChatNeoToolMessages(msg neoHistoryMessage) []any {
+	toolText, imageContent := openAIChatNeoToolContent(msg)
+	messages := []any{map[string]any{"role": "tool", "tool_call_id": msg.ToolCallID, "content": toolText}}
+	if len(imageContent) > 0 {
+		messages = append(messages, map[string]any{"role": "user", "content": imageContent})
+	}
+	return messages
+}
+
+func openAIChatNeoToolContent(msg neoHistoryMessage) (string, []any) {
+	if len(msg.Content) == 0 {
+		return msg.Text, nil
+	}
+	texts := make([]string, 0, len(msg.Content))
+	imageContent := make([]any, 0, len(msg.Content)*2)
+	hasImage := false
+	for _, raw := range msg.Content {
+		block := mapValue(raw)
+		switch stringValue(block["type"]) {
+		case "text":
+			if text := stringValue(block["text"]); text != "" {
+				texts = append(texts, text)
+				imageContent = append(imageContent, map[string]any{"type": "text", "text": text})
+			}
+		case "image", "input_image", "image_url":
+			imageURL := neoImageURL(block)
+			if imageURL == "" {
+				return msg.Text, nil
+			}
+			label := neoToolImageLabel(block)
+			texts = append(texts, label)
+			imageContent = append(imageContent, map[string]any{"type": "text", "text": label})
+			imageContent = append(imageContent, map[string]any{"type": "image_url", "image_url": map[string]any{"url": imageURL}})
+			hasImage = true
+		default:
+			return msg.Text, nil
+		}
+	}
+	if !hasImage || len(imageContent) == 0 {
+		return msg.Text, nil
+	}
+	return strings.Join(texts, "\n"), imageContent
+}
+
 func anthropicNeoToolResultContent(msg neoHistoryMessage) any {
 	if len(msg.Content) == 0 {
 		return msg.Text
@@ -16932,27 +16976,44 @@ func googleNeoToolResultParts(msg neoHistoryMessage) []any {
 		return parts
 	}
 	texts := make([]string, 0)
+	extraParts := make([]any, 0)
+	hasImage := false
 	for _, raw := range msg.Content {
 		block := mapValue(raw)
 		switch stringValue(block["type"]) {
 		case "text":
 			if text := stringValue(block["text"]); text != "" {
 				texts = append(texts, text)
+				extraParts = append(extraParts, map[string]any{"text": text})
 			}
 		case "image", "input_image", "image_url":
-			imageParts := googleNeoUserParts(neoHistoryMessage{Content: []any{block}})
-			for _, part := range imageParts {
-				if _, ok := mapValue(part)["text"]; ok {
-					continue
-				}
-				parts = append(parts, part)
+			label := neoToolImageLabel(block)
+			texts = append(texts, label)
+			extraParts = append(extraParts, map[string]any{"text": label})
+			if data, mediaType := neoImageBase64(block); data != "" {
+				extraParts = append(extraParts, map[string]any{"inlineData": map[string]any{"mimeType": fallbackString(mediaType, "image/png"), "data": data}})
+			} else if imageURL := neoImageURL(block); imageURL != "" {
+				extraParts = append(extraParts, map[string]any{"text": "[Image URL: " + imageURL + "]"})
+			} else {
+				return parts
 			}
+			hasImage = true
+		default:
+			return parts
 		}
 	}
-	if len(texts) > 0 {
+	if hasImage && len(texts) > 0 {
 		response["content"] = strings.Join(texts, "\n")
+		parts = append(parts, extraParts...)
 	}
 	return parts
+}
+
+func neoToolImageLabel(block map[string]any) string {
+	if savedPath := firstNonEmptyString(block["savedPath"], block["saved_path"], block["path"], block["filePath"], block["file_path"]); savedPath != "" {
+		return "Image: " + savedPath
+	}
+	return "Image:"
 }
 
 func googleNeoContents(history []neoHistoryMessage, system string) []any {

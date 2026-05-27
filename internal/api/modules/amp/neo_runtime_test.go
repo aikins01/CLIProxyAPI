@@ -9876,16 +9876,35 @@ func TestNeoImageToolResultReplaysImageContentToProviders(t *testing.T) {
 		t.Fatalf("responses image_url = %q", imageURL)
 	}
 
+	openAIChat := openAINeoMessages(history, "")
+	if len(openAIChat) != 3 {
+		t.Fatalf("openAI chat messages = %#v", openAIChat)
+	}
+	openAITool := mapValue(openAIChat[1])
+	if stringValue(openAITool["role"]) != "tool" || stringValue(openAITool["content"]) != "Viewed image: /tmp/chart.png\nImage:" {
+		t.Fatalf("openAI tool message = %#v", openAITool)
+	}
+	openAIImageContent := arrayValue(mapValue(openAIChat[2])["content"])
+	if len(openAIImageContent) != 3 || stringValue(mapValue(openAIImageContent[0])["text"]) != "Viewed image: /tmp/chart.png" || stringValue(mapValue(openAIImageContent[1])["text"]) != "Image:" {
+		t.Fatalf("openAI image content = %#v", openAIImageContent)
+	}
+	if imageURL := stringValue(mapValue(mapValue(openAIImageContent[2])["image_url"])["url"]); imageURL != "data:image/png;base64,abc123" {
+		t.Fatalf("openAI image_url = %q", imageURL)
+	}
+
 	google := googleNeoContents(history, "")
 	googleParts := arrayValue(mapValue(google[1])["parts"])
-	if len(googleParts) != 2 {
+	if len(googleParts) != 4 {
 		t.Fatalf("google parts = %#v", googleParts)
 	}
 	response := mapValue(mapValue(googleParts[0])["functionResponse"])
-	if stringValue(mapValue(response["response"])["content"]) != "Viewed image: /tmp/chart.png" {
+	if stringValue(mapValue(response["response"])["content"]) != "Viewed image: /tmp/chart.png\nImage:" {
 		t.Fatalf("google function response = %#v", response)
 	}
-	inlineData := mapValue(mapValue(googleParts[1])["inlineData"])
+	if stringValue(mapValue(googleParts[1])["text"]) != "Viewed image: /tmp/chart.png" || stringValue(mapValue(googleParts[2])["text"]) != "Image:" {
+		t.Fatalf("google text parts = %#v", googleParts)
+	}
+	inlineData := mapValue(mapValue(googleParts[3])["inlineData"])
 	if stringValue(inlineData["mimeType"]) != "image/png" || stringValue(inlineData["data"]) != "abc123" {
 		t.Fatalf("google inline data = %#v", inlineData)
 	}
