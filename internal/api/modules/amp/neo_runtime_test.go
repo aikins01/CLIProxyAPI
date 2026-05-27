@@ -3364,6 +3364,13 @@ func TestSelectNeoModelRouteDefaultsFrontierToGemini35Flash(t *testing.T) {
 	}
 }
 
+func TestSelectNeoModelRouteDefaultsNostromoToAmpNostromo(t *testing.T) {
+	got := selectNeoModelRoute("nostromo", nil)
+	if got.Provider != "openai" || got.Model != "amp-nostromo-v1" {
+		t.Fatalf("route = %+v, want openai/amp-nostromo-v1", got)
+	}
+}
+
 func TestNeoModelRegistryMatchesAmpBinaryValues(t *testing.T) {
 	for _, tc := range []struct {
 		model    string
@@ -3954,6 +3961,9 @@ func TestNeoActorReasoningEffortDefaultsByMode(t *testing.T) {
 	if got := actor.reasoningEffortForModeLocked("frontier"); got != "medium" {
 		t.Fatalf("frontier effort = %q, want medium", got)
 	}
+	if got := actor.reasoningEffortForModeLocked("nostromo"); got != "low" {
+		t.Fatalf("nostromo effort = %q, want low", got)
+	}
 }
 
 func TestNeoActorFiltersAmpBuiltInToolsByMode(t *testing.T) {
@@ -4455,7 +4465,7 @@ func TestInferNeoOpenAIStreamHandlesCRLFSSESeparatorsBeforeUpstreamCompletes(t *
 	}
 }
 
-func TestInferNeoOpenAIChatCompletionsOmitsReasoningEffortWithTools(t *testing.T) {
+func TestInferNeoOpenAIChatCompletionsSendsReasoningEffortWithTools(t *testing.T) {
 	for _, stream := range []bool{false, true} {
 		t.Run(fmt.Sprintf("stream_%t", stream), func(t *testing.T) {
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -4466,8 +4476,8 @@ func TestInferNeoOpenAIChatCompletionsOmitsReasoningEffortWithTools(t *testing.T
 				if payload["stream"] != stream {
 					t.Fatalf("stream = %#v, want %v", payload["stream"], stream)
 				}
-				if _, ok := payload["reasoning_effort"]; ok {
-					t.Fatalf("reasoning_effort should be omitted when tools are present: %#v", payload)
+				if payload["reasoning_effort"] != "xhigh" {
+					t.Fatalf("reasoning_effort = %#v, want xhigh", payload["reasoning_effort"])
 				}
 				if len(arrayValue(payload["tools"])) == 0 {
 					t.Fatalf("tools missing: %#v", payload)

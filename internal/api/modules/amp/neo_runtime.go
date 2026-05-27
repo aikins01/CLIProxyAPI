@@ -10349,6 +10349,8 @@ func defaultNeoReasoningEffort(agentMode string) string {
 		return "medium"
 	case "frontier":
 		return "medium"
+	case "nostromo":
+		return "low"
 	default:
 		return ""
 	}
@@ -10363,7 +10365,7 @@ func normalizeNeoReasoningEffortForMode(agentMode, effort string) string {
 
 func neoModeSupportsReasoningEffort(agentMode string) bool {
 	switch strings.ToLower(strings.TrimSpace(agentMode)) {
-	case "smart", "rush", "deep", "frontier":
+	case "smart", "rush", "deep", "frontier", "nostromo":
 		return true
 	default:
 		return false
@@ -10384,6 +10386,8 @@ func neoReasoningEffortAllowedForMode(agentMode, effort string) bool {
 		return effort == "low" || effort == "medium" || effort == "xhigh"
 	case "frontier":
 		return effort == "medium"
+	case "nostromo":
+		return effort == "low"
 	default:
 		return false
 	}
@@ -11186,6 +11190,8 @@ func selectNeoModelRoute(agentMode string, settings map[string]any) neoModelRout
 		return neoModelRoute{Provider: "anthropic", Model: "claude-opus-4-6"}
 	case "frontier":
 		return neoModelRoute{Provider: "google", Model: "gemini-3.5-flash"}
+	case "nostromo":
+		return neoModelRoute{Provider: "openai", Model: "amp-nostromo-v1"}
 	default:
 		return neoModelRoute{Provider: "anthropic", Model: "claude-opus-4-7"}
 	}
@@ -11353,9 +11359,8 @@ func inferNeoOpenAI(rt *neoRuntime, request neoInferenceRequest, route neoModelR
 	if len(request.Tools) > 0 {
 		body["tools"] = openAINeoTools(request.Tools)
 		body["tool_choice"] = "auto"
-	} else {
-		neoApplyOpenAIReasoning(body, route, request.ReasoningEffort)
 	}
+	neoApplyOpenAIReasoning(body, route, request.ReasoningEffort)
 
 	jsonBody, err := callNeoLocalProvider(rt, "openai", "/v1/chat/completions", body, request.ThreadID)
 	if err != nil {
@@ -11639,9 +11644,8 @@ func inferNeoOpenAIStream(rt *neoRuntime, request neoInferenceRequest, route neo
 	if len(request.Tools) > 0 {
 		body["tools"] = openAINeoTools(request.Tools)
 		body["tool_choice"] = "auto"
-	} else {
-		neoApplyOpenAIReasoning(body, route, request.ReasoningEffort)
 	}
+	neoApplyOpenAIReasoning(body, route, request.ReasoningEffort)
 
 	type partialToolCall struct {
 		id   string

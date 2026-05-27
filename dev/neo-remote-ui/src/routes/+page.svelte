@@ -1939,6 +1939,8 @@
         return 'medium';
       case 'frontier':
         return 'medium';
+      case 'nostromo':
+        return 'low';
       default:
         return '';
     }
@@ -2859,15 +2861,21 @@
 
   // Classify a tool_use block into an ampcode-style category for grouping.
   // Normalize by stripping spaces/underscores/dashes so 'Shell command', 'shell_command', 'shellCommand' all match.
-  type ToolCategory = 'explore' | 'edit' | 'command' | 'thread' | 'skill' | 'task' | 'web' | 'painter' | 'other';
+  type ToolCategory = 'explore' | 'edit' | 'command' | 'thread' | 'skill' | 'task' | 'web' | 'painter' | 'review' | 'other';
   function normalizedToolName(name: string) {
     return (name || '').toLowerCase().replace(/[\s_-]+/g, '');
+  }
+
+  function isCodeReviewToolName(name: string) {
+    const n = normalizedToolName(name);
+    return n === 'codereview' || n.includes('codereview');
   }
 
   function toolCategory(name: string): ToolCategory {
     const n = normalizedToolName(name);
     // Order matters — check most specific first
     if (n === 'painter' || n === 'renderaggman' || n === 'viewmedia' || n === 'lookat') return 'painter';
+    if (isCodeReviewToolName(name)) return 'review';
     if (n.includes('shell') || n.includes('command') || n.includes('bash') || n.includes('terminal') || n === 'exec' || n === 'run') return 'command';
     if (n.includes('editfile') || n.includes('writefile') || n.includes('createfile') || n.includes('patch') || n.includes('edit') || n === 'write' || n === 'modify' || n === 'update') return 'edit';
     if (n.includes('subagent') || n === 'task' || n === 'agent' || n.includes('spawn')) return 'task';
@@ -2925,6 +2933,7 @@
     | { kind: 'edit'; block: ContentBlock; result?: ContentBlock }
     | { kind: 'command'; block: ContentBlock; result?: ContentBlock }
     | { kind: 'painter'; block: ContentBlock; result?: ContentBlock }
+    | { kind: 'review'; block: ContentBlock; result?: ContentBlock }
     | { kind: 'tool'; block: ContentBlock; result?: ContentBlock }
     | { kind: 'result'; block: ContentBlock };
 
@@ -2953,6 +2962,7 @@
         else if (cat === 'edit') { flush(); rows.push({ kind: 'edit', block: b, result }); }
         else if (cat === 'command') { flush(); rows.push({ kind: 'command', block: b, result }); }
         else if (cat === 'painter') { flush(); rows.push({ kind: 'painter', block: b, result }); }
+        else if (cat === 'review') { flush(); rows.push({ kind: 'review', block: b, result }); }
         else { flush(); rows.push({ kind: 'tool', block: b, result }); }
       } else if (b.type === 'tool_result') { continue; }
       else { flush(); rows.push({ kind: 'tool', block: b }); }
@@ -3048,6 +3058,93 @@
     const exitCode = toolResultExitCode(block);
     if (Number.isFinite(exitCode) && exitCode !== 0) return true;
     return ['error', 'failed', 'cancelled', 'rejected-by-user'].includes(toolResultStatus(block));
+  }
+
+  function codeReviewTitle(result?: ContentBlock) {
+    const status = toolResultStatus(result);
+    if (status === 'queued' || status === 'in-progress') return 'Reviewing code';
+    if (status === 'error' || status === 'failed') return 'Code review failed';
+    return 'Reviewed code';
+  }
+
+  function codeReviewIssueCount(check: Record<string, unknown>) {
+    for (const value of [
+      check.issueCount,
+      check.issue_count,
+      check.issuesCount,
+      check.issues_count,
+      check.findingCount,
+      check.finding_count,
+      check.findingsCount,
+      check.findings_count,
+      check.problemCount,
+      check.problem_count
+    ]) {
+      const n = numberFrom(value);
+      if (Number.isFinite(n)) return n;
+    }
+    for (const key of ['issues', 'findings', 'problems', 'diagnostics', 'results']) {
+      const value = check[key];
+      if (Array.isArray(value)) return value.length;
+    }
+    return NaN;
+  }
+
+  function codeReviewCheckLabel(key: string, check: Record<string, unknown>) {
+    return firstString(check.title, check.name, check.label, key).replace(/[_-]+/g, ' ');
+  }
+
+  function codeReviewErrorText(value: unknown) {
+    const record = asRecord(value);
+    return firstString(value, record.message, record.error);
+  }
+
+  function codeReviewActions(result?: ContentBlock) {
+    const run = toolResultRun(result);
+    const nestedResult = asRecord(run.result);
+    const progress = asRecord(run.progress);
+    const main = firstRecord(nestedResult.main, progress.main);
+    const checks = firstRecord(nestedResult.checks, progress.checks);
+    const status = toolResultStatus(result);
+    const actions: string[] = [];
+    const seen = new Set<string>();
+    const add = (title: string) => {
+      if (!title || seen.has(title)) return;
+      seen.add(title);
+      actions.push(title);
+    };
+
+    if (status === 'queued') add('Code review queued');
+    if (status === 'error' || status === 'failed') add(`Code review failed: ${codeReviewErrorText(run.error ?? nestedResult.error) || 'Unknown error'}`);
+
+    let completedChecks = 0;
+    let totalChecks = 0;
+    for (const [key, rawCheck] of Object.entries(checks)) {
+      const check = asRecord(rawCheck);
+      if (Object.keys(check).length === 0) continue;
+      totalChecks += 1;
+      const label = codeReviewCheckLabel(key, check);
+      const checkStatus = stringFrom(check.status).trim().toLowerCase();
+      if (checkStatus === 'done' || checkStatus === 'complete' || checkStatus === 'completed') {
+        completedChecks += 1;
+        const count = codeReviewIssueCount(check);
+        if (!Number.isFinite(count)) add(`Check ${label}: complete`);
+        else if (count === 0) add(`Check ${label}: ok`);
+        else add(`Check ${label}: ${count} ${count === 1 ? 'issue' : 'issues'} found`);
+      } else if (checkStatus === 'error' || checkStatus === 'failed') {
+        completedChecks += 1;
+        add(`Check ${label}: error (${codeReviewErrorText(check.error) || 'Unknown error'})`);
+      } else if (checkStatus === 'in-progress' || checkStatus === 'running') {
+        add(`Check ${label}: ${firstString(check.message) || 'Running check...'}`);
+      }
+    }
+
+    if (stringFrom(main.status).trim().toLowerCase() === 'done' && totalChecks > 0 && completedChecks < totalChecks) {
+      add('Main review complete, running checks...');
+    }
+    if (status === 'done' || status === 'complete' || status === 'completed') add('Code review complete');
+    if (actions.length === 0) add(status === 'queued' ? 'Code review queued' : 'Reviewing code changes...');
+    return { actions, summary: totalChecks > 0 ? `${completedChecks}/${totalChecks} checks · code review` : 'code review' };
   }
 
   function toolResultPreview(block?: ContentBlock) {
@@ -3585,6 +3682,23 @@
                 <div class="painter-panel__text">{painterText}</div>
               {/if}
             </div>
+          </details>
+        {:else if row.kind === 'review'}
+          {@const review = codeReviewActions(row.result)}
+          <details class="trace-row trace-row--review" open={toolResultStatus(row.result) === 'in-progress' || toolResultStatus(row.result) === 'queued'}>
+            <summary class="trace-time-anchor" data-time={traceTimeLabelForRow(row.block, row.result)}>
+              <span class="trace-row__label">{codeReviewTitle(row.result)}</span>
+              <span class="trace-row__sub">{review.summary}</span>
+              <ChevronRight size={12} class="trace-row__chevron" />
+            </summary>
+            <ul class="trace-row__list">
+              {#each review.actions as action}
+                <li>
+                  <span class="trace-row__list-label">Review</span>
+                  <span class="trace-row__list-target">{action}</span>
+                </li>
+              {/each}
+            </ul>
           </details>
         {:else}
           {@const ranLabel = prettyToolLabel(row.block.name || '')}
