@@ -8600,6 +8600,15 @@ func TestNeoActorHandlesBinaryToolDeltas(t *testing.T) {
 		t.Fatalf("empty processed tool block = %#v original=%#v", toolBlock, original)
 	}
 
+	actor.handle(map[string]any{"type": "tool:processed", "toolUse": "TU-1", "args": map[string]any{"cmd": "not used by binary"}})
+	actor.mu.Lock()
+	toolBlock = mapValue(actor.messages[0].Content[0])
+	original = mapValue(mapValue(actor.messages[0].OriginalToolUseInput)["TU-1"])
+	actor.mu.Unlock()
+	if len(mapValue(toolBlock["input"])) != 0 || len(original) != 0 {
+		t.Fatalf("missing-newArgs processed tool block = %#v original=%#v", toolBlock, original)
+	}
+
 	actor.handle(map[string]any{"type": "tool:data", "toolUse": "TU-1", "data": map[string]any{}, "run": map[string]any{"status": "done", "result": "ignored fallback"}})
 	actor.mu.Lock()
 	if len(actor.messages) != 2 {
@@ -9091,6 +9100,21 @@ func TestNeoActorBinaryEnvironmentDeltaClearsExistingEnvironment(t *testing.T) {
 	}
 }
 
+func TestNeoActorBinaryEnvironmentDeltaIgnoresAliasOnlyPayload(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	actor.environment = map[string]any{"workspaceRoot": "/tmp/work", "shell": "zsh"}
+
+	actor.handle(map[string]any{"type": "environment", "environment": map[string]any{"workspaceRoot": "/tmp/other"}})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.environment) != 0 {
+		t.Fatalf("environment = %#v, want binary env field only", actor.environment)
+	}
+}
+
 func TestNeoActorBinaryModeDeltasUseUserTurnBoundary(t *testing.T) {
 	useTempNeoThreadStore(t)
 	rt := newNeoRuntime(&config.Config{})
@@ -9133,6 +9157,15 @@ func TestNeoActorBinaryAgentModeDoesNotMaterializeDefaultEffort(t *testing.T) {
 	useTempNeoThreadStore(t)
 	rt := newNeoRuntime(&config.Config{})
 	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+
+	actor.handle(map[string]any{"type": "agent-mode", "agentMode": "deep", "value": "deep"})
+	actor.handle(map[string]any{"type": "reasoning-effort", "reasoningEffort": "xhigh", "value": "xhigh"})
+	actor.mu.Lock()
+	if _, exists := actor.settings["agentMode"]; exists {
+		actor.mu.Unlock()
+		t.Fatalf("agent-mode alias materialized settings: %#v", actor.settings)
+	}
+	actor.mu.Unlock()
 
 	actor.handle(map[string]any{"type": "agent-mode", "mode": "deep"})
 
@@ -9210,6 +9243,8 @@ func TestNeoActorBinaryScalarDeltasUseFalseyClears(t *testing.T) {
 	actor.handle(map[string]any{"type": "max-tokens", "value": "", "maxTokens": 64000})
 	actor.handle(map[string]any{"type": "main-thread", "value": "", "threadID": parentID})
 	actor.handle(map[string]any{"type": "setPendingNavigation", "threadID": ""})
+	actor.handle(map[string]any{"type": "max-tokens", "maxTokens": 64000})
+	actor.handle(map[string]any{"type": "main-thread", "threadID": parentID})
 
 	actor.mu.Lock()
 	if actor.title != "" {

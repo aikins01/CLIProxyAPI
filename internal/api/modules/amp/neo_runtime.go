@@ -2154,12 +2154,7 @@ func (a *neoActor) handleBinaryUserToolInput(msg map[string]any) {
 
 func (a *neoActor) handleBinaryToolProcessed(msg map[string]any) {
 	toolCallID := neoToolCallIDFromMessage(msg)
-	var newArgs map[string]any
-	if _, exists := msg["newArgs"]; exists {
-		newArgs = cloneMap(mapValue(msg["newArgs"]))
-	} else {
-		newArgs = cloneMap(mapValue(msg["args"]))
-	}
+	newArgs := cloneMap(mapValue(msg["newArgs"]))
 	if toolCallID == "" {
 		return
 	}
@@ -10629,7 +10624,7 @@ func (a *neoActor) updateTitleFromBinary(msg map[string]any) {
 }
 
 func (a *neoActor) updateAgentModeFromBinary(msg map[string]any) {
-	mode := firstNonEmptyString(msg["mode"], msg["agentMode"], msg["value"])
+	mode := stringValue(msg["mode"])
 	if mode == "" {
 		return
 	}
@@ -10653,7 +10648,7 @@ func (a *neoActor) updateAgentModeFromBinary(msg map[string]any) {
 }
 
 func (a *neoActor) updateReasoningEffortFromBinary(msg map[string]any) {
-	rawEffort, hasEffort := firstPresentValue(msg, "effort", "reasoningEffort", "value")
+	rawEffort, hasEffort := firstPresentValue(msg, "effort")
 	effort := stringValue(rawEffort)
 	a.mu.Lock()
 	hasUserTurn := a.hasUserTurnLocked()
@@ -10698,7 +10693,7 @@ func (a *neoActor) updateReasoningEffortFromBinary(msg map[string]any) {
 }
 
 func (a *neoActor) updateMaxTokensFromBinary(msg map[string]any) {
-	rawValue, _ := firstPresentValue(msg, "value", "maxTokens", "max_tokens")
+	rawValue := msg["value"]
 	value := neoNormalizeMaxTokensValue(rawValue)
 	a.mu.Lock()
 	a.maxTokens = value
@@ -10754,7 +10749,7 @@ func neoNormalizeMaxTokensValue(value any) any {
 }
 
 func (a *neoActor) updateMainThreadFromBinary(msg map[string]any) {
-	threadID := stringValue(firstPresentValueOrNil(msg, "value", "threadID", "threadId", "mainThreadID", "mainThreadId"))
+	threadID := stringValue(msg["value"])
 	a.mu.Lock()
 	a.mainThreadID = threadID
 	if a.settings == nil {
@@ -10777,7 +10772,7 @@ func (a *neoActor) updateMainThreadFromBinary(msg map[string]any) {
 }
 
 func (a *neoActor) updateEnvironmentFromBinary(msg map[string]any) {
-	env := mapValue(firstNonNil(msg["env"], msg["environment"]))
+	env := mapValue(msg["env"])
 	a.updateEnvironment(env)
 	a.syncCloudAsync()
 }
