@@ -8610,12 +8610,43 @@ func TestNeoCloudMessageSanitizesUserMetaLikeBinary(t *testing.T) {
 	}
 }
 
+func TestNeoCloudMessageNormalizesUserStateForBinaryImport(t *testing.T) {
+	cloud := neoCloudMessage(neoMessage{
+		Role:      "user",
+		MessageID: "M-user",
+		Content:   []any{map[string]any{"type": "text", "text": "hello"}},
+		UserState: map[string]any{
+			"cwd":                     "/tmp/work",
+			"runningTerminalCommands": "not-an-array",
+			"aggmanContext": map[string]any{
+				"availableProjects": []any{map[string]any{"name": "project"}},
+			},
+		},
+	})
+
+	userState := mapValue(cloud["userState"])
+	if stringValue(userState["cwd"]) != "/tmp/work" {
+		t.Fatalf("userState cwd = %#v, want preserved cwd", userState)
+	}
+	if files := arrayValue(userState["currentlyVisibleFiles"]); len(files) != 0 {
+		t.Fatalf("currentlyVisibleFiles = %#v, want empty binary-safe array", files)
+	}
+	if _, exists := userState["runningTerminalCommands"]; exists {
+		t.Fatalf("runningTerminalCommands = %#v, want omitted when not an array", userState["runningTerminalCommands"])
+	}
+	projects := arrayValue(mapValue(userState["aggmanContext"])["availableProjects"])
+	if len(projects) != 1 || stringValue(mapValue(projects[0])["name"]) != "project" {
+		t.Fatalf("aggmanContext = %#v, want cloned available projects", userState["aggmanContext"])
+	}
+}
+
 func TestNeoMessageFromImportedThreadSanitizesUserMetaLikeBinary(t *testing.T) {
 	executorThreadID := "T-019e1046-656d-7132-879f-390ded941c16"
 	imported := neoMessageFromImportedThread("T-test", map[string]any{
 		"role":      "user",
 		"messageId": "M-user",
 		"content":   []any{map[string]any{"type": "text", "text": "hello"}},
+		"userState": map[string]any{"cwd": "/tmp/work"},
 		"meta": map[string]any{
 			"sentAt":               1778170001000,
 			"fromAggman":           false,
@@ -8637,6 +8668,10 @@ func TestNeoMessageFromImportedThreadSanitizesUserMetaLikeBinary(t *testing.T) {
 	if _, ok := imported.Meta["source"]; ok {
 		t.Fatalf("source = %#v, want omitted like binary import", imported.Meta["source"])
 	}
+	userState := mapValue(imported.UserState)
+	if stringValue(userState["cwd"]) != "/tmp/work" || arrayValue(userState["currentlyVisibleFiles"]) == nil {
+		t.Fatalf("userState = %#v, want binary-safe user state", userState)
+	}
 
 	assistant := neoMessageFromImportedThread("T-test", map[string]any{
 		"role":      "assistant",
@@ -8646,6 +8681,40 @@ func TestNeoMessageFromImportedThreadSanitizesUserMetaLikeBinary(t *testing.T) {
 	}, 1)
 	if len(assistant.Meta) != 0 {
 		t.Fatalf("assistant meta = %#v, want omitted like binary import", assistant.Meta)
+	}
+}
+
+func TestNeoMessageFromImportedThreadMatchesBinaryAssistantAndInfoImport(t *testing.T) {
+	complete := neoMessageFromImportedThread("T-test", map[string]any{
+		"role":      "assistant",
+		"messageId": "M-complete",
+		"content":   []any{map[string]any{"type": "text", "text": "done"}},
+		"state":     map[string]any{"type": "complete", "stopReason": "end_turn"},
+	}, 0)
+	if len(complete.State) != 0 {
+		t.Fatalf("complete assistant state = %#v, want omitted like binary import", complete.State)
+	}
+
+	cancelled := neoMessageFromImportedThread("T-test", map[string]any{
+		"role":      "assistant",
+		"messageId": "M-cancelled",
+		"content":   []any{map[string]any{"type": "text", "text": "stopped"}},
+		"state":     map[string]any{"type": "cancelled", "reason": "interrupt"},
+	}, 1)
+	if stringValue(cancelled.State["type"]) != "cancelled" || len(cancelled.State) != 1 {
+		t.Fatalf("cancelled assistant state = %#v, want only type=cancelled", cancelled.State)
+	}
+
+	info := neoMessageFromImportedThread("T-test", map[string]any{
+		"role":      "info",
+		"messageId": "M-info",
+		"content": []any{
+			map[string]any{"type": "summary", "text": "skip"},
+			map[string]any{"type": "manual_bash_invocation", "args": map[string]any{"cmd": "git status"}},
+		},
+	}, 2)
+	if len(info.Content) != 1 || stringValue(mapValue(info.Content[0])["type"]) != "manual_bash_invocation" {
+		t.Fatalf("info content = %#v, want only manual bash invocation", info.Content)
 	}
 }
 

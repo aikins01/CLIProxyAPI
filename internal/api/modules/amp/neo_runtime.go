@@ -6537,6 +6537,61 @@ func neoBinaryUserMeta(meta map[string]any) map[string]any {
 	return out
 }
 
+func neoBinaryUserState(raw any) any {
+	if raw == nil {
+		return nil
+	}
+	state := mapValue(raw)
+	out := cloneNeoJSONMap(state)
+	if files := arrayValue(state["currentlyVisibleFiles"]); files != nil {
+		out["currentlyVisibleFiles"] = cloneArray(files)
+	} else if files := stringArrayValue(state["currentlyVisibleFiles"]); files != nil {
+		out["currentlyVisibleFiles"] = files
+	} else {
+		out["currentlyVisibleFiles"] = []any{}
+	}
+	if commands := arrayValue(state["runningTerminalCommands"]); commands != nil {
+		out["runningTerminalCommands"] = cloneArray(commands)
+	} else {
+		delete(out, "runningTerminalCommands")
+	}
+	if aggmanContext := mapValue(state["aggmanContext"]); len(aggmanContext) > 0 {
+		contextOut := cloneNeoJSONMap(aggmanContext)
+		if projects := arrayValue(aggmanContext["availableProjects"]); projects != nil {
+			contextOut["availableProjects"] = cloneArray(projects)
+		} else {
+			delete(contextOut, "availableProjects")
+		}
+		if threads := arrayValue(aggmanContext["recentUnreadThreads"]); threads != nil {
+			contextOut["recentUnreadThreads"] = cloneArray(threads)
+		} else {
+			delete(contextOut, "recentUnreadThreads")
+		}
+		out["aggmanContext"] = contextOut
+	}
+	return out
+}
+
+func neoBinaryImportedContent(role string, content []any) []any {
+	if role != "info" {
+		return content
+	}
+	filtered := make([]any, 0, len(content))
+	for _, block := range content {
+		if stringValue(mapValue(block)["type"]) == "manual_bash_invocation" {
+			filtered = append(filtered, block)
+		}
+	}
+	return filtered
+}
+
+func neoBinaryImportedAssistantState(role string, state map[string]any) map[string]any {
+	if role != "assistant" || stringValue(state["type"]) != "cancelled" {
+		return nil
+	}
+	return map[string]any{"type": "cancelled"}
+}
+
 func neoNumericValue(value any) (any, bool) {
 	switch typed := value.(type) {
 	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64:
@@ -8720,8 +8775,8 @@ func neoCloudMessage(message neoMessage) map[string]any {
 		if meta := neoBinaryUserMeta(message.Meta); len(meta) > 0 {
 			out["meta"] = meta
 		}
-		if message.UserState != nil {
-			out["userState"] = message.UserState
+		if userState := neoBinaryUserState(message.UserState); userState != nil {
+			out["userState"] = userState
 		}
 		if message.AgentMode != "" {
 			out["agentMode"] = message.AgentMode
@@ -10082,12 +10137,16 @@ func neoMessageFromImportedThread(threadID string, raw any, index int) neoMessag
 	if content == nil {
 		content = []any{}
 	}
+	content = neoBinaryImportedContent(role, content)
 	meta := mapValue(message["meta"])
+	userState := any(nil)
 	if role == "user" {
 		meta = neoBinaryUserMeta(meta)
+		userState = neoBinaryUserState(message["userState"])
 	} else {
 		meta = nil
 	}
+	state := neoBinaryImportedAssistantState(role, mapValue(message["state"]))
 	return neoMessage{
 		ThreadID:             threadID,
 		MessageID:            messageID,
@@ -10100,9 +10159,9 @@ func neoMessageFromImportedThread(threadID string, raw any, index int) neoMessag
 		CreatedAt:            stringValue(message["createdAt"]),
 		ReadAt:               stringValue(message["readAt"]),
 		Meta:                 meta,
-		UserState:            message["userState"],
+		UserState:            userState,
 		FileMentions:         mapValue(message["fileMentions"]),
-		State:                mapValue(message["state"]),
+		State:                state,
 		Usage:                mapValue(message["usage"]),
 		OriginalToolUseInput: mapValue(message["originalToolUseInput"]),
 		Seq:                  index + 1,
@@ -12022,8 +12081,8 @@ func (m neoQueuedMessage) protocol() map[string]any {
 		"messageId": m.MessageID,
 		"content":   m.Content,
 	}
-	if m.UserState != nil {
-		out["userState"] = m.UserState
+	if userState := neoBinaryUserState(m.UserState); userState != nil {
+		out["userState"] = userState
 	}
 	if len(m.Meta) > 0 {
 		out["meta"] = m.Meta
@@ -12098,8 +12157,10 @@ func (m neoMessage) protocol() map[string]any {
 	if len(m.Meta) > 0 {
 		out["meta"] = m.Meta
 	}
-	if m.UserState != nil {
-		out["userState"] = m.UserState
+	if m.Role == "user" {
+		if userState := neoBinaryUserState(m.UserState); userState != nil {
+			out["userState"] = userState
+		}
 	}
 	if state := neoProtocolAssistantState(m.State); len(state) > 0 {
 		out["state"] = state
