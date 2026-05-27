@@ -4036,6 +4036,142 @@ func TestInferNeoLocalStreamUsesBinaryOpenAICompatibleProviderRoute(t *testing.T
 	}
 }
 
+func TestInferNeoLocalFireworksAppliesBinaryProviderSettings(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream_%v", stream), func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/api/provider/fireworks/v1/chat/completions" {
+					t.Fatalf("unexpected path %s", r.URL.Path)
+				}
+				if got := r.Header.Get("x-fireworks-direct-routing"); got != "true" {
+					t.Fatalf("x-fireworks-direct-routing = %q, want true", got)
+				}
+				payload := readNeoJSON(r.Body)
+				if payload["stream"] != stream || payload["model"] != "accounts/fireworks/models/kimi-k2-instruct-0905" {
+					t.Fatalf("payload = %#v, want fireworks kimi stream=%v", payload, stream)
+				}
+				if got := stringValue(payload["reasoning_effort"]); got != "none" {
+					t.Fatalf("reasoning_effort = %q, want none; payload=%#v", got, payload)
+				}
+				if got := payload["temperature"]; got != 0.6 {
+					t.Fatalf("temperature = %#v, want 0.6; payload=%#v", got, payload)
+				}
+				if got := payload["top_p"]; got != 0.95 {
+					t.Fatalf("top_p = %#v, want 0.95; payload=%#v", got, payload)
+				}
+				if got := numberFrom(payload["max_tokens"]); got != 32000 {
+					t.Fatalf("max_tokens = %d, want 32000; payload=%#v", got, payload)
+				}
+
+				if stream {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n"))
+					_, _ = w.Write([]byte("data: [DONE]\n\n"))
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":2,"completion_tokens":1}}`))
+			}))
+			defer upstream.Close()
+
+			request := neoInferenceRequest{
+				ThreadID:  "T-test",
+				AgentMode: "smart",
+				Settings: map[string]any{
+					"internal.model":                   "accounts/fireworks/models/kimi-k2-instruct-0905",
+					"internal.fireworks.directRouting": true,
+					"internal.kimi.reasoning":          "none",
+				},
+				History: []neoHistoryMessage{{Role: "user", Text: "hello"}},
+			}
+			if stream {
+				var deltas []string
+				result, err := inferNeoLocalStream(testNeoRuntimeForServer(t, upstream), request, func(delta neoInferenceDelta) {
+					deltas = append(deltas, delta.Text)
+				})
+				if err != nil {
+					t.Fatalf("inferNeoLocalStream error: %v", err)
+				}
+				if result.Provider != "fireworks" || result.Model != "accounts/fireworks/models/kimi-k2-instruct-0905" || result.Text != "hi" || strings.Join(deltas, "") != "hi" {
+					t.Fatalf("result = %+v deltas=%#v, want fireworks stream", result, deltas)
+				}
+				return
+			}
+			result, err := inferNeoLocal(testNeoRuntimeForServer(t, upstream), request)
+			if err != nil {
+				t.Fatalf("inferNeoLocal error: %v", err)
+			}
+			if result.Provider != "fireworks" || result.Model != "accounts/fireworks/models/kimi-k2-instruct-0905" || result.Text != "ok" {
+				t.Fatalf("result = %+v, want fireworks text", result)
+			}
+		})
+	}
+}
+
+func TestInferNeoLocalBasetenAppliesBinaryKimiReasoningSettings(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		reasoning    string
+		wantTemplate bool
+		wantTemp     float64
+	}{
+		{name: "default", wantTemplate: true, wantTemp: 1},
+		{name: "none", reasoning: "none", wantTemp: 0.6},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/api/provider/baseten/v1/chat/completions" {
+					t.Fatalf("unexpected path %s", r.URL.Path)
+				}
+				payload := readNeoJSON(r.Body)
+				if payload["model"] != "moonshotai/Kimi-K2.5" {
+					t.Fatalf("model = %#v, want moonshotai/Kimi-K2.5; payload=%#v", payload["model"], payload)
+				}
+				if _, exists := payload["reasoning_effort"]; exists {
+					t.Fatalf("baseten payload should not include reasoning_effort: %#v", payload)
+				}
+				template := mapValue(payload["chat_template_args"])
+				if tc.wantTemplate {
+					if template["enable_thinking"] != true {
+						t.Fatalf("chat_template_args = %#v, want enable_thinking true; payload=%#v", template, payload)
+					}
+				} else if len(template) > 0 {
+					t.Fatalf("chat_template_args should be omitted for none reasoning: %#v", payload)
+				}
+				if got, ok := payload["temperature"].(float64); !ok || got != tc.wantTemp {
+					t.Fatalf("temperature = %#v, want %#v; payload=%#v", payload["temperature"], tc.wantTemp, payload)
+				}
+				if got := payload["top_p"]; got != 0.95 {
+					t.Fatalf("top_p = %#v, want 0.95; payload=%#v", got, payload)
+				}
+				if got := numberFrom(payload["max_tokens"]); got != 32000 {
+					t.Fatalf("max_tokens = %d, want 32000; payload=%#v", got, payload)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":2,"completion_tokens":1}}`))
+			}))
+			defer upstream.Close()
+
+			settings := map[string]any{"internal.model": "moonshotai/Kimi-K2.5"}
+			if tc.reasoning != "" {
+				settings["internal.kimi.reasoning"] = tc.reasoning
+			}
+			result, err := inferNeoLocal(testNeoRuntimeForServer(t, upstream), neoInferenceRequest{
+				ThreadID:  "T-test",
+				AgentMode: "smart",
+				Settings:  settings,
+				History:   []neoHistoryMessage{{Role: "user", Text: "hello"}},
+			})
+			if err != nil {
+				t.Fatalf("inferNeoLocal error: %v", err)
+			}
+			if result.Provider != "baseten" || result.Model != "moonshotai/Kimi-K2.5" || result.Text != "ok" {
+				t.Fatalf("result = %+v, want baseten text", result)
+			}
+		})
+	}
+}
+
 func TestNeoModelRegistryMatchesAmpBinaryValues(t *testing.T) {
 	for _, tc := range []struct {
 		model    string

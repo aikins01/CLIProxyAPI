@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -99,6 +100,54 @@ func TestOpenAICompatExecutorPayloadOverrideWinsOverThinkingSuffix(t *testing.T)
 	}
 	if got := gjson.GetBytes(gotBody, "reasoning_effort").String(); got != "low" {
 		t.Fatalf("reasoning_effort = %q, want %q; body=%s", got, "low", string(gotBody))
+	}
+}
+
+func TestOpenAICompatExecutorForwardsFireworksDirectRoutingHeader(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream_%v", stream), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if got := r.Header.Get("x-fireworks-direct-routing"); got != "true" {
+					t.Fatalf("x-fireworks-direct-routing = %q, want true", got)
+				}
+				if stream {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n"))
+					_, _ = w.Write([]byte("data: [DONE]\n\n"))
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"id":"chatcmpl_1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+			}))
+			defer server.Close()
+
+			executor := NewOpenAICompatExecutor("fireworks", &config.Config{})
+			auth := &cliproxyauth.Auth{Attributes: map[string]string{
+				"base_url": server.URL + "/v1",
+				"api_key":  "test",
+			}}
+			opts := cliproxyexecutor.Options{
+				SourceFormat: sdktranslator.FromString("openai"),
+				Stream:       stream,
+				Headers:      http.Header{"X-Fireworks-Direct-Routing": []string{"true"}},
+			}
+			request := cliproxyexecutor.Request{
+				Model:   "accounts/fireworks/models/glm-5",
+				Payload: []byte(`{"model":"accounts/fireworks/models/glm-5","messages":[{"role":"user","content":"hi"}]}`),
+			}
+			if stream {
+				result, err := executor.ExecuteStream(context.Background(), auth, request, opts)
+				if err != nil {
+					t.Fatalf("ExecuteStream error: %v", err)
+				}
+				for range result.Chunks {
+				}
+				return
+			}
+			if _, err := executor.Execute(context.Background(), auth, request, opts); err != nil {
+				t.Fatalf("Execute error: %v", err)
+			}
+		})
 	}
 }
 

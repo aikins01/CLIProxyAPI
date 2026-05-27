@@ -13510,9 +13510,11 @@ func inferNeoOpenAIChatProvider(rt *neoRuntime, request neoInferenceRequest, rou
 	}
 	if provider == "openai" {
 		neoApplyOpenAIReasoning(body, route, request.ReasoningEffort)
+	} else {
+		neoApplyOpenAICompatibleProviderSettings(body, route, request, provider)
 	}
 
-	jsonBody, err := callNeoLocalProvider(rt, provider, "/v1/chat/completions", body, request.ThreadID)
+	jsonBody, err := callNeoLocalProvider(rt, provider, "/v1/chat/completions", body, request.ThreadID, neoOpenAICompatibleProviderHeaders(provider, request))
 	if err != nil {
 		return neoInferenceResult{}, err
 	}
@@ -14252,6 +14254,8 @@ func inferNeoOpenAIChatStreamProvider(rt *neoRuntime, request neoInferenceReques
 	}
 	if provider == "openai" {
 		neoApplyOpenAIReasoning(body, route, request.ReasoningEffort)
+	} else {
+		neoApplyOpenAICompatibleProviderSettings(body, route, request, provider)
 	}
 
 	type partialToolCall struct {
@@ -14323,7 +14327,7 @@ func inferNeoOpenAIChatStreamProvider(rt *neoRuntime, request neoInferenceReques
 			}
 		}
 		return nil
-	})
+	}, neoOpenAICompatibleProviderHeaders(provider, request))
 	if err != nil {
 		if isNeoLocalEmptyStreamError(err) {
 			return inferNeoOpenAI(rt, request, route)
@@ -14724,7 +14728,7 @@ func neoTitleGenerationEnabled(cfg *config.Config) bool {
 	return neoRuntimeEnabled(cfg)
 }
 
-func callNeoLocalProvider(rt *neoRuntime, provider, subpath string, body map[string]any, threadID string) (map[string]any, error) {
+func callNeoLocalProvider(rt *neoRuntime, provider, subpath string, body map[string]any, threadID string, extraHeaders ...http.Header) (map[string]any, error) {
 	cfg := rt.configSnapshot()
 	if cfg == nil {
 		return nil, fmt.Errorf("missing CLIProxyAPI config for local Neo inference")
@@ -14746,6 +14750,7 @@ func callNeoLocalProvider(rt *neoRuntime, provider, subpath string, body map[str
 	if provider == "anthropic" {
 		req.Header.Set("Anthropic-Version", "2023-06-01")
 	}
+	applyNeoLocalProviderHeaders(req.Header, extraHeaders...)
 	if key := firstConfiguredAPIKey(cfg); key != "" {
 		req.Header.Set("Authorization", "Bearer "+key)
 	}
@@ -14766,7 +14771,7 @@ func callNeoLocalProvider(rt *neoRuntime, provider, subpath string, body map[str
 	return decoded, nil
 }
 
-func callNeoLocalProviderSSE(rt *neoRuntime, provider, subpath string, body map[string]any, threadID string, handle func(event, data string) error) error {
+func callNeoLocalProviderSSE(rt *neoRuntime, provider, subpath string, body map[string]any, threadID string, handle func(event, data string) error, extraHeaders ...http.Header) error {
 	cfg := rt.configSnapshot()
 	if cfg == nil {
 		return fmt.Errorf("missing CLIProxyAPI config for local Neo inference")
@@ -14788,6 +14793,7 @@ func callNeoLocalProviderSSE(rt *neoRuntime, provider, subpath string, body map[
 	if provider == "anthropic" {
 		req.Header.Set("Anthropic-Version", "2023-06-01")
 	}
+	applyNeoLocalProviderHeaders(req.Header, extraHeaders...)
 	if key := firstConfiguredAPIKey(cfg); key != "" {
 		req.Header.Set("Authorization", "Bearer "+key)
 	}
@@ -14875,6 +14881,27 @@ func callNeoLocalProviderSSE(rt *neoRuntime, provider, subpath string, body map[
 		return errNeoLocalEmptyStream
 	}
 	return nil
+}
+
+func applyNeoLocalProviderHeaders(dst http.Header, extraHeaders ...http.Header) {
+	if dst == nil {
+		return
+	}
+	for _, headers := range extraHeaders {
+		for key, values := range headers {
+			key = strings.TrimSpace(key)
+			if key == "" {
+				continue
+			}
+			for _, value := range values {
+				value = strings.TrimSpace(value)
+				if value == "" {
+					continue
+				}
+				dst.Set(key, value)
+			}
+		}
+	}
 }
 
 func isNeoLocalEmptyStreamError(err error) bool {
@@ -16723,6 +16750,45 @@ func neoOpenAIResponsesServiceTier(request neoInferenceRequest) string {
 	default:
 		return ""
 	}
+}
+
+func neoApplyOpenAICompatibleProviderSettings(body map[string]any, route neoModelRoute, request neoInferenceRequest, provider string) {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "fireworks", "baseten":
+		reasoning := neoKimiReasoningSetting(request)
+		if strings.Contains(strings.ToLower(route.Model), "kimi") && reasoning == "none" {
+			body["temperature"] = 0.6
+		} else {
+			body["temperature"] = 1
+		}
+		body["top_p"] = 0.95
+		if maxOutput := neoModelMaxOutputTokens[strings.TrimSpace(route.Model)]; maxOutput > 0 {
+			body["max_tokens"] = maxOutput
+		}
+		if strings.EqualFold(provider, "baseten") {
+			if reasoning != "none" {
+				body["chat_template_args"] = map[string]any{"enable_thinking": true}
+			}
+			return
+		}
+		body["reasoning_effort"] = reasoning
+	}
+}
+
+func neoKimiReasoningSetting(request neoInferenceRequest) string {
+	reasoning := strings.TrimSpace(stringValue(request.Settings["internal.kimi.reasoning"]))
+	if reasoning == "" {
+		return "medium"
+	}
+	return reasoning
+}
+
+func neoOpenAICompatibleProviderHeaders(provider string, request neoInferenceRequest) http.Header {
+	headers := http.Header{}
+	if strings.EqualFold(provider, "fireworks") && boolValue(request.Settings["internal.fireworks.directRouting"]) {
+		headers.Set("x-fireworks-direct-routing", "true")
+	}
+	return headers
 }
 
 func openAIResponsesNeoInput(history []neoHistoryMessage, system string) []any {
