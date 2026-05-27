@@ -9462,11 +9462,8 @@ func TestNeoActorBinaryUserMessageCleanupUsesBinaryToolResultShape(t *testing.T)
 	}
 	result := mapValue(actor.messages[1].Content[0])
 	run := mapValue(result["run"])
-	if stringValue(run["status"]) != "cancelled" {
+	if stringValue(run["status"]) != "cancelled" || stringValue(run["reason"]) != "user:interrupted" {
 		t.Fatalf("cancelled run = %#v", run)
-	}
-	if _, exists := run["reason"]; exists {
-		t.Fatalf("binary cleanup run gained reason: %#v", run)
 	}
 	if textFromBlocks(actor.messages[2].Content) != "next" {
 		t.Fatalf("new user = %#v", actor.messages[2])

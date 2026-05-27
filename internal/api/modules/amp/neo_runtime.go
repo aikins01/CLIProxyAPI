@@ -3139,8 +3139,12 @@ func (a *neoActor) markLastToolResultCancelledLocked() (neoMessage, bool) {
 }
 
 func (a *neoActor) cleanupPriorAssistantForBinaryDelta() {
+	a.cleanupPriorAssistantForBinaryDeltaWithReason("")
+}
+
+func (a *neoActor) cleanupPriorAssistantForBinaryDeltaWithReason(cancelReason string) {
 	a.mu.Lock()
-	events := a.cleanupPriorAssistantForBinaryDeltaLocked("", nil)
+	events := a.cleanupPriorAssistantForBinaryDeltaLocked(cancelReason, nil)
 	a.mu.Unlock()
 	for _, event := range events {
 		a.broadcast(event)
@@ -4901,7 +4905,7 @@ func (a *neoActor) receiveUserMessage(msg map[string]any) {
 }
 
 func (a *neoActor) handleBinaryUserMessage(msg map[string]any) {
-	a.cleanupPriorAssistantForBinaryDelta()
+	a.cleanupPriorAssistantForBinaryDeltaWithReason("user:interrupted")
 	user := neoQueuedMessageFromBinaryDelta(msg, false)
 	if _, hasIndex := msg["index"]; hasIndex {
 		a.replaceBinaryUserMessageAtIndex(numberFrom(msg["index"]), user)
