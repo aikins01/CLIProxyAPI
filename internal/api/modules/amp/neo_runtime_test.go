@@ -3922,6 +3922,120 @@ func TestSelectNeoModelRouteDefaultsNostromoToAmpNostromo(t *testing.T) {
 	}
 }
 
+func TestProviderForNeoModelMatchesBinaryProviderTable(t *testing.T) {
+	for _, tc := range []struct {
+		model string
+		want  string
+	}{
+		{model: "gpt-5.5", want: "openai"},
+		{model: "openai/gpt-oss-120b", want: "openai"},
+		{model: "grok-code-fast-1", want: "xai"},
+		{model: "gemini-3.5-flash", want: "google"},
+		{model: "zai-glm-4.7", want: "cerebras"},
+		{model: "accounts/fireworks/models/glm-5", want: "fireworks"},
+		{model: "moonshotai/Kimi-K2.5", want: "baseten"},
+		{model: "kimi-k2-instruct-0905", want: "moonshotai"},
+		{model: "sonoma-sky-alpha", want: "openrouter"},
+		{model: "z-ai/glm-4.6", want: "openrouter"},
+		{model: "moonshotai/kimi-k2-0905", want: "openrouter"},
+		{model: "qwen/qwen3-coder", want: "openrouter"},
+		{model: "claude-opus-4-7", want: "anthropic"},
+	} {
+		t.Run(tc.model, func(t *testing.T) {
+			if got := providerForNeoModel(tc.model); got != tc.want {
+				t.Fatalf("provider = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseNeoModelRoutePreservesBinarySlashModelNames(t *testing.T) {
+	for _, tc := range []struct {
+		raw      string
+		provider string
+		model    string
+	}{
+		{raw: "openai/gpt-oss-120b", provider: "openai", model: "openai/gpt-oss-120b"},
+		{raw: "accounts/fireworks/models/glm-5", provider: "fireworks", model: "accounts/fireworks/models/glm-5"},
+		{raw: "moonshotai/Kimi-K2.5", provider: "baseten", model: "moonshotai/Kimi-K2.5"},
+		{raw: "z-ai/glm-4.6", provider: "openrouter", model: "z-ai/glm-4.6"},
+		{raw: "qwen/qwen3-coder", provider: "openrouter", model: "qwen/qwen3-coder"},
+		{raw: "openai:gpt-5.5", provider: "openai", model: "gpt-5.5"},
+	} {
+		t.Run(tc.raw, func(t *testing.T) {
+			got := parseNeoModelRoute(tc.raw)
+			if got.Provider != tc.provider || got.Model != tc.model {
+				t.Fatalf("route = %+v, want %s/%s", got, tc.provider, tc.model)
+			}
+		})
+	}
+}
+
+func TestInferNeoLocalUsesBinaryOpenAICompatibleProviderRoute(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/provider/openrouter/v1/chat/completions" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		payload := readNeoJSON(r.Body)
+		if payload["stream"] != false || payload["model"] != "sonoma-sky-alpha" {
+			t.Fatalf("payload = %#v, want non-streaming sonoma chat completion", payload)
+		}
+		if _, exists := payload["reasoning_effort"]; exists {
+			t.Fatalf("openai-compatible provider should not receive OpenAI reasoning_effort: %#v", payload)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":2,"completion_tokens":1}}`))
+	}))
+	defer upstream.Close()
+
+	result, err := inferNeoLocal(testNeoRuntimeForServer(t, upstream), neoInferenceRequest{
+		AgentMode: "smart",
+		Settings:  map[string]any{"internal.model": map[string]any{"smart": "sonoma-sky-alpha"}},
+		History:   []neoHistoryMessage{{Role: "user", Text: "hello"}},
+	})
+	if err != nil {
+		t.Fatalf("inferNeoLocal error: %v", err)
+	}
+	if result.Provider != "openrouter" || result.Model != "sonoma-sky-alpha" || result.Text != "ok" {
+		t.Fatalf("result = %+v, want openrouter sonoma text", result)
+	}
+}
+
+func TestInferNeoLocalStreamUsesBinaryOpenAICompatibleProviderRoute(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/provider/openrouter/v1/chat/completions" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		payload := readNeoJSON(r.Body)
+		if payload["stream"] != true || payload["model"] != "sonoma-sky-alpha" {
+			t.Fatalf("payload = %#v, want streaming sonoma chat completion", payload)
+		}
+		if _, exists := payload["reasoning_effort"]; exists {
+			t.Fatalf("openai-compatible provider should not receive OpenAI reasoning_effort: %#v", payload)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	var deltas []string
+	result, err := inferNeoLocalStream(testNeoRuntimeForServer(t, upstream), neoInferenceRequest{
+		AgentMode:       "smart",
+		ReasoningEffort: "max",
+		Settings:        map[string]any{"internal.model": map[string]any{"smart": "sonoma-sky-alpha"}},
+		History:         []neoHistoryMessage{{Role: "user", Text: "hello"}},
+	}, func(delta neoInferenceDelta) {
+		deltas = append(deltas, delta.Text)
+	})
+	if err != nil {
+		t.Fatalf("inferNeoLocalStream error: %v", err)
+	}
+	if result.Provider != "openrouter" || result.Model != "sonoma-sky-alpha" || result.Text != "hi" || strings.Join(deltas, "") != "hi" {
+		t.Fatalf("result = %+v deltas=%#v, want streaming openrouter sonoma text", result, deltas)
+	}
+}
+
 func TestNeoModelRegistryMatchesAmpBinaryValues(t *testing.T) {
 	for _, tc := range []struct {
 		model    string

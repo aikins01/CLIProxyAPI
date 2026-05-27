@@ -10015,7 +10015,7 @@ func neoContextAnalysisToolsSection(tools []neoToolSpec, route neoModelRoute, ma
 	}
 	tokens := 0
 	switch route.Provider {
-	case "openai":
+	case "openai", "xai", "cerebras", "fireworks", "baseten", "moonshotai", "openrouter", "groq":
 		tokens = neoEstimateJSONTokens(openAINeoTools(tools))
 	case "google":
 		tokens = neoEstimateJSONTokens(googleNeoTools(tools))
@@ -13108,6 +13108,9 @@ func inferNeoLocal(rt *neoRuntime, request neoInferenceRequest) (neoInferenceRes
 	case "google":
 		return inferNeoGoogle(rt, request, route)
 	default:
+		if neoOpenAICompatibleProvider(route.Provider) {
+			return inferNeoOpenAICompatibleChat(rt, request, route)
+		}
 		return neoInferenceResult{}, fmt.Errorf("unsupported local Neo provider %q", route.Provider)
 	}
 }
@@ -13123,6 +13126,9 @@ func inferNeoLocalStream(rt *neoRuntime, request neoInferenceRequest, onDelta ne
 	case "google":
 		return inferNeoGoogleStream(rt, request, route, onDelta)
 	default:
+		if neoOpenAICompatibleProvider(route.Provider) {
+			return inferNeoOpenAICompatibleChatStream(rt, request, route, onDelta)
+		}
 		return neoInferenceResult{}, fmt.Errorf("unsupported local Neo provider %q", route.Provider)
 	}
 }
@@ -13253,6 +13259,9 @@ func parseNeoModelRoute(value string) neoModelRoute {
 	if value == "" {
 		return neoModelRoute{}
 	}
+	if !strings.Contains(value, ":") && neoKnownBinaryModelName(value) {
+		return neoModelRoute{Provider: providerForNeoModel(value), Model: value}
+	}
 	value = strings.Replace(value, ":", "/", 1)
 	parts := strings.SplitN(value, "/", 2)
 	var route neoModelRoute
@@ -13279,14 +13288,40 @@ func parseNeoModelRoute(value string) neoModelRoute {
 	return route
 }
 
+func neoKnownBinaryModelName(model string) bool {
+	_, ok := neoModelContextWindow[strings.TrimSpace(model)]
+	return ok
+}
+
 func providerForNeoModel(model string) string {
 	switch {
-	case strings.HasPrefix(model, "gpt-") || strings.Contains(model, "codex"):
+	case model == "sonoma-sky-alpha" || strings.HasPrefix(model, "z-ai/") || strings.HasPrefix(model, "moonshotai/kimi-k2-") || strings.HasPrefix(model, "qwen/"):
+		return "openrouter"
+	case model == "zai-glm-4.7":
+		return "cerebras"
+	case strings.HasPrefix(model, "accounts/fireworks/models/"):
+		return "fireworks"
+	case model == "moonshotai/Kimi-K2.5":
+		return "baseten"
+	case strings.HasPrefix(model, "kimi-k2"):
+		return "moonshotai"
+	case strings.HasPrefix(model, "grok-"):
+		return "xai"
+	case strings.HasPrefix(model, "gpt-") || strings.HasPrefix(model, "openai/") || strings.Contains(model, "codex"):
 		return "openai"
 	case strings.HasPrefix(model, "gemini-"):
 		return "google"
 	default:
 		return "anthropic"
+	}
+}
+
+func neoOpenAICompatibleProvider(provider string) bool {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "xai", "cerebras", "fireworks", "baseten", "moonshotai", "openrouter", "groq":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -13376,6 +13411,18 @@ func inferNeoOpenAIResponses(rt *neoRuntime, request neoInferenceRequest, route 
 }
 
 func inferNeoOpenAIChat(rt *neoRuntime, request neoInferenceRequest, route neoModelRoute) (neoInferenceResult, error) {
+	return inferNeoOpenAIChatProvider(rt, request, route, "openai")
+}
+
+func inferNeoOpenAICompatibleChat(rt *neoRuntime, request neoInferenceRequest, route neoModelRoute) (neoInferenceResult, error) {
+	provider := strings.ToLower(strings.TrimSpace(route.Provider))
+	if provider == "" {
+		provider = providerForNeoModel(route.Model)
+	}
+	return inferNeoOpenAIChatProvider(rt, request, route, provider)
+}
+
+func inferNeoOpenAIChatProvider(rt *neoRuntime, request neoInferenceRequest, route neoModelRoute, provider string) (neoInferenceResult, error) {
 	body := map[string]any{
 		"model":    route.Model,
 		"stream":   false,
@@ -13385,9 +13432,11 @@ func inferNeoOpenAIChat(rt *neoRuntime, request neoInferenceRequest, route neoMo
 		body["tools"] = openAINeoTools(request.Tools)
 		body["tool_choice"] = "auto"
 	}
-	neoApplyOpenAIReasoning(body, route, request.ReasoningEffort)
+	if provider == "openai" {
+		neoApplyOpenAIReasoning(body, route, request.ReasoningEffort)
+	}
 
-	jsonBody, err := callNeoLocalProvider(rt, "openai", "/v1/chat/completions", body, request.ThreadID)
+	jsonBody, err := callNeoLocalProvider(rt, provider, "/v1/chat/completions", body, request.ThreadID)
 	if err != nil {
 		return neoInferenceResult{}, err
 	}
@@ -14103,6 +14152,18 @@ func inferNeoOpenAIResponsesStream(rt *neoRuntime, request neoInferenceRequest, 
 }
 
 func inferNeoOpenAIChatStream(rt *neoRuntime, request neoInferenceRequest, route neoModelRoute, onDelta neoStreamCallback) (neoInferenceResult, error) {
+	return inferNeoOpenAIChatStreamProvider(rt, request, route, onDelta, "openai")
+}
+
+func inferNeoOpenAICompatibleChatStream(rt *neoRuntime, request neoInferenceRequest, route neoModelRoute, onDelta neoStreamCallback) (neoInferenceResult, error) {
+	provider := strings.ToLower(strings.TrimSpace(route.Provider))
+	if provider == "" {
+		provider = providerForNeoModel(route.Model)
+	}
+	return inferNeoOpenAIChatStreamProvider(rt, request, route, onDelta, provider)
+}
+
+func inferNeoOpenAIChatStreamProvider(rt *neoRuntime, request neoInferenceRequest, route neoModelRoute, onDelta neoStreamCallback, provider string) (neoInferenceResult, error) {
 	body := map[string]any{
 		"model":    route.Model,
 		"stream":   true,
@@ -14112,7 +14173,9 @@ func inferNeoOpenAIChatStream(rt *neoRuntime, request neoInferenceRequest, route
 		body["tools"] = openAINeoTools(request.Tools)
 		body["tool_choice"] = "auto"
 	}
-	neoApplyOpenAIReasoning(body, route, request.ReasoningEffort)
+	if provider == "openai" {
+		neoApplyOpenAIReasoning(body, route, request.ReasoningEffort)
+	}
 
 	type partialToolCall struct {
 		id   string
@@ -14137,7 +14200,7 @@ func inferNeoOpenAIChatStream(rt *neoRuntime, request neoInferenceRequest, route
 		return call
 	}
 
-	err := callNeoLocalProviderSSE(rt, "openai", "/v1/chat/completions", body, request.ThreadID, func(event, data string) error {
+	err := callNeoLocalProviderSSE(rt, provider, "/v1/chat/completions", body, request.ThreadID, func(event, data string) error {
 		var payload map[string]any
 		if err := json.Unmarshal([]byte(data), &payload); err != nil {
 			return err
