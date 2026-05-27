@@ -6617,6 +6617,41 @@ func TestNeoActorHandlesBinaryUserThreadDeltas(t *testing.T) {
 	waitForNeoActorSyncIdle(t, actor)
 }
 
+func TestNeoActorBinaryThreadTruncateDefaultsMissingIndexToZero(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	actor.messages = []neoMessage{
+		{ThreadID: "T-test", MessageID: "M-user", Role: "user", Content: []any{map[string]any{"type": "text", "text": "hello"}}, Seq: 1},
+		{ThreadID: "T-test", MessageID: "M-assistant", Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "old"}}, Seq: 2},
+	}
+	actor.relationships = []map[string]any{
+		{"threadID": "T-019e0e6e-f3f1-7081-b5dd-748f66f8c25d", "type": "mention", "role": "parent", "createdAt": 1, "messageIndex": 0},
+		{"threadID": "T-019e0e6e-f3f1-7081-b5dd-748f66f8c25e", "type": "mention", "role": "parent", "createdAt": 2},
+	}
+	actor.pendingTools["TU-test"] = neoPendingTool{ID: "TU-test", MessageID: "M-assistant"}
+	actor.approvalQueue = []map[string]any{{"toolCallId": "TU-test"}}
+	actor.currentInference = &neoInferenceInflight{messageID: "M-assistant", agentMode: "smart"}
+	actor.rebuildHistoryLocked()
+
+	actor.handle(map[string]any{"type": "thread:truncate"})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.messages) != 0 {
+		t.Fatalf("messages after missing-index truncate = %#v, want empty", actor.messages)
+	}
+	if len(actor.history) != 0 {
+		t.Fatalf("history after missing-index truncate = %#v, want empty", actor.history)
+	}
+	if len(actor.relationships) != 1 || stringValue(actor.relationships[0]["threadID"]) != "T-019e0e6e-f3f1-7081-b5dd-748f66f8c25e" {
+		t.Fatalf("relationships after missing-index truncate = %#v", actor.relationships)
+	}
+	if len(actor.pendingTools) != 0 || len(actor.approvalQueue) != 0 || actor.currentInference != nil {
+		t.Fatalf("tool/inference state after truncate = tools:%#v approvals:%#v inference:%#v", actor.pendingTools, actor.approvalQueue, actor.currentInference)
+	}
+}
+
 func TestNeoActorHandlesBinaryQueueDeltas(t *testing.T) {
 	useTempNeoThreadStore(t)
 	rt := newNeoRuntime(&config.Config{})

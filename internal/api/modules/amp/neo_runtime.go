@@ -3449,10 +3449,6 @@ func neoTraceReplayEvents(meta map[string]any) []map[string]any {
 }
 
 func (a *neoActor) handleBinaryThreadTruncate(msg map[string]any) {
-	if _, ok := msg["fromIndex"]; !ok {
-		a.broadcast(msg)
-		return
-	}
 	fromIndex := numberFrom(msg["fromIndex"])
 	if fromIndex < 0 {
 		return
@@ -3463,7 +3459,6 @@ func (a *neoActor) handleBinaryThreadTruncate(msg map[string]any) {
 	if fromIndex < len(a.messages) {
 		truncateFromMessage = a.messages[fromIndex].MessageID
 		a.messages = append([]neoMessage(nil), a.messages[:fromIndex]...)
-		a.filterRelationshipsForTruncationLocked(fromIndex)
 		a.rebuildHistoryLocked()
 		a.filterPendingToolsToMessagesLocked()
 		a.approvalQueue = nil
@@ -3471,6 +3466,7 @@ func (a *neoActor) handleBinaryThreadTruncate(msg map[string]any) {
 			a.currentInference = nil
 		}
 	}
+	a.filterRelationshipsForTruncationLocked(fromIndex)
 	seq := a.protocolSeqLocked(msg)
 	event := map[string]any{"type": "thread_truncated", "seq": seq, "fromIndex": fromIndex}
 	if truncateFromMessage != "" {
