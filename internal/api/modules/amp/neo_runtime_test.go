@@ -1853,6 +1853,11 @@ func TestNeoActorClientRetryWaitsForExecutorReady(t *testing.T) {
 }
 
 func TestNeoActorHandlesProtocolLifecycleEvents(t *testing.T) {
+	dir := t.TempDir()
+	oldStoreDir := neoAmpThreadStoreDir
+	neoAmpThreadStoreDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
+
 	rt := newNeoRuntime(&config.Config{})
 	actor := newNeoActor(rt, "actor-test", "threadActor", "T-test", "T-test", neoActorRecord("actor-test", "threadActor", "T-test"), nil)
 
@@ -1882,16 +1887,140 @@ func TestNeoActorHandlesProtocolLifecycleEvents(t *testing.T) {
 
 	actor.handle(map[string]any{"type": "thread_truncated", "seq": 11, "truncateFromMessage": "M-assistant"})
 	actor.mu.Lock()
-	defer actor.mu.Unlock()
 	if len(actor.messages) != 0 {
+		actor.mu.Unlock()
 		t.Fatalf("messages after truncation = %#v, want empty", actor.messages)
 	}
 	if len(actor.pendingTools) != 0 {
+		actor.mu.Unlock()
 		t.Fatalf("pending tools after truncation = %#v, want empty", actor.pendingTools)
 	}
 	if len(actor.replayEvents) == 0 || actor.replayEvents[len(actor.replayEvents)-1].Payload["type"] != "thread_truncated" {
+		actor.mu.Unlock()
 		t.Fatalf("last replay event = %#v, want thread_truncated", actor.replayEvents)
 	}
+	actor.mu.Unlock()
+	waitForNeoActorSyncIdle(t, actor)
+}
+
+func TestNeoActorHandlesExactProtocolStateEvents(t *testing.T) {
+	dir := t.TempDir()
+	oldStoreDir := neoAmpThreadStoreDir
+	neoAmpThreadStoreDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
+
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "threadActor", "T-test", "T-test", neoActorRecord("actor-test", "threadActor", "T-test"), nil)
+
+	actor.handle(map[string]any{"type": "thread_settings", "settings": map[string]any{"reasoning.effort": "high", "openai.speed": "turbo"}})
+	actor.handle(map[string]any{"type": "environment_update", "environment": map[string]any{"workingDirectory": "/tmp/project"}})
+	actor.handle(map[string]any{"type": "tool_approval_queue", "approvals": []any{
+		map[string]any{"id": "approval-1", "toolCallId": "TU-0000000000000000000001", "toolName": "shell_command", "args": map[string]any{"cmd": "pwd"}, "context": "invalid", "timestamp": float64(1), "ruleSource": "bad"},
+	}})
+	actor.handle(map[string]any{"type": "queued_messages", "messages": []any{
+		map[string]any{"steer": true, "queuedMessage": map[string]any{"role": "user", "messageId": "M-0000000000000000000001", "content": []any{map[string]any{"type": "text", "text": "queued"}}}},
+		map[string]any{"queuedMessage": map[string]any{"role": "user", "messageId": "M-0000000000000000000002", "content": []any{map[string]any{"type": "text", "text": "drop missing steer"}}}},
+	}})
+	actor.handle(map[string]any{"type": "queued_message_added", "seq": 9, "message": map[string]any{"steer": false, "queuedMessage": map[string]any{"role": "user", "messageId": "M-0000000000000000000003", "content": []any{map[string]any{"type": "text", "text": "added"}}}}})
+	actor.handle(map[string]any{"type": "queued_message_removed", "queuedMessageId": "M-0000000000000000000001", "seq": 10})
+	actor.handle(map[string]any{"type": "artifacts_snapshot", "artifacts": []any{map[string]any{"key": "diff", "dataType": "text/plain", "contentBase64": "ZGlmZg=="}}})
+	actor.handle(map[string]any{"type": "artifact_upserted", "artifact": map[string]any{"key": "summary", "content": "done"}})
+	actor.handle(map[string]any{"type": "artifact_deleted", "key": "diff"})
+	actor.handle(map[string]any{"type": "thread_title", "title": "Exact title"})
+	actor.handle(map[string]any{"type": "thread_relationships", "seq": 11, "relationships": []any{
+		map[string]any{"threadID": "T-019e65c0-0310-77a8-b233-4b84d9c0612b", "type": "mention", "role": "parent", "createdAt": float64(1), "comment": "related"},
+		map[string]any{"threadID": "bad", "type": "mention", "role": "parent", "createdAt": float64(1)},
+	}})
+
+	actor.mu.Lock()
+	if _, exists := actor.settings["openai.speed"]; exists {
+		actor.mu.Unlock()
+		t.Fatalf("invalid thread setting was preserved: %#v", actor.settings)
+	}
+	if actor.settings["reasoning.effort"] != "high" {
+		actor.mu.Unlock()
+		t.Fatalf("settings = %#v, want reasoning.effort high", actor.settings)
+	}
+	if got := stringValue(actor.environment["workingDirectory"]); got != "/tmp/project" {
+		actor.mu.Unlock()
+		t.Fatalf("environment = %#v, want workingDirectory", actor.environment)
+	}
+	if actor.agentState != "awaiting_approval" || len(actor.approvalQueue) != 1 {
+		actor.mu.Unlock()
+		t.Fatalf("approval state/queue = %q/%#v, want awaiting_approval with one approval", actor.agentState, actor.approvalQueue)
+	}
+	approval := actor.approvalQueue[0]
+	if approval["context"] != "thread" {
+		actor.mu.Unlock()
+		t.Fatalf("approval context = %#v, want thread default", approval)
+	}
+	if _, exists := approval["ruleSource"]; exists {
+		actor.mu.Unlock()
+		t.Fatalf("invalid ruleSource was preserved: %#v", approval)
+	}
+	if len(actor.queue) != 1 || actor.queue[0].MessageID != "M-0000000000000000000003" || actor.queue[0].Steer {
+		actor.mu.Unlock()
+		t.Fatalf("queue = %#v, want only added non-steer message", actor.queue)
+	}
+	if _, exists := actor.artifacts["diff"]; exists {
+		actor.mu.Unlock()
+		t.Fatalf("deleted artifact remained: %#v", actor.artifacts)
+	}
+	if _, exists := actor.artifacts["summary"]; !exists {
+		actor.mu.Unlock()
+		t.Fatalf("summary artifact missing: %#v", actor.artifacts)
+	}
+	if actor.title != "Exact title" {
+		actor.mu.Unlock()
+		t.Fatalf("title = %q, want Exact title", actor.title)
+	}
+	if len(actor.relationships) != 1 || actor.relationships[0]["threadID"] != "T-019e65c0-0310-77a8-b233-4b84d9c0612b" {
+		actor.mu.Unlock()
+		t.Fatalf("relationships = %#v, want one normalized relationship", actor.relationships)
+	}
+	if last := actor.replayEvents[len(actor.replayEvents)-1].Payload; last["type"] != "thread_relationships" || numberFrom(last["seq"]) != 11 {
+		actor.mu.Unlock()
+		t.Fatalf("last replay event = %#v, want thread_relationships seq 11", last)
+	}
+	actor.mu.Unlock()
+	waitForNeoActorSyncIdle(t, actor)
+}
+
+func TestNeoBinaryThreadTruncateBroadcastsProtocolShape(t *testing.T) {
+	dir := t.TempDir()
+	oldStoreDir := neoAmpThreadStoreDir
+	neoAmpThreadStoreDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
+
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "threadActor", "T-test", "T-test", neoActorRecord("actor-test", "threadActor", "T-test"), nil)
+	actor.messages = []neoMessage{
+		{ThreadID: "T-test", MessageID: "M-user", Role: "user", Content: []any{map[string]any{"type": "text", "text": "keep"}}, Seq: 1},
+		{ThreadID: "T-test", MessageID: "M-assistant", Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "drop"}}, Seq: 2},
+	}
+
+	actor.handle(map[string]any{"type": "thread:truncate", "fromIndex": 1, "seq": 7})
+
+	actor.mu.Lock()
+	if len(actor.messages) != 1 || actor.messages[0].MessageID != "M-user" {
+		actor.mu.Unlock()
+		t.Fatalf("messages = %#v, want only first message", actor.messages)
+	}
+	if len(actor.replayEvents) == 0 {
+		actor.mu.Unlock()
+		t.Fatal("missing replay event")
+	}
+	event := actor.replayEvents[len(actor.replayEvents)-1].Payload
+	if event["type"] != "thread_truncated" || stringValue(event["truncateFromMessage"]) != "M-assistant" || numberFrom(event["seq"]) != 7 {
+		actor.mu.Unlock()
+		t.Fatalf("truncate event = %#v, want protocol truncate shape", event)
+	}
+	if _, exists := event["fromIndex"]; exists {
+		actor.mu.Unlock()
+		t.Fatalf("truncate event kept binary-only fromIndex: %#v", event)
+	}
+	actor.mu.Unlock()
+	waitForNeoActorSyncIdle(t, actor)
 }
 
 func TestNeoAgentStateUsesOfficialSchemaEnum(t *testing.T) {
@@ -10285,6 +10414,7 @@ func TestNeoRuntimeProtocolDeltaNormalizesLikeBinary(t *testing.T) {
 	if len(user.Content) != 1 || stringValue(mapValue(user.Content[0])["text"]) != "user text" {
 		t.Fatalf("user content = %#v, want filtered text", user.Content)
 	}
+	waitForNeoActorSyncIdle(t, actor)
 }
 
 func TestNeoRuntimeProtocolMessagesNormalizeContentLikeBinary(t *testing.T) {
@@ -10365,6 +10495,7 @@ func TestNeoRuntimeProtocolMessagesNormalizeContentLikeBinary(t *testing.T) {
 	if afterInvalid != beforeInvalid {
 		t.Fatalf("invalid message without content was stored: before=%d after=%d", beforeInvalid, afterInvalid)
 	}
+	waitForNeoActorSyncIdle(t, actor)
 }
 
 func TestNeoRuntimeThreadImportDerivesModeFromMessages(t *testing.T) {

@@ -1400,9 +1400,13 @@ func (a *neoActor) handleForSocket(socket *neoSocket, msg map[string]any) {
 		}
 	case "client_update_thread_settings":
 		a.updateSettings(mapValue(msg["settings"]))
+	case "thread_settings":
+		a.updateSettings(sanitizeNeoThreadSettings(mapValue(msg["settings"])))
 	case "executor_connect":
 		a.executorConnect(msg)
 	case "executor_environment_snapshot", "executor_environment_update":
+		a.updateEnvironment(mapValue(msg["environment"]))
+	case "environment_update":
 		a.updateEnvironment(mapValue(msg["environment"]))
 	case "executor_guidance_snapshot", "executor_guidance_update", "executor_guidance_discovery":
 		a.updateGuidanceSnapshot(msg)
@@ -1482,6 +1486,8 @@ func (a *neoActor) handleForSocket(socket *neoSocket, msg map[string]any) {
 		a.handleToolProgress(msg)
 	case "executor_tool_approval_request":
 		a.handleToolApprovalRequest(msg)
+	case "tool_approval_queue":
+		a.handleProtocolToolApprovalQueue(msg)
 	case "client_tool_approval_response":
 		a.handleToolApprovalResponse(msg)
 	case "executor_tool_approval_response":
@@ -1506,8 +1512,18 @@ func (a *neoActor) handleForSocket(socket *neoSocket, msg map[string]any) {
 		a.handleProtocolErrorSet(msg)
 	case "error_cleared":
 		a.handleProtocolErrorCleared(msg)
+	case "error":
+		a.handleProtocolError(msg)
 	case "cancelled":
 		a.handleProtocolCancelled(msg)
+	case "queued_messages":
+		a.handleProtocolQueuedMessages(msg)
+	case "queued_message_added":
+		a.handleProtocolQueuedMessageAdded(msg)
+	case "queued_message_removed", "queued_message_dequeued":
+		a.handleProtocolQueuedMessageRemoved(msg)
+	case "edit_rejected", "observers":
+		a.broadcast(msg)
 	case "client_filesystem_read_directory":
 		a.forwardFilesystemRequest("directory", msg)
 	case "client_filesystem_read_file":
@@ -1530,12 +1546,24 @@ func (a *neoActor) handleForSocket(socket *neoSocket, msg map[string]any) {
 		a.broadcast(msg)
 	case "executor_plugin_message":
 		a.broadcast(map[string]any{"type": "plugin_message", "message": msg["message"]})
+	case "plugin_message":
+		a.handleProtocolPluginMessage(msg)
 	case "executor_artifact_upsert":
 		a.upsertArtifact(neoArtifactPayloadFromExecutorMessage(msg), firstNonEmptyString(msg["toolCallId"], msg["toolUseId"], msg["toolUseID"]))
 	case "executor_artifact_delete":
 		a.deleteArtifact(stringValue(msg["key"]))
+	case "artifacts_snapshot":
+		a.handleProtocolArtifactsSnapshot(msg)
+	case "artifact_upserted":
+		a.upsertArtifact(msg["artifact"], "")
+	case "artifact_deleted":
+		a.deleteArtifact(stringValue(msg["key"]))
 	case "thread_status":
 		a.updateThreadStatus(msg)
+	case "thread_title":
+		a.handleProtocolThreadTitle(msg)
+	case "thread_relationships":
+		a.handleProtocolThreadRelationships(msg)
 	case "compaction_started", "compaction_complete", "compaction_records":
 		a.handleCompactionEvent(msg)
 	case "retry_scheduled", "retry_started", "retry_cancelled":
@@ -1629,6 +1657,156 @@ func (a *neoActor) updateSettings(settings map[string]any) {
 	merged := cloneMap(a.settings)
 	a.mu.Unlock()
 	a.broadcast(neoThreadSettingsPayload(merged))
+}
+
+func (a *neoActor) handleProtocolError(msg map[string]any) {
+	message, ok := msg["message"].(string)
+	if !ok {
+		return
+	}
+	payload := map[string]any{"type": "error", "message": message}
+	if code := stringValue(msg["code"]); validNeoProtocolErrorCode(code) {
+		payload["code"] = code
+	}
+	a.broadcast(payload)
+}
+
+func (a *neoActor) handleProtocolToolApprovalQueue(msg map[string]any) {
+	rawApprovals := arrayValue(msg["approvals"])
+	approvals := make([]map[string]any, 0, len(rawApprovals))
+	for _, rawApproval := range rawApprovals {
+		approval := mapValue(rawApproval)
+		if neoApprovalKey(approval) == "" {
+			continue
+		}
+		approvals = append(approvals, neoProtocolApproval(approval))
+	}
+
+	a.mu.Lock()
+	a.approvalQueue = approvals
+	stateChanged := false
+	state := a.agentState
+	if len(approvals) > 0 && a.agentState != "awaiting_approval" {
+		state = "awaiting_approval"
+		a.agentState = state
+		stateChanged = true
+	} else if len(approvals) == 0 && a.agentState == "awaiting_approval" {
+		if len(a.pendingTools) > 0 {
+			state = "running_tools"
+		} else {
+			state = "idle"
+		}
+		a.agentState = state
+		stateChanged = true
+	}
+	agentMode := a.currentAgentMode
+	reasoningEffort := a.currentReasoningEffort
+	payload := toolApprovalQueuePayload(a.approvalQueueListLocked())
+	a.mu.Unlock()
+
+	a.broadcast(payload)
+	if stateChanged {
+		a.broadcast(map[string]any{"type": "agent_state", "state": state, "agentMode": agentMode, "reasoningEffort": omitEmpty(reasoningEffort)})
+	}
+}
+
+func (a *neoActor) handleProtocolQueuedMessages(msg map[string]any) {
+	queue := neoQueuedMessagesFromProtocol(msg["messages"])
+	a.mu.Lock()
+	a.queue = queue
+	messages := a.queuedMessageProtocolListLocked()
+	a.mu.Unlock()
+	a.broadcast(map[string]any{"type": "queued_messages", "messages": messages})
+	a.syncCloudAsync()
+}
+
+func (a *neoActor) handleProtocolQueuedMessageAdded(msg map[string]any) {
+	item, ok := neoQueuedMessageFromProtocol(msg["message"])
+	if !ok {
+		return
+	}
+	a.mu.Lock()
+	a.upsertQueuedMessageLocked(item)
+	seq := a.protocolSeqLocked(msg)
+	a.mu.Unlock()
+
+	a.broadcast(map[string]any{"type": "queued_message_added", "message": item.queueProtocol(), "seq": seq})
+	a.syncCloudAsync()
+}
+
+func (a *neoActor) handleProtocolQueuedMessageRemoved(msg map[string]any) {
+	queuedMessageID := stringValue(msg["queuedMessageId"])
+	if queuedMessageID == "" {
+		return
+	}
+	a.mu.Lock()
+	a.removeQueuedMessageLocked(queuedMessageID)
+	seq := a.protocolSeqLocked(msg)
+	a.mu.Unlock()
+
+	a.broadcast(map[string]any{"type": stringValue(msg["type"]), "queuedMessageId": queuedMessageID, "seq": seq})
+	a.syncCloudAsync()
+}
+
+func (a *neoActor) handleProtocolPluginMessage(msg map[string]any) {
+	message, ok := normalizeNeoProtocolPluginMessage(msg["message"])
+	if !ok {
+		return
+	}
+	a.broadcast(map[string]any{"type": "plugin_message", "message": message})
+}
+
+func (a *neoActor) handleProtocolArtifactsSnapshot(msg map[string]any) {
+	artifacts := neoArtifactsMap(msg["artifacts"])
+	a.mu.Lock()
+	a.artifacts = map[string]any{}
+	for key, artifact := range artifacts {
+		a.artifacts[key] = normalizeNeoArtifact(artifact, "")
+	}
+	payload := a.artifactListLocked()
+	a.mu.Unlock()
+
+	a.broadcast(map[string]any{"type": "artifacts_snapshot", "artifacts": payload})
+	a.syncCloudAsync()
+}
+
+func (a *neoActor) handleProtocolThreadTitle(msg map[string]any) {
+	rawTitle, exists := msg["title"]
+	if !exists {
+		return
+	}
+	title := ""
+	if rawTitle != nil {
+		var ok bool
+		title, ok = rawTitle.(string)
+		if !ok {
+			return
+		}
+	}
+	a.mu.Lock()
+	if a.title == title {
+		a.mu.Unlock()
+		return
+	}
+	a.title = title
+	a.titleSource = "explicit"
+	a.mu.Unlock()
+
+	a.broadcast(map[string]any{"type": "thread_title", "title": rawTitle})
+	a.syncCloudAsync()
+}
+
+func (a *neoActor) handleProtocolThreadRelationships(msg map[string]any) {
+	relationships := normalizeNeoThreadRelationships(msg["relationships"])
+	a.mu.Lock()
+	a.relationships = relationships
+	seq := a.protocolSeqLocked(msg)
+	event := map[string]any{"type": "thread_relationships", "relationships": a.relationshipListLocked(), "seq": seq}
+	a.rememberReplayEventLocked(event)
+	a.mu.Unlock()
+
+	a.broadcast(event)
+	a.syncCloudAsync()
 }
 
 func (a *neoActor) toolProgressPayload(msg map[string]any) map[string]any {
@@ -2980,11 +3158,11 @@ func (a *neoActor) cleanupPriorAssistantForBinaryDeltaLocked(cancelReason string
 			if a.currentInference != nil && a.messageIndexLocked(a.currentInference.messageID) < 0 {
 				a.currentInference = nil
 			}
-			seq := a.nextSeqLocked()
-			event := map[string]any{"type": "thread_truncated", "seq": seq, "fromIndex": assistantIndex}
-			if removedMessageID != "" {
-				event["truncateFromMessage"] = removedMessageID
+			if removedMessageID == "" {
+				return nil
 			}
+			seq := a.nextSeqLocked()
+			event := map[string]any{"type": "thread_truncated", "seq": seq, "truncateFromMessage": removedMessageID}
 			a.rememberReplayEventLocked(event)
 			return []map[string]any{event}
 		}
@@ -3577,6 +3755,10 @@ func (a *neoActor) handleBinaryThreadTruncate(msg map[string]any) {
 	truncateFromMessage := ""
 	if fromIndex < len(a.messages) {
 		truncateFromMessage = a.messages[fromIndex].MessageID
+		if truncateFromMessage == "" {
+			a.mu.Unlock()
+			return
+		}
 		a.messages = append([]neoMessage(nil), a.messages[:fromIndex]...)
 		a.rebuildHistoryLocked()
 		a.filterPendingToolsToMessagesLocked()
@@ -3584,13 +3766,13 @@ func (a *neoActor) handleBinaryThreadTruncate(msg map[string]any) {
 		if a.currentInference != nil && a.messageIndexLocked(a.currentInference.messageID) < 0 {
 			a.currentInference = nil
 		}
+	} else {
+		a.mu.Unlock()
+		return
 	}
 	a.filterRelationshipsForTruncationLocked(fromIndex)
 	seq := a.protocolSeqLocked(msg)
-	event := map[string]any{"type": "thread_truncated", "seq": seq, "fromIndex": fromIndex}
-	if truncateFromMessage != "" {
-		event["truncateFromMessage"] = truncateFromMessage
-	}
+	event := map[string]any{"type": "thread_truncated", "seq": seq, "truncateFromMessage": truncateFromMessage}
 	a.rememberReplayEventLocked(event)
 	a.mu.Unlock()
 
@@ -4162,6 +4344,19 @@ func (a *neoActor) removeQueuedMessageLocked(messageID string) {
 		}
 	}
 	a.queue = filtered
+}
+
+func (a *neoActor) upsertQueuedMessageLocked(item neoQueuedMessage) {
+	if item.MessageID == "" {
+		return
+	}
+	for i, existing := range a.queue {
+		if existing.MessageID == item.MessageID || existing.queueID() == item.queueID() {
+			a.queue[i] = item
+			return
+		}
+	}
+	a.queue = append(a.queue, item)
 }
 
 func (a *neoActor) filterPendingToolsToMessagesLocked() {
@@ -10578,6 +10773,50 @@ func neoQueuedMessagesFromThread(raw any) []neoQueuedMessage {
 	return queued
 }
 
+func neoQueuedMessagesFromProtocol(raw any) []neoQueuedMessage {
+	items := arrayValue(raw)
+	if len(items) == 0 {
+		return nil
+	}
+	queued := make([]neoQueuedMessage, 0, len(items))
+	for _, rawItem := range items {
+		item, ok := neoQueuedMessageFromProtocol(rawItem)
+		if ok {
+			queued = append(queued, item)
+		}
+	}
+	return queued
+}
+
+func neoQueuedMessageFromProtocol(raw any) (neoQueuedMessage, bool) {
+	item := mapValue(raw)
+	steer, ok := item["steer"].(bool)
+	if !ok {
+		return neoQueuedMessage{}, false
+	}
+	message, ok := normalizeNeoProtocolMessagePayload(item["queuedMessage"])
+	if !ok || stringValue(message["role"]) != "user" {
+		return neoQueuedMessage{}, false
+	}
+	messageID := stringValue(message["messageId"])
+	content := arrayValue(message["content"])
+	if messageID == "" || content == nil {
+		return neoQueuedMessage{}, false
+	}
+	return neoQueuedMessage{
+		ID:              firstNonEmptyString(item["id"], item["queuedMessageId"], messageID),
+		MessageID:       messageID,
+		Content:         content,
+		UserState:       message["userState"],
+		FileMentions:    mapValue(message["fileMentions"]),
+		Meta:            mapValue(message["meta"]),
+		CreatedAt:       stringValue(message["createdAt"]),
+		AgentMode:       stringValue(message["agentMode"]),
+		ReasoningEffort: firstNonEmptyString(message["reasoningEffort"], message["reasoning_effort"]),
+		Steer:           steer,
+	}, true
+}
+
 func neoImportedThreadReasoningEffort(messages []neoMessage, agentMode string) string {
 	for i := len(messages) - 1; i >= 0; i-- {
 		message := messages[i]
@@ -11806,6 +12045,20 @@ func (a *neoActor) threadQueuedMessageListLocked() []any {
 			"id":            item.queueID(),
 			"queuedMessage": item.threadProtocol(),
 		})
+	}
+	return messages
+}
+
+func (a *neoActor) queuedMessageProtocolListLocked() []any {
+	if len(a.queue) == 0 {
+		return []any{}
+	}
+	messages := make([]any, 0, len(a.queue))
+	for _, item := range a.queue {
+		if item.MessageID == "" {
+			continue
+		}
+		messages = append(messages, item.queueProtocol())
 	}
 	return messages
 }
@@ -17649,6 +17902,61 @@ func validNeoExecutorErrorCode(code string) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+func validNeoProtocolErrorCode(code string) bool {
+	switch code {
+	case "ACCESS_DENIED", "ACTOR_STOPPING", "CONNECTION_ERROR", "MAX_RECONNECT_EXCEEDED", "MESSAGE_ERROR", "LOOP_RUNNING", "NO_THREAD_ID", "NO_ERROR", "INVALID_MESSAGE", "PARSE_ERROR", "UNKNOWN_TYPE", "INTERNAL_ERROR":
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeNeoProtocolPluginMessage(raw any) (map[string]any, bool) {
+	message := mapValue(raw)
+	switch stringValue(message["type"]) {
+	case "request":
+		id := stringValue(message["id"])
+		method := stringValue(message["method"])
+		if id == "" || method == "" {
+			return nil, false
+		}
+		out := map[string]any{"type": "request", "id": id, "method": method}
+		if params, exists := message["params"]; exists {
+			out["params"] = cloneNeoJSONValue(params)
+		}
+		return out, true
+	case "response":
+		id := stringValue(message["id"])
+		if id == "" {
+			return nil, false
+		}
+		out := map[string]any{"type": "response", "id": id}
+		if result, exists := message["result"]; exists {
+			out["result"] = cloneNeoJSONValue(result)
+		}
+		if errText, ok := message["error"].(string); ok {
+			out["error"] = errText
+		}
+		return out, true
+	case "event":
+		event := stringValue(message["event"])
+		if event == "" {
+			return nil, false
+		}
+		data, exists := message["data"]
+		if !exists {
+			return nil, false
+		}
+		out := map[string]any{"type": "event", "event": event, "data": cloneNeoJSONValue(data)}
+		if span, ok := message["span"].(string); ok {
+			out["span"] = span
+		}
+		return out, true
+	default:
+		return nil, false
 	}
 }
 
