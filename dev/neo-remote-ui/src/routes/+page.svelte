@@ -52,6 +52,9 @@
     patch?: unknown;
     diff?: unknown;
     run?: unknown;
+    args?: unknown;
+    toolRun?: unknown;
+    hidden?: unknown;
     userInput?: unknown;
     toolUseID?: string;
     blockState?: string;
@@ -2695,7 +2698,7 @@
     };
 
     for (const message of messages) {
-      if (isCompactionSummaryInfoMessage(message)) continue;
+      if (shouldSkipInfoTranscriptMessage(message)) continue;
 
       if (isHumanUserMessage(message)) {
         flushAssistant();
@@ -2717,9 +2720,19 @@
     return stringFrom(record.cutMessageId ?? record.cut_message_id ?? record.messageId ?? record.message_id);
   }
 
-  function isCompactionSummaryInfoMessage(message: NeoMessage) {
+  function shouldSkipInfoTranscriptMessage(message: NeoMessage) {
     if (message.role !== 'info') return false;
-    return message.content.some((block) => block.type === 'summary' && stringFrom(asRecord(block.summary).type) === 'message');
+    return !message.content.some(isRenderableInfoBlock);
+  }
+
+  function isRenderableInfoBlock(block: ContentBlock) {
+    return block.type === 'manual_bash_invocation' && !isHiddenBlock(block);
+  }
+
+  function isHiddenBlock(block: ContentBlock) {
+    const hidden = block.hidden;
+    if (typeof hidden === 'string') return hidden.trim().length > 0 && hidden.trim().toLowerCase() !== 'false';
+    return Boolean(hidden);
   }
 
   function dedupeReplayMessages(messages: NeoMessage[]) {
@@ -2793,7 +2806,7 @@
           return;
         }
 
-        if (block.type === 'text' && block.text) {
+        if (message.role !== 'info' && block.type === 'text' && block.text) {
           textSegments.push({ kind: 'text', block, key });
         }
       });
@@ -2832,7 +2845,7 @@
       }
 
       flushWork();
-      if (block.type === 'text' && block.text) {
+      if (message.role !== 'info' && block.type === 'text' && block.text) {
         segments.push({ kind: 'text', block, key: `${message.messageId}-text-${index}` });
       }
     });
@@ -2844,6 +2857,7 @@
   function isRenderableWorkBlock(block: ContentBlock) {
     if (block.type === 'thinking') return Boolean(block.thinking) || plausibleBlockTimeMillis(block.startTime) > 0;
     if (block.type === 'tool_use') return true;
+    if (block.type === 'manual_bash_invocation') return !isHiddenBlock(block);
     if (block.type === 'tool_result') {
       return Boolean(blockContentPreview(block) || toolResultUseID(block) || Object.keys(toolResultRun(block)).length > 0);
     }
@@ -3042,6 +3056,9 @@
         else if (cat === 'painter') { flush(); rows.push({ kind: 'painter', block: b, result }); }
         else if (cat === 'review') { flush(); rows.push({ kind: 'review', block: b, result }); }
         else { flush(); rows.push({ kind: 'tool', block: b, result }); }
+      } else if (b.type === 'manual_bash_invocation') {
+        flush();
+        rows.push({ kind: 'command', block: b, result: b });
       } else if (b.type === 'tool_result') { continue; }
       else { flush(); rows.push({ kind: 'tool', block: b }); }
     }
@@ -3082,6 +3099,12 @@
   }
 
   function commandText(block: ContentBlock): string {
+    if (block.type === 'manual_bash_invocation') {
+      const args = block.args;
+      if (Array.isArray(args)) return args.map((value) => stringFrom(value)).filter(Boolean).join(' ');
+      const record = asRecord(args);
+      return stringFrom(record.cmd ?? record.command ?? block.content) || '';
+    }
     const input = toolInputRecord(block);
     return stringFrom(input.command ?? input.cmd ?? input.script) || '';
   }
@@ -3112,7 +3135,7 @@
   }
 
   function toolResultRun(block?: ContentBlock) {
-    return asRecord(block?.run ?? asRecord(block).run);
+    return asRecord(block?.run ?? block?.toolRun ?? asRecord(block).run ?? asRecord(block).toolRun);
   }
 
   function toolResultResult(block?: ContentBlock) {
