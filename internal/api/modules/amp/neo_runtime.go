@@ -7723,6 +7723,7 @@ func (rt *neoRuntime) localThreadActorManagementResponse(ctx context.Context, bo
 	}
 	if executorType != "" {
 		actor.bootstrapExecutorType = executorType
+		actor.meta = neoThreadActorImportedMeta(actor.meta)
 	}
 	agentMode := actor.currentAgentMode
 	threadVersion := actor.seq
@@ -7731,6 +7732,9 @@ func (rt *neoRuntime) localThreadActorManagementResponse(ctx context.Context, bo
 	}
 	bootstrapExecutorType := actor.bootstrapExecutorType
 	actor.mu.Unlock()
+	if executorType != "" {
+		markNeoLocalThreadActorImported(threadID)
+	}
 
 	baseResponse := map[string]any{
 		"threadId":      threadID,
@@ -8358,13 +8362,7 @@ func neoCloudThread(snapshot neoCloudThreadSnapshot) map[string]any {
 
 	threadStatus := neoThreadStatusValue(snapshot.threadStatus)
 	relationships := neoMergeThreadRelationshipsWithExplicit(neoThreadRelationships(messages), snapshot.relationships)
-	meta := cloneMap(snapshot.meta)
-	meta["usesDtw"] = true
-	meta["usesThreadActors"] = true
-	meta["ampcodeConnectorLocalNeo"] = true
-	meta["cliProxyAPILocalNeo"] = true
-	meta["ampcodeLocalRuntime"] = true
-	meta["ampcodeConnectorMode"] = "local-neo"
+	meta := neoThreadActorImportedMeta(snapshot.meta)
 	thread := map[string]any{
 		"id":                snapshot.threadID,
 		"v":                 version,
@@ -8417,6 +8415,26 @@ func neoCloudThread(snapshot neoCloudThreadSnapshot) map[string]any {
 		}
 	}
 	return thread
+}
+
+func neoThreadActorImportedMeta(meta map[string]any) map[string]any {
+	out := cloneMap(meta)
+	out["usesDtw"] = true
+	out["usesThreadActors"] = true
+	out["ampcodeConnectorLocalNeo"] = true
+	out["cliProxyAPILocalNeo"] = true
+	out["ampcodeLocalRuntime"] = true
+	out["ampcodeConnectorMode"] = "local-neo"
+	return out
+}
+
+func markNeoLocalThreadActorImported(threadID string) {
+	thread, ok := loadNeoLocalThread(threadID)
+	if !ok {
+		return
+	}
+	thread["meta"] = neoThreadActorImportedMeta(mapValue(thread["meta"]))
+	cacheNeoLocalThread(thread)
 }
 
 func neoThreadRelationships(messages []neoMessage) []any {
@@ -9784,7 +9802,7 @@ func (a *neoActor) importThreadWithSync(thread map[string]any, syncCloud bool) e
 	archived := boolValue(thread["archived"]) || strings.EqualFold(rawThreadStatus, "archived")
 	compactionRecords := normalizeNeoCompactionRecords(firstArray(thread["compactionRecords"], thread["compaction_records"]))
 	relationships := normalizeNeoThreadRelationships(thread["relationships"])
-	meta := cloneMap(mapValue(thread["meta"]))
+	meta := neoThreadActorImportedMeta(mapValue(thread["meta"]))
 	debug := cloneMap(firstMap(thread["~debug"], thread["debug"]))
 	draft := cloneArray(arrayValue(thread["draft"]))
 	autoSubmitDraft := boolValue(thread["autoSubmitDraft"])

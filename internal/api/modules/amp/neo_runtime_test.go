@@ -9735,8 +9735,49 @@ func TestNeoRuntimeThreadImportHTTP(t *testing.T) {
 	if len(actor.relationships) != 1 || stringValue(actor.relationships[0]["threadID"]) != "T-019e1046-656d-7132-879f-390ded941c16" {
 		t.Fatalf("relationships = %#v", actor.relationships)
 	}
+	if actor.meta["usesThreadActors"] != true || actor.meta["usesDtw"] != true {
+		t.Fatalf("imported thread actor meta = %#v", actor.meta)
+	}
 	if got := stringValue(mapValue(actor.artifacts["artifact-1"])["content"]); got != "notes" {
 		t.Fatalf("imported artifact content = %q", got)
+	}
+}
+
+func TestNeoRuntimeThreadActorMarkPersistsImportedMeta(t *testing.T) {
+	dir := t.TempDir()
+	oldStoreDir := neoAmpThreadStoreDir
+	neoAmpThreadStoreDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
+
+	threadID := "T-import-mark"
+	rawThread := []byte(`{"id":"` + threadID + `","v":4,"title":"Legacy","agentMode":"deep","messages":[{"role":"user","messageId":"M-user","agentMode":"deep","content":[{"type":"text","text":"legacy thread"}]}]}`)
+	if err := os.WriteFile(filepath.Join(dir, threadID+".json"), rawThread, 0o600); err != nil {
+		t.Fatalf("write local thread: %v", err)
+	}
+
+	rt := newNeoRuntime(&config.Config{})
+	response, status := rt.localThreadActorManagementResponse(context.Background(), map[string]any{"executorType": "local-client"}, threadID)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d response=%#v", status, response)
+	}
+	if response["usesThreadActors"] != true || response["executorType"] != "local-client" {
+		t.Fatalf("thread actor mark response = %#v", response)
+	}
+
+	actor := rt.store.ensureThreadActor(threadID)
+	actor.mu.Lock()
+	actorMeta := cloneMap(actor.meta)
+	actor.mu.Unlock()
+	if actorMeta["usesThreadActors"] != true || actorMeta["usesDtw"] != true {
+		t.Fatalf("actor meta = %#v", actorMeta)
+	}
+	reloaded, ok := loadNeoLocalThread(threadID)
+	if !ok {
+		t.Fatal("local thread missing after mark")
+	}
+	meta := mapValue(reloaded["meta"])
+	if meta["usesThreadActors"] != true || meta["usesDtw"] != true {
+		t.Fatalf("persisted meta = %#v", meta)
 	}
 }
 
