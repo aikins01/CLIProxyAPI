@@ -4684,6 +4684,68 @@ func TestNeoActorRebuildHistoryIncludesManualBashInvocation(t *testing.T) {
 	}
 }
 
+func TestNeoActorRebuildHistoryIncludesInfoTextLikeBinary(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+
+	actor.mu.Lock()
+	actor.messages = []neoMessage{{
+		ThreadID:  "T-test",
+		MessageID: "M-info",
+		Role:      "info",
+		Content: []any{
+			map[string]any{"type": "text", "text": "You MUST call the skill tool before using this skill."},
+			map[string]any{"type": "summary", "summary": map[string]any{"type": "transcript", "summary": "skip transcript marker"}},
+		},
+	}}
+	actor.rebuildHistoryLocked()
+	history := append([]neoHistoryMessage(nil), actor.history...)
+	actor.mu.Unlock()
+
+	if len(history) != 1 {
+		t.Fatalf("history = %#v", history)
+	}
+	if history[0].Role != "user" || history[0].Text != "You MUST call the skill tool before using this skill." {
+		t.Fatalf("info text history = %#v", history[0])
+	}
+	if len(history[0].Content) != 1 || stringValue(mapValue(history[0].Content[0])["text"]) != "You MUST call the skill tool before using this skill." {
+		t.Fatalf("info text content = %#v", history[0].Content)
+	}
+}
+
+func TestNeoActorRebuildHistoryCombinesInfoTextAndManualBashLikeBinary(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+
+	actor.mu.Lock()
+	actor.messages = []neoMessage{{
+		ThreadID:  "T-test",
+		MessageID: "M-info",
+		Role:      "info",
+		Content: []any{
+			map[string]any{"type": "text", "text": "Loaded skill: code-review"},
+			map[string]any{
+				"type":    "manual_bash_invocation",
+				"args":    map[string]any{"cmd": "git status --short", "cwd": "/tmp/work"},
+				"toolRun": map[string]any{"status": "done", "result": map[string]any{"output": "clean", "exitCode": 0}},
+			},
+		},
+	}}
+	actor.rebuildHistoryLocked()
+	history := append([]neoHistoryMessage(nil), actor.history...)
+	actor.mu.Unlock()
+
+	if len(history) != 1 {
+		t.Fatalf("history = %#v", history)
+	}
+	if history[0].Role != "user" || !strings.Contains(history[0].Text, "Loaded skill: code-review") || !strings.Contains(history[0].Text, neoManualBashHistoryReminder) || !strings.Contains(history[0].Text, "<command>git status --short</command>") {
+		t.Fatalf("combined info history = %#v", history[0])
+	}
+	if len(history[0].Content) != 3 || stringValue(mapValue(history[0].Content[0])["text"]) != "Loaded skill: code-review" || stringValue(mapValue(history[0].Content[1])["text"]) != neoManualBashHistoryReminder || !strings.Contains(stringValue(mapValue(history[0].Content[2])["text"]), "<output>clean</output>") {
+		t.Fatalf("combined info content = %#v", history[0].Content)
+	}
+}
+
 func TestNeoActorRebuildHistorySkipsHiddenManualBashInvocationLikeBinary(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)

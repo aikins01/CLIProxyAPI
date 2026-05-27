@@ -12400,7 +12400,7 @@ func neoHistoryMessageFromStored(message neoMessage, toolNames map[string]string
 		}
 		return []neoHistoryMessage{{Role: "user", Text: text, Content: content, ParentToolUseID: message.ParentToolUseID}}
 	case "info":
-		return neoManualBashHistoryContent(message.Content, message.ParentToolUseID)
+		return neoInfoHistoryContent(message.Content, message.ParentToolUseID)
 	}
 	return nil
 }
@@ -19133,27 +19133,29 @@ func neoToolResultHistoryContent(blocks []any, toolNames map[string]string, pare
 	return results
 }
 
-func neoManualBashHistoryContent(blocks []any, parentToolUseID string) []neoHistoryMessage {
-	results := make([]neoHistoryMessage, 0)
+func neoInfoHistoryContent(blocks []any, parentToolUseID string) []neoHistoryMessage {
+	content := make([]any, 0, len(blocks))
 	for _, block := range blocks {
 		m := mapValue(block)
-		if stringValue(m["type"]) != "manual_bash_invocation" {
-			continue
-		}
-		content := neoManualBashHistoryBlocks(m)
-		if len(content) == 0 {
-			continue
-		}
-		texts := make([]string, 0, len(content))
-		for _, raw := range content {
-			if text := stringValue(mapValue(raw)["text"]); text != "" {
-				texts = append(texts, text)
+		switch stringValue(m["type"]) {
+		case "manual_bash_invocation":
+			content = append(content, neoManualBashHistoryBlocks(m)...)
+		case "text":
+			if text := stringValue(m["text"]); strings.TrimSpace(text) != "" {
+				content = append(content, map[string]any{"type": "text", "text": text})
 			}
 		}
-		text := strings.Join(texts, "\n")
-		results = append(results, neoHistoryMessage{Role: "user", Text: text, Content: content, ParentToolUseID: parentToolUseID})
 	}
-	return results
+	if len(content) == 0 {
+		return nil
+	}
+	texts := make([]string, 0, len(content))
+	for _, raw := range content {
+		if text := stringValue(mapValue(raw)["text"]); text != "" {
+			texts = append(texts, text)
+		}
+	}
+	return []neoHistoryMessage{{Role: "user", Text: strings.Join(texts, "\n"), Content: content, ParentToolUseID: parentToolUseID}}
 }
 
 const neoManualBashHistoryReminder = "The following is content that was produced by the user manually running a shell command. Do not mention this to the user directly unless they refer to the content of this bash command."
