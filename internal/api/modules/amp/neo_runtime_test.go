@@ -7333,8 +7333,14 @@ func TestNeoReadThreadToolFallbackUsesCloudThread(t *testing.T) {
 			if !strings.Contains(mentioned, "<mentionedThread>") || !strings.Contains(mentioned, "cloud fallback details") {
 				t.Fatalf("mentioned thread prompt = %q", mentioned)
 			}
+			if !strings.HasPrefix(mentioned, "\nHere is the mentioned thread content:\n<mentionedThread>\n") || strings.Contains(mentioned, "content:\n\n<mentionedThread>") || !strings.HasSuffix(mentioned, "\n</mentionedThread>\n") {
+				t.Fatalf("mentioned thread wrapper spacing = %q", mentioned)
+			}
 			if !strings.Contains(prompt, "## Goal") || !strings.Contains(prompt, "extract task") || !strings.Contains(prompt, "`relevantContent`") {
 				t.Fatalf("extraction prompt = %q", prompt)
+			}
+			if !strings.HasPrefix(prompt, "\nYou are helping me extract relevant information from the mentioned thread based on a goal.\n## Task\n") || strings.Contains(prompt, "\n\n") || !strings.HasSuffix(prompt, "- `relevantContent`: The extracted relevant information (as markdown text)\n") {
+				t.Fatalf("extraction prompt spacing = %q", prompt)
 			}
 			writeNeoJSON(w, http.StatusOK, map[string]any{
 				"candidates": []any{map[string]any{

@@ -3099,13 +3099,19 @@
     return firstString(value, record.message, record.error);
   }
 
-  function codeReviewActions(result?: ContentBlock) {
+  function codeReviewSummaryName(block?: ContentBlock) {
+    const input = block ? toolInputRecord(block) : {};
+    return stringFrom(input.thinking).trim().toLowerCase() === 'low' ? 'quick code review' : 'code review';
+  }
+
+  function codeReviewActions(block?: ContentBlock, result?: ContentBlock) {
     const run = toolResultRun(result);
     const nestedResult = asRecord(run.result);
     const progress = asRecord(run.progress);
     const main = firstRecord(nestedResult.main, progress.main);
     const checks = firstRecord(nestedResult.checks, progress.checks);
     const status = toolResultStatus(result);
+    const reviewKind = codeReviewSummaryName(block);
     const actions: string[] = [];
     const seen = new Set<string>();
     const add = (title: string) => {
@@ -3144,7 +3150,7 @@
     }
     if (status === 'done' || status === 'complete' || status === 'completed') add('Code review complete');
     if (actions.length === 0) add(status === 'queued' ? 'Code review queued' : 'Reviewing code changes...');
-    return { actions, summary: totalChecks > 0 ? `${completedChecks}/${totalChecks} checks · code review` : 'code review' };
+    return { actions, summary: totalChecks > 0 ? `${completedChecks}/${totalChecks} checks · ${reviewKind}` : reviewKind };
   }
 
   function toolResultPreview(block?: ContentBlock) {
@@ -3684,7 +3690,7 @@
             </div>
           </details>
         {:else if row.kind === 'review'}
-          {@const review = codeReviewActions(row.result)}
+          {@const review = codeReviewActions(row.block, row.result)}
           <details class="trace-row trace-row--review" open={toolResultStatus(row.result) === 'in-progress' || toolResultStatus(row.result) === 'queued'}>
             <summary class="trace-time-anchor" data-time={traceTimeLabelForRow(row.block, row.result)}>
               <span class="trace-row__label">{codeReviewTitle(row.result)}</span>
