@@ -5340,6 +5340,58 @@ func TestNeoProviderMessagesPreserveImageBlocks(t *testing.T) {
 	}
 }
 
+func TestNeoProviderMessagesFilterThinkingByProviderLikeBinary(t *testing.T) {
+	msg := neoHistoryMessage{
+		Role: "assistant",
+		Text: "final answer",
+		ThinkingBlocks: []neoThinkingBlock{
+			{Thinking: "openai plan", Signature: "openai-sig", Provider: "openai", ID: "rs-openai"},
+			{Thinking: "anthropic plan", Signature: "anthropic-sig", Provider: "anthropic"},
+		},
+	}
+
+	anthropic := anthropicNeoMessages([]neoHistoryMessage{msg})
+	anthropicContent := arrayValue(mapValue(anthropic[0])["content"])
+	if len(anthropicContent) != 2 {
+		t.Fatalf("anthropic content = %#v", anthropicContent)
+	}
+	if thinking := mapValue(anthropicContent[0]); stringValue(thinking["type"]) != "thinking" || stringValue(thinking["thinking"]) != "anthropic plan" || stringValue(thinking["signature"]) != "anthropic-sig" {
+		t.Fatalf("anthropic thinking = %#v", thinking)
+	}
+	if text := mapValue(anthropicContent[1]); stringValue(text["text"]) != "final answer" {
+		t.Fatalf("anthropic text = %#v", text)
+	}
+
+	openAIChat := openAINeoMessages([]neoHistoryMessage{msg}, "")
+	openAIContent := arrayValue(mapValue(openAIChat[0])["content"])
+	if len(openAIContent) != 2 {
+		t.Fatalf("openai chat content = %#v", openAIContent)
+	}
+	if got := stringValue(mapValue(openAIContent[0])["text"]); got != "Thoughts: openai plan" {
+		t.Fatalf("openai thought = %q", got)
+	}
+	if got := stringValue(mapValue(openAIContent[1])["text"]); got != "final answer" {
+		t.Fatalf("openai text = %q", got)
+	}
+
+	responsesInput := openAIResponsesNeoInput([]neoHistoryMessage{msg}, "")
+	if len(responsesInput) != 2 {
+		t.Fatalf("responses input = %#v", responsesInput)
+	}
+	reasoning := mapValue(responsesInput[0])
+	if reasoning["type"] != "reasoning" || reasoning["id"] != "rs-openai" || reasoning["encrypted_content"] != "openai-sig" {
+		t.Fatalf("responses reasoning = %#v", reasoning)
+	}
+	summary := arrayValue(reasoning["summary"])
+	if len(summary) != 1 || stringValue(mapValue(summary[0])["text"]) != "openai plan" {
+		t.Fatalf("responses summary = %#v", summary)
+	}
+	message := mapValue(responsesInput[1])
+	if message["type"] != "message" || message["role"] != "assistant" || message["content"] != "final answer" {
+		t.Fatalf("responses assistant message = %#v", message)
+	}
+}
+
 func TestNeoProviderMessagesNormalizeInternalImageMediaType(t *testing.T) {
 	msg := neoHistoryMessage{
 		Role: "user",
@@ -6055,7 +6107,7 @@ func TestInferNeoOpenAIResponsesStreamHandlesReasoningTextEvents(t *testing.T) {
 	if result.Text != "done" || text.String() != "done" {
 		t.Fatalf("text result=%q delta=%q, want done", result.Text, text.String())
 	}
-	if len(result.ThinkingBlocks) != 1 || result.ThinkingBlocks[0].Thinking != "plan then act" || result.ThinkingBlocks[0].Signature != "sig" {
+	if len(result.ThinkingBlocks) != 1 || result.ThinkingBlocks[0].Thinking != "plan then act" || result.ThinkingBlocks[0].Signature != "sig" || result.ThinkingBlocks[0].Provider != "openai" || result.ThinkingBlocks[0].ID != "rs_1" {
 		t.Fatalf("thinking blocks = %#v", result.ThinkingBlocks)
 	}
 	if thinking.String() != "plan then act" {
@@ -6217,6 +6269,7 @@ func TestParseNeoOpenAIResponsesResultReadsReasoningTextContent(t *testing.T) {
 	result, err := parseNeoOpenAIResponsesResult(map[string]any{
 		"output": []any{map[string]any{
 			"type":              "reasoning",
+			"id":                "rs_content",
 			"encrypted_content": "sig",
 			"content": []any{map[string]any{
 				"type": "reasoning_text",
@@ -6228,7 +6281,7 @@ func TestParseNeoOpenAIResponsesResultReadsReasoningTextContent(t *testing.T) {
 		t.Fatalf("parseNeoOpenAIResponsesResult error: %v", err)
 	}
 
-	if len(result.ThinkingBlocks) != 1 || result.ThinkingBlocks[0].Thinking != "reasoned from content" || result.ThinkingBlocks[0].Signature != "sig" {
+	if len(result.ThinkingBlocks) != 1 || result.ThinkingBlocks[0].Thinking != "reasoned from content" || result.ThinkingBlocks[0].Signature != "sig" || result.ThinkingBlocks[0].Provider != "openai" || result.ThinkingBlocks[0].ID != "rs_content" {
 		t.Fatalf("thinking blocks = %#v", result.ThinkingBlocks)
 	}
 }
@@ -12414,12 +12467,46 @@ func TestFinishAssistantMessageAddsOpenAIThinkingBlockForDeepMode(t *testing.T) 
 		t.Fatalf("assistant content = %#v", content)
 	}
 	thinking := mapValue(content[0])
-	if thinking["type"] != "thinking" || thinking["signature"] != "" {
+	if thinking["type"] != "thinking" || thinking["signature"] != "" || thinking["provider"] != "openai" {
 		t.Fatalf("thinking block = %#v", thinking)
 	}
 	text := mapValue(content[1])
 	if text["type"] != "text" || text["text"] != "hello" {
 		t.Fatalf("text block = %#v", text)
+	}
+}
+
+func TestFinishAssistantMessageStoresOpenAIReasoningMetadataLikeBinary(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+
+	actor.finishAssistantMessage("M-assistant", neoInferenceResult{
+		Provider: "openai",
+		Model:    "gpt-5.5",
+		Text:     "done",
+		ThinkingBlocks: []neoThinkingBlock{{
+			Thinking:  "plan then act",
+			Signature: "encrypted",
+			ID:        "rs_1",
+		}},
+	}, "deep", "xhigh")
+
+	actor.mu.Lock()
+	content := cloneArray(actor.messages[0].Content)
+	history := append([]neoHistoryMessage(nil), actor.history...)
+	actor.mu.Unlock()
+
+	thinking := mapValue(content[0])
+	reasoning := mapValue(thinking["openAIReasoning"])
+	if thinking["type"] != "thinking" || thinking["provider"] != "openai" || reasoning["id"] != "rs_1" || reasoning["encryptedContent"] != "encrypted" {
+		t.Fatalf("stored thinking block = %#v", thinking)
+	}
+	if len(history) != 1 || len(history[0].ThinkingBlocks) != 1 {
+		t.Fatalf("history = %#v", history)
+	}
+	historyThinking := history[0].ThinkingBlocks[0]
+	if historyThinking.Provider != "openai" || historyThinking.ID != "rs_1" || historyThinking.Signature != "encrypted" || historyThinking.Thinking != "plan then act" {
+		t.Fatalf("history thinking = %#v", historyThinking)
 	}
 }
 

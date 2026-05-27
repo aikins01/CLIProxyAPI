@@ -5753,18 +5753,30 @@ func (a *neoActor) finishAssistantMessageWithOptions(messageID string, result ne
 	// anthropic extended-thinking blocks must be emitted before text/tool_use
 	// in the assistant message and carry their signature for replay.
 	for _, tb := range result.ThinkingBlocks {
-		blocks = append(blocks, map[string]any{
+		provider := fallbackString(tb.Provider, result.Provider)
+		block := map[string]any{
 			"type":      "thinking",
 			"thinking":  tb.Thinking,
 			"signature": tb.Signature,
-		})
+		}
+		if provider != "" {
+			block["provider"] = provider
+		}
+		if strings.EqualFold(provider, "openai") && tb.ID != "" && tb.Signature != "" {
+			block["openAIReasoning"] = map[string]any{"id": tb.ID, "encryptedContent": tb.Signature}
+		}
+		blocks = append(blocks, block)
 	}
 	if streamBlockOffset > 0 && len(result.ThinkingBlocks) == 0 {
-		blocks = append(blocks, map[string]any{
+		block := map[string]any{
 			"type":      "thinking",
 			"thinking":  "",
 			"signature": "",
-		})
+		}
+		if result.Provider != "" {
+			block["provider"] = result.Provider
+		}
+		blocks = append(blocks, block)
 	}
 	if result.Text != "" {
 		blocks = append(blocks, map[string]any{"type": "text", "text": result.Text})
@@ -13276,12 +13288,12 @@ type neoInferenceResult struct {
 	ThinkingBlocks []neoThinkingBlock
 }
 
-// neoThinkingBlock captures Anthropic extended-thinking output so we can
-// preserve the signature on history replay (Anthropic requires it for chained
-// tool-use calls under extended thinking).
+// neoThinkingBlock captures provider reasoning output and its replay metadata.
 type neoThinkingBlock struct {
 	Thinking  string
 	Signature string
+	Provider  string
+	ID        string
 }
 
 type neoInferenceDelta struct {
@@ -13648,6 +13660,7 @@ func inferNeoAnthropic(rt *neoRuntime, request neoInferenceRequest, route neoMod
 			thinkingBlocks = append(thinkingBlocks, neoThinkingBlock{
 				Thinking:  stringValue(item["thinking"]),
 				Signature: stringValue(item["signature"]),
+				Provider:  "anthropic",
 			})
 		}
 	}
@@ -13967,6 +13980,7 @@ func inferNeoAnthropicStream(rt *neoRuntime, request neoInferenceRequest, route 
 			thinkingBlocks = append(thinkingBlocks, neoThinkingBlock{
 				Thinking:  block.thinking.String(),
 				Signature: block.signature,
+				Provider:  "anthropic",
 			})
 		}
 	}
@@ -14416,7 +14430,7 @@ func inferNeoOpenAIResponsesStream(rt *neoRuntime, request neoInferenceRequest, 
 		if block.text.Len() == 0 && block.signature == "" {
 			continue
 		}
-		thinkingBlocks = append(thinkingBlocks, neoThinkingBlock{Thinking: block.text.String(), Signature: block.signature})
+		thinkingBlocks = append(thinkingBlocks, neoThinkingBlock{Thinking: block.text.String(), Signature: block.signature, Provider: "openai", ID: block.id})
 	}
 	return neoInferenceResult{Provider: route.Provider, Model: route.Model, Text: streamText(), ToolCalls: toolCalls, Usage: usage, ThinkingBlocks: thinkingBlocks}, nil
 }
@@ -16861,6 +16875,9 @@ func anthropicNeoMessages(history []neoHistoryMessage) []any {
 		case "assistant":
 			content := make([]any, 0, len(msg.ThinkingBlocks)+1+len(msg.ToolCalls))
 			for _, tb := range msg.ThinkingBlocks {
+				if !neoThinkingBlockMatchesProvider(tb, "anthropic") || (tb.Thinking == "" && tb.Signature == "") {
+					continue
+				}
 				content = append(content, map[string]any{"type": "thinking", "thinking": tb.Thinking, "signature": tb.Signature})
 			}
 			if msg.Text != "" {
@@ -16869,12 +16886,20 @@ func anthropicNeoMessages(history []neoHistoryMessage) []any {
 			for _, call := range msg.ToolCalls {
 				content = append(content, map[string]any{"type": "tool_use", "id": call.ID, "name": call.Name, "input": call.Input})
 			}
+			if len(content) == 0 {
+				continue
+			}
 			messages = append(messages, map[string]any{"role": "assistant", "content": content})
 		default:
 			messages = append(messages, map[string]any{"role": "user", "content": anthropicNeoUserContent(msg)})
 		}
 	}
 	return messages
+}
+
+func neoThinkingBlockMatchesProvider(block neoThinkingBlock, provider string) bool {
+	blockProvider := strings.ToLower(strings.TrimSpace(block.Provider))
+	return blockProvider == "" || blockProvider == strings.ToLower(strings.TrimSpace(provider))
 }
 
 func openAINeoMessages(history []neoHistoryMessage, system string) []any {
@@ -16889,6 +16914,13 @@ func openAINeoMessages(history []neoHistoryMessage, system string) []any {
 			messages = append(messages, openAIChatNeoToolMessages(msg)...)
 		case "assistant":
 			assistant := map[string]any{"role": "assistant", "content": msg.Text}
+			thinkingContent := openAIChatNeoThinkingContent(msg)
+			if len(thinkingContent) > 0 {
+				if msg.Text != "" {
+					thinkingContent = append(thinkingContent, map[string]any{"type": "text", "text": msg.Text})
+				}
+				assistant["content"] = thinkingContent
+			}
 			if len(msg.ToolCalls) > 0 {
 				calls := make([]any, 0, len(msg.ToolCalls))
 				for _, call := range msg.ToolCalls {
@@ -16896,7 +16928,7 @@ func openAINeoMessages(history []neoHistoryMessage, system string) []any {
 					calls = append(calls, map[string]any{"id": call.ID, "type": "function", "function": map[string]any{"name": call.Name, "arguments": string(args)}})
 				}
 				assistant["tool_calls"] = calls
-				if msg.Text == "" {
+				if msg.Text == "" && len(thinkingContent) == 0 {
 					assistant["content"] = nil
 				}
 			}
@@ -16906,6 +16938,17 @@ func openAINeoMessages(history []neoHistoryMessage, system string) []any {
 		}
 	}
 	return messages
+}
+
+func openAIChatNeoThinkingContent(msg neoHistoryMessage) []any {
+	content := make([]any, 0, len(msg.ThinkingBlocks))
+	for _, tb := range msg.ThinkingBlocks {
+		if !neoThinkingBlockMatchesProvider(tb, "openai") || tb.Thinking == "" {
+			continue
+		}
+		content = append(content, map[string]any{"type": "text", "text": "Thoughts: " + tb.Thinking})
+	}
+	return content
 }
 
 func openAIResponsesNeoBody(request neoInferenceRequest, route neoModelRoute, stream bool) map[string]any {
@@ -16999,18 +17042,16 @@ func openAIResponsesNeoInput(history []neoHistoryMessage, system string) []any {
 			}
 		case "assistant":
 			for _, tb := range msg.ThinkingBlocks {
-				if tb.Thinking == "" && tb.Signature == "" {
+				if !neoThinkingBlockMatchesProvider(tb, "openai") || tb.Signature == "" || tb.ID == "" {
 					continue
 				}
-				item := map[string]any{"type": "reasoning"}
+				item := map[string]any{"type": "reasoning", "id": tb.ID}
 				if tb.Thinking != "" {
 					item["summary"] = []any{map[string]any{"type": "summary_text", "text": tb.Thinking}}
 				} else {
 					item["summary"] = []any{}
 				}
-				if tb.Signature != "" {
-					item["encrypted_content"] = tb.Signature
-				}
+				item["encrypted_content"] = tb.Signature
 				input = append(input, item)
 			}
 			if msg.Text != "" {
@@ -17997,11 +18038,12 @@ func parseNeoOpenAIResponsesResult(jsonBody map[string]any, route neoModelRoute,
 			})
 		case "reasoning":
 			signature := stringValue(item["encrypted_content"])
+			reasoningID := stringValue(item["id"])
 			added := false
 			for _, rawSummary := range arrayValue(item["summary"]) {
 				summary := mapValue(rawSummary)
 				if text := stringValue(summary["text"]); text != "" {
-					thinkingBlocks = append(thinkingBlocks, neoThinkingBlock{Thinking: text, Signature: signature})
+					thinkingBlocks = append(thinkingBlocks, neoThinkingBlock{Thinking: text, Signature: signature, Provider: "openai", ID: reasoningID})
 					added = true
 				}
 			}
@@ -18012,13 +18054,13 @@ func parseNeoOpenAIResponsesResult(jsonBody map[string]any, route neoModelRoute,
 						continue
 					}
 					if text := stringValue(content["text"]); text != "" {
-						thinkingBlocks = append(thinkingBlocks, neoThinkingBlock{Thinking: text, Signature: signature})
+						thinkingBlocks = append(thinkingBlocks, neoThinkingBlock{Thinking: text, Signature: signature, Provider: "openai", ID: reasoningID})
 						added = true
 					}
 				}
 			}
 			if !added && signature != "" {
-				thinkingBlocks = append(thinkingBlocks, neoThinkingBlock{Signature: signature})
+				thinkingBlocks = append(thinkingBlocks, neoThinkingBlock{Signature: signature, Provider: "openai", ID: reasoningID})
 			}
 		default:
 			if neoUnsupportedOpenAIResponsesOutputType(itemType) {
@@ -19104,9 +19146,21 @@ func neoAssistantHistoryContent(blocks []any) (string, []neoToolCall, []neoThink
 				CustomInputField: neoOpenAICustomToolInputFieldFromBlock(m),
 			})
 		case "thinking":
+			reasoning := mapValue(m["openAIReasoning"])
+			signature := firstNonEmptyString(m["signature"], reasoning["encryptedContent"])
+			thinkingText := stringValue(m["thinking"])
+			if thinkingText == "" && signature == "" {
+				continue
+			}
+			provider := stringValue(m["provider"])
+			if provider == "" && len(reasoning) > 0 {
+				provider = "openai"
+			}
 			thinking = append(thinking, neoThinkingBlock{
-				Thinking:  stringValue(m["thinking"]),
-				Signature: stringValue(m["signature"]),
+				Thinking:  thinkingText,
+				Signature: signature,
+				Provider:  provider,
+				ID:        firstNonEmptyString(reasoning["id"], m["id"]),
 			})
 		}
 	}
