@@ -60,6 +60,7 @@
     timestamp?: number | string;
     source?: Record<string, unknown>;
     image_url?: unknown;
+    summary?: unknown;
     url?: string;
     uri?: string;
     href?: string;
@@ -97,7 +98,8 @@
 
   type TranscriptItem =
     | { kind: 'user'; message: NeoMessage; key: string }
-    | { kind: 'assistant'; messages: NeoMessage[]; key: string };
+    | { kind: 'assistant'; messages: NeoMessage[]; key: string }
+    | { kind: 'compaction'; cutMessageId: string; key: string };
 
   type ThreadSummary = {
     id: string;
@@ -126,6 +128,7 @@
     cost?: { amount: number; free?: number; paid?: number; included?: boolean; url?: string };
     costBreakdownURL?: string;
     handoffFrom?: { threadId: string; instructions?: string };
+    compactionRecords?: Record<string, unknown>[];
   };
 
   type Incoming = Record<string, unknown>;
@@ -289,7 +292,8 @@
   }
 
   const activeMessages = $derived.by(() => dedupeReplayMessages(detail?.messages ?? []));
-  const transcriptItems = $derived.by(() => groupTranscriptItems(activeMessages));
+  const activeCompactionRecords = $derived.by(() => compactionRecords.length > 0 ? compactionRecords : (detail?.compactionRecords ?? []));
+  const transcriptItems = $derived.by(() => groupTranscriptItems(activeMessages, activeCompactionRecords));
   // Per-message jump nav: only user turns are anchors (matches ampcode pattern of one mark per turn)
   const userTurnAnchors = $derived(
     activeMessages
@@ -629,6 +633,7 @@
       const result = await rpc('getThread', { thread: threadId });
       const thread = normalizeThreadPayload(result);
       detail = threadDetailFromAPI(thread);
+      compactionRecords = detail.compactionRecords ?? [];
       void refreshThreadUsageInfo(threadId);
       connect(threadId, Number(thread?.v ?? detail.messages.length));
     } catch (error) {
@@ -2089,6 +2094,9 @@
       : [];
     const env = asRecord(thread.env);
     const agentMode = threadAgentModeFrom(thread, messages);
+    const records = Array.isArray(thread.compactionRecords)
+      ? thread.compactionRecords.map(asRecord)
+      : [];
     return {
       id: stringFrom(thread.id) || selectedThreadId,
       title: stringFrom(thread.title) || 'Untitled',
@@ -2102,6 +2110,7 @@
       cost: costFrom(thread),
       costBreakdownURL: costBreakdownURLFrom(thread),
       handoffFrom: handoffFromMessages(messages),
+      compactionRecords: records,
     };
   }
 
@@ -2252,7 +2261,8 @@
       agentMode: summary.agentMode,
       reasoningEffort: summary.reasoningEffort,
       messages: [],
-      contextLabel: 'local context'
+      contextLabel: 'local context',
+      compactionRecords: []
     };
   }
 
@@ -2658,10 +2668,12 @@
     return connection;
   }
 
-  function groupTranscriptItems(messages: NeoMessage[]): TranscriptItem[] {
+  function groupTranscriptItems(messages: NeoMessage[], records: Record<string, unknown>[] = []): TranscriptItem[] {
     const items: TranscriptItem[] = [];
     let assistantMessages: NeoMessage[] = [];
     let assistantStart = '';
+    const cutMessageIds = new Set(records.map(compactionCutMessageId).filter(Boolean));
+    const emittedCompactions = new Set<string>();
 
     const flushAssistant = () => {
       if (assistantMessages.length === 0) return;
@@ -2674,19 +2686,40 @@
       assistantStart = '';
     };
 
+    const pushCompactionAfter = (message: NeoMessage) => {
+      const cutMessageId = message.messageId;
+      if (!cutMessageIds.has(cutMessageId) || emittedCompactions.has(cutMessageId)) return;
+      flushAssistant();
+      emittedCompactions.add(cutMessageId);
+      items.push({ kind: 'compaction', cutMessageId, key: `compaction-${cutMessageId}` });
+    };
+
     for (const message of messages) {
+      if (isCompactionSummaryInfoMessage(message)) continue;
+
       if (isHumanUserMessage(message)) {
         flushAssistant();
         items.push({ kind: 'user', message, key: `user-${message.messageId}` });
+        pushCompactionAfter(message);
         continue;
       }
 
       if (!assistantStart) assistantStart = message.messageId;
       assistantMessages.push(message);
+      pushCompactionAfter(message);
     }
 
     flushAssistant();
     return items;
+  }
+
+  function compactionCutMessageId(record: Record<string, unknown>) {
+    return stringFrom(record.cutMessageId ?? record.cut_message_id ?? record.messageId ?? record.message_id);
+  }
+
+  function isCompactionSummaryInfoMessage(message: NeoMessage) {
+    if (message.role !== 'info') return false;
+    return message.content.some((block) => block.type === 'summary' && stringFrom(asRecord(block.summary).type) === 'message');
   }
 
   function dedupeReplayMessages(messages: NeoMessage[]) {
@@ -4308,6 +4341,12 @@
               <article class="message message--user" data-message-id={item.message.messageId}>
                 {@render userBubble(item.message.content)}
               </article>
+            {:else if item.kind === 'compaction'}
+              <div class="compaction-row" data-cut-message-id={item.cutMessageId}>
+                <span class="compaction-row__line"></span>
+                <span class="compaction-row__label">Compacted</span>
+                <span class="compaction-row__line"></span>
+              </div>
             {:else if assistantTurnSegments(item.messages).length > 0}
               <article class="message" data-message-id={item.key}>
                 <div class="message__agent">
@@ -5376,6 +5415,28 @@
   .message {
     min-width: 0;
     animation: message-enter 180ms ease-out;
+  }
+  .compaction-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    min-width: 0;
+    padding: 2px 0;
+    color: var(--neo-muted);
+    font-size: 13px;
+    font-style: italic;
+    line-height: 20px;
+    animation: message-enter 180ms ease-out;
+  }
+  .compaction-row__line {
+    flex: 1 1 0;
+    height: 1px;
+    min-width: 24px;
+    background: color-mix(in srgb, var(--neo-border) 68%, transparent);
+  }
+  .compaction-row__label {
+    flex: 0 0 auto;
+    white-space: nowrap;
   }
   .message--user {
     display: flex;
