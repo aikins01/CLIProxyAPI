@@ -11965,6 +11965,7 @@ func inferNeoOpenAIResponsesStream(rt *neoRuntime, request neoInferenceRequest, 
 	var usage map[string]any
 	streamBlockOffset := neoOpenAIThinkingBlockOffset(request.AgentMode, route.Provider)
 	customTools := neoOpenAICustomToolConfigByName(request.Tools)
+	textByContent := map[string]*strings.Builder{}
 	toolCallsByIndex := map[int]*partialToolCall{}
 	toolIndexes := make([]int, 0)
 	thinkingBlocksByIndex := map[int]*partialThinkingBlock{}
@@ -11999,6 +12000,40 @@ func inferNeoOpenAIResponsesStream(rt *neoRuntime, request neoInferenceRequest, 
 			index++
 		}
 		return index
+	}
+	textContentKey := func(outputIndex, contentIndex int) string {
+		return fmt.Sprintf("%d/%d", outputIndex, contentIndex)
+	}
+	ensureTextContent := func(outputIndex, contentIndex int) *strings.Builder {
+		key := textContentKey(outputIndex, contentIndex)
+		if builder := textByContent[key]; builder != nil {
+			return builder
+		}
+		builder := &strings.Builder{}
+		textByContent[key] = builder
+		return builder
+	}
+	emitTextDelta := func(outputIndex, contentIndex int, text string) {
+		if text == "" {
+			return
+		}
+		sawContent = true
+		ensureTextContent(outputIndex, contentIndex).WriteString(text)
+		fullText.WriteString(text)
+		if onDelta != nil {
+			onDelta(neoInferenceDelta{Text: text, BlockIndex: streamBlockOffset, Usage: usage})
+		}
+	}
+	emitReasoningDelta := func(outputIndex int, text string) {
+		if text == "" {
+			return
+		}
+		sawContent = true
+		block := ensureThinkingBlock(outputIndex)
+		block.text.WriteString(text)
+		if onDelta != nil {
+			onDelta(neoInferenceDelta{Thinking: text, BlockIndex: 0, Usage: usage})
+		}
 	}
 	emitToolDelta := func(call *partialToolCall, partialJSONDelta string) {
 		if onDelta == nil || call == nil || call.name == "" {
@@ -12040,36 +12075,65 @@ func inferNeoOpenAIResponsesStream(rt *neoRuntime, request neoInferenceRequest, 
 		}
 		switch stringValue(payload["type"]) {
 		case "response.output_text.delta":
-			text := stringValue(payload["delta"])
-			if text != "" {
-				sawContent = true
-				fullText.WriteString(text)
-				if onDelta != nil {
-					onDelta(neoInferenceDelta{Text: text, BlockIndex: streamBlockOffset, Usage: usage})
-				}
+			emitTextDelta(numberFrom(payload["output_index"]), numberFrom(payload["content_index"]), stringValue(payload["delta"]))
+		case "response.output_text.done":
+			outputIndex := numberFrom(payload["output_index"])
+			contentIndex := numberFrom(payload["content_index"])
+			if builder := ensureTextContent(outputIndex, contentIndex); builder.Len() == 0 {
+				emitTextDelta(outputIndex, contentIndex, stringValue(payload["text"]))
+			}
+		case "response.refusal.delta":
+			emitTextDelta(numberFrom(payload["output_index"]), numberFrom(payload["content_index"]), stringValue(payload["delta"]))
+		case "response.refusal.done":
+			outputIndex := numberFrom(payload["output_index"])
+			contentIndex := numberFrom(payload["content_index"])
+			if builder := ensureTextContent(outputIndex, contentIndex); builder.Len() == 0 {
+				emitTextDelta(outputIndex, contentIndex, stringValue(payload["refusal"]))
+			}
+		case "response.content_part.added":
+			index := numberFrom(payload["output_index"])
+			contentIndex := numberFrom(payload["content_index"])
+			part := mapValue(payload["part"])
+			switch stringValue(part["type"]) {
+			case "output_text":
+				emitTextDelta(index, contentIndex, stringValue(part["text"]))
+			case "refusal":
+				emitTextDelta(index, contentIndex, stringValue(part["refusal"]))
+			case "reasoning_text":
+				emitReasoningDelta(index, stringValue(part["text"]))
 			}
 		case "response.reasoning_summary_text.delta":
 			text := stringValue(payload["delta"])
 			if text != "" {
-				sawContent = true
 				index := numberFrom(payload["output_index"])
-				block := ensureThinkingBlock(index)
-				block.text.WriteString(text)
-				if onDelta != nil {
-					onDelta(neoInferenceDelta{Thinking: text, BlockIndex: 0, Usage: usage})
-				}
+				emitReasoningDelta(index, text)
 			}
 		case "response.reasoning_summary_text.done":
 			index := numberFrom(payload["output_index"])
 			block := ensureThinkingBlock(index)
 			if text := stringValue(payload["text"]); text != "" && block.text.Len() == 0 {
-				block.text.WriteString(text)
+				emitReasoningDelta(index, text)
 			}
 			if !block.sentDoneNewlines {
 				block.sentDoneNewlines = true
 				if onDelta != nil {
 					onDelta(neoInferenceDelta{Thinking: "\n\n", BlockIndex: 0, Usage: usage})
 				}
+			}
+		case "response.reasoning_text.delta":
+			emitReasoningDelta(numberFrom(payload["output_index"]), stringValue(payload["delta"]))
+		case "response.reasoning_text.done":
+			index := numberFrom(payload["output_index"])
+			block := ensureThinkingBlock(index)
+			if text := stringValue(payload["text"]); text != "" && block.text.Len() == 0 {
+				emitReasoningDelta(index, text)
+			}
+		case "response.reasoning_summary_part.added", "response.reasoning_summary_part.done":
+			index := numberFrom(payload["output_index"])
+			block := ensureThinkingBlock(index)
+			part := mapValue(payload["part"])
+			if text := stringValue(part["text"]); text != "" && block.text.Len() == 0 {
+				emitReasoningDelta(index, text)
 			}
 		case "response.output_item.added":
 			index := numberFrom(payload["output_index"])
@@ -12177,6 +12241,14 @@ func inferNeoOpenAIResponsesStream(rt *neoRuntime, request neoInferenceRequest, 
 		case "response.completed":
 			completedResponse = mapValue(payload["response"])
 			usage = mergeNeoUsage(usage, mapValue(completedResponse["usage"]))
+		case "response.failed":
+			response := mapValue(payload["response"])
+			errorBody := mapValue(response["error"])
+			return fmt.Errorf("local provider stream error: %s", firstNonEmptyString(errorBody["message"], response["status"], data))
+		case "response.incomplete":
+			response := mapValue(payload["response"])
+			details := mapValue(response["incomplete_details"])
+			return fmt.Errorf("local provider stream incomplete: %s", fallbackString(details["reason"], data))
 		case "error":
 			return fmt.Errorf("local provider stream error: %s", data)
 		}
@@ -15311,6 +15383,18 @@ func parseNeoOpenAIResponsesResult(jsonBody map[string]any, route neoModelRoute,
 				if text := stringValue(summary["text"]); text != "" {
 					thinkingBlocks = append(thinkingBlocks, neoThinkingBlock{Thinking: text, Signature: signature})
 					added = true
+				}
+			}
+			if !added {
+				for _, rawContent := range arrayValue(item["content"]) {
+					content := mapValue(rawContent)
+					if stringValue(content["type"]) != "reasoning_text" {
+						continue
+					}
+					if text := stringValue(content["text"]); text != "" {
+						thinkingBlocks = append(thinkingBlocks, neoThinkingBlock{Thinking: text, Signature: signature})
+						added = true
+					}
 				}
 			}
 			if !added && signature != "" {

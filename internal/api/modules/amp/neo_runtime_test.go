@@ -4688,6 +4688,64 @@ func TestInferNeoOpenAIResponsesStreamCustomToolCall(t *testing.T) {
 	}
 }
 
+func TestInferNeoOpenAIResponsesStreamHandlesReasoningTextEvents(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/provider/openai/v1/responses" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[],\"encrypted_content\":\"sig\"}}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.content_part.added\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"reasoning_text\",\"text\":\"plan \"}}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.reasoning_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"then act\"}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[],\"content\":[{\"type\":\"reasoning_text\",\"text\":\"plan then act\"}],\"encrypted_content\":\"sig\"}}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.done\",\"output_index\":1,\"content_index\":0,\"text\":\"done\"}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1},\"output\":[]}}\n\ndata: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	var thinking strings.Builder
+	var text strings.Builder
+	result, err := inferNeoLocalStream(testNeoRuntimeForServer(t, upstream), neoInferenceRequest{
+		ThreadID:        "T-test",
+		AgentMode:       "deep",
+		ReasoningEffort: "xhigh",
+		Settings:        map[string]any{"internal.model": "openai/gpt-5.5"},
+		History:         []neoHistoryMessage{{Role: "user", Text: "hi"}},
+	}, func(delta neoInferenceDelta) {
+		thinking.WriteString(delta.Thinking)
+		text.WriteString(delta.Text)
+	})
+	if err != nil {
+		t.Fatalf("inferNeoLocalStream error: %v", err)
+	}
+	if result.Text != "done" || text.String() != "done" {
+		t.Fatalf("text result=%q delta=%q, want done", result.Text, text.String())
+	}
+	if len(result.ThinkingBlocks) != 1 || result.ThinkingBlocks[0].Thinking != "plan then act" || result.ThinkingBlocks[0].Signature != "sig" {
+		t.Fatalf("thinking blocks = %#v", result.ThinkingBlocks)
+	}
+	if thinking.String() != "plan then act" {
+		t.Fatalf("thinking delta = %q", thinking.String())
+	}
+}
+
+func TestParseNeoOpenAIResponsesResultReadsReasoningTextContent(t *testing.T) {
+	result := parseNeoOpenAIResponsesResult(map[string]any{
+		"output": []any{map[string]any{
+			"type":              "reasoning",
+			"encrypted_content": "sig",
+			"content": []any{map[string]any{
+				"type": "reasoning_text",
+				"text": "reasoned from content",
+			}},
+		}},
+	}, neoModelRoute{Provider: "openai", Model: "gpt-5.5"}, nil)
+
+	if len(result.ThinkingBlocks) != 1 || result.ThinkingBlocks[0].Thinking != "reasoned from content" || result.ThinkingBlocks[0].Signature != "sig" {
+		t.Fatalf("thinking blocks = %#v", result.ThinkingBlocks)
+	}
+}
+
 func TestInferNeoOpenAIResponsesFallsBackToChatCompletionsWhenUnsupported(t *testing.T) {
 	responsesCalls := 0
 	chatCalls := 0
