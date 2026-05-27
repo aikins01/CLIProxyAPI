@@ -998,6 +998,25 @@ func TestNeoThreadRelationshipsIgnoreBareUserThreadID(t *testing.T) {
 	}
 }
 
+func TestNeoThreadRelationshipsIgnoreIncompleteReadThreadLikeBinary(t *testing.T) {
+	validThreadID := "T-019e1046-656d-7132-879f-390ded941c16"
+	relationships := neoThreadRelationships([]neoMessage{{
+		ThreadID:  "T-current",
+		MessageID: "M-assistant",
+		Role:      "assistant",
+		Content: []any{map[string]any{
+			"type":     "tool_use",
+			"name":     "read_thread",
+			"complete": false,
+			"input":    map[string]any{"threadID": validThreadID},
+		}},
+		CreatedAt: "2026-05-07T21:00:00Z",
+	}})
+	if len(relationships) != 0 {
+		t.Fatalf("relationships = %#v, want no incomplete read_thread relationship", relationships)
+	}
+}
+
 func TestNeoActorThreadRelationshipEventsUseOfficialSchema(t *testing.T) {
 	dir := t.TempDir()
 	oldStoreDir := neoAmpThreadStoreDir
@@ -9939,6 +9958,35 @@ func TestNeoThreadListEntryPreservesBinaryRelationshipThreadIDs(t *testing.T) {
 	}
 }
 
+func TestNeoThreadListEntryInfersBinaryReadThreadRelationships(t *testing.T) {
+	parentID := "T-019e1046-656d-7132-879f-390ded941c16"
+	explicitID := "T-019e1046-656d-7132-879f-390ded941c17"
+	entry := neoThreadListEntry(map[string]any{
+		"id":            "T-list-related",
+		"relationships": []any{map[string]any{"threadID": explicitID, "type": "fork", "role": "child", "createdAt": 1}},
+		"messages": []any{
+			map[string]any{"role": "user", "messageId": "M-user", "content": []any{map[string]any{"type": "text", "text": "read parent"}}},
+			map[string]any{"role": "assistant", "messageId": "M-assistant", "createdAt": "2026-05-07T21:00:00Z", "content": []any{
+				map[string]any{"type": "tool_use", "name": "read_thread", "complete": true, "input": map[string]any{"threadID": parentID}},
+				map[string]any{"type": "tool_use", "name": "read_thread", "complete": false, "input": map[string]any{"threadID": "T-019e1046-656d-7132-879f-390ded941c18"}},
+				map[string]any{"type": "tool_use", "name": "read_thread", "complete": true, "input": map[string]any{"threadID": parentID}},
+			}},
+		},
+	})
+	relationships := arrayValue(entry["relationships"])
+	if len(relationships) != 2 {
+		t.Fatalf("relationships = %#v, want explicit plus one inferred", relationships)
+	}
+	explicit := mapValue(relationships[0])
+	inferred := mapValue(relationships[1])
+	if stringValue(explicit["threadID"]) != explicitID || stringValue(explicit["type"]) != "fork" {
+		t.Fatalf("explicit relationship order/shape = %#v", explicit)
+	}
+	if stringValue(inferred["threadID"]) != parentID || stringValue(inferred["type"]) != "mention" || stringValue(inferred["role"]) != "parent" || numberFrom(inferred["messageIndex"]) != 1 {
+		t.Fatalf("inferred relationship = %#v", inferred)
+	}
+}
+
 func TestNeoThreadListEntryComputesBinaryDiffStats(t *testing.T) {
 	entry := neoThreadListEntry(map[string]any{
 		"id": "T-list-diff",
@@ -9988,6 +10036,7 @@ func TestRecentNeoLocalThreadsComputesBinaryDiffStats(t *testing.T) {
 	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
 
 	threadID := "T-019e0e6e-f3f1-7081-b5dd-748f66f8c25d"
+	parentID := "T-019e1046-656d-7132-879f-390ded941c16"
 	raw := []byte(`{
 		"id": "` + threadID + `",
 		"title": "diff stats",
@@ -10002,7 +10051,9 @@ func TestRecentNeoLocalThreadsComputesBinaryDiffStats(t *testing.T) {
 			{"role": "user", "messageId": "M-tool-result", "content": [{"type": "tool_result", "toolUseID": "TU-read"}]},
 			{"role": "assistant", "messageId": "M-assistant", "content": [
 				{"type": "server_tool_use", "name": "functions.edit_file", "input": {"old_str": "alpha\nbeta", "new_str": "alpha\ngamma\nbeta"}},
-				{"type": "tool_use", "complete": true, "name": "write_file", "input": {"content": "new file"}}
+				{"type": "tool_use", "complete": true, "name": "write_file", "input": {"content": "new file"}},
+				{"type": "tool_use", "complete": true, "name": "read_thread", "input": {"threadID": "` + parentID + `"}},
+				{"type": "tool_use", "complete": false, "name": "read_thread", "input": {"threadID": "T-019e1046-656d-7132-879f-390ded941c17"}}
 			]}
 		]
 	}`)
@@ -10026,6 +10077,10 @@ func TestRecentNeoLocalThreadsComputesBinaryDiffStats(t *testing.T) {
 	}
 	if numberFrom(threads[0]["messageCount"]) != 1 || numberFrom(mapValue(threads[0]["summaryStats"])["messageCount"]) != 1 {
 		t.Fatalf("message counts = entry:%#v summary:%#v, want 1", threads[0]["messageCount"], threads[0]["summaryStats"])
+	}
+	relationships := arrayValue(threads[0]["relationships"])
+	if len(relationships) != 1 || stringValue(mapValue(relationships[0])["threadID"]) != parentID {
+		t.Fatalf("relationships = %#v, want inferred parent %s", relationships, parentID)
 	}
 }
 

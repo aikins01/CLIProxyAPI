@@ -6236,6 +6236,7 @@ func recentNeoLocalThreads(limit int) []map[string]any {
 		if messages := gjson.GetBytes(raw, "messages"); messages.Exists() && messages.IsArray() {
 			messageCount := neoBinaryThreadMessageCountFromJSON(messages)
 			thread["messageCount"] = messageCount
+			thread["relationships"] = neoMergeThreadRelationshipsWithExplicit(neoThreadRelationshipsFromJSONMessages(messages, id), firstArray(thread["relationships"]))
 			thread["summaryStats"] = neoMergeThreadSummaryStats(thread["summaryStats"], messageCount, neoThreadDiffStatsFromJSONMessages(messages))
 		}
 		if updated := neoThreadUpdatedMillisFromJSONBytes(raw); updated > 0 {
@@ -6357,7 +6358,11 @@ func neoThreadListEntry(thread map[string]any) map[string]any {
 		meta["sharedGroupIDs"] = []any{}
 	}
 	entry["meta"] = meta
-	if relationships := firstArray(thread["relationships"]); relationships != nil {
+	relationships := firstArray(thread["relationships"])
+	if rawMessages, exists := thread["messages"]; exists {
+		relationships = neoMergeThreadRelationshipsWithExplicit(neoThreadRelationshipsFromRawMessages(arrayValue(rawMessages), threadID), relationships)
+	}
+	if relationships != nil {
 		entry["relationships"] = relationships
 	} else {
 		entry["relationships"] = []any{}
@@ -6456,6 +6461,88 @@ func neoBinaryThreadMessageCountFromJSON(messages gjson.Result) int {
 		}
 	}
 	return count
+}
+
+func neoThreadRelationshipsFromRawMessages(messages []any, currentThreadID string) []any {
+	relationships := make([]any, 0)
+	seen := map[string]struct{}{}
+	for index, raw := range messages {
+		message := mapValue(raw)
+		if stringValue(message["role"]) != "assistant" {
+			continue
+		}
+		for _, rawBlock := range arrayValue(message["content"]) {
+			block := mapValue(rawBlock)
+			if stringValue(block["type"]) != "tool_use" || stringValue(block["name"]) != "read_thread" || !neoBinaryToolUseBlockComplete(block) {
+				continue
+			}
+			threadID := neoToolInputThreadID(mapValue(block["input"]))
+			if threadID == "" || threadID == currentThreadID || !neoCloudThreadIDPattern.MatchString(threadID) {
+				continue
+			}
+			if _, exists := seen[threadID]; exists {
+				continue
+			}
+			seen[threadID] = struct{}{}
+			createdAt := int64(firstNonZero(numberFrom(message["created"], message["createdAt"]), neoTimeStringMillis(stringValue(message["createdAt"]))))
+			if relationship, ok := neoProtocolThreadRelationship(threadID, "mention", "parent", createdAt, ""); ok {
+				relationship["messageIndex"] = index
+				relationships = append(relationships, relationship)
+			}
+		}
+	}
+	return relationships
+}
+
+func neoThreadRelationshipsFromJSONMessages(messages gjson.Result, currentThreadID string) []any {
+	if !messages.Exists() || !messages.IsArray() {
+		return nil
+	}
+	relationships := make([]any, 0)
+	seen := map[string]struct{}{}
+	for index, message := range messages.Array() {
+		if message.Get("role").String() != "assistant" {
+			continue
+		}
+		for _, block := range message.Get("content").Array() {
+			if block.Get("type").String() != "tool_use" || block.Get("name").String() != "read_thread" || !neoJSONToolUseBlockComplete(block) {
+				continue
+			}
+			threadID := neoToolInputThreadID(map[string]any{
+				"threadID":  block.Get("input.threadID").Value(),
+				"threadId":  block.Get("input.threadId").Value(),
+				"thread_id": block.Get("input.thread_id").Value(),
+			})
+			if threadID == "" || threadID == currentThreadID || !neoCloudThreadIDPattern.MatchString(threadID) {
+				continue
+			}
+			if _, exists := seen[threadID]; exists {
+				continue
+			}
+			seen[threadID] = struct{}{}
+			createdAt := int64(firstNonZero(neoJSONMillis(message.Get("created")), neoJSONMillis(message.Get("createdAt"))))
+			if relationship, ok := neoProtocolThreadRelationship(threadID, "mention", "parent", createdAt, ""); ok {
+				relationship["messageIndex"] = index
+				relationships = append(relationships, relationship)
+			}
+		}
+	}
+	return relationships
+}
+
+func neoBinaryToolUseBlockComplete(block map[string]any) bool {
+	if complete, exists := block["complete"]; exists {
+		return boolValue(complete)
+	}
+	_, hasPartial := block["inputPartialJSON"]
+	return !hasPartial
+}
+
+func neoJSONToolUseBlockComplete(block gjson.Result) bool {
+	if complete := block.Get("complete"); complete.Exists() {
+		return complete.Bool()
+	}
+	return !block.Get("inputPartialJSON").Exists()
 }
 
 func neoThreadDiffStatsFromThread(thread map[string]any) map[string]any {
@@ -8250,7 +8337,7 @@ func neoThreadRelationships(messages []neoMessage) []any {
 		if message.Role == "assistant" {
 			for _, raw := range message.Content {
 				block := mapValue(raw)
-				if stringValue(block["type"]) != "tool_use" || stringValue(block["name"]) != "read_thread" {
+				if stringValue(block["type"]) != "tool_use" || stringValue(block["name"]) != "read_thread" || !neoBinaryToolUseBlockComplete(block) {
 					continue
 				}
 				if threadID := neoToolInputThreadID(mapValue(block["input"])); threadID != "" {
@@ -8368,9 +8455,9 @@ func neoMergeThreadRelationships(groups ...[]any) []any {
 func neoMergeThreadRelationshipsWithExplicit(inferred, explicit []any) []any {
 	merged := make([]any, 0, len(inferred)+len(explicit))
 	seen := map[string]struct{}{}
-	for _, raw := range inferred {
-		relationship, ok := normalizeNeoThreadRelationship(raw)
-		if !ok {
+	for _, raw := range explicit {
+		relationship := cloneMap(mapValue(raw))
+		if len(relationship) == 0 {
 			continue
 		}
 		key := neoThreadRelationshipKey(relationship)
@@ -8380,9 +8467,9 @@ func neoMergeThreadRelationshipsWithExplicit(inferred, explicit []any) []any {
 		seen[key] = struct{}{}
 		merged = append(merged, relationship)
 	}
-	for _, raw := range explicit {
-		relationship := cloneMap(mapValue(raw))
-		if len(relationship) == 0 {
+	for _, raw := range inferred {
+		relationship, ok := normalizeNeoThreadRelationship(raw)
+		if !ok {
 			continue
 		}
 		key := neoThreadRelationshipKey(relationship)
