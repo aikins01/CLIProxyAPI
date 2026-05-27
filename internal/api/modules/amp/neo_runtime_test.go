@@ -7239,8 +7239,91 @@ func TestNeoActorHandlesBinaryAssistantAndSettingsDeltas(t *testing.T) {
 	if len(actor.messages) != 1 || textFromBlocks(actor.messages[0].Content) != "done" {
 		t.Fatalf("assistant messages = %#v", actor.messages)
 	}
-	if numberFrom(actor.messages[0].Usage["inputTokens"]) != 3 || numberFrom(actor.messages[0].Usage["outputTokens"]) != 4 || stringValue(actor.messages[0].Usage["model"]) != "gpt-5.5" {
+	if numberFrom(actor.messages[0].Usage["inputTokens"]) != 3 || numberFrom(actor.messages[0].Usage["outputTokens"]) != 4 {
 		t.Fatalf("assistant usage = %#v", actor.messages[0].Usage)
+	}
+	if _, exists := actor.messages[0].Usage["model"]; exists {
+		t.Fatalf("inference model should not be copied into usage: %#v", actor.messages[0].Usage)
+	}
+	tags := stringArrayValue(mapValue(actor.environment["initial"])["tags"])
+	if len(tags) != 1 || stringValue(tags[0]) != "model:gpt-5.5" {
+		t.Fatalf("environment tags = %#v", tags)
+	}
+	debugUsage := mapValue(mapValue(actor.debug["lastInferenceUsage"]))
+	if numberFrom(debugUsage["outputTokens"]) != 4 {
+		t.Fatalf("debug usage = %#v", actor.debug)
+	}
+	actor.mu.Unlock()
+	waitForNeoActorSyncIdle(t, actor)
+}
+
+func TestNeoActorBinaryInferenceCompletedMirrorsEnvAndDebugSemantics(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	actor.environment = map[string]any{"initial": map[string]any{"tags": []any{"repo:cliproxy", "model:undefined"}}}
+	actor.debug = map[string]any{"lastInferenceUsage": map[string]any{"inputTokens": 9, "outputTokens": 1}}
+	actor.messages = []neoMessage{{
+		ThreadID:  "T-test",
+		MessageID: "M-assistant",
+		Role:      "assistant",
+		Content:   []any{map[string]any{"type": "text", "text": "done"}},
+		State:     map[string]any{"type": "complete", "stopReason": "end_turn"},
+		Usage:     map[string]any{"inputTokens": 8},
+		Seq:       1,
+	}}
+
+	actor.handle(map[string]any{"type": "inference:completed", "model": "claude-test", "usage": map[string]any{"inputTokens": 3, "outputTokens": 7}})
+
+	actor.mu.Lock()
+	tags := stringArrayValue(mapValue(actor.environment["initial"])["tags"])
+	if len(tags) != 2 || stringValue(tags[0]) != "repo:cliproxy" || stringValue(tags[1]) != "model:claude-test" {
+		actor.mu.Unlock()
+		t.Fatalf("environment tags = %#v", tags)
+	}
+	usage := actor.messages[0].Usage
+	if numberFrom(usage["inputTokens"]) != 8 || numberFrom(usage["outputTokens"]) != 7 {
+		actor.mu.Unlock()
+		t.Fatalf("assistant usage = %#v", usage)
+	}
+	if _, exists := usage["model"]; exists {
+		actor.mu.Unlock()
+		t.Fatalf("assistant usage should not receive inference model: %#v", usage)
+	}
+	debugUsage := mapValue(actor.debug["lastInferenceUsage"])
+	if numberFrom(debugUsage["inputTokens"]) != 9 || numberFrom(debugUsage["outputTokens"]) != 7 {
+		actor.mu.Unlock()
+		t.Fatalf("debug usage = %#v", actor.debug)
+	}
+	actor.mu.Unlock()
+
+	snapshot, ok := actor.threadSnapshot()
+	if !ok {
+		t.Fatal("threadSnapshot returned false")
+	}
+	thread := neoCloudThread(snapshot)
+	if len(mapValue(thread["~debug"])) == 0 {
+		t.Fatalf("cloud thread missing ~debug: %#v", thread)
+	}
+	waitForNeoActorSyncIdle(t, actor)
+}
+
+func TestNeoActorBinaryInferenceCompletedCreatesInitialTagsWithoutUsage(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+
+	actor.handle(map[string]any{"type": "inference:completed"})
+
+	actor.mu.Lock()
+	tags := stringArrayValue(mapValue(actor.environment["initial"])["tags"])
+	if len(tags) != 0 {
+		actor.mu.Unlock()
+		t.Fatalf("environment tags = %#v, want empty list", tags)
+	}
+	if len(actor.debug) != 0 {
+		actor.mu.Unlock()
+		t.Fatalf("debug = %#v, want empty", actor.debug)
 	}
 	actor.mu.Unlock()
 	waitForNeoActorSyncIdle(t, actor)
@@ -7623,6 +7706,7 @@ func TestNeoRuntimeImportRestoresResidualThreadState(t *testing.T) {
 		"agentMode":         "deep",
 		"messages":          []any{},
 		"meta":              map[string]any{"visibility": "private", "traces": []any{map[string]any{"id": "trace-1", "startTime": "2026-05-24T00:00:00Z"}}},
+		"~debug":            map[string]any{"lastInferenceUsage": map[string]any{"inputTokens": 12}},
 		"draft":             []any{map[string]any{"type": "text", "text": "restore draft"}},
 		"autoSubmitDraft":   true,
 		"pendingNavigation": parentID,
@@ -7646,6 +7730,10 @@ func TestNeoRuntimeImportRestoresResidualThreadState(t *testing.T) {
 	meta := mapValue(state["meta"])
 	if stringValue(meta["visibility"]) != "private" || len(arrayValue(meta["traces"])) != 1 {
 		t.Fatalf("state meta = %#v", meta)
+	}
+	debug := mapValue(state["~debug"])
+	if numberFrom(mapValue(debug["lastInferenceUsage"])["inputTokens"]) != 12 {
+		t.Fatalf("state debug = %#v", debug)
 	}
 }
 

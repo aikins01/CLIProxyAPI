@@ -1189,6 +1189,7 @@ type neoActor struct {
 	artifacts                 map[string]any
 	kv                        map[string]any
 	meta                      map[string]any
+	debug                     map[string]any
 	draft                     []any
 	autoSubmitDraft           bool
 	pendingNavigation         string
@@ -1294,6 +1295,7 @@ func newNeoActor(rt *neoRuntime, id, name, key, threadID string, record map[stri
 		artifacts:              map[string]any{},
 		kv:                     map[string]any{},
 		meta:                   map[string]any{},
+		debug:                  map[string]any{},
 		notificationSubs:       map[string]map[string]any{},
 		lastUsed:               time.Now(),
 		seq:                    1,
@@ -1368,7 +1370,7 @@ func (a *neoActor) prunable(now time.Time, ttl time.Duration) bool {
 	if len(a.kv) > 0 {
 		return false
 	}
-	if len(a.meta) > 0 || len(a.draft) > 0 || a.maxTokens != nil || a.mainThreadID != "" || a.pendingNavigation != "" || a.autoSubmitDraft {
+	if len(a.meta) > 0 || len(a.debug) > 0 || len(a.draft) > 0 || a.maxTokens != nil || a.mainThreadID != "" || a.pendingNavigation != "" || a.autoSubmitDraft {
 		return false
 	}
 	return true
@@ -3184,28 +3186,21 @@ func (a *neoActor) handleBinaryAssistantMessageUpdate(msg map[string]any) {
 func (a *neoActor) handleBinaryInferenceCompleted(msg map[string]any) {
 	usage := cloneMap(mapValue(msg["usage"]))
 	model := stringValue(msg["model"])
-	if model != "" {
-		if usage == nil {
-			usage = map[string]any{}
-		}
-		usage["model"] = model
-	}
-	if len(usage) == 0 {
-		return
-	}
 	a.mu.Lock()
-	if model != "" {
-		a.addEnvironmentModelTagLocked(model)
-	}
+	a.ensureEnvironmentInitialTagsLocked(model)
+	a.updateDebugLastInferenceUsageLocked(usage)
 	index := -1
-	for i := len(a.messages) - 1; i >= 0; i-- {
-		if a.messages[i].Role == "assistant" {
-			index = i
-			break
+	if len(usage) > 0 {
+		for i := len(a.messages) - 1; i >= 0; i-- {
+			if a.messages[i].Role == "assistant" {
+				index = i
+				break
+			}
 		}
 	}
 	if index < 0 {
 		a.mu.Unlock()
+		a.syncCloudAsync()
 		return
 	}
 	message := a.messages[index]
@@ -5694,6 +5689,7 @@ type neoCloudThreadSnapshot struct {
 	artifacts         []any
 	actorKV           map[string]any
 	meta              map[string]any
+	debug             map[string]any
 	draft             []any
 	autoSubmitDraft   bool
 	pendingNavigation string
@@ -5779,6 +5775,7 @@ func (a *neoActor) threadSnapshot() (neoCloudThreadSnapshot, bool) {
 		artifacts:         cloneNeoJSONArray(a.artifactListLocked()),
 		actorKV:           cloneNeoJSONMap(a.kv),
 		meta:              cloneNeoJSONMap(a.meta),
+		debug:             cloneNeoJSONMap(a.debug),
 		draft:             cloneNeoJSONArray(a.draft),
 		autoSubmitDraft:   a.autoSubmitDraft,
 		pendingNavigation: a.pendingNavigation,
@@ -7846,6 +7843,9 @@ func neoCloudThread(snapshot neoCloudThreadSnapshot) map[string]any {
 	if snapshot.pendingNavigation != "" {
 		thread["pendingNavigation"] = snapshot.pendingNavigation
 	}
+	if len(snapshot.debug) > 0 {
+		thread["~debug"] = cloneMap(snapshot.debug)
+	}
 	if snapshot.currentInference != nil {
 		toolsList := make([]any, 0, len(snapshot.currentInference.tools))
 		for _, name := range snapshot.currentInference.tools {
@@ -8453,6 +8453,7 @@ func (a *neoActor) stateSnapshotResponse() map[string]any {
 		"settings":          cloneMap(a.settings),
 		"environment":       cloneMap(a.environment),
 		"meta":              cloneMap(a.meta),
+		"~debug":            cloneMap(a.debug),
 		"draft":             cloneArray(a.draft),
 		"autoSubmitDraft":   a.autoSubmitDraft,
 		"pendingNavigation": omitEmpty(a.pendingNavigation),
@@ -9050,16 +9051,16 @@ func (a *neoActor) updateEnvironmentFromBinary(msg map[string]any) {
 	a.syncCloudAsync()
 }
 
-func (a *neoActor) addEnvironmentModelTagLocked(model string) {
-	if strings.TrimSpace(model) == "" {
-		return
-	}
+func (a *neoActor) ensureEnvironmentInitialTagsLocked(model string) {
 	if a.environment == nil {
 		a.environment = map[string]any{}
 	}
 	initial := cloneMap(mapValue(a.environment["initial"]))
 	tags := stringArrayValue(initial["tags"])
-	modelTag := "model:" + model
+	modelTag := ""
+	if strings.TrimSpace(model) != "" {
+		modelTag = "model:" + model
+	}
 	out := make([]any, 0, len(tags)+1)
 	found := false
 	for _, raw := range tags {
@@ -9067,16 +9068,30 @@ func (a *neoActor) addEnvironmentModelTagLocked(model string) {
 		if tag == "" || tag == "model:undefined" {
 			continue
 		}
-		if tag == modelTag {
+		if modelTag != "" && tag == modelTag {
 			found = true
 		}
 		out = append(out, tag)
 	}
-	if !found {
+	if modelTag != "" && !found {
 		out = append(out, modelTag)
 	}
 	initial["tags"] = out
 	a.environment["initial"] = initial
+}
+
+func (a *neoActor) updateDebugLastInferenceUsageLocked(usage map[string]any) {
+	if len(usage) == 0 {
+		return
+	}
+	if a.debug == nil {
+		a.debug = map[string]any{}
+	}
+	merged := mergeNeoUsage(cloneMap(mapValue(a.debug["lastInferenceUsage"])), usage)
+	if len(merged) == 0 {
+		return
+	}
+	a.debug["lastInferenceUsage"] = merged
 }
 
 func (a *neoActor) markMessageRead(messageID string, read bool) {
@@ -9169,6 +9184,7 @@ func (a *neoActor) importThreadWithSync(thread map[string]any, syncCloud bool) e
 	compactionRecords := normalizeNeoCompactionRecords(firstArray(thread["compactionRecords"], thread["compaction_records"]))
 	relationships := normalizeNeoThreadRelationships(thread["relationships"])
 	meta := cloneMap(mapValue(thread["meta"]))
+	debug := cloneMap(firstMap(thread["~debug"], thread["debug"]))
 	draft := cloneArray(arrayValue(thread["draft"]))
 	autoSubmitDraft := boolValue(thread["autoSubmitDraft"])
 	pendingNavigation := firstNonEmptyString(thread["pendingNavigation"])
@@ -9200,6 +9216,7 @@ func (a *neoActor) importThreadWithSync(thread map[string]any, syncCloud bool) e
 	a.artifacts = artifacts
 	a.kv = actorKV
 	a.meta = meta
+	a.debug = debug
 	a.draft = draft
 	a.autoSubmitDraft = autoSubmitDraft
 	a.pendingNavigation = pendingNavigation
