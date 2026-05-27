@@ -4729,6 +4729,111 @@ func TestInferNeoOpenAIResponsesStreamHandlesReasoningTextEvents(t *testing.T) {
 	}
 }
 
+func TestInferNeoOpenAIResponsesStreamHandlesContentPartDone(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/provider/openai/v1/responses" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.content_part.added\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"\"}}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.content_part.done\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"done from part\"}}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1},\"output\":[]}}\n\ndata: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	var text strings.Builder
+	result, err := inferNeoLocalStream(testNeoRuntimeForServer(t, upstream), neoInferenceRequest{
+		ThreadID:        "T-test",
+		AgentMode:       "deep",
+		ReasoningEffort: "xhigh",
+		Settings:        map[string]any{"internal.model": "openai/gpt-5.5"},
+		History:         []neoHistoryMessage{{Role: "user", Text: "hi"}},
+	}, func(delta neoInferenceDelta) {
+		text.WriteString(delta.Text)
+	})
+	if err != nil {
+		t.Fatalf("inferNeoLocalStream error: %v", err)
+	}
+	if result.Text != "done from part" || text.String() != "done from part" {
+		t.Fatalf("text result=%q delta=%q, want done from part", result.Text, text.String())
+	}
+}
+
+func TestInferNeoOpenAIResponsesStreamUsesDoneTextForFinalResult(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/provider/openai/v1/responses" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"hel\"}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.done\",\"output_index\":0,\"content_index\":0,\"text\":\"hello\"}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1},\"output\":[]}}\n\ndata: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	var text strings.Builder
+	result, err := inferNeoLocalStream(testNeoRuntimeForServer(t, upstream), neoInferenceRequest{
+		ThreadID:        "T-test",
+		AgentMode:       "deep",
+		ReasoningEffort: "xhigh",
+		Settings:        map[string]any{"internal.model": "openai/gpt-5.5"},
+		History:         []neoHistoryMessage{{Role: "user", Text: "hi"}},
+	}, func(delta neoInferenceDelta) {
+		text.WriteString(delta.Text)
+	})
+	if err != nil {
+		t.Fatalf("inferNeoLocalStream error: %v", err)
+	}
+	if text.String() != "hello" || result.Text != "hello" {
+		t.Fatalf("text result=%q delta=%q, want hello", result.Text, text.String())
+	}
+}
+
+func TestInferNeoOpenAIResponsesRejectsFailedStatus(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/provider/openai/v1/responses" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"failed","error":{"message":"model failed"},"output":[]}`))
+	}))
+	defer upstream.Close()
+
+	_, err := inferNeoLocal(testNeoRuntimeForServer(t, upstream), neoInferenceRequest{
+		ThreadID:        "T-test",
+		AgentMode:       "deep",
+		ReasoningEffort: "xhigh",
+		Settings:        map[string]any{"internal.model": "openai/gpt-5.5"},
+		History:         []neoHistoryMessage{{Role: "user", Text: "hi"}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "model failed") {
+		t.Fatalf("error = %v, want model failed", err)
+	}
+}
+
+func TestInferNeoOpenAIResponsesStreamRejectsIncompleteStatus(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/provider/openai/v1/responses" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"partial\"}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"usage\":{\"input_tokens\":1,\"output_tokens\":1},\"output\":[]}}\n\ndata: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	_, err := inferNeoLocalStream(testNeoRuntimeForServer(t, upstream), neoInferenceRequest{
+		ThreadID:        "T-test",
+		AgentMode:       "deep",
+		ReasoningEffort: "xhigh",
+		Settings:        map[string]any{"internal.model": "openai/gpt-5.5"},
+		History:         []neoHistoryMessage{{Role: "user", Text: "hi"}},
+	}, nil)
+	if err == nil || !strings.Contains(err.Error(), "max_output_tokens") {
+		t.Fatalf("error = %v, want max_output_tokens", err)
+	}
+}
+
 func TestParseNeoOpenAIResponsesResultReadsReasoningTextContent(t *testing.T) {
 	result := parseNeoOpenAIResponsesResult(map[string]any{
 		"output": []any{map[string]any{

@@ -4787,11 +4787,13 @@ func cloneNeoMessages(messages []neoMessage) []neoMessage {
 	out := make([]neoMessage, 0, len(messages))
 	for _, message := range messages {
 		clone := message
-		clone.Content = cloneArray(message.Content)
-		clone.Meta = cloneMap(message.Meta)
-		clone.FileMentions = cloneMap(message.FileMentions)
-		clone.State = cloneMap(message.State)
-		clone.Usage = cloneMap(message.Usage)
+		clone.Content = cloneNeoJSONArray(message.Content)
+		clone.Meta = cloneNeoJSONMap(message.Meta)
+		clone.UserState = cloneNeoJSONValue(message.UserState)
+		clone.FileMentions = cloneNeoJSONMap(message.FileMentions)
+		clone.State = cloneNeoJSONMap(message.State)
+		clone.Usage = cloneNeoJSONMap(message.Usage)
+		clone.OriginalToolUseInput = cloneNeoJSONMap(message.OriginalToolUseInput)
 		out = append(out, clone)
 	}
 	return out
@@ -5591,7 +5593,7 @@ func (a *neoActor) threadSnapshot() (neoCloudThreadSnapshot, bool) {
 	if a.threadID == "" {
 		return neoCloudThreadSnapshot{}, false
 	}
-	messages := append([]neoMessage(nil), a.messages...)
+	messages := cloneNeoMessages(a.messages)
 	var inflight *neoInferenceInflight
 	if a.currentInference != nil {
 		clone := *a.currentInference
@@ -5605,20 +5607,20 @@ func (a *neoActor) threadSnapshot() (neoCloudThreadSnapshot, bool) {
 		title:             a.title,
 		archived:          a.archived,
 		threadStatus:      a.threadStatus,
-		settings:          cloneMap(a.settings),
+		settings:          cloneNeoJSONMap(a.settings),
 		messages:          messages,
-		environment:       cloneMap(a.environment),
-		artifacts:         a.artifactListLocked(),
-		actorKV:           cloneMap(a.kv),
-		meta:              cloneMap(a.meta),
-		draft:             cloneArray(a.draft),
+		environment:       cloneNeoJSONMap(a.environment),
+		artifacts:         cloneNeoJSONArray(a.artifactListLocked()),
+		actorKV:           cloneNeoJSONMap(a.kv),
+		meta:              cloneNeoJSONMap(a.meta),
+		draft:             cloneNeoJSONArray(a.draft),
 		autoSubmitDraft:   a.autoSubmitDraft,
 		pendingNavigation: a.pendingNavigation,
 		maxTokens:         a.maxTokens,
 		mainThreadID:      a.mainThreadID,
-		queuedMessages:    a.threadQueuedMessageListLocked(),
-		compactionRecords: a.compactionRecordListLocked(),
-		relationships:     a.relationshipListLocked(),
+		queuedMessages:    cloneNeoJSONArray(a.threadQueuedMessageListLocked()),
+		compactionRecords: cloneNeoJSONArray(a.compactionRecordListLocked()),
+		relationships:     cloneNeoJSONArray(a.relationshipListLocked()),
 		currentInference:  inflight,
 	}, true
 }
@@ -11649,6 +11651,9 @@ func inferNeoOpenAIResponses(rt *neoRuntime, request neoInferenceRequest, route 
 	if err != nil {
 		return neoInferenceResult{}, err
 	}
+	if err := neoOpenAIResponsesStatusError(jsonBody); err != nil {
+		return neoInferenceResult{}, err
+	}
 	return parseNeoOpenAIResponsesResult(jsonBody, route, request.Tools), nil
 }
 
@@ -12024,6 +12029,22 @@ func inferNeoOpenAIResponsesStream(rt *neoRuntime, request neoInferenceRequest, 
 			onDelta(neoInferenceDelta{Text: text, BlockIndex: streamBlockOffset, Usage: usage})
 		}
 	}
+	setTextDone := func(outputIndex, contentIndex int, text string) {
+		if text == "" {
+			return
+		}
+		builder := ensureTextContent(outputIndex, contentIndex)
+		current := builder.String()
+		switch {
+		case current == "":
+			emitTextDelta(outputIndex, contentIndex, text)
+		case strings.HasPrefix(text, current) && len(text) > len(current):
+			emitTextDelta(outputIndex, contentIndex, strings.TrimPrefix(text, current))
+		case text != current:
+			builder.Reset()
+			builder.WriteString(text)
+		}
+	}
 	emitReasoningDelta := func(outputIndex int, text string) {
 		if text == "" {
 			return
@@ -12034,6 +12055,44 @@ func inferNeoOpenAIResponsesStream(rt *neoRuntime, request neoInferenceRequest, 
 		if onDelta != nil {
 			onDelta(neoInferenceDelta{Thinking: text, BlockIndex: 0, Usage: usage})
 		}
+	}
+	setReasoningDone := func(outputIndex int, text string) {
+		if text == "" {
+			return
+		}
+		block := ensureThinkingBlock(outputIndex)
+		current := block.text.String()
+		switch {
+		case current == "":
+			emitReasoningDelta(outputIndex, text)
+		case strings.HasPrefix(text, current) && len(text) > len(current):
+			emitReasoningDelta(outputIndex, strings.TrimPrefix(text, current))
+		case text != current:
+			block.text.Reset()
+			block.text.WriteString(text)
+		}
+	}
+	streamText := func() string {
+		if len(textByContent) == 0 {
+			return fullText.String()
+		}
+		keys := make([]string, 0, len(textByContent))
+		for key := range textByContent {
+			keys = append(keys, key)
+		}
+		sort.Slice(keys, func(i, j int) bool {
+			leftOutput, leftContent := splitNeoOpenAIResponseTextKey(keys[i])
+			rightOutput, rightContent := splitNeoOpenAIResponseTextKey(keys[j])
+			if leftOutput != rightOutput {
+				return leftOutput < rightOutput
+			}
+			return leftContent < rightContent
+		})
+		var out strings.Builder
+		for _, key := range keys {
+			out.WriteString(textByContent[key].String())
+		}
+		return out.String()
 	}
 	emitToolDelta := func(call *partialToolCall, partialJSONDelta string) {
 		if onDelta == nil || call == nil || call.name == "" {
@@ -12077,19 +12136,11 @@ func inferNeoOpenAIResponsesStream(rt *neoRuntime, request neoInferenceRequest, 
 		case "response.output_text.delta":
 			emitTextDelta(numberFrom(payload["output_index"]), numberFrom(payload["content_index"]), stringValue(payload["delta"]))
 		case "response.output_text.done":
-			outputIndex := numberFrom(payload["output_index"])
-			contentIndex := numberFrom(payload["content_index"])
-			if builder := ensureTextContent(outputIndex, contentIndex); builder.Len() == 0 {
-				emitTextDelta(outputIndex, contentIndex, stringValue(payload["text"]))
-			}
+			setTextDone(numberFrom(payload["output_index"]), numberFrom(payload["content_index"]), stringValue(payload["text"]))
 		case "response.refusal.delta":
 			emitTextDelta(numberFrom(payload["output_index"]), numberFrom(payload["content_index"]), stringValue(payload["delta"]))
 		case "response.refusal.done":
-			outputIndex := numberFrom(payload["output_index"])
-			contentIndex := numberFrom(payload["content_index"])
-			if builder := ensureTextContent(outputIndex, contentIndex); builder.Len() == 0 {
-				emitTextDelta(outputIndex, contentIndex, stringValue(payload["refusal"]))
-			}
+			setTextDone(numberFrom(payload["output_index"]), numberFrom(payload["content_index"]), stringValue(payload["refusal"]))
 		case "response.content_part.added":
 			index := numberFrom(payload["output_index"])
 			contentIndex := numberFrom(payload["content_index"])
@@ -12102,6 +12153,18 @@ func inferNeoOpenAIResponsesStream(rt *neoRuntime, request neoInferenceRequest, 
 			case "reasoning_text":
 				emitReasoningDelta(index, stringValue(part["text"]))
 			}
+		case "response.content_part.done":
+			index := numberFrom(payload["output_index"])
+			contentIndex := numberFrom(payload["content_index"])
+			part := mapValue(payload["part"])
+			switch stringValue(part["type"]) {
+			case "output_text":
+				setTextDone(index, contentIndex, stringValue(part["text"]))
+			case "refusal":
+				setTextDone(index, contentIndex, stringValue(part["refusal"]))
+			case "reasoning_text":
+				setReasoningDone(index, stringValue(part["text"]))
+			}
 		case "response.reasoning_summary_text.delta":
 			text := stringValue(payload["delta"])
 			if text != "" {
@@ -12111,8 +12174,8 @@ func inferNeoOpenAIResponsesStream(rt *neoRuntime, request neoInferenceRequest, 
 		case "response.reasoning_summary_text.done":
 			index := numberFrom(payload["output_index"])
 			block := ensureThinkingBlock(index)
-			if text := stringValue(payload["text"]); text != "" && block.text.Len() == 0 {
-				emitReasoningDelta(index, text)
+			if text := stringValue(payload["text"]); text != "" {
+				setReasoningDone(index, text)
 			}
 			if !block.sentDoneNewlines {
 				block.sentDoneNewlines = true
@@ -12123,11 +12186,7 @@ func inferNeoOpenAIResponsesStream(rt *neoRuntime, request neoInferenceRequest, 
 		case "response.reasoning_text.delta":
 			emitReasoningDelta(numberFrom(payload["output_index"]), stringValue(payload["delta"]))
 		case "response.reasoning_text.done":
-			index := numberFrom(payload["output_index"])
-			block := ensureThinkingBlock(index)
-			if text := stringValue(payload["text"]); text != "" && block.text.Len() == 0 {
-				emitReasoningDelta(index, text)
-			}
+			setReasoningDone(numberFrom(payload["output_index"]), stringValue(payload["text"]))
 		case "response.reasoning_summary_part.added", "response.reasoning_summary_part.done":
 			index := numberFrom(payload["output_index"])
 			block := ensureThinkingBlock(index)
@@ -12269,6 +12328,9 @@ func inferNeoOpenAIResponsesStream(rt *neoRuntime, request neoInferenceRequest, 
 	if !sawContent {
 		return inferNeoOpenAI(rt, request, route)
 	}
+	if err := neoOpenAIResponsesStatusError(completedResponse); err != nil {
+		return neoInferenceResult{}, err
+	}
 
 	sort.Ints(toolIndexes)
 	toolCalls := make([]neoToolCall, 0, len(toolIndexes))
@@ -12306,7 +12368,7 @@ func inferNeoOpenAIResponsesStream(rt *neoRuntime, request neoInferenceRequest, 
 		}
 		thinkingBlocks = append(thinkingBlocks, neoThinkingBlock{Thinking: block.text.String(), Signature: block.signature})
 	}
-	return neoInferenceResult{Provider: route.Provider, Model: route.Model, Text: fullText.String(), ToolCalls: toolCalls, Usage: usage, ThinkingBlocks: thinkingBlocks}, nil
+	return neoInferenceResult{Provider: route.Provider, Model: route.Model, Text: streamText(), ToolCalls: toolCalls, Usage: usage, ThinkingBlocks: thinkingBlocks}, nil
 }
 
 func inferNeoOpenAIChatStream(rt *neoRuntime, request neoInferenceRequest, route neoModelRoute, onDelta neoStreamCallback) (neoInferenceResult, error) {
@@ -15133,6 +15195,36 @@ func neoOpenAIResponsesMaxOutputTokens(model string) int {
 	return neoModelMaxOutputTokens[model]
 }
 
+func splitNeoOpenAIResponseTextKey(key string) (int, int) {
+	left, right, ok := strings.Cut(key, "/")
+	if !ok {
+		return 0, 0
+	}
+	outputIndex, _ := strconv.Atoi(left)
+	contentIndex, _ := strconv.Atoi(right)
+	return outputIndex, contentIndex
+}
+
+func neoOpenAIResponsesStatusError(response map[string]any) error {
+	status := strings.ToLower(strings.TrimSpace(stringValue(response["status"])))
+	switch status {
+	case "", "completed":
+		return nil
+	case "failed":
+		errorBody := mapValue(response["error"])
+		return fmt.Errorf("local provider response failed: %s", firstNonEmptyString(errorBody["message"], response["status"]))
+	case "incomplete":
+		details := mapValue(response["incomplete_details"])
+		return fmt.Errorf("local provider response incomplete: %s", firstNonEmptyString(details["reason"], "unknown reason"))
+	case "cancelled":
+		return fmt.Errorf("local provider response cancelled")
+	case "in_progress":
+		return fmt.Errorf("local provider response incomplete: stream ended unexpectedly")
+	default:
+		return nil
+	}
+}
+
 // neoEffectiveThinkingLevel picks the level to apply for an inference call.
 // the route's ThinkingSuffix (set when a user-configured remap targets a
 // model with a "(level)" suffix) wins over the agent-mode reasoning effort.
@@ -16611,6 +16703,47 @@ func cloneMap(in map[string]any) map[string]any {
 	out := make(map[string]any, len(in))
 	for k, v := range in {
 		out[k] = v
+	}
+	return out
+}
+
+func cloneNeoJSONValue(value any) any {
+	switch v := value.(type) {
+	case map[string]any:
+		return cloneNeoJSONMap(v)
+	case []any:
+		return cloneNeoJSONArray(v)
+	case []string:
+		return append([]string(nil), v...)
+	case map[string]string:
+		out := make(map[string]string, len(v))
+		for key, item := range v {
+			out[key] = item
+		}
+		return out
+	default:
+		return value
+	}
+}
+
+func cloneNeoJSONMap(in map[string]any) map[string]any {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]any, len(in))
+	for key, value := range in {
+		out[key] = cloneNeoJSONValue(value)
+	}
+	return out
+}
+
+func cloneNeoJSONArray(in []any) []any {
+	if in == nil {
+		return nil
+	}
+	out := make([]any, len(in))
+	for i, value := range in {
+		out[i] = cloneNeoJSONValue(value)
 	}
 	return out
 }
