@@ -1628,7 +1628,7 @@ func (a *neoActor) updateSettings(settings map[string]any) {
 	}
 	merged := cloneMap(a.settings)
 	a.mu.Unlock()
-	a.broadcast(map[string]any{"type": "thread_settings", "settings": merged})
+	a.broadcast(neoThreadSettingsPayload(merged))
 }
 
 func (a *neoActor) toolProgressPayload(msg map[string]any) map[string]any {
@@ -9465,7 +9465,7 @@ func (a *neoActor) sendSnapshot(socket *neoSocket, sinceSeq int) {
 		}
 		a.broadcast(payload)
 	}
-	send(map[string]any{"type": "thread_settings", "settings": settings})
+	send(neoThreadSettingsPayload(settings))
 	send(map[string]any{"type": "queued_messages", "messages": queue})
 	send(toolApprovalQueuePayload(approvals))
 	for _, status := range spawnedExecutorStatuses {
@@ -9704,7 +9704,7 @@ func (a *neoActor) updateAgentModeFromBinary(msg map[string]any) {
 	settings := cloneMap(a.settings)
 	a.mu.Unlock()
 
-	a.broadcast(map[string]any{"type": "thread_settings", "settings": settings})
+	a.broadcast(neoThreadSettingsPayload(settings))
 	a.syncCloudAsync()
 }
 
@@ -9727,7 +9727,7 @@ func (a *neoActor) updateReasoningEffortFromBinary(msg map[string]any) {
 		a.currentReasoningEffort = ""
 		settings := cloneMap(a.settings)
 		a.mu.Unlock()
-		a.broadcast(map[string]any{"type": "thread_settings", "settings": settings})
+		a.broadcast(neoThreadSettingsPayload(settings))
 		a.syncCloudAsync()
 		return
 	}
@@ -9744,7 +9744,7 @@ func (a *neoActor) updateReasoningEffortFromBinary(msg map[string]any) {
 	settings := cloneMap(a.settings)
 	a.mu.Unlock()
 
-	a.broadcast(map[string]any{"type": "thread_settings", "settings": settings})
+	a.broadcast(neoThreadSettingsPayload(settings))
 	a.syncCloudAsync()
 }
 
@@ -9768,7 +9768,7 @@ func (a *neoActor) updateMaxTokensFromBinary(msg map[string]any) {
 	a.mu.Unlock()
 
 	a.broadcast(event)
-	a.broadcast(map[string]any{"type": "thread_settings", "settings": settings})
+	a.broadcast(neoThreadSettingsPayload(settings))
 	a.syncCloudAsync()
 }
 
@@ -9823,7 +9823,7 @@ func (a *neoActor) updateMainThreadFromBinary(msg map[string]any) {
 	a.mu.Unlock()
 
 	a.broadcast(event)
-	a.broadcast(map[string]any{"type": "thread_settings", "settings": settings})
+	a.broadcast(neoThreadSettingsPayload(settings))
 	a.syncCloudAsync()
 }
 
@@ -16887,6 +16887,113 @@ func normalizeNeoProtocolReasoningEffort(effort string) string {
 	default:
 		return ""
 	}
+}
+
+func neoThreadSettingsPayload(settings map[string]any) map[string]any {
+	return map[string]any{"type": "thread_settings", "settings": sanitizeNeoThreadSettings(settings)}
+}
+
+func sanitizeNeoThreadSettings(settings map[string]any) map[string]any {
+	out := cloneMap(settings)
+	deleteInvalidNeoSetting(out, "anthropic.provider", validNeoAnthropicProvider)
+	deleteInvalidNeoSetting(out, "openai.speed", validNeoOpenAISpeed)
+	deleteInvalidNeoSetting(out, "reasoning.effort", validNeoReasoningEffortSetting)
+	deleteInvalidNeoSetting(out, "internal.oracleReasoningEffort", validNeoOracleReasoningEffort)
+	deleteInvalidNeoSetting(out, "gemini.thinkingLevel", validNeoGeminiThinkingLevel)
+	if value, exists := out["internal.compactionThresholdPercent"]; exists && !validNeoCompactionThresholdPercentSetting(value) {
+		delete(out, "internal.compactionThresholdPercent")
+	}
+	return out
+}
+
+func deleteInvalidNeoSetting(settings map[string]any, key string, valid func(string) bool) {
+	if _, exists := settings[key]; exists && !valid(stringValue(settings[key])) {
+		delete(settings, key)
+	}
+}
+
+func validNeoAnthropicProvider(provider string) bool {
+	switch provider {
+	case "anthropic", "vertex":
+		return true
+	default:
+		return false
+	}
+}
+
+func validNeoOpenAISpeed(speed string) bool {
+	switch speed {
+	case "standard", "fast":
+		return true
+	default:
+		return false
+	}
+}
+
+func validNeoReasoningEffortSetting(effort string) bool {
+	switch effort {
+	case "none", "minimal", "low", "medium", "high", "xhigh", "max":
+		return true
+	default:
+		return false
+	}
+}
+
+func validNeoOracleReasoningEffort(effort string) bool {
+	switch effort {
+	case "none", "minimal", "low", "medium", "high", "xhigh":
+		return true
+	default:
+		return false
+	}
+}
+
+func validNeoGeminiThinkingLevel(level string) bool {
+	switch level {
+	case "minimal", "low", "medium", "high":
+		return true
+	default:
+		return false
+	}
+}
+
+func validNeoCompactionThresholdPercentSetting(value any) bool {
+	var number float64
+	switch typed := value.(type) {
+	case int:
+		number = float64(typed)
+	case int8:
+		number = float64(typed)
+	case int16:
+		number = float64(typed)
+	case int32:
+		number = float64(typed)
+	case int64:
+		number = float64(typed)
+	case uint:
+		number = float64(typed)
+	case uint8:
+		number = float64(typed)
+	case uint16:
+		number = float64(typed)
+	case uint32:
+		number = float64(typed)
+	case uint64:
+		number = float64(typed)
+	case float32:
+		number = float64(typed)
+	case float64:
+		number = typed
+	case json.Number:
+		parsed, err := typed.Float64()
+		if err != nil {
+			return false
+		}
+		number = parsed
+	default:
+		return false
+	}
+	return number >= 0 && number <= 100
 }
 
 func normalizedNeoThreadStatus(status string) string {

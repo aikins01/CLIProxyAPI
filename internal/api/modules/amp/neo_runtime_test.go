@@ -3606,6 +3606,42 @@ func TestNeoExecutorStatusDetailsDropsInvalidFieldsLikeBinary(t *testing.T) {
 	}
 }
 
+func TestNeoThreadSettingsPayloadSanitizesKnownValuesLikeBinary(t *testing.T) {
+	payload := neoThreadSettingsPayload(map[string]any{
+		"agentMode":                                  "deep",
+		"anthropic.provider":                         "bedrock",
+		"openai.speed":                               "fast",
+		"reasoning.effort":                           "extreme",
+		"internal.oracleReasoningEffort":             "max",
+		"gemini.thinkingLevel":                       "huge",
+		"internal.compactionThresholdPercent":        120,
+		"agent.skipTitleGenerationIfMessageContains": []any{"keep"},
+	})
+	settings := mapValue(payload["settings"])
+	for _, key := range []string{"anthropic.provider", "reasoning.effort", "internal.oracleReasoningEffort", "gemini.thinkingLevel", "internal.compactionThresholdPercent"} {
+		if _, exists := settings[key]; exists {
+			t.Fatalf("invalid setting %s was kept: %#v", key, settings)
+		}
+	}
+	if settings["openai.speed"] != "fast" || settings["agentMode"] != "deep" {
+		t.Fatalf("valid settings changed: %#v", settings)
+	}
+	if len(arrayValue(settings["agent.skipTitleGenerationIfMessageContains"])) != 1 {
+		t.Fatalf("unknown/schema setting was not preserved: %#v", settings)
+	}
+
+	valid := mapValue(neoThreadSettingsPayload(map[string]any{
+		"anthropic.provider":                  "vertex",
+		"reasoning.effort":                    "max",
+		"internal.oracleReasoningEffort":      "xhigh",
+		"gemini.thinkingLevel":                "medium",
+		"internal.compactionThresholdPercent": json.Number("75.5"),
+	})["settings"])
+	if valid["anthropic.provider"] != "vertex" || valid["reasoning.effort"] != "max" || valid["internal.oracleReasoningEffort"] != "xhigh" || valid["gemini.thinkingLevel"] != "medium" || valid["internal.compactionThresholdPercent"] != json.Number("75.5") {
+		t.Fatalf("valid settings were not preserved: %#v", valid)
+	}
+}
+
 func TestNeoHeadlessExecutorArgsByMode(t *testing.T) {
 	tests := []struct {
 		name   string
