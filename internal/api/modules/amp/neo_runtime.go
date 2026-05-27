@@ -16707,8 +16707,20 @@ func openAIResponsesNeoBody(request neoInferenceRequest, route neoModelRoute, st
 	if len(request.Tools) > 0 {
 		body["tools"] = openAIResponsesNeoTools(request.Tools)
 	}
+	if serviceTier := neoOpenAIResponsesServiceTier(request); serviceTier != "" {
+		body["service_tier"] = serviceTier
+	}
 	neoApplyOpenAIResponsesReasoning(body, route, request.ReasoningEffort)
 	return body
+}
+
+func neoOpenAIResponsesServiceTier(request neoInferenceRequest) string {
+	switch strings.TrimSpace(stringValue(request.Settings["openai.speed"])) {
+	case "fast":
+		return "priority"
+	default:
+		return ""
+	}
 }
 
 func openAIResponsesNeoInput(history []neoHistoryMessage, system string) []any {

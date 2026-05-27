@@ -5327,6 +5327,9 @@ func TestInferNeoOpenAIResponsesSendsReasoningEffortWithTools(t *testing.T) {
 				if numberFrom(payload["max_output_tokens"]) != 128000 {
 					t.Fatalf("max_output_tokens = %#v, want 128000", payload["max_output_tokens"])
 				}
+				if payload["service_tier"] != "priority" {
+					t.Fatalf("service_tier = %#v, want priority", payload["service_tier"])
+				}
 				if stream {
 					w.Header().Set("Content-Type", "text/event-stream")
 					_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"ok\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1},\"output\":[]}}\n\ndata: [DONE]\n\n"))
@@ -5341,7 +5344,7 @@ func TestInferNeoOpenAIResponsesSendsReasoningEffortWithTools(t *testing.T) {
 				ThreadID:        "T-test",
 				AgentMode:       "deep",
 				ReasoningEffort: "xhigh",
-				Settings:        map[string]any{"internal.model": "openai/gpt-5.5"},
+				Settings:        map[string]any{"internal.model": "openai/gpt-5.5", "openai.speed": "fast"},
 				History:         []neoHistoryMessage{{Role: "user", Text: "hi"}},
 				Tools:           []neoToolSpec{{Name: "Bash", InputSchema: map[string]any{"type": "object"}}},
 			}
@@ -5362,6 +5365,28 @@ func TestInferNeoOpenAIResponsesSendsReasoningEffortWithTools(t *testing.T) {
 				t.Fatalf("text = %q, want ok", result.Text)
 			}
 		})
+	}
+}
+
+func TestOpenAIResponsesServiceTierOnlyUsesFastSpeed(t *testing.T) {
+	fastBody := openAIResponsesNeoBody(neoInferenceRequest{
+		ThreadID:        "T-test",
+		AgentMode:       "smart",
+		ReasoningEffort: "high",
+		Settings:        map[string]any{"openai.speed": "fast"},
+	}, neoModelRoute{Provider: "openai", Model: "gpt-5.5"}, true)
+	if fastBody["service_tier"] != "priority" {
+		t.Fatalf("fast service_tier = %#v, want priority", fastBody["service_tier"])
+	}
+
+	standardBody := openAIResponsesNeoBody(neoInferenceRequest{
+		ThreadID:        "T-test",
+		AgentMode:       "smart",
+		ReasoningEffort: "high",
+		Settings:        map[string]any{"openai.speed": "standard"},
+	}, neoModelRoute{Provider: "openai", Model: "gpt-5.5"}, true)
+	if _, exists := standardBody["service_tier"]; exists {
+		t.Fatalf("standard service_tier should be omitted: %#v", standardBody)
 	}
 }
 
