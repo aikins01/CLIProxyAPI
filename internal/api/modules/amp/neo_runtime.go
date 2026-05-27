@@ -1917,6 +1917,10 @@ func (a *neoActor) handleBinaryUserToolInput(msg map[string]any) {
 		return
 	}
 	a.mu.Lock()
+	if _, ok := a.storedToolUseLocked(toolCallID); !ok {
+		a.mu.Unlock()
+		return
+	}
 	messageIndex := -1
 	blockIndex := -1
 	for i, message := range a.messages {

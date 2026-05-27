@@ -7039,6 +7039,33 @@ func TestNeoActorHandlesBinaryToolDeltas(t *testing.T) {
 	waitForNeoActorSyncIdle(t, actor)
 }
 
+func TestNeoActorBinaryUserToolInputRequiresToolUse(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	actor.messages = []neoMessage{{
+		ThreadID:  "T-test",
+		MessageID: "M-tool-result",
+		Role:      "user",
+		Content: []any{map[string]any{
+			"type":      "tool_result",
+			"toolUseID": "TU-orphan",
+			"run":       map[string]any{"status": "done"},
+		}},
+		Seq: 1,
+	}}
+	actor.rebuildHistoryLocked()
+
+	actor.handle(map[string]any{"type": "user:tool-input", "toolUse": "TU-orphan", "value": map[string]any{"accepted": true}})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	block := mapValue(actor.messages[0].Content[0])
+	if _, exists := block["userInput"]; exists {
+		t.Fatalf("orphan tool result was updated: %#v", block)
+	}
+}
+
 func TestNeoActorBinaryToolDataGroupsResultsAfterAssistant(t *testing.T) {
 	useTempNeoThreadStore(t)
 	rt := newNeoRuntime(&config.Config{})
