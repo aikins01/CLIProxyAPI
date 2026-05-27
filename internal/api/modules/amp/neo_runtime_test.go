@@ -6617,6 +6617,88 @@ func TestNeoActorHandlesBinaryUserThreadDeltas(t *testing.T) {
 	waitForNeoActorSyncIdle(t, actor)
 }
 
+func TestNeoActorBinaryUserMessageUpdatesStateWithoutSubmitting(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	actor.executorReady = false
+	actor.agentState = "idle"
+	actor.draft = []any{map[string]any{"type": "text", "text": "draft"}}
+
+	actor.handle(map[string]any{
+		"type":            "user:message",
+		"reasoningEffort": "xhigh",
+		"message": map[string]any{
+			"messageId":       "ignored-binary-id",
+			"agentMode":       "deep",
+			"reasoningEffort": "xhigh",
+			"content":         []any{map[string]any{"type": "text", "text": "binary user"}},
+		},
+	})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.queue) != 0 {
+		t.Fatalf("queue after binary user message = %#v, want no queued submit", actor.queue)
+	}
+	if actor.pendingInference != nil {
+		t.Fatalf("pending inference after binary user message = %#v, want nil", actor.pendingInference)
+	}
+	if len(actor.messages) != 1 || actor.messages[0].Role != "user" || textFromBlocks(actor.messages[0].Content) != "binary user" {
+		t.Fatalf("messages after binary user message = %#v", actor.messages)
+	}
+	if actor.messages[0].MessageID == "ignored-binary-id" || actor.messages[0].MessageID == "" {
+		t.Fatalf("binary user message id = %q, want generated runtime id", actor.messages[0].MessageID)
+	}
+	if actor.settings["agentMode"] != "deep" || actor.settings["reasoning.effort"] != "xhigh" {
+		t.Fatalf("thread settings after first binary user message = %#v", actor.settings)
+	}
+	if actor.title != "" {
+		t.Fatalf("title = %q, want binary user delta not to generate title", actor.title)
+	}
+	if actor.draft != nil {
+		t.Fatalf("draft after binary user message = %#v, want cleared", actor.draft)
+	}
+}
+
+func TestNeoActorBinaryUserMessageIndexReplacesWithoutSubmitting(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	actor.executorReady = false
+	actor.messages = []neoMessage{
+		{ThreadID: "T-test", MessageID: "M-user", Role: "user", AgentMode: "smart", Content: []any{map[string]any{"type": "text", "text": "old"}}, Seq: 1},
+		{ThreadID: "T-test", MessageID: "M-assistant", Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "answer"}}, Seq: 2},
+	}
+	actor.pendingInference = &neoInferenceInflight{agentMode: "smart", reasoningEffort: "high"}
+	actor.rebuildHistoryLocked()
+
+	actor.handle(map[string]any{
+		"type":  "user:message",
+		"index": 0,
+		"message": map[string]any{
+			"agentMode":       "deep",
+			"reasoningEffort": "xhigh",
+			"content":         []any{map[string]any{"type": "text", "text": "edited"}},
+		},
+	})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.messages) != 1 || actor.messages[0].Role != "user" || textFromBlocks(actor.messages[0].Content) != "edited" {
+		t.Fatalf("messages after indexed binary user message = %#v", actor.messages)
+	}
+	if actor.pendingInference != nil {
+		t.Fatalf("pending inference after indexed binary user message = %#v, want nil", actor.pendingInference)
+	}
+	if actor.settings["agentMode"] != "deep" {
+		t.Fatalf("settings after indexed binary user message = %#v", actor.settings)
+	}
+	if actor.title != "" {
+		t.Fatalf("title = %q, want indexed binary user delta not to generate title", actor.title)
+	}
+}
+
 func TestNeoActorBinaryThreadTruncateDefaultsMissingIndexToZero(t *testing.T) {
 	useTempNeoThreadStore(t)
 	rt := newNeoRuntime(&config.Config{})

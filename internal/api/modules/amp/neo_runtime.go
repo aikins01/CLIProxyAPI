@@ -4106,18 +4106,10 @@ func (a *neoActor) handleBinaryUserMessage(msg map[string]any) {
 	a.cleanupPriorAssistantForBinaryDelta()
 	user := neoQueuedMessageFromBinaryDelta(msg, false)
 	if _, hasIndex := msg["index"]; hasIndex {
-		a.replaceUserMessageAtIndex(numberFrom(msg["index"]), user)
+		a.replaceBinaryUserMessageAtIndex(numberFrom(msg["index"]), user)
 		return
 	}
-	a.receiveUserMessage(map[string]any{
-		"messageId":       user.MessageID,
-		"content":         user.Content,
-		"userState":       user.UserState,
-		"fileMentions":    user.FileMentions,
-		"meta":            user.Meta,
-		"agentMode":       user.AgentMode,
-		"reasoningEffort": user.ReasoningEffort,
-	})
+	a.appendBinaryUserMessage(user, msg)
 }
 
 func neoQueuedMessageFromBinaryDelta(msg map[string]any, queue bool) neoQueuedMessage {
@@ -4162,7 +4154,78 @@ func neoContentFromBinaryValue(raw any) []any {
 	return []any{}
 }
 
-func (a *neoActor) replaceUserMessageAtIndex(index int, user neoQueuedMessage) {
+func (a *neoActor) hasUserTurnLocked() bool {
+	return a.firstUserMessageIndexLocked() >= 0
+}
+
+func (a *neoActor) firstUserMessageIndexLocked() int {
+	for i, message := range a.messages {
+		if message.Role != "user" {
+			continue
+		}
+		for _, raw := range message.Content {
+			if stringValue(mapValue(raw)["type"]) != "tool_result" {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+func (a *neoActor) appendBinaryUserMessage(user neoQueuedMessage, msg map[string]any) {
+	a.mu.Lock()
+	a.archived = false
+	firstUser := !a.hasUserTurnLocked()
+	mode := user.AgentMode
+	if mode != "" && a.mainThreadID == "" {
+		if a.settings == nil {
+			a.settings = map[string]any{}
+		}
+		if stringValue(a.settings["agentMode"]) == "" || firstUser {
+			a.settings["agentMode"] = mode
+			a.currentAgentMode = mode
+		}
+	}
+	if firstUser && a.mainThreadID == "" {
+		if rawEffort, exists := firstPresentValue(msg, "reasoningEffort", "reasoning_effort"); exists {
+			effort := stringValue(rawEffort)
+			if neoReasoningEffortAllowedForMode(a.agentModeLocked(), effort) {
+				if a.settings == nil {
+					a.settings = map[string]any{}
+				}
+				effort = strings.ToLower(strings.TrimSpace(effort))
+				a.settings["reasoning.effort"] = effort
+				a.currentReasoningEffort = effort
+			}
+		}
+	}
+	message := neoMessage{
+		ThreadID:         a.threadID,
+		MessageID:        user.MessageID,
+		Role:             "user",
+		Content:          user.Content,
+		AgentMode:        user.AgentMode,
+		ReasoningEffort:  user.ReasoningEffort,
+		UserState:        user.UserState,
+		FileMentions:     user.FileMentions,
+		Meta:             user.Meta,
+		CreatedAt:        user.CreatedAt,
+		CompletionStatus: "",
+	}
+	stored := a.storeMessageLocked(message)
+	a.history = append(a.history, neoHistoryMessage{Role: "user", Text: neoUserHistoryText(user.Content, user.UserState, user.FileMentions), Content: neoUserHistoryContent(user.Content, user.UserState, user.FileMentions)})
+	if a.draft != nil {
+		a.draft = nil
+	}
+	event := neoMessageAddedPayload(stored)
+	a.rememberReplayEventLocked(event)
+	a.mu.Unlock()
+
+	a.broadcast(event)
+	a.syncCloudAsync()
+}
+
+func (a *neoActor) replaceBinaryUserMessageAtIndex(index int, user neoQueuedMessage) {
 	if index < 0 {
 		a.broadcast(map[string]any{"type": "error", "message": "invalid user message index", "code": "INVALID_MESSAGE_INDEX"})
 		return
@@ -4181,21 +4244,20 @@ func (a *neoActor) replaceUserMessageAtIndex(index int, user neoQueuedMessage) {
 
 	a.generation++
 	a.archived = false
-	mode := user.AgentMode
-	if mode == "" {
-		mode = a.agentModeLocked()
-	}
-	effort := user.ReasoningEffort
-	if !neoReasoningEffortAllowedForMode(mode, effort) {
-		effort = a.reasoningEffortForModeLocked(mode)
+	if a.firstUserMessageIndexLocked() == index && user.AgentMode != "" && a.mainThreadID == "" {
+		if a.settings == nil {
+			a.settings = map[string]any{}
+		}
+		a.settings["agentMode"] = user.AgentMode
+		a.currentAgentMode = user.AgentMode
 	}
 	replacement := neoMessage{
 		ThreadID:         a.threadID,
 		MessageID:        user.MessageID,
 		Role:             "user",
 		Content:          user.Content,
-		AgentMode:        mode,
-		ReasoningEffort:  effort,
+		AgentMode:        user.AgentMode,
+		ReasoningEffort:  user.ReasoningEffort,
 		UserState:        user.UserState,
 		FileMentions:     user.FileMentions,
 		Meta:             user.Meta,
@@ -4218,12 +4280,7 @@ func (a *neoActor) replaceUserMessageAtIndex(index int, user neoQueuedMessage) {
 	a.filterPendingToolsToMessagesLocked()
 	a.approvalQueue = nil
 	a.agentState = "idle"
-	a.currentAgentMode = mode
-	a.currentReasoningEffort = effort
-	ready := a.executorReady
-	if !ready {
-		a.pendingInference = &neoInferenceInflight{agentMode: mode, reasoningEffort: effort}
-	}
+	a.pendingInference = nil
 	var truncateEvent map[string]any
 	if truncateFromMessage != "" {
 		truncateSeq := a.nextSeqLocked()
@@ -4238,11 +4295,7 @@ func (a *neoActor) replaceUserMessageAtIndex(index int, user neoQueuedMessage) {
 	if truncateEvent != nil {
 		a.broadcast(truncateEvent)
 	}
-	a.ensureThreadTitle(user.Content)
 	a.syncCloudAsync()
-	if ready {
-		go a.runInference(mode, effort)
-	}
 }
 
 func (a *neoActor) appendUserMessageContent(msg map[string]any) {
