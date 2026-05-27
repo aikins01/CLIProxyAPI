@@ -1139,21 +1139,56 @@ func TestNeoActorBinaryRelationshipPreservesRawShapeLikeBinary(t *testing.T) {
 	actor.handle(map[string]any{"type": "relationship", "relationship": relationship})
 
 	actor.mu.Lock()
-	defer actor.mu.Unlock()
 	if len(actor.relationships) != 1 {
+		actor.mu.Unlock()
 		t.Fatalf("relationships = %#v, want one raw relationship", actor.relationships)
 	}
 	stored := actor.relationships[0]
 	if stored["threadID"] != "not-a-cloud-thread-id" || stored["type"] != "custom-type" || stored["role"] != "custom-role" || stored["note"] != "preserve me" {
+		actor.mu.Unlock()
 		t.Fatalf("stored relationship = %#v, want raw reducer shape", stored)
 	}
 	if _, exists := stored["createdAt"]; exists {
+		actor.mu.Unlock()
 		t.Fatalf("stored relationship gained createdAt: %#v", stored)
 	}
 	last := actor.replayEvents[len(actor.replayEvents)-1].Payload
+	actor.mu.Unlock()
+
 	replayed := mapValue(arrayValue(last["relationships"])[0])
 	if replayed["threadID"] != "not-a-cloud-thread-id" || replayed["type"] != "custom-type" || replayed["role"] != "custom-role" || replayed["note"] != "preserve me" {
 		t.Fatalf("replayed relationship = %#v, want raw reducer shape", replayed)
+	}
+	stateRelationship := mapValue(arrayValue(actor.stateSnapshotResponse()["relationships"])[0])
+	if stateRelationship["threadID"] != "not-a-cloud-thread-id" || stateRelationship["type"] != "custom-type" || stateRelationship["role"] != "custom-role" || stateRelationship["note"] != "preserve me" {
+		t.Fatalf("state relationship = %#v, want raw reducer shape", stateRelationship)
+	}
+	snapshot, ok := actor.threadSnapshot()
+	if !ok {
+		t.Fatal("threadSnapshot returned false")
+	}
+	cloudRelationship := mapValue(arrayValue(neoCloudThread(snapshot)["relationships"])[0])
+	if cloudRelationship["threadID"] != "not-a-cloud-thread-id" || cloudRelationship["type"] != "custom-type" || cloudRelationship["role"] != "custom-role" || cloudRelationship["note"] != "preserve me" {
+		t.Fatalf("cloud relationship = %#v, want raw reducer shape", cloudRelationship)
+	}
+}
+
+func TestNeoActorBinaryDraftMissingContentClearsLikeBinary(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	actor.draft = []any{map[string]any{"type": "text", "text": "stale draft"}}
+
+	actor.handle(map[string]any{"type": "draft"})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.draft != nil {
+		t.Fatalf("draft = %#v, want nil when binary draft content is missing", actor.draft)
+	}
+	last := actor.replayEvents[len(actor.replayEvents)-1].Payload
+	if content, exists := last["content"]; !exists || content != nil {
+		t.Fatalf("draft replay content = %#v exists=%v, want explicit nil", content, exists)
 	}
 }
 
@@ -3841,6 +3876,36 @@ func TestNeoActorManualBashInvocationUsesBinarySchema(t *testing.T) {
 	}
 	if _, exists := block["run"]; exists {
 		t.Fatalf("manual bash block should use toolRun, not run: %#v", block)
+	}
+}
+
+func TestNeoActorBinaryManualBashInvocationPreservesRawFieldsLikeBinary(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+
+	actor.handle(map[string]any{
+		"type":    "info:manual-bash-invocation",
+		"args":    []any{"git", "status"},
+		"run":     map[string]any{"status": "done", "result": "ignored client fallback"},
+		"toolRun": "raw tool run",
+		"hidden":  "yes",
+	})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.messages) != 1 {
+		t.Fatalf("messages = %#v", actor.messages)
+	}
+	block := mapValue(actor.messages[0].Content[0])
+	if stringValue(block["type"]) != "manual_bash_invocation" {
+		t.Fatalf("manual bash block = %#v", block)
+	}
+	if args := arrayValue(block["args"]); len(args) != 2 || args[0] != "git" || args[1] != "status" {
+		t.Fatalf("manual bash args = %#v", block["args"])
+	}
+	if block["toolRun"] != "raw tool run" || block["hidden"] != "yes" {
+		t.Fatalf("manual bash raw fields = %#v", block)
 	}
 }
 
@@ -6704,6 +6769,35 @@ func TestNeoActorBinaryUserMessageIndexCanReplaceNonUserLikeBinary(t *testing.T)
 	}
 }
 
+func TestNeoActorBinaryUserMessageIndexModeUsesFirstRoleUserLikeBinary(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	actor.messages = []neoMessage{
+		{ThreadID: "T-test", MessageID: "M-tool-result", Role: "user", Content: []any{map[string]any{"type": "tool_result", "toolUseID": "TU-old", "run": map[string]any{"status": "done"}}}, Seq: 1},
+		{ThreadID: "T-test", MessageID: "M-user", Role: "user", Content: []any{map[string]any{"type": "text", "text": "real user"}}, Seq: 2},
+	}
+	actor.rebuildHistoryLocked()
+
+	actor.handle(map[string]any{
+		"type":  "user:message",
+		"index": 0,
+		"message": map[string]any{
+			"agentMode": "deep",
+			"content":   []any{map[string]any{"type": "text", "text": "replacement user"}},
+		},
+	})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.settings["agentMode"] != "deep" || actor.currentAgentMode != "deep" {
+		t.Fatalf("mode after replacing first role=user message = current:%q settings:%#v", actor.currentAgentMode, actor.settings)
+	}
+	if len(actor.messages) != 1 || actor.messages[0].Role != "user" || textFromBlocks(actor.messages[0].Content) != "replacement user" {
+		t.Fatalf("messages after indexed replacement = %#v", actor.messages)
+	}
+}
+
 func TestNeoActorBinaryUserMessageUpdatesStateWithoutSubmitting(t *testing.T) {
 	useTempNeoThreadStore(t)
 	rt := newNeoRuntime(&config.Config{})
@@ -7867,6 +7961,15 @@ func TestNeoActorHandlesResidualBinaryThreadDeltas(t *testing.T) {
 	})
 	actor.handle(map[string]any{"type": "draft", "content": []any{map[string]any{"type": "text", "text": "draft text"}}, "autoSubmit": true})
 	actor.handle(map[string]any{"type": "setPendingNavigation", "threadID": parentID})
+	actor.handle(map[string]any{"type": "setPendingNavigation", "threadID": "  " + parentID + "  "})
+
+	actor.mu.Lock()
+	if actor.pendingNavigation != "  "+parentID+"  " {
+		t.Fatalf("pendingNavigation = %q, want binary whitespace preserved", actor.pendingNavigation)
+	}
+	actor.mu.Unlock()
+
+	actor.handle(map[string]any{"type": "setPendingNavigation", "threadID": parentID})
 	actor.handle(map[string]any{"type": "max-tokens", "value": 32000})
 	actor.handle(map[string]any{"type": "main-thread", "value": parentID})
 	actor.handle(map[string]any{"type": "trace:start", "span": map[string]any{"id": "trace-1", "name": "turn", "startTime": "2026-05-24T00:00:00Z"}})
@@ -7941,17 +8044,21 @@ func TestNeoActorBinaryTraceDeltasIgnoreMissingOrCompletedSpansLikeBinary(t *tes
 
 	actor.handle(map[string]any{"type": "trace:start", "span": map[string]any{"id": "trace-1", "startTime": "2026-05-24T00:00:00Z"}})
 	actor.handle(map[string]any{"type": "trace:start", "span": map[string]any{"id": "trace-1", "startTime": "2026-05-24T00:00:02Z"}})
+	actor.handle(map[string]any{"type": "trace:attributes", "span": "trace-1", "attributes": map[string]any{}})
 	actor.handle(map[string]any{"type": "trace:end", "span": map[string]any{"id": "trace-1", "endTime": "2026-05-24T00:00:03Z"}})
 	actor.handle(map[string]any{"type": "trace:end", "span": map[string]any{"id": "trace-1", "endTime": "2026-05-24T00:00:04Z"}})
 
 	actor.mu.Lock()
 	defer actor.mu.Unlock()
-	if len(actor.replayEvents) != 2 {
-		t.Fatalf("trace replay events = %#v, want only initial start and end mutations", actor.replayEvents)
+	if len(actor.replayEvents) != 3 {
+		t.Fatalf("trace replay events = %#v, want start, empty attributes, and end mutations", actor.replayEvents)
 	}
 	trace := mapValue(arrayValue(actor.meta["traces"])[0])
 	if stringValue(trace["startTime"]) != "2026-05-24T00:00:00Z" || stringValue(trace["endTime"]) != "2026-05-24T00:00:03Z" {
 		t.Fatalf("trace = %#v, want first start/end preserved", trace)
+	}
+	if attributes := mapValue(trace["attributes"]); len(attributes) != 0 {
+		t.Fatalf("trace attributes = %#v, want empty object preserved", attributes)
 	}
 }
 
@@ -8885,7 +8992,7 @@ func TestNeoRuntimePrefersRicherCloudThreadOverPartialLocalCache(t *testing.T) {
 	localThread := map[string]any{
 		"id":        threadID,
 		"title":     `{"error":{"message":"Subagent error"}}`,
-		"agentMode": "",
+		"agentMode": "smart",
 		"created":   float64(1779845494198),
 		"messages": []any{
 			map[string]any{

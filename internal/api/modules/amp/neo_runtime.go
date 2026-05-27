@@ -1451,7 +1451,7 @@ func (a *neoActor) handleForSocket(socket *neoSocket, msg map[string]any) {
 	case "inference:completed":
 		a.handleBinaryInferenceCompleted(msg)
 	case "info:manual-bash-invocation":
-		a.appendManualBashInvocation(msg)
+		a.appendBinaryManualBashInvocation(msg)
 	case "relationship":
 		a.handleBinaryRelationship(msg)
 	case "draft":
@@ -3252,6 +3252,31 @@ func (a *neoActor) appendManualBashInvocation(msg map[string]any) {
 	a.syncCloudAsync()
 }
 
+func (a *neoActor) appendBinaryManualBashInvocation(msg map[string]any) {
+	block := map[string]any{
+		"type":    "manual_bash_invocation",
+		"args":    cloneNeoJSONValue(msg["args"]),
+		"toolRun": cloneNeoJSONValue(msg["toolRun"]),
+		"hidden":  cloneNeoJSONValue(msg["hidden"]),
+	}
+	message := neoMessage{
+		ThreadID:  a.threadID,
+		MessageID: newNeoMessageID(),
+		Role:      "info",
+		Content:   []any{block},
+		CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	a.mu.Lock()
+	stored := a.storeMessageLocked(message)
+	a.rebuildHistoryLocked()
+	event := neoMessageAddedPayload(stored)
+	a.rememberReplayEventLocked(event)
+	a.mu.Unlock()
+
+	a.broadcast(event)
+	a.syncCloudAsync()
+}
+
 func (a *neoActor) handleBinaryRelationship(msg map[string]any) {
 	relationship := cloneMap(mapValue(msg["relationship"]))
 	if len(relationship) == 0 {
@@ -3290,7 +3315,7 @@ func (a *neoActor) hasRelationshipCoreLocked(relationship map[string]any) bool {
 }
 
 func (a *neoActor) handleBinaryDraft(msg map[string]any) {
-	content := neoContentFromBinaryValue(msg["content"])
+	content := neoDraftContentFromBinaryValue(msg["content"])
 	autoSubmit := boolValue(msg["autoSubmit"])
 	a.mu.Lock()
 	a.draft = content
@@ -3298,7 +3323,11 @@ func (a *neoActor) handleBinaryDraft(msg map[string]any) {
 		a.autoSubmitDraft = true
 	}
 	seq := a.nextSeqLocked()
-	event := map[string]any{"type": "draft", "content": cloneArray(content), "seq": seq}
+	var eventContent any
+	if content != nil {
+		eventContent = cloneNeoJSONArray(content)
+	}
+	event := map[string]any{"type": "draft", "content": eventContent, "seq": seq}
 	if autoSubmit {
 		event["autoSubmit"] = true
 	}
@@ -3309,8 +3338,17 @@ func (a *neoActor) handleBinaryDraft(msg map[string]any) {
 	a.syncCloudAsync()
 }
 
+func neoDraftContentFromBinaryValue(raw any) []any {
+	if content := arrayValue(raw); content != nil {
+		return cloneNeoJSONArray(content)
+	}
+	if text := stringValue(raw); text != "" {
+		return []any{map[string]any{"type": "text", "text": text}}
+	}
+	return nil
+}
+
 func (a *neoActor) setPendingNavigation(threadID string) {
-	threadID = strings.TrimSpace(threadID)
 	a.mu.Lock()
 	a.pendingNavigation = threadID
 	seq := a.nextSeqLocked()
@@ -3447,7 +3485,7 @@ func (a *neoActor) handleBinaryTraceEvent(msg map[string]any) {
 func (a *neoActor) handleBinaryTraceAttributes(msg map[string]any) {
 	traceID := firstNonEmptyString(msg["span"], msg["spanID"], msg["spanId"], msg["id"])
 	attributes := cloneMap(mapValue(msg["attributes"]))
-	if traceID == "" || len(attributes) == 0 {
+	if traceID == "" {
 		return
 	}
 	a.mu.Lock()
@@ -4254,6 +4292,15 @@ func (a *neoActor) firstUserMessageIndexLocked() int {
 	return -1
 }
 
+func (a *neoActor) firstRoleUserMessageIndexLocked() int {
+	for i, message := range a.messages {
+		if message.Role == "user" {
+			return i
+		}
+	}
+	return -1
+}
+
 func (a *neoActor) appendBinaryUserMessage(user neoQueuedMessage, msg map[string]any) {
 	a.mu.Lock()
 	a.archived = false
@@ -4320,7 +4367,7 @@ func (a *neoActor) replaceBinaryUserMessageAtIndex(index int, user neoQueuedMess
 	}
 	a.generation++
 	a.archived = false
-	if a.firstUserMessageIndexLocked() == index && user.AgentMode != "" && a.mainThreadID == "" {
+	if a.firstRoleUserMessageIndexLocked() == index && user.AgentMode != "" && a.mainThreadID == "" {
 		if a.settings == nil {
 			a.settings = map[string]any{}
 		}
@@ -7444,12 +7491,12 @@ func neoThreadNeedsCloudRefresh(thread map[string]any) bool {
 		return true
 	}
 	messages := arrayValue(thread["messages"])
-	if len(messages) != 1 {
-		return false
+	if len(messages) == 1 {
+		message := mapValue(messages[0])
+		content := arrayValue(message["content"])
+		return len(content) == 1 && stringValue(mapValue(content[0])["type"]) == "tool_result"
 	}
-	message := mapValue(messages[0])
-	content := arrayValue(message["content"])
-	return len(content) == 1 && stringValue(mapValue(content[0])["type"]) == "tool_result"
+	return false
 }
 
 func preferNeoIncomingThread(existing, incoming map[string]any) bool {
@@ -7851,7 +7898,7 @@ func neoCloudThread(snapshot neoCloudThreadSnapshot) map[string]any {
 	}
 
 	threadStatus := neoThreadStatusValue(snapshot.threadStatus)
-	relationships := neoMergeThreadRelationships(neoThreadRelationships(messages), snapshot.relationships)
+	relationships := neoMergeThreadRelationshipsWithExplicit(neoThreadRelationships(messages), snapshot.relationships)
 	meta := cloneMap(snapshot.meta)
 	meta["usesDtw"] = true
 	meta["usesThreadActors"] = true
@@ -8032,6 +8079,36 @@ func neoMergeThreadRelationships(groups ...[]any) []any {
 			seen[key] = struct{}{}
 			merged = append(merged, relationship)
 		}
+	}
+	return merged
+}
+
+func neoMergeThreadRelationshipsWithExplicit(inferred, explicit []any) []any {
+	merged := make([]any, 0, len(inferred)+len(explicit))
+	seen := map[string]struct{}{}
+	for _, raw := range inferred {
+		relationship, ok := normalizeNeoThreadRelationship(raw)
+		if !ok {
+			continue
+		}
+		key := neoThreadRelationshipKey(relationship)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		merged = append(merged, relationship)
+	}
+	for _, raw := range explicit {
+		relationship := cloneMap(mapValue(raw))
+		if len(relationship) == 0 {
+			continue
+		}
+		key := neoThreadRelationshipKey(relationship)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		merged = append(merged, relationship)
 	}
 	return merged
 }
@@ -10250,7 +10327,7 @@ func (a *neoActor) relationshipListLocked() []any {
 }
 
 func (a *neoActor) threadRelationshipsLocked(messages []neoMessage) []any {
-	return neoMergeThreadRelationships(neoThreadRelationships(messages), a.relationshipListLocked())
+	return neoMergeThreadRelationshipsWithExplicit(neoThreadRelationships(messages), a.relationshipListLocked())
 }
 
 func (a *neoActor) upsertRelationshipLocked(relationship map[string]any) {
