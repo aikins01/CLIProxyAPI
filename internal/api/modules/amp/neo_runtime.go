@@ -6220,7 +6220,7 @@ func recentNeoLocalThreads(limit int) []map[string]any {
 			continue
 		}
 		thread := map[string]any{"id": id}
-		for _, key := range []string{"title", "created", "createdAt", "updated", "updatedAt", "userLastInteractedAt", "creatorUserID", "v", "agentMode", "env", "summaryStats", "usesDtw", "usesThreadActors", "meta", "relationships"} {
+		for _, key := range []string{"title", "created", "createdAt", "updated", "updatedAt", "userLastInteractedAt", "creatorUserID", "v", "agentMode", "env", "summaryStats", "usesDtw", "usesThreadActors", "meta", "relationships", "originThreadID", "originThreadId", "mainThreadID", "mainThreadId", "mainThread"} {
 			if value := gjson.GetBytes(raw, key); value.Exists() {
 				thread[key] = value.Value()
 			}
@@ -6300,7 +6300,7 @@ func mergeNeoThreadListEntry(existing, incoming map[string]any) map[string]any {
 	}
 	merged := cloneMap(existing)
 	replacePreferred := preferNeoIncomingThread(existing, incoming)
-	for _, key := range []string{"title", "created", "createdAt", "updated", "updatedAt", "userLastInteractedAt", "messageCount", "archived", "meta", "relationships", "labels", "v", "agentMode", "env", "summaryStats", "usesDtw", "usesThreadActors"} {
+	for _, key := range []string{"title", "created", "createdAt", "updated", "updatedAt", "userLastInteractedAt", "messageCount", "archived", "meta", "relationships", "labels", "v", "agentMode", "env", "summaryStats", "usesDtw", "usesThreadActors", "originThreadID", "mainThreadID"} {
 		if _, exists := incoming[key]; !exists {
 			continue
 		}
@@ -6333,6 +6333,12 @@ func neoThreadListEntry(thread map[string]any) map[string]any {
 		entry["agentMode"] = mode
 	} else if stringValue(entry["agentMode"]) == "" {
 		entry["agentMode"] = "smart"
+	}
+	if originThreadID := firstNonEmptyString(thread["originThreadID"], thread["originThreadId"], thread["originThread"], nestedString(thread["data"], "originThreadID"), nestedString(thread["data"], "originThreadId")); originThreadID != "" {
+		entry["originThreadID"] = originThreadID
+	}
+	if mainThreadID := firstNonEmptyString(thread["mainThreadID"], thread["mainThreadId"], thread["mainThread"], nestedString(thread["data"], "mainThreadID"), nestedString(thread["data"], "mainThreadId"), nestedString(thread["settings"], "mainThreadID")); mainThreadID != "" {
+		entry["mainThreadID"] = mainThreadID
 	}
 	meta := mapValue(entry["meta"])
 	for _, key := range []string{"usesDtw", "usesThreadActors"} {

@@ -9925,6 +9925,20 @@ func TestNeoThreadListEntryPromotesMetaAgentModeForBinarySwitch(t *testing.T) {
 	}
 }
 
+func TestNeoThreadListEntryPreservesBinaryRelationshipThreadIDs(t *testing.T) {
+	entry := neoThreadListEntry(map[string]any{
+		"id":             "T-list-related",
+		"originThreadId": "T-origin",
+		"data":           map[string]any{"mainThreadID": "T-main"},
+		"messages": []any{
+			map[string]any{"role": "user", "messageId": "M-user"},
+		},
+	})
+	if stringValue(entry["originThreadID"]) != "T-origin" || stringValue(entry["mainThreadID"]) != "T-main" {
+		t.Fatalf("thread relationship ids = origin:%#v main:%#v entry:%#v", entry["originThreadID"], entry["mainThreadID"], entry)
+	}
+}
+
 func TestNeoThreadListEntryComputesBinaryDiffStats(t *testing.T) {
 	entry := neoThreadListEntry(map[string]any{
 		"id": "T-list-diff",
@@ -9959,6 +9973,8 @@ func TestRecentNeoLocalThreadsComputesBinaryDiffStats(t *testing.T) {
 		"title": "diff stats",
 		"agentMode": "smart",
 		"created": 1778170000000,
+		"originThreadID": "T-origin",
+		"mainThreadID": "T-main",
 		"messages": [
 			{"role": "user", "messageId": "M-user", "content": [{"type": "text", "text": "patch it"}]},
 			{"role": "assistant", "messageId": "M-assistant", "content": [
@@ -9978,6 +9994,9 @@ func TestRecentNeoLocalThreadsComputesBinaryDiffStats(t *testing.T) {
 	diffStats := mapValue(mapValue(threads[0]["summaryStats"])["diffStats"])
 	if numberFrom(diffStats["added"]) != 2 || numberFrom(diffStats["deleted"]) != 0 || numberFrom(diffStats["changed"]) != 0 {
 		t.Fatalf("diffStats = %#v, want added=2 deleted=0 changed=0", diffStats)
+	}
+	if stringValue(threads[0]["originThreadID"]) != "T-origin" || stringValue(threads[0]["mainThreadID"]) != "T-main" {
+		t.Fatalf("thread relationship ids = origin:%#v main:%#v", threads[0]["originThreadID"], threads[0]["mainThreadID"])
 	}
 }
 

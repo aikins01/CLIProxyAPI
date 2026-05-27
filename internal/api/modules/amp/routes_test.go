@@ -780,7 +780,7 @@ func TestRegisterManagementRoutesServesNeoStartupInternalRPCPostsLocally(t *test
 	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
 
 	threadID := "T-019e06a8-13c9-708d-8090-783005818ea7"
-	rawThread := []byte(`{"id":"` + threadID + `","title":"local","creatorUserID":"user_cloud","v":7,"agentMode":"deep","env":{"initial":{"trees":[]}},"meta":{"usesDtw":true,"usesThreadActors":true},"relationships":[],"messages":[{"messageId":"M-large","role":"user","content":[{"type":"text","text":"hello"}]}]}`)
+	rawThread := []byte(`{"id":"` + threadID + `","title":"local","creatorUserID":"user_cloud","v":7,"agentMode":"deep","originThreadID":"T-origin","mainThreadID":"T-main","env":{"initial":{"trees":[]}},"meta":{"usesDtw":true,"usesThreadActors":true},"relationships":[],"messages":[{"messageId":"M-large","role":"user","content":[{"type":"text","text":"hello"}]}]}`)
 	if err := os.WriteFile(filepath.Join(dir, threadID+".json"), rawThread, 0o600); err != nil {
 		t.Fatalf("write local thread: %v", err)
 	}
@@ -843,6 +843,9 @@ func TestRegisterManagementRoutesServesNeoStartupInternalRPCPostsLocally(t *test
 		}
 		if stringValue(thread["agentMode"]) != "deep" || numberFrom(thread["v"]) != 7 {
 			t.Fatalf("local list metadata = %#v", thread)
+		}
+		if stringValue(thread["originThreadID"]) != "T-origin" || stringValue(thread["mainThreadID"]) != "T-main" {
+			t.Fatalf("local related thread metadata = origin:%#v main:%#v", thread["originThreadID"], thread["mainThreadID"])
 		}
 		if _, exists := thread["env"]; !exists {
 			t.Fatalf("local env metadata missing: %#v", thread)
