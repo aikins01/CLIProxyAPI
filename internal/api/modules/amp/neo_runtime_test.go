@@ -6970,6 +6970,55 @@ func TestNeoActorHandlesBinaryAssistantAndSettingsDeltas(t *testing.T) {
 	waitForNeoActorSyncIdle(t, actor)
 }
 
+func TestNeoActorBinaryAssistantUpdateWithoutIDOnlyUpdatesLastAssistant(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	actor.messages = []neoMessage{
+		{
+			ThreadID:  "T-test",
+			MessageID: "M-assistant-old",
+			Role:      "assistant",
+			Content:   []any{map[string]any{"type": "text", "text": "old assistant"}},
+			State:     map[string]any{"type": "complete", "stopReason": "tool_use"},
+			Seq:       1,
+		},
+		{
+			ThreadID:  "T-test",
+			MessageID: "M-tool-result",
+			Role:      "user",
+			Content: []any{map[string]any{
+				"type":      "tool_result",
+				"toolUseID": "TU-old",
+				"run":       map[string]any{"status": "done", "result": "ok"},
+			}},
+			Seq: 2,
+		},
+	}
+	actor.rebuildHistoryLocked()
+
+	actor.handle(map[string]any{
+		"type": "assistant:message-update",
+		"message": map[string]any{
+			"content": []any{map[string]any{"type": "text", "text": "new assistant"}},
+			"state":   map[string]any{"type": "complete", "stopReason": "end_turn"},
+		},
+	})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.messages) != 3 {
+		t.Fatalf("messages = %#v, want old assistant, tool result, appended assistant", actor.messages)
+	}
+	if actor.messages[0].MessageID != "M-assistant-old" || textFromBlocks(actor.messages[0].Content) != "old assistant" {
+		t.Fatalf("old assistant was overwritten: %#v", actor.messages[0])
+	}
+	appended := actor.messages[2]
+	if appended.Role != "assistant" || appended.MessageID == "" || appended.MessageID == "M-assistant-old" || textFromBlocks(appended.Content) != "new assistant" {
+		t.Fatalf("appended assistant = %#v", appended)
+	}
+}
+
 func TestNeoActorBinaryAssistantMessageCleansPriorIncompleteAssistant(t *testing.T) {
 	useTempNeoThreadStore(t)
 	rt := newNeoRuntime(&config.Config{})

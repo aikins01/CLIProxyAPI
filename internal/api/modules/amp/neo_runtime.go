@@ -3105,13 +3105,13 @@ func (a *neoActor) handleBinaryAssistantMessageUpdate(msg map[string]any) {
 	}
 	a.mu.Lock()
 	if messageIDValue(message["messageId"]) == "" && messageIDValue(message["protocolMessageID"]) == "" {
-		for i := len(a.messages) - 1; i >= 0; i-- {
-			if a.messages[i].Role == "assistant" {
-				message["messageId"] = a.messages[i].MessageID
+		if len(a.messages) > 0 {
+			last := a.messages[len(a.messages)-1]
+			if last.Role == "assistant" {
+				message["messageId"] = last.MessageID
 				if len(mapValue(message["usage"])) > 0 {
-					message["usage"] = mergeNeoUsage(cloneMap(a.messages[i].Usage), mapValue(message["usage"]))
+					message["usage"] = mergeNeoUsage(cloneMap(last.Usage), mapValue(message["usage"]))
 				}
-				break
 			}
 		}
 	}
