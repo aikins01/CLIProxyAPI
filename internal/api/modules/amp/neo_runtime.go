@@ -4243,13 +4243,15 @@ func neoQueuedMessageFromBinaryDelta(msg map[string]any, queue bool) neoQueuedMe
 	if createdAt == "" {
 		createdAt = time.Now().UTC().Format(time.RFC3339Nano)
 	}
+	meta := sanitizeNeoBinaryReducerMap(mapValue(firstNonNil(source["meta"], msg["meta"])))
+	meta = neoEnsureUserMessageSentAt(meta, createdAt, content)
 	return neoQueuedMessage{
 		ID:              queueID,
 		MessageID:       messageID,
 		Content:         sanitizeNeoBinaryReducerArray(content),
 		UserState:       sanitizeNeoBinaryReducerValue(firstNonNil(source["userState"], msg["userState"])),
 		FileMentions:    sanitizeNeoBinaryReducerMap(mapValue(firstNonNil(source["fileMentions"], msg["fileMentions"]))),
-		Meta:            sanitizeNeoBinaryReducerMap(mapValue(firstNonNil(source["meta"], msg["meta"]))),
+		Meta:            meta,
 		CreatedAt:       createdAt,
 		AgentMode:       firstNonEmptyString(source["agentMode"], msg["agentMode"]),
 		ReasoningEffort: firstNonEmptyString(source["reasoningEffort"], source["reasoning_effort"], msg["reasoningEffort"], msg["reasoning_effort"]),
@@ -4723,7 +4725,7 @@ func (a *neoActor) storeQueuedUserMessageLocked(user neoQueuedMessage, preserveM
 		ReasoningEffort:  messageEffort,
 		UserState:        user.UserState,
 		FileMentions:     user.FileMentions,
-		Meta:             user.Meta,
+		Meta:             neoEnsureUserMessageSentAt(user.Meta, user.CreatedAt, user.Content),
 		CreatedAt:        user.CreatedAt,
 		CompletionStatus: "",
 	})
@@ -6237,14 +6239,18 @@ func recentNeoLocalThreads(limit int) []map[string]any {
 			messageCount := neoBinaryThreadMessageCountFromJSON(messages)
 			thread["messageCount"] = messageCount
 			thread["relationships"] = neoMergeThreadRelationshipsWithExplicit(neoThreadRelationshipsFromJSONMessages(messages, id), firstArray(thread["relationships"]))
+			if interacted := neoThreadUserLastInteractedAtFromJSON(gjson.ParseBytes(raw)); interacted > 0 {
+				thread["userLastInteractedAt"] = interacted
+			}
 			thread["summaryStats"] = neoMergeThreadSummaryStats(thread["summaryStats"], messageCount, neoThreadDiffStatsFromJSONMessages(messages))
 		}
 		if updated := neoThreadUpdatedMillisFromJSONBytes(raw); updated > 0 {
 			thread["updated"] = updated
-			thread["userLastInteractedAt"] = updated
 		} else if file.updatedMs > 0 {
 			thread["updated"] = file.updatedMs
-			thread["userLastInteractedAt"] = file.updatedMs
+			if _, exists := thread["userLastInteractedAt"]; !exists {
+				thread["userLastInteractedAt"] = file.updatedMs
+			}
 		}
 		threads = append(threads, neoThreadListEntry(thread))
 	}
@@ -6329,6 +6335,11 @@ func neoThreadListEntry(thread map[string]any) map[string]any {
 	for _, key := range []string{"created", "createdAt", "updated", "updatedAt", "userLastInteractedAt", "messageCount", "v", "agentMode", "env", "summaryStats"} {
 		if _, exists := thread[key]; exists {
 			entry[key] = thread[key]
+		}
+	}
+	if rawMessages, exists := thread["messages"]; exists {
+		if interacted := neoThreadUserLastInteractedAtFromMessages(thread, arrayValue(rawMessages)); interacted > 0 {
+			entry["userLastInteractedAt"] = interacted
 		}
 	}
 	if mode := neoThreadMapAgentMode(thread); mode != "" {
@@ -6461,6 +6472,85 @@ func neoBinaryThreadMessageCountFromJSON(messages gjson.Result) int {
 		}
 	}
 	return count
+}
+
+func neoUserVisibleContent(content []any) bool {
+	for _, rawContent := range content {
+		if stringValue(mapValue(rawContent)["type"]) != "tool_result" {
+			return true
+		}
+	}
+	return false
+}
+
+func neoEnsureUserMessageSentAt(meta map[string]any, createdAt string, content []any) map[string]any {
+	if !neoUserVisibleContent(content) || neoMessageMetaSentAtMillis(meta) > 0 {
+		return meta
+	}
+	if meta == nil {
+		meta = map[string]any{}
+	}
+	if sentAt := neoTimeStringMillis(createdAt); sentAt > 0 {
+		meta["sentAt"] = sentAt
+	} else {
+		meta["sentAt"] = time.Now().UnixMilli()
+	}
+	return meta
+}
+
+func neoMessageMetaSentAtMillis(meta map[string]any) int {
+	switch value := meta["sentAt"].(type) {
+	case int:
+		return value
+	case int64:
+		return int(value)
+	case float64:
+		return int(value)
+	case json.Number:
+		if parsed, err := value.Int64(); err == nil {
+			return int(parsed)
+		}
+	}
+	return 0
+}
+
+func neoJSONMessageMetaSentAtMillis(message gjson.Result) int {
+	sentAt := message.Get("meta.sentAt")
+	if !sentAt.Exists() || sentAt.Type != gjson.Number {
+		return 0
+	}
+	return int(sentAt.Int())
+}
+
+func neoThreadUserLastInteractedAtFromMessages(thread map[string]any, messages []any) int {
+	last := firstNonZero(numberFrom(thread["created"]), neoTimeStringMillis(stringValue(thread["createdAt"])))
+	for _, raw := range messages {
+		message := mapValue(raw)
+		if stringValue(message["role"]) != "user" {
+			continue
+		}
+		if sentAt := neoMessageMetaSentAtMillis(mapValue(message["meta"])); sentAt > last {
+			last = sentAt
+		}
+	}
+	return last
+}
+
+func neoThreadUserLastInteractedAtFromJSON(thread gjson.Result) int {
+	last := firstNonZero(neoJSONMillis(thread.Get("created")), neoJSONMillis(thread.Get("createdAt")))
+	messages := thread.Get("messages")
+	if !messages.Exists() || !messages.IsArray() {
+		return last
+	}
+	for _, message := range messages.Array() {
+		if message.Get("role").String() != "user" {
+			continue
+		}
+		if sentAt := neoJSONMessageMetaSentAtMillis(message); sentAt > last {
+			last = sentAt
+		}
+	}
+	return last
 }
 
 func neoThreadRelationshipsFromRawMessages(messages []any, currentThreadID string) []any {

@@ -1094,6 +1094,9 @@ func TestRegisterManagementRoutesServesNeoStartupInternalRPCPostsLocally(t *test
 		if stringValue(envelope["agentMode"]) != "deep" || stringValue(thread["agentMode"]) != "deep" {
 			t.Fatalf("agentMode envelope=%#v data=%#v, want deep", envelope["agentMode"], thread["agentMode"])
 		}
+		if numberFrom(envelope["v"]) != 7 || len(arrayValue(envelope["messages"])) != 1 {
+			t.Fatalf("binary thread envelope missing raw thread fields: %#v", envelope)
+		}
 	})
 
 	t.Run("thread meta", func(t *testing.T) {

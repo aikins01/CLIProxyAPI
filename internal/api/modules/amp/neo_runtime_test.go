@@ -10029,6 +10029,25 @@ func TestNeoThreadListEntryCountsBinaryDisplayMessages(t *testing.T) {
 	}
 }
 
+func TestNeoThreadListEntryUsesBinaryUserInteractionTime(t *testing.T) {
+	entry := neoThreadListEntry(map[string]any{
+		"id":        "T-list-interaction",
+		"created":   1000,
+		"updatedAt": 9000,
+		"messages": []any{
+			map[string]any{"role": "user", "messageId": "M-user-1", "meta": map[string]any{"sentAt": 2000}, "content": []any{map[string]any{"type": "text", "text": "visible"}}},
+			map[string]any{"role": "assistant", "messageId": "M-assistant", "createdAt": "2026-05-07T21:00:00Z", "content": []any{map[string]any{"type": "text", "text": "ignored"}}},
+			map[string]any{"role": "user", "messageId": "M-tool-result", "meta": map[string]any{"sentAt": 8000}, "content": []any{map[string]any{"type": "tool_result", "toolUseID": "TU-read"}}},
+		},
+	})
+	if numberFrom(entry["userLastInteractedAt"]) != 8000 {
+		t.Fatalf("userLastInteractedAt = %#v, want max user meta.sentAt", entry["userLastInteractedAt"])
+	}
+	if numberFrom(entry["updated"]) != 9000 {
+		t.Fatalf("updated = %#v, want updatedAt preserved for local sort fallback", entry["updated"])
+	}
+}
+
 func TestRecentNeoLocalThreadsComputesBinaryDiffStats(t *testing.T) {
 	dir := t.TempDir()
 	oldStoreDir := neoAmpThreadStoreDir
@@ -10043,12 +10062,13 @@ func TestRecentNeoLocalThreadsComputesBinaryDiffStats(t *testing.T) {
 		"agentMode": "smart",
 		"archived": true,
 		"created": 1778170000000,
+		"updatedAt": 1778179999000,
 		"summaryStats": {"messageCount": 99},
 		"originThreadID": "T-origin",
 		"mainThreadID": "T-main",
 		"messages": [
-			{"role": "user", "messageId": "M-user", "content": [{"type": "text", "text": "patch it"}]},
-			{"role": "user", "messageId": "M-tool-result", "content": [{"type": "tool_result", "toolUseID": "TU-read"}]},
+			{"role": "user", "messageId": "M-user", "meta": {"sentAt": 1778170001000}, "content": [{"type": "text", "text": "patch it"}]},
+			{"role": "user", "messageId": "M-tool-result", "meta": {"sentAt": 1778170002000}, "content": [{"type": "tool_result", "toolUseID": "TU-read"}]},
 			{"role": "assistant", "messageId": "M-assistant", "content": [
 				{"type": "server_tool_use", "name": "functions.edit_file", "input": {"old_str": "alpha\nbeta", "new_str": "alpha\ngamma\nbeta"}},
 				{"type": "tool_use", "complete": true, "name": "write_file", "input": {"content": "new file"}},
@@ -10077,6 +10097,12 @@ func TestRecentNeoLocalThreadsComputesBinaryDiffStats(t *testing.T) {
 	}
 	if numberFrom(threads[0]["messageCount"]) != 1 || numberFrom(mapValue(threads[0]["summaryStats"])["messageCount"]) != 1 {
 		t.Fatalf("message counts = entry:%#v summary:%#v, want 1", threads[0]["messageCount"], threads[0]["summaryStats"])
+	}
+	if numberFrom(threads[0]["userLastInteractedAt"]) != 1778170002000 {
+		t.Fatalf("userLastInteractedAt = %#v, want binary user meta sentAt", threads[0]["userLastInteractedAt"])
+	}
+	if numberFrom(threads[0]["updated"]) != 1778179999000 {
+		t.Fatalf("updated = %#v, want top-level updatedAt retained", threads[0]["updated"])
 	}
 	relationships := arrayValue(threads[0]["relationships"])
 	if len(relationships) != 1 || stringValue(mapValue(relationships[0])["threadID"]) != parentID {
