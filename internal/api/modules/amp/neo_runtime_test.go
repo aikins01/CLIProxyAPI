@@ -4688,6 +4688,83 @@ func TestParseNeoOpenAIResponsesResultCustomToolCall(t *testing.T) {
 	}
 }
 
+func TestParseNeoOpenAIResponsesResultKeepsMalformedFunctionCallArgumentsIncomplete(t *testing.T) {
+	result, err := parseNeoOpenAIResponsesResult(map[string]any{
+		"output": []any{map[string]any{
+			"type":      "function_call",
+			"call_id":   "call_1",
+			"name":      "Bash",
+			"arguments": `{"cmd":"pwd"`,
+		}},
+	}, neoModelRoute{Provider: "openai", Model: "gpt-5.5"}, nil)
+	if err != nil {
+		t.Fatalf("parseNeoOpenAIResponsesResult error: %v", err)
+	}
+	if len(result.ToolCalls) != 1 {
+		t.Fatalf("tool calls = %#v, want one", result.ToolCalls)
+	}
+	call := result.ToolCalls[0]
+	if !call.Incomplete || call.PartialJSON != `{"cmd":"pwd"` || stringValue(call.InputIncomplete["cmd"]) != "pwd" {
+		t.Fatalf("tool call = %#v, want incomplete partial JSON", call)
+	}
+	block := neoToolUseBlock(call, true)
+	if boolValue(block["complete"]) {
+		t.Fatalf("tool block complete = %#v, want false", block)
+	}
+	if stringValue(mapValue(block["inputPartialJSON"])["json"]) != `{"cmd":"pwd"` || stringValue(mapValue(block["inputIncomplete"])["cmd"]) != "pwd" {
+		t.Fatalf("tool block partial fields = %#v", block)
+	}
+	emptyInput, emptyPartialJSON, emptyIncomplete, emptyBroken := parseOpenAIResponsesFunctionArguments("")
+	if !emptyBroken || emptyPartialJSON != "" || len(emptyInput) != 0 || len(emptyIncomplete) != 0 {
+		t.Fatalf("empty arguments parsed as input=%#v partial=%q incomplete=%#v broken=%v, want incomplete empty object", emptyInput, emptyPartialJSON, emptyIncomplete, emptyBroken)
+	}
+}
+
+func TestFinishAssistantMessageDoesNotLeaseIncompleteToolCall(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := rt.store.ensureThreadActor("T-incomplete-tool")
+	result := neoInferenceResult{
+		Provider: "openai",
+		Model:    "gpt-5.5",
+		ToolCalls: []neoToolCall{{
+			ID:              "TU-incomplete",
+			Name:            "Bash",
+			Input:           map[string]any{},
+			PartialJSON:     `{"cmd":"pwd"`,
+			InputIncomplete: map[string]any{"cmd": "pwd"},
+			Incomplete:      true,
+		}},
+	}
+
+	actor.finishAssistantMessageWithOptions("M-assistant", result, "deep", "xhigh", false, "")
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.pendingTools) != 0 {
+		t.Fatalf("pending tools = %#v, want none for incomplete call", actor.pendingTools)
+	}
+	if actor.agentState != "idle" {
+		t.Fatalf("agent state = %q, want idle", actor.agentState)
+	}
+	if len(actor.messages) != 1 {
+		t.Fatalf("messages = %#v, want one assistant message", actor.messages)
+	}
+	var block map[string]any
+	for _, raw := range actor.messages[0].Content {
+		candidate := mapValue(raw)
+		if stringValue(candidate["type"]) == "tool_use" {
+			block = candidate
+			break
+		}
+	}
+	if len(block) == 0 {
+		t.Fatalf("assistant content = %#v, want tool_use block", actor.messages[0].Content)
+	}
+	if boolValue(block["complete"]) || stringValue(mapValue(block["inputPartialJSON"])["json"]) != `{"cmd":"pwd"` {
+		t.Fatalf("stored tool block = %#v, want incomplete partial JSON", block)
+	}
+}
+
 func TestInferNeoOpenAIResponsesStreamCustomToolCall(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/provider/openai/v1/responses" {

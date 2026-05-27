@@ -4918,6 +4918,9 @@ func (a *neoActor) finishAssistantMessageWithOptions(messageID string, result ne
 	stored := a.storeMessageLocked(finalMessage)
 	toolCalls := make([]neoPendingTool, 0, len(normalizedCalls))
 	for _, call := range normalizedCalls {
+		if call.Incomplete {
+			continue
+		}
 		pending := neoPendingTool{ID: call.ID, Name: call.Name, Input: call.Input, AgentMode: agentMode, ReasoningEffort: reasoningEffort, MessageID: messageID, ParentToolCallID: parentToolCallID}
 		a.pendingTools[call.ID] = pending
 		toolCalls = append(toolCalls, pending)
@@ -4941,7 +4944,16 @@ func (a *neoActor) finishAssistantMessageWithOptions(messageID string, result ne
 }
 
 func neoToolUseBlock(call neoToolCall, complete bool) map[string]any {
-	block := map[string]any{"type": "tool_use", "id": call.ID, "name": call.Name, "input": call.Input, "complete": complete}
+	blockComplete := complete && !call.Incomplete
+	block := map[string]any{"type": "tool_use", "id": call.ID, "name": call.Name, "input": call.Input, "complete": blockComplete}
+	if call.Incomplete {
+		block["inputPartialJSON"] = map[string]any{"json": call.PartialJSON}
+		if len(call.InputIncomplete) > 0 {
+			block["inputIncomplete"] = call.InputIncomplete
+		} else {
+			block["inputIncomplete"] = map[string]any{}
+		}
+	}
 	if call.CustomInputField != "" {
 		block["metadata"] = map[string]any{
 			"openAICustomTool": map[string]any{
@@ -11081,6 +11093,9 @@ type neoToolCall struct {
 	Name             string
 	Input            map[string]any
 	CustomInputField string
+	PartialJSON      string
+	InputIncomplete  map[string]any
+	Incomplete       bool
 }
 
 type neoPendingTool struct {
@@ -15481,10 +15496,14 @@ func parseNeoOpenAIResponsesResult(jsonBody map[string]any, route neoModelRoute,
 			if name == "" {
 				continue
 			}
+			input, partialJSON, inputIncomplete, incomplete := parseOpenAIResponsesFunctionArguments(item["arguments"])
 			toolCalls = append(toolCalls, neoToolCall{
-				ID:    fallbackString(item["call_id"], fmt.Sprintf("call-%d", i)),
-				Name:  name,
-				Input: parseToolArguments(item["arguments"]),
+				ID:              fallbackString(item["call_id"], fmt.Sprintf("call-%d", i)),
+				Name:            name,
+				Input:           input,
+				PartialJSON:     partialJSON,
+				InputIncomplete: inputIncomplete,
+				Incomplete:      incomplete,
 			})
 		case "custom_tool_call":
 			name := stringValue(item["name"])
@@ -15551,6 +15570,28 @@ func neoUnsupportedOpenAIResponsesOutputType(itemType string) bool {
 
 func neoUnsupportedOpenAIResponsesOutputError(itemType string) error {
 	return fmt.Errorf("unsupported content block type %s", itemType)
+}
+
+func parseOpenAIResponsesFunctionArguments(value any) (map[string]any, string, map[string]any, bool) {
+	if m, ok := asMap(value); ok {
+		return m, "", nil, false
+	}
+	text := stringValue(value)
+	var decoded map[string]any
+	if text != "" {
+		if err := json.Unmarshal([]byte(text), &decoded); err == nil {
+			return decoded, "", nil, false
+		}
+	}
+	if text == "" {
+		inputIncomplete := map[string]any{}
+		return map[string]any{}, text, inputIncomplete, true
+	}
+	inputIncomplete := parseNeoPartialJSONObject(text)
+	if inputIncomplete == nil {
+		inputIncomplete = map[string]any{}
+	}
+	return map[string]any{}, text, inputIncomplete, true
 }
 
 func isNeoOpenAIResponsesUnsupportedError(err error) bool {
