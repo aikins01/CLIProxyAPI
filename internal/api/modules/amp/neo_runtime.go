@@ -10385,7 +10385,7 @@ func (a *neoActor) updateReasoningEffortFromBinary(msg map[string]any) {
 	effort := stringValue(rawEffort)
 	a.mu.Lock()
 	hasUserTurn := a.hasUserTurnLocked()
-	mode := a.agentModeLocked()
+	mode := stringValue(a.settings["agentMode"])
 	if hasUserTurn {
 		a.mu.Unlock()
 		log.Debugf("amp neo local runtime ignored reasoning-effort after first message")
@@ -10401,6 +10401,11 @@ func (a *neoActor) updateReasoningEffortFromBinary(msg map[string]any) {
 		a.mu.Unlock()
 		a.broadcast(neoThreadSettingsPayload(settings))
 		a.syncCloudAsync()
+		return
+	}
+	if mode == "" {
+		a.mu.Unlock()
+		log.Debugf("amp neo local runtime ignored reasoning-effort before agent-mode")
 		return
 	}
 	if !neoReasoningEffortAllowedForMode(mode, effort) {

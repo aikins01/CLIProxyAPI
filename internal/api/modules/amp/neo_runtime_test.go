@@ -8292,6 +8292,23 @@ func TestNeoActorBinaryReasoningEffortAbsentClearsExplicitEffort(t *testing.T) {
 	}
 }
 
+func TestNeoActorBinaryReasoningEffortRequiresAgentModeLikeBinary(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+
+	actor.handle(map[string]any{"type": "reasoning-effort", "effort": "max"})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if _, exists := actor.settings["reasoning.effort"]; exists {
+		t.Fatalf("reasoning effort was set before agent-mode: %#v", actor.settings)
+	}
+	if actor.currentReasoningEffort != "high" {
+		t.Fatalf("current reasoning effort = %q, want default high", actor.currentReasoningEffort)
+	}
+}
+
 func TestNeoActorBinaryScalarDeltasUseFalseyClears(t *testing.T) {
 	useTempNeoThreadStore(t)
 	parentID := "T-019e1046-656d-7132-879f-390ded941c16"
