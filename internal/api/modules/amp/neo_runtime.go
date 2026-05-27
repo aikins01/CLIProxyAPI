@@ -5618,8 +5618,8 @@ func (a *neoActor) maybeCompactBeforeInference(agentMode, reasoningEffort, paren
 	}
 	summaryMessage.Seq = a.nextSeqLocked()
 	compacted := make([]neoMessage, 0, len(a.messages)-cutIndex+1)
-	compacted = append(compacted, a.messages[cutIndex:]...)
 	compacted = append(compacted, summaryMessage)
+	compacted = append(compacted, a.messages[cutIndex:]...)
 	a.messages = compacted
 	a.rebuildHistoryLocked()
 	record := map[string]any{"cutMessageId": cutMessageID, "createdAt": time.Now().UTC().Format(time.RFC3339Nano)}

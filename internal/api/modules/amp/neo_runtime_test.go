@@ -397,21 +397,24 @@ func TestNeoRuntimeAutoCompactsLargeLocalHistory(t *testing.T) {
 		t.Fatalf("message count after compaction = %d, want %d", len(actor.messages), neoCompactionTailMessages+1)
 	}
 	first := actor.messages[0]
-	if first.Role != "user" || first.MessageID != "M-0000000000000000000022" {
-		t.Fatalf("first compacted message = %#v, want retained cut message", first)
+	if first.Role != "info" || stringValue(mapValue(first.Content[0])["type"]) != "summary" {
+		t.Fatalf("first compacted message = %#v, want summary info", first)
 	}
-	last := actor.messages[len(actor.messages)-1]
-	if last.Role != "info" || stringValue(mapValue(last.Content[0])["type"]) != "summary" {
-		t.Fatalf("last compacted message = %#v, want summary info", last)
+	second := actor.messages[1]
+	if second.Role != "user" || second.MessageID != "M-0000000000000000000022" {
+		t.Fatalf("second compacted message = %#v, want retained cut message", second)
 	}
-	if !strings.Contains(stringValue(mapValue(mapValue(last.Content[0])["summary"])["summary"]), "preserved project goal") {
-		t.Fatalf("summary message content = %#v", last.Content)
+	if !strings.Contains(stringValue(mapValue(mapValue(first.Content[0])["summary"])["summary"]), "preserved project goal") {
+		t.Fatalf("summary message content = %#v", first.Content)
 	}
 	if len(actor.compactionRecords) != 1 || stringValue(actor.compactionRecords[0]["cutMessageId"]) != "M-0000000000000000000022" {
 		t.Fatalf("compaction records = %#v", actor.compactionRecords)
 	}
 	if len(actor.history) == 0 || actor.history[0].Role != "assistant" || !strings.Contains(actor.history[0].Text, "preserved project goal") {
 		t.Fatalf("history after compaction = %#v", actor.history)
+	}
+	if !strings.Contains(fmt.Sprint(actor.history), "message 29") {
+		t.Fatalf("history after compaction lost retained tail messages: %#v", actor.history)
 	}
 }
 
