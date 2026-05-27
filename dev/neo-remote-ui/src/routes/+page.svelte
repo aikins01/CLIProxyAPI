@@ -2051,7 +2051,7 @@
     const preview = previewFromMessage(lastMessage) || stringFrom(data.preview) || stringFrom(data.title);
     const env = asRecord(data.env);
     const repo = stringFrom(data.repository) || repoFromEnv(env) || 'local';
-    const agentMode = normalizeAgentMode(stringFrom(data.agentMode) || 'smart');
+    const agentMode = normalizeAgentMode(agentModeFromMessages(messages) || stringFrom(data.agentMode) || 'smart');
     return {
       id,
       title: stringFrom(data.title) || 'Untitled',
@@ -2072,7 +2072,7 @@
       ? thread.messages.map(normalizeMessage).filter(Boolean) as NeoMessage[]
       : [];
     const env = asRecord(thread.env);
-    const agentMode = normalizeAgentMode(stringFrom(thread.agentMode) || 'smart');
+    const agentMode = normalizeAgentMode(agentModeFromMessages(messages) || stringFrom(thread.agentMode) || 'smart');
     return {
       id: stringFrom(thread.id) || selectedThreadId,
       title: stringFrom(thread.title) || 'Untitled',
@@ -2238,6 +2238,17 @@
       messages: [],
       contextLabel: 'local context'
     };
+  }
+
+  function agentModeFromMessages(messages: unknown[]) {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = asRecord(messages[index]);
+      if (stringFrom(message.role) === 'user') {
+        const mode = stringFrom(message.agentMode);
+        if (mode) return mode;
+      }
+    }
+    return '';
   }
 
   function normalizeMessage(raw: unknown): NeoMessage | null {

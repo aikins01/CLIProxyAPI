@@ -8446,6 +8446,21 @@ func TestNeoRuntimeThreadActorResumeKeepsImportedMode(t *testing.T) {
 	}
 }
 
+func TestNeoThreadListEntryPrefersMessageAgentModeLikeBinary(t *testing.T) {
+	entry := neoThreadListEntry(map[string]any{
+		"id":        "T-list-mode",
+		"agentMode": "smart",
+		"messages": []any{
+			map[string]any{"role": "user", "messageId": "M-1", "agentMode": "large"},
+			map[string]any{"role": "assistant", "messageId": "M-2"},
+			map[string]any{"role": "user", "messageId": "M-3", "agentMode": "deep"},
+		},
+	})
+	if entry["agentMode"] != "deep" {
+		t.Fatalf("entry agentMode = %#v, want deep", entry["agentMode"])
+	}
+}
+
 func TestNeoRuntimeThreadActorManagementUsesExistingModeWhenRequestOmitsMode(t *testing.T) {
 	dir := t.TempDir()
 	oldStoreDir := neoAmpThreadStoreDir

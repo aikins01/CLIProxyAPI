@@ -6074,8 +6074,10 @@ func neoThreadListEntry(thread map[string]any) map[string]any {
 			entry[key] = thread[key]
 		}
 	}
-	if stringValue(entry["agentMode"]) == "" {
-		entry["agentMode"] = firstNonEmptyString(neoThreadMapAgentMode(thread), "smart")
+	if mode := neoThreadMapAgentMode(thread); mode != "" {
+		entry["agentMode"] = mode
+	} else if stringValue(entry["agentMode"]) == "" {
+		entry["agentMode"] = "smart"
 	}
 	meta := mapValue(entry["meta"])
 	for _, key := range []string{"usesDtw", "usesThreadActors"} {
@@ -7347,10 +7349,10 @@ func neoThreadMapAgentMode(thread map[string]any) string {
 	if len(thread) == 0 {
 		return ""
 	}
-	if mode := firstNonEmptyString(thread["agentMode"], nestedString(thread["settings"], "agentMode")); mode != "" {
+	if mode := neoThreadMessagesAgentMode(thread["messages"]); mode != "" {
 		return mode
 	}
-	if mode := neoThreadMessagesAgentMode(thread["messages"]); mode != "" {
+	if mode := firstNonEmptyString(thread["agentMode"], nestedString(thread["settings"], "agentMode")); mode != "" {
 		return mode
 	}
 	if data := mapValue(thread["data"]); len(data) > 0 {
