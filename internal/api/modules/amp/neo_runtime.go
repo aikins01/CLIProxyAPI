@@ -15111,19 +15111,32 @@ func openAIResponsesNeoTools(tools []neoToolSpec) []any {
 			out = append(out, item)
 			continue
 		}
-		schema := tool.InputSchema
-		if len(schema) == 0 {
-			schema = map[string]any{"type": "object"}
-		}
 		out = append(out, map[string]any{
 			"type":        "function",
 			"name":        tool.Name,
 			"description": tool.Description,
-			"parameters":  schema,
+			"parameters":  openAIResponsesNeoFunctionParameters(tool.InputSchema),
 			"strict":      false,
 		})
 	}
 	return out
+}
+
+func openAIResponsesNeoFunctionParameters(schema map[string]any) map[string]any {
+	parameterType := stringValue(schema["type"])
+	if parameterType == "" {
+		parameterType = "object"
+	}
+	required := arrayValue(schema["required"])
+	if required == nil {
+		required = stringArrayValue(schema["required"])
+	}
+	return map[string]any{
+		"type":                 parameterType,
+		"properties":           mapValue(schema["properties"]),
+		"required":             nonNilArray(required),
+		"additionalProperties": true,
+	}
 }
 
 func neoOpenAICustomToolConfigByName(tools []neoToolSpec) map[string]map[string]any {

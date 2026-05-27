@@ -4590,6 +4590,45 @@ func TestOpenAIResponsesNeoToolsPreserveCustomToolConfig(t *testing.T) {
 	}
 }
 
+func TestOpenAIResponsesNeoToolsNormalizeFunctionSchemaLikeBinary(t *testing.T) {
+	body := openAIResponsesNeoBody(neoInferenceRequest{
+		ThreadID: "T-test",
+		Tools: []neoToolSpec{{
+			Name:        "Bash",
+			Description: "run shell",
+			InputSchema: map[string]any{
+				"type":                 "object",
+				"properties":           map[string]any{"cmd": map[string]any{"type": "string"}},
+				"additionalProperties": false,
+				"$defs":                map[string]any{"unused": map[string]any{"type": "string"}},
+			},
+		}},
+	}, neoModelRoute{Provider: "openai", Model: "gpt-5.5"}, true)
+
+	tools := arrayValue(body["tools"])
+	if len(tools) != 1 {
+		t.Fatalf("tools = %#v, want one function tool", tools)
+	}
+	tool := mapValue(tools[0])
+	if tool["type"] != "function" || tool["name"] != "Bash" || tool["strict"] != false {
+		t.Fatalf("tool = %#v, want function Bash", tool)
+	}
+	parameters := mapValue(tool["parameters"])
+	if parameters["type"] != "object" || parameters["additionalProperties"] != true {
+		t.Fatalf("parameters = %#v, want object with additionalProperties true", parameters)
+	}
+	if _, hasDefs := parameters["$defs"]; hasDefs {
+		t.Fatalf("parameters retained unsupported top-level schema key: %#v", parameters)
+	}
+	if required := arrayValue(parameters["required"]); len(required) != 0 {
+		t.Fatalf("required = %#v, want empty array", required)
+	}
+	properties := mapValue(parameters["properties"])
+	if cmd := mapValue(properties["cmd"]); cmd["type"] != "string" {
+		t.Fatalf("properties = %#v, want cmd string schema", properties)
+	}
+}
+
 func TestOpenAIResponsesNeoInputReplaysCustomToolCalls(t *testing.T) {
 	input := openAIResponsesNeoInput([]neoHistoryMessage{
 		{
