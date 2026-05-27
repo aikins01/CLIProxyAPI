@@ -2048,7 +2048,8 @@
 
   function threadSummaryFromAPI(raw: unknown): ThreadSummary | null {
     const item = asRecord(raw);
-    const data = Object.keys(asRecord(item.data)).length ? asRecord(item.data) : item;
+    const itemData = asRecord(item.data);
+    const data = Object.keys(itemData).length ? { ...item, ...itemData } : item;
     const id = stringFrom(data.id ?? item.id);
     if (!id) return null;
     const messages = Array.isArray(data.messages) ? data.messages : [];
@@ -2056,7 +2057,7 @@
     const preview = previewFromMessage(lastMessage) || stringFrom(data.preview) || stringFrom(data.title);
     const env = asRecord(data.env);
     const repo = stringFrom(data.repository) || repoFromEnv(env) || 'local';
-    const agentMode = normalizeAgentMode(agentModeFromMessages(messages) || stringFrom(data.agentMode) || 'smart');
+    const agentMode = threadAgentModeFrom(data, messages);
     return {
       id,
       title: stringFrom(data.title) || 'Untitled',
@@ -2077,7 +2078,7 @@
       ? thread.messages.map(normalizeMessage).filter(Boolean) as NeoMessage[]
       : [];
     const env = asRecord(thread.env);
-    const agentMode = normalizeAgentMode(agentModeFromMessages(messages) || stringFrom(thread.agentMode) || 'smart');
+    const agentMode = threadAgentModeFrom(thread, messages);
     return {
       id: stringFrom(thread.id) || selectedThreadId,
       title: stringFrom(thread.title) || 'Untitled',
@@ -2254,6 +2255,18 @@
       }
     }
     return '';
+  }
+
+  function threadAgentModeFrom(raw: Record<string, unknown>, messages: unknown[] = []) {
+    const settings = asRecord(raw.settings);
+    const meta = asRecord(raw.meta);
+    return normalizeAgentMode(
+      stringFrom(raw.agentMode)
+        || stringFrom(settings.agentMode)
+        || stringFrom(meta.agentMode)
+        || agentModeFromMessages(messages)
+        || 'smart'
+    );
   }
 
   function normalizeMessage(raw: unknown): NeoMessage | null {

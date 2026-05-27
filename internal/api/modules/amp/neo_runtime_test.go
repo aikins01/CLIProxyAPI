@@ -3504,6 +3504,17 @@ func handledNeoInboundTypesForTest() map[string]bool {
 	)
 }
 
+func TestNeoExecutorStatusDefaultsInvalidStatusToStartingLikeBinary(t *testing.T) {
+	invalid := normalizeNeoExecutorStatus(map[string]any{"type": "executor_status", "status": "not-valid"})
+	if invalid["status"] != "starting" {
+		t.Fatalf("invalid status = %#v, want starting", invalid["status"])
+	}
+	missing := normalizeNeoExecutorStatus(map[string]any{"type": "executor_status"})
+	if missing["status"] != "starting" {
+		t.Fatalf("missing status = %#v, want starting", missing["status"])
+	}
+}
+
 func TestNeoHeadlessExecutorArgsByMode(t *testing.T) {
 	tests := []struct {
 		name   string

@@ -16935,7 +16935,7 @@ func normalizeNeoExecutorStatus(msg map[string]any) map[string]any {
 	switch status {
 	case "starting", "running", "failed":
 	default:
-		status = "failed"
+		status = "starting"
 	}
 	out := map[string]any{
 		"type":    "executor_status",
