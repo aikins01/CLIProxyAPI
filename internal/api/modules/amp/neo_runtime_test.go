@@ -6714,6 +6714,20 @@ func TestNeoActorHandlesBinaryUserThreadDeltas(t *testing.T) {
 	waitForNeoActorSyncIdle(t, actor)
 }
 
+func TestNeoBinaryReducerSanitizerMatchesBinaryPatternTable(t *testing.T) {
+	if got := len(neoBinarySecretRedactionPatterns); got != 112 {
+		t.Fatalf("binary redaction pattern count = %d, want 112", got)
+	}
+	herokuToken := "012345678-ABCD-ABCD-ABCD-ABCDEF123456"
+	redacted := sanitizeNeoBinaryReducerString("é heroku=\"" + herokuToken + "\"")
+	if strings.Contains(redacted, herokuToken) || !strings.Contains(redacted, "[REDACTED:heroku-api-key]") {
+		t.Fatalf("heroku redaction = %q", redacted)
+	}
+	if got := sanitizeNeoBinaryReducerString("api_key=example"); got != "api_key=example" {
+		t.Fatalf("negative-lookahead redaction = %q, want unchanged example value", got)
+	}
+}
+
 func TestNeoActorBinaryUserMessageSanitizesReducerPayload(t *testing.T) {
 	useTempNeoThreadStore(t)
 	rt := newNeoRuntime(&config.Config{})
@@ -6729,7 +6743,7 @@ func TestNeoActorBinaryUserMessageSanitizesReducerPayload(t *testing.T) {
 				map[string]any{"type": "image", "data": imageContent, "caption": githubToken},
 			},
 			"userState": map[string]any{
-				"activeEditor": "api_key=abcDEF123",
+				"activeEditor": "api_key=z9YxWv77",
 			},
 			"fileMentions": map[string]any{
 				"files": []any{

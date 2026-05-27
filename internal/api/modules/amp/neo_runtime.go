@@ -27,6 +27,7 @@ import (
 	"sync"
 	"time"
 
+	regexp2 "github.com/dlclark/regexp2"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -17181,66 +17182,130 @@ type neoBinarySecretRedactionPattern struct {
 	id              string
 	keywords        []string
 	caseInsensitive bool
-	re              *regexp.Regexp
+	re              *regexp2.Regexp
+}
+
+func mustCompileNeoBinarySecretRegexp(pattern string, caseInsensitive bool) *regexp2.Regexp {
+	options := regexp2.None
+	if caseInsensitive {
+		options |= regexp2.IgnoreCase
+	}
+	return regexp2.MustCompile(pattern, options)
 }
 
 var neoBinarySecretRedactionPatterns = []neoBinarySecretRedactionPattern{
-	{id: "sourcegraph-access-token-v3", keywords: []string{"sgp_"}, re: regexp.MustCompile(`(sgp_(?:[a-fA-F0-9]{16}|local)_[a-fA-F0-9]{40})`)},
-	{id: "sourcegraph-access-token-v2", keywords: []string{"sgp_"}, re: regexp.MustCompile(`(sgp_[a-fA-F0-9]{40})`)},
-	{id: "sourcegraph-dotcom-user-gateway", keywords: []string{"sgd_"}, re: regexp.MustCompile(`(sgd_[a-fA-F0-9]{64})`)},
-	{id: "sourcegraph-license-key", keywords: []string{"slk_"}, re: regexp.MustCompile(`(slk_[a-fA-F0-9]{64})`)},
-	{id: "sourcegraph-enterprise-subscription", keywords: []string{"sgs_"}, re: regexp.MustCompile(`(sgs_[a-fA-F0-9]{64})`)},
-	{id: "sourcegraph-amp", keywords: []string{"sgamp_user_"}, re: regexp.MustCompile(`(sgamp_user_[A-Z0-9]{26}_[a-f0-9]{64})`)},
-	{id: "sourcegraph-amp-auth-bypass", keywords: []string{"sgamp_user_auth-bypass_"}, re: regexp.MustCompile(`(sgamp_user_auth-bypass_[a-zA-Z0-9_-]+)`)},
-	{id: "sourcegraph-workspace-token", keywords: []string{"sgp_ws"}, re: regexp.MustCompile(`(sgp_ws[a-fA-F0-9]{32}_[a-fA-F0-9]{40})`)},
-	{id: "github-pat", keywords: []string{"ghp_"}, re: regexp.MustCompile(`(ghp_[0-9a-zA-Z]{36})`)},
-	{id: "github-oauth", keywords: []string{"gho_"}, re: regexp.MustCompile(`(gho_[0-9a-zA-Z]{36})`)},
-	{id: "github-app-token", keywords: []string{"ghu_", "ghs_"}, re: regexp.MustCompile(`((ghu|ghs)_[0-9a-zA-Z]{36})`)},
-	{id: "github-refresh-token", keywords: []string{"ghr_"}, re: regexp.MustCompile(`(ghr_[0-9a-zA-Z]{76})`)},
-	{id: "github-fine-grained-pat", keywords: []string{"github_pat_"}, re: regexp.MustCompile(`(github_pat_[a-zA-Z0-9]{22}_[a-zA-Z0-9]{59})`)},
-	{id: "gitlab-pat", keywords: []string{"glpat-"}, re: regexp.MustCompile(`(glpat-[0-9a-zA-Z_-]{20})`)},
-	{id: "bitbucket-pat", keywords: []string{"bbpat-"}, re: regexp.MustCompile(`(bbpat-[A-Za-z0-9]{20,200})`)},
-	{id: "bitbucket-repo-access-token", keywords: []string{"bbrat-"}, re: regexp.MustCompile(`(bbrat-[A-Za-z0-9]{20,200})`)},
-	{id: "aws-access-key-id", keywords: []string{"A3T", "AKIA", "ASIA"}, re: regexp.MustCompile(`((A3T[A-Z0-9]|AKIA|ASIA)[A-Z0-9]{16})`)},
-	{id: "hugging-face-access-token", keywords: []string{"hf_"}, re: regexp.MustCompile(`(hf_[A-Za-z0-9]{34,40})`)},
-	{id: "private-key", keywords: []string{"-----"}, caseInsensitive: true, re: regexp.MustCompile(`(?is)-----\s*?BEGIN[ A-Z0-9_-]*?PRIVATE KEY(?: BLOCK)?\s*?-----\s*([A-Za-z0-9=+/\s]+)\s*-----\s*?END[ A-Z0-9_-]*? PRIVATE KEY(?: BLOCK)?\s*?-----`)},
-	{id: "shopify-token", keywords: []string{"shpss_", "shpat_", "shpca_", "shppa_"}, re: regexp.MustCompile(`(shp(ss|at|ca|pa)_[a-fA-F0-9]{32})`)},
-	{id: "slack-access-token", keywords: []string{"xoxb-", "xoxa-", "xoxp-", "xoxr-", "xoxs-", "xoxo-", "xapp-", "xwfp-"}, re: regexp.MustCompile(`((xox[baoprs]-|xapp-|xwfp-)([0-9a-zA-Z-]{10,100}))`)},
-	{id: "slack-config-refresh-token", keywords: []string{"xoxe-"}, caseInsensitive: true, re: regexp.MustCompile(`(?i)(xoxe-[0-9]-[a-zA-Z0-9]{146})`)},
-	{id: "slack-config-access-token", keywords: []string{"xoxe.xoxb-", "xoxe.xoxp-"}, caseInsensitive: true, re: regexp.MustCompile(`(?i)(xoxe\.xox[bp]-[0-9]-[A-Z0-9]{163,166})`)},
-	{id: "slack-web-hook", keywords: []string{"hooks.slack.com"}, caseInsensitive: true, re: regexp.MustCompile(`(?i)(https://hooks\.slack\.com/(services|triggers|workflows)/[A-Za-z0-9+/]{43,56})`)},
-	{id: "stripe-secret-token", keywords: []string{"sk_test_", "sk_live_"}, caseInsensitive: true, re: regexp.MustCompile(`(?i)(sk_(test|live)_[0-9a-z]{10,99})`)},
-	{id: "supabase-service-key", keywords: []string{"sbp_"}, re: regexp.MustCompile(`(sbp_[a-fA-F0-9]{40})`)},
-	{id: "pypi-upload-token", keywords: []string{"pypi-AgEIcHlwaS5vcmc"}, re: regexp.MustCompile(`(pypi-AgEIcHlwaS5vcmc[A-Za-z0-9_-]{50,1000})`)},
-	{id: "cloudflare-api-token", keywords: []string{"cfut_"}, re: regexp.MustCompile(`\b(cfut_[A-Za-z0-9]{48})\b`)},
-	{id: "e2b-api-key", keywords: []string{"e2b_"}, re: regexp.MustCompile(`\b(e2b_[a-f0-9]{40})\b`)},
-	{id: "google-api-key", keywords: []string{"AIza"}, re: regexp.MustCompile(`\b(AIza[0-9A-Za-z_-]{35,40})\b`)},
-	{id: "twilio-api-key", keywords: []string{"SK"}, re: regexp.MustCompile(`(SK[0-9a-fA-F]{32})`)},
-	{id: "age-secret-key", keywords: []string{"AGE-SECRET-KEY-1"}, re: regexp.MustCompile(`(AGE-SECRET-KEY-1[QPZRY9X8GF2TVDW0S3JN54KHCE6MUA7L]{58})`)},
-	{id: "jwt-token", keywords: []string{".eyJ"}, re: regexp.MustCompile(`(ey[a-zA-Z0-9]{17,}\.ey[a-zA-Z0-9/_-]{17,}\.(?:[a-zA-Z0-9/_-]{10,}={0,2})?)`)},
-	{id: "npm-access-token", keywords: []string{"npm_"}, caseInsensitive: true, re: regexp.MustCompile(`(?i)(npm_[a-z0-9]{36})`)},
-	{id: "sendgrid-api-token", keywords: []string{"SG."}, caseInsensitive: true, re: regexp.MustCompile(`(?i)(SG\.[a-z0-9_.-]{66})`)},
-	{id: "linear-api-token", keywords: []string{"lin_api_"}, caseInsensitive: true, re: regexp.MustCompile(`(?i)(lin_api_[a-z0-9]{40})`)},
-	{id: "pulumi-api-token", keywords: []string{"pul-"}, re: regexp.MustCompile(`(pul-[a-f0-9]{40})`)},
-	{id: "postman-api-token", keywords: []string{"PMAK-"}, caseInsensitive: true, re: regexp.MustCompile(`(?i)(PMAK-[a-f0-9]{24}-[a-f0-9]{34})`)},
-	{id: "databricks-api-token", keywords: []string{"dapi"}, re: regexp.MustCompile(`(dapi[a-h0-9]{32})`)},
-	{id: "duffel-api-token", keywords: []string{"duffel_test_", "duffel_live_"}, caseInsensitive: true, re: regexp.MustCompile(`(?i)(duffel_(test|live)_[a-z0-9_-]{43})`)},
-	{id: "dynatrace-api-token", keywords: []string{"dt0c01."}, caseInsensitive: true, re: regexp.MustCompile(`(?i)(dt0c01\.[a-z0-9]{24}\.[a-z0-9]{64})`)},
-	{id: "new-relic-user-api-key", keywords: []string{"NRAK-"}, re: regexp.MustCompile(`(NRAK-[A-Z0-9]{27})`)},
-	{id: "new-relic-browser-api-token", keywords: []string{"NRJS-"}, re: regexp.MustCompile(`(NRJS-[a-f0-9]{19})`)},
-	{id: "planetscale-api-token", keywords: []string{"pscale_tkn_"}, caseInsensitive: true, re: regexp.MustCompile(`(?i)(pscale_tkn_[a-z0-9_.-]{43})`)},
-	{id: "planetscale-password", keywords: []string{"pscale_pw_"}, caseInsensitive: true, re: regexp.MustCompile(`(?i)(pscale_pw_[a-z0-9_.-]{43})`)},
-	{id: "rubygems-api-token", keywords: []string{"rubygems_"}, re: regexp.MustCompile(`(rubygems_[a-f0-9]{48})`)},
-	{id: "shippo-api-token", keywords: []string{"shippo_live_", "shippo_test_"}, re: regexp.MustCompile(`(shippo_(live|test)_[a-f0-9]{40})`)},
-	{id: "openai-api-key-project", keywords: []string{"sk-proj-"}, caseInsensitive: true, re: regexp.MustCompile(`(?i)(sk-proj-[A-Za-z0-9]{24}-[A-Za-z0-9]{40,128})`)},
-	{id: "openai-api-key-env", keywords: []string{"sk-live-", "sk-test-"}, caseInsensitive: true, re: regexp.MustCompile(`(?i)(sk-(?:live|test)-[A-Za-z0-9]{24}-[A-Za-z0-9]{40,128})`)},
-	{id: "openai-api-key", keywords: []string{"sk-"}, re: regexp.MustCompile(`(sk-[a-zA-Z0-9]{50})`)},
-	{id: "anthropic-api-key", keywords: []string{"sk-ant-"}, re: regexp.MustCompile(`(sk-ant-([a-zA-Z0-9]{1,10}-)?[a-zA-Z0-9_-]{32,128})`)},
-	{id: "api-key", keywords: []string{"api-key", "api_key", "api-token", "api_token"}, caseInsensitive: true, re: regexp.MustCompile(`(?i)(?:[a-z0-9_ .,-]{0,25}api[-_](?:key|token)[a-z0-9_ .,-]{0,25})\s*(?:=|>|:=|\|\|:|<=|=>|:)\s*['"]?([a-z0-9+/=_-]{6,256})`)},
-	{id: "webhook-secret", keywords: []string{"webhook-secret", "webhook_secret"}, caseInsensitive: true, re: regexp.MustCompile(`(?i)(?:[a-z0-9_ .,-]{0,25}webhook[-_]secret[a-z0-9_ .,-]{0,25})\s*(?:=|>|:=|\|\|:|<=|=>|:)\s*['"]?([a-z0-9+/=_-]{6,256})`)},
-	{id: "secret-value", keywords: []string{"secret"}, caseInsensitive: true, re: regexp.MustCompile(`(?i)(?:[a-z0-9_ .,-]{0,25}[-_](?:secret)[a-z0-9_ .,-]{0,25})\s*(?:=|>|:=|\|\|:|<=|=>|:)\s*['"]?([a-z0-9+/=_-]{6,256})`)},
-	{id: "password", keywords: []string{"password"}, caseInsensitive: true, re: regexp.MustCompile(`(?i)(?:[a-z0-9_ .,-]{0,25}password[a-z0-9_ .,-]{0,25})\s*(?:=|>|:=|\|\|:|<=|=>|:)\s*['"]?([a-z0-9+/=_-]{6,128})`)},
-	{id: "sk-secret", keywords: []string{"sk-", "sk_"}, caseInsensitive: true, re: regexp.MustCompile(`(?i)(?:^|['"\s])(sk(?:[-_][a-z0-9]{1,10})?[-_][a-z0-9]{10,99})(?:$|['"\s])`)},
+	{id: "sourcegraph-access-token-v3", keywords: []string{"sgp_"}, caseInsensitive: false, re: mustCompileNeoBinarySecretRegexp(`(sgp_(?:[a-fA-F0-9]{16}|local)_[a-fA-F0-9]{40})`, false)},
+	{id: "sourcegraph-access-token-v2", keywords: []string{"sgp_"}, caseInsensitive: false, re: mustCompileNeoBinarySecretRegexp(`(sgp_[a-fA-F0-9]{40})`, false)},
+	{id: "sourcegraph-dotcom-user-gateway", keywords: []string{"sgd_"}, caseInsensitive: false, re: mustCompileNeoBinarySecretRegexp(`(sgd_[a-fA-F0-9]{64})`, false)},
+	{id: "sourcegraph-license-key", keywords: []string{"slk_"}, caseInsensitive: false, re: mustCompileNeoBinarySecretRegexp(`(slk_[a-fA-F0-9]{64})`, false)},
+	{id: "sourcegraph-enterprise-subscription", keywords: []string{"sgs_"}, caseInsensitive: false, re: mustCompileNeoBinarySecretRegexp(`(sgs_[a-fA-F0-9]{64})`, false)},
+	{id: "sourcegraph-amp", keywords: []string{"sgamp_user_"}, caseInsensitive: false, re: mustCompileNeoBinarySecretRegexp(`(sgamp_user_[A-Z0-9]{26}_[a-f0-9]{64})`, false)},
+	{id: "sourcegraph-amp-auth-bypass", keywords: []string{"sgamp_user_auth-bypass_"}, caseInsensitive: false, re: mustCompileNeoBinarySecretRegexp(`(sgamp_user_auth-bypass_[a-zA-Z0-9_-]+)`, false)},
+	{id: "sourcegraph-workspace-token", keywords: []string{"sgp_ws"}, caseInsensitive: false, re: mustCompileNeoBinarySecretRegexp(`(sgp_ws[a-fA-F0-9]{32}_[a-fA-F0-9]{40})`, false)},
+	{id: "github-pat", keywords: []string{"ghp_"}, caseInsensitive: false, re: mustCompileNeoBinarySecretRegexp(`(ghp_[0-9a-zA-Z]{36})`, false)},
+	{id: "github-oauth", keywords: []string{"gho_"}, caseInsensitive: false, re: mustCompileNeoBinarySecretRegexp(`(gho_[0-9a-zA-Z]{36})`, false)},
+	{id: "github-app-token", keywords: []string{"ghu_", "ghs_"}, caseInsensitive: false, re: mustCompileNeoBinarySecretRegexp(`((ghu|ghs)_[0-9a-zA-Z]{36})`, false)},
+	{id: "github-refresh-token", keywords: []string{"ghr_"}, caseInsensitive: false, re: mustCompileNeoBinarySecretRegexp(`(ghr_[0-9a-zA-Z]{76})`, false)},
+	{id: "github-fine-grained-pat", keywords: []string{"github_pat_"}, caseInsensitive: false, re: mustCompileNeoBinarySecretRegexp(`(github_pat_[a-zA-Z0-9]{22}_[a-zA-Z0-9]{59})`, false)},
+	{id: "gitlab-pat", keywords: []string{"glpat-"}, caseInsensitive: false, re: mustCompileNeoBinarySecretRegexp(`(glpat-[0-9a-zA-Z_-]{20})`, false)},
+	{id: "bitbucket-pat", keywords: []string{"bbpat-"}, caseInsensitive: false, re: mustCompileNeoBinarySecretRegexp(`(bbpat-[A-Za-z0-9]{20,200})`, false)},
+	{id: "bitbucket-repo-access-token", keywords: []string{"bbrat-"}, caseInsensitive: false, re: mustCompileNeoBinarySecretRegexp(`(bbrat-[A-Za-z0-9]{20,200})`, false)},
+	{id: "bitbucket-dc-http-token", keywords: []string{"bitbucket"}, caseInsensitive: false, re: mustCompileNeoBinarySecretRegexp(`(?:[a-z0-9_ .,-]{0,25}bitbucket[a-z0-9_ .,-]{0,25})(?:=|>|:=|\|\|:|<=|=>|:).{0,5}['"]([A-Za-z0-9+/]{40,80}={0,2})['"]`, false)},
+	{id: "aws-access-key-id", keywords: []string{"A3T", "AKIA", "ASIA"}, caseInsensitive: false, re: mustCompileNeoBinarySecretRegexp(`((A3T[A-Z0-9]|AKIA|ASIA)[A-Z0-9]{16})`, false)},
+	{id: "hugging-face-access-token", keywords: []string{"hf_"}, caseInsensitive: false, re: mustCompileNeoBinarySecretRegexp(`(hf_[A-Za-z0-9]{34,40})`, false)},
+	{id: "private-key", keywords: []string{"-----"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`-----\s*?BEGIN[ A-Z0-9_-]*?PRIVATE KEY(?: BLOCK)?\s*?-----\s*([A-Za-z0-9=+/\s]+)\s*-----\s*?END[ A-Z0-9_-]*? PRIVATE KEY(?: BLOCK)?\s*?-----`, true)},
+	{id: "shopify-token", keywords: []string{"shpss_", "shpat_", "shpca_", "shppa_"}, caseInsensitive: false, re: mustCompileNeoBinarySecretRegexp(`(shp(ss|at|ca|pa)_[a-fA-F0-9]{32})`, false)},
+	{id: "slack-access-token", keywords: []string{"xoxb-", "xoxa-", "xoxp-", "xoxr-", "xoxs-", "xoxo-", "xapp-", "xwfp-"}, caseInsensitive: false, re: mustCompileNeoBinarySecretRegexp(`((xox[baoprs]-|xapp-|xwfp-)([0-9a-zA-Z-]{10,100}))`, false)},
+	{id: "slack-config-refresh-token", keywords: []string{"xoxe-"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(xoxe-\d-[a-zA-Z0-9]{146})`, true)},
+	{id: "slack-config-access-token", keywords: []string{"xoxe.xoxb-", "xoxe.xoxp-"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(xoxe.xox[bp]-\d-[A-Z0-9]{163,166})`, true)},
+	{id: "slack-web-hook", keywords: []string{"hooks.slack.com"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(https:\/\/hooks\.slack\.com\/(services|triggers|workflows)\/[A-Za-z0-9+\/]{43,56})`, true)},
+	{id: "stripe-secret-token", keywords: []string{"sk_test_", "sk_live_"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(sk_(test|live)_[0-9a-z]{10,99})`, true)},
+	{id: "supabase-service-key", keywords: []string{"sbp_"}, caseInsensitive: false, re: mustCompileNeoBinarySecretRegexp(`(sbp_[a-fA-F0-9]{40})`, false)},
+	{id: "pypi-upload-token", keywords: []string{"pypi-AgEIcHlwaS5vcmc"}, caseInsensitive: false, re: mustCompileNeoBinarySecretRegexp(`(pypi-AgEIcHlwaS5vcmc[A-Za-z0-9_-]{50,1000})`, false)},
+	{id: "gcp-service-account", keywords: []string{"\"type\": \"service_account\""}, caseInsensitive: false, re: mustCompileNeoBinarySecretRegexp(`("type": "service_account")`, false)},
+	{id: "cloudflare-api-token", keywords: []string{"cfut_"}, caseInsensitive: false, re: mustCompileNeoBinarySecretRegexp(`\b(cfut_[A-Za-z0-9]{48})\b`, false)},
+	{id: "e2b-api-key", keywords: []string{"e2b_"}, caseInsensitive: false, re: mustCompileNeoBinarySecretRegexp(`\b(e2b_[a-f0-9]{40})\b`, false)},
+	{id: "google-api-key", keywords: []string{"AIza"}, caseInsensitive: false, re: mustCompileNeoBinarySecretRegexp(`\b(AIza[0-9A-Za-z_-]{35,40})\b`, false)},
+	{id: "heroku-api-key", keywords: []string{"heroku"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(?:heroku[a-z0-9_ .,-]{0,25})(?:=|>|:=|\|\|:|<=|=>|:).{0,5}['"](\d[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12})['"]`, true)},
+	{id: "twilio-api-key", keywords: []string{"SK"}, caseInsensitive: false, re: mustCompileNeoBinarySecretRegexp(`(SK[0-9a-fA-F]{32})`, false)},
+	{id: "age-secret-key", keywords: []string{"AGE-SECRET-KEY-1"}, caseInsensitive: false, re: mustCompileNeoBinarySecretRegexp(`(AGE-SECRET-KEY-1[QPZRY9X8GF2TVDW0S3JN54KHCE6MUA7L]{58})`, false)},
+	{id: "jwt-token", keywords: []string{".eyJ"}, caseInsensitive: false, re: mustCompileNeoBinarySecretRegexp(`(ey[a-zA-Z0-9]{17,}\.ey[a-zA-Z0-9/\\_-]{17,}\.(?:[a-zA-Z0-9/\\_-]{10,}={0,2})?)`, false)},
+	{id: "npm-access-token", keywords: []string{"npm_"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(npm_[a-z0-9]{36})`, true)},
+	{id: "sendgrid-api-token", keywords: []string{"SG."}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(SG\.[a-z0-9_.-]{66})`, true)},
+	{id: "aws-secret-access-key", keywords: []string{"key"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(aws[_-]secret[_-]access[_-]key[_-][A-Za-z0-9/+=]{40})`, true)},
+	{id: "dockerconfig-secret", keywords: []string{"dockerc"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`((\.dockerconfigjson|dockercfg):\s*\|*\s*((ey|ew)+[A-Za-z0-9/+=]+))`, true)},
+	{id: "linear-api-token", keywords: []string{"lin_api_"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(lin_api_[a-z0-9]{40})`, true)},
+	{id: "sendinblue-api-token", keywords: []string{"xkeysib-"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(xkeysib-[a-f0-9]{64}-[a-z0-9]{16})`, true)},
+	{id: "planetscale-api-token", keywords: []string{"pscale_tkn_"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(pscale_tkn_[a-z0-9_.-]{43})`, true)},
+	{id: "doppler-api-token", keywords: []string{"dp.pt."}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(dp\.pt\.[a-z0-9]{43})`, true)},
+	{id: "discord-api-token", keywords: []string{"discord"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(?:discord[a-z0-9_ .,-]{0,25})(?:=|>|:=|\|\|:|<=|=>|:).{0,5}['"]([a-h0-9]{64})['"]`, true)},
+	{id: "pulumi-api-token", keywords: []string{"pul-"}, caseInsensitive: false, re: mustCompileNeoBinarySecretRegexp(`(pul-[a-f0-9]{40})`, false)},
+	{id: "postman-api-token", keywords: []string{"PMAK-"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(PMAK-[a-f0-9]{24}-[a-f0-9]{34})`, true)},
+	{id: "facebook-token", keywords: []string{"facebook"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(?:facebook[a-z0-9_ .,-]{0,25})(?:=|>|:=|\|\|:|<=|=>|:).{0,5}['"]([a-f0-9]{32})['"]`, true)},
+	{id: "twitter-token", keywords: []string{"twitter"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(?:twitter[a-z0-9_ .,-]{0,25})(?:=|>|:=|\|\|:|<=|=>|:).{0,5}['"]([a-f0-9]{35,44})['"]`, true)},
+	{id: "adobe-client-id", keywords: []string{"adobe"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(?:adobe[a-z0-9_ .,-]{0,25})(?:=|>|:=|\|\|:|<=|=>|:).{0,5}['"]([a-f0-9]{32})['"]`, true)},
+	{id: "adobe-client-secret", keywords: []string{"p8e-"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(p8e-[a-z0-9]{32})`, true)},
+	{id: "alibaba-access-key-id", keywords: []string{"LTAI"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`((LTAI)[a-z0-9]{20})`, true)},
+	{id: "alibaba-secret-key", keywords: []string{"alibaba"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(?:alibaba[a-z0-9_ .,-]{0,25})(?:=|>|:=|\|\|:|<=|=>|:).{0,5}['"]([a-z0-9]{30})['"]`, true)},
+	{id: "asana-client-id", keywords: []string{"asana"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(?:asana[a-z0-9_ .,-]{0,25})(?:=|>|:=|\|\|:|<=|=>|:).{0,5}['"]([0-9]{16})['"]`, true)},
+	{id: "asana-client-secret", keywords: []string{"asana"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(?:asana[a-z0-9_ .,-]{0,25})(?:=|>|:=|\|\|:|<=|=>|:).{0,5}['"]([a-z0-9]{32})['"]`, true)},
+	{id: "atlassian-api-token", keywords: []string{"atlassian"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(?:atlassian[a-z0-9_ .,-]{0,25})(?:=|>|:=|\|\|:|<=|=>|:).{0,5}['"]([a-z0-9]{24})['"]`, true)},
+	{id: "beamer-api-token", keywords: []string{"beamer"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(?:beamer[a-z0-9_ .,-]{0,25})(?:=|>|:=|\|\|:|<=|=>|:).{0,5}['"](b_[a-z0-9=_-]{44})['"]`, true)},
+	{id: "buildkite-agent-token", keywords: []string{"bkua_"}, caseInsensitive: false, re: mustCompileNeoBinarySecretRegexp(`(bkua_[a-fA-F0-9]{40})`, false)},
+	{id: "clojars-api-token", keywords: []string{"CLOJARS_"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(CLOJARS_[a-z0-9]{60})`, true)},
+	{id: "contentful-delivery-api-token", keywords: []string{"contentful"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(?:contentful[a-z0-9_ .,-]{0,25})(?:=|>|:=|\|\|:|<=|=>|:).{0,5}['"]([a-z0-9=_-]{43})['"]`, true)},
+	{id: "databricks-api-token", keywords: []string{"dapi"}, caseInsensitive: false, re: mustCompileNeoBinarySecretRegexp(`(dapi[a-h0-9]{32})`, false)},
+	{id: "discord-client-id", keywords: []string{"discord"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(?:discord[a-z0-9_ .,-]{0,25})(?:=|>|:=|\|\|:|<=|=>|:).{0,5}['"]([0-9]{18})['"]`, true)},
+	{id: "discord-client-secret", keywords: []string{"discord"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(?:discord[a-z0-9_ .,-]{0,25})(?:=|>|:=|\|\|:|<=|=>|:).{0,5}['"]([a-z0-9=_-]{32})['"]`, true)},
+	{id: "dropbox-api-secret", keywords: []string{"dropbox"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(?:dropbox[a-z0-9_ .,-]{0,25})(?:=|>|:=|\|\|:|<=|=>|:).{0,5}['"]([a-z0-9]{15})['"]`, true)},
+	{id: "dropbox-short-lived-api-token", keywords: []string{"dropbox"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(?:dropbox[a-z0-9_ .,-]{0,25})(?:=|>|:=|\|\|:|<=|=>|:).{0,5}['"](sl\.[a-z0-9=_-]{135})['"]`, true)},
+	{id: "dropbox-long-lived-api-token", keywords: []string{"dropbox"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(?:dropbox[a-z0-9_ .,-]{0,25})(?:=|>|:=|\|\|:|<=|=>|:).{0,5}['"]([a-z0-9]{11}(AAAAAAAAAA)[a-z0-9_=-]{43})['"]`, true)},
+	{id: "duffel-api-token", keywords: []string{"duffel_test_", "duffel_live_"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(duffel_(test|live)_[a-z0-9_-]{43})`, true)},
+	{id: "dynatrace-api-token", keywords: []string{"dt0c01."}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(dt0c01\.[a-z0-9]{24}\.[a-z0-9]{64})`, true)},
+	{id: "easypost-api-token", keywords: []string{"EZAK", "EZAT"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(EZ[AT]K[a-z0-9]{54})`, true)},
+	{id: "fastly-api-token", keywords: []string{"fastly"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(?:fastly[a-z0-9_ .,-]{0,25})(?:=|>|:=|\|\|:|<=|=>|:).{0,5}['"]([a-z0-9=_-]{32})['"]`, true)},
+	{id: "finicity-client-secret", keywords: []string{"finicity"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(?:finicity[a-z0-9_ .,-]{0,25})(?:=|>|:=|\|\|:|<=|=>|:).{0,5}['"]([a-z0-9]{20})['"]`, true)},
+	{id: "finicity-api-token", keywords: []string{"finicity"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(?:finicity[a-z0-9_ .,-]{0,25})(?:=|>|:=|\|\|:|<=|=>|:).{0,5}['"]([a-f0-9]{32})['"]`, true)},
+	{id: "flutterwave-public-key", keywords: []string{"FLWSECK_TEST-", "FLWPUBK_TEST-"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(FLW(PUB|SEC)K_TEST-[a-h0-9]{32}-X)`, true)},
+	{id: "flutterwave-enc-key", keywords: []string{"FLWSECK_TEST"}, caseInsensitive: false, re: mustCompileNeoBinarySecretRegexp(`(FLWSECK_TEST[a-h0-9]{12})`, false)},
+	{id: "frameio-api-token", keywords: []string{"fio-u-"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(fio-u-[a-z0-9_=-]{64})`, true)},
+	{id: "gocardless-api-token", keywords: []string{"live_"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(live_[a-z0-9_=-]{40})`, true)},
+	{id: "grafana-api-token", keywords: []string{"eyJrIjoi"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(eyJrIjoi[a-z0-9_=-]{72,92})`, true)},
+	{id: "hashicorp-tf-api-token", keywords: []string{"atlasv1."}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`([a-z0-9]{14}\.atlasv1\.[a-z0-9_=-]{60,70})`, true)},
+	{id: "hubspot-api-token", keywords: []string{"hubspot"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(?:hubspot[a-z0-9_ .,-]{0,25})(?:=|>|:=|\|\|:|<=|=>|:).{0,5}['"]([a-h0-9]{8}-[a-h0-9]{4}-[a-h0-9]{4}-[a-h0-9]{4}-[a-h0-9]{12})['"]`, true)},
+	{id: "intercom-api-token", keywords: []string{"intercom"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(?:intercom[a-z0-9_ .,-]{0,25})(?:=|>|:=|\|\|:|<=|=>|:).{0,5}['"]([a-z0-9=_]{60})['"]`, true)},
+	{id: "intercom-client-secret", keywords: []string{"intercom"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(?:intercom[a-z0-9_ .,-]{0,25})(?:=|>|:=|\|\|:|<=|=>|:).{0,5}['"]([a-h0-9]{8}-[a-h0-9]{4}-[a-h0-9]{4}-[a-h0-9]{4}-[a-h0-9]{12})['"]`, true)},
+	{id: "ionic-api-token", keywords: []string{"ionic"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(?:ionic[a-z0-9_ .,-]{0,25})(?:=|>|:=|\|\|:|<=|=>|:).{0,5}['"](ion_[a-z0-9]{42})['"]`, true)},
+	{id: "linear-client-secret", keywords: []string{"linear"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(?:linear[a-z0-9_ .,-]{0,25})(?:=|>|:=|\|\|:|<=|=>|:).{0,5}['"]([a-f0-9]{32})['"]`, true)},
+	{id: "lob-api-key", keywords: []string{"lob"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(?:lob[a-z0-9_ .,-]{0,25})(?:=|>|:=|\|\|:|<=|=>|:).{0,5}['"]((live|test)_[a-f0-9]{35})['"]`, true)},
+	{id: "mailchimp-api-key", keywords: []string{"mailchimp"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(?:mailchimp[a-z0-9_ .,-]{0,25})(?:=|>|:=|\|\|:|<=|=>|:).{0,5}['"]([a-f0-9]{32}-us20)['"]`, true)},
+	{id: "mailgun-token", keywords: []string{"mailgun"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(?:mailgun[a-z0-9_ .,-]{0,25})(?:=|>|:=|\|\|:|<=|=>|:).{0,5}['"]((pub)?key-[a-f0-9]{32})['"]`, true)},
+	{id: "mailgun-signing-key", keywords: []string{"mailgun"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(?:mailgun[a-z0-9_ .,-]{0,25})(?:=|>|:=|\|\|:|<=|=>|:).{0,5}['"]([a-h0-9]{32}-[a-h0-9]{8}-[a-h0-9]{8})['"]`, true)},
+	{id: "mapbox-api-token", keywords: []string{"pk."}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(pk\.[a-z0-9]{60}\.[a-z0-9]{22})`, true)},
+	{id: "messagebird-api-token", keywords: []string{"messagebird"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(?:messagebird[a-z0-9_ .,-]{0,25})(?:=|>|:=|\|\|:|<=|=>|:).{0,5}['"]([a-z0-9]{25})['"]`, true)},
+	{id: "messagebird-client-id", keywords: []string{"messagebird"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(?:messagebird[a-z0-9_ .,-]{0,25})(?:=|>|:=|\|\|:|<=|=>|:).{0,5}['"]([a-h0-9]{8}-[a-h0-9]{4}-[a-h0-9]{4}-[a-h0-9]{4}-[a-h0-9]{12})['"]`, true)},
+	{id: "new-relic-user-api-key", keywords: []string{"NRAK-"}, caseInsensitive: false, re: mustCompileNeoBinarySecretRegexp(`(NRAK-[A-Z0-9]{27})`, false)},
+	{id: "new-relic-user-api-id", keywords: []string{"newrelic"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(?:newrelic[a-z0-9_ .,-]{0,25})(?:=|>|:=|\|\|:|<=|=>|:).{0,5}['"]([A-Z0-9]{64})['"]`, true)},
+	{id: "new-relic-browser-api-token", keywords: []string{"NRJS-"}, caseInsensitive: false, re: mustCompileNeoBinarySecretRegexp(`(NRJS-[a-f0-9]{19})`, false)},
+	{id: "planetscale-password", keywords: []string{"pscale_pw_"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(pscale_pw_[a-z0-9_.-]{43})`, true)},
+	{id: "private-packagist-token", keywords: []string{"packagist_uut_", "packagist_ort_", "packagist_out_"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(packagist_[ou][ru]t_[a-f0-9]{68})`, true)},
+	{id: "rubygems-api-token", keywords: []string{"rubygems_"}, caseInsensitive: false, re: mustCompileNeoBinarySecretRegexp(`(rubygems_[a-f0-9]{48})`, false)},
+	{id: "shippo-api-token", keywords: []string{"shippo_live_", "shippo_test_"}, caseInsensitive: false, re: mustCompileNeoBinarySecretRegexp(`(shippo_(live|test)_[a-f0-9]{40})`, false)},
+	{id: "linkedin-client-secret", keywords: []string{"linkedin"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(?:linkedin[a-z0-9_ .,-]{0,25})(?:=|>|:=|\|\|:|<=|=>|:).{0,5}['"]([a-z]{16})['"]`, true)},
+	{id: "linkedin-client-id", keywords: []string{"linkedin"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(?:linkedin[a-z0-9_ .,-]{0,25})(?:=|>|:=|\|\|:|<=|=>|:).{0,5}['"]([a-z0-9]{14})['"]`, true)},
+	{id: "twitch-api-token", keywords: []string{"twitch"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(?:twitch[a-z0-9_ .,-]{0,25})(?:=|>|:=|\|\|:|<=|=>|:).{0,5}['"]([a-z0-9]{30})['"]`, true)},
+	{id: "typeform-api-token", keywords: []string{"typeform"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(?:typeform[a-z0-9_ .,-]{0,25})(?:=|>|:=|\|\|:|<=|=>|:).{0,5}(tfp_[a-z0-9_.=-]{59})`, true)},
+	{id: "todoist-api-token", keywords: []string{"todoist"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(?:todoist[a-z0-9_ .,-]{0,25})(?:=|>|:=|\|\|:|<=|=>|:)[\s'"]{0,3}([0-9a-f]{40})`, true)},
+	{id: "openai-api-key", keywords: []string{"sk-"}, caseInsensitive: false, re: mustCompileNeoBinarySecretRegexp(`(sk-[a-zA-Z0-9]{50})`, false)},
+	{id: "openai-api-key-project", keywords: []string{"sk-proj-"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(sk-proj-[A-Za-z0-9]{24}-[A-Za-z0-9]{40,128})`, true)},
+	{id: "openai-api-key-env", keywords: []string{"sk-live-", "sk-test-"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(sk-(?:live|test)-[A-Za-z0-9]{24}-[A-Za-z0-9]{40,128})`, true)},
+	{id: "anthropic-api-key", keywords: []string{"sk-ant-"}, caseInsensitive: false, re: mustCompileNeoBinarySecretRegexp(`(sk-ant-([a-zA-Z0-9]{1,10}-)?[a-zA-Z0-9_-]{32,128})`, false)},
+	{id: "canva-token", keywords: []string{"cnv"}, caseInsensitive: false, re: mustCompileNeoBinarySecretRegexp(`\b(cnv[a-z0-9]{2}[A-Za-z0-9_=-]+[a-f0-9]{8})\b`, false)},
+	{id: "api-key", keywords: []string{"api-key", "api_key", "api-token", "api_token"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(?:[a-z0-9_ .,-]{0,25}api[-_](?:key|token)(?!length|count|max|min|maxlength|_length|_count|_min|_maxlength)[a-z0-9_ .,-]{0,25})\s*(?:=|>|:=|\|\|:|<=|=>|:)\s*['"]?((?!.*(?:api|key|secret|foo|example|dummy|password|12345|abcde|placeholder|fake|token))[a-z0-9+/=_-]{6,256})['"]?(?=\s|$|[;,\]})'"])`, true)},
+	{id: "webhook-secret", keywords: []string{"webhook-secret", "webhook_secret"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(?:[a-z0-9_ .,-]{0,25}webhook[-_]secret(?!length|count|max|min|maxlength|_length|_count|_min|_maxlength)[a-z0-9_ .,-]{0,25})\s*(?:=|>|:=|\|\|:|<=|=>|:)\s*['"]?((?!.*(?:api|key|secret|foo|example|dummy|password|12345|abcde|placeholder|fake|token|webhook))[a-z0-9+/=_-]{6,256})['"]?(?=\s|$|[;,\]})'"])`, true)},
+	{id: "secret-value", keywords: []string{"secret"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(?:[a-z0-9_ .,-]{0,25}[-_](?:secret)(?!length|count|max|min|maxlength|_length|_count|_min|_maxlength)[a-z0-9_ .,-]{0,25})\s*(?:=|>|:=|\|\|:|<=|=>|:)\s*['"]?((?!.*(?:api|key|secret|foo|example|dummy|password|12345|abcde|placeholder|fake|token))[a-z0-9+/=_-]{6,256})['"]?(?=\s|$|[;,\]})'"])`, true)},
+	{id: "password", keywords: []string{"password"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(?:[a-z0-9_ .,-]{0,25}password(?!length|count|max|min|maxlength|_length|_count|_min|_maxlength)[a-z0-9_ .,-]{0,25})\s*(?:=|>|:=|\|\|:|<=|=>|:)\s*['"]?((?!.*(?:api|key|secret|foo|example|dummy|string|password|12345|abcde|placeholder|fake|token|password|pass|pwd))[a-z0-9+/=_-]{6,128})['"]?(?=\s|$|[;,\]})'"])`, true)},
+	{id: "sk-secret", keywords: []string{"sk-", "sk_"}, caseInsensitive: true, re: mustCompileNeoBinarySecretRegexp(`(?:^|['"\s])(sk(?:[-_][a-z0-9]{1,10})?[-_][a-z0-9]{10,99})(?:$|['"\s])`, true)},
 }
 
 func sanitizeNeoBinaryReducerValue(value any) any {
@@ -17358,32 +17423,53 @@ func neoBinaryRedactionPatternKeywordMatches(value string, pattern neoBinarySecr
 }
 
 func redactNeoBinarySecretPattern(value string, pattern neoBinarySecretRedactionPattern) string {
-	matches := pattern.re.FindAllStringSubmatchIndex(value, -1)
-	if len(matches) == 0 {
-		return value
-	}
 	replacement := "[REDACTED:" + pattern.id + "]"
 	var out strings.Builder
 	out.Grow(len(value))
 	last := 0
 	changed := false
-	for _, match := range matches {
-		if len(match) < 4 || match[2] < 0 || match[3] < 0 {
+	match, err := pattern.re.FindStringMatch(value)
+	for err == nil && match != nil {
+		groups := match.Groups()
+		if len(groups) < 2 {
+			match, err = pattern.re.FindNextMatch(match)
 			continue
 		}
-		if match[2] < last {
+		group := groups[1]
+		start := byteIndexForRuneOffset(value, group.Index)
+		end := byteIndexForRuneOffset(value, group.Index+group.Length)
+		if start < 0 || end < start || start < last {
+			match, err = pattern.re.FindNextMatch(match)
 			continue
 		}
-		out.WriteString(value[last:match[2]])
+		out.WriteString(value[last:start])
 		out.WriteString(replacement)
-		last = match[3]
+		last = end
 		changed = true
+		match, err = pattern.re.FindNextMatch(match)
 	}
 	if !changed {
 		return value
 	}
 	out.WriteString(value[last:])
 	return out.String()
+}
+
+func byteIndexForRuneOffset(value string, offset int) int {
+	if offset <= 0 {
+		return 0
+	}
+	count := 0
+	for index := range value {
+		if count == offset {
+			return index
+		}
+		count++
+	}
+	if count == offset {
+		return len(value)
+	}
+	return len(value)
 }
 
 func cloneNeoJSONMap(in map[string]any) map[string]any {
