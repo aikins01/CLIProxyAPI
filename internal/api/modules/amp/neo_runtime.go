@@ -16954,15 +16954,91 @@ func normalizeNeoExecutorStatus(msg map[string]any) map[string]any {
 
 func normalizeNeoExecutorStatusDetails(details map[string]any) map[string]any {
 	out := cloneMap(details)
-	if reason := stringValue(out["reasonCode"]); reason != "" && !validNeoExecutorReason(reason) {
-		out["reasonCode"] = "spawn_failed"
+	if _, exists := out["reasonCode"]; exists && !validNeoExecutorReason(stringValue(out["reasonCode"])) {
+		delete(out, "reasonCode")
+	}
+	if rawEnvironment, exists := out["executionEnvironment"]; exists {
+		if environment, ok := normalizeNeoExecutorExecutionEnvironment(rawEnvironment); ok {
+			out["executionEnvironment"] = environment
+		} else {
+			delete(out, "executionEnvironment")
+		}
 	}
 	return out
+}
+
+func normalizeNeoExecutorExecutionEnvironment(raw any) (map[string]any, bool) {
+	environment, ok := asMap(raw)
+	if !ok {
+		return nil, false
+	}
+	out := cloneMap(environment)
+	if value, exists := out["setupState"]; exists && value != nil && !validNeoExecutorSetupState(stringValue(value)) {
+		delete(out, "setupState")
+	}
+	if value, exists := out["setupPhase"]; exists && value != nil && !validNeoExecutorSetupPhase(stringValue(value)) {
+		delete(out, "setupPhase")
+	}
+	if _, exists := out["stage"]; exists && !validNeoExecutorStage(stringValue(out["stage"])) {
+		delete(out, "stage")
+	}
+	if _, exists := out["operation"]; exists && !validNeoExecutorOperation(stringValue(out["operation"])) {
+		delete(out, "operation")
+	}
+	if _, exists := out["providerState"]; exists && !validNeoExecutorProviderState(stringValue(out["providerState"])) {
+		delete(out, "providerState")
+	}
+	return out, true
 }
 
 func validNeoExecutorReason(reason string) bool {
 	switch reason {
 	case "spawn_requested", "spawn_rejected", "environment_recovering", "waiting_for_executor_connect", "executor_connected", "executor_disconnected", "connect_timeout", "executor_connect_rejected", "spawn_failed", "restart_failed", "environment_missing":
+		return true
+	default:
+		return false
+	}
+}
+
+func validNeoExecutorStage(stage string) bool {
+	switch stage {
+	case "missing", "allocating_environment", "configuring_workspace", "starting_headless", "headless_ready", "paused", "failed":
+		return true
+	default:
+		return false
+	}
+}
+
+func validNeoExecutorSetupState(state string) bool {
+	switch state {
+	case "pending", "ready", "failed":
+		return true
+	default:
+		return false
+	}
+}
+
+func validNeoExecutorSetupPhase(phase string) bool {
+	switch phase {
+	case "allocating_environment", "configuring_workspace", "starting_headless":
+		return true
+	default:
+		return false
+	}
+}
+
+func validNeoExecutorOperation(operation string) bool {
+	switch operation {
+	case "idle", "creating", "recovering":
+		return true
+	default:
+		return false
+	}
+}
+
+func validNeoExecutorProviderState(state string) bool {
+	switch state {
+	case "unknown", "running", "paused", "missing":
 		return true
 	default:
 		return false
@@ -17048,9 +17124,7 @@ func toolApprovalQueuePayload(approvals []any) map[string]any {
 	for _, approval := range approvals {
 		if approvalMap, ok := asMap(approval); ok {
 			normalized = append(normalized, neoProtocolApproval(approvalMap))
-			continue
 		}
-		normalized = append(normalized, approval)
 	}
 	approvals = normalized
 	return map[string]any{"type": "tool_approval_queue", "approvals": approvals}
@@ -17066,6 +17140,15 @@ func neoProtocolApproval(approval map[string]any) map[string]any {
 		out["toolCallId"] = toolCallID
 	}
 	delete(out, "toolUseId")
+	if context := stringValue(out["context"]); context != "thread" && context != "subagent" {
+		out["context"] = "thread"
+	}
+	if _, exists := out["ruleSource"]; exists {
+		ruleSource := stringValue(out["ruleSource"])
+		if ruleSource != "user" && ruleSource != "built-in" {
+			delete(out, "ruleSource")
+		}
+	}
 	return out
 }
 

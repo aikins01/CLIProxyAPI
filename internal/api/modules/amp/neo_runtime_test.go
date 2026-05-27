@@ -2440,6 +2440,43 @@ func TestNeoToolProtocolNormalizersAcceptToolUseAliases(t *testing.T) {
 	}
 }
 
+func TestNeoToolApprovalQueueNormalizesLikeBinary(t *testing.T) {
+	payload := toolApprovalQueuePayload([]any{
+		"not-an-approval",
+		map[string]any{
+			"id":         "TU-approval",
+			"toolUseId":  "TU-approval",
+			"toolName":   "Bash",
+			"context":    "workspace",
+			"ruleSource": "workspace",
+		},
+		map[string]any{
+			"toolCallId": "TU-valid",
+			"toolName":   "Read",
+			"context":    "subagent",
+			"ruleSource": "user",
+		},
+	})
+	approvals := arrayValue(payload["approvals"])
+	if len(approvals) != 2 {
+		t.Fatalf("approvals = %#v, want 2 object approvals", approvals)
+	}
+	first := mapValue(approvals[0])
+	if first["toolCallId"] != "TU-approval" || first["context"] != "thread" {
+		t.Fatalf("first approval = %#v, want alias plus thread context", first)
+	}
+	if _, exists := first["toolUseId"]; exists {
+		t.Fatalf("first approval leaked toolUseId: %#v", first)
+	}
+	if _, exists := first["ruleSource"]; exists {
+		t.Fatalf("first approval kept invalid ruleSource: %#v", first)
+	}
+	second := mapValue(approvals[1])
+	if second["context"] != "subagent" || second["ruleSource"] != "user" {
+		t.Fatalf("second approval = %#v, want valid context/ruleSource preserved", second)
+	}
+}
+
 func TestNeoActorProtocolToolResultMessageDropsSyntheticProgress(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	actor := newNeoActor(rt, "actor-test", "threadActor", "T-test", "T-test", neoActorRecord("actor-test", "threadActor", "T-test"), nil)
@@ -3512,6 +3549,60 @@ func TestNeoExecutorStatusDefaultsInvalidStatusToStartingLikeBinary(t *testing.T
 	missing := normalizeNeoExecutorStatus(map[string]any{"type": "executor_status"})
 	if missing["status"] != "starting" {
 		t.Fatalf("missing status = %#v, want starting", missing["status"])
+	}
+}
+
+func TestNeoExecutorStatusDetailsDropsInvalidFieldsLikeBinary(t *testing.T) {
+	payload := normalizeNeoExecutorStatus(map[string]any{
+		"type":   "executor_status",
+		"status": "running",
+		"details": map[string]any{
+			"reasonCode": "executor_exited",
+			"executionEnvironment": map[string]any{
+				"setupState":    "not-valid",
+				"setupPhase":    "not-valid",
+				"stage":         "not-valid",
+				"operation":     "not-valid",
+				"providerState": "not-valid",
+				"extra":         "kept",
+			},
+		},
+	})
+	details := mapValue(payload["details"])
+	if _, exists := details["reasonCode"]; exists {
+		t.Fatalf("invalid reasonCode was kept: %#v", details)
+	}
+	environment := mapValue(details["executionEnvironment"])
+	for _, key := range []string{"setupState", "setupPhase", "stage", "operation", "providerState"} {
+		if _, exists := environment[key]; exists {
+			t.Fatalf("invalid executionEnvironment %s was kept: %#v", key, environment)
+		}
+	}
+	if environment["extra"] != "kept" {
+		t.Fatalf("executionEnvironment extra = %#v, want kept", environment["extra"])
+	}
+
+	valid := normalizeNeoExecutorStatus(map[string]any{
+		"type":   "executor_status",
+		"status": "running",
+		"details": map[string]any{
+			"reasonCode": "executor_connected",
+			"executionEnvironment": map[string]any{
+				"setupState":    "ready",
+				"setupPhase":    nil,
+				"stage":         "headless_ready",
+				"operation":     "recovering",
+				"providerState": "running",
+			},
+		},
+	})
+	validDetails := mapValue(valid["details"])
+	validEnvironment := mapValue(validDetails["executionEnvironment"])
+	if validDetails["reasonCode"] != "executor_connected" || validEnvironment["setupState"] != "ready" || validEnvironment["stage"] != "headless_ready" || validEnvironment["operation"] != "recovering" || validEnvironment["providerState"] != "running" {
+		t.Fatalf("valid executor status details changed: %#v", validDetails)
+	}
+	if _, exists := validEnvironment["setupPhase"]; !exists || validEnvironment["setupPhase"] != nil {
+		t.Fatalf("nullable setupPhase was not preserved: %#v", validEnvironment)
 	}
 }
 
