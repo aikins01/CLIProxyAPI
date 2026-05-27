@@ -1124,6 +1124,10 @@
       if (next) upsertMessage(next, true);
       return;
     }
+    if (type === 'thread_truncated') {
+      truncateMessagesFromEvent(message);
+      return;
+    }
     if (type === 'delta') {
       applyDelta(message);
       return;
@@ -1323,6 +1327,21 @@
     const state = Object.keys(message.state ?? {}).length > 0 ? message.state : next[index].state;
     next[index] = replace ? { ...message, state, usage } : { ...next[index], ...message, state, usage };
     detail = { ...detail, messages: next };
+  }
+
+  function truncateMessagesFromEvent(message: Incoming) {
+    if (!detail) return;
+    const truncateFromMessage = stringFrom(message.truncateFromMessage);
+    let index = -1;
+    if (truncateFromMessage) {
+      index = detail.messages.findIndex((item) => item.messageId === truncateFromMessage);
+    }
+    if (index < 0) {
+      const fromIndex = Number(message.fromIndex);
+      if (Number.isFinite(fromIndex)) index = Math.max(0, Math.trunc(fromIndex));
+    }
+    if (index < 0) return;
+    detail = { ...detail, messages: detail.messages.slice(0, index) };
   }
 
   function applyDelta(delta: Incoming) {

@@ -2966,7 +2966,24 @@ func (a *neoActor) cleanupPriorAssistantForBinaryDeltaLocked(cancelReason string
 		return nil
 	}
 	message := a.messages[assistantIndex]
+	stateType := stringValue(mapValue(message.State)["type"])
 	if len(message.Content) == 0 {
+		if stateType == "streaming" {
+			removedMessageID := message.MessageID
+			a.messages = append(a.messages[:assistantIndex], a.messages[assistantIndex+1:]...)
+			a.rebuildHistoryLocked()
+			a.filterPendingToolsToMessagesLocked()
+			if a.currentInference != nil && a.messageIndexLocked(a.currentInference.messageID) < 0 {
+				a.currentInference = nil
+			}
+			seq := a.nextSeqLocked()
+			event := map[string]any{"type": "thread_truncated", "seq": seq, "fromIndex": assistantIndex}
+			if removedMessageID != "" {
+				event["truncateFromMessage"] = removedMessageID
+			}
+			a.rememberReplayEventLocked(event)
+			return []map[string]any{event}
+		}
 		return nil
 	}
 
@@ -2993,7 +3010,6 @@ func (a *neoActor) cleanupPriorAssistantForBinaryDeltaLocked(cancelReason string
 		}
 	}
 
-	stateType := stringValue(mapValue(message.State)["type"])
 	changedState := false
 	if stateType == "streaming" || (stateType == "complete" && hadIncompleteTool) {
 		message.State = map[string]any{"type": "cancelled"}

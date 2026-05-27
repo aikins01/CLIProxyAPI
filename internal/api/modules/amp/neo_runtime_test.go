@@ -7497,6 +7497,45 @@ func TestNeoActorBinaryAssistantMessageCleansPriorIncompleteAssistant(t *testing
 	}
 }
 
+func TestNeoActorBinaryCleanupRemovesEmptyStreamingAssistant(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	actor.messages = []neoMessage{
+		{ThreadID: "T-test", MessageID: "M-user", Role: "user", Content: []any{map[string]any{"type": "text", "text": "hello"}}, Seq: 1},
+		{ThreadID: "T-test", MessageID: "M-empty", Role: "assistant", Content: []any{}, State: map[string]any{"type": "streaming"}, Seq: 2},
+	}
+	actor.currentInference = &neoInferenceInflight{messageID: "M-empty", agentMode: "smart"}
+	actor.rebuildHistoryLocked()
+
+	actor.handle(map[string]any{
+		"type": "user:message",
+		"message": map[string]any{
+			"content": []any{map[string]any{"type": "text", "text": "next"}},
+		},
+	})
+
+	actor.mu.Lock()
+	if len(actor.messages) != 2 {
+		actor.mu.Unlock()
+		t.Fatalf("messages = %#v, want original user and next user", actor.messages)
+	}
+	if actor.messages[0].MessageID != "M-user" || actor.messages[1].Role != "user" || textFromBlocks(actor.messages[1].Content) != "next" {
+		actor.mu.Unlock()
+		t.Fatalf("messages after cleanup = %#v", actor.messages)
+	}
+	if actor.currentInference != nil {
+		actor.mu.Unlock()
+		t.Fatalf("current inference = %#v, want cleared", actor.currentInference)
+	}
+	if len(actor.replayEvents) < 2 || actor.replayEvents[len(actor.replayEvents)-2].Payload["type"] != "thread_truncated" {
+		actor.mu.Unlock()
+		t.Fatalf("replay events = %#v, want truncation before user message", actor.replayEvents)
+	}
+	actor.mu.Unlock()
+	waitForNeoActorSyncIdle(t, actor)
+}
+
 func TestNeoActorHandlesResidualBinaryThreadDeltas(t *testing.T) {
 	useTempNeoThreadStore(t)
 	threadID := "T-019e0e6e-f3f1-7081-b5dd-748f66f8c25d"
