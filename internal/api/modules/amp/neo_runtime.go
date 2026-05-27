@@ -6234,8 +6234,9 @@ func recentNeoLocalThreads(limit int) []map[string]any {
 			}
 		}
 		if messages := gjson.GetBytes(raw, "messages"); messages.Exists() && messages.IsArray() {
-			thread["messageCount"] = len(messages.Array())
-			thread["summaryStats"] = neoMergeThreadSummaryStats(thread["summaryStats"], len(messages.Array()), neoThreadDiffStatsFromJSONMessages(messages))
+			messageCount := neoBinaryThreadMessageCountFromJSON(messages)
+			thread["messageCount"] = messageCount
+			thread["summaryStats"] = neoMergeThreadSummaryStats(thread["summaryStats"], messageCount, neoThreadDiffStatsFromJSONMessages(messages))
 		}
 		if updated := neoThreadUpdatedMillisFromJSONBytes(raw); updated > 0 {
 			thread["updated"] = updated
@@ -6366,13 +6367,15 @@ func neoThreadListEntry(thread map[string]any) map[string]any {
 	} else if _, exists := thread["labels"]; exists {
 		entry["labels"] = []any{}
 	}
-	if entry["messageCount"] == nil {
+	if _, exists := thread["messages"]; exists {
+		entry["messageCount"] = neoBinaryThreadMessageCount(arrayValue(thread["messages"]))
+	} else if entry["messageCount"] == nil {
 		entry["messageCount"] = firstNonZero(numberFrom(mapValue(thread["summaryStats"])["messageCount"]), len(arrayValue(thread["messages"])))
 	}
 	diffStats := neoThreadDiffStatsFromThread(thread)
 	if summaryStats := mapValue(entry["summaryStats"]); len(summaryStats) == 0 {
 		entry["summaryStats"] = neoMergeThreadSummaryStats(nil, numberFrom(entry["messageCount"]), diffStats)
-	} else if summaryStats["messageCount"] == nil {
+	} else if _, hasMessages := thread["messages"]; hasMessages || summaryStats["messageCount"] == nil {
 		summaryStats = cloneMap(summaryStats)
 		summaryStats["messageCount"] = entry["messageCount"]
 		if _, exists := summaryStats["diffStats"]; !exists && len(diffStats) > 0 {
@@ -6412,13 +6415,47 @@ func (s neoDiffStats) add(next neoDiffStats) neoDiffStats {
 
 func neoMergeThreadSummaryStats(raw any, messageCount int, diffStats map[string]any) map[string]any {
 	stats := cloneMap(mapValue(raw))
-	if stats["messageCount"] == nil {
-		stats["messageCount"] = messageCount
-	}
+	stats["messageCount"] = messageCount
 	if stats["diffStats"] == nil && diffStats != nil {
 		stats["diffStats"] = diffStats
 	}
 	return stats
+}
+
+func neoBinaryThreadMessageCount(messages []any) int {
+	count := 0
+	for _, raw := range messages {
+		message := mapValue(raw)
+		if stringValue(message["role"]) != "user" {
+			continue
+		}
+		for _, rawContent := range arrayValue(message["content"]) {
+			if stringValue(mapValue(rawContent)["type"]) != "tool_result" {
+				count++
+				break
+			}
+		}
+	}
+	return count
+}
+
+func neoBinaryThreadMessageCountFromJSON(messages gjson.Result) int {
+	if !messages.Exists() || !messages.IsArray() {
+		return 0
+	}
+	count := 0
+	for _, message := range messages.Array() {
+		if message.Get("role").String() != "user" {
+			continue
+		}
+		for _, content := range message.Get("content").Array() {
+			if content.Get("type").String() != "tool_result" {
+				count++
+				break
+			}
+		}
+	}
+	return count
 }
 
 func neoThreadDiffStatsFromThread(thread map[string]any) map[string]any {
@@ -7770,11 +7807,15 @@ func neoThreadMessageCount(thread map[string]any) int {
 	if len(thread) == 0 {
 		return 0
 	}
-	count := firstNonZero(
-		len(arrayValue(thread["messages"])),
-		numberFrom(thread["messageCount"]),
-		numberFrom(mapValue(thread["summaryStats"])["messageCount"]),
-	)
+	count := 0
+	if rawMessages, exists := thread["messages"]; exists {
+		count = neoBinaryThreadMessageCount(arrayValue(rawMessages))
+	} else {
+		count = firstNonZero(
+			numberFrom(thread["messageCount"]),
+			numberFrom(mapValue(thread["summaryStats"])["messageCount"]),
+		)
+	}
 	if data := mapValue(thread["data"]); len(data) > 0 {
 		if dataCount := neoThreadMessageCount(data); dataCount > count {
 			count = dataCount
@@ -8022,7 +8063,7 @@ func neoLocalThreadSearchResult(thread map[string]any, query string) map[string]
 		"agentMode":         firstNonEmptyString(neoThreadMapAgentMode(thread), "smart"),
 		"created":           created,
 		"updatedAt":         neoMillisRFC3339(updated),
-		"messageCount":      len(messages),
+		"messageCount":      neoBinaryThreadMessageCount(messages),
 		"matchedSearchText": neoLocalThreadMatchedText(thread, query),
 	}
 }

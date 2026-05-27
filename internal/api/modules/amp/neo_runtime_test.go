@@ -9961,6 +9961,26 @@ func TestNeoThreadListEntryComputesBinaryDiffStats(t *testing.T) {
 	}
 }
 
+func TestNeoThreadListEntryCountsBinaryDisplayMessages(t *testing.T) {
+	entry := neoThreadListEntry(map[string]any{
+		"id":           "T-list-count",
+		"summaryStats": map[string]any{"messageCount": 99},
+		"messages": []any{
+			map[string]any{"role": "user", "messageId": "M-user-1", "content": []any{map[string]any{"type": "text", "text": "visible"}}},
+			map[string]any{"role": "assistant", "messageId": "M-assistant", "content": []any{map[string]any{"type": "text", "text": "ignored"}}},
+			map[string]any{"role": "user", "messageId": "M-tool-result", "content": []any{map[string]any{"type": "tool_result", "toolUseID": "TU-read"}}},
+			map[string]any{"role": "user", "messageId": "M-user-2", "content": []any{
+				map[string]any{"type": "tool_result", "toolUseID": "TU-bash"},
+				map[string]any{"type": "text", "text": "also visible"},
+			}},
+			map[string]any{"role": "user", "messageId": "M-empty", "content": []any{}},
+		},
+	})
+	if numberFrom(entry["messageCount"]) != 2 || numberFrom(mapValue(entry["summaryStats"])["messageCount"]) != 2 {
+		t.Fatalf("message counts = entry:%#v summary:%#v, want 2", entry["messageCount"], entry["summaryStats"])
+	}
+}
+
 func TestRecentNeoLocalThreadsComputesBinaryDiffStats(t *testing.T) {
 	dir := t.TempDir()
 	oldStoreDir := neoAmpThreadStoreDir
@@ -9974,10 +9994,12 @@ func TestRecentNeoLocalThreadsComputesBinaryDiffStats(t *testing.T) {
 		"agentMode": "smart",
 		"archived": true,
 		"created": 1778170000000,
+		"summaryStats": {"messageCount": 99},
 		"originThreadID": "T-origin",
 		"mainThreadID": "T-main",
 		"messages": [
 			{"role": "user", "messageId": "M-user", "content": [{"type": "text", "text": "patch it"}]},
+			{"role": "user", "messageId": "M-tool-result", "content": [{"type": "tool_result", "toolUseID": "TU-read"}]},
 			{"role": "assistant", "messageId": "M-assistant", "content": [
 				{"type": "server_tool_use", "name": "functions.edit_file", "input": {"old_str": "alpha\nbeta", "new_str": "alpha\ngamma\nbeta"}},
 				{"type": "tool_use", "complete": true, "name": "write_file", "input": {"content": "new file"}}
@@ -10001,6 +10023,9 @@ func TestRecentNeoLocalThreadsComputesBinaryDiffStats(t *testing.T) {
 	}
 	if threads[0]["archived"] != true {
 		t.Fatalf("archived = %#v, want true", threads[0]["archived"])
+	}
+	if numberFrom(threads[0]["messageCount"]) != 1 || numberFrom(mapValue(threads[0]["summaryStats"])["messageCount"]) != 1 {
+		t.Fatalf("message counts = entry:%#v summary:%#v, want 1", threads[0]["messageCount"], threads[0]["summaryStats"])
 	}
 }
 
@@ -10259,6 +10284,8 @@ func TestNeoRuntimeSearchesLocalThreadsHTTP(t *testing.T) {
 		title:     "Local strategy migration",
 		messages: []neoMessage{
 			{ThreadID: "T-local-search", MessageID: "M-user", Role: "user", Content: []any{map[string]any{"type": "text", "text": "arena strategy context"}}, AgentMode: "deep", Seq: 1},
+			{ThreadID: "T-local-search", MessageID: "M-assistant", Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "assistant response"}}, Seq: 2},
+			{ThreadID: "T-local-search", MessageID: "M-tool-result", Role: "user", Content: []any{map[string]any{"type": "tool_result", "toolUseID": "TU-read"}}, Seq: 3},
 		},
 	}
 	if err := writeNeoLocalThreadSnapshot(snapshot); err != nil {
