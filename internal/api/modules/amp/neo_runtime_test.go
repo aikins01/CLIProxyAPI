@@ -9814,6 +9814,34 @@ func TestNeoImageToolResultPreservesImagesAndCompactsHistoryText(t *testing.T) {
 	}
 }
 
+func TestNeoImageToolResultAcceptsBinaryResultArray(t *testing.T) {
+	run := normalizeNeoLocalThreadToolRun(context.Background(), nil, neoPendingTool{
+		Name:  "painter",
+		Input: map[string]any{"prompt": "draw a ship"},
+	}, map[string]any{
+		"status": "done",
+		"result": []any{
+			map[string]any{"type": "image", "mimeType": "image/png", "url": "https://example.test/image.png"},
+		},
+	}, "T-current")
+
+	images := arrayValue(run["images"])
+	if len(images) != 1 {
+		t.Fatalf("images = %#v", run["images"])
+	}
+	image := mapValue(images[0])
+	if stringValue(image["url"]) != "https://example.test/image.png" || stringValue(image["mimeType"]) != "image/png" {
+		t.Fatalf("image = %#v", image)
+	}
+	result := arrayValue(run["result"])
+	if len(result) != 1 || stringValue(mapValue(result[0])["url"]) != "https://example.test/image.png" {
+		t.Fatalf("result = %#v", run["result"])
+	}
+	if got := runToText(run); got != "generated 1 image" {
+		t.Fatalf("runToText = %q, want generated image text", got)
+	}
+}
+
 func TestNeoToolRunTextResultMatchesBinaryTypedTextBlocks(t *testing.T) {
 	run := map[string]any{
 		"status": "done",

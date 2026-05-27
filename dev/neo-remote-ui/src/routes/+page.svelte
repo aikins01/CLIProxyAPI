@@ -3241,7 +3241,7 @@
     const run = toolResultRun(block);
     const result = toolResultResult(block);
     const images: PainterImage[] = [];
-    const primary = [run.images, run.image, result.images, result.image].find((value) => Array.isArray(value) && value.length > 0);
+    const primary = [run.images, run.image, result.images, result.image, run.result].find((value) => Array.isArray(value) && value.length > 0);
     const append = (value: unknown) => {
       if (Array.isArray(value)) {
         value.forEach(append);
@@ -3261,7 +3261,7 @@
     if (primary) {
       append(primary);
     } else {
-      [run.outputImages, run.output_images, run.generatedImages, run.generated_images, result.outputImages, result.output_images, result.generatedImages, result.generated_images, run].forEach(append);
+      [run.outputImages, run.output_images, run.generatedImages, run.generated_images, result.outputImages, result.output_images, result.generatedImages, result.generated_images, run.result, run].forEach(append);
     }
     return images;
   }

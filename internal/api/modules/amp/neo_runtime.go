@@ -6088,6 +6088,12 @@ func neoToolRunImages(run map[string]any) []any {
 			return images
 		}
 	}
+	if resultItems := arrayValue(run["result"]); len(resultItems) > 0 {
+		images := appendNeoToolRunImages(nil, resultItems)
+		if len(images) > 0 {
+			return images
+		}
+	}
 	if image, ok := normalizeNeoToolRunImage(run); ok {
 		return []any{image}
 	}
