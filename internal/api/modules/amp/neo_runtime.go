@@ -1182,6 +1182,7 @@ type neoActor struct {
 	messages                  []neoMessage
 	history                   []neoHistoryMessage
 	queue                     []neoQueuedMessage
+	queuedIDSeq               int
 	pendingTools              map[string]neoPendingTool
 	approvalQueue             []map[string]any
 	sockets                   map[*neoSocket]struct{}
@@ -1546,7 +1547,7 @@ func (a *neoActor) handleForSocket(socket *neoSocket, msg map[string]any) {
 	case "client_set_thread_title":
 		a.setTitle(stringValue(msg["title"]))
 	case "title":
-		a.setTitle(firstPresentString(msg, "value", "title"))
+		a.updateTitleFromBinary(msg)
 	case "agent-mode":
 		a.updateAgentModeFromBinary(msg)
 	case "reasoning-effort":
@@ -1749,11 +1750,16 @@ func (a *neoActor) storedToolUseLocked(toolCallID string) (neoStoredToolUseRef, 
 
 func (a *neoActor) handleBinaryToolData(msg map[string]any) {
 	toolCallID := neoToolCallIDFromMessage(msg)
-	run := cloneMap(mapValue(msg["data"]))
-	if len(run) == 0 {
+	var run map[string]any
+	if _, exists := msg["data"]; exists {
+		run = cloneMap(mapValue(msg["data"]))
+	} else {
 		run = cloneMap(firstMap(msg["run"], msg["toolRun"], msg["tool_run"]))
+		if len(run) == 0 {
+			return
+		}
 	}
-	if toolCallID == "" || len(run) == 0 {
+	if toolCallID == "" {
 		return
 	}
 
@@ -1964,8 +1970,10 @@ func (a *neoActor) handleBinaryUserToolInput(msg map[string]any) {
 
 func (a *neoActor) handleBinaryToolProcessed(msg map[string]any) {
 	toolCallID := neoToolCallIDFromMessage(msg)
-	newArgs := cloneMap(mapValue(msg["newArgs"]))
-	if len(newArgs) == 0 {
+	var newArgs map[string]any
+	if _, exists := msg["newArgs"]; exists {
+		newArgs = cloneMap(mapValue(msg["newArgs"]))
+	} else {
 		newArgs = cloneMap(mapValue(msg["args"]))
 	}
 	if toolCallID == "" {
@@ -4178,9 +4186,6 @@ func neoQueuedMessageFromBinaryDelta(msg map[string]any, queue bool) neoQueuedMe
 		messageID = newNeoMessageID()
 	}
 	queueID := firstNonEmptyString(msg["id"], msg["queuedMessageId"], msg["queuedMessageID"])
-	if queue && queueID == "" {
-		queueID = "queued-" + randomBase62(12)
-	}
 	content := neoContentFromBinaryValue(firstNonNil(source["content"], msg["content"], source["text"], msg["text"]))
 	createdAt := stringValue(source["createdAt"])
 	if createdAt == "" {
@@ -4410,6 +4415,9 @@ func (a *neoActor) enqueueBinaryQueuedMessage(msg map[string]any) {
 		a.mu.Unlock()
 		return
 	}
+	if user.ID == "" {
+		user.ID = a.nextQueuedMessageIDLocked()
+	}
 	if user.Steer {
 		a.queue = append([]neoQueuedMessage{user}, a.queue...)
 	} else {
@@ -4420,6 +4428,26 @@ func (a *neoActor) enqueueBinaryQueuedMessage(msg map[string]any) {
 
 	a.broadcast(map[string]any{"type": "queued_message_added", "message": user.queueProtocol(), "seq": seq})
 	a.syncCloudAsync()
+}
+
+func (a *neoActor) nextQueuedMessageIDLocked() string {
+	if a.queuedIDSeq < 0 {
+		a.queuedIDSeq = 0
+	}
+	for {
+		a.queuedIDSeq++
+		id := fmt.Sprintf("queued-%d", a.queuedIDSeq)
+		collides := false
+		for _, item := range a.queue {
+			if item.queueID() == id {
+				collides = true
+				break
+			}
+		}
+		if !collides {
+			return id
+		}
+	}
 }
 
 func (a *neoActor) dequeueQueuedMessage() {
@@ -8063,7 +8091,7 @@ func neoCloudMessage(message neoMessage) map[string]any {
 }
 
 func neoCloudEnvironment(environment map[string]any) map[string]any {
-	initial := map[string]any{}
+	initial := cloneMap(mapValue(environment["initial"]))
 	for _, key := range []string{"platform", "workspaceRoot", "workingDirectory"} {
 		if value := stringValue(environment[key]); value != "" {
 			initial[key] = value
@@ -8917,6 +8945,20 @@ func (a *neoActor) configSnapshot() *config.Config {
 
 func (a *neoActor) setTitle(title string) {
 	title = strings.TrimSpace(title)
+	a.mu.Lock()
+	if a.title == title {
+		a.mu.Unlock()
+		return
+	}
+	a.title = title
+	a.titleSource = "explicit"
+	a.mu.Unlock()
+	a.broadcast(map[string]any{"type": "thread_title", "title": title})
+	a.syncCloudAsync()
+}
+
+func (a *neoActor) updateTitleFromBinary(msg map[string]any) {
+	title := stringValue(msg["value"])
 	a.mu.Lock()
 	if a.title == title {
 		a.mu.Unlock()

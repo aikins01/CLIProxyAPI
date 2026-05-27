@@ -6873,6 +6873,12 @@ func TestNeoActorBinaryQueueEnqueueCapsAndDoesNotAutoRun(t *testing.T) {
 	if len(actor.queue) != neoMaxQueuedMessages {
 		t.Fatalf("queue len = %d, want binary cap %d: %#v", len(actor.queue), neoMaxQueuedMessages, actor.queue)
 	}
+	for i, queued := range actor.queue {
+		wantID := fmt.Sprintf("queued-%d", i+1)
+		if queued.ID != wantID {
+			t.Fatalf("queue id at %d = %q, want %q: %#v", i, queued.ID, wantID, actor.queue)
+		}
+	}
 	if len(actor.messages) != 0 {
 		t.Fatalf("messages = %#v, want enqueue to leave queued messages pending", actor.messages)
 	}
@@ -7075,6 +7081,26 @@ func TestNeoActorHandlesBinaryToolDeltas(t *testing.T) {
 		t.Fatalf("second processed tool block = %#v original=%#v", toolBlock, original)
 	}
 
+	actor.handle(map[string]any{"type": "tool:processed", "toolUse": "TU-1", "newArgs": map[string]any{}, "args": map[string]any{"cmd": "ignored fallback"}})
+	actor.mu.Lock()
+	toolBlock = mapValue(actor.messages[0].Content[0])
+	original = mapValue(mapValue(actor.messages[0].OriginalToolUseInput)["TU-1"])
+	actor.mu.Unlock()
+	if len(mapValue(toolBlock["input"])) != 0 || stringValue(original["cmd"]) != "printf redacted" {
+		t.Fatalf("empty processed tool block = %#v original=%#v", toolBlock, original)
+	}
+
+	actor.handle(map[string]any{"type": "tool:data", "toolUse": "TU-1", "data": map[string]any{}, "run": map[string]any{"status": "done", "result": "ignored fallback"}})
+	actor.mu.Lock()
+	if len(actor.messages) != 2 {
+		t.Fatalf("messages after empty tool data = %#v", actor.messages)
+	}
+	resultBlock := mapValue(actor.messages[1].Content[0])
+	if len(mapValue(resultBlock["run"])) != 0 {
+		t.Fatalf("empty tool data run = %#v", resultBlock)
+	}
+	actor.mu.Unlock()
+
 	actor.handle(map[string]any{"type": "tool:data", "toolUse": "TU-1", "data": map[string]any{"status": "in-progress", "progress": map[string]any{"phase": "run"}}})
 	actor.handle(map[string]any{"type": "user:tool-input", "toolUse": "TU-1", "value": map[string]any{"accepted": true}})
 	actor.handle(map[string]any{"type": "tool:data", "toolUse": "TU-1", "data": map[string]any{"status": "done", "result": "ok"}})
@@ -7083,7 +7109,7 @@ func TestNeoActorHandlesBinaryToolDeltas(t *testing.T) {
 	if len(actor.messages) != 2 {
 		t.Fatalf("messages = %#v", actor.messages)
 	}
-	resultBlock := mapValue(actor.messages[1].Content[0])
+	resultBlock = mapValue(actor.messages[1].Content[0])
 	if stringValue(mapValue(resultBlock["run"])["status"]) != "done" || boolValue(mapValue(resultBlock["userInput"])["accepted"]) != true {
 		t.Fatalf("tool result block = %#v", resultBlock)
 	}
@@ -7360,6 +7386,10 @@ func TestNeoActorBinaryInferenceCompletedMirrorsEnvAndDebugSemantics(t *testing.
 	if len(mapValue(thread["~debug"])) == 0 {
 		t.Fatalf("cloud thread missing ~debug: %#v", thread)
 	}
+	cloudTags := stringArrayValue(mapValue(mapValue(thread["env"])["initial"])["tags"])
+	if len(cloudTags) != 2 || stringValue(cloudTags[0]) != "repo:cliproxy" || stringValue(cloudTags[1]) != "model:claude-test" {
+		t.Fatalf("cloud env tags = %#v in thread %#v", cloudTags, thread["env"])
+	}
 	waitForNeoActorSyncIdle(t, actor)
 }
 
@@ -7485,6 +7515,13 @@ func TestNeoActorBinaryScalarDeltasUseFalseyClears(t *testing.T) {
 	actor.handle(map[string]any{"type": "max-tokens", "value": 32000})
 	actor.handle(map[string]any{"type": "main-thread", "value": parentID})
 	actor.handle(map[string]any{"type": "setPendingNavigation", "threadID": parentID})
+
+	actor.handle(map[string]any{"type": "title", "value": "  Binary Title  "})
+	actor.mu.Lock()
+	if actor.title != "  Binary Title  " {
+		t.Fatalf("binary title = %q, want whitespace preserved", actor.title)
+	}
+	actor.mu.Unlock()
 
 	actor.handle(map[string]any{"type": "title", "value": "", "title": "ignored fallback"})
 	actor.handle(map[string]any{"type": "max-tokens", "value": "", "maxTokens": 64000})
