@@ -6914,11 +6914,17 @@ func recentNeoLocalThreads(limit int) []map[string]any {
 				thread["labels"] = fallback
 			}
 		}
-		if messages := gjson.GetBytes(raw, "messages"); messages.Exists() && messages.IsArray() {
+		parsed := gjson.ParseBytes(raw)
+		if stringValue(thread["agentMode"]) == "" {
+			if mode := neoThreadAgentModeFromJSON(parsed); mode != "" {
+				thread["agentMode"] = mode
+			}
+		}
+		if messages := neoThreadMessagesFromJSON(parsed); messages.Exists() && messages.IsArray() {
 			messageCount := neoBinaryThreadMessageCountFromJSON(messages)
 			thread["messageCount"] = messageCount
 			thread["relationships"] = neoMergeThreadRelationshipsWithExplicit(neoThreadRelationshipsFromJSONMessages(messages, id), firstArray(thread["relationships"]))
-			if interacted := neoThreadUserLastInteractedAtFromJSON(gjson.ParseBytes(raw)); interacted > 0 {
+			if interacted := neoThreadUserLastInteractedAtFromJSON(parsed); interacted > 0 {
 				thread["userLastInteractedAt"] = interacted
 			}
 			thread["summaryStats"] = neoMergeThreadSummaryStats(thread["summaryStats"], messageCount, neoThreadDiffStatsFromJSONMessages(messages))
@@ -7153,6 +7159,47 @@ func neoBinaryThreadMessageCountFromJSON(messages gjson.Result) int {
 	return count
 }
 
+func neoThreadMessagesFromJSON(thread gjson.Result) gjson.Result {
+	messages := thread.Get("messages")
+	if messages.Exists() && messages.IsArray() {
+		return messages
+	}
+	return thread.Get("data.messages")
+}
+
+func neoThreadAgentModeFromJSON(thread gjson.Result) string {
+	for _, path := range []string{
+		"agentMode",
+		"settings.agentMode",
+		"meta.agentMode",
+		"data.agentMode",
+		"data.settings.agentMode",
+		"data.meta.agentMode",
+	} {
+		if mode := strings.TrimSpace(thread.Get(path).String()); mode != "" {
+			return mode
+		}
+	}
+	return neoThreadMessagesAgentModeFromJSON(neoThreadMessagesFromJSON(thread))
+}
+
+func neoThreadMessagesAgentModeFromJSON(messages gjson.Result) string {
+	if !messages.Exists() || !messages.IsArray() {
+		return ""
+	}
+	items := messages.Array()
+	for i := len(items) - 1; i >= 0; i-- {
+		message := items[i]
+		if message.Get("role").String() != "user" {
+			continue
+		}
+		if mode := strings.TrimSpace(message.Get("agentMode").String()); mode != "" {
+			return mode
+		}
+	}
+	return ""
+}
+
 func neoUserVisibleContent(content []any) bool {
 	for _, rawContent := range content {
 		if stringValue(mapValue(rawContent)["type"]) != "tool_result" {
@@ -7345,8 +7392,8 @@ func neoThreadUserLastInteractedAtFromMessages(thread map[string]any, messages [
 }
 
 func neoThreadUserLastInteractedAtFromJSON(thread gjson.Result) int {
-	last := firstNonZero(neoJSONMillis(thread.Get("created")), neoJSONMillis(thread.Get("createdAt")))
-	messages := thread.Get("messages")
+	last := firstNonZero(neoJSONMillis(thread.Get("created")), neoJSONMillis(thread.Get("createdAt")), neoJSONMillis(thread.Get("data.created")), neoJSONMillis(thread.Get("data.createdAt")))
+	messages := neoThreadMessagesFromJSON(thread)
 	if !messages.Exists() || !messages.IsArray() {
 		return last
 	}
@@ -7652,22 +7699,17 @@ func neoLineDiffStats(oldText, newText string) neoDiffStats {
 }
 
 func neoThreadUpdatedMillisFromJSONBytes(raw []byte) int {
-	for _, key := range []string{"updatedAt", "updated", "userLastInteractedAt", "createdAt", "created"} {
-		if updated := neoJSONMillis(gjson.GetBytes(raw, key)); updated > 0 {
-			return updated
-		}
-	}
-	return 0
+	return neoThreadUpdatedMillisFromJSON(gjson.ParseBytes(raw))
 }
 
 func neoThreadUpdatedMillisFromJSON(thread gjson.Result) int {
-	for _, key := range []string{"updatedAt", "updated", "userLastInteractedAt", "createdAt", "created"} {
+	for _, key := range []string{"updatedAt", "updated", "userLastInteractedAt", "createdAt", "created", "data.updatedAt", "data.updated", "data.userLastInteractedAt", "data.createdAt", "data.created"} {
 		if updated := neoJSONMillis(thread.Get(key)); updated > 0 {
 			return updated
 		}
 	}
 	updated := 0
-	if messages := thread.Get("messages"); messages.Exists() && messages.IsArray() {
+	if messages := neoThreadMessagesFromJSON(thread); messages.Exists() && messages.IsArray() {
 		messages.ForEach(func(_, message gjson.Result) bool {
 			if created := firstNonZero(neoJSONMillis(message.Get("created")), neoJSONMillis(message.Get("createdAt"))); created > updated {
 				updated = created

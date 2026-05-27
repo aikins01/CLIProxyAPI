@@ -10860,6 +10860,72 @@ func TestRecentNeoLocalThreadsReturnsMetadataOnly(t *testing.T) {
 	}
 }
 
+func TestRecentNeoLocalThreadsInfersAgentModeFromMessagesLikeBinary(t *testing.T) {
+	dir := t.TempDir()
+	oldStoreDir := neoAmpThreadStoreDir
+	neoAmpThreadStoreDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
+
+	threadID := "T-019e65c0-0310-77a8-b233-4b84d9c0612b"
+	raw := []byte(`{
+		"id": "` + threadID + `",
+		"title": "missing top-level mode",
+		"messages": [
+			{"role": "user", "messageId": "M-1", "agentMode": "smart", "content": [{"type": "text", "text": "first"}]},
+			{"role": "assistant", "messageId": "M-2"},
+			{"role": "user", "messageId": "M-3", "agentMode": "deep", "content": [{"type": "text", "text": "latest"}]}
+		]
+	}`)
+	if err := os.WriteFile(filepath.Join(dir, threadID+".json"), raw, 0o600); err != nil {
+		t.Fatalf("write local thread: %v", err)
+	}
+
+	threads := recentNeoLocalThreads(10)
+	if len(threads) != 1 {
+		t.Fatalf("threads = %#v", threads)
+	}
+	if got := stringValue(threads[0]["agentMode"]); got != "deep" {
+		t.Fatalf("agentMode = %q, want binary last-user mode deep", got)
+	}
+	if _, exists := threads[0]["messages"]; exists {
+		t.Fatalf("recent thread should not include full messages: %#v", threads[0])
+	}
+}
+
+func TestRecentNeoLocalThreadsPromotesNestedDataAgentMode(t *testing.T) {
+	dir := t.TempDir()
+	oldStoreDir := neoAmpThreadStoreDir
+	neoAmpThreadStoreDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
+
+	threadID := "T-019e65c0-0310-77a8-b233-4b84d9c0612c"
+	raw := []byte(`{
+		"id": "` + threadID + `",
+		"title": "nested mode",
+		"data": {
+			"id": "` + threadID + `",
+			"agentMode": "large",
+			"messages": [
+				{"role": "user", "messageId": "M-1", "agentMode": "deep", "content": [{"type": "text", "text": "nested"}]}
+			]
+		}
+	}`)
+	if err := os.WriteFile(filepath.Join(dir, threadID+".json"), raw, 0o600); err != nil {
+		t.Fatalf("write local thread: %v", err)
+	}
+
+	threads := recentNeoLocalThreads(10)
+	if len(threads) != 1 {
+		t.Fatalf("threads = %#v", threads)
+	}
+	if got := stringValue(threads[0]["agentMode"]); got != "large" {
+		t.Fatalf("agentMode = %q, want nested data mode large", got)
+	}
+	if got := numberFrom(threads[0]["messageCount"]); got != 1 {
+		t.Fatalf("messageCount = %#v, want nested data messages counted", threads[0]["messageCount"])
+	}
+}
+
 func TestNeoSystemPromptFiltersDisabledSkills(t *testing.T) {
 	prompt := neoSystemPrompt(neoInferenceRequest{
 		Capabilities: map[string]any{
