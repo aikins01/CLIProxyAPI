@@ -10199,6 +10199,174 @@ func TestNeoRuntimeThreadImportVersionAllocatesFutureSeq(t *testing.T) {
 	}
 }
 
+func TestNeoRuntimeProtocolDeltaNormalizesLikeBinary(t *testing.T) {
+	dir := t.TempDir()
+	oldStoreDir := neoAmpThreadStoreDir
+	neoAmpThreadStoreDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
+
+	rt := newNeoRuntime(&config.Config{})
+	actor := rt.store.ensureThreadActor("T-protocol-delta-normalize")
+
+	actor.handle(map[string]any{
+		"type":      "delta",
+		"messageId": "M-ignored",
+		"role":      "system",
+		"blocks":    []any{map[string]any{"type": "text", "text": "ignored"}},
+	})
+	actor.mu.Lock()
+	if len(actor.messages) != 0 || len(actor.replayEvents) != 0 {
+		actor.mu.Unlock()
+		t.Fatalf("invalid role was not dropped: messages=%#v replay=%#v", actor.messages, actor.replayEvents)
+	}
+	actor.mu.Unlock()
+
+	actor.handle(map[string]any{
+		"type":       "delta",
+		"messageId":  "M-assistant",
+		"role":       "assistant",
+		"state":      "not-a-state",
+		"blockIndex": "bad",
+		"blocks": []any{
+			map[string]any{"type": "unknown"},
+			map[string]any{"type": "text", "text": "hello", "blockState": "bad"},
+		},
+	})
+	actor.mu.Lock()
+	if len(actor.messages) != 1 {
+		actor.mu.Unlock()
+		t.Fatalf("messages = %#v, want assistant message", actor.messages)
+	}
+	assistant := actor.messages[0]
+	replay := actor.replayEvents[len(actor.replayEvents)-1].Payload
+	actor.mu.Unlock()
+	if got := stringValue(mapValue(assistant.State)["type"]); got != "streaming" {
+		t.Fatalf("assistant state = %q, want streaming", got)
+	}
+	if len(assistant.Content) != 2 {
+		t.Fatalf("assistant content = %#v, want 2 blocks", assistant.Content)
+	}
+	if hidden := mapValue(assistant.Content[0]); stringValue(hidden["type"]) != "text" || stringValue(hidden["text"]) != "" || !boolValue(hidden["hidden"]) {
+		t.Fatalf("hidden replacement block = %#v", hidden)
+	}
+	if text := mapValue(assistant.Content[1]); stringValue(text["text"]) != "hello" {
+		t.Fatalf("text block = %#v", text)
+	} else if _, exists := text["blockState"]; exists {
+		t.Fatalf("invalid blockState was preserved: %#v", text)
+	}
+	if got := stringValue(replay["state"]); got != "generating" {
+		t.Fatalf("replay state = %q, want generating", got)
+	}
+	if got := numberFrom(replay["blockIndex"]); got != 0 {
+		t.Fatalf("replay blockIndex = %d, want 0", got)
+	}
+
+	actor.handle(map[string]any{
+		"type":       "delta",
+		"messageId":  "M-user",
+		"role":       "user",
+		"state":      "generating",
+		"blockIndex": 3,
+		"blocks": []any{
+			map[string]any{"type": "tool_use", "id": "TU-invalid"},
+			map[string]any{"type": "text", "text": "user text"},
+		},
+	})
+	actor.mu.Lock()
+	user := actor.messages[1]
+	userReplay := actor.replayEvents[len(actor.replayEvents)-1].Payload
+	actor.mu.Unlock()
+	if got := stringValue(userReplay["state"]); got != "complete" {
+		t.Fatalf("user replay state = %q, want complete", got)
+	}
+	if _, exists := userReplay["blockIndex"]; exists {
+		t.Fatalf("user replay kept blockIndex: %#v", userReplay)
+	}
+	if len(user.Content) != 1 || stringValue(mapValue(user.Content[0])["text"]) != "user text" {
+		t.Fatalf("user content = %#v, want filtered text", user.Content)
+	}
+}
+
+func TestNeoRuntimeProtocolMessagesNormalizeContentLikeBinary(t *testing.T) {
+	dir := t.TempDir()
+	oldStoreDir := neoAmpThreadStoreDir
+	neoAmpThreadStoreDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
+
+	rt := newNeoRuntime(&config.Config{})
+	actor := rt.store.ensureThreadActor("T-protocol-message-normalize")
+
+	actor.handle(map[string]any{"type": "message_added", "message": map[string]any{
+		"messageId": "M-assistant",
+		"role":      "assistant",
+		"content": []any{
+			map[string]any{"type": "text", "text": "kept"},
+			map[string]any{"type": "thinking", "thinking": "missing signature"},
+		},
+		"state": map[string]any{"type": "streaming"},
+	}})
+	actor.mu.Lock()
+	assistant := actor.messages[0]
+	actor.mu.Unlock()
+	if len(assistant.Content) != 1 || stringValue(mapValue(assistant.Content[0])["text"]) != "kept" {
+		t.Fatalf("assistant content = %#v, want only valid text", assistant.Content)
+	}
+	if len(assistant.State) != 0 {
+		t.Fatalf("assistant invalid message state was preserved: %#v", assistant.State)
+	}
+
+	actor.handle(map[string]any{"type": "message_added", "message": map[string]any{
+		"messageId": "M-user",
+		"role":      "user",
+		"content": []any{
+			map[string]any{
+				"type":       "image",
+				"name":       "shot.png",
+				"media_type": "image/png",
+				"source":     map[string]any{"type": "base64", "media_type": "image/png", "data": "abcd"},
+			},
+		},
+	}})
+	actor.mu.Lock()
+	user := actor.messages[1]
+	actor.mu.Unlock()
+	image := mapValue(user.Content[0])
+	source := mapValue(image["source"])
+	if got := stringValue(source["mediaType"]); got != "image/png" {
+		t.Fatalf("image source mediaType = %q, want image/png; block=%#v", got, image)
+	}
+	if got := stringValue(image["sourcePath"]); got != "shot.png" {
+		t.Fatalf("image sourcePath = %q, want shot.png", got)
+	}
+
+	actor.handle(map[string]any{"type": "message_added", "message": map[string]any{
+		"messageId": "M-info",
+		"role":      "info",
+		"content": []any{
+			map[string]any{"type": "text", "text": "drop"},
+			map[string]any{"type": "manual_bash_invocation", "args": map[string]any{"cmd": "pwd"}, "toolRun": map[string]any{"status": "success"}},
+		},
+	}})
+	actor.mu.Lock()
+	info := actor.messages[2]
+	beforeInvalid := len(actor.messages)
+	actor.mu.Unlock()
+	if len(info.Content) != 1 || stringValue(mapValue(info.Content[0])["type"]) != "manual_bash_invocation" {
+		t.Fatalf("info content = %#v, want only manual bash invocation", info.Content)
+	}
+
+	actor.handle(map[string]any{"type": "message_added", "message": map[string]any{
+		"messageId": "M-invalid",
+		"role":      "assistant",
+	}})
+	actor.mu.Lock()
+	afterInvalid := len(actor.messages)
+	actor.mu.Unlock()
+	if afterInvalid != beforeInvalid {
+		t.Fatalf("invalid message without content was stored: before=%d after=%d", beforeInvalid, afterInvalid)
+	}
+}
+
 func TestNeoRuntimeThreadImportDerivesModeFromMessages(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	actor := rt.store.ensureThreadActor("T-import-mode")

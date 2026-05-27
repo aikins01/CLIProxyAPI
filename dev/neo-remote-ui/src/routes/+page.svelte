@@ -66,6 +66,8 @@
     path?: string;
     savedPath?: string;
     saved_path?: string;
+    sourcePath?: string;
+    source_path?: string;
     data?: string;
     base64?: string;
     mediaType?: string;
@@ -1005,17 +1007,19 @@
       throw new Error(`Image upload failed for ${attachment.name}`);
     }
     const uploaded = asRecord(await response.json().catch(() => ({})));
+    const attachmentUrl = stringFrom(uploaded.url);
     return {
       type: 'image',
       name: attachment.name,
       filename: attachment.name,
-      media_type: attachment.mediaType,
+      mediaType: attachment.mediaType,
+      sourcePath: attachmentUrl || attachment.name || 'image',
       source: {
         type: 'base64',
-        media_type: attachment.mediaType,
+        mediaType: attachment.mediaType,
         data
       },
-      attachmentUrl: stringFrom(uploaded.url)
+      attachmentUrl
     };
   }
 

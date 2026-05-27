@@ -2601,11 +2601,15 @@ func (a *neoActor) handleProtocolInferenceTools(msg map[string]any) {
 }
 
 func (a *neoActor) handleProtocolDelta(msg map[string]any) {
+	normalized, ok := normalizeNeoProtocolDelta(msg)
+	if !ok {
+		return
+	}
+	msg = normalized
 	messageID := stringValue(msg["messageId"])
 	role := stringValue(msg["role"])
 	blocks := cloneArray(arrayValue(msg["blocks"]))
-	if messageID == "" || role == "" {
-		a.broadcast(msg)
+	if messageID == "" {
 		return
 	}
 
@@ -2703,7 +2707,6 @@ func (a *neoActor) handleProtocolDelta(msg map[string]any) {
 func (a *neoActor) handleProtocolMessageAdded(msg map[string]any) {
 	incoming, ok := a.protocolMessageFromPayload(msg["message"])
 	if !ok {
-		a.broadcast(msg)
 		return
 	}
 	if incoming.ParentToolUseID == "" {
@@ -2735,7 +2738,6 @@ func (a *neoActor) handleProtocolMessageAdded(msg map[string]any) {
 func (a *neoActor) handleProtocolMessageUpdated(msg map[string]any) {
 	incoming, ok := a.protocolMessageFromPayload(msg["message"])
 	if !ok {
-		a.broadcast(msg)
 		return
 	}
 	if incoming.ParentToolUseID == "" {
@@ -3597,11 +3599,11 @@ func (a *neoActor) handleBinaryThreadTruncate(msg map[string]any) {
 }
 
 func (a *neoActor) protocolMessageFromPayload(raw any) (neoMessage, bool) {
-	m := mapValue(raw)
-	role := stringValue(m["role"])
-	if role == "" {
+	m, ok := normalizeNeoProtocolMessagePayload(raw)
+	if !ok {
 		return neoMessage{}, false
 	}
+	role := stringValue(m["role"])
 	messageID := messageIDValue(m["messageId"])
 	if messageID == "" {
 		messageID = messageIDValue(m["protocolMessageID"])
@@ -3610,15 +3612,12 @@ func (a *neoActor) protocolMessageFromPayload(raw any) (neoMessage, bool) {
 		return neoMessage{}, false
 	}
 	content := arrayValue(m["content"])
-	if content == nil {
-		content = []any{}
-	}
 	threadID := firstNonEmptyString(m["threadId"], m["threadID"], a.threadID)
 	return neoMessage{
 		ThreadID:             threadID,
 		MessageID:            messageID,
 		Role:                 role,
-		Content:              cloneArray(content),
+		Content:              content,
 		ParentToolUseID:      firstNonEmptyString(m["parentToolUseId"], m["parentToolUseID"], m["parentToolCallId"], m["parent_tool_use_id"]),
 		AgentMode:            stringValue(m["agentMode"]),
 		ReasoningEffort:      firstNonEmptyString(m["reasoningEffort"], m["reasoning_effort"]),
@@ -3633,6 +3632,481 @@ func (a *neoActor) protocolMessageFromPayload(raw any) (neoMessage, bool) {
 		OriginalToolUseInput: mapValue(m["originalToolUseInput"]),
 		CompletionStatus:     stringValue(m["completionStatus"]),
 	}, true
+}
+
+func normalizeNeoProtocolDelta(msg map[string]any) (map[string]any, bool) {
+	role := stringValue(msg["role"])
+	if role != "assistant" && role != "user" {
+		return nil, false
+	}
+	messageID := messageIDValue(msg["messageId"])
+	if messageID == "" {
+		return nil, false
+	}
+	out := cloneNeoJSONMap(msg)
+	out["messageId"] = messageID
+	if role == "assistant" {
+		if !neoProtocolAssistantDeltaState(stringValue(out["state"])) {
+			out["state"] = "generating"
+		}
+		if blocksRaw, exists := out["blocks"]; exists {
+			blocks := arrayValue(blocksRaw)
+			if blocks == nil {
+				delete(out, "blocks")
+				delete(out, "blockIndex")
+			} else {
+				normalized := make([]any, 0, len(blocks))
+				for _, rawBlock := range blocks {
+					block, ok := normalizeNeoProtocolAssistantBlock(rawBlock, true)
+					if !ok {
+						block = map[string]any{"type": "text", "text": "", "hidden": true}
+					}
+					normalized = append(normalized, block)
+				}
+				out["blocks"] = normalized
+				if blockIndex, ok := neoProtocolNonNegativeInt(out["blockIndex"]); ok {
+					out["blockIndex"] = blockIndex
+				} else {
+					out["blockIndex"] = 0
+				}
+			}
+		}
+		if usage := normalizeNeoUsage(mapValue(out["usage"])); len(usage) > 0 {
+			out["usage"] = usage
+		} else {
+			delete(out, "usage")
+		}
+		return out, true
+	}
+
+	out["state"] = "complete"
+	if blocksRaw, exists := out["blocks"]; exists {
+		blocks := arrayValue(blocksRaw)
+		if blocks == nil {
+			delete(out, "blocks")
+		} else {
+			out["blocks"] = normalizeNeoProtocolContent("user", blocks, false)
+		}
+	}
+	delete(out, "blockIndex")
+	return out, true
+}
+
+func normalizeNeoProtocolMessagePayload(raw any) (map[string]any, bool) {
+	m := mapValue(raw)
+	role := stringValue(m["role"])
+	if role != "user" && role != "assistant" && role != "info" {
+		return nil, false
+	}
+	messageID := messageIDValue(firstNonNil(m["messageId"], m["protocolMessageID"]))
+	if messageID == "" {
+		return nil, false
+	}
+	content := arrayValue(m["content"])
+	if content == nil {
+		return nil, false
+	}
+	out := cloneNeoJSONMap(m)
+	out["messageId"] = messageID
+	out["content"] = normalizeNeoProtocolContent(role, content, false)
+	if role == "assistant" {
+		if state, ok := normalizeNeoProtocolAssistantMessageState(out["state"]); ok {
+			out["state"] = state
+		} else {
+			delete(out, "state")
+		}
+		if usage := normalizeNeoUsage(mapValue(out["usage"])); len(usage) > 0 {
+			out["usage"] = usage
+		} else {
+			delete(out, "usage")
+		}
+	}
+	return out, true
+}
+
+func normalizeNeoProtocolContent(role string, content []any, assistantDelta bool) []any {
+	out := make([]any, 0, len(content))
+	for _, rawBlock := range content {
+		var (
+			block map[string]any
+			ok    bool
+		)
+		switch role {
+		case "assistant":
+			block, ok = normalizeNeoProtocolAssistantBlock(rawBlock, assistantDelta)
+		case "user":
+			block, ok = normalizeNeoProtocolUserBlock(rawBlock)
+		case "info":
+			block, ok = normalizeNeoProtocolInfoBlock(rawBlock)
+		}
+		if ok {
+			out = append(out, block)
+		}
+	}
+	return out
+}
+
+func normalizeNeoProtocolAssistantBlock(raw any, delta bool) (map[string]any, bool) {
+	block := mapValue(raw)
+	if len(block) == 0 {
+		return nil, false
+	}
+	switch stringValue(block["type"]) {
+	case "text":
+		return normalizeNeoProtocolTextBlock(block)
+	case "thinking":
+		return normalizeNeoProtocolThinkingBlock(block, delta)
+	case "redacted_thinking":
+		return normalizeNeoProtocolRedactedThinkingBlock(block)
+	case "tool_use":
+		return normalizeNeoProtocolAssistantToolUseBlock(block, delta)
+	case "server_tool_use":
+		return normalizeNeoProtocolServerToolUseBlock(block)
+	default:
+		return nil, false
+	}
+}
+
+func normalizeNeoProtocolUserBlock(raw any) (map[string]any, bool) {
+	block := mapValue(raw)
+	if len(block) == 0 {
+		return nil, false
+	}
+	switch stringValue(block["type"]) {
+	case "text":
+		return normalizeNeoProtocolTextBlock(block)
+	case "image":
+		return normalizeNeoProtocolImageBlock(block)
+	case "tool_result":
+		return normalizeNeoProtocolToolResultBlock(block)
+	default:
+		return nil, false
+	}
+}
+
+func normalizeNeoProtocolTextBlock(block map[string]any) (map[string]any, bool) {
+	text, ok := block["text"].(string)
+	if !ok {
+		return nil, false
+	}
+	out := cloneNeoJSONMap(block)
+	out["type"] = "text"
+	out["text"] = text
+	if hidden, ok := out["hidden"].(bool); ok {
+		out["hidden"] = hidden
+	} else {
+		delete(out, "hidden")
+	}
+	normalizeNeoProtocolBlockState(out)
+	return out, true
+}
+
+func normalizeNeoProtocolImageBlock(block map[string]any) (map[string]any, bool) {
+	source := mapValue(block["source"])
+	sourceType := stringValue(source["type"])
+	out := cloneNeoJSONMap(block)
+	out["type"] = "image"
+	switch sourceType {
+	case "base64":
+		data, ok := source["data"].(string)
+		if !ok {
+			return nil, false
+		}
+		mediaType := firstNonEmptyString(source["mediaType"], source["media_type"], source["mimeType"], source["mime_type"], block["mediaType"], block["media_type"], block["mimeType"], block["mime_type"])
+		if !neoProtocolImageMediaType(mediaType) {
+			mediaType = "image/png"
+		}
+		out["source"] = map[string]any{"type": "base64", "mediaType": mediaType, "data": data}
+	case "url":
+		url := stringValue(source["url"])
+		if url == "" {
+			return nil, false
+		}
+		out["source"] = map[string]any{"type": "url", "url": url}
+	default:
+		url := firstNonEmptyString(block["url"], block["uri"], block["href"], block["attachmentUrl"])
+		if url == "" {
+			return nil, false
+		}
+		out["source"] = map[string]any{"type": "url", "url": url}
+	}
+	sourcePath := firstNonEmptyString(block["sourcePath"], block["source_path"], block["path"], block["filePath"], block["filename"], block["name"], block["attachmentUrl"], block["url"], block["uri"], mapValue(out["source"])["url"])
+	if sourcePath == "" {
+		sourcePath = "image"
+	}
+	out["sourcePath"] = sourcePath
+	return out, true
+}
+
+func normalizeNeoProtocolToolResultBlock(block map[string]any) (map[string]any, bool) {
+	toolUseID := firstNonEmptyString(block["toolUseID"], block["toolUseId"], block["tool_use_id"], block["toolCallId"])
+	if toolUseID == "" {
+		return nil, false
+	}
+	run, ok := asMap(block["run"])
+	if !ok {
+		return nil, false
+	}
+	if _, ok := run["status"].(string); !ok {
+		return nil, false
+	}
+	out := cloneNeoJSONMap(block)
+	out["type"] = "tool_result"
+	out["toolUseID"] = toolUseID
+	out["run"] = cloneNeoJSONMap(run)
+	if userInput, ok := normalizeNeoProtocolToolResultUserInput(out["userInput"]); ok {
+		out["userInput"] = userInput
+	} else {
+		delete(out, "userInput")
+	}
+	return out, true
+}
+
+func normalizeNeoProtocolToolResultUserInput(raw any) (map[string]any, bool) {
+	if raw == nil {
+		return nil, false
+	}
+	input := mapValue(raw)
+	accepted, ok := input["accepted"].(bool)
+	if !ok {
+		return nil, false
+	}
+	out := map[string]any{"accepted": accepted}
+	if answers := mapValue(input["askAnswers"]); len(answers) > 0 {
+		filtered := map[string]any{}
+		for key, value := range answers {
+			if answer, ok := value.(string); ok {
+				filtered[key] = answer
+			}
+		}
+		if len(filtered) > 0 {
+			out["askAnswers"] = filtered
+		}
+	}
+	if feedback, ok := input["denyFeedback"].(string); ok {
+		out["denyFeedback"] = feedback
+	}
+	return out, true
+}
+
+func normalizeNeoProtocolThinkingBlock(block map[string]any, delta bool) (map[string]any, bool) {
+	thinking, ok := block["thinking"].(string)
+	if !ok {
+		return nil, false
+	}
+	out := cloneNeoJSONMap(block)
+	out["type"] = "thinking"
+	out["thinking"] = thinking
+	if signature, ok := block["signature"].(string); ok {
+		out["signature"] = signature
+	} else if !delta {
+		return nil, false
+	} else {
+		delete(out, "signature")
+	}
+	normalizeNeoProtocolBlockState(out)
+	return out, true
+}
+
+func normalizeNeoProtocolRedactedThinkingBlock(block map[string]any) (map[string]any, bool) {
+	data, ok := block["data"].(string)
+	if !ok {
+		return nil, false
+	}
+	out := cloneNeoJSONMap(block)
+	out["type"] = "redacted_thinking"
+	out["data"] = data
+	normalizeNeoProtocolBlockState(out)
+	return out, true
+}
+
+func normalizeNeoProtocolAssistantToolUseBlock(block map[string]any, delta bool) (map[string]any, bool) {
+	id := stringValue(block["id"])
+	if id == "" {
+		return nil, false
+	}
+	if complete, hasComplete := block["complete"].(bool); delta && hasComplete && !complete {
+		if partialDelta := mapValue(block["inputPartialJSONDelta"]); partialDelta != nil {
+			if jsonDelta, ok := partialDelta["json"].(string); ok {
+				out := cloneNeoJSONMap(block)
+				out["type"] = "tool_use"
+				out["id"] = id
+				out["complete"] = false
+				out["inputPartialJSONDelta"] = map[string]any{"json": jsonDelta}
+				return out, true
+			}
+		}
+	}
+	name := stringValue(block["name"])
+	if name == "" {
+		return nil, false
+	}
+	complete, ok := block["complete"].(bool)
+	if !ok {
+		return nil, false
+	}
+	input, ok := asMap(block["input"])
+	if !ok {
+		return nil, false
+	}
+	out := cloneNeoJSONMap(block)
+	out["type"] = "tool_use"
+	out["id"] = id
+	out["name"] = name
+	out["complete"] = complete
+	out["input"] = cloneNeoJSONMap(input)
+	if complete {
+		delete(out, "inputIncomplete")
+		delete(out, "inputPartialJSON")
+		delete(out, "inputPartialJSONDelta")
+	} else {
+		inputIncomplete, ok := asMap(block["inputIncomplete"])
+		if !ok {
+			return nil, false
+		}
+		partialJSON := mapValue(block["inputPartialJSON"])
+		jsonValue, ok := partialJSON["json"].(string)
+		if !ok {
+			return nil, false
+		}
+		out["inputIncomplete"] = cloneNeoJSONMap(inputIncomplete)
+		out["inputPartialJSON"] = map[string]any{"json": jsonValue}
+		delete(out, "inputPartialJSONDelta")
+	}
+	if normalizedName, ok := out["normalizedName"].(string); ok {
+		out["normalizedName"] = normalizedName
+	} else {
+		delete(out, "normalizedName")
+	}
+	if normalizedInput, ok := asMap(out["normalizedInput"]); ok {
+		out["normalizedInput"] = cloneNeoJSONMap(normalizedInput)
+	} else {
+		delete(out, "normalizedInput")
+	}
+	if metadata, ok := asMap(out["metadata"]); ok {
+		out["metadata"] = cloneNeoJSONMap(metadata)
+	} else {
+		delete(out, "metadata")
+	}
+	normalizeNeoProtocolBlockState(out)
+	return out, true
+}
+
+func normalizeNeoProtocolServerToolUseBlock(block map[string]any) (map[string]any, bool) {
+	id := stringValue(block["id"])
+	name := stringValue(block["name"])
+	input, ok := asMap(block["input"])
+	if id == "" || name == "" || !ok {
+		return nil, false
+	}
+	out := cloneNeoJSONMap(block)
+	out["type"] = "server_tool_use"
+	out["id"] = id
+	out["name"] = name
+	out["input"] = cloneNeoJSONMap(input)
+	normalizeNeoProtocolBlockState(out)
+	return out, true
+}
+
+func normalizeNeoProtocolInfoBlock(raw any) (map[string]any, bool) {
+	block := mapValue(raw)
+	if stringValue(block["type"]) != "manual_bash_invocation" {
+		return nil, false
+	}
+	args := mapValue(block["args"])
+	cmd, ok := args["cmd"].(string)
+	if !ok {
+		return nil, false
+	}
+	toolRun, ok := asMap(block["toolRun"])
+	if !ok {
+		return nil, false
+	}
+	if _, ok := toolRun["status"].(string); !ok {
+		return nil, false
+	}
+	out := cloneNeoJSONMap(block)
+	out["type"] = "manual_bash_invocation"
+	argsOut := map[string]any{"cmd": cmd}
+	if rawArgs := arrayValue(args["args"]); rawArgs != nil {
+		values := make([]any, 0, len(rawArgs))
+		for _, value := range rawArgs {
+			if arg, ok := value.(string); ok {
+				values = append(values, arg)
+			}
+		}
+		argsOut["args"] = values
+	}
+	if cwd, ok := args["cwd"].(string); ok {
+		argsOut["cwd"] = cwd
+	}
+	out["args"] = argsOut
+	out["toolRun"] = cloneNeoJSONMap(toolRun)
+	if hidden, ok := out["hidden"].(bool); ok {
+		out["hidden"] = hidden
+	} else {
+		delete(out, "hidden")
+	}
+	return out, true
+}
+
+func normalizeNeoProtocolAssistantMessageState(raw any) (map[string]any, bool) {
+	stateType := stringValue(mapValue(raw)["type"])
+	if stateType != "complete" && stateType != "cancelled" {
+		return nil, false
+	}
+	return map[string]any{"type": stateType}, true
+}
+
+func normalizeNeoProtocolBlockState(block map[string]any) {
+	if _, exists := block["blockState"]; !exists {
+		return
+	}
+	switch stringValue(block["blockState"]) {
+	case "start", "streaming", "complete":
+	default:
+		delete(block, "blockState")
+	}
+}
+
+func neoProtocolAssistantDeltaState(state string) bool {
+	switch state {
+	case "start", "generating", "tool_use", "complete", "error", "aborted":
+		return true
+	default:
+		return false
+	}
+}
+
+func neoProtocolImageMediaType(mediaType string) bool {
+	switch mediaType {
+	case "image/jpeg", "image/png", "image/gif", "image/webp":
+		return true
+	default:
+		return false
+	}
+}
+
+func neoProtocolNonNegativeInt(raw any) (int, bool) {
+	switch value := raw.(type) {
+	case int:
+		return value, value >= 0
+	case int64:
+		return int(value), value >= 0
+	case float64:
+		if value < 0 || value != float64(int(value)) {
+			return 0, false
+		}
+		return int(value), true
+	case json.Number:
+		i, err := value.Int64()
+		if err != nil || i < 0 {
+			return 0, false
+		}
+		return int(i), true
+	default:
+		return 0, false
+	}
 }
 
 func (a *neoActor) protocolSeqLocked(msg map[string]any) int {
@@ -4185,9 +4659,10 @@ func stringSliceFromAny(raw any) []string {
 }
 
 func (a *neoActor) receiveUserMessage(msg map[string]any) {
+	content := normalizeNeoProtocolContent("user", arrayValue(msg["content"]), false)
 	user := neoQueuedMessage{
 		MessageID:       fallbackString(msg["messageId"], newNeoMessageID()),
-		Content:         arrayValue(msg["content"]),
+		Content:         content,
 		UserState:       msg["userState"],
 		FileMentions:    mapValue(msg["fileMentions"]),
 		Meta:            mapValue(msg["meta"]),
