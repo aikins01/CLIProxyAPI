@@ -5715,6 +5715,7 @@ func getNeoCloudThread(ctx context.Context, cfg *config.Config, threadID string)
 		return nil, false, nil
 	}
 	normalizeNeoThreadOwnership(thread)
+	normalizeNeoThreadAgentMode(thread)
 	return thread, true, nil
 }
 
@@ -6003,6 +6004,9 @@ func neoThreadListEntry(thread map[string]any) map[string]any {
 		if _, exists := thread[key]; exists {
 			entry[key] = thread[key]
 		}
+	}
+	if stringValue(entry["agentMode"]) == "" {
+		entry["agentMode"] = firstNonEmptyString(neoThreadMapAgentMode(thread), "smart")
 	}
 	meta := mapValue(entry["meta"])
 	for _, key := range []string{"usesDtw", "usesThreadActors"} {
@@ -7097,6 +7101,7 @@ func neoThreadSearchResponse(ctx context.Context, cfg *config.Config, q url.Valu
 func loadNeoThread(ctx context.Context, cfg *config.Config, threadID string) (map[string]any, bool) {
 	local, localOK := loadNeoLocalThread(threadID)
 	if localOK && neoThreadHasUsefulContent(local) {
+		normalizeNeoThreadAgentMode(local)
 		return local, true
 	}
 	if neoCloudThreadID(threadID) {
@@ -7105,6 +7110,7 @@ func loadNeoThread(ctx context.Context, cfg *config.Config, threadID string) (ma
 			log.Debugf("amp neo cloud thread read failed thread=%s: %v", threadID, err)
 		}
 		if ok {
+			normalizeNeoThreadAgentMode(cloud)
 			if neoThreadHasUsefulContent(cloud) {
 				cacheNeoLocalThread(cloud)
 			}
@@ -7112,6 +7118,7 @@ func loadNeoThread(ctx context.Context, cfg *config.Config, threadID string) (ma
 		}
 	}
 	if localOK {
+		normalizeNeoThreadAgentMode(local)
 		return local, true
 	}
 	return nil, false
@@ -7136,6 +7143,7 @@ func cacheNeoLocalThread(thread map[string]any) {
 		return
 	}
 	normalizeNeoThreadOwnership(thread)
+	normalizeNeoThreadAgentMode(thread)
 	dir := neoAmpThreadStoreDir()
 	if dir == "" {
 		return
@@ -7172,6 +7180,55 @@ func normalizeNeoThreadOwnership(thread map[string]any) bool {
 		}
 	}
 	return changed
+}
+
+func normalizeNeoThreadAgentMode(thread map[string]any) bool {
+	if len(thread) == 0 {
+		return false
+	}
+	changed := false
+	if data := mapValue(thread["data"]); len(data) > 0 {
+		if normalizeNeoThreadAgentMode(data) {
+			thread["data"] = data
+			changed = true
+		}
+	}
+	mode := firstNonEmptyString(neoThreadMapAgentMode(thread), nestedString(thread["data"], "agentMode"), "smart")
+	if stringValue(thread["agentMode"]) != mode {
+		thread["agentMode"] = mode
+		changed = true
+	}
+	return changed
+}
+
+func neoThreadMapAgentMode(thread map[string]any) string {
+	if len(thread) == 0 {
+		return ""
+	}
+	if mode := firstNonEmptyString(thread["agentMode"], nestedString(thread["settings"], "agentMode")); mode != "" {
+		return mode
+	}
+	if mode := neoThreadMessagesAgentMode(thread["messages"]); mode != "" {
+		return mode
+	}
+	if data := mapValue(thread["data"]); len(data) > 0 {
+		return neoThreadMapAgentMode(data)
+	}
+	return ""
+}
+
+func neoThreadMessagesAgentMode(raw any) string {
+	messages := arrayValue(raw)
+	for i := len(messages) - 1; i >= 0; i-- {
+		message := mapValue(messages[i])
+		if stringValue(message["role"]) != "user" {
+			continue
+		}
+		if mode := strings.TrimSpace(stringValue(message["agentMode"])); mode != "" {
+			return mode
+		}
+	}
+	return ""
 }
 
 func neoThreadIDsFromQuery(query string) []string {
@@ -7314,6 +7371,7 @@ func neoLocalThreadSearchResult(thread map[string]any, query string) map[string]
 		"id":                stringValue(thread["id"]),
 		"title":             stringValue(thread["title"]),
 		"creatorUserID":     neoLocalOwnerUserID,
+		"agentMode":         firstNonEmptyString(neoThreadMapAgentMode(thread), "smart"),
 		"created":           created,
 		"updatedAt":         neoMillisRFC3339(updated),
 		"messageCount":      len(messages),
@@ -7332,6 +7390,7 @@ func neoCloudThreadSearchResult(thread map[string]any, query string) map[string]
 	result["created"] = firstNonZero(numberFrom(result["created"], result["createdAt"]), neoTimeStringMillis(stringValue(result["created"])), neoTimeStringMillis(stringValue(result["createdAt"])))
 	result["creatorUserID"] = neoLocalOwnerUserID
 	result["ownerUserId"] = neoLocalOwnerUserID
+	result["agentMode"] = firstNonEmptyString(neoThreadMapAgentMode(thread), "smart")
 	result["messageCount"] = firstNonZero(numberFrom(result["messageCount"]), numberFrom(mapValue(thread["summaryStats"])["messageCount"]), len(arrayValue(thread["messages"])))
 	if updated := neoThreadResultUpdatedMillis(result); updated > 0 {
 		result["updatedAt"] = neoMillisRFC3339(updated)
@@ -7714,12 +7773,13 @@ func neoCloudAgentMode(snapshot neoCloudThreadSnapshot, messages []neoMessage) s
 	if mode := stringValue(snapshot.settings["agentMode"]); mode != "" {
 		return mode
 	}
-	for _, message := range messages {
+	for i := len(messages) - 1; i >= 0; i-- {
+		message := messages[i]
 		if message.Role == "user" && message.AgentMode != "" {
 			return message.AgentMode
 		}
 	}
-	return ""
+	return "smart"
 }
 
 func neoCloudTitle(messages []neoMessage) string {

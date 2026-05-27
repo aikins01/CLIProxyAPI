@@ -7241,6 +7241,9 @@ func TestNeoCloudGetThreadDecodesCloudData(t *testing.T) {
 	if !ok || thread["id"] != threadID || thread["title"] != "Cloud thread" {
 		t.Fatalf("thread = %#v ok=%v", thread, ok)
 	}
+	if thread["agentMode"] != "smart" {
+		t.Fatalf("agentMode = %#v, want smart fallback", thread["agentMode"])
+	}
 	if gotAuth != "Bearer secret" {
 		t.Fatalf("Authorization = %q", gotAuth)
 	}
@@ -7311,6 +7314,9 @@ func TestNeoRuntimeServesCloudThreadWhenLocalMissing(t *testing.T) {
 	if got := stringValue(thread["ownerUserId"]); got != neoLocalOwnerUserID {
 		t.Fatalf("ownerUserId = %q, want %q", got, neoLocalOwnerUserID)
 	}
+	if got := stringValue(thread["agentMode"]); got != "smart" {
+		t.Fatalf("agentMode = %q, want smart fallback", got)
+	}
 
 	req = httptest.NewRequest(http.MethodGet, "/threads/"+threadID+".md", nil)
 	rec = httptest.NewRecorder()
@@ -7338,6 +7344,9 @@ func TestNeoRuntimeServesCloudThreadWhenLocalMissing(t *testing.T) {
 	}
 	if got := stringValue(mapValue(threads[0])["creatorUserID"]); got != neoLocalOwnerUserID {
 		t.Fatalf("search creatorUserID = %q, want %q", got, neoLocalOwnerUserID)
+	}
+	if got := stringValue(mapValue(threads[0])["agentMode"]); got != "smart" {
+		t.Fatalf("search agentMode = %q, want smart fallback", got)
 	}
 	if _, ok := mapValue(threads[0])["updatedAt"].(string); !ok {
 		t.Fatalf("search updatedAt = %#v, want string", mapValue(threads[0])["updatedAt"])
@@ -7399,6 +7408,9 @@ func TestNeoRuntimeSearchesCloudThreadsHTTP(t *testing.T) {
 	}
 	if got := stringValue(mapValue(threads[0])["creatorUserID"]); got != neoLocalOwnerUserID {
 		t.Fatalf("creatorUserID = %q, want %q", got, neoLocalOwnerUserID)
+	}
+	if got := stringValue(mapValue(threads[0])["agentMode"]); got != "smart" {
+		t.Fatalf("agentMode = %q, want smart fallback", got)
 	}
 	if got := mapValue(threads[0])["updatedAt"]; got != "2026-05-08T08:35:29.803Z" {
 		t.Fatalf("updatedAt = %#v", got)
@@ -7683,6 +7695,21 @@ func TestNeoCloudThreadIncludesProtocolMessageIDAndCompleteState(t *testing.T) {
 	}
 	if meta["usesThreadActors"] != true {
 		t.Fatalf("missing thread actor marker in meta: %#v", meta)
+	}
+}
+
+func TestNeoCloudThreadDefaultsAgentModeForBinarySwitch(t *testing.T) {
+	thread := neoCloudThread(neoCloudThreadSnapshot{
+		threadID:  "T-test",
+		seq:       1,
+		createdMs: 1778170000000,
+		messages: []neoMessage{
+			{MessageID: "M-user", Role: "user", Content: []any{map[string]any{"type": "text", "text": "hi"}}, Seq: 1},
+		},
+	})
+
+	if thread["agentMode"] != "smart" {
+		t.Fatalf("agentMode = %#v, want smart fallback for Amp binary thread switch", thread["agentMode"])
 	}
 }
 
