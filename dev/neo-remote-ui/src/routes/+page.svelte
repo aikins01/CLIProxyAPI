@@ -247,6 +247,7 @@
   });
   const maxComposerImages = 8;
   const maxComposerImageBytes = 45 * 1024 * 1024;
+  const maxQueuedMessages = 5;
   const agentModeOptions = ['smart', 'large', 'rush', 'deep', 'frontier', 'nostromo', 'agg-man'];
   const visibleAgentModeOptions = ['smart', 'large', 'rush', 'deep', 'frontier', 'nostromo'];
   const agentModeLabels: Record<string, string> = {
@@ -710,7 +711,7 @@
   }
 
   function canSubmitComposer() {
-    return composerHasDraft() && canSendMessage() && !composerUploadActive;
+    return composerHasDraft() && canSendMessage() && !composerUploadActive && !(shouldQueueOutgoingMessage() && queueIsFull());
   }
 
   function shouldQueueOutgoingMessage() {
@@ -718,6 +719,10 @@
     if (agentState && agentState !== 'idle') return true;
     if (toolLeases.length > 0 || toolApprovals.length > 0 || compactionActive || retryNotice) return true;
     return Boolean(liveTranscriptVerb());
+  }
+
+  function queueIsFull() {
+    return queuedMessages.length >= maxQueuedMessages;
   }
 
   function canInterruptActor() {
@@ -1029,6 +1034,10 @@
     const attachments = composerAttachments;
     const thread = detail;
     if ((!text && attachments.length === 0) || !thread || !canSendMessage() || composerUploadActive) return;
+    if (shouldQueueOutgoingMessage() && queueIsFull()) {
+      lastError = `Queue is full. Amp keeps up to ${maxQueuedMessages} queued messages.`;
+      return;
+    }
     composerUploadActive = true;
     lastError = '';
     let imageBlocks: ContentBlock[] = [];
@@ -1051,6 +1060,11 @@
     const agentMode = currentComposerMode();
     const reasoningEffort = currentComposerReasoningEffort();
     const shouldQueue = shouldQueueOutgoingMessage();
+    if (shouldQueue && queueIsFull()) {
+      lastError = `Queue is full. Amp keeps up to ${maxQueuedMessages} queued messages.`;
+      composerUploadActive = false;
+      return;
+    }
     const message: NeoMessage = {
       threadId: thread.id,
       messageId,
@@ -4324,7 +4338,7 @@
               bind:this={composerTextarea}
               bind:value={composer}
               rows="2"
-              placeholder={canSendMessage() ? shouldQueueOutgoingMessage() ? 'Queue a message for this thread...' : 'Send a message to this thread...' : connection === 'connected' ? 'Open this thread locally to send...' : 'Connect to send a message...'}
+              placeholder={canSendMessage() ? shouldQueueOutgoingMessage() ? queueIsFull() ? 'Queue is full for this thread...' : 'Queue a message for this thread...' : 'Send a message to this thread...' : connection === 'connected' ? 'Open this thread locally to send...' : 'Connect to send a message...'}
               onpaste={handleComposerPaste}
               oninput={detectThreadMentionTrigger}
               onkeydown={handleComposerKeydown}
@@ -4471,8 +4485,8 @@
                   class="send-button"
                   type="submit"
                   disabled={!canSubmitComposer()}
-                  title={shouldQueueOutgoingMessage() ? 'Queue message' : 'Send message'}
-                  aria-label={shouldQueueOutgoingMessage() ? 'Queue message' : 'Send message'}
+                  title={shouldQueueOutgoingMessage() ? queueIsFull() ? 'Queue full' : 'Queue message' : 'Send message'}
+                  aria-label={shouldQueueOutgoingMessage() ? queueIsFull() ? 'Queue full' : 'Queue message' : 'Send message'}
                 >
                   {#if composerUploadActive}
                     <Loader2 size={14} class="spin" />

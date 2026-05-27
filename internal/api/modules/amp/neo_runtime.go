@@ -61,6 +61,7 @@ const (
 	neoThreadExtractionModel         = "gemini-3-flash-preview"
 	neoJSONRPCFrameKey               = "__neo_jsonrpc_frame"
 	neoJSONRPCRequestIDKey           = "__neo_jsonrpc_request_id"
+	neoMaxQueuedMessages             = 5
 )
 
 var (
@@ -4307,20 +4308,20 @@ func (a *neoActor) enqueueBinaryQueuedMessage(msg map[string]any) {
 	user := neoQueuedMessageFromBinaryDelta(msg, true)
 	a.mu.Lock()
 	a.touchLocked()
+	if len(a.queue) >= neoMaxQueuedMessages {
+		a.mu.Unlock()
+		return
+	}
 	if user.Steer {
 		a.queue = append([]neoQueuedMessage{user}, a.queue...)
 	} else {
 		a.queue = append(a.queue, user)
 	}
 	seq := a.nextSeqLocked()
-	shouldProcess := a.agentState == "idle" && a.executorReady
 	a.mu.Unlock()
 
 	a.broadcast(map[string]any{"type": "queued_message_added", "message": user.queueProtocol(), "seq": seq})
 	a.syncCloudAsync()
-	if shouldProcess {
-		a.processQueue()
-	}
 }
 
 func (a *neoActor) dequeueQueuedMessage() {

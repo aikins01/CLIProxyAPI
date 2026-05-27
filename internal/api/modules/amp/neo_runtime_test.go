@@ -6586,6 +6586,32 @@ func TestNeoActorHandlesBinaryQueueDeltas(t *testing.T) {
 	waitForNeoActorSyncIdle(t, actor)
 }
 
+func TestNeoActorBinaryQueueEnqueueCapsAndDoesNotAutoRun(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	actor.executorReady = true
+	actor.agentState = "idle"
+
+	for i := 0; i < neoMaxQueuedMessages+1; i++ {
+		actor.handle(map[string]any{
+			"type": "user:message-queue:enqueue",
+			"message": map[string]any{
+				"content": []any{map[string]any{"type": "text", "text": fmt.Sprintf("queued %d", i)}},
+			},
+		})
+	}
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.queue) != neoMaxQueuedMessages {
+		t.Fatalf("queue len = %d, want binary cap %d: %#v", len(actor.queue), neoMaxQueuedMessages, actor.queue)
+	}
+	if len(actor.messages) != 0 {
+		t.Fatalf("messages = %#v, want enqueue to leave queued messages pending", actor.messages)
+	}
+}
+
 func TestNeoActorQueuedRemovalEventUsesQueuedMessageID(t *testing.T) {
 	useTempNeoThreadStore(t)
 	rt := newNeoRuntime(&config.Config{})
