@@ -7890,6 +7890,48 @@ func TestNeoActorBinaryModeDeltasUseUserTurnBoundary(t *testing.T) {
 	}
 }
 
+func TestNeoActorBinaryAgentModeDoesNotMaterializeDefaultEffort(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+
+	actor.handle(map[string]any{"type": "agent-mode", "mode": "deep"})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.currentAgentMode != "deep" || actor.settings["agentMode"] != "deep" {
+		t.Fatalf("agent mode = current:%q settings:%#v", actor.currentAgentMode, actor.settings)
+	}
+	if _, exists := actor.settings["reasoning.effort"]; exists {
+		t.Fatalf("agent-mode materialized reasoning effort: %#v", actor.settings)
+	}
+	if got := actor.reasoningEffortForModeLocked("deep"); got != "medium" {
+		t.Fatalf("resolved default effort = %q, want medium without explicit setting", got)
+	}
+}
+
+func TestNeoActorBinaryReasoningEffortAbsentClearsExplicitEffort(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+
+	actor.handle(map[string]any{"type": "agent-mode", "mode": "deep"})
+	actor.handle(map[string]any{"type": "reasoning-effort", "effort": "xhigh"})
+	actor.handle(map[string]any{"type": "reasoning-effort"})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.currentReasoningEffort != "" {
+		t.Fatalf("current reasoning effort = %q, want cleared", actor.currentReasoningEffort)
+	}
+	if _, exists := actor.settings["reasoning.effort"]; exists {
+		t.Fatalf("settings kept reasoning effort after absent effort delta: %#v", actor.settings)
+	}
+	if got := actor.reasoningEffortForModeLocked("deep"); got != "medium" {
+		t.Fatalf("resolved default effort = %q, want medium after clearing explicit setting", got)
+	}
+}
+
 func TestNeoActorBinaryScalarDeltasUseFalseyClears(t *testing.T) {
 	useTempNeoThreadStore(t)
 	parentID := "T-019e1046-656d-7132-879f-390ded941c16"

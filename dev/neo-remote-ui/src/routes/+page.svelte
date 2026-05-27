@@ -651,13 +651,9 @@
       connection = 'connected';
       sendFrame({ type: 'client_resume', version });
       if (options.bootstrapExecutor) {
-        sendFrame({
-          type: 'client_update_thread_settings',
-          settings: {
-            agentMode: options.agentMode || 'smart',
-            'reasoning.effort': options.reasoningEffort || ''
-          }
-        });
+        sendFrame({ type: 'agent-mode', mode: options.agentMode || 'smart' });
+        sendFrame(options.reasoningEffort ? { type: 'reasoning-effort', effort: options.reasoningEffort } : { type: 'reasoning-effort' });
+        sendFrame({ type: 'environment', env: options.environment ?? {} });
         sendFrame({
           type: 'client_spawn_executor',
           requestId: `spawn-${crypto.randomUUID()}`,
@@ -2017,10 +2013,8 @@
     const agentMode = normalizeAgentMode(mode);
     const reasoningEffort = normalizeReasoningEffortForMode(agentMode, effort);
     applyLocalThreadSettings(agentMode, reasoningEffort);
-    sendFrame({ type: 'agent-mode', value: agentMode });
-    if (reasoningEffort) {
-      sendFrame({ type: 'reasoning-effort', value: reasoningEffort });
-    }
+    sendFrame({ type: 'agent-mode', mode: agentMode });
+    sendFrame(reasoningEffort ? { type: 'reasoning-effort', effort: reasoningEffort } : { type: 'reasoning-effort' });
   }
 
   function toggleSettingsMenu(menu: 'mode' | 'effort') {

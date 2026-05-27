@@ -9691,30 +9691,60 @@ func (a *neoActor) updateAgentModeFromBinary(msg map[string]any) {
 	}
 	a.mu.Lock()
 	hasUserTurn := a.hasUserTurnLocked()
-	a.mu.Unlock()
 	if hasUserTurn {
+		a.mu.Unlock()
 		log.Debugf("amp neo local runtime ignored agent-mode after first message")
 		return
 	}
-	a.updateSettings(map[string]any{"agentMode": mode})
+	if a.settings == nil {
+		a.settings = map[string]any{}
+	}
+	a.settings["agentMode"] = mode
+	a.currentAgentMode = mode
+	settings := cloneMap(a.settings)
+	a.mu.Unlock()
+
+	a.broadcast(map[string]any{"type": "thread_settings", "settings": settings})
 	a.syncCloudAsync()
 }
 
 func (a *neoActor) updateReasoningEffortFromBinary(msg map[string]any) {
-	effort := firstNonEmptyString(msg["effort"], msg["reasoningEffort"], msg["value"])
+	rawEffort, hasEffort := firstPresentValue(msg, "effort", "reasoningEffort", "value")
+	effort := stringValue(rawEffort)
 	a.mu.Lock()
 	hasUserTurn := a.hasUserTurnLocked()
 	mode := a.agentModeLocked()
-	a.mu.Unlock()
 	if hasUserTurn {
+		a.mu.Unlock()
 		log.Debugf("amp neo local runtime ignored reasoning-effort after first message")
 		return
 	}
-	if effort != "" && !neoReasoningEffortAllowedForMode(mode, effort) {
+	if !hasEffort {
+		if a.settings == nil {
+			a.settings = map[string]any{}
+		}
+		delete(a.settings, "reasoning.effort")
+		a.currentReasoningEffort = ""
+		settings := cloneMap(a.settings)
+		a.mu.Unlock()
+		a.broadcast(map[string]any{"type": "thread_settings", "settings": settings})
+		a.syncCloudAsync()
+		return
+	}
+	if !neoReasoningEffortAllowedForMode(mode, effort) {
+		a.mu.Unlock()
 		log.Debugf("amp neo local runtime ignored invalid reasoning effort %q for mode %q", effort, mode)
 		return
 	}
-	a.updateSettings(map[string]any{"reasoning.effort": effort})
+	if a.settings == nil {
+		a.settings = map[string]any{}
+	}
+	a.settings["reasoning.effort"] = effort
+	a.currentReasoningEffort = effort
+	settings := cloneMap(a.settings)
+	a.mu.Unlock()
+
+	a.broadcast(map[string]any{"type": "thread_settings", "settings": settings})
 	a.syncCloudAsync()
 }
 
