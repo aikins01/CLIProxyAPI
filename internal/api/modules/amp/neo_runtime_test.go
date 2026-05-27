@@ -9842,6 +9842,55 @@ func TestNeoImageToolResultAcceptsBinaryResultArray(t *testing.T) {
 	}
 }
 
+func TestNeoImageToolResultReplaysImageContentToProviders(t *testing.T) {
+	run := normalizeNeoLocalThreadToolRun(context.Background(), nil, neoPendingTool{Name: "view_media"}, map[string]any{
+		"status": "done",
+		"result": []any{
+			map[string]any{"type": "text", "text": "Viewed image: /tmp/chart.png"},
+			map[string]any{"type": "image", "mimeType": "image/png", "data": "abc123"},
+		},
+	}, "T-current")
+	tool := neoHistoryMessage{Role: "tool", ToolCallID: "TU-view", ToolName: "view_media", Text: runToText(run), Content: neoToolRunHistoryContent(run)}
+	history := []neoHistoryMessage{
+		{Role: "assistant", ToolCalls: []neoToolCall{{ID: "TU-view", Name: "view_media"}}},
+		tool,
+	}
+
+	anthropic := anthropicNeoMessages(history)
+	anthropicTool := mapValue(arrayValue(mapValue(anthropic[1])["content"])[0])
+	anthropicContent := arrayValue(anthropicTool["content"])
+	if len(anthropicContent) != 2 || stringValue(mapValue(anthropicContent[0])["text"]) != "Viewed image: /tmp/chart.png" {
+		t.Fatalf("anthropic tool content = %#v", anthropicContent)
+	}
+	anthropicImageSource := mapValue(mapValue(anthropicContent[1])["source"])
+	if stringValue(anthropicImageSource["media_type"]) != "image/png" || stringValue(anthropicImageSource["data"]) != "abc123" {
+		t.Fatalf("anthropic image source = %#v", anthropicImageSource)
+	}
+
+	responsesInput := openAIResponsesNeoInput(history, "")
+	responsesOutput := arrayValue(mapValue(responsesInput[1])["output"])
+	if len(responsesOutput) != 2 || stringValue(mapValue(responsesOutput[0])["text"]) != "Viewed image: /tmp/chart.png" {
+		t.Fatalf("responses output = %#v", responsesOutput)
+	}
+	if imageURL := stringValue(mapValue(responsesOutput[1])["image_url"]); imageURL != "data:image/png;base64,abc123" {
+		t.Fatalf("responses image_url = %q", imageURL)
+	}
+
+	google := googleNeoContents(history, "")
+	googleParts := arrayValue(mapValue(google[1])["parts"])
+	if len(googleParts) != 2 {
+		t.Fatalf("google parts = %#v", googleParts)
+	}
+	response := mapValue(mapValue(googleParts[0])["functionResponse"])
+	if stringValue(mapValue(response["response"])["content"]) != "Viewed image: /tmp/chart.png" {
+		t.Fatalf("google function response = %#v", response)
+	}
+	inlineData := mapValue(mapValue(googleParts[1])["inlineData"])
+	if stringValue(inlineData["mimeType"]) != "image/png" || stringValue(inlineData["data"]) != "abc123" {
+		t.Fatalf("google inline data = %#v", inlineData)
+	}
+}
+
 func TestNeoToolRunTextResultMatchesBinaryTypedTextBlocks(t *testing.T) {
 	run := map[string]any{
 		"status": "done",

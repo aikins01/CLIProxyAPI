@@ -5928,7 +5928,7 @@ func (a *neoActor) receiveToolResult(msg map[string]any) {
 		CreatedAt:       time.Now().UTC().Format(time.RFC3339Nano),
 		ParentToolUseID: pending.ParentToolCallID,
 	})
-	a.history = append(a.history, neoHistoryMessage{Role: "tool", ToolCallID: toolCallID, ToolName: pending.Name, Text: runToText(run), ParentToolUseID: pending.ParentToolCallID})
+	a.history = append(a.history, neoHistoryMessage{Role: "tool", ToolCallID: toolCallID, ToolName: pending.Name, Text: runToText(run), Content: neoToolRunHistoryContent(run), ParentToolUseID: pending.ParentToolCallID})
 	remaining := len(a.pendingTools)
 	ready := a.executorReady
 	if remaining == 0 && !ready {
@@ -16672,7 +16672,7 @@ func anthropicNeoMessages(history []neoHistoryMessage) []any {
 	for _, msg := range history {
 		switch msg.Role {
 		case "tool":
-			messages = append(messages, map[string]any{"role": "user", "content": []any{map[string]any{"type": "tool_result", "tool_use_id": msg.ToolCallID, "content": msg.Text}}})
+			messages = append(messages, map[string]any{"role": "user", "content": []any{map[string]any{"type": "tool_result", "tool_use_id": msg.ToolCallID, "content": anthropicNeoToolResultContent(msg)}}})
 		case "assistant":
 			content := make([]any, 0, len(msg.ThinkingBlocks)+1+len(msg.ToolCalls))
 			for _, tb := range msg.ThinkingBlocks {
@@ -16812,7 +16812,7 @@ func openAIResponsesNeoInput(history []neoHistoryMessage, system string) []any {
 				if customToolCalls[msg.ToolCallID] {
 					outputType = "custom_tool_call_output"
 				}
-				input = append(input, map[string]any{"type": outputType, "call_id": msg.ToolCallID, "output": msg.Text})
+				input = append(input, map[string]any{"type": outputType, "call_id": msg.ToolCallID, "output": openAIResponsesNeoToolOutput(msg)})
 			}
 		case "assistant":
 			for _, tb := range msg.ThinkingBlocks {
@@ -16890,6 +16890,71 @@ func openAIResponsesNeoUserContent(msg neoHistoryMessage) []any {
 	return content
 }
 
+func anthropicNeoToolResultContent(msg neoHistoryMessage) any {
+	if len(msg.Content) == 0 {
+		return msg.Text
+	}
+	content := make([]any, 0, len(msg.Content))
+	for _, raw := range msg.Content {
+		block := mapValue(raw)
+		switch stringValue(block["type"]) {
+		case "text":
+			if text := stringValue(block["text"]); text != "" {
+				content = append(content, map[string]any{"type": "text", "text": text})
+			}
+		case "image", "input_image", "image_url":
+			if image := anthropicNeoImageBlock(block); len(image) > 0 {
+				content = append(content, image)
+			}
+		}
+	}
+	if len(content) == 0 {
+		return msg.Text
+	}
+	return content
+}
+
+func openAIResponsesNeoToolOutput(msg neoHistoryMessage) any {
+	if len(msg.Content) == 0 {
+		return msg.Text
+	}
+	content := openAIResponsesNeoUserContent(msg)
+	if len(content) == 0 {
+		return msg.Text
+	}
+	return content
+}
+
+func googleNeoToolResultParts(msg neoHistoryMessage) []any {
+	response := map[string]any{"content": msg.Text}
+	parts := []any{map[string]any{"functionResponse": map[string]any{"name": fallbackString(msg.ToolName, msg.ToolCallID), "response": response}}}
+	if len(msg.Content) == 0 {
+		return parts
+	}
+	texts := make([]string, 0)
+	for _, raw := range msg.Content {
+		block := mapValue(raw)
+		switch stringValue(block["type"]) {
+		case "text":
+			if text := stringValue(block["text"]); text != "" {
+				texts = append(texts, text)
+			}
+		case "image", "input_image", "image_url":
+			imageParts := googleNeoUserParts(neoHistoryMessage{Content: []any{block}})
+			for _, part := range imageParts {
+				if _, ok := mapValue(part)["text"]; ok {
+					continue
+				}
+				parts = append(parts, part)
+			}
+		}
+	}
+	if len(texts) > 0 {
+		response["content"] = strings.Join(texts, "\n")
+	}
+	return parts
+}
+
 func googleNeoContents(history []neoHistoryMessage, system string) []any {
 	history = sanitizeNeoHistoryToolPairs(history)
 	contents := make([]any, 0, len(history)+1)
@@ -16899,7 +16964,7 @@ func googleNeoContents(history []neoHistoryMessage, system string) []any {
 	for _, msg := range history {
 		switch msg.Role {
 		case "tool":
-			contents = append(contents, map[string]any{"role": "user", "parts": []any{map[string]any{"functionResponse": map[string]any{"name": fallbackString(msg.ToolName, msg.ToolCallID), "response": map[string]any{"content": msg.Text}}}}})
+			contents = append(contents, map[string]any{"role": "user", "parts": googleNeoToolResultParts(msg)})
 		case "assistant":
 			parts := make([]any, 0, 1+len(msg.ToolCalls))
 			if msg.Text != "" {
@@ -18781,7 +18846,7 @@ func neoToolResultHistoryContent(blocks []any, toolNames map[string]string, pare
 		if toolCallID == "" {
 			continue
 		}
-		results = append(results, neoHistoryMessage{Role: "tool", ToolCallID: toolCallID, ToolName: toolNames[toolCallID], Text: runToText(run), ParentToolUseID: parentToolUseID})
+		results = append(results, neoHistoryMessage{Role: "tool", ToolCallID: toolCallID, ToolName: toolNames[toolCallID], Text: runToText(run), Content: neoToolRunHistoryContent(run), ParentToolUseID: parentToolUseID})
 	}
 	return results
 }
@@ -18967,6 +19032,41 @@ func runToText(run any) string {
 	}
 	raw, _ := json.Marshal(m)
 	return string(raw)
+}
+
+func neoToolRunHistoryContent(run map[string]any) []any {
+	if stringValue(run["status"]) != "done" {
+		return nil
+	}
+	items := arrayValue(run["result"])
+	if len(items) == 0 {
+		return nil
+	}
+	content := make([]any, 0, len(items))
+	hasImage := false
+	for _, raw := range items {
+		block := mapValue(raw)
+		switch stringValue(block["type"]) {
+		case "text":
+			if text := stringValue(block["text"]); text != "" {
+				content = append(content, map[string]any{"type": "text", "text": text})
+			}
+		case "image":
+			image, ok := normalizeNeoToolRunImage(block)
+			if !ok {
+				return nil
+			}
+			image["type"] = "image"
+			content = append(content, image)
+			hasImage = true
+		default:
+			return nil
+		}
+	}
+	if !hasImage || len(content) == 0 {
+		return nil
+	}
+	return content
 }
 
 func neoToolRunTextResult(value any) string {
