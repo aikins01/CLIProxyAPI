@@ -13419,6 +13419,7 @@ func inferNeoAnthropic(rt *neoRuntime, request neoInferenceRequest, route neoMod
 		"messages":   anthropicNeoMessages(request.History),
 	}
 	neoApplyAnthropicThinking(body, route, request.ReasoningEffort)
+	neoApplyAnthropicRequestSettings(body, route, request)
 	if len(request.Tools) > 0 {
 		body["tools"] = anthropicNeoTools(request.Tools)
 		body["tool_choice"] = map[string]any{"type": "auto"}
@@ -13581,6 +13582,7 @@ func inferNeoAnthropicStream(rt *neoRuntime, request neoInferenceRequest, route 
 		"messages":   anthropicNeoMessages(request.History),
 	}
 	neoApplyAnthropicThinking(body, route, request.ReasoningEffort)
+	neoApplyAnthropicRequestSettings(body, route, request)
 	if len(request.Tools) > 0 {
 		body["tools"] = anthropicNeoTools(request.Tools)
 		body["tool_choice"] = map[string]any{"type": "auto"}
@@ -17339,6 +17341,84 @@ func neoApplyAnthropicThinking(body map[string]any, route neoModelRoute, fallbac
 	// level suffix: convert to a budget.
 	if budget, ok := thinking.ConvertLevelToBudget(suffix); ok && budget > 0 {
 		body["thinking"] = map[string]any{"type": "enabled", "budget_tokens": budget}
+	}
+}
+
+func neoApplyAnthropicRequestSettings(body map[string]any, route neoModelRoute, request neoInferenceRequest) {
+	thinkingEnabled := neoAnthropicThinkingEnabled(request)
+	if !thinkingEnabled && !neoAnthropicSupportsAdaptiveEffort(route.Model) {
+		delete(body, "thinking")
+		outputConfig := cloneMap(mapValue(body["output_config"]))
+		delete(outputConfig, "effort")
+		if len(outputConfig) == 0 {
+			delete(body, "output_config")
+		} else {
+			body["output_config"] = outputConfig
+		}
+	}
+	if temperature, ok := neoAnthropicTemperature(request.Settings); ok && !thinkingEnabled {
+		body["temperature"] = temperature
+	}
+}
+
+func neoAnthropicThinkingEnabled(request neoInferenceRequest) bool {
+	if strings.TrimSpace(request.ReasoningEffort) == "none" {
+		return false
+	}
+	if value, exists := request.Settings["anthropic.thinking.enabled"]; exists {
+		switch typed := value.(type) {
+		case bool:
+			return typed
+		case string:
+			switch strings.ToLower(strings.TrimSpace(typed)) {
+			case "false", "0", "no", "off":
+				return false
+			case "true", "1", "yes", "on":
+				return true
+			}
+		}
+	}
+	return true
+}
+
+func neoAnthropicTemperature(settings map[string]any) (any, bool) {
+	value, exists := settings["anthropic.temperature"]
+	if !exists {
+		return nil, false
+	}
+	switch typed := value.(type) {
+	case int:
+		return typed, true
+	case int8:
+		return int(typed), true
+	case int16:
+		return int(typed), true
+	case int32:
+		return int(typed), true
+	case int64:
+		return typed, true
+	case uint:
+		return typed, true
+	case uint8:
+		return uint(typed), true
+	case uint16:
+		return uint(typed), true
+	case uint32:
+		return uint(typed), true
+	case uint64:
+		return typed, true
+	case float32:
+		return float64(typed), true
+	case float64:
+		return typed, true
+	case json.Number:
+		parsed, err := typed.Float64()
+		if err != nil {
+			return nil, false
+		}
+		return parsed, true
+	default:
+		return nil, false
 	}
 }
 

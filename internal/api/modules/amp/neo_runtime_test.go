@@ -6152,6 +6152,89 @@ func TestInferNeoAnthropicUsesBinaryDefaultMaxTokens(t *testing.T) {
 	}
 }
 
+func TestInferNeoAnthropicAppliesTemperatureOnlyWhenThinkingDisabled(t *testing.T) {
+	tests := []struct {
+		name           string
+		request        neoInferenceRequest
+		wantTemp       bool
+		wantNoThinking bool
+	}{
+		{
+			name: "reasoning none",
+			request: neoInferenceRequest{
+				ThreadID:        "T-test",
+				AgentMode:       "smart",
+				ReasoningEffort: "none",
+				Settings:        map[string]any{"anthropic.temperature": 0.7},
+				History:         []neoHistoryMessage{{Role: "user", Text: "hi"}},
+			},
+			wantTemp:       true,
+			wantNoThinking: true,
+		},
+		{
+			name: "setting disabled",
+			request: neoInferenceRequest{
+				ThreadID:        "T-test",
+				AgentMode:       "smart",
+				ReasoningEffort: "high",
+				Settings:        map[string]any{"anthropic.temperature": 0.7, "anthropic.thinking.enabled": false},
+				History:         []neoHistoryMessage{{Role: "user", Text: "hi"}},
+			},
+			wantTemp:       true,
+			wantNoThinking: true,
+		},
+		{
+			name: "thinking enabled",
+			request: neoInferenceRequest{
+				ThreadID:        "T-test",
+				AgentMode:       "smart",
+				ReasoningEffort: "high",
+				Settings:        map[string]any{"anthropic.temperature": 0.7},
+				History:         []neoHistoryMessage{{Role: "user", Text: "hi"}},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/api/provider/anthropic/v1/messages" {
+					t.Fatalf("unexpected path %s", r.URL.Path)
+				}
+				payload := readNeoJSON(r.Body)
+				if tt.wantTemp {
+					if temp, ok := payload["temperature"].(float64); !ok || temp != 0.7 {
+						t.Fatalf("temperature = %#v, want 0.7; payload=%#v", payload["temperature"], payload)
+					}
+				} else if _, exists := payload["temperature"]; exists {
+					t.Fatalf("temperature should be omitted while thinking is enabled: %#v", payload)
+				}
+				if tt.wantNoThinking {
+					if _, exists := payload["thinking"]; exists {
+						t.Fatalf("thinking should be omitted when disabled for non-adaptive Anthropic models: %#v", payload)
+					}
+				} else {
+					thinkingBody := mapValue(payload["thinking"])
+					if stringValue(thinkingBody["type"]) != "enabled" {
+						t.Fatalf("thinking = %#v, want enabled", thinkingBody)
+					}
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"content":[{"type":"text","text":"ok"}]}`))
+			}))
+			defer upstream.Close()
+
+			result, err := inferNeoAnthropic(testNeoRuntimeForServer(t, upstream), tt.request, neoModelRoute{Provider: "anthropic", Model: "claude-test"})
+			if err != nil {
+				t.Fatalf("inferNeoAnthropic error: %v", err)
+			}
+			if result.Text != "ok" {
+				t.Fatalf("text=%q, want ok", result.Text)
+			}
+		})
+	}
+}
+
 func TestInferNeoAnthropicStreamRetriesWithAdaptiveThinkingWhenEnabledUnsupported(t *testing.T) {
 	calls := 0
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
