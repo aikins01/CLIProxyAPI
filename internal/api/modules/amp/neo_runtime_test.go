@@ -6320,12 +6320,22 @@ func TestInferNeoAnthropicAppliesTemperatureOnlyWhenThinkingDisabled(t *testing.
 			wantNoThinking: true,
 		},
 		{
+			name: "default disabled",
+			request: neoInferenceRequest{
+				ThreadID:        "T-test",
+				AgentMode:       "smart",
+				ReasoningEffort: "high",
+				History:         []neoHistoryMessage{{Role: "user", Text: "hi"}},
+			},
+			wantNoThinking: true,
+		},
+		{
 			name: "thinking enabled",
 			request: neoInferenceRequest{
 				ThreadID:        "T-test",
 				AgentMode:       "smart",
 				ReasoningEffort: "high",
-				Settings:        map[string]any{"anthropic.temperature": 0.7},
+				Settings:        map[string]any{"anthropic.temperature": 0.7, "anthropic.thinking.enabled": true},
 				History:         []neoHistoryMessage{{Role: "user", Text: "hi"}},
 			},
 		},
@@ -6421,7 +6431,7 @@ func TestInferNeoAnthropicStreamRetriesWithAdaptiveThinkingWhenEnabledUnsupporte
 		ThreadID:        "T-test",
 		AgentMode:       "smart",
 		ReasoningEffort: "high",
-		Settings:        map[string]any{"internal.model": "anthropic/claude-test"},
+		Settings:        map[string]any{"internal.model": "anthropic/claude-test", "anthropic.thinking.enabled": true},
 		History:         []neoHistoryMessage{{Role: "user", Text: "hi"}},
 	}, func(delta neoInferenceDelta) {
 		deltas = append(deltas, delta.Text)

@@ -17444,7 +17444,7 @@ func neoAnthropicThinkingEnabled(request neoInferenceRequest) bool {
 			}
 		}
 	}
-	return true
+	return false
 }
 
 func neoAnthropicTemperature(settings map[string]any) (any, bool) {
