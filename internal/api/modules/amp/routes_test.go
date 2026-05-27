@@ -3,6 +3,7 @@ package amp
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -915,6 +916,21 @@ func TestRegisterManagementRoutesServesNeoStartupInternalRPCPostsLocally(t *test
 			path: "/api/internal?uploadThread",
 			body: `{"method":"uploadThread","params":{"thread":{"id":"` + threadID + `"},"createdOnServer":false}}`,
 		},
+		{
+			name: "logNoticeAction",
+			path: "/api/internal?logNoticeAction",
+			body: `{"method":"logNoticeAction","params":{"key":"local","action":"view"}}`,
+		},
+		{
+			name: "markAsReadMysteriousMessage",
+			path: "/api/internal?markAsReadMysteriousMessage",
+			body: `{"method":"markAsReadMysteriousMessage","params":{"messageId":"msg_local"}}`,
+		},
+		{
+			name: "userDisplayBalanceInfo",
+			path: "/api/internal?userDisplayBalanceInfo",
+			body: `{"method":"userDisplayBalanceInfo","params":{}}`,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			proxyCalled = false
@@ -966,6 +982,178 @@ func TestRegisterManagementRoutesServesNeoStartupInternalRPCPostsLocally(t *test
 		}
 		if stringValue(thread["creatorUserID"]) != neoLocalOwnerUserID {
 			t.Fatalf("creatorUserID = %#v, want %q", thread["creatorUserID"], neoLocalOwnerUserID)
+		}
+	})
+
+	t.Run("thread meta", func(t *testing.T) {
+		proxyCalled = false
+		body := bytes.NewBufferString(`{"method":"getThreadMeta","params":{"thread":"` + threadID + `"}}`)
+		req := httptest.NewRequest(http.MethodPost, "/api/internal?getThreadMeta", body)
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("getThreadMeta status = %d, body=%s", rec.Code, rec.Body.String())
+		}
+		if proxyCalled {
+			t.Fatal("getThreadMeta should be served locally")
+		}
+		var response map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+			t.Fatalf("getThreadMeta response JSON error: %v", err)
+		}
+		meta := mapValue(mapValue(response["result"])["meta"])
+		if stringValue(meta["visibility"]) != "private" {
+			t.Fatalf("initial meta = %#v, want private visibility", meta)
+		}
+
+		setBody := bytes.NewBufferString(`{"method":"setThreadMeta","params":{"thread":"` + threadID + `","meta":{"visibility":"thread_workspace_shared","shareWithAllCreatorGroups":true,"sharedGroupIDs":["G-local"]}}}`)
+		setReq := httptest.NewRequest(http.MethodPost, "/api/internal?setThreadMeta", setBody)
+		setReq.Header.Set("Content-Type", "application/json")
+		setRec := httptest.NewRecorder()
+		r.ServeHTTP(setRec, setReq)
+
+		if setRec.Code != http.StatusOK {
+			t.Fatalf("setThreadMeta status = %d, body=%s", setRec.Code, setRec.Body.String())
+		}
+		if proxyCalled {
+			t.Fatal("setThreadMeta should be served locally")
+		}
+		if err := json.Unmarshal(setRec.Body.Bytes(), &response); err != nil {
+			t.Fatalf("setThreadMeta response JSON error: %v", err)
+		}
+		meta = mapValue(mapValue(response["result"])["meta"])
+		if stringValue(meta["visibility"]) != "thread_workspace_shared" {
+			t.Fatalf("updated meta = %#v, want workspace shared visibility", meta)
+		}
+		reloaded, ok := loadNeoLocalThread(threadID)
+		if !ok {
+			t.Fatal("thread should still be stored locally")
+		}
+		if stringValue(mapValue(reloaded["meta"])["visibility"]) != "thread_workspace_shared" {
+			t.Fatalf("persisted meta = %#v", reloaded["meta"])
+		}
+	})
+
+	t.Run("thread labels", func(t *testing.T) {
+		proxyCalled = false
+		addBody := bytes.NewBufferString(`{"method":"addThreadLabels","params":{"thread":"` + threadID + `","labels":["parity","runtime"]}}`)
+		addReq := httptest.NewRequest(http.MethodPost, "/api/internal?addThreadLabels", addBody)
+		addReq.Header.Set("Content-Type", "application/json")
+		addRec := httptest.NewRecorder()
+		r.ServeHTTP(addRec, addReq)
+
+		if addRec.Code != http.StatusOK {
+			t.Fatalf("addThreadLabels status = %d, body=%s", addRec.Code, addRec.Body.String())
+		}
+		if proxyCalled {
+			t.Fatal("addThreadLabels should be served locally")
+		}
+		var response map[string]any
+		if err := json.Unmarshal(addRec.Body.Bytes(), &response); err != nil {
+			t.Fatalf("addThreadLabels response JSON error: %v", err)
+		}
+		labels := arrayValue(response["result"])
+		if len(labels) != 2 {
+			t.Fatalf("addThreadLabels result = %#v", response["result"])
+		}
+
+		getReq := httptest.NewRequest(http.MethodPost, "/api/internal?getThreadLabels", bytes.NewBufferString(`{"method":"getThreadLabels","params":{"thread":"`+threadID+`"}}`))
+		getReq.Header.Set("Content-Type", "application/json")
+		getRec := httptest.NewRecorder()
+		r.ServeHTTP(getRec, getReq)
+		if getRec.Code != http.StatusOK {
+			t.Fatalf("getThreadLabels status = %d, body=%s", getRec.Code, getRec.Body.String())
+		}
+		if err := json.Unmarshal(getRec.Body.Bytes(), &response); err != nil {
+			t.Fatalf("getThreadLabels response JSON error: %v", err)
+		}
+		labels = arrayValue(response["result"])
+		if len(labels) != 2 || stringValue(mapValue(labels[0])["name"]) != "parity" || stringValue(mapValue(labels[1])["name"]) != "runtime" {
+			t.Fatalf("getThreadLabels result = %#v", response["result"])
+		}
+
+		userReq := httptest.NewRequest(http.MethodPost, "/api/internal?getUserLabels", bytes.NewBufferString(`{"method":"getUserLabels","params":{"query":"run"}}`))
+		userReq.Header.Set("Content-Type", "application/json")
+		userRec := httptest.NewRecorder()
+		r.ServeHTTP(userRec, userReq)
+		if userRec.Code != http.StatusOK {
+			t.Fatalf("getUserLabels status = %d, body=%s", userRec.Code, userRec.Body.String())
+		}
+		if err := json.Unmarshal(userRec.Body.Bytes(), &response); err != nil {
+			t.Fatalf("getUserLabels response JSON error: %v", err)
+		}
+		labels = arrayValue(response["result"])
+		if len(labels) != 1 || stringValue(mapValue(labels[0])["name"]) != "runtime" {
+			t.Fatalf("getUserLabels result = %#v", response["result"])
+		}
+
+		listReq := httptest.NewRequest(http.MethodPost, "/api/internal?listThreads", bytes.NewBufferString(`{"method":"listThreads","params":{"includeArchived":false,"limit":10}}`))
+		listReq.Header.Set("Content-Type", "application/json")
+		listRec := httptest.NewRecorder()
+		r.ServeHTTP(listRec, listReq)
+		if listRec.Code != http.StatusOK {
+			t.Fatalf("listThreads status = %d, body=%s", listRec.Code, listRec.Body.String())
+		}
+		if err := json.Unmarshal(listRec.Body.Bytes(), &response); err != nil {
+			t.Fatalf("listThreads response JSON error: %v", err)
+		}
+		threads := arrayValue(mapValue(response["result"])["threads"])
+		if len(threads) == 0 {
+			t.Fatalf("listThreads result = %#v", response["result"])
+		}
+		var listedThread map[string]any
+		for _, thread := range threads {
+			candidate := mapValue(thread)
+			if stringValue(candidate["id"]) == threadID {
+				listedThread = candidate
+				break
+			}
+		}
+		if len(listedThread) == 0 {
+			t.Fatalf("thread %s missing from listThreads result: %#v", threadID, response["result"])
+		}
+		listLabels := arrayValue(listedThread["labels"])
+		if len(listLabels) != 2 || stringValue(mapValue(listLabels[0])["name"]) != "parity" || stringValue(mapValue(listLabels[1])["name"]) != "runtime" {
+			t.Fatalf("list thread = %#v", listedThread)
+		}
+	})
+
+	t.Run("archive and delete thread", func(t *testing.T) {
+		proxyCalled = false
+		archiveBody := bytes.NewBufferString(`{"method":"archiveThread","params":{"thread":"` + threadID + `","archived":true}}`)
+		archiveReq := httptest.NewRequest(http.MethodPost, "/api/internal?archiveThread", archiveBody)
+		archiveReq.Header.Set("Content-Type", "application/json")
+		archiveRec := httptest.NewRecorder()
+		r.ServeHTTP(archiveRec, archiveReq)
+
+		if archiveRec.Code != http.StatusOK {
+			t.Fatalf("archiveThread status = %d, body=%s", archiveRec.Code, archiveRec.Body.String())
+		}
+		if proxyCalled {
+			t.Fatal("archiveThread should be served locally")
+		}
+		reloaded, ok := loadNeoLocalThread(threadID)
+		if !ok || reloaded["archived"] != true {
+			t.Fatalf("archived thread = %#v, ok=%v", reloaded, ok)
+		}
+
+		deleteID := "T-019e06a8-13c9-708d-8090-783005818ef0"
+		if err := os.WriteFile(filepath.Join(dir, deleteID+".json"), []byte(`{"id":"`+deleteID+`","title":"delete me"}`), 0o600); err != nil {
+			t.Fatalf("write delete thread: %v", err)
+		}
+		deleteBody := bytes.NewBufferString(`{"method":"deleteThread","params":{"thread":"` + deleteID + `"}}`)
+		deleteReq := httptest.NewRequest(http.MethodPost, "/api/internal?deleteThread", deleteBody)
+		deleteReq.Header.Set("Content-Type", "application/json")
+		deleteRec := httptest.NewRecorder()
+		r.ServeHTTP(deleteRec, deleteReq)
+
+		if deleteRec.Code != http.StatusOK {
+			t.Fatalf("deleteThread status = %d, body=%s", deleteRec.Code, deleteRec.Body.String())
+		}
+		if _, err := os.Stat(filepath.Join(dir, deleteID+".json")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("deleteThread stat err = %v, want not exist", err)
 		}
 	})
 }

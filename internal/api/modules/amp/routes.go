@@ -10,6 +10,9 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -392,7 +395,7 @@ func neoLocalInternalMethod(r *http.Request) string {
 		return ""
 	}
 	query := r.URL.Query()
-	for _, method := range []string{"loadPlugins", "getUserInfo", "getThreadLinkInfo", "threadDisplayCostInfo", "listThreads", "getUserFreeTierStatus", "uploadThread", "getThread", "notices"} {
+	for _, method := range neoLocalInternalMethods {
 		if _, ok := query[method]; ok {
 			return method
 		}
@@ -407,12 +410,36 @@ func neoLocalInternalMethod(r *http.Request) string {
 }
 
 func neoLocalInternalMethodSupported(method string) bool {
-	switch strings.TrimSpace(method) {
-	case "loadPlugins", "getUserInfo", "getThreadLinkInfo", "threadDisplayCostInfo", "listThreads", "getUserFreeTierStatus", "uploadThread", "getThread", "notices":
-		return true
-	default:
-		return false
+	method = strings.TrimSpace(method)
+	for _, supported := range neoLocalInternalMethods {
+		if method == supported {
+			return true
+		}
 	}
+	return false
+}
+
+var neoLocalInternalMethods = []string{
+	"loadPlugins",
+	"getUserInfo",
+	"getThreadLinkInfo",
+	"threadDisplayCostInfo",
+	"listThreads",
+	"getUserFreeTierStatus",
+	"uploadThread",
+	"getThread",
+	"getThreadMeta",
+	"setThreadMeta",
+	"archiveThread",
+	"deleteThread",
+	"getThreadLabels",
+	"setThreadLabels",
+	"addThreadLabels",
+	"getUserLabels",
+	"notices",
+	"logNoticeAction",
+	"markAsReadMysteriousMessage",
+	"userDisplayBalanceInfo",
 }
 
 func neoLocalInternalPayload(r *http.Request) map[string]any {
@@ -475,8 +502,30 @@ func neoLocalInternalResponse(ctx context.Context, cfg *config.Config, r *http.R
 		return gin.H{"ok": true, "result": gin.H{}}
 	case "getThread":
 		return neoLocalGetThreadResponse(ctx, cfg, r)
+	case "getThreadMeta":
+		return neoLocalGetThreadMetaResponse(ctx, cfg, r)
+	case "setThreadMeta":
+		return neoLocalSetThreadMetaResponse(ctx, cfg, r)
+	case "archiveThread":
+		return neoLocalArchiveThreadResponse(ctx, cfg, r)
+	case "deleteThread":
+		return neoLocalDeleteThreadResponse(r)
+	case "getThreadLabels":
+		return neoLocalGetThreadLabelsResponse(ctx, cfg, r)
+	case "setThreadLabels":
+		return neoLocalSetThreadLabelsResponse(ctx, cfg, r, false)
+	case "addThreadLabels":
+		return neoLocalSetThreadLabelsResponse(ctx, cfg, r, true)
+	case "getUserLabels":
+		return neoLocalGetUserLabelsResponse(r)
 	case "notices":
 		return gin.H{"ok": true, "result": []any{}}
+	case "logNoticeAction", "markAsReadMysteriousMessage":
+		return gin.H{"ok": true, "result": gin.H{}}
+	case "userDisplayBalanceInfo":
+		return gin.H{"ok": true, "result": gin.H{
+			"displayText": "Local runtime: usage and credit balance are not tracked by the local proxy.",
+		}}
 	default:
 		return gin.H{"ok": true, "result": nil}
 	}
@@ -570,11 +619,11 @@ func neoLocalListThreadsResult(ctx context.Context, cfg *config.Config, r *http.
 func neoLocalGetThreadResponse(ctx context.Context, cfg *config.Config, r *http.Request) gin.H {
 	threadID := neoLocalInternalThreadID(r)
 	if threadID == "" {
-		return gin.H{"ok": false, "error": gin.H{"code": "thread-not-found", "message": "thread not found"}}
+		return neoLocalThreadNotFoundResponse()
 	}
 	thread, ok := loadNeoThread(ctx, cfg, threadID)
 	if !ok {
-		return gin.H{"ok": false, "error": gin.H{"code": "thread-not-found", "message": "thread not found"}}
+		return neoLocalThreadNotFoundResponse()
 	}
 	normalizeNeoThreadOwnership(thread)
 	envelope := gin.H{
@@ -588,6 +637,217 @@ func neoLocalGetThreadResponse(ctx context.Context, cfg *config.Config, r *http.
 		}
 	}
 	return gin.H{"ok": true, "result": gin.H{"thread": envelope}}
+}
+
+func neoLocalGetThreadMetaResponse(ctx context.Context, cfg *config.Config, r *http.Request) gin.H {
+	threadID := neoLocalInternalThreadID(r)
+	if threadID == "" {
+		return neoLocalThreadNotFoundResponse()
+	}
+	thread, ok := loadNeoThread(ctx, cfg, threadID)
+	if !ok {
+		return neoLocalThreadNotFoundResponse()
+	}
+	return gin.H{"ok": true, "result": gin.H{"meta": neoNormalizedThreadMeta(thread["meta"])}}
+}
+
+func neoLocalSetThreadMetaResponse(ctx context.Context, cfg *config.Config, r *http.Request) gin.H {
+	threadID := neoLocalInternalThreadID(r)
+	if threadID == "" {
+		return neoLocalThreadNotFoundResponse()
+	}
+	thread, ok := loadNeoThread(ctx, cfg, threadID)
+	if !ok {
+		return neoLocalThreadNotFoundResponse()
+	}
+	params := neoLocalInternalParams(r)
+	meta := neoNormalizedThreadMeta(params["meta"])
+	thread["meta"] = meta
+	cacheNeoLocalThread(thread)
+	return gin.H{"ok": true, "result": gin.H{"meta": meta}}
+}
+
+func neoLocalArchiveThreadResponse(ctx context.Context, cfg *config.Config, r *http.Request) gin.H {
+	threadID := neoLocalInternalThreadID(r)
+	if threadID == "" {
+		return neoLocalThreadNotFoundResponse()
+	}
+	thread, ok := loadNeoThread(ctx, cfg, threadID)
+	if !ok {
+		return neoLocalThreadNotFoundResponse()
+	}
+	params := neoLocalInternalParams(r)
+	thread["archived"] = boolValue(params["archived"])
+	cacheNeoLocalThread(thread)
+	return gin.H{"ok": true, "result": gin.H{"archived": thread["archived"]}}
+}
+
+func neoLocalDeleteThreadResponse(r *http.Request) gin.H {
+	threadID := neoLocalInternalThreadID(r)
+	if !neoThreadIDExactPattern.MatchString(threadID) {
+		return neoLocalThreadNotFoundResponse()
+	}
+	dir := neoAmpThreadStoreDir()
+	if dir == "" {
+		return neoLocalThreadNotFoundResponse()
+	}
+	path := filepath.Join(dir, threadID+".json")
+	if err := os.Remove(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return neoLocalThreadNotFoundResponse()
+		}
+		return gin.H{"ok": false, "error": gin.H{"code": "delete-failed", "message": err.Error()}}
+	}
+	return gin.H{"ok": true, "result": gin.H{}}
+}
+
+func neoLocalGetThreadLabelsResponse(ctx context.Context, cfg *config.Config, r *http.Request) gin.H {
+	threadID := neoLocalInternalThreadID(r)
+	if threadID == "" {
+		return neoLocalThreadNotFoundResponse()
+	}
+	thread, ok := loadNeoThread(ctx, cfg, threadID)
+	if !ok {
+		return neoLocalThreadNotFoundResponse()
+	}
+	return gin.H{"ok": true, "result": neoThreadLabelObjects(neoLocalThreadLabelNames(thread))}
+}
+
+func neoLocalSetThreadLabelsResponse(ctx context.Context, cfg *config.Config, r *http.Request, appendLabels bool) gin.H {
+	threadID := neoLocalInternalThreadID(r)
+	if threadID == "" {
+		return neoLocalThreadNotFoundResponse()
+	}
+	thread, ok := loadNeoThread(ctx, cfg, threadID)
+	if !ok {
+		return neoLocalThreadNotFoundResponse()
+	}
+	labels := neoLabelsFromValue(neoLocalInternalParams(r)["labels"])
+	if appendLabels {
+		labels = neoMergeThreadLabels(neoLocalThreadLabelNames(thread), labels)
+	}
+	thread["labels"] = neoThreadLabelObjects(labels)
+	cacheNeoLocalThread(thread)
+	return gin.H{"ok": true, "result": neoThreadLabelObjects(labels)}
+}
+
+func neoLocalGetUserLabelsResponse(r *http.Request) gin.H {
+	threads, err := loadNeoLocalThreads()
+	if err != nil {
+		return gin.H{"ok": true, "result": []any{}}
+	}
+	names := make([]string, 0)
+	for _, thread := range threads {
+		names = neoMergeThreadLabels(names, neoLocalThreadLabelNames(thread))
+	}
+	query := ""
+	if r != nil && r.URL != nil {
+		query = strings.ToLower(strings.TrimSpace(r.URL.Query().Get("query")))
+	}
+	if params := neoLocalInternalParams(r); len(params) > 0 {
+		query = strings.ToLower(strings.TrimSpace(firstNonEmptyString(params["query"], query)))
+	}
+	if query != "" {
+		filtered := names[:0]
+		for _, name := range names {
+			if strings.Contains(strings.ToLower(name), query) {
+				filtered = append(filtered, name)
+			}
+		}
+		names = filtered
+	}
+	return gin.H{"ok": true, "result": neoThreadLabelObjects(names)}
+}
+
+func neoLocalThreadNotFoundResponse() gin.H {
+	return gin.H{"ok": false, "error": gin.H{"code": "thread-not-found", "message": "thread not found"}}
+}
+
+func neoNormalizedThreadMeta(raw any) map[string]any {
+	meta := cloneMap(mapValue(raw))
+	meta["visibility"] = neoNormalizedThreadVisibility(stringValue(meta["visibility"]))
+	if sharedGroupIDs := firstArray(meta["sharedGroupIDs"]); sharedGroupIDs != nil {
+		meta["sharedGroupIDs"] = sharedGroupIDs
+	} else {
+		meta["sharedGroupIDs"] = []any{}
+	}
+	return meta
+}
+
+func neoNormalizedThreadVisibility(value string) string {
+	switch value {
+	case "private", "thread_group_shared", "thread_workspace_shared", "public_unlisted", "public_discoverable":
+		return value
+	default:
+		return "private"
+	}
+}
+
+func neoLocalThreadLabelNames(thread map[string]any) []string {
+	return neoMergeThreadLabels(
+		neoLabelsFromValue(thread["labels"]),
+		neoLabelsFromValue(mapValue(thread["meta"])["labels"]),
+	)
+}
+
+func neoLabelsFromValue(raw any) []string {
+	var values []any
+	switch typed := raw.(type) {
+	case []string:
+		values = make([]any, 0, len(typed))
+		for _, value := range typed {
+			values = append(values, value)
+		}
+	default:
+		values = arrayValue(raw)
+	}
+	if len(values) == 0 {
+		return nil
+	}
+	labels := make([]string, 0, len(values))
+	for _, value := range values {
+		label := ""
+		switch typed := value.(type) {
+		case string:
+			label = typed
+		case gin.H:
+			label = stringValue(typed["name"])
+		case map[string]any:
+			label = stringValue(typed["name"])
+		default:
+			label = stringValue(value)
+		}
+		label = strings.TrimSpace(label)
+		if label != "" {
+			labels = append(labels, label)
+		}
+	}
+	return neoMergeThreadLabels(labels)
+}
+
+func neoMergeThreadLabels(groups ...[]string) []string {
+	seen := make(map[string]bool)
+	labels := make([]string, 0)
+	for _, group := range groups {
+		for _, label := range group {
+			label = strings.TrimSpace(label)
+			if label == "" || seen[label] {
+				continue
+			}
+			seen[label] = true
+			labels = append(labels, label)
+		}
+	}
+	sort.Strings(labels)
+	return labels
+}
+
+func neoThreadLabelObjects(labels []string) []any {
+	out := make([]any, 0, len(labels))
+	for _, label := range labels {
+		out = append(out, gin.H{"name": label})
+	}
+	return out
 }
 
 func neoLocalThreadLinkInfoResult(ctx context.Context, cfg *config.Config, r *http.Request) gin.H {

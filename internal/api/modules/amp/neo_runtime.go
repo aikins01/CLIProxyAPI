@@ -5919,6 +5919,14 @@ func recentNeoLocalThreads(limit int) []map[string]any {
 				thread[key] = value.Value()
 			}
 		}
+		if value := gjson.GetBytes(raw, "labels"); value.Exists() {
+			var labels []any
+			if err := json.Unmarshal([]byte(value.Raw), &labels); err == nil && labels != nil {
+				thread["labels"] = labels
+			} else if fallback := arrayValue(value.Value()); fallback != nil {
+				thread["labels"] = fallback
+			}
+		}
 		if messages := gjson.GetBytes(raw, "messages"); messages.Exists() && messages.IsArray() {
 			thread["messageCount"] = len(messages.Array())
 		}
@@ -5985,7 +5993,7 @@ func mergeNeoThreadListEntry(existing, incoming map[string]any) map[string]any {
 	}
 	merged := cloneMap(existing)
 	replacePreferred := neoThreadUpdatedMillis(incoming) >= neoThreadUpdatedMillis(existing)
-	for _, key := range []string{"title", "created", "createdAt", "updated", "updatedAt", "userLastInteractedAt", "messageCount", "archived", "meta", "relationships", "v", "agentMode", "env", "summaryStats", "usesDtw", "usesThreadActors"} {
+	for _, key := range []string{"title", "created", "createdAt", "updated", "updatedAt", "userLastInteractedAt", "messageCount", "archived", "meta", "relationships", "labels", "v", "agentMode", "env", "summaryStats", "usesDtw", "usesThreadActors"} {
 		if _, exists := incoming[key]; !exists {
 			continue
 		}
@@ -6034,6 +6042,11 @@ func neoThreadListEntry(thread map[string]any) map[string]any {
 		entry["relationships"] = relationships
 	} else {
 		entry["relationships"] = []any{}
+	}
+	if labels := neoLocalThreadLabelNames(thread); len(labels) > 0 {
+		entry["labels"] = neoThreadLabelObjects(labels)
+	} else if _, exists := thread["labels"]; exists {
+		entry["labels"] = []any{}
 	}
 	if entry["messageCount"] == nil {
 		entry["messageCount"] = firstNonZero(numberFrom(mapValue(thread["summaryStats"])["messageCount"]), len(arrayValue(thread["messages"])))
