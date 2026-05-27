@@ -1762,9 +1762,9 @@ func (a *neoActor) handleBinaryToolData(msg map[string]any) {
 	toolCallID := neoToolCallIDFromMessage(msg)
 	var run map[string]any
 	if _, exists := msg["data"]; exists {
-		run = cloneMap(mapValue(msg["data"]))
+		run = mapValue(sanitizeNeoBinaryReducerValue(msg["data"]))
 	} else {
-		run = cloneMap(firstMap(msg["run"], msg["toolRun"], msg["tool_run"]))
+		run = mapValue(sanitizeNeoBinaryReducerValue(firstMap(msg["run"], msg["toolRun"], msg["tool_run"])))
 		if len(run) == 0 {
 			return
 		}
@@ -4245,10 +4245,10 @@ func neoQueuedMessageFromBinaryDelta(msg map[string]any, queue bool) neoQueuedMe
 	return neoQueuedMessage{
 		ID:              queueID,
 		MessageID:       messageID,
-		Content:         content,
-		UserState:       firstNonNil(source["userState"], msg["userState"]),
-		FileMentions:    mapValue(firstNonNil(source["fileMentions"], msg["fileMentions"])),
-		Meta:            mapValue(firstNonNil(source["meta"], msg["meta"])),
+		Content:         sanitizeNeoBinaryReducerArray(content),
+		UserState:       sanitizeNeoBinaryReducerValue(firstNonNil(source["userState"], msg["userState"])),
+		FileMentions:    sanitizeNeoBinaryReducerMap(mapValue(firstNonNil(source["fileMentions"], msg["fileMentions"]))),
+		Meta:            sanitizeNeoBinaryReducerMap(mapValue(firstNonNil(source["meta"], msg["meta"]))),
 		CreatedAt:       createdAt,
 		AgentMode:       firstNonEmptyString(source["agentMode"], msg["agentMode"]),
 		ReasoningEffort: firstNonEmptyString(source["reasoningEffort"], source["reasoning_effort"], msg["reasoningEffort"], msg["reasoning_effort"]),
@@ -17175,6 +17175,215 @@ func cloneNeoJSONValue(value any) any {
 	default:
 		return value
 	}
+}
+
+type neoBinarySecretRedactionPattern struct {
+	id              string
+	keywords        []string
+	caseInsensitive bool
+	re              *regexp.Regexp
+}
+
+var neoBinarySecretRedactionPatterns = []neoBinarySecretRedactionPattern{
+	{id: "sourcegraph-access-token-v3", keywords: []string{"sgp_"}, re: regexp.MustCompile(`(sgp_(?:[a-fA-F0-9]{16}|local)_[a-fA-F0-9]{40})`)},
+	{id: "sourcegraph-access-token-v2", keywords: []string{"sgp_"}, re: regexp.MustCompile(`(sgp_[a-fA-F0-9]{40})`)},
+	{id: "sourcegraph-dotcom-user-gateway", keywords: []string{"sgd_"}, re: regexp.MustCompile(`(sgd_[a-fA-F0-9]{64})`)},
+	{id: "sourcegraph-license-key", keywords: []string{"slk_"}, re: regexp.MustCompile(`(slk_[a-fA-F0-9]{64})`)},
+	{id: "sourcegraph-enterprise-subscription", keywords: []string{"sgs_"}, re: regexp.MustCompile(`(sgs_[a-fA-F0-9]{64})`)},
+	{id: "sourcegraph-amp", keywords: []string{"sgamp_user_"}, re: regexp.MustCompile(`(sgamp_user_[A-Z0-9]{26}_[a-f0-9]{64})`)},
+	{id: "sourcegraph-amp-auth-bypass", keywords: []string{"sgamp_user_auth-bypass_"}, re: regexp.MustCompile(`(sgamp_user_auth-bypass_[a-zA-Z0-9_-]+)`)},
+	{id: "sourcegraph-workspace-token", keywords: []string{"sgp_ws"}, re: regexp.MustCompile(`(sgp_ws[a-fA-F0-9]{32}_[a-fA-F0-9]{40})`)},
+	{id: "github-pat", keywords: []string{"ghp_"}, re: regexp.MustCompile(`(ghp_[0-9a-zA-Z]{36})`)},
+	{id: "github-oauth", keywords: []string{"gho_"}, re: regexp.MustCompile(`(gho_[0-9a-zA-Z]{36})`)},
+	{id: "github-app-token", keywords: []string{"ghu_", "ghs_"}, re: regexp.MustCompile(`((ghu|ghs)_[0-9a-zA-Z]{36})`)},
+	{id: "github-refresh-token", keywords: []string{"ghr_"}, re: regexp.MustCompile(`(ghr_[0-9a-zA-Z]{76})`)},
+	{id: "github-fine-grained-pat", keywords: []string{"github_pat_"}, re: regexp.MustCompile(`(github_pat_[a-zA-Z0-9]{22}_[a-zA-Z0-9]{59})`)},
+	{id: "gitlab-pat", keywords: []string{"glpat-"}, re: regexp.MustCompile(`(glpat-[0-9a-zA-Z_-]{20})`)},
+	{id: "bitbucket-pat", keywords: []string{"bbpat-"}, re: regexp.MustCompile(`(bbpat-[A-Za-z0-9]{20,200})`)},
+	{id: "bitbucket-repo-access-token", keywords: []string{"bbrat-"}, re: regexp.MustCompile(`(bbrat-[A-Za-z0-9]{20,200})`)},
+	{id: "aws-access-key-id", keywords: []string{"A3T", "AKIA", "ASIA"}, re: regexp.MustCompile(`((A3T[A-Z0-9]|AKIA|ASIA)[A-Z0-9]{16})`)},
+	{id: "hugging-face-access-token", keywords: []string{"hf_"}, re: regexp.MustCompile(`(hf_[A-Za-z0-9]{34,40})`)},
+	{id: "private-key", keywords: []string{"-----"}, caseInsensitive: true, re: regexp.MustCompile(`(?is)-----\s*?BEGIN[ A-Z0-9_-]*?PRIVATE KEY(?: BLOCK)?\s*?-----\s*([A-Za-z0-9=+/\s]+)\s*-----\s*?END[ A-Z0-9_-]*? PRIVATE KEY(?: BLOCK)?\s*?-----`)},
+	{id: "shopify-token", keywords: []string{"shpss_", "shpat_", "shpca_", "shppa_"}, re: regexp.MustCompile(`(shp(ss|at|ca|pa)_[a-fA-F0-9]{32})`)},
+	{id: "slack-access-token", keywords: []string{"xoxb-", "xoxa-", "xoxp-", "xoxr-", "xoxs-", "xoxo-", "xapp-", "xwfp-"}, re: regexp.MustCompile(`((xox[baoprs]-|xapp-|xwfp-)([0-9a-zA-Z-]{10,100}))`)},
+	{id: "slack-config-refresh-token", keywords: []string{"xoxe-"}, caseInsensitive: true, re: regexp.MustCompile(`(?i)(xoxe-[0-9]-[a-zA-Z0-9]{146})`)},
+	{id: "slack-config-access-token", keywords: []string{"xoxe.xoxb-", "xoxe.xoxp-"}, caseInsensitive: true, re: regexp.MustCompile(`(?i)(xoxe\.xox[bp]-[0-9]-[A-Z0-9]{163,166})`)},
+	{id: "slack-web-hook", keywords: []string{"hooks.slack.com"}, caseInsensitive: true, re: regexp.MustCompile(`(?i)(https://hooks\.slack\.com/(services|triggers|workflows)/[A-Za-z0-9+/]{43,56})`)},
+	{id: "stripe-secret-token", keywords: []string{"sk_test_", "sk_live_"}, caseInsensitive: true, re: regexp.MustCompile(`(?i)(sk_(test|live)_[0-9a-z]{10,99})`)},
+	{id: "supabase-service-key", keywords: []string{"sbp_"}, re: regexp.MustCompile(`(sbp_[a-fA-F0-9]{40})`)},
+	{id: "pypi-upload-token", keywords: []string{"pypi-AgEIcHlwaS5vcmc"}, re: regexp.MustCompile(`(pypi-AgEIcHlwaS5vcmc[A-Za-z0-9_-]{50,1000})`)},
+	{id: "cloudflare-api-token", keywords: []string{"cfut_"}, re: regexp.MustCompile(`\b(cfut_[A-Za-z0-9]{48})\b`)},
+	{id: "e2b-api-key", keywords: []string{"e2b_"}, re: regexp.MustCompile(`\b(e2b_[a-f0-9]{40})\b`)},
+	{id: "google-api-key", keywords: []string{"AIza"}, re: regexp.MustCompile(`\b(AIza[0-9A-Za-z_-]{35,40})\b`)},
+	{id: "twilio-api-key", keywords: []string{"SK"}, re: regexp.MustCompile(`(SK[0-9a-fA-F]{32})`)},
+	{id: "age-secret-key", keywords: []string{"AGE-SECRET-KEY-1"}, re: regexp.MustCompile(`(AGE-SECRET-KEY-1[QPZRY9X8GF2TVDW0S3JN54KHCE6MUA7L]{58})`)},
+	{id: "jwt-token", keywords: []string{".eyJ"}, re: regexp.MustCompile(`(ey[a-zA-Z0-9]{17,}\.ey[a-zA-Z0-9/_-]{17,}\.(?:[a-zA-Z0-9/_-]{10,}={0,2})?)`)},
+	{id: "npm-access-token", keywords: []string{"npm_"}, caseInsensitive: true, re: regexp.MustCompile(`(?i)(npm_[a-z0-9]{36})`)},
+	{id: "sendgrid-api-token", keywords: []string{"SG."}, caseInsensitive: true, re: regexp.MustCompile(`(?i)(SG\.[a-z0-9_.-]{66})`)},
+	{id: "linear-api-token", keywords: []string{"lin_api_"}, caseInsensitive: true, re: regexp.MustCompile(`(?i)(lin_api_[a-z0-9]{40})`)},
+	{id: "pulumi-api-token", keywords: []string{"pul-"}, re: regexp.MustCompile(`(pul-[a-f0-9]{40})`)},
+	{id: "postman-api-token", keywords: []string{"PMAK-"}, caseInsensitive: true, re: regexp.MustCompile(`(?i)(PMAK-[a-f0-9]{24}-[a-f0-9]{34})`)},
+	{id: "databricks-api-token", keywords: []string{"dapi"}, re: regexp.MustCompile(`(dapi[a-h0-9]{32})`)},
+	{id: "duffel-api-token", keywords: []string{"duffel_test_", "duffel_live_"}, caseInsensitive: true, re: regexp.MustCompile(`(?i)(duffel_(test|live)_[a-z0-9_-]{43})`)},
+	{id: "dynatrace-api-token", keywords: []string{"dt0c01."}, caseInsensitive: true, re: regexp.MustCompile(`(?i)(dt0c01\.[a-z0-9]{24}\.[a-z0-9]{64})`)},
+	{id: "new-relic-user-api-key", keywords: []string{"NRAK-"}, re: regexp.MustCompile(`(NRAK-[A-Z0-9]{27})`)},
+	{id: "new-relic-browser-api-token", keywords: []string{"NRJS-"}, re: regexp.MustCompile(`(NRJS-[a-f0-9]{19})`)},
+	{id: "planetscale-api-token", keywords: []string{"pscale_tkn_"}, caseInsensitive: true, re: regexp.MustCompile(`(?i)(pscale_tkn_[a-z0-9_.-]{43})`)},
+	{id: "planetscale-password", keywords: []string{"pscale_pw_"}, caseInsensitive: true, re: regexp.MustCompile(`(?i)(pscale_pw_[a-z0-9_.-]{43})`)},
+	{id: "rubygems-api-token", keywords: []string{"rubygems_"}, re: regexp.MustCompile(`(rubygems_[a-f0-9]{48})`)},
+	{id: "shippo-api-token", keywords: []string{"shippo_live_", "shippo_test_"}, re: regexp.MustCompile(`(shippo_(live|test)_[a-f0-9]{40})`)},
+	{id: "openai-api-key-project", keywords: []string{"sk-proj-"}, caseInsensitive: true, re: regexp.MustCompile(`(?i)(sk-proj-[A-Za-z0-9]{24}-[A-Za-z0-9]{40,128})`)},
+	{id: "openai-api-key-env", keywords: []string{"sk-live-", "sk-test-"}, caseInsensitive: true, re: regexp.MustCompile(`(?i)(sk-(?:live|test)-[A-Za-z0-9]{24}-[A-Za-z0-9]{40,128})`)},
+	{id: "openai-api-key", keywords: []string{"sk-"}, re: regexp.MustCompile(`(sk-[a-zA-Z0-9]{50})`)},
+	{id: "anthropic-api-key", keywords: []string{"sk-ant-"}, re: regexp.MustCompile(`(sk-ant-([a-zA-Z0-9]{1,10}-)?[a-zA-Z0-9_-]{32,128})`)},
+	{id: "api-key", keywords: []string{"api-key", "api_key", "api-token", "api_token"}, caseInsensitive: true, re: regexp.MustCompile(`(?i)(?:[a-z0-9_ .,-]{0,25}api[-_](?:key|token)[a-z0-9_ .,-]{0,25})\s*(?:=|>|:=|\|\|:|<=|=>|:)\s*['"]?([a-z0-9+/=_-]{6,256})`)},
+	{id: "webhook-secret", keywords: []string{"webhook-secret", "webhook_secret"}, caseInsensitive: true, re: regexp.MustCompile(`(?i)(?:[a-z0-9_ .,-]{0,25}webhook[-_]secret[a-z0-9_ .,-]{0,25})\s*(?:=|>|:=|\|\|:|<=|=>|:)\s*['"]?([a-z0-9+/=_-]{6,256})`)},
+	{id: "secret-value", keywords: []string{"secret"}, caseInsensitive: true, re: regexp.MustCompile(`(?i)(?:[a-z0-9_ .,-]{0,25}[-_](?:secret)[a-z0-9_ .,-]{0,25})\s*(?:=|>|:=|\|\|:|<=|=>|:)\s*['"]?([a-z0-9+/=_-]{6,256})`)},
+	{id: "password", keywords: []string{"password"}, caseInsensitive: true, re: regexp.MustCompile(`(?i)(?:[a-z0-9_ .,-]{0,25}password[a-z0-9_ .,-]{0,25})\s*(?:=|>|:=|\|\|:|<=|=>|:)\s*['"]?([a-z0-9+/=_-]{6,128})`)},
+	{id: "sk-secret", keywords: []string{"sk-", "sk_"}, caseInsensitive: true, re: regexp.MustCompile(`(?i)(?:^|['"\s])(sk(?:[-_][a-z0-9]{1,10})?[-_][a-z0-9]{10,99})(?:$|['"\s])`)},
+}
+
+func sanitizeNeoBinaryReducerValue(value any) any {
+	switch v := value.(type) {
+	case nil, bool, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64, json.Number:
+		return v
+	case string:
+		return sanitizeNeoBinaryReducerString(v)
+	case []any:
+		return sanitizeNeoBinaryReducerArray(v)
+	case []string:
+		out := make([]string, len(v))
+		for i, item := range v {
+			out[i] = sanitizeNeoBinaryReducerString(item)
+		}
+		return out
+	case map[string]string:
+		out := make(map[string]string, len(v))
+		for key, item := range v {
+			out[key] = sanitizeNeoBinaryReducerString(item)
+		}
+		return out
+	case map[string]any:
+		return sanitizeNeoBinaryReducerMap(v)
+	default:
+		return v
+	}
+}
+
+func sanitizeNeoBinaryReducerMap(in map[string]any) map[string]any {
+	if in == nil {
+		return nil
+	}
+	if valueType := stringValue(in["type"]); (valueType == "base64" || valueType == "image") && in["data"] != nil {
+		return cloneMap(in)
+	}
+	out := make(map[string]any, len(in))
+	if boolValue(in["isImage"]) {
+		if _, ok := in["content"].(string); ok {
+			for key, value := range in {
+				if key == "content" {
+					out[key] = value
+					continue
+				}
+				out[key] = sanitizeNeoBinaryReducerValue(value)
+			}
+			return out
+		}
+	}
+	for key, value := range in {
+		out[key] = sanitizeNeoBinaryReducerValue(value)
+	}
+	return out
+}
+
+func sanitizeNeoBinaryReducerArray(in []any) []any {
+	if in == nil {
+		return nil
+	}
+	out := make([]any, len(in))
+	for i, value := range in {
+		out[i] = sanitizeNeoBinaryReducerValue(value)
+	}
+	return out
+}
+
+func sanitizeNeoBinaryReducerString(value string) string {
+	out := removeNeoBinaryUnicodeTagChars(value)
+	for _, pattern := range neoBinarySecretRedactionPatterns {
+		if !neoBinaryRedactionPatternKeywordMatches(out, pattern) {
+			continue
+		}
+		out = redactNeoBinarySecretPattern(out, pattern)
+	}
+	return out
+}
+
+func removeNeoBinaryUnicodeTagChars(value string) string {
+	changed := false
+	for _, r := range value {
+		if r >= 0xE0000 && r <= 0xE007F {
+			changed = true
+			break
+		}
+	}
+	if !changed {
+		return value
+	}
+	var out strings.Builder
+	out.Grow(len(value))
+	for _, r := range value {
+		if r >= 0xE0000 && r <= 0xE007F {
+			continue
+		}
+		out.WriteRune(r)
+	}
+	return out.String()
+}
+
+func neoBinaryRedactionPatternKeywordMatches(value string, pattern neoBinarySecretRedactionPattern) bool {
+	haystack := value
+	if pattern.caseInsensitive {
+		haystack = strings.ToLower(value)
+	}
+	for _, keyword := range pattern.keywords {
+		needle := keyword
+		if pattern.caseInsensitive {
+			needle = strings.ToLower(keyword)
+		}
+		if strings.Contains(haystack, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func redactNeoBinarySecretPattern(value string, pattern neoBinarySecretRedactionPattern) string {
+	matches := pattern.re.FindAllStringSubmatchIndex(value, -1)
+	if len(matches) == 0 {
+		return value
+	}
+	replacement := "[REDACTED:" + pattern.id + "]"
+	var out strings.Builder
+	out.Grow(len(value))
+	last := 0
+	changed := false
+	for _, match := range matches {
+		if len(match) < 4 || match[2] < 0 || match[3] < 0 {
+			continue
+		}
+		if match[2] < last {
+			continue
+		}
+		out.WriteString(value[last:match[2]])
+		out.WriteString(replacement)
+		last = match[3]
+		changed = true
+	}
+	if !changed {
+		return value
+	}
+	out.WriteString(value[last:])
+	return out.String()
 }
 
 func cloneNeoJSONMap(in map[string]any) map[string]any {

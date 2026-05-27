@@ -6714,6 +6714,60 @@ func TestNeoActorHandlesBinaryUserThreadDeltas(t *testing.T) {
 	waitForNeoActorSyncIdle(t, actor)
 }
 
+func TestNeoActorBinaryUserMessageSanitizesReducerPayload(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+
+	githubToken := "ghp_" + strings.Repeat("A", 36)
+	imageContent := "sk-ant-api03-" + strings.Repeat("B", 32)
+	actor.handle(map[string]any{
+		"type": "user:message",
+		"message": map[string]any{
+			"content": []any{
+				map[string]any{"type": "text", "text": "token " + githubToken + "\U000E0001"},
+				map[string]any{"type": "image", "data": imageContent, "caption": githubToken},
+			},
+			"userState": map[string]any{
+				"activeEditor": "api_key=abcDEF123",
+			},
+			"fileMentions": map[string]any{
+				"files": []any{
+					map[string]any{"uri": "file:///image.png", "isImage": true, "content": githubToken, "imageInfo": map[string]any{"alt": githubToken}},
+					map[string]any{"uri": "file:///plain.txt", "content": githubToken},
+				},
+			},
+		},
+	})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.messages) != 1 {
+		t.Fatalf("messages = %#v", actor.messages)
+	}
+	text := stringValue(mapValue(actor.messages[0].Content[0])["text"])
+	if strings.Contains(text, githubToken) || strings.Contains(text, "\U000E0001") || !strings.Contains(text, "[REDACTED:github-pat]") {
+		t.Fatalf("sanitized text = %q", text)
+	}
+	imageBlock := mapValue(actor.messages[0].Content[1])
+	if stringValue(imageBlock["data"]) != imageContent || stringValue(imageBlock["caption"]) != githubToken {
+		t.Fatalf("image block should be preserved like binary uo(): %#v", imageBlock)
+	}
+	userState := mapValue(actor.messages[0].UserState)
+	if got := stringValue(userState["activeEditor"]); got != "api_key=[REDACTED:api-key]" {
+		t.Fatalf("user state = %#v", userState)
+	}
+	files := arrayValue(mapValue(actor.messages[0].FileMentions)["files"])
+	imageFile := mapValue(files[0])
+	if stringValue(imageFile["content"]) != githubToken || stringValue(mapValue(imageFile["imageInfo"])["alt"]) != "[REDACTED:github-pat]" {
+		t.Fatalf("image file mention = %#v", imageFile)
+	}
+	plainFile := mapValue(files[1])
+	if strings.Contains(stringValue(plainFile["content"]), githubToken) || stringValue(plainFile["content"]) != "[REDACTED:github-pat]" {
+		t.Fatalf("plain file mention = %#v", plainFile)
+	}
+}
+
 func TestNeoActorBinaryThreadTruncateUsesArrayOrderLikeBinary(t *testing.T) {
 	useTempNeoThreadStore(t)
 	rt := newNeoRuntime(&config.Config{})
@@ -7472,6 +7526,57 @@ func TestNeoActorBinaryToolDataStoresRawImageRun(t *testing.T) {
 		if _, exists := run[key]; exists {
 			t.Fatalf("binary tool:data run gained normalized key %q: %#v", key, run)
 		}
+	}
+}
+
+func TestNeoActorBinaryToolDataSanitizesReducerPayload(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	actor.messages = []neoMessage{{
+		ThreadID:  "T-test",
+		MessageID: "M-assistant",
+		Role:      "assistant",
+		Content: []any{map[string]any{
+			"type":  "tool_use",
+			"id":    "TU-secret",
+			"name":  "Bash",
+			"input": map[string]any{"cmd": "pwd"},
+		}},
+		State: map[string]any{"type": "complete", "stopReason": "tool_use"},
+		Seq:   1,
+	}}
+	actor.rebuildHistoryLocked()
+
+	githubToken := "ghp_" + strings.Repeat("A", 36)
+	imageData := "sk-ant-api03-" + strings.Repeat("B", 32)
+	actor.handle(map[string]any{
+		"type":    "tool:data",
+		"toolUse": "TU-secret",
+		"data": map[string]any{
+			"status": "done",
+			"result": map[string]any{
+				"output": "token=" + githubToken + "\U000E0001",
+				"image": map[string]any{
+					"type": "image",
+					"data": imageData,
+					"note": githubToken,
+				},
+			},
+		},
+	})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	run := mapValue(mapValue(actor.messages[1].Content[0])["run"])
+	result := mapValue(run["result"])
+	output := stringValue(result["output"])
+	if strings.Contains(output, githubToken) || strings.Contains(output, "\U000E0001") || !strings.Contains(output, "[REDACTED:github-pat]") {
+		t.Fatalf("sanitized output = %q", output)
+	}
+	image := mapValue(result["image"])
+	if stringValue(image["data"]) != imageData || stringValue(image["note"]) != githubToken {
+		t.Fatalf("image payload should be preserved like binary uo(): %#v", image)
 	}
 }
 
