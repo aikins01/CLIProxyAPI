@@ -11465,6 +11465,8 @@ func selectNeoModelRoute(agentMode string, settings map[string]any) neoModelRout
 		return neoModelRoute{Provider: "openai", Model: "gpt-5.5"}
 	case "rush":
 		return neoModelRoute{Provider: "openai", Model: "gpt-5.5"}
+	case "agg-man":
+		return neoModelRoute{Provider: "anthropic", Model: "claude-opus-4-6"}
 	case "large":
 		return neoModelRoute{Provider: "anthropic", Model: "claude-opus-4-6"}
 	case "frontier":

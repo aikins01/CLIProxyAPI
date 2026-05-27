@@ -3357,6 +3357,13 @@ func TestSelectNeoModelRouteDefaultsRushToGPT55(t *testing.T) {
 	}
 }
 
+func TestSelectNeoModelRouteDefaultsAggManToOpus46(t *testing.T) {
+	got := selectNeoModelRoute("agg-man", nil)
+	if got.Provider != "anthropic" || got.Model != "claude-opus-4-6" {
+		t.Fatalf("route = %+v, want anthropic/claude-opus-4-6", got)
+	}
+}
+
 func TestSelectNeoModelRouteDefaultsFrontierToGemini35Flash(t *testing.T) {
 	got := selectNeoModelRoute("frontier", nil)
 	if got.Provider != "google" || got.Model != "gemini-3.5-flash" {
