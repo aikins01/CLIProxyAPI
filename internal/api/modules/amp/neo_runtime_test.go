@@ -11877,8 +11877,8 @@ func TestNeoRuntimeThreadActorManagementUsesExistingModeWhenRequestOmitsMode(t *
 	}
 	actor.mu.Lock()
 	defer actor.mu.Unlock()
-	if actor.currentAgentMode != "rush" || actor.currentReasoningEffort != "" {
-		t.Fatalf("actor mode/effort = %q/%q, want rush/empty", actor.currentAgentMode, actor.currentReasoningEffort)
+	if actor.currentAgentMode != "rush" || actor.currentReasoningEffort != "none" {
+		t.Fatalf("actor mode/effort = %q/%q, want rush/none", actor.currentAgentMode, actor.currentReasoningEffort)
 	}
 }
 
