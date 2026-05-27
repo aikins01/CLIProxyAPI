@@ -7784,7 +7784,11 @@ func loadNeoLocalThread(threadID string) (map[string]any, bool) {
 		log.Warnf("amp neo local thread store read failed thread=%s: %v", threadID, err)
 		return nil, false
 	}
-	if normalizeNeoThreadOwnership(thread) {
+	changed := normalizeNeoThreadOwnership(thread)
+	if normalizeNeoThreadAgentMode(thread) {
+		changed = true
+	}
+	if changed {
 		cacheNeoLocalThread(thread)
 	}
 	return thread, true

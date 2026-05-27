@@ -205,6 +205,78 @@ func TestLoadNeoLocalThreadRewritesOwnershipMetadata(t *testing.T) {
 	}
 }
 
+func TestLoadNeoLocalThreadRewritesAgentModeForBinaryLoader(t *testing.T) {
+	dir := t.TempDir()
+	oldStoreDir := neoAmpThreadStoreDir
+	neoAmpThreadStoreDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
+
+	threadID := "T-019e65c0-0310-77a8-b233-4b84d9c0612b"
+	raw := []byte(`{
+		"id": "` + threadID + `",
+		"title": "missing top-level mode",
+		"messages": [
+			{"role": "assistant", "messageId": "M-assistant"},
+			{"role": "user", "messageId": "M-user", "agentMode": "deep", "reasoningEffort": "xhigh"}
+		]
+	}`)
+	if err := os.WriteFile(filepath.Join(dir, threadID+".json"), raw, 0o600); err != nil {
+		t.Fatalf("write local thread: %v", err)
+	}
+
+	thread, ok := loadNeoLocalThread(threadID)
+	if !ok {
+		t.Fatal("loadNeoLocalThread returned false")
+	}
+	if got := stringValue(thread["agentMode"]); got != "deep" {
+		t.Fatalf("agentMode = %q, want deep", got)
+	}
+
+	persistedRaw, err := os.ReadFile(filepath.Join(dir, threadID+".json"))
+	if err != nil {
+		t.Fatalf("read rewritten local thread: %v", err)
+	}
+	var persisted map[string]any
+	if err := json.Unmarshal(persistedRaw, &persisted); err != nil {
+		t.Fatalf("decode rewritten local thread: %v", err)
+	}
+	if got := stringValue(persisted["agentMode"]); got != "deep" {
+		t.Fatalf("persisted agentMode = %q, want deep", got)
+	}
+}
+
+func TestLoadNeoLocalThreadWritesSmartAgentModeFallbackForBinaryLoader(t *testing.T) {
+	dir := t.TempDir()
+	oldStoreDir := neoAmpThreadStoreDir
+	neoAmpThreadStoreDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
+
+	threadID := "T-019e65c0-0310-77a8-b233-4b84d9c0612c"
+	if err := os.WriteFile(filepath.Join(dir, threadID+".json"), []byte(`{"id":"`+threadID+`","title":"legacy thread","messages":[{"role":"user","messageId":"M-user"}]}`), 0o600); err != nil {
+		t.Fatalf("write local thread: %v", err)
+	}
+
+	thread, ok := loadNeoLocalThread(threadID)
+	if !ok {
+		t.Fatal("loadNeoLocalThread returned false")
+	}
+	if got := stringValue(thread["agentMode"]); got != "smart" {
+		t.Fatalf("agentMode = %q, want smart", got)
+	}
+
+	persistedRaw, err := os.ReadFile(filepath.Join(dir, threadID+".json"))
+	if err != nil {
+		t.Fatalf("read rewritten local thread: %v", err)
+	}
+	var persisted map[string]any
+	if err := json.Unmarshal(persistedRaw, &persisted); err != nil {
+		t.Fatalf("decode rewritten local thread: %v", err)
+	}
+	if got := stringValue(persisted["agentMode"]); got != "smart" {
+		t.Fatalf("persisted agentMode = %q, want smart", got)
+	}
+}
+
 func TestNeoRuntimeAutoCompactsLargeLocalHistory(t *testing.T) {
 	dir := t.TempDir()
 	oldStoreDir := neoAmpThreadStoreDir
