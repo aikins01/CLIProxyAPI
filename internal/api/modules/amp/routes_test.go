@@ -449,6 +449,20 @@ func TestRegisterManagementRoutesServesNeoBootstrapInternalsLocally(t *testing.T
 				if stringValue(result["id"]) != neoLocalOwnerUserID || stringValue(result["githubLogin"]) == "" || result["mysteriousMessage"] != nil {
 					t.Fatalf("user info result = %#v", result)
 				}
+				features := arrayValue(result["features"])
+				if len(features) == 0 {
+					t.Fatalf("user info features missing: %#v", result)
+				}
+				foundRetentionFeature := false
+				for _, raw := range features {
+					feature := mapValue(raw)
+					if stringValue(feature["name"]) == "accept-abuse-data-retention" && boolValue(feature["enabled"]) {
+						foundRetentionFeature = true
+					}
+				}
+				if !foundRetentionFeature {
+					t.Fatalf("user info missing GPT-5.5 retention feature: %#v", features)
+				}
 			},
 		},
 		{name: "getThreadLinkInfo", path: "/api/internal?getThreadLinkInfo&thread=T-019e1046-656d-7132-879f-390ded941c16"},

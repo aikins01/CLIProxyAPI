@@ -487,6 +487,7 @@ func neoLocalInternalResponse(ctx context.Context, cfg *config.Config, r *http.R
 			"updatedAt":         nil,
 			"siteAdmin":         false,
 			"features": []any{
+				gin.H{"name": "accept-abuse-data-retention", "enabled": true},
 				gin.H{"name": "thread-actors-tui", "enabled": true},
 				gin.H{"name": "thread-actors-k8s-pool", "enabled": true},
 			},
