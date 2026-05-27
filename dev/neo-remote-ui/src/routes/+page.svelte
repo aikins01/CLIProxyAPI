@@ -3110,7 +3110,17 @@
     return 'Reviewed code';
   }
 
+  function codeReviewCheckPayload(check: Record<string, unknown>) {
+    return asRecord(check.result);
+  }
+
+  function codeReviewCheckNestedResult(check: Record<string, unknown>) {
+    return asRecord(codeReviewCheckPayload(check).result);
+  }
+
   function codeReviewIssueCount(check: Record<string, unknown>) {
+    const payload = codeReviewCheckPayload(check);
+    const nested = codeReviewCheckNestedResult(check);
     for (const value of [
       check.issueCount,
       check.issue_count,
@@ -3121,25 +3131,58 @@
       check.findingsCount,
       check.findings_count,
       check.problemCount,
-      check.problem_count
+      check.problem_count,
+      payload.issueCount,
+      payload.issue_count,
+      payload.issuesCount,
+      payload.issues_count,
+      payload.findingCount,
+      payload.finding_count,
+      nested.issuesFound,
+      nested.issues_found,
+      nested.issueCount,
+      nested.issue_count
     ]) {
       const n = numberFrom(value);
       if (Number.isFinite(n)) return n;
     }
-    for (const key of ['issues', 'findings', 'problems', 'diagnostics', 'results']) {
-      const value = check[key];
-      if (Array.isArray(value)) return value.length;
+    for (const source of [check, payload, nested]) {
+      for (const key of ['issues', 'findings', 'problems', 'diagnostics', 'results']) {
+        const value = source[key];
+        if (Array.isArray(value)) return value.length;
+      }
     }
     return NaN;
   }
 
+  function codeReviewCheckFallbackLabel(key: string) {
+    const path = filePathFromURI(key).replace(/\/+$/, '');
+    const base = path.split(/[\\/]/).pop() || path || key;
+    return base.replace(/\.md$/i, '');
+  }
+
   function codeReviewCheckLabel(key: string, check: Record<string, unknown>) {
-    return firstString(check.title, check.name, check.label, key).replace(/[_-]+/g, ' ');
+    const payload = codeReviewCheckPayload(check);
+    const checkMeta = asRecord(payload.check);
+    const nested = codeReviewCheckNestedResult(check);
+    return firstString(
+      check.title,
+      check.name,
+      check.label,
+      checkMeta.name,
+      nested.name,
+      codeReviewCheckFallbackLabel(key)
+    ).replace(/[_-]+/g, ' ');
   }
 
   function codeReviewErrorText(value: unknown) {
     const record = asRecord(value);
-    return firstString(value, record.message, record.error);
+    return firstString(value, record.message, record.error, record.errorMessage);
+  }
+
+  function codeReviewCheckStatus(check: Record<string, unknown>) {
+    const nested = codeReviewCheckNestedResult(check);
+    return stringFrom(check.status ?? nested.status).trim().toLowerCase().replace(/_/g, '-');
   }
 
   function codeReviewSummaryName(block?: ContentBlock) {
@@ -3173,7 +3216,7 @@
       if (Object.keys(check).length === 0) continue;
       totalChecks += 1;
       const label = codeReviewCheckLabel(key, check);
-      const checkStatus = stringFrom(check.status).trim().toLowerCase();
+      const checkStatus = codeReviewCheckStatus(check);
       if (checkStatus === 'done' || checkStatus === 'complete' || checkStatus === 'completed') {
         completedChecks += 1;
         const count = codeReviewIssueCount(check);
