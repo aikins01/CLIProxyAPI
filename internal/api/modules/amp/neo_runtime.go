@@ -5562,22 +5562,24 @@ func (a *neoActor) maybeCompactBeforeInference(agentMode, reasoningEffort, paren
 	}
 
 	a.mu.Lock()
-	if generation != a.generation || a.compacting || len(a.messages) < neoCompactionMinMessages || len(a.pendingTools) > 0 || len(a.approvalQueue) > 0 {
+	if generation != a.generation || a.compacting || len(a.pendingTools) > 0 || len(a.approvalQueue) > 0 {
 		a.mu.Unlock()
 		return
 	}
 	settings := cloneMap(a.settings)
+	compactionMessagesWindow, compactionOffset := neoCompactionWindow(a.messages)
 	inferenceRoute := applyNeoModelMapping(a.runtime, selectNeoModelRoute(agentMode, settings))
 	maxInput := neoEffectiveMaxInputTokens(agentMode, inferenceRoute.Model)
 	if maxInput <= 0 {
 		maxInput = neoCompactionFallbackMaxInput
 	}
 	thresholdPercent := neoCompactionThresholdPercent(settings)
-	if !neoCompactionShouldRun(a.messages, maxInput, thresholdPercent) {
+	if !neoCompactionShouldRun(compactionMessagesWindow, maxInput, thresholdPercent) {
 		a.mu.Unlock()
 		return
 	}
-	cutIndex := neoCompactionCutIndex(a.messages)
+	cutRelativeIndex := neoCompactionCutIndex(compactionMessagesWindow)
+	cutIndex := compactionOffset + cutRelativeIndex
 	if cutIndex <= 0 || cutIndex >= len(a.messages) {
 		a.mu.Unlock()
 		return
@@ -5617,10 +5619,11 @@ func (a *neoActor) maybeCompactBeforeInference(agentMode, reasoningEffort, paren
 		return
 	}
 	summaryMessage.Seq = a.nextSeqLocked()
-	compacted := make([]neoMessage, 0, len(a.messages)-cutIndex+1)
-	compacted = append(compacted, summaryMessage)
-	compacted = append(compacted, a.messages[cutIndex:]...)
-	a.messages = compacted
+	updated := make([]neoMessage, 0, len(a.messages)+1)
+	updated = append(updated, a.messages[:cutIndex]...)
+	updated = append(updated, summaryMessage)
+	updated = append(updated, a.messages[cutIndex:]...)
+	a.messages = updated
 	a.rebuildHistoryLocked()
 	record := map[string]any{"cutMessageId": cutMessageID, "createdAt": time.Now().UTC().Format(time.RFC3339Nano)}
 	a.compacting = false
@@ -5667,6 +5670,16 @@ func neoCompactionThresholdPercent(settings map[string]any) int {
 		return 100
 	}
 	return percent
+}
+
+func neoCompactionWindow(messages []neoMessage) ([]neoMessage, int) {
+	if cutIndex, _, ok := neoCompactionSummary(messages); ok {
+		start := cutIndex + 1
+		if start >= 0 && start <= len(messages) {
+			return messages[start:], start
+		}
+	}
+	return messages, 0
 }
 
 func neoEstimateMessageTokens(messages []neoMessage) int {

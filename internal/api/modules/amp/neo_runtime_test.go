@@ -389,32 +389,58 @@ func TestNeoRuntimeAutoCompactsLargeLocalHistory(t *testing.T) {
 	waitForNeoActorSyncIdle(t, actor)
 
 	actor.mu.Lock()
-	defer actor.mu.Unlock()
 	if calls != 1 {
+		actor.mu.Unlock()
 		t.Fatalf("compaction calls = %d, want 1", calls)
 	}
-	if len(actor.messages) != neoCompactionTailMessages+1 {
-		t.Fatalf("message count after compaction = %d, want %d", len(actor.messages), neoCompactionTailMessages+1)
+	if len(actor.messages) != 31 {
+		actor.mu.Unlock()
+		t.Fatalf("message count after compaction = %d, want preserved 30 messages plus summary", len(actor.messages))
 	}
-	first := actor.messages[0]
-	if first.Role != "info" || stringValue(mapValue(first.Content[0])["type"]) != "summary" {
-		t.Fatalf("first compacted message = %#v, want summary info", first)
+	if actor.messages[0].MessageID != "M-0000000000000000000000" {
+		actor.mu.Unlock()
+		t.Fatalf("old transcript prefix was removed: first message = %#v", actor.messages[0])
 	}
-	second := actor.messages[1]
-	if second.Role != "user" || second.MessageID != "M-0000000000000000000022" {
-		t.Fatalf("second compacted message = %#v, want retained cut message", second)
+	summaryIndex := 30 - neoCompactionTailMessages
+	summaryMessage := actor.messages[summaryIndex]
+	if summaryMessage.Role != "info" || stringValue(mapValue(summaryMessage.Content[0])["type"]) != "summary" {
+		actor.mu.Unlock()
+		t.Fatalf("summary message = %#v, want summary info at cut boundary", summaryMessage)
 	}
-	if !strings.Contains(stringValue(mapValue(mapValue(first.Content[0])["summary"])["summary"]), "preserved project goal") {
-		t.Fatalf("summary message content = %#v", first.Content)
+	retained := actor.messages[summaryIndex+1]
+	if retained.Role != "user" || retained.MessageID != "M-0000000000000000000022" {
+		actor.mu.Unlock()
+		t.Fatalf("retained cut message = %#v, want original cut message after summary", retained)
+	}
+	if !strings.Contains(stringValue(mapValue(mapValue(summaryMessage.Content[0])["summary"])["summary"]), "preserved project goal") {
+		actor.mu.Unlock()
+		t.Fatalf("summary message content = %#v", summaryMessage.Content)
 	}
 	if len(actor.compactionRecords) != 1 || stringValue(actor.compactionRecords[0]["cutMessageId"]) != "M-0000000000000000000022" {
+		actor.mu.Unlock()
 		t.Fatalf("compaction records = %#v", actor.compactionRecords)
 	}
 	if len(actor.history) == 0 || actor.history[0].Role != "assistant" || !strings.Contains(actor.history[0].Text, "preserved project goal") {
+		actor.mu.Unlock()
 		t.Fatalf("history after compaction = %#v", actor.history)
 	}
 	if !strings.Contains(fmt.Sprint(actor.history), "message 29") {
+		actor.mu.Unlock()
 		t.Fatalf("history after compaction lost retained tail messages: %#v", actor.history)
+	}
+	if strings.Contains(fmt.Sprint(actor.history), "message 00") {
+		actor.mu.Unlock()
+		t.Fatalf("history after compaction leaked pre-summary messages: %#v", actor.history)
+	}
+	actor.mu.Unlock()
+
+	actor.maybeCompactBeforeInference("smart", "medium", "", actor.generation)
+	waitForNeoActorSyncIdle(t, actor)
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("compaction calls after unchanged compacted window = %d, want 1", calls)
 	}
 }
 
@@ -8131,6 +8157,31 @@ func TestNeoActorBinaryUserMessageIndexReplacesWithoutSubmitting(t *testing.T) {
 	}
 	if actor.title != "" {
 		t.Fatalf("title = %q, want indexed binary user delta not to generate title", actor.title)
+	}
+}
+
+func TestNeoActorThreadTruncateBeforeCompactionBoundaryPreservesPrefix(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	actor.messages = []neoMessage{
+		{ThreadID: "T-test", MessageID: "M-old", Role: "user", Content: []any{map[string]any{"type": "text", "text": "old context"}}, Seq: 1},
+		neoCompactionSummaryMessage("T-test", "compacted summary"),
+		{ThreadID: "T-test", MessageID: "M-cut", Role: "user", Content: []any{map[string]any{"type": "text", "text": "cut message"}}, Seq: 3},
+		{ThreadID: "T-test", MessageID: "M-after", Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "after"}}, Seq: 4},
+	}
+	actor.compactionRecords = []map[string]any{{"cutMessageId": "M-cut", "createdAt": "2026-01-01T00:00:00Z"}}
+	actor.rebuildHistoryLocked()
+
+	actor.handle(map[string]any{"type": "thread:truncate", "fromIndex": 1})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.messages) != 1 || actor.messages[0].MessageID != "M-old" {
+		t.Fatalf("messages after truncate before compaction boundary = %#v, want old prefix preserved", actor.messages)
+	}
+	if len(actor.history) != 1 || actor.history[0].Role != "user" || !strings.Contains(actor.history[0].Text, "old context") {
+		t.Fatalf("history after truncate before compaction boundary = %#v, want old context", actor.history)
 	}
 }
 
