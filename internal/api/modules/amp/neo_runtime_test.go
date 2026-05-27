@@ -9799,6 +9799,31 @@ func TestNeoRuntimeThreadImportDerivesModeFromMessages(t *testing.T) {
 	}
 }
 
+func TestNeoRuntimeThreadImportDerivesModeFromMetaForBinarySwitch(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := rt.store.ensureThreadActor("T-import-meta-mode")
+	actor.currentAgentMode = "smart"
+	actor.currentReasoningEffort = "high"
+	actor.settings = map[string]any{"agentMode": "smart", "reasoning.effort": "high"}
+
+	thread := map[string]any{
+		"id":   "T-import-meta-mode",
+		"meta": map[string]any{"agentMode": "deep"},
+		"messages": []any{
+			map[string]any{"role": "user", "messageId": "M-user", "content": []any{map[string]any{"type": "text", "text": "meta carries mode"}}},
+		},
+	}
+	if err := actor.importThreadLocalOnly(thread); err != nil {
+		t.Fatalf("importThreadLocalOnly error: %v", err)
+	}
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.currentAgentMode != "deep" || actor.settings["agentMode"] != "deep" || actor.currentReasoningEffort != "medium" || actor.settings["reasoning.effort"] != "medium" {
+		t.Fatalf("imported meta mode/effort = current:%q/%q settings:%#v", actor.currentAgentMode, actor.currentReasoningEffort, actor.settings)
+	}
+}
+
 func TestNeoRuntimeThreadImportResetsSmartEffortForDeepThread(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	actor := rt.store.ensureThreadActor("T-import-effort")
@@ -9877,6 +9902,26 @@ func TestNeoThreadListEntryFallsBackToMessageAgentModeLikeBinary(t *testing.T) {
 	})
 	if entry["agentMode"] != "deep" {
 		t.Fatalf("entry agentMode = %#v, want deep fallback", entry["agentMode"])
+	}
+}
+
+func TestNeoThreadListEntryPromotesMetaAgentModeForBinarySwitch(t *testing.T) {
+	thread := map[string]any{
+		"id":   "T-list-meta-mode",
+		"meta": map[string]any{"agentMode": "deep"},
+		"messages": []any{
+			map[string]any{"role": "user", "messageId": "M-user"},
+		},
+	}
+	if !normalizeNeoThreadAgentMode(thread) {
+		t.Fatalf("normalizeNeoThreadAgentMode reported no change for %#v", thread)
+	}
+	if thread["agentMode"] != "deep" {
+		t.Fatalf("thread agentMode = %#v, want deep", thread["agentMode"])
+	}
+	entry := neoThreadListEntry(thread)
+	if entry["agentMode"] != "deep" {
+		t.Fatalf("entry agentMode = %#v, want deep", entry["agentMode"])
 	}
 }
 
