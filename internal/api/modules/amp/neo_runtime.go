@@ -3321,9 +3321,7 @@ func (a *neoActor) handleBinaryAssistantMessage(msg map[string]any) {
 	if stringValue(message["role"]) == "" {
 		message["role"] = "assistant"
 	}
-	if messageIDValue(message["messageId"]) == "" && messageIDValue(message["protocolMessageID"]) == "" {
-		message["messageId"] = newNeoMessageID()
-	}
+	message["messageId"] = newNeoMessageID()
 	a.mu.Lock()
 	suppressMissingToolResults := a.suppressedBinaryAssistantMessageToolResultsLocked()
 	cleanupEvents := a.cleanupPriorAssistantForBinaryDeltaLocked("", suppressMissingToolResults)
@@ -17398,8 +17396,7 @@ func normalizeNeoUsage(usage map[string]any) map[string]any {
 	if maxInput == 0 && model != "" {
 		maxInput = neoEffectiveMaxInputTokens(agentMode, model)
 	}
-	return map[string]any{
-		"model":                    omitEmpty(model),
+	out := map[string]any{
 		"maxInputTokens":           maxInput,
 		"inputTokens":              input,
 		"outputTokens":             output,
@@ -17408,6 +17405,10 @@ func normalizeNeoUsage(usage map[string]any) map[string]any {
 		"totalInputTokens":         total,
 		"timestamp":                time.Now().UTC().Format(time.RFC3339Nano),
 	}
+	if model != "" {
+		out["model"] = model
+	}
+	return out
 }
 
 // neoModelContextWindow mirrors the Amp binary's model registry so the

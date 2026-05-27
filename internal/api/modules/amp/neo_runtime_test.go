@@ -8062,6 +8062,27 @@ func TestNeoActorHandlesBinaryAssistantAndSettingsDeltas(t *testing.T) {
 	waitForNeoActorSyncIdle(t, actor)
 }
 
+func TestNeoActorBinaryAssistantMessageIgnoresSuppliedIDLikeBinary(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+
+	actor.handle(map[string]any{"type": "assistant:message", "message": map[string]any{
+		"messageId": "M-supplied",
+		"content":   []any{map[string]any{"type": "text", "text": "hello"}},
+		"state":     map[string]any{"type": "complete", "stopReason": "end_turn"},
+	}})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.messages) != 1 {
+		t.Fatalf("messages = %#v", actor.messages)
+	}
+	if got := actor.messages[0].MessageID; got == "" || got == "M-supplied" {
+		t.Fatalf("assistant message id = %q, want generated id", got)
+	}
+}
+
 func TestNeoActorBinaryInferenceCompletedMirrorsEnvAndDebugSemantics(t *testing.T) {
 	useTempNeoThreadStore(t)
 	rt := newNeoRuntime(&config.Config{})
