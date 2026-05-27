@@ -3163,23 +3163,27 @@ func (a *neoActor) handleBinaryAssistantMessageUpdate(msg map[string]any) {
 	if stringValue(message["role"]) == "" {
 		message["role"] = "assistant"
 	}
+	appendNewAssistant := true
 	a.mu.Lock()
-	if messageIDValue(message["messageId"]) == "" && messageIDValue(message["protocolMessageID"]) == "" {
-		if len(a.messages) > 0 {
-			last := a.messages[len(a.messages)-1]
-			if last.Role == "assistant" {
-				message["messageId"] = last.MessageID
-				if len(mapValue(message["usage"])) > 0 {
-					message["usage"] = mergeNeoUsage(cloneMap(last.Usage), mapValue(message["usage"]))
-				}
+	if len(a.messages) > 0 {
+		last := a.messages[len(a.messages)-1]
+		if last.Role == "assistant" {
+			appendNewAssistant = false
+			message["messageId"] = last.MessageID
+			if len(mapValue(message["usage"])) > 0 {
+				message["usage"] = mergeNeoUsage(cloneMap(last.Usage), mapValue(message["usage"]))
 			}
 		}
 	}
-	if messageIDValue(message["messageId"]) == "" {
+	if appendNewAssistant {
 		message["messageId"] = newNeoMessageID()
 	}
 	a.mu.Unlock()
 
+	if appendNewAssistant {
+		a.handleProtocolMessageAdded(map[string]any{"type": "message_added", "message": message})
+		return
+	}
 	a.handleProtocolMessageUpdated(map[string]any{"type": "message_updated", "message": message})
 }
 

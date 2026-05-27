@@ -7483,7 +7483,7 @@ func TestNeoNormalizeMaxTokensValueMirrorsBinaryTruthiness(t *testing.T) {
 	}
 }
 
-func TestNeoActorBinaryAssistantUpdateWithoutIDOnlyUpdatesLastAssistant(t *testing.T) {
+func TestNeoActorBinaryAssistantUpdateAppendsWhenLastIsNotAssistant(t *testing.T) {
 	useTempNeoThreadStore(t)
 	rt := newNeoRuntime(&config.Config{})
 	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
@@ -7513,8 +7513,9 @@ func TestNeoActorBinaryAssistantUpdateWithoutIDOnlyUpdatesLastAssistant(t *testi
 	actor.handle(map[string]any{
 		"type": "assistant:message-update",
 		"message": map[string]any{
-			"content": []any{map[string]any{"type": "text", "text": "new assistant"}},
-			"state":   map[string]any{"type": "complete", "stopReason": "end_turn"},
+			"messageId": "M-assistant-old",
+			"content":   []any{map[string]any{"type": "text", "text": "new assistant"}},
+			"state":     map[string]any{"type": "complete", "stopReason": "end_turn"},
 		},
 	})
 
@@ -7529,6 +7530,61 @@ func TestNeoActorBinaryAssistantUpdateWithoutIDOnlyUpdatesLastAssistant(t *testi
 	appended := actor.messages[2]
 	if appended.Role != "assistant" || appended.MessageID == "" || appended.MessageID == "M-assistant-old" || textFromBlocks(appended.Content) != "new assistant" {
 		t.Fatalf("appended assistant = %#v", appended)
+	}
+}
+
+func TestNeoActorBinaryAssistantUpdateIgnoresSuppliedIDAndUpdatesLastAssistant(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	actor.messages = []neoMessage{
+		{
+			ThreadID:  "T-test",
+			MessageID: "M-other",
+			Role:      "assistant",
+			Content:   []any{map[string]any{"type": "text", "text": "other assistant"}},
+			State:     map[string]any{"type": "complete", "stopReason": "end_turn"},
+			Seq:       1,
+		},
+		{
+			ThreadID:  "T-test",
+			MessageID: "M-last",
+			Role:      "assistant",
+			Content:   []any{map[string]any{"type": "text", "text": "old last"}},
+			State:     map[string]any{"type": "streaming"},
+			Usage:     map[string]any{"inputTokens": 10},
+			Seq:       2,
+		},
+	}
+	actor.rebuildHistoryLocked()
+
+	actor.handle(map[string]any{
+		"type": "assistant:message-update",
+		"message": map[string]any{
+			"messageId": "M-other",
+			"content":   []any{map[string]any{"type": "text", "text": "new last"}},
+			"state":     map[string]any{"type": "complete", "stopReason": "end_turn"},
+			"usage":     map[string]any{"inputTokens": 3, "outputTokens": 4},
+		},
+	})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.messages) != 2 {
+		t.Fatalf("messages = %#v", actor.messages)
+	}
+	if textFromBlocks(actor.messages[0].Content) != "other assistant" {
+		t.Fatalf("non-last assistant was overwritten: %#v", actor.messages[0])
+	}
+	last := actor.messages[1]
+	if last.MessageID != "M-last" || textFromBlocks(last.Content) != "new last" {
+		t.Fatalf("last assistant = %#v", last)
+	}
+	if numberFrom(last.Usage["inputTokens"]) != 10 || numberFrom(last.Usage["outputTokens"]) != 4 {
+		t.Fatalf("last assistant usage = %#v", last.Usage)
+	}
+	if len(actor.replayEvents) == 0 || actor.replayEvents[len(actor.replayEvents)-1].Payload["type"] != "message_updated" {
+		t.Fatalf("last replay event = %#v, want message_updated", actor.replayEvents)
 	}
 }
 
