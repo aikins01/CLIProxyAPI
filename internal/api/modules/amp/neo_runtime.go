@@ -6836,7 +6836,7 @@ func (m *AmpModule) tryServeNeoLocalThreadActor(c *gin.Context) bool {
 	if !ok || m.neoRuntime == nil {
 		return false
 	}
-	if m.getProxy() != nil && !m.forceNeoLocalThreadActors() {
+	if m.getProxy() != nil && !m.shouldServeNeoLocalThreadActor(c.Request.Context(), threadID) {
 		return false
 	}
 	if c.Request.Method != http.MethodPost {
@@ -6850,9 +6850,19 @@ func (m *AmpModule) tryServeNeoLocalThreadActor(c *gin.Context) bool {
 	return true
 }
 
-func (m *AmpModule) forceNeoLocalThreadActors() bool {
+func (m *AmpModule) shouldServeNeoLocalThreadActor(ctx context.Context, threadID string) bool {
 	cfg := m.neoThreadConfigSnapshot()
-	return cfg != nil && cfg.AmpCode.NeoLocalRuntime.ForceThreadActors
+	if cfg == nil || !neoRuntimeEnabled(cfg) {
+		return false
+	}
+	if cfg.AmpCode.NeoLocalRuntime.ForceThreadActors {
+		return true
+	}
+	if strings.TrimSpace(threadID) == "" {
+		return false
+	}
+	thread, ok := loadNeoThread(ctx, cfg, threadID)
+	return ok && neoThreadHasUsefulContent(thread)
 }
 
 func neoThreadActorManagementPath(path string) (string, bool) {

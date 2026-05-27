@@ -331,6 +331,60 @@ func TestRegisterManagementRoutesCanForceLocalNeoThreadActorsWithProxy(t *testin
 	}
 }
 
+func TestRegisterManagementRoutesServesExistingNeoThreadActorLocallyWithProxy(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	enabled := true
+	proxyCalled := false
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxyCalled = true
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	defer upstream.Close()
+
+	dir := t.TempDir()
+	oldStoreDir := neoAmpThreadStoreDir
+	neoAmpThreadStoreDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
+
+	threadID := "T-019e65c0-0310-77a8-b233-4b84d9c0612b"
+	rawThread := []byte(`{"id":"` + threadID + `","title":"deep resume","agentMode":"deep","messages":[{"messageId":"M-user","role":"user","agentMode":"deep","reasoningEffort":"xhigh","content":[{"type":"text","text":"resume this thread"}]}]}`)
+	if err := os.WriteFile(filepath.Join(dir, threadID+".json"), rawThread, 0o600); err != nil {
+		t.Fatalf("write local thread: %v", err)
+	}
+
+	m := &AmpModule{
+		restrictToLocalhost: false,
+		neoRuntime: newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+			UpstreamURL: upstream.URL,
+			NeoLocalRuntime: config.AmpNeoLocalRuntime{
+				Enabled: &enabled,
+			},
+		}}),
+	}
+	proxy, _ := createReverseProxy(upstream.URL, NewStaticSecretSource(""))
+	m.setProxy(proxy)
+	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/thread-actors/"+threadID, bytes.NewBufferString(`{}`))
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if proxyCalled {
+		t.Fatal("existing thread-actors request should be served locally")
+	}
+	var response map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("response JSON error: %v", err)
+	}
+	if response["agentMode"] != "deep" || stringValue(response["wsToken"]) == "" || stringValue(response["ownerUserId"]) != neoLocalOwnerUserID {
+		t.Fatalf("unexpected local thread actor response: %#v", response)
+	}
+}
+
 func TestRegisterManagementRoutesMimicsCloudThreadActorHandshake(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
