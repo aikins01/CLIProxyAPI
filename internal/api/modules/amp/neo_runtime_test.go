@@ -9910,6 +9910,83 @@ func TestNeoImageToolResultReplaysImageContentToProviders(t *testing.T) {
 	}
 }
 
+func TestNeoReadImageToolResultReplaysImageContentToProviders(t *testing.T) {
+	run := map[string]any{
+		"status": "done",
+		"result": map[string]any{
+			"absolutePath": "/tmp/chart.png",
+			"content":      "abc123",
+			"isImage":      true,
+			"imageInfo":    map[string]any{"mimeType": "image/png", "size": 1234},
+		},
+	}
+	tool := neoHistoryMessage{Role: "tool", ToolCallID: "TU-read", ToolName: "Read", Text: runToText(run), Content: neoToolRunHistoryContent(run)}
+	history := []neoHistoryMessage{
+		{Role: "assistant", ToolCalls: []neoToolCall{{ID: "TU-read", Name: "Read"}}},
+		tool,
+	}
+
+	if tool.Text != "Image: /tmp/chart.png" {
+		t.Fatalf("tool text = %q", tool.Text)
+	}
+	if len(tool.Content) != 2 {
+		t.Fatalf("tool content = %#v", tool.Content)
+	}
+
+	anthropic := anthropicNeoMessages(history)
+	anthropicTool := mapValue(arrayValue(mapValue(anthropic[1])["content"])[0])
+	anthropicContent := arrayValue(anthropicTool["content"])
+	if len(anthropicContent) != 2 || stringValue(mapValue(anthropicContent[0])["text"]) != "Image: /tmp/chart.png" {
+		t.Fatalf("anthropic tool content = %#v", anthropicContent)
+	}
+	anthropicImageSource := mapValue(mapValue(anthropicContent[1])["source"])
+	if stringValue(anthropicImageSource["media_type"]) != "image/png" || stringValue(anthropicImageSource["data"]) != "abc123" {
+		t.Fatalf("anthropic image source = %#v", anthropicImageSource)
+	}
+
+	responsesInput := openAIResponsesNeoInput(history, "")
+	responsesOutput := arrayValue(mapValue(responsesInput[1])["output"])
+	if len(responsesOutput) != 2 || stringValue(mapValue(responsesOutput[0])["text"]) != "Image: /tmp/chart.png" {
+		t.Fatalf("responses output = %#v", responsesOutput)
+	}
+	if imageURL := stringValue(mapValue(responsesOutput[1])["image_url"]); imageURL != "data:image/png;base64,abc123" {
+		t.Fatalf("responses image_url = %q", imageURL)
+	}
+
+	openAIChat := openAINeoMessages(history, "")
+	if len(openAIChat) != 3 {
+		t.Fatalf("openAI chat messages = %#v", openAIChat)
+	}
+	openAITool := mapValue(openAIChat[1])
+	if stringValue(openAITool["content"]) != "Image: /tmp/chart.png" {
+		t.Fatalf("openAI tool message = %#v", openAITool)
+	}
+	openAIImageContent := arrayValue(mapValue(openAIChat[2])["content"])
+	if len(openAIImageContent) != 2 || stringValue(mapValue(openAIImageContent[0])["text"]) != "Image: /tmp/chart.png" {
+		t.Fatalf("openAI image content = %#v", openAIImageContent)
+	}
+	if imageURL := stringValue(mapValue(mapValue(openAIImageContent[1])["image_url"])["url"]); imageURL != "data:image/png;base64,abc123" {
+		t.Fatalf("openAI image_url = %q", imageURL)
+	}
+
+	google := googleNeoContents(history, "")
+	googleParts := arrayValue(mapValue(google[1])["parts"])
+	if len(googleParts) != 3 {
+		t.Fatalf("google parts = %#v", googleParts)
+	}
+	response := mapValue(mapValue(googleParts[0])["functionResponse"])
+	if stringValue(mapValue(response["response"])["content"]) != "Image: /tmp/chart.png" {
+		t.Fatalf("google function response = %#v", response)
+	}
+	if stringValue(mapValue(googleParts[1])["text"]) != "Image: /tmp/chart.png" {
+		t.Fatalf("google text part = %#v", googleParts[1])
+	}
+	inlineData := mapValue(mapValue(googleParts[2])["inlineData"])
+	if stringValue(inlineData["mimeType"]) != "image/png" || stringValue(inlineData["data"]) != "abc123" {
+		t.Fatalf("google inline data = %#v", inlineData)
+	}
+}
+
 func TestNeoToolRunTextResultMatchesBinaryTypedTextBlocks(t *testing.T) {
 	run := map[string]any{
 		"status": "done",

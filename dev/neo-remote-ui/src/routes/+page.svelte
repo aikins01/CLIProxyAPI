@@ -2963,7 +2963,7 @@
   type DisplayRow =
     | { kind: 'thinking'; block: ContentBlock }
     | { kind: 'progress'; block: ContentBlock }
-    | { kind: 'explore'; tools: ContentBlock[] }
+    | { kind: 'explore'; tools: TraceToolEntry[] }
     | { kind: 'edit'; block: ContentBlock; result?: ContentBlock }
     | { kind: 'command'; block: ContentBlock; result?: ContentBlock }
     | { kind: 'painter'; block: ContentBlock; result?: ContentBlock }
@@ -2971,9 +2971,14 @@
     | { kind: 'tool'; block: ContentBlock; result?: ContentBlock }
     | { kind: 'result'; block: ContentBlock };
 
+  type TraceToolEntry = {
+    block: ContentBlock;
+    result?: ContentBlock;
+  };
+
   function groupWorkBlocks(blocks: ContentBlock[]): DisplayRow[] {
     const rows: DisplayRow[] = [];
-    let buf: ContentBlock[] = [];
+    let buf: TraceToolEntry[] = [];
     const flush = () => { if (buf.length) { rows.push({ kind: 'explore', tools: buf }); buf = []; } };
     const results = collectToolResults(blocks);
     for (const b of blocks) {
@@ -2992,7 +2997,7 @@
       else if (b.type === 'tool_use') {
         const cat = toolCategoryForBlock(b);
         const result = toolResultForBlock(results, b);
-        if (cat === 'explore') buf.push(b);
+        if (cat === 'explore') buf.push({ block: b, result });
         else if (cat === 'edit') { flush(); rows.push({ kind: 'edit', block: b, result }); }
         else if (cat === 'command') { flush(); rows.push({ kind: 'command', block: b, result }); }
         else if (cat === 'painter') { flush(); rows.push({ kind: 'painter', block: b, result }); }
@@ -3005,16 +3010,20 @@
     return rows;
   }
 
-  function exploreSummary(tools: ContentBlock[]): string {
+  function exploreSummary(tools: TraceToolEntry[]): string {
     const counts: Record<string, number> = {};
     for (const t of tools) {
-      const noun = exploreNounForBlock(t);
+      const noun = exploreNounForBlock(t.block);
       counts[noun] = (counts[noun] || 0) + 1;
     }
     const order = ['file', 'thread', 'search', 'list', 'skill'];
     const parts: string[] = [];
     for (const k of order) if (counts[k]) parts.push(pluralize(k, counts[k]));
     return parts.join(', ');
+  }
+
+  function traceTimeLabelForToolEntries(tools: TraceToolEntry[]) {
+    return traceTimeLabelForBlocks(tools.flatMap((tool) => tool.result ? [tool.block, tool.result] : [tool.block]));
   }
 
   function editTarget(block: ContentBlock): string {
@@ -3237,6 +3246,20 @@
     );
   }
 
+  function readImageFromToolResult(block?: ContentBlock) {
+    const result = toolResultResult(block);
+    if (result.isImage !== true) return null;
+    return painterImageFromAny({
+      type: 'image',
+      ...result,
+      mimeType: stringFrom(asRecord(result.imageInfo).mimeType ?? asRecord(result.imageInfo).mime_type ?? result.mimeType ?? result.mime_type),
+      mediaType: stringFrom(asRecord(result.imageInfo).mimeType ?? asRecord(result.imageInfo).mime_type ?? result.mediaType ?? result.media_type),
+      data: stringFrom(result.content ?? result.data ?? result.base64),
+      url: stringFrom(result.contentURL ?? result.contentUrl ?? result.url ?? result.uri),
+      savedPath: stringFrom(result.absolutePath ?? result.path ?? result.filePath ?? result.file_path)
+    }, 0);
+  }
+
   function painterImagesFromResult(block?: ContentBlock) {
     const run = toolResultRun(block);
     const result = toolResultResult(block);
@@ -3283,10 +3306,11 @@
     if (Object.keys(record).length === 0) return null;
     const source = asRecord(record.source);
     const imageUrl = asRecord(record.image_url);
-    const mediaType = stringFrom(record.mediaType ?? record.media_type ?? record.mimeType ?? record.mime_type ?? source.mediaType ?? source.media_type ?? source.mimeType ?? source.mime_type) || 'image/png';
-    const data = firstString(record.data, record.base64, record.b64_json, record.contentBase64, source.data, source.base64, source.b64_json);
-    const url = firstString(record.url, record.uri, record.href, record.imageURL, record.imageUrl, record.image_url, source.url, source.uri, imageUrl.url);
-    let savedPath = firstString(record.savedPath, record.saved_path, record.path, record.file, record.filename, record.filePath, record.file_path);
+    const imageInfo = asRecord(record.imageInfo);
+    const mediaType = stringFrom(record.mediaType ?? record.media_type ?? record.mimeType ?? record.mime_type ?? source.mediaType ?? source.media_type ?? source.mimeType ?? source.mime_type ?? imageInfo.mimeType ?? imageInfo.mime_type) || 'image/png';
+    const data = firstString(record.data, record.base64, record.b64_json, record.content, record.contentBase64, source.data, source.base64, source.b64_json);
+    const url = firstString(record.url, record.uri, record.href, record.contentURL, record.contentUrl, record.imageURL, record.imageUrl, record.image_url, source.url, source.uri, imageUrl.url);
+    let savedPath = firstString(record.savedPath, record.saved_path, record.absolutePath, record.path, record.file, record.filename, record.filePath, record.file_path);
     const block = {
       type: 'image',
       ...record,
@@ -3633,16 +3657,27 @@
           {/if}
         {:else if row.kind === 'explore'}
           <details class="trace-row trace-row--explore">
-            <summary class="trace-time-anchor" data-time={traceTimeLabelForBlocks(row.tools)}>
+            <summary class="trace-time-anchor" data-time={traceTimeLabelForToolEntries(row.tools)}>
               <span class="trace-row__label">Explored</span>
               <span class="trace-row__sub">{exploreSummary(row.tools)}</span>
               <ChevronRight size={12} class="trace-row__chevron" />
             </summary>
             <ul class="trace-row__list">
-              {#each row.tools as tool, i (tool.id ?? i)}
-                <li class="trace-time-anchor" data-time={traceTimeLabel(tool)}>
-                  <span class="trace-row__list-label">{traceActionLabel(tool)}</span>
-                  <span class="trace-row__list-target">{toolSubtitle(tool)}</span>
+              {#each row.tools as tool, i (tool.block.id ?? i)}
+                {@const readImage = readImageFromToolResult(tool.result)}
+                <li class="trace-time-anchor" data-time={traceTimeLabelForRow(tool.block, tool.result)}>
+                  <span class="trace-row__list-label">{traceActionLabel(tool.block)}</span>
+                  <span class="trace-row__list-target">{toolSubtitle(tool.block)}</span>
+                  {#if readImage}
+                    <figure class="trace-row__image">
+                      {#if readImage.src}
+                        <img src={readImage.src} alt={readImage.name} />
+                      {:else}
+                        <div class="painter-image__placeholder"><ImagePlus size={18} /></div>
+                      {/if}
+                      <figcaption title={readImage.savedPath || readImage.name}>{readImage.savedPath || readImage.name}</figcaption>
+                    </figure>
+                  {/if}
                 </li>
               {/each}
             </ul>
@@ -5644,6 +5679,7 @@
   }
   .trace-row__list li {
     display: flex;
+    flex-wrap: wrap;
     align-items: baseline;
     gap: 4px;
     padding: 0;
@@ -5663,6 +5699,30 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  .trace-row__image {
+    flex-basis: 100%;
+    width: min(220px, 100%);
+    margin: 6px 0 4px 42px;
+    color: var(--neo-muted);
+  }
+  .trace-row__image img,
+  .trace-row__image .painter-image__placeholder {
+    display: block;
+    width: 100%;
+    aspect-ratio: 1 / 1;
+    border-radius: 6px;
+    background: color-mix(in srgb, var(--neo-ink) 5%, transparent);
+    outline: 1px solid color-mix(in srgb, var(--neo-ink) 12%, transparent);
+    object-fit: cover;
+  }
+  .trace-row__image figcaption {
+    padding-top: 4px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 12px;
+    line-height: 16px;
   }
 
   .trace-row__file {

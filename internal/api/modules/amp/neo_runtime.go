@@ -16920,8 +16920,10 @@ func openAIChatNeoToolContent(msg neoHistoryMessage) (string, []any) {
 				return msg.Text, nil
 			}
 			label := neoToolImageLabel(block)
-			texts = append(texts, label)
-			imageContent = append(imageContent, map[string]any{"type": "text", "text": label})
+			if len(texts) == 0 || texts[len(texts)-1] != label {
+				texts = append(texts, label)
+				imageContent = append(imageContent, map[string]any{"type": "text", "text": label})
+			}
 			imageContent = append(imageContent, map[string]any{"type": "image_url", "image_url": map[string]any{"url": imageURL}})
 			hasImage = true
 		default:
@@ -16988,8 +16990,10 @@ func googleNeoToolResultParts(msg neoHistoryMessage) []any {
 			}
 		case "image", "input_image", "image_url":
 			label := neoToolImageLabel(block)
-			texts = append(texts, label)
-			extraParts = append(extraParts, map[string]any{"text": label})
+			if len(texts) == 0 || texts[len(texts)-1] != label {
+				texts = append(texts, label)
+				extraParts = append(extraParts, map[string]any{"text": label})
+			}
 			if data, mediaType := neoImageBase64(block); data != "" {
 				extraParts = append(extraParts, map[string]any{"inlineData": map[string]any{"mimeType": fallbackString(mediaType, "image/png"), "data": data}})
 			} else if imageURL := neoImageURL(block); imageURL != "" {
@@ -19086,6 +19090,9 @@ func runToText(run any) string {
 		return neoImageToolText(stringValue(m["toolName"]), len(images))
 	}
 	if result, ok := m["result"]; ok {
+		if image, ok := neoReadImageResultBlock(mapValue(result)); ok {
+			return neoToolImageLabel(image)
+		}
 		if text := neoToolRunTextResult(result); text != "" {
 			return text
 		}
@@ -19098,6 +19105,12 @@ func runToText(run any) string {
 func neoToolRunHistoryContent(run map[string]any) []any {
 	if stringValue(run["status"]) != "done" {
 		return nil
+	}
+	if image, ok := neoReadImageResultBlock(mapValue(run["result"])); ok {
+		return []any{
+			map[string]any{"type": "text", "text": neoToolImageLabel(image)},
+			image,
+		}
 	}
 	items := arrayValue(run["result"])
 	if len(items) == 0 {
@@ -19128,6 +19141,41 @@ func neoToolRunHistoryContent(run map[string]any) []any {
 		return nil
 	}
 	return content
+}
+
+func neoReadImageResultBlock(result map[string]any) (map[string]any, bool) {
+	if len(result) == 0 || !boolValue(result["isImage"]) {
+		return nil, false
+	}
+	info := mapValue(result["imageInfo"])
+	mediaType := firstNonEmptyString(info["mimeType"], info["mime_type"], result["mimeType"], result["mime_type"], result["mediaType"], result["media_type"])
+	data := firstNonEmptyString(result["content"], result["data"], result["base64"])
+	urlValue := firstNonEmptyString(result["contentURL"], result["contentUrl"], result["url"], result["uri"])
+	if parsedMime, parsedData, ok := splitNeoImageDataURL(data); ok {
+		mediaType = firstNonEmptyString(mediaType, parsedMime)
+		data = parsedData
+	}
+	if parsedMime, parsedData, ok := splitNeoImageDataURL(urlValue); ok {
+		mediaType = firstNonEmptyString(mediaType, parsedMime)
+		data = parsedData
+		urlValue = ""
+	}
+	if data == "" && urlValue == "" {
+		return nil, false
+	}
+	if mediaType == "" {
+		mediaType = "image/png"
+	}
+	image := map[string]any{"type": "image", "mimeType": mediaType, "mediaType": mediaType}
+	if data != "" {
+		image["data"] = data
+	} else {
+		image["url"] = urlValue
+	}
+	if path := firstNonEmptyString(result["absolutePath"], result["path"], result["filePath"], result["file_path"]); path != "" {
+		image["savedPath"] = path
+	}
+	return image, true
 }
 
 func neoToolRunTextResult(value any) string {
