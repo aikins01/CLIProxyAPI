@@ -1454,7 +1454,7 @@ func (a *neoActor) handleForSocket(socket *neoSocket, msg map[string]any) {
 	case "draft":
 		a.handleBinaryDraft(msg)
 	case "setPendingNavigation":
-		a.setPendingNavigation(firstNonEmptyString(msg["threadID"], msg["threadId"], msg["value"]))
+		a.setPendingNavigation(firstPresentString(msg, "threadID", "threadId", "value"))
 	case "clearPendingNavigation":
 		a.clearPendingNavigation()
 	case "trace:start":
@@ -1544,7 +1544,7 @@ func (a *neoActor) handleForSocket(socket *neoSocket, msg map[string]any) {
 	case "client_set_thread_title":
 		a.setTitle(stringValue(msg["title"]))
 	case "title":
-		a.setTitle(firstNonEmptyString(msg["value"], msg["title"]))
+		a.setTitle(firstPresentString(msg, "value", "title"))
 	case "agent-mode":
 		a.updateAgentModeFromBinary(msg)
 	case "reasoning-effort":
@@ -3247,9 +3247,6 @@ func (a *neoActor) handleBinaryDraft(msg map[string]any) {
 
 func (a *neoActor) setPendingNavigation(threadID string) {
 	threadID = strings.TrimSpace(threadID)
-	if threadID == "" {
-		return
-	}
 	a.mu.Lock()
 	a.pendingNavigation = threadID
 	seq := a.nextSeqLocked()
@@ -8821,7 +8818,8 @@ func (a *neoActor) updateReasoningEffortFromBinary(msg map[string]any) {
 }
 
 func (a *neoActor) updateMaxTokensFromBinary(msg map[string]any) {
-	value := neoNormalizeMaxTokensValue(firstNonNil(msg["value"], msg["maxTokens"], msg["max_tokens"]))
+	rawValue, _ := firstPresentValue(msg, "value", "maxTokens", "max_tokens")
+	value := neoNormalizeMaxTokensValue(rawValue)
 	a.mu.Lock()
 	a.maxTokens = value
 	if a.settings == nil {
@@ -8848,23 +8846,27 @@ func neoNormalizeMaxTokensValue(value any) any {
 	case nil:
 		return nil
 	case int:
-		if typed <= 0 {
+		if typed == 0 {
 			return nil
 		}
 	case int64:
-		if typed <= 0 {
+		if typed == 0 {
 			return nil
 		}
 	case float64:
-		if typed <= 0 {
+		if typed == 0 {
 			return nil
 		}
 	case json.Number:
-		if numeric, err := typed.Int64(); err == nil && numeric <= 0 {
+		if numeric, err := typed.Int64(); err == nil && numeric == 0 {
 			return nil
 		}
 	case bool:
 		if !typed {
+			return nil
+		}
+	case string:
+		if typed == "" {
 			return nil
 		}
 	}
@@ -8872,7 +8874,7 @@ func neoNormalizeMaxTokensValue(value any) any {
 }
 
 func (a *neoActor) updateMainThreadFromBinary(msg map[string]any) {
-	threadID := firstNonEmptyString(msg["value"], msg["threadID"], msg["threadId"], msg["mainThreadID"], msg["mainThreadId"])
+	threadID := stringValue(firstPresentValueOrNil(msg, "value", "threadID", "threadId", "mainThreadID", "mainThreadId"))
 	a.mu.Lock()
 	a.mainThreadID = threadID
 	if a.settings == nil {
@@ -16710,6 +16712,24 @@ func firstNonNil(values ...any) any {
 		}
 	}
 	return nil
+}
+
+func firstPresentValue(values map[string]any, keys ...string) (any, bool) {
+	for _, key := range keys {
+		if value, ok := values[key]; ok {
+			return value, true
+		}
+	}
+	return nil, false
+}
+
+func firstPresentValueOrNil(values map[string]any, keys ...string) any {
+	value, _ := firstPresentValue(values, keys...)
+	return value
+}
+
+func firstPresentString(values map[string]any, keys ...string) string {
+	return stringValue(firstPresentValueOrNil(values, keys...))
 }
 
 func boolValue(v any) bool {

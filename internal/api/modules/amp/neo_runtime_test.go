@@ -7053,6 +7053,69 @@ func TestNeoActorBinaryEnvironmentDeltaClearsExistingEnvironment(t *testing.T) {
 	}
 }
 
+func TestNeoActorBinaryScalarDeltasUseFalseyClears(t *testing.T) {
+	useTempNeoThreadStore(t)
+	parentID := "T-019e1046-656d-7132-879f-390ded941c16"
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+
+	actor.handle(map[string]any{"type": "title", "value": "Binary Title"})
+	actor.handle(map[string]any{"type": "max-tokens", "value": 32000})
+	actor.handle(map[string]any{"type": "main-thread", "value": parentID})
+	actor.handle(map[string]any{"type": "setPendingNavigation", "threadID": parentID})
+
+	actor.handle(map[string]any{"type": "title", "value": "", "title": "ignored fallback"})
+	actor.handle(map[string]any{"type": "max-tokens", "value": "", "maxTokens": 64000})
+	actor.handle(map[string]any{"type": "main-thread", "value": "", "threadID": parentID})
+	actor.handle(map[string]any{"type": "setPendingNavigation", "threadID": ""})
+
+	actor.mu.Lock()
+	if actor.title != "" {
+		t.Fatalf("title = %q, want cleared empty value", actor.title)
+	}
+	if actor.maxTokens != nil {
+		t.Fatalf("maxTokens = %#v, want cleared empty value", actor.maxTokens)
+	}
+	if _, ok := actor.settings["maxTokens"]; ok {
+		t.Fatalf("settings maxTokens should be cleared: %#v", actor.settings)
+	}
+	if actor.mainThreadID != "" {
+		t.Fatalf("mainThreadID = %q, want cleared empty value", actor.mainThreadID)
+	}
+	if _, ok := actor.settings["mainThreadID"]; ok {
+		t.Fatalf("settings mainThreadID should be cleared: %#v", actor.settings)
+	}
+	if actor.pendingNavigation != "" {
+		t.Fatalf("pendingNavigation = %q, want cleared empty threadID", actor.pendingNavigation)
+	}
+	actor.mu.Unlock()
+
+	snapshot, ok := actor.threadSnapshot()
+	if !ok {
+		t.Fatal("threadSnapshot returned false")
+	}
+	thread := neoCloudThread(snapshot)
+	for _, key := range []string{"maxTokens", "mainThreadID", "pendingNavigation"} {
+		if _, exists := thread[key]; exists {
+			t.Fatalf("%s should be omitted after binary falsey clear: %#v", key, thread[key])
+		}
+	}
+}
+
+func TestNeoNormalizeMaxTokensValueMirrorsBinaryTruthiness(t *testing.T) {
+	for _, value := range []any{0, int64(0), float64(0), json.Number("0"), false, ""} {
+		if got := neoNormalizeMaxTokensValue(value); got != nil {
+			t.Fatalf("neoNormalizeMaxTokensValue(%#v) = %#v, want nil", value, got)
+		}
+	}
+	if got := neoNormalizeMaxTokensValue(-1); got != -1 {
+		t.Fatalf("neoNormalizeMaxTokensValue(-1) = %#v, want -1", got)
+	}
+	if got := neoNormalizeMaxTokensValue("0"); got != "0" {
+		t.Fatalf("neoNormalizeMaxTokensValue(%q) = %#v, want %q", "0", got, "0")
+	}
+}
+
 func TestNeoActorBinaryAssistantUpdateWithoutIDOnlyUpdatesLastAssistant(t *testing.T) {
 	useTempNeoThreadStore(t)
 	rt := newNeoRuntime(&config.Config{})
