@@ -4326,18 +4326,27 @@ func (a *neoActor) enqueueBinaryQueuedMessage(msg map[string]any) {
 func (a *neoActor) dequeueQueuedMessage() {
 	a.cleanupPriorAssistantForBinaryDelta()
 	a.mu.Lock()
-	if a.agentState != "idle" || !a.executorReady || len(a.queue) == 0 {
+	if len(a.queue) == 0 {
 		a.mu.Unlock()
 		return
 	}
 	next := a.queue[0]
 	a.queue = a.queue[1:]
 	seq := a.nextSeqLocked()
+	ready := a.agentState == "idle" && a.executorReady
+	message, mode, effort := a.storeQueuedUserMessageLocked(next)
+	if !a.executorReady && a.agentState == "idle" {
+		a.pendingInference = &neoInferenceInflight{agentMode: mode, reasoningEffort: effort}
+	}
 	a.mu.Unlock()
 
 	a.broadcast(map[string]any{"type": "queued_message_dequeued", "queuedMessageId": next.eventMessageID(), "seq": seq})
+	a.broadcast(neoMessageAddedPayload(message))
+	a.ensureThreadTitle(next.Content)
 	a.syncCloudAsync()
-	a.startUserMessage(next)
+	if ready {
+		go a.runInference(mode, effort)
+	}
 }
 
 func (a *neoActor) discardQueuedMessages(msg map[string]any) {
@@ -4469,6 +4478,16 @@ func (a *neoActor) rejectEdit(editID, message string) {
 
 func (a *neoActor) startUserMessage(user neoQueuedMessage) {
 	a.mu.Lock()
+	message, mode, effort := a.storeQueuedUserMessageLocked(user)
+	a.mu.Unlock()
+
+	a.broadcast(neoMessageAddedPayload(message))
+	a.ensureThreadTitle(user.Content)
+	a.syncCloudAsync()
+	go a.runInference(mode, effort)
+}
+
+func (a *neoActor) storeQueuedUserMessageLocked(user neoQueuedMessage) (neoMessage, string, string) {
 	mode := user.AgentMode
 	if mode == "" {
 		mode = a.agentModeLocked()
@@ -4491,12 +4510,7 @@ func (a *neoActor) startUserMessage(user neoQueuedMessage) {
 		CompletionStatus: "",
 	})
 	a.history = append(a.history, neoHistoryMessage{Role: "user", Text: neoUserHistoryText(user.Content, user.UserState, user.FileMentions), Content: neoUserHistoryContent(user.Content, user.UserState, user.FileMentions)})
-	a.mu.Unlock()
-
-	a.broadcast(neoMessageAddedPayload(message))
-	a.ensureThreadTitle(user.Content)
-	a.syncCloudAsync()
-	go a.runInference(mode, effort)
+	return message, mode, effort
 }
 
 func (a *neoActor) runInference(agentMode, reasoningEffort string) {

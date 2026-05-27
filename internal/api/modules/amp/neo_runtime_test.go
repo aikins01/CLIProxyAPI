@@ -6680,6 +6680,35 @@ func TestNeoActorBinaryQueueEnqueueCapsAndDoesNotAutoRun(t *testing.T) {
 	}
 }
 
+func TestNeoActorBinaryQueueDequeueDoesNotRequireExecutorReady(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	actor.executorReady = false
+	actor.agentState = "idle"
+	actor.queue = []neoQueuedMessage{{
+		ID:              "queued-1",
+		MessageID:       "M-queued",
+		Content:         []any{map[string]any{"type": "text", "text": "run later"}},
+		AgentMode:       "deep",
+		ReasoningEffort: "xhigh",
+	}}
+
+	actor.handle(map[string]any{"type": "user:message-queue:dequeue"})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.queue) != 0 {
+		t.Fatalf("queue after dequeue = %#v", actor.queue)
+	}
+	if len(actor.messages) != 1 || actor.messages[0].MessageID != "M-queued" || textFromBlocks(actor.messages[0].Content) != "run later" {
+		t.Fatalf("messages after dequeue = %#v", actor.messages)
+	}
+	if actor.pendingInference == nil || actor.pendingInference.agentMode != "deep" || actor.pendingInference.reasoningEffort != "xhigh" {
+		t.Fatalf("pending inference = %#v, want queued message to run when executor connects", actor.pendingInference)
+	}
+}
+
 func TestNeoActorQueuedRemovalEventUsesQueuedMessageID(t *testing.T) {
 	useTempNeoThreadStore(t)
 	rt := newNeoRuntime(&config.Config{})
