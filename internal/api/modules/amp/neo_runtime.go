@@ -4352,7 +4352,7 @@ func (a *neoActor) dequeueQueuedMessage() {
 func (a *neoActor) discardQueuedMessages(msg map[string]any) {
 	queueID := firstNonEmptyString(msg["id"], msg["queuedMessageId"], msg["queuedMessageID"])
 	if queueID != "" {
-		a.removeQueuedMessage(queueID)
+		a.discardBinaryQueuedMessage(queueID)
 		return
 	}
 	a.mu.Lock()
@@ -4365,6 +4365,31 @@ func (a *neoActor) discardQueuedMessages(msg map[string]any) {
 	a.mu.Unlock()
 
 	a.broadcast(map[string]any{"type": "queued_messages", "messages": []any{}, "seq": seq})
+	a.syncCloudAsync()
+}
+
+func (a *neoActor) discardBinaryQueuedMessage(queueID string) {
+	a.mu.Lock()
+	if len(a.queue) == 0 {
+		a.mu.Unlock()
+		return
+	}
+	index := -1
+	for i, item := range a.queue {
+		if item.queueID() == queueID {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		index = len(a.queue) - 1
+	}
+	removed := a.queue[index]
+	a.queue = append(a.queue[:index], a.queue[index+1:]...)
+	seq := a.nextSeqLocked()
+	a.mu.Unlock()
+
+	a.broadcast(map[string]any{"type": "queued_message_removed", "queuedMessageId": removed.eventMessageID(), "seq": seq})
 	a.syncCloudAsync()
 }
 

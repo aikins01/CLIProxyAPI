@@ -6654,6 +6654,32 @@ func TestNeoActorHandlesBinaryQueueDeltas(t *testing.T) {
 	waitForNeoActorSyncIdle(t, actor)
 }
 
+func TestNeoActorBinaryQueueDiscardUsesWrapperIDAndFindIndexFallback(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	actor.queue = []neoQueuedMessage{
+		{ID: "queued-a", MessageID: "M-a", Content: []any{map[string]any{"type": "text", "text": "a"}}},
+		{ID: "queued-b", MessageID: "M-b", Content: []any{map[string]any{"type": "text", "text": "b"}}},
+	}
+
+	actor.handle(map[string]any{"type": "user:message-queue:discard", "id": "M-a"})
+
+	actor.mu.Lock()
+	if len(actor.queue) != 1 || actor.queue[0].ID != "queued-a" {
+		t.Fatalf("queue after message-id discard = %#v, want binary findIndex fallback to remove last wrapper", actor.queue)
+	}
+	actor.mu.Unlock()
+
+	actor.handle(map[string]any{"type": "user:message-queue:discard", "id": "queued-a"})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.queue) != 0 {
+		t.Fatalf("queue after wrapper-id discard = %#v", actor.queue)
+	}
+}
+
 func TestNeoActorBinaryQueueEnqueueCapsAndDoesNotAutoRun(t *testing.T) {
 	useTempNeoThreadStore(t)
 	rt := newNeoRuntime(&config.Config{})
