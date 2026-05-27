@@ -643,12 +643,13 @@ func neoLocalGetThreadResponse(ctx context.Context, cfg *config.Config, r *http.
 		return neoLocalThreadNotFoundResponse()
 	}
 	normalizeNeoThreadOwnership(thread)
+	normalizeNeoThreadAgentMode(thread)
 	envelope := gin.H{
 		"id":    firstNonEmptyString(thread["id"], threadID),
 		"title": stringValue(thread["title"]),
 		"data":  thread,
 	}
-	for _, key := range []string{"created", "updatedAt", "creatorUserID", "ownerUserId"} {
+	for _, key := range []string{"created", "updatedAt", "creatorUserID", "ownerUserId", "agentMode"} {
 		if value := thread[key]; value != nil {
 			envelope[key] = value
 		}

@@ -997,6 +997,10 @@ func TestRegisterManagementRoutesServesNeoStartupInternalRPCPostsLocally(t *test
 		if stringValue(thread["creatorUserID"]) != neoLocalOwnerUserID {
 			t.Fatalf("creatorUserID = %#v, want %q", thread["creatorUserID"], neoLocalOwnerUserID)
 		}
+		envelope := mapValue(mapValue(response["result"])["thread"])
+		if stringValue(envelope["agentMode"]) != "deep" || stringValue(thread["agentMode"]) != "deep" {
+			t.Fatalf("agentMode envelope=%#v data=%#v, want deep", envelope["agentMode"], thread["agentMode"])
+		}
 	})
 
 	t.Run("thread meta", func(t *testing.T) {
