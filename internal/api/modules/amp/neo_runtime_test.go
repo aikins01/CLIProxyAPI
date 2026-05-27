@@ -7038,6 +7038,21 @@ func TestNeoActorHandlesBinaryAssistantAndSettingsDeltas(t *testing.T) {
 	waitForNeoActorSyncIdle(t, actor)
 }
 
+func TestNeoActorBinaryEnvironmentDeltaClearsExistingEnvironment(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	actor.environment = map[string]any{"workspaceRoot": "/tmp/work", "shell": "zsh"}
+
+	actor.handle(map[string]any{"type": "environment", "env": map[string]any{}})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.environment) != 0 {
+		t.Fatalf("environment = %#v, want cleared empty environment", actor.environment)
+	}
+}
+
 func TestNeoActorBinaryAssistantUpdateWithoutIDOnlyUpdatesLastAssistant(t *testing.T) {
 	useTempNeoThreadStore(t)
 	rt := newNeoRuntime(&config.Config{})

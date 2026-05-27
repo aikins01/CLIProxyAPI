@@ -8896,9 +8896,6 @@ func (a *neoActor) updateMainThreadFromBinary(msg map[string]any) {
 
 func (a *neoActor) updateEnvironmentFromBinary(msg map[string]any) {
 	env := mapValue(firstNonNil(msg["env"], msg["environment"]))
-	if len(env) == 0 {
-		return
-	}
 	a.updateEnvironment(env)
 	a.syncCloudAsync()
 }
