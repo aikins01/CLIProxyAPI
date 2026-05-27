@@ -9925,6 +9925,62 @@ func TestNeoThreadListEntryPromotesMetaAgentModeForBinarySwitch(t *testing.T) {
 	}
 }
 
+func TestNeoThreadListEntryComputesBinaryDiffStats(t *testing.T) {
+	entry := neoThreadListEntry(map[string]any{
+		"id": "T-list-diff",
+		"messages": []any{
+			map[string]any{"role": "user", "messageId": "M-user", "content": []any{map[string]any{"type": "text", "text": "edit files"}}},
+			map[string]any{
+				"role":      "assistant",
+				"messageId": "M-assistant",
+				"content": []any{
+					map[string]any{"type": "tool_use", "complete": true, "name": "edit_file", "input": map[string]any{"old_str": "old\nsame", "new_str": "new\nsame\nextra"}},
+					map[string]any{"type": "tool_use", "complete": true, "name": "create_file", "input": map[string]any{"content": "one\ntwo"}},
+					map[string]any{"type": "tool_use", "complete": false, "name": "create_file", "input": map[string]any{"content": "ignored"}},
+				},
+			},
+		},
+	})
+	diffStats := mapValue(mapValue(entry["summaryStats"])["diffStats"])
+	if numberFrom(diffStats["added"]) != 4 || numberFrom(diffStats["deleted"]) != 1 || numberFrom(diffStats["changed"]) != 1 {
+		t.Fatalf("diffStats = %#v, want added=4 deleted=1 changed=1", diffStats)
+	}
+}
+
+func TestRecentNeoLocalThreadsComputesBinaryDiffStats(t *testing.T) {
+	dir := t.TempDir()
+	oldStoreDir := neoAmpThreadStoreDir
+	neoAmpThreadStoreDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
+
+	threadID := "T-019e0e6e-f3f1-7081-b5dd-748f66f8c25d"
+	raw := []byte(`{
+		"id": "` + threadID + `",
+		"title": "diff stats",
+		"agentMode": "smart",
+		"created": 1778170000000,
+		"messages": [
+			{"role": "user", "messageId": "M-user", "content": [{"type": "text", "text": "patch it"}]},
+			{"role": "assistant", "messageId": "M-assistant", "content": [
+				{"type": "server_tool_use", "name": "functions.edit_file", "input": {"old_str": "alpha\nbeta", "new_str": "alpha\ngamma\nbeta"}},
+				{"type": "tool_use", "complete": true, "name": "write_file", "input": {"content": "new file"}}
+			]}
+		]
+	}`)
+	if err := os.WriteFile(filepath.Join(dir, threadID+".json"), raw, 0o600); err != nil {
+		t.Fatalf("write local thread: %v", err)
+	}
+
+	threads := recentNeoLocalThreads(10)
+	if len(threads) != 1 {
+		t.Fatalf("threads = %#v", threads)
+	}
+	diffStats := mapValue(mapValue(threads[0]["summaryStats"])["diffStats"])
+	if numberFrom(diffStats["added"]) != 2 || numberFrom(diffStats["deleted"]) != 0 || numberFrom(diffStats["changed"]) != 0 {
+		t.Fatalf("diffStats = %#v, want added=2 deleted=0 changed=0", diffStats)
+	}
+}
+
 func TestNeoRuntimeThreadActorManagementUsesExistingModeWhenRequestOmitsMode(t *testing.T) {
 	dir := t.TempDir()
 	oldStoreDir := neoAmpThreadStoreDir

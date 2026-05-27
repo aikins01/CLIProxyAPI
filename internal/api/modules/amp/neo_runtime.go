@@ -6235,6 +6235,7 @@ func recentNeoLocalThreads(limit int) []map[string]any {
 		}
 		if messages := gjson.GetBytes(raw, "messages"); messages.Exists() && messages.IsArray() {
 			thread["messageCount"] = len(messages.Array())
+			thread["summaryStats"] = neoMergeThreadSummaryStats(thread["summaryStats"], len(messages.Array()), neoThreadDiffStatsFromJSONMessages(messages))
 		}
 		if updated := neoThreadUpdatedMillisFromJSONBytes(raw); updated > 0 {
 			thread["updated"] = updated
@@ -6362,11 +6363,19 @@ func neoThreadListEntry(thread map[string]any) map[string]any {
 	if entry["messageCount"] == nil {
 		entry["messageCount"] = firstNonZero(numberFrom(mapValue(thread["summaryStats"])["messageCount"]), len(arrayValue(thread["messages"])))
 	}
+	diffStats := neoThreadDiffStatsFromThread(thread)
 	if summaryStats := mapValue(entry["summaryStats"]); len(summaryStats) == 0 {
-		entry["summaryStats"] = map[string]any{"messageCount": entry["messageCount"]}
+		entry["summaryStats"] = neoMergeThreadSummaryStats(nil, numberFrom(entry["messageCount"]), diffStats)
 	} else if summaryStats["messageCount"] == nil {
 		summaryStats = cloneMap(summaryStats)
 		summaryStats["messageCount"] = entry["messageCount"]
+		if _, exists := summaryStats["diffStats"]; !exists && len(diffStats) > 0 {
+			summaryStats["diffStats"] = diffStats
+		}
+		entry["summaryStats"] = summaryStats
+	} else if _, exists := summaryStats["diffStats"]; !exists && len(diffStats) > 0 {
+		summaryStats = cloneMap(summaryStats)
+		summaryStats["diffStats"] = diffStats
 		entry["summaryStats"] = summaryStats
 	}
 	if updated := neoThreadUpdatedMillis(entry); updated > 0 {
@@ -6379,6 +6388,239 @@ func neoThreadListEntry(thread map[string]any) map[string]any {
 		}
 	}
 	return entry
+}
+
+type neoDiffStats struct {
+	added   int
+	changed int
+	deleted int
+}
+
+func (s neoDiffStats) mapValue() map[string]any {
+	return map[string]any{"added": s.added, "changed": s.changed, "deleted": s.deleted}
+}
+
+func (s neoDiffStats) add(next neoDiffStats) neoDiffStats {
+	return neoDiffStats{added: s.added + next.added, changed: s.changed + next.changed, deleted: s.deleted + next.deleted}
+}
+
+func neoMergeThreadSummaryStats(raw any, messageCount int, diffStats map[string]any) map[string]any {
+	stats := cloneMap(mapValue(raw))
+	if stats["messageCount"] == nil {
+		stats["messageCount"] = messageCount
+	}
+	if stats["diffStats"] == nil && diffStats != nil {
+		stats["diffStats"] = diffStats
+	}
+	return stats
+}
+
+func neoThreadDiffStatsFromThread(thread map[string]any) map[string]any {
+	rawMessages, exists := thread["messages"]
+	if !exists {
+		return nil
+	}
+	return neoThreadDiffStatsFromMessages(arrayValue(rawMessages)).mapValue()
+}
+
+func neoThreadDiffStatsFromJSONMessages(messages gjson.Result) map[string]any {
+	if !messages.Exists() || !messages.IsArray() {
+		return nil
+	}
+	stats := neoDiffStats{}
+	messages.ForEach(func(_, message gjson.Result) bool {
+		if message.Get("role").String() != "assistant" {
+			return true
+		}
+		content := message.Get("content")
+		if !content.IsArray() {
+			return true
+		}
+		content.ForEach(func(_, block gjson.Result) bool {
+			stats = stats.add(neoToolUseDiffStatsFromJSONBlock(block))
+			return true
+		})
+		return true
+	})
+	return stats.mapValue()
+}
+
+func neoThreadDiffStatsFromMessages(messages []any) neoDiffStats {
+	stats := neoDiffStats{}
+	for _, rawMessage := range messages {
+		message := mapValue(rawMessage)
+		if stringValue(message["role"]) != "assistant" {
+			continue
+		}
+		for _, rawBlock := range arrayValue(message["content"]) {
+			stats = stats.add(neoToolUseDiffStatsFromBlock(mapValue(rawBlock)))
+		}
+	}
+	return stats
+}
+
+func neoToolUseDiffStatsFromJSONBlock(block gjson.Result) neoDiffStats {
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(block.Raw), &decoded); err != nil {
+		return neoDiffStats{}
+	}
+	return neoToolUseDiffStatsFromBlock(decoded)
+}
+
+func neoToolUseDiffStatsFromBlock(block map[string]any) neoDiffStats {
+	blockType := stringValue(block["type"])
+	if blockType != "tool_use" && blockType != "server_tool_use" {
+		return neoDiffStats{}
+	}
+	if blockType == "tool_use" {
+		if complete, exists := block["complete"]; exists && !boolValue(complete) {
+			return neoDiffStats{}
+		}
+		if _, exists := block["inputPartialJSON"]; exists {
+			return neoDiffStats{}
+		}
+	}
+	name := firstNonEmptyString(block["normalizedName"], block["name"])
+	name = strings.TrimPrefix(name, "functions.")
+	input := mapValue(block["input"])
+	switch name {
+	case "edit_file":
+		oldText, oldOK := input["old_str"].(string)
+		newText, newOK := input["new_str"].(string)
+		if oldOK && newOK {
+			return neoLineDiffStats(oldText, newText)
+		}
+	case "apply_patch":
+		if patchText, ok := input["patchText"].(string); ok {
+			return neoApplyPatchDiffStats(patchText)
+		}
+	case "write_file", "create_file":
+		if content, ok := input["content"].(string); ok {
+			return neoCreatedContentDiffStats(content)
+		}
+	}
+	return neoDiffStats{}
+}
+
+func neoCreatedContentDiffStats(content string) neoDiffStats {
+	return neoDiffStats{added: len(strings.Split(content, "\n"))}
+}
+
+func neoApplyPatchDiffStats(patchText string) neoDiffStats {
+	lines := strings.Split(patchText, "\n")
+	stats := neoDiffStats{}
+	mode := ""
+	var oldLines []string
+	var newLines []string
+	var addLines []string
+	flushUpdate := func() {
+		if oldLines != nil || newLines != nil {
+			stats = stats.add(neoLineDiffStats(strings.Join(oldLines, "\n"), strings.Join(newLines, "\n")))
+			oldLines = nil
+			newLines = nil
+		}
+	}
+	flushAdd := func() {
+		if addLines != nil {
+			stats = stats.add(neoCreatedContentDiffStats(strings.Join(addLines, "\n")))
+			addLines = nil
+		}
+	}
+	for _, line := range lines {
+		switch {
+		case strings.HasPrefix(line, "*** Add File: "):
+			flushUpdate()
+			flushAdd()
+			mode = "add"
+		case strings.HasPrefix(line, "*** Update File: "):
+			flushUpdate()
+			flushAdd()
+			mode = "update"
+		case strings.HasPrefix(line, "*** Delete File: "):
+			flushUpdate()
+			flushAdd()
+			mode = "delete"
+		case strings.HasPrefix(line, "*** End Patch"):
+			flushUpdate()
+			flushAdd()
+			mode = ""
+		case strings.HasPrefix(line, "***"):
+			flushUpdate()
+			flushAdd()
+		case mode == "add":
+			if strings.HasPrefix(line, "+") {
+				addLines = append(addLines, strings.TrimPrefix(line, "+"))
+			}
+		case mode == "update":
+			if strings.HasPrefix(line, "@@") {
+				continue
+			}
+			switch {
+			case strings.HasPrefix(line, "+"):
+				newLines = append(newLines, strings.TrimPrefix(line, "+"))
+			case strings.HasPrefix(line, "-"):
+				oldLines = append(oldLines, strings.TrimPrefix(line, "-"))
+			case strings.HasPrefix(line, " "):
+				text := strings.TrimPrefix(line, " ")
+				oldLines = append(oldLines, text)
+				newLines = append(newLines, text)
+			}
+		}
+	}
+	flushUpdate()
+	flushAdd()
+	return stats
+}
+
+func neoLineDiffStats(oldText, newText string) neoDiffStats {
+	if oldText == newText {
+		return neoDiffStats{}
+	}
+	oldLines := strings.Split(oldText, "\n")
+	newLines := strings.Split(newText, "\n")
+	if len(oldLines)*len(newLines) > 1_000_000 {
+		deleted := len(oldLines)
+		added := len(newLines)
+		return neoDiffStats{added: added, deleted: deleted, changed: min(added, deleted)}
+	}
+	width := len(newLines) + 1
+	lcs := make([]int, (len(oldLines)+1)*width)
+	at := func(i, j int) int { return i*width + j }
+	for i := len(oldLines) - 1; i >= 0; i-- {
+		for j := len(newLines) - 1; j >= 0; j-- {
+			if oldLines[i] == newLines[j] {
+				lcs[at(i, j)] = lcs[at(i+1, j+1)] + 1
+			} else {
+				lcs[at(i, j)] = max(lcs[at(i+1, j)], lcs[at(i, j+1)])
+			}
+		}
+	}
+	stats := neoDiffStats{}
+	for i, j := 0, 0; i < len(oldLines) || j < len(newLines); {
+		if i < len(oldLines) && j < len(newLines) && oldLines[i] == newLines[j] {
+			i++
+			j++
+			continue
+		}
+		deleted := 0
+		added := 0
+		for i < len(oldLines) || j < len(newLines) {
+			if i < len(oldLines) && j < len(newLines) && oldLines[i] == newLines[j] {
+				break
+			}
+			if j < len(newLines) && (i == len(oldLines) || lcs[at(i, j+1)] >= lcs[at(i+1, j)]) {
+				added++
+				j++
+				continue
+			}
+			deleted++
+			i++
+		}
+		stats.added += added
+		stats.deleted += deleted
+		stats.changed += min(added, deleted)
+	}
+	return stats
 }
 
 func neoThreadUpdatedMillisFromJSONBytes(raw []byte) int {
