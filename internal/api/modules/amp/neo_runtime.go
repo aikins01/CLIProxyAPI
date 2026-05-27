@@ -6709,7 +6709,14 @@ func getNeoCloudThread(ctx context.Context, cfg *config.Config, threadID string)
 	if len(thread) == 0 {
 		thread = envelope
 	} else {
-		for _, key := range []string{"id", "title", "created", "updatedAt", "creatorUserID"} {
+		for _, key := range []string{
+			"id", "title", "created", "createdAt", "updated", "updatedAt", "userLastInteractedAt",
+			"creatorUserID", "ownerUserId", "v", "agentMode", "archived", "env", "summaryStats",
+			"usesDtw", "usesThreadActors", "meta", "relationships", "originThreadID", "originThreadId",
+			"mainThreadID", "mainThreadId", "mainThread", "maxTokens", "max_tokens", "threadStatus",
+			"status", "labels", "artifacts", "queuedMessages", "compactionRecords", "draft",
+			"autoSubmitDraft", "pendingNavigation", "messages",
+		} {
 			if _, exists := thread[key]; !exists && envelope[key] != nil {
 				thread[key] = envelope[key]
 			}

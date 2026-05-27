@@ -10549,6 +10549,56 @@ func TestNeoCloudGetThreadDecodesCloudData(t *testing.T) {
 	}
 }
 
+func TestNeoCloudGetThreadPreservesEnvelopeAgentModeForBinaryResume(t *testing.T) {
+	threadID := "T-019e65c0-0310-77a8-b233-4b84d9c0612b"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeNeoJSON(w, http.StatusOK, map[string]any{
+			"ok": true,
+			"result": map[string]any{
+				"thread": map[string]any{
+					"id":        threadID,
+					"v":         float64(17),
+					"agentMode": "deep",
+					"meta": map[string]any{
+						"usesThreadActors": true,
+					},
+					"data": map[string]any{
+						"id":    threadID,
+						"title": "deep thread from envelope",
+						"messages": []any{
+							map[string]any{
+								"role":      "user",
+								"messageId": "M-user",
+								"content":   []any{map[string]any{"type": "text", "text": "resume"}},
+							},
+						},
+					},
+				},
+			},
+		})
+	}))
+	defer upstream.Close()
+
+	thread, ok, err := getNeoCloudThread(context.Background(), &config.Config{
+		AmpCode: config.AmpCode{UpstreamURL: upstream.URL, UpstreamAPIKey: "secret"},
+	}, threadID)
+	if err != nil {
+		t.Fatalf("getNeoCloudThread error: %v", err)
+	}
+	if !ok {
+		t.Fatal("getNeoCloudThread returned not ok")
+	}
+	if got := stringValue(thread["agentMode"]); got != "deep" {
+		t.Fatalf("agentMode = %q, want envelope deep for binary resume", got)
+	}
+	if got := numberFrom(thread["v"]); got != 17 {
+		t.Fatalf("v = %#v, want 17", thread["v"])
+	}
+	if mapValue(thread["meta"])["usesThreadActors"] != true {
+		t.Fatalf("meta = %#v, want envelope meta preserved", thread["meta"])
+	}
+}
+
 func TestNeoRuntimeServesCloudThreadWhenLocalMissing(t *testing.T) {
 	dir := t.TempDir()
 	oldStoreDir := neoAmpThreadStoreDir
