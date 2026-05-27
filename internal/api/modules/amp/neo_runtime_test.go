@@ -4181,11 +4181,11 @@ func TestNeoActorUpdateSettingsPreservesModeWhenPatchOmitsAgentMode(t *testing.T
 	actor.updateSettings(map[string]any{"agentMode": "rush"})
 	actor.mu.Lock()
 	defer actor.mu.Unlock()
-	if actor.currentAgentMode != "rush" || actor.currentReasoningEffort != "none" {
-		t.Fatalf("rush update should default reasoning effort to none: mode=%q effort=%q", actor.currentAgentMode, actor.currentReasoningEffort)
+	if actor.currentAgentMode != "rush" || actor.currentReasoningEffort != "" {
+		t.Fatalf("rush update should clear reasoning effort: mode=%q effort=%q", actor.currentAgentMode, actor.currentReasoningEffort)
 	}
-	if got := stringValue(actor.settings["reasoning.effort"]); got != "none" {
-		t.Fatalf("rush settings reasoning.effort = %q, want none", got)
+	if _, exists := actor.settings["reasoning.effort"]; exists {
+		t.Fatalf("rush settings kept reasoning.effort: %#v", actor.settings)
 	}
 }
 
@@ -4196,8 +4196,8 @@ func TestNeoActorReasoningEffortDefaultsByMode(t *testing.T) {
 	actor.currentReasoningEffort = "high"
 	actor.messages = []neoMessage{{Role: "user", AgentMode: "smart", ReasoningEffort: "max"}}
 
-	if got := actor.reasoningEffortForModeLocked("rush"); got != "none" {
-		t.Fatalf("rush effort = %q, want none", got)
+	if got := actor.reasoningEffortForModeLocked("rush"); got != "" {
+		t.Fatalf("rush effort = %q, want empty", got)
 	}
 	if got := actor.reasoningEffortForModeLocked("deep"); got != "medium" {
 		t.Fatalf("deep effort = %q, want medium", got)
@@ -4205,11 +4205,11 @@ func TestNeoActorReasoningEffortDefaultsByMode(t *testing.T) {
 	if got := actor.reasoningEffortForModeLocked("smart"); got != "high" {
 		t.Fatalf("smart effort = %q, want high", got)
 	}
-	if got := actor.reasoningEffortForModeLocked("frontier"); got != "medium" {
-		t.Fatalf("frontier effort = %q, want medium", got)
+	if got := actor.reasoningEffortForModeLocked("frontier"); got != "" {
+		t.Fatalf("frontier effort = %q, want empty", got)
 	}
-	if got := actor.reasoningEffortForModeLocked("nostromo"); got != "low" {
-		t.Fatalf("nostromo effort = %q, want low", got)
+	if got := actor.reasoningEffortForModeLocked("nostromo"); got != "" {
+		t.Fatalf("nostromo effort = %q, want empty", got)
 	}
 }
 
@@ -7362,7 +7362,7 @@ func TestNeoActorBinaryToolDataGroupsResultsAfterAssistant(t *testing.T) {
 	}
 }
 
-func TestNeoActorNormalizesBinaryToolDataResult(t *testing.T) {
+func TestNeoActorBinaryToolDataStoresRawFindThreadResult(t *testing.T) {
 	useTempNeoThreadStore(t)
 	snapshot := neoCloudThreadSnapshot{
 		threadID:  "T-search-target",
@@ -7421,15 +7421,57 @@ func TestNeoActorNormalizesBinaryToolDataResult(t *testing.T) {
 	}
 	run := mapValue(mapValue(actor.messages[1].Content[0])["run"])
 	result := mapValue(run["result"])
-	threads, ok := result["threads"].([]map[string]any)
-	if !ok || len(threads) != 1 {
+	threads := arrayValue(result["threads"])
+	if len(threads) != 1 {
 		t.Fatalf("threads = %#v", result["threads"])
 	}
-	if threads[0]["id"] != "T-search-target" {
-		t.Fatalf("thread result = %#v", threads[0])
+	thread := mapValue(threads[0])
+	if thread["id"] != "T-wrong-thread" || stringValue(thread["matchedSearchText"]) != "wrong result" {
+		t.Fatalf("binary tool:data result was locally normalized: %#v", thread)
 	}
-	if _, ok := threads[0]["updatedAt"].(string); !ok || stringValue(threads[0]["updatedAt"]) == "" {
-		t.Fatalf("updatedAt = %#v, want non-empty string", threads[0]["updatedAt"])
+}
+
+func TestNeoActorBinaryToolDataStoresRawImageRun(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	actor.messages = []neoMessage{{
+		ThreadID:  "T-test",
+		MessageID: "M-assistant",
+		Role:      "assistant",
+		Content: []any{map[string]any{
+			"type":  "tool_use",
+			"id":    "TU-painter",
+			"name":  "painter",
+			"input": map[string]any{"prompt": "draw"},
+		}},
+		State: map[string]any{"type": "complete", "stopReason": "tool_use"},
+		Seq:   1,
+	}}
+	actor.rebuildHistoryLocked()
+
+	actor.handle(map[string]any{
+		"type":    "tool:data",
+		"toolUse": "TU-painter",
+		"data": map[string]any{
+			"status": "done",
+			"images": []any{map[string]any{"mimeType": "image/png", "data": "abc"}},
+		},
+	})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.messages) != 2 {
+		t.Fatalf("messages = %#v", actor.messages)
+	}
+	run := mapValue(mapValue(actor.messages[1].Content[0])["run"])
+	if stringValue(run["status"]) != "done" || len(arrayValue(run["images"])) != 1 {
+		t.Fatalf("raw tool run = %#v", run)
+	}
+	for _, key := range []string{"imageCount", "displayMessage", "result", "prompt"} {
+		if _, exists := run[key]; exists {
+			t.Fatalf("binary tool:data run gained normalized key %q: %#v", key, run)
+		}
 	}
 }
 
@@ -7895,11 +7937,73 @@ func TestNeoActorBinaryAssistantMessageCleansPriorIncompleteAssistant(t *testing
 	if !boolValue(toolUse["complete"]) || stringValue(mapValue(toolUse["input"])["cmd"]) != "sleep 60" {
 		t.Fatalf("stale tool use = %#v", toolUse)
 	}
+	if _, exists := toolUse["blockState"]; exists {
+		t.Fatalf("stale tool use kept blockState: %#v", toolUse)
+	}
+	if _, exists := toolUse["inputIncomplete"]; exists {
+		t.Fatalf("stale tool use kept inputIncomplete: %#v", toolUse)
+	}
+	if _, exists := toolUse["inputPartialJSON"]; exists {
+		t.Fatalf("stale tool use kept inputPartialJSON: %#v", toolUse)
+	}
 	if _, ok := actor.pendingTools["TU-stale"]; ok {
 		t.Fatalf("stale pending tool was not removed: %#v", actor.pendingTools)
 	}
 	if textFromBlocks(actor.messages[1].Content) != "next" {
 		t.Fatalf("new assistant = %#v", actor.messages[1])
+	}
+}
+
+func TestNeoActorBinaryUserMessageCleanupUsesBinaryToolResultShape(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	actor.messages = []neoMessage{{
+		ThreadID:  "T-test",
+		MessageID: "M-stale",
+		Role:      "assistant",
+		Content: []any{map[string]any{
+			"type":             "tool_use",
+			"id":               "TU-stale",
+			"name":             "Bash",
+			"complete":         false,
+			"blockState":       "streaming",
+			"inputPartialJSON": map[string]any{"json": `{"cmd":"sleep 60"`},
+			"inputIncomplete":  map[string]any{"cmd": "sleep 60"},
+		}},
+		State: map[string]any{"type": "streaming"},
+		Seq:   1,
+	}}
+	actor.pendingTools["TU-stale"] = neoPendingTool{ID: "TU-stale", Name: "Bash", MessageID: "M-stale"}
+	actor.seq = 2
+	actor.rebuildHistoryLocked()
+
+	actor.handle(map[string]any{
+		"type": "user:message",
+		"message": map[string]any{
+			"content": []any{map[string]any{"type": "text", "text": "next"}},
+		},
+	})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.messages) != 3 {
+		t.Fatalf("messages = %#v, want stale assistant, cancelled tool result, and new user", actor.messages)
+	}
+	toolUse := mapValue(actor.messages[0].Content[0])
+	if len(toolUse) != 5 || toolUse["type"] != "tool_use" || toolUse["id"] != "TU-stale" || toolUse["name"] != "Bash" || !boolValue(toolUse["complete"]) || stringValue(mapValue(toolUse["input"])["cmd"]) != "sleep 60" {
+		t.Fatalf("stale tool use = %#v, want exact binary completed shape", toolUse)
+	}
+	result := mapValue(actor.messages[1].Content[0])
+	run := mapValue(result["run"])
+	if stringValue(run["status"]) != "cancelled" {
+		t.Fatalf("cancelled run = %#v", run)
+	}
+	if _, exists := run["reason"]; exists {
+		t.Fatalf("binary cleanup run gained reason: %#v", run)
+	}
+	if textFromBlocks(actor.messages[2].Content) != "next" {
+		t.Fatalf("new user = %#v", actor.messages[2])
 	}
 }
 
@@ -9677,8 +9781,8 @@ func TestNeoRuntimeThreadActorManagementUsesExistingModeWhenRequestOmitsMode(t *
 	}
 	actor.mu.Lock()
 	defer actor.mu.Unlock()
-	if actor.currentAgentMode != "rush" || actor.currentReasoningEffort != "none" {
-		t.Fatalf("actor mode/effort = %q/%q, want rush/none", actor.currentAgentMode, actor.currentReasoningEffort)
+	if actor.currentAgentMode != "rush" || actor.currentReasoningEffort != "" {
+		t.Fatalf("actor mode/effort = %q/%q, want rush/empty", actor.currentAgentMode, actor.currentReasoningEffort)
 	}
 }
 

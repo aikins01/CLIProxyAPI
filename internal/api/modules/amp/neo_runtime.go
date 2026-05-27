@@ -1611,8 +1611,18 @@ func (a *neoActor) updateSettings(settings map[string]any) {
 		}
 	} else if a.currentAgentMode == "" {
 		a.currentAgentMode = a.agentModeLocked()
-	} else if effort := stringValue(settings["reasoning.effort"]); effort != "" {
-		a.currentReasoningEffort = effort
+	} else if _, exists := settings["reasoning.effort"]; exists {
+		mode := a.agentModeLocked()
+		if effort := stringValue(settings["reasoning.effort"]); neoReasoningEffortAllowedForMode(mode, effort) {
+			a.currentReasoningEffort = effort
+		} else {
+			a.currentReasoningEffort = defaultNeoReasoningEffort(mode)
+			if a.currentReasoningEffort == "" {
+				delete(a.settings, "reasoning.effort")
+			} else {
+				a.settings["reasoning.effort"] = a.currentReasoningEffort
+			}
+		}
 	}
 	merged := cloneMap(a.settings)
 	a.mu.Unlock()
@@ -1770,26 +1780,6 @@ func (a *neoActor) handleBinaryToolData(msg map[string]any) {
 		return
 	}
 	existingRun, userInput := a.toolResultRunLocked(toolCallID)
-	if neoToolRunTerminal(existingRun) && !neoToolRunTerminal(run) {
-		a.mu.Unlock()
-		return
-	}
-	a.mu.Unlock()
-
-	run = a.normalizeToolRunForPending(neoPendingTool{
-		ID:               toolCallID,
-		Name:             ref.ToolName,
-		Input:            ref.Input,
-		ParentToolCallID: ref.ParentToolCallID,
-	}, run)
-
-	a.mu.Lock()
-	ref, ok = a.storedToolUseLocked(toolCallID)
-	if !ok {
-		a.mu.Unlock()
-		return
-	}
-	existingRun, userInput = a.toolResultRunLocked(toolCallID)
 	if neoToolRunTerminal(existingRun) && !neoToolRunTerminal(run) {
 		a.mu.Unlock()
 		return
@@ -2954,7 +2944,7 @@ func (a *neoActor) markLastToolResultCancelledLocked() (neoMessage, bool) {
 
 func (a *neoActor) cleanupPriorAssistantForBinaryDelta() {
 	a.mu.Lock()
-	events := a.cleanupPriorAssistantForBinaryDeltaLocked("user:interrupted", nil)
+	events := a.cleanupPriorAssistantForBinaryDeltaLocked("", nil)
 	a.mu.Unlock()
 	for _, event := range events {
 		a.broadcast(event)
@@ -3124,17 +3114,19 @@ func neoToolUseBlockComplete(block map[string]any) bool {
 }
 
 func neoCompleteInterruptedToolUseBlock(block map[string]any) map[string]any {
-	out := cloneMap(block)
-	if input := mapValue(out["inputIncomplete"]); len(input) > 0 {
-		out["input"] = input
-	} else if _, exists := out["input"]; !exists {
+	out := map[string]any{
+		"type":     "tool_use",
+		"id":       stringValue(block["id"]),
+		"name":     stringValue(block["name"]),
+		"complete": true,
+	}
+	if input := mapValue(block["inputIncomplete"]); len(input) > 0 {
+		out["input"] = cloneMap(input)
+	} else if input := mapValue(block["input"]); input != nil {
+		out["input"] = cloneMap(input)
+	} else {
 		out["input"] = map[string]any{}
 	}
-	out["complete"] = true
-	out["blockState"] = "complete"
-	delete(out, "inputPartialJSON")
-	delete(out, "inputPartialJSONDelta")
-	delete(out, "inputIncomplete")
 	return out
 }
 
@@ -3152,7 +3144,7 @@ func (a *neoActor) handleBinaryAssistantMessage(msg map[string]any) {
 	}
 	a.mu.Lock()
 	suppressMissingToolResults := a.suppressedBinaryAssistantMessageToolResultsLocked()
-	cleanupEvents := a.cleanupPriorAssistantForBinaryDeltaLocked("user:interrupted", suppressMissingToolResults)
+	cleanupEvents := a.cleanupPriorAssistantForBinaryDeltaLocked("", suppressMissingToolResults)
 	a.mu.Unlock()
 	for _, event := range cleanupEvents {
 		a.broadcast(event)
@@ -10956,14 +10948,8 @@ func defaultNeoReasoningEffort(agentMode string) string {
 	switch strings.ToLower(strings.TrimSpace(agentMode)) {
 	case "smart":
 		return "high"
-	case "rush":
-		return "none"
 	case "deep":
 		return "medium"
-	case "frontier":
-		return "medium"
-	case "nostromo":
-		return "low"
 	default:
 		return ""
 	}
@@ -10978,7 +10964,7 @@ func normalizeNeoReasoningEffortForMode(agentMode, effort string) string {
 
 func neoModeSupportsReasoningEffort(agentMode string) bool {
 	switch strings.ToLower(strings.TrimSpace(agentMode)) {
-	case "smart", "rush", "deep", "frontier", "nostromo":
+	case "smart", "deep":
 		return true
 	default:
 		return false
@@ -10993,14 +10979,8 @@ func neoReasoningEffortAllowedForMode(agentMode, effort string) bool {
 	switch strings.ToLower(strings.TrimSpace(agentMode)) {
 	case "smart":
 		return effort == "high" || effort == "xhigh" || effort == "max"
-	case "rush":
-		return effort == "none"
 	case "deep":
 		return effort == "low" || effort == "medium" || effort == "xhigh"
-	case "frontier":
-		return effort == "medium"
-	case "nostromo":
-		return effort == "low"
 	default:
 		return false
 	}
