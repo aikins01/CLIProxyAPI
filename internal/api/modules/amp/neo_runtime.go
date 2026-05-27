@@ -7499,14 +7499,16 @@ func neoThreadMapAgentMode(thread map[string]any) string {
 	if len(thread) == 0 {
 		return ""
 	}
-	if mode := neoThreadMessagesAgentMode(thread["messages"]); mode != "" {
-		return mode
-	}
 	if mode := firstNonEmptyString(thread["agentMode"], nestedString(thread["settings"], "agentMode")); mode != "" {
 		return mode
 	}
 	if data := mapValue(thread["data"]); len(data) > 0 {
-		return neoThreadMapAgentMode(data)
+		if mode := neoThreadMapAgentMode(data); mode != "" {
+			return mode
+		}
+	}
+	if mode := neoThreadMessagesAgentMode(thread["messages"]); mode != "" {
+		return mode
 	}
 	return ""
 }
@@ -9135,7 +9137,7 @@ func (a *neoActor) importThreadWithSync(thread map[string]any, syncCloud bool) e
 		messages = append(messages, message)
 	}
 
-	agentMode := firstNonEmptyString(neoImportedThreadAgentMode(messages), thread["agentMode"], nestedString(thread["settings"], "agentMode"))
+	agentMode := firstNonEmptyString(thread["agentMode"], nestedString(thread["settings"], "agentMode"), neoImportedThreadAgentMode(messages))
 	if agentMode == "" {
 		agentMode = "smart"
 	}

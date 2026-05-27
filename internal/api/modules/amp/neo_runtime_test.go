@@ -8986,8 +8986,7 @@ func TestNeoRuntimeThreadImportDerivesModeFromMessages(t *testing.T) {
 	actor.pendingInference = &neoInferenceInflight{agentMode: "smart", reasoningEffort: "high"}
 
 	thread := map[string]any{
-		"id":        "T-import-mode",
-		"agentMode": "smart",
+		"id": "T-import-mode",
 		"messages": []any{
 			map[string]any{"role": "user", "messageId": "M-user", "agentMode": "deep", "reasoningEffort": "xhigh", "content": []any{map[string]any{"type": "text", "text": "keep deep"}}},
 		},
@@ -9038,7 +9037,7 @@ func TestNeoRuntimeThreadActorResumeKeepsImportedMode(t *testing.T) {
 	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
 
 	threadID := "T-resume-mode"
-	if err := os.WriteFile(filepath.Join(dir, threadID+".json"), []byte(`{"id":"`+threadID+`","agentMode":"smart","messages":[{"role":"user","messageId":"M-user","agentMode":"deep","reasoningEffort":"xhigh","content":[{"type":"text","text":"keep deep"}]}]}`), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, threadID+".json"), []byte(`{"id":"`+threadID+`","agentMode":"deep","messages":[{"role":"user","messageId":"M-user","agentMode":"smart","reasoningEffort":"high","content":[{"type":"text","text":"keep top-level deep"}]}]}`), 0o600); err != nil {
 		t.Fatalf("write local thread: %v", err)
 	}
 
@@ -9053,15 +9052,29 @@ func TestNeoRuntimeThreadActorResumeKeepsImportedMode(t *testing.T) {
 	actor := rt.store.ensureThreadActor(threadID)
 	actor.mu.Lock()
 	defer actor.mu.Unlock()
-	if actor.currentAgentMode != "deep" || actor.currentReasoningEffort != "xhigh" || actor.settings["agentMode"] != "deep" || actor.settings["reasoning.effort"] != "xhigh" {
+	if actor.currentAgentMode != "deep" || actor.currentReasoningEffort != "medium" || actor.settings["agentMode"] != "deep" || actor.settings["reasoning.effort"] != "medium" {
 		t.Fatalf("actor mode/effort = current:%q/%q settings:%#v", actor.currentAgentMode, actor.currentReasoningEffort, actor.settings)
 	}
 }
 
-func TestNeoThreadListEntryPrefersMessageAgentModeLikeBinary(t *testing.T) {
+func TestNeoThreadListEntryPrefersTopLevelAgentModeLikeBinary(t *testing.T) {
 	entry := neoThreadListEntry(map[string]any{
 		"id":        "T-list-mode",
-		"agentMode": "smart",
+		"agentMode": "deep",
+		"messages": []any{
+			map[string]any{"role": "user", "messageId": "M-1", "agentMode": "large"},
+			map[string]any{"role": "assistant", "messageId": "M-2"},
+			map[string]any{"role": "user", "messageId": "M-3", "agentMode": "smart"},
+		},
+	})
+	if entry["agentMode"] != "deep" {
+		t.Fatalf("entry agentMode = %#v, want deep", entry["agentMode"])
+	}
+}
+
+func TestNeoThreadListEntryFallsBackToMessageAgentModeLikeBinary(t *testing.T) {
+	entry := neoThreadListEntry(map[string]any{
+		"id": "T-list-mode",
 		"messages": []any{
 			map[string]any{"role": "user", "messageId": "M-1", "agentMode": "large"},
 			map[string]any{"role": "assistant", "messageId": "M-2"},
@@ -9069,7 +9082,7 @@ func TestNeoThreadListEntryPrefersMessageAgentModeLikeBinary(t *testing.T) {
 		},
 	})
 	if entry["agentMode"] != "deep" {
-		t.Fatalf("entry agentMode = %#v, want deep", entry["agentMode"])
+		t.Fatalf("entry agentMode = %#v, want deep fallback", entry["agentMode"])
 	}
 }
 
