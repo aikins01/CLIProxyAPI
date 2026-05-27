@@ -5975,7 +5975,7 @@ func mergeNeoThreadListEntry(existing, incoming map[string]any) map[string]any {
 		return existing
 	}
 	merged := cloneMap(existing)
-	replacePreferred := neoThreadUpdatedMillis(incoming) >= neoThreadUpdatedMillis(existing)
+	replacePreferred := preferNeoIncomingThread(existing, incoming)
 	for _, key := range []string{"title", "created", "createdAt", "updated", "updatedAt", "userLastInteractedAt", "messageCount", "archived", "meta", "relationships", "labels", "v", "agentMode", "env", "summaryStats", "usesDtw", "usesThreadActors"} {
 		if _, exists := incoming[key]; !exists {
 			continue
@@ -7100,7 +7100,7 @@ func neoThreadSearchResponse(ctx context.Context, cfg *config.Config, q url.Valu
 
 func loadNeoThread(ctx context.Context, cfg *config.Config, threadID string) (map[string]any, bool) {
 	local, localOK := loadNeoLocalThread(threadID)
-	if localOK && neoThreadHasUsefulContent(local) {
+	if localOK && neoThreadHasUsefulContent(local) && !neoThreadNeedsCloudRefresh(local) {
 		normalizeNeoThreadAgentMode(local)
 		return local, true
 	}
@@ -7111,11 +7111,15 @@ func loadNeoThread(ctx context.Context, cfg *config.Config, threadID string) (ma
 		}
 		if ok {
 			normalizeNeoThreadAgentMode(cloud)
-			if neoThreadHasUsefulContent(cloud) {
+			if preferNeoIncomingThread(local, cloud) {
 				cacheNeoLocalThread(cloud)
+				return cloud, true
 			}
-			return cloud, true
 		}
+	}
+	if localOK && neoThreadHasUsefulContent(local) {
+		normalizeNeoThreadAgentMode(local)
+		return local, true
 	}
 	if localOK {
 		normalizeNeoThreadAgentMode(local)
@@ -7135,6 +7139,65 @@ func neoThreadHasUsefulContent(thread map[string]any) bool {
 		return neoThreadHasUsefulContent(data)
 	}
 	return false
+}
+
+func neoThreadNeedsCloudRefresh(thread map[string]any) bool {
+	if len(thread) == 0 || !neoCloudThreadID(stringValue(thread["id"])) {
+		return false
+	}
+	if neoThreadMapAgentMode(thread) == "" {
+		return true
+	}
+	messages := arrayValue(thread["messages"])
+	if len(messages) != 1 {
+		return false
+	}
+	message := mapValue(messages[0])
+	content := arrayValue(message["content"])
+	return len(content) == 1 && stringValue(mapValue(content[0])["type"]) == "tool_result"
+}
+
+func preferNeoIncomingThread(existing, incoming map[string]any) bool {
+	if len(incoming) == 0 {
+		return false
+	}
+	if len(existing) == 0 {
+		return true
+	}
+	incomingUseful := neoThreadHasUsefulContent(incoming)
+	existingUseful := neoThreadHasUsefulContent(existing)
+	if incomingUseful && !existingUseful {
+		return true
+	}
+	if existingUseful && !incomingUseful {
+		return false
+	}
+	incomingCount := neoThreadMessageCount(incoming)
+	existingCount := neoThreadMessageCount(existing)
+	if incomingCount != existingCount {
+		return incomingCount > existingCount
+	}
+	if neoThreadMapAgentMode(existing) == "" && neoThreadMapAgentMode(incoming) != "" {
+		return true
+	}
+	return neoThreadUpdatedMillis(incoming) >= neoThreadUpdatedMillis(existing)
+}
+
+func neoThreadMessageCount(thread map[string]any) int {
+	if len(thread) == 0 {
+		return 0
+	}
+	count := firstNonZero(
+		len(arrayValue(thread["messages"])),
+		numberFrom(thread["messageCount"]),
+		numberFrom(mapValue(thread["summaryStats"])["messageCount"]),
+	)
+	if data := mapValue(thread["data"]); len(data) > 0 {
+		if dataCount := neoThreadMessageCount(data); dataCount > count {
+			count = dataCount
+		}
+	}
+	return count
 }
 
 func cacheNeoLocalThread(thread map[string]any) {

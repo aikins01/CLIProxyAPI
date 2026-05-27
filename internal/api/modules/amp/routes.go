@@ -1176,7 +1176,9 @@ func neoLocalThreadLinkInfoResult(ctx context.Context, cfg *config.Config, r *ht
 	if threadID == "" {
 		return result
 	}
-	if thread, ok := loadNeoThread(ctx, cfg, threadID); ok {
+	if thread, ok := loadNeoLocalThread(threadID); ok {
+		normalizeNeoThreadOwnership(thread)
+		normalizeNeoThreadAgentMode(thread)
 		result["id"] = firstNonEmptyString(thread["id"], threadID)
 		result["creatorUserID"] = firstNonEmptyString(thread["creatorUserID"], neoLocalOwnerUserID)
 		result["ownerUserId"] = firstNonEmptyString(thread["ownerUserId"], neoLocalOwnerUserID)
