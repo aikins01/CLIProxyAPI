@@ -3199,11 +3199,13 @@ func (a *neoActor) handleBinaryRelationship(msg map[string]any) {
 	}
 
 	a.mu.Lock()
-	if !a.hasRelationshipCoreLocked(normalized) {
-		a.relationships = append(a.relationships, normalized)
+	if a.hasRelationshipCoreLocked(normalized) {
+		a.mu.Unlock()
+		return
 	}
+	a.relationships = append(a.relationships, normalized)
 	seq := a.nextSeqLocked()
-	event := map[string]any{"type": "thread_relationships", "relationships": []any{cloneMap(normalized)}, "seq": seq}
+	event := map[string]any{"type": "thread_relationships", "relationships": a.relationshipListLocked(), "seq": seq}
 	a.rememberReplayEventLocked(event)
 	a.mu.Unlock()
 
@@ -9896,8 +9898,11 @@ func (a *neoActor) recordRelationshipEvent(payload map[string]any) int {
 	}
 	seq := a.nextSeqLocked()
 	clone := cloneMap(payload)
+	relationships := a.relationshipListLocked()
+	clone["relationships"] = relationships
 	clone["seq"] = seq
 	a.rememberReplayEventLocked(clone)
+	payload["relationships"] = relationships
 	a.mu.Unlock()
 	return seq
 }

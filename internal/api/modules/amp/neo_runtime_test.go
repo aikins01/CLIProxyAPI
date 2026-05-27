@@ -1032,7 +1032,18 @@ func TestNeoActorThreadRelationshipEventsUseOfficialSchema(t *testing.T) {
 	actor.mu.Lock()
 	forked := actor.replayEvents[len(actor.replayEvents)-1].Payload
 	actor.mu.Unlock()
-	forkRelationship := mapValue(arrayValue(forked["relationships"])[0])
+	forkRelationships := arrayValue(forked["relationships"])
+	if len(forkRelationships) != 2 {
+		t.Fatalf("fork relationship payload = %#v, want full relationship list", forked)
+	}
+	var forkRelationship map[string]any
+	for _, raw := range forkRelationships {
+		relationship := mapValue(raw)
+		if stringValue(relationship["threadID"]) == forkID {
+			forkRelationship = relationship
+			break
+		}
+	}
 	if stringValue(forkRelationship["threadID"]) != forkID || stringValue(forkRelationship["type"]) != "fork" || stringValue(forkRelationship["role"]) != "child" || stringValue(forkRelationship["comment"]) == "" {
 		t.Fatalf("fork relationship = %#v", forkRelationship)
 	}
@@ -1055,6 +1066,63 @@ func TestNeoActorThreadRelationshipEventsUseOfficialSchema(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("relationship sync did not finish")
+}
+
+func TestNeoActorBinaryRelationshipDeltasAreSetLikeAndEmitFullList(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	firstID := "T-019e1046-656d-7132-879f-390ded941c16"
+	secondID := "T-019e1046-656d-7132-879f-390ded941c17"
+
+	actor.handle(map[string]any{
+		"type": "relationship",
+		"relationship": map[string]any{
+			"threadID":  firstID,
+			"type":      "mention",
+			"role":      "parent",
+			"createdAt": float64(1),
+		},
+	})
+	actor.mu.Lock()
+	firstReplayLen := len(actor.replayEvents)
+	actor.mu.Unlock()
+
+	actor.handle(map[string]any{
+		"type": "relationship",
+		"relationship": map[string]any{
+			"threadID":  firstID,
+			"type":      "mention",
+			"role":      "parent",
+			"createdAt": float64(2),
+			"comment":   "duplicate should not replace",
+		},
+	})
+	actor.mu.Lock()
+	if len(actor.relationships) != 1 || len(actor.replayEvents) != firstReplayLen {
+		t.Fatalf("duplicate relationship mutated state relationships=%#v replay=%d want replay=%d", actor.relationships, len(actor.replayEvents), firstReplayLen)
+	}
+	actor.mu.Unlock()
+
+	actor.handle(map[string]any{
+		"type": "relationship",
+		"relationship": map[string]any{
+			"threadID":  secondID,
+			"type":      "mention",
+			"role":      "child",
+			"createdAt": float64(3),
+		},
+	})
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.relationships) != 2 {
+		t.Fatalf("relationships = %#v, want two", actor.relationships)
+	}
+	last := actor.replayEvents[len(actor.replayEvents)-1].Payload
+	relationships := arrayValue(last["relationships"])
+	if last["type"] != "thread_relationships" || len(relationships) != 2 {
+		t.Fatalf("last relationship event = %#v, want full list", last)
+	}
 }
 
 func TestNeoActorArchiveUsesTopLevelArchivedFlag(t *testing.T) {
