@@ -3574,6 +3574,30 @@ func TestNeoSystemPromptIncludesLocalClientActorFailureGuidance(t *testing.T) {
 	}
 }
 
+func TestNeoSystemPromptIncludesSendMessageWorkflowGuidance(t *testing.T) {
+	prompt := neoSystemPrompt(neoInferenceRequest{
+		AgentMode: "agg-man",
+		Tools:     []neoToolSpec{{Name: "send_message_to_thread"}},
+	}, neoModelRoute{Provider: "openai", Model: "gpt-5.5"})
+
+	for _, want := range []string{
+		`workflow: "merge_changes"`,
+		`workflow: "code_review"`,
+		`The canonical merge prompt sent by workflow: "merge_changes" is: "Commit and merge the changes to a single commit on origin/main.`,
+		`The canonical code review prompt sent by workflow: "code_review" is: "Review the changes with the code review tool."`,
+		`Phrases like "make that change", "do it", "go ahead", or "sounds good" are instructions to implement or continue work -- they are not merge requests.`,
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing send_message_to_thread workflow guidance %q:\n%s", want, prompt)
+		}
+	}
+
+	withoutTool := neoSystemPrompt(neoInferenceRequest{AgentMode: "agg-man"}, neoModelRoute{Provider: "openai", Model: "gpt-5.5"})
+	if strings.Contains(withoutTool, `workflow: "merge_changes"`) {
+		t.Fatalf("prompt without send_message_to_thread tool should not include workflow guidance:\n%s", withoutTool)
+	}
+}
+
 func TestNeoSystemPromptMatchesBinaryEnvironmentThreadContext(t *testing.T) {
 	prompt := neoSystemPrompt(neoInferenceRequest{
 		ThreadID:  "T-019e1055-055c-705b-ae36-73d934ec6a89",
@@ -6038,6 +6062,55 @@ func TestNeoActorQueuedDequeueEventUsesQueuedMessageID(t *testing.T) {
 	if got := stringValue(dequeued["queuedMessageId"]); got != messageID {
 		t.Fatalf("dequeued queuedMessageId = %q, want message id %q: %#v", got, messageID, dequeued)
 	}
+}
+
+func TestNeoSendMessageToThreadWorkflowPromptsMatchBinary(t *testing.T) {
+	targetID := "T-target-thread"
+
+	codeReviewContent := neoSendMessageToThreadContent(map[string]any{"workflow": "code_review"}, targetID)
+	if got := textFromBlocks(arrayValue(codeReviewContent)); got != "Review the changes with the code review tool." {
+		t.Fatalf("code review workflow content = %q", got)
+	}
+
+	mergeContent := neoSendMessageToThreadContent(map[string]any{"input": map[string]any{"workflow": "merge_changes"}}, targetID)
+	wantMerge := "Commit and merge the changes to a single commit on origin/main. Run the full test suite before pushing. If there's a non-trivial merge conflict, resolve it and confirm with me before pushing. After resolving any merge conflict, ensure the changes are properly formatted before committing and pushing. If test failures are unrelated to this change (due to a commit upstream that introduced the failure), they can be ignored. After the merge succeeds, run `amp threads archive T-target-thread` to archive this thread."
+	if got := textFromBlocks(arrayValue(mergeContent)); got != wantMerge {
+		t.Fatalf("merge workflow content = %q, want %q", got, wantMerge)
+	}
+
+	explicitContent := []any{map[string]any{"type": "text", "text": "custom message"}}
+	if got := textFromBlocks(arrayValue(neoSendMessageToThreadContent(map[string]any{"workflow": "code_review", "content": explicitContent}, targetID))); got != "custom message" {
+		t.Fatalf("explicit content should win over workflow, got %q", got)
+	}
+}
+
+func TestNeoActorSendMessageToThreadWorkflowQueuesCanonicalPrompt(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	source := rt.store.ensureThreadActor("T-source-thread")
+	target := rt.store.ensureThreadActor("T-target-thread")
+
+	source.handle(map[string]any{
+		"type":           "send_message_to_thread",
+		"targetThreadId": "T-target-thread",
+		"workflow":       "code_review",
+	})
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		target.mu.Lock()
+		if len(target.queue) > 0 {
+			got := textFromBlocks(target.queue[0].Content)
+			target.mu.Unlock()
+			if got != "Review the changes with the code review tool." {
+				t.Fatalf("queued workflow message = %q", got)
+			}
+			return
+		}
+		target.mu.Unlock()
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("timed out waiting for workflow message to queue on target thread")
 }
 
 func TestNeoActorHandlesBinaryToolDeltas(t *testing.T) {

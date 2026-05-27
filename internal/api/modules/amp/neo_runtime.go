@@ -9529,7 +9529,7 @@ func (a *neoActor) handleSendMessageToThread(msg map[string]any) {
 	payload := map[string]any{
 		"type":             "client_append_user_msg",
 		"messageId":        firstNonEmptyString(msg["messageId"], newNeoMessageID()),
-		"content":          msg["content"],
+		"content":          neoSendMessageToThreadContent(msg, targetID),
 		"parentToolCallId": stringValue(msg["parentToolCallId"]),
 		"sourceThreadId":   a.threadID,
 	}
@@ -9540,6 +9540,69 @@ func (a *neoActor) handleSendMessageToThread(msg map[string]any) {
 		a.broadcast(relationshipPayload)
 		a.syncCloudAsync()
 	}
+}
+
+func neoSendMessageToThreadContent(msg map[string]any, targetID string) any {
+	if neoMessageContentPresent(msg["content"]) {
+		return msg["content"]
+	}
+	if prompt := neoSendMessageToThreadWorkflowPrompt(neoSendMessageToThreadWorkflow(msg), targetID); prompt != "" {
+		return []any{map[string]any{"type": "text", "text": prompt}}
+	}
+	return msg["content"]
+}
+
+func neoMessageContentPresent(value any) bool {
+	switch typed := value.(type) {
+	case nil:
+		return false
+	case string:
+		return strings.TrimSpace(typed) != ""
+	case []any:
+		return len(typed) > 0
+	}
+	if m, ok := asMap(value); ok {
+		return len(m) > 0
+	}
+	return true
+}
+
+func neoSendMessageToThreadWorkflow(msg map[string]any) string {
+	return firstNonEmptyString(
+		msg["workflow"],
+		nestedValue(msg["input"], "workflow"),
+		nestedValue(msg["arguments"], "workflow"),
+		nestedValue(msg["args"], "workflow"),
+	)
+}
+
+func neoSendMessageToThreadWorkflowPrompt(workflow, targetID string) string {
+	switch strings.ToLower(strings.TrimSpace(workflow)) {
+	case "code_review":
+		return neoCanonicalCodeReviewPrompt()
+	case "merge_changes":
+		return neoCanonicalMergeChangesPrompt(targetID)
+	default:
+		return ""
+	}
+}
+
+func neoCanonicalCodeReviewPrompt() string {
+	return "Review the changes with the code review tool."
+}
+
+func neoCanonicalMergeChangesPrompt(threadID string) string {
+	if strings.TrimSpace(threadID) == "" {
+		threadID = "<thread-id>"
+	}
+	return strings.Join([]string{
+		"Commit and merge the changes to a single commit on origin/main.",
+		"Run the full test suite before pushing.",
+		"If there's a non-trivial merge conflict, resolve it and confirm with me before pushing.",
+		"After resolving any merge conflict, ensure the changes are properly formatted before committing and pushing.",
+		"If test failures are unrelated to this change (due to a commit upstream that introduced the failure), they can be ignored.",
+		"After the merge succeeds, run `amp threads archive " + threadID + "` to archive this thread.",
+	}, " ")
 }
 
 // handleSendMessageToAggman is a stub for the aggregator manager flow used in
@@ -13242,6 +13305,9 @@ func neoSystemPrompt(request neoInferenceRequest, route neoModelRoute) string {
 
 func neoFinalPromptBlocks(request neoInferenceRequest, route neoModelRoute) []string {
 	blocks := make([]string, 0, 2)
+	if neoRequestHasTool(request, "send_message_to_thread") {
+		blocks = append(blocks, neoSendMessageToThreadWorkflowGuidance())
+	}
 	if boolValue(request.Environment["isLocalClientActorThread"]) || boolValue(request.Settings["isLocalClientActorThread"]) {
 		blocks = append(blocks, "For Amp's own tool connection failures (for example, 'Executor did not acknowledge tool lease' or 'Executor did not reconnect before the tool call expired'), explain that the user's Amp client went offline and they can retry once it reconnects, without repeating the internal error message.")
 	}
@@ -13249,6 +13315,17 @@ func neoFinalPromptBlocks(request neoInferenceRequest, route neoModelRoute) []st
 		blocks = append(blocks, "You MUST answer concisely with fewer than 4 lines of text (not including tool use or code generation), unless the user asks for more detail.")
 	}
 	return blocks
+}
+
+func neoSendMessageToThreadWorkflowGuidance() string {
+	return strings.Join([]string{
+		`- When the user asks to "merge", "merge changes", "ship it", or "let's ship it" for a thread, call send_message_to_thread with the target thread and workflow: "merge_changes". For merge requests, do NOT compose freeform message text. Use workflow: "merge_changes" so the tool sends the canonical merge prompt verbatim.`,
+		`- The canonical merge prompt sent by workflow: "merge_changes" is: "` + neoCanonicalMergeChangesPrompt("<thread-id>") + `"`,
+		`- Do not trigger merge workflow for discussion-only or hypothetical merge/shipping talk. If intent to act is ambiguous, ask for explicit confirmation before calling any tool. Never merge a thread proactively or as an assumed next step. Only trigger the merge workflow when the user explicitly asks to merge or ship using clear merge/ship language (e.g., "merge", "merge it", "ship it", "merge changes"). Phrases like "make that change", "do it", "go ahead", or "sounds good" are instructions to implement or continue work -- they are not merge requests. When a thread finishes and reports back, report the thread's status and results to the user and wait for them to explicitly request a merge.`,
+		`- When the user asks to "review", "code review", or "do a code review" for a thread, call send_message_to_thread with the target thread and workflow: "code_review".`,
+		`- For code review requests, do NOT compose freeform review text. Use workflow: "code_review" so the tool sends the canonical code review prompt verbatim.`,
+		`- The canonical code review prompt sent by workflow: "code_review" is: "` + neoCanonicalCodeReviewPrompt() + `"`,
+	}, "\n")
 }
 
 func neoBasePrompt(request neoInferenceRequest, route neoModelRoute) string {
