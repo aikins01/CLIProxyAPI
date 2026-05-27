@@ -4719,7 +4719,7 @@ func TestInferNeoAnthropicStreamFallsBackToNonStreamOnEmptyPayload(t *testing.T)
 	}
 }
 
-func TestInferNeoAnthropicStreamRetriesWithoutContextManagementWhenUnsupported(t *testing.T) {
+func TestInferNeoAnthropicStreamMatchesBinaryRequestEnvelope(t *testing.T) {
 	calls := 0
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/provider/anthropic/v1/messages" {
@@ -4729,33 +4729,26 @@ func TestInferNeoAnthropicStreamRetriesWithoutContextManagementWhenUnsupported(t
 		if payload["stream"] != true {
 			t.Fatalf("stream = %#v, want true", payload["stream"])
 		}
-		if beta := r.Header.Get("Anthropic-Beta"); !strings.Contains(beta, "context-management-2025-06-27") {
-			t.Fatalf("Anthropic-Beta = %q, want context management beta", beta)
+		if got := numberFrom(payload["max_tokens"]); got != 64000 {
+			t.Fatalf("max_tokens = %d, want binary thread maxTokens override 64000; payload=%#v", got, payload)
+		}
+		if _, ok := payload["context_management"]; ok {
+			t.Fatalf("request included context_management, but current Amp binary omits it: %#v", payload)
+		}
+		if beta := r.Header.Get("Anthropic-Beta"); strings.Contains(beta, "context-management") {
+			t.Fatalf("Anthropic-Beta = %q, want no context-management beta", beta)
 		}
 
 		calls++
-		switch calls {
-		case 1:
-			if _, ok := payload["context_management"]; !ok {
-				t.Fatalf("first request missing context_management: %#v", payload)
-			}
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusBadRequest)
-			_, _ = w.Write([]byte(`{"type":"error","error":{"type":"invalid_request_error","message":"context_management: Extra inputs are not permitted"}}`))
-		case 2:
-			if _, ok := payload["context_management"]; ok {
-				t.Fatalf("retry request retained context_management: %#v", payload)
-			}
-			w.Header().Set("Content-Type", "text/event-stream")
-			_, _ = w.Write([]byte("event: message_start\n" +
-				`data: {"type":"message_start","message":{"usage":{"input_tokens":3}}}` + "\n\n" +
-				"event: content_block_delta\n" +
-				`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"retried"}}` + "\n\n" +
-				"event: message_stop\n" +
-				`data: {"type":"message_stop"}` + "\n\n"))
-		default:
-			t.Fatalf("unexpected retry call %d", calls)
-		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: message_start\n" +
+			`data: {"type":"message_start","message":{"usage":{"input_tokens":3}}}` + "\n\n" +
+			"event: content_block_start\n" +
+			`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}` + "\n\n" +
+			"event: content_block_delta\n" +
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"retried"}}` + "\n\n" +
+			"event: message_stop\n" +
+			`data: {"type":"message_stop"}` + "\n\n"))
 	}))
 	defer upstream.Close()
 
@@ -4763,6 +4756,7 @@ func TestInferNeoAnthropicStreamRetriesWithoutContextManagementWhenUnsupported(t
 	result, err := inferNeoLocalStream(testNeoRuntimeForServer(t, upstream), neoInferenceRequest{
 		ThreadID:  "T-test",
 		AgentMode: "smart",
+		MaxTokens: 64000,
 		Settings:  map[string]any{"internal.model": "anthropic/claude-test"},
 		History:   []neoHistoryMessage{{Role: "user", Text: "hi"}},
 	}, func(delta neoInferenceDelta) {
@@ -4771,11 +4765,47 @@ func TestInferNeoAnthropicStreamRetriesWithoutContextManagementWhenUnsupported(t
 	if err != nil {
 		t.Fatalf("inferNeoLocalStream error: %v", err)
 	}
-	if calls != 2 {
-		t.Fatalf("calls=%d, want 2", calls)
+	if calls != 1 {
+		t.Fatalf("calls=%d, want 1", calls)
 	}
 	if result.Text != "retried" || strings.Join(deltas, "") != "retried" {
 		t.Fatalf("text=%q deltas=%#v", result.Text, deltas)
+	}
+}
+
+func TestInferNeoAnthropicUsesBinaryDefaultMaxTokens(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/provider/anthropic/v1/messages" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		payload := readNeoJSON(r.Body)
+		if payload["stream"] != false {
+			t.Fatalf("stream = %#v, want false", payload["stream"])
+		}
+		if got := numberFrom(payload["max_tokens"]); got != 32000 {
+			t.Fatalf("max_tokens = %d, want Amp binary default 32000; payload=%#v", got, payload)
+		}
+		if _, ok := payload["context_management"]; ok {
+			t.Fatalf("request included context_management, but current Amp binary omits it: %#v", payload)
+		}
+		if beta := r.Header.Get("Anthropic-Beta"); strings.Contains(beta, "context-management") {
+			t.Fatalf("Anthropic-Beta = %q, want no context-management beta", beta)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"content":[{"type":"text","text":"ok"}]}`))
+	}))
+	defer upstream.Close()
+
+	result, err := inferNeoAnthropic(testNeoRuntimeForServer(t, upstream), neoInferenceRequest{
+		ThreadID:  "T-test",
+		AgentMode: "smart",
+		History:   []neoHistoryMessage{{Role: "user", Text: "hi"}},
+	}, neoModelRoute{Provider: "anthropic", Model: "claude-opus-4-7"})
+	if err != nil {
+		t.Fatalf("inferNeoAnthropic error: %v", err)
+	}
+	if result.Text != "ok" {
+		t.Fatalf("text=%q, want ok", result.Text)
 	}
 }
 

@@ -8038,6 +8038,7 @@ func (a *neoActor) inferenceRequestLocked(agentMode, reasoningEffort, parentTool
 		AgentMode:        agentMode,
 		ReasoningEffort:  reasoningEffort,
 		ParentToolCallID: parentToolCallID,
+		MaxTokens:        a.maxTokens,
 		Settings:         cloneMap(a.settings),
 		History:          history,
 		Tools:            tools,
@@ -8593,7 +8594,7 @@ func (a *neoActor) updateReasoningEffortFromBinary(msg map[string]any) {
 }
 
 func (a *neoActor) updateMaxTokensFromBinary(msg map[string]any) {
-	value := firstNonNil(msg["value"], msg["maxTokens"], msg["max_tokens"])
+	value := neoNormalizeMaxTokensValue(firstNonNil(msg["value"], msg["maxTokens"], msg["max_tokens"]))
 	a.mu.Lock()
 	a.maxTokens = value
 	if a.settings == nil {
@@ -8613,6 +8614,34 @@ func (a *neoActor) updateMaxTokensFromBinary(msg map[string]any) {
 	a.broadcast(event)
 	a.broadcast(map[string]any{"type": "thread_settings", "settings": settings})
 	a.syncCloudAsync()
+}
+
+func neoNormalizeMaxTokensValue(value any) any {
+	switch typed := value.(type) {
+	case nil:
+		return nil
+	case int:
+		if typed <= 0 {
+			return nil
+		}
+	case int64:
+		if typed <= 0 {
+			return nil
+		}
+	case float64:
+		if typed <= 0 {
+			return nil
+		}
+	case json.Number:
+		if numeric, err := typed.Int64(); err == nil && numeric <= 0 {
+			return nil
+		}
+	case bool:
+		if !typed {
+			return nil
+		}
+	}
+	return value
 }
 
 func (a *neoActor) updateMainThreadFromBinary(msg map[string]any) {
@@ -11043,6 +11072,7 @@ type neoInferenceRequest struct {
 	AgentMode        string
 	ReasoningEffort  string
 	ParentToolCallID string
+	MaxTokens        any
 	Settings         map[string]any
 	History          []neoHistoryMessage
 	Tools            []neoToolSpec
@@ -11337,10 +11367,20 @@ func providerForNeoModel(model string) string {
 	}
 }
 
+const neoDefaultAnthropicMaxTokens = 32000
+
+func neoAnthropicMaxTokens(request neoInferenceRequest) int {
+	maxTokens := firstNonNil(request.MaxTokens, request.Settings["maxTokens"], request.Settings["max_tokens"])
+	if value := numberFrom(maxTokens); value > 0 {
+		return value
+	}
+	return neoDefaultAnthropicMaxTokens
+}
+
 func inferNeoAnthropic(rt *neoRuntime, request neoInferenceRequest, route neoModelRoute) (neoInferenceResult, error) {
 	body := map[string]any{
 		"model":      route.Model,
-		"max_tokens": 8192,
+		"max_tokens": neoAnthropicMaxTokens(request),
 		"stream":     false,
 		"system":     neoAnthropicSystemBlocks(neoSystemPrompt(request, route)),
 		"messages":   anthropicNeoMessages(request.History),
@@ -11351,16 +11391,11 @@ func inferNeoAnthropic(rt *neoRuntime, request neoInferenceRequest, route neoMod
 		body["tool_choice"] = map[string]any{"type": "auto"}
 	}
 	neoApplyAnthropicCacheBreakpoints(body)
-	neoApplyAnthropicContextManagement(body, route)
 
 	retryBody := body
 	jsonBody, err := callNeoLocalProvider(rt, "anthropic", "/v1/messages", retryBody, request.ThreadID)
 	if err != nil && isNeoAnthropicEnabledThinkingUnsupported(err) {
 		retryBody = withNeoAnthropicAdaptiveThinking(retryBody)
-		jsonBody, err = callNeoLocalProvider(rt, "anthropic", "/v1/messages", retryBody, request.ThreadID)
-	}
-	if err != nil && isNeoAnthropicContextManagementUnsupported(err) {
-		retryBody = withoutNeoAnthropicContextManagement(retryBody)
 		jsonBody, err = callNeoLocalProvider(rt, "anthropic", "/v1/messages", retryBody, request.ThreadID)
 	}
 	if err != nil && isNeoAnthropicEnabledThinkingUnsupported(err) {
@@ -11470,7 +11505,7 @@ func inferNeoGoogle(rt *neoRuntime, request neoInferenceRequest, route neoModelR
 func inferNeoAnthropicStream(rt *neoRuntime, request neoInferenceRequest, route neoModelRoute, onDelta neoStreamCallback) (neoInferenceResult, error) {
 	body := map[string]any{
 		"model":      route.Model,
-		"max_tokens": 8192,
+		"max_tokens": neoAnthropicMaxTokens(request),
 		"stream":     true,
 		"system":     neoAnthropicSystemBlocks(neoSystemPrompt(request, route)),
 		"messages":   anthropicNeoMessages(request.History),
@@ -11481,7 +11516,6 @@ func inferNeoAnthropicStream(rt *neoRuntime, request neoInferenceRequest, route 
 		body["tool_choice"] = map[string]any{"type": "auto"}
 	}
 	neoApplyAnthropicCacheBreakpoints(body)
-	neoApplyAnthropicContextManagement(body, route)
 
 	type partialBlock struct {
 		blockType string
@@ -11629,11 +11663,6 @@ func inferNeoAnthropicStream(rt *neoRuntime, request neoInferenceRequest, route 
 	if err != nil && !sawContent && isNeoAnthropicEnabledThinkingUnsupported(err) {
 		resetStreamState()
 		streamBody = withNeoAnthropicAdaptiveThinking(streamBody)
-		err = stream(streamBody)
-	}
-	if err != nil && !sawContent && isNeoAnthropicContextManagementUnsupported(err) {
-		resetStreamState()
-		streamBody = withoutNeoAnthropicContextManagement(streamBody)
 		err = stream(streamBody)
 	}
 	if err != nil && !sawContent && isNeoAnthropicEnabledThinkingUnsupported(err) {
@@ -12182,11 +12211,6 @@ func callNeoLocalProvider(rt *neoRuntime, provider, subpath string, body map[str
 	req.Header.Set("X-Amp-Thread-ID", threadID)
 	if provider == "anthropic" {
 		req.Header.Set("Anthropic-Version", "2023-06-01")
-		// enable server-side context management so anthropic auto-clears
-		// old tool results and thinking blocks beyond our configured
-		// thresholds, mirroring what neoApplyAnthropicContextManagement
-		// adds to the request body below.
-		req.Header.Set("Anthropic-Beta", "context-management-2025-06-27")
 	}
 	if key := firstConfiguredAPIKey(cfg); key != "" {
 		req.Header.Set("Authorization", "Bearer "+key)
@@ -12229,7 +12253,6 @@ func callNeoLocalProviderSSE(rt *neoRuntime, provider, subpath string, body map[
 	req.Header.Set("X-Amp-Thread-ID", threadID)
 	if provider == "anthropic" {
 		req.Header.Set("Anthropic-Version", "2023-06-01")
-		req.Header.Set("Anthropic-Beta", "context-management-2025-06-27")
 	}
 	if key := firstConfiguredAPIKey(cfg); key != "" {
 		req.Header.Set("Authorization", "Bearer "+key)
@@ -12338,22 +12361,6 @@ func isNeoLocalEmptyStreamBody(body []byte) bool {
 		strings.Contains(lower, "stream closed before response.completed")
 }
 
-func isNeoAnthropicContextManagementUnsupported(err error) bool {
-	if err == nil {
-		return false
-	}
-	lower := strings.ToLower(err.Error())
-	if !strings.Contains(lower, "context_management") && !strings.Contains(lower, "context management") {
-		return false
-	}
-	return strings.Contains(lower, "extra inputs") ||
-		strings.Contains(lower, "not permitted") ||
-		strings.Contains(lower, "not allowed") ||
-		strings.Contains(lower, "unsupported") ||
-		strings.Contains(lower, "unknown") ||
-		strings.Contains(lower, "unrecognized")
-}
-
 func isNeoAnthropicEnabledThinkingUnsupported(err error) bool {
 	if err == nil {
 		return false
@@ -12362,23 +12369,6 @@ func isNeoAnthropicEnabledThinkingUnsupported(err error) bool {
 	return strings.Contains(lower, "thinking.type.enabled") &&
 		(strings.Contains(lower, "not supported") || strings.Contains(lower, "unsupported")) &&
 		strings.Contains(lower, "thinking.type.adaptive")
-}
-
-func withoutNeoAnthropicContextManagement(body map[string]any) map[string]any {
-	if body == nil {
-		return nil
-	}
-	if _, ok := body["context_management"]; !ok {
-		return body
-	}
-	copyBody := make(map[string]any, len(body)-1)
-	for key, value := range body {
-		if key == "context_management" {
-			continue
-		}
-		copyBody[key] = value
-	}
-	return copyBody
 }
 
 func withNeoAnthropicAdaptiveThinking(body map[string]any) map[string]any {
@@ -14358,41 +14348,6 @@ func neoEffectiveThinkingLevel(route neoModelRoute, fallback string) string {
 		return level
 	}
 	return fallback
-}
-
-// neoApplyAnthropicContextManagement enables anthropic's server-side context
-// editing so old tool results and thinking blocks are auto-cleared when the
-// conversation exceeds a token threshold. mirrors what the Amp binary's
-// extended-thinking flow does for opus 4.6+/4.7 models, and is required to
-// avoid hitting the 1M-token hard limit on long agentic threads.
-//
-// the trigger threshold scales with the model's effective context window.
-// thinking-clearing is listed first because anthropic requires that order
-// when combining strategies.
-func neoApplyAnthropicContextManagement(body map[string]any, route neoModelRoute) {
-	ctxWindow := neoModelContextWindow[route.Model]
-	if ctxWindow == 0 {
-		ctxWindow = neoLargeModeContextWindow
-	}
-	// trigger tool-result clearing at 60% of the model's window; aggressive
-	// enough to keep us well clear of the 1M ceiling on long threads while
-	// preserving recent tool context for the agent to reason over.
-	triggerTokens := ctxWindow * 6 / 10
-	if triggerTokens < 30000 {
-		triggerTokens = 30000
-	}
-	edits := []any{
-		map[string]any{
-			"type": "clear_thinking_20251015",
-			"keep": map[string]any{"type": "thinking_turns", "value": 2},
-		},
-		map[string]any{
-			"type":    "clear_tool_uses_20250919",
-			"trigger": map[string]any{"type": "input_tokens", "value": triggerTokens},
-			"keep":    map[string]any{"type": "tool_uses", "value": 5},
-		},
-	}
-	body["context_management"] = map[string]any{"edits": edits}
 }
 
 // neoAnthropicSystemBlocks wraps the system prompt as a single text block.
