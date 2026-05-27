@@ -8668,6 +8668,9 @@ func TestNeoMessageFromImportedThreadSanitizesUserMetaLikeBinary(t *testing.T) {
 	if _, ok := imported.Meta["source"]; ok {
 		t.Fatalf("source = %#v, want omitted like binary import", imported.Meta["source"])
 	}
+	if !neoMessageIDPattern.MatchString(imported.MessageID) || imported.MessageID == "M-user" {
+		t.Fatalf("messageID = %q, want generated binary-valid id for invalid import id", imported.MessageID)
+	}
 	userState := mapValue(imported.UserState)
 	if stringValue(userState["cwd"]) != "/tmp/work" || arrayValue(userState["currentlyVisibleFiles"]) == nil {
 		t.Fatalf("userState = %#v, want binary-safe user state", userState)
@@ -9878,7 +9881,7 @@ func TestNeoRuntimeThreadImportHTTP(t *testing.T) {
 	if actor.title != "Imported" || actor.currentAgentMode != "deep" {
 		t.Fatalf("imported title/mode = %q/%q", actor.title, actor.currentAgentMode)
 	}
-	if len(actor.messages) != 2 || actor.messages[0].MessageID != "0" || actor.messages[1].MessageID != "1" || textFromBlocks(actor.messages[0].Content) != "carry this" {
+	if len(actor.messages) != 2 || !neoMessageIDPattern.MatchString(actor.messages[0].MessageID) || !neoMessageIDPattern.MatchString(actor.messages[1].MessageID) || actor.messages[0].MessageID == "0" || actor.messages[1].MessageID == "1" || textFromBlocks(actor.messages[0].Content) != "carry this" {
 		t.Fatalf("imported messages = %#v", actor.messages)
 	}
 	if len(actor.history) != 2 || actor.history[0].Text != "carry this" || actor.history[1].Text != "done" {

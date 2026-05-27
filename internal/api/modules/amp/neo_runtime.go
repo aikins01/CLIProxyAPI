@@ -10126,9 +10126,9 @@ func neoMessageFromImportedThread(threadID string, raw any, index int) neoMessag
 	if role == "" {
 		return neoMessage{}
 	}
-	messageID := messageIDValue(message["protocolMessageID"])
+	messageID := protocolMessageIDValue(message["protocolMessageID"])
 	if messageID == "" {
-		messageID = messageIDValue(message["messageId"])
+		messageID = protocolMessageIDValue(message["messageId"])
 	}
 	if messageID == "" {
 		messageID = newNeoMessageID()
