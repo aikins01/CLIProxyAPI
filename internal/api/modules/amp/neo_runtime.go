@@ -2441,10 +2441,11 @@ func (a *neoActor) registerTools(raw any) {
 			continue
 		}
 		a.tools[name] = neoToolSpec{
-			Name:        name,
-			Description: stringValue(m["description"]),
-			InputSchema: firstMap(m["inputSchema"], m["input_schema"], m["parameters"]),
-			Meta:        mapValue(m["meta"]),
+			Name:                   name,
+			Description:            stringValue(m["description"]),
+			InputSchema:            firstMap(m["inputSchema"], m["input_schema"], m["parameters"]),
+			Meta:                   mapValue(m["meta"]),
+			OpenAICustomToolConfig: neoOpenAICustomToolConfigFromTool(m),
 		}
 	}
 }
@@ -2456,6 +2457,59 @@ func (a *neoActor) unregisterTools(raw any) {
 	for _, name := range names {
 		delete(a.tools, stringValue(name))
 	}
+}
+
+func neoOpenAICustomToolConfigFromTool(tool map[string]any) map[string]any {
+	for _, raw := range []any{
+		tool["openAICustomToolConfig"],
+		tool["open_ai_custom_tool_config"],
+		mapValue(tool["meta"])["openAICustomToolConfig"],
+		mapValue(tool["meta"])["open_ai_custom_tool_config"],
+		mapValue(tool["meta"])["openAICustomTool"],
+		mapValue(tool["metadata"])["openAICustomTool"],
+		mapValue(tool["metadata"])["openAICustomToolConfig"],
+	} {
+		if config := neoNormalizeOpenAICustomToolConfig(mapValue(raw)); len(config) > 0 {
+			return config
+		}
+	}
+	return nil
+}
+
+func neoNormalizeOpenAICustomToolConfig(config map[string]any) map[string]any {
+	if len(config) == 0 || stringValue(config["type"]) != "custom" {
+		return nil
+	}
+	normalized := cloneMap(config)
+	if inputField := firstNonEmptyString(normalized["inputField"], normalized["input_field"]); inputField != "" {
+		normalized["inputField"] = inputField
+	}
+	normalized["type"] = "custom"
+	return normalized
+}
+
+func neoOpenAICustomToolInputField(config map[string]any) string {
+	config = neoNormalizeOpenAICustomToolConfig(config)
+	if len(config) == 0 {
+		return ""
+	}
+	return firstNonEmptyString(config["inputField"], config["input_field"])
+}
+
+func neoOpenAICustomToolInputFieldFromBlock(block map[string]any) string {
+	for _, raw := range []any{
+		mapValue(block["metadata"])["openAICustomTool"],
+		mapValue(block["metadata"])["open_ai_custom_tool"],
+		mapValue(block["meta"])["openAICustomTool"],
+		mapValue(block["meta"])["open_ai_custom_tool"],
+		block["openAICustomTool"],
+		block["openAICustomToolConfig"],
+	} {
+		if field := neoOpenAICustomToolInputField(mapValue(raw)); field != "" {
+			return field
+		}
+	}
+	return ""
 }
 
 func (a *neoActor) handleProtocolAgentState(msg map[string]any) {
@@ -4523,7 +4577,7 @@ func (a *neoActor) runInferenceForParent(agentMode, reasoningEffort, parentToolC
 				toolStartTime = time.Now().UnixMilli()
 				toolBlockStartTimes[toolID] = toolStartTime
 			}
-			block := map[string]any{"type": "tool_use", "id": toolID, "name": delta.ToolCall.Name, "input": input, "complete": delta.ToolCall.Complete}
+			block := neoToolUseBlock(neoToolCall{ID: toolID, Name: delta.ToolCall.Name, Input: input, CustomInputField: delta.ToolCall.CustomInputField}, delta.ToolCall.Complete)
 			if !delta.ToolCall.Complete {
 				previousJSON := partialToolJSONByID[toolID]
 				partialJSONDelta := delta.ToolCall.PartialJSONDelta
@@ -4787,7 +4841,7 @@ func (a *neoActor) finishAssistantMessageWithOptions(messageID string, result ne
 		blocks = append(blocks, map[string]any{"type": "text", "text": result.Text})
 	}
 	for _, call := range normalizedCalls {
-		blocks = append(blocks, map[string]any{"type": "tool_use", "id": call.ID, "name": call.Name, "input": call.Input, "complete": true})
+		blocks = append(blocks, neoToolUseBlock(call, true))
 	}
 	// ensure the upstream usage carries the model name so normalizeNeoUsage
 	// can populate maxInputTokens from the local registry. anthropic does not
@@ -4824,7 +4878,7 @@ func (a *neoActor) finishAssistantMessageWithOptions(messageID string, result ne
 	if streamed {
 		streamBlocks := make([]any, 0, len(normalizedCalls))
 		for _, call := range normalizedCalls {
-			streamBlocks = append(streamBlocks, neoMarkCompleteBlock(map[string]any{"type": "tool_use", "id": call.ID, "name": call.Name, "input": call.Input, "complete": true}, neoAssistantToolBlockStartTime(previousContent, call.ID), finalTime))
+			streamBlocks = append(streamBlocks, neoMarkCompleteBlock(neoToolUseBlock(call, true), neoAssistantToolBlockStartTime(previousContent, call.ID), finalTime))
 		}
 		if len(streamBlocks) > 0 {
 			blockIndex := streamBlockOffset
@@ -4882,6 +4936,19 @@ func (a *neoActor) finishAssistantMessageWithOptions(messageID string, result ne
 	for _, call := range toolCalls {
 		a.broadcast(withNeoParentToolCallID(map[string]any{"type": "tool_lease", "toolCallId": call.ID, "toolName": call.Name, "args": call.Input, "messageId": stored.MessageID}, call.ParentToolCallID))
 	}
+}
+
+func neoToolUseBlock(call neoToolCall, complete bool) map[string]any {
+	block := map[string]any{"type": "tool_use", "id": call.ID, "name": call.Name, "input": call.Input, "complete": complete}
+	if call.CustomInputField != "" {
+		block["metadata"] = map[string]any{
+			"openAICustomTool": map[string]any{
+				"type":       "custom",
+				"inputField": call.CustomInputField,
+			},
+		}
+	}
+	return block
 }
 
 func shouldAddNeoOpenAIThinkingBlock(result neoInferenceResult, agentMode string) bool {
@@ -10998,16 +11065,18 @@ func neoProtocolSummary(payload any) string {
 }
 
 type neoToolSpec struct {
-	Name        string
-	Description string
-	InputSchema map[string]any
-	Meta        map[string]any
+	Name                   string
+	Description            string
+	InputSchema            map[string]any
+	Meta                   map[string]any
+	OpenAICustomToolConfig map[string]any
 }
 
 type neoToolCall struct {
-	ID    string
-	Name  string
-	Input map[string]any
+	ID               string
+	Name             string
+	Input            map[string]any
+	CustomInputField string
 }
 
 type neoPendingTool struct {
@@ -11244,6 +11313,7 @@ type neoToolCallDelta struct {
 	ID               string
 	Name             string
 	Input            map[string]any
+	CustomInputField string
 	PartialJSON      string
 	PartialJSONDelta string
 	Complete         bool
@@ -11579,7 +11649,7 @@ func inferNeoOpenAIResponses(rt *neoRuntime, request neoInferenceRequest, route 
 	if err != nil {
 		return neoInferenceResult{}, err
 	}
-	return parseNeoOpenAIResponsesResult(jsonBody, route), nil
+	return parseNeoOpenAIResponsesResult(jsonBody, route, request.Tools), nil
 }
 
 func inferNeoOpenAIChat(rt *neoRuntime, request neoInferenceRequest, route neoModelRoute) (neoInferenceResult, error) {
@@ -11876,10 +11946,12 @@ func inferNeoOpenAIResponsesStream(rt *neoRuntime, request neoInferenceRequest, 
 	body := openAIResponsesNeoBody(request, route, true)
 
 	type partialToolCall struct {
-		id      string
-		name    string
-		args    strings.Builder
-		ordinal int
+		id               string
+		name             string
+		args             strings.Builder
+		customInput      strings.Builder
+		customInputField string
+		ordinal          int
 	}
 
 	type partialThinkingBlock struct {
@@ -11892,6 +11964,7 @@ func inferNeoOpenAIResponsesStream(rt *neoRuntime, request neoInferenceRequest, 
 	var fullText strings.Builder
 	var usage map[string]any
 	streamBlockOffset := neoOpenAIThinkingBlockOffset(request.AgentMode, route.Provider)
+	customTools := neoOpenAICustomToolConfigByName(request.Tools)
 	toolCallsByIndex := map[int]*partialToolCall{}
 	toolIndexes := make([]int, 0)
 	thinkingBlocksByIndex := map[int]*partialThinkingBlock{}
@@ -11931,11 +12004,27 @@ func inferNeoOpenAIResponsesStream(rt *neoRuntime, request neoInferenceRequest, 
 		if onDelta == nil || call == nil || call.name == "" {
 			return
 		}
+		if call.customInputField == "" {
+			call.customInputField = neoOpenAICustomToolInputField(customTools[call.name])
+		}
+		if call.customInputField == "" && call.customInput.Len() > 0 {
+			call.customInputField = "input"
+		}
+		input := parseToolArguments(call.args.String())
+		partialJSON := call.args.String()
+		customInputField := ""
+		if call.customInputField != "" {
+			customInputField = call.customInputField
+			input = neoOpenAICustomToolInputMap(call.customInputField, call.customInput.String())
+			partialJSON = clipNeoToolPartialJSON(input, "")
+			partialJSONDelta = ""
+		}
 		onDelta(neoInferenceDelta{ToolCall: &neoToolCallDelta{
 			ID:               fallbackString(call.id, neoStableToolCallID("")),
 			Name:             call.name,
-			Input:            parseToolArguments(call.args.String()),
-			PartialJSON:      call.args.String(),
+			Input:            input,
+			CustomInputField: customInputField,
+			PartialJSON:      partialJSON,
 			PartialJSONDelta: partialJSONDelta,
 			BlockIndex:       toolBlockIndex(call),
 		}, Usage: usage})
@@ -11999,6 +12088,20 @@ func inferNeoOpenAIResponsesStream(rt *neoRuntime, request neoInferenceRequest, 
 					call.args.WriteString(args)
 				}
 				emitToolDelta(call, stringValue(item["arguments"]))
+			case "custom_tool_call":
+				call := ensureToolCall(index)
+				if call.id == "" {
+					call.id = neoStableToolCallID(stringValue(item["call_id"]))
+				}
+				if name := stringValue(item["name"]); name != "" {
+					call.name = name
+					call.customInputField = fallbackString(neoOpenAICustomToolInputField(customTools[name]), "input")
+					sawContent = true
+				}
+				if input := stringValue(item["input"]); input != "" {
+					call.customInput.WriteString(input)
+				}
+				emitToolDelta(call, "")
 			case "reasoning":
 				block := ensureThinkingBlock(index)
 				block.signature = stringValue(item["encrypted_content"])
@@ -12018,6 +12121,18 @@ func inferNeoOpenAIResponsesStream(rt *neoRuntime, request neoInferenceRequest, 
 				}
 				if args := stringValue(item["arguments"]); args != "" && call.args.Len() == 0 {
 					call.args.WriteString(args)
+				}
+			case "custom_tool_call":
+				call := ensureToolCall(index)
+				if call.id == "" {
+					call.id = neoStableToolCallID(stringValue(item["call_id"]))
+				}
+				if name := stringValue(item["name"]); name != "" {
+					call.name = name
+					call.customInputField = fallbackString(neoOpenAICustomToolInputField(customTools[name]), "input")
+				}
+				if input := stringValue(item["input"]); input != "" && call.customInput.Len() == 0 {
+					call.customInput.WriteString(input)
 				}
 			case "reasoning":
 				block := ensureThinkingBlock(index)
@@ -12046,6 +12161,19 @@ func inferNeoOpenAIResponsesStream(rt *neoRuntime, request neoInferenceRequest, 
 				call.args.Reset()
 				call.args.WriteString(args)
 			}
+		case "response.custom_tool_call_input.delta":
+			index := numberFrom(payload["output_index"])
+			call := ensureToolCall(index)
+			inputDelta := stringValue(payload["delta"])
+			call.customInput.WriteString(inputDelta)
+			emitToolDelta(call, "")
+		case "response.custom_tool_call_input.done":
+			index := numberFrom(payload["output_index"])
+			call := ensureToolCall(index)
+			if input := stringValue(payload["input"]); input != "" {
+				call.customInput.Reset()
+				call.customInput.WriteString(input)
+			}
 		case "response.completed":
 			completedResponse = mapValue(payload["response"])
 			usage = mergeNeoUsage(usage, mapValue(completedResponse["usage"]))
@@ -12061,7 +12189,7 @@ func inferNeoOpenAIResponsesStream(rt *neoRuntime, request neoInferenceRequest, 
 		return neoInferenceResult{}, err
 	}
 	if !sawContent && len(completedResponse) > 0 {
-		result := parseNeoOpenAIResponsesResult(completedResponse, route)
+		result := parseNeoOpenAIResponsesResult(completedResponse, route, request.Tools)
 		if result.Text != "" || len(result.ToolCalls) > 0 || len(result.ThinkingBlocks) > 0 {
 			return result, nil
 		}
@@ -12077,10 +12205,21 @@ func inferNeoOpenAIResponsesStream(rt *neoRuntime, request neoInferenceRequest, 
 		if call == nil || call.name == "" {
 			continue
 		}
+		if call.customInputField == "" {
+			call.customInputField = neoOpenAICustomToolInputField(customTools[call.name])
+		}
+		if call.customInputField == "" && call.customInput.Len() > 0 {
+			call.customInputField = "input"
+		}
+		input := parseToolArguments(call.args.String())
+		if call.customInputField != "" {
+			input = neoOpenAICustomToolInputMap(call.customInputField, call.customInput.String())
+		}
 		toolCalls = append(toolCalls, neoToolCall{
-			ID:    fallbackString(call.id, neoStableToolCallID(fmt.Sprintf("call-%d", index))),
-			Name:  call.name,
-			Input: parseToolArguments(call.args.String()),
+			ID:               fallbackString(call.id, neoStableToolCallID(fmt.Sprintf("call-%d", index))),
+			Name:             call.name,
+			Input:            input,
+			CustomInputField: call.customInputField,
 		})
 	}
 	sort.Ints(thinkingIndexes)
@@ -14458,6 +14597,7 @@ func openAIResponsesNeoBody(request neoInferenceRequest, route neoModelRoute, st
 func openAIResponsesNeoInput(history []neoHistoryMessage, system string) []any {
 	history = sanitizeNeoHistoryToolPairs(history)
 	input := make([]any, 0, len(history)+1)
+	customToolCalls := map[string]bool{}
 	if strings.TrimSpace(system) != "" {
 		input = append(input, map[string]any{"role": "system", "content": system})
 	}
@@ -14465,7 +14605,11 @@ func openAIResponsesNeoInput(history []neoHistoryMessage, system string) []any {
 		switch msg.Role {
 		case "tool":
 			if msg.ToolCallID != "" {
-				input = append(input, map[string]any{"type": "function_call_output", "call_id": msg.ToolCallID, "output": msg.Text})
+				outputType := "function_call_output"
+				if customToolCalls[msg.ToolCallID] {
+					outputType = "custom_tool_call_output"
+				}
+				input = append(input, map[string]any{"type": outputType, "call_id": msg.ToolCallID, "output": msg.Text})
 			}
 		case "assistant":
 			for _, tb := range msg.ThinkingBlocks {
@@ -14488,6 +14632,13 @@ func openAIResponsesNeoInput(history []neoHistoryMessage, system string) []any {
 			}
 			for _, call := range msg.ToolCalls {
 				if call.Name == "" {
+					continue
+				}
+				if call.CustomInputField != "" {
+					if call.ID != "" {
+						customToolCalls[call.ID] = true
+					}
+					input = append(input, map[string]any{"type": "custom_tool_call", "name": call.Name, "call_id": call.ID, "input": stringValue(call.Input[call.CustomInputField])})
 					continue
 				}
 				args, _ := json.Marshal(call.Input)
@@ -14814,6 +14965,18 @@ func openAINeoTools(tools []neoToolSpec) []any {
 func openAIResponsesNeoTools(tools []neoToolSpec) []any {
 	out := make([]any, 0, len(tools))
 	for _, tool := range tools {
+		if config := neoNormalizeOpenAICustomToolConfig(tool.OpenAICustomToolConfig); len(config) > 0 {
+			item := map[string]any{
+				"type":        "custom",
+				"name":        tool.Name,
+				"description": tool.Description,
+			}
+			if format := config["format"]; format != nil {
+				item["format"] = format
+			}
+			out = append(out, item)
+			continue
+		}
 		schema := tool.InputSchema
 		if len(schema) == 0 {
 			schema = map[string]any{"type": "object"}
@@ -14827,6 +14990,23 @@ func openAIResponsesNeoTools(tools []neoToolSpec) []any {
 		})
 	}
 	return out
+}
+
+func neoOpenAICustomToolConfigByName(tools []neoToolSpec) map[string]map[string]any {
+	out := map[string]map[string]any{}
+	for _, tool := range tools {
+		if config := neoNormalizeOpenAICustomToolConfig(tool.OpenAICustomToolConfig); len(config) > 0 {
+			out[tool.Name] = config
+		}
+	}
+	return out
+}
+
+func neoOpenAICustomToolInputMap(inputField, value string) map[string]any {
+	if inputField == "" {
+		inputField = "input"
+	}
+	return map[string]any{inputField: value}
 }
 
 func googleNeoTools(tools []neoToolSpec) []any {
@@ -15080,10 +15260,11 @@ func neoApplyOpenAIResponsesReasoning(body map[string]any, route neoModelRoute, 
 	body["temperature"] = 0.1
 }
 
-func parseNeoOpenAIResponsesResult(jsonBody map[string]any, route neoModelRoute) neoInferenceResult {
+func parseNeoOpenAIResponsesResult(jsonBody map[string]any, route neoModelRoute, tools []neoToolSpec) neoInferenceResult {
 	var text strings.Builder
 	toolCalls := make([]neoToolCall, 0)
 	thinkingBlocks := make([]neoThinkingBlock, 0)
+	customTools := neoOpenAICustomToolConfigByName(tools)
 	for i, raw := range arrayValue(jsonBody["output"]) {
 		item := mapValue(raw)
 		switch stringValue(item["type"]) {
@@ -15109,6 +15290,18 @@ func parseNeoOpenAIResponsesResult(jsonBody map[string]any, route neoModelRoute)
 				ID:    fallbackString(item["call_id"], fmt.Sprintf("call-%d", i)),
 				Name:  name,
 				Input: parseToolArguments(item["arguments"]),
+			})
+		case "custom_tool_call":
+			name := stringValue(item["name"])
+			if name == "" {
+				continue
+			}
+			inputField := neoOpenAICustomToolInputField(customTools[name])
+			toolCalls = append(toolCalls, neoToolCall{
+				ID:               fallbackString(item["call_id"], fmt.Sprintf("call-%d", i)),
+				Name:             name,
+				Input:            neoOpenAICustomToolInputMap(inputField, stringValue(item["input"])),
+				CustomInputField: fallbackString(inputField, "input"),
 			})
 		case "reasoning":
 			signature := stringValue(item["encrypted_content"])
@@ -15872,9 +16065,10 @@ func neoAssistantHistoryContent(blocks []any) (string, []neoToolCall, []neoThink
 				continue
 			}
 			calls = append(calls, neoToolCall{
-				ID:    fallbackString(m["id"], newNeoToolCallID()),
-				Name:  name,
-				Input: mapValue(m["input"]),
+				ID:               fallbackString(m["id"], newNeoToolCallID()),
+				Name:             name,
+				Input:            mapValue(m["input"]),
+				CustomInputField: neoOpenAICustomToolInputFieldFromBlock(m),
 			})
 		case "thinking":
 			thinking = append(thinking, neoThinkingBlock{

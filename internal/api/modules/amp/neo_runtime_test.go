@@ -4560,6 +4560,134 @@ func TestInferNeoOpenAIResponsesSendsReasoningEffortWithTools(t *testing.T) {
 	}
 }
 
+func TestOpenAIResponsesNeoToolsPreserveCustomToolConfig(t *testing.T) {
+	body := openAIResponsesNeoBody(neoInferenceRequest{
+		ThreadID: "T-test",
+		Tools: []neoToolSpec{{
+			Name:        "apply_patch",
+			Description: "apply a patch",
+			OpenAICustomToolConfig: map[string]any{
+				"type":       "custom",
+				"inputField": "patchText",
+				"format":     map[string]any{"type": "grammar", "syntax": "lark", "definition": "start: /.+/"},
+			},
+		}},
+	}, neoModelRoute{Provider: "openai", Model: "gpt-5.5"}, true)
+
+	tools := arrayValue(body["tools"])
+	if len(tools) != 1 {
+		t.Fatalf("tools = %#v, want one custom tool", tools)
+	}
+	tool := mapValue(tools[0])
+	if tool["type"] != "custom" || tool["name"] != "apply_patch" {
+		t.Fatalf("tool = %#v, want custom apply_patch", tool)
+	}
+	if _, hasParameters := tool["parameters"]; hasParameters {
+		t.Fatalf("custom tool unexpectedly had parameters: %#v", tool)
+	}
+	if format := mapValue(tool["format"]); format["type"] != "grammar" {
+		t.Fatalf("format = %#v, want grammar", format)
+	}
+}
+
+func TestOpenAIResponsesNeoInputReplaysCustomToolCalls(t *testing.T) {
+	input := openAIResponsesNeoInput([]neoHistoryMessage{
+		{
+			Role: "assistant",
+			ToolCalls: []neoToolCall{{
+				ID:               "TU-patch",
+				Name:             "apply_patch",
+				Input:            map[string]any{"patchText": "*** Begin Patch"},
+				CustomInputField: "patchText",
+			}},
+		},
+		{Role: "tool", ToolCallID: "TU-patch", Text: "applied"},
+	}, "")
+
+	if len(input) != 2 {
+		t.Fatalf("input = %#v, want custom call and output", input)
+	}
+	call := mapValue(input[0])
+	if call["type"] != "custom_tool_call" || call["name"] != "apply_patch" || call["input"] != "*** Begin Patch" {
+		t.Fatalf("custom call = %#v", call)
+	}
+	output := mapValue(input[1])
+	if output["type"] != "custom_tool_call_output" || output["call_id"] != "TU-patch" || output["output"] != "applied" {
+		t.Fatalf("custom output = %#v", output)
+	}
+}
+
+func TestParseNeoOpenAIResponsesResultCustomToolCall(t *testing.T) {
+	result := parseNeoOpenAIResponsesResult(map[string]any{
+		"output": []any{map[string]any{
+			"type":    "custom_tool_call",
+			"call_id": "TU-patch",
+			"name":    "apply_patch",
+			"input":   "*** Begin Patch",
+		}},
+	}, neoModelRoute{Provider: "openai", Model: "gpt-5.5"}, []neoToolSpec{{
+		Name:                   "apply_patch",
+		OpenAICustomToolConfig: map[string]any{"type": "custom", "inputField": "patchText"},
+	}})
+
+	if len(result.ToolCalls) != 1 {
+		t.Fatalf("tool calls = %#v, want one", result.ToolCalls)
+	}
+	call := result.ToolCalls[0]
+	if call.ID != "TU-patch" || call.Name != "apply_patch" || call.CustomInputField != "patchText" || call.Input["patchText"] != "*** Begin Patch" {
+		t.Fatalf("custom tool call = %#v", call)
+	}
+}
+
+func TestInferNeoOpenAIResponsesStreamCustomToolCall(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/provider/openai/v1/responses" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		payload := readNeoJSON(r.Body)
+		tools := arrayValue(payload["tools"])
+		if len(tools) != 1 || mapValue(tools[0])["type"] != "custom" {
+			t.Fatalf("tools = %#v, want custom tool", tools)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"custom_tool_call\",\"call_id\":\"TU-patch\",\"name\":\"apply_patch\",\"input\":\"\"}}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.custom_tool_call_input.delta\",\"output_index\":0,\"delta\":\"*** Begin\"}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.custom_tool_call_input.delta\",\"output_index\":0,\"delta\":\" Patch\"}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.custom_tool_call_input.done\",\"output_index\":0,\"input\":\"*** Begin Patch\"}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"custom_tool_call\",\"call_id\":\"TU-patch\",\"name\":\"apply_patch\",\"input\":\"*** Begin Patch\"}}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1},\"output\":[]}}\n\ndata: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	var lastToolDelta *neoToolCallDelta
+	result, err := inferNeoLocalStream(testNeoRuntimeForServer(t, upstream), neoInferenceRequest{
+		ThreadID:        "T-test",
+		AgentMode:       "deep",
+		ReasoningEffort: "xhigh",
+		Settings:        map[string]any{"internal.model": "openai/gpt-5.5"},
+		History:         []neoHistoryMessage{{Role: "user", Text: "hi"}},
+		Tools: []neoToolSpec{{
+			Name:                   "apply_patch",
+			Description:            "apply a patch",
+			OpenAICustomToolConfig: map[string]any{"type": "custom", "inputField": "patchText"},
+		}},
+	}, func(delta neoInferenceDelta) {
+		if delta.ToolCall != nil {
+			copy := *delta.ToolCall
+			lastToolDelta = &copy
+		}
+	})
+	if err != nil {
+		t.Fatalf("inferNeoLocalStream error: %v", err)
+	}
+	if len(result.ToolCalls) != 1 || result.ToolCalls[0].CustomInputField != "patchText" || result.ToolCalls[0].Input["patchText"] != "*** Begin Patch" {
+		t.Fatalf("result tool calls = %#v", result.ToolCalls)
+	}
+	if lastToolDelta == nil || lastToolDelta.CustomInputField != "patchText" || lastToolDelta.Input["patchText"] != "*** Begin Patch" {
+		t.Fatalf("last tool delta = %#v", lastToolDelta)
+	}
+}
+
 func TestInferNeoOpenAIResponsesFallsBackToChatCompletionsWhenUnsupported(t *testing.T) {
 	responsesCalls := 0
 	chatCalls := 0
