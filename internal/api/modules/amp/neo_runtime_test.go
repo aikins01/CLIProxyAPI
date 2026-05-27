@@ -8566,6 +8566,89 @@ func TestNeoActorPropagatesParentToolCallToNestedAssistantAndLease(t *testing.T)
 	}
 }
 
+func TestNeoCloudMessageSanitizesUserMetaLikeBinary(t *testing.T) {
+	executorThreadID := "T-019e1046-656d-7132-879f-390ded941c16"
+	cloud := neoCloudMessage(neoMessage{
+		Role:      "user",
+		MessageID: "M-user",
+		Content:   []any{map[string]any{"type": "text", "text": "hello"}},
+		Meta: map[string]any{
+			"sentAt":               float64(1778170001000),
+			"aggman":               "yes",
+			"fromExecutorThreadID": executorThreadID,
+			"source":               "persisted",
+			"accountID":            "local-proxy-account",
+		},
+	})
+
+	meta := mapValue(cloud["meta"])
+	if numberFrom(meta["sentAt"]) != 1778170001000 {
+		t.Fatalf("sentAt = %#v, want binary numeric sentAt", meta["sentAt"])
+	}
+	if meta["fromAggman"] != true {
+		t.Fatalf("fromAggman = %#v, want true from aggman truthy alias", meta["fromAggman"])
+	}
+	if stringValue(meta["fromExecutorThreadID"]) != executorThreadID {
+		t.Fatalf("fromExecutorThreadID = %#v, want %s", meta["fromExecutorThreadID"], executorThreadID)
+	}
+	for _, key := range []string{"source", "accountID", "aggman"} {
+		if _, ok := meta[key]; ok {
+			t.Fatalf("meta[%s] = %#v, want omitted like binary import", key, meta[key])
+		}
+	}
+
+	invalid := neoCloudMessage(neoMessage{
+		Role:      "user",
+		MessageID: "M-invalid",
+		Content:   []any{map[string]any{"type": "text", "text": "hello"}},
+		Meta: map[string]any{
+			"fromExecutorThreadID": "T-019E1046-656D-7132-879F-390DED941C16",
+		},
+	})
+	if _, ok := invalid["meta"]; ok {
+		t.Fatalf("invalid meta = %#v, want omitted for non-binary thread id", invalid["meta"])
+	}
+}
+
+func TestNeoMessageFromImportedThreadSanitizesUserMetaLikeBinary(t *testing.T) {
+	executorThreadID := "T-019e1046-656d-7132-879f-390ded941c16"
+	imported := neoMessageFromImportedThread("T-test", map[string]any{
+		"role":      "user",
+		"messageId": "M-user",
+		"content":   []any{map[string]any{"type": "text", "text": "hello"}},
+		"meta": map[string]any{
+			"sentAt":               1778170001000,
+			"fromAggman":           false,
+			"aggman":               true,
+			"fromExecutorThreadID": executorThreadID,
+			"source":               "persisted",
+		},
+	}, 0)
+
+	if numberFrom(imported.Meta["sentAt"]) != 1778170001000 {
+		t.Fatalf("sentAt = %#v, want binary numeric sentAt", imported.Meta["sentAt"])
+	}
+	if imported.Meta["fromAggman"] != true {
+		t.Fatalf("fromAggman = %#v, want true from aggman alias", imported.Meta["fromAggman"])
+	}
+	if stringValue(imported.Meta["fromExecutorThreadID"]) != executorThreadID {
+		t.Fatalf("fromExecutorThreadID = %#v, want %s", imported.Meta["fromExecutorThreadID"], executorThreadID)
+	}
+	if _, ok := imported.Meta["source"]; ok {
+		t.Fatalf("source = %#v, want omitted like binary import", imported.Meta["source"])
+	}
+
+	assistant := neoMessageFromImportedThread("T-test", map[string]any{
+		"role":      "assistant",
+		"messageId": "M-assistant",
+		"content":   []any{map[string]any{"type": "text", "text": "answer"}},
+		"meta":      map[string]any{"sentAt": 1778170001000},
+	}, 1)
+	if len(assistant.Meta) != 0 {
+		t.Fatalf("assistant meta = %#v, want omitted like binary import", assistant.Meta)
+	}
+}
+
 func TestNeoActorPropagatesParentToolCallToNestedToolResultAndProgress(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)

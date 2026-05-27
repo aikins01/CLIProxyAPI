@@ -66,16 +66,17 @@ const (
 )
 
 var (
-	neoThreadIDPattern      = regexp.MustCompile(`T-[0-9A-Za-z][0-9A-Za-z-]*`)
-	neoThreadIDExactPattern = regexp.MustCompile(`^T-[0-9A-Za-z][0-9A-Za-z-]*$`)
-	neoCloudThreadIDPattern = regexp.MustCompile(`^T-([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$`)
-	neoMessageIDPattern     = regexp.MustCompile(`^M-[0-9A-Za-z]{22}$`)
-	neoAmpThreadStoreDir    = defaultNeoAmpThreadStoreDir
-	neoAmpTaskStoreMu       sync.Mutex
-	neoInboundMessageHookMu sync.RWMutex
-	neoInboundMessageHook   func(actor *neoActor, msg map[string]any)
-	errNeoLocalEmptyStream  = errors.New("local provider stream closed before first payload")
-	neoModeToolAllowlist    = map[string]map[string]bool{
+	neoThreadIDPattern            = regexp.MustCompile(`T-[0-9A-Za-z][0-9A-Za-z-]*`)
+	neoThreadIDExactPattern       = regexp.MustCompile(`^T-[0-9A-Za-z][0-9A-Za-z-]*$`)
+	neoBinaryThreadIDExactPattern = regexp.MustCompile(`^T-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+	neoCloudThreadIDPattern       = regexp.MustCompile(`^T-([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$`)
+	neoMessageIDPattern           = regexp.MustCompile(`^M-[0-9A-Za-z]{22}$`)
+	neoAmpThreadStoreDir          = defaultNeoAmpThreadStoreDir
+	neoAmpTaskStoreMu             sync.Mutex
+	neoInboundMessageHookMu       sync.RWMutex
+	neoInboundMessageHook         func(actor *neoActor, msg map[string]any)
+	errNeoLocalEmptyStream        = errors.New("local provider stream closed before first payload")
+	neoModeToolAllowlist          = map[string]map[string]bool{
 		"smart":    toolSet("Read", "finder", "Bash", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "handoff", "painter", "read_mcp_resource", "code_review"),
 		"large":    toolSet("Read", "finder", "Bash", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "handoff", "painter", "read_mcp_resource", "code_review"),
 		"rush":     toolSet("finder", "shell_command", "apply_patch", "web_search", "read_web_page", "read_mcp_resource", "read_thread", "find_thread", "skill", "oracle", "handoff", "librarian", "Task", "view_media", "painter"),
@@ -6514,6 +6515,80 @@ func neoMessageMetaSentAtMillis(meta map[string]any) int {
 	return 0
 }
 
+func neoBinaryUserMeta(meta map[string]any) map[string]any {
+	if len(meta) == 0 {
+		return nil
+	}
+	out := map[string]any{}
+	if sentAt, ok := neoNumericValue(meta["sentAt"]); ok {
+		out["sentAt"] = sentAt
+	}
+	if boolValue(meta["fromAggman"]) {
+		out["fromAggman"] = true
+	} else if aggman, ok := meta["aggman"]; ok && neoJSTruthy(aggman) {
+		out["fromAggman"] = true
+	}
+	if threadID := stringValue(meta["fromExecutorThreadID"]); neoBinaryThreadIDExactPattern.MatchString(threadID) {
+		out["fromExecutorThreadID"] = threadID
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func neoNumericValue(value any) (any, bool) {
+	switch typed := value.(type) {
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64:
+		return typed, true
+	case json.Number:
+		if _, err := strconv.ParseFloat(typed.String(), 64); err == nil {
+			return typed, true
+		}
+	}
+	return nil, false
+}
+
+func neoJSTruthy(value any) bool {
+	switch typed := value.(type) {
+	case nil:
+		return false
+	case bool:
+		return typed
+	case string:
+		return typed != ""
+	case int:
+		return typed != 0
+	case int8:
+		return typed != 0
+	case int16:
+		return typed != 0
+	case int32:
+		return typed != 0
+	case int64:
+		return typed != 0
+	case uint:
+		return typed != 0
+	case uint8:
+		return typed != 0
+	case uint16:
+		return typed != 0
+	case uint32:
+		return typed != 0
+	case uint64:
+		return typed != 0
+	case float32:
+		return typed != 0
+	case float64:
+		return typed != 0
+	case json.Number:
+		parsed, err := strconv.ParseFloat(typed.String(), 64)
+		return err == nil && parsed != 0
+	default:
+		return true
+	}
+}
+
 func neoJSONMessageMetaSentAtMillis(message gjson.Result) int {
 	sentAt := message.Get("meta.sentAt")
 	if !sentAt.Exists() || sentAt.Type != gjson.Number {
@@ -8642,8 +8717,8 @@ func neoCloudMessage(message neoMessage) map[string]any {
 		if message.Interrupted {
 			out["interrupted"] = true
 		}
-		if len(message.Meta) > 0 {
-			out["meta"] = message.Meta
+		if meta := neoBinaryUserMeta(message.Meta); len(meta) > 0 {
+			out["meta"] = meta
 		}
 		if message.UserState != nil {
 			out["userState"] = message.UserState
@@ -10007,6 +10082,12 @@ func neoMessageFromImportedThread(threadID string, raw any, index int) neoMessag
 	if content == nil {
 		content = []any{}
 	}
+	meta := mapValue(message["meta"])
+	if role == "user" {
+		meta = neoBinaryUserMeta(meta)
+	} else {
+		meta = nil
+	}
 	return neoMessage{
 		ThreadID:             threadID,
 		MessageID:            messageID,
@@ -10018,7 +10099,7 @@ func neoMessageFromImportedThread(threadID string, raw any, index int) neoMessag
 		Interrupted:          boolValue(message["interrupted"]),
 		CreatedAt:            stringValue(message["createdAt"]),
 		ReadAt:               stringValue(message["readAt"]),
-		Meta:                 mapValue(message["meta"]),
+		Meta:                 meta,
 		UserState:            message["userState"],
 		FileMentions:         mapValue(message["fileMentions"]),
 		State:                mapValue(message["state"]),
