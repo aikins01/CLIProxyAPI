@@ -13,12 +13,21 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 )
+
+func clearNeoCloudThreadListCacheForTest(t *testing.T) {
+	t.Helper()
+	neoCloudThreadListCache.Lock()
+	neoCloudThreadListCache.entries = map[string]*neoCloudThreadListCacheEntry{}
+	neoCloudThreadListCache.Unlock()
+}
 
 func TestRegisterManagementRoutes(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -806,7 +815,7 @@ func TestRegisterManagementRoutesServesNeoStartupInternalRPCPostsLocally(t *test
 
 	t.Run("listThreads", func(t *testing.T) {
 		proxyCalled = false
-		body := bytes.NewBufferString(`{"method":"listThreads","params":{"includeArchived":false,"limit":200}}`)
+		body := bytes.NewBufferString(`{"method":"listThreads","params":{"includeArchived":false,"includeCloud":false,"limit":200}}`)
 		req := httptest.NewRequest(http.MethodPost, "/api/internal?listThreads", body)
 		req.Header.Set("Content-Type", "application/json")
 		rec := httptest.NewRecorder()
@@ -861,7 +870,7 @@ func TestRegisterManagementRoutesServesNeoStartupInternalRPCPostsLocally(t *test
 	})
 
 	t.Run("listThreads includes archived when requested", func(t *testing.T) {
-		body := bytes.NewBufferString(`{"method":"listThreads","params":{"includeArchived":true,"limit":200}}`)
+		body := bytes.NewBufferString(`{"method":"listThreads","params":{"includeArchived":true,"includeCloud":false,"limit":200}}`)
 		req := httptest.NewRequest(http.MethodPost, "/api/internal?listThreads", body)
 		req.Header.Set("Content-Type", "application/json")
 		rec := httptest.NewRecorder()
@@ -892,6 +901,7 @@ func TestRegisterManagementRoutesServesNeoStartupInternalRPCPostsLocally(t *test
 	})
 
 	t.Run("listThreads merges cloud threads", func(t *testing.T) {
+		clearNeoCloudThreadListCacheForTest(t)
 		cloudThreadID := "T-019e1046-656d-7132-879f-390ded941c99"
 		cloudOnlyThreadID := "T-019e1046-656d-7132-879f-390ded941c98"
 		upstreamRequests := 0
@@ -932,7 +942,7 @@ func TestRegisterManagementRoutesServesNeoStartupInternalRPCPostsLocally(t *test
 			t.Fatalf("write local thread: %v", err)
 		}
 
-		body := bytes.NewBufferString(`{"method":"listThreads","params":{"includeArchived":false,"limit":10}}`)
+		body := bytes.NewBufferString(`{"method":"listThreads","params":{"includeArchived":false,"limit":10,"waitForCloud":true}}`)
 		req := httptest.NewRequest(http.MethodPost, "/api/internal?listThreads", body)
 		req.Header.Set("Content-Type", "application/json")
 		rec := httptest.NewRecorder()
@@ -986,7 +996,7 @@ func TestRegisterManagementRoutesServesNeoStartupInternalRPCPostsLocally(t *test
 			t.Fatalf("merged relationships = %#v, want empty array", third["relationships"])
 		}
 
-		limitedBody := bytes.NewBufferString(`{"method":"listThreads","params":{"includeArchived":false,"limit":2}}`)
+		limitedBody := bytes.NewBufferString(`{"method":"listThreads","params":{"includeArchived":false,"limit":2,"waitForCloud":true}}`)
 		limitedReq := httptest.NewRequest(http.MethodPost, "/api/internal?listThreads", limitedBody)
 		limitedReq.Header.Set("Content-Type", "application/json")
 		limitedRec := httptest.NewRecorder()
@@ -1000,6 +1010,91 @@ func TestRegisterManagementRoutesServesNeoStartupInternalRPCPostsLocally(t *test
 		}
 		if limited := arrayValue(mapValue(limitedResponse["result"])["threads"]); len(limited) != 2 {
 			t.Fatalf("limited result length = %d, want 2: %#v", len(limited), limited)
+		}
+	})
+
+	t.Run("listThreads returns before pending cloud refresh", func(t *testing.T) {
+		clearNeoCloudThreadListCacheForTest(t)
+		cloudOnlyThreadID := "T-019e1046-656d-7132-879f-390ded941c97"
+		started := make(chan struct{}, 1)
+		release := make(chan struct{})
+		handled := make(chan struct{}, 1)
+		var releaseOnce sync.Once
+		releaseCloud := func() {
+			releaseOnce.Do(func() {
+				close(release)
+			})
+		}
+		upstreamHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/api/internal" || r.URL.RawQuery != "listThreads" {
+				w.WriteHeader(http.StatusTeapot)
+				_, _ = w.Write([]byte("unexpected upstream request"))
+				return
+			}
+			select {
+			case started <- struct{}{}:
+			default:
+			}
+			<-release
+			writeNeoJSON(w, http.StatusOK, map[string]any{
+				"ok": true,
+				"result": map[string]any{
+					"threads": []any{
+						map[string]any{"id": cloudOnlyThreadID, "title": "slow cloud", "updatedAt": 4000},
+					},
+				},
+			})
+			select {
+			case handled <- struct{}{}:
+			default:
+			}
+		})
+
+		body := bytes.NewBufferString(`{"method":"listThreads","params":{"includeArchived":false,"limit":10}}`)
+		req := httptest.NewRequest(http.MethodPost, "/api/internal?listThreads", body)
+		req.Header.Set("Content-Type", "application/json")
+		done := make(chan *httptest.ResponseRecorder, 1)
+		go func() {
+			rec := httptest.NewRecorder()
+			r.ServeHTTP(rec, req)
+			done <- rec
+		}()
+
+		var rec *httptest.ResponseRecorder
+		select {
+		case rec = <-done:
+		case <-time.After(2 * time.Second):
+			releaseCloud()
+			t.Fatal("listThreads blocked on the cloud refresh")
+		}
+		if rec.Code != http.StatusOK {
+			releaseCloud()
+			t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+		}
+		var response map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+			releaseCloud()
+			t.Fatalf("response JSON error: %v", err)
+		}
+		result := arrayValue(mapValue(response["result"])["threads"])
+		for _, raw := range result {
+			if stringValue(mapValue(raw)["id"]) == cloudOnlyThreadID {
+				releaseCloud()
+				t.Fatalf("cloud thread should not be returned before refresh completes: %#v", result)
+			}
+		}
+
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			releaseCloud()
+			t.Fatal("cloud refresh did not start asynchronously")
+		}
+		releaseCloud()
+		select {
+		case <-handled:
+		case <-time.After(2 * time.Second):
+			t.Fatal("cloud refresh did not finish after release")
 		}
 	})
 
@@ -1203,7 +1298,7 @@ func TestRegisterManagementRoutesServesNeoStartupInternalRPCPostsLocally(t *test
 			t.Fatalf("getUserLabels result = %#v", response["result"])
 		}
 
-		listReq := httptest.NewRequest(http.MethodPost, "/api/internal?listThreads", bytes.NewBufferString(`{"method":"listThreads","params":{"includeArchived":false,"limit":10}}`))
+		listReq := httptest.NewRequest(http.MethodPost, "/api/internal?listThreads", bytes.NewBufferString(`{"method":"listThreads","params":{"includeArchived":false,"includeCloud":false,"limit":10}}`))
 		listReq.Header.Set("Content-Type", "application/json")
 		listRec := httptest.NewRecorder()
 		r.ServeHTTP(listRec, listReq)

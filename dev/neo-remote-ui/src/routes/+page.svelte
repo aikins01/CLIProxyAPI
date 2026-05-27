@@ -545,7 +545,7 @@
       threads = rawThreads.map(threadSummaryFromAPI).filter(Boolean) as ThreadSummary[];
       const targetThreadId = preferredThreadId || selectedThreadId || threads[0]?.id || '';
       if (targetThreadId) {
-        await openThread(targetThreadId, { replaceURL: true });
+        void openThread(targetThreadId, { replaceURL: true });
       }
       return true;
     } catch (error) {

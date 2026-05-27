@@ -592,9 +592,20 @@ func neoLocalInternalParams(r *http.Request) map[string]any {
 func neoLocalListThreadsResult(ctx context.Context, cfg *config.Config, r *http.Request) []map[string]any {
 	limit := 200
 	includeArchived := false
+	includeCloud := true
+	waitForCloud := false
 	if r != nil && r.URL != nil {
-		limit = neoQueryInt(r.URL.Query().Get("limit"), limit)
-		includeArchived = boolValue(r.URL.Query().Get("includeArchived"))
+		q := r.URL.Query()
+		limit = neoQueryInt(q.Get("limit"), limit)
+		if q.Has("includeArchived") {
+			includeArchived = neoQueryBool(q.Get("includeArchived"), includeArchived)
+		}
+		if q.Has("includeCloud") {
+			includeCloud = neoQueryBool(q.Get("includeCloud"), includeCloud)
+		}
+		if q.Has("waitForCloud") {
+			waitForCloud = neoQueryBool(q.Get("waitForCloud"), waitForCloud)
+		}
 	}
 	if payload := neoLocalInternalPayload(r); len(payload) > 0 {
 		if params := mapValue(payload["params"]); len(params) > 0 {
@@ -611,14 +622,29 @@ func neoLocalListThreadsResult(ctx context.Context, cfg *config.Config, r *http.
 				}
 			}
 			if value, exists := params["includeArchived"]; exists {
-				includeArchived = boolValue(value)
+				includeArchived = neoParamBool(value, includeArchived)
+			}
+			if value, exists := params["includeCloud"]; exists {
+				includeCloud = neoParamBool(value, includeCloud)
+			}
+			if value, exists := params["waitForCloud"]; exists {
+				waitForCloud = neoParamBool(value, waitForCloud)
 			}
 		}
 	}
 	if limit <= 0 {
 		limit = 200
 	}
-	threads := mergeNeoThreadListResults(recentNeoLocalThreads(limit), getNeoCloudThreadList(ctx, cfg, limit, includeArchived))
+	var cloudThreads []map[string]any
+	if includeCloud {
+		if waitForCloud {
+			cloudThreads = getNeoCloudThreadList(ctx, cfg, limit, includeArchived)
+			cacheNeoCloudThreadList(cfg, limit, includeArchived, cloudThreads)
+		} else {
+			cloudThreads = getNeoCloudThreadListCached(cfg, limit, includeArchived)
+		}
+	}
+	threads := mergeNeoThreadListResults(recentNeoLocalThreads(limit), cloudThreads)
 	filtered := make([]map[string]any, 0, len(threads))
 	for _, thread := range threads {
 		if !includeArchived && boolValue(thread["archived"]) {

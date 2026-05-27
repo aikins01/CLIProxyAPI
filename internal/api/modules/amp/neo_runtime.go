@@ -6,7 +6,9 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -60,11 +62,18 @@ const (
 	neoThreadMarkdownToolTextLimit   = 2000
 	neoThreadMarkdownToolByteLimit   = 100 * 1024
 	neoThreadMarkdownOmittedText     = "\n[ ... omitted remaining lines to make summarizing use less tokens ... ]"
+	neoCloudThreadListCacheTTL       = 30 * time.Second
 	neoThreadExtractionModel         = "gemini-3-flash-preview"
 	neoJSONRPCFrameKey               = "__neo_jsonrpc_frame"
 	neoJSONRPCRequestIDKey           = "__neo_jsonrpc_request_id"
 	neoMaxQueuedMessages             = 5
 )
+
+type neoCloudThreadListCacheEntry struct {
+	threads    []map[string]any
+	fetchedAt  time.Time
+	refreshing bool
+}
 
 var (
 	neoThreadIDPattern            = regexp.MustCompile(`T-[0-9A-Za-z][0-9A-Za-z-]*`)
@@ -77,7 +86,11 @@ var (
 	neoInboundMessageHookMu       sync.RWMutex
 	neoInboundMessageHook         func(actor *neoActor, msg map[string]any)
 	errNeoLocalEmptyStream        = errors.New("local provider stream closed before first payload")
-	neoModeToolAllowlist          = map[string]map[string]bool{
+	neoCloudThreadListCache       = struct {
+		sync.Mutex
+		entries map[string]*neoCloudThreadListCacheEntry
+	}{entries: map[string]*neoCloudThreadListCacheEntry{}}
+	neoModeToolAllowlist = map[string]map[string]bool{
 		"smart":    toolSet("Read", "finder", "Bash", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "handoff", "painter", "read_mcp_resource", "code_review"),
 		"large":    toolSet("Read", "finder", "Bash", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "handoff", "painter", "read_mcp_resource", "code_review"),
 		"rush":     toolSet("finder", "shell_command", "apply_patch", "web_search", "read_web_page", "read_mcp_resource", "read_thread", "find_thread", "skill", "oracle", "handoff", "librarian", "Task", "view_media", "painter"),
@@ -6800,6 +6813,86 @@ func getNeoCloudThreadList(ctx context.Context, cfg *config.Config, limit int, i
 	return threads
 }
 
+func getNeoCloudThreadListCached(cfg *config.Config, limit int, includeArchived bool) []map[string]any {
+	key, ok := neoCloudThreadListCacheKey(cfg, limit, includeArchived)
+	if !ok {
+		return nil
+	}
+	now := time.Now()
+	startRefresh := false
+
+	neoCloudThreadListCache.Lock()
+	entry := neoCloudThreadListCache.entries[key]
+	if entry == nil {
+		entry = &neoCloudThreadListCacheEntry{}
+		neoCloudThreadListCache.entries[key] = entry
+	}
+	threads := cloneNeoThreadList(entry.threads)
+	if !entry.refreshing && (entry.fetchedAt.IsZero() || now.Sub(entry.fetchedAt) > neoCloudThreadListCacheTTL) {
+		entry.refreshing = true
+		startRefresh = true
+	}
+	neoCloudThreadListCache.Unlock()
+
+	if startRefresh {
+		go refreshNeoCloudThreadListCache(key, cfg, limit, includeArchived)
+	}
+	return threads
+}
+
+func refreshNeoCloudThreadListCache(key string, cfg *config.Config, limit int, includeArchived bool) {
+	threads := getNeoCloudThreadList(context.Background(), cfg, limit, includeArchived)
+	storeNeoCloudThreadListCache(key, threads)
+}
+
+func storeNeoCloudThreadListCache(key string, threads []map[string]any) {
+	if strings.TrimSpace(key) == "" {
+		return
+	}
+	neoCloudThreadListCache.Lock()
+	defer neoCloudThreadListCache.Unlock()
+	entry := neoCloudThreadListCache.entries[key]
+	if entry == nil {
+		entry = &neoCloudThreadListCacheEntry{}
+		neoCloudThreadListCache.entries[key] = entry
+	}
+	entry.threads = cloneNeoThreadList(threads)
+	entry.fetchedAt = time.Now()
+	entry.refreshing = false
+}
+
+func cacheNeoCloudThreadList(cfg *config.Config, limit int, includeArchived bool, threads []map[string]any) {
+	key, ok := neoCloudThreadListCacheKey(cfg, limit, includeArchived)
+	if !ok {
+		return
+	}
+	storeNeoCloudThreadListCache(key, threads)
+}
+
+func neoCloudThreadListCacheKey(cfg *config.Config, limit int, includeArchived bool) (string, bool) {
+	if cfg == nil || limit <= 0 {
+		return "", false
+	}
+	upstreamURL := strings.TrimSpace(cfg.AmpCode.UpstreamURL)
+	apiKey := strings.TrimSpace(cfg.AmpCode.UpstreamAPIKey)
+	if upstreamURL == "" || apiKey == "" {
+		return "", false
+	}
+	sum := sha256.Sum256([]byte(apiKey))
+	return upstreamURL + "|" + hex.EncodeToString(sum[:]) + "|" + strconv.Itoa(limit) + "|" + strconv.FormatBool(includeArchived), true
+}
+
+func cloneNeoThreadList(threads []map[string]any) []map[string]any {
+	if threads == nil {
+		return nil
+	}
+	out := make([]map[string]any, 0, len(threads))
+	for _, thread := range threads {
+		out = append(out, cloneNeoJSONMap(thread))
+	}
+	return out
+}
+
 func getNeoCloudThreadSearch(ctx context.Context, cfg *config.Config, q url.Values) (map[string]any, bool, error) {
 	if cfg == nil || strings.TrimSpace(q.Get("q")) == "" {
 		return nil, false, nil
@@ -9000,6 +9093,38 @@ func neoQueryInt(value string, fallback int) int {
 		return fallback
 	}
 	return parsed
+}
+
+func neoQueryBool(value string, fallback bool) bool {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseBool(strings.TrimSpace(value))
+	if err != nil {
+		return fallback
+	}
+	return parsed
+}
+
+func neoParamBool(value any, fallback bool) bool {
+	switch typed := value.(type) {
+	case bool:
+		return typed
+	case string:
+		return neoQueryBool(typed, fallback)
+	case int:
+		return typed != 0
+	case float64:
+		return typed != 0
+	case json.Number:
+		parsed, err := typed.Int64()
+		if err != nil {
+			return fallback
+		}
+		return parsed != 0
+	default:
+		return fallback
+	}
 }
 
 func cloneURLValues(values url.Values) url.Values {
