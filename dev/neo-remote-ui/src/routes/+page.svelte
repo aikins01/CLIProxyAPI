@@ -248,6 +248,7 @@
   const maxComposerImages = 8;
   const maxComposerImageBytes = 45 * 1024 * 1024;
   const agentModeOptions = ['smart', 'large', 'rush', 'deep', 'frontier', 'nostromo', 'agg-man'];
+  const visibleAgentModeOptions = ['smart', 'large', 'rush', 'deep', 'frontier', 'nostromo'];
   const agentModeLabels: Record<string, string> = {
     smart: 'Smart',
     large: 'Large',
@@ -255,7 +256,7 @@
     deep: 'Deep',
     frontier: 'Frontier',
     nostromo: 'Nostromo',
-    'agg-man': 'Agg-man'
+    'agg-man': 'Agg'
   };
   const reasoningEffortLabels: Record<string, string> = {
     none: 'None',
@@ -4379,7 +4380,7 @@
                       </button>
                       {#if settingsMenuOpen === 'mode'}
                         <div class="composer-menu__panel" role="menu" aria-label="Agent mode">
-                          {#each agentModeOptions as mode}
+                          {#each visibleAgentModeOptions as mode}
                             <button
                               class:composer-menu__item--active={currentComposerMode() === mode}
                               class="composer-menu__item"
