@@ -11656,7 +11656,7 @@ func inferNeoOpenAIResponses(rt *neoRuntime, request neoInferenceRequest, route 
 	if err := neoOpenAIResponsesStatusError(jsonBody); err != nil {
 		return neoInferenceResult{}, err
 	}
-	return parseNeoOpenAIResponsesResult(jsonBody, route, request.Tools), nil
+	return parseNeoOpenAIResponsesResult(jsonBody, route, request.Tools)
 }
 
 func inferNeoOpenAIChat(rt *neoRuntime, request neoInferenceRequest, route neoModelRoute) (neoInferenceResult, error) {
@@ -12199,7 +12199,8 @@ func inferNeoOpenAIResponsesStream(rt *neoRuntime, request neoInferenceRequest, 
 		case "response.output_item.added":
 			index := numberFrom(payload["output_index"])
 			item := mapValue(payload["item"])
-			switch stringValue(item["type"]) {
+			itemType := stringValue(item["type"])
+			switch itemType {
 			case "function_call":
 				call := ensureToolCall(index)
 				if call.id == "" {
@@ -12231,11 +12232,16 @@ func inferNeoOpenAIResponsesStream(rt *neoRuntime, request neoInferenceRequest, 
 				block := ensureThinkingBlock(index)
 				block.signature = stringValue(item["encrypted_content"])
 				block.id = stringValue(item["id"])
+			default:
+				if neoUnsupportedOpenAIResponsesOutputType(itemType) {
+					return neoUnsupportedOpenAIResponsesOutputError(itemType)
+				}
 			}
 		case "response.output_item.done":
 			index := numberFrom(payload["output_index"])
 			item := mapValue(payload["item"])
-			switch stringValue(item["type"]) {
+			itemType := stringValue(item["type"])
+			switch itemType {
 			case "function_call":
 				call := ensureToolCall(index)
 				if call.id == "" {
@@ -12268,6 +12274,10 @@ func inferNeoOpenAIResponsesStream(rt *neoRuntime, request neoInferenceRequest, 
 					if text := stringValue(part["text"]); text != "" && block.text.Len() == 0 {
 						block.text.WriteString(text)
 					}
+				}
+			default:
+				if neoUnsupportedOpenAIResponsesOutputType(itemType) {
+					return neoUnsupportedOpenAIResponsesOutputError(itemType)
 				}
 			}
 		case "response.function_call_arguments.delta":
@@ -12322,7 +12332,10 @@ func inferNeoOpenAIResponsesStream(rt *neoRuntime, request neoInferenceRequest, 
 		return neoInferenceResult{}, err
 	}
 	if !sawContent && len(completedResponse) > 0 {
-		result := parseNeoOpenAIResponsesResult(completedResponse, route, request.Tools)
+		result, err := parseNeoOpenAIResponsesResult(completedResponse, route, request.Tools)
+		if err != nil {
+			return neoInferenceResult{}, err
+		}
 		if result.Text != "" || len(result.ToolCalls) > 0 || len(result.ThinkingBlocks) > 0 {
 			return result, nil
 		}
@@ -15439,14 +15452,15 @@ func neoApplyOpenAIResponsesReasoning(body map[string]any, route neoModelRoute, 
 	body["temperature"] = 0.1
 }
 
-func parseNeoOpenAIResponsesResult(jsonBody map[string]any, route neoModelRoute, tools []neoToolSpec) neoInferenceResult {
+func parseNeoOpenAIResponsesResult(jsonBody map[string]any, route neoModelRoute, tools []neoToolSpec) (neoInferenceResult, error) {
 	var text strings.Builder
 	toolCalls := make([]neoToolCall, 0)
 	thinkingBlocks := make([]neoThinkingBlock, 0)
 	customTools := neoOpenAICustomToolConfigByName(tools)
 	for i, raw := range arrayValue(jsonBody["output"]) {
 		item := mapValue(raw)
-		switch stringValue(item["type"]) {
+		itemType := stringValue(item["type"])
+		switch itemType {
 		case "message":
 			for _, rawContent := range arrayValue(item["content"]) {
 				content := mapValue(rawContent)
@@ -15507,9 +15521,34 @@ func parseNeoOpenAIResponsesResult(jsonBody map[string]any, route neoModelRoute,
 			if !added && signature != "" {
 				thinkingBlocks = append(thinkingBlocks, neoThinkingBlock{Signature: signature})
 			}
+		default:
+			if neoUnsupportedOpenAIResponsesOutputType(itemType) {
+				return neoInferenceResult{}, neoUnsupportedOpenAIResponsesOutputError(itemType)
+			}
 		}
 	}
-	return neoInferenceResult{Provider: route.Provider, Model: route.Model, Text: text.String(), ToolCalls: toolCalls, Usage: mapValue(jsonBody["usage"]), ThinkingBlocks: thinkingBlocks}
+	return neoInferenceResult{Provider: route.Provider, Model: route.Model, Text: text.String(), ToolCalls: toolCalls, Usage: mapValue(jsonBody["usage"]), ThinkingBlocks: thinkingBlocks}, nil
+}
+
+func neoUnsupportedOpenAIResponsesOutputType(itemType string) bool {
+	switch itemType {
+	case "file_search_call",
+		"web_search_call",
+		"computer_call",
+		"image_generation_call",
+		"code_interpreter_call",
+		"local_shell_call",
+		"mcp_call",
+		"mcp_list_tools",
+		"mcp_approval_request":
+		return true
+	default:
+		return false
+	}
+}
+
+func neoUnsupportedOpenAIResponsesOutputError(itemType string) error {
+	return fmt.Errorf("unsupported content block type %s", itemType)
 }
 
 func isNeoOpenAIResponsesUnsupportedError(err error) bool {

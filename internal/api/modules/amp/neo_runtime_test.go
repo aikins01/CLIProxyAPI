@@ -4664,7 +4664,7 @@ func TestOpenAIResponsesNeoInputReplaysCustomToolCalls(t *testing.T) {
 }
 
 func TestParseNeoOpenAIResponsesResultCustomToolCall(t *testing.T) {
-	result := parseNeoOpenAIResponsesResult(map[string]any{
+	result, err := parseNeoOpenAIResponsesResult(map[string]any{
 		"output": []any{map[string]any{
 			"type":    "custom_tool_call",
 			"call_id": "TU-patch",
@@ -4675,6 +4675,9 @@ func TestParseNeoOpenAIResponsesResultCustomToolCall(t *testing.T) {
 		Name:                   "apply_patch",
 		OpenAICustomToolConfig: map[string]any{"type": "custom", "inputField": "patchText"},
 	}})
+	if err != nil {
+		t.Fatalf("parseNeoOpenAIResponsesResult error: %v", err)
+	}
 
 	if len(result.ToolCalls) != 1 {
 		t.Fatalf("tool calls = %#v, want one", result.ToolCalls)
@@ -4880,8 +4883,53 @@ func TestInferNeoOpenAIResponsesStreamRejectsIncompleteStatus(t *testing.T) {
 	}
 }
 
+func TestInferNeoOpenAIResponsesErrorsOnUnsupportedOutputItem(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/provider/openai/v1/responses" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"output":[{"type":"image_generation_call","id":"ig_1"}]}`))
+	}))
+	defer upstream.Close()
+
+	_, err := inferNeoLocal(testNeoRuntimeForServer(t, upstream), neoInferenceRequest{
+		ThreadID:        "T-test",
+		AgentMode:       "deep",
+		ReasoningEffort: "xhigh",
+		Settings:        map[string]any{"internal.model": "openai/gpt-test"},
+		History:         []neoHistoryMessage{{Role: "user", Text: "hi"}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "unsupported content block type image_generation_call") {
+		t.Fatalf("error = %v, want unsupported image_generation_call", err)
+	}
+}
+
+func TestInferNeoOpenAIResponsesStreamErrorsOnUnsupportedOutputItem(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/provider/openai/v1/responses" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"computer_call\",\"id\":\"comp_1\"}}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	_, err := inferNeoLocalStream(testNeoRuntimeForServer(t, upstream), neoInferenceRequest{
+		ThreadID:        "T-test",
+		AgentMode:       "deep",
+		ReasoningEffort: "xhigh",
+		Settings:        map[string]any{"internal.model": "openai/gpt-test"},
+		History:         []neoHistoryMessage{{Role: "user", Text: "hi"}},
+	}, nil)
+	if err == nil || !strings.Contains(err.Error(), "unsupported content block type computer_call") {
+		t.Fatalf("error = %v, want unsupported computer_call", err)
+	}
+}
+
 func TestParseNeoOpenAIResponsesResultReadsReasoningTextContent(t *testing.T) {
-	result := parseNeoOpenAIResponsesResult(map[string]any{
+	result, err := parseNeoOpenAIResponsesResult(map[string]any{
 		"output": []any{map[string]any{
 			"type":              "reasoning",
 			"encrypted_content": "sig",
@@ -4891,6 +4939,9 @@ func TestParseNeoOpenAIResponsesResultReadsReasoningTextContent(t *testing.T) {
 			}},
 		}},
 	}, neoModelRoute{Provider: "openai", Model: "gpt-5.5"}, nil)
+	if err != nil {
+		t.Fatalf("parseNeoOpenAIResponsesResult error: %v", err)
+	}
 
 	if len(result.ThinkingBlocks) != 1 || result.ThinkingBlocks[0].Thinking != "reasoned from content" || result.ThinkingBlocks[0].Signature != "sig" {
 		t.Fatalf("thinking blocks = %#v", result.ThinkingBlocks)
