@@ -4662,8 +4662,8 @@ func TestNeoActorRebuildHistoryIncludesManualBashInvocation(t *testing.T) {
 		Role:      "info",
 		Content: []any{map[string]any{
 			"type":    "manual_bash_invocation",
-			"args":    map[string]any{"cmd": "git", "args": []any{"status", "--short"}},
-			"toolRun": map[string]any{"status": "done", "result": " M internal/api/modules/amp/neo_runtime.go"},
+			"args":    map[string]any{"cmd": "git status --short", "cwd": "/tmp/work"},
+			"toolRun": map[string]any{"status": "done", "result": map[string]any{"output": " M internal/api/modules/amp/neo_runtime.go", "exitCode": 0}},
 		}},
 	}}
 	actor.rebuildHistoryLocked()
@@ -4673,11 +4673,36 @@ func TestNeoActorRebuildHistoryIncludesManualBashInvocation(t *testing.T) {
 	if len(history) != 1 {
 		t.Fatalf("history = %#v", history)
 	}
-	if history[0].Role != "user" || !strings.Contains(history[0].Text, "Command: git status --short") || !strings.Contains(history[0].Text, "Output:\n M internal/api/modules/amp/neo_runtime.go") {
+	if history[0].Role != "user" || !strings.Contains(history[0].Text, neoManualBashHistoryReminder) || !strings.Contains(history[0].Text, "<command>git status --short</command>") || !strings.Contains(history[0].Text, "<working_directory>/tmp/work</working_directory>") || !strings.Contains(history[0].Text, "<output> M internal/api/modules/amp/neo_runtime.go</output>") || !strings.Contains(history[0].Text, "<exit_code>0</exit_code>") {
 		t.Fatalf("manual bash history = %#v", history[0])
 	}
-	if len(history[0].Content) != 1 || stringValue(mapValue(history[0].Content[0])["text"]) != history[0].Text {
+	if len(history[0].Content) != 2 || stringValue(mapValue(history[0].Content[0])["text"]) != neoManualBashHistoryReminder || !strings.Contains(stringValue(mapValue(history[0].Content[1])["text"]), "<command>git status --short</command>") {
 		t.Fatalf("manual bash history content = %#v", history[0].Content)
+	}
+}
+
+func TestNeoActorRebuildHistorySkipsHiddenManualBashInvocationLikeBinary(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+
+	actor.mu.Lock()
+	actor.messages = []neoMessage{{
+		ThreadID:  "T-test",
+		MessageID: "M-hidden",
+		Role:      "info",
+		Content: []any{map[string]any{
+			"type":    "manual_bash_invocation",
+			"args":    map[string]any{"cmd": "git status"},
+			"toolRun": map[string]any{"status": "done", "result": map[string]any{"output": "clean", "exitCode": 0}},
+			"hidden":  true,
+		}},
+	}}
+	actor.rebuildHistoryLocked()
+	history := append([]neoHistoryMessage(nil), actor.history...)
+	actor.mu.Unlock()
+
+	if len(history) != 0 {
+		t.Fatalf("history = %#v, want hidden manual bash skipped", history)
 	}
 }
 

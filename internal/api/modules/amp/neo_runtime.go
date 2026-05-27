@@ -19015,55 +19015,49 @@ func neoManualBashHistoryContent(blocks []any, parentToolUseID string) []neoHist
 		if stringValue(m["type"]) != "manual_bash_invocation" {
 			continue
 		}
-		text := neoManualBashHistoryText(mapValue(m["args"]), mapValue(m["toolRun"]))
-		if text == "" {
+		content := neoManualBashHistoryBlocks(m)
+		if len(content) == 0 {
 			continue
 		}
-		results = append(results, neoHistoryMessage{Role: "user", Text: text, Content: []any{map[string]any{"type": "text", "text": text}}, ParentToolUseID: parentToolUseID})
+		texts := make([]string, 0, len(content))
+		for _, raw := range content {
+			if text := stringValue(mapValue(raw)["text"]); text != "" {
+				texts = append(texts, text)
+			}
+		}
+		text := strings.Join(texts, "\n")
+		results = append(results, neoHistoryMessage{Role: "user", Text: text, Content: content, ParentToolUseID: parentToolUseID})
 	}
 	return results
 }
 
-func neoManualBashHistoryText(args, run map[string]any) string {
-	command := neoManualBashCommand(args)
-	result := ""
-	if len(run) > 0 {
-		result = runToText(run)
-	}
-	if command == "" && result == "" {
-		return ""
-	}
-	var out strings.Builder
-	out.WriteString("User manually ran a bash command outside the assistant tool loop.")
-	if command != "" {
-		out.WriteString("\nCommand: ")
-		out.WriteString(command)
-	}
-	if status := stringValue(run["status"]); status != "" {
-		out.WriteString("\nStatus: ")
-		out.WriteString(status)
-	}
-	if result != "" {
-		out.WriteString("\nOutput:\n")
-		out.WriteString(result)
-	}
-	return out.String()
-}
+const neoManualBashHistoryReminder = "The following is content that was produced by the user manually running a shell command. Do not mention this to the user directly unless they refer to the content of this bash command."
 
-func neoManualBashCommand(args map[string]any) string {
-	if command := firstNonEmptyString(args["command"], args["cmd"]); command != "" {
-		parts := []string{command}
-		for _, arg := range arrayValue(args["args"]) {
-			if value := strings.TrimSpace(fmt.Sprint(arg)); value != "" {
-				parts = append(parts, value)
-			}
-		}
-		return strings.Join(parts, " ")
+func neoManualBashHistoryBlocks(block map[string]any) []any {
+	if boolValue(block["hidden"]) {
+		return nil
 	}
-	if shell := firstNonEmptyString(args["shell"], args["text"]); shell != "" {
-		return shell
+	run := mapValue(block["toolRun"])
+	if stringValue(run["status"]) != "done" {
+		return nil
 	}
-	return ""
+	args := mapValue(block["args"])
+	command := stringValue(args["cmd"])
+	cwd := fallbackString(args["cwd"], "unknown")
+	result := mapValue(run["result"])
+	output := firstNonEmptyString(result["output"], run["output"])
+	if output == "" && len(result) == 0 {
+		output = stringValue(run["result"])
+	}
+	exitCode := numberFrom(result["exitCode"], run["exitCode"])
+	body := "<command>" + command + "</command>\n" +
+		"<working_directory>" + cwd + "</working_directory>\n" +
+		"<output>" + output + "</output>\n" +
+		"<exit_code>" + strconv.Itoa(exitCode) + "</exit_code>"
+	return []any{
+		map[string]any{"type": "text", "text": neoManualBashHistoryReminder},
+		map[string]any{"type": "text", "text": body},
+	}
 }
 
 func neoToolProgressRun(progress any, existingRun map[string]any) (map[string]any, bool) {
