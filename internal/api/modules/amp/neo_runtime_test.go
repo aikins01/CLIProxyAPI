@@ -9770,6 +9770,63 @@ func useTempNeoThreadStore(t *testing.T) {
 	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
 }
 
+func TestNeoLocalThreadLoadDropsStaleCurrentInference(t *testing.T) {
+	useTempNeoThreadStore(t)
+	threadID := "T-019e6541-06ae-75d7-b10e-d893170fa62c"
+	raw := []byte(`{
+		"id": "` + threadID + `",
+		"agentMode": "deep",
+		"messages": [
+			{"messageId": "M-existing", "role": "user", "content": [{"type": "text", "text": "hello"}]}
+		],
+		"currentInference": {"messageId": "M-missing", "agentMode": "deep", "tools": ["shell_command"]}
+	}`)
+	path := filepath.Join(neoAmpThreadStoreDir(), threadID+".json")
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatalf("write thread: %v", err)
+	}
+
+	thread, ok := loadNeoLocalThread(threadID)
+	if !ok {
+		t.Fatal("thread was not loaded")
+	}
+	if _, exists := thread["currentInference"]; exists {
+		t.Fatalf("currentInference was not dropped: %#v", thread["currentInference"])
+	}
+	persistedRaw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read persisted thread: %v", err)
+	}
+	var persisted map[string]any
+	if err := json.Unmarshal(persistedRaw, &persisted); err != nil {
+		t.Fatalf("decode persisted thread: %v", err)
+	}
+	if _, exists := persisted["currentInference"]; exists {
+		t.Fatalf("stale currentInference was re-cached: %#v", persisted["currentInference"])
+	}
+}
+
+func TestNeoActorThreadSnapshotDropsStaleCurrentInference(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	actor.messages = []neoMessage{{ThreadID: "T-test", MessageID: "M-existing", Role: "user", Content: []any{map[string]any{"type": "text", "text": "hello"}}, Seq: 1}}
+	actor.currentInference = &neoInferenceInflight{messageID: "M-missing", agentMode: "deep", tools: []string{"shell_command"}}
+
+	snapshot, ok := actor.threadSnapshot()
+	if !ok {
+		t.Fatal("snapshot failed")
+	}
+	if snapshot.currentInference != nil {
+		t.Fatalf("snapshot currentInference = %#v, want nil", snapshot.currentInference)
+	}
+	if actor.currentInference != nil {
+		t.Fatalf("actor currentInference = %#v, want nil", actor.currentInference)
+	}
+	if thread := neoCloudThread(snapshot); thread["currentInference"] != nil {
+		t.Fatalf("cloud thread retained currentInference: %#v", thread["currentInference"])
+	}
+}
+
 func TestNeoActorThreadSnapshotIncludesQueuedMessages(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)

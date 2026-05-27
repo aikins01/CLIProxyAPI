@@ -6566,6 +6566,9 @@ func (a *neoActor) threadSnapshot() (neoCloudThreadSnapshot, bool) {
 	}
 	messages := cloneNeoMessages(a.messages)
 	var inflight *neoInferenceInflight
+	if a.currentInference != nil && a.messageIndexLocked(a.currentInference.messageID) < 0 {
+		a.currentInference = nil
+	}
 	if a.currentInference != nil {
 		clone := *a.currentInference
 		clone.tools = append([]string(nil), a.currentInference.tools...)
@@ -7959,6 +7962,9 @@ func loadNeoLocalThread(threadID string) (map[string]any, bool) {
 	if normalizeNeoThreadAgentMode(thread) {
 		changed = true
 	}
+	if normalizeNeoThreadCurrentInference(thread) {
+		changed = true
+	}
 	if changed {
 		cacheNeoLocalThread(thread)
 	}
@@ -8890,6 +8896,7 @@ func loadNeoThread(ctx context.Context, cfg *config.Config, threadID string) (ma
 		}
 		if ok {
 			normalizeNeoThreadAgentMode(cloud)
+			normalizeNeoThreadCurrentInference(cloud)
 			if preferNeoIncomingThread(local, cloud) {
 				cacheNeoLocalThread(cloud)
 				return cloud, true
@@ -8990,6 +8997,7 @@ func cacheNeoLocalThread(thread map[string]any) {
 	}
 	normalizeNeoThreadOwnership(thread)
 	normalizeNeoThreadAgentMode(thread)
+	normalizeNeoThreadCurrentInference(thread)
 	dir := neoAmpThreadStoreDir()
 	if dir == "" {
 		return
@@ -9045,6 +9053,45 @@ func normalizeNeoThreadAgentMode(thread map[string]any) bool {
 		changed = true
 	}
 	return changed
+}
+
+func normalizeNeoThreadCurrentInference(thread map[string]any) bool {
+	if len(thread) == 0 {
+		return false
+	}
+	changed := false
+	if data := mapValue(thread["data"]); len(data) > 0 {
+		if normalizeNeoThreadCurrentInference(data) {
+			thread["data"] = data
+			changed = true
+		}
+	}
+	inference := mapValue(thread["currentInference"])
+	if len(inference) == 0 {
+		return changed
+	}
+	messageID := firstNonEmptyString(inference["messageId"], inference["messageID"], inference["protocolMessageID"])
+	if messageID == "" || !neoThreadContainsMessageID(thread, messageID) {
+		delete(thread, "currentInference")
+		changed = true
+	}
+	return changed
+}
+
+func neoThreadContainsMessageID(thread map[string]any, messageID string) bool {
+	if strings.TrimSpace(messageID) == "" {
+		return false
+	}
+	for _, raw := range arrayValue(thread["messages"]) {
+		message := mapValue(raw)
+		if firstNonEmptyString(message["messageId"], message["messageID"], message["protocolMessageID"], message["id"]) == messageID {
+			return true
+		}
+	}
+	if data := mapValue(thread["data"]); len(data) > 0 {
+		return neoThreadContainsMessageID(data, messageID)
+	}
+	return false
 }
 
 func neoThreadMapAgentMode(thread map[string]any) string {
@@ -9411,7 +9458,7 @@ func neoCloudThread(snapshot neoCloudThreadSnapshot) map[string]any {
 	if len(snapshot.debug) > 0 {
 		thread["~debug"] = cloneMap(snapshot.debug)
 	}
-	if snapshot.currentInference != nil {
+	if snapshot.currentInference != nil && neoMessagesContainID(messages, snapshot.currentInference.messageID) {
 		toolsList := make([]any, 0, len(snapshot.currentInference.tools))
 		for _, name := range snapshot.currentInference.tools {
 			toolsList = append(toolsList, name)
@@ -9425,6 +9472,18 @@ func neoCloudThread(snapshot neoCloudThreadSnapshot) map[string]any {
 		}
 	}
 	return thread
+}
+
+func neoMessagesContainID(messages []neoMessage, messageID string) bool {
+	if strings.TrimSpace(messageID) == "" {
+		return false
+	}
+	for _, message := range messages {
+		if message.MessageID == messageID {
+			return true
+		}
+	}
+	return false
 }
 
 func neoThreadActorImportedMeta(meta map[string]any) map[string]any {
@@ -10310,6 +10369,9 @@ func (a *neoActor) sendSnapshot(socket *neoSocket, sinceSeq int) {
 	spawnedExecutorStatuses := a.spawnedExecutorStatusListLocked()
 	relationships := a.threadRelationshipsLocked(allMessages)
 	var inflightInference *neoInferenceInflight
+	if a.currentInference != nil && a.messageIndexLocked(a.currentInference.messageID) < 0 {
+		a.currentInference = nil
+	}
 	if a.currentInference != nil {
 		clone := *a.currentInference
 		clone.tools = append([]string(nil), a.currentInference.tools...)
