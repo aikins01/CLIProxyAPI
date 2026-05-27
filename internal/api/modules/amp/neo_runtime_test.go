@@ -4117,6 +4117,31 @@ func TestNeoSystemPromptIncludesSkillNames(t *testing.T) {
 	}
 }
 
+func TestNeoSystemPromptUsesCustomSystemPromptSettingAsBase(t *testing.T) {
+	prompt := neoSystemPrompt(neoInferenceRequest{
+		AgentMode: "deep",
+		Settings:  map[string]any{"systemPrompt": "Custom base prompt for this SDK actor."},
+		Environment: map[string]any{
+			"isLocalClientActorThread": true,
+		},
+		Tools: []neoToolSpec{
+			{Name: "skill", Meta: map[string]any{"skillNames": []any{"code-review"}}},
+		},
+	}, neoModelRoute{Provider: "openai", Model: "gpt-5.5"})
+
+	if !strings.HasPrefix(prompt, "Custom base prompt for this SDK actor.") {
+		t.Fatalf("custom prompt was not used as the base:\n%s", prompt)
+	}
+	if strings.Contains(prompt, "You are Amp, an autonomous coding agent") {
+		t.Fatalf("built-in base prompt was not replaced:\n%s", prompt)
+	}
+	for _, want := range []string{"### Available skills", "- code-review:", "the user's Amp client went offline"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("custom prompt assembly missing %q:\n%s", want, prompt)
+		}
+	}
+}
+
 func TestNeoSystemPromptUsesRushModeInstructions(t *testing.T) {
 	prompt := neoSystemPrompt(neoInferenceRequest{AgentMode: "rush"}, neoModelRoute{Provider: "openai", Model: "gpt-5.5"})
 	for _, want := range []string{"fewest useful tool loops", "## Contract", "## Operating Mode", "## Discovery", "# File Links", "Speed and low token use are the priority"} {
@@ -6781,6 +6806,54 @@ func TestInferNeoAnthropicStreamsTextAndToolCalls(t *testing.T) {
 	}
 	if len(result.ToolCalls) != 1 || result.ToolCalls[0].Name != "shell_command" || stringValue(result.ToolCalls[0].Input["cmd"]) != "pwd" {
 		t.Fatalf("tool calls = %#v", result.ToolCalls)
+	}
+}
+
+func TestInferNeoGoogleUsesGeminiThinkingLevelSetting(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/provider/google/v1beta/models/gemini-3-pro:generateContent" {
+			t.Fatalf("provider path = %s", r.URL.Path)
+		}
+		payload := readNeoJSON(r.Body)
+		thinkingConfig := mapValue(mapValue(payload["generationConfig"])["thinkingConfig"])
+		if got := numberFrom(thinkingConfig["thinkingBudget"]); got != 8192 {
+			t.Fatalf("thinkingBudget = %d, want 8192; payload=%#v", got, payload)
+		}
+		writeNeoJSON(w, http.StatusOK, map[string]any{
+			"candidates": []any{map[string]any{
+				"content": map[string]any{"parts": []any{map[string]any{"text": "ok"}}},
+			}},
+		})
+	}))
+	defer upstream.Close()
+
+	result, err := inferNeoGoogle(testNeoRuntimeForServer(t, upstream), neoInferenceRequest{
+		ThreadID: "T-test",
+		Settings: map[string]any{
+			"gemini.thinkingLevel": "medium",
+		},
+		History: []neoHistoryMessage{{Role: "user", Text: "hi"}},
+	}, neoModelRoute{Provider: "google", Model: "gemini-3-pro"})
+	if err != nil {
+		t.Fatalf("inferNeoGoogle error: %v", err)
+	}
+	if result.Text != "ok" {
+		t.Fatalf("result text = %q", result.Text)
+	}
+}
+
+func TestNeoGoogleThinkingFallbackPrefersValidReasoningEffort(t *testing.T) {
+	if got := neoGoogleThinkingFallback(neoInferenceRequest{
+		ReasoningEffort: "none",
+		Settings:        map[string]any{"gemini.thinkingLevel": "medium"},
+	}); got != "none" {
+		t.Fatalf("fallback = %q, want none", got)
+	}
+	if got := neoGoogleThinkingFallback(neoInferenceRequest{
+		ReasoningEffort: "ultra",
+		Settings:        map[string]any{"gemini.thinkingLevel": "medium"},
+	}); got != "medium" {
+		t.Fatalf("fallback = %q, want medium", got)
 	}
 }
 

@@ -13471,7 +13471,7 @@ func inferNeoGoogle(rt *neoRuntime, request neoInferenceRequest, route neoModelR
 	if len(request.Tools) > 0 {
 		body["tools"] = []any{map[string]any{"functionDeclarations": googleNeoTools(request.Tools)}}
 	}
-	neoApplyGoogleThinking(body, route, request.ReasoningEffort)
+	neoApplyGoogleThinking(body, route, neoGoogleThinkingFallback(request))
 	subpath := "/v1beta/models/" + url.PathEscape(route.Model) + ":generateContent"
 	jsonBody, err := callNeoLocalProvider(rt, "google", subpath, body, request.ThreadID)
 	if err != nil {
@@ -14280,7 +14280,7 @@ func inferNeoGoogleStream(rt *neoRuntime, request neoInferenceRequest, route neo
 	if len(request.Tools) > 0 {
 		body["tools"] = []any{map[string]any{"functionDeclarations": googleNeoTools(request.Tools)}}
 	}
-	neoApplyGoogleThinking(body, route, request.ReasoningEffort)
+	neoApplyGoogleThinking(body, route, neoGoogleThinkingFallback(request))
 
 	subpath := "/v1beta/models/" + url.PathEscape(route.Model) + ":streamGenerateContent?alt=sse"
 	var fullText strings.Builder
@@ -15776,6 +15776,9 @@ func neoSendMessageToThreadWorkflowGuidance() string {
 }
 
 func neoBasePrompt(request neoInferenceRequest, route neoModelRoute) string {
+	if custom := strings.TrimSpace(stringValue(request.Settings["systemPrompt"])); custom != "" {
+		return custom
+	}
 	switch neoPromptFamily(request.AgentMode, route) {
 	case neoPromptFamilyRush:
 		return neoUpstreamPrompt(neoPromptFamilyRush, neoPromptFamilyRushGzip, neoRushPrompt)
@@ -17183,6 +17186,32 @@ func neoApplyGoogleThinking(body map[string]any, route neoModelRoute, fallback s
 	if suffix == "" {
 		return
 	}
+	budget, resolved := neoGoogleThinkingBudget(suffix)
+	if !resolved {
+		return
+	}
+	gen := mapValue(body["generationConfig"])
+	if gen == nil {
+		gen = map[string]any{}
+	}
+	gen["thinkingConfig"] = map[string]any{"thinkingBudget": budget}
+	body["generationConfig"] = gen
+}
+
+func neoGoogleThinkingFallback(request neoInferenceRequest) string {
+	for _, candidate := range []string{request.ReasoningEffort, stringValue(request.Settings["gemini.thinkingLevel"])} {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			continue
+		}
+		if _, ok := neoGoogleThinkingBudget(candidate); ok {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func neoGoogleThinkingBudget(suffix string) (int, bool) {
 	budget := 0
 	resolved := false
 	if v, ok := thinking.ParseNumericSuffix(suffix); ok {
@@ -17197,15 +17226,7 @@ func neoApplyGoogleThinking(body map[string]any, route neoModelRoute, fallback s
 	} else if v, ok := thinking.ConvertLevelToBudget(suffix); ok {
 		budget, resolved = v, true
 	}
-	if !resolved {
-		return
-	}
-	gen := mapValue(body["generationConfig"])
-	if gen == nil {
-		gen = map[string]any{}
-	}
-	gen["thinkingConfig"] = map[string]any{"thinkingBudget": budget}
-	body["generationConfig"] = gen
+	return budget, resolved
 }
 
 // neoApplyOpenAIReasoning sets reasoning_effort on an OpenAI chat-completions
