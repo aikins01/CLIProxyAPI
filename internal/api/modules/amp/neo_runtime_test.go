@@ -7021,7 +7021,7 @@ func TestNeoActorHandlesBinaryQueueDeltas(t *testing.T) {
 		t.Fatalf("queue = %#v", actor.queue)
 	}
 	queued := actor.queue[0]
-	if queued.ID == "" || queued.ID == queued.MessageID || textFromBlocks(queued.Content) != "queued" || queued.AgentMode != "deep" {
+	if queued.ID != "queued-1" || queued.ID == queued.MessageID || textFromBlocks(queued.Content) != "queued" || queued.AgentMode != "deep" {
 		t.Fatalf("queued item = %#v", queued)
 	}
 	queueProtocol := queued.queueProtocol()
@@ -7115,6 +7115,31 @@ func TestNeoActorBinaryQueueEnqueueCapsAndDoesNotAutoRun(t *testing.T) {
 	}
 }
 
+func TestNeoActorBinaryQueueEnqueueIgnoresInboundWrapperID(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+
+	actor.handle(map[string]any{
+		"type": "user:message-queue:enqueue",
+		"id":   "queued-client",
+		"message": map[string]any{
+			"messageId": "M-client",
+			"content":   []any{map[string]any{"type": "text", "text": "queued"}},
+		},
+	})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.queue) != 1 {
+		t.Fatalf("queue = %#v", actor.queue)
+	}
+	queued := actor.queue[0]
+	if queued.ID != "queued-1" || queued.MessageID == "M-client" {
+		t.Fatalf("queued item = %#v, want binary-owned wrapper and message ids", queued)
+	}
+}
+
 func TestNeoActorBinaryQueueDequeueDoesNotRequireExecutorReady(t *testing.T) {
 	useTempNeoThreadStore(t)
 	rt := newNeoRuntime(&config.Config{})
@@ -7197,15 +7222,16 @@ func TestNeoActorQueuedRemovalEventUsesQueuedMessageID(t *testing.T) {
 	added := waitForNeoMessageType(t, conn, "queued_message_added", 2*time.Second)
 	item := mapValue(added["message"])
 	queuedMessage := mapValue(item["queuedMessage"])
-	if got := stringValue(item["id"]); got != "queued-wrapper" {
-		t.Fatalf("queued wrapper id = %q, want queued-wrapper: %#v", got, added)
+	wrapperID := stringValue(item["id"])
+	if wrapperID != "queued-1" {
+		t.Fatalf("queued wrapper id = %q, want binary-owned queued-1: %#v", wrapperID, added)
 	}
 	messageID := stringValue(queuedMessage["messageId"])
 	if messageID == "" || messageID == "queued-wrapper" {
 		t.Fatalf("queued message id = %q, wrapper=%q: %#v", messageID, stringValue(item["id"]), added)
 	}
 
-	if err := conn.WriteJSON(map[string]any{"type": "client_remove_queued_msg", "queuedMessageId": "queued-wrapper"}); err != nil {
+	if err := conn.WriteJSON(map[string]any{"type": "client_remove_queued_msg", "queuedMessageId": wrapperID}); err != nil {
 		t.Fatalf("write remove queued: %v", err)
 	}
 	removed := waitForNeoMessageType(t, conn, "queued_message_removed", 2*time.Second)
@@ -7240,6 +7266,10 @@ func TestNeoActorQueuedDequeueEventUsesQueuedMessageID(t *testing.T) {
 	}
 
 	added := waitForNeoMessageType(t, conn, "queued_message_added", 2*time.Second)
+	item := mapValue(added["message"])
+	if got := stringValue(item["id"]); got != "queued-1" {
+		t.Fatalf("queued wrapper id = %q, want binary-owned queued-1: %#v", got, added)
+	}
 	messageID := stringValue(mapValue(mapValue(added["message"])["queuedMessage"])["messageId"])
 	if messageID == "" || messageID == "queued-wrapper" {
 		t.Fatalf("queued message id = %q: %#v", messageID, added)

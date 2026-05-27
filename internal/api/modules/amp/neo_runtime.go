@@ -4239,6 +4239,9 @@ func neoQueuedMessageFromBinaryDelta(msg map[string]any, queue bool) neoQueuedMe
 		messageID = newNeoMessageID()
 	}
 	queueID := firstNonEmptyString(msg["id"], msg["queuedMessageId"], msg["queuedMessageID"])
+	if msg["type"] == "user:message-queue:enqueue" {
+		queueID = ""
+	}
 	content := neoContentFromBinaryValue(firstNonNil(source["content"], msg["content"], source["text"], msg["text"]))
 	createdAt := stringValue(source["createdAt"])
 	if createdAt == "" {

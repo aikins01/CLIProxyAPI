@@ -1052,7 +1052,6 @@
       return;
     }
     const messageId = `M-local-${crypto.randomUUID()}`;
-    const queueID = `queued-${crypto.randomUUID()}`;
     const content: ContentBlock[] = [
       ...(text ? [{ type: 'text', text }] : []),
       ...imageBlocks
@@ -1073,19 +1072,7 @@
       agentMode,
       reasoningEffort
     };
-    if (shouldQueue) {
-      const queued = queuedMessageFromAny({
-        id: queueID,
-        queuedMessage: {
-          messageId,
-          content,
-          agentMode,
-          reasoningEffort
-        }
-      });
-      queuedMessages = [...queuedMessages.filter((item) => !sameQueuedMessage(item, queued)), queued];
-      queuedCount = queuedMessages.length;
-    } else {
+    if (!shouldQueue) {
       detail = { ...thread, messages: [...thread.messages, message] };
     }
     composer = '';
@@ -1094,7 +1081,6 @@
     if (shouldQueue) {
       sendFrame({
         type: 'user:message-queue:enqueue',
-        id: queueID,
         message: {
           content,
           agentMode,
