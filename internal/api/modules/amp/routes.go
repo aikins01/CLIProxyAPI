@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -436,6 +437,11 @@ var neoLocalInternalMethods = []string{
 	"setThreadLabels",
 	"addThreadLabels",
 	"getUserLabels",
+	"createTask",
+	"getTask",
+	"listTasks",
+	"updateTask",
+	"deleteTask",
 	"notices",
 	"logNoticeAction",
 	"markAsReadMysteriousMessage",
@@ -518,6 +524,16 @@ func neoLocalInternalResponse(ctx context.Context, cfg *config.Config, r *http.R
 		return neoLocalSetThreadLabelsResponse(ctx, cfg, r, true)
 	case "getUserLabels":
 		return neoLocalGetUserLabelsResponse(r)
+	case "createTask":
+		return neoLocalCreateTaskResponse(r)
+	case "getTask":
+		return neoLocalGetTaskResponse(r)
+	case "listTasks":
+		return neoLocalListTasksResponse(r)
+	case "updateTask":
+		return neoLocalUpdateTaskResponse(r)
+	case "deleteTask":
+		return neoLocalDeleteTaskResponse(r)
 	case "notices":
 		return gin.H{"ok": true, "result": []any{}}
 	case "logNoticeAction", "markAsReadMysteriousMessage":
@@ -759,8 +775,307 @@ func neoLocalGetUserLabelsResponse(r *http.Request) gin.H {
 	return gin.H{"ok": true, "result": neoThreadLabelObjects(names)}
 }
 
+func neoLocalCreateTaskResponse(r *http.Request) gin.H {
+	params := neoLocalInternalParams(r)
+	title := strings.TrimSpace(stringValue(params["title"]))
+	if title == "" {
+		return neoLocalTaskError("invalid-request", "title is required")
+	}
+	neoAmpTaskStoreMu.Lock()
+	defer neoAmpTaskStoreMu.Unlock()
+
+	tasks, err := loadNeoLocalTasksLocked()
+	if err != nil {
+		return neoLocalTaskError("task-store-read-failed", err.Error())
+	}
+	now := time.Now().UTC()
+	task := map[string]any{
+		"id":          newNeoLocalTaskID(tasks),
+		"title":       title,
+		"description": stringValue(params["description"]),
+		"repoURL":     stringValue(params["repoURL"]),
+		"status":      normalizeNeoLocalTaskStatus(firstNonEmptyString(params["status"], "open")),
+		"dependsOn":   stringSliceFromAny(params["dependsOn"]),
+		"parentID":    stringValue(params["parentID"]),
+		"threadID":    firstNonEmptyString(params["threadID"], params["threadId"]),
+		"createdAt":   now.Format(time.RFC3339Nano),
+		"updatedAt":   now.Format(time.RFC3339Nano),
+		"created":     now.UnixMilli(),
+		"updated":     now.UnixMilli(),
+	}
+	tasks = append(tasks, task)
+	if err := writeNeoLocalTasksLocked(tasks); err != nil {
+		return neoLocalTaskError("task-store-write-failed", err.Error())
+	}
+	return gin.H{"ok": true, "result": cloneMap(task)}
+}
+
+func neoLocalGetTaskResponse(r *http.Request) gin.H {
+	taskID := neoLocalTaskID(neoLocalInternalParams(r))
+	if taskID == "" {
+		return neoLocalTaskError("invalid-request", "taskID is required")
+	}
+	neoAmpTaskStoreMu.Lock()
+	defer neoAmpTaskStoreMu.Unlock()
+
+	tasks, err := loadNeoLocalTasksLocked()
+	if err != nil {
+		return neoLocalTaskError("task-store-read-failed", err.Error())
+	}
+	if task, _ := findNeoLocalTask(tasks, taskID); task != nil {
+		return gin.H{"ok": true, "result": cloneMap(task)}
+	}
+	return neoLocalTaskError("not-found", "task not found")
+}
+
+func neoLocalListTasksResponse(r *http.Request) gin.H {
+	params := neoLocalInternalParams(r)
+	neoAmpTaskStoreMu.Lock()
+	defer neoAmpTaskStoreMu.Unlock()
+
+	tasks, err := loadNeoLocalTasksLocked()
+	if err != nil {
+		return neoLocalTaskError("task-store-read-failed", err.Error())
+	}
+	limit := neoLocalTaskLimit(params["limit"])
+	filtered := make([]any, 0, len(tasks))
+	for _, task := range tasks {
+		if !neoLocalTaskMatches(task, params, tasks) {
+			continue
+		}
+		filtered = append(filtered, cloneMap(task))
+		if limit > 0 && len(filtered) >= limit {
+			break
+		}
+	}
+	return gin.H{"ok": true, "result": gin.H{"tasks": filtered}}
+}
+
+func neoLocalUpdateTaskResponse(r *http.Request) gin.H {
+	params := neoLocalInternalParams(r)
+	taskID := neoLocalTaskID(params)
+	if taskID == "" {
+		return neoLocalTaskError("invalid-request", "taskID is required")
+	}
+	neoAmpTaskStoreMu.Lock()
+	defer neoAmpTaskStoreMu.Unlock()
+
+	tasks, err := loadNeoLocalTasksLocked()
+	if err != nil {
+		return neoLocalTaskError("task-store-read-failed", err.Error())
+	}
+	task, index := findNeoLocalTask(tasks, taskID)
+	if task == nil {
+		return neoLocalTaskError("not-found", "task not found")
+	}
+	if _, ok := params["title"]; ok {
+		task["title"] = strings.TrimSpace(stringValue(params["title"]))
+	}
+	if _, ok := params["description"]; ok {
+		task["description"] = stringValue(params["description"])
+	}
+	if _, ok := params["repoURL"]; ok {
+		task["repoURL"] = stringValue(params["repoURL"])
+	}
+	if _, ok := params["status"]; ok {
+		task["status"] = normalizeNeoLocalTaskStatus(stringValue(params["status"]))
+	}
+	if _, ok := params["dependsOn"]; ok {
+		task["dependsOn"] = stringSliceFromAny(params["dependsOn"])
+	}
+	if _, ok := params["parentID"]; ok {
+		task["parentID"] = stringValue(params["parentID"])
+	}
+	if threadID := firstNonEmptyString(params["threadID"], params["threadId"]); threadID != "" {
+		task["threadID"] = threadID
+	}
+	now := time.Now().UTC()
+	task["updatedAt"] = now.Format(time.RFC3339Nano)
+	task["updated"] = now.UnixMilli()
+	tasks[index] = task
+	if err := writeNeoLocalTasksLocked(tasks); err != nil {
+		return neoLocalTaskError("task-store-write-failed", err.Error())
+	}
+	return gin.H{"ok": true, "result": cloneMap(task)}
+}
+
+func neoLocalDeleteTaskResponse(r *http.Request) gin.H {
+	params := neoLocalInternalParams(r)
+	taskID := neoLocalTaskID(params)
+	if taskID == "" {
+		return neoLocalTaskError("invalid-request", "taskID is required")
+	}
+	neoAmpTaskStoreMu.Lock()
+	defer neoAmpTaskStoreMu.Unlock()
+
+	tasks, err := loadNeoLocalTasksLocked()
+	if err != nil {
+		return neoLocalTaskError("task-store-read-failed", err.Error())
+	}
+	_, index := findNeoLocalTask(tasks, taskID)
+	if index < 0 {
+		return neoLocalTaskError("not-found", "task not found")
+	}
+	if boolValue(params["blockIfHasChildren"]) {
+		for _, task := range tasks {
+			if stringValue(task["parentID"]) == taskID {
+				return neoLocalTaskError("has-children", "task has child tasks")
+			}
+		}
+	}
+	tasks = append(tasks[:index], tasks[index+1:]...)
+	if err := writeNeoLocalTasksLocked(tasks); err != nil {
+		return neoLocalTaskError("task-store-write-failed", err.Error())
+	}
+	return gin.H{"ok": true, "result": gin.H{}}
+}
+
 func neoLocalThreadNotFoundResponse() gin.H {
 	return gin.H{"ok": false, "error": gin.H{"code": "thread-not-found", "message": "thread not found"}}
+}
+
+func neoLocalTaskID(params map[string]any) string {
+	return strings.TrimSpace(firstNonEmptyString(params["taskID"], params["taskId"], params["id"]))
+}
+
+func neoLocalTaskMatches(task map[string]any, params map[string]any, allTasks []map[string]any) bool {
+	if repoURL := strings.TrimSpace(stringValue(params["repoURL"])); repoURL != "" && strings.TrimSpace(stringValue(task["repoURL"])) != repoURL {
+		return false
+	}
+	if status := strings.TrimSpace(stringValue(params["status"])); status != "" && normalizeNeoLocalTaskStatus(stringValue(task["status"])) != normalizeNeoLocalTaskStatus(status) {
+		return false
+	}
+	if dependsOn := strings.TrimSpace(stringValue(params["dependsOn"])); dependsOn != "" && !neoLocalTaskDependsOn(task, dependsOn) {
+		return false
+	}
+	if boolValue(params["ready"]) && !neoLocalTaskReady(task, allTasks) {
+		return false
+	}
+	return true
+}
+
+func neoLocalTaskReady(task map[string]any, allTasks []map[string]any) bool {
+	status := normalizeNeoLocalTaskStatus(stringValue(task["status"]))
+	if status == "completed" || status == "canceled" {
+		return false
+	}
+	for _, taskID := range stringSliceFromAny(task["dependsOn"]) {
+		dependency, _ := findNeoLocalTask(allTasks, taskID)
+		if dependency == nil || normalizeNeoLocalTaskStatus(stringValue(dependency["status"])) != "completed" {
+			return false
+		}
+	}
+	return true
+}
+
+func neoLocalTaskDependsOn(task map[string]any, taskID string) bool {
+	for _, dependency := range stringSliceFromAny(task["dependsOn"]) {
+		if dependency == taskID {
+			return true
+		}
+	}
+	return false
+}
+
+func neoLocalTaskLimit(raw any) int {
+	limit := 100
+	switch value := raw.(type) {
+	case int:
+		limit = value
+	case float64:
+		limit = int(value)
+	case string:
+		limit = neoQueryInt(value, limit)
+	}
+	if limit < 0 {
+		return 0
+	}
+	return limit
+}
+
+func normalizeNeoLocalTaskStatus(status string) string {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "in_progress", "completed", "canceled":
+		return strings.ToLower(strings.TrimSpace(status))
+	default:
+		return "open"
+	}
+}
+
+func newNeoLocalTaskID(tasks []map[string]any) string {
+	for {
+		id := "task_" + randomBase62(10)
+		if task, _ := findNeoLocalTask(tasks, id); task == nil {
+			return id
+		}
+	}
+}
+
+func findNeoLocalTask(tasks []map[string]any, taskID string) (map[string]any, int) {
+	for i, task := range tasks {
+		if stringValue(task["id"]) == taskID {
+			return cloneMap(task), i
+		}
+	}
+	return nil, -1
+}
+
+func loadNeoLocalTasksLocked() ([]map[string]any, error) {
+	path := neoLocalTaskStorePath()
+	if path == "" {
+		return nil, errors.New("task store directory is empty")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return []map[string]any{}, nil
+		}
+		return nil, err
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		var arrayPayload []map[string]any
+		if arrayErr := json.Unmarshal(raw, &arrayPayload); arrayErr != nil {
+			return nil, err
+		}
+		return arrayPayload, nil
+	}
+	values := arrayValue(payload["tasks"])
+	tasks := make([]map[string]any, 0, len(values))
+	for _, value := range values {
+		task := mapValue(value)
+		if stringValue(task["id"]) != "" {
+			tasks = append(tasks, task)
+		}
+	}
+	return tasks, nil
+}
+
+func writeNeoLocalTasksLocked(tasks []map[string]any) error {
+	path := neoLocalTaskStorePath()
+	if path == "" {
+		return errors.New("task store directory is empty")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	raw, err := json.MarshalIndent(map[string]any{"tasks": tasks}, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(raw, '\n'), 0o600)
+}
+
+func neoLocalTaskStorePath() string {
+	dir := neoAmpThreadStoreDir()
+	if dir == "" {
+		return ""
+	}
+	return filepath.Join(dir, "tasks", "tasks.json")
+}
+
+func neoLocalTaskError(code, message string) gin.H {
+	return gin.H{"ok": false, "error": gin.H{"code": code, "message": message}}
 }
 
 func neoNormalizedThreadMeta(raw any) map[string]any {

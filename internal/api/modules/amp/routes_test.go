@@ -1158,6 +1158,115 @@ func TestRegisterManagementRoutesServesNeoStartupInternalRPCPostsLocally(t *test
 	})
 }
 
+func TestRegisterManagementRoutesServesNeoTaskInternalMethodsLocally(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	enabled := true
+	proxyCalled := false
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxyCalled = true
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	defer upstream.Close()
+
+	dir := t.TempDir()
+	oldStoreDir := neoAmpThreadStoreDir
+	neoAmpThreadStoreDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
+
+	m := &AmpModule{
+		restrictToLocalhost: false,
+		neoRuntime: newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+			UpstreamURL:    upstream.URL,
+			UpstreamAPIKey: "secret",
+			NeoLocalRuntime: config.AmpNeoLocalRuntime{
+				Enabled: &enabled,
+			},
+		}}),
+	}
+	proxy, _ := createReverseProxy(upstream.URL, NewStaticSecretSource(""))
+	m.setProxy(proxy)
+	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, nil)
+
+	postTask := func(method, body string) map[string]any {
+		t.Helper()
+		proxyCalled = false
+		req := httptest.NewRequest(http.MethodPost, "/api/internal?"+method, bytes.NewBufferString(body))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s status = %d, body=%s", method, rec.Code, rec.Body.String())
+		}
+		if proxyCalled {
+			t.Fatalf("%s should be served locally", method)
+		}
+		var response map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+			t.Fatalf("%s response JSON error: %v", method, err)
+		}
+		return response
+	}
+
+	createBuild := postTask("createTask", `{"method":"createTask","params":{"title":"Run the build","repoURL":"https://github.com/acme/repo","threadID":"T-local"}}`)
+	if createBuild["ok"] != true {
+		t.Fatalf("createTask build response = %#v", createBuild)
+	}
+	buildTask := mapValue(createBuild["result"])
+	buildID := stringValue(buildTask["id"])
+	if buildID == "" || stringValue(buildTask["status"]) != "open" || stringValue(buildTask["threadID"]) != "T-local" {
+		t.Fatalf("created build task = %#v", buildTask)
+	}
+
+	createFix := postTask("createTask", `{"method":"createTask","params":{"title":"Fix type errors","repoURL":"https://github.com/acme/repo","dependsOn":["`+buildID+`"],"parentID":"`+buildID+`"}}`)
+	if createFix["ok"] != true {
+		t.Fatalf("createTask fix response = %#v", createFix)
+	}
+	fixTask := mapValue(createFix["result"])
+	fixID := stringValue(fixTask["id"])
+	if fixID == "" || stringValue(fixTask["parentID"]) != buildID {
+		t.Fatalf("created fix task = %#v", fixTask)
+	}
+
+	notReady := postTask("listTasks", `{"method":"listTasks","params":{"dependsOn":"`+buildID+`","ready":true}}`)
+	if tasks := arrayValue(mapValue(notReady["result"])["tasks"]); len(tasks) != 0 {
+		t.Fatalf("ready tasks before dependency completion = %#v", tasks)
+	}
+
+	updateBuild := postTask("updateTask", `{"method":"updateTask","params":{"taskID":"`+buildID+`","status":"completed"}}`)
+	if updateBuild["ok"] != true || stringValue(mapValue(updateBuild["result"])["status"]) != "completed" {
+		t.Fatalf("updateTask build response = %#v", updateBuild)
+	}
+
+	ready := postTask("listTasks", `{"method":"listTasks","params":{"repoURL":"https://github.com/acme/repo","dependsOn":"`+buildID+`","ready":true,"limit":1}}`)
+	readyTasks := arrayValue(mapValue(ready["result"])["tasks"])
+	if len(readyTasks) != 1 || stringValue(mapValue(readyTasks[0])["id"]) != fixID {
+		t.Fatalf("ready tasks after dependency completion = %#v", readyTasks)
+	}
+
+	getFix := postTask("getTask", `{"method":"getTask","params":{"taskID":"`+fixID+`"}}`)
+	if getFix["ok"] != true || stringValue(mapValue(getFix["result"])["title"]) != "Fix type errors" {
+		t.Fatalf("getTask response = %#v", getFix)
+	}
+
+	blockedDelete := postTask("deleteTask", `{"method":"deleteTask","params":{"taskID":"`+buildID+`","blockIfHasChildren":true}}`)
+	if blockedDelete["ok"] != false || stringValue(mapValue(blockedDelete["error"])["code"]) != "has-children" {
+		t.Fatalf("deleteTask blocked response = %#v", blockedDelete)
+	}
+
+	deleteFix := postTask("deleteTask", `{"method":"deleteTask","params":{"taskID":"`+fixID+`","blockIfHasChildren":true}}`)
+	if deleteFix["ok"] != true {
+		t.Fatalf("deleteTask fix response = %#v", deleteFix)
+	}
+	deleteBuild := postTask("deleteTask", `{"method":"deleteTask","params":{"taskID":"`+buildID+`","blockIfHasChildren":true}}`)
+	if deleteBuild["ok"] != true {
+		t.Fatalf("deleteTask build response = %#v", deleteBuild)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "tasks", "tasks.json")); err != nil {
+		t.Fatalf("task store stat error: %v", err)
+	}
+}
+
 func TestRegisterManagementRoutesServesLocalThreadLinkInfoWithNormalizedOwnership(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()

@@ -69,6 +69,7 @@ var (
 	neoCloudThreadIDPattern = regexp.MustCompile(`^T-([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$`)
 	neoMessageIDPattern     = regexp.MustCompile(`^M-[0-9A-Za-z]{22}$`)
 	neoAmpThreadStoreDir    = defaultNeoAmpThreadStoreDir
+	neoAmpTaskStoreMu       sync.Mutex
 	neoInboundMessageHookMu sync.RWMutex
 	neoInboundMessageHook   func(actor *neoActor, msg map[string]any)
 	errNeoLocalEmptyStream  = errors.New("local provider stream closed before first payload")
