@@ -4142,6 +4142,61 @@ func TestNeoSystemPromptUsesCustomSystemPromptSettingAsBase(t *testing.T) {
 	}
 }
 
+func TestNeoSystemPromptAppliesScaffoldCustomizationReplaceBase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "scaffold.yaml")
+	if err := os.WriteFile(path, []byte("systemPrompt:\n  type: replaceBase\n  value:\n    - Custom scaffold foundation.\n"), 0o600); err != nil {
+		t.Fatalf("write scaffold customization: %v", err)
+	}
+
+	prompt := neoSystemPrompt(neoInferenceRequest{
+		AgentMode: "deep",
+		Settings:  map[string]any{"internal.scaffoldCustomizationFile": path},
+		Environment: map[string]any{
+			"isLocalClientActorThread": true,
+		},
+		Tools: []neoToolSpec{
+			{Name: "skill", Meta: map[string]any{"skillNames": []any{"code-review"}}},
+		},
+	}, neoModelRoute{Provider: "openai", Model: "gpt-5.5"})
+
+	if !strings.HasPrefix(prompt, "Custom scaffold foundation.") {
+		t.Fatalf("scaffold prompt did not replace base:\n%s", prompt)
+	}
+	if strings.Contains(prompt, "You are Amp, an autonomous coding agent") {
+		t.Fatalf("built-in base prompt was not replaced:\n%s", prompt)
+	}
+	for _, want := range []string{"### Available skills", "- code-review:", "the user's Amp client went offline"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("scaffold replaceBase prompt missing %q:\n%s", want, prompt)
+		}
+	}
+}
+
+func TestNeoSystemPromptCreatesScaffoldCustomizationTemplateWithoutApplyingIt(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "scaffold.yaml")
+	prompt := neoSystemPrompt(neoInferenceRequest{
+		AgentMode: "smart",
+		Settings:  map[string]any{"internal.scaffoldCustomizationFile": path},
+		Tools: []neoToolSpec{
+			{Name: "Read", Description: "read files", InputSchema: map[string]any{"type": "object"}},
+		},
+	}, neoModelRoute{Provider: "openai", Model: "gpt-5"})
+
+	if !strings.Contains(prompt, "You are Amp, a powerful AI coding agent") {
+		t.Fatalf("missing scaffold file should not alter current prompt:\n%s", prompt)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("scaffold template was not created: %v", err)
+	}
+	template := string(raw)
+	for _, want := range []string{"systemPrompt:", "type: replaceAll", "enableToolSpecs:", "name: Read"} {
+		if !strings.Contains(template, want) {
+			t.Fatalf("template missing %q:\n%s", want, template)
+		}
+	}
+}
+
 func TestNeoSystemPromptUsesRushModeInstructions(t *testing.T) {
 	prompt := neoSystemPrompt(neoInferenceRequest{AgentMode: "rush"}, neoModelRoute{Provider: "openai", Model: "gpt-5.5"})
 	for _, want := range []string{"fewest useful tool loops", "## Contract", "## Operating Mode", "## Discovery", "# File Links", "Speed and low token use are the priority"} {
@@ -4818,6 +4873,36 @@ func TestNeoActorFiltersAmpBuiltInToolsByMode(t *testing.T) {
 	assertMode("nostromo", nostromoNames,
 		[]string{"Read", "Bash", "create_file", "edit_file", "Task", "shell_command", "apply_patch", "chart", "view_media", "send_message_to_aggman", "tb__gemini-oracle"},
 		[]string{"Grep", "glob", "Glob", "get_diagnostics", "look_at", "task_list", "todo_write", "file_tree", "code_review", "deferred_custom", "docs_read"})
+}
+
+func TestNeoActorAppliesScaffoldToolCustomization(t *testing.T) {
+	useTempNeoThreadStore(t)
+	path := filepath.Join(t.TempDir(), "scaffold.yaml")
+	if err := os.WriteFile(path, []byte("enableToolSpecs:\n  - name: Task\n    description: custom task runner\n    inputSchema:\n      type: object\n      properties:\n        goal:\n          type: string\n  - name: view_media\ndisableTools:\n  - view_media\n"), 0o600); err != nil {
+		t.Fatalf("write scaffold customization: %v", err)
+	}
+
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	actor.settings["internal.scaffoldCustomizationFile"] = path
+	actor.tools = map[string]neoToolSpec{
+		"Read":       {Name: "Read", Description: "read files"},
+		"Task":       {Name: "Task", Description: "original task"},
+		"view_media": {Name: "view_media", Description: "view image"},
+	}
+
+	request := actor.inferenceRequestLocked("smart", "", "")
+	if len(request.Tools) != 1 || request.Tools[0].Name != "Task" {
+		t.Fatalf("tools = %#v, want only Task", request.Tools)
+	}
+	if request.Tools[0].Description != "custom task runner" {
+		t.Fatalf("Task description = %q", request.Tools[0].Description)
+	}
+	properties := mapValue(request.Tools[0].InputSchema["properties"])
+	goal := mapValue(properties["goal"])
+	if stringValue(goal["type"]) != "string" {
+		t.Fatalf("Task schema = %#v", request.Tools[0].InputSchema)
+	}
 }
 
 func TestNormalizeNeoToolCallsOmitsEmptyCodeReviewDefaults(t *testing.T) {

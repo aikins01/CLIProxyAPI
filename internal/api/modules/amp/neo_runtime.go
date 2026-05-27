@@ -35,6 +35,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
+	"gopkg.in/yaml.v3"
 )
 
 const (
@@ -9810,6 +9811,7 @@ func (a *neoActor) inferenceRequestLocked(agentMode, reasoningEffort, parentTool
 		tools = append(tools, tool)
 	}
 	sort.Slice(tools, func(i, j int) bool { return tools[i].Name < tools[j].Name })
+	tools = neoApplyScaffoldToolCustomization(tools, a.settings)
 	environment := cloneMap(a.environment)
 	if cfg := a.configSnapshot(); cfg != nil {
 		environment["ampURL"] = neoProxyBaseURL(cfg)
@@ -12416,6 +12418,79 @@ func neoToolIncludedForMode(agentMode string, tool neoToolSpec, settings map[str
 		return false
 	}
 	return neoToolAllowedForMode(agentMode, tool.Name) && neoToolAllowedBySettings(tool, settings)
+}
+
+func neoApplyScaffoldToolCustomization(tools []neoToolSpec, settings map[string]any) []neoToolSpec {
+	custom := neoLoadScaffoldCustomization(settings, false, nil, nil)
+	if custom == nil {
+		return tools
+	}
+	out := append([]neoToolSpec(nil), tools...)
+	if custom.EnableToolSpecs != nil {
+		enabled := make([]neoToolSpec, 0, len(*custom.EnableToolSpecs))
+		for _, tool := range out {
+			if neoScaffoldHasToolSpec(*custom.EnableToolSpecs, tool.Name) {
+				enabled = append(enabled, tool)
+			}
+		}
+		out = enabled
+	}
+	if len(custom.DisableTools) > 0 {
+		filtered := out[:0]
+		for _, tool := range out {
+			if !neoScaffoldToolNameInList(custom.DisableTools, tool.Name) {
+				filtered = append(filtered, tool)
+			}
+		}
+		out = filtered
+	}
+	if custom.EnableToolSpecs != nil && len(*custom.EnableToolSpecs) > 0 {
+		for _, override := range *custom.EnableToolSpecs {
+			index := neoScaffoldToolIndex(out, override.Name)
+			if index < 0 {
+				log.WithField("tool", override.Name).Debug("amp neo local runtime scaffold tool spec missing from original list")
+				continue
+			}
+			if override.Description != "" {
+				out[index].Description = override.Description
+			}
+			if override.InputSchema != nil {
+				out[index].InputSchema = cloneMap(override.InputSchema)
+			}
+		}
+	}
+	return out
+}
+
+func neoScaffoldHasToolSpec(specs []neoScaffoldToolSpec, name string) bool {
+	return neoScaffoldToolIndexBySpec(specs, name) >= 0
+}
+
+func neoScaffoldToolIndexBySpec(specs []neoScaffoldToolSpec, name string) int {
+	for i, spec := range specs {
+		if spec.Name == name {
+			return i
+		}
+	}
+	return -1
+}
+
+func neoScaffoldToolIndex(tools []neoToolSpec, name string) int {
+	for i, tool := range tools {
+		if tool.Name == name {
+			return i
+		}
+	}
+	return -1
+}
+
+func neoScaffoldToolNameInList(names []string, name string) bool {
+	for _, candidate := range names {
+		if candidate == name {
+			return true
+		}
+	}
+	return false
 }
 
 func neoToolAllowedBySettings(tool neoToolSpec, settings map[string]any) bool {
@@ -15738,16 +15813,127 @@ func neoRequestHasTool(request neoInferenceRequest, name string) bool {
 
 func neoSystemPrompt(request neoInferenceRequest, route neoModelRoute) string {
 	deep := strings.EqualFold(request.AgentMode, "deep")
-	blocks := []string{neoBasePrompt(request, route)}
-	blocks = append(blocks, neoGuidanceBlocks(request, deep)...)
+	basePrompt := neoBasePrompt(request, route)
+	contextBlocks := neoGuidanceBlocks(request, deep)
 	if environment := neoEnvironmentBlock(request, deep); environment != "" {
-		blocks = append(blocks, environment)
+		contextBlocks = append(contextBlocks, environment)
 	}
 	if skills := neoSkillsPrompt(request, deep); skills != "" {
-		blocks = append(blocks, skills)
+		contextBlocks = append(contextBlocks, skills)
 	}
-	blocks = append(blocks, neoFinalPromptBlocks(request, route)...)
+	finalBlocks := neoFinalPromptBlocks(request, route)
+	blocks := append([]string{basePrompt}, contextBlocks...)
+	blocks = append(blocks, finalBlocks...)
+	if custom := neoLoadScaffoldCustomization(request.Settings, true, blocks, request.Tools); custom != nil {
+		blocks = neoApplyScaffoldPromptCustomization(custom, []string{basePrompt}, contextBlocks, finalBlocks)
+	}
 	return strings.Join(compactStrings(blocks), "\n\n")
+}
+
+type neoScaffoldCustomization struct {
+	SystemPrompt    *neoScaffoldSystemPrompt `yaml:"systemPrompt"`
+	EnableToolSpecs *[]neoScaffoldToolSpec   `yaml:"enableToolSpecs"`
+	DisableTools    []string                 `yaml:"disableTools"`
+}
+
+type neoScaffoldSystemPrompt struct {
+	Type  string `yaml:"type"`
+	Value any    `yaml:"value"`
+}
+
+type neoScaffoldToolSpec struct {
+	Name        string         `yaml:"name"`
+	Description string         `yaml:"description,omitempty"`
+	InputSchema map[string]any `yaml:"inputSchema,omitempty"`
+}
+
+func neoLoadScaffoldCustomization(settings map[string]any, createTemplate bool, promptBlocks []string, tools []neoToolSpec) *neoScaffoldCustomization {
+	path := strings.TrimSpace(stringValue(settings["internal.scaffoldCustomizationFile"]))
+	if path == "" {
+		return nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if createTemplate {
+			if errWrite := neoWriteScaffoldCustomizationTemplate(path, promptBlocks, tools); errWrite != nil {
+				log.WithError(errWrite).Debug("amp neo local runtime failed to create scaffold customization template")
+			} else {
+				log.WithField("file", path).Info("amp neo local runtime created scaffold customization template")
+			}
+		}
+		return nil
+	}
+	var custom neoScaffoldCustomization
+	if err := yaml.Unmarshal(data, &custom); err != nil {
+		log.WithError(err).Debug("amp neo local runtime ignored invalid scaffold customization file")
+		return nil
+	}
+	return &custom
+}
+
+func neoWriteScaffoldCustomizationTemplate(path string, promptBlocks []string, tools []neoToolSpec) error {
+	enable := make([]neoScaffoldToolSpec, 0, len(tools))
+	for _, tool := range tools {
+		enable = append(enable, neoScaffoldToolSpec{
+			Name:        tool.Name,
+			Description: tool.Description,
+			InputSchema: cloneMap(tool.InputSchema),
+		})
+	}
+	payload := neoScaffoldCustomization{
+		SystemPrompt: &neoScaffoldSystemPrompt{
+			Type:  "replaceAll",
+			Value: append([]string(nil), promptBlocks...),
+		},
+		EnableToolSpecs: &enable,
+		DisableTools:    []string{},
+	}
+	raw, err := yaml.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, raw, 0o600)
+}
+
+func neoApplyScaffoldPromptCustomization(custom *neoScaffoldCustomization, baseBlocks, contextBlocks, finalBlocks []string) []string {
+	if custom == nil || custom.SystemPrompt == nil {
+		blocks := append([]string{}, baseBlocks...)
+		blocks = append(blocks, contextBlocks...)
+		blocks = append(blocks, finalBlocks...)
+		return blocks
+	}
+	replacement := neoScaffoldPromptValues(custom.SystemPrompt.Value)
+	switch custom.SystemPrompt.Type {
+	case "replaceAll":
+		return replacement
+	case "replaceBase":
+		blocks := append([]string{}, replacement...)
+		blocks = append(blocks, contextBlocks...)
+		blocks = append(blocks, finalBlocks...)
+		return blocks
+	default:
+		blocks := append([]string{}, baseBlocks...)
+		blocks = append(blocks, contextBlocks...)
+		blocks = append(blocks, finalBlocks...)
+		return blocks
+	}
+}
+
+func neoScaffoldPromptValues(value any) []string {
+	switch typed := value.(type) {
+	case []string:
+		return append([]string(nil), typed...)
+	case []any:
+		out := make([]string, 0, len(typed))
+		for _, item := range typed {
+			out = append(out, stringValue(item))
+		}
+		return out
+	case nil:
+		return nil
+	default:
+		return []string{stringValue(typed)}
+	}
 }
 
 func neoFinalPromptBlocks(request neoInferenceRequest, route neoModelRoute) []string {
