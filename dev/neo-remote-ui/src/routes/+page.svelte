@@ -1951,8 +1951,14 @@
     switch (normalizeAgentMode(mode)) {
       case 'smart':
         return 'high';
+      case 'rush':
+        return 'none';
       case 'deep':
         return 'medium';
+      case 'frontier':
+        return 'medium';
+      case 'nostromo':
+        return 'low';
       default:
         return '';
     }

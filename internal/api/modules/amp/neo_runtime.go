@@ -12391,8 +12391,14 @@ func defaultNeoReasoningEffort(agentMode string) string {
 	switch strings.ToLower(strings.TrimSpace(agentMode)) {
 	case "smart":
 		return "high"
+	case "rush":
+		return "none"
 	case "deep":
 		return "medium"
+	case "frontier":
+		return "medium"
+	case "nostromo":
+		return "low"
 	default:
 		return ""
 	}
@@ -12407,7 +12413,7 @@ func normalizeNeoReasoningEffortForMode(agentMode, effort string) string {
 
 func neoModeSupportsReasoningEffort(agentMode string) bool {
 	switch strings.ToLower(strings.TrimSpace(agentMode)) {
-	case "smart", "deep":
+	case "smart", "rush", "deep", "frontier", "nostromo":
 		return true
 	default:
 		return false
@@ -12422,8 +12428,14 @@ func neoReasoningEffortAllowedForMode(agentMode, effort string) bool {
 	switch strings.ToLower(strings.TrimSpace(agentMode)) {
 	case "smart":
 		return effort == "high" || effort == "xhigh" || effort == "max"
+	case "rush":
+		return effort == "none"
 	case "deep":
 		return effort == "low" || effort == "medium" || effort == "xhigh"
+	case "frontier":
+		return effort == "medium"
+	case "nostromo":
+		return effort == "low"
 	default:
 		return false
 	}
@@ -17409,10 +17421,8 @@ func googleNeoTools(tools []neoToolSpec) []any {
 
 func openAIReasoningEffort(effort string) string {
 	switch strings.ToLower(strings.TrimSpace(effort)) {
-	case "minimal", "low", "medium", "high", "xhigh", "max":
+	case "none", "minimal", "low", "medium", "high", "xhigh", "max":
 		return strings.ToLower(strings.TrimSpace(effort))
-	case "none":
-		return "low"
 	default:
 		return "medium"
 	}

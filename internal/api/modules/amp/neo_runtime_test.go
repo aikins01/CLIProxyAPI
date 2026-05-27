@@ -4923,11 +4923,11 @@ func TestNeoActorUpdateSettingsPreservesModeWhenPatchOmitsAgentMode(t *testing.T
 	actor.updateSettings(map[string]any{"agentMode": "rush"})
 	actor.mu.Lock()
 	defer actor.mu.Unlock()
-	if actor.currentAgentMode != "rush" || actor.currentReasoningEffort != "" {
-		t.Fatalf("rush update should clear reasoning effort: mode=%q effort=%q", actor.currentAgentMode, actor.currentReasoningEffort)
+	if actor.currentAgentMode != "rush" || actor.currentReasoningEffort != "none" {
+		t.Fatalf("rush update should reset effort to binary default: mode=%q effort=%q", actor.currentAgentMode, actor.currentReasoningEffort)
 	}
-	if _, exists := actor.settings["reasoning.effort"]; exists {
-		t.Fatalf("rush settings kept reasoning.effort: %#v", actor.settings)
+	if actor.settings["reasoning.effort"] != "none" {
+		t.Fatalf("rush settings did not keep binary default effort: %#v", actor.settings)
 	}
 }
 
@@ -4938,8 +4938,8 @@ func TestNeoActorReasoningEffortDefaultsByMode(t *testing.T) {
 	actor.currentReasoningEffort = "high"
 	actor.messages = []neoMessage{{Role: "user", AgentMode: "smart", ReasoningEffort: "max"}}
 
-	if got := actor.reasoningEffortForModeLocked("rush"); got != "" {
-		t.Fatalf("rush effort = %q, want empty", got)
+	if got := actor.reasoningEffortForModeLocked("rush"); got != "none" {
+		t.Fatalf("rush effort = %q, want none", got)
 	}
 	if got := actor.reasoningEffortForModeLocked("deep"); got != "medium" {
 		t.Fatalf("deep effort = %q, want medium", got)
@@ -4947,11 +4947,11 @@ func TestNeoActorReasoningEffortDefaultsByMode(t *testing.T) {
 	if got := actor.reasoningEffortForModeLocked("smart"); got != "high" {
 		t.Fatalf("smart effort = %q, want high", got)
 	}
-	if got := actor.reasoningEffortForModeLocked("frontier"); got != "" {
-		t.Fatalf("frontier effort = %q, want empty", got)
+	if got := actor.reasoningEffortForModeLocked("frontier"); got != "medium" {
+		t.Fatalf("frontier effort = %q, want medium", got)
 	}
-	if got := actor.reasoningEffortForModeLocked("nostromo"); got != "" {
-		t.Fatalf("nostromo effort = %q, want empty", got)
+	if got := actor.reasoningEffortForModeLocked("nostromo"); got != "low" {
+		t.Fatalf("nostromo effort = %q, want low", got)
 	}
 }
 
@@ -5620,6 +5620,26 @@ func TestOpenAIResponsesMaxOutputUsesBinaryOpenAIFallback(t *testing.T) {
 
 	if numberFrom(body["max_output_tokens"]) != 128000 {
 		t.Fatalf("max_output_tokens = %#v, want 128000", body["max_output_tokens"])
+	}
+}
+
+func TestOpenAIResponsesRushUsesBinaryNoneReasoningDefault(t *testing.T) {
+	body := openAIResponsesNeoBody(neoInferenceRequest{
+		ThreadID:        "T-test",
+		AgentMode:       "rush",
+		ReasoningEffort: defaultNeoReasoningEffort("rush"),
+		History:         []neoHistoryMessage{{Role: "user", Text: "hi"}},
+	}, neoModelRoute{Provider: "openai", Model: "gpt-5.5"}, true)
+
+	reasoning := mapValue(body["reasoning"])
+	if reasoning["effort"] != "none" || reasoning["summary"] != "auto" {
+		t.Fatalf("reasoning = %#v, want none summary auto", reasoning)
+	}
+}
+
+func TestOpenAIChatReasoningEffortPreservesBinaryNone(t *testing.T) {
+	if got := openAIReasoningEffort("none"); got != "none" {
+		t.Fatalf("openAIReasoningEffort(none) = %q, want none", got)
 	}
 }
 
