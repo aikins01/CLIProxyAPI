@@ -44,10 +44,15 @@
     name?: string;
     id?: string;
     input?: unknown;
+    inputIncomplete?: unknown;
+    inputPartialJSON?: unknown;
+    inputPartialJSONDelta?: unknown;
+    complete?: boolean;
     content?: unknown;
     patch?: unknown;
     diff?: unknown;
     run?: unknown;
+    userInput?: unknown;
     toolUseID?: string;
     blockState?: string;
     startTime?: number | string;
@@ -1152,6 +1157,10 @@
       }
       return;
     }
+    if (type === 'tool_progress') {
+      applyToolProgress(message);
+      return;
+    }
     if (type === 'executor_tool_lease_revoked' || type === 'executor_tool_result_ack') {
       const id = stringFrom(message.toolCallId ?? message.toolUseId ?? message.id);
       toolLeases = toolLeases.filter((lease) => lease.toolCallId !== id);
@@ -1296,7 +1305,8 @@
     }
     const next = [...detail.messages];
     const usage = mergeUsage(next[index].usage, message.usage);
-    next[index] = replace ? { ...message, usage } : { ...next[index], ...message, usage };
+    const state = Object.keys(message.state ?? {}).length > 0 ? message.state : next[index].state;
+    next[index] = replace ? { ...message, state, usage } : { ...next[index], ...message, state, usage };
     detail = { ...detail, messages: next };
   }
 
@@ -1338,6 +1348,122 @@
     detail = { ...detail, messages: nextMessages };
   }
 
+  function applyToolProgress(event: Incoming) {
+    if (!detail) return;
+    const toolCallId = stringFrom(event.toolCallId ?? event.toolUseId ?? event.id);
+    if (!toolCallId) return;
+    const progressMessageId = toolProgressMessageId(toolCallId);
+    const nextMessages = [...detail.messages];
+    let messageIndex = -1;
+    let blockIndex = -1;
+    let existingBlock: ContentBlock | undefined;
+
+    for (let i = 0; i < nextMessages.length; i += 1) {
+      const message = nextMessages[i];
+      if (message.role !== 'user') continue;
+      const index = message.content.findIndex((block) => block.type === 'tool_result' && toolResultUseID(block) === toolCallId);
+      if (index >= 0) {
+        messageIndex = i;
+        blockIndex = index;
+        existingBlock = message.content[index];
+        break;
+      }
+    }
+
+    const run = toolProgressRun(event.progress, asRecord(existingBlock?.run));
+    if (!run) return;
+    const block: ContentBlock = { type: 'tool_result', toolUseID: toolCallId, run };
+    if (existingBlock?.userInput !== undefined) block.userInput = existingBlock.userInput;
+
+    if (messageIndex >= 0) {
+      const current = nextMessages[messageIndex];
+      const content = [...current.content];
+      content[blockIndex] = block;
+      nextMessages[messageIndex] = { ...current, content };
+    } else {
+      nextMessages.push({
+        threadId: detail.id,
+        messageId: progressMessageId,
+        role: 'user',
+        content: [block]
+      });
+    }
+
+    detail = { ...detail, messages: nextMessages };
+  }
+
+  function toolProgressMessageId(toolCallId: string) {
+    return `M-${toolCallId.replace(/^TU-/, '')}`;
+  }
+
+  function toolProgressRun(progress: unknown, existingRun: Record<string, unknown>): Record<string, unknown> | null {
+    const progressMap = asRecord(progress);
+    if (stringFrom(progressMap.type) === 'snapshot') {
+      const snapshot = cloneRecord(asRecord(progressMap.value));
+      const status = stringFrom(snapshot.status).trim().toLowerCase();
+      if (status) {
+        if (isTerminalToolStatus(status) || status === 'in-progress') {
+          snapshot.status = status;
+          return snapshot;
+        }
+        return null;
+      }
+    }
+
+    const status = stringFrom(progressMap.status).trim().toLowerCase();
+    if (status) {
+      if (isTerminalToolStatus(status) || status === 'in-progress') {
+        return { ...cloneRecord(progressMap), status };
+      }
+      return null;
+    }
+
+    const existingProgress = existingRun.progress;
+    const merged = emptyToolProgress(progress)
+      ? cloneProgressValue(existingProgress)
+      : mergeToolProgress(existingProgress, progress);
+    const run: Record<string, unknown> = { status: 'in-progress' };
+    if (!emptyToolProgress(merged)) run.progress = merged;
+    return run;
+  }
+
+  function isTerminalToolStatus(status: string) {
+    return ['done', 'error', 'cancelled', 'rejected-by-user'].includes(status.trim().toLowerCase());
+  }
+
+  function emptyToolProgress(value: unknown) {
+    if (value === null || value === undefined) return true;
+    if (Array.isArray(value)) return value.length === 0;
+    if (typeof value === 'object') return Object.keys(value).length === 0;
+    return false;
+  }
+
+  function mergeToolProgress(existing: unknown, next: unknown): unknown {
+    if (emptyToolProgress(next)) return cloneProgressValue(existing);
+    if (emptyToolProgress(existing)) return cloneProgressValue(next);
+    if (Array.isArray(existing) && Array.isArray(next)) {
+      return [...cloneProgressValue(existing) as unknown[], ...cloneProgressValue(next) as unknown[]];
+    }
+    if (existing && next && typeof existing === 'object' && typeof next === 'object' && !Array.isArray(existing) && !Array.isArray(next)) {
+      const out: Record<string, unknown> = { ...asRecord(cloneProgressValue(existing)) };
+      for (const [key, value] of Object.entries(asRecord(next))) {
+        out[key] = mergeToolProgress(out[key], value);
+      }
+      return out;
+    }
+    return cloneProgressValue(next);
+  }
+
+  function cloneProgressValue(value: unknown): unknown {
+    try {
+      return structuredClone(value);
+    } catch {
+      if (Array.isArray(value)) return [...value];
+      if (value && typeof value === 'object') return { ...asRecord(value) };
+      return value;
+    }
+  }
+
   function mergeBlock(previous: ContentBlock | undefined, incoming: ContentBlock): ContentBlock {
     if (!previous) return { ...incoming };
     if (incoming.type === 'text') {
@@ -1346,7 +1472,54 @@
     if (incoming.type === 'thinking') {
       return { ...previous, ...incoming, thinking: `${previous.thinking ?? ''}${incoming.thinking ?? ''}` };
     }
+    if (incoming.type === 'tool_use') {
+      return mergeToolUseBlock(previous, incoming);
+    }
     return { ...previous, ...incoming };
+  }
+
+  function mergeToolUseBlock(previous: ContentBlock, incoming: ContentBlock): ContentBlock {
+    const merged: ContentBlock = { ...previous, ...incoming };
+    const delta = stringFrom(asRecord(incoming.inputPartialJSONDelta).json);
+    if (delta) {
+      const previousPartial = stringFrom(asRecord(previous.inputPartialJSON).json);
+      const incomingPartial = stringFrom(asRecord(incoming.inputPartialJSON).json);
+      const partial = `${previousPartial || incomingPartial}${delta}`;
+      merged.inputPartialJSON = { json: partial };
+      merged.complete = false;
+      const parsed = parsePartialJSONObject(partial);
+      if (Object.keys(parsed).length > 0) {
+        merged.input = parsed;
+        merged.inputIncomplete = parsed;
+      }
+    }
+    if (merged.complete === true) {
+      delete merged.inputPartialJSON;
+      delete merged.inputPartialJSONDelta;
+      delete merged.inputIncomplete;
+    }
+    return merged;
+  }
+
+  function parsePartialJSONObject(value: string): Record<string, unknown> {
+    const trimmed = value.trim();
+    if (!trimmed) return {};
+    try {
+      const parsed = JSON.parse(trimmed);
+      return asRecord(parsed);
+    } catch {
+      const parsed: Record<string, unknown> = {};
+      const matcher = /"((?:\\.|[^"\\])+)":\s*("(?:\\.|[^"\\])*"|true|false|null|-?\d+(?:\.\d+)?)/g;
+      let match: RegExpExecArray | null;
+      while ((match = matcher.exec(trimmed))) {
+        try {
+          parsed[JSON.parse(`"${match[1]}"`)] = JSON.parse(match[2]);
+        } catch {
+          continue;
+        }
+      }
+      return parsed;
+    }
   }
 
   function queuedMessageFromAny(raw: unknown): QueuedMessage {
@@ -1763,7 +1936,9 @@
       case 'rush':
         return 'none';
       case 'deep':
-        return 'xhigh';
+        return 'medium';
+      case 'frontier':
+        return 'medium';
       default:
         return '';
     }
@@ -2760,6 +2935,10 @@
     const results = collectToolResults(blocks);
     for (const b of blocks) {
       if (b.type === 'thinking') {
+        if (b.thinking?.trim()) {
+          flush();
+          rows.push({ kind: 'thinking', block: b });
+        }
         continue;
       }
       else if (b.type === 'text') {
@@ -2795,7 +2974,7 @@
   }
 
   function editTarget(block: ContentBlock): string {
-    const input = asRecord(block.input);
+    const input = toolInputRecord(block);
     const path = stringFrom(input.path ?? input.file ?? input.filename ?? input.file_path);
     if (path) {
       const parts = path.split('/');
@@ -2811,7 +2990,7 @@
   }
 
   function commandText(block: ContentBlock): string {
-    const input = asRecord(block.input);
+    const input = toolInputRecord(block);
     return stringFrom(input.command ?? input.cmd ?? input.script) || '';
   }
 
@@ -2907,7 +3086,7 @@
   }
 
   function painterPrompt(block: ContentBlock, result?: ContentBlock) {
-    const input = asRecord(block.input);
+    const input = toolInputRecord(block);
     const run = toolResultRun(result);
     const nestedResult = asRecord(run.result);
     return firstString(
@@ -3030,7 +3209,7 @@
   }
 
   function toolSubtitle(block: ContentBlock) {
-    const input = asRecord(block.input);
+    const input = toolInputRecord(block);
     const shellKind = shellExploreKind(commandText(block));
     if (shellKind === 'grep') {
       const summary = grepCommandSummary(commandText(block));
@@ -3080,7 +3259,7 @@
   }
 
   function rawPatchFromBlock(block: ContentBlock) {
-    const input = asRecord(block.input);
+    const input = toolInputRecord(block);
     return firstString(block.patch, block.diff, input.patchText, input.patch, input.diff);
   }
 
@@ -3118,9 +3297,9 @@
   // Format tool input as ampcode-style key: value lines (strings unquoted, primitives bare,
   // nested objects/arrays JSON-stringified inline). Falls back to JSON if input isn't a plain object.
   function toolInputPreview(block: ContentBlock) {
-    const input = asRecord(block.input);
+    const input = toolInputRecord(block);
     const keys = Object.keys(input);
-    if (keys.length === 0) return '';
+    if (keys.length === 0) return partialJSONFromBlock(block);
     const lines: string[] = [];
     for (const key of keys) {
       const value = input[key];
@@ -3141,6 +3320,16 @@
       lines.push(`${key}: ${rendered}`);
     }
     return lines.join('\n');
+  }
+
+  function toolInputRecord(block: ContentBlock) {
+    const incomplete = asRecord(block.inputIncomplete);
+    if (Object.keys(incomplete).length > 0) return incomplete;
+    return asRecord(block.input);
+  }
+
+  function partialJSONFromBlock(block: ContentBlock) {
+    return stringFrom(asRecord(block.inputPartialJSON).json ?? asRecord(block.inputPartialJSONDelta).json);
   }
 
   function blockContentPreview(block: ContentBlock) {
@@ -3281,7 +3470,7 @@
 
 {#snippet workGroup(blocks: ContentBlock[], live = false)}
   {@const duration = workDurationLabel(blocks, live)}
-  <details class="work-group">
+  <details class="work-group" open={live}>
     <!-- Ampcode parity: the "Worked for X minutes" header has no hover timestamp. -->
     <summary>
       <span class="work-group__line"></span>

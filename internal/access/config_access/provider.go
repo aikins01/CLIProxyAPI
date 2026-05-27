@@ -3,6 +3,7 @@ package configaccess
 import (
 	"context"
 	"net/http"
+	"net/url"
 	"strings"
 
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
@@ -62,13 +63,17 @@ func (p *provider) Authenticate(_ context.Context, r *http.Request) (*sdkaccess.
 	authHeader := r.Header.Get("Authorization")
 	authHeaderGoogle := r.Header.Get("X-Goog-Api-Key")
 	authHeaderAnthropic := r.Header.Get("X-Api-Key")
+	authHeaderRivet := r.Header.Get("X-Rivet-Token")
 	queryKey := ""
 	queryAuthToken := ""
+	queryRivetToken := ""
 	if r.URL != nil {
 		queryKey = r.URL.Query().Get("key")
 		queryAuthToken = r.URL.Query().Get("auth_token")
+		queryRivetToken = r.URL.Query().Get("rvt-token")
 	}
-	if authHeader == "" && authHeaderGoogle == "" && authHeaderAnthropic == "" && queryKey == "" && queryAuthToken == "" {
+	subprotocolRivetToken := extractRivetSubprotocolToken(r.Header.Get("Sec-WebSocket-Protocol"))
+	if authHeader == "" && authHeaderGoogle == "" && authHeaderAnthropic == "" && authHeaderRivet == "" && queryKey == "" && queryAuthToken == "" && queryRivetToken == "" && subprotocolRivetToken == "" {
 		return nil, sdkaccess.NewNoCredentialsError()
 	}
 
@@ -81,8 +86,11 @@ func (p *provider) Authenticate(_ context.Context, r *http.Request) (*sdkaccess.
 		{apiKey, "authorization"},
 		{authHeaderGoogle, "x-goog-api-key"},
 		{authHeaderAnthropic, "x-api-key"},
+		{authHeaderRivet, "x-rivet-token"},
 		{queryKey, "query-key"},
 		{queryAuthToken, "query-auth-token"},
+		{queryRivetToken, "query-rivet-token"},
+		{subprotocolRivetToken, "subprotocol-rivet-token"},
 	}
 
 	for _, candidate := range candidates {
@@ -115,6 +123,24 @@ func extractBearerToken(header string) string {
 		return header
 	}
 	return strings.TrimSpace(parts[1])
+}
+
+func extractRivetSubprotocolToken(header string) string {
+	for _, part := range strings.Split(header, ",") {
+		token := strings.TrimSpace(part)
+		if !strings.HasPrefix(token, "rivet_token.") {
+			continue
+		}
+		value := strings.TrimPrefix(token, "rivet_token.")
+		if value == "" {
+			continue
+		}
+		if decoded, err := url.QueryUnescape(value); err == nil {
+			return decoded
+		}
+		return value
+	}
+	return ""
 }
 
 func normalizeKeys(keys []string) []string {

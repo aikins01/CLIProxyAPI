@@ -59,6 +59,8 @@ const (
 	neoThreadMarkdownToolByteLimit   = 100 * 1024
 	neoThreadMarkdownOmittedText     = "\n[ ... omitted remaining lines to make summarizing use less tokens ... ]"
 	neoThreadExtractionModel         = "gemini-3-flash-preview"
+	neoJSONRPCFrameKey               = "__neo_jsonrpc_frame"
+	neoJSONRPCRequestIDKey           = "__neo_jsonrpc_request_id"
 )
 
 var (
@@ -71,13 +73,13 @@ var (
 	neoInboundMessageHook   func(actor *neoActor, msg map[string]any)
 	errNeoLocalEmptyStream  = errors.New("local provider stream closed before first payload")
 	neoModeToolAllowlist    = map[string]map[string]bool{
-		"smart":    toolSet("Read", "finder", "Bash", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "look_at", "handoff", "painter", "read_mcp_resource", "code_review"),
-		"large":    toolSet("Read", "finder", "Bash", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "look_at", "handoff", "painter", "read_mcp_resource", "code_review"),
-		"rush":     toolSet("finder", "shell_command", "apply_patch", "web_search", "read_web_page", "read_mcp_resource", "read_thread", "find_thread", "skill", "oracle", "handoff", "librarian", "Task", "view_media", "look_at", "painter"),
+		"smart":    toolSet("Read", "finder", "Bash", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "handoff", "painter", "read_mcp_resource", "code_review"),
+		"large":    toolSet("Read", "finder", "Bash", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "handoff", "painter", "read_mcp_resource", "code_review"),
+		"rush":     toolSet("finder", "shell_command", "apply_patch", "web_search", "read_web_page", "read_mcp_resource", "read_thread", "find_thread", "skill", "oracle", "handoff", "librarian", "Task", "view_media", "painter"),
 		"agg-man":  toolSet("find_thread", "read_thread", "web_search", "read_web_page", "docs_list", "docs_read", "docs_write", "render_agg_man", "create_project", "create_thread", "archive_thread", "unarchive_thread", "send_message_to_thread", "slack_write", "slack_read", "github_repo_ci_status", "read_github", "search_github", "commit_search", "list_directory_github", "list_repositories", "glob_github", "diff"),
-		"deep":     toolSet("shell_command", "apply_patch", "web_search", "read_web_page", "chart", "skill", "read_thread", "find_thread", "librarian", "oracle", "finder", "view_media", "look_at", "painter", "handoff", "send_message_to_aggman", "code_review"),
-		"frontier": toolSet("finder", "apply_patch", "shell_command", "Task", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "view_media", "look_at", "handoff", "painter", "code_review"),
-		"nostromo": toolSet("Read", "finder", "Bash", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "look_at", "handoff", "painter", "read_mcp_resource", "apply_patch", "shell_command", "chart", "send_message_to_aggman"),
+		"deep":     toolSet("shell_command", "apply_patch", "web_search", "read_web_page", "chart", "skill", "read_thread", "find_thread", "librarian", "oracle", "finder", "view_media", "painter", "handoff", "send_message_to_aggman", "code_review"),
+		"frontier": toolSet("finder", "apply_patch", "shell_command", "Task", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "view_media", "handoff", "painter", "code_review"),
+		"nostromo": toolSet("Read", "finder", "Bash", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "handoff", "painter", "read_mcp_resource", "apply_patch", "shell_command", "chart", "send_message_to_aggman"),
 	}
 	neoKnownModeTools = toolSet(
 		"Read", "Grep", "glob", "Glob", "finder", "file_tree", "Bash", "create_file", "edit_file", "delete_file", "get_diagnostics",
@@ -557,6 +559,66 @@ func neoSkipReadyWaitRequested(r *http.Request) bool {
 	return value == "1" || strings.EqualFold(value, "true")
 }
 
+func neoJSONRPCTransportRequested(r *http.Request, protocols []string) bool {
+	values := append([]string{}, protocols...)
+	for _, protocol := range protocols {
+		if !strings.HasPrefix(protocol, "rivet_conn_params.") {
+			continue
+		}
+		encoded := strings.TrimPrefix(protocol, "rivet_conn_params.")
+		decoded, err := url.QueryUnescape(encoded)
+		if err != nil {
+			continue
+		}
+		values = append(values, decoded)
+		var params any
+		if err := json.Unmarshal([]byte(decoded), &params); err == nil && neoValueContainsJSONRPCTransport(params) {
+			return true
+		}
+	}
+	if r != nil {
+		if r.URL != nil {
+			query := r.URL.Query()
+			values = append(values, r.URL.RawQuery, query.Get("transport"), query.Get("rvt-transport"))
+			if neoValueContainsJSONRPCTransport(decodeNeoGatewayInput(query.Get("rvt-input"))) {
+				return true
+			}
+		}
+		values = append(values, r.Header.Get("Sec-WebSocket-Protocol"), r.Header.Get("x-rivet-conn-params"))
+	}
+	for _, value := range values {
+		if strings.Contains(strings.ToLower(value), "json-rpc") {
+			return true
+		}
+	}
+	return false
+}
+
+func neoValueContainsJSONRPCTransport(value any) bool {
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, item := range typed {
+			if strings.EqualFold(key, "transport") || strings.EqualFold(key, "threadActorTransport") {
+				if strings.EqualFold(stringValue(item), "json-rpc") {
+					return true
+				}
+			}
+			if neoValueContainsJSONRPCTransport(item) {
+				return true
+			}
+		}
+	case []any:
+		for _, item := range typed {
+			if neoValueContainsJSONRPCTransport(item) {
+				return true
+			}
+		}
+	case string:
+		return strings.EqualFold(typed, "json-rpc")
+	}
+	return false
+}
+
 func runtimeHost() string {
 	return runtime.GOOS
 }
@@ -637,7 +699,7 @@ func (rt *neoRuntime) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		_ = conn.WriteControl(websocket.PongMessage, []byte(data), time.Time{})
 		return nil
 	})
-	socket := &neoSocket{conn: conn}
+	socket := &neoSocket{conn: conn, jsonRPC: neoJSONRPCTransportRequested(r, protocols)}
 	actor.open(socket, !neoSkipReadyWaitRequested(r))
 	defer actor.close(socket)
 	defer conn.Close()
@@ -667,6 +729,13 @@ func (rt *neoRuntime) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		for _, msg := range messages {
+			jsonRPCFrame := boolValue(msg[neoJSONRPCFrameKey])
+			requestID, hasRequestID := msg[neoJSONRPCRequestIDKey]
+			delete(msg, neoJSONRPCFrameKey)
+			delete(msg, neoJSONRPCRequestIDKey)
+			if jsonRPCFrame {
+				socket.setJSONRPC(true)
+			}
 			neoInboundMessageHookMu.RLock()
 			hook := neoInboundMessageHook
 			neoInboundMessageHookMu.RUnlock()
@@ -674,6 +743,9 @@ func (rt *neoRuntime) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				hook(actor, cloneMap(msg))
 			}
 			actor.handleForSocket(socket, msg)
+			if hasRequestID {
+				socket.sendJSONRPCResponse(requestID, nil)
+			}
 		}
 	}
 }
@@ -684,6 +756,12 @@ func decodeNeoClientFrame(payload []byte) ([]map[string]any, error) {
 		return nil, err
 	}
 	if msg, ok := decoded.(map[string]any); ok {
+		if converted, handled := decodeNeoJSONRPCFrame(msg); handled {
+			if converted == nil {
+				return nil, nil
+			}
+			return []map[string]any{converted}, nil
+		}
 		return []map[string]any{msg}, nil
 	}
 	items, ok := decoded.([]any)
@@ -696,9 +774,33 @@ func decodeNeoClientFrame(payload []byte) ([]map[string]any, error) {
 		if !ok {
 			return nil, fmt.Errorf("invalid Neo protocol batch item")
 		}
+		if converted, handled := decodeNeoJSONRPCFrame(msg); handled {
+			if converted != nil {
+				messages = append(messages, converted)
+			}
+			continue
+		}
 		messages = append(messages, msg)
 	}
 	return messages, nil
+}
+
+func decodeNeoJSONRPCFrame(frame map[string]any) (map[string]any, bool) {
+	method := stringValue(frame["method"])
+	if method == "" {
+		if frame["jsonrpc"] != nil {
+			return nil, true
+		}
+		return nil, false
+	}
+	params := mapValue(frame["params"])
+	msg := cloneMap(params)
+	msg["type"] = method
+	msg[neoJSONRPCFrameKey] = true
+	if requestID, ok := frame["id"]; ok {
+		msg[neoJSONRPCRequestIDKey] = requestID
+	}
+	return msg, true
 }
 
 type neoActorStore struct {
@@ -1572,22 +1674,29 @@ func (a *neoActor) handleToolProgress(msg map[string]any) {
 	if !neoToolRunTerminal(run) {
 		completionStatus = "tool_progress"
 	}
-	_, event := a.storeMessageEventLocked(neoMessage{
+	eventSeq := a.nextSeqLocked()
+	payload["seq"] = eventSeq
+	progressMessageID := toolResultMessageID(toolCallID)
+	message := neoMessage{
 		ThreadID:         a.threadID,
 		Role:             "user",
-		MessageID:        toolResultMessageID(toolCallID),
+		MessageID:        progressMessageID,
 		Content:          []any{block},
 		CreatedAt:        time.Now().UTC().Format(time.RFC3339Nano),
 		ParentToolUseID:  parentToolCallID,
 		CompletionStatus: completionStatus,
-	})
+	}
+	if a.messageIndexLocked(progressMessageID) < 0 {
+		message.Seq = eventSeq
+	}
+	a.storeMessageLocked(message)
+	a.rememberReplayEventLocked(payload)
 	if completionStatus == "" {
 		a.rebuildHistoryLocked()
 	}
 	a.mu.Unlock()
 
 	a.broadcast(payload)
-	a.broadcast(event)
 	a.syncCloudAsync()
 }
 
@@ -2521,11 +2630,6 @@ func (a *neoActor) handleProtocolDelta(msg map[string]any) {
 	}
 	stored := a.storeMessageLocked(message)
 	a.rememberReplayEventLocked(msg)
-	var updateEvent map[string]any
-	if role == "assistant" {
-		updateEvent = map[string]any{"type": "message_updated", "message": stored.protocol(), "seq": seq}
-		a.rememberReplayEventLocked(updateEvent)
-	}
 	a.rebuildHistoryLocked()
 	if role == "assistant" && (state == "aborted" || state == "complete" || (state == "tool_use" && stringValue(mapValue(stored.State)["type"]) == "complete")) {
 		a.clearCurrentInferenceLocked(messageID)
@@ -2533,9 +2637,6 @@ func (a *neoActor) handleProtocolDelta(msg map[string]any) {
 	a.mu.Unlock()
 
 	a.broadcast(msg)
-	if updateEvent != nil {
-		a.broadcast(updateEvent)
-	}
 	a.syncCloudAsync()
 }
 
@@ -4360,7 +4461,7 @@ func (a *neoActor) runInferenceForParent(agentMode, reasoningEffort, parentToolC
 
 	a.broadcast(map[string]any{"type": "agent_state", "state": "working", "messageId": assistantID, "agentMode": agentMode, "reasoningEffort": omitEmpty(reasoningEffort)})
 	a.broadcast(withNeoParentToolCallID(map[string]any{"type": "inference_tools", "messageId": assistantID, "agentMode": agentMode, "tools": tools}, parentToolCallID))
-	a.handleProtocolDelta(withNeoParentToolCallID(map[string]any{"type": "delta", "messageId": assistantID, "role": "assistant", "blocks": []any{}, "blockIndex": 0, "state": "start"}, parentToolCallID))
+	a.handleProtocolDelta(withNeoParentToolCallID(neoAssistantDeltaPayload(assistantID, []any{}, 0, "start", nil), parentToolCallID))
 
 	a.maybeCompactBeforeInference(agentMode, reasoningEffort, parentToolCallID, generation)
 	a.mu.Lock()
@@ -4371,15 +4472,14 @@ func (a *neoActor) runInferenceForParent(agentMode, reasoningEffort, parentToolC
 	}
 	request := a.inferenceRequestLocked(agentMode, reasoningEffort, parentToolCallID)
 	a.mu.Unlock()
-	streamBlockOffset := neoOpenAIThinkingBlockOffset(agentMode, applyNeoModelMapping(a.runtime, selectNeoModelRoute(agentMode, request.Settings)).Provider)
-
 	streamed := false
 	streamingStateSent := false
 	textBlockStartTime := int64(0)
+	thinkingBlockStartTimes := map[int]int64{}
 	toolBlockStartTimes := map[string]int64{}
 	partialToolJSONByID := map[string]string{}
 	result, err := inferNeoLocalStream(a.runtime, request, func(delta neoInferenceDelta) {
-		if delta.Text == "" && delta.ToolCall == nil {
+		if delta.Text == "" && delta.Thinking == "" && delta.ThinkingSignature == "" && delta.ToolCall == nil {
 			return
 		}
 		a.mu.Lock()
@@ -4398,7 +4498,18 @@ func (a *neoActor) runInferenceForParent(agentMode, reasoningEffort, parentToolC
 				textBlockStartTime = time.Now().UnixMilli()
 			}
 			block := neoMarkStreamingBlock(map[string]any{"type": "text", "text": delta.Text}, textBlockStartTime)
-			a.handleProtocolDelta(withNeoParentToolCallID(map[string]any{"type": "delta", "messageId": assistantID, "role": "assistant", "blocks": []any{block}, "blockIndex": streamBlockOffset, "state": "generating", "usage": delta.Usage}, parentToolCallID))
+			a.handleProtocolDelta(withNeoParentToolCallID(neoAssistantDeltaPayload(assistantID, []any{block}, delta.BlockIndex, "generating", delta.Usage), parentToolCallID))
+		}
+		if delta.Thinking != "" || delta.ThinkingSignature != "" {
+			blockIndex := delta.BlockIndex
+			thinkingStartTime := thinkingBlockStartTimes[blockIndex]
+			if thinkingStartTime == 0 {
+				thinkingStartTime = time.Now().UnixMilli()
+				thinkingBlockStartTimes[blockIndex] = thinkingStartTime
+			}
+			block := map[string]any{"type": "thinking", "thinking": delta.Thinking, "signature": delta.ThinkingSignature}
+			block = neoMarkStreamingBlock(block, thinkingStartTime)
+			a.handleProtocolDelta(withNeoParentToolCallID(neoAssistantDeltaPayload(assistantID, []any{block}, blockIndex, "generating", delta.Usage), parentToolCallID))
 		}
 		if delta.ToolCall != nil && delta.ToolCall.Name != "" {
 			input := delta.ToolCall.Input
@@ -4438,7 +4549,7 @@ func (a *neoActor) runInferenceForParent(agentMode, reasoningEffort, parentToolC
 			} else {
 				block = neoMarkStreamingBlock(block, toolStartTime)
 			}
-			a.handleProtocolDelta(withNeoParentToolCallID(map[string]any{"type": "delta", "messageId": assistantID, "role": "assistant", "blocks": []any{block}, "blockIndex": delta.ToolCall.BlockIndex, "state": "tool_use", "usage": delta.Usage}, parentToolCallID))
+			a.handleProtocolDelta(withNeoParentToolCallID(neoAssistantDeltaPayload(assistantID, []any{block}, delta.ToolCall.BlockIndex, "tool_use", delta.Usage), parentToolCallID))
 		}
 	})
 	if err != nil {
@@ -4719,14 +4830,14 @@ func (a *neoActor) finishAssistantMessageWithOptions(messageID string, result ne
 			if result.Text != "" {
 				blockIndex++
 			}
-			a.handleProtocolDelta(withNeoParentToolCallID(map[string]any{"type": "delta", "messageId": messageID, "role": "assistant", "blocks": streamBlocks, "blockIndex": blockIndex, "state": state, "usage": usage}, parentToolCallID))
+			a.handleProtocolDelta(withNeoParentToolCallID(neoAssistantDeltaPayload(messageID, streamBlocks, blockIndex, state, usage), parentToolCallID))
 		}
 	} else {
-		a.handleProtocolDelta(withNeoParentToolCallID(map[string]any{"type": "delta", "messageId": messageID, "role": "assistant", "blocks": blocks, "blockIndex": 0, "state": state, "usage": usage}, parentToolCallID))
+		a.handleProtocolDelta(withNeoParentToolCallID(neoAssistantDeltaPayload(messageID, blocks, 0, state, usage), parentToolCallID))
 	}
 	if len(normalizedCalls) == 0 {
 		a.setAgentState("streaming", messageID, agentMode, reasoningEffort)
-		a.handleProtocolDelta(withNeoParentToolCallID(map[string]any{"type": "delta", "messageId": messageID, "role": "assistant", "blocks": []any{}, "state": "complete", "usage": usage}, parentToolCallID))
+		a.handleProtocolDelta(withNeoParentToolCallID(neoAssistantDeltaPayload(messageID, []any{}, 0, "complete", usage), parentToolCallID))
 	}
 
 	a.mu.Lock()
@@ -6715,7 +6826,7 @@ func (m *AmpModule) canServeNeoLocalManagement(r *http.Request) bool {
 
 func neoRuntimeBridgePath(path string) bool {
 	path = "/" + strings.Trim(path, "/")
-	return path == "/gateway" || strings.HasPrefix(path, "/gateway/") || path == "/actors" || strings.HasPrefix(path, "/actors/")
+	return path == "/metadata" || path == "/gateway" || strings.HasPrefix(path, "/gateway/") || path == "/actors" || strings.HasPrefix(path, "/actors/")
 }
 
 func (m *AmpModule) tryServeNeoLocalThreadActor(c *gin.Context) bool {
@@ -10221,7 +10332,9 @@ func defaultNeoReasoningEffort(agentMode string) string {
 	case "rush":
 		return "none"
 	case "deep":
-		return "xhigh"
+		return "medium"
+	case "frontier":
+		return "medium"
 	default:
 		return ""
 	}
@@ -10236,7 +10349,7 @@ func normalizeNeoReasoningEffortForMode(agentMode, effort string) string {
 
 func neoModeSupportsReasoningEffort(agentMode string) bool {
 	switch strings.ToLower(strings.TrimSpace(agentMode)) {
-	case "smart", "rush", "deep":
+	case "smart", "rush", "deep", "frontier":
 		return true
 	default:
 		return false
@@ -10255,6 +10368,8 @@ func neoReasoningEffortAllowedForMode(agentMode, effort string) bool {
 		return effort == "none"
 	case "deep":
 		return effort == "low" || effort == "medium" || effort == "xhigh"
+	case "frontier":
+		return effort == "medium"
 	default:
 		return false
 	}
@@ -10457,6 +10572,7 @@ type neoSocket struct {
 	mu           sync.Mutex
 	conn         *websocket.Conn
 	snapshotSent bool
+	jsonRPC      bool
 }
 
 func (s *neoSocket) markSnapshotSent() {
@@ -10477,14 +10593,77 @@ func (s *neoSocket) hasSnapshotSent() bool {
 	return s.snapshotSent
 }
 
+func (s *neoSocket) setJSONRPC(enabled bool) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.jsonRPC = enabled
+	s.mu.Unlock()
+}
+
+func (s *neoSocket) isJSONRPC() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.jsonRPC
+}
+
 func (s *neoSocket) send(payload any) {
 	cleaned := normalizeNeoOutboundJSON(payload)
+	if s.isJSONRPC() {
+		if frame, ok := neoJSONRPCNotification(cleaned); ok {
+			data, err := json.Marshal(frame)
+			if err != nil {
+				return
+			}
+			log.Debugf("amp neo local runtime WS send %s", neoProtocolSummary(cleaned))
+			s.sendText(string(data))
+			return
+		}
+	}
 	data, err := json.Marshal(cleaned)
 	if err != nil {
 		return
 	}
 	log.Debugf("amp neo local runtime WS send %s", neoProtocolSummary(cleaned))
 	s.sendText(string(data))
+}
+
+func (s *neoSocket) sendJSONRPCResponse(id any, result any) {
+	if s == nil || id == nil || !s.isJSONRPC() {
+		return
+	}
+	frame := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      id,
+		"result":  result,
+	}
+	data, err := json.Marshal(frame)
+	if err != nil {
+		return
+	}
+	s.sendText(string(data))
+}
+
+func neoJSONRPCNotification(payload any) (map[string]any, bool) {
+	msg, ok := payload.(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	method := stringValue(msg["type"])
+	if method == "" {
+		return nil, false
+	}
+	params := cloneMap(msg)
+	delete(params, "type")
+	return map[string]any{
+		"jsonrpc": "2.0",
+		"method":  method,
+		"params":  params,
+	}, true
 }
 
 func (s *neoSocket) sendText(text string) {
@@ -10781,6 +10960,21 @@ func withNeoParentToolCallID(payload map[string]any, parentToolCallID string) ma
 	return payload
 }
 
+func neoAssistantDeltaPayload(messageID string, blocks []any, blockIndex int, state string, usage map[string]any) map[string]any {
+	payload := map[string]any{
+		"type":       "delta",
+		"messageId":  messageID,
+		"role":       "assistant",
+		"blocks":     blocks,
+		"blockIndex": blockIndex,
+		"state":      state,
+	}
+	if normalizedUsage := normalizeNeoUsage(usage); len(normalizedUsage) > 0 {
+		payload["usage"] = normalizedUsage
+	}
+	return payload
+}
+
 type neoInferenceRequest struct {
 	ActorID          string
 	ThreadID         string
@@ -10813,9 +11007,12 @@ type neoThinkingBlock struct {
 }
 
 type neoInferenceDelta struct {
-	Text     string
-	ToolCall *neoToolCallDelta
-	Usage    map[string]any
+	Text              string
+	Thinking          string
+	ThinkingSignature string
+	BlockIndex        int
+	ToolCall          *neoToolCallDelta
+	Usage             map[string]any
 }
 
 type neoToolCallDelta struct {
@@ -10973,6 +11170,8 @@ func selectNeoModelRoute(agentMode string, settings map[string]any) neoModelRout
 		return neoModelRoute{Provider: "openai", Model: "gpt-5.5"}
 	case "large":
 		return neoModelRoute{Provider: "anthropic", Model: "claude-opus-4-6"}
+	case "frontier":
+		return neoModelRoute{Provider: "google", Model: "gemini-3.5-flash"}
 	default:
 		return neoModelRoute{Provider: "anthropic", Model: "claude-opus-4-7"}
 	}
@@ -11275,7 +11474,7 @@ func inferNeoAnthropicStream(rt *neoRuntime, request neoInferenceRequest, route 
 						block.text.WriteString(text)
 						fullText.WriteString(text)
 						if onDelta != nil {
-							onDelta(neoInferenceDelta{Text: text, Usage: usage})
+							onDelta(neoInferenceDelta{Text: text, BlockIndex: index, Usage: usage})
 						}
 					}
 				case "tool_use":
@@ -11291,9 +11490,15 @@ func inferNeoAnthropicStream(rt *neoRuntime, request neoInferenceRequest, route 
 				case "thinking":
 					if text := stringValue(contentBlock["thinking"]); text != "" {
 						block.thinking.WriteString(text)
+						if onDelta != nil {
+							onDelta(neoInferenceDelta{Thinking: text, BlockIndex: index, Usage: usage})
+						}
 					}
 					if sig := stringValue(contentBlock["signature"]); sig != "" {
 						block.signature = sig
+						if onDelta != nil {
+							onDelta(neoInferenceDelta{ThinkingSignature: sig, BlockIndex: index, Usage: usage})
+						}
 					}
 				}
 			case "content_block_delta":
@@ -11308,7 +11513,7 @@ func inferNeoAnthropicStream(rt *neoRuntime, request neoInferenceRequest, route 
 						block.text.WriteString(text)
 						fullText.WriteString(text)
 						if onDelta != nil {
-							onDelta(neoInferenceDelta{Text: text, Usage: usage})
+							onDelta(neoInferenceDelta{Text: text, BlockIndex: index, Usage: usage})
 						}
 					}
 				case "input_json_delta":
@@ -11328,11 +11533,17 @@ func inferNeoAnthropicStream(rt *neoRuntime, request neoInferenceRequest, route 
 					block.blockType = "thinking"
 					if text := stringValue(delta["thinking"]); text != "" {
 						block.thinking.WriteString(text)
+						if onDelta != nil {
+							onDelta(neoInferenceDelta{Thinking: text, BlockIndex: index, Usage: usage})
+						}
 					}
 				case "signature_delta":
 					block.blockType = "thinking"
 					if sig := stringValue(delta["signature"]); sig != "" {
 						block.signature = sig
+						if onDelta != nil {
+							onDelta(neoInferenceDelta{ThinkingSignature: sig, BlockIndex: index, Usage: usage})
+						}
 					}
 				}
 			case "error":
@@ -11457,7 +11668,7 @@ func inferNeoOpenAIStream(rt *neoRuntime, request neoInferenceRequest, route neo
 				sawContent = true
 				fullText.WriteString(text)
 				if onDelta != nil {
-					onDelta(neoInferenceDelta{Text: text, Usage: usage})
+					onDelta(neoInferenceDelta{Text: text, BlockIndex: streamBlockOffset, Usage: usage})
 				}
 			}
 			for _, rawCall := range arrayValue(delta["tool_calls"]) {
@@ -12008,8 +12219,8 @@ func callNeoLocalProviderSSE(rt *neoRuntime, provider, subpath string, body map[
 	}
 
 	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" {
+		line := strings.TrimSuffix(scanner.Text(), "\r")
+		if strings.TrimSpace(line) == "" {
 			if err := dispatch(); err != nil {
 				return err
 			}
@@ -12123,12 +12334,13 @@ func withNeoAnthropicAdaptiveThinking(body map[string]any) map[string]any {
 	copyThinking := cloneMap(thinkingBody)
 	delete(copyThinking, "budget_tokens")
 	copyThinking["type"] = "adaptive"
+	copyThinking["display"] = "summarized"
 	copyBody["thinking"] = copyThinking
 
 	effort := "high"
 	if budget := numberFrom(thinkingBody["budget_tokens"]); budget > 0 {
 		if level, ok := thinking.ConvertBudgetToLevel(budget); ok {
-			if mapped, ok := thinking.MapToClaudeEffort(level, true); ok && mapped != "" {
+			if mapped, ok := neoAnthropicAdaptiveEffortFromLevel(level); ok && mapped != "" {
 				effort = mapped
 			}
 		}
@@ -12137,6 +12349,19 @@ func withNeoAnthropicAdaptiveThinking(body map[string]any) map[string]any {
 	outputConfig["effort"] = effort
 	copyBody["output_config"] = outputConfig
 	return copyBody
+}
+
+func neoAnthropicAdaptiveEffortFromLevel(level string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(level)) {
+	case "minimal", "low":
+		return "low", true
+	case "medium", "high", "xhigh", "max":
+		return strings.ToLower(strings.TrimSpace(level)), true
+	case "auto":
+		return "high", true
+	default:
+		return "", false
+	}
 }
 
 func firstConfiguredAPIKey(cfg *config.Config) string {
@@ -14150,6 +14375,25 @@ func neoApplyAnthropicCacheBreakpoints(body map[string]any) {
 // or a level. anthropic accepts {"type":"enabled","budget_tokens":N}.
 func neoApplyAnthropicThinking(body map[string]any, route neoModelRoute, fallback string) {
 	suffix := neoEffectiveThinkingLevel(route, fallback)
+	if neoAnthropicSupportsAdaptiveEffort(route.Model) {
+		effort := neoAnthropicAdaptiveEffort(route.Model, suffix)
+		if effort == "none" {
+			body["thinking"] = map[string]any{"type": "disabled"}
+			outputConfig := cloneMap(mapValue(body["output_config"]))
+			delete(outputConfig, "effort")
+			if len(outputConfig) == 0 {
+				delete(body, "output_config")
+			} else {
+				body["output_config"] = outputConfig
+			}
+			return
+		}
+		body["thinking"] = map[string]any{"type": "adaptive", "display": "summarized"}
+		outputConfig := cloneMap(mapValue(body["output_config"]))
+		outputConfig["effort"] = effort
+		body["output_config"] = outputConfig
+		return
+	}
 	if suffix == "" {
 		return
 	}
@@ -14171,6 +14415,41 @@ func neoApplyAnthropicThinking(body map[string]any, route neoModelRoute, fallbac
 	// level suffix: convert to a budget.
 	if budget, ok := thinking.ConvertLevelToBudget(suffix); ok && budget > 0 {
 		body["thinking"] = map[string]any{"type": "enabled", "budget_tokens": budget}
+	}
+}
+
+func neoAnthropicSupportsAdaptiveEffort(model string) bool {
+	switch strings.TrimSpace(model) {
+	case "claude-opus-4-6", "claude-opus-4-6-1m", "claude-opus-4-7":
+		return true
+	default:
+		return false
+	}
+}
+
+func neoAnthropicAdaptiveEffort(model, effort string) string {
+	if budget, ok := thinking.ParseNumericSuffix(effort); ok {
+		if budget <= 0 {
+			return "none"
+		}
+		if level, ok := thinking.ConvertBudgetToLevel(budget); ok {
+			if mapped, ok := neoAnthropicAdaptiveEffortFromLevel(level); ok && mapped != "" {
+				return mapped
+			}
+		}
+	}
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case "none":
+		return "none"
+	case "low", "medium", "high", "xhigh", "max":
+		return strings.ToLower(strings.TrimSpace(effort))
+	case "auto":
+		return "high"
+	default:
+		if strings.TrimSpace(model) == "claude-opus-4-7" {
+			return "medium"
+		}
+		return "high"
 	}
 }
 

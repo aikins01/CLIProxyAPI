@@ -139,12 +139,30 @@ func TestRegisterManagementRoutesNeoRuntimeBridgeUsesManagementAuth(t *testing.T
 	var runtimeRequests int
 	var sawAuthToken bool
 	var sawAuthorization bool
+	var sawRivetHeader bool
+	var sawRivetToken bool
+	var sawRivetSubprotocol bool
+	var sawRivetEncoding bool
 	var sawRivetKey bool
+	var sawMetadataPath bool
 	runtimeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		runtimeRequests++
 		sawAuthToken = r.URL.Query().Get("auth_token") != ""
 		sawAuthorization = r.Header.Get("Authorization") != ""
+		sawRivetHeader = r.Header.Get("X-Rivet-Token") != ""
+		sawRivetToken = r.URL.Query().Get("rvt-token") != ""
+		for _, header := range r.Header.Values("Sec-WebSocket-Protocol") {
+			if strings.Contains(header, "rivet_token.") {
+				sawRivetSubprotocol = true
+			}
+			if strings.Contains(header, "rivet_encoding.json") {
+				sawRivetEncoding = true
+			}
+		}
 		sawRivetKey = r.URL.Query().Get("rvt-key") == "T-bridge"
+		if r.URL.Path == "/metadata" {
+			sawMetadataPath = true
+		}
 		writeNeoJSON(w, http.StatusOK, map[string]any{"ok": true})
 	}))
 	defer runtimeServer.Close()
@@ -168,7 +186,18 @@ func TestRegisterManagementRoutesNeoRuntimeBridgeUsesManagementAuth(t *testing.T
 		neoRuntime:          &neoRuntime{host: host, port: port},
 	}
 	auth := func(c *gin.Context) {
-		if c.Query("auth_token") != "local-key" {
+		token := c.Query("auth_token")
+		if token == "" {
+			token = c.Query("rvt-token")
+		}
+		if token == "" {
+			token = strings.TrimSpace(c.GetHeader("X-Rivet-Token"))
+		}
+		if token == "" {
+			token = strings.TrimSpace(c.GetHeader("Authorization"))
+			token = strings.TrimSpace(strings.TrimPrefix(token, "Bearer "))
+		}
+		if token != "local-key" {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing auth"})
 			return
 		}
@@ -192,11 +221,13 @@ func TestRegisterManagementRoutesNeoRuntimeBridgeUsesManagementAuth(t *testing.T
 		t.Fatalf("runtime saw unauthenticated request")
 	}
 
-	authReq, err := http.NewRequest(http.MethodGet, server.URL+"/gateway/threadActor/?rvt-method=getOrCreate&rvt-key=T-bridge&auth_token=local-key", nil)
+	authReq, err := http.NewRequest(http.MethodGet, server.URL+"/gateway/threadActor/?rvt-method=getOrCreate&rvt-key=T-bridge&rvt-token=local-key", nil)
 	if err != nil {
 		t.Fatalf("auth request build: %v", err)
 	}
 	authReq.Header.Set("Authorization", "Bearer local-key")
+	authReq.Header.Set("X-Rivet-Token", "local-key")
+	authReq.Header.Set("Sec-WebSocket-Protocol", "rivet, rivet_token.local-key, rivet_encoding.json")
 	authResp, err := http.DefaultClient.Do(authReq)
 	if err != nil {
 		t.Fatalf("auth request: %v", err)
@@ -215,8 +246,38 @@ func TestRegisterManagementRoutesNeoRuntimeBridgeUsesManagementAuth(t *testing.T
 	if sawAuthorization {
 		t.Fatalf("Authorization leaked to runtime")
 	}
+	if sawRivetHeader {
+		t.Fatalf("X-Rivet-Token leaked to runtime")
+	}
+	if sawRivetToken {
+		t.Fatalf("rvt-token leaked to runtime")
+	}
+	if sawRivetSubprotocol {
+		t.Fatalf("rivet_token subprotocol leaked to runtime")
+	}
+	if !sawRivetEncoding {
+		t.Fatalf("non-credential websocket subprotocol was stripped")
+	}
 	if !sawRivetKey {
 		t.Fatalf("rvt-key did not reach runtime")
+	}
+
+	metadataReq, err := http.NewRequest(http.MethodGet, server.URL+"/metadata", nil)
+	if err != nil {
+		t.Fatalf("metadata request build: %v", err)
+	}
+	metadataReq.Header.Set("Authorization", "Bearer local-key")
+	metadataResp, err := http.DefaultClient.Do(metadataReq)
+	if err != nil {
+		t.Fatalf("metadata request: %v", err)
+	}
+	defer metadataResp.Body.Close()
+	if metadataResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(metadataResp.Body)
+		t.Fatalf("metadata status = %d, body=%s", metadataResp.StatusCode, body)
+	}
+	if !sawMetadataPath {
+		t.Fatalf("metadata route did not reach runtime")
 	}
 }
 

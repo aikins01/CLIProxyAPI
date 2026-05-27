@@ -269,6 +269,7 @@ func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *ha
 	engine.Any("/gateway/*path", append(rootMiddleware, neoRuntimeBridgeHandler)...)
 	engine.Any("/actors", append(rootMiddleware, neoRuntimeBridgeHandler)...)
 	engine.Any("/actors/*path", append(rootMiddleware, neoRuntimeBridgeHandler)...)
+	engine.GET("/metadata", append(rootMiddleware, neoRuntimeBridgeHandler)...)
 
 	// Root-level auth routes for CLI login flow
 	// Amp uses multiple auth routes: /auth/cli-login, /auth/callback, /auth/sign-in, /auth/logout
@@ -338,13 +339,36 @@ func stripNeoRuntimeBridgeCredentials(req *http.Request) {
 	req.Header.Del("Authorization")
 	req.Header.Del("X-Api-Key")
 	req.Header.Del("X-Goog-Api-Key")
+	req.Header.Del("X-Rivet-Token")
+	if protocols := stripNeoCredentialSubprotocols(req.Header.Get("Sec-WebSocket-Protocol")); protocols != "" {
+		req.Header.Set("Sec-WebSocket-Protocol", protocols)
+	} else {
+		req.Header.Del("Sec-WebSocket-Protocol")
+	}
 	if req.URL == nil {
 		return
 	}
 	query := req.URL.Query()
 	query.Del("auth_token")
 	query.Del("access_token")
+	query.Del("rvt-token")
 	req.URL.RawQuery = query.Encode()
+}
+
+func stripNeoCredentialSubprotocols(header string) string {
+	if strings.TrimSpace(header) == "" {
+		return ""
+	}
+	parts := strings.Split(header, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		trimmed := strings.TrimSpace(part)
+		if trimmed == "" || strings.HasPrefix(trimmed, "rivet_token.") {
+			continue
+		}
+		out = append(out, trimmed)
+	}
+	return strings.Join(out, ", ")
 }
 
 func (m *AmpModule) tryServeNeoLocalInternal(c *gin.Context) bool {

@@ -672,6 +672,73 @@ func TestNeoRuntimeGatewayWebSocketGetOrCreate(t *testing.T) {
 	}
 }
 
+func TestNeoRuntimeGatewayWebSocketJSONRPCTransport(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	t.Cleanup(server.Close)
+
+	dialer := websocket.Dialer{Subprotocols: []string{"rivet", "rivet_conn_params.%7B%22transport%22%3A%22json-rpc%22%7D", "rivet_encoding.4", "rivet_skip_ready_wait"}}
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/gateway/threadActor/?rvt-method=getOrCreate&rvt-key=T-jsonrpc"
+	conn, resp, err := dialer.Dial(wsURL, nil)
+	if err != nil {
+		status := 0
+		if resp != nil {
+			status = resp.StatusCode
+		}
+		t.Fatalf("gateway websocket dial failed status=%d err=%v", status, err)
+	}
+	defer conn.Close()
+
+	if err := conn.WriteJSON(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      "req-1",
+		"method":  "executor_connect",
+		"params": map[string]any{
+			"clientId":     "executor-jsonrpc",
+			"executorType": "local-client",
+			"handshakeSeq": 1,
+			"capabilities": map[string]any{"workspaceId": "/tmp/workspace"},
+		},
+	}); err != nil {
+		t.Fatalf("write jsonrpc executor_connect: %v", err)
+	}
+
+	var sawConnected bool
+	var sawResponse bool
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && (!sawConnected || !sawResponse) {
+		_ = conn.SetReadDeadline(time.Now().Add(time.Until(deadline)))
+		_, payload, err := conn.ReadMessage()
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				break
+			}
+			t.Fatalf("read jsonrpc websocket message: %v", err)
+		}
+		var frame map[string]any
+		if err := json.Unmarshal(payload, &frame); err != nil {
+			t.Fatalf("jsonrpc websocket JSON error: %v", err)
+		}
+		if _, hasRawType := frame["type"]; hasRawType {
+			t.Fatalf("jsonrpc websocket received raw protocol frame: %#v", frame)
+		}
+		if frame["id"] == "req-1" {
+			sawResponse = true
+			continue
+		}
+		if frame["method"] == "executor_connected" {
+			params := mapValue(frame["params"])
+			if params["executorId"] != "executor-jsonrpc" {
+				t.Fatalf("executor_connected params = %#v", params)
+			}
+			sawConnected = true
+		}
+	}
+	if !sawConnected || !sawResponse {
+		t.Fatalf("jsonrpc websocket sawConnected=%v sawResponse=%v", sawConnected, sawResponse)
+	}
+}
+
 func TestNeoRuntimeEnsureThreadActorIndexesGatewayThreadActorName(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	threadID := "T-index-gateway"
@@ -1882,7 +1949,6 @@ func TestNeoActorProtocolDeltaSequencesAndPersistsStreamingAssistant(t *testing.
 		t.Fatalf("first delta did not persist streaming assistant: %#v", actor.messages)
 	}
 	foundDelta := false
-	foundStreamingUpdate := false
 	for _, event := range actor.replayEvents {
 		if event.Seq != firstSeq {
 			continue
@@ -1893,17 +1959,11 @@ func TestNeoActorProtocolDeltaSequencesAndPersistsStreamingAssistant(t *testing.
 				foundDelta = true
 			}
 		case "message_updated":
-			message := mapValue(event.Payload["message"])
-			if stringValue(message["messageId"]) == "M-assistant" && textFromBlocks(arrayValue(message["content"])) == "hel" {
-				foundStreamingUpdate = true
-			}
+			t.Fatalf("streaming delta should replay as delta only, got message_updated: %#v", event.Payload)
 		}
 	}
 	if !foundDelta {
 		t.Fatalf("first delta replay event missing: %#v", actor.replayEvents)
-	}
-	if !foundStreamingUpdate {
-		t.Fatalf("streaming message_updated replay event missing: %#v", actor.replayEvents)
 	}
 	actor.mu.Unlock()
 
@@ -3297,6 +3357,13 @@ func TestSelectNeoModelRouteDefaultsRushToGPT55(t *testing.T) {
 	}
 }
 
+func TestSelectNeoModelRouteDefaultsFrontierToGemini35Flash(t *testing.T) {
+	got := selectNeoModelRoute("frontier", nil)
+	if got.Provider != "google" || got.Model != "gemini-3.5-flash" {
+		t.Fatalf("route = %+v, want google/gemini-3.5-flash", got)
+	}
+}
+
 func TestNeoModelRegistryMatchesAmpBinaryValues(t *testing.T) {
 	for _, tc := range []struct {
 		model    string
@@ -3418,7 +3485,7 @@ func TestNeoPromptFamilyMatchesBinarySelector(t *testing.T) {
 		{name: "rush mode", agentMode: "rush", route: neoModelRoute{Provider: "openai", Model: "gpt-5.5"}, want: neoPromptFamilyRush},
 		{name: "deep gpt55", agentMode: "deep", route: neoModelRoute{Provider: "openai", Model: "gpt-5.5"}, want: neoPromptFamilyDeep},
 		{name: "deep gpt54", agentMode: "deep", route: neoModelRoute{Provider: "openai", Model: "gpt-5.4"}, want: neoPromptFamilyDeepGPT54},
-		{name: "frontier mode", agentMode: "frontier", route: neoModelRoute{Provider: "anthropic", Model: "claude-opus-4-7"}, want: neoPromptFamilyFrontier},
+		{name: "frontier mode", agentMode: "frontier", route: neoModelRoute{Provider: "google", Model: "gemini-3.5-flash"}, want: neoPromptFamilyFrontier},
 		{name: "codex model", agentMode: "smart", route: neoModelRoute{Provider: "openai", Model: "gpt-5-codex"}, want: neoPromptFamilyGPT5Codex},
 		{name: "kimi model", agentMode: "smart", route: neoModelRoute{Provider: "anthropic", Model: "kimi-k2-0905"}, want: neoPromptFamilyKimi},
 		{name: "generic openai", agentMode: "smart", route: neoModelRoute{Provider: "openai", Model: "o3"}, want: neoPromptFamilyGPT},
@@ -3878,11 +3945,14 @@ func TestNeoActorReasoningEffortDefaultsByMode(t *testing.T) {
 	if got := actor.reasoningEffortForModeLocked("rush"); got != "none" {
 		t.Fatalf("rush effort = %q, want none", got)
 	}
-	if got := actor.reasoningEffortForModeLocked("deep"); got != "xhigh" {
-		t.Fatalf("deep effort = %q, want xhigh", got)
+	if got := actor.reasoningEffortForModeLocked("deep"); got != "medium" {
+		t.Fatalf("deep effort = %q, want medium", got)
 	}
 	if got := actor.reasoningEffortForModeLocked("smart"); got != "high" {
 		t.Fatalf("smart effort = %q, want high", got)
+	}
+	if got := actor.reasoningEffortForModeLocked("frontier"); got != "medium" {
+		t.Fatalf("frontier effort = %q, want medium", got)
 	}
 }
 
@@ -3955,12 +4025,12 @@ func TestNeoActorFiltersAmpBuiltInToolsByMode(t *testing.T) {
 	deepNames := requestNames("deep")
 	assertMode("deep", deepNames,
 		[]string{"read_thread", "shell_command", "apply_patch", "chart", "view_media", "tb__gemini-oracle", "code_review"},
-		[]string{"Read", "Grep", "glob", "Glob", "Bash", "create_file", "edit_file", "get_diagnostics", "Task", "task_list", "todo_write", "file_tree", "deferred_custom", "docs_read"})
+		[]string{"Read", "Grep", "glob", "Glob", "Bash", "create_file", "edit_file", "get_diagnostics", "Task", "look_at", "task_list", "todo_write", "file_tree", "deferred_custom", "docs_read"})
 
 	smartNames := requestNames("smart")
 	assertMode("smart", smartNames,
 		[]string{"Read", "Bash", "create_file", "edit_file", "Task", "view_media", "tb__gemini-oracle", "code_review"},
-		[]string{"Grep", "glob", "Glob", "delete_file", "get_diagnostics", "shell_command", "apply_patch", "chart", "task_list", "todo_write", "file_tree", "deferred_custom", "search_documents", "get_document", "docs_read"})
+		[]string{"Grep", "glob", "Glob", "delete_file", "get_diagnostics", "shell_command", "apply_patch", "chart", "look_at", "task_list", "todo_write", "file_tree", "deferred_custom", "search_documents", "get_document", "docs_read"})
 
 	smartPromptNames := map[string]bool{}
 	for _, name := range actor.toolNamesLocked("smart") {
@@ -3973,12 +4043,12 @@ func TestNeoActorFiltersAmpBuiltInToolsByMode(t *testing.T) {
 	rushNames := requestNames("rush")
 	assertMode("rush", rushNames,
 		[]string{"Task", "shell_command", "apply_patch", "view_media", "read_mcp_resource", "tb__gemini-oracle"},
-		[]string{"Read", "Grep", "glob", "Glob", "Bash", "create_file", "edit_file", "get_diagnostics", "chart", "task_list", "todo_write", "file_tree", "code_review", "deferred_custom", "docs_read"})
+		[]string{"Read", "Grep", "glob", "Glob", "Bash", "create_file", "edit_file", "get_diagnostics", "chart", "look_at", "task_list", "todo_write", "file_tree", "code_review", "deferred_custom", "docs_read"})
 
 	largeNames := requestNames("large")
 	assertMode("large", largeNames,
 		[]string{"Read", "Bash", "create_file", "edit_file", "Task", "view_media", "tb__gemini-oracle", "code_review"},
-		[]string{"Grep", "glob", "Glob", "get_diagnostics", "shell_command", "apply_patch", "chart", "task_list", "todo_write", "file_tree", "deferred_custom", "docs_read"})
+		[]string{"Grep", "glob", "Glob", "get_diagnostics", "shell_command", "apply_patch", "chart", "look_at", "task_list", "todo_write", "file_tree", "deferred_custom", "docs_read"})
 
 	aggNames := requestNames("agg-man")
 	assertMode("agg-man", aggNames,
@@ -3988,12 +4058,12 @@ func TestNeoActorFiltersAmpBuiltInToolsByMode(t *testing.T) {
 	frontierNames := requestNames("frontier")
 	assertMode("frontier", frontierNames,
 		[]string{"Task", "shell_command", "apply_patch", "view_media", "tb__gemini-oracle", "code_review"},
-		[]string{"Read", "Grep", "glob", "Glob", "Bash", "create_file", "edit_file", "get_diagnostics", "chart", "read_mcp_resource", "todo_write", "file_tree", "deferred_custom", "docs_read"})
+		[]string{"Read", "Grep", "glob", "Glob", "Bash", "create_file", "edit_file", "get_diagnostics", "chart", "look_at", "read_mcp_resource", "todo_write", "file_tree", "deferred_custom", "docs_read"})
 
 	nostromoNames := requestNames("nostromo")
 	assertMode("nostromo", nostromoNames,
 		[]string{"Read", "Bash", "create_file", "edit_file", "Task", "shell_command", "apply_patch", "chart", "view_media", "send_message_to_aggman", "tb__gemini-oracle"},
-		[]string{"Grep", "glob", "Glob", "get_diagnostics", "task_list", "todo_write", "file_tree", "code_review", "deferred_custom", "docs_read"})
+		[]string{"Grep", "glob", "Glob", "get_diagnostics", "look_at", "task_list", "todo_write", "file_tree", "code_review", "deferred_custom", "docs_read"})
 }
 
 func TestNormalizeNeoToolCallsOmitsEmptyCodeReviewDefaults(t *testing.T) {
@@ -4301,6 +4371,87 @@ func TestInferNeoOpenAIStreamEmitsDeltaBeforeUpstreamCompletes(t *testing.T) {
 		t.Fatalf("inferNeoLocalStream error: %v", err)
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for completed stream")
+	}
+}
+
+func TestInferNeoOpenAIStreamHandlesCRLFSSESeparatorsBeforeUpstreamCompletes(t *testing.T) {
+	firstSent := make(chan struct{})
+	allowFinish := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/provider/openai/v1/chat/completions" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, _ := w.(http.Flusher)
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\r\n\r\n"))
+		if flusher != nil {
+			flusher.Flush()
+		}
+		close(firstSent)
+		select {
+		case <-allowFinish:
+		case <-time.After(2 * time.Second):
+			return
+		}
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\r\n\r\n"))
+		_, _ = w.Write([]byte("data: [DONE]\r\n\r\n"))
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}))
+	defer upstream.Close()
+
+	deltaCh := make(chan string, 2)
+	resultCh := make(chan neoInferenceResult, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		result, err := inferNeoLocalStream(testNeoRuntimeForServer(t, upstream), neoInferenceRequest{
+			ThreadID:        "T-test",
+			AgentMode:       "deep",
+			ReasoningEffort: "medium",
+			Settings:        map[string]any{"internal.model": "openai/gpt-test"},
+			History:         []neoHistoryMessage{{Role: "user", Text: "hi"}},
+		}, func(delta neoInferenceDelta) {
+			deltaCh <- delta.Text
+		})
+		if err != nil {
+			errCh <- err
+			return
+		}
+		resultCh <- result
+	}()
+
+	select {
+	case <-firstSent:
+	case err := <-errCh:
+		t.Fatalf("inferNeoLocalStream error before first delta: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("upstream did not send first chunk")
+	}
+
+	select {
+	case delta := <-deltaCh:
+		if delta != "hel" {
+			t.Fatalf("first delta = %q, want hel", delta)
+		}
+	case result := <-resultCh:
+		t.Fatalf("stream completed before first delta: %#v", result)
+	case err := <-errCh:
+		t.Fatalf("inferNeoLocalStream error: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for first CRLF streamed delta")
+	}
+
+	close(allowFinish)
+	select {
+	case result := <-resultCh:
+		if result.Text != "hello" {
+			t.Fatalf("text=%q, want hello", result.Text)
+		}
+	case err := <-errCh:
+		t.Fatalf("inferNeoLocalStream error: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for completed CRLF stream")
 	}
 }
 
@@ -4660,6 +4811,57 @@ func TestInferNeoAnthropicStreamRetriesWithAdaptiveThinkingWhenEnabledUnsupporte
 	}
 }
 
+func TestNeoApplyAnthropicThinkingUsesAdaptiveEffortForAmpOpusModels(t *testing.T) {
+	tests := []struct {
+		name     string
+		model    string
+		fallback string
+		want     string
+	}{
+		{name: "smart opus 4.7 effort", model: "claude-opus-4-7", fallback: "xhigh", want: "xhigh"},
+		{name: "opus 4.7 default", model: "claude-opus-4-7", fallback: "", want: "medium"},
+		{name: "large opus 4.6 default", model: "claude-opus-4-6", fallback: "", want: "high"},
+		{name: "large opus 4.6 1m default", model: "claude-opus-4-6-1m", fallback: "", want: "high"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := map[string]any{}
+			neoApplyAnthropicThinking(body, neoModelRoute{Provider: "anthropic", Model: tt.model}, tt.fallback)
+			thinkingBody := mapValue(body["thinking"])
+			if stringValue(thinkingBody["type"]) != "adaptive" || stringValue(thinkingBody["display"]) != "summarized" {
+				t.Fatalf("thinking = %#v, want adaptive summarized", thinkingBody)
+			}
+			if _, ok := thinkingBody["budget_tokens"]; ok {
+				t.Fatalf("adaptive thinking retained budget_tokens: %#v", thinkingBody)
+			}
+			if effort := stringValue(mapValue(body["output_config"])["effort"]); effort != tt.want {
+				t.Fatalf("output_config.effort = %q, want %q; body=%#v", effort, tt.want, body)
+			}
+		})
+	}
+}
+
+func TestWithNeoAnthropicAdaptiveThinkingPreservesXHighEffort(t *testing.T) {
+	body := map[string]any{
+		"thinking": map[string]any{"type": "enabled", "budget_tokens": 32768},
+	}
+	out := withNeoAnthropicAdaptiveThinking(body)
+	thinkingBody := mapValue(out["thinking"])
+	if stringValue(thinkingBody["type"]) != "adaptive" {
+		t.Fatalf("thinking = %#v, want adaptive", thinkingBody)
+	}
+	if stringValue(thinkingBody["display"]) != "summarized" {
+		t.Fatalf("thinking display = %#v, want summarized", thinkingBody)
+	}
+	if _, ok := thinkingBody["budget_tokens"]; ok {
+		t.Fatalf("adaptive thinking retained budget_tokens: %#v", thinkingBody)
+	}
+	if effort := stringValue(mapValue(out["output_config"])["effort"]); effort != "xhigh" {
+		t.Fatalf("output_config.effort = %q, want xhigh", effort)
+	}
+}
+
 func TestInferNeoGoogleStreamFallsBackToNonStreamOnEmptyPayload(t *testing.T) {
 	streamCalls := 0
 	nonStreamCalls := 0
@@ -5015,6 +5217,147 @@ func TestNeoRuntimeWebSocketStreamingToolArgumentsUseAmpDeltaShape(t *testing.T)
 	if _, exists := toolDeltas[1]["inputPartialJSON"]; exists {
 		t.Fatalf("second tool delta should not repeat cumulative inputPartialJSON: %#v", toolDeltas[1])
 	}
+}
+
+func TestNeoRuntimeWebSocketStreamsAnthropicThinkingAndTextIndexes(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/provider/anthropic/v1/messages" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		payload := readNeoJSON(r.Body)
+		if payload["stream"] != true {
+			t.Fatalf("stream = %#v, want true", payload["stream"])
+		}
+		if thinkingBody := mapValue(payload["thinking"]); stringValue(thinkingBody["type"]) != "adaptive" || stringValue(thinkingBody["display"]) != "summarized" {
+			t.Fatalf("thinking = %#v, want adaptive summarized", thinkingBody)
+		}
+		if effort := stringValue(mapValue(payload["output_config"])["effort"]); effort != "max" {
+			t.Fatalf("output_config.effort = %q, want max; payload=%#v", effort, payload)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, _ := w.(http.Flusher)
+		for _, chunk := range []string{
+			`event: message_start` + "\n" + `data: {"type":"message_start","message":{"id":"msg_1","model":"claude-opus-4-7","usage":{"input_tokens":2,"output_tokens":0}}}`,
+			`event: content_block_start` + "\n" + `data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}`,
+			`event: content_block_delta` + "\n" + `data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"considering"}}`,
+			`event: content_block_delta` + "\n" + `data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig_1"}}`,
+			`event: content_block_start` + "\n" + `data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}`,
+			`event: content_block_delta` + "\n" + `data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"hello"}}`,
+			`event: message_delta` + "\n" + `data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":2,"output_tokens":1}}`,
+			`data: [DONE]`,
+		} {
+			_, _ = w.Write([]byte(chunk + "\n\n"))
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+	}))
+	defer upstream.Close()
+
+	rt := testNeoRuntimeForServer(t, upstream)
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	t.Cleanup(server.Close)
+
+	threadID := "T-019e0e6e-f3f1-7078-b5dd-748f66f8c25f"
+	conn := dialNeoActorWebSocket(t, server.URL, threadID)
+	defer conn.Close()
+
+	if err := conn.WriteJSON(map[string]any{"type": "executor_connected", "executorId": "executor-test", "registeredToolCount": 0}); err != nil {
+		t.Fatalf("write executor_connected: %v", err)
+	}
+	if err := conn.WriteJSON(map[string]any{
+		"type":            "client_append_user_msg",
+		"messageId":       "M-user",
+		"agentMode":       "smart",
+		"reasoningEffort": "max",
+		"content":         []any{map[string]any{"type": "text", "text": "hi"}},
+	}); err != nil {
+		t.Fatalf("write user message: %v", err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	sawThinking := false
+	sawText := false
+	sawComplete := false
+	for time.Now().Before(deadline) {
+		msg, ok := readNeoMessage(t, conn, time.Until(deadline))
+		if !ok {
+			break
+		}
+		switch msg["type"] {
+		case "delta":
+			if msg["role"] != "assistant" || msg["state"] != "generating" {
+				continue
+			}
+			blocks := arrayValue(msg["blocks"])
+			if len(blocks) == 0 {
+				continue
+			}
+			if usage := mapValue(msg["usage"]); len(usage) > 0 {
+				if _, ok := usage["input_tokens"]; ok {
+					t.Fatalf("streaming delta leaked provider usage shape: %#v", msg)
+				}
+				for _, key := range []string{"maxInputTokens", "inputTokens", "outputTokens", "cacheCreationInputTokens", "cacheReadInputTokens", "totalInputTokens"} {
+					if _, ok := usage[key]; !ok {
+						t.Fatalf("streaming delta usage missing %s: %#v", key, msg)
+					}
+				}
+			}
+			block := mapValue(blocks[0])
+			switch stringValue(block["type"]) {
+			case "thinking":
+				if _, ok := block["signature"]; !ok {
+					t.Fatalf("thinking delta missing required signature field: %#v", msg)
+				}
+				if numberFrom(msg["blockIndex"]) != 0 {
+					t.Fatalf("thinking blockIndex = %d, want 0: %#v", numberFrom(msg["blockIndex"]), msg)
+				}
+				if strings.Contains(stringValue(block["thinking"]), "considering") {
+					sawThinking = true
+				}
+			case "text":
+				if numberFrom(msg["blockIndex"]) != 1 {
+					t.Fatalf("text blockIndex = %d, want 1 after thinking: %#v", numberFrom(msg["blockIndex"]), msg)
+				}
+				if stringValue(block["text"]) == "hello" {
+					sawText = true
+				}
+			}
+		case "message_updated":
+			message := mapValue(msg["message"])
+			if stringValue(message["role"]) != "assistant" {
+				continue
+			}
+			if stringValue(mapValue(message["state"])["type"]) == "streaming" {
+				t.Fatalf("streaming assistant frame should be a delta, got message_updated: %#v", msg)
+			}
+			if stringValue(mapValue(message["state"])["type"]) == "complete" {
+				content := arrayValue(message["content"])
+				if len(content) >= 2 &&
+					stringValue(mapValue(content[0])["type"]) == "thinking" &&
+					stringValue(mapValue(content[1])["text"]) == "hello" {
+					sawComplete = true
+				}
+			}
+		case "message_added":
+			message := mapValue(msg["message"])
+			if stringValue(message["role"]) != "assistant" || stringValue(mapValue(message["state"])["type"]) != "complete" {
+				continue
+			}
+			content := arrayValue(message["content"])
+			if len(content) >= 2 &&
+				stringValue(mapValue(content[0])["type"]) == "thinking" &&
+				stringValue(mapValue(content[1])["text"]) == "hello" {
+				sawComplete = true
+			}
+		case "agent_state":
+			if msg["state"] == "idle" && sawThinking && sawText && sawComplete {
+				return
+			}
+		}
+	}
+	t.Fatalf("timed out waiting for streamed thinking/text, sawThinking=%t sawText=%t sawComplete=%t", sawThinking, sawText, sawComplete)
 }
 
 func collectNeoOpenAIStreamBlockIndexes(t *testing.T, agentMode, toolName string, settings map[string]any) ([]int, int) {
@@ -5606,6 +5949,7 @@ func TestNeoActorHandlesBinaryQueueDeltas(t *testing.T) {
 }
 
 func TestNeoActorQueuedRemovalEventUsesQueuedMessageID(t *testing.T) {
+	useTempNeoThreadStore(t)
 	rt := newNeoRuntime(&config.Config{})
 	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
 	t.Cleanup(server.Close)
@@ -5644,6 +5988,7 @@ func TestNeoActorQueuedRemovalEventUsesQueuedMessageID(t *testing.T) {
 }
 
 func TestNeoActorQueuedDequeueEventUsesQueuedMessageID(t *testing.T) {
+	useTempNeoThreadStore(t)
 	rt := newNeoRuntime(&config.Config{})
 	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
 	t.Cleanup(server.Close)
@@ -7394,7 +7739,7 @@ func TestNeoRuntimeThreadImportResetsSmartEffortForDeepThread(t *testing.T) {
 
 	actor.mu.Lock()
 	defer actor.mu.Unlock()
-	if actor.currentAgentMode != "deep" || actor.currentReasoningEffort != "xhigh" || actor.settings["reasoning.effort"] != "xhigh" {
+	if actor.currentAgentMode != "deep" || actor.currentReasoningEffort != "medium" || actor.settings["reasoning.effort"] != "medium" {
 		t.Fatalf("imported mode/effort = current:%q/%q settings:%#v", actor.currentAgentMode, actor.currentReasoningEffort, actor.settings)
 	}
 }
@@ -7878,6 +8223,30 @@ func TestNormalizeNeoUsageKeepsRequiredCacheFields(t *testing.T) {
 	}
 	if _, ok := usage["cacheReadInputTokens"]; !ok {
 		t.Fatalf("cacheReadInputTokens was pruned: %#v", usage)
+	}
+}
+
+func TestNeoAssistantDeltaPayloadNormalizesUsageForAmpSchema(t *testing.T) {
+	payload := neoAssistantDeltaPayload("M-assistant", []any{map[string]any{"type": "text", "text": "hi"}}, 0, "generating", map[string]any{
+		"input_tokens":  2,
+		"output_tokens": 1,
+	})
+	usage := mapValue(payload["usage"])
+	if len(usage) == 0 {
+		t.Fatalf("usage missing from payload: %#v", payload)
+	}
+	if _, ok := usage["input_tokens"]; ok {
+		t.Fatalf("provider usage key leaked into payload: %#v", payload)
+	}
+	for _, key := range []string{"maxInputTokens", "inputTokens", "outputTokens", "cacheCreationInputTokens", "cacheReadInputTokens", "totalInputTokens"} {
+		if _, ok := usage[key]; !ok {
+			t.Fatalf("usage missing %s: %#v", key, usage)
+		}
+	}
+
+	withoutUsage := neoAssistantDeltaPayload("M-assistant", []any{}, 0, "start", nil)
+	if _, ok := withoutUsage["usage"]; ok {
+		t.Fatalf("nil usage should be omitted: %#v", withoutUsage)
 	}
 }
 
