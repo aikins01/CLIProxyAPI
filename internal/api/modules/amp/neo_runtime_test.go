@@ -7246,6 +7246,44 @@ func TestNeoActorHandlesBinaryAssistantAndSettingsDeltas(t *testing.T) {
 	waitForNeoActorSyncIdle(t, actor)
 }
 
+func TestMergeNeoUsageMirrorsBinaryMaxSemantics(t *testing.T) {
+	merged := mergeNeoUsage(
+		map[string]any{
+			"model":                    "old-model",
+			"maxInputTokens":           100,
+			"inputTokens":              10,
+			"outputTokens":             5,
+			"cacheCreationInputTokens": nil,
+			"cacheReadInputTokens":     7,
+			"totalInputTokens":         17,
+			"thinkingBudget":           1000,
+			"timestamp":                "old",
+		},
+		map[string]any{
+			"model":                    "new-model",
+			"maxInputTokens":           80,
+			"inputTokens":              3,
+			"outputTokens":             8,
+			"cacheCreationInputTokens": 4,
+			"cacheReadInputTokens":     nil,
+			"totalInputTokens":         14,
+			"timestamp":                "new",
+		},
+	)
+
+	if stringValue(merged["model"]) != "new-model" ||
+		numberFrom(merged["maxInputTokens"]) != 100 ||
+		numberFrom(merged["inputTokens"]) != 10 ||
+		numberFrom(merged["outputTokens"]) != 8 ||
+		numberFrom(merged["cacheCreationInputTokens"]) != 4 ||
+		numberFrom(merged["cacheReadInputTokens"]) != 7 ||
+		numberFrom(merged["totalInputTokens"]) != 17 ||
+		numberFrom(merged["thinkingBudget"]) != 1000 ||
+		stringValue(merged["timestamp"]) != "new" {
+		t.Fatalf("merged usage = %#v", merged)
+	}
+}
+
 func TestNeoActorBinaryEnvironmentDeltaClearsExistingEnvironment(t *testing.T) {
 	useTempNeoThreadStore(t)
 	rt := newNeoRuntime(&config.Config{})

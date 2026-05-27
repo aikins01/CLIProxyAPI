@@ -15798,10 +15798,42 @@ func mergeNeoUsage(dst, src map[string]any) map[string]any {
 	if dst == nil {
 		return cloneMap(src)
 	}
-	for key, value := range src {
-		dst[key] = value
+	out := cloneMap(dst)
+	if value, exists := src["model"]; exists && value != nil {
+		out["model"] = value
 	}
-	return dst
+	for _, key := range []string{"maxInputTokens", "inputTokens", "outputTokens", "totalInputTokens"} {
+		if value, exists := src[key]; exists {
+			out[key] = max(numberFrom(out[key]), numberFrom(value))
+		}
+	}
+	for _, key := range []string{"cacheCreationInputTokens", "cacheReadInputTokens"} {
+		value, exists := src[key]
+		if !exists || value == nil {
+			continue
+		}
+		if existing, ok := out[key]; ok && existing != nil {
+			out[key] = max(numberFrom(existing), numberFrom(value))
+		} else {
+			out[key] = value
+		}
+	}
+	for _, key := range []string{"thinkingBudget", "timestamp"} {
+		if value, exists := src[key]; exists && value != nil {
+			out[key] = value
+		}
+	}
+	for key, value := range src {
+		if _, known := map[string]bool{
+			"model": true, "maxInputTokens": true, "inputTokens": true, "outputTokens": true,
+			"cacheCreationInputTokens": true, "cacheReadInputTokens": true, "totalInputTokens": true,
+			"thinkingBudget": true, "timestamp": true,
+		}[key]; known {
+			continue
+		}
+		out[key] = value
+	}
+	return out
 }
 
 func normalizeNeoUsage(usage map[string]any) map[string]any {
