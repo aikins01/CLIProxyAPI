@@ -2427,6 +2427,57 @@ func TestNeoActorClientCancelUsesCurrentInferenceMessageID(t *testing.T) {
 	}
 }
 
+func TestNeoActorClientCancelCleansIncompleteAssistantLikeBinary(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "threadActor", "T-test", "T-test", neoActorRecord("actor-test", "threadActor", "T-test"), nil)
+	actor.messages = []neoMessage{
+		{
+			ThreadID:  "T-test",
+			MessageID: "M-user",
+			Role:      "user",
+			Content:   []any{map[string]any{"type": "text", "text": "run pwd"}},
+			Seq:       1,
+		},
+		{
+			ThreadID:  "T-test",
+			MessageID: "M-assistant",
+			Role:      "assistant",
+			Content: []any{map[string]any{
+				"type":             "tool_use",
+				"id":               "TU-incomplete",
+				"name":             "Bash",
+				"input":            map[string]any{},
+				"inputPartialJSON": map[string]any{"json": `{"cmd":"pwd"`},
+				"inputIncomplete":  map[string]any{"cmd": "pwd"},
+				"complete":         false,
+			}},
+			State: map[string]any{"type": "streaming"},
+			Seq:   2,
+		},
+	}
+	actor.currentInference = &neoInferenceInflight{messageID: "M-assistant", agentMode: "smart"}
+	actor.pendingTools["TU-incomplete"] = neoPendingTool{ID: "TU-incomplete", Name: "Bash", MessageID: "M-assistant"}
+	actor.agentState = "running_tools"
+	actor.rebuildHistoryLocked()
+
+	actor.cancel()
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	assistant := actor.messages[1]
+	if stringValue(mapValue(assistant.State)["type"]) != "cancelled" {
+		t.Fatalf("assistant state = %#v, want cancelled", assistant.State)
+	}
+	result := mapValue(actor.messages[2].Content[0])
+	run := mapValue(result["run"])
+	if firstNonEmptyString(result["toolUseID"], result["toolUseId"]) != "TU-incomplete" || stringValue(run["status"]) != "cancelled" || stringValue(run["reason"]) != "user:cancelled" {
+		t.Fatalf("tool result = %#v", result)
+	}
+	if len(actor.pendingTools) != 0 || actor.currentInference != nil || actor.agentState != "idle" {
+		t.Fatalf("cancel state = pending:%#v inference:%#v agent:%q", actor.pendingTools, actor.currentInference, actor.agentState)
+	}
+}
+
 func TestNeoActorSpawnExecutorStartsHeadlessAmp(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("fake Amp executor script uses /bin/sh")
@@ -7083,6 +7134,66 @@ func TestNeoActorCancelledMarksLastToolResult(t *testing.T) {
 	run := mapValue(mapValue(actor.messages[0].Content[0])["run"])
 	if stringValue(run["status"]) != "cancelled" {
 		t.Fatalf("tool result run = %#v", run)
+	}
+}
+
+func TestNeoActorCancelledCleansIncompleteAssistantLikeBinary(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	actor.messages = []neoMessage{
+		{
+			ThreadID:  "T-test",
+			MessageID: "M-user",
+			Role:      "user",
+			Content:   []any{map[string]any{"type": "text", "text": "run pwd"}},
+			Seq:       1,
+		},
+		{
+			ThreadID:  "T-test",
+			MessageID: "M-assistant",
+			Role:      "assistant",
+			Content: []any{map[string]any{
+				"type":             "tool_use",
+				"id":               "TU-incomplete",
+				"name":             "Bash",
+				"input":            map[string]any{},
+				"inputPartialJSON": map[string]any{"json": `{"cmd":"pwd"`},
+				"inputIncomplete":  map[string]any{"cmd": "pwd"},
+				"complete":         false,
+			}},
+			State: map[string]any{"type": "streaming"},
+			Seq:   2,
+		},
+	}
+	actor.pendingTools["TU-incomplete"] = neoPendingTool{ID: "TU-incomplete", Name: "Bash", MessageID: "M-assistant"}
+	actor.rebuildHistoryLocked()
+
+	actor.handle(map[string]any{"type": "cancelled", "messageId": "M-assistant"})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.pendingTools) != 0 {
+		t.Fatalf("pending tools = %#v, want none", actor.pendingTools)
+	}
+	if len(actor.messages) != 3 {
+		t.Fatalf("messages = %#v, want user, cancelled assistant, cancelled tool result", actor.messages)
+	}
+	assistant := actor.messages[1]
+	if stringValue(mapValue(assistant.State)["type"]) != "cancelled" {
+		t.Fatalf("assistant state = %#v, want cancelled", assistant.State)
+	}
+	toolUse := mapValue(assistant.Content[0])
+	if !boolValue(toolUse["complete"]) || stringValue(mapValue(toolUse["input"])["cmd"]) != "pwd" {
+		t.Fatalf("tool use = %#v, want completed with incomplete input", toolUse)
+	}
+	if _, exists := toolUse["inputPartialJSON"]; exists {
+		t.Fatalf("tool use still has inputPartialJSON: %#v", toolUse)
+	}
+	result := mapValue(actor.messages[2].Content[0])
+	run := mapValue(result["run"])
+	if firstNonEmptyString(result["toolUseID"], result["toolUseId"]) != "TU-incomplete" || stringValue(run["status"]) != "cancelled" {
+		t.Fatalf("tool result = %#v", result)
 	}
 }
 

@@ -2881,6 +2881,7 @@ func (a *neoActor) handleProtocolCancelled(msg map[string]any) {
 	a.activeError = nil
 	a.activeErrorSeq = 0
 	a.agentState = "idle"
+	cleanupEvents := a.cleanupPriorAssistantForBinaryDeltaLocked("")
 	var updateEvent map[string]any
 	if updated, ok := a.markLastToolResultCancelledLocked(); ok {
 		updateSeq := a.nextSeqLocked()
@@ -2894,12 +2895,15 @@ func (a *neoActor) handleProtocolCancelled(msg map[string]any) {
 	a.mu.Unlock()
 
 	a.broadcast(toolApprovalQueuePayload(nil))
-	a.broadcast(event)
+	for _, cleanupEvent := range cleanupEvents {
+		a.broadcast(cleanupEvent)
+	}
 	if updateEvent != nil {
 		a.broadcast(updateEvent)
 	}
+	a.broadcast(event)
 	a.broadcast(map[string]any{"type": "agent_state", "state": "idle", "messageId": omitEmpty(messageID), "agentMode": agentMode, "reasoningEffort": omitEmpty(reasoningEffort)})
-	if updateEvent != nil {
+	if len(cleanupEvents) > 0 || updateEvent != nil {
 		a.syncCloudAsync()
 	}
 	a.processQueue()
@@ -2937,7 +2941,7 @@ func (a *neoActor) markLastToolResultCancelledLocked() (neoMessage, bool) {
 
 func (a *neoActor) cleanupPriorAssistantForBinaryDelta() {
 	a.mu.Lock()
-	events := a.cleanupPriorAssistantForBinaryDeltaLocked()
+	events := a.cleanupPriorAssistantForBinaryDeltaLocked("user:interrupted")
 	a.mu.Unlock()
 	for _, event := range events {
 		a.broadcast(event)
@@ -2947,7 +2951,7 @@ func (a *neoActor) cleanupPriorAssistantForBinaryDelta() {
 	}
 }
 
-func (a *neoActor) cleanupPriorAssistantForBinaryDeltaLocked() []map[string]any {
+func (a *neoActor) cleanupPriorAssistantForBinaryDeltaLocked(cancelReason string) []map[string]any {
 	assistantIndex := -1
 	for i := len(a.messages) - 1; i >= 0; i-- {
 		if a.messages[i].Role == "assistant" {
@@ -3005,10 +3009,14 @@ func (a *neoActor) cleanupPriorAssistantForBinaryDeltaLocked() []map[string]any 
 	ref := neoStoredToolUseRef{MessageIndex: assistantIndex, ParentToolCallID: message.ParentToolUseID}
 	for _, toolCallID := range missingToolIDs {
 		delete(a.pendingTools, toolCallID)
+		run := map[string]any{"status": "cancelled"}
+		if cancelReason != "" {
+			run["reason"] = cancelReason
+		}
 		block := map[string]any{
 			"type":      "tool_result",
 			"toolUseID": toolCallID,
-			"run":       map[string]any{"status": "cancelled", "reason": "user:interrupted"},
+			"run":       run,
 		}
 		_, event := a.storeToolResultEventLocked(ref, block, "")
 		events = append(events, event)
@@ -9459,6 +9467,7 @@ func (a *neoActor) cancel() {
 	a.mu.Lock()
 	a.generation++
 	pending := a.pendingToolIDsLocked()
+	cleanupEvents := a.cleanupPriorAssistantForBinaryDeltaLocked("user:cancelled")
 	updateEvents := a.cancelToolResultMessagesLocked(pending, "user:cancelled")
 	a.pendingTools = map[string]neoPendingTool{}
 	hadApprovals := len(a.approvalQueue) > 0
@@ -9493,6 +9502,9 @@ func (a *neoActor) cancel() {
 	}
 	if retryScheduled {
 		a.broadcast(map[string]any{"type": "retry_cancelled"})
+	}
+	for _, event := range cleanupEvents {
+		a.broadcast(event)
 	}
 	for _, event := range updateEvents {
 		a.broadcast(event)
