@@ -9972,6 +9972,7 @@ func TestRecentNeoLocalThreadsComputesBinaryDiffStats(t *testing.T) {
 		"id": "` + threadID + `",
 		"title": "diff stats",
 		"agentMode": "smart",
+		"archived": true,
 		"created": 1778170000000,
 		"originThreadID": "T-origin",
 		"mainThreadID": "T-main",
@@ -9997,6 +9998,9 @@ func TestRecentNeoLocalThreadsComputesBinaryDiffStats(t *testing.T) {
 	}
 	if stringValue(threads[0]["originThreadID"]) != "T-origin" || stringValue(threads[0]["mainThreadID"]) != "T-main" {
 		t.Fatalf("thread relationship ids = origin:%#v main:%#v", threads[0]["originThreadID"], threads[0]["mainThreadID"])
+	}
+	if threads[0]["archived"] != true {
+		t.Fatalf("archived = %#v, want true", threads[0]["archived"])
 	}
 }
 

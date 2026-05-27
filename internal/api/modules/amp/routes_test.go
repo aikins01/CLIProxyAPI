@@ -784,6 +784,11 @@ func TestRegisterManagementRoutesServesNeoStartupInternalRPCPostsLocally(t *test
 	if err := os.WriteFile(filepath.Join(dir, threadID+".json"), rawThread, 0o600); err != nil {
 		t.Fatalf("write local thread: %v", err)
 	}
+	archivedThreadID := "T-019e06a8-13c9-708d-8090-783005818ea8"
+	rawArchivedThread := []byte(`{"id":"` + archivedThreadID + `","title":"archived local","archived":true,"agentMode":"rush","messages":[{"messageId":"M-archived","role":"user","content":[{"type":"text","text":"old thread"}]}]}`)
+	if err := os.WriteFile(filepath.Join(dir, archivedThreadID+".json"), rawArchivedThread, 0o600); err != nil {
+		t.Fatalf("write archived local thread: %v", err)
+	}
 
 	m := &AmpModule{
 		restrictToLocalhost: false,
@@ -852,6 +857,37 @@ func TestRegisterManagementRoutesServesNeoStartupInternalRPCPostsLocally(t *test
 		}
 		if thread["usesDtw"] != true || thread["usesThreadActors"] != true {
 			t.Fatalf("local DTW/thread-actors flags = %#v", thread)
+		}
+	})
+
+	t.Run("listThreads includes archived when requested", func(t *testing.T) {
+		body := bytes.NewBufferString(`{"method":"listThreads","params":{"includeArchived":true,"limit":200}}`)
+		req := httptest.NewRequest(http.MethodPost, "/api/internal?listThreads", body)
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+		}
+		var response map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+			t.Fatalf("response JSON error: %v", err)
+		}
+		result := arrayValue(mapValue(response["result"])["threads"])
+		archived := map[string]any(nil)
+		for _, raw := range result {
+			thread := mapValue(raw)
+			if stringValue(thread["id"]) == archivedThreadID {
+				archived = thread
+				break
+			}
+		}
+		if archived == nil {
+			t.Fatalf("archived thread missing from includeArchived result: %#v", result)
+		}
+		if archived["archived"] != true || stringValue(archived["agentMode"]) != "rush" {
+			t.Fatalf("archived thread metadata = %#v", archived)
 		}
 	})
 

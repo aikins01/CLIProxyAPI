@@ -6220,7 +6220,7 @@ func recentNeoLocalThreads(limit int) []map[string]any {
 			continue
 		}
 		thread := map[string]any{"id": id}
-		for _, key := range []string{"title", "created", "createdAt", "updated", "updatedAt", "userLastInteractedAt", "creatorUserID", "v", "agentMode", "env", "summaryStats", "usesDtw", "usesThreadActors", "meta", "relationships", "originThreadID", "originThreadId", "mainThreadID", "mainThreadId", "mainThread"} {
+		for _, key := range []string{"title", "created", "createdAt", "updated", "updatedAt", "userLastInteractedAt", "creatorUserID", "v", "agentMode", "archived", "env", "summaryStats", "usesDtw", "usesThreadActors", "meta", "relationships", "originThreadID", "originThreadId", "mainThreadID", "mainThreadId", "mainThread"} {
 			if value := gjson.GetBytes(raw, key); value.Exists() {
 				thread[key] = value.Value()
 			}
