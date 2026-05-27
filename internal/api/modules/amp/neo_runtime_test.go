@@ -5208,40 +5208,43 @@ func TestNeoProviderMessagesPreserveImageBlocks(t *testing.T) {
 
 	anthropic := anthropicNeoMessages([]neoHistoryMessage{msg})
 	anthropicContent := arrayValue(mapValue(anthropic[0])["content"])
-	if len(anthropicContent) != 2 || stringValue(mapValue(anthropicContent[1])["type"]) != "image" {
+	if len(anthropicContent) != 3 || stringValue(mapValue(anthropicContent[2])["type"]) != "image" {
 		t.Fatalf("anthropic content did not preserve image: %#v", anthropicContent)
 	}
-	if data := stringValue(mapValue(mapValue(anthropicContent[1])["source"])["data"]); data != "aW1n" {
+	if label := stringValue(mapValue(anthropicContent[1])["text"]); label != `<attached_image path="image">The following image is from the source above.</attached_image>` {
+		t.Fatalf("anthropic image label = %q", label)
+	}
+	if data := stringValue(mapValue(mapValue(anthropicContent[2])["source"])["data"]); data != "aW1n" {
 		t.Fatalf("anthropic image data = %q", data)
 	}
-	if mediaType := stringValue(mapValue(mapValue(anthropicContent[1])["source"])["media_type"]); mediaType != "image/png" {
+	if mediaType := stringValue(mapValue(mapValue(anthropicContent[2])["source"])["media_type"]); mediaType != "image/png" {
 		t.Fatalf("anthropic image media_type = %q", mediaType)
 	}
 
 	openai := openAINeoMessages([]neoHistoryMessage{msg}, "system")
 	openAIContent := arrayValue(mapValue(openai[1])["content"])
-	if len(openAIContent) != 2 || stringValue(mapValue(openAIContent[1])["type"]) != "image_url" {
+	if len(openAIContent) != 3 || stringValue(mapValue(openAIContent[2])["type"]) != "image_url" {
 		t.Fatalf("openai content did not preserve image: %#v", openAIContent)
 	}
-	if url := stringValue(mapValue(mapValue(openAIContent[1])["image_url"])["url"]); url != "data:image/png;base64,aW1n" {
+	if url := stringValue(mapValue(mapValue(openAIContent[2])["image_url"])["url"]); url != "data:image/png;base64,aW1n" {
 		t.Fatalf("openai image url = %q", url)
 	}
 
 	openAIResponses := openAIResponsesNeoInput([]neoHistoryMessage{msg}, "system")
 	openAIResponsesContent := arrayValue(mapValue(openAIResponses[1])["content"])
-	if len(openAIResponsesContent) != 2 || stringValue(mapValue(openAIResponsesContent[1])["type"]) != "input_image" {
+	if len(openAIResponsesContent) != 3 || stringValue(mapValue(openAIResponsesContent[2])["type"]) != "input_image" {
 		t.Fatalf("openai responses content did not preserve image: %#v", openAIResponsesContent)
 	}
-	if url := stringValue(mapValue(openAIResponsesContent[1])["image_url"]); url != "data:image/png;base64,aW1n" {
+	if url := stringValue(mapValue(openAIResponsesContent[2])["image_url"]); url != "data:image/png;base64,aW1n" {
 		t.Fatalf("openai responses image_url = %q", url)
 	}
 
 	google := googleNeoContents([]neoHistoryMessage{msg}, "system")
 	googleParts := arrayValue(mapValue(google[1])["parts"])
-	if len(googleParts) != 2 {
+	if len(googleParts) != 3 {
 		t.Fatalf("google parts = %#v", googleParts)
 	}
-	inlineData := mapValue(mapValue(googleParts[1])["inlineData"])
+	inlineData := mapValue(mapValue(googleParts[2])["inlineData"])
 	if stringValue(inlineData["data"]) != "aW1n" || stringValue(inlineData["mimeType"]) != "image/png" {
 		t.Fatalf("google inlineData = %#v", inlineData)
 	}
@@ -5258,12 +5261,51 @@ func TestNeoProviderMessagesNormalizeInternalImageMediaType(t *testing.T) {
 
 	anthropic := anthropicNeoMessages([]neoHistoryMessage{msg})
 	anthropicContent := arrayValue(mapValue(anthropic[0])["content"])
-	source := mapValue(mapValue(anthropicContent[0])["source"])
+	source := mapValue(mapValue(anthropicContent[1])["source"])
 	if stringValue(source["media_type"]) != "image/png" {
 		t.Fatalf("anthropic image source = %#v", source)
 	}
 	if _, exists := source["mediaType"]; exists {
 		t.Fatalf("anthropic image leaked internal mediaType key: %#v", source)
+	}
+}
+
+func TestNeoProviderMessagesNormalizeNestedImageBase64Envelope(t *testing.T) {
+	msg := neoHistoryMessage{
+		Role: "user",
+		Content: []any{
+			map[string]any{
+				"type":       "image",
+				"sourcePath": "shot.png",
+				"source": map[string]any{
+					"type": "base64",
+					"base64": map[string]any{
+						"media_type": "image/png",
+						"data":       "aW1n",
+					},
+				},
+			},
+		},
+	}
+
+	anthropic := anthropicNeoMessages([]neoHistoryMessage{msg})
+	anthropicContent := arrayValue(mapValue(anthropic[0])["content"])
+	if len(anthropicContent) != 2 {
+		t.Fatalf("anthropic content = %#v", anthropicContent)
+	}
+	if label := stringValue(mapValue(anthropicContent[0])["text"]); label != `<attached_image path="shot.png">The following image is from the source above.</attached_image>` {
+		t.Fatalf("anthropic image label = %q", label)
+	}
+	source := mapValue(mapValue(anthropicContent[1])["source"])
+	if stringValue(source["data"]) != "aW1n" || stringValue(source["media_type"]) != "image/png" {
+		t.Fatalf("anthropic image source = %#v", source)
+	}
+
+	normalized := neoContentFromBinaryValue(msg.Content)
+	image := mapValue(normalized[0])
+	normalizedSource := mapValue(image["source"])
+	if stringValue(normalizedSource["mediaType"]) != "image/png" || stringValue(normalizedSource["data"]) != "aW1n" {
+		t.Fatalf("normalized binary image source = %#v", normalizedSource)
 	}
 }
 

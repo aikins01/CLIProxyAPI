@@ -3989,11 +3989,10 @@ func normalizeNeoProtocolImageBlock(block map[string]any) (map[string]any, bool)
 	out["type"] = "image"
 	switch sourceType {
 	case "base64":
-		data, ok := source["data"].(string)
-		if !ok {
+		data, mediaType := neoImageBase64(block)
+		if data == "" {
 			return nil, false
 		}
-		mediaType := firstNonEmptyString(source["mediaType"], source["media_type"], source["mimeType"], source["mime_type"], block["mediaType"], block["media_type"], block["mimeType"], block["mime_type"])
 		if !neoProtocolImageMediaType(mediaType) {
 			mediaType = "image/png"
 		}
@@ -4934,7 +4933,7 @@ func neoQueuedMessageFromBinaryDelta(msg map[string]any, queue bool) neoQueuedMe
 
 func neoContentFromBinaryValue(raw any) []any {
 	if content := arrayValue(raw); content != nil {
-		return cloneArray(content)
+		return normalizeNeoProtocolContent("user", cloneArray(content), false)
 	}
 	if text := stringValue(raw); text != "" {
 		return []any{map[string]any{"type": "text", "text": text}}
@@ -16917,6 +16916,10 @@ func openAIResponsesNeoInput(history []neoHistoryMessage, system string) []any {
 }
 
 func openAIResponsesNeoUserContent(msg neoHistoryMessage) []any {
+	return openAIResponsesNeoContent(msg, true)
+}
+
+func openAIResponsesNeoContent(msg neoHistoryMessage, includeImageDescriptor bool) []any {
 	if len(msg.Content) == 0 {
 		if strings.TrimSpace(msg.Text) == "" {
 			return nil
@@ -16933,6 +16936,9 @@ func openAIResponsesNeoUserContent(msg neoHistoryMessage) []any {
 			}
 		case "image", "input_image", "image_url":
 			if imageURL := neoImageURL(block); imageURL != "" {
+				if includeImageDescriptor {
+					content = append(content, map[string]any{"type": "input_text", "text": neoAttachedImageText(block)})
+				}
 				content = append(content, map[string]any{"type": "input_image", "detail": "auto", "image_url": imageURL})
 			} else if text := neoAttachmentFallbackText(block); text != "" {
 				content = append(content, map[string]any{"type": "input_text", "text": text})
@@ -17023,7 +17029,7 @@ func openAIResponsesNeoToolOutput(msg neoHistoryMessage) any {
 	if len(msg.Content) == 0 {
 		return msg.Text
 	}
-	content := openAIResponsesNeoUserContent(msg)
+	content := openAIResponsesNeoContent(msg, false)
 	if len(content) == 0 {
 		return msg.Text
 	}
@@ -17119,6 +17125,7 @@ func anthropicNeoUserContent(msg neoHistoryMessage) []any {
 			}
 		case "image", "input_image", "image_url":
 			if image := anthropicNeoImageBlock(block); len(image) > 0 {
+				content = append(content, map[string]any{"type": "text", "text": neoAttachedImageText(block)})
 				content = append(content, image)
 			} else if text := neoAttachmentFallbackText(block); text != "" {
 				content = append(content, map[string]any{"type": "text", "text": text})
@@ -17153,6 +17160,7 @@ func openAINeoUserContent(msg neoHistoryMessage) any {
 			}
 		case "image", "input_image", "image_url":
 			if imageURL := neoImageURL(block); imageURL != "" {
+				content = append(content, map[string]any{"type": "text", "text": neoAttachedImageText(block)})
 				content = append(content, map[string]any{"type": "image_url", "image_url": map[string]any{"url": imageURL}})
 			} else if text := neoAttachmentFallbackText(block); text != "" {
 				content = append(content, map[string]any{"type": "text", "text": text})
@@ -17185,9 +17193,12 @@ func googleNeoUserParts(msg neoHistoryMessage) []any {
 				parts = append(parts, map[string]any{"text": text})
 			}
 		case "image", "input_image", "image_url":
+			label := neoAttachedImageText(block)
 			if data, mediaType := neoImageBase64(block); data != "" {
+				parts = append(parts, map[string]any{"text": label})
 				parts = append(parts, map[string]any{"inlineData": map[string]any{"mimeType": fallbackString(mediaType, "image/png"), "data": data}})
 			} else if imageURL := neoImageURL(block); imageURL != "" {
+				parts = append(parts, map[string]any{"text": label})
 				parts = append(parts, map[string]any{"fileData": map[string]any{"fileUri": imageURL, "mimeType": stringValue(block["media_type"])}})
 			}
 		default:
@@ -17237,15 +17248,21 @@ func neoImageURL(block map[string]any) string {
 }
 
 func neoImageBase64(block map[string]any) (string, string) {
-	data := firstNonEmptyString(block["data"], block["base64"])
-	mediaType := firstNonEmptyString(block["media_type"], block["mediaType"], block["mime_type"], block["mimeType"])
+	source := mapValue(block["source"])
+	data := firstNonEmptyString(block["data"], block["base64"], block["b64_json"], block["contentBase64"], source["data"], source["base64"], source["b64_json"], source["contentBase64"])
+	mediaType := firstNonEmptyString(block["media_type"], block["mediaType"], block["mime_type"], block["mimeType"], source["media_type"], source["mediaType"], source["mime_type"], source["mimeType"])
 	if data == "" {
-		if source := mapValue(block["source"]); len(source) > 0 {
-			sourceData, sourceMediaType := neoImageBase64(source)
+		for _, nested := range []map[string]any{source, mapValue(block["base64"]), mapValue(source["base64"]), mapValue(block["image"]), mapValue(source["image"])} {
+			if len(nested) == 0 {
+				continue
+			}
+			sourceData, sourceMediaType := neoImageBase64(nested)
 			if sourceMediaType == "" {
 				sourceMediaType = mediaType
 			}
-			return sourceData, sourceMediaType
+			if sourceData != "" {
+				return sourceData, sourceMediaType
+			}
 		}
 	}
 	if strings.HasPrefix(data, "data:") {
@@ -17258,6 +17275,19 @@ func neoImageBase64(block map[string]any) (string, string) {
 		}
 	}
 	return data, mediaType
+}
+
+func neoAttachedImageText(block map[string]any) string {
+	source := mapValue(block["source"])
+	sourcePath := firstNonEmptyString(block["sourcePath"], block["source_path"], block["path"], block["filePath"], block["file_path"], block["filename"], block["name"], source["url"], block["attachmentUrl"], block["url"], block["uri"])
+	if sourcePath == "" {
+		sourcePath = "image"
+	}
+	return `<attached_image path="` + neoAttachedImagePathEscape(sourcePath) + `">The following image is from the source above.</attached_image>`
+}
+
+func neoAttachedImagePathEscape(value string) string {
+	return strings.NewReplacer("&", "&amp;", `"`, "&quot;", "<", "&lt;", ">", "&gt;").Replace(value)
 }
 
 func neoAttachmentFallbackText(block map[string]any) string {

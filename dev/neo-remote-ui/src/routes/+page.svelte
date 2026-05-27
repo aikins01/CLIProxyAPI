@@ -1013,7 +1013,7 @@
       name: attachment.name,
       filename: attachment.name,
       mediaType: attachment.mediaType,
-      sourcePath: attachmentUrl || attachment.name || 'image',
+      sourcePath: attachment.name || attachmentUrl || 'image',
       source: {
         type: 'base64',
         mediaType: attachment.mediaType,
