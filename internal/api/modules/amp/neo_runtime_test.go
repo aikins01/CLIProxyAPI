@@ -7011,6 +7011,15 @@ func TestNeoActorHandlesBinaryToolDeltas(t *testing.T) {
 		t.Fatalf("processed tool block = %#v original=%#v", toolBlock, original)
 	}
 
+	actor.handle(map[string]any{"type": "tool:processed", "toolUse": "TU-1", "newArgs": map[string]any{"cmd": "printf redacted"}})
+	actor.mu.Lock()
+	toolBlock = mapValue(actor.messages[0].Content[0])
+	original = mapValue(mapValue(actor.messages[0].OriginalToolUseInput)["TU-1"])
+	actor.mu.Unlock()
+	if stringValue(mapValue(toolBlock["input"])["cmd"]) != "printf redacted" || stringValue(original["cmd"]) != "echo redacted" {
+		t.Fatalf("second processed tool block = %#v original=%#v", toolBlock, original)
+	}
+
 	actor.handle(map[string]any{"type": "tool:data", "toolUse": "TU-1", "data": map[string]any{"status": "in-progress", "progress": map[string]any{"phase": "run"}}})
 	actor.handle(map[string]any{"type": "user:tool-input", "toolUse": "TU-1", "value": map[string]any{"accepted": true}})
 	actor.handle(map[string]any{"type": "tool:data", "toolUse": "TU-1", "data": map[string]any{"status": "done", "result": "ok"}})
@@ -7366,8 +7375,8 @@ func TestNeoActorBinaryAssistantMessageCleansPriorIncompleteAssistant(t *testing
 
 	actor.mu.Lock()
 	defer actor.mu.Unlock()
-	if len(actor.messages) != 3 {
-		t.Fatalf("messages = %#v, want stale assistant, cancelled tool result, new assistant", actor.messages)
+	if len(actor.messages) != 2 {
+		t.Fatalf("messages = %#v, want stale assistant and new assistant", actor.messages)
 	}
 	stale := actor.messages[0]
 	if stringValue(mapValue(stale.State)["type"]) != "cancelled" {
@@ -7377,16 +7386,11 @@ func TestNeoActorBinaryAssistantMessageCleansPriorIncompleteAssistant(t *testing
 	if !boolValue(toolUse["complete"]) || stringValue(mapValue(toolUse["input"])["cmd"]) != "sleep 60" {
 		t.Fatalf("stale tool use = %#v", toolUse)
 	}
-	result := mapValue(actor.messages[1].Content[0])
-	run := mapValue(result["run"])
-	if firstNonEmptyString(result["toolUseID"], result["toolUseId"]) != "TU-stale" || stringValue(run["status"]) != "cancelled" || stringValue(run["reason"]) != "user:interrupted" {
-		t.Fatalf("cancelled tool result = %#v", result)
-	}
 	if _, ok := actor.pendingTools["TU-stale"]; ok {
 		t.Fatalf("stale pending tool was not removed: %#v", actor.pendingTools)
 	}
-	if textFromBlocks(actor.messages[2].Content) != "next" {
-		t.Fatalf("new assistant = %#v", actor.messages[2])
+	if textFromBlocks(actor.messages[1].Content) != "next" {
+		t.Fatalf("new assistant = %#v", actor.messages[1])
 	}
 }
 
