@@ -8921,9 +8921,9 @@ func (a *neoActor) updateAgentModeFromBinary(msg map[string]any) {
 		return
 	}
 	a.mu.Lock()
-	hasMessages := len(a.messages) > 0
+	hasUserTurn := a.hasUserTurnLocked()
 	a.mu.Unlock()
-	if hasMessages {
+	if hasUserTurn {
 		log.Debugf("amp neo local runtime ignored agent-mode after first message")
 		return
 	}
@@ -8934,10 +8934,10 @@ func (a *neoActor) updateAgentModeFromBinary(msg map[string]any) {
 func (a *neoActor) updateReasoningEffortFromBinary(msg map[string]any) {
 	effort := firstNonEmptyString(msg["effort"], msg["reasoningEffort"], msg["value"])
 	a.mu.Lock()
-	hasMessages := len(a.messages) > 0
+	hasUserTurn := a.hasUserTurnLocked()
 	mode := a.agentModeLocked()
 	a.mu.Unlock()
-	if hasMessages {
+	if hasUserTurn {
 		log.Debugf("amp neo local runtime ignored reasoning-effort after first message")
 		return
 	}

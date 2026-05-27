@@ -7261,6 +7261,44 @@ func TestNeoActorBinaryEnvironmentDeltaClearsExistingEnvironment(t *testing.T) {
 	}
 }
 
+func TestNeoActorBinaryModeDeltasUseUserTurnBoundary(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	actor.messages = []neoMessage{{
+		ThreadID:  "T-test",
+		MessageID: "M-info",
+		Role:      "info",
+		Content:   []any{map[string]any{"type": "text", "text": "system note"}},
+		Seq:       1,
+	}}
+
+	actor.handle(map[string]any{"type": "agent-mode", "mode": "deep"})
+	actor.handle(map[string]any{"type": "reasoning-effort", "effort": "xhigh"})
+
+	actor.mu.Lock()
+	if actor.settings["agentMode"] != "deep" || actor.settings["reasoning.effort"] != "xhigh" {
+		t.Fatalf("settings before user turn = %#v", actor.settings)
+	}
+	actor.messages = append(actor.messages, neoMessage{
+		ThreadID:  "T-test",
+		MessageID: "M-user",
+		Role:      "user",
+		Content:   []any{map[string]any{"type": "text", "text": "hello"}},
+		Seq:       2,
+	})
+	actor.mu.Unlock()
+
+	actor.handle(map[string]any{"type": "agent-mode", "mode": "smart"})
+	actor.handle(map[string]any{"type": "reasoning-effort", "effort": "high"})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.settings["agentMode"] != "deep" || actor.settings["reasoning.effort"] != "xhigh" {
+		t.Fatalf("settings after user turn = %#v", actor.settings)
+	}
+}
+
 func TestNeoActorBinaryScalarDeltasUseFalseyClears(t *testing.T) {
 	useTempNeoThreadStore(t)
 	parentID := "T-019e1046-656d-7132-879f-390ded941c16"
