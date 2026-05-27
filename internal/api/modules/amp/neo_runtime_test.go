@@ -2988,15 +2988,69 @@ func TestNeoAmpBinaryHeadlessBootstrapSmoke(t *testing.T) {
 		providerMu    sync.Mutex
 		providerCalls int
 	)
+	nextProviderCall := func() int {
+		providerMu.Lock()
+		defer providerMu.Unlock()
+		providerCalls++
+		return providerCalls
+	}
+	writeOpenAIResponsesSmokeStream := func(w http.ResponseWriter, callIndex int) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		chunks := []string{
+			`{"type":"response.created","response":{"id":"resp_binary_tool","status":"in_progress","model":"gpt-5.5","output":[]}}`,
+			`{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_binary_pwd","call_id":"call_binary_pwd","name":"Bash","arguments":"","status":"in_progress"}}`,
+			`{"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"cmd\":\"pwd\"}"}`,
+			`{"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\"cmd\":\"pwd\"}"}`,
+			`{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_binary_pwd","call_id":"call_binary_pwd","name":"Bash","arguments":"{\"cmd\":\"pwd\"}","status":"completed"}}`,
+			`{"type":"response.completed","response":{"id":"resp_binary_tool","status":"completed","usage":{"input_tokens":3,"output_tokens":1},"output":[{"type":"function_call","id":"fc_binary_pwd","call_id":"call_binary_pwd","name":"Bash","arguments":"{\"cmd\":\"pwd\"}","status":"completed"}]}}`,
+		}
+		if callIndex > 1 {
+			chunks = []string{
+				`{"type":"response.created","response":{"id":"resp_binary_text","status":"in_progress","model":"gpt-5.5","output":[]}}`,
+				`{"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"binary cycle ok"}`,
+				`{"type":"response.output_text.done","output_index":0,"content_index":0,"text":"binary cycle ok"}`,
+				`{"type":"response.completed","response":{"id":"resp_binary_text","status":"completed","usage":{"input_tokens":3,"output_tokens":3},"output":[{"type":"message","id":"msg_binary_text","status":"completed","role":"assistant","content":[{"type":"output_text","text":"binary cycle ok"}]}]}}`,
+			}
+		}
+		for _, chunk := range chunks {
+			_, _ = w.Write([]byte("data: " + chunk + "\n\n"))
+		}
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}
+	writeOpenAIChatSmokeStream := func(w http.ResponseWriter, callIndex int) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		if callIndex == 1 {
+			_, _ = w.Write([]byte(`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_binary_pwd","type":"function","function":{"name":"Bash","arguments":"{\"cmd\":\"pwd\"}"}}]}}],"usage":{"prompt_tokens":3,"completion_tokens":1}}` + "\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+			return
+		}
+		_, _ = w.Write([]byte(`data: {"choices":[{"delta":{"content":"binary cycle ok"}}],"usage":{"prompt_tokens":3,"completion_tokens":3}}` + "\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestsMu.Lock()
 		requests = append(requests, r.Method+" "+r.URL.RequestURI())
 		requestsMu.Unlock()
+		if r.URL.Path == "/api/provider/openai/v1/responses" && r.Method == http.MethodPost {
+			callIndex := nextProviderCall()
+			payload := readNeoJSON(r.Body)
+			if payload["stream"] != true {
+				t.Fatalf("binary smoke provider stream = %#v, want true", payload["stream"])
+			}
+			writeOpenAIResponsesSmokeStream(w, callIndex)
+			return
+		}
+		if r.URL.Path == "/api/provider/openai/v1/chat/completions" && r.Method == http.MethodPost {
+			callIndex := nextProviderCall()
+			payload := readNeoJSON(r.Body)
+			if payload["stream"] != true {
+				t.Fatalf("binary smoke chat stream = %#v, want true", payload["stream"])
+			}
+			writeOpenAIChatSmokeStream(w, callIndex)
+			return
+		}
 		if r.URL.Path == "/api/provider/anthropic/v1/messages" && r.Method == http.MethodPost {
-			providerMu.Lock()
-			providerCalls++
-			callIndex := providerCalls
-			providerMu.Unlock()
+			callIndex := nextProviderCall()
 			payload := readNeoJSON(r.Body)
 			if payload["stream"] != true {
 				t.Fatalf("binary smoke provider stream = %#v, want true", payload["stream"])
