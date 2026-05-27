@@ -5580,6 +5580,49 @@ func TestOpenAIResponsesServiceTierOnlyUsesFastSpeed(t *testing.T) {
 	}
 }
 
+func TestOpenAIResponsesNeoBodyMatchesBinaryBaseEnvelopeWithoutTools(t *testing.T) {
+	body := openAIResponsesNeoBody(neoInferenceRequest{
+		ThreadID: "T-test",
+		History:  []neoHistoryMessage{{Role: "user", Text: "hi"}},
+	}, neoModelRoute{Provider: "openai", Model: "gpt-5.5"}, true)
+
+	tools, exists := body["tools"]
+	if !exists {
+		t.Fatalf("tools field missing: %#v", body)
+	}
+	if got := arrayValue(tools); len(got) != 0 {
+		t.Fatalf("tools = %#v, want empty array", got)
+	}
+	if numberFrom(body["max_output_tokens"]) != 128000 {
+		t.Fatalf("max_output_tokens = %#v, want 128000", body["max_output_tokens"])
+	}
+	if body["store"] != false || body["stream"] != true || body["prompt_cache_key"] != "T-test" || body["parallel_tool_calls"] != true {
+		t.Fatalf("base envelope mismatch: %#v", body)
+	}
+	include := arrayValue(body["include"])
+	if len(include) != 1 || include[0] != "reasoning.encrypted_content" {
+		t.Fatalf("include = %#v, want encrypted reasoning content", include)
+	}
+	streamOptions := mapValue(body["stream_options"])
+	if streamOptions["include_obfuscation"] != false {
+		t.Fatalf("stream_options = %#v, want include_obfuscation false", streamOptions)
+	}
+	reasoning := mapValue(body["reasoning"])
+	if reasoning["effort"] != "medium" || reasoning["summary"] != "auto" {
+		t.Fatalf("reasoning = %#v, want medium summary auto", reasoning)
+	}
+}
+
+func TestOpenAIResponsesMaxOutputUsesBinaryOpenAIFallback(t *testing.T) {
+	body := openAIResponsesNeoBody(neoInferenceRequest{
+		ThreadID: "T-test",
+	}, neoModelRoute{Provider: "openai", Model: "gpt-test"}, true)
+
+	if numberFrom(body["max_output_tokens"]) != 128000 {
+		t.Fatalf("max_output_tokens = %#v, want 128000", body["max_output_tokens"])
+	}
+}
+
 func TestOpenAIResponsesNeoToolsPreserveCustomToolConfig(t *testing.T) {
 	body := openAIResponsesNeoBody(neoInferenceRequest{
 		ThreadID: "T-test",

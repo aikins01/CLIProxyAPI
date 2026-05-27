@@ -16774,15 +16774,13 @@ func openAIResponsesNeoBody(request neoInferenceRequest, route neoModelRoute, st
 		"stream":              stream,
 		"prompt_cache_key":    request.ThreadID,
 		"parallel_tool_calls": true,
+		"tools":               openAIResponsesNeoTools(request.Tools),
 	}
 	if stream {
 		body["stream_options"] = map[string]any{"include_obfuscation": false}
 	}
 	if maxOutput := neoOpenAIResponsesMaxOutputTokens(route.Model); maxOutput > 0 {
 		body["max_output_tokens"] = maxOutput
-	}
-	if len(request.Tools) > 0 {
-		body["tools"] = openAIResponsesNeoTools(request.Tools)
 	}
 	if serviceTier := neoOpenAIResponsesServiceTier(request); serviceTier != "" {
 		body["service_tier"] = serviceTier
@@ -17446,7 +17444,10 @@ func neoOpenAIResponsesMaxOutputTokens(model string) int {
 	if model == "" {
 		return 0
 	}
-	return neoModelMaxOutputTokens[model]
+	if maxOutput := neoModelMaxOutputTokens[model]; maxOutput > 0 {
+		return maxOutput
+	}
+	return defaultNeoOpenAIMaxOutputTokens
 }
 
 func splitNeoOpenAIResponseTextKey(key string) (int, int) {
@@ -18129,6 +18130,8 @@ var neoModelMaxOutputTokens = map[string]int{
 	"z-ai/glm-4.6":                     40000,
 	"zai-glm-4.7":                      40000,
 }
+
+const defaultNeoOpenAIMaxOutputTokens = 128000
 
 // neoLargeModeContextWindow is the extended window enabled when the user
 // runs `large` mode against an Anthropic Opus model that natively supports
