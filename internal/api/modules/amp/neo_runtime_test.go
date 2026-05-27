@@ -1125,6 +1125,38 @@ func TestNeoActorBinaryRelationshipDeltasAreSetLikeAndEmitFullList(t *testing.T)
 	}
 }
 
+func TestNeoActorBinaryRelationshipPreservesRawShapeLikeBinary(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	relationship := map[string]any{
+		"threadID": "not-a-cloud-thread-id",
+		"type":     "custom-type",
+		"role":     "custom-role",
+		"note":     "preserve me",
+	}
+
+	actor.handle(map[string]any{"type": "relationship", "relationship": relationship})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.relationships) != 1 {
+		t.Fatalf("relationships = %#v, want one raw relationship", actor.relationships)
+	}
+	stored := actor.relationships[0]
+	if stored["threadID"] != "not-a-cloud-thread-id" || stored["type"] != "custom-type" || stored["role"] != "custom-role" || stored["note"] != "preserve me" {
+		t.Fatalf("stored relationship = %#v, want raw reducer shape", stored)
+	}
+	if _, exists := stored["createdAt"]; exists {
+		t.Fatalf("stored relationship gained createdAt: %#v", stored)
+	}
+	last := actor.replayEvents[len(actor.replayEvents)-1].Payload
+	replayed := mapValue(arrayValue(last["relationships"])[0])
+	if replayed["threadID"] != "not-a-cloud-thread-id" || replayed["type"] != "custom-type" || replayed["role"] != "custom-role" || replayed["note"] != "preserve me" {
+		t.Fatalf("replayed relationship = %#v, want raw reducer shape", replayed)
+	}
+}
+
 func TestNeoActorArchiveUsesTopLevelArchivedFlag(t *testing.T) {
 	dir := t.TempDir()
 	oldStoreDir := neoAmpThreadStoreDir
@@ -6852,6 +6884,24 @@ func TestNeoActorBinaryQueueDiscardUsesWrapperIDAndFindIndexFallback(t *testing.
 	}
 }
 
+func TestNeoActorBinaryQueueDiscardTreatsEmptyIDAsPresentLikeBinary(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	actor.queue = []neoQueuedMessage{
+		{ID: "queued-a", MessageID: "M-a", Content: []any{map[string]any{"type": "text", "text": "a"}}},
+		{ID: "queued-b", MessageID: "M-b", Content: []any{map[string]any{"type": "text", "text": "b"}}},
+	}
+
+	actor.handle(map[string]any{"type": "user:message-queue:discard", "id": ""})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.queue) != 1 || actor.queue[0].ID != "queued-a" {
+		t.Fatalf("queue after empty-id discard = %#v, want binary splice(-1) behavior", actor.queue)
+	}
+}
+
 func TestNeoActorBinaryQueueEnqueueCapsAndDoesNotAutoRun(t *testing.T) {
 	useTempNeoThreadStore(t)
 	rt := newNeoRuntime(&config.Config{})
@@ -6910,6 +6960,37 @@ func TestNeoActorBinaryQueueDequeueDoesNotRequireExecutorReady(t *testing.T) {
 	}
 	if actor.pendingInference == nil || actor.pendingInference.agentMode != "deep" || actor.pendingInference.reasoningEffort != "xhigh" {
 		t.Fatalf("pending inference = %#v, want queued message to run when executor connects", actor.pendingInference)
+	}
+}
+
+func TestNeoActorBinaryQueueDequeuePreservesQueuedMessageModeFields(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	actor.executorReady = false
+	actor.agentState = "idle"
+	actor.currentAgentMode = "deep"
+	actor.currentReasoningEffort = "xhigh"
+	actor.settings["agentMode"] = "deep"
+	actor.settings["reasoning.effort"] = "xhigh"
+	actor.queue = []neoQueuedMessage{{
+		ID:        "queued-1",
+		MessageID: "M-queued",
+		Content:   []any{map[string]any{"type": "text", "text": "run later"}},
+	}}
+
+	actor.handle(map[string]any{"type": "user:message-queue:dequeue"})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.messages) != 1 {
+		t.Fatalf("messages after dequeue = %#v", actor.messages)
+	}
+	if actor.messages[0].AgentMode != "" || actor.messages[0].ReasoningEffort != "" {
+		t.Fatalf("queued message gained mode fields: %#v", actor.messages[0])
+	}
+	if actor.pendingInference == nil || actor.pendingInference.agentMode != "deep" || actor.pendingInference.reasoningEffort != "xhigh" {
+		t.Fatalf("pending inference = %#v, want resolved runtime mode", actor.pendingInference)
 	}
 }
 
@@ -7840,6 +7921,38 @@ func TestNeoActorHandlesResidualBinaryThreadDeltas(t *testing.T) {
 		t.Fatalf("cloud meta = %#v", meta)
 	}
 	waitForNeoActorSyncIdle(t, actor)
+}
+
+func TestNeoActorBinaryTraceDeltasIgnoreMissingOrCompletedSpansLikeBinary(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+
+	actor.handle(map[string]any{"type": "trace:event", "span": "missing", "event": map[string]any{"name": "ignored"}})
+	actor.handle(map[string]any{"type": "trace:attributes", "span": "missing", "attributes": map[string]any{"ignored": true}})
+	actor.handle(map[string]any{"type": "trace:end", "span": map[string]any{"id": "missing", "endTime": "2026-05-24T00:00:01Z"}})
+
+	actor.mu.Lock()
+	if len(actor.replayEvents) != 0 {
+		actor.mu.Unlock()
+		t.Fatalf("missing trace deltas replayed events: %#v", actor.replayEvents)
+	}
+	actor.mu.Unlock()
+
+	actor.handle(map[string]any{"type": "trace:start", "span": map[string]any{"id": "trace-1", "startTime": "2026-05-24T00:00:00Z"}})
+	actor.handle(map[string]any{"type": "trace:start", "span": map[string]any{"id": "trace-1", "startTime": "2026-05-24T00:00:02Z"}})
+	actor.handle(map[string]any{"type": "trace:end", "span": map[string]any{"id": "trace-1", "endTime": "2026-05-24T00:00:03Z"}})
+	actor.handle(map[string]any{"type": "trace:end", "span": map[string]any{"id": "trace-1", "endTime": "2026-05-24T00:00:04Z"}})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.replayEvents) != 2 {
+		t.Fatalf("trace replay events = %#v, want only initial start and end mutations", actor.replayEvents)
+	}
+	trace := mapValue(arrayValue(actor.meta["traces"])[0])
+	if stringValue(trace["startTime"]) != "2026-05-24T00:00:00Z" || stringValue(trace["endTime"]) != "2026-05-24T00:00:03Z" {
+		t.Fatalf("trace = %#v, want first start/end preserved", trace)
+	}
 }
 
 func TestNeoRuntimeImportRestoresResidualThreadState(t *testing.T) {

@@ -3253,22 +3253,21 @@ func (a *neoActor) appendManualBashInvocation(msg map[string]any) {
 }
 
 func (a *neoActor) handleBinaryRelationship(msg map[string]any) {
-	relationship := mapValue(msg["relationship"])
+	relationship := cloneMap(mapValue(msg["relationship"]))
 	if len(relationship) == 0 {
 		relationship = cloneMap(msg)
 		delete(relationship, "type")
 	}
-	normalized, ok := normalizeNeoThreadRelationship(relationship)
-	if !ok {
+	if len(relationship) == 0 {
 		return
 	}
 
 	a.mu.Lock()
-	if a.hasRelationshipCoreLocked(normalized) {
+	if a.hasRelationshipCoreLocked(relationship) {
 		a.mu.Unlock()
 		return
 	}
-	a.relationships = append(a.relationships, normalized)
+	a.relationships = append(a.relationships, relationship)
 	seq := a.nextSeqLocked()
 	event := map[string]any{"type": "thread_relationships", "relationships": a.relationshipListLocked(), "seq": seq}
 	a.rememberReplayEventLocked(event)
@@ -3359,6 +3358,10 @@ func (a *neoActor) handleBinaryTraceStart(msg map[string]any) {
 		traces = append(traces, span)
 		updated = true
 	}
+	if !updated {
+		a.mu.Unlock()
+		return
+	}
 	a.meta["traces"] = traces
 	seq := a.nextSeqLocked()
 	event := map[string]any{"type": "trace:start", "span": cloneMap(span), "seq": seq}
@@ -3378,6 +3381,7 @@ func (a *neoActor) handleBinaryTraceEnd(msg map[string]any) {
 	a.mu.Lock()
 	a.ensureMetaLocked()
 	traces := a.metaTraceListLocked()
+	updated := false
 	for _, raw := range traces {
 		trace := mapValue(raw)
 		if stringValue(trace["id"]) != traceID {
@@ -3387,8 +3391,13 @@ func (a *neoActor) handleBinaryTraceEnd(msg map[string]any) {
 			endTime := firstNonEmptyString(span["endTime"], time.Now().UTC().Format(time.RFC3339Nano))
 			trace["endTime"] = endTime
 			span["endTime"] = endTime
+			updated = true
 		}
 		break
+	}
+	if !updated {
+		a.mu.Unlock()
+		return
 	}
 	a.meta["traces"] = traces
 	seq := a.nextSeqLocked()
@@ -3407,6 +3416,7 @@ func (a *neoActor) handleBinaryTraceEvent(msg map[string]any) {
 	}
 	eventPayload := firstNonNil(msg["event"], msg["value"])
 	a.mu.Lock()
+	updated := false
 	if traces, ok := a.meta["traces"].([]any); ok {
 		for _, raw := range traces {
 			trace := mapValue(raw)
@@ -3416,9 +3426,14 @@ func (a *neoActor) handleBinaryTraceEvent(msg map[string]any) {
 			events := cloneArray(arrayValue(trace["events"]))
 			events = append(events, eventPayload)
 			trace["events"] = events
+			updated = true
 			break
 		}
 		a.meta["traces"] = traces
+	}
+	if !updated {
+		a.mu.Unlock()
+		return
 	}
 	seq := a.nextSeqLocked()
 	event := map[string]any{"type": "trace:event", "span": traceID, "event": eventPayload, "seq": seq}
@@ -3436,6 +3451,7 @@ func (a *neoActor) handleBinaryTraceAttributes(msg map[string]any) {
 		return
 	}
 	a.mu.Lock()
+	updated := false
 	if traces, ok := a.meta["traces"].([]any); ok {
 		for _, raw := range traces {
 			trace := mapValue(raw)
@@ -3447,9 +3463,14 @@ func (a *neoActor) handleBinaryTraceAttributes(msg map[string]any) {
 				merged[key] = value
 			}
 			trace["attributes"] = merged
+			updated = true
 			break
 		}
 		a.meta["traces"] = traces
+	}
+	if !updated {
+		a.mu.Unlock()
+		return
 	}
 	seq := a.nextSeqLocked()
 	event := map[string]any{"type": "trace:attributes", "span": traceID, "attributes": attributes, "seq": seq}
@@ -4461,7 +4482,7 @@ func (a *neoActor) dequeueQueuedMessage() {
 	a.queue = a.queue[1:]
 	seq := a.nextSeqLocked()
 	ready := a.agentState == "idle" && a.executorReady
-	message, mode, effort := a.storeQueuedUserMessageLocked(next)
+	message, mode, effort := a.storeQueuedUserMessageLocked(next, true)
 	if !a.executorReady && a.agentState == "idle" {
 		a.pendingInference = &neoInferenceInflight{agentMode: mode, reasoningEffort: effort}
 	}
@@ -4477,9 +4498,8 @@ func (a *neoActor) dequeueQueuedMessage() {
 }
 
 func (a *neoActor) discardQueuedMessages(msg map[string]any) {
-	queueID := firstNonEmptyString(msg["id"], msg["queuedMessageId"], msg["queuedMessageID"])
-	if queueID != "" {
-		a.discardBinaryQueuedMessage(queueID)
+	if queueID, exists := firstPresentValue(msg, "id", "queuedMessageId", "queuedMessageID"); exists {
+		a.discardBinaryQueuedMessage(stringValue(queueID))
 		return
 	}
 	a.mu.Lock()
@@ -4630,7 +4650,7 @@ func (a *neoActor) rejectEdit(editID, message string) {
 
 func (a *neoActor) startUserMessage(user neoQueuedMessage) {
 	a.mu.Lock()
-	message, mode, effort := a.storeQueuedUserMessageLocked(user)
+	message, mode, effort := a.storeQueuedUserMessageLocked(user, false)
 	a.mu.Unlock()
 
 	a.broadcast(neoMessageAddedPayload(message))
@@ -4639,7 +4659,7 @@ func (a *neoActor) startUserMessage(user neoQueuedMessage) {
 	go a.runInference(mode, effort)
 }
 
-func (a *neoActor) storeQueuedUserMessageLocked(user neoQueuedMessage) (neoMessage, string, string) {
+func (a *neoActor) storeQueuedUserMessageLocked(user neoQueuedMessage, preserveMessageFields bool) (neoMessage, string, string) {
 	mode := user.AgentMode
 	if mode == "" {
 		mode = a.agentModeLocked()
@@ -4648,13 +4668,19 @@ func (a *neoActor) storeQueuedUserMessageLocked(user neoQueuedMessage) (neoMessa
 	if !neoReasoningEffortAllowedForMode(mode, effort) {
 		effort = a.reasoningEffortForModeLocked(mode)
 	}
+	messageMode := mode
+	messageEffort := effort
+	if preserveMessageFields {
+		messageMode = user.AgentMode
+		messageEffort = user.ReasoningEffort
+	}
 	message := a.storeMessageLocked(neoMessage{
 		ThreadID:         a.threadID,
 		MessageID:        user.MessageID,
 		Role:             "user",
 		Content:          user.Content,
-		AgentMode:        mode,
-		ReasoningEffort:  effort,
+		AgentMode:        messageMode,
+		ReasoningEffort:  messageEffort,
 		UserState:        user.UserState,
 		FileMentions:     user.FileMentions,
 		Meta:             user.Meta,
