@@ -6617,6 +6617,61 @@ func TestNeoActorHandlesBinaryUserThreadDeltas(t *testing.T) {
 	waitForNeoActorSyncIdle(t, actor)
 }
 
+func TestNeoActorBinaryThreadTruncateUsesArrayOrderLikeBinary(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	actor.messages = []neoMessage{
+		{ThreadID: "T-test", MessageID: "M-array-first", Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "array first"}}, Seq: 3},
+		{ThreadID: "T-test", MessageID: "M-array-cut", Role: "user", Content: []any{map[string]any{"type": "text", "text": "array cut"}}, Seq: 1},
+		{ThreadID: "T-test", MessageID: "M-array-last", Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "array last"}}, Seq: 2},
+	}
+	actor.relationships = []map[string]any{
+		{"threadID": "T-019e1046-656d-7132-879f-390ded941c16", "type": "mention", "role": "parent", "createdAt": 1, "messageIndex": 0},
+		{"threadID": "T-019e1046-656d-7132-879f-390ded941c17", "type": "mention", "role": "parent", "createdAt": 1, "messageIndex": 1},
+	}
+
+	actor.handle(map[string]any{"type": "thread:truncate", "fromIndex": 1})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.messages) != 1 || actor.messages[0].MessageID != "M-array-first" {
+		t.Fatalf("messages after binary truncate = %#v, want current array prefix", actor.messages)
+	}
+	if len(actor.relationships) != 1 || numberFrom(actor.relationships[0]["messageIndex"]) != 0 {
+		t.Fatalf("relationships after binary truncate = %#v, want current array prefix relationship", actor.relationships)
+	}
+}
+
+func TestNeoActorBinaryUserMessageIndexCanReplaceNonUserLikeBinary(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	actor.messages = []neoMessage{
+		{ThreadID: "T-test", MessageID: "M-user", Role: "user", Content: []any{map[string]any{"type": "text", "text": "keep"}}, Seq: 1},
+		{ThreadID: "T-test", MessageID: "M-assistant", Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "replace"}}, Seq: 2},
+		{ThreadID: "T-test", MessageID: "M-tail", Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "tail"}}, Seq: 3},
+	}
+	actor.rebuildHistoryLocked()
+
+	actor.handle(map[string]any{
+		"type":  "user:message",
+		"index": 1,
+		"message": map[string]any{
+			"content": []any{map[string]any{"type": "text", "text": "replacement user"}},
+		},
+	})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.messages) != 2 {
+		t.Fatalf("messages = %#v, want prefix plus replacement", actor.messages)
+	}
+	if actor.messages[0].MessageID != "M-user" || actor.messages[1].Role != "user" || textFromBlocks(actor.messages[1].Content) != "replacement user" {
+		t.Fatalf("messages after indexed binary user message = %#v", actor.messages)
+	}
+}
+
 func TestNeoActorBinaryUserMessageUpdatesStateWithoutSubmitting(t *testing.T) {
 	useTempNeoThreadStore(t)
 	rt := newNeoRuntime(&config.Config{})

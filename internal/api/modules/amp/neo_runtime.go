@@ -3511,7 +3511,6 @@ func (a *neoActor) handleBinaryThreadTruncate(msg map[string]any) {
 		return
 	}
 	a.mu.Lock()
-	a.sortMessagesBySeqLocked()
 	truncateFromMessage := ""
 	if fromIndex < len(a.messages) {
 		truncateFromMessage = a.messages[fromIndex].MessageID
@@ -4293,12 +4292,6 @@ func (a *neoActor) replaceBinaryUserMessageAtIndex(index int, user neoQueuedMess
 		a.broadcast(map[string]any{"type": "error", "message": "user message index not found", "code": "MESSAGE_NOT_FOUND"})
 		return
 	}
-	if a.messages[index].Role != "user" {
-		a.mu.Unlock()
-		a.broadcast(map[string]any{"type": "error", "message": "message at index is not a user message", "code": "INVALID_MESSAGE_ROLE"})
-		return
-	}
-
 	a.generation++
 	a.archived = false
 	if a.firstUserMessageIndexLocked() == index && user.AgentMode != "" && a.mainThreadID == "" {
