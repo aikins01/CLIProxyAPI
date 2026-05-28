@@ -358,16 +358,19 @@ func (m *AmpModule) enableUpstreamProxy(upstreamURL string, settings *config.Amp
 	if m.secretSource == nil {
 		// Create MultiSourceSecret as the default source, then wrap with MappedSecretSource
 		defaultSource := NewMultiSourceSecret(settings.UpstreamAPIKey, 0 /* default 5min */)
+		defaultSource.UpdateUpstreamURL(upstreamURL)
 		mappedSource := NewMappedSecretSource(defaultSource)
 		mappedSource.UpdateMappings(settings.UpstreamAPIKeys)
 		m.secretSource = mappedSource
 	} else if ms, ok := m.secretSource.(*MappedSecretSource); ok {
 		ms.UpdateDefaultExplicitKey(settings.UpstreamAPIKey)
+		ms.UpdateDefaultUpstreamURL(upstreamURL)
 		ms.InvalidateCache()
 		ms.UpdateMappings(settings.UpstreamAPIKeys)
 	} else if ms, ok := m.secretSource.(*MultiSourceSecret); ok {
 		// Legacy path: wrap existing MultiSourceSecret with MappedSecretSource
 		ms.UpdateExplicitKey(settings.UpstreamAPIKey)
+		ms.UpdateUpstreamURL(upstreamURL)
 		ms.InvalidateCache()
 		mappedSource := NewMappedSecretSource(ms)
 		mappedSource.UpdateMappings(settings.UpstreamAPIKeys)

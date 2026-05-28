@@ -35,8 +35,9 @@ type MultiSourceSecret struct {
 	filePath    string
 	cacheTTL    time.Duration
 
-	mu    sync.RWMutex
-	cache *cachedSecret
+	mu          sync.RWMutex
+	cache       *cachedSecret
+	upstreamURL string
 }
 
 // NewMultiSourceSecret creates a secret source with precedence and caching
@@ -121,8 +122,38 @@ func (s *MultiSourceSecret) readFromFile() (string, error) {
 		return "", fmt.Errorf("failed to parse amp secrets from %s: %w", s.filePath, err)
 	}
 
-	key := strings.TrimSpace(secrets["apiKey@https://ampcode.com/"])
-	return key, nil
+	key := s.fileKey()
+	value, ok := secrets[key]
+	if !ok && key != defaultAmpSecretsKey {
+		// fall back to the binary's default key for users who upgraded
+		// configuration but kept the prior secrets file layout
+		value = secrets[defaultAmpSecretsKey]
+	}
+	return strings.TrimSpace(value), nil
+}
+
+const defaultAmpSecretsKey = "apiKey@https://ampcode.com/"
+
+func (s *MultiSourceSecret) fileKey() string {
+	s.mu.RLock()
+	url := s.upstreamURL
+	s.mu.RUnlock()
+	if url == "" {
+		return defaultAmpSecretsKey
+	}
+	return "apiKey@" + url
+}
+
+// UpdateUpstreamURL sets the upstream URL used to derive the secrets.json
+// file key (apiKey@<url>) and invalidates any cached file read.
+func (s *MultiSourceSecret) UpdateUpstreamURL(url string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.upstreamURL = strings.TrimSpace(url)
+	s.cache = nil
+	s.mu.Unlock()
 }
 
 // updateCache updates the cached secret value
@@ -237,6 +268,15 @@ func (s *MappedSecretSource) UpdateMappings(entries []config.AmpUpstreamAPIKeyEn
 func (s *MappedSecretSource) UpdateDefaultExplicitKey(key string) {
 	if ms, ok := s.defaultSource.(*MultiSourceSecret); ok {
 		ms.UpdateExplicitKey(key)
+	}
+}
+
+// UpdateDefaultUpstreamURL updates the upstream URL on the underlying
+// MultiSourceSecret (if applicable) so its file lookup tracks the configured
+// upstream rather than the hard-coded default.
+func (s *MappedSecretSource) UpdateDefaultUpstreamURL(url string) {
+	if ms, ok := s.defaultSource.(*MultiSourceSecret); ok {
+		ms.UpdateUpstreamURL(url)
 	}
 }
 
