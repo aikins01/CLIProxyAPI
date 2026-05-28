@@ -1369,9 +1369,9 @@ func TestNeoActorBinaryRelationshipPreservesRawShapeLikeBinary(t *testing.T) {
 	last := actor.replayEvents[len(actor.replayEvents)-1].Payload
 	actor.mu.Unlock()
 
-	replayed := mapValue(arrayValue(last["relationships"])[0])
-	if replayed["threadID"] != "not-a-cloud-thread-id" || replayed["type"] != "custom-type" || replayed["role"] != "custom-role" || replayed["note"] != "preserve me" {
-		t.Fatalf("replayed relationship = %#v, want raw reducer shape", replayed)
+	replayed := arrayValue(last["relationships"])
+	if len(replayed) != 0 {
+		t.Fatalf("replayed relationships = %#v, want invalid raw shape filtered from protocol event", replayed)
 	}
 	stateRelationship := mapValue(arrayValue(actor.stateSnapshotResponse()["relationships"])[0])
 	if stateRelationship["threadID"] != "not-a-cloud-thread-id" || stateRelationship["type"] != "custom-type" || stateRelationship["role"] != "custom-role" || stateRelationship["note"] != "preserve me" {
@@ -1452,7 +1452,7 @@ func TestNeoRuntimeSnapshotIncludesThreadStatusAndCompactionRecords(t *testing.T
 	threadID := "T-019e0e6e-f3f1-7078-b5dd-748f66f8c25d"
 	actor, _ := rt.store.upsert(map[string]any{"name": "threadActor", "key": threadID, "input": map[string]any{"threadId": threadID}}, true)
 	actor.mu.Lock()
-	actor.compactionRecords = []map[string]any{{"cutMessageId": "M-cut", "createdAt": "2026-01-01T00:00:00Z"}}
+	actor.compactionRecords = []map[string]any{{"cutMessageId": "M-00000000000000000000aa", "createdAt": "2026-01-01T00:00:00Z"}}
 	actor.mu.Unlock()
 
 	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
@@ -1494,7 +1494,7 @@ func TestNeoRuntimeSnapshotIncludesThreadStatusAndCompactionRecords(t *testing.T
 			sawThreadStatus = true
 		case "compaction_records":
 			records := arrayValue(msg["records"])
-			if len(records) != 1 || stringValue(mapValue(records[0])["cutMessageId"]) != "M-cut" {
+			if len(records) != 1 || stringValue(mapValue(records[0])["cutMessageId"]) != "M-00000000000000000000aa" {
 				t.Fatalf("compaction_records = %#v", msg)
 			}
 			sawCompactionRecords = true
@@ -2094,7 +2094,7 @@ func TestNeoActorHandlesThreadStatusCompactionAndRetryEvents(t *testing.T) {
 
 	actor.handle(map[string]any{"type": "thread_status", "status": "merged"})
 	actor.handle(map[string]any{"type": "compaction_started"})
-	actor.handle(map[string]any{"type": "compaction_complete", "cutMessageId": "M-cut", "createdAt": "2026-01-01T00:00:00Z"})
+	actor.handle(map[string]any{"type": "compaction_complete", "cutMessageId": "M-00000000000000000000aa", "createdAt": "2026-01-01T00:00:00Z"})
 	actor.handle(map[string]any{"type": "retry_scheduled", "retryAt": 123, "attempt": 2, "maxAttempts": 3, "reason": "rate_limit"})
 
 	actor.mu.Lock()
@@ -2104,7 +2104,7 @@ func TestNeoActorHandlesThreadStatusCompactionAndRetryEvents(t *testing.T) {
 	if actor.compacting {
 		t.Fatal("compacting should be false after compaction_complete")
 	}
-	if len(actor.compactionRecords) != 1 || stringValue(actor.compactionRecords[0]["cutMessageId"]) != "M-cut" {
+	if len(actor.compactionRecords) != 1 || stringValue(actor.compactionRecords[0]["cutMessageId"]) != "M-00000000000000000000aa" {
 		t.Fatalf("compactionRecords = %#v", actor.compactionRecords)
 	}
 	if !actor.retryScheduled {
@@ -2406,7 +2406,7 @@ func TestNeoActorProtocolThreadTruncatedUsesSeqOrder(t *testing.T) {
 	actor.mu.Lock()
 	actor.messages = []neoMessage{
 		{ThreadID: "T-test", MessageID: "M-late", Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "late"}}, Seq: 3},
-		{ThreadID: "T-test", MessageID: "M-cut", Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "cut"}}, Seq: 2},
+		{ThreadID: "T-test", MessageID: "M-00000000000000000000aa", Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "cut"}}, Seq: 2},
 		{ThreadID: "T-test", MessageID: "M-early", Role: "user", Content: []any{map[string]any{"type": "text", "text": "early"}}, Seq: 1},
 	}
 	actor.relationships = []map[string]any{
@@ -2416,7 +2416,7 @@ func TestNeoActorProtocolThreadTruncatedUsesSeqOrder(t *testing.T) {
 	actor.seq = 4
 	actor.mu.Unlock()
 
-	actor.handle(map[string]any{"type": "thread_truncated", "seq": 5, "truncateFromMessage": "M-cut"})
+	actor.handle(map[string]any{"type": "thread_truncated", "seq": 5, "truncateFromMessage": "M-00000000000000000000aa"})
 
 	actor.mu.Lock()
 	defer actor.mu.Unlock()
@@ -2833,6 +2833,21 @@ func TestNeoMessageProtocolUsesOfficialAssistantStateSchema(t *testing.T) {
 	queuedProtocol := queued.protocol()
 	if queuedProtocol["agentMode"] != nil || queuedProtocol["reasoningEffort"] != nil || queuedProtocol["fileMentions"] != nil {
 		t.Fatalf("queued message protocol retained non-schema mode fields: %#v", queuedProtocol)
+	}
+
+	info := neoMessage{
+		ThreadID:  message.ThreadID,
+		MessageID: newNeoMessageID(),
+		Role:      "info",
+		Content: []any{
+			map[string]any{"type": "text", "text": "local-only info text"},
+			map[string]any{"type": "summary", "summary": map[string]any{"type": "message", "summary": "compacted"}},
+			map[string]any{"type": "manual_bash_invocation", "args": map[string]any{"cmd": "git", "args": []any{"status"}}, "toolRun": map[string]any{"status": "done", "result": "clean"}},
+		},
+	}
+	infoContent := arrayValue(info.protocol()["content"])
+	if len(infoContent) != 1 || stringValue(mapValue(infoContent[0])["type"]) != "manual_bash_invocation" {
+		t.Fatalf("info protocol content = %#v, want only manual bash invocation", infoContent)
 	}
 }
 
@@ -8360,10 +8375,10 @@ func TestNeoActorThreadTruncateBeforeCompactionBoundaryPreservesPrefix(t *testin
 	actor.messages = []neoMessage{
 		{ThreadID: "T-test", MessageID: "M-old", Role: "user", Content: []any{map[string]any{"type": "text", "text": "old context"}}, Seq: 1},
 		neoCompactionSummaryMessage("T-test", "compacted summary"),
-		{ThreadID: "T-test", MessageID: "M-cut", Role: "user", Content: []any{map[string]any{"type": "text", "text": "cut message"}}, Seq: 3},
+		{ThreadID: "T-test", MessageID: "M-00000000000000000000aa", Role: "user", Content: []any{map[string]any{"type": "text", "text": "cut message"}}, Seq: 3},
 		{ThreadID: "T-test", MessageID: "M-after", Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "after"}}, Seq: 4},
 	}
-	actor.compactionRecords = []map[string]any{{"cutMessageId": "M-cut", "createdAt": "2026-01-01T00:00:00Z"}}
+	actor.compactionRecords = []map[string]any{{"cutMessageId": "M-00000000000000000000aa", "createdAt": "2026-01-01T00:00:00Z"}}
 	actor.rebuildHistoryLocked()
 
 	actor.handle(map[string]any{"type": "thread:truncate", "fromIndex": 1})

@@ -76,6 +76,21 @@ type neoCloudThreadListCacheEntry struct {
 	refreshing bool
 }
 
+// neoLocalThreadCacheEntry memoizes a parsed local thread document keyed by the
+// backing file's mtime and size, mirroring the official Amp client's in-session
+// thread cache so repeat thread opens/switches don't re-read and re-parse the
+// (potentially multi-MB) document from disk on every switch.
+type neoLocalThreadCacheEntry struct {
+	thread  map[string]any
+	modTime time.Time
+	size    int64
+}
+
+var neoLocalThreadCache = struct {
+	sync.RWMutex
+	entries map[string]*neoLocalThreadCacheEntry
+}{entries: map[string]*neoLocalThreadCacheEntry{}}
+
 var (
 	neoThreadIDPattern            = regexp.MustCompile(`T-[0-9A-Za-z][0-9A-Za-z-]*`)
 	neoThreadIDExactPattern       = regexp.MustCompile(`^T-[0-9A-Za-z][0-9A-Za-z-]*$`)
@@ -1826,7 +1841,7 @@ func (a *neoActor) handleProtocolThreadRelationships(msg map[string]any) {
 	a.mu.Lock()
 	a.relationships = relationships
 	seq := a.protocolSeqLocked(msg)
-	event := map[string]any{"type": "thread_relationships", "relationships": a.relationshipListLocked(), "seq": seq}
+	event := map[string]any{"type": "thread_relationships", "relationships": a.protocolRelationshipListLocked(), "seq": seq}
 	a.rememberReplayEventLocked(event)
 	a.mu.Unlock()
 
@@ -3523,7 +3538,7 @@ func (a *neoActor) handleBinaryRelationship(msg map[string]any) {
 	}
 	a.relationships = append(a.relationships, relationship)
 	seq := a.nextSeqLocked()
-	event := map[string]any{"type": "thread_relationships", "relationships": a.relationshipListLocked(), "seq": seq}
+	event := map[string]any{"type": "thread_relationships", "relationships": a.protocolRelationshipListLocked(), "seq": seq}
 	a.rememberReplayEventLocked(event)
 	a.mu.Unlock()
 
@@ -3981,6 +3996,13 @@ func normalizeNeoProtocolContent(role string, content []any, assistantDelta bool
 		}
 	}
 	return out
+}
+
+// neoProtocolInfoContent filters info-role message content for the wire protocol,
+// keeping only renderable blocks (e.g. manual_bash_invocation) and dropping
+// local-only content such as text and summary blocks.
+func neoProtocolInfoContent(content []any) []any {
+	return normalizeNeoProtocolContent("info", content, false)
 }
 
 func normalizeNeoProtocolAssistantBlock(raw any, delta bool) (map[string]any, bool) {
@@ -5686,8 +5708,8 @@ func (a *neoActor) maybeCompactBeforeInference(agentMode, reasoningEffort, paren
 	a.mu.Unlock()
 
 	a.broadcast(addedEvent)
-	a.broadcast(map[string]any{"type": "compaction_complete", "cutMessageId": cutMessageID})
-	a.broadcast(map[string]any{"type": "compaction_records", "records": records})
+	a.broadcast(neoProtocolCompactionCompletePayload(cutMessageID))
+	a.broadcast(map[string]any{"type": "compaction_records", "records": neoProtocolCompactionRecordList(records)})
 	a.dispatchNotification("thread", "compaction_complete", map[string]any{"cutMessageId": cutMessageID})
 	a.syncCloudAsync()
 }
@@ -7086,7 +7108,7 @@ func recentNeoLocalThreads(limit int) []map[string]any {
 			continue
 		}
 		thread := map[string]any{"id": id}
-		for _, key := range []string{"title", "created", "createdAt", "updated", "updatedAt", "userLastInteractedAt", "creatorUserID", "v", "agentMode", "archived", "env", "summaryStats", "usesDtw", "usesThreadActors", "meta", "relationships", "originThreadID", "originThreadId", "mainThreadID", "mainThreadId", "mainThread"} {
+		for _, key := range []string{"title", "created", "createdAt", "updated", "updatedAt", "userLastInteractedAt", "creatorUserID", "v", "agentMode", "archived", "env", "messageCount", "messageCharCount", "summaryStats", "usesDtw", "usesThreadActors", "meta", "relationships", "originThreadID", "originThreadId", "mainThreadID", "mainThreadId", "mainThread"} {
 			if value := gjson.GetBytes(raw, key); value.Exists() {
 				thread[key] = value.Value()
 			}
@@ -7099,20 +7121,35 @@ func recentNeoLocalThreads(limit int) []map[string]any {
 				thread["labels"] = fallback
 			}
 		}
-		parsed := gjson.ParseBytes(raw)
-		if stringValue(thread["agentMode"]) == "" {
-			if mode := neoThreadAgentModeFromJSON(parsed); mode != "" {
-				thread["agentMode"] = mode
+		// Trust the summary fields persisted in the thread file (messageCount,
+		// summaryStats) when present. Otherwise derive them from the messages array.
+		// Building the thread list must avoid gjson.ParseBytes on the whole document
+		// (which materializes every nested message/content object and dominates the
+		// cost for multi-MB thread files); instead query only the fields we need and
+		// scan messages a single time, computing messageCount, diffStats,
+		// relationships, and userLastInteractedAt in that one pass.
+		_, hasMessageCount := thread["messageCount"]
+		_, hasSummaryStats := thread["summaryStats"]
+		if !hasMessageCount || !hasSummaryStats || stringValue(thread["agentMode"]) == "" {
+			if stringValue(thread["agentMode"]) == "" {
+				if mode := neoThreadAgentModeFromBytes(raw); mode != "" {
+					thread["agentMode"] = mode
+				}
 			}
-		}
-		if messages := neoThreadMessagesFromJSON(parsed); messages.Exists() && messages.IsArray() {
-			messageCount := neoBinaryThreadMessageCountFromJSON(messages)
-			thread["messageCount"] = messageCount
-			thread["relationships"] = neoMergeThreadRelationshipsWithExplicit(neoThreadRelationshipsFromJSONMessages(messages, id), firstArray(thread["relationships"]))
-			if interacted := neoThreadUserLastInteractedAtFromJSON(parsed); interacted > 0 {
-				thread["userLastInteractedAt"] = interacted
+			messages := gjson.GetBytes(raw, "messages")
+			if !messages.Exists() || !messages.IsArray() {
+				messages = gjson.GetBytes(raw, "data.messages")
 			}
-			thread["summaryStats"] = neoMergeThreadSummaryStats(thread["summaryStats"], messageCount, neoThreadDiffStatsFromJSONMessages(messages))
+			if messages.Exists() && messages.IsArray() {
+				base := firstNonZero(neoJSONMillis(gjson.GetBytes(raw, "created")), neoJSONMillis(gjson.GetBytes(raw, "createdAt")), neoJSONMillis(gjson.GetBytes(raw, "data.created")), neoJSONMillis(gjson.GetBytes(raw, "data.createdAt")))
+				summary := neoThreadListSummaryFromMessages(messages, id, base)
+				thread["messageCount"] = summary.messageCount
+				thread["relationships"] = neoMergeThreadRelationshipsWithExplicit(summary.relationships, firstArray(thread["relationships"]))
+				if summary.userLastInteractedAt > 0 {
+					thread["userLastInteractedAt"] = summary.userLastInteractedAt
+				}
+				thread["summaryStats"] = neoMergeThreadSummaryStats(thread["summaryStats"], summary.messageCount, summary.diffStats)
+			}
 		}
 		if updated := neoThreadUpdatedMillisFromJSONBytes(raw); updated > 0 {
 			thread["updated"] = updated
@@ -7366,6 +7403,105 @@ func neoThreadAgentModeFromJSON(thread gjson.Result) string {
 		}
 	}
 	return neoThreadMessagesAgentModeFromJSON(neoThreadMessagesFromJSON(thread))
+}
+
+// neoThreadAgentModeFromBytes resolves the thread agent mode using targeted gjson
+// queries against the raw bytes, avoiding a full document parse for the thread list.
+func neoThreadAgentModeFromBytes(raw []byte) string {
+	for _, path := range []string{
+		"agentMode",
+		"settings.agentMode",
+		"meta.agentMode",
+		"data.agentMode",
+		"data.settings.agentMode",
+		"data.meta.agentMode",
+	} {
+		if mode := strings.TrimSpace(gjson.GetBytes(raw, path).String()); mode != "" {
+			return mode
+		}
+	}
+	messages := gjson.GetBytes(raw, "messages")
+	if !messages.Exists() || !messages.IsArray() {
+		messages = gjson.GetBytes(raw, "data.messages")
+	}
+	return neoThreadMessagesAgentModeFromJSON(messages)
+}
+
+// neoThreadListSummary holds the per-thread fields the thread list derives from a
+// single pass over the messages array.
+type neoThreadListSummary struct {
+	messageCount         int
+	diffStats            map[string]any
+	relationships        []any
+	userLastInteractedAt int
+}
+
+// neoThreadListSummaryFromMessages computes the messageCount, aggregate diff stats,
+// inferred relationships, and userLastInteractedAt the thread list needs in a single
+// pass over the messages array, avoiding the multiple full-array iterations (and full
+// document parse) the per-field helpers would otherwise do.
+func neoThreadListSummaryFromMessages(messages gjson.Result, currentThreadID string, baseLastInteractedAt int) neoThreadListSummary {
+	summary := neoThreadListSummary{userLastInteractedAt: baseLastInteractedAt}
+	if !messages.Exists() || !messages.IsArray() {
+		summary.diffStats = neoDiffStats{}.mapValue()
+		summary.relationships = []any{}
+		return summary
+	}
+	stats := neoDiffStats{}
+	relationships := make([]any, 0)
+	seen := map[string]struct{}{}
+	index := 0
+	messages.ForEach(func(_, message gjson.Result) bool {
+		i := index
+		index++
+		role := message.Get("role").String()
+		content := message.Get("content")
+		switch role {
+		case "user":
+			content.ForEach(func(_, block gjson.Result) bool {
+				if block.Get("type").String() != "tool_result" {
+					summary.messageCount++
+					return false
+				}
+				return true
+			})
+			if sentAt := neoJSONMessageMetaSentAtMillis(message); sentAt > summary.userLastInteractedAt {
+				summary.userLastInteractedAt = sentAt
+			}
+		case "assistant":
+			if !content.IsArray() {
+				break
+			}
+			content.ForEach(func(_, block gjson.Result) bool {
+				stats = stats.add(neoToolUseDiffStatsFromJSONBlock(block))
+				if block.Get("type").String() == "tool_use" && block.Get("name").String() == "read_thread" && neoJSONToolUseBlockComplete(block) {
+					rawThreadID := block.Get("input.threadID").String()
+					if rawThreadID == "" {
+						rawThreadID = block.Get("input.threadId").String()
+					}
+					if rawThreadID == "" {
+						rawThreadID = block.Get("input.thread_id").String()
+					}
+					threadID := neoToolInputThreadID(map[string]any{"threadID": rawThreadID})
+					if threadID != "" && threadID != currentThreadID && neoCloudThreadIDPattern.MatchString(threadID) {
+						if _, exists := seen[threadID]; !exists {
+							seen[threadID] = struct{}{}
+							createdAt := int64(firstNonZero(neoJSONMillis(message.Get("created")), neoJSONMillis(message.Get("createdAt"))))
+							if relationship, ok := neoProtocolThreadRelationship(threadID, "mention", "parent", createdAt, ""); ok {
+								relationship["messageIndex"] = i
+								relationships = append(relationships, relationship)
+							}
+						}
+					}
+				}
+				return true
+			})
+		}
+		return true
+	})
+	summary.diffStats = stats.mapValue()
+	summary.relationships = relationships
+	return summary
 }
 
 func neoThreadMessagesAgentModeFromJSON(messages gjson.Result) string {
@@ -7763,6 +7899,9 @@ func neoToolUseDiffStatsFromBlock(block map[string]any) neoDiffStats {
 }
 
 func neoCreatedContentDiffStats(content string) neoDiffStats {
+	if strings.HasSuffix(content, "\n") {
+		return neoDiffStats{added: len(strings.Split(content[:len(content)-1], "\n"))}
+	}
 	return neoDiffStats{added: len(strings.Split(content, "\n"))}
 }
 
@@ -7995,6 +8134,7 @@ func writeNeoLocalThreadSnapshot(snapshot neoCloudThreadSnapshot) error {
 	if err := os.WriteFile(path, append(raw, '\n'), 0o600); err != nil {
 		return err
 	}
+	neoInvalidateLocalThreadCache(snapshot.threadID)
 	log.Debugf("amp neo local runtime thread store sync complete thread=%s path=%s", snapshot.threadID, path)
 	return nil
 }
@@ -8007,7 +8147,24 @@ func loadNeoLocalThread(threadID string) (map[string]any, bool) {
 	if dir == "" {
 		return nil, false
 	}
-	raw, err := os.ReadFile(filepath.Join(dir, threadID+".json"))
+	path := filepath.Join(dir, threadID+".json")
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, false
+	}
+
+	// Serve from the in-memory cache when the file is unchanged (mtime+size),
+	// returning a deep clone so callers can mutate freely. This avoids re-reading
+	// and re-parsing the full thread document on every open/switch.
+	neoLocalThreadCache.RLock()
+	if entry := neoLocalThreadCache.entries[threadID]; entry != nil && entry.modTime.Equal(info.ModTime()) && entry.size == info.Size() {
+		clone := cloneNeoJSONMap(entry.thread)
+		neoLocalThreadCache.RUnlock()
+		return clone, true
+	}
+	neoLocalThreadCache.RUnlock()
+
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, false
 	}
@@ -8027,9 +8184,25 @@ func loadNeoLocalThread(threadID string) (map[string]any, bool) {
 		changed = true
 	}
 	if changed {
+		// Persist normalization back to disk (this also refreshes the cache via
+		// cacheNeoLocalThread using the post-write file stat).
 		cacheNeoLocalThread(thread)
+	} else {
+		neoStoreLocalThreadCache(threadID, thread, info.ModTime(), info.Size())
 	}
 	return thread, true
+}
+
+// neoStoreLocalThreadCache stores a deep clone of the parsed thread in the
+// in-memory cache keyed by the backing file's mtime and size.
+func neoStoreLocalThreadCache(threadID string, thread map[string]any, modTime time.Time, size int64) {
+	neoLocalThreadCache.Lock()
+	neoLocalThreadCache.entries[threadID] = &neoLocalThreadCacheEntry{
+		thread:  cloneNeoJSONMap(thread),
+		modTime: modTime,
+		size:    size,
+	}
+	neoLocalThreadCache.Unlock()
 }
 
 func tryServeNeoLocalThread(c *gin.Context, cfg *config.Config) bool {
@@ -9077,7 +9250,23 @@ func cacheNeoLocalThread(thread map[string]any) {
 	}
 	if err := os.WriteFile(filepath.Join(dir, threadID+".json"), append(raw, '\n'), 0o600); err != nil {
 		log.Debugf("amp neo cloud thread cache write failed thread=%s: %v", threadID, err)
+		return
 	}
+	// Refresh the in-memory cache to match the freshly written file so a
+	// subsequent open serves the updated document without re-reading from disk.
+	if info, err := os.Stat(filepath.Join(dir, threadID+".json")); err == nil {
+		neoStoreLocalThreadCache(threadID, thread, info.ModTime(), info.Size())
+	} else {
+		neoInvalidateLocalThreadCache(threadID)
+	}
+}
+
+// neoInvalidateLocalThreadCache drops any cached parse for the thread, forcing the
+// next open to re-read from disk.
+func neoInvalidateLocalThreadCache(threadID string) {
+	neoLocalThreadCache.Lock()
+	delete(neoLocalThreadCache.entries, threadID)
+	neoLocalThreadCache.Unlock()
 }
 
 func normalizeNeoThreadOwnership(thread map[string]any) bool {
@@ -9660,10 +9849,15 @@ func neoThreadRelationships(messages []neoMessage) []any {
 	return relationships
 }
 
+// neoProtocolThreadRelationship builds a protocol-valid thread relationship,
+// returning ok=false when threadID is not a valid cloud thread ID. The returned
+// threadID is normalized to lowercase ("T-" + lowercased UUID) and the type/role
+// are coerced into their allowed enums.
 func neoProtocolThreadRelationship(threadID, relationshipType, role string, createdAt int64, comment string) (map[string]any, bool) {
 	if !neoCloudThreadIDPattern.MatchString(threadID) {
 		return nil, false
 	}
+	threadID = "T-" + strings.ToLower(threadID[2:])
 	switch relationshipType {
 	case "fork", "handoff", "mention":
 	default:
@@ -9696,6 +9890,18 @@ func normalizeNeoThreadRelationships(raw any) []map[string]any {
 	}
 	relationships := make([]map[string]any, 0, len(items))
 	for _, item := range items {
+		if relationship, ok := normalizeNeoThreadRelationship(item); ok {
+			relationships = append(relationships, relationship)
+		}
+	}
+	return relationships
+}
+
+// neoProtocolThreadRelationshipList normalizes relationships for the wire protocol,
+// silently dropping any whose threadID is not a valid cloud thread ID.
+func neoProtocolThreadRelationshipList(raw []any) []any {
+	relationships := make([]any, 0, len(raw))
+	for _, item := range raw {
 		if relationship, ok := normalizeNeoThreadRelationship(item); ok {
 			relationships = append(relationships, relationship)
 		}
@@ -10478,13 +10684,13 @@ func (a *neoActor) sendSnapshot(socket *neoSocket, sinceSeq int) {
 	registeredTools := len(a.tools)
 	guidanceInventory := neoGuidanceInventory(a.guidanceSnapshot)
 	artifacts := a.artifactListLocked()
-	compactionRecords := a.compactionRecordListLocked()
+	compactionRecords := neoProtocolCompactionRecordList(a.compactionRecordListLocked())
 	approvals := a.approvalQueueListLocked()
 	if len(approvals) > 0 {
 		agentState = "awaiting_approval"
 	}
 	spawnedExecutorStatuses := a.spawnedExecutorStatusListLocked()
-	relationships := a.threadRelationshipsLocked(allMessages)
+	relationships := a.threadProtocolRelationshipsLocked(allMessages)
 	var inflightInference *neoInferenceInflight
 	if a.currentInference != nil && a.messageIndexLocked(a.currentInference.messageID) < 0 {
 		a.currentInference = nil
@@ -11512,12 +11718,12 @@ func (a *neoActor) handleCompactionEvent(msg map[string]any) {
 		}
 		records := a.compactionRecordListLocked()
 		a.mu.Unlock()
-		payload := map[string]any{"type": "compaction_complete"}
+		payload := neoProtocolCompactionCompletePayload(nil)
 		if ok {
-			payload["cutMessageId"] = record["cutMessageId"]
+			payload = neoProtocolCompactionCompletePayload(record["cutMessageId"])
 		}
 		a.broadcast(payload)
-		a.broadcast(map[string]any{"type": "compaction_records", "records": records})
+		a.broadcast(map[string]any{"type": "compaction_records", "records": neoProtocolCompactionRecordList(records)})
 		notif := map[string]any{}
 		if ok {
 			notif["cutMessageId"] = record["cutMessageId"]
@@ -11530,7 +11736,7 @@ func (a *neoActor) handleCompactionEvent(msg map[string]any) {
 		a.compactionRecords = records
 		payload := a.compactionRecordListLocked()
 		a.mu.Unlock()
-		a.broadcast(map[string]any{"type": "compaction_records", "records": payload})
+		a.broadcast(map[string]any{"type": "compaction_records", "records": neoProtocolCompactionRecordList(payload)})
 		a.syncCloudAsync()
 	}
 }
@@ -12485,7 +12691,7 @@ func (a *neoActor) recordRelationshipEvent(payload map[string]any) int {
 	}
 	seq := a.nextSeqLocked()
 	clone := cloneMap(payload)
-	relationships := a.relationshipListLocked()
+	relationships := a.protocolRelationshipListLocked()
 	clone["relationships"] = relationships
 	clone["seq"] = seq
 	a.rememberReplayEventLocked(clone)
@@ -12607,8 +12813,16 @@ func (a *neoActor) relationshipListLocked() []any {
 	return relationships
 }
 
+func (a *neoActor) protocolRelationshipListLocked() []any {
+	return neoProtocolThreadRelationshipList(a.relationshipListLocked())
+}
+
 func (a *neoActor) threadRelationshipsLocked(messages []neoMessage) []any {
 	return neoMergeThreadRelationshipsWithExplicit(neoThreadRelationships(messages), a.relationshipListLocked())
+}
+
+func (a *neoActor) threadProtocolRelationshipsLocked(messages []neoMessage) []any {
+	return neoProtocolThreadRelationshipList(neoMergeThreadRelationshipsWithExplicit(neoThreadRelationships(messages), a.relationshipListLocked()))
 }
 
 func (a *neoActor) upsertRelationshipLocked(relationship map[string]any) {
@@ -13896,11 +14110,15 @@ type neoMessage struct {
 }
 
 func (m neoMessage) protocol() map[string]any {
+	content := m.Content
+	if m.Role == "info" {
+		content = neoProtocolInfoContent(m.Content)
+	}
 	out := map[string]any{
 		"threadId":  m.ThreadID,
 		"messageId": m.MessageID,
 		"role":      m.Role,
-		"content":   m.Content,
+		"content":   content,
 	}
 	if m.ParentToolUseID != "" {
 		out["parentToolUseId"] = m.ParentToolUseID
@@ -17553,7 +17771,11 @@ func neoGuidanceInventory(guidance map[string]any) []any {
 		if uri == "" || hash == "" {
 			continue
 		}
-		out = append(out, map[string]any{"uri": uri, "hash": hash})
+		entry := map[string]any{"uri": uri, "hash": hash}
+		if _, ok := file["lineCount"]; ok {
+			entry["lineCount"] = numberFrom(file["lineCount"])
+		}
+		out = append(out, entry)
 	}
 	return out
 }
@@ -19326,6 +19548,33 @@ func normalizeNeoCompactionRecords(raw any) []map[string]any {
 		if ok {
 			records = append(records, record)
 		}
+	}
+	return records
+}
+
+// neoProtocolCompactionCompletePayload builds a compaction_complete event, including
+// cutMessageId only when the provided value is a valid protocol message ID.
+func neoProtocolCompactionCompletePayload(cutMessageID any) map[string]any {
+	payload := map[string]any{"type": "compaction_complete"}
+	if messageID := protocolMessageIDValue(cutMessageID); messageID != "" {
+		payload["cutMessageId"] = messageID
+	}
+	return payload
+}
+
+// neoProtocolCompactionRecordList normalizes compaction records for the wire protocol,
+// keeping only records with a valid cutMessageId and a non-empty createdAt and emitting
+// just those two fields per record.
+func neoProtocolCompactionRecordList(raw []any) []any {
+	records := make([]any, 0, len(raw))
+	for _, item := range raw {
+		record := mapValue(item)
+		cutMessageID := protocolMessageIDValue(record["cutMessageId"])
+		createdAt := stringValue(record["createdAt"])
+		if cutMessageID == "" || createdAt == "" {
+			continue
+		}
+		records = append(records, map[string]any{"cutMessageId": cutMessageID, "createdAt": createdAt})
 	}
 	return records
 }
