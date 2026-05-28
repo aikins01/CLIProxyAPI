@@ -143,6 +143,47 @@ func TestRegisterManagementRoutesLocalNeoThreadActorsWithoutProxy(t *testing.T) 
 	}
 }
 
+func TestRegisterManagementRoutesLocalNeoThreadActorsReturnAuthenticatedWsToken(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	enabled := true
+	m := &AmpModule{
+		restrictToLocalhost: false,
+		neoRuntime: newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+			NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled},
+		}}),
+	}
+	auth := func(c *gin.Context) {
+		token := strings.TrimSpace(c.GetHeader("Authorization"))
+		token = strings.TrimSpace(strings.TrimPrefix(token, "Bearer "))
+		if token != "amp-local-key" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing auth"})
+			return
+		}
+		c.Set("userApiKey", token)
+		c.Next()
+	}
+
+	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, auth)
+
+	body := bytes.NewBufferString(`{"agentMode":"deep","usesThreadActors":true}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/thread-actors", body)
+	req.Header.Set("Authorization", "Bearer amp-local-key")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	var response map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("response JSON error: %v", err)
+	}
+	if got := stringValue(response["wsToken"]); got != "amp-local-key" {
+		t.Fatalf("wsToken = %q, want authenticated client key", got)
+	}
+}
+
 func TestRegisterManagementRoutesNeoRuntimeBridgeUsesManagementAuth(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

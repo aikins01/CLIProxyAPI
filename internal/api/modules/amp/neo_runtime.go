@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"runtime"
 	"sort"
@@ -1536,27 +1537,37 @@ func (a *neoActor) handleForSocket(socket *neoSocket, msg map[string]any) {
 		a.handleProtocolQueuedMessageAdded(msg)
 	case "queued_message_removed", "queued_message_dequeued":
 		a.handleProtocolQueuedMessageRemoved(msg)
-	case "edit_rejected", "observers":
+	case "edit_rejected", "observers", "executor_workspace_maybe_changed":
 		a.broadcast(msg)
 	case "client_filesystem_read_directory":
 		a.forwardFilesystemRequest("directory", msg)
 	case "client_filesystem_read_file":
 		a.forwardFilesystemRequest("file", msg)
+	case "client_git_command":
+		a.handleClientGitCommand(msg)
 	case "executor_filesystem_read_directory":
 		a.forwardFilesystemRequest("directory", msg)
 	case "executor_filesystem_read_file":
 		a.forwardFilesystemRequest("file", msg)
+	case "executor_git_command":
+		a.forwardGitCommandRequest(msg)
 	case "executor_filesystem_read_directory_result":
 		msg["type"] = "client_filesystem_read_directory_result"
 		a.broadcast(msg)
 	case "executor_filesystem_read_file_result":
 		msg["type"] = "client_filesystem_read_file_result"
 		a.broadcast(msg)
+	case "executor_git_command_result":
+		msg["type"] = "client_git_command_result"
+		a.broadcast(msg)
 	case "client_filesystem_read_directory_result":
 		msg["type"] = "executor_filesystem_read_directory_result"
 		a.broadcast(msg)
 	case "client_filesystem_read_file_result":
 		msg["type"] = "executor_filesystem_read_file_result"
+		a.broadcast(msg)
+	case "client_git_command_result":
+		msg["type"] = "executor_git_command_result"
 		a.broadcast(msg)
 	case "executor_plugin_message":
 		a.broadcast(map[string]any{"type": "plugin_message", "message": msg["message"]})
@@ -6766,6 +6777,7 @@ func getNeoCloudThread(ctx context.Context, cfg *config.Config, threadID string)
 	}
 	normalizeNeoThreadOwnership(thread)
 	normalizeNeoThreadAgentMode(thread)
+	normalizeNeoThreadMessageShapes(thread)
 	return thread, true, nil
 }
 
@@ -7964,6 +7976,9 @@ func loadNeoLocalThread(threadID string) (map[string]any, bool) {
 	if normalizeNeoThreadCurrentInference(thread) {
 		changed = true
 	}
+	if normalizeNeoThreadMessageShapes(thread) {
+		changed = true
+	}
 	if changed {
 		cacheNeoLocalThread(thread)
 	}
@@ -8719,13 +8734,17 @@ func (rt *neoRuntime) localThreadActorManagementResponse(ctx context.Context, bo
 		markNeoLocalThreadActorImported(threadID)
 	}
 
+	wsToken := strings.TrimSpace(getClientAPIKeyFromContext(ctx))
+	if wsToken == "" {
+		wsToken = "local-" + randomBase62(32)
+	}
 	baseResponse := map[string]any{
 		"threadId":      threadID,
 		"userId":        neoLocalOwnerUserID,
 		"ownerUserId":   neoLocalOwnerUserID,
 		"threadVersion": threadVersion,
 		"agentMode":     agentMode,
-		"wsToken":       "local-" + randomBase62(32),
+		"wsToken":       wsToken,
 		"capability":    "write",
 		"poolName":      "local",
 	}
@@ -8997,6 +9016,7 @@ func cacheNeoLocalThread(thread map[string]any) {
 	normalizeNeoThreadOwnership(thread)
 	normalizeNeoThreadAgentMode(thread)
 	normalizeNeoThreadCurrentInference(thread)
+	normalizeNeoThreadMessageShapes(thread)
 	dir := neoAmpThreadStoreDir()
 	if dir == "" {
 		return
@@ -9073,6 +9093,57 @@ func normalizeNeoThreadCurrentInference(thread map[string]any) bool {
 	if messageID == "" || !neoThreadContainsMessageID(thread, messageID) {
 		delete(thread, "currentInference")
 		changed = true
+	}
+	return changed
+}
+
+func normalizeNeoThreadMessageShapes(thread map[string]any) bool {
+	if len(thread) == 0 {
+		return false
+	}
+	changed := false
+	if data := mapValue(thread["data"]); len(data) > 0 {
+		if normalizeNeoThreadMessageShapes(data) {
+			thread["data"] = data
+			changed = true
+		}
+	}
+	rawMessages, exists := thread["messages"]
+	if !exists {
+		return changed
+	}
+	messages := arrayValue(rawMessages)
+	if messages == nil {
+		thread["messages"] = []any{}
+		return true
+	}
+	out := make([]any, 0, len(messages))
+	for _, raw := range messages {
+		message := mapValue(raw)
+		if len(message) == 0 {
+			out = append(out, raw)
+			continue
+		}
+		normalized := cloneMap(message)
+		if content := arrayValue(message["content"]); content != nil {
+			normalized["content"] = cloneArray(content)
+		} else {
+			normalized["content"] = []any{}
+		}
+		if stringValue(normalized["role"]) == "user" {
+			if userState := neoBinaryUserState(message["userState"]); userState != nil {
+				normalized["userState"] = userState
+			} else {
+				delete(normalized, "userState")
+			}
+		}
+		if !reflect.DeepEqual(normalized, message) {
+			changed = true
+		}
+		out = append(out, normalized)
+	}
+	if changed {
+		thread["messages"] = out
 	}
 	return changed
 }
@@ -11628,6 +11699,524 @@ func (a *neoActor) forwardFilesystemRequest(kind string, msg map[string]any) {
 		payload["maxBytes"] = max
 	}
 	a.broadcast(payload)
+}
+
+func (a *neoActor) handleClientGitCommand(msg map[string]any) {
+	requestID := firstNonEmptyString(msg["requestId"], msg["requestID"], msg["id"])
+	if requestID == "" {
+		return
+	}
+	operation := cloneMap(mapValue(msg["operation"]))
+	args := stringSliceFromAny(msg["args"])
+	maxOutputBytes := numberFrom(msg["maxOutputBytes"], msg["max_output_bytes"])
+	a.mu.Lock()
+	environment := cloneMap(a.environment)
+	a.mu.Unlock()
+	cwd := neoHeadlessWorkingDirectory(msg, environment)
+
+	go func() {
+		result := neoRunClientGitCommand(cwd, operation, args, maxOutputBytes)
+		result["type"] = "client_git_command_result"
+		result["requestId"] = requestID
+		a.broadcast(result)
+	}()
+}
+
+func (a *neoActor) forwardGitCommandRequest(msg map[string]any) {
+	requestID := firstNonEmptyString(msg["requestId"], msg["requestID"], msg["id"])
+	args := stringSliceFromAny(msg["args"])
+	if len(args) == 0 {
+		if generated, ok := neoGitArgsForOperation(mapValue(msg["operation"])); ok {
+			args = generated
+		}
+	}
+	payload := map[string]any{"type": "executor_git_command", "requestId": requestID, "args": args}
+	if max := firstNonNil(msg["maxOutputBytes"], msg["max_output_bytes"], msg["limit"]); max != nil {
+		payload["maxOutputBytes"] = max
+	}
+	if operation := cloneMap(mapValue(msg["operation"])); len(operation) > 0 {
+		payload["operation"] = operation
+	}
+	a.broadcast(payload)
+}
+
+func neoRunClientGitCommand(cwd string, operation map[string]any, args []string, maxOutputBytes int) map[string]any {
+	if len(operation) > 0 {
+		return neoRunGitOperation(cwd, operation, maxOutputBytes)
+	}
+	if len(args) == 0 {
+		return neoGitCommandError("INVALID_ARGS", "Git command arguments must be non-empty")
+	}
+	return neoRunGitCommand(cwd, args, maxOutputBytes, false)
+}
+
+func neoRunGitOperation(cwd string, operation map[string]any, maxOutputBytes int) map[string]any {
+	switch stringValue(operation["type"]) {
+	case "status_snapshot":
+		snapshot := neoGitStatusSnapshot(cwd)
+		raw, err := json.Marshal(snapshot)
+		if err != nil {
+			return neoGitCommandError("INTERNAL_ERROR", err.Error())
+		}
+		return neoGitCommandOK(0, string(raw), "")
+	case "comparison_base_ref":
+		base, ok := neoGitComparisonBase(cwd)
+		if !ok {
+			return neoGitCommandOK(1, "", "comparison base ref not found\n")
+		}
+		return neoGitCommandOK(0, base.baseRef+"\n", "")
+	case "comparison_base_head":
+		base, ok := neoGitComparisonBase(cwd)
+		if !ok {
+			return neoGitCommandOK(1, "", "comparison base head not found\n")
+		}
+		return neoGitCommandOK(0, base.baseRefHead+"\n", "")
+	case "ahead_count":
+		return neoRunGitAheadBehindCount(cwd, true)
+	case "behind_count":
+		return neoRunGitAheadBehindCount(cwd, false)
+	case "ahead_commits":
+		return neoRunGitAheadCommits(cwd)
+	case "file_diff":
+		return neoRunGitFileDiff(cwd, operation, maxOutputBytes)
+	default:
+		args, ok := neoGitArgsForOperation(operation)
+		if !ok {
+			return neoGitCommandError("INVALID_ARGS", "Unsupported git operation")
+		}
+		return neoRunGitCommand(cwd, args, maxOutputBytes, false)
+	}
+}
+
+func neoGitArgsForOperation(operation map[string]any) ([]string, bool) {
+	switch stringValue(operation["type"]) {
+	case "repository_root":
+		return []string{"rev-parse", "--show-toplevel"}, true
+	case "head":
+		return []string{"rev-parse", "--verify", "HEAD"}, true
+	case "branch":
+		return []string{"symbolic-ref", "--short", "HEAD"}, true
+	case "status":
+		return []string{"status", "--porcelain=v1", "--untracked-files=all", "-z"}, true
+	default:
+		return nil, false
+	}
+}
+
+type neoGitComparisonBaseInfo struct {
+	baseRef       string
+	comparisonRef string
+	baseRefHead   string
+	mergeBaseHead string
+}
+
+func neoGitComparisonBase(cwd string) (neoGitComparisonBaseInfo, bool) {
+	refResult := neoRunGitCommand(cwd, []string{"symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"}, 0, false)
+	if numberFrom(refResult["exitCode"]) != 0 {
+		return neoGitComparisonBaseInfo{}, false
+	}
+	rawRef := strings.TrimSpace(stringValue(refResult["stdout"]))
+	const prefix = "refs/remotes/origin/"
+	if !strings.HasPrefix(rawRef, prefix) {
+		return neoGitComparisonBaseInfo{}, false
+	}
+	baseRef := strings.TrimPrefix(rawRef, prefix)
+	if baseRef == "" {
+		return neoGitComparisonBaseInfo{}, false
+	}
+	comparisonRef := "origin/" + baseRef
+	headResult := neoRunGitCommand(cwd, []string{"rev-parse", "--verify", "--quiet", comparisonRef + "^{commit}"}, 0, false)
+	if numberFrom(headResult["exitCode"]) != 0 {
+		return neoGitComparisonBaseInfo{}, false
+	}
+	mergeBaseResult := neoRunGitCommand(cwd, []string{"merge-base", "HEAD", comparisonRef}, 0, false)
+	if numberFrom(mergeBaseResult["exitCode"]) != 0 {
+		return neoGitComparisonBaseInfo{}, false
+	}
+	return neoGitComparisonBaseInfo{
+		baseRef:       baseRef,
+		comparisonRef: comparisonRef,
+		baseRefHead:   strings.TrimSpace(stringValue(headResult["stdout"])),
+		mergeBaseHead: strings.TrimSpace(stringValue(mergeBaseResult["stdout"])),
+	}, true
+}
+
+func neoRunGitAheadBehindCount(cwd string, ahead bool) map[string]any {
+	base, ok := neoGitComparisonBase(cwd)
+	if !ok {
+		return neoGitCommandOK(1, "", "comparison base not found\n")
+	}
+	rangeSpec := base.comparisonRef + "..HEAD"
+	if !ahead {
+		rangeSpec = "HEAD.." + base.comparisonRef
+	}
+	return neoRunGitCommand(cwd, []string{"rev-list", "--count", rangeSpec}, 0, false)
+}
+
+func neoRunGitAheadCommits(cwd string) map[string]any {
+	base, ok := neoGitComparisonBase(cwd)
+	if !ok || base.mergeBaseHead == "" {
+		return neoGitCommandOK(1, "", "comparison base not found\n")
+	}
+	return neoRunGitCommand(cwd, []string{"log", "-z", "--reverse", "--max-count=20", "--format=%H%x00%s", base.mergeBaseHead + "..HEAD"}, 0, false)
+}
+
+func neoRunGitFileDiff(cwd string, operation map[string]any, maxOutputBytes int) map[string]any {
+	path := strings.TrimSpace(stringValue(operation["path"]))
+	if path == "" || strings.Contains(path, "\x00") {
+		return neoGitCommandError("INVALID_ARGS", "Git file diff path is required")
+	}
+	args := []string{"-c", "core.quotepath=false", "diff", "--no-color", "--no-ext-diff"}
+	if boolValue(operation["full"]) {
+		args = append(args, "--unified=999999")
+	}
+	if stringValue(operation["changeType"]) == "untracked" {
+		args = append(args, "--no-index", "--", os.DevNull, path)
+		result := neoRunGitCommand(cwd, args, maxOutputBytes, true)
+		if numberFrom(result["exitCode"]) == 1 {
+			result["exitCode"] = 0
+		}
+		return result
+	}
+	if neoGitHeadExists(cwd) {
+		args = append(args, "HEAD", "--", path)
+		return neoRunGitCommand(cwd, args, maxOutputBytes, false)
+	}
+	cached := neoRunGitCommand(cwd, append(append([]string{}, args...), "--cached", "--", path), maxOutputBytes, false)
+	unstaged := neoRunGitCommand(cwd, append(append([]string{}, args...), "--", path), maxOutputBytes, false)
+	stdout := strings.TrimRight(stringValue(cached["stdout"]), "\n")
+	if extra := strings.TrimRight(stringValue(unstaged["stdout"]), "\n"); extra != "" {
+		if stdout != "" {
+			stdout += "\n"
+		}
+		stdout += extra
+	}
+	stderr := stringValue(cached["stderr"]) + stringValue(unstaged["stderr"])
+	exitCode := numberFrom(cached["exitCode"])
+	if exitCode == 0 {
+		exitCode = numberFrom(unstaged["exitCode"])
+	}
+	return neoGitCommandOK(exitCode, stdout, stderr)
+}
+
+func neoGitHeadExists(cwd string) bool {
+	result := neoRunGitCommand(cwd, []string{"rev-parse", "--verify", "HEAD"}, 0, false)
+	return numberFrom(result["exitCode"]) == 0
+}
+
+func neoGitStatusSnapshot(cwd string) map[string]any {
+	capturedAt := time.Now().UnixMilli()
+	rootResult := neoRunGitCommand(cwd, []string{"rev-parse", "--show-toplevel"}, 0, false)
+	if numberFrom(rootResult["exitCode"]) != 0 {
+		return neoUnavailableGitSnapshot(capturedAt, "not a git repository")
+	}
+	root := strings.TrimSpace(stringValue(rootResult["stdout"]))
+	headResult := neoRunGitCommand(root, []string{"rev-parse", "--verify", "HEAD"}, 0, false)
+	branchResult := neoRunGitCommand(root, []string{"symbolic-ref", "--short", "HEAD"}, 0, false)
+	statusResult := neoRunGitCommand(root, []string{"status", "--porcelain=v1", "--untracked-files=all", "-z"}, 0, false)
+	if numberFrom(statusResult["exitCode"]) != 0 {
+		return neoUnavailableGitSnapshot(capturedAt, "failed to read git status")
+	}
+	files := neoGitStatusFiles(root, strings.TrimSpace(stringValue(headResult["stdout"])), stringValue(statusResult["stdout"]))
+	snapshot := map[string]any{
+		"provider":       "git",
+		"capturedAt":     capturedAt,
+		"available":      true,
+		"repositoryRoot": root,
+		"repositoryName": filepath.Base(root),
+		"branch":         nullableString(strings.TrimSpace(stringValue(branchResult["stdout"]))),
+		"head":           nullableString(strings.TrimSpace(stringValue(headResult["stdout"]))),
+		"files":          files,
+		"diffHash":       neoGitDiffHash(files),
+		"baseRef":        nil,
+		"baseRefHead":    nil,
+		"aheadCount":     0,
+	}
+	if base, ok := neoGitComparisonBase(root); ok {
+		snapshot["baseRef"] = base.baseRef
+		snapshot["baseRefHead"] = base.baseRefHead
+		if ahead := neoRunGitAheadBehindCount(root, true); numberFrom(ahead["exitCode"]) == 0 {
+			snapshot["aheadCount"] = numberFromString(strings.TrimSpace(stringValue(ahead["stdout"])))
+		}
+		if behind := neoRunGitAheadBehindCount(root, false); numberFrom(behind["exitCode"]) == 0 {
+			snapshot["behindCount"] = numberFromString(strings.TrimSpace(stringValue(behind["stdout"])))
+		}
+		if commits := neoGitAheadCommitObjects(root, base.mergeBaseHead); commits != nil {
+			snapshot["aheadCommits"] = commits
+		}
+	}
+	return snapshot
+}
+
+func neoUnavailableGitSnapshot(capturedAt int64, reason string) map[string]any {
+	return map[string]any{
+		"provider":          "git",
+		"capturedAt":        capturedAt,
+		"available":         false,
+		"repositoryRoot":    nil,
+		"repositoryName":    nil,
+		"branch":            nil,
+		"head":              nil,
+		"files":             []any{},
+		"unavailableReason": reason,
+	}
+}
+
+func neoGitStatusFiles(root, head, status string) []any {
+	entries := neoParseGitPorcelainZ(status)
+	files := make([]any, 0, len(entries))
+	for _, entry := range entries {
+		if entry.path == "" {
+			continue
+		}
+		diff := ""
+		if entry.changeType == "untracked" {
+			result := neoRunGitFileDiff(root, map[string]any{"type": "file_diff", "path": entry.path, "changeType": entry.changeType}, 0)
+			if numberFrom(result["exitCode"]) == 0 {
+				diff = strings.TrimRight(stringValue(result["stdout"]), "\n")
+			}
+		} else if head != "" {
+			result := neoRunGitFileDiff(root, map[string]any{"type": "file_diff", "path": entry.path, "changeType": entry.changeType}, 0)
+			if numberFrom(result["exitCode"]) == 0 {
+				diff = strings.TrimRight(stringValue(result["stdout"]), "\n")
+			}
+		}
+		files = append(files, map[string]any{
+			"path":         entry.path,
+			"previousPath": omitEmpty(entry.previousPath),
+			"changeType":   entry.changeType,
+			"created":      entry.changeType == "added" || entry.changeType == "untracked",
+			"diff":         diff,
+			"diffStat":     neoGitDiffStat(diff),
+		})
+	}
+	return files
+}
+
+type neoGitStatusEntry struct {
+	path         string
+	previousPath string
+	changeType   string
+	rawStatus    string
+}
+
+func neoParseGitPorcelainZ(status string) []neoGitStatusEntry {
+	parts := strings.Split(status, "\x00")
+	entries := make([]neoGitStatusEntry, 0, len(parts))
+	for i := 0; i < len(parts); i++ {
+		item := parts[i]
+		if len(item) < 4 {
+			continue
+		}
+		rawStatus := item[:2]
+		path := item[3:]
+		if path == "" || strings.HasSuffix(path, "/") {
+			continue
+		}
+		entry := neoGitStatusEntry{path: path, changeType: neoGitChangeType(rawStatus), rawStatus: rawStatus}
+		if (entry.changeType == "renamed" || entry.changeType == "copied") && i+1 < len(parts) {
+			entry.previousPath = parts[i+1]
+			i++
+		}
+		entries = append(entries, entry)
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].path < entries[j].path })
+	return entries
+}
+
+func neoGitChangeType(status string) string {
+	if status == "??" {
+		return "untracked"
+	}
+	x := byte(' ')
+	y := byte(' ')
+	if len(status) > 0 {
+		x = status[0]
+	}
+	if len(status) > 1 {
+		y = status[1]
+	}
+	if x == 'U' || y == 'U' || status == "AA" || status == "DD" {
+		return "unmerged"
+	}
+	if x == 'R' || y == 'R' {
+		return "renamed"
+	}
+	if x == 'C' || y == 'C' {
+		return "copied"
+	}
+	if x == 'A' || y == 'A' {
+		return "added"
+	}
+	if x == 'D' || y == 'D' {
+		return "deleted"
+	}
+	if x == 'T' || y == 'T' {
+		return "type_changed"
+	}
+	return "modified"
+}
+
+func neoGitDiffStat(diff string) map[string]any {
+	added := 0
+	deleted := 0
+	changed := 0
+	pendingAdded := 0
+	pendingDeleted := 0
+	flush := func() {
+		if pendingAdded == 0 && pendingDeleted == 0 {
+			return
+		}
+		if pendingAdded < pendingDeleted {
+			changed += pendingAdded
+		} else {
+			changed += pendingDeleted
+		}
+		pendingAdded = 0
+		pendingDeleted = 0
+	}
+	for _, line := range strings.Split(diff, "\n") {
+		if strings.HasPrefix(line, "+") && !strings.HasPrefix(line, "+++") {
+			added++
+			pendingAdded++
+			continue
+		}
+		if strings.HasPrefix(line, "-") && !strings.HasPrefix(line, "---") {
+			deleted++
+			pendingDeleted++
+			continue
+		}
+		flush()
+	}
+	flush()
+	return map[string]any{"added": added, "deleted": deleted, "changed": changed}
+}
+
+func neoGitDiffHash(files []any) string {
+	hash := sha256.New()
+	for _, raw := range files {
+		file := mapValue(raw)
+		hash.Write([]byte(stringValue(file["path"])))
+		hash.Write([]byte{0})
+		hash.Write([]byte(stringValue(file["diffToken"])))
+		if stringValue(file["diffToken"]) == "" {
+			hash.Write([]byte(stringValue(file["diff"])))
+		}
+		hash.Write([]byte{0})
+	}
+	return hex.EncodeToString(hash.Sum(nil))
+}
+
+func neoGitAheadCommitObjects(cwd, mergeBase string) []any {
+	if mergeBase == "" {
+		return nil
+	}
+	result := neoRunGitCommand(cwd, []string{"log", "-z", "--reverse", "--max-count=20", "--format=%H%x00%s", mergeBase + "..HEAD"}, 0, false)
+	if numberFrom(result["exitCode"]) != 0 {
+		return nil
+	}
+	parts := strings.Split(stringValue(result["stdout"]), "\x00")
+	commits := make([]any, 0, len(parts)/2)
+	for i := 0; i+1 < len(parts); i += 2 {
+		hash := strings.TrimSpace(parts[i])
+		if hash == "" {
+			continue
+		}
+		commits = append(commits, map[string]any{
+			"hash":      hash,
+			"shortHash": firstN(hash, 12),
+			"subject":   parts[i+1],
+			"metadata":  map[string]any{"isMergeBase": false},
+		})
+	}
+	return commits
+}
+
+func neoRunGitCommand(cwd string, args []string, maxOutputBytes int, allowExitOne bool) map[string]any {
+	if len(args) == 0 {
+		return neoGitCommandError("INVALID_ARGS", "Git command arguments must be non-empty")
+	}
+	for _, arg := range args {
+		if strings.Contains(arg, "\x00") {
+			return neoGitCommandError("INVALID_ARGS", "Git command arguments must not contain NUL bytes")
+		}
+	}
+	cmd := exec.Command("git", args...)
+	if cwd != "" {
+		cmd.Dir = cwd
+	}
+	cmd.Env = neoGitCommandEnv()
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	exitCode := 0
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+			if allowExitOne && exitCode == 1 {
+				exitCode = 0
+			}
+		} else {
+			return neoGitCommandError("INTERNAL_ERROR", err.Error())
+		}
+	}
+	return neoGitCommandOK(exitCode, neoTrimGitOutput(stdout.String(), maxOutputBytes), neoTrimGitOutput(stderr.String(), maxOutputBytes))
+}
+
+func neoGitCommandEnv() []string {
+	base := os.Environ()
+	out := make([]string, 0, len(base)+3)
+	for _, item := range base {
+		key := item
+		if index := strings.IndexByte(item, '='); index >= 0 {
+			key = item[:index]
+		}
+		if key == "GIT_CONFIG" || key == "GIT_CONFIG_COUNT" || key == "GIT_CONFIG_PARAMETERS" || strings.HasPrefix(key, "GIT_CONFIG_KEY_") || strings.HasPrefix(key, "GIT_CONFIG_VALUE_") {
+			continue
+		}
+		out = append(out, item)
+	}
+	out = append(out, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_SYSTEM="+os.DevNull, "GIT_CONFIG_GLOBAL="+os.DevNull)
+	return out
+}
+
+func neoGitCommandOK(exitCode int, stdout, stderr string) map[string]any {
+	return map[string]any{"ok": true, "exitCode": exitCode, "stdout": stdout, "stderr": stderr}
+}
+
+func neoGitCommandError(code, message string) map[string]any {
+	return map[string]any{"ok": false, "error": map[string]any{"code": code, "message": message}}
+}
+
+func neoTrimGitOutput(output string, maxOutputBytes int) string {
+	if maxOutputBytes <= 0 || len(output) <= maxOutputBytes {
+		return output
+	}
+	return output[:maxOutputBytes]
+}
+
+func nullableString(value string) any {
+	if value == "" {
+		return nil
+	}
+	return value
+}
+
+func numberFromString(value string) int {
+	parsed, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil {
+		return 0
+	}
+	return parsed
+}
+
+func firstN(value string, n int) string {
+	if len(value) <= n {
+		return value
+	}
+	return value[:n]
 }
 
 func (a *neoActor) upsertNotificationSubscription(msg map[string]any) {
@@ -20166,7 +20755,7 @@ func cloneArray(in []any) []any {
 	if in == nil {
 		return nil
 	}
-	return append([]any(nil), in...)
+	return append([]any{}, in...)
 }
 
 func nonNilArray(items []any) []any {

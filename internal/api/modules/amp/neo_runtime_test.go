@@ -277,6 +277,100 @@ func TestLoadNeoLocalThreadWritesSmartAgentModeFallbackForBinaryLoader(t *testin
 	}
 }
 
+func TestLoadNeoLocalThreadNormalizesBinaryIterableFields(t *testing.T) {
+	dir := t.TempDir()
+	oldStoreDir := neoAmpThreadStoreDir
+	neoAmpThreadStoreDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
+
+	threadID := "T-019e6541-06ae-75d7-b10e-d893170fa62c"
+	raw := []byte(`{
+		"id": "` + threadID + `",
+		"title": "legacy null fields",
+		"messages": [
+			{
+				"role": "user",
+				"messageId": "M-user",
+				"content": null,
+				"userState": {
+					"cwd": "/tmp/work",
+					"currentlyVisibleFiles": null,
+					"runningTerminalCommands": null,
+					"aggmanContext": {
+						"availableProjects": null,
+						"recentUnreadThreads": null
+					}
+				}
+			},
+			{"role": "assistant", "messageId": "M-assistant", "content": null}
+		],
+		"data": {
+			"messages": [
+				{"role": "user", "messageId": "M-data-user", "userState": {"currentlyVisibleFiles": null}}
+			]
+		}
+	}`)
+	if err := os.WriteFile(filepath.Join(dir, threadID+".json"), raw, 0o600); err != nil {
+		t.Fatalf("write local thread: %v", err)
+	}
+
+	thread, ok := loadNeoLocalThread(threadID)
+	if !ok {
+		t.Fatal("loadNeoLocalThread returned false")
+	}
+	assertBinarySafeMessagesForTest(t, thread)
+	assertBinarySafeMessagesForTest(t, mapValue(thread["data"]))
+
+	persistedRaw, err := os.ReadFile(filepath.Join(dir, threadID+".json"))
+	if err != nil {
+		t.Fatalf("read rewritten local thread: %v", err)
+	}
+	var persisted map[string]any
+	if err := json.Unmarshal(persistedRaw, &persisted); err != nil {
+		t.Fatalf("decode rewritten local thread: %v", err)
+	}
+	assertBinarySafeMessagesForTest(t, persisted)
+	assertBinarySafeMessagesForTest(t, mapValue(persisted["data"]))
+}
+
+func assertBinarySafeMessagesForTest(t *testing.T, thread map[string]any) {
+	t.Helper()
+	messages := arrayValue(thread["messages"])
+	if messages == nil {
+		t.Fatalf("messages = %#v, want binary-safe array", thread["messages"])
+	}
+	for _, raw := range messages {
+		message := mapValue(raw)
+		if len(message) == 0 {
+			continue
+		}
+		if content := arrayValue(message["content"]); content == nil {
+			t.Fatalf("message content = %#v, want binary-safe array for %#v", message["content"], message)
+		}
+		if stringValue(message["role"]) != "user" {
+			continue
+		}
+		userState := mapValue(message["userState"])
+		if userState == nil {
+			t.Fatalf("userState = %#v, want binary-safe object", message["userState"])
+		}
+		if files := arrayValue(userState["currentlyVisibleFiles"]); files == nil {
+			t.Fatalf("currentlyVisibleFiles = %#v, want binary-safe array", userState["currentlyVisibleFiles"])
+		}
+		if _, exists := userState["runningTerminalCommands"]; exists {
+			t.Fatalf("runningTerminalCommands = %#v, want omitted when not an array", userState["runningTerminalCommands"])
+		}
+		if aggman := mapValue(userState["aggmanContext"]); len(aggman) > 0 {
+			if _, exists := aggman["availableProjects"]; exists {
+				t.Fatalf("aggmanContext.availableProjects = %#v, want omitted when not an array", aggman["availableProjects"])
+			}
+			if _, exists := aggman["recentUnreadThreads"]; exists {
+				t.Fatalf("aggmanContext.recentUnreadThreads = %#v, want omitted when not an array", aggman["recentUnreadThreads"])
+			}
+		}
+	}
+}
+
 func TestNeoRuntimeAutoCompactsLargeLocalHistory(t *testing.T) {
 	dir := t.TempDir()
 	oldStoreDir := neoAmpThreadStoreDir
@@ -1619,6 +1713,99 @@ func TestNeoRuntimeFilesystemBridgeNormalizesBothDirections(t *testing.T) {
 	result := waitForNeoMessageType(t, executor, "executor_filesystem_read_file_result", 2*time.Second)
 	if result["requestId"] != "fs-1" || result["content"] != "hello" {
 		t.Fatalf("filesystem result = %#v", result)
+	}
+}
+
+func TestNeoRuntimeGitCommandMatchesCurrentBinaryProtocol(t *testing.T) {
+	repo := t.TempDir()
+	if out, err := exec.Command("git", "init", repo).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, out)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "untracked.txt"), []byte("hello\n"), 0o600); err != nil {
+		t.Fatalf("write repo file: %v", err)
+	}
+
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019e0e6e-f3f1-7081-b5dd-748f66f8c25f"
+	actor, _ := rt.store.upsert(map[string]any{"name": "threadActor", "key": threadID, "input": map[string]any{"threadId": threadID}}, true)
+	actor.mu.Lock()
+	actor.environment = map[string]any{"workingDirectory": repo, "workspaceRoot": repo}
+	actor.mu.Unlock()
+
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	t.Cleanup(server.Close)
+
+	conn := dialNeoActorWebSocket(t, server.URL, threadID)
+	defer conn.Close()
+	waitForNeoMessageType(t, conn, "agent_state", 2*time.Second)
+
+	if err := conn.WriteJSON(map[string]any{"type": "client_git_command", "requestId": "git-1", "operation": map[string]any{"type": "status"}}); err != nil {
+		t.Fatalf("write client_git_command: %v", err)
+	}
+	result := waitForNeoMessageType(t, conn, "client_git_command_result", 2*time.Second)
+	if result["requestId"] != "git-1" || result["ok"] != true || numberFrom(result["exitCode"]) != 0 || !strings.Contains(stringValue(result["stdout"]), "untracked.txt") {
+		t.Fatalf("git status result = %#v", result)
+	}
+
+	if err := conn.WriteJSON(map[string]any{"type": "client_git_command", "requestId": "git-2", "operation": map[string]any{"type": "status_snapshot"}}); err != nil {
+		t.Fatalf("write status_snapshot command: %v", err)
+	}
+	snapshotResult := waitForNeoMessageType(t, conn, "client_git_command_result", 2*time.Second)
+	if snapshotResult["requestId"] != "git-2" || snapshotResult["ok"] != true {
+		t.Fatalf("status snapshot result = %#v", snapshotResult)
+	}
+	var snapshot map[string]any
+	if err := json.Unmarshal([]byte(stringValue(snapshotResult["stdout"])), &snapshot); err != nil {
+		t.Fatalf("status snapshot JSON: %v payload=%q", err, stringValue(snapshotResult["stdout"]))
+	}
+	if snapshot["available"] != true || stringValue(snapshot["repositoryRoot"]) != repo {
+		realRepo, err := filepath.EvalSymlinks(repo)
+		if err != nil || stringValue(snapshot["repositoryRoot"]) != realRepo {
+			t.Fatalf("status snapshot = %#v", snapshot)
+		}
+	}
+}
+
+func TestNeoRuntimeGitBridgeAndWorkspaceMessageTypes(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	t.Cleanup(server.Close)
+
+	threadID := "T-019e0e6e-f3f1-7081-b5dd-748f66f8c260"
+	conn := dialNeoActorWebSocket(t, server.URL, threadID)
+	defer conn.Close()
+	waitForNeoMessageType(t, conn, "agent_state", 2*time.Second)
+
+	if err := conn.WriteJSON(map[string]any{"type": "executor_git_command", "requestID": "git-raw", "args": []any{"status"}, "max_output_bytes": 128}); err != nil {
+		t.Fatalf("write executor_git_command: %v", err)
+	}
+	rawRequest := waitForNeoMessageType(t, conn, "executor_git_command", 2*time.Second)
+	if rawRequest["requestId"] != "git-raw" || numberFrom(rawRequest["maxOutputBytes"]) != 128 {
+		t.Fatalf("executor git command request = %#v", rawRequest)
+	}
+
+	if err := conn.WriteJSON(map[string]any{"type": "executor_git_command_result", "requestId": "git-raw", "ok": true, "exitCode": 0, "stdout": "ok", "stderr": ""}); err != nil {
+		t.Fatalf("write executor_git_command_result: %v", err)
+	}
+	clientResult := waitForNeoMessageType(t, conn, "client_git_command_result", 2*time.Second)
+	if clientResult["requestId"] != "git-raw" || clientResult["stdout"] != "ok" {
+		t.Fatalf("client git command result = %#v", clientResult)
+	}
+
+	if err := conn.WriteJSON(map[string]any{"type": "client_git_command_result", "requestId": "git-client", "ok": false, "error": map[string]any{"code": "INTERNAL_ERROR", "message": "failed"}}); err != nil {
+		t.Fatalf("write client_git_command_result: %v", err)
+	}
+	executorResult := waitForNeoMessageType(t, conn, "executor_git_command_result", 2*time.Second)
+	if executorResult["requestId"] != "git-client" || executorResult["ok"] != false {
+		t.Fatalf("executor git command result = %#v", executorResult)
+	}
+
+	if err := conn.WriteJSON(map[string]any{"type": "executor_workspace_maybe_changed", "toolCallId": "TU-git", "toolName": "apply_patch"}); err != nil {
+		t.Fatalf("write executor_workspace_maybe_changed: %v", err)
+	}
+	workspace := waitForNeoMessageType(t, conn, "executor_workspace_maybe_changed", 2*time.Second)
+	if workspace["toolCallId"] != "TU-git" || workspace["toolName"] != "apply_patch" {
+		t.Fatalf("workspace maybe changed = %#v", workspace)
 	}
 }
 
@@ -3732,6 +3919,8 @@ func handledNeoInboundTypesForTest() map[string]bool {
 		"client_filesystem_read_directory_result",
 		"client_filesystem_read_file",
 		"client_filesystem_read_file_result",
+		"client_git_command",
+		"client_git_command_result",
 		"client_fork_thread",
 		"client_mark_message_read",
 		"client_mark_message_unread",
@@ -3768,6 +3957,8 @@ func handledNeoInboundTypesForTest() map[string]bool {
 		"executor_filesystem_read_directory_result",
 		"executor_filesystem_read_file",
 		"executor_filesystem_read_file_result",
+		"executor_git_command",
+		"executor_git_command_result",
 		"executor_guidance_discovery",
 		"executor_guidance_snapshot",
 		"executor_guidance_update",
@@ -3783,6 +3974,7 @@ func handledNeoInboundTypesForTest() map[string]bool {
 		"executor_tools_bootstrap_complete",
 		"executor_tools_register",
 		"executor_tools_unregister",
+		"executor_workspace_maybe_changed",
 		"fork",
 		"fork_thread",
 		"info:manual-bash-invocation",
