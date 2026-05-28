@@ -6041,7 +6041,7 @@ func (a *neoActor) receiveToolResult(msg map[string]any) {
 		a.broadcast(map[string]any{"type": "agent_state", "state": approvalState, "agentMode": pending.AgentMode, "reasoningEffort": omitEmpty(pending.ReasoningEffort)})
 	}
 	if remaining == 0 && !ready && !approvalStateChanged {
-		a.broadcast(map[string]any{"type": "agent_state", "state": "idle", "agentMode": pending.AgentMode, "reasoningEffort": omitEmpty(pending.ReasoningEffort)})
+		a.broadcast(map[string]any{"type": "agent_state", "state": "idle", "messageId": omitEmpty(pending.MessageID), "agentMode": pending.AgentMode, "reasoningEffort": omitEmpty(pending.ReasoningEffort)})
 	}
 	if remaining == 0 && ready {
 		go a.runInferenceForParent(pending.AgentMode, pending.ReasoningEffort, pending.ParentToolCallID)
