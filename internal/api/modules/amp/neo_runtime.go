@@ -19534,7 +19534,11 @@ func normalizeNeoToolLeaseRevoked(msg map[string]any) map[string]any {
 }
 
 func normalizeNeoToolResultAck(msg map[string]any) map[string]any {
-	return map[string]any{"type": "executor_tool_result_ack", "toolCallId": firstNonEmptyString(msg["toolCallId"], msg["toolUseId"], msg["toolUseID"], msg["id"])}
+	out := map[string]any{"type": "executor_tool_result_ack", "toolCallId": firstNonEmptyString(msg["toolCallId"], msg["toolUseId"], msg["toolUseID"], msg["id"])}
+	if workspaceChanged, ok := msg["workspaceChanged"].(bool); ok {
+		out["workspaceChanged"] = workspaceChanged
+	}
+	return out
 }
 
 func normalizeNeoToolApprovalResponse(msg map[string]any) map[string]any {
