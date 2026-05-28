@@ -226,6 +226,7 @@ func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *ha
 	ampAPI.Any("/internal/*path", proxyHandler)
 	ampAPI.Any("/user", proxyHandler)
 	ampAPI.Any("/user/*path", proxyHandler)
+	ampAPI.Any("/user-actor-credentials", proxyHandler)
 	ampAPI.Any("/auth", proxyHandler)
 	ampAPI.Any("/auth/*path", proxyHandler)
 	ampAPI.Any("/meta", proxyHandler)
