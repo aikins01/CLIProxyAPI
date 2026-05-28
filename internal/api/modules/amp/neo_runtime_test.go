@@ -5332,12 +5332,12 @@ func TestNeoActorFiltersAmpBuiltInToolsByMode(t *testing.T) {
 	deepNames := requestNames("deep")
 	assertMode("deep", deepNames,
 		[]string{"Task", "read_thread", "shell_command", "apply_patch", "chart", "view_media", "tb__gemini-oracle", "code_review"},
-		[]string{"Read", "Grep", "glob", "Glob", "Bash", "create_file", "edit_file", "get_diagnostics", "look_at", "task_list", "todo_write", "file_tree", "deferred_custom", "docs_read"})
+		[]string{"Read", "Grep", "glob", "Glob", "Bash", "create_file", "edit_file", "get_diagnostics", "look_at", "handoff", "task_list", "todo_write", "file_tree", "deferred_custom", "docs_read"})
 
 	smartNames := requestNames("smart")
 	assertMode("smart", smartNames,
 		[]string{"Read", "Bash", "create_file", "edit_file", "Task", "view_media", "tb__gemini-oracle", "code_review"},
-		[]string{"Grep", "glob", "Glob", "delete_file", "get_diagnostics", "shell_command", "apply_patch", "chart", "look_at", "task_list", "todo_write", "file_tree", "deferred_custom", "search_documents", "get_document", "docs_read"})
+		[]string{"Grep", "glob", "Glob", "delete_file", "get_diagnostics", "shell_command", "apply_patch", "chart", "look_at", "handoff", "task_list", "todo_write", "file_tree", "deferred_custom", "search_documents", "get_document", "docs_read"})
 
 	smartPromptNames := map[string]bool{}
 	for _, name := range actor.toolNamesLocked("smart") {
@@ -5350,12 +5350,12 @@ func TestNeoActorFiltersAmpBuiltInToolsByMode(t *testing.T) {
 	rushNames := requestNames("rush")
 	assertMode("rush", rushNames,
 		[]string{"Task", "shell_command", "apply_patch", "view_media", "read_mcp_resource", "tb__gemini-oracle"},
-		[]string{"Read", "Grep", "glob", "Glob", "Bash", "create_file", "edit_file", "get_diagnostics", "chart", "look_at", "task_list", "todo_write", "file_tree", "code_review", "deferred_custom", "docs_read"})
+		[]string{"Read", "Grep", "glob", "Glob", "Bash", "create_file", "edit_file", "get_diagnostics", "chart", "look_at", "handoff", "task_list", "todo_write", "file_tree", "code_review", "deferred_custom", "docs_read"})
 
 	largeNames := requestNames("large")
 	assertMode("large", largeNames,
 		[]string{"Read", "Bash", "create_file", "edit_file", "Task", "view_media", "tb__gemini-oracle", "code_review"},
-		[]string{"Grep", "glob", "Glob", "get_diagnostics", "shell_command", "apply_patch", "chart", "look_at", "task_list", "todo_write", "file_tree", "deferred_custom", "docs_read"})
+		[]string{"Grep", "glob", "Glob", "get_diagnostics", "shell_command", "apply_patch", "chart", "look_at", "handoff", "task_list", "todo_write", "file_tree", "deferred_custom", "docs_read"})
 
 	aggNames := requestNames("agg-man")
 	assertMode("agg-man", aggNames,
@@ -5365,12 +5365,12 @@ func TestNeoActorFiltersAmpBuiltInToolsByMode(t *testing.T) {
 	frontierNames := requestNames("frontier")
 	assertMode("frontier", frontierNames,
 		[]string{"Task", "shell_command", "apply_patch", "view_media", "tb__gemini-oracle", "code_review"},
-		[]string{"Read", "Grep", "glob", "Glob", "Bash", "create_file", "edit_file", "get_diagnostics", "chart", "look_at", "read_mcp_resource", "todo_write", "file_tree", "deferred_custom", "docs_read"})
+		[]string{"Read", "Grep", "glob", "Glob", "Bash", "create_file", "edit_file", "get_diagnostics", "chart", "look_at", "handoff", "read_mcp_resource", "todo_write", "file_tree", "deferred_custom", "docs_read"})
 
 	nostromoNames := requestNames("nostromo")
 	assertMode("nostromo", nostromoNames,
 		[]string{"Read", "Bash", "create_file", "edit_file", "Task", "shell_command", "apply_patch", "chart", "view_media", "send_message_to_aggman", "tb__gemini-oracle"},
-		[]string{"Grep", "glob", "Glob", "get_diagnostics", "look_at", "task_list", "todo_write", "file_tree", "code_review", "deferred_custom", "docs_read"})
+		[]string{"Grep", "glob", "Glob", "get_diagnostics", "look_at", "handoff", "task_list", "todo_write", "file_tree", "code_review", "deferred_custom", "docs_read"})
 }
 
 func TestNeoActorAppliesScaffoldToolCustomization(t *testing.T) {

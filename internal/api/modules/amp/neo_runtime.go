@@ -92,13 +92,13 @@ var (
 		entries map[string]*neoCloudThreadListCacheEntry
 	}{entries: map[string]*neoCloudThreadListCacheEntry{}}
 	neoModeToolAllowlist = map[string]map[string]bool{
-		"smart":    toolSet("Read", "finder", "Bash", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "handoff", "painter", "read_mcp_resource", "code_review"),
-		"large":    toolSet("Read", "finder", "Bash", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "handoff", "painter", "read_mcp_resource", "code_review"),
-		"rush":     toolSet("finder", "shell_command", "apply_patch", "web_search", "read_web_page", "read_mcp_resource", "read_thread", "find_thread", "skill", "oracle", "handoff", "librarian", "Task", "view_media", "painter"),
+		"smart":    toolSet("Read", "finder", "Bash", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "code_review"),
+		"large":    toolSet("Read", "finder", "Bash", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "code_review"),
+		"rush":     toolSet("finder", "shell_command", "apply_patch", "web_search", "read_web_page", "read_mcp_resource", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "painter"),
 		"agg-man":  toolSet("find_thread", "read_thread", "web_search", "read_web_page", "docs_list", "docs_read", "docs_write", "render_agg_man", "create_project", "create_thread", "archive_thread", "unarchive_thread", "send_message_to_thread", "slack_write", "slack_read", "github_repo_ci_status", "read_github", "search_github", "commit_search", "list_directory_github", "list_repositories", "glob_github", "diff"),
-		"deep":     toolSet("shell_command", "apply_patch", "web_search", "read_web_page", "chart", "Task", "skill", "read_thread", "find_thread", "librarian", "oracle", "finder", "view_media", "painter", "handoff", "send_message_to_aggman", "code_review"),
-		"frontier": toolSet("finder", "apply_patch", "shell_command", "Task", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "view_media", "handoff", "painter", "code_review"),
-		"nostromo": toolSet("Read", "finder", "Bash", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "handoff", "painter", "read_mcp_resource", "apply_patch", "shell_command", "chart", "send_message_to_aggman"),
+		"deep":     toolSet("shell_command", "apply_patch", "web_search", "read_web_page", "chart", "Task", "skill", "read_thread", "find_thread", "librarian", "oracle", "finder", "view_media", "painter", "send_message_to_aggman", "code_review"),
+		"frontier": toolSet("finder", "apply_patch", "shell_command", "Task", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "view_media", "painter", "code_review"),
+		"nostromo": toolSet("Read", "finder", "Bash", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "apply_patch", "shell_command", "chart", "send_message_to_aggman"),
 	}
 	neoKnownModeTools = toolSet(
 		"Read", "Grep", "glob", "Glob", "finder", "file_tree", "Bash", "create_file", "edit_file", "delete_file", "get_diagnostics",
