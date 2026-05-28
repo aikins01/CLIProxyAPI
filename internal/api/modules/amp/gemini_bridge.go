@@ -51,9 +51,15 @@ func createGeminiBridgeHandler(handler gin.HandlerFunc) gin.HandlerFunc {
 			return
 		}
 
-		// If we can't parse the path, return 400
+		// If we can't parse the path, return Google-style error envelope so
+		// Amp's Gemini parser surfaces a structured error instead of a raw
+		// string.
 		c.JSON(400, gin.H{
-			"error": "Invalid Gemini API path format",
+			"error": gin.H{
+				"code":    400,
+				"message": "Invalid Gemini API path format",
+				"status":  "INVALID_ARGUMENT",
+			},
 		})
 	}
 }
