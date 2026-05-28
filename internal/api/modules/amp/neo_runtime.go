@@ -2803,6 +2803,7 @@ func (a *neoActor) handleProtocolDelta(msg map[string]any) {
 	if !ok {
 		return
 	}
+	original := msg
 	msg = normalized
 	messageID := stringValue(msg["messageId"])
 	role := stringValue(msg["role"])
@@ -2813,6 +2814,7 @@ func (a *neoActor) handleProtocolDelta(msg map[string]any) {
 
 	a.mu.Lock()
 	seq := a.protocolSeqLocked(msg)
+	original["seq"] = seq
 	index := a.messageIndexLocked(messageID)
 	state := stringValue(msg["state"])
 	removedAborted := false
