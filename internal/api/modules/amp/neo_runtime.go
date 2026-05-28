@@ -11469,17 +11469,24 @@ func (a *neoActor) handleCompactionEvent(msg map[string]any) {
 		a.broadcast(map[string]any{"type": "compaction_started"})
 	case "compaction_complete":
 		record, ok := neoCompactionRecord(msg, time.Now().UTC().Format(time.RFC3339Nano))
-		if !ok {
-			return
-		}
 		a.mu.Lock()
 		a.compacting = false
-		a.upsertCompactionRecordLocked(record)
+		if ok {
+			a.upsertCompactionRecordLocked(record)
+		}
 		records := a.compactionRecordListLocked()
 		a.mu.Unlock()
-		a.broadcast(map[string]any{"type": "compaction_complete", "cutMessageId": record["cutMessageId"]})
+		payload := map[string]any{"type": "compaction_complete"}
+		if ok {
+			payload["cutMessageId"] = record["cutMessageId"]
+		}
+		a.broadcast(payload)
 		a.broadcast(map[string]any{"type": "compaction_records", "records": records})
-		a.dispatchNotification("thread", "compaction_complete", map[string]any{"cutMessageId": record["cutMessageId"]})
+		notif := map[string]any{}
+		if ok {
+			notif["cutMessageId"] = record["cutMessageId"]
+		}
+		a.dispatchNotification("thread", "compaction_complete", notif)
 		a.syncCloudAsync()
 	case "compaction_records":
 		records := normalizeNeoCompactionRecords(msg["records"])
