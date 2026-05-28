@@ -1214,6 +1214,14 @@
       activeError = { message: message.message, code: message.code };
       return;
     }
+    if (type === 'error') {
+      activeError = { message: message.message, code: message.code };
+      return;
+    }
+    if (type === 'edit_rejected') {
+      activeError = { message: message.message, code: 'EDIT_REJECTED', editId: message.editId };
+      return;
+    }
     if (type === 'error_set') {
       activeError = asRecord(message.error);
       return;
