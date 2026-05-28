@@ -4030,10 +4030,16 @@ func normalizeNeoProtocolImageBlock(block map[string]any) (map[string]any, bool)
 		out["source"] = map[string]any{"type": "url", "url": url}
 	default:
 		url := firstNonEmptyString(block["url"], block["uri"], block["href"], block["attachmentUrl"])
-		if url == "" {
-			return nil, false
+		if url != "" {
+			out["source"] = map[string]any{"type": "url", "url": url}
+			break
 		}
-		out["source"] = map[string]any{"type": "url", "url": url}
+		if data, mediaType := neoImageBase64(block); data != "" {
+			if !neoProtocolImageMediaType(mediaType) {
+				mediaType = "image/png"
+			}
+			out["source"] = map[string]any{"type": "base64", "mediaType": mediaType, "data": data}
+		}
 	}
 	sourcePath := firstNonEmptyString(block["sourcePath"], block["source_path"], block["path"], block["filePath"], block["filename"], block["name"], block["attachmentUrl"], block["url"], block["uri"], mapValue(out["source"])["url"])
 	if sourcePath == "" {
