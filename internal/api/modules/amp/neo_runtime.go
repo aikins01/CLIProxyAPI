@@ -2614,6 +2614,10 @@ func (a *neoActor) updateSkillSnapshot(msg map[string]any) {
 	a.mu.Lock()
 	if snapshotID != "" && snapshotID != stringValue(a.skillSnapshot["snapshotId"]) {
 		a.skillSnapshot = map[string]any{"snapshotId": snapshotID, "skills": []any{}, "errors": []any{}}
+		// Clear previously published capabilities so consumers don't read
+		// stale skills while the new snapshot is still streaming.
+		delete(a.capabilities, "skills")
+		delete(a.capabilities, "skillNames")
 	}
 	for key, value := range snapshot {
 		if key != "skills" && key != "skillInventory" && key != "errors" {
