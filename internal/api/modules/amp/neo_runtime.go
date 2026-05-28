@@ -17527,14 +17527,35 @@ func looksLikeNeoGuidance(text string) bool {
 }
 
 func neoGuidanceInventory(guidance map[string]any) []any {
-	return firstArray(
+	if inventory := firstArray(
 		guidance["guidanceInventory"],
 		guidance["guidance_inventory"],
 		guidance["inventory"],
 		guidance["guidances"],
 		guidance["guidance"],
 		guidance["items"],
-	)
+	); len(inventory) > 0 {
+		return inventory
+	}
+	// Binary executor stores discovered AGENTS.md files under "files" with
+	// {uri, content, lineCount, hash}. Project that down to the {uri, hash}
+	// inventory shape the executor's content cache expects so reconnects can
+	// skip resending unchanged file content.
+	files := arrayValue(guidance["files"])
+	if len(files) == 0 {
+		return nil
+	}
+	out := make([]any, 0, len(files))
+	for _, raw := range files {
+		file := mapValue(raw)
+		uri := firstNonEmptyString(file["uri"], file["path"], file["name"])
+		hash := stringValue(file["hash"])
+		if uri == "" || hash == "" {
+			continue
+		}
+		out = append(out, map[string]any{"uri": uri, "hash": hash})
+	}
+	return out
 }
 
 func neoSkillNames(request neoInferenceRequest) []string {
