@@ -2435,6 +2435,7 @@ func TestNeoActorProtocolToolLeaseNormalizesOfficialPayload(t *testing.T) {
 	assistantID := newNeoMessageID()
 	toolCallID := newNeoToolCallID()
 	actor.mu.Lock()
+	actor.messages = []neoMessage{{ThreadID: threadID, MessageID: assistantID, Role: "assistant", Seq: 1, Content: []any{map[string]any{"type": "text", "text": ""}}, State: map[string]any{"type": "streaming"}}}
 	actor.currentInference = &neoInferenceInflight{messageID: assistantID, agentMode: "smart"}
 	actor.mu.Unlock()
 
