@@ -5947,6 +5947,7 @@ func neoOpenAIThinkingBlockOffset(agentMode, provider string) int {
 func (a *neoActor) receiveToolResult(msg map[string]any) {
 	toolCallID := stringValue(msg["toolCallId"])
 	run := firstMap(msg["run"], msg["toolRun"], msg["tool_run"])
+	workspaceChanged, hasWorkspaceChanged := msg["workspaceChanged"].(bool)
 	a.mu.Lock()
 	pending, ok := a.pendingTools[toolCallID]
 	if !ok {
@@ -5992,7 +5993,11 @@ func (a *neoActor) receiveToolResult(msg map[string]any) {
 
 	a.broadcast(event)
 	a.syncCloudAsync()
-	a.broadcast(map[string]any{"type": "executor_tool_result_ack", "toolCallId": toolCallID})
+	ack := map[string]any{"type": "executor_tool_result_ack", "toolCallId": toolCallID}
+	if hasWorkspaceChanged {
+		ack["workspaceChanged"] = workspaceChanged
+	}
+	a.broadcast(ack)
 	if approvalRemoved {
 		a.broadcast(toolApprovalQueuePayload(approvals))
 	}
