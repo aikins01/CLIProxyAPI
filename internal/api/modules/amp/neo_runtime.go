@@ -2190,7 +2190,6 @@ func (a *neoActor) handleBinaryToolProcessed(msg map[string]any) {
 	seq := a.nextSeqLocked()
 	event := map[string]any{"type": "message_updated", "message": message.protocol(), "seq": seq}
 	a.rememberReplayEventLocked(event)
-	a.rebuildHistoryLocked()
 	a.mu.Unlock()
 
 	a.broadcast(event)
