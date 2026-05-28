@@ -2605,6 +2605,7 @@ func (a *neoActor) updateSkillSnapshot(msg map[string]any) {
 	snapshotID := stringValue(snapshot["snapshotId"])
 	skills := firstArray(snapshot["skills"], snapshot["skillInventory"])
 	errors := arrayValue(snapshot["errors"])
+	isLast, hasIsLast := snapshot["isLast"].(bool)
 
 	a.mu.Lock()
 	if snapshotID != "" && snapshotID != stringValue(a.skillSnapshot["snapshotId"]) {
@@ -2621,13 +2622,20 @@ func (a *neoActor) updateSkillSnapshot(msg map[string]any) {
 		combined = append(combined, prior...)
 		combined = append(combined, skills...)
 		a.skillSnapshot["skills"] = combined
-		a.capabilities["skills"] = combined
 	}
 	if errors != nil {
 		a.skillSnapshot["errors"] = errors
 	}
-	if names := neoSkillNamesFromAny(a.skillSnapshot["skills"]); len(names) > 0 {
-		a.capabilities["skillNames"] = names
+	// Only publish into capabilities once the snapshot is complete to mirror
+	// the binary, which marks skills available after the isLast=true chunk.
+	finalized := !hasIsLast || isLast
+	if finalized {
+		if combined := firstArray(a.skillSnapshot["skills"], a.skillSnapshot["skillInventory"]); combined != nil {
+			a.capabilities["skills"] = combined
+		}
+		if names := neoSkillNamesFromAny(a.skillSnapshot["skills"]); len(names) > 0 {
+			a.capabilities["skillNames"] = names
+		}
 	}
 	totalSkills := len(firstArray(a.skillSnapshot["skills"], a.skillSnapshot["skillInventory"]))
 	a.mu.Unlock()
