@@ -4150,9 +4150,12 @@ func normalizeNeoProtocolAssistantToolUseBlock(block map[string]any, delta bool)
 	if !ok {
 		return nil, false
 	}
-	input, ok := asMap(block["input"])
-	if !ok {
-		return nil, false
+	input, hasInput := asMap(block["input"])
+	if !hasInput {
+		if complete {
+			return nil, false
+		}
+		input = map[string]any{}
 	}
 	out := cloneNeoJSONMap(block)
 	out["type"] = "tool_use"
