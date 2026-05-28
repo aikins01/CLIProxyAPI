@@ -15984,10 +15984,16 @@ func neoHeadlessWorkingDirectory(msg map[string]any, environment map[string]any)
 		msg["working_directory"],
 		msg["cwd"],
 		msg["workspaceRoot"],
+		msg["repositoryURL"],
 		environment["workingDirectory"],
 		environment["working_directory"],
 		environment["cwd"],
 		environment["workspaceRoot"],
+	}
+	if additional := arrayValue(msg["additionalRepositories"]); len(additional) > 0 {
+		for _, entry := range additional {
+			candidates = append(candidates, entry)
+		}
 	}
 	if initial := mapValue(environment["initial"]); len(initial) > 0 {
 		candidates = append(candidates, initial["workingDirectory"], initial["cwd"], initial["workspaceRoot"])
