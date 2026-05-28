@@ -2203,7 +2203,6 @@ func (a *neoActor) handleToolApprovalRequest(msg map[string]any) {
 	if !ok {
 		a.mu.Unlock()
 		log.Debugf("amp neo local runtime dropped malformed tool approval request")
-		a.broadcast(toolApprovalQueuePayload(nil))
 		return
 	}
 	a.upsertApprovalLocked(approval)
