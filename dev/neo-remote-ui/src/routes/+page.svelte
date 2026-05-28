@@ -1128,6 +1128,16 @@
     }
     if (type === 'agent_state') {
       agentState = String(message.state ?? 'idle');
+      if (detail && (message.agentMode != null || message.reasoningEffort != null)) {
+        const nextMode = normalizeAgentMode(stringFrom(message.agentMode) || detail.agentMode);
+        const nextEffort = normalizeReasoningEffortForMode(
+          nextMode,
+          stringFrom(message.reasoningEffort) || detail.reasoningEffort || ''
+        );
+        if (nextMode !== detail.agentMode || nextEffort !== detail.reasoningEffort) {
+          applyLocalThreadSettings(nextMode, nextEffort);
+        }
+      }
       return;
     }
     if (type === 'thread_settings') {
