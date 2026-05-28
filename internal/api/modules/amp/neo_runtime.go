@@ -2266,11 +2266,6 @@ func (a *neoActor) executorConnect(msg map[string]any) {
 	a.guidanceSnapshot = map[string]any{}
 	a.skillSnapshot = map[string]any{}
 	a.capabilities = mapValue(msg["capabilities"])
-	if env, ok := asMap(mapValue(msg["capabilities"])["environment"]); ok {
-		for k, v := range env {
-			a.environment[k] = v
-		}
-	}
 	a.mu.Unlock()
 	a.sendExecutorConnected(nil, false)
 	a.broadcastObservers()
