@@ -54,6 +54,36 @@ func TestNeoRuntimeEnabledIsOptIn(t *testing.T) {
 	}
 }
 
+func TestNeoRuntimeSubagentInferHandlesProviderStopReasons(t *testing.T) {
+	tests := []struct {
+		name      string
+		result    neoInferenceResult
+		wantError bool
+	}{
+		{name: "normal text", result: neoInferenceResult{Text: "done", StopReason: "end_turn"}},
+		{name: "truncated text", result: neoInferenceResult{Text: "partial", StopReason: "max_tokens"}, wantError: true},
+		{name: "refusal", result: neoInferenceResult{Text: "no", StopReason: "refusal"}, wantError: true},
+		{name: "complete tool", result: neoInferenceResult{StopReason: "max_tokens", ToolCalls: []neoToolCall{{ID: "TU-test", Name: "finder", Input: map[string]any{"query": "target"}}}}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rt := newNeoRuntime(&config.Config{})
+			rt.inferStream = func(*neoRuntime, neoInferenceRequest, neoStreamCallback) (neoInferenceResult, error) {
+				return tc.result, nil
+			}
+
+			result, err := rt.subagentInfer(neoInferenceRequest{}, nil)
+			if (err != nil) != tc.wantError {
+				t.Fatalf("subagentInfer error = %v, wantError %v", err, tc.wantError)
+			}
+			if !tc.wantError && !reflect.DeepEqual(result, tc.result) {
+				t.Fatalf("subagentInfer result = %#v, want %#v", result, tc.result)
+			}
+		})
+	}
+}
+
 func TestNeoRuntimeMetadataIncludesClientEndpoint(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 
@@ -6496,9 +6526,11 @@ func TestNeoActorLocalSnapshotCachesUnchangedMessageJSON(t *testing.T) {
 	bytesValue[0] = 'B'
 	rawValue[10] = 'R'
 	typedMaps[0]["text"] = "changed typed"
-	actor.messages[1].State["stopReason"] = "end_turn"
+	actor.messages[1].State["stopReason"] = "max_tokens"
 	actor.messages[1].Usage["outputTokens"] = 2
 	mapValue(actor.messages[1].OriginalToolUseInput["call"])["value"] = "second"
+	actor.activeError = neoProviderStopReasonErrorPayload("max_tokens")
+	actor.activeErrorSeq = actor.nextSeqLocked()
 	actor.mu.Unlock()
 	fourth, ok := actor.threadSnapshot()
 	if !ok {
@@ -6591,8 +6623,19 @@ func TestNeoActorLocalSnapshotCachesUnchangedMessageJSON(t *testing.T) {
 				t.Fatalf("restored messages = %#v", restored.messages)
 			}
 			assistant := restored.messages[1]
-			if textFromBlocks(assistant.Content) != "changed" || assistant.CompletionStatus != "complete" || len(assistant.State) != 0 {
+			if textFromBlocks(assistant.Content) != "changed" || assistant.CompletionStatus != "complete" || stringValue(assistant.State["type"]) != "complete" || stringValue(assistant.State["stopReason"]) != "max_tokens" {
 				t.Fatalf("restored assistant state = %#v", assistant)
+			}
+			cloudState := mapValue(neoCloudMessage(assistant)["state"])
+			if stringValue(cloudState["type"]) != "complete" || stringValue(cloudState["stopReason"]) != "max_tokens" {
+				t.Fatalf("restored cloud assistant state = %#v", cloudState)
+			}
+			protocolState := mapValue(mapValue(neoMessageAddedPayload(assistant)["message"])["state"])
+			if stringValue(protocolState["type"]) != "complete" || protocolState["stopReason"] != nil {
+				t.Fatalf("replayed assistant state = %#v", protocolState)
+			}
+			if !neoProviderStopReasonActiveError(restored.activeError) || !strings.Contains(stringValue(restored.activeError["message"]), "max_tokens") {
+				t.Fatalf("restored active error = %#v, want max_tokens provider stop error", restored.activeError)
 			}
 			if numberFrom(assistant.Usage["inputTokens"]) != 1 || numberFrom(assistant.Usage["outputTokens"]) != 2 || stringValue(mapValue(assistant.OriginalToolUseInput["call"])["value"]) != "second" {
 				t.Fatalf("restored assistant metadata = usage:%#v tool-input:%#v", assistant.Usage, assistant.OriginalToolUseInput)
@@ -12898,6 +12941,134 @@ func TestNeoActorClientRetryWaitsForExecutorReady(t *testing.T) {
 	}
 }
 
+func TestNeoActorClientRetryRemovesProviderStopMessage(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "threadActor", "T-test", "T-test", neoActorRecord("actor-test", "threadActor", "T-test"), nil)
+	defer waitForNeoActorSyncIdle(t, actor)
+	actor.mu.Lock()
+	actor.executorReady = false
+	actor.agentState = "idle"
+	actor.messages = []neoMessage{{
+		ThreadID:  "T-test",
+		MessageID: "M-user",
+		Role:      "user",
+		Content:   []any{map[string]any{"type": "text", "text": "try again"}},
+		Seq:       1,
+	}}
+	actor.rebuildHistoryLocked()
+	actor.mu.Unlock()
+
+	actor.finishAssistantMessageWithOptions("M-truncated", neoInferenceResult{Provider: "anthropic", Text: "partial", StopReason: "max_tokens"}, "smart", "", false, "")
+	actor.mu.Lock()
+	errorSeq := actor.activeErrorSeq
+	actor.mu.Unlock()
+
+	actor.retry()
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.messages) != 1 || actor.messages[0].MessageID != "M-user" {
+		t.Fatalf("messages after retry = %#v, want original user message only", actor.messages)
+	}
+	if strings.Contains(fmt.Sprint(actor.history), "partial") {
+		t.Fatalf("history after retry = %#v, retained stopped assistant", actor.history)
+	}
+	if len(actor.activeError) != 0 || actor.activeErrorMessageID != "" || actor.activeErrorSeq <= errorSeq {
+		t.Fatalf("active error after retry = seq:%d source:%q payload:%#v, want cleared after %d", actor.activeErrorSeq, actor.activeErrorMessageID, actor.activeError, errorSeq)
+	}
+	if !actor.retryScheduled {
+		t.Fatal("retryScheduled = false, want retry to wait for executor")
+	}
+	if len(actor.replayEvents) == 0 {
+		t.Fatal("retry did not persist truncation event")
+	}
+	truncateEvent := actor.replayEvents[len(actor.replayEvents)-1].Payload
+	truncateSeq := numberFrom(truncateEvent["seq"])
+	if truncateEvent["type"] != "thread_truncated" || stringValue(truncateEvent["truncateFromMessage"]) != "M-truncated" || truncateSeq <= errorSeq || actor.activeErrorSeq <= truncateSeq {
+		t.Fatalf("truncate event = %#v, active error seq = %d, want truncation then clear after %d", truncateEvent, actor.activeErrorSeq, errorSeq)
+	}
+}
+
+func TestNeoActorClientRetryRemovesDismissedProviderStopMessage(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	actor := newNeoActor(newNeoRuntime(&config.Config{}), "actor-test", "threadActor", "T-test", "T-test", neoActorRecord("actor-test", "threadActor", "T-test"), nil)
+	defer waitForNeoActorSyncIdle(t, actor)
+	actor.mu.Lock()
+	actor.executorReady = false
+	actor.agentState = "idle"
+	actor.messages = []neoMessage{{
+		ThreadID:  "T-test",
+		MessageID: "M-user",
+		Role:      "user",
+		Content:   []any{map[string]any{"type": "text", "text": "try again"}},
+		Seq:       1,
+	}}
+	actor.rebuildHistoryLocked()
+	actor.mu.Unlock()
+
+	actor.finishAssistantMessageWithOptions("M-truncated", neoInferenceResult{Provider: "anthropic", Text: "partial", StopReason: "max_tokens"}, "smart", "", false, "")
+	actor.clearActiveError(map[string]any{})
+	actor.retry()
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.messages) != 1 || actor.messages[0].MessageID != "M-user" {
+		t.Fatalf("messages after retry = %#v, want original user message only", actor.messages)
+	}
+	if len(actor.activeError) != 0 || actor.activeErrorMessageID != "" {
+		t.Fatalf("dismissed active error returned after retry: source:%q payload:%#v", actor.activeErrorMessageID, actor.activeError)
+	}
+}
+
+func TestNeoActorClientRetryPreservesUserTurnAfterProviderStop(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	actor := newNeoActor(newNeoRuntime(&config.Config{}), "actor-test", "threadActor", "T-test", "T-test", neoActorRecord("actor-test", "threadActor", "T-test"), nil)
+	defer waitForNeoActorSyncIdle(t, actor)
+	actor.mu.Lock()
+	actor.executorReady = false
+	actor.agentState = "idle"
+	actor.messages = []neoMessage{{
+		ThreadID:  "T-test",
+		MessageID: "M-user-1",
+		Role:      "user",
+		Content:   []any{map[string]any{"type": "text", "text": "first"}},
+		Seq:       1,
+	}}
+	actor.rebuildHistoryLocked()
+	actor.mu.Unlock()
+
+	actor.finishAssistantMessageWithOptions("M-truncated", neoInferenceResult{Provider: "anthropic", Text: "partial", StopReason: "max_tokens"}, "smart", "", false, "")
+	actor.mu.Lock()
+	actor.storeMessageLocked(neoMessage{
+		ThreadID:  "T-test",
+		MessageID: "M-user-2",
+		Role:      "user",
+		Content:   []any{map[string]any{"type": "text", "text": "follow-up"}},
+	})
+	actor.rebuildHistoryLocked()
+	actor.mu.Unlock()
+
+	actor.retry()
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.messages) != 3 || actor.messages[2].MessageID != "M-user-2" {
+		t.Fatalf("messages after retry = %#v, want newer user turn preserved", actor.messages)
+	}
+	for _, event := range actor.replayEvents {
+		if event.Payload["type"] == "thread_truncated" {
+			t.Fatalf("replay events after retry = %#v, want no truncation", actor.replayEvents)
+		}
+	}
+	if len(actor.activeError) != 0 || actor.activeErrorMessageID != "" {
+		t.Fatalf("active error after retry: source:%q payload:%#v, want cleared", actor.activeErrorMessageID, actor.activeError)
+	}
+	if !actor.retryScheduled {
+		t.Fatal("retryScheduled = false, want retry to wait for executor")
+	}
+}
+
 func TestNeoActorHandlesProtocolLifecycleEvents(t *testing.T) {
 	dir := t.TempDir()
 	oldStoreDir := neoAmpDataDir
@@ -13643,6 +13814,230 @@ func TestNeoActorFinishAdvancesSeqAfterStreamedPartial(t *testing.T) {
 	}
 }
 
+func TestNeoActorFinishPreservesUpstreamStopReason(t *testing.T) {
+	cases := []struct {
+		name       string
+		result     neoInferenceResult
+		wantReason string
+		wantError  bool
+	}{
+		{
+			name:       "max_tokens passes through",
+			result:     neoInferenceResult{Provider: "anthropic", Model: "claude-test", Text: "truncated", StopReason: "max_tokens"},
+			wantReason: "max_tokens",
+			wantError:  true,
+		},
+		{
+			name:       "refusal passes through",
+			result:     neoInferenceResult{Provider: "anthropic", Model: "claude-test", Text: "no", StopReason: "refusal"},
+			wantReason: "refusal",
+			wantError:  true,
+		},
+		{
+			name:       "empty stop reason falls back to end_turn",
+			result:     neoInferenceResult{Provider: "anthropic", Model: "claude-test", Text: "done"},
+			wantReason: "end_turn",
+		},
+		{
+			name: "max_tokens with complete tool continues without error",
+			result: neoInferenceResult{
+				Provider:   "anthropic",
+				Model:      "claude-test",
+				StopReason: "max_tokens",
+				ToolCalls:  []neoToolCall{{ID: "TU-complete", Name: "shell_command", Input: map[string]any{"command": "pwd"}}},
+			},
+			wantReason: "max_tokens",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			rt := newNeoRuntime(&config.Config{})
+			actor := newNeoActor(rt, "actor-test", "threadActor", "T-test", "T-test", neoActorRecord("actor-test", "threadActor", "T-test"), nil)
+			defer waitForNeoActorSyncIdle(t, actor)
+
+			actor.finishAssistantMessageWithOptions("M-assistant", tc.result, "smart", "", false, "")
+
+			actor.mu.Lock()
+			defer actor.mu.Unlock()
+			if len(actor.messages) != 1 {
+				t.Fatalf("messages = %#v", actor.messages)
+			}
+			state := mapValue(actor.messages[0].State)
+			if stringValue(state["stopReason"]) != tc.wantReason {
+				t.Fatalf("stopReason = %q, want %q", stringValue(state["stopReason"]), tc.wantReason)
+			}
+			cloudState := mapValue(neoCloudMessage(actor.messages[0])["state"])
+			if stringValue(cloudState["stopReason"]) != tc.wantReason {
+				t.Fatalf("cloud stopReason = %q, want %q", stringValue(cloudState["stopReason"]), tc.wantReason)
+			}
+			if tc.wantError {
+				if stringValue(actor.activeError["code"]) != "MESSAGE_ERROR" || !strings.Contains(stringValue(actor.activeError["message"]), tc.wantReason) {
+					t.Fatalf("active error = %#v, want MESSAGE_ERROR containing %q", actor.activeError, tc.wantReason)
+				}
+			} else if len(actor.activeError) != 0 {
+				t.Fatalf("active error = %#v, want none", actor.activeError)
+			}
+		})
+	}
+}
+
+func TestNeoActorNormalCompletionClearsProviderStopError(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	actor := newNeoActor(newNeoRuntime(&config.Config{}), "actor-test", "threadActor", "T-test", "T-test", neoActorRecord("actor-test", "threadActor", "T-test"), nil)
+	defer waitForNeoActorSyncIdle(t, actor)
+
+	actor.finishAssistantMessageWithOptions("M-truncated", neoInferenceResult{Provider: "anthropic", Text: "truncated", StopReason: "max_tokens"}, "smart", "", false, "")
+	actor.mu.Lock()
+	errorSeq := actor.activeErrorSeq
+	actor.mu.Unlock()
+
+	actor.finishAssistantMessageWithOptions("M-complete", neoInferenceResult{Provider: "anthropic", Text: "done", StopReason: "end_turn"}, "smart", "", false, "")
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.activeError) != 0 || actor.activeErrorSeq <= errorSeq {
+		t.Fatalf("active error after normal completion = seq:%d payload:%#v, want cleared after seq %d", actor.activeErrorSeq, actor.activeError, errorSeq)
+	}
+}
+
+func TestNeoActorToolContinuationClearsProviderStopError(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	actor := newNeoActor(newNeoRuntime(&config.Config{}), "actor-test", "threadActor", "T-test", "T-test", neoActorRecord("actor-test", "threadActor", "T-test"), nil)
+	defer waitForNeoActorSyncIdle(t, actor)
+
+	actor.finishAssistantMessageWithOptions("M-truncated", neoInferenceResult{Provider: "anthropic", Text: "truncated", StopReason: "max_tokens"}, "smart", "", false, "")
+	actor.mu.Lock()
+	errorSeq := actor.activeErrorSeq
+	actor.mu.Unlock()
+
+	actor.finishAssistantMessageWithOptions("M-tool", neoInferenceResult{Provider: "anthropic", StopReason: "max_tokens", ToolCalls: []neoToolCall{{ID: "TU-test", Name: "custom_tool", Input: map[string]any{"value": "ready"}}}}, "smart", "", false, "")
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.activeError) != 0 || actor.activeErrorSeq <= errorSeq {
+		t.Fatalf("active error after tool continuation = seq:%d payload:%#v, want cleared after seq %d", actor.activeErrorSeq, actor.activeError, errorSeq)
+	}
+}
+
+func TestNeoActorTruncationClearsProviderStopError(t *testing.T) {
+	cases := []struct {
+		name  string
+		event map[string]any
+	}{
+		{name: "protocol", event: map[string]any{"type": "thread_truncated", "truncateFromMessage": "M-truncated"}},
+		{name: "binary", event: map[string]any{"type": "thread:truncate", "fromIndex": 0}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			actor := newNeoActor(newNeoRuntime(&config.Config{}), "actor-test", "threadActor", "T-test", "T-test", neoActorRecord("actor-test", "threadActor", "T-test"), nil)
+			defer waitForNeoActorSyncIdle(t, actor)
+
+			actor.finishAssistantMessageWithOptions("M-truncated", neoInferenceResult{Provider: "anthropic", Text: "truncated", StopReason: "max_tokens"}, "smart", "", false, "")
+			before, ok := actor.threadSnapshot()
+			if !ok {
+				t.Fatal("snapshot unavailable before truncation")
+			}
+			activeState := mapValue(before.meta[neoActiveErrorStateMetaKey])
+			if stringValue(activeState["sourceMessageId"]) != "M-truncated" {
+				t.Fatalf("active error state = %#v, want source message", activeState)
+			}
+			actor.mu.Lock()
+			errorSeq := actor.activeErrorSeq
+			actor.mu.Unlock()
+
+			actor.handle(tc.event)
+
+			actor.mu.Lock()
+			activeError := cloneMap(actor.activeError)
+			activeErrorMessageID := actor.activeErrorMessageID
+			activeErrorSeq := actor.activeErrorSeq
+			truncateSeq := numberFrom(actor.replayEvents[len(actor.replayEvents)-1].Payload["seq"])
+			actor.mu.Unlock()
+			if len(activeError) != 0 || activeErrorMessageID != "" || activeErrorSeq <= errorSeq || activeErrorSeq <= truncateSeq {
+				t.Fatalf("active error after truncation = seq:%d source:%q payload:%#v, want cleared after error seq %d and truncate seq %d", activeErrorSeq, activeErrorMessageID, activeError, errorSeq, truncateSeq)
+			}
+
+			after, ok := actor.threadSnapshot()
+			if !ok {
+				t.Fatal("snapshot unavailable after truncation")
+			}
+			restored := newNeoActor(nil, "actor-restored", "threadActor", "T-test", "T-test", neoActorRecord("actor-restored", "threadActor", "T-test"), nil)
+			if err := restored.importThreadLocalOnly(neoCloudThread(after)); err != nil {
+				t.Fatalf("restore snapshot: %v", err)
+			}
+			restored.mu.Lock()
+			defer restored.mu.Unlock()
+			if len(restored.activeError) != 0 || restored.activeErrorMessageID != "" {
+				t.Fatalf("truncated provider error restored: source:%q payload:%#v", restored.activeErrorMessageID, restored.activeError)
+			}
+		})
+	}
+}
+
+func TestNeoActorDismissedProviderStopErrorStaysClearedAfterRestore(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	actor := newNeoActor(newNeoRuntime(&config.Config{}), "actor-test", "threadActor", "T-test", "T-test", neoActorRecord("actor-test", "threadActor", "T-test"), nil)
+	defer waitForNeoActorSyncIdle(t, actor)
+
+	actor.finishAssistantMessageWithOptions("M-truncated", neoInferenceResult{Provider: "anthropic", Text: "truncated", StopReason: "max_tokens"}, "smart", "", false, "")
+	actor.clearActiveError(map[string]any{})
+	snapshot, ok := actor.threadSnapshot()
+	if !ok {
+		t.Fatal("snapshot unavailable")
+	}
+
+	restored := newNeoActor(newNeoRuntime(&config.Config{}), "actor-restored", "threadActor", "T-test", "T-test", neoActorRecord("actor-restored", "threadActor", "T-test"), nil)
+	defer waitForNeoActorSyncIdle(t, restored)
+	if err := restored.importThreadLocalOnly(neoCloudThread(snapshot)); err != nil {
+		t.Fatalf("restore snapshot: %v", err)
+	}
+	restored.mu.Lock()
+	restoredError := cloneMap(restored.activeError)
+	if len(restoredError) != 0 {
+		restored.mu.Unlock()
+		t.Fatalf("dismissed active error restored: %#v", restoredError)
+	}
+	restored.executorReady = false
+	restored.agentState = "idle"
+	restored.mu.Unlock()
+
+	restored.retry()
+
+	restored.mu.Lock()
+	defer restored.mu.Unlock()
+	if restored.messageIndexLocked("M-truncated") >= 0 {
+		t.Fatalf("restored retry retained stopped assistant: %#v", restored.messages)
+	}
+}
+
+func TestNeoActorFinishBroadcastsAbnormalProviderStopReason(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019e0e6e-f3f1-7089-b5dd-748f66f8c25d"
+	actor, _ := rt.store.upsert(map[string]any{"name": "threadActor", "key": threadID, "input": map[string]any{"threadId": threadID}}, true)
+	defer waitForNeoActorSyncIdle(t, actor)
+
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	defer server.Close()
+	conn := dialNeoActorWebSocket(t, server.URL, threadID)
+	defer conn.Close()
+
+	actor.finishAssistantMessageWithOptions("M-assistant", neoInferenceResult{
+		Provider:   "anthropic",
+		Model:      "claude-test",
+		Text:       "truncated",
+		StopReason: "max_tokens",
+	}, "smart", "", false, "")
+
+	errorSet := waitForNeoMessageType(t, conn, "error_set", 2*time.Second)
+	errorPayload := mapValue(errorSet["error"])
+	if stringValue(errorPayload["code"]) != "MESSAGE_ERROR" || !strings.Contains(stringValue(errorPayload["message"]), "max_tokens") {
+		t.Fatalf("error_set = %#v, want MESSAGE_ERROR containing max_tokens", errorSet)
+	}
+}
+
 func TestNeoMessageProtocolUsesOfficialAssistantStateSchema(t *testing.T) {
 	message := neoMessage{
 		ThreadID:        "T-019e0e6e-f3f1-7089-b5dd-748f66f8c25d",
@@ -14016,6 +14411,32 @@ func TestNeoActorProtocolErrorAndCancelClearRuntimeState(t *testing.T) {
 	}
 	if actor.retryScheduled || actor.agentState != "idle" {
 		t.Fatalf("runtime state after cancel = retry:%v agent:%q", actor.retryScheduled, actor.agentState)
+	}
+}
+
+func TestNeoActorProtocolErrorClearPersistsForRestore(t *testing.T) {
+	useTempNeoThreadStore(t)
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled}}})
+	threadID := "T-019f627c-592e-7663-8dab-c8bf3ff93c34"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+
+	actor.handleProtocolErrorSet(map[string]any{"type": "error_set", "seq": 2, "error": map[string]any{"message": "boom", "code": "INTERNAL_ERROR"}})
+	actor.handleProtocolErrorCleared(map[string]any{"type": "error_cleared", "seq": 3})
+	waitForNeoActorSyncIdle(t, actor)
+
+	persisted, ok := loadNeoThreadFromDir(threadID, rt.threadDir)
+	if !ok {
+		t.Fatal("load persisted thread")
+	}
+	restored := newNeoActor(nil, "actor-restored", "threadActor", threadID, threadID, neoActorRecord("actor-restored", "threadActor", threadID), nil)
+	if err := restored.importThreadLocalOnly(persisted); err != nil {
+		t.Fatalf("restore persisted thread: %v", err)
+	}
+	restored.mu.Lock()
+	defer restored.mu.Unlock()
+	if len(restored.activeError) != 0 {
+		t.Fatalf("cleared protocol error restored: %#v", restored.activeError)
 	}
 }
 
@@ -23541,6 +23962,200 @@ func TestInferNeoAnthropicStreamRejectsMaxTokensStopReason(t *testing.T) {
 	}
 	if deltaCalls == 0 {
 		t.Fatalf("deltaCalls=%d, want partial tool delta before max_tokens error", deltaCalls)
+	}
+}
+
+func TestInferNeoAnthropicStreamReturnsTextAtMaxTokens(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/provider/anthropic/v1/messages" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: message_start\n" +
+			`data: {"type":"message_start","message":{"usage":{"input_tokens":3}}}` + "\n\n" +
+			"event: content_block_start\n" +
+			`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}` + "\n\n" +
+			"event: content_block_delta\n" +
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"truncated answer"}}` + "\n\n" +
+			"event: message_delta\n" +
+			`data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"input_tokens":3,"output_tokens":32000}}` + "\n\n" +
+			"event: message_stop\n" +
+			`data: {"type":"message_stop"}` + "\n\n" +
+			"data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	result, err := inferNeoLocalStream(testNeoRuntimeForServer(t, upstream), neoInferenceRequest{
+		ThreadID:  "T-test",
+		AgentMode: "smart",
+		Settings:  map[string]any{"internal.model": "anthropic/claude-test"},
+		History:   []neoHistoryMessage{{Role: "user", Text: "hi"}},
+	}, nil)
+	if err != nil {
+		t.Fatalf("inferNeoLocalStream error: %v", err)
+	}
+	if result.Text != "truncated answer" || result.StopReason != "max_tokens" {
+		t.Fatalf("result = %#v, want text with max_tokens stop reason", result)
+	}
+}
+
+func TestInferNeoAnthropicStreamDoesNotRetryThinkingOnlyMaxTokens(t *testing.T) {
+	var requests atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/provider/anthropic/v1/messages" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		if requests.Add(1) != 1 {
+			http.Error(w, "duplicate request", http.StatusBadGateway)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: message_start\n" +
+			`data: {"type":"message_start","message":{"usage":{"input_tokens":3}}}` + "\n\n" +
+			"event: content_block_start\n" +
+			`data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}` + "\n\n" +
+			"event: content_block_delta\n" +
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"unfinished reasoning"}}` + "\n\n" +
+			"event: message_delta\n" +
+			`data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"input_tokens":3,"output_tokens":32000}}` + "\n\n" +
+			"event: message_stop\n" +
+			`data: {"type":"message_stop"}` + "\n\n" +
+			"data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	result, err := inferNeoLocalStream(testNeoRuntimeForServer(t, upstream), neoInferenceRequest{
+		ThreadID:  "T-test",
+		AgentMode: "smart",
+		Settings:  map[string]any{"internal.model": "anthropic/claude-test"},
+		History:   []neoHistoryMessage{{Role: "user", Text: "hi"}},
+	}, nil)
+	if err != nil {
+		t.Fatalf("inferNeoLocalStream error: %v", err)
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("requests = %d, want 1", requests.Load())
+	}
+	if result.StopReason != "max_tokens" || len(result.ThinkingBlocks) != 1 || result.ThinkingBlocks[0].Thinking != "unfinished reasoning" {
+		t.Fatalf("result = %#v, want one thinking block with max_tokens stop reason", result)
+	}
+}
+
+func TestInferNeoAnthropicStreamRejectsUnstoppedToolAtMaxTokens(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: message_start\n" +
+			`data: {"type":"message_start","message":{"usage":{"input_tokens":3}}}` + "\n\n" +
+			"event: content_block_start\n" +
+			`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_create","name":"create_file","input":{}}}` + "\n\n" +
+			"event: content_block_delta\n" +
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}` + "\n\n" +
+			"event: message_delta\n" +
+			`data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"}}` + "\n\n" +
+			"event: message_stop\n" +
+			`data: {"type":"message_stop"}` + "\n\n"))
+	}))
+	defer upstream.Close()
+
+	_, err := inferNeoLocalStream(testNeoRuntimeForServer(t, upstream), neoInferenceRequest{
+		ThreadID: "T-test",
+		Settings: map[string]any{"internal.model": "anthropic/claude-test"},
+		History:  []neoHistoryMessage{{Role: "user", Text: "create it"}},
+		Tools:    []neoToolSpec{{Name: "create_file", InputSchema: map[string]any{"type": "object"}}},
+	}, nil)
+	if err == nil || !strings.Contains(err.Error(), "max_tokens") {
+		t.Fatalf("error = %v, want max_tokens rejection for unstopped tool", err)
+	}
+}
+
+func TestInferNeoAnthropicStreamAcceptsCompleteEmptyInputToolAtMaxTokens(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: message_start\n" +
+			`data: {"type":"message_start","message":{"usage":{"input_tokens":3}}}` + "\n\n" +
+			"event: content_block_start\n" +
+			`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_create","name":"create_file","input":{}}}` + "\n\n" +
+			"event: content_block_stop\n" +
+			`data: {"type":"content_block_stop","index":0}` + "\n\n" +
+			"event: message_delta\n" +
+			`data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"}}` + "\n\n" +
+			"event: message_stop\n" +
+			`data: {"type":"message_stop"}` + "\n\n"))
+	}))
+	defer upstream.Close()
+
+	result, err := inferNeoLocalStream(testNeoRuntimeForServer(t, upstream), neoInferenceRequest{
+		ThreadID: "T-test",
+		Settings: map[string]any{"internal.model": "anthropic/claude-test"},
+		History:  []neoHistoryMessage{{Role: "user", Text: "create it"}},
+		Tools:    []neoToolSpec{{Name: "create_file", InputSchema: map[string]any{"type": "object"}}},
+	}, nil)
+	if err != nil {
+		t.Fatalf("inferNeoLocalStream error: %v", err)
+	}
+	if len(result.ToolCalls) != 1 || result.ToolCalls[0].Incomplete || len(result.ToolCalls[0].Input) != 0 {
+		t.Fatalf("tool calls = %#v, want one completed empty-input call", result.ToolCalls)
+	}
+}
+
+func TestInferNeoAnthropicStreamRejectsTruncatedStoppedToolAtMaxTokens(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: message_start\n" +
+			`data: {"type":"message_start","message":{"usage":{"input_tokens":3}}}` + "\n\n" +
+			"event: content_block_start\n" +
+			`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_create","name":"create_file","input":{}}}` + "\n\n" +
+			"event: content_block_delta\n" +
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"/tmp/cut"}}` + "\n\n" +
+			"event: content_block_stop\n" +
+			`data: {"type":"content_block_stop","index":0}` + "\n\n" +
+			"event: message_delta\n" +
+			`data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"}}` + "\n\n" +
+			"event: message_stop\n" +
+			`data: {"type":"message_stop"}` + "\n\n"))
+	}))
+	defer upstream.Close()
+
+	_, err := inferNeoLocalStream(testNeoRuntimeForServer(t, upstream), neoInferenceRequest{
+		ThreadID: "T-test",
+		Settings: map[string]any{"internal.model": "anthropic/claude-test"},
+		History:  []neoHistoryMessage{{Role: "user", Text: "create it"}},
+		Tools:    []neoToolSpec{{Name: "create_file", InputSchema: map[string]any{"type": "object"}}},
+	}, nil)
+	if err == nil || !strings.Contains(err.Error(), "max_tokens") {
+		t.Fatalf("error = %v, want max_tokens rejection for truncated tool", err)
+	}
+}
+
+func TestInferNeoAnthropicStreamAcceptsCompleteToolAtMaxTokens(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: message_start\n" +
+			`data: {"type":"message_start","message":{"usage":{"input_tokens":3}}}` + "\n\n" +
+			"event: content_block_start\n" +
+			`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_create","name":"create_file","input":{}}}` + "\n\n" +
+			"event: content_block_delta\n" +
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"/tmp/done\"}"}}` + "\n\n" +
+			"event: content_block_stop\n" +
+			`data: {"type":"content_block_stop","index":0}` + "\n\n" +
+			"event: message_delta\n" +
+			`data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"}}` + "\n\n" +
+			"event: message_stop\n" +
+			`data: {"type":"message_stop"}` + "\n\n"))
+	}))
+	defer upstream.Close()
+
+	result, err := inferNeoLocalStream(testNeoRuntimeForServer(t, upstream), neoInferenceRequest{
+		ThreadID: "T-test",
+		Settings: map[string]any{"internal.model": "anthropic/claude-test"},
+		History:  []neoHistoryMessage{{Role: "user", Text: "create it"}},
+		Tools:    []neoToolSpec{{Name: "create_file", InputSchema: map[string]any{"type": "object"}}},
+	}, nil)
+	if err != nil {
+		t.Fatalf("inferNeoLocalStream error: %v", err)
+	}
+	if len(result.ToolCalls) != 1 || result.ToolCalls[0].Incomplete || stringValue(result.ToolCalls[0].Input["path"]) != "/tmp/done" {
+		t.Fatalf("tool calls = %#v, want one completed call", result.ToolCalls)
 	}
 }
 

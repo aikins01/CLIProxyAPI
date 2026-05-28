@@ -97,6 +97,7 @@ const (
 	neoWebLocalProjectIndexFileName  = ".cliproxyapi-projects.json"
 	neoWebLocalProjectIndexVersion   = 1
 	neoResumeExecutorIDMetaKey       = "cliProxyAPIResumeExecutorID"
+	neoActiveErrorStateMetaKey       = "cliProxyAPIActiveErrorState"
 )
 
 var neoHeadlessLoginShellPath = neoDiscoverHeadlessLoginShellPath
@@ -211,10 +212,22 @@ type neoWebLocalFileStamp struct {
 // subagentInfer runs one inference for a local subagent loop, honoring a test
 // override when present.
 func (rt *neoRuntime) subagentInfer(request neoInferenceRequest, onDelta neoStreamCallback) (neoInferenceResult, error) {
+	var result neoInferenceResult
+	var err error
 	if rt != nil && rt.inferStream != nil {
-		return rt.inferStream(rt, request, onDelta)
+		result, err = rt.inferStream(rt, request, onDelta)
+	} else {
+		result, err = inferNeoLocalStream(rt, request, onDelta)
 	}
-	return inferNeoLocalStream(rt, request, onDelta)
+	if err != nil {
+		return neoInferenceResult{}, err
+	}
+	if len(result.ToolCalls) == 0 {
+		if errorPayload := neoProviderStopReasonErrorPayload(result.StopReason); len(errorPayload) > 0 {
+			return neoInferenceResult{}, errors.New(stringValue(errorPayload["message"]))
+		}
+	}
+	return result, nil
 }
 
 func newNeoRuntime(cfg *config.Config) *neoRuntime {
@@ -2528,6 +2541,7 @@ type neoActor struct {
 	replayEvents                []neoReplayEvent
 	replayContinuityKnown       bool
 	activeError                 map[string]any
+	activeErrorMessageID        string
 	activeErrorSeq              int
 	seq                         int
 	agentState                  string
@@ -6101,10 +6115,12 @@ func (a *neoActor) handleProtocolDelta(msg map[string]any) {
 	index := a.messageIndexLocked(messageID)
 	state := stringValue(msg["state"])
 	removedAborted := false
+	var errorCleared map[string]any
 	if role == "assistant" && state == "aborted" && index >= 0 {
 		a.messages = append(a.messages[:index], a.messages[index+1:]...)
 		index = -1
 		removedAborted = true
+		errorCleared = a.clearRemovedProviderStopReasonErrorLocked()
 	}
 	if role == "assistant" && state == "aborted" && len(blocks) == 0 {
 		if removedAborted {
@@ -6116,6 +6132,9 @@ func (a *neoActor) handleProtocolDelta(msg map[string]any) {
 		a.mu.Unlock()
 
 		a.broadcast(msg)
+		if errorCleared != nil {
+			a.broadcast(errorCleared)
+		}
 		if removedAborted {
 			a.syncCloudAsync()
 		}
@@ -6188,6 +6207,9 @@ func (a *neoActor) handleProtocolDelta(msg map[string]any) {
 	a.mu.Unlock()
 
 	a.broadcast(msg)
+	if errorCleared != nil {
+		a.broadcast(errorCleared)
+	}
 	a.syncCloudAsync()
 	if clearedInference {
 		a.scheduleExecutorIdleStopIfNeeded()
@@ -6276,6 +6298,7 @@ func (a *neoActor) handleProtocolThreadTruncated(msg map[string]any) {
 	seq := a.protocolSeqLocked(msg)
 	index := a.messageIndexLocked(truncateFromMessage)
 	pluginUIRequestIDs := []string(nil)
+	var errorCleared map[string]any
 	if index >= 0 {
 		trimmed := make([]neoMessage, index)
 		copy(trimmed, a.messages[:index])
@@ -6291,10 +6314,14 @@ func (a *neoActor) handleProtocolThreadTruncated(msg map[string]any) {
 	}
 	event := map[string]any{"type": "thread_truncated", "seq": seq, "truncateFromMessage": truncateFromMessage}
 	a.rememberReplayEventLocked(event)
+	errorCleared = a.clearRemovedProviderStopReasonErrorLocked()
 	a.mu.Unlock()
 
 	a.broadcastPluginUIRequestRemovals(pluginUIRequestIDs)
 	a.broadcast(event)
+	if errorCleared != nil {
+		a.broadcast(errorCleared)
+	}
 	a.syncCloudAsync()
 }
 
@@ -6360,6 +6387,7 @@ func (a *neoActor) handleProtocolErrorSet(msg map[string]any) {
 	a.mu.Lock()
 	seq := a.protocolSeqLocked(msg)
 	a.activeError = cloneMap(errorPayload)
+	a.activeErrorMessageID = ""
 	a.activeErrorSeq = seq
 	a.compacting = false
 	a.mu.Unlock()
@@ -6367,15 +6395,18 @@ func (a *neoActor) handleProtocolErrorSet(msg map[string]any) {
 	payload := map[string]any{"type": "error_set", "seq": seq, "error": errorPayload}
 	a.broadcast(payload)
 	a.dispatchNotification("error", "error_set", map[string]any{"seq": seq, "error": errorPayload})
+	a.syncCloudAsync()
 }
 
 func (a *neoActor) handleProtocolErrorCleared(msg map[string]any) {
 	a.mu.Lock()
 	seq := a.protocolSeqLocked(msg)
 	a.activeError = nil
+	a.activeErrorMessageID = ""
 	a.activeErrorSeq = seq
 	a.mu.Unlock()
 	a.broadcast(map[string]any{"type": "error_cleared", "seq": seq})
+	a.syncCloudAsync()
 }
 
 func (a *neoActor) handleProtocolCancelled(msg map[string]any) {
@@ -6403,6 +6434,7 @@ func (a *neoActor) handleProtocolCancelled(msg map[string]any) {
 	a.pendingInference = nil
 	a.retryScheduled = false
 	a.activeError = nil
+	a.activeErrorMessageID = ""
 	a.activeErrorSeq = 0
 	a.agentState = "idle"
 	a.executorIdleGeneration++
@@ -7164,6 +7196,7 @@ func (a *neoActor) handleBinaryThreadTruncate(msg map[string]any) {
 	a.mu.Lock()
 	truncateFromMessage := ""
 	pluginUIRequestIDs := []string(nil)
+	var errorCleared map[string]any
 	if fromIndex < len(a.messages) {
 		truncateFromMessage = a.messages[fromIndex].MessageID
 		if truncateFromMessage == "" {
@@ -7186,10 +7219,14 @@ func (a *neoActor) handleBinaryThreadTruncate(msg map[string]any) {
 	seq := a.protocolSeqLocked(msg)
 	event := map[string]any{"type": "thread_truncated", "seq": seq, "truncateFromMessage": truncateFromMessage}
 	a.rememberReplayEventLocked(event)
+	errorCleared = a.clearRemovedProviderStopReasonErrorLocked()
 	a.mu.Unlock()
 
 	a.broadcastPluginUIRequestRemovals(pluginUIRequestIDs)
 	a.broadcast(event)
+	if errorCleared != nil {
+		a.broadcast(errorCleared)
+	}
 	a.syncCloudAsync()
 }
 
@@ -9053,12 +9090,16 @@ func (a *neoActor) replaceBinaryUserMessageAtIndex(index int, user neoQueuedMess
 	}
 	added := neoMessageAddedPayload(replacement)
 	a.rememberReplayEventLocked(added)
+	errorCleared := a.clearRemovedProviderStopReasonErrorLocked()
 	a.mu.Unlock()
 
 	a.broadcastPluginUIRequestRemovals(pluginUIRequestIDs)
 	a.broadcast(added)
 	if truncateEvent != nil {
 		a.broadcast(truncateEvent)
+	}
+	if errorCleared != nil {
+		a.broadcast(errorCleared)
 	}
 	a.syncCloudAsync()
 }
@@ -9346,6 +9387,7 @@ func (a *neoActor) editMessage(socket *neoSocket, msg map[string]any) {
 		a.rememberReplayEventLocked(truncateEvent)
 		addedEvent := neoMessageAddedPayload(updated)
 		a.rememberReplayEventLocked(addedEvent)
+		errorCleared := a.clearRemovedProviderStopReasonErrorLocked()
 		ready := a.executorReady
 		mode := updated.AgentMode
 		if mode == "" {
@@ -9367,6 +9409,9 @@ func (a *neoActor) editMessage(socket *neoSocket, msg map[string]any) {
 		a.broadcastPluginUIRequestRemovals(pluginUIRequestIDs)
 		a.broadcast(truncateEvent)
 		a.broadcast(addedEvent)
+		if errorCleared != nil {
+			a.broadcast(errorCleared)
+		}
 		a.syncCloudAsync()
 		if ready {
 			go a.runInferenceWithOptions(mode, effort, neoInferenceRunOptions{clientAPIKey: socket.clientKey()})
@@ -9407,6 +9452,7 @@ func (a *neoActor) editMessage(socket *neoSocket, msg map[string]any) {
 		truncateEvent = map[string]any{"type": "thread_truncated", "seq": truncateSeq, "truncateFromMessage": truncateFromMessage}
 		a.rememberReplayEventLocked(truncateEvent)
 	}
+	errorCleared := a.clearRemovedProviderStopReasonErrorLocked()
 	ready := a.executorReady
 	mode := updated.AgentMode
 	if mode == "" {
@@ -9429,6 +9475,9 @@ func (a *neoActor) editMessage(socket *neoSocket, msg map[string]any) {
 	a.broadcast(updateEvent)
 	if truncateEvent != nil {
 		a.broadcast(truncateEvent)
+	}
+	if errorCleared != nil {
+		a.broadcast(errorCleared)
 	}
 	a.syncCloudAsync()
 	if ready {
@@ -10448,10 +10497,15 @@ func (a *neoActor) finishAssistantMessageWithOptions(messageID string, result ne
 		a.setAgentState("streaming", messageID, agentMode, reasoningEffort)
 	}
 	state := "generating"
-	stopReason := "end_turn"
-	if len(normalizedCalls) > 0 {
+	stopReason := result.StopReason
+	if stopReason == "" {
+		stopReason = "end_turn"
+		if len(normalizedCalls) > 0 {
+			stopReason = "tool_use"
+		}
+	}
+	if stopReason == "tool_use" || len(normalizedCalls) > 0 {
 		state = "tool_use"
-		stopReason = "tool_use"
 	}
 	if streamed {
 		streamBlocks := make([]any, 0, len(normalizedCalls))
@@ -10507,9 +10561,16 @@ func (a *neoActor) finishAssistantMessageWithOptions(messageID string, result ne
 		toolCalls = append(toolCalls, pending)
 	}
 	a.rebuildHistoryLocked()
+	providerErrorEvent := a.updateProviderStopReasonErrorLocked(messageID, stopReason, len(toolCalls) == 0)
 	a.mu.Unlock()
 
 	a.broadcast(neoMessageAddedPayload(stored))
+	if providerErrorEvent != nil {
+		a.broadcast(providerErrorEvent)
+		if providerError := mapValue(providerErrorEvent["error"]); len(providerError) > 0 {
+			a.dispatchNotification("error", "error_set", map[string]any{"seq": providerErrorEvent["seq"], "error": providerError})
+		}
+	}
 	a.syncCloudAsync()
 	a.maybeCompactAfterInference(agentMode, reasoningEffort, parentToolCallID, messageID)
 
@@ -10537,6 +10598,52 @@ func (a *neoActor) finishAssistantMessageWithOptions(messageID string, result ne
 		}
 		a.broadcast(withNeoParentToolCallID(map[string]any{"type": "tool_lease", "toolCallId": call.ID, "toolName": call.Name, "args": call.Input, "messageId": stored.MessageID}, call.ParentToolCallID))
 	}
+}
+
+func neoProviderStopReasonErrorPayload(stopReason string) map[string]any {
+	stopReason = strings.ToLower(strings.TrimSpace(stopReason))
+	if stopReason == "" || stopReason == "end_turn" || stopReason == "tool_use" {
+		return nil
+	}
+	return map[string]any{
+		"message": fmt.Sprintf("Provider stopped generation with stop reason %q", stopReason),
+		"code":    "MESSAGE_ERROR",
+	}
+}
+
+func neoProviderStopReasonActiveError(errorPayload map[string]any) bool {
+	return stringValue(errorPayload["code"]) == "MESSAGE_ERROR" && strings.HasPrefix(stringValue(errorPayload["message"]), "Provider stopped generation with stop reason ")
+}
+
+func (a *neoActor) updateProviderStopReasonErrorLocked(messageID, stopReason string, surfaceAbnormal bool) map[string]any {
+	errorPayload := neoProviderStopReasonErrorPayload(stopReason)
+	if len(errorPayload) == 0 || !surfaceAbnormal {
+		if !neoProviderStopReasonActiveError(a.activeError) {
+			return nil
+		}
+		seq := a.nextSeqLocked()
+		a.activeError = nil
+		a.activeErrorMessageID = ""
+		a.activeErrorSeq = seq
+		return map[string]any{"type": "error_cleared", "seq": seq}
+	}
+
+	seq := a.nextSeqLocked()
+	a.activeError = cloneMap(errorPayload)
+	a.activeErrorMessageID = messageID
+	a.activeErrorSeq = seq
+	return map[string]any{"type": "error_set", "seq": seq, "error": errorPayload}
+}
+
+func (a *neoActor) clearRemovedProviderStopReasonErrorLocked() map[string]any {
+	if !neoProviderStopReasonActiveError(a.activeError) || a.activeErrorMessageID == "" || a.messageIndexLocked(a.activeErrorMessageID) >= 0 {
+		return nil
+	}
+	seq := a.nextSeqLocked()
+	a.activeError = nil
+	a.activeErrorMessageID = ""
+	a.activeErrorSeq = seq
+	return map[string]any{"type": "error_cleared", "seq": seq}
 }
 
 func neoToolUseBlock(call neoToolCall, complete bool) map[string]any {
@@ -11478,6 +11585,14 @@ func (a *neoActor) threadSnapshotLocked(options neoThreadSnapshotOptions) (neoCl
 	if meta == nil {
 		meta = map[string]any{}
 	}
+	activeErrorState := map[string]any{"known": true}
+	if len(a.activeError) > 0 {
+		activeErrorState["error"] = cloneMap(a.activeError)
+		if a.activeErrorMessageID != "" {
+			activeErrorState["sourceMessageId"] = a.activeErrorMessageID
+		}
+	}
+	meta[neoActiveErrorStateMetaKey] = activeErrorState
 	executorType := firstNonEmptyString(a.bootstrapExecutorType, stringValue(meta["executorType"]))
 	if executorConnected {
 		if executorType == "" && a.executorID != "" {
@@ -12111,11 +12226,23 @@ func neoBinaryImportedContent(role string, content []any) []any {
 	return filtered
 }
 
-func neoBinaryImportedAssistantState(role string, state map[string]any) map[string]any {
-	if role != "assistant" || stringValue(state["type"]) != "cancelled" {
+func neoBinaryImportedAssistantState(role string, state map[string]any, preserveCompleteState bool) map[string]any {
+	if role != "assistant" {
 		return nil
 	}
-	return map[string]any{"type": "cancelled"}
+	switch stringValue(state["type"]) {
+	case "cancelled":
+		return map[string]any{"type": "cancelled"}
+	case "complete":
+		if preserveCompleteState {
+			out := map[string]any{"type": "complete"}
+			if reason := stringValue(state["stopReason"]); reason != "" {
+				out["stopReason"] = reason
+			}
+			return out
+		}
+	}
+	return nil
 }
 
 func neoNumericValue(value any) (any, bool) {
@@ -17442,14 +17569,27 @@ func (a *neoActor) importThreadWithSyncOptions(thread map[string]any, syncCloud,
 
 	rawMessages := arrayValue(thread["messages"])
 	messages := make([]neoMessage, 0, len(rawMessages))
+	preserveCompleteState := neoCloudThreadHasLocalNeoMarker(thread)
 	for i, raw := range rawMessages {
-		message := neoMessageFromImportedThread(threadID, raw, i)
+		message := neoMessageFromImportedThreadWithOptions(threadID, raw, i, preserveCompleteState)
 		if message.Role == "" {
 			continue
 		}
 		messages = append(messages, message)
 	}
 	messages = neoNormalizeImportedToolProgressMessages(messages)
+	importedActiveError, importedActiveErrorMessageID := neoImportedProviderStopReasonError(messages)
+	threadMeta := mapValue(thread["meta"])
+	if activeErrorState, exists := threadMeta[neoActiveErrorStateMetaKey]; preserveCompleteState && exists {
+		state := mapValue(activeErrorState)
+		if boolValue(state["known"]) {
+			importedActiveError = cloneMap(mapValue(state["error"]))
+			importedActiveErrorMessageID = stringValue(state["sourceMessageId"])
+			if neoProviderStopReasonActiveError(importedActiveError) && importedActiveErrorMessageID == "" {
+				_, importedActiveErrorMessageID = neoImportedProviderStopReasonError(messages)
+			}
+		}
+	}
 
 	agentMode := firstNonEmptyString(neoThreadMapAgentMode(thread), neoImportedThreadAgentMode(messages))
 	if agentMode == "" {
@@ -17467,7 +17607,7 @@ func (a *neoActor) importThreadWithSyncOptions(thread map[string]any, syncCloud,
 	archived := boolValue(thread["archived"]) || strings.EqualFold(rawThreadStatus, "archived")
 	compactionRecords := normalizeNeoCompactionRecords(firstArray(thread["compactionRecords"], thread["compaction_records"]))
 	relationships := normalizeNeoThreadRelationships(thread["relationships"])
-	meta := neoThreadActorImportedMeta(mapValue(thread["meta"]))
+	meta := neoThreadActorImportedMeta(threadMeta)
 	debug := cloneMap(firstMap(thread["~debug"], thread["debug"]))
 	draft := cloneArray(arrayValue(thread["draft"]))
 	autoSubmitDraft := boolValue(thread["autoSubmitDraft"])
@@ -17493,6 +17633,11 @@ func (a *neoActor) importThreadWithSyncOptions(thread map[string]any, syncCloud,
 	nextSeq := version + 1
 	if nextSeq < 1 {
 		nextSeq = 1
+	}
+	activeErrorSeq := 0
+	if len(importedActiveError) > 0 {
+		activeErrorSeq = nextSeq
+		nextSeq++
 	}
 	if pendingInference != nil {
 		if pendingInference.agentMode == "" {
@@ -17553,8 +17698,9 @@ func (a *neoActor) importThreadWithSyncOptions(thread map[string]any, syncCloud,
 	a.pendingInference = pendingInference
 	a.replayEvents = nil
 	a.replayContinuityKnown = false
-	a.activeError = nil
-	a.activeErrorSeq = 0
+	a.activeError = cloneMap(importedActiveError)
+	a.activeErrorMessageID = importedActiveErrorMessageID
+	a.activeErrorSeq = activeErrorSeq
 	a.queue = queuedMessages
 	if len(approvalQueue) > 0 {
 		a.agentState = "awaiting_approval"
@@ -17596,6 +17742,41 @@ func (a *neoActor) importThreadWithSyncOptions(thread map[string]any, syncCloud,
 		a.syncCloudAsync()
 	}
 	return nil
+}
+
+func neoImportedProviderStopReasonError(messages []neoMessage) (map[string]any, string) {
+	for i := len(messages) - 1; i >= 0; i-- {
+		message := messages[i]
+		if message.Role != "assistant" {
+			continue
+		}
+		if stringValue(mapValue(message.State)["type"]) != "complete" || neoAssistantToolUseComplete(message.Content) {
+			return nil, ""
+		}
+		errorPayload := neoProviderStopReasonErrorPayload(stringValue(mapValue(message.State)["stopReason"]))
+		if len(errorPayload) == 0 {
+			return nil, ""
+		}
+		return errorPayload, message.MessageID
+	}
+	return nil, ""
+}
+
+func neoRetryProviderStopReasonMessageID(messages []neoMessage) string {
+	for i := len(messages) - 1; i >= 0; i-- {
+		message := messages[i]
+		if message.Role == "info" {
+			continue
+		}
+		if message.Role != "assistant" || stringValue(mapValue(message.State)["type"]) != "complete" || neoAssistantToolUseComplete(message.Content) {
+			return ""
+		}
+		if len(neoProviderStopReasonErrorPayload(stringValue(mapValue(message.State)["stopReason"]))) == 0 {
+			return ""
+		}
+		return message.MessageID
+	}
+	return ""
 }
 
 func neoShouldPreservePendingInferenceOnImport(existing *neoInferenceInflight, imported []neoMessage) bool {
@@ -17795,6 +17976,10 @@ func neoArtifactsMap(raw any) map[string]any {
 }
 
 func neoMessageFromImportedThread(threadID string, raw any, index int) neoMessage {
+	return neoMessageFromImportedThreadWithOptions(threadID, raw, index, false)
+}
+
+func neoMessageFromImportedThreadWithOptions(threadID string, raw any, index int, preserveCompleteState bool) neoMessage {
 	message := mapValue(raw)
 	role := stringValue(message["role"])
 	if role == "" {
@@ -17820,7 +18005,7 @@ func neoMessageFromImportedThread(threadID string, raw any, index int) neoMessag
 	} else {
 		meta = nil
 	}
-	state := neoBinaryImportedAssistantState(role, mapValue(message["state"]))
+	state := neoBinaryImportedAssistantState(role, mapValue(message["state"]), preserveCompleteState)
 	return neoMessage{
 		ThreadID:             threadID,
 		MessageID:            messageID,
@@ -17946,11 +18131,19 @@ func (a *neoActor) retry() {
 		a.broadcast(map[string]any{"type": "retry_cancelled"})
 		return
 	}
+	truncateEvent, errorCleared := a.prepareRetryLocked()
 	if !a.executorReady {
 		a.retryScheduled = true
 		a.executorIdleGeneration++
 		a.mu.Unlock()
+		if truncateEvent != nil {
+			a.broadcast(truncateEvent)
+		}
 		a.broadcast(normalizeNeoRetryScheduled(map[string]any{"reason": "executor_not_ready"}))
+		if errorCleared != nil {
+			a.broadcast(errorCleared)
+		}
+		a.syncCloudAsync()
 		a.maybeSpawnWebLocalExecutorForPendingWork()
 		return
 	}
@@ -17963,14 +18156,17 @@ func (a *neoActor) retry() {
 		effort = a.reasoningEffortForModeLocked(mode)
 	}
 	a.retryScheduled = false
-	seq := a.nextSeqLocked()
-	a.activeError = nil
-	a.activeErrorSeq = seq
 	a.markInferenceAcceptedLocked()
 	a.mu.Unlock()
 
+	if truncateEvent != nil {
+		a.broadcast(truncateEvent)
+	}
 	a.broadcast(map[string]any{"type": "retry_started"})
-	a.broadcast(map[string]any{"type": "error_cleared", "seq": seq})
+	if errorCleared != nil {
+		a.broadcast(errorCleared)
+	}
+	a.syncCloudAsync()
 	go a.runInference(mode, effort)
 }
 
@@ -17989,16 +18185,49 @@ func (a *neoActor) processRetryIfReady() bool {
 		effort = a.reasoningEffortForModeLocked(mode)
 	}
 	a.retryScheduled = false
-	seq := a.nextSeqLocked()
-	a.activeError = nil
-	a.activeErrorSeq = seq
+	truncateEvent, errorCleared := a.prepareRetryLocked()
 	a.markInferenceAcceptedLocked()
 	a.mu.Unlock()
 
+	if truncateEvent != nil {
+		a.broadcast(truncateEvent)
+	}
 	a.broadcast(map[string]any{"type": "retry_started"})
-	a.broadcast(map[string]any{"type": "error_cleared", "seq": seq})
+	if errorCleared != nil {
+		a.broadcast(errorCleared)
+	}
+	a.syncCloudAsync()
 	go a.runInference(mode, effort)
 	return true
+}
+
+func (a *neoActor) prepareRetryLocked() (map[string]any, map[string]any) {
+	var truncateEvent map[string]any
+	retryMessageID := neoRetryProviderStopReasonMessageID(a.messages)
+	if retryMessageID != "" {
+		if index := a.messageIndexLocked(retryMessageID); index >= 0 {
+			truncateFromMessage := a.messages[index].MessageID
+			a.messages = append([]neoMessage(nil), a.messages[:index]...)
+			a.filterRelationshipsForTruncationLocked(index)
+			a.rebuildHistoryLocked()
+			a.filterPendingToolsToMessagesLocked()
+			a.approvalQueue = nil
+			if a.currentInference != nil && a.messageIndexLocked(a.currentInference.messageID) < 0 {
+				a.currentInference = nil
+			}
+			seq := a.nextSeqLocked()
+			truncateEvent = map[string]any{"type": "thread_truncated", "seq": seq, "truncateFromMessage": truncateFromMessage}
+			a.rememberReplayEventLocked(truncateEvent)
+		}
+	}
+	if len(a.activeError) == 0 && a.activeErrorMessageID == "" {
+		return truncateEvent, nil
+	}
+	seq := a.nextSeqLocked()
+	a.activeError = nil
+	a.activeErrorMessageID = ""
+	a.activeErrorSeq = seq
+	return truncateEvent, map[string]any{"type": "error_cleared", "seq": seq}
 }
 
 func (a *neoActor) processPendingInferenceIfReady() bool {
@@ -18384,6 +18613,7 @@ func (a *neoActor) cancel() {
 	a.pendingInference = nil
 	seq := a.nextSeqLocked()
 	a.activeError = nil
+	a.activeErrorMessageID = ""
 	a.activeErrorSeq = 0
 	cancelEvent := map[string]any{"type": "cancelled", "seq": seq, "messageId": omitEmpty(messageID)}
 	a.rememberReplayEventLocked(cancelEvent)
@@ -18445,11 +18675,13 @@ func (a *neoActor) fail(err error) {
 	seq := a.nextSeqLocked()
 	errorPayload := map[string]any{"message": err.Error(), "code": "INTERNAL_ERROR"}
 	a.activeError = cloneMap(errorPayload)
+	a.activeErrorMessageID = ""
 	a.activeErrorSeq = seq
 	a.mu.Unlock()
 	a.broadcast(map[string]any{"type": "error", "message": err.Error(), "code": "INTERNAL_ERROR"})
 	a.broadcast(map[string]any{"type": "error_set", "seq": seq, "error": errorPayload})
 	a.dispatchNotification("error", "error_set", map[string]any{"seq": seq, "error": errorPayload})
+	a.syncCloudAsync()
 }
 
 func (a *neoActor) clearActiveError(msg map[string]any) {
@@ -18461,9 +18693,11 @@ func (a *neoActor) clearActiveError(msg map[string]any) {
 	}
 	seq := a.nextSeqLocked()
 	a.activeError = nil
+	a.activeErrorMessageID = ""
 	a.activeErrorSeq = seq
 	a.mu.Unlock()
 	a.broadcast(map[string]any{"type": "error_cleared", "seq": seq})
+	a.syncCloudAsync()
 }
 
 func normalizeNeoClientDismissActiveError(msg map[string]any) (map[string]any, bool) {
@@ -22782,6 +23016,7 @@ type neoInferenceResult struct {
 	ToolCalls      []neoToolCall
 	Usage          map[string]any
 	ThinkingBlocks []neoThinkingBlock
+	StopReason     string
 }
 
 // neoThinkingBlock captures provider reasoning output and its replay metadata.
@@ -23284,7 +23519,7 @@ func inferNeoAnthropic(rt *neoRuntime, request neoInferenceRequest, route neoMod
 			})
 		}
 	}
-	return neoInferenceResult{Provider: route.Provider, Model: route.Model, Text: text.String(), TextCitations: textCitations, ToolCalls: toolCalls, Usage: mapValue(jsonBody["usage"]), ThinkingBlocks: thinkingBlocks}, nil
+	return neoInferenceResult{Provider: route.Provider, Model: route.Model, Text: text.String(), TextCitations: textCitations, ToolCalls: toolCalls, Usage: mapValue(jsonBody["usage"]), ThinkingBlocks: thinkingBlocks, StopReason: stringValue(jsonBody["stop_reason"])}, nil
 }
 
 func inferNeoOpenAI(rt *neoRuntime, request neoInferenceRequest, route neoModelRoute) (neoInferenceResult, error) {
@@ -23438,6 +23673,7 @@ func inferNeoAnthropicStream(rt *neoRuntime, request neoInferenceRequest, route 
 		id        string
 		name      string
 		input     map[string]any
+		complete  bool
 		text      strings.Builder
 		citations []any
 		args      strings.Builder
@@ -23574,6 +23810,8 @@ func inferNeoAnthropicStream(rt *neoRuntime, request neoInferenceRequest, route 
 					}
 				case "compaction_delta":
 				}
+			case "content_block_stop":
+				ensureBlock(numberFrom(payload["index"])).complete = true
 			case "error":
 				return fmt.Errorf("local provider stream error: %s", data)
 			}
@@ -23586,6 +23824,7 @@ func inferNeoAnthropicStream(rt *neoRuntime, request neoInferenceRequest, route 
 		order = order[:0]
 		fullText.Reset()
 		usage = nil
+		stopReason = ""
 		sawContent = false
 	}
 
@@ -23607,10 +23846,7 @@ func inferNeoAnthropicStream(rt *neoRuntime, request neoInferenceRequest, route 
 		}
 		return neoInferenceResult{}, err
 	}
-	if strings.EqualFold(strings.TrimSpace(stopReason), "max_tokens") {
-		return neoInferenceResult{}, fmt.Errorf("local provider stream incomplete: %s", stopReason)
-	}
-	if !sawContent {
+	if !sawContent && strings.TrimSpace(stopReason) == "" {
 		return inferNeoAnthropic(rt, request, route)
 	}
 
@@ -23639,6 +23875,12 @@ func inferNeoAnthropicStream(rt *neoRuntime, request neoInferenceRequest, route 
 			if block.args.Len() > 0 {
 				input, partialJSON, inputIncomplete, incomplete = parseOpenAIResponsesFunctionArguments(block.args.String())
 			}
+			if strings.EqualFold(strings.TrimSpace(stopReason), "max_tokens") && !block.complete {
+				incomplete = true
+				if inputIncomplete == nil {
+					inputIncomplete = cloneMap(block.input)
+				}
+			}
 			if input == nil {
 				input = map[string]any{}
 			}
@@ -23658,7 +23900,14 @@ func inferNeoAnthropicStream(rt *neoRuntime, request neoInferenceRequest, route 
 			})
 		}
 	}
-	return neoInferenceResult{Provider: route.Provider, Model: route.Model, Text: fullText.String(), TextCitations: textCitations, ToolCalls: toolCalls, Usage: usage, ThinkingBlocks: thinkingBlocks}, nil
+	if strings.EqualFold(strings.TrimSpace(stopReason), "max_tokens") {
+		for _, call := range toolCalls {
+			if call.Incomplete {
+				return neoInferenceResult{}, fmt.Errorf("local provider stream incomplete: %s", stopReason)
+			}
+		}
+	}
+	return neoInferenceResult{Provider: route.Provider, Model: route.Model, Text: fullText.String(), TextCitations: textCitations, ToolCalls: toolCalls, Usage: usage, ThinkingBlocks: thinkingBlocks, StopReason: stopReason}, nil
 }
 
 func inferNeoOpenAIStream(rt *neoRuntime, request neoInferenceRequest, route neoModelRoute, onDelta neoStreamCallback) (neoInferenceResult, error) {
