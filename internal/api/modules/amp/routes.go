@@ -423,11 +423,6 @@ func neoLocalInternalMethodSupported(method string) bool {
 var neoLocalInternalMethods = []string{
 	"loadPlugins",
 	"getUserInfo",
-	"getUserFreeTierStatus",
-	"notices",
-	"logNoticeAction",
-	"markAsReadMysteriousMessage",
-	"userDisplayBalanceInfo",
 }
 
 func neoLocalInternalPayload(r *http.Request) map[string]any {
@@ -477,16 +472,6 @@ func neoLocalInternalResponse(ctx context.Context, cfg *config.Config, r *http.R
 			"workspaceID":       "local-workspace",
 			"workspaceId":       "local-workspace",
 			"mysteriousMessage": nil,
-		}}
-	case "getUserFreeTierStatus":
-		return gin.H{"ok": true, "result": gin.H{}}
-	case "notices":
-		return gin.H{"ok": true, "result": []any{}}
-	case "logNoticeAction", "markAsReadMysteriousMessage":
-		return gin.H{"ok": true, "result": gin.H{}}
-	case "userDisplayBalanceInfo":
-		return gin.H{"ok": true, "result": gin.H{
-			"displayText": "Local runtime: usage and credit balance are not tracked by the local proxy.",
 		}}
 	default:
 		return gin.H{"ok": true, "result": nil}

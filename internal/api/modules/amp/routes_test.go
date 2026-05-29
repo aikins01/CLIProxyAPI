@@ -1061,7 +1061,7 @@ func TestRegisterManagementRoutesPassesNeoLegacyRunEndpointsUpstreamWhenProxyExi
 	}
 }
 
-func TestRegisterManagementRoutesServesNeoStartupInternalRPCPostsLocally(t *testing.T) {
+func TestRegisterManagementRoutesDoesNotSynthesizeAmpControlPlaneRPCs(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	enabled := true
@@ -1084,41 +1084,12 @@ func TestRegisterManagementRoutesServesNeoStartupInternalRPCPostsLocally(t *test
 	}
 	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, nil)
 
-	for _, tc := range []struct {
-		name string
-		path string
-		body string
-	}{
-		{name: "notices", path: "/api/internal?notices", body: `{"method":"notices","params":{}}`},
-		{name: "getUserFreeTierStatus", path: "/api/internal?getUserFreeTierStatus", body: `{"method":"getUserFreeTierStatus","params":{}}`},
-		{name: "logNoticeAction", path: "/api/internal?logNoticeAction", body: `{"method":"logNoticeAction","params":{"key":"local","action":"view"}}`},
-		{name: "markAsReadMysteriousMessage", path: "/api/internal?markAsReadMysteriousMessage", body: `{"method":"markAsReadMysteriousMessage","params":{"messageId":"msg_local"}}`},
-		{name: "userDisplayBalanceInfo", path: "/api/internal?userDisplayBalanceInfo", body: `{"method":"userDisplayBalanceInfo","params":{}}`},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			proxyCalled = false
-			req := httptest.NewRequest(http.MethodPost, tc.path, bytes.NewBufferString(tc.body))
-			req.Header.Set("Content-Type", "application/json")
-			rec := httptest.NewRecorder()
-			r.ServeHTTP(rec, req)
-
-			if rec.Code != http.StatusOK {
-				t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
-			}
-			if proxyCalled {
-				t.Fatalf("%s should be served locally during Neo startup", tc.name)
-			}
-			var response map[string]any
-			if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
-				t.Fatalf("response JSON error: %v", err)
-			}
-			if response["ok"] != true {
-				t.Fatalf("unexpected local internal response: %#v", response)
-			}
-		})
-	}
-
 	for _, method := range []string{
+		"notices",
+		"getUserFreeTierStatus",
+		"logNoticeAction",
+		"markAsReadMysteriousMessage",
+		"userDisplayBalanceInfo",
 		"listThreads",
 		"uploadThread",
 		"getThread",
