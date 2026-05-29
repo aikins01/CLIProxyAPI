@@ -1014,6 +1014,63 @@ func TestRegisterManagementRoutesServesNeoLegacyRunEndpointsLocally(t *testing.T
 	}
 }
 
+func TestRegisterManagementRoutesPassesNeoLegacyRunEndpointsUpstreamWhenProxyExists(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	enabled := true
+	upstreamRequests := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequests++
+		if r.URL.Path != "/api/threads/T-legacy/runs" {
+			t.Fatalf("unexpected upstream path = %s", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusTeapot)
+		_, _ = w.Write([]byte("proxied"))
+	}))
+	defer upstream.Close()
+
+	m := &AmpModule{
+		restrictToLocalhost: false,
+		neoRuntime: newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+			UpstreamURL: upstream.URL,
+			NeoLocalRuntime: config.AmpNeoLocalRuntime{
+				Enabled: &enabled,
+			},
+		}}),
+	}
+	proxy, _ := createReverseProxy(upstream.URL, NewStaticSecretSource(""))
+	m.setProxy(proxy)
+	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, nil)
+
+	localServer := httptest.NewServer(r)
+	defer localServer.Close()
+
+	req, err := http.NewRequest(http.MethodPost, localServer.URL+"/api/threads/T-legacy/runs", bytes.NewBufferString(`{"assistant_id":"asst_test"}`))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do request: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+
+	if resp.StatusCode != http.StatusTeapot {
+		t.Fatalf("status = %d, body=%s", resp.StatusCode, string(body))
+	}
+	if upstreamRequests != 1 {
+		t.Fatalf("expected one upstream request, got %d", upstreamRequests)
+	}
+	if string(body) != "proxied" {
+		t.Fatalf("body = %q, want proxied", string(body))
+	}
+}
+
 func TestRegisterManagementRoutesServesNeoStartupInternalRPCPostsLocally(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()

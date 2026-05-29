@@ -7729,6 +7729,9 @@ func (m *AmpModule) tryServeNeoLegacyThreadRun(c *gin.Context) bool {
 	if !ok {
 		return false
 	}
+	if m.getProxy() != nil {
+		return false
+	}
 	cfg := m.neoThreadConfigSnapshot()
 	if cfg == nil || !neoRuntimeEnabled(cfg) {
 		return false
