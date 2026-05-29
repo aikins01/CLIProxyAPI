@@ -623,7 +623,6 @@
       thread.usesThreadActors === true ||
       data.usesThreadActors === true ||
       meta.usesThreadActors === true ||
-      meta.usesDtw === true ||
       meta.cliProxyAPILocalNeo === true ||
       meta.ampcodeConnectorLocalNeo === true ||
       meta.ampcodeLocalRuntime === true ||
