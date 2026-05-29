@@ -1586,6 +1586,111 @@ func TestRegisterManagementRoutesPassesAmpBinaryInternalRPCsUpstream(t *testing.
 	}
 }
 
+func TestRegisterManagementRoutesPassesAmpBinaryThreadGETsUpstream(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	enabled := true
+
+	dir := t.TempDir()
+	oldStoreDir := neoAmpThreadStoreDir
+	neoAmpThreadStoreDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
+
+	threadID := "T-019e65c0-0310-77a8-b233-4b84d9c0612b"
+	rawThread := []byte(`{"id":"` + threadID + `","title":"local thread","messages":[{"messageId":"M-local","role":"user","content":[{"type":"text","text":"local needle"}]}]}`)
+	if err := os.WriteFile(filepath.Join(dir, threadID+".json"), rawThread, 0o600); err != nil {
+		t.Fatalf("write local thread: %v", err)
+	}
+
+	upstreamRequests := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequests++
+		if got := r.Header.Get("X-Amp-Client-Application"); got != "CLI" {
+			t.Fatalf("X-Amp-Client-Application = %q", got)
+		}
+		switch r.URL.Path {
+		case "/api/threads/find":
+			writeNeoJSON(w, http.StatusOK, map[string]any{
+				"threads": []any{map[string]any{"id": threadID, "title": "upstream search"}},
+			})
+		case "/threads/" + threadID:
+			writeNeoJSON(w, http.StatusOK, map[string]any{"id": threadID, "title": "upstream thread"})
+		default:
+			t.Fatalf("unexpected upstream request path=%s", r.URL.Path)
+		}
+	}))
+	defer upstream.Close()
+
+	m := &AmpModule{
+		restrictToLocalhost: false,
+		neoRuntime: newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+			UpstreamURL:    upstream.URL,
+			UpstreamAPIKey: "secret",
+			NeoLocalRuntime: config.AmpNeoLocalRuntime{
+				Enabled: &enabled,
+			},
+		}}),
+	}
+	proxy, _ := createReverseProxy(upstream.URL, NewStaticSecretSource(""))
+	m.setProxy(proxy)
+	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, nil)
+
+	localServer := httptest.NewServer(r)
+	defer localServer.Close()
+
+	tests := []struct {
+		name      string
+		path      string
+		wantTitle string
+	}{
+		{name: "find", path: "/api/threads/find?q=local+needle&limit=5", wantTitle: "upstream search"},
+		{name: "thread", path: "/threads/" + threadID, wantTitle: "upstream thread"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodGet, localServer.URL+tc.path, nil)
+			if err != nil {
+				t.Fatalf("new request: %v", err)
+			}
+			req.Header.Set("X-Amp-Client-Application", "CLI")
+			req.Header.Set("X-Amp-Client-Type", "cli")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("do request: %v", err)
+			}
+			defer func() {
+				if err := resp.Body.Close(); err != nil {
+					t.Fatalf("close response body: %v", err)
+				}
+			}()
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("read response body: %v", err)
+			}
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, body=%s", resp.StatusCode, string(body))
+			}
+			var response map[string]any
+			if err := json.Unmarshal(body, &response); err != nil {
+				t.Fatalf("response JSON error: %v", err)
+			}
+			title := stringValue(response["title"])
+			if title == "" {
+				threads := arrayValue(response["threads"])
+				if len(threads) > 0 {
+					title = stringValue(mapValue(threads[0])["title"])
+				}
+			}
+			if title != tc.wantTitle {
+				t.Fatalf("title = %q, want %q; response=%#v", title, tc.wantTitle, response)
+			}
+		})
+	}
+	if upstreamRequests != len(tests) {
+		t.Fatalf("upstreamRequests = %d, want %d", upstreamRequests, len(tests))
+	}
+}
+
 func TestRegisterManagementRoutesServesNeoTaskInternalMethodsLocally(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()

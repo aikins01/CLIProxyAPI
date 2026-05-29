@@ -195,7 +195,7 @@ func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *ha
 		if m.tryServeNeoLegacyThreadRun(c) {
 			return
 		}
-		if tryServeNeoLocalThread(c, m.neoThreadConfigSnapshot()) {
+		if tryServeNeoLocalThread(c, m.neoThreadConfigSnapshot(), m.getProxy() != nil) {
 			return
 		}
 		if tryServeNeoLocalThreadReaderTool(c) {

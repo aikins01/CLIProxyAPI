@@ -8185,8 +8185,11 @@ func neoStoreLocalThreadCache(threadID string, thread map[string]any, modTime ti
 	neoLocalThreadCache.Unlock()
 }
 
-func tryServeNeoLocalThread(c *gin.Context, cfg *config.Config) bool {
+func tryServeNeoLocalThread(c *gin.Context, cfg *config.Config, hasUpstreamProxy bool) bool {
 	if c == nil || c.Request == nil || c.Request.Method != http.MethodGet {
+		return false
+	}
+	if hasUpstreamProxy && requestHasAmpClientHeaders(c.Request) {
 		return false
 	}
 	if neoThreadSearchPath(c.Request.URL.Path) {
