@@ -672,6 +672,76 @@ func TestRegisterManagementRoutesServesNeoAttachmentsLocally(t *testing.T) {
 	}
 }
 
+func TestRegisterManagementRoutesPassesAmpBinaryAttachmentsUpstream(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	enabled := true
+	proxyCalled := false
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxyCalled = true
+		if r.URL.Path != "/api/attachments" {
+			t.Fatalf("unexpected upstream request path=%s", r.URL.Path)
+		}
+		if got := r.Header.Get("X-Amp-Client-Application"); got != "CLI" {
+			t.Fatalf("X-Amp-Client-Application = %q", got)
+		}
+		writeNeoJSON(w, http.StatusOK, map[string]any{"url": "https://ampcode.com/api/attachments/upstream"})
+	}))
+	defer upstream.Close()
+
+	m := &AmpModule{
+		restrictToLocalhost: false,
+		neoRuntime: newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+			UpstreamURL:    upstream.URL,
+			UpstreamAPIKey: "secret",
+			NeoLocalRuntime: config.AmpNeoLocalRuntime{
+				Enabled: &enabled,
+			},
+		}}),
+	}
+	proxy, _ := createReverseProxy(upstream.URL, NewStaticSecretSource(""))
+	m.setProxy(proxy)
+	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, nil)
+
+	localServer := httptest.NewServer(r)
+	defer localServer.Close()
+
+	req, err := http.NewRequest(http.MethodPost, localServer.URL+"/api/attachments", bytes.NewBufferString(`{"data":"aGVsbG8=","mediaType":"image/png"}`))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Amp-Client-Application", "CLI")
+	req.Header.Set("X-Amp-Client-Type", "cli")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do request: %v", err)
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Fatalf("close response body: %v", err)
+		}
+	}()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", resp.StatusCode, string(body))
+	}
+	if !proxyCalled {
+		t.Fatal("Amp binary attachment upload should pass through to upstream")
+	}
+	var response map[string]any
+	if err := json.Unmarshal(body, &response); err != nil {
+		t.Fatalf("response JSON error: %v", err)
+	}
+	if stringValue(response["url"]) != "https://ampcode.com/api/attachments/upstream" {
+		t.Fatalf("unexpected upstream response: %#v", response)
+	}
+}
+
 func TestDecodeNeoAttachmentPayloadMatchesBinaryImageLimits(t *testing.T) {
 	data := testNeoPNGBase64(t, 1, 1)
 	raw, mediaType, err := decodeNeoAttachmentPayload(data, "image/png")
