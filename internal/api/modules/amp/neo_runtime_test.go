@@ -4498,6 +4498,7 @@ func TestProviderForNeoModelMatchesBinaryProviderTable(t *testing.T) {
 		{model: "moonshotai/kimi-k2-0905", want: "openrouter"},
 		{model: "qwen/qwen3-coder", want: "openrouter"},
 		{model: "claude-opus-4-7", want: "anthropic"},
+		{model: "claude-opus-4-8", want: "anthropic"},
 	} {
 		t.Run(tc.model, func(t *testing.T) {
 			if got := providerForNeoModel(tc.model); got != tc.want {
@@ -4740,6 +4741,8 @@ func TestNeoModelRegistryMatchesAmpBinaryValues(t *testing.T) {
 		{model: "claude-sonnet-4-20250514", context: 1000000, maxOut: 32000, maxInput: 968000},
 		{model: "claude-sonnet-4-6", context: 1000000, maxOut: 64000, maxInput: 936000},
 		{model: "claude-opus-4-6-1m", context: 1000000, maxOut: 32000, maxInput: 968000},
+		{model: "claude-opus-4-7", context: 332000, maxOut: 32000, maxInput: 300000},
+		{model: "claude-opus-4-8", context: 332000, maxOut: 32000, maxInput: 300000},
 		{model: "o3", context: 200000, maxOut: 100000, maxInput: 100000},
 		{model: "o3-mini", context: 200000, maxOut: 100000, maxInput: 100000},
 		{model: "openai/gpt-oss-120b", context: 128000, maxOut: 32000, maxInput: 96000},
@@ -4760,6 +4763,31 @@ func TestNeoModelRegistryMatchesAmpBinaryValues(t *testing.T) {
 			}
 			if got := neoModelMaxInputTokens(tc.model); got != tc.maxInput {
 				t.Fatalf("max input = %d, want %d", got, tc.maxInput)
+			}
+		})
+	}
+}
+
+func TestNeoEffectiveContextWindowMatchesAmpLargeContextRules(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		mode     string
+		model    string
+		context  int
+		maxInput int
+	}{
+		{name: "smart opus 4.6 registry window", mode: "smart", model: "claude-opus-4-6", context: 332000, maxInput: 300000},
+		{name: "large opus 4.6 expands", mode: "large", model: "claude-opus-4-6", context: 1000000, maxInput: 968000},
+		{name: "large opus 4.6 alias stays 1m", mode: "large", model: "claude-opus-4-6-1m", context: 1000000, maxInput: 968000},
+		{name: "large opus 4.7 stays registry window", mode: "large", model: "claude-opus-4-7", context: 332000, maxInput: 300000},
+		{name: "large opus 4.8 stays registry window", mode: "large", model: "claude-opus-4-8", context: 332000, maxInput: 300000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := neoEffectiveContextWindow(tc.mode, tc.model); got != tc.context {
+				t.Fatalf("effective context = %d, want %d", got, tc.context)
+			}
+			if got := neoEffectiveMaxInputTokens(tc.mode, tc.model); got != tc.maxInput {
+				t.Fatalf("effective max input = %d, want %d", got, tc.maxInput)
 			}
 		})
 	}
@@ -7286,6 +7314,7 @@ func TestNeoApplyAnthropicThinkingUsesAdaptiveEffortForAmpOpusModels(t *testing.
 		want     string
 	}{
 		{name: "smart opus 4.7 effort", model: "claude-opus-4-7", fallback: "xhigh", want: "xhigh"},
+		{name: "smart opus 4.8 effort", model: "claude-opus-4-8", fallback: "xhigh", want: "xhigh"},
 		{name: "opus 4.7 default", model: "claude-opus-4-7", fallback: "", want: "medium"},
 		{name: "large opus 4.6 default", model: "claude-opus-4-6", fallback: "", want: "high"},
 		{name: "large opus 4.6 1m default", model: "claude-opus-4-6-1m", fallback: "", want: "high"},

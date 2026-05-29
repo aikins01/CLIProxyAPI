@@ -18842,7 +18842,7 @@ func neoAnthropicTemperature(settings map[string]any) (any, bool) {
 
 func neoAnthropicSupportsAdaptiveEffort(model string) bool {
 	switch strings.TrimSpace(model) {
-	case "claude-opus-4-6", "claude-opus-4-6-1m", "claude-opus-4-7":
+	case "claude-opus-4-6", "claude-opus-4-6-1m", "claude-opus-4-7", "claude-opus-4-8":
 		return true
 	default:
 		return false
@@ -19231,6 +19231,7 @@ var neoModelContextWindow = map[string]int{
 	"claude-opus-4-6":                  332000,
 	"claude-opus-4-6-1m":               1000000,
 	"claude-opus-4-7":                  332000,
+	"claude-opus-4-8":                  332000,
 	"claude-sonnet-4-20250514":         1000000,
 	"claude-sonnet-4-5-20250929":       1000000,
 	"claude-sonnet-4-6":                1000000,
@@ -19283,6 +19284,7 @@ var neoModelMaxOutputTokens = map[string]int{
 	"claude-opus-4-6":                  32000,
 	"claude-opus-4-6-1m":               32000,
 	"claude-opus-4-7":                  32000,
+	"claude-opus-4-8":                  32000,
 	"claude-sonnet-4-20250514":         32000,
 	"claude-sonnet-4-5-20250929":       32000,
 	"claude-sonnet-4-6":                64000,
@@ -19324,15 +19326,14 @@ const defaultNeoOpenAIMaxOutputTokens = 128000
 
 // neoLargeModeContextWindow is the extended window enabled when the user
 // runs `large` mode against an Anthropic Opus model that natively supports
-// 1M tokens (Opus 4.6, 4.7, Sonnet 4.6).
+// 1M tokens (Opus 4.6 and the 4.6-1m alias).
 const neoLargeModeContextWindow = 1000000
 
 // neoLargeModelSupportsExtendedContext reports whether the given Anthropic
-// model can be safely expanded to 1M tokens. matches Anthropic's published
-// list of 1M-native models.
+// model gets the binary's enableLargeContext expansion.
 func neoLargeModelSupportsExtendedContext(model string) bool {
 	switch model {
-	case "claude-opus-4-6", "claude-opus-4-6-1m", "claude-opus-4-7":
+	case "claude-opus-4-6", "claude-opus-4-6-1m":
 		return true
 	}
 	return false

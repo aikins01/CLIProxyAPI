@@ -252,9 +252,13 @@
   let retryNotice = $state('');
   let settingsMenuOpen = $state<'mode' | 'effort' | null>(null);
   let newActivityBelow = $state(false);
-  let transcriptScrollPlan: { kind: 'follow' } | { kind: 'preserve'; top: number } | null = null;
+  let transcriptScrollPlan:
+    | { kind: 'follow'; top: number; manualScrollVersion: number; force: boolean }
+    | { kind: 'preserve'; top: number; manualScrollVersion: number }
+    | null = null;
   let transcriptScrollScheduled = false;
   let programmaticScrollUntil = 0;
+  let manualTranscriptScrollVersion = 0;
   const devSignalCount = $derived.by(() => {
     let count = artifacts.length + executorStatuses.length + toolLeases.length;
     if (inferenceTools) count += 1;
@@ -371,20 +375,27 @@
     transcriptScrollScheduled = false;
     if (!plan) return;
     if (plan.kind === 'follow') {
+      if (!plan.force && manualTranscriptScrollVersion !== plan.manualScrollVersion && !isNearTranscriptBottom()) {
+        newActivityBelow = true;
+        return;
+      }
       scrollTranscriptToBottom();
       return;
     }
+    if (manualTranscriptScrollVersion !== plan.manualScrollVersion) return;
     restoreTranscriptScrollTop(plan.top);
   }
 
   function planTranscriptScroll(options: { forceFollow?: boolean; markNewActivity?: boolean } = {}) {
     if (typeof window === 'undefined') return;
+    const scroller = pageScroller();
+    const top = scroller?.scrollTop ?? window.scrollY;
+    const manualScrollVersion = manualTranscriptScrollVersion;
     const shouldFollow = Boolean(options.forceFollow) || isNearTranscriptBottom();
     if (shouldFollow) {
-      transcriptScrollPlan = { kind: 'follow' };
+      transcriptScrollPlan = { kind: 'follow', top, manualScrollVersion, force: Boolean(options.forceFollow) };
     } else {
-      const scroller = pageScroller();
-      transcriptScrollPlan = { kind: 'preserve', top: scroller?.scrollTop ?? window.scrollY };
+      transcriptScrollPlan = { kind: 'preserve', top, manualScrollVersion };
       if (options.markNewActivity !== false) newActivityBelow = true;
     }
     void flushTranscriptScrollPlan();
@@ -392,6 +403,7 @@
 
   function handlePageScroll() {
     if (Date.now() <= programmaticScrollUntil) return;
+    manualTranscriptScrollVersion += 1;
     if (isNearTranscriptBottom()) newActivityBelow = false;
   }
 
