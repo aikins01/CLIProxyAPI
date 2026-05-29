@@ -61,6 +61,8 @@ func TestRegisterManagementRoutes(t *testing.T) {
 		{"/api/auth/login", http.MethodGet},
 		{"/api/meta", http.MethodGet},
 		{"/api/telemetry", http.MethodGet},
+		{"/api/1.0/projects/local/project", http.MethodGet},
+		{"/api/1.0/repos", http.MethodGet},
 		{"/api/threads", http.MethodGet},
 		{"/api/thread-actors", http.MethodPost},
 		{"/threads/", http.MethodGet},

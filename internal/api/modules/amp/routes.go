@@ -214,6 +214,8 @@ func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *ha
 	ampAPI.Any("/ads", proxyHandler)
 	ampAPI.Any("/telemetry", proxyHandler)
 	ampAPI.Any("/telemetry/*path", proxyHandler)
+	ampAPI.Any("/1.0", proxyHandler)
+	ampAPI.Any("/1.0/*path", proxyHandler)
 	ampAPI.Any("/threads", proxyHandler)
 	ampAPI.Any("/threads/*path", proxyHandler)
 	ampAPI.Any("/thread-actors", proxyHandler)
