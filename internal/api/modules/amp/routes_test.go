@@ -793,6 +793,30 @@ func TestRegisterManagementRoutesPassesAmpBinaryAttachmentsUpstream(t *testing.T
 	}
 }
 
+func TestRegisterManagementRoutesDoesNotServeAmpBinaryAttachmentsLocally(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	enabled := true
+	m := &AmpModule{
+		restrictToLocalhost: false,
+		neoRuntime: newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+			NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled},
+		}}),
+	}
+	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/attachments", bytes.NewBufferString(`{"data":"aGVsbG8=","mediaType":"image/png"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Amp-Client-Application", "CLI")
+	req.Header.Set("X-Amp-Client-Type", "cli")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestRegisterManagementRoutesPassesMissingAttachmentGETUpstream(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()

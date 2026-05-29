@@ -7362,7 +7362,7 @@ func (m *AmpModule) tryServeNeoLocalAttachment(c *gin.Context) bool {
 	if !isAttachmentPath {
 		return false
 	}
-	if m.getProxy() != nil && requestHasAmpClientHeaders(c.Request) {
+	if requestHasAmpClientHeaders(c.Request) {
 		return false
 	}
 	cfg := m.neoThreadConfigSnapshot()
@@ -7617,6 +7617,9 @@ func (m *AmpModule) canServeNeoLocalManagement(r *http.Request) bool {
 		return true
 	}
 	if _, ok := neoAttachmentRequestPath(r.URL.Path); ok {
+		if requestHasAmpClientHeaders(r) {
+			return false
+		}
 		cfg := m.neoThreadConfigSnapshot()
 		return cfg != nil && neoRuntimeEnabled(cfg)
 	}
