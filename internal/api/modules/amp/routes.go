@@ -198,6 +198,9 @@ func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *ha
 		if tryServeNeoLocalThread(c, m.neoThreadConfigSnapshot()) {
 			return
 		}
+		if tryServeNeoLocalThreadReaderTool(c) {
+			return
+		}
 
 		// Swallow ErrAbortHandler panics from ReverseProxy copyResponse to avoid noisy stack traces
 		defer func() {
