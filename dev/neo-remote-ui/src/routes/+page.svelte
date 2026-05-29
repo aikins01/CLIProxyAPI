@@ -256,14 +256,13 @@
   const maxComposerImages = 8;
   const maxComposerImageBytes = 45 * 1024 * 1024;
   const maxQueuedMessages = 5;
-  const agentModeOptions = ['smart', 'large', 'rush', 'deep', 'frontier', 'nostromo', 'agg-man'];
-  const visibleAgentModeOptions = ['smart', 'large', 'rush', 'deep', 'frontier', 'nostromo'];
+  const agentModeOptions = ['smart', 'large', 'rush', 'deep', 'nostromo', 'agg-man'];
+  const visibleAgentModeOptions = ['smart', 'large', 'rush', 'deep', 'nostromo'];
   const agentModeLabels: Record<string, string> = {
     smart: 'Smart',
     large: 'Large',
     rush: 'Rush',
     deep: 'Deep',
-    frontier: 'Frontier',
     nostromo: 'Nostromo',
     'agg-man': 'Agg'
   };
@@ -1980,8 +1979,6 @@
       case 'rush':
         return 'none';
       case 'deep':
-        return 'medium';
-      case 'frontier':
         return 'medium';
       case 'nostromo':
         return 'low';

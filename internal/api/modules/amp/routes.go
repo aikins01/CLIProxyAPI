@@ -493,7 +493,6 @@ func neoLocalInternalResponse(ctx context.Context, cfg *config.Config, r *http.R
 			"features": []any{
 				gin.H{"name": "accept-abuse-data-retention", "enabled": true},
 				gin.H{"name": "thread-actors-tui", "enabled": true},
-				gin.H{"name": "thread-actors-k8s-pool", "enabled": true},
 			},
 			"name":              "Local User",
 			"team":              gin.H{"id": "local-workspace", "name": "Local Workspace"},
