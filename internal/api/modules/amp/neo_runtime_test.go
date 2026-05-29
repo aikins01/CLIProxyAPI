@@ -11977,7 +11977,7 @@ func TestTryServeNeoLocalThreadReaderToolEndpoints(t *testing.T) {
 			c, _ := gin.CreateTestContext(rec)
 			c.Request = req
 
-			handled := tryServeNeoLocalThreadReaderTool(c)
+			handled := tryServeNeoLocalThreadReaderTool(c, false)
 			if tc.assert == nil {
 				if handled {
 					t.Fatalf("expected fall-through (handled=false), got handled=true status=%d", rec.Code)

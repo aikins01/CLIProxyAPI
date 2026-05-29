@@ -438,6 +438,114 @@ func TestRegisterManagementRoutesServesExistingNeoThreadActorLocallyWithProxy(t 
 	}
 }
 
+func TestRegisterManagementRoutesPassesCloudOnlyThreadActorsUpstream(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	enabled := true
+
+	dir := t.TempDir()
+	oldStoreDir := neoAmpThreadStoreDir
+	neoAmpThreadStoreDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
+
+	threadID := "T-019e65c0-0310-77a8-b233-4b84d9c0612c"
+	threadActorRequests := 0
+	getThreadRequests := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/internal" && r.URL.RawQuery == "getThread":
+			getThreadRequests++
+			writeNeoJSON(w, http.StatusOK, map[string]any{
+				"ok": true,
+				"result": map[string]any{
+					"thread": map[string]any{
+						"id":    threadID,
+						"title": "cloud-only thread",
+						"data": map[string]any{
+							"id":    threadID,
+							"title": "cloud-only thread",
+							"messages": []any{
+								map[string]any{"messageId": "M-cloud", "role": "user", "content": []any{map[string]any{"type": "text", "text": "cloud content"}}},
+							},
+						},
+					},
+				},
+			})
+		case r.URL.Path == "/api/thread-actors/"+threadID:
+			threadActorRequests++
+			writeNeoJSON(w, http.StatusOK, map[string]any{
+				"threadId":          threadID,
+				"wsToken":           "upstream-token",
+				"ownerUserId":       "upstream-user",
+				"threadVersion":     3,
+				"usesDtw":           true,
+				"usesThreadActors":  true,
+				"executorType":      "upstream",
+				"agentMode":         "deep",
+				"cloudOnlyResponse": true,
+			})
+		default:
+			t.Fatalf("unexpected upstream request path=%s query=%s", r.URL.Path, r.URL.RawQuery)
+		}
+	}))
+	defer upstream.Close()
+
+	m := &AmpModule{
+		restrictToLocalhost: false,
+		neoRuntime: newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+			UpstreamURL:    upstream.URL,
+			UpstreamAPIKey: "secret",
+			NeoLocalRuntime: config.AmpNeoLocalRuntime{
+				Enabled: &enabled,
+			},
+		}}),
+	}
+	proxy, _ := createReverseProxy(upstream.URL, NewStaticSecretSource(""))
+	m.setProxy(proxy)
+	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, nil)
+
+	localServer := httptest.NewServer(r)
+	defer localServer.Close()
+
+	req, err := http.NewRequest(http.MethodPost, localServer.URL+"/api/thread-actors/"+threadID, bytes.NewBufferString(`{}`))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Amp-Client-Application", "CLI")
+	req.Header.Set("X-Amp-Client-Type", "cli")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do request: %v", err)
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Fatalf("close response body: %v", err)
+		}
+	}()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", resp.StatusCode, string(body))
+	}
+	if getThreadRequests != 0 {
+		t.Fatalf("cloud-only thread actor decision fetched cloud thread %d times", getThreadRequests)
+	}
+	if threadActorRequests != 1 {
+		t.Fatalf("threadActorRequests = %d, want 1", threadActorRequests)
+	}
+	var response map[string]any
+	if err := json.Unmarshal(body, &response); err != nil {
+		t.Fatalf("response JSON error: %v", err)
+	}
+	if response["cloudOnlyResponse"] != true || stringValue(response["wsToken"]) != "upstream-token" {
+		t.Fatalf("unexpected upstream thread-actor response: %#v", response)
+	}
+}
+
 func TestRegisterManagementRoutesMimicsCloudThreadActorHandshake(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
@@ -1586,7 +1694,7 @@ func TestRegisterManagementRoutesPassesAmpBinaryInternalRPCsUpstream(t *testing.
 	}
 }
 
-func TestRegisterManagementRoutesPassesAmpBinaryThreadGETsUpstream(t *testing.T) {
+func TestRegisterManagementRoutesPassesThreadGETsUpstreamWhenProxyExists(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	enabled := true
@@ -1605,9 +1713,6 @@ func TestRegisterManagementRoutesPassesAmpBinaryThreadGETsUpstream(t *testing.T)
 	upstreamRequests := 0
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		upstreamRequests++
-		if got := r.Header.Get("X-Amp-Client-Application"); got != "CLI" {
-			t.Fatalf("X-Amp-Client-Application = %q", got)
-		}
 		switch r.URL.Path {
 		case "/api/threads/find":
 			writeNeoJSON(w, http.StatusOK, map[string]any{
@@ -1639,12 +1744,15 @@ func TestRegisterManagementRoutesPassesAmpBinaryThreadGETsUpstream(t *testing.T)
 	defer localServer.Close()
 
 	tests := []struct {
-		name      string
-		path      string
-		wantTitle string
+		name       string
+		path       string
+		ampHeaders bool
+		wantTitle  string
 	}{
-		{name: "find", path: "/api/threads/find?q=local+needle&limit=5", wantTitle: "upstream search"},
-		{name: "thread", path: "/threads/" + threadID, wantTitle: "upstream thread"},
+		{name: "find web", path: "/api/threads/find?q=local+needle&limit=5", wantTitle: "upstream search"},
+		{name: "thread web", path: "/threads/" + threadID, wantTitle: "upstream thread"},
+		{name: "find amp", path: "/api/threads/find?q=local+needle&limit=5", ampHeaders: true, wantTitle: "upstream search"},
+		{name: "thread amp", path: "/threads/" + threadID, ampHeaders: true, wantTitle: "upstream thread"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1652,8 +1760,10 @@ func TestRegisterManagementRoutesPassesAmpBinaryThreadGETsUpstream(t *testing.T)
 			if err != nil {
 				t.Fatalf("new request: %v", err)
 			}
-			req.Header.Set("X-Amp-Client-Application", "CLI")
-			req.Header.Set("X-Amp-Client-Type", "cli")
+			if tc.ampHeaders {
+				req.Header.Set("X-Amp-Client-Application", "CLI")
+				req.Header.Set("X-Amp-Client-Type", "cli")
+			}
 			resp, err := http.DefaultClient.Do(req)
 			if err != nil {
 				t.Fatalf("do request: %v", err)
@@ -1688,6 +1798,83 @@ func TestRegisterManagementRoutesPassesAmpBinaryThreadGETsUpstream(t *testing.T)
 	}
 	if upstreamRequests != len(tests) {
 		t.Fatalf("upstreamRequests = %d, want %d", upstreamRequests, len(tests))
+	}
+}
+
+func TestRegisterManagementRoutesPassesThreadReaderToolsUpstreamWhenProxyExists(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	enabled := true
+
+	dir := t.TempDir()
+	oldStoreDir := neoAmpThreadStoreDir
+	neoAmpThreadStoreDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
+
+	threadID := "T-019e65c0-0310-77a8-b233-4b84d9c0612d"
+	rawThread := []byte(`{"id":"` + threadID + `","title":"local thread","messages":[{"messageId":"M-local","role":"user","content":[{"type":"text","text":"local content"}]}]}`)
+	if err := os.WriteFile(filepath.Join(dir, threadID+".json"), rawThread, 0o600); err != nil {
+		t.Fatalf("write local thread: %v", err)
+	}
+
+	upstreamRequests := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequests++
+		if r.URL.Path != "/api/threads/"+threadID+"/messages/message_stats" {
+			t.Fatalf("unexpected upstream request path=%s", r.URL.Path)
+		}
+		writeNeoJSON(w, http.StatusOK, map[string]any{"messageCount": 99, "upstream": true})
+	}))
+	defer upstream.Close()
+
+	m := &AmpModule{
+		restrictToLocalhost: false,
+		neoRuntime: newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+			UpstreamURL:    upstream.URL,
+			UpstreamAPIKey: "secret",
+			NeoLocalRuntime: config.AmpNeoLocalRuntime{
+				Enabled: &enabled,
+			},
+		}}),
+	}
+	proxy, _ := createReverseProxy(upstream.URL, NewStaticSecretSource(""))
+	m.setProxy(proxy)
+	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, nil)
+
+	localServer := httptest.NewServer(r)
+	defer localServer.Close()
+
+	req, err := http.NewRequest(http.MethodPost, localServer.URL+"/api/threads/"+threadID+"/messages/message_stats", bytes.NewBufferString(`{}`))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do request: %v", err)
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Fatalf("close response body: %v", err)
+		}
+	}()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", resp.StatusCode, string(body))
+	}
+	if upstreamRequests != 1 {
+		t.Fatalf("upstreamRequests = %d, want 1", upstreamRequests)
+	}
+	var response map[string]any
+	if err := json.Unmarshal(body, &response); err != nil {
+		t.Fatalf("response JSON error: %v", err)
+	}
+	if response["upstream"] != true || numberFrom(response["messageCount"]) != 99 {
+		t.Fatalf("unexpected upstream reader response: %#v", response)
 	}
 }
 

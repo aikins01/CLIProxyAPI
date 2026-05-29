@@ -567,10 +567,15 @@
     disconnect();
   }
 
-  function headers() {
+  function headers(options: { ampClient?: boolean } = {}) {
     const next: Record<string, string> = { 'Content-Type': 'application/json' };
     if (apiKey.trim()) {
       next.Authorization = `Bearer ${apiKey.trim()}`;
+    }
+    if (options.ampClient) {
+      next['X-Amp-Client-Application'] = 'CLI';
+      next['X-Amp-Client-Type'] = 'cli';
+      next['X-Amp-Client-Version'] = 'neo-remote-ui';
     }
     return next;
   }
@@ -589,7 +594,7 @@
   async function rpc(method: string, params: Record<string, unknown>) {
     const response = await fetch(`/api/internal?${encodeURIComponent(method)}`, {
       method: 'POST',
-      headers: headers(),
+      headers: headers({ ampClient: true }),
       body: JSON.stringify({ method, params })
     });
     if (!response.ok) {
@@ -612,7 +617,7 @@
     }
     try {
       const response = await fetch(`/api/threads/${encodeURIComponent(threadId)}/usage`, {
-        headers: headers()
+        headers: headers({ ampClient: true })
       });
       if (!response.ok) return;
       applyThreadUsageInfo(threadId, await response.json());

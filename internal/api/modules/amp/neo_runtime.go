@@ -8189,7 +8189,7 @@ func tryServeNeoLocalThread(c *gin.Context, cfg *config.Config, hasUpstreamProxy
 	if c == nil || c.Request == nil || c.Request.Method != http.MethodGet {
 		return false
 	}
-	if hasUpstreamProxy && requestHasAmpClientHeaders(c.Request) {
+	if hasUpstreamProxy {
 		return false
 	}
 	if neoThreadSearchPath(c.Request.URL.Path) {
@@ -8228,8 +8228,11 @@ var neoThreadReaderMessagePathPattern = regexp.MustCompile(`^(?:/api)?/threads/(
 // is not cached locally the handler returns false so the request can fall through
 // to the upstream proxy; the amp cloud then serves the same shape for cloud-only
 // threads.
-func tryServeNeoLocalThreadReaderTool(c *gin.Context) bool {
+func tryServeNeoLocalThreadReaderTool(c *gin.Context, hasUpstreamProxy bool) bool {
 	if c == nil || c.Request == nil || c.Request.URL == nil || c.Request.Method != http.MethodPost {
+		return false
+	}
+	if hasUpstreamProxy {
 		return false
 	}
 	match := neoThreadReaderMessagePathPattern.FindStringSubmatch(c.Request.URL.Path)
@@ -8241,7 +8244,6 @@ func tryServeNeoLocalThreadReaderTool(c *gin.Context) bool {
 	if !ok {
 		return false
 	}
-
 	args := map[string]any{}
 	if c.Request.Body != nil {
 		body, err := io.ReadAll(c.Request.Body)
@@ -8273,6 +8275,9 @@ func tryServeNeoLocalThreadReaderTool(c *gin.Context) bool {
 
 func (m *AmpModule) tryServeNeoLocalThreadUsage(c *gin.Context) bool {
 	if m == nil || c == nil || c.Request == nil || c.Request.URL == nil {
+		return false
+	}
+	if m.getProxy() != nil {
 		return false
 	}
 	threadID, ok := neoThreadUsagePath(c.Request.URL.Path)
@@ -8941,7 +8946,7 @@ func (m *AmpModule) tryServeNeoLocalThreadActor(c *gin.Context) bool {
 	if !ok || m.neoRuntime == nil {
 		return false
 	}
-	if m.getProxy() != nil && !m.shouldServeNeoLocalThreadActor(c.Request.Context(), threadID) {
+	if m.getProxy() != nil && !m.shouldServeNeoLocalThreadActor(threadID) {
 		return false
 	}
 	if c.Request.Method != http.MethodPost {
@@ -8955,7 +8960,7 @@ func (m *AmpModule) tryServeNeoLocalThreadActor(c *gin.Context) bool {
 	return true
 }
 
-func (m *AmpModule) shouldServeNeoLocalThreadActor(ctx context.Context, threadID string) bool {
+func (m *AmpModule) shouldServeNeoLocalThreadActor(threadID string) bool {
 	cfg := m.neoThreadConfigSnapshot()
 	if cfg == nil || !neoRuntimeEnabled(cfg) {
 		return false
@@ -8966,8 +8971,8 @@ func (m *AmpModule) shouldServeNeoLocalThreadActor(ctx context.Context, threadID
 	if strings.TrimSpace(threadID) == "" {
 		return false
 	}
-	thread, ok := loadNeoThread(ctx, cfg, threadID)
-	return ok && neoThreadHasUsefulContent(thread)
+	thread, ok := loadNeoLocalThread(threadID)
+	return ok && neoThreadLocalBridgeEligible(thread)
 }
 
 func neoThreadActorManagementPath(path string) (string, bool) {
@@ -9236,7 +9241,8 @@ func loadNeoThread(ctx context.Context, cfg *config.Config, threadID string) (ma
 			normalizeNeoThreadAgentMode(cloud)
 			normalizeNeoThreadCurrentInference(cloud)
 			if preferNeoIncomingThread(local, cloud) {
-				cacheNeoLocalThread(cloud)
+				cacheThread := markNeoCloudCachedThread(cloneNeoJSONMap(cloud))
+				cacheNeoLocalThread(cacheThread)
 				return cloud, true
 			}
 		}
@@ -9359,6 +9365,36 @@ func cacheNeoLocalThread(thread map[string]any) {
 	} else {
 		neoInvalidateLocalThreadCache(threadID)
 	}
+}
+
+func markNeoCloudCachedThread(thread map[string]any) map[string]any {
+	if len(thread) == 0 {
+		return thread
+	}
+	meta := cloneMap(mapValue(thread["meta"]))
+	meta["cliProxyAPICloudCache"] = true
+	thread["meta"] = meta
+	if data := mapValue(thread["data"]); len(data) > 0 {
+		thread["data"] = markNeoCloudCachedThread(data)
+	}
+	return thread
+}
+
+func neoThreadIsCloudCached(thread map[string]any) bool {
+	if len(thread) == 0 {
+		return false
+	}
+	if boolValue(mapValue(thread["meta"])["cliProxyAPICloudCache"]) {
+		return true
+	}
+	if data := mapValue(thread["data"]); len(data) > 0 {
+		return neoThreadIsCloudCached(data)
+	}
+	return false
+}
+
+func neoThreadLocalBridgeEligible(thread map[string]any) bool {
+	return neoThreadHasUsefulContent(thread) && !neoThreadIsCloudCached(thread)
 }
 
 // neoInvalidateLocalThreadCache drops any cached parse for the thread, forcing the
