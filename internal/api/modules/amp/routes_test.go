@@ -1537,6 +1537,63 @@ func TestRegisterManagementRoutesDoesNotServeAmpOwnedInternalMethodsLocally(t *t
 	}
 }
 
+func TestRegisterManagementRoutesDoesNotServeThreadDiscoveryLocallyWithoutProxy(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	enabled := true
+
+	dir := t.TempDir()
+	oldStoreDir := neoAmpThreadStoreDir
+	neoAmpThreadStoreDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
+
+	threadID := "T-019e65c0-0310-77a8-b233-4b84d9c0612e"
+	rawThread := []byte(`{"id":"` + threadID + `","title":"local-only thread","messages":[{"messageId":"M-local","role":"user","content":[{"type":"text","text":"local needle"}]}]}`)
+	if err := os.WriteFile(filepath.Join(dir, threadID+".json"), rawThread, 0o600); err != nil {
+		t.Fatalf("write local thread: %v", err)
+	}
+
+	m := &AmpModule{
+		restrictToLocalhost: false,
+		neoRuntime: newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+			UpstreamURL:    "https://ampcode.test",
+			UpstreamAPIKey: "secret",
+			NeoLocalRuntime: config.AmpNeoLocalRuntime{
+				Enabled: &enabled,
+			},
+		}}),
+	}
+	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, nil)
+
+	tests := []struct {
+		name   string
+		method string
+		path   string
+		body   string
+	}{
+		{name: "internal list threads", method: http.MethodPost, path: "/api/internal?listThreads", body: `{"method":"listThreads","params":{"limit":20}}`},
+		{name: "internal get thread", method: http.MethodPost, path: "/api/internal?getThread", body: `{"method":"getThread","params":{"thread":"` + threadID + `"}}`},
+		{name: "thread search", method: http.MethodGet, path: "/api/threads/find?q=local+needle&limit=5"},
+		{name: "thread read", method: http.MethodGet, path: "/threads/" + threadID},
+		{name: "thread reader stats", method: http.MethodPost, path: "/api/threads/" + threadID + "/messages/message_stats", body: `{}`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, bytes.NewBufferString(tc.body))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			r.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+			}
+			if strings.Contains(rec.Body.String(), "local needle") || strings.Contains(rec.Body.String(), "local-only thread") {
+				t.Fatalf("response leaked local thread data: %s", rec.Body.String())
+			}
+		})
+	}
+}
+
 func TestRegisterManagementRoutesGetThreadLinkInfoProxiesWhenProxyExists(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
