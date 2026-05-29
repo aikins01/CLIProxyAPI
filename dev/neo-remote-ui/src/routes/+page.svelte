@@ -131,7 +131,7 @@
     contextUsage?: { used: number; total: number };
     cost?: { amount: number; free?: number; paid?: number; included?: boolean; url?: string };
     costBreakdownURL?: string;
-    handoffFrom?: { threadId: string; instructions?: string };
+    referencedThread?: { threadId: string; instructions?: string };
     compactionRecords?: Record<string, unknown>[];
   };
 
@@ -413,10 +413,10 @@
   function jumpToLatest() {
     scrollTranscriptToBottom('smooth');
   }
-  // Handoff marker derived from current messages (messages stream in after initial detail load).
+  // Thread-reference marker derived from current messages (messages stream in after initial detail load).
   // Use the thread title as the displayed "Instructions:" sentence, matching ampcode.
-  const handoffFrom = $derived.by(() => {
-    const base = handoffFromMessages(activeMessages);
+  const referencedThread = $derived.by(() => {
+    const base = referencedThreadFromMessages(activeMessages) ?? detail?.referencedThread;
     if (!base) return undefined;
     return { threadId: base.threadId, instructions: detail?.title ?? base.instructions };
   });
@@ -2339,7 +2339,7 @@
       contextUsage: contextUsageFrom(thread) ?? contextUsageFromMessages(messages),
       cost: costFrom(thread),
       costBreakdownURL: costBreakdownURLFrom(thread),
-      handoffFrom: handoffFromMessages(messages),
+      referencedThread: referencedThreadFromMessages(messages),
       compactionRecords: records,
     };
   }
@@ -2461,13 +2461,13 @@
   }
 
   // Strip the "Continuing work from thread T-..." sentence so the user message bubble
-  // doesn't repeat the same info that's already shown in the handoff card above.
-  function stripHandoffPrefix(text: string): string {
+  // doesn't repeat the same info that's already shown in the reference card above.
+  function stripReferencePrefix(text: string): string {
     return text.replace(/^Continuing work from thread\s+T-[a-f0-9-]+\.?\s*/i, '').trim();
   }
 
-  // Detect "Continuing work from thread T-..." marker in the first user message
-  function handoffFromMessages(messages: NeoMessage[]): { threadId: string; instructions?: string } | undefined {
+  // Detect "Continuing work from thread T-..." marker in the first user message.
+  function referencedThreadFromMessages(messages: NeoMessage[]): { threadId: string; instructions?: string } | undefined {
     const first = messages.find((m) => m.role === 'user');
     if (!first) return undefined;
     const text = userTextFromBlocks(first.content);
@@ -2475,7 +2475,7 @@
     if (!m) return undefined;
     const threadId = m[1];
     const rest = m[2].trim();
-    // Pull "Instructions:" sentence if present; otherwise take first ~120 chars
+    // Pull "Instructions:" sentence if present; otherwise take the first short line.
     const instr = rest.match(/Instructions?:?\s*["']?(.+?)["']?(?:\n|$)/i);
     const instructions = instr ? instr[1] : rest.split('\n')[0]?.slice(0, 140);
     return { threadId, instructions };
@@ -3677,7 +3677,7 @@
     if (cat === 'web') return 'Searched the web';
     if (cat === 'thread') return 'Read thread';
     if (cat === 'skill') return 'Used skill';
-    // Everything else (handoff, subagent, task, custom tools) renders as
+    // Everything else (legacy relationship tools, subagent, task, custom tools) renders as
     // "Ran tool <name>" — matches ampcode exactly: "Ran tool" + muted tool name.
     return 'Ran tool';
   }
@@ -3907,7 +3907,7 @@
 </svelte:head>
 
 {#snippet userBubble(blocks: ContentBlock[])}
-  {@const text = userTextFromBlocks(blocks)}
+  {@const text = stripReferencePrefix(userTextFromBlocks(blocks))}
   {@const images = imageBlocksFrom(blocks)}
   <div class:message__bubble--media={images.length > 0 && !text.trim()} class="message__bubble">{#if text.trim()}<div class="message__bubble-text">{text}</div>{/if}{#if images.length > 0}<div class="message-images" aria-label="Attached images">{#each images as block, i (`${imageBlockName(block)}-${i}`)}<figure class="message-image"><img src={imageBlockSrc(block)} alt={imageBlockName(block)} /></figure>{/each}</div>{/if}</div>
 {/snippet}
@@ -4570,18 +4570,18 @@
           {#if loadingThread}
             <div class="loading-row"><Loader2 size={18} class="spin" /> Loading thread</div>
           {/if}
-          {#if handoffFrom}
+          {#if referencedThread}
             <button
-              class="handoff-card"
+              class="reference-card"
               type="button"
-              onclick={() => { void selectThread(handoffFrom.threadId); }}
+              onclick={() => { void selectThread(referencedThread.threadId); }}
               title="Open source thread"
             >
               <ArrowLeft size={14} />
-              <div class="handoff-card__body">
-                <div class="handoff-card__head">Handed off from <span class="handoff-card__id">{handoffFrom.threadId}</span></div>
-                {#if handoffFrom.instructions}
-                  <div class="handoff-card__instr">Instructions: "{handoffFrom.instructions}"</div>
+              <div class="reference-card__body">
+                <div class="reference-card__head">Referenced thread <span class="reference-card__id">{referencedThread.threadId}</span></div>
+                {#if referencedThread.instructions}
+                  <div class="reference-card__instr">Instructions: "{referencedThread.instructions}"</div>
                 {/if}
               </div>
             </button>
@@ -7254,8 +7254,7 @@
   :global(.diff-del) { color: var(--neo-danger); }
   :global(.diff-mod) { color: #d4a045; }
 
-  /* === HANDOFF CARD (above transcript when thread continues from another) === */
-  .handoff-card {
+  .reference-card {
     display: flex;
     align-items: flex-start;
     gap: 8px;
@@ -7272,18 +7271,18 @@
     font-family: inherit;
     text-align: left;
   }
-  .handoff-card:hover { background: var(--neo-card-hover); }
-  .handoff-card > :global(svg) { color: var(--neo-muted); flex-shrink: 0; margin-top: 2px; }
-  .handoff-card__body { min-width: 0; flex: 1; }
-  .handoff-card__head { color: var(--neo-ink); font-size: 12px; opacity: 0.7; }
-  .handoff-card__id {
+  .reference-card:hover { background: var(--neo-card-hover); }
+  .reference-card > :global(svg) { color: var(--neo-muted); flex-shrink: 0; margin-top: 2px; }
+  .reference-card__body { min-width: 0; flex: 1; }
+  .reference-card__head { color: var(--neo-ink); font-size: 12px; opacity: 0.7; }
+  .reference-card__id {
     font-family: var(--neo-mono);
     font-weight: 600;
     color: var(--neo-ink);
     opacity: 1;
     word-break: break-all;
   }
-  .handoff-card__instr {
+  .reference-card__instr {
     margin-top: 2px;
     font-size: 12px;
     color: var(--neo-muted);

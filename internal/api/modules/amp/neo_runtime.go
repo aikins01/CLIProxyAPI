@@ -8198,7 +8198,7 @@ func neoProtocolThreadRelationship(threadID, relationshipType, role string, crea
 	switch relationshipType {
 	case "fork", "handoff", "mention":
 	default:
-		relationshipType = "handoff"
+		relationshipType = "mention"
 	}
 	switch role {
 	case "parent", "child":
@@ -10868,8 +10868,9 @@ func (a *neoActor) archiveThread(archive bool, _ map[string]any) {
 }
 
 // handleCreateThread acknowledges a request to create a sibling/child thread.
-// we synthesize a fresh actor for the requested thread id and broadcast a
-// thread_relationships update so the UI knows it was created.
+// The current binary removed handoff and deprecated fork commands in favor of
+// thread mentions, so newly created local relationships use mention while
+// legacy imports can still preserve their original relationship type.
 func (a *neoActor) handleCreateThread(msg map[string]any) {
 	threadID := firstNonEmptyString(msg["threadId"], msg["threadID"], msg["thread_id"])
 	if threadID == "" {
@@ -10882,7 +10883,7 @@ func (a *neoActor) handleCreateThread(msg map[string]any) {
 	if a.runtime != nil && a.runtime.store != nil {
 		_ = a.runtime.store.ensureThreadActor(threadID)
 	}
-	relationshipType := firstNonEmptyString(msg["type"], msg["kind"], "handoff")
+	relationshipType := neoActiveThreadRelationshipType(msg)
 	relationship, ok := neoProtocolThreadRelationship(threadID, relationshipType, "child", time.Now().UnixMilli(), stringValue(msg["comment"]))
 	if !ok {
 		return
@@ -10895,6 +10896,18 @@ func (a *neoActor) handleCreateThread(msg map[string]any) {
 	a.broadcast(payload)
 	a.dispatchNotification("thread", "thread_created", map[string]any{"threadId": threadID, "kind": relationship["type"]})
 	a.syncCloudAsync()
+}
+
+func neoActiveThreadRelationshipType(msg map[string]any) string {
+	kind := firstNonEmptyString(msg["kind"], msg["relationshipType"], msg["relationship_type"], msg["type"])
+	switch kind {
+	case "fork":
+		return "fork"
+	case "mention", "client_create_thread", "create_thread", "":
+		return "mention"
+	default:
+		return "mention"
+	}
 }
 
 // handleForkThread accepts a `fork` request and emits a relationships update
@@ -10950,7 +10963,7 @@ func (a *neoActor) handleSendMessageToThread(msg map[string]any) {
 		"sourceThreadId":   a.threadID,
 	}
 	go target.handle(payload)
-	if relationship, ok := neoProtocolThreadRelationship(targetID, "handoff", "child", time.Now().UnixMilli(), stringValue(msg["comment"])); ok {
+	if relationship, ok := neoProtocolThreadRelationship(targetID, "mention", "child", time.Now().UnixMilli(), stringValue(msg["comment"])); ok {
 		relationshipPayload := map[string]any{"type": "thread_relationships", "relationships": []any{relationship}}
 		relationshipPayload["seq"] = a.recordRelationshipEvent(relationshipPayload)
 		a.broadcast(relationshipPayload)

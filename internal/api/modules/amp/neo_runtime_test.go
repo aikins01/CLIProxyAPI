@@ -1258,11 +1258,19 @@ func TestNeoActorThreadRelationshipEventsUseOfficialSchema(t *testing.T) {
 		t.Fatalf("created relationship payload = %#v", created)
 	}
 	relationship := mapValue(arrayValue(created["relationships"])[0])
-	if stringValue(relationship["threadID"]) != threadID || stringValue(relationship["type"]) != "handoff" || stringValue(relationship["role"]) != "child" || numberFrom(relationship["createdAt"]) == 0 {
+	if stringValue(relationship["threadID"]) != threadID || stringValue(relationship["type"]) != "mention" || stringValue(relationship["role"]) != "child" || numberFrom(relationship["createdAt"]) == 0 {
 		t.Fatalf("created relationship = %#v", relationship)
 	}
 	if _, exists := relationship["sourceThreadId"]; exists {
 		t.Fatalf("relationship should not include legacy sourceThreadId: %#v", relationship)
+	}
+	unknownRelationship, ok := neoProtocolThreadRelationship(threadID, "client_create_thread", "child", 123, "")
+	if !ok || stringValue(unknownRelationship["type"]) != "mention" {
+		t.Fatalf("unknown relationship should default to mention: %#v ok=%v", unknownRelationship, ok)
+	}
+	legacyRelationship, ok := neoProtocolThreadRelationship(threadID, "handoff", "child", 123, "")
+	if !ok || stringValue(legacyRelationship["type"]) != "handoff" {
+		t.Fatalf("explicit legacy relationship should be preserved: %#v ok=%v", legacyRelationship, ok)
 	}
 
 	forkID := "T-019e1046-656d-7132-879f-390ded941c17"
@@ -8946,12 +8954,14 @@ func TestNeoSendMessageToThreadWorkflowPromptsMatchBinary(t *testing.T) {
 func TestNeoActorSendMessageToThreadWorkflowQueuesCanonicalPrompt(t *testing.T) {
 	useTempNeoThreadStore(t)
 	rt := newNeoRuntime(&config.Config{})
-	source := rt.store.ensureThreadActor("T-source-thread")
-	target := rt.store.ensureThreadActor("T-target-thread")
+	sourceID := "T-019e1046-656d-7132-879f-390ded941c18"
+	targetID := "T-019e1046-656d-7132-879f-390ded941c19"
+	source := rt.store.ensureThreadActor(sourceID)
+	target := rt.store.ensureThreadActor(targetID)
 
 	source.handle(map[string]any{
 		"type":           "send_message_to_thread",
-		"targetThreadId": "T-target-thread",
+		"targetThreadId": targetID,
 		"workflow":       "code_review",
 	})
 
@@ -8964,12 +8974,26 @@ func TestNeoActorSendMessageToThreadWorkflowQueuesCanonicalPrompt(t *testing.T) 
 			if got != "Review the changes with the code review tool." {
 				t.Fatalf("queued workflow message = %q", got)
 			}
-			return
+			break
 		}
 		target.mu.Unlock()
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatal("timed out waiting for workflow message to queue on target thread")
+	target.mu.Lock()
+	queueLen := len(target.queue)
+	target.mu.Unlock()
+	if queueLen == 0 {
+		t.Fatal("timed out waiting for workflow message to queue on target thread")
+	}
+	source.mu.Lock()
+	defer source.mu.Unlock()
+	if len(source.relationships) != 1 {
+		t.Fatalf("source relationships = %#v", source.relationships)
+	}
+	relationship := source.relationships[0]
+	if stringValue(relationship["threadID"]) != targetID || stringValue(relationship["type"]) != "mention" || stringValue(relationship["role"]) != "child" {
+		t.Fatalf("source relationship = %#v", relationship)
+	}
 }
 
 func TestNeoActorHandlesBinaryToolDeltas(t *testing.T) {
