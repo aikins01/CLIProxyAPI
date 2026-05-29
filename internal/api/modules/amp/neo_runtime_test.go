@@ -11435,108 +11435,6 @@ func TestNeoActorHandlesExecutorDisconnected(t *testing.T) {
 	}
 }
 
-func TestNeoCloudGetThreadDecodesCloudData(t *testing.T) {
-	threadID := "T-019e06a8-13c9-708d-8090-783005818ea7"
-	var gotAuth string
-	requests := 0
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requests++
-		if r.URL.Path != "/api/internal" || r.URL.RawQuery != "getThread" {
-			t.Fatalf("request path = %s?%s", r.URL.Path, r.URL.RawQuery)
-		}
-		gotAuth = r.Header.Get("Authorization")
-		writeNeoJSON(w, http.StatusOK, map[string]any{
-			"ok": true,
-			"result": map[string]any{
-				"thread": map[string]any{
-					"id": threadID,
-					"data": map[string]any{
-						"id":       threadID,
-						"title":    "Cloud thread",
-						"messages": []any{},
-					},
-				},
-			},
-		})
-	}))
-	defer upstream.Close()
-
-	thread, ok, err := getNeoCloudThread(context.Background(), &config.Config{
-		AmpCode: config.AmpCode{UpstreamURL: upstream.URL, UpstreamAPIKey: "secret"},
-	}, threadID)
-	if err != nil {
-		t.Fatalf("getNeoCloudThread error: %v", err)
-	}
-	if !ok || thread["id"] != threadID || thread["title"] != "Cloud thread" {
-		t.Fatalf("thread = %#v ok=%v", thread, ok)
-	}
-	if thread["agentMode"] != "smart" {
-		t.Fatalf("agentMode = %#v, want smart fallback", thread["agentMode"])
-	}
-	if gotAuth != "Bearer secret" {
-		t.Fatalf("Authorization = %q", gotAuth)
-	}
-
-	if _, ok, err := getNeoCloudThread(context.Background(), &config.Config{
-		AmpCode: config.AmpCode{UpstreamURL: upstream.URL, UpstreamAPIKey: "secret"},
-	}, "T-test"); err != nil || ok {
-		t.Fatalf("invalid cloud thread id returned ok=%v err=%v", ok, err)
-	}
-	if requests != 1 {
-		t.Fatalf("invalid cloud thread id should not be requested; requests=%d", requests)
-	}
-}
-
-func TestNeoCloudGetThreadPreservesEnvelopeAgentModeForBinaryResume(t *testing.T) {
-	threadID := "T-019e65c0-0310-77a8-b233-4b84d9c0612b"
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		writeNeoJSON(w, http.StatusOK, map[string]any{
-			"ok": true,
-			"result": map[string]any{
-				"thread": map[string]any{
-					"id":        threadID,
-					"v":         float64(17),
-					"agentMode": "deep",
-					"meta": map[string]any{
-						"usesThreadActors": true,
-					},
-					"data": map[string]any{
-						"id":    threadID,
-						"title": "deep thread from envelope",
-						"messages": []any{
-							map[string]any{
-								"role":      "user",
-								"messageId": "M-user",
-								"content":   []any{map[string]any{"type": "text", "text": "resume"}},
-							},
-						},
-					},
-				},
-			},
-		})
-	}))
-	defer upstream.Close()
-
-	thread, ok, err := getNeoCloudThread(context.Background(), &config.Config{
-		AmpCode: config.AmpCode{UpstreamURL: upstream.URL, UpstreamAPIKey: "secret"},
-	}, threadID)
-	if err != nil {
-		t.Fatalf("getNeoCloudThread error: %v", err)
-	}
-	if !ok {
-		t.Fatal("getNeoCloudThread returned not ok")
-	}
-	if got := stringValue(thread["agentMode"]); got != "deep" {
-		t.Fatalf("agentMode = %q, want envelope deep for binary resume", got)
-	}
-	if got := numberFrom(thread["v"]); got != 17 {
-		t.Fatalf("v = %#v, want 17", thread["v"])
-	}
-	if mapValue(thread["meta"])["usesThreadActors"] != true {
-		t.Fatalf("meta = %#v, want envelope meta preserved", thread["meta"])
-	}
-}
-
 func TestNeoRuntimeDoesNotServeThreadReadSearchHTTP(t *testing.T) {
 	dir := t.TempDir()
 	oldStoreDir := neoAmpThreadStoreDir
@@ -11569,90 +11467,40 @@ func TestNeoRuntimeDoesNotServeThreadReadSearchHTTP(t *testing.T) {
 	}
 }
 
-func TestNeoRuntimePrefersRicherCloudThreadOverPartialLocalCache(t *testing.T) {
+func TestNeoRuntimeThreadActorBootstrapDoesNotFetchCloudThread(t *testing.T) {
 	dir := t.TempDir()
 	oldStoreDir := neoAmpThreadStoreDir
 	neoAmpThreadStoreDir = func() string { return dir }
 	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
 
 	threadID := "T-019e65c0-0310-77a8-b233-4b84d9c0612b"
-	localThread := map[string]any{
-		"id":        threadID,
-		"title":     `{"error":{"message":"Subagent error"}}`,
-		"agentMode": "smart",
-		"created":   float64(1779845494198),
-		"messages": []any{
-			map[string]any{
-				"role":      "user",
-				"messageId": "M-QmRj9rOwcTrWpvrwxlRUXn",
-				"content":   []any{map[string]any{"type": "tool_result", "toolUseID": "TU-child"}},
-			},
-		},
-	}
-	rawLocal, err := json.Marshal(localThread)
-	if err != nil {
-		t.Fatalf("marshal local thread: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, threadID+".json"), rawLocal, 0o600); err != nil {
-		t.Fatalf("write local thread: %v", err)
-	}
-
+	upstreamRequests := 0
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/internal" || r.URL.RawQuery != "getThread" {
-			t.Fatalf("request path = %s?%s", r.URL.Path, r.URL.RawQuery)
-		}
-		writeNeoJSON(w, http.StatusOK, map[string]any{
-			"ok": true,
-			"result": map[string]any{
-				"thread": map[string]any{
-					"id":    threadID,
-					"title": "H.264 video pipeline running",
-					"data": map[string]any{
-						"id":        threadID,
-						"title":     "H.264 video pipeline running",
-						"agentMode": "deep",
-						"created":   float64(1779823543056),
-						"updatedAt": "2026-05-26T19:25:43.056Z",
-						"messages": []any{
-							map[string]any{"role": "user", "messageId": "M-033NgBzGTLq4IzvZrbDTGC", "agentMode": "deep", "reasoningEffort": "xhigh", "content": []any{map[string]any{"type": "text", "text": "doesn't fill stage like macos"}}},
-							map[string]any{"role": "assistant", "messageId": "M-assistant", "content": []any{map[string]any{"type": "text", "text": "fixed"}}},
-						},
-					},
-				},
-			},
-		})
+		upstreamRequests++
+		writeNeoJSON(w, http.StatusOK, map[string]any{"unexpected": true})
 	}))
 	defer upstream.Close()
 
-	thread, ok := loadNeoThread(context.Background(), &config.Config{
+	rt := newNeoRuntime(&config.Config{
 		AmpCode: config.AmpCode{UpstreamURL: upstream.URL, UpstreamAPIKey: "secret"},
-	}, threadID)
-	if !ok {
-		t.Fatal("loadNeoThread returned not ok")
-	}
-	if got := stringValue(thread["agentMode"]); got != "deep" {
-		t.Fatalf("agentMode = %q, want deep from cloud", got)
-	}
-	if got := len(arrayValue(thread["messages"])); got != 2 {
-		t.Fatalf("messages = %d, want richer cloud messages", got)
-	}
-	if got := stringValue(thread["title"]); got != "H.264 video pipeline running" {
-		t.Fatalf("title = %q", got)
+	})
+	response, status := rt.localThreadActorManagementResponse(context.Background(), map[string]any{"threadId": threadID}, "")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d response=%#v", status, response)
 	}
 
-	cached, ok := loadNeoLocalThread(threadID)
-	if !ok {
-		t.Fatal("expected cloud thread to replace partial local cache")
+	actor := rt.store.ensureThreadActor(threadID)
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.messages) != 0 {
+		t.Fatalf("actor imported cloud messages locally: %#v", actor.messages)
 	}
-	if got := stringValue(cached["agentMode"]); got != "deep" {
-		t.Fatalf("cached agentMode = %q, want deep", got)
-	}
-	if got := len(arrayValue(cached["messages"])); got != 2 {
-		t.Fatalf("cached messages = %d, want 2", got)
+	if upstreamRequests != 0 {
+		t.Fatalf("runtime fetched upstream thread %d time(s)", upstreamRequests)
 	}
 }
 
-func TestNeoRuntimeChecksCloudBeforeUsingUsefulLocalCloudCache(t *testing.T) {
+func TestNeoRuntimeIgnoresCloudCachedLocalThreadOnBootstrap(t *testing.T) {
 	dir := t.TempDir()
 	oldStoreDir := neoAmpThreadStoreDir
 	neoAmpThreadStoreDir = func() string { return dir }
@@ -11661,15 +11509,11 @@ func TestNeoRuntimeChecksCloudBeforeUsingUsefulLocalCloudCache(t *testing.T) {
 	threadID := "T-019e65c0-0310-77a8-b233-4b84d9c0612b"
 	localThread := map[string]any{
 		"id":        threadID,
-		"title":     "stale local thread",
-		"agentMode": "smart",
-		"updatedAt": "2026-05-25T10:00:00Z",
+		"title":     "stale cloud cache",
+		"agentMode": "deep",
+		"meta":      map[string]any{"cliProxyAPICloudCache": true},
 		"messages": []any{
-			map[string]any{
-				"role":      "user",
-				"messageId": "M-local-user",
-				"content":   []any{map[string]any{"type": "text", "text": "stale local message"}},
-			},
+			map[string]any{"role": "user", "messageId": "M-local", "content": []any{map[string]any{"type": "text", "text": "stale local message"}}},
 		},
 	}
 	rawLocal, err := json.Marshal(localThread)
@@ -11680,116 +11524,8 @@ func TestNeoRuntimeChecksCloudBeforeUsingUsefulLocalCloudCache(t *testing.T) {
 		t.Fatalf("write local thread: %v", err)
 	}
 
-	requests := 0
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requests++
-		if r.URL.Path != "/api/internal" || r.URL.RawQuery != "getThread" {
-			t.Fatalf("request path = %s?%s", r.URL.Path, r.URL.RawQuery)
-		}
-		writeNeoJSON(w, http.StatusOK, map[string]any{
-			"ok": true,
-			"result": map[string]any{
-				"thread": map[string]any{
-					"id": threadID,
-					"data": map[string]any{
-						"id":        threadID,
-						"title":     "fresh cloud thread",
-						"agentMode": "deep",
-						"updatedAt": "2026-05-26T10:00:00Z",
-						"messages": []any{
-							map[string]any{"role": "user", "messageId": "M-cloud-user", "content": []any{map[string]any{"type": "text", "text": "fresh cloud message"}}},
-						},
-					},
-				},
-			},
-		})
-	}))
-	defer upstream.Close()
-
-	thread, ok := loadNeoThread(context.Background(), &config.Config{
-		AmpCode: config.AmpCode{UpstreamURL: upstream.URL, UpstreamAPIKey: "secret"},
-	}, threadID)
-	if !ok {
-		t.Fatal("loadNeoThread returned not ok")
-	}
-	if requests != 1 {
-		t.Fatalf("cloud getThread requests = %d, want 1", requests)
-	}
-	if got := stringValue(thread["title"]); got != "fresh cloud thread" {
-		t.Fatalf("title = %q, want fresh cloud thread", got)
-	}
-	if got := stringValue(thread["agentMode"]); got != "deep" {
-		t.Fatalf("agentMode = %q, want deep", got)
-	}
-}
-
-func TestNeoRuntimeUsesSuccessfulCloudThreadEvenWhenLocalCacheHasMoreMessages(t *testing.T) {
-	dir := t.TempDir()
-	oldStoreDir := neoAmpThreadStoreDir
-	neoAmpThreadStoreDir = func() string { return dir }
-	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
-
-	threadID := "T-019e65c0-0310-77a8-b233-4b84d9c0612b"
-	localThread := map[string]any{
-		"id":        threadID,
-		"title":     "local cache with extra messages",
-		"agentMode": "smart",
-		"updatedAt": "2026-05-27T10:00:00Z",
-		"messages": []any{
-			map[string]any{"role": "user", "messageId": "M-local-1", "content": []any{map[string]any{"type": "text", "text": "local one"}}},
-			map[string]any{"role": "assistant", "messageId": "M-local-2", "content": []any{map[string]any{"type": "text", "text": "local two"}}},
-		},
-	}
-	rawLocal, err := json.Marshal(localThread)
-	if err != nil {
-		t.Fatalf("marshal local thread: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, threadID+".json"), rawLocal, 0o600); err != nil {
-		t.Fatalf("write local thread: %v", err)
-	}
-
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/internal" || r.URL.RawQuery != "getThread" {
-			t.Fatalf("request path = %s?%s", r.URL.Path, r.URL.RawQuery)
-		}
-		writeNeoJSON(w, http.StatusOK, map[string]any{
-			"ok": true,
-			"result": map[string]any{
-				"thread": map[string]any{
-					"id": threadID,
-					"data": map[string]any{
-						"id":        threadID,
-						"title":     "authoritative cloud thread",
-						"agentMode": "deep",
-						"updatedAt": "2026-05-26T10:00:00Z",
-						"messages": []any{
-							map[string]any{"role": "user", "messageId": "M-cloud-1", "content": []any{map[string]any{"type": "text", "text": "cloud one"}}},
-						},
-					},
-				},
-			},
-		})
-	}))
-	defer upstream.Close()
-
-	thread, ok := loadNeoThread(context.Background(), &config.Config{
-		AmpCode: config.AmpCode{UpstreamURL: upstream.URL, UpstreamAPIKey: "secret"},
-	}, threadID)
-	if !ok {
-		t.Fatal("loadNeoThread returned not ok")
-	}
-	if got := stringValue(thread["title"]); got != "authoritative cloud thread" {
-		t.Fatalf("title = %q, want authoritative cloud thread", got)
-	}
-	if got := len(arrayValue(thread["messages"])); got != 1 {
-		t.Fatalf("message count = %d, want cloud count 1", got)
-	}
-	cached, ok := loadNeoLocalThread(threadID)
-	if !ok {
-		t.Fatal("expected cloud thread to replace local cache")
-	}
-	if got := stringValue(cached["title"]); got != "authoritative cloud thread" {
-		t.Fatalf("cached title = %q, want authoritative cloud thread", got)
+	if thread, ok := loadNeoThread(threadID); ok {
+		t.Fatalf("loadNeoThread returned cloud cache: %#v", thread)
 	}
 }
 
@@ -12002,6 +11738,28 @@ func TestNeoRuntimeThreadImportHTTP(t *testing.T) {
 	}
 	if got := stringValue(mapValue(actor.artifacts["artifact-1"])["content"]); got != "notes" {
 		t.Fatalf("imported artifact content = %q", got)
+	}
+}
+
+func TestNeoRuntimeThreadImportGatewayCreatesActor(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-import-gateway"
+
+	req := httptest.NewRequest(http.MethodPost, "/gateway/threadActor/request/import?rvt-method=getOrCreate&rvt-key="+threadID+"&rvt-skip-ready-wait=true", strings.NewReader(`{"thread":{"id":"`+threadID+`","v":3,"title":"Gateway import","agentMode":"deep","messages":[{"role":"user","messageId":"M-user","agentMode":"deep","content":[{"type":"text","text":"from upstream"}]}]}}`))
+	rec := httptest.NewRecorder()
+	rt.handleHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST gateway import status = %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	actor := rt.store.ensureThreadActor(threadID)
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.title != "Gateway import" || actor.currentAgentMode != "deep" {
+		t.Fatalf("imported actor title/mode = %q/%q", actor.title, actor.currentAgentMode)
+	}
+	if len(actor.messages) != 1 || textFromBlocks(actor.messages[0].Content) != "from upstream" {
+		t.Fatalf("imported messages = %#v", actor.messages)
 	}
 }
 

@@ -607,6 +607,29 @@
     return data?.result ?? data;
   }
 
+  function threadNeedsRuntimeImport(thread: Record<string, unknown>) {
+    return asRecord(thread.meta).usesThreadActors !== true;
+  }
+
+  async function importThreadIntoRuntime(threadId: string, thread: Record<string, unknown>) {
+    if (!threadId || !threadNeedsRuntimeImport(thread)) return;
+    const params = new URLSearchParams({
+      'rvt-method': 'getOrCreate',
+      'rvt-key': threadId,
+      'rvt-skip-ready-wait': 'true'
+    });
+    const runtimeKey = apiKey.trim();
+    if (runtimeKey) params.set('auth_token', runtimeKey);
+    const response = await fetch(`/gateway/threadActor/request/import?${params.toString()}`, {
+      method: 'POST',
+      headers: headers(),
+      body: JSON.stringify({ thread })
+    });
+    if (!response.ok && response.status !== 409) {
+      throw new RpcError('importThread', response.status);
+    }
+  }
+
   async function refreshThreadUsageInfo(threadId: string) {
     if (!threadId) return;
     try {
@@ -738,6 +761,7 @@
       const thread = normalizeThreadPayload(result);
       detail = threadDetailFromAPI(thread);
       compactionRecords = detail.compactionRecords ?? [];
+      await importThreadIntoRuntime(threadId, thread);
       void refreshThreadUsageInfo(threadId);
       connect(threadId, Number(thread?.v ?? detail.messages.length));
     } catch (error) {

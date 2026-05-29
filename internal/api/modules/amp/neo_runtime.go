@@ -1030,20 +1030,19 @@ func (s *neoActorStore) upsert(body map[string]any, reuse bool) (*neoActor, bool
 	if key != "" {
 		s.byNameKey[name+"\x00"+key] = id
 	}
-	// auto-import persisted thread state for fresh actors backed by a valid
-	// thread id, so resuming after an Amp restart (or after the actor was
-	// pruned) restores the conversation. importing inline would hold the
-	// store lock during disk/cloud I/O, so we kick off a goroutine.
+	// auto-import persisted local thread state for fresh actors backed by a
+	// valid thread id, so local Neo threads survive Amp/runtime restarts.
+	// importing inline would hold the store lock during disk I/O, so we kick
+	// off a goroutine.
 	if s.runtime != nil && neoThreadIDExactPattern.MatchString(threadID) {
 		go s.runtime.autoImportThreadActor(actor, threadID)
 	}
 	return actor, true
 }
 
-// autoImportThreadActor loads a persisted thread snapshot (local store first,
-// cloud second) into a freshly created actor. safe to call once per actor
-// creation; subsequent calls are guarded by checking whether the actor
-// already has any messages.
+// autoImportThreadActor loads a persisted local thread snapshot into a freshly
+// created actor. upstream thread reads are owned by the Amp client, which sends
+// imported thread payloads through /request/import when needed.
 func (rt *neoRuntime) autoImportThreadActor(actor *neoActor, threadID string) {
 	if actor == nil {
 		return
@@ -1054,7 +1053,7 @@ func (rt *neoRuntime) autoImportThreadActor(actor *neoActor, threadID string) {
 	if alreadyHydrated {
 		return
 	}
-	thread, ok := loadNeoThread(context.Background(), rt.configSnapshot(), threadID)
+	thread, ok := loadNeoThread(threadID)
 	if !ok || len(thread) == 0 {
 		return
 	}
@@ -6547,97 +6546,6 @@ func uploadNeoCloudThread(snapshot neoCloudThreadSnapshot) error {
 	return nil
 }
 
-func getNeoCloudThreadBody(ctx context.Context, cfg *config.Config, threadID string) ([]byte, bool, error) {
-	if cfg == nil {
-		return nil, false, nil
-	}
-	upstreamURL := strings.TrimSpace(cfg.AmpCode.UpstreamURL)
-	apiKey := strings.TrimSpace(cfg.AmpCode.UpstreamAPIKey)
-	if upstreamURL == "" || apiKey == "" || !neoCloudThreadID(threadID) {
-		return nil, false, nil
-	}
-	payload := map[string]any{
-		"method": "getThread",
-		"params": map[string]any{"thread": threadID},
-	}
-	raw, err := json.Marshal(payload)
-	if err != nil {
-		return nil, false, err
-	}
-	base, err := url.Parse(upstreamURL)
-	if err != nil {
-		return nil, false, err
-	}
-	base.Path = strings.TrimRight(base.Path, "/") + "/api/internal"
-	base.RawQuery = url.QueryEscape("getThread")
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base.String(), bytes.NewReader(raw))
-	if err != nil {
-		return nil, false, err
-	}
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, false, err
-	}
-	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode == http.StatusNotFound {
-		return nil, false, nil
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, false, fmt.Errorf("HTTP %d: %s", resp.StatusCode, clipNeoErrorBody(respBody))
-	}
-	decoded := gjson.ParseBytes(respBody)
-	if decoded.Get("ok").Exists() && !decoded.Get("ok").Bool() {
-		if decoded.Get("error.code").String() == "thread-not-found" {
-			return nil, false, nil
-		}
-		return nil, false, fmt.Errorf("getThread failed: %s", clipNeoErrorBody(respBody))
-	}
-	return respBody, true, nil
-}
-
-func getNeoCloudThread(ctx context.Context, cfg *config.Config, threadID string) (map[string]any, bool, error) {
-	respBody, ok, err := getNeoCloudThreadBody(ctx, cfg, threadID)
-	if err != nil || !ok {
-		return nil, ok, err
-	}
-	var decoded map[string]any
-	if err := json.Unmarshal(respBody, &decoded); err != nil {
-		return nil, false, err
-	}
-	envelope := mapValue(mapValue(decoded["result"])["thread"])
-	thread := mapValue(envelope["data"])
-	if len(thread) == 0 {
-		thread = envelope
-	} else {
-		for _, key := range []string{
-			"id", "title", "created", "createdAt", "updated", "updatedAt", "userLastInteractedAt",
-			"creatorUserID", "ownerUserId", "v", "agentMode", "archived", "env", "summaryStats",
-			"usesDtw", "usesThreadActors", "meta", "relationships", "originThreadID", "originThreadId",
-			"mainThreadID", "mainThreadId", "mainThread", "maxTokens", "max_tokens", "threadStatus",
-			"status", "labels", "artifacts", "queuedMessages", "compactionRecords", "draft",
-			"autoSubmitDraft", "pendingNavigation", "messages",
-		} {
-			if _, exists := thread[key]; !exists && envelope[key] != nil {
-				thread[key] = envelope[key]
-			}
-		}
-	}
-	if len(thread) == 0 {
-		return nil, false, nil
-	}
-	normalizeNeoThreadOwnership(thread)
-	normalizeNeoThreadAgentMode(thread)
-	normalizeNeoThreadMessageShapes(thread)
-	return thread, true, nil
-}
-
 func neoCloudThreadID(threadID string) bool {
 	return neoCloudThreadIDPattern.MatchString(strings.TrimSpace(threadID))
 }
@@ -7767,7 +7675,7 @@ func (rt *neoRuntime) localThreadActorManagementResponse(ctx context.Context, bo
 	actor := rt.store.ensureThreadActor(threadID)
 	actor.touch()
 	loadedThread := false
-	if thread, ok := loadNeoThread(ctx, rt.configSnapshot(), threadID); ok {
+	if thread, ok := loadNeoThread(threadID); ok {
 		loadedThread = true
 		if err := actor.importThreadLocalOnly(thread); err != nil {
 			log.Debugf("amp neo local runtime thread-actors import failed thread=%s: %v", threadID, err)
@@ -7867,30 +7775,13 @@ func (rt *neoRuntime) localThreadActorManagementResponse(ctx context.Context, bo
 	return baseResponse, http.StatusOK
 }
 
-func loadNeoThread(ctx context.Context, cfg *config.Config, threadID string) (map[string]any, bool) {
-	local, localOK := loadNeoLocalThread(threadID)
-	if neoCloudThreadID(threadID) {
-		cloud, ok, err := getNeoCloudThread(ctx, cfg, threadID)
-		if err != nil {
-			log.Debugf("amp neo cloud thread read failed thread=%s: %v", threadID, err)
-		}
-		if ok {
-			normalizeNeoThreadAgentMode(cloud)
-			normalizeNeoThreadCurrentInference(cloud)
-			cacheThread := markNeoCloudCachedThread(cloneNeoJSONMap(cloud))
-			cacheNeoLocalThread(cacheThread)
-			return cloud, true
-		}
+func loadNeoThread(threadID string) (map[string]any, bool) {
+	local, ok := loadNeoLocalThread(threadID)
+	if !ok || !neoThreadLocalBridgeEligible(local) {
+		return nil, false
 	}
-	if localOK && neoThreadHasUsefulContent(local) {
-		normalizeNeoThreadAgentMode(local)
-		return local, true
-	}
-	if localOK {
-		normalizeNeoThreadAgentMode(local)
-		return local, true
-	}
-	return nil, false
+	normalizeNeoThreadAgentMode(local)
+	return local, true
 }
 
 func neoThreadHasUsefulContent(thread map[string]any) bool {
@@ -7937,19 +7828,6 @@ func cacheNeoLocalThread(thread map[string]any) {
 	} else {
 		neoInvalidateLocalThreadCache(threadID)
 	}
-}
-
-func markNeoCloudCachedThread(thread map[string]any) map[string]any {
-	if len(thread) == 0 {
-		return thread
-	}
-	meta := cloneMap(mapValue(thread["meta"]))
-	meta["cliProxyAPICloudCache"] = true
-	thread["meta"] = meta
-	if data := mapValue(thread["data"]); len(data) > 0 {
-		thread["data"] = markNeoCloudCachedThread(data)
-	}
-	return thread
 }
 
 func neoThreadIsCloudCached(thread map[string]any) bool {
