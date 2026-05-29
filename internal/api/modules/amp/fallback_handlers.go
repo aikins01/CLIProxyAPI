@@ -5,7 +5,10 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
+	"mime"
+	"mime/multipart"
 	"net/http"
 	"net/http/httputil"
 	"os"
@@ -552,6 +555,9 @@ func extractModelFromRequest(body []byte, c *gin.Context) string {
 	if result := gjson.GetBytes(body, "model"); result.Exists() && result.Type == gjson.String {
 		return result.String()
 	}
+	if model := extractMultipartModelFromRequest(body, c); model != "" {
+		return model
+	}
 
 	// For Gemini requests, model is in the URL path
 	// Standard format: /models/{model}:generateContent -> :action parameter
@@ -577,4 +583,38 @@ func extractModelFromRequest(body []byte, c *gin.Context) string {
 	}
 
 	return ""
+}
+
+func extractMultipartModelFromRequest(body []byte, c *gin.Context) string {
+	if c == nil || c.Request == nil {
+		return ""
+	}
+	mediaType, params, err := mime.ParseMediaType(c.GetHeader("Content-Type"))
+	if err != nil || !strings.HasPrefix(strings.ToLower(mediaType), "multipart/") {
+		return ""
+	}
+	boundary := strings.TrimSpace(params["boundary"])
+	if boundary == "" {
+		return ""
+	}
+	reader := multipart.NewReader(bytes.NewReader(body), boundary)
+	for {
+		part, err := reader.NextPart()
+		if errors.Is(err, io.EOF) {
+			return ""
+		}
+		if err != nil {
+			return ""
+		}
+		if part.FormName() != "model" {
+			_ = part.Close()
+			continue
+		}
+		raw, err := io.ReadAll(io.LimitReader(part, 4096))
+		_ = part.Close()
+		if err != nil {
+			return ""
+		}
+		return strings.TrimSpace(string(raw))
+	}
 }

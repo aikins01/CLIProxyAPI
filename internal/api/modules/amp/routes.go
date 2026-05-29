@@ -418,6 +418,9 @@ func (m *AmpModule) registerProviderAliases(engine *gin.Engine, baseHandler *han
 	provider.POST("/chat/completions", fallbackHandler.WrapHandler(openaiHandlers.ChatCompletions))
 	provider.POST("/completions", fallbackHandler.WrapHandler(openaiHandlers.Completions))
 	provider.POST("/responses", fallbackHandler.WrapHandler(openaiResponsesHandlers.Responses))
+	provider.POST("/responses/compact", fallbackHandler.WrapHandler(openaiResponsesHandlers.Compact))
+	provider.POST("/images/generations", fallbackHandler.WrapHandler(openaiHandlers.ImagesGenerations))
+	provider.POST("/images/edits", fallbackHandler.WrapHandler(openaiHandlers.ImagesEdits))
 
 	// /v1 routes (OpenAI/Claude-compatible endpoints)
 	v1Amp := provider.Group("/v1")
@@ -428,6 +431,9 @@ func (m *AmpModule) registerProviderAliases(engine *gin.Engine, baseHandler *han
 		v1Amp.POST("/chat/completions", fallbackHandler.WrapHandler(openaiHandlers.ChatCompletions))
 		v1Amp.POST("/completions", fallbackHandler.WrapHandler(openaiHandlers.Completions))
 		v1Amp.POST("/responses", fallbackHandler.WrapHandler(openaiResponsesHandlers.Responses))
+		v1Amp.POST("/responses/compact", fallbackHandler.WrapHandler(openaiResponsesHandlers.Compact))
+		v1Amp.POST("/images/generations", fallbackHandler.WrapHandler(openaiHandlers.ImagesGenerations))
+		v1Amp.POST("/images/edits", fallbackHandler.WrapHandler(openaiHandlers.ImagesEdits))
 
 		// Claude/Anthropic-compatible endpoints with fallback
 		v1Amp.POST("/messages", fallbackHandler.WrapHandler(claudeCodeHandlers.ClaudeMessages))

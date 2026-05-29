@@ -1696,6 +1696,10 @@ func TestRegisterProviderAliases_V1Routes(t *testing.T) {
 		{"/api/provider/openai/v1/models", http.MethodGet},
 		{"/api/provider/openai/v1/chat/completions", http.MethodPost},
 		{"/api/provider/openai/v1/completions", http.MethodPost},
+		{"/api/provider/openai/v1/responses", http.MethodPost},
+		{"/api/provider/openai/v1/responses/compact", http.MethodPost},
+		{"/api/provider/openai/v1/images/generations", http.MethodPost},
+		{"/api/provider/openai/v1/images/edits", http.MethodPost},
 		{"/api/provider/anthropic/v1/messages", http.MethodPost},
 		{"/api/provider/anthropic/v1/messages/count_tokens", http.MethodPost},
 	}

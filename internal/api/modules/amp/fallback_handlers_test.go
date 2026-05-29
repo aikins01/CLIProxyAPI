@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -198,6 +200,83 @@ func TestFallbackHandler_LocalAuthUnavailableDoesNotFallbackToAmpProxy(t *testin
 	}
 	if upstreamCalls != 0 {
 		t.Fatalf("upstream calls = %d, want 0", upstreamCalls)
+	}
+}
+
+func TestFallbackHandlerMultipartModelFallsBackToAmpProxy(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	type capturedRequest struct {
+		path string
+		body []byte
+	}
+	gotRequest := make(chan capturedRequest, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		gotRequest <- capturedRequest{path: r.URL.Path, body: body}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"amp-image-upstream"}`))
+	}))
+	defer upstream.Close()
+
+	proxy, err := createReverseProxy(upstream.URL, NewStaticSecretSource("amp-secret"))
+	if err != nil {
+		t.Fatalf("create reverse proxy: %v", err)
+	}
+	fallback := NewFallbackHandlerWithMapper(func() *httputil.ReverseProxy { return proxy }, nil, nil)
+
+	r := gin.New()
+	r.POST("/api/provider/openai/v1/images/edits", fallback.WrapHandler(func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"unexpected": true})
+	}))
+	server := httptest.NewServer(r)
+	defer server.Close()
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	if err := writer.WriteField("model", "definitely-not-a-local-provider-model"); err != nil {
+		t.Fatalf("write model field: %v", err)
+	}
+	if err := writer.WriteField("prompt", "edit this image"); err != nil {
+		t.Fatalf("write prompt field: %v", err)
+	}
+	imagePart, err := writer.CreateFormFile("image", "input.png")
+	if err != nil {
+		t.Fatalf("create image part: %v", err)
+	}
+	if _, err := imagePart.Write([]byte("not-a-real-image")); err != nil {
+		t.Fatalf("write image part: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close multipart writer: %v", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/api/provider/openai/v1/images/edits", bytes.NewReader(body.Bytes()))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set(localNeoInferenceHeader, "1")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request fallback route: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, body=%s", resp.StatusCode, body)
+	}
+
+	select {
+	case got := <-gotRequest:
+		if got.path != "/api/provider/openai/v1/images/edits" {
+			t.Fatalf("upstream path = %q", got.path)
+		}
+		if !bytes.Contains(got.body, []byte("definitely-not-a-local-provider-model")) {
+			t.Fatalf("upstream body did not preserve multipart model field: %q", string(got.body))
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for upstream fallback request")
 	}
 }
 
