@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"image"
 	"image/png"
 	"io"
@@ -16,21 +15,12 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"testing"
-	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 )
-
-func clearNeoCloudThreadListCacheForTest(t *testing.T) {
-	t.Helper()
-	neoCloudThreadListCache.Lock()
-	neoCloudThreadListCache.entries = map[string]*neoCloudThreadListCacheEntry{}
-	neoCloudThreadListCache.Unlock()
-}
 
 func TestRegisterManagementRoutes(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -1029,30 +1019,11 @@ func TestRegisterManagementRoutesServesNeoStartupInternalRPCPostsLocally(t *test
 	r := gin.New()
 	enabled := true
 	proxyCalled := false
-	upstreamHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		proxyCalled = true
 		w.WriteHeader(http.StatusTeapot)
-	})
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upstreamHandler(w, r)
 	}))
 	defer upstream.Close()
-
-	dir := t.TempDir()
-	oldStoreDir := neoAmpThreadStoreDir
-	neoAmpThreadStoreDir = func() string { return dir }
-	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
-
-	threadID := "T-019e06a8-13c9-708d-8090-783005818ea7"
-	rawThread := []byte(`{"id":"` + threadID + `","title":"local","creatorUserID":"user_cloud","v":7,"agentMode":"deep","originThreadID":"T-origin","mainThreadID":"T-main","env":{"initial":{"trees":[]}},"meta":{"usesDtw":true,"usesThreadActors":true},"relationships":[],"messages":[{"messageId":"M-large","role":"user","content":[{"type":"text","text":"hello"}]}]}`)
-	if err := os.WriteFile(filepath.Join(dir, threadID+".json"), rawThread, 0o600); err != nil {
-		t.Fatalf("write local thread: %v", err)
-	}
-	archivedThreadID := "T-019e06a8-13c9-708d-8090-783005818ea8"
-	rawArchivedThread := []byte(`{"id":"` + archivedThreadID + `","title":"archived local","archived":true,"agentMode":"rush","messages":[{"messageId":"M-archived","role":"user","content":[{"type":"text","text":"old thread"}]}]}`)
-	if err := os.WriteFile(filepath.Join(dir, archivedThreadID+".json"), rawArchivedThread, 0o600); err != nil {
-		t.Fatalf("write archived local thread: %v", err)
-	}
 
 	m := &AmpModule{
 		restrictToLocalhost: false,
@@ -1066,326 +1037,16 @@ func TestRegisterManagementRoutesServesNeoStartupInternalRPCPostsLocally(t *test
 	}
 	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, nil)
 
-	t.Run("listThreads", func(t *testing.T) {
-		proxyCalled = false
-		body := bytes.NewBufferString(`{"method":"listThreads","params":{"includeArchived":false,"includeCloud":false,"limit":200}}`)
-		req := httptest.NewRequest(http.MethodPost, "/api/internal?listThreads", body)
-		req.Header.Set("Content-Type", "application/json")
-		rec := httptest.NewRecorder()
-		r.ServeHTTP(rec, req)
-
-		if rec.Code != http.StatusOK {
-			t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
-		}
-		var response map[string]any
-		if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
-			t.Fatalf("response JSON error: %v", err)
-		}
-		result := arrayValue(mapValue(response["result"])["threads"])
-		if len(result) != 1 {
-			t.Fatalf("result = %#v", response["result"])
-		}
-		thread := mapValue(result[0])
-		if stringValue(thread["id"]) != threadID || stringValue(thread["title"]) != "local" {
-			t.Fatalf("thread metadata = %#v", thread)
-		}
-		if _, exists := thread["messages"]; exists {
-			t.Fatalf("listThreads should return metadata-only thread entries: %#v", thread)
-		}
-		if stringValue(thread["creatorUserID"]) != neoLocalOwnerUserID {
-			t.Fatalf("creatorUserID = %#v, want %q", thread["creatorUserID"], neoLocalOwnerUserID)
-		}
-		if relationships, ok := thread["relationships"].([]any); !ok || relationships == nil {
-			t.Fatalf("relationships = %#v, want empty array", thread["relationships"])
-		}
-		meta := mapValue(thread["meta"])
-		if stringValue(meta["visibility"]) != "private" {
-			t.Fatalf("meta = %#v, want private visibility", thread["meta"])
-		}
-		if sharedGroupIDs, ok := meta["sharedGroupIDs"].([]any); !ok || sharedGroupIDs == nil {
-			t.Fatalf("sharedGroupIDs = %#v, want empty array", meta["sharedGroupIDs"])
-		}
-		if numberFrom(mapValue(thread["summaryStats"])["messageCount"]) != 1 {
-			t.Fatalf("summaryStats = %#v, want messageCount=1", thread["summaryStats"])
-		}
-		if stringValue(thread["agentMode"]) != "deep" || numberFrom(thread["v"]) != 7 {
-			t.Fatalf("local list metadata = %#v", thread)
-		}
-		if stringValue(thread["originThreadID"]) != "T-origin" || stringValue(thread["mainThreadID"]) != "T-main" {
-			t.Fatalf("local related thread metadata = origin:%#v main:%#v", thread["originThreadID"], thread["mainThreadID"])
-		}
-		if _, exists := thread["env"]; !exists {
-			t.Fatalf("local env metadata missing: %#v", thread)
-		}
-		if thread["usesDtw"] != true || thread["usesThreadActors"] != true {
-			t.Fatalf("local DTW/thread-actors flags = %#v", thread)
-		}
-	})
-
-	t.Run("listThreads includes archived when requested", func(t *testing.T) {
-		body := bytes.NewBufferString(`{"method":"listThreads","params":{"includeArchived":true,"includeCloud":false,"limit":200}}`)
-		req := httptest.NewRequest(http.MethodPost, "/api/internal?listThreads", body)
-		req.Header.Set("Content-Type", "application/json")
-		rec := httptest.NewRecorder()
-		r.ServeHTTP(rec, req)
-
-		if rec.Code != http.StatusOK {
-			t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
-		}
-		var response map[string]any
-		if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
-			t.Fatalf("response JSON error: %v", err)
-		}
-		result := arrayValue(mapValue(response["result"])["threads"])
-		archived := map[string]any(nil)
-		for _, raw := range result {
-			thread := mapValue(raw)
-			if stringValue(thread["id"]) == archivedThreadID {
-				archived = thread
-				break
-			}
-		}
-		if archived == nil {
-			t.Fatalf("archived thread missing from includeArchived result: %#v", result)
-		}
-		if archived["archived"] != true || stringValue(archived["agentMode"]) != "rush" {
-			t.Fatalf("archived thread metadata = %#v", archived)
-		}
-	})
-
-	t.Run("listThreads merges cloud threads", func(t *testing.T) {
-		clearNeoCloudThreadListCacheForTest(t)
-		cloudThreadID := "T-019e1046-656d-7132-879f-390ded941c99"
-		cloudOnlyThreadID := "T-019e1046-656d-7132-879f-390ded941c98"
-		upstreamRequests := 0
-		gotAuth := ""
-		upstreamHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			upstreamRequests++
-			if r.URL.Path != "/api/internal" || r.URL.RawQuery != "listThreads" {
-				proxyCalled = true
-				w.WriteHeader(http.StatusTeapot)
-				_, _ = w.Write([]byte("unexpected upstream request"))
-				return
-			}
-			gotAuth = r.Header.Get("Authorization")
-			writeNeoJSON(w, http.StatusOK, map[string]any{
-				"ok": true,
-				"result": map[string]any{
-					"threads": []any{
-						map[string]any{
-							"id":               cloudOnlyThreadID,
-							"title":            "cloud only",
-							"updatedAt":        3000,
-							"messageCount":     4,
-							"v":                7,
-							"agentMode":        "deep",
-							"env":              map[string]any{"initial": map[string]any{"trees": []any{}}},
-							"summaryStats":     map[string]any{"messageCount": 4},
-							"usesDtw":          false,
-							"usesThreadActors": false,
-							"relationships":    []any{},
-						},
-						map[string]any{"id": cloudThreadID, "title": "cloud newer", "updatedAt": 2000, "messageCount": 2},
-					},
-				},
-			})
-		})
-
-		if err := os.WriteFile(filepath.Join(dir, cloudThreadID+".json"), []byte(`{"id":"`+cloudThreadID+`","title":"local older","updatedAt":1000,"messages":[{"messageId":"M-local","role":"user","created":1000,"content":[{"type":"text","text":"hello"}]}]}`), 0o600); err != nil {
-			t.Fatalf("write local thread: %v", err)
-		}
-
-		body := bytes.NewBufferString(`{"method":"listThreads","params":{"includeArchived":false,"limit":10,"waitForCloud":true}}`)
-		req := httptest.NewRequest(http.MethodPost, "/api/internal?listThreads", body)
-		req.Header.Set("Content-Type", "application/json")
-		rec := httptest.NewRecorder()
-		r.ServeHTTP(rec, req)
-
-		if rec.Code != http.StatusOK {
-			t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
-		}
-		if upstreamRequests != 1 {
-			t.Fatalf("upstreamRequests = %d, want 1", upstreamRequests)
-		}
-		if gotAuth != "Bearer secret" {
-			t.Fatalf("Authorization = %q", gotAuth)
-		}
-		var response map[string]any
-		if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
-			t.Fatalf("response JSON error: %v", err)
-		}
-		result := arrayValue(mapValue(response["result"])["threads"])
-		if len(result) != 3 {
-			t.Fatalf("result = %#v", response["result"])
-		}
-		first := mapValue(result[0])
-		second := mapValue(result[1])
-		third := mapValue(result[2])
-		if stringValue(first["id"]) != threadID || stringValue(second["id"]) != cloudOnlyThreadID || stringValue(third["id"]) != cloudThreadID {
-			t.Fatalf("thread order = %#v", result)
-		}
-		if relationships, ok := second["relationships"].([]any); !ok || relationships == nil {
-			t.Fatalf("cloud relationships = %#v, want empty array", second["relationships"])
-		}
-		if stringValue(second["agentMode"]) != "deep" || numberFrom(second["v"]) != 7 {
-			t.Fatalf("cloud metadata = %#v", second)
-		}
-		if _, exists := second["env"]; !exists {
-			t.Fatalf("cloud env metadata missing: %#v", second)
-		}
-		if numberFrom(mapValue(second["summaryStats"])["messageCount"]) != 4 {
-			t.Fatalf("cloud summaryStats = %#v, want messageCount=4", second["summaryStats"])
-		}
-		if stringValue(third["title"]) != "cloud newer" {
-			t.Fatalf("merged thread title = %#v", third["title"])
-		}
-		if numberFrom(third["messageCount"]) != 2 {
-			t.Fatalf("merged thread messageCount = %#v", third["messageCount"])
-		}
-		if _, exists := third["messages"]; exists {
-			t.Fatalf("listThreads should stay metadata-only after cloud merge: %#v", third)
-		}
-		if relationships, ok := third["relationships"].([]any); !ok || relationships == nil {
-			t.Fatalf("merged relationships = %#v, want empty array", third["relationships"])
-		}
-
-		limitedBody := bytes.NewBufferString(`{"method":"listThreads","params":{"includeArchived":false,"limit":2,"waitForCloud":true}}`)
-		limitedReq := httptest.NewRequest(http.MethodPost, "/api/internal?listThreads", limitedBody)
-		limitedReq.Header.Set("Content-Type", "application/json")
-		limitedRec := httptest.NewRecorder()
-		r.ServeHTTP(limitedRec, limitedReq)
-		if limitedRec.Code != http.StatusOK {
-			t.Fatalf("limited status = %d, body=%s", limitedRec.Code, limitedRec.Body.String())
-		}
-		var limitedResponse map[string]any
-		if err := json.Unmarshal(limitedRec.Body.Bytes(), &limitedResponse); err != nil {
-			t.Fatalf("limited response JSON error: %v", err)
-		}
-		if limited := arrayValue(mapValue(limitedResponse["result"])["threads"]); len(limited) != 2 {
-			t.Fatalf("limited result length = %d, want 2: %#v", len(limited), limited)
-		}
-	})
-
-	t.Run("listThreads returns before pending cloud refresh", func(t *testing.T) {
-		clearNeoCloudThreadListCacheForTest(t)
-		cloudOnlyThreadID := "T-019e1046-656d-7132-879f-390ded941c97"
-		started := make(chan struct{}, 1)
-		release := make(chan struct{})
-		handled := make(chan struct{}, 1)
-		var releaseOnce sync.Once
-		releaseCloud := func() {
-			releaseOnce.Do(func() {
-				close(release)
-			})
-		}
-		upstreamHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path != "/api/internal" || r.URL.RawQuery != "listThreads" {
-				w.WriteHeader(http.StatusTeapot)
-				_, _ = w.Write([]byte("unexpected upstream request"))
-				return
-			}
-			select {
-			case started <- struct{}{}:
-			default:
-			}
-			<-release
-			writeNeoJSON(w, http.StatusOK, map[string]any{
-				"ok": true,
-				"result": map[string]any{
-					"threads": []any{
-						map[string]any{"id": cloudOnlyThreadID, "title": "slow cloud", "updatedAt": 4000},
-					},
-				},
-			})
-			select {
-			case handled <- struct{}{}:
-			default:
-			}
-		})
-
-		body := bytes.NewBufferString(`{"method":"listThreads","params":{"includeArchived":false,"limit":10}}`)
-		req := httptest.NewRequest(http.MethodPost, "/api/internal?listThreads", body)
-		req.Header.Set("Content-Type", "application/json")
-		done := make(chan *httptest.ResponseRecorder, 1)
-		go func() {
-			rec := httptest.NewRecorder()
-			r.ServeHTTP(rec, req)
-			done <- rec
-		}()
-
-		var rec *httptest.ResponseRecorder
-		select {
-		case rec = <-done:
-		case <-time.After(2 * time.Second):
-			releaseCloud()
-			t.Fatal("listThreads blocked on the cloud refresh")
-		}
-		if rec.Code != http.StatusOK {
-			releaseCloud()
-			t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
-		}
-		var response map[string]any
-		if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
-			releaseCloud()
-			t.Fatalf("response JSON error: %v", err)
-		}
-		result := arrayValue(mapValue(response["result"])["threads"])
-		for _, raw := range result {
-			if stringValue(mapValue(raw)["id"]) == cloudOnlyThreadID {
-				releaseCloud()
-				t.Fatalf("cloud thread should not be returned before refresh completes: %#v", result)
-			}
-		}
-
-		select {
-		case <-started:
-		case <-time.After(2 * time.Second):
-			releaseCloud()
-			t.Fatal("cloud refresh did not start asynchronously")
-		}
-		releaseCloud()
-		select {
-		case <-handled:
-		case <-time.After(2 * time.Second):
-			t.Fatal("cloud refresh did not finish after release")
-		}
-	})
-
 	for _, tc := range []struct {
 		name string
 		path string
 		body string
 	}{
-		{
-			name: "notices",
-			path: "/api/internal?notices",
-			body: `{"method":"notices","params":{}}`,
-		},
-		{
-			name: "getUserFreeTierStatus",
-			path: "/api/internal?getUserFreeTierStatus",
-			body: `{"method":"getUserFreeTierStatus","params":{}}`,
-		},
-		{
-			name: "uploadThread",
-			path: "/api/internal?uploadThread",
-			body: `{"method":"uploadThread","params":{"thread":{"id":"` + threadID + `"},"createdOnServer":false}}`,
-		},
-		{
-			name: "logNoticeAction",
-			path: "/api/internal?logNoticeAction",
-			body: `{"method":"logNoticeAction","params":{"key":"local","action":"view"}}`,
-		},
-		{
-			name: "markAsReadMysteriousMessage",
-			path: "/api/internal?markAsReadMysteriousMessage",
-			body: `{"method":"markAsReadMysteriousMessage","params":{"messageId":"msg_local"}}`,
-		},
-		{
-			name: "userDisplayBalanceInfo",
-			path: "/api/internal?userDisplayBalanceInfo",
-			body: `{"method":"userDisplayBalanceInfo","params":{}}`,
-		},
+		{name: "notices", path: "/api/internal?notices", body: `{"method":"notices","params":{}}`},
+		{name: "getUserFreeTierStatus", path: "/api/internal?getUserFreeTierStatus", body: `{"method":"getUserFreeTierStatus","params":{}}`},
+		{name: "logNoticeAction", path: "/api/internal?logNoticeAction", body: `{"method":"logNoticeAction","params":{"key":"local","action":"view"}}`},
+		{name: "markAsReadMysteriousMessage", path: "/api/internal?markAsReadMysteriousMessage", body: `{"method":"markAsReadMysteriousMessage","params":{"messageId":"msg_local"}}`},
+		{name: "userDisplayBalanceInfo", path: "/api/internal?userDisplayBalanceInfo", body: `{"method":"userDisplayBalanceInfo","params":{}}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			proxyCalled = false
@@ -1410,214 +1071,40 @@ func TestRegisterManagementRoutesServesNeoStartupInternalRPCPostsLocally(t *test
 		})
 	}
 
-	t.Run("getThread", func(t *testing.T) {
-		proxyCalled = false
-		body := bytes.NewBufferString(`{"method":"getThread","params":{"thread":"` + threadID + `"}}`)
-		req := httptest.NewRequest(http.MethodPost, "/api/internal?getThread", body)
-		req.Header.Set("Content-Type", "application/json")
-		rec := httptest.NewRecorder()
-		r.ServeHTTP(rec, req)
+	for _, method := range []string{
+		"listThreads",
+		"uploadThread",
+		"getThread",
+		"getThreadMeta",
+		"setThreadMeta",
+		"archiveThread",
+		"deleteThread",
+		"getThreadLabels",
+		"setThreadLabels",
+		"addThreadLabels",
+		"getUserLabels",
+		"createTask",
+		"getTask",
+		"listTasks",
+		"updateTask",
+		"deleteTask",
+	} {
+		t.Run(method+" is not locally synthesized", func(t *testing.T) {
+			proxyCalled = false
+			body := bytes.NewBufferString(`{"method":"` + method + `","params":{"thread":"T-019e06a8-13c9-708d-8090-783005818ea7","taskID":"task-local"}}`)
+			req := httptest.NewRequest(http.MethodPost, "/api/internal?"+method, body)
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			r.ServeHTTP(rec, req)
 
-		if rec.Code != http.StatusOK {
-			t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
-		}
-		if proxyCalled {
-			t.Fatal("getThread should be served locally during Neo startup")
-		}
-		var response map[string]any
-		if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
-			t.Fatalf("response JSON error: %v", err)
-		}
-		if response["ok"] != true {
-			t.Fatalf("unexpected local internal response: %#v", response)
-		}
-		thread := mapValue(mapValue(mapValue(response["result"])["thread"])["data"])
-		if stringValue(thread["id"]) != threadID || stringValue(thread["title"]) != "local" {
-			t.Fatalf("thread data = %#v", thread)
-		}
-		if stringValue(thread["creatorUserID"]) != neoLocalOwnerUserID {
-			t.Fatalf("creatorUserID = %#v, want %q", thread["creatorUserID"], neoLocalOwnerUserID)
-		}
-		envelope := mapValue(mapValue(response["result"])["thread"])
-		if stringValue(envelope["agentMode"]) != "deep" || stringValue(thread["agentMode"]) != "deep" {
-			t.Fatalf("agentMode envelope=%#v data=%#v, want deep", envelope["agentMode"], thread["agentMode"])
-		}
-		if numberFrom(envelope["v"]) != 7 || len(arrayValue(envelope["messages"])) != 1 {
-			t.Fatalf("binary thread envelope missing raw thread fields: %#v", envelope)
-		}
-	})
-
-	t.Run("thread meta", func(t *testing.T) {
-		proxyCalled = false
-		body := bytes.NewBufferString(`{"method":"getThreadMeta","params":{"thread":"` + threadID + `"}}`)
-		req := httptest.NewRequest(http.MethodPost, "/api/internal?getThreadMeta", body)
-		req.Header.Set("Content-Type", "application/json")
-		rec := httptest.NewRecorder()
-		r.ServeHTTP(rec, req)
-
-		if rec.Code != http.StatusOK {
-			t.Fatalf("getThreadMeta status = %d, body=%s", rec.Code, rec.Body.String())
-		}
-		if proxyCalled {
-			t.Fatal("getThreadMeta should be served locally")
-		}
-		var response map[string]any
-		if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
-			t.Fatalf("getThreadMeta response JSON error: %v", err)
-		}
-		meta := mapValue(mapValue(response["result"])["meta"])
-		if stringValue(meta["visibility"]) != "private" {
-			t.Fatalf("initial meta = %#v, want private visibility", meta)
-		}
-
-		setBody := bytes.NewBufferString(`{"method":"setThreadMeta","params":{"thread":"` + threadID + `","meta":{"visibility":"thread_workspace_shared","shareWithAllCreatorGroups":true,"sharedGroupIDs":["G-local"]}}}`)
-		setReq := httptest.NewRequest(http.MethodPost, "/api/internal?setThreadMeta", setBody)
-		setReq.Header.Set("Content-Type", "application/json")
-		setRec := httptest.NewRecorder()
-		r.ServeHTTP(setRec, setReq)
-
-		if setRec.Code != http.StatusOK {
-			t.Fatalf("setThreadMeta status = %d, body=%s", setRec.Code, setRec.Body.String())
-		}
-		if proxyCalled {
-			t.Fatal("setThreadMeta should be served locally")
-		}
-		if err := json.Unmarshal(setRec.Body.Bytes(), &response); err != nil {
-			t.Fatalf("setThreadMeta response JSON error: %v", err)
-		}
-		meta = mapValue(mapValue(response["result"])["meta"])
-		if stringValue(meta["visibility"]) != "thread_workspace_shared" {
-			t.Fatalf("updated meta = %#v, want workspace shared visibility", meta)
-		}
-		reloaded, ok := loadNeoLocalThread(threadID)
-		if !ok {
-			t.Fatal("thread should still be stored locally")
-		}
-		if stringValue(mapValue(reloaded["meta"])["visibility"]) != "thread_workspace_shared" {
-			t.Fatalf("persisted meta = %#v", reloaded["meta"])
-		}
-	})
-
-	t.Run("thread labels", func(t *testing.T) {
-		proxyCalled = false
-		addBody := bytes.NewBufferString(`{"method":"addThreadLabels","params":{"thread":"` + threadID + `","labels":["parity","runtime"]}}`)
-		addReq := httptest.NewRequest(http.MethodPost, "/api/internal?addThreadLabels", addBody)
-		addReq.Header.Set("Content-Type", "application/json")
-		addRec := httptest.NewRecorder()
-		r.ServeHTTP(addRec, addReq)
-
-		if addRec.Code != http.StatusOK {
-			t.Fatalf("addThreadLabels status = %d, body=%s", addRec.Code, addRec.Body.String())
-		}
-		if proxyCalled {
-			t.Fatal("addThreadLabels should be served locally")
-		}
-		var response map[string]any
-		if err := json.Unmarshal(addRec.Body.Bytes(), &response); err != nil {
-			t.Fatalf("addThreadLabels response JSON error: %v", err)
-		}
-		labels := arrayValue(response["result"])
-		if len(labels) != 2 {
-			t.Fatalf("addThreadLabels result = %#v", response["result"])
-		}
-
-		getReq := httptest.NewRequest(http.MethodPost, "/api/internal?getThreadLabels", bytes.NewBufferString(`{"method":"getThreadLabels","params":{"thread":"`+threadID+`"}}`))
-		getReq.Header.Set("Content-Type", "application/json")
-		getRec := httptest.NewRecorder()
-		r.ServeHTTP(getRec, getReq)
-		if getRec.Code != http.StatusOK {
-			t.Fatalf("getThreadLabels status = %d, body=%s", getRec.Code, getRec.Body.String())
-		}
-		if err := json.Unmarshal(getRec.Body.Bytes(), &response); err != nil {
-			t.Fatalf("getThreadLabels response JSON error: %v", err)
-		}
-		labels = arrayValue(response["result"])
-		if len(labels) != 2 || stringValue(mapValue(labels[0])["name"]) != "parity" || stringValue(mapValue(labels[1])["name"]) != "runtime" {
-			t.Fatalf("getThreadLabels result = %#v", response["result"])
-		}
-
-		userReq := httptest.NewRequest(http.MethodPost, "/api/internal?getUserLabels", bytes.NewBufferString(`{"method":"getUserLabels","params":{"query":"run"}}`))
-		userReq.Header.Set("Content-Type", "application/json")
-		userRec := httptest.NewRecorder()
-		r.ServeHTTP(userRec, userReq)
-		if userRec.Code != http.StatusOK {
-			t.Fatalf("getUserLabels status = %d, body=%s", userRec.Code, userRec.Body.String())
-		}
-		if err := json.Unmarshal(userRec.Body.Bytes(), &response); err != nil {
-			t.Fatalf("getUserLabels response JSON error: %v", err)
-		}
-		labels = arrayValue(response["result"])
-		if len(labels) != 1 || stringValue(mapValue(labels[0])["name"]) != "runtime" {
-			t.Fatalf("getUserLabels result = %#v", response["result"])
-		}
-
-		listReq := httptest.NewRequest(http.MethodPost, "/api/internal?listThreads", bytes.NewBufferString(`{"method":"listThreads","params":{"includeArchived":false,"includeCloud":false,"limit":10}}`))
-		listReq.Header.Set("Content-Type", "application/json")
-		listRec := httptest.NewRecorder()
-		r.ServeHTTP(listRec, listReq)
-		if listRec.Code != http.StatusOK {
-			t.Fatalf("listThreads status = %d, body=%s", listRec.Code, listRec.Body.String())
-		}
-		if err := json.Unmarshal(listRec.Body.Bytes(), &response); err != nil {
-			t.Fatalf("listThreads response JSON error: %v", err)
-		}
-		threads := arrayValue(mapValue(response["result"])["threads"])
-		if len(threads) == 0 {
-			t.Fatalf("listThreads result = %#v", response["result"])
-		}
-		var listedThread map[string]any
-		for _, thread := range threads {
-			candidate := mapValue(thread)
-			if stringValue(candidate["id"]) == threadID {
-				listedThread = candidate
-				break
+			if rec.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
 			}
-		}
-		if len(listedThread) == 0 {
-			t.Fatalf("thread %s missing from listThreads result: %#v", threadID, response["result"])
-		}
-		listLabels := arrayValue(listedThread["labels"])
-		if len(listLabels) != 2 || stringValue(mapValue(listLabels[0])["name"]) != "parity" || stringValue(mapValue(listLabels[1])["name"]) != "runtime" {
-			t.Fatalf("list thread = %#v", listedThread)
-		}
-	})
-
-	t.Run("archive and delete thread", func(t *testing.T) {
-		proxyCalled = false
-		archiveBody := bytes.NewBufferString(`{"method":"archiveThread","params":{"thread":"` + threadID + `","archived":true}}`)
-		archiveReq := httptest.NewRequest(http.MethodPost, "/api/internal?archiveThread", archiveBody)
-		archiveReq.Header.Set("Content-Type", "application/json")
-		archiveRec := httptest.NewRecorder()
-		r.ServeHTTP(archiveRec, archiveReq)
-
-		if archiveRec.Code != http.StatusOK {
-			t.Fatalf("archiveThread status = %d, body=%s", archiveRec.Code, archiveRec.Body.String())
-		}
-		if proxyCalled {
-			t.Fatal("archiveThread should be served locally")
-		}
-		reloaded, ok := loadNeoLocalThread(threadID)
-		if !ok || reloaded["archived"] != true {
-			t.Fatalf("archived thread = %#v, ok=%v", reloaded, ok)
-		}
-
-		deleteID := "T-019e06a8-13c9-708d-8090-783005818ef0"
-		if err := os.WriteFile(filepath.Join(dir, deleteID+".json"), []byte(`{"id":"`+deleteID+`","title":"delete me"}`), 0o600); err != nil {
-			t.Fatalf("write delete thread: %v", err)
-		}
-		deleteBody := bytes.NewBufferString(`{"method":"deleteThread","params":{"thread":"` + deleteID + `"}}`)
-		deleteReq := httptest.NewRequest(http.MethodPost, "/api/internal?deleteThread", deleteBody)
-		deleteReq.Header.Set("Content-Type", "application/json")
-		deleteRec := httptest.NewRecorder()
-		r.ServeHTTP(deleteRec, deleteReq)
-
-		if deleteRec.Code != http.StatusOK {
-			t.Fatalf("deleteThread status = %d, body=%s", deleteRec.Code, deleteRec.Body.String())
-		}
-		if _, err := os.Stat(filepath.Join(dir, deleteID+".json")); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("deleteThread stat err = %v, want not exist", err)
-		}
-	})
+			if proxyCalled {
+				t.Fatalf("%s should not call the test upstream without a configured proxy", method)
+			}
+		})
+	}
 }
 
 func TestRegisterManagementRoutesPassesInternalRPCsUpstreamWhenProxyExists(t *testing.T) {
@@ -1630,13 +1117,10 @@ func TestRegisterManagementRoutesPassesInternalRPCsUpstreamWhenProxyExists(t *te
 		if r.URL.Path != "/api/internal" {
 			t.Fatalf("unexpected upstream request path=%s query=%s", r.URL.Path, r.URL.RawQuery)
 		}
-		if r.URL.RawQuery != "listThreads" && r.URL.RawQuery != "getThread" {
-			t.Fatalf("unexpected upstream query=%s", r.URL.RawQuery)
-		}
 		if r.Header.Get("X-Test-Amp-Headers") == "required" && r.Header.Get("X-Amp-Client-Application") != "CLI" {
 			t.Fatalf("X-Amp-Client-Application = %q", r.Header.Get("X-Amp-Client-Application"))
 		}
-		writeNeoJSON(w, http.StatusOK, map[string]any{"ok": true, "result": map[string]any{"threads": []any{}}})
+		writeNeoJSON(w, http.StatusOK, map[string]any{"ok": true, "method": r.URL.RawQuery, "result": map[string]any{"threads": []any{}}})
 	}))
 	defer upstream.Close()
 
@@ -1667,6 +1151,20 @@ func TestRegisterManagementRoutesPassesInternalRPCsUpstreamWhenProxyExists(t *te
 		{name: "listThreads amp", method: "listThreads", body: `{"method":"listThreads","params":{"limit":10}}`, ampHeaders: true},
 		{name: "getThread web", method: "getThread", body: `{"method":"getThread","params":{"thread":"T-019e65c0-0310-77a8-b233-4b84d9c0612b"}}`},
 		{name: "getThread amp", method: "getThread", body: `{"method":"getThread","params":{"thread":"T-019e65c0-0310-77a8-b233-4b84d9c0612b"}}`, ampHeaders: true},
+		{name: "uploadThread", method: "uploadThread", body: `{"method":"uploadThread","params":{"thread":{"id":"T-019e65c0-0310-77a8-b233-4b84d9c0612b"}}}`},
+		{name: "getThreadMeta", method: "getThreadMeta", body: `{"method":"getThreadMeta","params":{"thread":"T-019e65c0-0310-77a8-b233-4b84d9c0612b"}}`},
+		{name: "setThreadMeta", method: "setThreadMeta", body: `{"method":"setThreadMeta","params":{"thread":"T-019e65c0-0310-77a8-b233-4b84d9c0612b","meta":{}}}`},
+		{name: "archiveThread", method: "archiveThread", body: `{"method":"archiveThread","params":{"thread":"T-019e65c0-0310-77a8-b233-4b84d9c0612b","archived":true}}`},
+		{name: "deleteThread", method: "deleteThread", body: `{"method":"deleteThread","params":{"thread":"T-019e65c0-0310-77a8-b233-4b84d9c0612b"}}`},
+		{name: "getThreadLabels", method: "getThreadLabels", body: `{"method":"getThreadLabels","params":{"thread":"T-019e65c0-0310-77a8-b233-4b84d9c0612b"}}`},
+		{name: "setThreadLabels", method: "setThreadLabels", body: `{"method":"setThreadLabels","params":{"thread":"T-019e65c0-0310-77a8-b233-4b84d9c0612b","labels":[]}}`},
+		{name: "addThreadLabels", method: "addThreadLabels", body: `{"method":"addThreadLabels","params":{"thread":"T-019e65c0-0310-77a8-b233-4b84d9c0612b","labels":[]}}`},
+		{name: "getUserLabels", method: "getUserLabels", body: `{"method":"getUserLabels","params":{}}`},
+		{name: "createTask", method: "createTask", body: `{"method":"createTask","params":{"title":"Run the build"}}`},
+		{name: "getTask", method: "getTask", body: `{"method":"getTask","params":{"taskID":"task-local"}}`},
+		{name: "listTasks", method: "listTasks", body: `{"method":"listTasks","params":{}}`},
+		{name: "updateTask", method: "updateTask", body: `{"method":"updateTask","params":{"taskID":"task-local"}}`},
+		{name: "deleteTask", method: "deleteTask", body: `{"method":"deleteTask","params":{"taskID":"task-local"}}`},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1895,7 +1393,7 @@ func TestRegisterManagementRoutesPassesThreadReaderToolsUpstreamWhenProxyExists(
 	}
 }
 
-func TestRegisterManagementRoutesServesNeoTaskInternalMethodsLocally(t *testing.T) {
+func TestRegisterManagementRoutesDoesNotServeNeoTaskInternalMethodsLocally(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	enabled := true
@@ -1905,11 +1403,6 @@ func TestRegisterManagementRoutesServesNeoTaskInternalMethodsLocally(t *testing.
 		w.WriteHeader(http.StatusTeapot)
 	}))
 	defer upstream.Close()
-
-	dir := t.TempDir()
-	oldStoreDir := neoAmpThreadStoreDir
-	neoAmpThreadStoreDir = func() string { return dir }
-	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
 
 	m := &AmpModule{
 		restrictToLocalhost: false,
@@ -1923,82 +1416,21 @@ func TestRegisterManagementRoutesServesNeoTaskInternalMethodsLocally(t *testing.
 	}
 	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, nil)
 
-	postTask := func(method, body string) map[string]any {
-		t.Helper()
-		proxyCalled = false
-		req := httptest.NewRequest(http.MethodPost, "/api/internal?"+method, bytes.NewBufferString(body))
-		req.Header.Set("Content-Type", "application/json")
-		rec := httptest.NewRecorder()
-		r.ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Fatalf("%s status = %d, body=%s", method, rec.Code, rec.Body.String())
-		}
-		if proxyCalled {
-			t.Fatalf("%s should be served locally", method)
-		}
-		var response map[string]any
-		if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
-			t.Fatalf("%s response JSON error: %v", method, err)
-		}
-		return response
-	}
+	for _, method := range []string{"createTask", "getTask", "listTasks", "updateTask", "deleteTask"} {
+		t.Run(method, func(t *testing.T) {
+			proxyCalled = false
+			req := httptest.NewRequest(http.MethodPost, "/api/internal?"+method, bytes.NewBufferString(`{"method":"`+method+`","params":{"taskID":"task-local","title":"Run the build"}}`))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			r.ServeHTTP(rec, req)
 
-	createBuild := postTask("createTask", `{"method":"createTask","params":{"title":"Run the build","repoURL":"https://github.com/acme/repo","threadID":"T-local"}}`)
-	if createBuild["ok"] != true {
-		t.Fatalf("createTask build response = %#v", createBuild)
-	}
-	buildTask := mapValue(createBuild["result"])
-	buildID := stringValue(buildTask["id"])
-	if buildID == "" || stringValue(buildTask["status"]) != "open" || stringValue(buildTask["threadID"]) != "T-local" {
-		t.Fatalf("created build task = %#v", buildTask)
-	}
-
-	createFix := postTask("createTask", `{"method":"createTask","params":{"title":"Fix type errors","repoURL":"https://github.com/acme/repo","dependsOn":["`+buildID+`"],"parentID":"`+buildID+`"}}`)
-	if createFix["ok"] != true {
-		t.Fatalf("createTask fix response = %#v", createFix)
-	}
-	fixTask := mapValue(createFix["result"])
-	fixID := stringValue(fixTask["id"])
-	if fixID == "" || stringValue(fixTask["parentID"]) != buildID {
-		t.Fatalf("created fix task = %#v", fixTask)
-	}
-
-	notReady := postTask("listTasks", `{"method":"listTasks","params":{"dependsOn":"`+buildID+`","ready":true}}`)
-	if tasks := arrayValue(mapValue(notReady["result"])["tasks"]); len(tasks) != 0 {
-		t.Fatalf("ready tasks before dependency completion = %#v", tasks)
-	}
-
-	updateBuild := postTask("updateTask", `{"method":"updateTask","params":{"taskID":"`+buildID+`","status":"completed"}}`)
-	if updateBuild["ok"] != true || stringValue(mapValue(updateBuild["result"])["status"]) != "completed" {
-		t.Fatalf("updateTask build response = %#v", updateBuild)
-	}
-
-	ready := postTask("listTasks", `{"method":"listTasks","params":{"repoURL":"https://github.com/acme/repo","dependsOn":"`+buildID+`","ready":true,"limit":1}}`)
-	readyTasks := arrayValue(mapValue(ready["result"])["tasks"])
-	if len(readyTasks) != 1 || stringValue(mapValue(readyTasks[0])["id"]) != fixID {
-		t.Fatalf("ready tasks after dependency completion = %#v", readyTasks)
-	}
-
-	getFix := postTask("getTask", `{"method":"getTask","params":{"taskID":"`+fixID+`"}}`)
-	if getFix["ok"] != true || stringValue(mapValue(getFix["result"])["title"]) != "Fix type errors" {
-		t.Fatalf("getTask response = %#v", getFix)
-	}
-
-	blockedDelete := postTask("deleteTask", `{"method":"deleteTask","params":{"taskID":"`+buildID+`","blockIfHasChildren":true}}`)
-	if blockedDelete["ok"] != false || stringValue(mapValue(blockedDelete["error"])["code"]) != "has-children" {
-		t.Fatalf("deleteTask blocked response = %#v", blockedDelete)
-	}
-
-	deleteFix := postTask("deleteTask", `{"method":"deleteTask","params":{"taskID":"`+fixID+`","blockIfHasChildren":true}}`)
-	if deleteFix["ok"] != true {
-		t.Fatalf("deleteTask fix response = %#v", deleteFix)
-	}
-	deleteBuild := postTask("deleteTask", `{"method":"deleteTask","params":{"taskID":"`+buildID+`","blockIfHasChildren":true}}`)
-	if deleteBuild["ok"] != true {
-		t.Fatalf("deleteTask build response = %#v", deleteBuild)
-	}
-	if _, err := os.Stat(filepath.Join(dir, "tasks", "tasks.json")); err != nil {
-		t.Fatalf("task store stat error: %v", err)
+			if rec.Code != http.StatusServiceUnavailable {
+				t.Fatalf("%s status = %d, body=%s", method, rec.Code, rec.Body.String())
+			}
+			if proxyCalled {
+				t.Fatalf("%s should not be served locally or call upstream without a configured proxy", method)
+			}
+		})
 	}
 }
 
