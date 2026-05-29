@@ -13,6 +13,10 @@ import (
 	"errors"
 	"fmt"
 	"html"
+	"image"
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
 	"io"
 	"math/big"
 	"net"
@@ -8637,7 +8641,11 @@ func writeNeoSSEEvent(w http.ResponseWriter, event string, payload any) {
 	_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, raw)
 }
 
-const neoAttachmentMaxEncodedBytes = 64 * 1024 * 1024
+const (
+	neoAttachmentMaxEncodedBytes   = 64 * 1024 * 1024
+	neoAttachmentMaxImageBytes     = 5138022
+	neoAttachmentMaxImageDimension = 8000
+)
 
 var neoAttachmentIDPattern = regexp.MustCompile(`^[0-9A-Za-z]{16,64}$`)
 
@@ -8724,6 +8732,9 @@ func decodeNeoAttachmentPayload(data, mediaType string) ([]byte, string, error) 
 			}
 		}
 	}
+	if len(data) > neoAttachmentMaxImageBytes {
+		return nil, "", fmt.Errorf("Error: Image file (%.1f MB) exceeds maximum allowed size (%.1f MB).", float64(len(data))/1048576, float64(neoAttachmentMaxImageBytes)/1048576)
+	}
 	raw, err := base64.StdEncoding.DecodeString(data)
 	if err != nil {
 		return nil, "", errors.New("invalid base64 attachment data")
@@ -8731,10 +8742,62 @@ func decodeNeoAttachmentPayload(data, mediaType string) ([]byte, string, error) 
 	if len(raw) == 0 {
 		return nil, "", errors.New("empty attachment data")
 	}
+	if len(raw) > neoAttachmentMaxImageBytes {
+		return nil, "", fmt.Errorf("Image too large: %.1fMB (max: %.1fMB)", float64(len(raw))/1048576, float64(neoAttachmentMaxImageBytes)/1048576)
+	}
 	if strings.TrimSpace(mediaType) == "" {
 		mediaType = http.DetectContentType(raw)
 	}
+	mediaType = strings.ToLower(strings.TrimSpace(mediaType))
+	if !neoProtocolImageMediaType(mediaType) {
+		return nil, "", fmt.Errorf("Unsupported image media type: %s. Supported media types: image/png, image/jpeg, image/gif, image/webp", mediaType)
+	}
+	if width, height, ok := neoAttachmentImageDimensions(raw, mediaType); ok && (width > neoAttachmentMaxImageDimension || height > neoAttachmentMaxImageDimension) {
+		return nil, "", fmt.Errorf("Image dimensions too large: %dx%dpx (max %dpx per dimension)", width, height, neoAttachmentMaxImageDimension)
+	}
 	return raw, mediaType, nil
+}
+
+func neoAttachmentImageDimensions(raw []byte, mediaType string) (int, int, bool) {
+	if mediaType == "image/webp" {
+		return neoWebPDimensions(raw)
+	}
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(raw))
+	if err != nil || cfg.Width <= 0 || cfg.Height <= 0 {
+		return 0, 0, false
+	}
+	return cfg.Width, cfg.Height, true
+}
+
+func neoWebPDimensions(raw []byte) (int, int, bool) {
+	if len(raw) < 30 || string(raw[:4]) != "RIFF" || string(raw[8:12]) != "WEBP" {
+		return 0, 0, false
+	}
+	chunk := string(raw[12:16])
+	switch chunk {
+	case "VP8X":
+		width := 1 + int(raw[24]) + (int(raw[25]) << 8) + (int(raw[26]) << 16)
+		height := 1 + int(raw[27]) + (int(raw[28]) << 8) + (int(raw[29]) << 16)
+		return width, height, width > 0 && height > 0
+	case "VP8L":
+		if len(raw) < 25 || raw[20] != 0x2f {
+			return 0, 0, false
+		}
+		width := 1 + int(raw[21]) + (int(raw[22]&0x3f) << 8)
+		height := 1 + (int(raw[23]) << 2) + (int(raw[22]&0xc0) >> 6) + (int(raw[24]&0x0f) << 10)
+		return width, height, width > 0 && height > 0
+	case "VP8 ":
+		if len(raw) < 30 || raw[23] != 0x9d || raw[24] != 0x01 || raw[25] != 0x2a {
+			return 0, 0, false
+		}
+		width := int(raw[26]) + int(raw[27])<<8
+		height := int(raw[28]) + int(raw[29])<<8
+		width &= 0x3fff
+		height &= 0x3fff
+		return width, height, width > 0 && height > 0
+	default:
+		return 0, 0, false
+	}
 }
 
 func writeNeoLocalAttachment(raw []byte, mediaType string) (string, error) {

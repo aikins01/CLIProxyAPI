@@ -266,10 +266,13 @@
     return count;
   });
   const maxComposerImages = 8;
-  const maxComposerImageBytes = 45 * 1024 * 1024;
+  const maxComposerImageEncodedBytes = 5_138_022;
+  const maxComposerImageBytes = Math.floor(maxComposerImageEncodedBytes / 4) * 3;
   const maxQueuedMessages = 5;
   const maxReconnectAttempts = 6;
-  const defaultAgentMode = 'deep';
+  const defaultAgentMode = 'smart';
+  const composerImageAccept = 'image/png,image/jpeg,image/gif,image/webp,.png,.jpg,.jpeg,.gif,.webp';
+  const composerImageMediaTypes = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
   const agentModeOptions = ['smart', 'large', 'rush', 'deep', 'nostromo', 'agg-man'];
   const visibleAgentModeOptions = ['smart', 'large', 'rush', 'deep', 'nostromo'];
   const agentModeLabels: Record<string, string> = {
@@ -1063,12 +1066,11 @@
   }
 
   function mediaTypeForImage(file: File) {
-    if (file.type && file.type.startsWith('image/')) return file.type;
+    const type = file.type.trim().toLowerCase();
+    if (composerImageMediaTypes.has(type)) return type;
     const ext = file.name.toLowerCase().split('.').pop() ?? '';
     const types: Record<string, string> = {
-      avif: 'image/avif',
       gif: 'image/gif',
-      heic: 'image/heic',
       jpeg: 'image/jpeg',
       jpg: 'image/jpeg',
       png: 'image/png',
@@ -1110,7 +1112,7 @@
       lastError = '';
     }
     if (rejected > 0) {
-      lastError = `Skipped ${rejected} file${rejected === 1 ? '' : 's'}; attach images under ${formatBytes(maxComposerImageBytes)}.`;
+      lastError = `Skipped ${rejected} file${rejected === 1 ? '' : 's'}; attach png, jpg, gif, or webp images under ${formatBytes(maxComposerImageEncodedBytes)} encoded.`;
     }
   }
 
@@ -1161,6 +1163,9 @@
 
   async function uploadComposerAttachment(attachment: ComposerAttachment): Promise<ContentBlock> {
     const data = await fileToBase64(attachment.file);
+    if (data.length > maxComposerImageEncodedBytes) {
+      throw new Error(`Image upload failed for ${attachment.name}: image exceeds ${formatBytes(maxComposerImageEncodedBytes)} encoded.`);
+    }
     const response = await fetch('/api/attachments', {
       method: 'POST',
       headers: headers(),
@@ -1771,6 +1776,7 @@
     try {
       const bytes = Uint8Array.from(atob(match[2]), (char) => char.charCodeAt(0));
       const mediaType = match[1] || 'image/png';
+      if (!composerImageMediaTypes.has(mediaType) || match[2].length > maxComposerImageEncodedBytes) return null;
       const name = imageBlockName(block);
       const file = new File([bytes], name, { type: mediaType });
       return {
@@ -4729,7 +4735,7 @@
                   bind:this={attachmentInput}
                   class="composer-file-input"
                   type="file"
-                  accept="image/*"
+                  accept={composerImageAccept}
                   multiple
                   onchange={handleAttachmentInput}
                 />

@@ -2,8 +2,11 @@ package amp
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"image"
+	"image/png"
 	"io"
 	"net"
 	"net/http"
@@ -667,6 +670,41 @@ func TestRegisterManagementRoutesServesNeoAttachmentsLocally(t *testing.T) {
 	if headRec.Code != http.StatusOK || headRec.Body.Len() != 0 {
 		t.Fatalf("head response = status %d body %q", headRec.Code, headRec.Body.String())
 	}
+}
+
+func TestDecodeNeoAttachmentPayloadMatchesBinaryImageLimits(t *testing.T) {
+	data := testNeoPNGBase64(t, 1, 1)
+	raw, mediaType, err := decodeNeoAttachmentPayload(data, "image/png")
+	if err != nil {
+		t.Fatalf("decode valid image: %v", err)
+	}
+	if len(raw) == 0 || mediaType != "image/png" {
+		t.Fatalf("decoded image = len %d mediaType %q", len(raw), mediaType)
+	}
+
+	if _, _, err := decodeNeoAttachmentPayload(data, "image/avif"); err == nil || !strings.Contains(err.Error(), "Unsupported image media type") {
+		t.Fatalf("unsupported media error = %v", err)
+	}
+
+	encoded := strings.Repeat("A", neoAttachmentMaxImageBytes+1)
+	if _, _, err := decodeNeoAttachmentPayload(encoded, "image/png"); err == nil || !strings.Contains(err.Error(), "exceeds maximum allowed size") {
+		t.Fatalf("oversized image error = %v", err)
+	}
+
+	oversizedDimensions := testNeoPNGBase64(t, neoAttachmentMaxImageDimension+1, 1)
+	if _, _, err := decodeNeoAttachmentPayload(oversizedDimensions, "image/png"); err == nil || !strings.Contains(err.Error(), "Image dimensions too large") {
+		t.Fatalf("oversized dimensions error = %v", err)
+	}
+}
+
+func testNeoPNGBase64(t *testing.T, width, height int) string {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, width, height))
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatalf("encode png: %v", err)
+	}
+	return base64.StdEncoding.EncodeToString(buf.Bytes())
 }
 
 func TestRegisterManagementRoutesServesNeoThreadUsageLocally(t *testing.T) {
