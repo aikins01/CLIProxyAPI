@@ -1,11 +1,8 @@
 package amp
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
-	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -14,7 +11,6 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers/claude"
@@ -176,9 +172,6 @@ func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *ha
 
 	// Dynamic proxy handler that uses m.getProxy() for hot-reload support
 	proxyHandler := func(c *gin.Context) {
-		if m.tryServeNeoLocalInternal(c) {
-			return
-		}
 		if m.tryServeNeoLocalThreadActor(c) {
 			return
 		}
@@ -363,21 +356,6 @@ func stripNeoCredentialSubprotocols(header string) string {
 	return strings.Join(out, ", ")
 }
 
-func (m *AmpModule) tryServeNeoLocalInternal(c *gin.Context) bool {
-	if m == nil || c == nil || c.Request == nil || c.Request.URL == nil || m.neoThreadConfigSnapshot() == nil {
-		return false
-	}
-	method := neoLocalInternalMethod(c.Request)
-	if method == "" {
-		return false
-	}
-	if m.getProxy() != nil {
-		return false
-	}
-	c.JSON(http.StatusOK, neoLocalInternalResponse(c.Request.Context(), m.neoThreadConfigSnapshot(), c.Request, method))
-	return true
-}
-
 func requestHasAmpClientHeaders(r *http.Request) bool {
 	if r == nil {
 		return false
@@ -385,97 +363,6 @@ func requestHasAmpClientHeaders(r *http.Request) bool {
 	return strings.TrimSpace(r.Header.Get("X-Amp-Client-Application")) != "" ||
 		strings.TrimSpace(r.Header.Get("X-Amp-Client-Type")) != "" ||
 		strings.TrimSpace(r.Header.Get("X-Amp-Client-Version")) != ""
-}
-
-func neoLocalInternalMethod(r *http.Request) string {
-	if r == nil || r.URL == nil {
-		return ""
-	}
-	path := strings.TrimPrefix(r.URL.Path, "/api")
-	if "/"+strings.Trim(path, "/") != "/internal" {
-		return ""
-	}
-	query := r.URL.Query()
-	for _, method := range neoLocalInternalMethods {
-		if _, ok := query[method]; ok {
-			return method
-		}
-	}
-	if method := strings.TrimSpace(query.Get("method")); neoLocalInternalMethodSupported(method) {
-		return method
-	}
-	if method := strings.TrimSpace(stringValue(neoLocalInternalPayload(r)["method"])); neoLocalInternalMethodSupported(method) {
-		return method
-	}
-	return ""
-}
-
-func neoLocalInternalMethodSupported(method string) bool {
-	method = strings.TrimSpace(method)
-	for _, supported := range neoLocalInternalMethods {
-		if method == supported {
-			return true
-		}
-	}
-	return false
-}
-
-var neoLocalInternalMethods = []string{
-	"loadPlugins",
-	"getUserInfo",
-}
-
-func neoLocalInternalPayload(r *http.Request) map[string]any {
-	if r == nil || r.Body == nil {
-		return nil
-	}
-	raw, err := io.ReadAll(r.Body)
-	if err != nil {
-		return nil
-	}
-	r.Body = io.NopCloser(bytes.NewReader(raw))
-	if len(bytes.TrimSpace(raw)) == 0 {
-		return nil
-	}
-	var payload map[string]any
-	if err := json.Unmarshal(raw, &payload); err != nil {
-		return nil
-	}
-	return payload
-}
-
-func neoLocalInternalResponse(ctx context.Context, cfg *config.Config, r *http.Request, method string) gin.H {
-	switch method {
-	case "loadPlugins":
-		return gin.H{"ok": true, "result": []any{}}
-	case "getUserInfo":
-		return gin.H{"ok": true, "result": gin.H{
-			"id":                neoLocalOwnerUserID,
-			"username":          neoLocalOwnerUserID,
-			"githubLogin":       neoLocalOwnerUserID,
-			"slackUserID":       nil,
-			"email":             "local@example.com",
-			"firstName":         "Local",
-			"lastName":          "User",
-			"emailVerified":     true,
-			"profilePictureUrl": nil,
-			"lastSignInAt":      nil,
-			"createdAt":         nil,
-			"updatedAt":         nil,
-			"siteAdmin":         false,
-			"features": []any{
-				gin.H{"name": "accept-abuse-data-retention", "enabled": true},
-				gin.H{"name": "thread-actors-tui", "enabled": true},
-			},
-			"name":              "Local User",
-			"team":              gin.H{"id": "local-workspace", "name": "Local Workspace"},
-			"workspaceID":       "local-workspace",
-			"workspaceId":       "local-workspace",
-			"mysteriousMessage": nil,
-		}}
-	default:
-		return gin.H{"ok": true, "result": nil}
-	}
 }
 
 // registerProviderAliases registers /api/provider/{provider}/... routes

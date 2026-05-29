@@ -7610,9 +7610,6 @@ func (m *AmpModule) canServeNeoLocalManagement(r *http.Request) bool {
 	if m == nil || r == nil || r.URL == nil {
 		return false
 	}
-	if neoLocalInternalMethod(r) != "" {
-		return m.neoThreadConfigSnapshot() != nil
-	}
 	if _, ok := neoThreadActorManagementPath(r.URL.Path); ok && m.neoRuntime != nil {
 		return true
 	}

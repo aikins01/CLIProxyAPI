@@ -614,7 +614,7 @@ func TestRegisterManagementRoutesMimicsCloudThreadActorHandshake(t *testing.T) {
 	}
 }
 
-func TestRegisterManagementRoutesServesNeoBootstrapInternalsLocally(t *testing.T) {
+func TestRegisterManagementRoutesDoesNotServeNeoBootstrapInternalsLocally(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	enabled := true
@@ -638,36 +638,11 @@ func TestRegisterManagementRoutesServesNeoBootstrapInternalsLocally(t *testing.T
 	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, nil)
 
 	for _, tc := range []struct {
-		name  string
-		path  string
-		check func(t *testing.T, response map[string]any)
+		name string
+		path string
 	}{
 		{name: "loadPlugins", path: "/api/internal?loadPlugins"},
-		{
-			name: "getUserInfo",
-			path: "/api/internal?getUserInfo",
-			check: func(t *testing.T, response map[string]any) {
-				t.Helper()
-				result := mapValue(response["result"])
-				if stringValue(result["id"]) != neoLocalOwnerUserID || stringValue(result["githubLogin"]) == "" || result["mysteriousMessage"] != nil {
-					t.Fatalf("user info result = %#v", result)
-				}
-				features := arrayValue(result["features"])
-				if len(features) == 0 {
-					t.Fatalf("user info features missing: %#v", result)
-				}
-				foundRetentionFeature := false
-				for _, raw := range features {
-					feature := mapValue(raw)
-					if stringValue(feature["name"]) == "accept-abuse-data-retention" && boolValue(feature["enabled"]) {
-						foundRetentionFeature = true
-					}
-				}
-				if !foundRetentionFeature {
-					t.Fatalf("user info missing GPT-5.5 retention feature: %#v", features)
-				}
-			},
-		},
+		{name: "getUserInfo", path: "/api/internal?getUserInfo"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			proxyCalled = false
@@ -675,21 +650,11 @@ func TestRegisterManagementRoutesServesNeoBootstrapInternalsLocally(t *testing.T
 			rec := httptest.NewRecorder()
 			r.ServeHTTP(rec, req)
 
-			if rec.Code != http.StatusOK {
+			if rec.Code != http.StatusServiceUnavailable {
 				t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
 			}
 			if proxyCalled {
-				t.Fatalf("%s should be served locally during Neo bootstrap", tc.path)
-			}
-			var response map[string]any
-			if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
-				t.Fatalf("response JSON error: %v", err)
-			}
-			if response["ok"] != true {
-				t.Fatalf("unexpected local internal response: %#v", response)
-			}
-			if tc.check != nil {
-				tc.check(t, response)
+				t.Fatalf("%s should not call the test upstream without a configured proxy", tc.path)
 			}
 		})
 	}
@@ -1169,6 +1134,8 @@ func TestRegisterManagementRoutesDoesNotSynthesizeAmpControlPlaneRPCs(t *testing
 
 	for _, method := range []string{
 		"notices",
+		"loadPlugins",
+		"getUserInfo",
 		"getUserFreeTierStatus",
 		"logNoticeAction",
 		"markAsReadMysteriousMessage",
