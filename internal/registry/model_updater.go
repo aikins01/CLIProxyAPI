@@ -179,6 +179,7 @@ func fetchModelsFromRemote(ctx context.Context) (*staticModelsJSON, string) {
 			log.Warnf("models parse failed from %s: %v", url, err)
 			continue
 		}
+		applyAmpBinaryModelOverrides(&parsed)
 		if err := validateModelsCatalog(&parsed); err != nil {
 			log.Warnf("models validate failed from %s: %v", url, err)
 			continue
@@ -299,6 +300,7 @@ func loadModelsFromBytes(data []byte, source string) error {
 	if err := json.Unmarshal(data, &parsed); err != nil {
 		return fmt.Errorf("%s: decode models catalog: %w", source, err)
 	}
+	applyAmpBinaryModelOverrides(&parsed)
 	if err := validateModelsCatalog(&parsed); err != nil {
 		return fmt.Errorf("%s: validate models catalog: %w", source, err)
 	}
@@ -307,6 +309,94 @@ func loadModelsFromBytes(data []byte, source string) error {
 	modelsCatalogStore.data = &parsed
 	modelsCatalogStore.mu.Unlock()
 	return nil
+}
+
+func applyAmpBinaryModelOverrides(data *staticModelsJSON) {
+	if data == nil {
+		return
+	}
+
+	setModelLimits(data.Claude, "claude-sonnet-4-6", 1000000, 64000)
+	setModelLimits(data.Claude, "claude-opus-4-6", 332000, 32000)
+	setModelLimits(data.Claude, "claude-opus-4-7", 332000, 32000)
+	data.Claude = upsertModelInfoPreserveOrder(data.Claude, ampBinaryClaudeOpus48Model())
+
+	for _, models := range [][]*ModelInfo{data.CodexFree, data.CodexTeam, data.CodexPlus, data.CodexPro} {
+		setModelLimits(models, "gpt-5.4", 400000, 128000)
+		setModelLimits(models, "gpt-5.5", 400000, 128000)
+	}
+	data.CodexPro = upsertModelInfoPreserveOrder(data.CodexPro, ampBinaryCodexProModel(data.CodexPro, "gpt-5.4", "gpt-5.4-pro", "GPT 5.4 Pro", "Extended-context GPT 5.4 Pro model."))
+	data.CodexPro = upsertModelInfoPreserveOrder(data.CodexPro, ampBinaryCodexProModel(data.CodexPro, "gpt-5.5", "gpt-5.5-pro", "GPT 5.5 Pro", "Extended-context GPT 5.5 Pro model."))
+}
+
+func setModelLimits(models []*ModelInfo, id string, contextLength, maxCompletionTokens int) {
+	if model := modelInfoByID(models, id); model != nil {
+		model.ContextLength = contextLength
+		model.MaxCompletionTokens = maxCompletionTokens
+	}
+}
+
+func modelInfoByID(models []*ModelInfo, id string) *ModelInfo {
+	for _, model := range models {
+		if model != nil && model.ID == id {
+			return model
+		}
+	}
+	return nil
+}
+
+func upsertModelInfoPreserveOrder(models []*ModelInfo, extra *ModelInfo) []*ModelInfo {
+	if extra == nil || strings.TrimSpace(extra.ID) == "" {
+		return models
+	}
+	for i, model := range models {
+		if model != nil && strings.EqualFold(strings.TrimSpace(model.ID), strings.TrimSpace(extra.ID)) {
+			models[i] = cloneModelInfo(extra)
+			return models
+		}
+	}
+	return append(models, cloneModelInfo(extra))
+}
+
+func ampBinaryClaudeOpus48Model() *ModelInfo {
+	return &ModelInfo{
+		ID:                  "claude-opus-4-8",
+		Object:              "model",
+		Created:             1779984000,
+		OwnedBy:             "anthropic",
+		Type:                "claude",
+		DisplayName:         "Claude Opus 4.8",
+		Description:         "Premium model combining maximum intelligence with practical performance",
+		ContextLength:       332000,
+		MaxCompletionTokens: 32000,
+		Thinking: &ThinkingSupport{
+			Min:         1024,
+			Max:         128000,
+			ZeroAllowed: true,
+			Levels:      []string{"low", "medium", "high", "xhigh", "max"},
+		},
+	}
+}
+
+func ampBinaryCodexProModel(models []*ModelInfo, baseID, id, displayName, description string) *ModelInfo {
+	model := cloneModelInfo(modelInfoByID(models, baseID))
+	if model == nil {
+		model = &ModelInfo{
+			Object:              "model",
+			OwnedBy:             "openai",
+			Type:                "openai",
+			MaxCompletionTokens: 128000,
+			SupportedParameters: []string{"tools"},
+			Thinking:            &ThinkingSupport{Levels: []string{"low", "medium", "high", "xhigh"}},
+		}
+	}
+	model.ID = id
+	model.DisplayName = displayName
+	model.Version = id
+	model.Description = description
+	model.ContextLength = 1050000
+	model.MaxCompletionTokens = 128000
+	return model
 }
 
 func getModels() *staticModelsJSON {
