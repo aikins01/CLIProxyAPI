@@ -327,7 +327,7 @@ func (rt *neoRuntime) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		rt.handleMessagesRequest(w, r)
 	case rt.serveActorKVKeyHTTP(w, r):
 		return
-	case isNeoSkillsPath(r.URL.Path):
+	case isNeoSkillsPath(r.URL.Path) && (r.Method == http.MethodGet || r.Method == http.MethodPost):
 		log.Debugf("amp neo local runtime HTTP skills method=%s path=%s rawQuery=%s", r.Method, r.URL.Path, r.URL.RawQuery)
 		writeNeoJSON(w, http.StatusOK, rt.store.skillsResponse(neoActorIDFromSkillsPath(r.URL.Path), r.URL.Query()))
 	case strings.HasPrefix(r.URL.Path, "/actors/") && r.Method == http.MethodDelete:
@@ -672,15 +672,15 @@ func runtimeArch() string {
 }
 
 func isNeoSkillsPath(path string) bool {
-	path = strings.TrimSuffix(path, "/")
-	if path == "/skills" || (strings.HasPrefix(path, "/actors/") && strings.HasSuffix(path, "/skills")) {
-		return true
-	}
-	if strings.Contains(strings.ToLower(path), "skills") {
+	path = "/" + strings.Trim(strings.TrimSuffix(path, "/"), "/")
+	if path == "/skills" || path == "/request/skills" || path == "/request/list-skills" {
 		return true
 	}
 	parts := strings.Split(strings.Trim(path, "/"), "/")
-	return len(parts) >= 3 && parts[len(parts)-2] == "request" && parts[len(parts)-1] == "skills"
+	if len(parts) == 3 && parts[0] == "actors" && parts[2] == "skills" && parts[1] != "" {
+		return true
+	}
+	return len(parts) >= 3 && parts[len(parts)-2] == "request" && (parts[len(parts)-1] == "skills" || parts[len(parts)-1] == "list-skills")
 }
 
 func neoActorIDFromSkillsPath(path string) string {
@@ -692,7 +692,7 @@ func neoActorIDFromSkillsPath(path string) string {
 		}
 	}
 	for i := len(parts) - 1; i >= 0; i-- {
-		if parts[i] != "" && parts[i] != "actors" && parts[i] != "gateway" && parts[i] != "request" && parts[i] != "skills" {
+		if parts[i] != "" && parts[i] != "actors" && parts[i] != "gateway" && parts[i] != "request" && parts[i] != "skills" && parts[i] != "list-skills" {
 			return neoActorPathID(parts[i])
 		}
 	}

@@ -12052,6 +12052,32 @@ func TestNeoRuntimeActorSkillsHTTP(t *testing.T) {
 	}
 }
 
+func TestNeoSkillsPathMatchesOnlyKnownEndpoints(t *testing.T) {
+	for _, path := range []string{
+		"/skills",
+		"/request/skills",
+		"/request/list-skills",
+		"/actors/A-123/skills",
+		"/gateway/A-123/request/skills",
+		"/gateway/threadActor/request/list-skills",
+	} {
+		if !isNeoSkillsPath(path) {
+			t.Fatalf("isNeoSkillsPath(%q) = false, want true", path)
+		}
+	}
+
+	for _, path := range []string{
+		"/gateway/threadActor/request/skillsets",
+		"/gateway/threadActor/request/user-skills-summary",
+		"/actors/A-123/kv/keys/skills%2Fstate",
+		"/api/threads/find?q=skills",
+	} {
+		if isNeoSkillsPath(path) {
+			t.Fatalf("isNeoSkillsPath(%q) = true, want false", path)
+		}
+	}
+}
+
 func TestNeoCloudThreadIncludesProtocolMessageIDAndCompleteState(t *testing.T) {
 	thread := neoCloudThread(neoCloudThreadSnapshot{
 		threadID:  "T-test",
