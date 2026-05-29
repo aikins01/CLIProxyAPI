@@ -11500,6 +11500,64 @@ func TestNeoRuntimeThreadActorBootstrapDoesNotFetchCloudThread(t *testing.T) {
 	}
 }
 
+func TestUploadNeoCloudThreadUsesAmpInternalClientHeaders(t *testing.T) {
+	threadID := "T-019e65c0-0310-77a8-b233-4b84d9c0612b"
+	var sawRequest bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawRequest = true
+		if r.URL.Path != "/api/internal" || r.URL.RawQuery != "uploadThread" {
+			t.Fatalf("request target = %s?%s", r.URL.Path, r.URL.RawQuery)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer secret" {
+			t.Fatalf("Authorization = %q", got)
+		}
+		if got := r.Header.Get("X-Amp-Client-Application"); got != "CLI" {
+			t.Fatalf("X-Amp-Client-Application = %q", got)
+		}
+		if got := r.Header.Get("X-Amp-Client-Type"); got != "cli" {
+			t.Fatalf("X-Amp-Client-Type = %q", got)
+		}
+		if got := r.Header.Get("X-Amp-Client-Version"); strings.TrimSpace(got) == "" {
+			t.Fatalf("X-Amp-Client-Version missing")
+		}
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode payload: %v", err)
+		}
+		if payload["method"] != "uploadThread" {
+			t.Fatalf("method = %#v", payload["method"])
+		}
+		params := mapValue(payload["params"])
+		if params["createdOnServer"] != false {
+			t.Fatalf("createdOnServer = %#v", params["createdOnServer"])
+		}
+		thread := mapValue(params["thread"])
+		if thread["id"] != threadID {
+			t.Fatalf("thread id = %#v", thread["id"])
+		}
+		writeNeoJSON(w, http.StatusOK, map[string]any{"ok": true})
+	}))
+	defer upstream.Close()
+
+	err := uploadNeoCloudThread(neoCloudThreadSnapshot{
+		upstreamURL: upstream.URL,
+		apiKey:      "secret",
+		threadID:    threadID,
+		seq:         1,
+		createdMs:   1778170000000,
+		title:       "Header parity",
+		messages: []neoMessage{
+			{ThreadID: threadID, MessageID: "M-user", Role: "user", Content: []any{map[string]any{"type": "text", "text": "hello"}}, Seq: 1},
+		},
+	})
+	if err != nil {
+		t.Fatalf("uploadNeoCloudThread error: %v", err)
+	}
+	if !sawRequest {
+		t.Fatal("upstream did not receive uploadThread request")
+	}
+}
+
 func TestNeoRuntimeIgnoresCloudCachedLocalThreadOnBootstrap(t *testing.T) {
 	dir := t.TempDir()
 	oldStoreDir := neoAmpThreadStoreDir

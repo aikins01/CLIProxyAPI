@@ -36,6 +36,7 @@ import (
 	regexp2 "github.com/dlclark/regexp2"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/buildinfo"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
@@ -6523,6 +6524,7 @@ func uploadNeoCloudThread(snapshot neoCloudThreadSnapshot) error {
 	}
 	req.Header.Set("Authorization", "Bearer "+snapshot.apiKey)
 	req.Header.Set("Content-Type", "application/json")
+	setAmpInternalClientHeaders(req)
 	if len(raw) >= neoCloudGzipBytes {
 		req.Header.Set("Content-Encoding", "gzip")
 	}
@@ -6544,6 +6546,25 @@ func uploadNeoCloudThread(snapshot neoCloudThreadSnapshot) error {
 	}
 	log.Debugf("amp neo local runtime cloud sync complete thread=%s", snapshot.threadID)
 	return nil
+}
+
+func setAmpInternalClientHeaders(req *http.Request) {
+	if req == nil {
+		return
+	}
+	if strings.TrimSpace(req.Header.Get("X-Amp-Client-Application")) == "" {
+		req.Header.Set("X-Amp-Client-Application", "CLI")
+	}
+	if strings.TrimSpace(req.Header.Get("X-Amp-Client-Type")) == "" {
+		req.Header.Set("X-Amp-Client-Type", "cli")
+	}
+	version := strings.TrimSpace(buildinfo.Version)
+	if version == "" {
+		version = "dev"
+	}
+	if strings.TrimSpace(req.Header.Get("X-Amp-Client-Version")) == "" {
+		req.Header.Set("X-Amp-Client-Version", version)
+	}
 }
 
 func neoCloudThreadID(threadID string) bool {
