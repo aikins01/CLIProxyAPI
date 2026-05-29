@@ -971,7 +971,7 @@ func TestRegisterManagementRoutesPassesNeoThreadUsageUpstreamWhenProxyExists(t *
 	}
 }
 
-func TestRegisterManagementRoutesServesNeoLegacyRunEndpointsLocally(t *testing.T) {
+func TestRegisterManagementRoutesDoesNotServeNeoLegacyRunEndpointsLocally(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	enabled := true
@@ -983,79 +983,24 @@ func TestRegisterManagementRoutesServesNeoLegacyRunEndpointsLocally(t *testing.T
 	}
 	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, nil)
 
-	threadReq := httptest.NewRequest(http.MethodPost, "/api/threads", bytes.NewBufferString(`{"metadata":{"source":"test"}}`))
-	threadReq.Header.Set("Content-Type", "application/json")
-	threadRec := httptest.NewRecorder()
-	r.ServeHTTP(threadRec, threadReq)
-	if threadRec.Code != http.StatusOK {
-		t.Fatalf("thread create status = %d body=%s", threadRec.Code, threadRec.Body.String())
-	}
-	var threadResponse map[string]any
-	if err := json.Unmarshal(threadRec.Body.Bytes(), &threadResponse); err != nil {
-		t.Fatalf("thread create JSON error: %v", err)
-	}
-	if stringValue(threadResponse["object"]) != "thread" || !strings.HasPrefix(stringValue(threadResponse["id"]), "T-") {
-		t.Fatalf("thread create response = %#v", threadResponse)
-	}
-
-	threadID := "T-legacy"
-	runReq := httptest.NewRequest(http.MethodPost, "/api/threads/"+threadID+"/runs", bytes.NewBufferString(`{"assistant_id":"asst_test","model":"gpt-5.5"}`))
-	runReq.Header.Set("Content-Type", "application/json")
-	runRec := httptest.NewRecorder()
-	r.ServeHTTP(runRec, runReq)
-	if runRec.Code != http.StatusOK {
-		t.Fatalf("run create status = %d body=%s", runRec.Code, runRec.Body.String())
-	}
-	var runResponse map[string]any
-	if err := json.Unmarshal(runRec.Body.Bytes(), &runResponse); err != nil {
-		t.Fatalf("run create JSON error: %v", err)
-	}
-	runID := stringValue(runResponse["id"])
-	if stringValue(runResponse["object"]) != "thread.run" || stringValue(runResponse["status"]) != "completed" || stringValue(runResponse["thread_id"]) != threadID || runID == "" {
-		t.Fatalf("run create response = %#v", runResponse)
-	}
-
-	listReq := httptest.NewRequest(http.MethodGet, "/api/threads/"+threadID+"/runs", nil)
-	listRec := httptest.NewRecorder()
-	r.ServeHTTP(listRec, listReq)
-	if listRec.Code != http.StatusOK {
-		t.Fatalf("run list status = %d body=%s", listRec.Code, listRec.Body.String())
-	}
-	var listResponse map[string]any
-	if err := json.Unmarshal(listRec.Body.Bytes(), &listResponse); err != nil {
-		t.Fatalf("run list JSON error: %v", err)
-	}
-	if stringValue(listResponse["object"]) != "list" || len(arrayValue(listResponse["data"])) != 0 {
-		t.Fatalf("run list response = %#v", listResponse)
-	}
-
-	stepsReq := httptest.NewRequest(http.MethodGet, "/api/threads/"+threadID+"/runs/"+runID+"/steps", nil)
-	stepsRec := httptest.NewRecorder()
-	r.ServeHTTP(stepsRec, stepsReq)
-	if stepsRec.Code != http.StatusOK {
-		t.Fatalf("steps status = %d body=%s", stepsRec.Code, stepsRec.Body.String())
-	}
-
-	cancelReq := httptest.NewRequest(http.MethodPost, "/api/threads/"+threadID+"/runs/"+runID+"/cancel", nil)
-	cancelRec := httptest.NewRecorder()
-	r.ServeHTTP(cancelRec, cancelReq)
-	if cancelRec.Code != http.StatusOK {
-		t.Fatalf("cancel status = %d body=%s", cancelRec.Code, cancelRec.Body.String())
-	}
-	var cancelResponse map[string]any
-	if err := json.Unmarshal(cancelRec.Body.Bytes(), &cancelResponse); err != nil {
-		t.Fatalf("cancel JSON error: %v", err)
-	}
-	if stringValue(cancelResponse["status"]) != "cancelled" || cancelResponse["cancelled_at"] == nil {
-		t.Fatalf("cancel response = %#v", cancelResponse)
-	}
-
-	streamReq := httptest.NewRequest(http.MethodPost, "/api/threads/"+threadID+"/runs/"+runID+"/submit_tool_outputs", bytes.NewBufferString(`{"stream":true,"tool_outputs":[]}`))
-	streamReq.Header.Set("Content-Type", "application/json")
-	streamRec := httptest.NewRecorder()
-	r.ServeHTTP(streamRec, streamReq)
-	if streamRec.Code != http.StatusOK || !strings.Contains(streamRec.Header().Get("Content-Type"), "text/event-stream") || !strings.Contains(streamRec.Body.String(), "thread.run.completed") || !strings.Contains(streamRec.Body.String(), "[DONE]") {
-		t.Fatalf("stream response = status %d content-type %q body=%s", streamRec.Code, streamRec.Header().Get("Content-Type"), streamRec.Body.String())
+	for _, path := range []string{
+		"/api/threads",
+		"/api/threads/runs",
+		"/api/threads/T-legacy/runs",
+		"/api/threads/T-legacy/runs/run_123",
+		"/api/threads/T-legacy/runs/run_123/steps",
+		"/api/threads/T-legacy/runs/run_123/cancel",
+		"/api/threads/T-legacy/runs/run_123/submit_tool_outputs",
+	} {
+		t.Run(path, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, path, bytes.NewBufferString(`{"assistant_id":"asst_test","stream":true}`))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			r.ServeHTTP(rec, req)
+			if rec.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+			}
+		})
 	}
 }
 

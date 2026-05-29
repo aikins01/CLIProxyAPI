@@ -185,9 +185,6 @@ func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *ha
 		if m.tryServeNeoLocalAttachment(c) {
 			return
 		}
-		if m.tryServeNeoLegacyThreadRun(c) {
-			return
-		}
 
 		// Swallow ErrAbortHandler panics from ReverseProxy copyResponse to avoid noisy stack traces
 		defer func() {
