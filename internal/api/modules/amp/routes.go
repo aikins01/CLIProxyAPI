@@ -195,12 +195,6 @@ func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *ha
 		if m.tryServeNeoLegacyThreadRun(c) {
 			return
 		}
-		if tryServeNeoLocalThread(c, m.neoThreadConfigSnapshot(), m.getProxy() != nil) {
-			return
-		}
-		if tryServeNeoLocalThreadReaderTool(c, m.getProxy() != nil) {
-			return
-		}
 
 		// Swallow ErrAbortHandler panics from ReverseProxy copyResponse to avoid noisy stack traces
 		defer func() {
@@ -387,7 +381,7 @@ func (m *AmpModule) tryServeNeoLocalInternal(c *gin.Context) bool {
 	if method == "" {
 		return false
 	}
-	if m.getProxy() != nil && requestHasAmpClientHeaders(c.Request) {
+	if m.getProxy() != nil {
 		return false
 	}
 	c.JSON(http.StatusOK, neoLocalInternalResponse(c.Request.Context(), m.neoThreadConfigSnapshot(), c.Request, method))

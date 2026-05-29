@@ -309,10 +309,6 @@ func (rt *neoRuntime) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			"cargo_target":    runtimeArch(),
 			"cargo_profile":   "release",
 		})
-	case r.Method == http.MethodGet && rt.serveLocalThreadSearchHTTP(w, r):
-		return
-	case r.Method == http.MethodGet && rt.serveLocalThreadHTTP(w, r):
-		return
 	case r.URL.Path == "/actors" && r.Method == http.MethodGet:
 		writeNeoJSON(w, http.StatusOK, map[string]any{"actors": rt.store.findActors(r.URL.Query())})
 	case r.URL.Path == "/actors" && (r.Method == http.MethodPut || r.Method == http.MethodPost):
@@ -446,43 +442,6 @@ func neoActorKVKeyPath(path string) (string, string, bool) {
 		key = parts[4]
 	}
 	return actorID, key, actorID != ""
-}
-
-func (rt *neoRuntime) serveLocalThreadSearchHTTP(w http.ResponseWriter, r *http.Request) bool {
-	if rt == nil || r == nil {
-		return false
-	}
-	if !neoThreadSearchPath(r.URL.Path) {
-		return false
-	}
-	result, ok := neoThreadSearchResponse(r.Context(), rt.configSnapshot(), r.URL.Query())
-	if !ok {
-		return false
-	}
-	writeNeoJSON(w, http.StatusOK, result)
-	return true
-}
-
-func (rt *neoRuntime) serveLocalThreadHTTP(w http.ResponseWriter, r *http.Request) bool {
-	if rt == nil || r == nil {
-		return false
-	}
-	threadID, markdown := neoThreadRequestPath(r.URL.Path)
-	if threadID == "" {
-		return false
-	}
-	thread, ok := loadNeoThread(r.Context(), rt.configSnapshot(), threadID)
-	if !ok {
-		return false
-	}
-	if markdown {
-		w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(neoThreadMarkdown(thread, neoThreadMarkdownOptions{TruncateToolResults: neoThreadMarkdownShouldTruncateToolResults(r.URL.Query())})))
-		return true
-	}
-	writeNeoJSON(w, http.StatusOK, thread)
-	return true
 }
 
 func (rt *neoRuntime) handleThreadImport(w http.ResponseWriter, r *http.Request) {
@@ -8183,94 +8142,6 @@ func neoStoreLocalThreadCache(threadID string, thread map[string]any, modTime ti
 		size:    size,
 	}
 	neoLocalThreadCache.Unlock()
-}
-
-func tryServeNeoLocalThread(c *gin.Context, cfg *config.Config, hasUpstreamProxy bool) bool {
-	if c == nil || c.Request == nil || c.Request.Method != http.MethodGet {
-		return false
-	}
-	if hasUpstreamProxy {
-		return false
-	}
-	if neoThreadSearchPath(c.Request.URL.Path) {
-		result, ok := neoThreadSearchResponse(c.Request.Context(), cfg, c.Request.URL.Query())
-		if !ok {
-			return false
-		}
-		c.JSON(http.StatusOK, result)
-		return true
-	}
-	threadID, markdown := neoThreadRequestPath(c.Request.URL.Path)
-	if threadID == "" {
-		return false
-	}
-	thread, ok := loadNeoThread(c.Request.Context(), cfg, threadID)
-	if !ok {
-		return false
-	}
-	if markdown {
-		c.Data(http.StatusOK, "text/markdown; charset=utf-8", []byte(neoThreadMarkdown(thread, neoThreadMarkdownOptions{TruncateToolResults: neoThreadMarkdownShouldTruncateToolResults(c.Request.URL.Query())})))
-		return true
-	}
-	c.JSON(http.StatusOK, thread)
-	return true
-}
-
-// neoThreadReaderMessagePathPattern matches the amp client's POST endpoints used
-// by the read_thread subagent (binary's wNR executor):
-//
-//	/api/threads/{threadID}/messages/{message_stats|read_messages|search_messages}
-//	/threads/{threadID}/messages/{message_stats|read_messages|search_messages}
-var neoThreadReaderMessagePathPattern = regexp.MustCompile(`^(?:/api)?/threads/(T-[0-9A-Za-z][0-9A-Za-z-]*)/messages/(message_stats|read_messages|search_messages)$`)
-
-// tryServeNeoLocalThreadReaderTool answers the three POST endpoints the amp
-// client's read_thread subagent hits to read local thread data. When the thread
-// is not cached locally the handler returns false so the request can fall through
-// to the upstream proxy; the amp cloud then serves the same shape for cloud-only
-// threads.
-func tryServeNeoLocalThreadReaderTool(c *gin.Context, hasUpstreamProxy bool) bool {
-	if c == nil || c.Request == nil || c.Request.URL == nil || c.Request.Method != http.MethodPost {
-		return false
-	}
-	if hasUpstreamProxy {
-		return false
-	}
-	match := neoThreadReaderMessagePathPattern.FindStringSubmatch(c.Request.URL.Path)
-	if match == nil {
-		return false
-	}
-	threadID, tool := match[1], match[2]
-	thread, ok := loadNeoLocalThread(threadID)
-	if !ok {
-		return false
-	}
-	args := map[string]any{}
-	if c.Request.Body != nil {
-		body, err := io.ReadAll(c.Request.Body)
-		_ = c.Request.Body.Close()
-		if err == nil && len(bytes.TrimSpace(body)) > 0 {
-			_ = json.Unmarshal(body, &args)
-		}
-	}
-
-	switch tool {
-	case "message_stats":
-		c.JSON(http.StatusOK, neoThreadReaderMessageStats(thread))
-	case "read_messages":
-		startIndex := int(numberFrom(args["startIndex"]))
-		limit := int(numberFrom(args["limit"]))
-		markdown := neoThreadReaderReadMessages(thread, startIndex, limit)
-		c.JSON(http.StatusOK, map[string]any{
-			"markdown":  markdown,
-			"bytesRead": len(markdown),
-		})
-	case "search_messages":
-		query := stringValue(args["query"])
-		startIndex := int(numberFrom(args["startIndex"]))
-		endIndex := int(numberFrom(args["endIndex"]))
-		c.JSON(http.StatusOK, map[string]any{"results": neoThreadReaderSearchMessages(thread, query, startIndex, endIndex)})
-	}
-	return true
 }
 
 func (m *AmpModule) tryServeNeoLocalThreadUsage(c *gin.Context) bool {

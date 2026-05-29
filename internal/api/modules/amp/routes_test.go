@@ -645,8 +645,6 @@ func TestRegisterManagementRoutesServesNeoBootstrapInternalsLocally(t *testing.T
 			},
 		}}),
 	}
-	proxy, _ := createReverseProxy(upstream.URL, NewStaticSecretSource(""))
-	m.setProxy(proxy)
 	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, nil)
 
 	for _, tc := range []struct {
@@ -1066,8 +1064,6 @@ func TestRegisterManagementRoutesServesNeoStartupInternalRPCPostsLocally(t *test
 			},
 		}}),
 	}
-	proxy, _ := createReverseProxy(upstream.URL, NewStaticSecretSource(""))
-	m.setProxy(proxy)
 	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, nil)
 
 	t.Run("listThreads", func(t *testing.T) {
@@ -1624,18 +1620,21 @@ func TestRegisterManagementRoutesServesNeoStartupInternalRPCPostsLocally(t *test
 	})
 }
 
-func TestRegisterManagementRoutesPassesAmpBinaryInternalRPCsUpstream(t *testing.T) {
+func TestRegisterManagementRoutesPassesInternalRPCsUpstreamWhenProxyExists(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	enabled := true
-	proxyCalled := false
+	upstreamRequests := 0
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		proxyCalled = true
-		if r.URL.Path != "/api/internal" || r.URL.RawQuery != "listThreads" {
+		upstreamRequests++
+		if r.URL.Path != "/api/internal" {
 			t.Fatalf("unexpected upstream request path=%s query=%s", r.URL.Path, r.URL.RawQuery)
 		}
-		if got := r.Header.Get("X-Amp-Client-Application"); got != "CLI" {
-			t.Fatalf("X-Amp-Client-Application = %q", got)
+		if r.URL.RawQuery != "listThreads" && r.URL.RawQuery != "getThread" {
+			t.Fatalf("unexpected upstream query=%s", r.URL.RawQuery)
+		}
+		if r.Header.Get("X-Test-Amp-Headers") == "required" && r.Header.Get("X-Amp-Client-Application") != "CLI" {
+			t.Fatalf("X-Amp-Client-Application = %q", r.Header.Get("X-Amp-Client-Application"))
 		}
 		writeNeoJSON(w, http.StatusOK, map[string]any{"ok": true, "result": map[string]any{"threads": []any{}}})
 	}))
@@ -1658,39 +1657,57 @@ func TestRegisterManagementRoutesPassesAmpBinaryInternalRPCsUpstream(t *testing.
 	localServer := httptest.NewServer(r)
 	defer localServer.Close()
 
-	req, err := http.NewRequest(http.MethodPost, localServer.URL+"/api/internal?listThreads", bytes.NewBufferString(`{"method":"listThreads","params":{"limit":10}}`))
-	if err != nil {
-		t.Fatalf("new request: %v", err)
+	tests := []struct {
+		name       string
+		method     string
+		body       string
+		ampHeaders bool
+	}{
+		{name: "listThreads web", method: "listThreads", body: `{"method":"listThreads","params":{"limit":10}}`},
+		{name: "listThreads amp", method: "listThreads", body: `{"method":"listThreads","params":{"limit":10}}`, ampHeaders: true},
+		{name: "getThread web", method: "getThread", body: `{"method":"getThread","params":{"thread":"T-019e65c0-0310-77a8-b233-4b84d9c0612b"}}`},
+		{name: "getThread amp", method: "getThread", body: `{"method":"getThread","params":{"thread":"T-019e65c0-0310-77a8-b233-4b84d9c0612b"}}`, ampHeaders: true},
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Amp-Client-Application", "CLI")
-	req.Header.Set("X-Amp-Client-Type", "cli")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("do request: %v", err)
-	}
-	defer func() {
-		if err := resp.Body.Close(); err != nil {
-			t.Fatalf("close response body: %v", err)
-		}
-	}()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("read response body: %v", err)
-	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodPost, localServer.URL+"/api/internal?"+tc.method, bytes.NewBufferString(tc.body))
+			if err != nil {
+				t.Fatalf("new request: %v", err)
+			}
+			req.Header.Set("Content-Type", "application/json")
+			if tc.ampHeaders {
+				req.Header.Set("X-Amp-Client-Application", "CLI")
+				req.Header.Set("X-Amp-Client-Type", "cli")
+				req.Header.Set("X-Test-Amp-Headers", "required")
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("do request: %v", err)
+			}
+			defer func() {
+				if err := resp.Body.Close(); err != nil {
+					t.Fatalf("close response body: %v", err)
+				}
+			}()
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("read response body: %v", err)
+			}
 
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, body=%s", resp.StatusCode, string(body))
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, body=%s", resp.StatusCode, string(body))
+			}
+			var response map[string]any
+			if err := json.Unmarshal(body, &response); err != nil {
+				t.Fatalf("response JSON error: %v", err)
+			}
+			if response["ok"] != true {
+				t.Fatalf("unexpected upstream response: %#v", response)
+			}
+		})
 	}
-	if !proxyCalled {
-		t.Fatal("Amp binary internal RPC should pass through to upstream")
-	}
-	var response map[string]any
-	if err := json.Unmarshal(body, &response); err != nil {
-		t.Fatalf("response JSON error: %v", err)
-	}
-	if response["ok"] != true {
-		t.Fatalf("unexpected upstream response: %#v", response)
+	if upstreamRequests != len(tests) {
+		t.Fatalf("upstreamRequests = %d, want %d", upstreamRequests, len(tests))
 	}
 }
 
@@ -1904,8 +1921,6 @@ func TestRegisterManagementRoutesServesNeoTaskInternalMethodsLocally(t *testing.
 			},
 		}}),
 	}
-	proxy, _ := createReverseProxy(upstream.URL, NewStaticSecretSource(""))
-	m.setProxy(proxy)
 	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, nil)
 
 	postTask := func(method, body string) map[string]any {
@@ -2023,8 +2038,6 @@ func TestRegisterManagementRoutesServesLocalThreadLinkInfoWithNormalizedOwnershi
 			},
 		}}),
 	}
-	proxy, _ := createReverseProxy(upstream.URL, NewStaticSecretSource(""))
-	m.setProxy(proxy)
 	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/internal?getThreadLinkInfo&thread="+threadID, nil)
@@ -2062,7 +2075,7 @@ func TestRegisterManagementRoutesServesLocalThreadLinkInfoWithNormalizedOwnershi
 	}
 }
 
-func TestRegisterManagementRoutesGetThreadLinkInfoDoesNotProxyEndToEnd(t *testing.T) {
+func TestRegisterManagementRoutesGetThreadLinkInfoProxiesWhenProxyExists(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	enabled := true
@@ -2116,28 +2129,14 @@ func TestRegisterManagementRoutesGetThreadLinkInfoDoesNotProxyEndToEnd(t *testin
 		t.Fatalf("read response body: %v", err)
 	}
 
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != http.StatusTeapot {
 		t.Fatalf("status = %d, body=%s", resp.StatusCode, body)
 	}
-	if upstreamRequests != 0 {
-		t.Fatalf("expected local response without proxying, upstream saw %d request(s)", upstreamRequests)
+	if upstreamRequests != 1 {
+		t.Fatalf("expected upstream proxy, upstream saw %d request(s)", upstreamRequests)
 	}
-	var response map[string]any
-	if err := json.Unmarshal(body, &response); err != nil {
-		t.Fatalf("response JSON error: %v body=%s", err, body)
-	}
-	result := mapValue(response["result"])
-	if stringValue(result["id"]) != threadID {
-		t.Fatalf("thread link info id = %#v, want %q", result["id"], threadID)
-	}
-	if stringValue(result["creatorUserID"]) != neoLocalOwnerUserID {
-		t.Fatalf("creatorUserID = %#v, want %q", result["creatorUserID"], neoLocalOwnerUserID)
-	}
-	if stringValue(result["ownerUserId"]) != neoLocalOwnerUserID {
-		t.Fatalf("ownerUserId = %#v, want %q", result["ownerUserId"], neoLocalOwnerUserID)
-	}
-	if stringValue(result["title"]) != "continued locally" {
-		t.Fatalf("title = %#v, want %q", result["title"], "continued locally")
+	if string(body) != "proxied" {
+		t.Fatalf("body = %q, want proxied", string(body))
 	}
 }
 

@@ -11537,98 +11537,35 @@ func TestNeoCloudGetThreadPreservesEnvelopeAgentModeForBinaryResume(t *testing.T
 	}
 }
 
-func TestNeoRuntimeServesCloudThreadWhenLocalMissing(t *testing.T) {
+func TestNeoRuntimeDoesNotServeThreadReadSearchHTTP(t *testing.T) {
 	dir := t.TempDir()
 	oldStoreDir := neoAmpThreadStoreDir
 	neoAmpThreadStoreDir = func() string { return dir }
 	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
 
 	threadID := "T-019e0379-5ef4-72e9-9ce6-dc9408a838f5"
+	upstreamRequests := 0
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/api/threads/find" {
-			writeNeoJSON(w, http.StatusOK, map[string]any{
-				"hasMore": false,
-				"threads": []any{map[string]any{
-					"id":                threadID,
-					"title":             "Cloud reference",
-					"matchedSearchText": "cloud thread details",
-				}},
-			})
-			return
-		}
-		if r.URL.Path != "/api/internal" || r.URL.RawQuery != "getThread" {
-			t.Fatalf("request path = %s?%s", r.URL.Path, r.URL.RawQuery)
-		}
-		writeNeoJSON(w, http.StatusOK, map[string]any{
-			"ok": true,
-			"result": map[string]any{
-				"thread": map[string]any{
-					"id":    threadID,
-					"title": "Cloud reference",
-					"data": map[string]any{
-						"messages": []any{
-							map[string]any{"role": "user", "messageId": "M-cloud", "content": []any{map[string]any{"type": "text", "text": "cloud thread details"}}},
-						},
-					},
-				},
-			},
-		})
+		upstreamRequests++
+		writeNeoJSON(w, http.StatusOK, map[string]any{"unexpected": true})
 	}))
 	defer upstream.Close()
 
 	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{UpstreamURL: upstream.URL, UpstreamAPIKey: "secret"}})
-	req := httptest.NewRequest(http.MethodGet, "/threads/"+threadID, nil)
-	rec := httptest.NewRecorder()
-	rt.handleHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("GET /threads/:id status = %d body=%s", rec.Code, rec.Body.String())
+	for _, path := range []string{
+		"/threads/" + threadID,
+		"/threads/" + threadID + ".md",
+		"/api/threads/find?q=remote+needle&limit=5",
+	} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rec := httptest.NewRecorder()
+		rt.handleHTTP(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("GET %s status = %d body=%s", path, rec.Code, rec.Body.String())
+		}
 	}
-	var thread map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &thread); err != nil {
-		t.Fatalf("thread JSON: %v", err)
-	}
-	if got := stringValue(thread["creatorUserID"]); got != neoLocalOwnerUserID {
-		t.Fatalf("creatorUserID = %q, want %q", got, neoLocalOwnerUserID)
-	}
-	if got := stringValue(thread["ownerUserId"]); got != neoLocalOwnerUserID {
-		t.Fatalf("ownerUserId = %q, want %q", got, neoLocalOwnerUserID)
-	}
-	if got := stringValue(thread["agentMode"]); got != "smart" {
-		t.Fatalf("agentMode = %q, want smart fallback", got)
-	}
-
-	req = httptest.NewRequest(http.MethodGet, "/threads/"+threadID+".md", nil)
-	rec = httptest.NewRecorder()
-	rt.handleHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("GET /threads/:id.md status = %d body=%s", rec.Code, rec.Body.String())
-	}
-	if body := rec.Body.String(); !strings.Contains(body, "threadId: "+threadID) || !strings.Contains(body, "cloud thread details") {
-		t.Fatalf("markdown missing cloud thread content:\n%s", body)
-	}
-
-	req = httptest.NewRequest(http.MethodGet, "/api/threads/find?q=@"+threadID+"&limit=5", nil)
-	rec = httptest.NewRecorder()
-	rt.handleHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("GET /api/threads/find status = %d body=%s", rec.Code, rec.Body.String())
-	}
-	var response map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
-		t.Fatalf("search JSON: %v", err)
-	}
-	threads := arrayValue(response["threads"])
-	if len(threads) != 1 || mapValue(threads[0])["id"] != threadID {
-		t.Fatalf("threads = %#v", response["threads"])
-	}
-	if got := stringValue(mapValue(threads[0])["creatorUserID"]); got != neoLocalOwnerUserID {
-		t.Fatalf("search creatorUserID = %q, want %q", got, neoLocalOwnerUserID)
-	}
-	if got := stringValue(mapValue(threads[0])["agentMode"]); got != "smart" {
-		t.Fatalf("search agentMode = %q, want smart fallback", got)
-	}
-	if _, ok := mapValue(threads[0])["updatedAt"].(string); !ok {
-		t.Fatalf("search updatedAt = %#v, want string", mapValue(threads[0])["updatedAt"])
+	if upstreamRequests != 0 {
+		t.Fatalf("runtime thread read/search HTTP should not call upstream; requests=%d", upstreamRequests)
 	}
 }
 
@@ -11715,7 +11652,7 @@ func TestNeoRuntimePrefersRicherCloudThreadOverPartialLocalCache(t *testing.T) {
 	}
 }
 
-func TestNeoRuntimeSearchesCloudThreadsHTTP(t *testing.T) {
+func TestNeoCloudThreadSearchFetchesUpstream(t *testing.T) {
 	dir := t.TempDir()
 	oldStoreDir := neoAmpThreadStoreDir
 	neoAmpThreadStoreDir = func() string { return dir }
@@ -11744,22 +11681,21 @@ func TestNeoRuntimeSearchesCloudThreadsHTTP(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{UpstreamURL: upstream.URL, UpstreamAPIKey: "secret"}})
-	req := httptest.NewRequest(http.MethodGet, "/api/threads/find?q=remote+needle&limit=5", nil)
-	rec := httptest.NewRecorder()
-	rt.handleHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("GET /api/threads/find status = %d body=%s", rec.Code, rec.Body.String())
+	q := url.Values{"q": []string{"remote needle"}, "limit": []string{"5"}}
+	response, ok, err := getNeoCloudThreadSearch(context.Background(), &config.Config{
+		AmpCode: config.AmpCode{UpstreamURL: upstream.URL, UpstreamAPIKey: "secret"},
+	}, q)
+	if err != nil {
+		t.Fatalf("getNeoCloudThreadSearch error: %v", err)
+	}
+	if !ok {
+		t.Fatal("getNeoCloudThreadSearch returned not ok")
 	}
 	if gotAuth != "Bearer secret" {
 		t.Fatalf("Authorization = %q", gotAuth)
 	}
 	if gotQuery != "remote needle" {
 		t.Fatalf("cloud q = %q", gotQuery)
-	}
-	var response map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
-		t.Fatalf("search JSON: %v", err)
 	}
 	threads := arrayValue(response["threads"])
 	if len(threads) != 1 || mapValue(threads[0])["id"] != threadID {
@@ -11768,16 +11704,10 @@ func TestNeoRuntimeSearchesCloudThreadsHTTP(t *testing.T) {
 	if stringValue(mapValue(threads[0])["matchedSearchText"]) != "remote needle context" {
 		t.Fatalf("matchedSearchText = %#v", mapValue(threads[0])["matchedSearchText"])
 	}
-	if got := stringValue(mapValue(threads[0])["creatorUserID"]); got != neoLocalOwnerUserID {
-		t.Fatalf("creatorUserID = %q, want %q", got, neoLocalOwnerUserID)
-	}
-	if got := stringValue(mapValue(threads[0])["agentMode"]); got != "smart" {
-		t.Fatalf("agentMode = %q, want smart fallback", got)
-	}
 	if got := mapValue(threads[0])["updatedAt"]; got != "2026-05-08T08:35:29.803Z" {
 		t.Fatalf("updatedAt = %#v", got)
 	}
-	if got := numberFrom(mapValue(threads[0])["created"]); got != 1778229329803 {
+	if got := mapValue(threads[0])["created"]; got != "2026-05-08T08:35:29.803Z" {
 		t.Fatalf("created = %#v", mapValue(threads[0])["created"])
 	}
 }
@@ -11868,135 +11798,6 @@ func TestNeoThreadReaderToolsAgainstLoadedThread(t *testing.T) {
 			t.Fatalf("empty query should return nil, got %#v", hits)
 		}
 	})
-}
-
-func TestTryServeNeoLocalThreadReaderToolEndpoints(t *testing.T) {
-	dir := t.TempDir()
-	oldStoreDir := neoAmpThreadStoreDir
-	neoAmpThreadStoreDir = func() string { return dir }
-	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
-
-	threadID := "T-019e9999-aaaa-bbbb-cccc-dddddddddddd"
-	if err := writeNeoLocalThreadSnapshot(neoCloudThreadSnapshot{
-		threadID:  threadID,
-		seq:       3,
-		createdMs: 1778170000000,
-		messages: []neoMessage{
-			{ThreadID: threadID, MessageID: "M-user", Role: "user", Content: []any{map[string]any{"type": "text", "text": "needle phrase about EMAILS"}}, Seq: 1},
-			{ThreadID: threadID, MessageID: "M-assistant", Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "assistant reply"}}, Seq: 2},
-			{ThreadID: threadID, MessageID: "M-info", Role: "info", Content: []any{map[string]any{"type": "summary", "summary": map[string]any{"type": "message", "summary": "checkpoint"}}}, Seq: 3},
-		},
-	}); err != nil {
-		t.Fatalf("writeNeoLocalThreadSnapshot error: %v", err)
-	}
-
-	cases := []struct {
-		name   string
-		path   string
-		body   string
-		method string
-		assert func(t *testing.T, resp map[string]any)
-	}{
-		{
-			name:   "message_stats POST",
-			path:   "/api/threads/" + threadID + "/messages/message_stats",
-			body:   "{}",
-			method: http.MethodPost,
-			assert: func(t *testing.T, resp map[string]any) {
-				if numberFrom(resp["messageCount"]) != 3 {
-					t.Fatalf("messageCount = %v", resp["messageCount"])
-				}
-				if numberFrom(resp["latestCompactionIndex"]) != 2 {
-					t.Fatalf("latestCompactionIndex = %v", resp["latestCompactionIndex"])
-				}
-				if len(arrayValue(resp["compactions"])) != 1 {
-					t.Fatalf("compactions = %#v", resp["compactions"])
-				}
-			},
-		},
-		{
-			name:   "read_messages POST returns markdown + bytesRead",
-			path:   "/api/threads/" + threadID + "/messages/read_messages",
-			body:   `{"startIndex":0,"limit":2}`,
-			method: http.MethodPost,
-			assert: func(t *testing.T, resp map[string]any) {
-				md := stringValue(resp["markdown"])
-				if !strings.Contains(md, "needle phrase") || !strings.Contains(md, "assistant reply") {
-					t.Fatalf("markdown missing content:\n%s", md)
-				}
-				if numberFrom(resp["bytesRead"]) != len(md) {
-					t.Fatalf("bytesRead %v != len(markdown) %d", resp["bytesRead"], len(md))
-				}
-			},
-		},
-		{
-			name:   "search_messages POST returns path/lineNumber hits",
-			path:   "/api/threads/" + threadID + "/messages/search_messages",
-			body:   `{"query":"email","startIndex":0,"endIndex":2}`,
-			method: http.MethodPost,
-			assert: func(t *testing.T, resp map[string]any) {
-				hits := arrayValue(resp["results"])
-				if len(hits) == 0 {
-					t.Fatalf("expected hits, got %#v", resp)
-				}
-				first := mapValue(hits[0])
-				if stringValue(first["path"]) != "messages[0]" || numberFrom(first["lineNumber"]) < 1 {
-					t.Fatalf("first hit = %#v", first)
-				}
-			},
-		},
-		{
-			name:   "wrong method falls through",
-			path:   "/api/threads/" + threadID + "/messages/message_stats",
-			method: http.MethodGet,
-		},
-		{
-			name:   "unknown tool falls through",
-			path:   "/api/threads/" + threadID + "/messages/list_messages",
-			body:   "{}",
-			method: http.MethodPost,
-		},
-		{
-			name:   "missing thread falls through",
-			path:   "/api/threads/T-not-exist-aaaa-bbbb-cccc-dddddddddddd/messages/message_stats",
-			body:   "{}",
-			method: http.MethodPost,
-		},
-		{
-			name:   "non-message path falls through",
-			path:   "/api/threads/" + threadID + "/runs",
-			method: http.MethodPost,
-			body:   "{}",
-		},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
-			rec := httptest.NewRecorder()
-			c, _ := gin.CreateTestContext(rec)
-			c.Request = req
-
-			handled := tryServeNeoLocalThreadReaderTool(c, false)
-			if tc.assert == nil {
-				if handled {
-					t.Fatalf("expected fall-through (handled=false), got handled=true status=%d", rec.Code)
-				}
-				return
-			}
-			if !handled {
-				t.Fatalf("expected handled=true, got false (path=%s)", tc.path)
-			}
-			if rec.Code != http.StatusOK {
-				t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
-			}
-			var resp map[string]any
-			if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-				t.Fatalf("unmarshal response: %v\nbody=%s", err, rec.Body.String())
-			}
-			tc.assert(t, resp)
-		})
-	}
 }
 
 func TestRecentNeoLocalThreadsReturnsMetadataOnly(t *testing.T) {
@@ -13037,7 +12838,7 @@ func TestNeoThreadMarkdownTruncatesToolResultsLikeAmpBinary(t *testing.T) {
 	}
 }
 
-func TestNeoRuntimeServesLocalThreadHTTP(t *testing.T) {
+func TestNeoRuntimeDoesNotServeLocalThreadHTTP(t *testing.T) {
 	dir := t.TempDir()
 	oldStoreDir := neoAmpThreadStoreDir
 	neoAmpThreadStoreDir = func() string { return dir }
@@ -13059,29 +12860,19 @@ func TestNeoRuntimeServesLocalThreadHTTP(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/threads/T-local-store.md", nil)
 	rec := httptest.NewRecorder()
 	rt.handleHTTP(rec, req)
-	if rec.Code != http.StatusOK {
+	if rec.Code != http.StatusNotFound {
 		t.Fatalf("GET /threads/T-local-store.md status = %d body=%s", rec.Code, rec.Body.String())
-	}
-	if body := rec.Body.String(); !strings.Contains(body, "threadId: T-local-store") || !strings.Contains(body, "hello from stored thread") {
-		t.Fatalf("markdown missing stored thread content:\n%s", body)
 	}
 
 	req = httptest.NewRequest(http.MethodGet, "/api/threads/T-local-store", nil)
 	rec = httptest.NewRecorder()
 	rt.handleHTTP(rec, req)
-	if rec.Code != http.StatusOK {
+	if rec.Code != http.StatusNotFound {
 		t.Fatalf("GET /api/threads/T-local-store status = %d body=%s", rec.Code, rec.Body.String())
-	}
-	var thread map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &thread); err != nil {
-		t.Fatalf("thread JSON: %v", err)
-	}
-	if thread["id"] != "T-local-store" {
-		t.Fatalf("thread id = %#v", thread["id"])
 	}
 }
 
-func TestNeoRuntimeServesTruncatedLocalThreadMarkdown(t *testing.T) {
+func TestNeoThreadMarkdownTruncatesLocalToolResults(t *testing.T) {
 	dir := t.TempDir()
 	oldStoreDir := neoAmpThreadStoreDir
 	neoAmpThreadStoreDir = func() string { return dir }
@@ -13109,15 +12900,11 @@ func TestNeoRuntimeServesTruncatedLocalThreadMarkdown(t *testing.T) {
 	if err := writeNeoLocalThreadSnapshot(snapshot); err != nil {
 		t.Fatalf("writeNeoLocalThreadSnapshot error: %v", err)
 	}
-
-	rt := newNeoRuntime(&config.Config{})
-	req := httptest.NewRequest(http.MethodGet, "/threads/"+threadID+".md?truncate_tool_results=1", nil)
-	rec := httptest.NewRecorder()
-	rt.handleHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("GET /threads/:id.md status = %d body=%s", rec.Code, rec.Body.String())
+	thread, ok := loadNeoLocalThread(threadID)
+	if !ok {
+		t.Fatal("loadNeoLocalThread returned not ok")
 	}
-	body := rec.Body.String()
+	body := neoThreadMarkdown(thread, neoThreadMarkdownOptions{TruncateToolResults: true})
 	if !strings.Contains(body, neoThreadMarkdownOmittedText) {
 		t.Fatalf("markdown was not truncated:\n%s", body)
 	}
@@ -13126,7 +12913,7 @@ func TestNeoRuntimeServesTruncatedLocalThreadMarkdown(t *testing.T) {
 	}
 }
 
-func TestNeoRuntimeSearchesLocalThreadsHTTP(t *testing.T) {
+func TestNeoRuntimeDoesNotServeLocalThreadSearchHTTP(t *testing.T) {
 	dir := t.TempDir()
 	oldStoreDir := neoAmpThreadStoreDir
 	neoAmpThreadStoreDir = func() string { return dir }
@@ -13163,26 +12950,8 @@ func TestNeoRuntimeSearchesLocalThreadsHTTP(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/api/threads/find?q=task:T-local-search&limit=5", nil)
 	rec := httptest.NewRecorder()
 	rt.handleHTTP(rec, req)
-	if rec.Code != http.StatusOK {
+	if rec.Code != http.StatusNotFound {
 		t.Fatalf("GET /api/threads/find status = %d body=%s", rec.Code, rec.Body.String())
-	}
-	var response map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
-		t.Fatalf("search JSON: %v", err)
-	}
-	threads := arrayValue(response["threads"])
-	if len(threads) < 2 {
-		t.Fatalf("threads = %#v", response["threads"])
-	}
-	thread := mapValue(threads[0])
-	if thread["id"] != "T-local-search" || thread["messageCount"] != float64(1) {
-		t.Fatalf("thread result = %#v", thread)
-	}
-	if _, ok := thread["updatedAt"].(string); !ok || stringValue(thread["updatedAt"]) == "" {
-		t.Fatalf("updatedAt = %#v, want non-empty string", thread["updatedAt"])
-	}
-	if !strings.Contains(stringValue(thread["matchedSearchText"]), "T-local-search") {
-		t.Fatalf("matchedSearchText = %#v", thread["matchedSearchText"])
 	}
 }
 
