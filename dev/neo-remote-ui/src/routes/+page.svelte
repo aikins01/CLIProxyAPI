@@ -221,6 +221,9 @@
   let mentionSearchInput = $state<HTMLInputElement | undefined>();
   let attachmentInput = $state<HTMLInputElement | undefined>();
   let socket: WebSocket | null = null;
+  let socketGeneration = 0;
+  let reconnectTimer: number | null = null;
+  let reconnectAttempts = 0;
   let lastError = $state('');
   let queuedCount = $state(0);
   let activeError = $state<Record<string, unknown> | null>(null);
@@ -256,6 +259,7 @@
   const maxComposerImages = 8;
   const maxComposerImageBytes = 45 * 1024 * 1024;
   const maxQueuedMessages = 5;
+  const maxReconnectAttempts = 6;
   const defaultAgentMode = 'deep';
   const agentModeOptions = ['smart', 'large', 'rush', 'deep', 'nostromo', 'agg-man'];
   const visibleAgentModeOptions = ['smart', 'large', 'rush', 'deep', 'nostromo'];
@@ -648,10 +652,46 @@
     }
   }
 
-  function connect(threadId: string, version = 0, options: ConnectOptions = {}) {
-    if (!threadId || typeof WebSocket === 'undefined') return;
-    disconnect();
+  function clearReconnectTimer() {
+    if (reconnectTimer !== null) {
+      window.clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+  }
+
+  function clearConnectionError() {
+    if (/websocket/i.test(lastError)) lastError = '';
+  }
+
+  function scheduleReconnect(threadId: string, version: number, options: ConnectOptions, generation: number) {
+    if (reconnectTimer !== null || generation !== socketGeneration || selectedThreadId !== threadId) return;
+    if (reconnectAttempts >= maxReconnectAttempts) {
+      connection = 'offline';
+      lastError = 'Connection failed: WebSocket connection failed';
+      return;
+    }
+
+    const delay = Math.min(750 * 2 ** reconnectAttempts, 8000);
+    reconnectAttempts += 1;
     connection = 'connecting';
+    reconnectTimer = window.setTimeout(() => {
+      reconnectTimer = null;
+      if (generation !== socketGeneration || selectedThreadId !== threadId) return;
+      connect(threadId, version, options, true);
+    }, delay);
+  }
+
+  function connect(threadId: string, version = 0, options: ConnectOptions = {}, reconnecting = false) {
+    if (!threadId || typeof WebSocket === 'undefined') return;
+    clearReconnectTimer();
+    const previousSocket = socket;
+    socket = null;
+    if (previousSocket) previousSocket.close();
+    if (!reconnecting) reconnectAttempts = 0;
+    const generation = socketGeneration + 1;
+    socketGeneration = generation;
+    connection = 'connecting';
+    clearConnectionError();
     const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
     const runtimeKey = apiKey.trim();
     const bootstrapAgentMode = normalizeAgentMode(options.agentMode || defaultAgentMode);
@@ -669,9 +709,14 @@
     }
     if (runtimeKey) params.set('auth_token', runtimeKey);
     const url = `${scheme}://${location.host}/gateway/threadActor/?${params.toString()}`;
-    socket = new WebSocket(url, ['rivet', 'rivet_encoding.4', 'rivet_skip_ready_wait']);
-    socket.addEventListener('open', () => {
+    const nextSocket = new WebSocket(url, ['rivet', 'rivet_encoding.4', 'rivet_skip_ready_wait']);
+    socket = nextSocket;
+    const activeSocket = () => socket === nextSocket && generation === socketGeneration && selectedThreadId === threadId;
+    nextSocket.addEventListener('open', () => {
+      if (!activeSocket()) return;
+      reconnectAttempts = 0;
       connection = 'connected';
+      clearConnectionError();
       sendFrame({ type: 'client_resume', version });
       if (options.bootstrapExecutor) {
         sendFrame({ type: 'agent-mode', mode: bootstrapAgentMode });
@@ -688,14 +733,19 @@
         });
       }
     });
-    socket.addEventListener('close', () => {
+    nextSocket.addEventListener('close', () => {
+      if (!activeSocket()) return;
+      socket = null;
       connection = 'offline';
+      scheduleReconnect(threadId, version, options, generation);
     });
-    socket.addEventListener('error', () => {
+    nextSocket.addEventListener('error', () => {
+      if (!activeSocket()) return;
       connection = 'offline';
-      lastError = 'WebSocket connection failed';
+      scheduleReconnect(threadId, version, options, generation);
     });
-    socket.addEventListener('message', (event) => {
+    nextSocket.addEventListener('message', (event) => {
+      if (!activeSocket()) return;
       if (event.data === 'pong') return;
       try {
         const decoded = JSON.parse(String(event.data));
@@ -712,10 +762,11 @@
   }
 
   function disconnect() {
-    if (socket) {
-      socket.close();
-      socket = null;
-    }
+    clearReconnectTimer();
+    socketGeneration += 1;
+    const closingSocket = socket;
+    socket = null;
+    if (closingSocket) closingSocket.close();
     connection = 'offline';
   }
 
