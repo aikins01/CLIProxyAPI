@@ -796,8 +796,10 @@
       clearConnectionError();
       sendFrame({ type: 'client_resume', version });
       if (options.bootstrapExecutor) {
-        sendFrame({ type: 'agent-mode', mode: bootstrapAgentMode });
-        sendFrame(options.reasoningEffort ? { type: 'reasoning-effort', effort: options.reasoningEffort } : { type: 'reasoning-effort' });
+        sendFrame({
+          type: 'client_update_thread_settings',
+          settings: threadSettingsPayload(bootstrapAgentMode, options.reasoningEffort || '')
+        });
         sendFrame({ type: 'environment', env: options.environment ?? {} });
         sendFrame({
           type: 'client_spawn_executor',
@@ -2108,6 +2110,14 @@
     return agentModeOptions.includes(normalized) ? normalized : defaultAgentMode;
   }
 
+  function threadSettingsPayload(mode: string, effort: string) {
+    const agentMode = normalizeAgentMode(mode);
+    const reasoningEffort = normalizeReasoningEffortForMode(agentMode, effort);
+    const settings: Record<string, unknown> = { agentMode };
+    if (reasoningEffort) settings['reasoning.effort'] = reasoningEffort;
+    return settings;
+  }
+
   function encodeGatewayInput(value: Record<string, unknown>) {
     const bytes = new TextEncoder().encode(JSON.stringify(value));
     let binary = '';
@@ -2202,8 +2212,7 @@
     const agentMode = normalizeAgentMode(mode);
     const reasoningEffort = normalizeReasoningEffortForMode(agentMode, effort);
     applyLocalThreadSettings(agentMode, reasoningEffort);
-    sendFrame({ type: 'agent-mode', mode: agentMode });
-    sendFrame(reasoningEffort ? { type: 'reasoning-effort', effort: reasoningEffort } : { type: 'reasoning-effort' });
+    sendFrame({ type: 'client_update_thread_settings', settings: threadSettingsPayload(agentMode, reasoningEffort) });
   }
 
   function toggleSettingsMenu(menu: 'mode' | 'effort') {
