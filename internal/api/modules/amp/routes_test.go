@@ -826,6 +826,89 @@ func TestRegisterManagementRoutesPassesAmpBinaryAttachmentsUpstream(t *testing.T
 	}
 }
 
+func TestRegisterManagementRoutesPassesMissingAttachmentGETUpstream(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	enabled := true
+
+	dir := t.TempDir()
+	oldStoreDir := neoAmpThreadStoreDir
+	neoAmpThreadStoreDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
+
+	upstreamRequests := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequests++
+		if r.URL.Path != "/api/attachments/AmpCloudAttachment123" {
+			t.Fatalf("unexpected upstream request path=%s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write([]byte("upstream image"))
+	}))
+	defer upstream.Close()
+
+	m := &AmpModule{
+		restrictToLocalhost: false,
+		neoRuntime: newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+			UpstreamURL:    upstream.URL,
+			UpstreamAPIKey: "secret",
+			NeoLocalRuntime: config.AmpNeoLocalRuntime{
+				Enabled: &enabled,
+			},
+		}}),
+	}
+	proxy, _ := createReverseProxy(upstream.URL, NewStaticSecretSource(""))
+	m.setProxy(proxy)
+	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, nil)
+
+	localServer := httptest.NewServer(r)
+	defer localServer.Close()
+
+	resp, err := http.Get(localServer.URL + "/api/attachments/AmpCloudAttachment123")
+	if err != nil {
+		t.Fatalf("get upstream attachment: %v", err)
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Fatalf("close upstream response body: %v", err)
+		}
+	}()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read upstream response body: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK || string(body) != "upstream image" {
+		t.Fatalf("upstream attachment response = status %d body %q", resp.StatusCode, string(body))
+	}
+	if upstreamRequests != 1 {
+		t.Fatalf("upstreamRequests = %d, want 1", upstreamRequests)
+	}
+
+	localID, err := writeNeoLocalAttachment([]byte("local image"), "image/png")
+	if err != nil {
+		t.Fatalf("write local attachment: %v", err)
+	}
+	localResp, err := http.Get(localServer.URL + "/api/attachments/" + localID)
+	if err != nil {
+		t.Fatalf("get local attachment: %v", err)
+	}
+	defer func() {
+		if err := localResp.Body.Close(); err != nil {
+			t.Fatalf("close local response body: %v", err)
+		}
+	}()
+	localBody, err := io.ReadAll(localResp.Body)
+	if err != nil {
+		t.Fatalf("read local response body: %v", err)
+	}
+	if localResp.StatusCode != http.StatusOK || string(localBody) != "local image" {
+		t.Fatalf("local attachment response = status %d body %q", localResp.StatusCode, string(localBody))
+	}
+	if upstreamRequests != 1 {
+		t.Fatalf("local attachment should not call upstream; upstreamRequests = %d", upstreamRequests)
+	}
+}
+
 func TestDecodeNeoAttachmentPayloadMatchesBinaryImageLimits(t *testing.T) {
 	data := testNeoPNGBase64(t, 1, 1)
 	raw, mediaType, err := decodeNeoAttachmentPayload(data, "image/png")

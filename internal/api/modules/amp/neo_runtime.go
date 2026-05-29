@@ -7382,6 +7382,9 @@ func (m *AmpModule) tryServeNeoLocalAttachment(c *gin.Context) bool {
 			c.JSON(http.StatusMethodNotAllowed, gin.H{"error": "method_not_allowed"})
 			return true
 		}
+		if m.getProxy() != nil && !neoLocalAttachmentExists(attachmentID) {
+			return false
+		}
 		serveNeoLocalAttachment(c, attachmentID)
 		return true
 	default:
@@ -7548,6 +7551,14 @@ func writeNeoLocalAttachment(raw []byte, mediaType string) (string, error) {
 		return id, nil
 	}
 	return "", errors.New("failed to allocate attachment id")
+}
+
+func neoLocalAttachmentExists(id string) bool {
+	if !neoAttachmentIDPattern.MatchString(id) {
+		return false
+	}
+	_, err := os.Stat(filepath.Join(neoAmpThreadStoreDir(), "attachments", id+".bin"))
+	return err == nil
 }
 
 func serveNeoLocalAttachment(c *gin.Context, id string) {
