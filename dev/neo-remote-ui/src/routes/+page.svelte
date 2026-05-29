@@ -527,7 +527,7 @@
     apiKey = key;
     persistAPIKey();
     try {
-      const result = await rpc('listThreads', { includeArchived: false, limit: 80 });
+      const result = await rpc('listThreads', neoThreadListParams(false, 80));
       const rawThreads = Array.isArray(result?.threads) ? result.threads : [];
       threads = rawThreads.map(threadSummaryFromAPI).filter(Boolean) as ThreadSummary[];
       isAuthenticated = true;
@@ -607,12 +607,32 @@
     return data?.result ?? data;
   }
 
-  function threadNeedsRuntimeImport(thread: Record<string, unknown>) {
-    return asRecord(thread.meta).usesThreadActors !== true;
+  function neoThreadListParams(includeArchived: boolean, limit: number): Record<string, unknown> {
+    return { includeArchived, limit, usesThreadActors: true };
+  }
+
+  function threadRuntimeMeta(thread: Record<string, unknown>) {
+    const data = asRecord(thread.data);
+    return { ...asRecord(data.meta), ...asRecord(thread.meta) };
+  }
+
+  function threadCanUseLocalRuntime(thread: Record<string, unknown>) {
+    const data = asRecord(thread.data);
+    const meta = threadRuntimeMeta(thread);
+    return Boolean(
+      thread.usesThreadActors === true ||
+      data.usesThreadActors === true ||
+      meta.usesThreadActors === true ||
+      meta.usesDtw === true ||
+      meta.cliProxyAPILocalNeo === true ||
+      meta.ampcodeConnectorLocalNeo === true ||
+      meta.ampcodeLocalRuntime === true ||
+      stringFrom(meta.ampcodeConnectorMode) === 'local-neo'
+    );
   }
 
   async function importThreadIntoRuntime(threadId: string, thread: Record<string, unknown>) {
-    if (!threadId || !threadNeedsRuntimeImport(thread)) return;
+    if (!threadId || !threadCanUseLocalRuntime(thread)) return false;
     const params = new URLSearchParams({
       'rvt-method': 'getOrCreate',
       'rvt-key': threadId,
@@ -628,6 +648,7 @@
     if (!response.ok && response.status !== 409) {
       throw new RpcError('importThread', response.status);
     }
+    return true;
   }
 
   async function refreshThreadUsageInfo(threadId: string) {
@@ -671,7 +692,7 @@
     loadingThreads = true;
     lastError = '';
     try {
-      const result = await rpc('listThreads', { includeArchived: true, limit: 120 });
+      const result = await rpc('listThreads', neoThreadListParams(true, 120));
       const rawThreads = Array.isArray(result?.threads) ? result.threads : [];
       threads = rawThreads.map(threadSummaryFromAPI).filter(Boolean) as ThreadSummary[];
       const targetThreadId = preferredThreadId || selectedThreadId || threads[0]?.id || '';
@@ -761,13 +782,21 @@
       const thread = normalizeThreadPayload(result);
       detail = threadDetailFromAPI(thread);
       compactionRecords = detail.compactionRecords ?? [];
+      if (!threadCanUseLocalRuntime(thread)) {
+        lastError = 'Thread is not available in the local runtime.';
+        connection = 'offline';
+        executorConnected = false;
+        void refreshThreadUsageInfo(threadId);
+        return;
+      }
       await importThreadIntoRuntime(threadId, thread);
       void refreshThreadUsageInfo(threadId);
       connect(threadId, Number(thread?.v ?? detail.messages.length));
     } catch (error) {
       lastError = error instanceof Error ? error.message : String(error);
       detail = threadDetailFromSummary(threads.find((thread) => thread.id === threadId));
-      connect(threadId, 0);
+      connection = 'offline';
+      executorConnected = false;
     } finally {
       loadingThread = false;
     }
