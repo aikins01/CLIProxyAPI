@@ -1147,6 +1147,15 @@ func TestRegisterManagementRoutesPassesInternalRPCsUpstreamWhenProxyExists(t *te
 		body       string
 		ampHeaders bool
 	}{
+		{name: "loadPlugins", method: "loadPlugins", body: `{"method":"loadPlugins","params":{}}`},
+		{name: "getUserInfo", method: "getUserInfo", body: `{"method":"getUserInfo","params":{}}`},
+		{name: "getThreadLinkInfo", method: "getThreadLinkInfo", body: `{"method":"getThreadLinkInfo","params":{"thread":"T-019e65c0-0310-77a8-b233-4b84d9c0612b"}}`},
+		{name: "threadDisplayCostInfo", method: "threadDisplayCostInfo", body: `{"method":"threadDisplayCostInfo","params":{"threadID":"T-019e65c0-0310-77a8-b233-4b84d9c0612b"}}`},
+		{name: "getUserFreeTierStatus", method: "getUserFreeTierStatus", body: `{"method":"getUserFreeTierStatus","params":{}}`},
+		{name: "notices", method: "notices", body: `{"method":"notices","params":{}}`},
+		{name: "logNoticeAction", method: "logNoticeAction", body: `{"method":"logNoticeAction","params":{"key":"local","action":"view"}}`},
+		{name: "markAsReadMysteriousMessage", method: "markAsReadMysteriousMessage", body: `{"method":"markAsReadMysteriousMessage","params":{"messageId":"msg_local"}}`},
+		{name: "userDisplayBalanceInfo", method: "userDisplayBalanceInfo", body: `{"method":"userDisplayBalanceInfo","params":{}}`},
 		{name: "listThreads web", method: "listThreads", body: `{"method":"listThreads","params":{"limit":10}}`},
 		{name: "listThreads amp", method: "listThreads", body: `{"method":"listThreads","params":{"limit":10}}`, ampHeaders: true},
 		{name: "getThread web", method: "getThread", body: `{"method":"getThread","params":{"thread":"T-019e65c0-0310-77a8-b233-4b84d9c0612b"}}`},
