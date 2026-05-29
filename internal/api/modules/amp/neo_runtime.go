@@ -1670,6 +1670,7 @@ func (a *neoActor) handleForSocket(socket *neoSocket, msg map[string]any) {
 }
 
 func (a *neoActor) updateSettings(settings map[string]any) {
+	settings = sanitizeNeoThreadSettings(settings)
 	a.mu.Lock()
 	if a.settings == nil {
 		a.settings = map[string]any{}
@@ -19426,11 +19427,26 @@ func neoThreadSettingsPayload(settings map[string]any) map[string]any {
 
 func sanitizeNeoThreadSettings(settings map[string]any) map[string]any {
 	out := cloneMap(settings)
+	deleteInvalidNeoSetting(out, "anthropic.speed", validNeoAnthropicSpeed)
 	deleteInvalidNeoSetting(out, "anthropic.provider", validNeoAnthropicProvider)
 	deleteInvalidNeoSetting(out, "openai.speed", validNeoOpenAISpeed)
 	deleteInvalidNeoSetting(out, "reasoning.effort", validNeoReasoningEffortSetting)
 	deleteInvalidNeoSetting(out, "internal.oracleReasoningEffort", validNeoOracleReasoningEffort)
 	deleteInvalidNeoSetting(out, "gemini.thinkingLevel", validNeoGeminiThinkingLevel)
+	deleteInvalidNeoStringArraySetting(out, "agent.skipTitleGenerationIfMessageContains")
+	deleteInvalidNeoStringArraySetting(out, "tools.disable")
+	deleteInvalidNeoStringArraySetting(out, "tools.enable")
+	deleteInvalidNeoBooleanSetting(out, "anthropic.thinking.enabled")
+	deleteInvalidNeoBooleanSetting(out, "anthropic.interleavedThinking.enabled")
+	if value, exists := out["anthropic.temperature"]; exists && !isNeoNumberSetting(value) {
+		delete(out, "anthropic.temperature")
+	}
+	if value, exists := out["painter.model"]; exists && strings.TrimSpace(stringValue(value)) == "" {
+		delete(out, "painter.model")
+	}
+	if value, exists := out["internal.model"]; exists && !validNeoInternalModelSetting(value) {
+		delete(out, "internal.model")
+	}
 	if value, exists := out["internal.compactionThresholdPercent"]; exists && !validNeoCompactionThresholdPercentSetting(value) {
 		delete(out, "internal.compactionThresholdPercent")
 	}
@@ -19443,9 +19459,44 @@ func deleteInvalidNeoSetting(settings map[string]any, key string, valid func(str
 	}
 }
 
+func deleteInvalidNeoStringArraySetting(settings map[string]any, key string) {
+	value, exists := settings[key]
+	if !exists {
+		return
+	}
+	items, ok := value.([]any)
+	if !ok {
+		delete(settings, key)
+		return
+	}
+	for _, item := range items {
+		if _, ok := item.(string); !ok {
+			delete(settings, key)
+			return
+		}
+	}
+}
+
+func deleteInvalidNeoBooleanSetting(settings map[string]any, key string) {
+	if value, exists := settings[key]; exists {
+		if _, ok := value.(bool); !ok {
+			delete(settings, key)
+		}
+	}
+}
+
 func validNeoAnthropicProvider(provider string) bool {
 	switch provider {
 	case "anthropic", "vertex":
+		return true
+	default:
+		return false
+	}
+}
+
+func validNeoAnthropicSpeed(speed string) bool {
+	switch speed {
+	case "standard", "fast":
 		return true
 	default:
 		return false
@@ -19482,6 +19533,34 @@ func validNeoOracleReasoningEffort(effort string) bool {
 func validNeoGeminiThinkingLevel(level string) bool {
 	switch level {
 	case "minimal", "low", "medium", "high":
+		return true
+	default:
+		return false
+	}
+}
+
+func validNeoInternalModelSetting(value any) bool {
+	if _, ok := value.(string); ok {
+		return true
+	}
+	models, ok := value.(map[string]any)
+	if !ok {
+		return false
+	}
+	for key, item := range models {
+		if strings.TrimSpace(key) == "" {
+			return false
+		}
+		if _, ok := item.(string); !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func isNeoNumberSetting(value any) bool {
+	switch value.(type) {
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64, json.Number:
 		return true
 	default:
 		return false

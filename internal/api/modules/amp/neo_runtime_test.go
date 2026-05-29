@@ -4303,15 +4303,23 @@ func TestNeoThreadSettingsPayloadSanitizesKnownValuesLikeBinary(t *testing.T) {
 	payload := neoThreadSettingsPayload(map[string]any{
 		"agentMode":                                  "deep",
 		"anthropic.provider":                         "bedrock",
+		"anthropic.speed":                            "turbo",
+		"anthropic.temperature":                      "warm",
+		"anthropic.thinking.enabled":                 "yes",
+		"anthropic.interleavedThinking.enabled":      "yes",
 		"openai.speed":                               "fast",
 		"reasoning.effort":                           "extreme",
 		"internal.oracleReasoningEffort":             "max",
 		"gemini.thinkingLevel":                       "huge",
 		"internal.compactionThresholdPercent":        120,
+		"painter.model":                              "",
+		"internal.model":                             []any{"bad"},
 		"agent.skipTitleGenerationIfMessageContains": []any{"keep"},
+		"tools.disable":                              []any{"Bash", 42},
+		"tools.enable":                               "Read",
 	})
 	settings := mapValue(payload["settings"])
-	for _, key := range []string{"anthropic.provider", "reasoning.effort", "internal.oracleReasoningEffort", "gemini.thinkingLevel", "internal.compactionThresholdPercent"} {
+	for _, key := range []string{"anthropic.provider", "anthropic.speed", "anthropic.temperature", "anthropic.thinking.enabled", "anthropic.interleavedThinking.enabled", "reasoning.effort", "internal.oracleReasoningEffort", "gemini.thinkingLevel", "internal.compactionThresholdPercent", "painter.model", "internal.model", "tools.disable", "tools.enable"} {
 		if _, exists := settings[key]; exists {
 			t.Fatalf("invalid setting %s was kept: %#v", key, settings)
 		}
@@ -4324,14 +4332,48 @@ func TestNeoThreadSettingsPayloadSanitizesKnownValuesLikeBinary(t *testing.T) {
 	}
 
 	valid := mapValue(neoThreadSettingsPayload(map[string]any{
-		"anthropic.provider":                  "vertex",
-		"reasoning.effort":                    "max",
-		"internal.oracleReasoningEffort":      "xhigh",
-		"gemini.thinkingLevel":                "medium",
-		"internal.compactionThresholdPercent": json.Number("75.5"),
+		"anthropic.provider":                    "vertex",
+		"anthropic.speed":                       "standard",
+		"anthropic.temperature":                 json.Number("0.2"),
+		"anthropic.thinking.enabled":            true,
+		"anthropic.interleavedThinking.enabled": false,
+		"openai.speed":                          "standard",
+		"reasoning.effort":                      "max",
+		"internal.oracleReasoningEffort":        "xhigh",
+		"gemini.thinkingLevel":                  "medium",
+		"internal.compactionThresholdPercent":   json.Number("75.5"),
+		"painter.model":                         "gpt-image-2",
+		"internal.model":                        map[string]any{"deep": "openai/gpt-5.5"},
+		"tools.disable":                         []any{"Bash"},
+		"tools.enable":                          []any{"Read"},
 	})["settings"])
-	if valid["anthropic.provider"] != "vertex" || valid["reasoning.effort"] != "max" || valid["internal.oracleReasoningEffort"] != "xhigh" || valid["gemini.thinkingLevel"] != "medium" || valid["internal.compactionThresholdPercent"] != json.Number("75.5") {
+	if valid["anthropic.provider"] != "vertex" || valid["anthropic.speed"] != "standard" || valid["anthropic.temperature"] != json.Number("0.2") || valid["anthropic.thinking.enabled"] != true || valid["anthropic.interleavedThinking.enabled"] != false || valid["openai.speed"] != "standard" || valid["reasoning.effort"] != "max" || valid["internal.oracleReasoningEffort"] != "xhigh" || valid["gemini.thinkingLevel"] != "medium" || valid["internal.compactionThresholdPercent"] != json.Number("75.5") || valid["painter.model"] != "gpt-image-2" {
 		t.Fatalf("valid settings were not preserved: %#v", valid)
+	}
+	if len(arrayValue(valid["tools.disable"])) != 1 || len(arrayValue(valid["tools.enable"])) != 1 {
+		t.Fatalf("valid tool settings were not preserved: %#v", valid)
+	}
+}
+
+func TestNeoActorUpdateSettingsStoresSanitizedKnownValues(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor, _ := rt.store.upsert(map[string]any{"name": "thread-actor", "key": "T-settings"}, true)
+	actor.updateSettings(map[string]any{
+		"agentMode":             "smart",
+		"reasoning.effort":      "invalid",
+		"anthropic.speed":       "turbo",
+		"tools.enable":          []any{"Read", 123},
+		"anthropic.temperature": 0.2,
+	})
+
+	if actor.settings["anthropic.speed"] != nil || actor.settings["tools.enable"] != nil {
+		t.Fatalf("invalid known settings were stored: %#v", actor.settings)
+	}
+	if actor.settings["anthropic.temperature"] != 0.2 {
+		t.Fatalf("valid known setting was not stored: %#v", actor.settings)
+	}
+	if actor.settings["reasoning.effort"] != "high" {
+		t.Fatalf("smart mode effort = %#v, want high default after invalid input", actor.settings["reasoning.effort"])
 	}
 }
 
