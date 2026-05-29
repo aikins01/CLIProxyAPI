@@ -1,6 +1,7 @@
 <script lang="ts">
   import {
     ArrowLeft,
+    ArrowDown,
     ArrowUp,
     CheckCircle2,
     ChevronRight,
@@ -31,7 +32,7 @@
     X
   } from 'lucide-svelte';
   import { pushState, replaceState } from '$app/navigation';
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import PatchDiff from '$lib/PatchDiff.svelte';
 
   type Theme = 'system' | 'dark' | 'light';
@@ -250,6 +251,10 @@
   let maxTokensLabel = $state('');
   let retryNotice = $state('');
   let settingsMenuOpen = $state<'mode' | 'effort' | null>(null);
+  let newActivityBelow = $state(false);
+  let transcriptScrollPlan: { kind: 'follow' } | { kind: 'preserve'; top: number } | null = null;
+  let transcriptScrollScheduled = false;
+  let programmaticScrollUntil = 0;
   const devSignalCount = $derived.by(() => {
     let count = artifacts.length + executorStatuses.length + toolLeases.length;
     if (inferenceTools) count += 1;
@@ -324,6 +329,75 @@
     const el = document.querySelector(`[data-message-id='${messageId}']`);
     if (el) (el as HTMLElement).scrollIntoView({ behavior: 'smooth', block: 'center' });
   }
+
+  function pageScroller() {
+    if (typeof document === 'undefined') return null;
+    return document.scrollingElement as HTMLElement | null;
+  }
+
+  function pageDistanceFromBottom() {
+    if (typeof window === 'undefined') return 0;
+    const scroller = pageScroller();
+    if (!scroller) return 0;
+    return scroller.scrollHeight - (scroller.scrollTop + window.innerHeight);
+  }
+
+  function isNearTranscriptBottom() {
+    return pageDistanceFromBottom() <= 180;
+  }
+
+  function scrollTranscriptToBottom(behavior: ScrollBehavior = 'auto') {
+    const scroller = pageScroller();
+    if (!scroller) return;
+    programmaticScrollUntil = Date.now() + 250;
+    scroller.scrollTo({ top: scroller.scrollHeight, behavior });
+    newActivityBelow = false;
+  }
+
+  function restoreTranscriptScrollTop(top: number) {
+    const scroller = pageScroller();
+    if (!scroller) return;
+    programmaticScrollUntil = Date.now() + 250;
+    scroller.scrollTop = Math.max(0, top);
+  }
+
+  async function flushTranscriptScrollPlan() {
+    if (transcriptScrollScheduled) return;
+    transcriptScrollScheduled = true;
+    await tick();
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    const plan = transcriptScrollPlan;
+    transcriptScrollPlan = null;
+    transcriptScrollScheduled = false;
+    if (!plan) return;
+    if (plan.kind === 'follow') {
+      scrollTranscriptToBottom();
+      return;
+    }
+    restoreTranscriptScrollTop(plan.top);
+  }
+
+  function planTranscriptScroll(options: { forceFollow?: boolean; markNewActivity?: boolean } = {}) {
+    if (typeof window === 'undefined') return;
+    const shouldFollow = Boolean(options.forceFollow) || isNearTranscriptBottom();
+    if (shouldFollow) {
+      transcriptScrollPlan = { kind: 'follow' };
+    } else {
+      const scroller = pageScroller();
+      transcriptScrollPlan = { kind: 'preserve', top: scroller?.scrollTop ?? window.scrollY };
+      if (options.markNewActivity !== false) newActivityBelow = true;
+    }
+    void flushTranscriptScrollPlan();
+  }
+
+  function handlePageScroll() {
+    if (Date.now() <= programmaticScrollUntil) return;
+    if (isNearTranscriptBottom()) newActivityBelow = false;
+  }
+
+  function jumpToLatest() {
+    scrollTranscriptToBottom('smooth');
+  }
   // Handoff marker derived from current messages (messages stream in after initial detail load).
   // Use the thread title as the displayed "Instructions:" sentence, matching ampcode.
   const handoffFrom = $derived.by(() => {
@@ -365,9 +439,11 @@
     };
     addEventListener('popstate', handlePopState);
     addEventListener('keydown', handleEscape);
+    addEventListener('scroll', handlePageScroll, { passive: true });
     return () => {
       removeEventListener('popstate', handlePopState);
       removeEventListener('keydown', handleEscape);
+      removeEventListener('scroll', handlePageScroll);
       clearComposerAttachments();
       disconnect();
     };
@@ -422,6 +498,7 @@
     mainThreadId = '';
     maxTokensLabel = '';
     retryNotice = '';
+    newActivityBelow = false;
   }
 
   async function submitKey() {
@@ -1145,6 +1222,7 @@
       reasoningEffort
     };
     if (!shouldQueue) {
+      planTranscriptScroll({ forceFollow: true, markNewActivity: false });
       detail = { ...thread, messages: [...thread.messages, message] };
     }
     composer = '';
@@ -1393,6 +1471,7 @@
 
   function upsertMessage(message: NeoMessage, replace: boolean) {
     if (!detail) return;
+    planTranscriptScroll();
     const index = detail.messages.findIndex((item) => item.messageId === message.messageId);
     if (index === -1) {
       detail = { ...detail, messages: [...detail.messages, message] };
@@ -1407,6 +1486,7 @@
 
   function truncateMessagesFromEvent(message: Incoming) {
     if (!detail) return;
+    planTranscriptScroll({ markNewActivity: false });
     const truncateFromMessage = stringFrom(message.truncateFromMessage);
     let index = -1;
     if (truncateFromMessage) {
@@ -1424,6 +1504,7 @@
     if (!detail) return;
     const messageId = String(delta.messageId ?? '');
     if (!messageId) return;
+    planTranscriptScroll();
     const role = String(delta.role ?? 'assistant');
     const state = String(delta.state ?? '');
     let nextMessages = [...detail.messages];
@@ -1462,6 +1543,7 @@
     if (!detail) return;
     const toolCallId = stringFrom(event.toolCallId ?? event.toolUseId ?? event.id);
     if (!toolCallId) return;
+    planTranscriptScroll();
     const progressMessageId = toolProgressMessageId(toolCallId);
     const nextMessages = [...detail.messages];
     let messageIndex = -1;
@@ -4477,6 +4559,19 @@
           {/each}
         </div>
 
+        {#if newActivityBelow}
+          <button
+            class:latest-chip--attachments={composerAttachments.length > 0}
+            class:latest-chip--queue={queuedMessages.length > 0}
+            class="latest-chip"
+            type="button"
+            onclick={jumpToLatest}
+          >
+            <ArrowDown size={13} />
+            New activity
+          </button>
+        {/if}
+
         <div
           class:composer-dock--attachments={composerAttachments.length > 0}
           class:composer-dock--queue={queuedMessages.length > 0}
@@ -6188,6 +6283,33 @@
   @media (min-width: 1024px) and (max-width: 1279.98px) {
     .composer-footer { padding-right: calc(8px + 21em); padding-left: 8px; }
   }
+  .latest-chip {
+    position: fixed;
+    left: 50%;
+    bottom: 204px;
+    z-index: 34;
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    min-height: 32px;
+    padding: 6px 11px;
+    border: 1px solid var(--neo-border-strong);
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--neo-bg) 92%, var(--neo-ink));
+    color: var(--neo-ink);
+    box-shadow: 0 12px 28px color-mix(in srgb, var(--neo-shadow) 18%, transparent);
+    font-size: 13px;
+    font-weight: 600;
+    line-height: 18px;
+    transform: translateX(-50%);
+    cursor: pointer;
+  }
+  .latest-chip:hover {
+    background: var(--neo-card-hover);
+  }
+  .latest-chip--attachments { bottom: 268px; }
+  .latest-chip--queue { bottom: 302px; }
+  .latest-chip--attachments.latest-chip--queue { bottom: 366px; }
   /* Spacer that reserves vertical space at the end of the transcript so the sticky composer never covers the last message. */
   .composer-dock {
     height: 188px;
@@ -6198,6 +6320,10 @@
   .composer-dock--attachments.composer-dock--queue { height: 350px; }
   @media (max-width: 640px) {
     .composer-footer { padding: 6px; }
+    .latest-chip { bottom: 188px; }
+    .latest-chip--attachments { bottom: 258px; }
+    .latest-chip--queue { bottom: 294px; }
+    .latest-chip--attachments.latest-chip--queue { bottom: 362px; }
     .composer-dock { height: 172px; }
     .composer-dock--attachments { height: 242px; }
     .composer-dock--queue { height: 278px; }
