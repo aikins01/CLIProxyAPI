@@ -67,16 +67,9 @@ const (
 	neoThreadMarkdownToolTextLimit   = 2000
 	neoThreadMarkdownToolByteLimit   = 100 * 1024
 	neoThreadMarkdownOmittedText     = "\n[ ... omitted remaining lines to make summarizing use less tokens ... ]"
-	// neoThreadReaderReadMessagesByteLimit caps the markdown returned from a
-	// single read_messages call against the local thread store, mirroring the
-	// binary's wLR=65536 truncation policy.
-	neoThreadReaderReadMessagesByteLimit = 65536
-	// neoThreadReaderSearchHitLimit caps how many line matches search_messages
-	// returns, mirroring the binary's HLR=500 limit.
-	neoThreadReaderSearchHitLimit = 500
-	neoJSONRPCFrameKey            = "__neo_jsonrpc_frame"
-	neoJSONRPCRequestIDKey        = "__neo_jsonrpc_request_id"
-	neoMaxQueuedMessages          = 5
+	neoJSONRPCFrameKey               = "__neo_jsonrpc_frame"
+	neoJSONRPCRequestIDKey           = "__neo_jsonrpc_request_id"
+	neoMaxQueuedMessages             = 5
 )
 
 // neoLocalThreadCacheEntry memoizes a parsed local thread document keyed by the
@@ -6316,138 +6309,6 @@ func neoToolInputThreadID(input map[string]any) string {
 		return ""
 	}
 	return raw
-}
-
-// neoThreadReaderMessageStats answers the amp client's POST /api/threads/{T}/messages/message_stats
-// call by counting messages and surfacing every compaction-summary anchor in the loaded thread.
-// Mirrors the binary's ONR helper: each compaction entry is {index, cutIndex, text}.
-func neoThreadReaderMessageStats(thread map[string]any) map[string]any {
-	messages := arrayValue(thread["messages"])
-	count := len(messages)
-	firstIndex, lastIndex := -1, -1
-	if count > 0 {
-		firstIndex, lastIndex = 0, count-1
-	}
-	compactions := neoThreadReaderCompactions(messages)
-	latestCompactionIndex := -1
-	if len(compactions) > 0 {
-		latestCompactionIndex = int(numberFrom(mapValue(compactions[len(compactions)-1])["index"]))
-	}
-	return map[string]any{
-		"messageCount":          count,
-		"firstIndex":            firstIndex,
-		"lastIndex":             lastIndex,
-		"compactions":           compactions,
-		"latestCompactionIndex": latestCompactionIndex,
-	}
-}
-
-// neoThreadReaderCompactions ports the binary's ONR: for each info-role message whose
-// content contains a summary block, emit {index, cutIndex, text} so the subagent can
-// orient itself around compaction boundaries.
-func neoThreadReaderCompactions(messages []any) []any {
-	out := make([]any, 0)
-	for i, raw := range messages {
-		msg := mapValue(raw)
-		if stringValue(msg["role"]) != "info" {
-			continue
-		}
-		texts := make([]string, 0)
-		for _, blk := range arrayValue(msg["content"]) {
-			block := mapValue(blk)
-			if stringValue(block["type"]) != "summary" {
-				continue
-			}
-			summary := mapValue(block["summary"])
-			if stringValue(summary["type"]) != "message" {
-				continue
-			}
-			if t := stringValue(summary["summary"]); t != "" {
-				texts = append(texts, t)
-			}
-		}
-		if len(texts) == 0 {
-			continue
-		}
-		out = append(out, map[string]any{
-			"index":    i,
-			"cutIndex": i + 1,
-			"text":     strings.Join(texts, "\n\n"),
-		})
-	}
-	return out
-}
-
-// neoThreadReaderReadMessages renders messages in [startIndex, startIndex+limit)
-// as markdown, capped at neoThreadReaderReadMessagesByteLimit bytes.
-func neoThreadReaderReadMessages(thread map[string]any, startIndex, limit int) string {
-	messages := arrayValue(thread["messages"])
-	if len(messages) == 0 || limit <= 0 || startIndex < 0 || startIndex >= len(messages) {
-		return ""
-	}
-	end := startIndex + limit
-	if end > len(messages) {
-		end = len(messages)
-	}
-	var out strings.Builder
-	for i := startIndex; i < end; i++ {
-		msg := mapValue(messages[i])
-		role := stringValue(msg["role"])
-		out.WriteString(fmt.Sprintf("## Message %d (role=%s)\n\n", i, role))
-		body := strings.TrimSpace(neoMarkdownTextFromBlocks(arrayValue(msg["content"]), neoThreadMarkdownOptions{TruncateToolResults: true}))
-		if body == "" {
-			body = "[no textual content]"
-		}
-		out.WriteString(body)
-		out.WriteString("\n\n")
-	}
-	raw := out.String()
-	if len(raw) > neoThreadReaderReadMessagesByteLimit {
-		raw = raw[:neoThreadReaderReadMessagesByteLimit] + "\n\n[ ... truncated ... ]\n"
-	}
-	return raw
-}
-
-// neoThreadReaderSearchMessages performs a case-insensitive literal substring scan
-// over the rendered markdown of each message in [startIndex, endIndex], returning
-// {path, lineNumber, line} hits (mirroring the binary's per-line search shape),
-// capped at neoThreadReaderSearchHitLimit matches.
-func neoThreadReaderSearchMessages(thread map[string]any, query string, startIndex, endIndex int) []map[string]any {
-	if query == "" {
-		return nil
-	}
-	messages := arrayValue(thread["messages"])
-	if len(messages) == 0 {
-		return nil
-	}
-	if startIndex < 0 {
-		startIndex = 0
-	}
-	if endIndex >= len(messages) {
-		endIndex = len(messages) - 1
-	}
-	if startIndex > endIndex {
-		return nil
-	}
-	queryLower := strings.ToLower(query)
-	results := make([]map[string]any, 0)
-	for i := startIndex; i <= endIndex; i++ {
-		msg := mapValue(messages[i])
-		markdown := neoMarkdownTextFromBlocks(arrayValue(msg["content"]), neoThreadMarkdownOptions{TruncateToolResults: true})
-		for lineIdx, line := range strings.Split(markdown, "\n") {
-			if strings.Contains(strings.ToLower(line), queryLower) {
-				results = append(results, map[string]any{
-					"path":       fmt.Sprintf("messages[%d]", i),
-					"lineNumber": lineIdx + 1,
-					"line":       line,
-				})
-				if len(results) >= neoThreadReaderSearchHitLimit {
-					return results
-				}
-			}
-		}
-	}
-	return results
 }
 
 func (a *neoActor) revokeToolLease(msg map[string]any) {

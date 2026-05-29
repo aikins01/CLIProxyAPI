@@ -926,6 +926,83 @@ func TestRegisterManagementRoutesServesNeoThreadUsageLocally(t *testing.T) {
 	}
 }
 
+func TestRegisterManagementRoutesPassesNeoThreadUsageUpstreamWhenProxyExists(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	enabled := true
+
+	dir := t.TempDir()
+	oldStoreDir := neoAmpThreadStoreDir
+	neoAmpThreadStoreDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
+
+	threadID := "T-019e1046-656d-7132-879f-390ded941c16"
+	rawThread := []byte(`{"id":"` + threadID + `","title":"local usage test","messages":[{"messageId":"M-one","role":"assistant","usage":{"inputTokens":3,"outputTokens":5}}]}`)
+	if err := os.WriteFile(filepath.Join(dir, threadID+".json"), rawThread, 0o600); err != nil {
+		t.Fatalf("write local thread: %v", err)
+	}
+
+	upstreamRequests := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequests++
+		switch r.URL.Path {
+		case "/api/threads/" + threadID + "/usage", "/threads/" + threadID + "/usage":
+			writeNeoJSON(w, http.StatusOK, map[string]any{"threadID": threadID, "upstream": true})
+		default:
+			t.Fatalf("unexpected upstream request path=%s", r.URL.Path)
+		}
+	}))
+	defer upstream.Close()
+
+	m := &AmpModule{
+		restrictToLocalhost: false,
+		neoRuntime: newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+			UpstreamURL:    upstream.URL,
+			UpstreamAPIKey: "secret",
+			NeoLocalRuntime: config.AmpNeoLocalRuntime{
+				Enabled: &enabled,
+			},
+		}}),
+	}
+	proxy, _ := createReverseProxy(upstream.URL, NewStaticSecretSource(""))
+	m.setProxy(proxy)
+	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, nil)
+
+	localServer := httptest.NewServer(r)
+	defer localServer.Close()
+
+	for _, path := range []string{"/api/threads/" + threadID + "/usage", "/threads/" + threadID + "/usage"} {
+		t.Run(path, func(t *testing.T) {
+			resp, err := http.Get(localServer.URL + path)
+			if err != nil {
+				t.Fatalf("get usage: %v", err)
+			}
+			defer func() {
+				if err := resp.Body.Close(); err != nil {
+					t.Fatalf("close response body: %v", err)
+				}
+			}()
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("read response body: %v", err)
+			}
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, body=%s", resp.StatusCode, string(body))
+			}
+			var response map[string]any
+			if err := json.Unmarshal(body, &response); err != nil {
+				t.Fatalf("response JSON error: %v", err)
+			}
+			if response["upstream"] != true {
+				t.Fatalf("expected upstream usage response, got %#v", response)
+			}
+		})
+	}
+	if upstreamRequests != 2 {
+		t.Fatalf("upstreamRequests = %d, want 2", upstreamRequests)
+	}
+}
+
 func TestRegisterManagementRoutesServesNeoLegacyRunEndpointsLocally(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
