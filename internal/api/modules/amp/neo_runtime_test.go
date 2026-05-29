@@ -144,6 +144,30 @@ func TestNeoRuntimeActorKVKeyHTTP(t *testing.T) {
 	}
 }
 
+func TestNeoRuntimeStateAndMessagesHTTPAreReadOnly(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor, _ := rt.store.upsert(map[string]any{"name": "threadActor", "key": "T-read-only"}, true)
+
+	for _, path := range []string{
+		"/gateway/" + actor.id + "/request/state",
+		"/gateway/" + actor.id + "/request/messages",
+	} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rec := httptest.NewRecorder()
+		rt.handleHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET %s status = %d, body=%s", path, rec.Code, rec.Body.String())
+		}
+
+		req = httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{}`))
+		rec = httptest.NewRecorder()
+		rt.handleHTTP(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("POST %s status = %d, want 404 not local compatibility handling", path, rec.Code)
+		}
+	}
+}
+
 func TestLoadNeoLocalThreadRewritesOwnershipMetadata(t *testing.T) {
 	dir := t.TempDir()
 	oldStoreDir := neoAmpThreadStoreDir

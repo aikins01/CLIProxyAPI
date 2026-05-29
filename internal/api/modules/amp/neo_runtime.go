@@ -321,9 +321,9 @@ func (rt *neoRuntime) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		rt.handleContextAnalysisRequest(w, r)
 	case isNeoDynamicReloadPath(r.URL.Path) && r.Method == http.MethodPut:
 		writeNeoJSON(w, http.StatusOK, map[string]any{"ok": true})
-	case isNeoStateRequestPath(r.URL.Path):
+	case isNeoStateRequestPath(r.URL.Path) && r.Method == http.MethodGet:
 		rt.handleStateRequest(w, r)
-	case isNeoMessagesRequestPath(r.URL.Path):
+	case isNeoMessagesRequestPath(r.URL.Path) && r.Method == http.MethodGet:
 		rt.handleMessagesRequest(w, r)
 	case rt.serveActorKVKeyHTTP(w, r):
 		return
