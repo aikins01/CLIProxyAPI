@@ -11652,6 +11652,77 @@ func TestNeoRuntimePrefersRicherCloudThreadOverPartialLocalCache(t *testing.T) {
 	}
 }
 
+func TestNeoRuntimeChecksCloudBeforeUsingUsefulLocalCloudCache(t *testing.T) {
+	dir := t.TempDir()
+	oldStoreDir := neoAmpThreadStoreDir
+	neoAmpThreadStoreDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
+
+	threadID := "T-019e65c0-0310-77a8-b233-4b84d9c0612b"
+	localThread := map[string]any{
+		"id":        threadID,
+		"title":     "stale local thread",
+		"agentMode": "smart",
+		"updatedAt": "2026-05-25T10:00:00Z",
+		"messages": []any{
+			map[string]any{
+				"role":      "user",
+				"messageId": "M-local-user",
+				"content":   []any{map[string]any{"type": "text", "text": "stale local message"}},
+			},
+		},
+	}
+	rawLocal, err := json.Marshal(localThread)
+	if err != nil {
+		t.Fatalf("marshal local thread: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, threadID+".json"), rawLocal, 0o600); err != nil {
+		t.Fatalf("write local thread: %v", err)
+	}
+
+	requests := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.URL.Path != "/api/internal" || r.URL.RawQuery != "getThread" {
+			t.Fatalf("request path = %s?%s", r.URL.Path, r.URL.RawQuery)
+		}
+		writeNeoJSON(w, http.StatusOK, map[string]any{
+			"ok": true,
+			"result": map[string]any{
+				"thread": map[string]any{
+					"id": threadID,
+					"data": map[string]any{
+						"id":        threadID,
+						"title":     "fresh cloud thread",
+						"agentMode": "deep",
+						"updatedAt": "2026-05-26T10:00:00Z",
+						"messages": []any{
+							map[string]any{"role": "user", "messageId": "M-cloud-user", "content": []any{map[string]any{"type": "text", "text": "fresh cloud message"}}},
+						},
+					},
+				},
+			},
+		})
+	}))
+	defer upstream.Close()
+
+	thread, ok := loadNeoThread(context.Background(), &config.Config{
+		AmpCode: config.AmpCode{UpstreamURL: upstream.URL, UpstreamAPIKey: "secret"},
+	}, threadID)
+	if !ok {
+		t.Fatal("loadNeoThread returned not ok")
+	}
+	if requests != 1 {
+		t.Fatalf("cloud getThread requests = %d, want 1", requests)
+	}
+	if got := stringValue(thread["title"]); got != "fresh cloud thread" {
+		t.Fatalf("title = %q, want fresh cloud thread", got)
+	}
+	if got := stringValue(thread["agentMode"]); got != "deep" {
+		t.Fatalf("agentMode = %q, want deep", got)
+	}
+}
+
 func TestNeoSystemPromptFiltersDisabledSkills(t *testing.T) {
 	prompt := neoSystemPrompt(neoInferenceRequest{
 		Capabilities: map[string]any{

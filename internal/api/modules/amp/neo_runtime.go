@@ -8257,10 +8257,6 @@ func (rt *neoRuntime) localThreadActorManagementResponse(ctx context.Context, bo
 
 func loadNeoThread(ctx context.Context, cfg *config.Config, threadID string) (map[string]any, bool) {
 	local, localOK := loadNeoLocalThread(threadID)
-	if localOK && neoThreadHasUsefulContent(local) && !neoThreadNeedsCloudRefresh(local) {
-		normalizeNeoThreadAgentMode(local)
-		return local, true
-	}
 	if neoCloudThreadID(threadID) {
 		cloud, ok, err := getNeoCloudThread(ctx, cfg, threadID)
 		if err != nil {
@@ -8296,22 +8292,6 @@ func neoThreadHasUsefulContent(thread map[string]any) bool {
 	}
 	if data := mapValue(thread["data"]); len(data) > 0 {
 		return neoThreadHasUsefulContent(data)
-	}
-	return false
-}
-
-func neoThreadNeedsCloudRefresh(thread map[string]any) bool {
-	if len(thread) == 0 || !neoCloudThreadID(stringValue(thread["id"])) {
-		return false
-	}
-	if neoThreadMapAgentMode(thread) == "" {
-		return true
-	}
-	messages := arrayValue(thread["messages"])
-	if len(messages) == 1 {
-		message := mapValue(messages[0])
-		content := arrayValue(message["content"])
-		return len(content) == 1 && stringValue(mapValue(content[0])["type"]) == "tool_result"
 	}
 	return false
 }
