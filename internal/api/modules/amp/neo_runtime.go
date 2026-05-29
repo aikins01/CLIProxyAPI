@@ -64,10 +64,16 @@ const (
 	neoThreadMarkdownToolByteLimit   = 100 * 1024
 	neoThreadMarkdownOmittedText     = "\n[ ... omitted remaining lines to make summarizing use less tokens ... ]"
 	neoCloudThreadListCacheTTL       = 30 * time.Second
-	neoThreadExtractionModel         = "gemini-3-flash-preview"
-	neoJSONRPCFrameKey               = "__neo_jsonrpc_frame"
-	neoJSONRPCRequestIDKey           = "__neo_jsonrpc_request_id"
-	neoMaxQueuedMessages             = 5
+	// neoThreadReaderReadMessagesByteLimit caps the markdown returned from a
+	// single read_messages call against the local thread store, mirroring the
+	// binary's wLR=65536 truncation policy.
+	neoThreadReaderReadMessagesByteLimit = 65536
+	// neoThreadReaderSearchHitLimit caps how many line matches search_messages
+	// returns, mirroring the binary's HLR=500 limit.
+	neoThreadReaderSearchHitLimit = 500
+	neoJSONRPCFrameKey            = "__neo_jsonrpc_frame"
+	neoJSONRPCRequestIDKey        = "__neo_jsonrpc_request_id"
+	neoMaxQueuedMessages          = 5
 )
 
 type neoCloudThreadListCacheEntry struct {
@@ -6079,8 +6085,6 @@ func normalizeNeoLocalThreadToolRun(ctx context.Context, rt *neoRuntime, pending
 	switch pending.Name {
 	case "painter", "render_agg_man", "view_media", "look_at":
 		return normalizeNeoImageToolRun(pending, run)
-	case "read_thread":
-		return normalizeNeoReadThreadToolRun(ctx, rt, cfg, pending, run, currentThreadID)
 	case "find_thread", "thread_search", "search_threads":
 		return normalizeNeoFindThreadToolRun(ctx, cfg, pending, run)
 	default:
@@ -6321,30 +6325,6 @@ func stripNeoDiscoveredGuidanceFromRun(run map[string]any) map[string]any {
 	return cleanedRun
 }
 
-func normalizeNeoReadThreadToolRun(ctx context.Context, rt *neoRuntime, cfg *config.Config, pending neoPendingTool, run map[string]any, currentThreadID string) map[string]any {
-	threadID := neoToolInputThreadID(pending.Input)
-	if threadID == "" {
-		return run
-	}
-	thread, ok := loadNeoThread(ctx, cfg, threadID)
-	if !ok {
-		return run
-	}
-	extracted, err := inferNeoThreadExtractionLocal(rt, currentThreadID, threadID, pending.Input, thread)
-	if err != nil {
-		rewritten := cloneMap(run)
-		rewritten["status"] = "error"
-		rewritten["error"] = "Reading thread failed: " + err.Error()
-		delete(rewritten, "result")
-		return rewritten
-	}
-	rewritten := cloneMap(run)
-	rewritten["status"] = "done"
-	rewritten["result"] = extracted
-	delete(rewritten, "error")
-	return rewritten
-}
-
 func normalizeNeoFindThreadToolRun(ctx context.Context, cfg *config.Config, pending neoPendingTool, run map[string]any) map[string]any {
 	query := strings.TrimSpace(stringValue(pending.Input["query"]))
 	if query == "" {
@@ -6380,146 +6360,140 @@ func neoToolInputThreadID(input map[string]any) string {
 	return raw
 }
 
-func inferNeoThreadExtractionLocal(rt *neoRuntime, currentThreadID string, mentionedThreadID string, input map[string]any, thread map[string]any) (string, error) {
-	if rt == nil {
-		return "", errors.New("missing local Neo runtime")
+// neoThreadReaderMessageStats answers the amp client's POST /api/threads/{T}/messages/message_stats
+// call by counting messages and surfacing every compaction-summary anchor in the loaded thread.
+// Mirrors the binary's ONR helper: each compaction entry is {index, cutIndex, text}.
+func neoThreadReaderMessageStats(thread map[string]any) map[string]any {
+	messages := arrayValue(thread["messages"])
+	count := len(messages)
+	firstIndex, lastIndex := -1, -1
+	if count > 0 {
+		firstIndex, lastIndex = 0, count-1
 	}
-	goal := strings.TrimSpace(stringValue(input["goal"]))
-	markdown := neoThreadMarkdown(thread, neoThreadMarkdownOptions{TruncateToolResults: true})
-	body := map[string]any{
-		"contents": []any{
-			map[string]any{
-				"role":  "user",
-				"parts": []any{map[string]any{"text": "\nHere is the mentioned thread content:\n<mentionedThread>\n" + markdown + "\n</mentionedThread>\n"}},
-			},
-			map[string]any{
-				"role":  "user",
-				"parts": []any{map[string]any{"text": neoThreadExtractionPrompt(goal)}},
-			},
-		},
-		"generationConfig": map[string]any{
-			"responseMimeType":   "application/json",
-			"responseJsonSchema": neoThreadExtractionResponseSchema(),
-		},
+	compactions := neoThreadReaderCompactions(messages)
+	latestCompactionIndex := -1
+	if len(compactions) > 0 {
+		latestCompactionIndex = int(numberFrom(mapValue(compactions[len(compactions)-1])["index"]))
 	}
-	sessionThreadID := currentThreadID
-	if sessionThreadID == "" {
-		sessionThreadID = mentionedThreadID
-	}
-	subpath := "/v1beta1/publishers/google/models/" + url.PathEscape(neoThreadExtractionModel) + ":generateContent"
-	jsonBody, err := callNeoLocalProvider(rt, "google", subpath, body, sessionThreadID)
-	if err != nil {
-		return "", err
-	}
-	text := strings.TrimSpace(neoGoogleResponseText(jsonBody))
-	parsed, err := parseNeoThreadExtractionJSON(text)
-	if err != nil {
-		return "", err
-	}
-	return stringValue(parsed["relevantContent"]), nil
-}
-
-func neoThreadExtractionPrompt(goal string) string {
-	return "\n" + strings.Join([]string{
-		"You are helping me extract relevant information from the mentioned thread based on a goal.",
-		"## Task",
-		"I am talking to another user. They mentioned a thread (a conversation) in their message last message. I turned the thread into Markdown and provided it to you, along with a goal of what I want you to extract.",
-		"Your job is to:",
-		"1. Analyze the mentioned thread's content",
-		"2. Identify information that is relevant to the goal",
-		"3. Extract and preserve those relevant parts with full fidelity",
-		"4. Omit clearly irrelevant content to keep the context concise",
-		"## Guidelines",
-		"**Preserve Fidelity**: When content IS relevant, include it completely with all important details, code snippets, explanations, and context.",
-		"**Be Selective**: When content is clearly NOT relevant to the user's query, omit it entirely.",
-		"**Maintain Structure**: Keep the extracted content well-organized and coherent. If multiple parts are relevant, preserve their logical flow.",
-		"**Technical Precision**: Preserve exact technical details like file paths, function names, error messages, and code snippets that are relevant.",
-		"## Examples",
-		"### Example 1: Extract implementation details",
-		"**Goal**: \"Extract the implementation details of the authentication mechanism in the mentioned thread\"",
-		"**Good Extraction**:",
-		"- Includes: Authentication logic, security considerations, code examples, relevant files",
-		"- Omits: Unrelated features, general discussion, tangential topics",
-		"### Example 2: Referencing a bug fix",
-		"**Goal**: \"Extract how the bug was fixed in the mentioned thread\"",
-		"**Good Extraction**:",
-		"- Includes: The bug description, root cause, the fix/solution, relevant code changes",
-		"- Omits: Initial troubleshooting steps, unrelated changes, meeting notes",
-		"### Example 3: Learning from past work",
-		"**Goal**: \"Describe what pattern was used to implemented the widget Foo in the mentioned thread\"",
-		"**Good Extraction**:",
-		"- Includes: The design pattern, implementation approach, example code, key decisions",
-		"- Omits: Project-specific details that don't apply, alternative approaches that were rejected",
-		"## Goal",
-		goal,
-		"## Your Response",
-		"Format your response as JSON with:",
-		"- `relevantContent`: The extracted relevant information (as markdown text)",
-	}, "\n") + "\n"
-}
-
-func neoThreadExtractionResponseSchema() map[string]any {
 	return map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"relevantContent": map[string]any{
-				"type":        "string",
-				"description": "Extracted relevant information from the thread based on the goal. Preserve fidelity and details for relevant parts. Omit irrelevant content.",
-			},
-		},
-		"required": []any{"relevantContent"},
+		"messageCount":          count,
+		"firstIndex":            firstIndex,
+		"lastIndex":             lastIndex,
+		"compactions":           compactions,
+		"latestCompactionIndex": latestCompactionIndex,
 	}
 }
 
-func neoGoogleResponseText(jsonBody map[string]any) string {
-	candidates := arrayValue(jsonBody["candidates"])
-	if len(candidates) == 0 {
+// neoThreadReaderCompactions ports the binary's ONR: for each info-role message whose
+// content contains a summary block, emit {index, cutIndex, text} so the subagent can
+// orient itself around compaction boundaries.
+func neoThreadReaderCompactions(messages []any) []any {
+	out := make([]any, 0)
+	for i, raw := range messages {
+		msg := mapValue(raw)
+		if stringValue(msg["role"]) != "info" {
+			continue
+		}
+		texts := make([]string, 0)
+		for _, blk := range arrayValue(msg["content"]) {
+			block := mapValue(blk)
+			if stringValue(block["type"]) != "summary" {
+				continue
+			}
+			summary := mapValue(block["summary"])
+			switch stringValue(summary["type"]) {
+			case "message":
+				if t := stringValue(summary["summary"]); t != "" {
+					texts = append(texts, t)
+				}
+			default:
+				if t := stringValue(summary["thread"]); t != "" {
+					texts = append(texts, "Summary thread: "+t)
+				}
+			}
+		}
+		if len(texts) == 0 {
+			continue
+		}
+		out = append(out, map[string]any{
+			"index":    i,
+			"cutIndex": i + 1,
+			"text":     strings.Join(texts, "\n"),
+		})
+	}
+	return out
+}
+
+// neoThreadReaderReadMessages renders messages in [startIndex, startIndex+limit)
+// as markdown, capped at neoThreadReaderReadMessagesByteLimit bytes.
+func neoThreadReaderReadMessages(thread map[string]any, startIndex, limit int) string {
+	messages := arrayValue(thread["messages"])
+	if len(messages) == 0 || limit <= 0 || startIndex < 0 || startIndex >= len(messages) {
 		return ""
 	}
-	parts := arrayValue(mapValue(mapValue(candidates[0])["content"])["parts"])
+	end := startIndex + limit
+	if end > len(messages) {
+		end = len(messages)
+	}
 	var out strings.Builder
-	for _, raw := range parts {
-		out.WriteString(stringValue(mapValue(raw)["text"]))
+	for i := startIndex; i < end; i++ {
+		msg := mapValue(messages[i])
+		role := stringValue(msg["role"])
+		out.WriteString(fmt.Sprintf("## Message %d (role=%s)\n\n", i, role))
+		body := strings.TrimSpace(neoMarkdownTextFromBlocks(arrayValue(msg["content"]), neoThreadMarkdownOptions{TruncateToolResults: true}))
+		if body == "" {
+			body = "[no textual content]"
+		}
+		out.WriteString(body)
+		out.WriteString("\n\n")
 	}
-	return out.String()
+	raw := out.String()
+	if len(raw) > neoThreadReaderReadMessagesByteLimit {
+		raw = raw[:neoThreadReaderReadMessagesByteLimit] + "\n\n[ ... truncated ... ]\n"
+	}
+	return raw
 }
 
-func parseNeoThreadExtractionJSON(text string) (map[string]any, error) {
-	text = strings.TrimSpace(text)
-	if parsed, ok := parseNeoThreadExtractionJSONObject(text); ok {
-		return parsed, nil
+// neoThreadReaderSearchMessages performs a case-insensitive literal substring scan
+// over the rendered markdown of each message in [startIndex, endIndex], returning
+// {path, lineNumber, line} hits (mirroring the binary's per-line search shape),
+// capped at neoThreadReaderSearchHitLimit matches.
+func neoThreadReaderSearchMessages(thread map[string]any, query string, startIndex, endIndex int) []map[string]any {
+	if query == "" {
+		return nil
 	}
-	if start := strings.Index(text, "```"); start >= 0 {
-		rest := text[start+3:]
-		if end := strings.Index(rest, "```"); end >= 0 {
-			fenced := strings.TrimSpace(rest[:end])
-			if newline := strings.IndexAny(fenced, "\r\n"); newline >= 0 && strings.EqualFold(strings.TrimSpace(fenced[:newline]), "json") {
-				fenced = strings.TrimSpace(fenced[newline+1:])
-			}
-			if parsed, ok := parseNeoThreadExtractionJSONObject(fenced); ok {
-				return parsed, nil
+	messages := arrayValue(thread["messages"])
+	if len(messages) == 0 {
+		return nil
+	}
+	if startIndex < 0 {
+		startIndex = 0
+	}
+	if endIndex >= len(messages) {
+		endIndex = len(messages) - 1
+	}
+	if startIndex > endIndex {
+		return nil
+	}
+	queryLower := strings.ToLower(query)
+	results := make([]map[string]any, 0)
+	for i := startIndex; i <= endIndex; i++ {
+		msg := mapValue(messages[i])
+		markdown := neoMarkdownTextFromBlocks(arrayValue(msg["content"]), neoThreadMarkdownOptions{TruncateToolResults: true})
+		for lineIdx, line := range strings.Split(markdown, "\n") {
+			if strings.Contains(strings.ToLower(line), queryLower) {
+				results = append(results, map[string]any{
+					"path":       fmt.Sprintf("messages[%d]", i),
+					"lineNumber": lineIdx + 1,
+					"line":       line,
+				})
+				if len(results) >= neoThreadReaderSearchHitLimit {
+					return results
+				}
 			}
 		}
 	}
-	start := strings.Index(text, "{")
-	end := strings.LastIndex(text, "}")
-	if start >= 0 && end > start {
-		if parsed, ok := parseNeoThreadExtractionJSONObject(text[start : end+1]); ok {
-			return parsed, nil
-		}
-	}
-	return nil, errors.New("failed to parse JSON from thread extraction result")
-}
-
-func parseNeoThreadExtractionJSONObject(text string) (map[string]any, bool) {
-	var parsed map[string]any
-	if err := json.Unmarshal([]byte(text), &parsed); err != nil {
-		return nil, false
-	}
-	if _, ok := parsed["relevantContent"]; !ok {
-		return nil, false
-	}
-	return parsed, true
+	return results
 }
 
 func (a *neoActor) revokeToolLease(msg map[string]any) {
@@ -8230,6 +8204,60 @@ func tryServeNeoLocalThread(c *gin.Context, cfg *config.Config) bool {
 		return true
 	}
 	c.JSON(http.StatusOK, thread)
+	return true
+}
+
+// neoThreadReaderMessagePathPattern matches the amp client's POST endpoints used
+// by the read_thread subagent (binary's wNR executor):
+//   /api/threads/{threadID}/messages/{message_stats|read_messages|search_messages}
+//   /threads/{threadID}/messages/{message_stats|read_messages|search_messages}
+var neoThreadReaderMessagePathPattern = regexp.MustCompile(`^(?:/api)?/threads/(T-[0-9A-Za-z][0-9A-Za-z-]*)/messages/(message_stats|read_messages|search_messages)$`)
+
+// tryServeNeoLocalThreadReaderTool answers the three POST endpoints the amp
+// client's read_thread subagent hits to read local thread data. When the thread
+// is not cached locally the handler returns false so the request can fall through
+// to the upstream proxy; the amp cloud then serves the same shape for cloud-only
+// threads.
+func tryServeNeoLocalThreadReaderTool(c *gin.Context) bool {
+	if c == nil || c.Request == nil || c.Request.URL == nil || c.Request.Method != http.MethodPost {
+		return false
+	}
+	match := neoThreadReaderMessagePathPattern.FindStringSubmatch(c.Request.URL.Path)
+	if match == nil {
+		return false
+	}
+	threadID, tool := match[1], match[2]
+	thread, ok := loadNeoLocalThread(threadID)
+	if !ok {
+		return false
+	}
+
+	args := map[string]any{}
+	if c.Request.Body != nil {
+		body, err := io.ReadAll(c.Request.Body)
+		_ = c.Request.Body.Close()
+		if err == nil && len(bytes.TrimSpace(body)) > 0 {
+			_ = json.Unmarshal(body, &args)
+		}
+	}
+
+	switch tool {
+	case "message_stats":
+		c.JSON(http.StatusOK, neoThreadReaderMessageStats(thread))
+	case "read_messages":
+		startIndex := int(numberFrom(args["startIndex"]))
+		limit := int(numberFrom(args["limit"]))
+		markdown := neoThreadReaderReadMessages(thread, startIndex, limit)
+		c.JSON(http.StatusOK, map[string]any{
+			"markdown":  markdown,
+			"bytesRead": len(markdown),
+		})
+	case "search_messages":
+		query := stringValue(args["query"])
+		startIndex := int(numberFrom(args["startIndex"]))
+		endIndex := int(numberFrom(args["endIndex"]))
+		c.JSON(http.StatusOK, map[string]any{"results": neoThreadReaderSearchMessages(thread, query, startIndex, endIndex)})
+	}
 	return true
 }
 

@@ -7800,57 +7800,26 @@ func TestNeoActorQueuesSteeredUserMessageAhead(t *testing.T) {
 	}
 }
 
-func TestNeoActorRewritesWrongReadThreadToolResultFromLocalStore(t *testing.T) {
+func TestNeoActorPassesReadThreadToolResultThrough(t *testing.T) {
 	dir := t.TempDir()
 	oldStoreDir := neoAmpThreadStoreDir
 	neoAmpThreadStoreDir = func() string { return dir }
 	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
 
-	snapshot := neoCloudThreadSnapshot{
-		threadID:  "T-target-thread",
-		seq:       2,
-		createdMs: 1778170000000,
-		messages: []neoMessage{
-			{ThreadID: "T-target-thread", MessageID: "M-user", Role: "user", Content: []any{map[string]any{"type": "text", "text": "target thread details"}}, Seq: 1},
-		},
-	}
-	if err := writeNeoLocalThreadSnapshot(snapshot); err != nil {
-		t.Fatalf("writeNeoLocalThreadSnapshot error: %v", err)
-	}
-
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/provider/google/v1beta1/publishers/google/models/gemini-3-flash-preview:generateContent" {
-			t.Fatalf("provider path = %s", r.URL.Path)
-		}
-		payload := readNeoJSON(r.Body)
-		contents := arrayValue(payload["contents"])
-		mentioned := stringValue(mapValue(arrayValue(mapValue(contents[0])["parts"])[0])["text"])
-		if !strings.Contains(mentioned, "target thread details") {
-			t.Fatalf("mentioned markdown = %q", mentioned)
-		}
-		writeNeoJSON(w, http.StatusOK, map[string]any{
-			"candidates": []any{map[string]any{
-				"content": map[string]any{"parts": []any{map[string]any{"text": `{"relevantContent":"target thread details"}`}}},
-			}},
-		})
-	}))
-	defer upstream.Close()
-
-	rt := testNeoRuntimeForServer(t, upstream)
+	rt := newNeoRuntime(&config.Config{})
 	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-current-thread", "T-current-thread", neoActorRecord("actor-test", "thread-actor", "T-current-thread"), nil)
 	actor.pendingTools["TU-read"] = neoPendingTool{
 		ID:    "TU-read",
 		Name:  "read_thread",
-		Input: map[string]any{"threadID": "T-target-thread", "goal": "extract context"},
+		Input: map[string]any{"threadID": "T-target-thread", "question": "extract context"},
 	}
-	actor.pendingTools["TU-other"] = neoPendingTool{ID: "TU-other", Name: "Bash"}
 
 	actor.receiveToolResult(map[string]any{
 		"type":       "executor_tool_result",
 		"toolCallId": "TU-read",
 		"run": map[string]any{
 			"status": "done",
-			"result": "The provided thread (T-current-thread) contains no message content.",
+			"result": "binary subagent answer goes straight through unchanged",
 		},
 	})
 
@@ -7859,60 +7828,11 @@ func TestNeoActorRewritesWrongReadThreadToolResultFromLocalStore(t *testing.T) {
 	if len(actor.history) != 1 {
 		t.Fatalf("history = %#v", actor.history)
 	}
-	if actor.history[0].Text != "target thread details" {
-		t.Fatalf("history text = %q", actor.history[0].Text)
+	if actor.history[0].Text != "binary subagent answer goes straight through unchanged" {
+		t.Fatalf("history text = %q, expected the binary's subagent result to pass through without override", actor.history[0].Text)
 	}
 	if _, ok := actor.pendingTools["TU-read"]; ok {
 		t.Fatal("read thread tool still pending")
-	}
-}
-
-func TestNeoReadThreadToolAlwaysExtractsLoadedTargetThread(t *testing.T) {
-	dir := t.TempDir()
-	oldStoreDir := neoAmpThreadStoreDir
-	neoAmpThreadStoreDir = func() string { return dir }
-	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
-
-	snapshot := neoCloudThreadSnapshot{
-		threadID:  "T-target-thread",
-		seq:       2,
-		createdMs: 1778170000000,
-		messages: []neoMessage{
-			{ThreadID: "T-target-thread", MessageID: "M-user", Role: "user", Content: []any{map[string]any{"type": "text", "text": "target thread email details"}}, Seq: 1},
-		},
-	}
-	if err := writeNeoLocalThreadSnapshot(snapshot); err != nil {
-		t.Fatalf("writeNeoLocalThreadSnapshot error: %v", err)
-	}
-
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/provider/google/v1beta1/publishers/google/models/gemini-3-flash-preview:generateContent" {
-			t.Fatalf("provider path = %s", r.URL.Path)
-		}
-		payload := readNeoJSON(r.Body)
-		contents := arrayValue(payload["contents"])
-		mentioned := stringValue(mapValue(arrayValue(mapValue(contents[0])["parts"])[0])["text"])
-		if !strings.Contains(mentioned, "threadId: T-target-thread") || !strings.Contains(mentioned, "target thread email details") {
-			t.Fatalf("mentioned markdown = %q", mentioned)
-		}
-		writeNeoJSON(w, http.StatusOK, map[string]any{
-			"candidates": []any{map[string]any{
-				"content": map[string]any{"parts": []any{map[string]any{"text": `{"relevantContent":"target thread extracted details"}`}}},
-			}},
-		})
-	}))
-	defer upstream.Close()
-
-	run := normalizeNeoLocalThreadToolRun(context.Background(), testNeoRuntimeForServer(t, upstream), neoPendingTool{
-		Name:  "read_thread",
-		Input: map[string]any{"threadID": "T-target-thread", "goal": "extract email details"},
-	}, map[string]any{
-		"status": "done",
-		"result": "No relevant content found. The provided thread content for T-current-thread is empty and does not match the requested thread T-target-thread.",
-	}, "T-current-thread")
-
-	if got := stringValue(run["result"]); got != "target thread extracted details" {
-		t.Fatalf("read_thread result = %q", got)
 	}
 }
 
@@ -11376,158 +11296,213 @@ func TestNeoRuntimeSearchesCloudThreadsHTTP(t *testing.T) {
 		t.Fatalf("created = %#v", mapValue(threads[0])["created"])
 	}
 }
-func TestNeoReadThreadToolFallbackUsesCloudThread(t *testing.T) {
-	dir := t.TempDir()
-	oldStoreDir := neoAmpThreadStoreDir
-	neoAmpThreadStoreDir = func() string { return dir }
-	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
 
-	threadID := "T-019e0379-5ef4-72e9-9ce6-dc9408a838f5"
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/api/provider/google/") {
-			payload := readNeoJSON(r.Body)
-			if r.URL.Path != "/api/provider/google/v1beta1/publishers/google/models/gemini-3-flash-preview:generateContent" {
-				t.Fatalf("provider path = %s", r.URL.Path)
-			}
-			if got := stringValue(mapValue(payload["generationConfig"])["responseMimeType"]); got != "application/json" {
-				t.Fatalf("responseMimeType = %q", got)
-			}
-			schema := mapValue(mapValue(mapValue(payload["generationConfig"])["responseJsonSchema"])["properties"])
-			if len(mapValue(schema["relevantContent"])) == 0 {
-				t.Fatalf("responseJsonSchema = %#v", payload["generationConfig"])
-			}
-			contents := arrayValue(payload["contents"])
-			if len(contents) != 2 {
-				t.Fatalf("contents = %#v", contents)
-			}
-			mentioned := stringValue(mapValue(arrayValue(mapValue(contents[0])["parts"])[0])["text"])
-			prompt := stringValue(mapValue(arrayValue(mapValue(contents[1])["parts"])[0])["text"])
-			if !strings.Contains(mentioned, "<mentionedThread>") || !strings.Contains(mentioned, "cloud fallback details") {
-				t.Fatalf("mentioned thread prompt = %q", mentioned)
-			}
-			if !strings.HasPrefix(mentioned, "\nHere is the mentioned thread content:\n<mentionedThread>\n") || strings.Contains(mentioned, "content:\n\n<mentionedThread>") || !strings.HasSuffix(mentioned, "\n</mentionedThread>\n") {
-				t.Fatalf("mentioned thread wrapper spacing = %q", mentioned)
-			}
-			if !strings.Contains(prompt, "## Goal") || !strings.Contains(prompt, "extract task") || !strings.Contains(prompt, "`relevantContent`") {
-				t.Fatalf("extraction prompt = %q", prompt)
-			}
-			if !strings.HasPrefix(prompt, "\nYou are helping me extract relevant information from the mentioned thread based on a goal.\n## Task\n") || strings.Contains(prompt, "\n\n") || !strings.HasSuffix(prompt, "- `relevantContent`: The extracted relevant information (as markdown text)\n") {
-				t.Fatalf("extraction prompt spacing = %q", prompt)
-			}
-			writeNeoJSON(w, http.StatusOK, map[string]any{
-				"candidates": []any{map[string]any{
-					"content": map[string]any{"parts": []any{map[string]any{"text": `{"relevantContent":"cloud fallback details"}`}}},
-				}},
-			})
-			return
-		}
-		if r.URL.Path != "/api/internal" || r.URL.RawQuery != "getThread" {
-			t.Fatalf("request path = %s?%s", r.URL.Path, r.URL.RawQuery)
-		}
-		writeNeoJSON(w, http.StatusOK, map[string]any{
-			"ok": true,
-			"result": map[string]any{
-				"thread": map[string]any{
-					"id": threadID,
-					"data": map[string]any{
-						"id": threadID,
-						"messages": []any{
-							map[string]any{"role": "user", "messageId": "M-cloud", "content": []any{map[string]any{"type": "text", "text": "cloud fallback details"}}},
-						},
-					},
-				},
-			},
-		})
-	}))
-	defer upstream.Close()
-
-	rt := testNeoRuntimeForServer(t, upstream)
-	rt.cfg.AmpCode.UpstreamURL = upstream.URL
-	rt.cfg.AmpCode.UpstreamAPIKey = "secret"
-
-	run := normalizeNeoLocalThreadToolRun(context.Background(), rt, neoPendingTool{
-		Name:  "read_thread",
-		Input: map[string]any{"threadID": threadID, "goal": "extract task"},
-	}, map[string]any{
-		"status": "done",
-		"result": "thread lookup returned no useful content-only metadata",
-	}, "T-current")
-
-	if got := stringValue(run["result"]); got != "cloud fallback details" {
-		t.Fatalf("fallback result = %q", got)
+func TestNeoThreadReaderToolsAgainstLoadedThread(t *testing.T) {
+	thread := map[string]any{
+		"id": "T-thread-reader-helpers",
+		"messages": []any{
+			map[string]any{"role": "user", "content": []any{map[string]any{"type": "text", "text": "user wants email cleanup"}}},
+			map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "text", "text": "assistant outlines email plan"}}},
+			map[string]any{"role": "info", "content": []any{map[string]any{"type": "summary", "summary": map[string]any{"type": "message", "summary": "first compaction"}}}},
+			map[string]any{"role": "user", "content": []any{map[string]any{"type": "text", "text": "needle phrase about EMAILS in caps"}}},
+			map[string]any{"role": "info", "content": []any{map[string]any{"type": "summary", "summary": map[string]any{"type": "message", "summary": "second compaction"}}}},
+		},
 	}
+
+	t.Run("message_stats reports counts and every compaction", func(t *testing.T) {
+		stats := neoThreadReaderMessageStats(thread)
+		if numberFrom(stats["messageCount"]) != 5 {
+			t.Fatalf("messageCount = %v, want 5", stats["messageCount"])
+		}
+		if numberFrom(stats["firstIndex"]) != 0 || numberFrom(stats["lastIndex"]) != 4 {
+			t.Fatalf("first/last = %v/%v, want 0/4", stats["firstIndex"], stats["lastIndex"])
+		}
+		comps := arrayValue(stats["compactions"])
+		if len(comps) != 2 {
+			t.Fatalf("compactions = %#v, want 2 entries", comps)
+		}
+		first := mapValue(comps[0])
+		if numberFrom(first["index"]) != 2 || numberFrom(first["cutIndex"]) != 3 || stringValue(first["text"]) != "first compaction" {
+			t.Fatalf("first compaction = %#v", first)
+		}
+		if numberFrom(stats["latestCompactionIndex"]) != 4 {
+			t.Fatalf("latestCompactionIndex = %v, want 4 (last compaction wins)", stats["latestCompactionIndex"])
+		}
+
+		empty := neoThreadReaderMessageStats(map[string]any{"messages": []any{}})
+		if numberFrom(empty["messageCount"]) != 0 || numberFrom(empty["firstIndex"]) != -1 || numberFrom(empty["lastIndex"]) != -1 {
+			t.Fatalf("empty stats = %#v", empty)
+		}
+	})
+
+	t.Run("read_messages clips to the thread bounds and emits markdown", func(t *testing.T) {
+		out := neoThreadReaderReadMessages(thread, 1, 2)
+		if !strings.Contains(out, "## Message 1 (role=assistant)") || !strings.Contains(out, "assistant outlines email plan") {
+			t.Fatalf("read_messages missing assistant turn:\n%s", out)
+		}
+		if !strings.Contains(out, "## Message 2 (role=info)") {
+			t.Fatalf("read_messages missing info turn:\n%s", out)
+		}
+		if strings.Contains(out, "## Message 3") {
+			t.Fatalf("read_messages exceeded limit:\n%s", out)
+		}
+		if neoThreadReaderReadMessages(thread, -1, 2) != "" || neoThreadReaderReadMessages(thread, 0, 0) != "" || neoThreadReaderReadMessages(thread, 99, 5) != "" {
+			t.Fatal("read_messages should return empty for invalid bounds")
+		}
+	})
+
+	t.Run("search_messages returns case-insensitive path/lineNumber hits", func(t *testing.T) {
+		results := neoThreadReaderSearchMessages(thread, "email", 0, 4)
+		if len(results) < 2 {
+			t.Fatalf("expected at least 2 hits, got %d: %#v", len(results), results)
+		}
+		seenIndex0, seenIndex3 := false, false
+		for _, r := range results {
+			if stringValue(r["path"]) == "messages[0]" {
+				seenIndex0 = true
+			}
+			if stringValue(r["path"]) == "messages[3]" {
+				seenIndex3 = true
+			}
+			if numberFrom(r["lineNumber"]) < 1 {
+				t.Fatalf("lineNumber should be 1-indexed: %#v", r)
+			}
+		}
+		if !seenIndex0 || !seenIndex3 {
+			t.Fatalf("missing expected hits in messages[0] and messages[3]: %#v", results)
+		}
+		if hits := neoThreadReaderSearchMessages(thread, "", 0, 4); hits != nil {
+			t.Fatalf("empty query should return nil, got %#v", hits)
+		}
+	})
 }
 
-func TestNeoReadThreadToolFallbackUsesBinaryStyleExtractionForLocalThread(t *testing.T) {
+func TestTryServeNeoLocalThreadReaderToolEndpoints(t *testing.T) {
 	dir := t.TempDir()
 	oldStoreDir := neoAmpThreadStoreDir
 	neoAmpThreadStoreDir = func() string { return dir }
 	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
 
-	threadID := "T-local-read-thread-extraction"
-	longResult := strings.Repeat("tool-output ", 500) + "tail"
+	threadID := "T-019e9999-aaaa-bbbb-cccc-dddddddddddd"
 	if err := writeNeoLocalThreadSnapshot(neoCloudThreadSnapshot{
 		threadID:  threadID,
 		seq:       3,
 		createdMs: 1778170000000,
 		messages: []neoMessage{
-			{
-				ThreadID:  threadID,
-				MessageID: "M-user",
-				Role:      "user",
-				Content:   []any{map[string]any{"type": "text", "text": "Initial email request: make onboarding emails clearer."}},
-				Seq:       1,
-			},
-			{
-				ThreadID:  threadID,
-				MessageID: "M-tool",
-				Role:      "user",
-				Content: []any{map[string]any{
-					"type":      "tool_result",
-					"toolUseID": "TU-read",
-					"run":       map[string]any{"status": "done", "result": longResult},
-				}},
-				Seq: 2,
-			},
+			{ThreadID: threadID, MessageID: "M-user", Role: "user", Content: []any{map[string]any{"type": "text", "text": "needle phrase about EMAILS"}}, Seq: 1},
+			{ThreadID: threadID, MessageID: "M-assistant", Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "assistant reply"}}, Seq: 2},
+			{ThreadID: threadID, MessageID: "M-info", Role: "info", Content: []any{map[string]any{"type": "summary", "summary": map[string]any{"type": "message", "summary": "checkpoint"}}}, Seq: 3},
 		},
 	}); err != nil {
 		t.Fatalf("writeNeoLocalThreadSnapshot error: %v", err)
 	}
 
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/provider/google/v1beta1/publishers/google/models/gemini-3-flash-preview:generateContent" {
-			t.Fatalf("provider path = %s", r.URL.Path)
-		}
-		payload := readNeoJSON(r.Body)
-		contents := arrayValue(payload["contents"])
-		mentioned := stringValue(mapValue(arrayValue(mapValue(contents[0])["parts"])[0])["text"])
-		if !strings.Contains(mentioned, "Initial email request") || !strings.Contains(mentioned, neoThreadMarkdownOmittedText) {
-			t.Fatalf("mentioned thread markdown was not truncated:\n%s", mentioned)
-		}
-		if strings.Contains(mentioned, "tail") {
-			t.Fatalf("mentioned thread markdown leaked truncated tail:\n%s", mentioned)
-		}
-		writeNeoJSON(w, http.StatusOK, map[string]any{
-			"candidates": []any{map[string]any{
-				"content": map[string]any{"parts": []any{map[string]any{"text": "```json\n{\"relevantContent\":\"extracted exact thread content\"}\n```"}}},
-			}},
-		})
-	}))
-	defer upstream.Close()
-
-	run := normalizeNeoLocalThreadToolRun(context.Background(), testNeoRuntimeForServer(t, upstream), neoPendingTool{
-		Name: "read_thread",
-		Input: map[string]any{
-			"threadID": threadID,
-			"goal":     "Extract the initial discussion/request about emails.",
+	cases := []struct {
+		name   string
+		path   string
+		body   string
+		method string
+		assert func(t *testing.T, resp map[string]any)
+	}{
+		{
+			name:   "message_stats POST",
+			path:   "/api/threads/" + threadID + "/messages/message_stats",
+			body:   "{}",
+			method: http.MethodPost,
+			assert: func(t *testing.T, resp map[string]any) {
+				if numberFrom(resp["messageCount"]) != 3 {
+					t.Fatalf("messageCount = %v", resp["messageCount"])
+				}
+				if numberFrom(resp["latestCompactionIndex"]) != 2 {
+					t.Fatalf("latestCompactionIndex = %v", resp["latestCompactionIndex"])
+				}
+				if len(arrayValue(resp["compactions"])) != 1 {
+					t.Fatalf("compactions = %#v", resp["compactions"])
+				}
+			},
 		},
-	}, map[string]any{
-		"status": "done",
-		"result": "lookup returned no content",
-	}, "T-current")
+		{
+			name:   "read_messages POST returns markdown + bytesRead",
+			path:   "/api/threads/" + threadID + "/messages/read_messages",
+			body:   `{"startIndex":0,"limit":2}`,
+			method: http.MethodPost,
+			assert: func(t *testing.T, resp map[string]any) {
+				md := stringValue(resp["markdown"])
+				if !strings.Contains(md, "needle phrase") || !strings.Contains(md, "assistant reply") {
+					t.Fatalf("markdown missing content:\n%s", md)
+				}
+				if numberFrom(resp["bytesRead"]) != len(md) {
+					t.Fatalf("bytesRead %v != len(markdown) %d", resp["bytesRead"], len(md))
+				}
+			},
+		},
+		{
+			name:   "search_messages POST returns path/lineNumber hits",
+			path:   "/api/threads/" + threadID + "/messages/search_messages",
+			body:   `{"query":"email","startIndex":0,"endIndex":2}`,
+			method: http.MethodPost,
+			assert: func(t *testing.T, resp map[string]any) {
+				hits := arrayValue(resp["results"])
+				if len(hits) == 0 {
+					t.Fatalf("expected hits, got %#v", resp)
+				}
+				first := mapValue(hits[0])
+				if stringValue(first["path"]) != "messages[0]" || numberFrom(first["lineNumber"]) < 1 {
+					t.Fatalf("first hit = %#v", first)
+				}
+			},
+		},
+		{
+			name:   "wrong method falls through",
+			path:   "/api/threads/" + threadID + "/messages/message_stats",
+			method: http.MethodGet,
+		},
+		{
+			name:   "unknown tool falls through",
+			path:   "/api/threads/" + threadID + "/messages/list_messages",
+			body:   "{}",
+			method: http.MethodPost,
+		},
+		{
+			name:   "missing thread falls through",
+			path:   "/api/threads/T-not-exist-aaaa-bbbb-cccc-dddddddddddd/messages/message_stats",
+			body:   "{}",
+			method: http.MethodPost,
+		},
+		{
+			name:   "non-message path falls through",
+			path:   "/api/threads/" + threadID + "/runs",
+			method: http.MethodPost,
+			body:   "{}",
+		},
+	}
 
-	if got := stringValue(run["result"]); got != "extracted exact thread content" {
-		t.Fatalf("fallback result = %q", got)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
+			rec := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(rec)
+			c.Request = req
+
+			handled := tryServeNeoLocalThreadReaderTool(c)
+			if tc.assert == nil {
+				if handled {
+					t.Fatalf("expected fall-through (handled=false), got handled=true status=%d", rec.Code)
+				}
+				return
+			}
+			if !handled {
+				t.Fatalf("expected handled=true, got false (path=%s)", tc.path)
+			}
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+			}
+			var resp map[string]any
+			if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("unmarshal response: %v\nbody=%s", err, rec.Body.String())
+			}
+			tc.assert(t, resp)
+		})
 	}
 }
 
