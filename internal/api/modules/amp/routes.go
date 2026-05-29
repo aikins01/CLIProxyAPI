@@ -387,8 +387,20 @@ func (m *AmpModule) tryServeNeoLocalInternal(c *gin.Context) bool {
 	if method == "" {
 		return false
 	}
+	if m.getProxy() != nil && requestHasAmpClientHeaders(c.Request) {
+		return false
+	}
 	c.JSON(http.StatusOK, neoLocalInternalResponse(c.Request.Context(), m.neoThreadConfigSnapshot(), c.Request, method))
 	return true
+}
+
+func requestHasAmpClientHeaders(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	return strings.TrimSpace(r.Header.Get("X-Amp-Client-Application")) != "" ||
+		strings.TrimSpace(r.Header.Get("X-Amp-Client-Type")) != "" ||
+		strings.TrimSpace(r.Header.Get("X-Amp-Client-Version")) != ""
 }
 
 func neoLocalInternalMethod(r *http.Request) string {
