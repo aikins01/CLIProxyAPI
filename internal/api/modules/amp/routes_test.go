@@ -668,18 +668,6 @@ func TestRegisterManagementRoutesServesNeoBootstrapInternalsLocally(t *testing.T
 				}
 			},
 		},
-		{name: "getThreadLinkInfo", path: "/api/internal?getThreadLinkInfo&thread=T-019e1046-656d-7132-879f-390ded941c16"},
-		{
-			name: "threadDisplayCostInfo",
-			path: "/api/internal?threadDisplayCostInfo&threadID=T-019e1046-656d-7132-879f-390ded941c16",
-			check: func(t *testing.T, response map[string]any) {
-				t.Helper()
-				result := mapValue(response["result"])
-				if result["totalCostUSD"] != nil || stringValue(result["costBreakdownURL"]) != "http://example.com/threads/T-019e1046-656d-7132-879f-390ded941c16/usage" {
-					t.Fatalf("threadDisplayCostInfo result = %#v", result)
-				}
-			},
-		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			proxyCalled = false
@@ -873,20 +861,11 @@ func testNeoPNGBase64(t *testing.T, width, height int) string {
 	return base64.StdEncoding.EncodeToString(buf.Bytes())
 }
 
-func TestRegisterManagementRoutesServesNeoThreadUsageLocally(t *testing.T) {
+func TestRegisterManagementRoutesDoesNotServeNeoThreadUsageLocally(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 
-	dir := t.TempDir()
-	oldStoreDir := neoAmpThreadStoreDir
-	neoAmpThreadStoreDir = func() string { return dir }
-	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
-
 	threadID := "T-019e1046-656d-7132-879f-390ded941c16"
-	rawThread := []byte(`{"id":"` + threadID + `","title":"usage test","messages":[{"messageId":"M-one","role":"assistant","usage":{"model":"gpt-5.5","inputTokens":3,"outputTokens":5,"cacheCreationInputTokens":7,"cacheReadInputTokens":11,"maxInputTokens":400000}}]}`)
-	if err := os.WriteFile(filepath.Join(dir, threadID+".json"), rawThread, 0o600); err != nil {
-		t.Fatalf("write local thread: %v", err)
-	}
 
 	enabled := true
 	m := &AmpModule{
@@ -902,26 +881,15 @@ func TestRegisterManagementRoutesServesNeoThreadUsageLocally(t *testing.T) {
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusOK {
+	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
-	}
-	var response map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
-		t.Fatalf("response JSON error: %v", err)
-	}
-	usage := mapValue(response["usage"])
-	if numberFrom(usage["inputTokens"]) != 3 || numberFrom(usage["outputTokens"]) != 5 || numberFrom(usage["totalTokens"]) != 26 {
-		t.Fatalf("usage summary = %#v", usage)
-	}
-	if got := stringValue(response["costBreakdownURL"]); got != "http://127.0.0.1:8317/threads/"+threadID+"/usage" {
-		t.Fatalf("costBreakdownURL = %q", got)
 	}
 
 	htmlReq := httptest.NewRequest(http.MethodGet, "/threads/"+threadID+"/usage", nil)
 	htmlReq.Header.Set("Accept", "text/html")
 	htmlRec := httptest.NewRecorder()
 	r.ServeHTTP(htmlRec, htmlReq)
-	if htmlRec.Code != http.StatusOK || !strings.Contains(htmlRec.Body.String(), "usage test") || !strings.Contains(htmlRec.Header().Get("Content-Type"), "text/html") {
+	if htmlRec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("html response = status %d content-type %q body=%s", htmlRec.Code, htmlRec.Header().Get("Content-Type"), htmlRec.Body.String())
 	}
 }
@@ -1536,7 +1504,7 @@ func TestRegisterManagementRoutesPassesThreadReaderToolsUpstreamWhenProxyExists(
 	}
 }
 
-func TestRegisterManagementRoutesDoesNotServeNeoTaskInternalMethodsLocally(t *testing.T) {
+func TestRegisterManagementRoutesDoesNotServeAmpOwnedInternalMethodsLocally(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	enabled := true
@@ -1559,7 +1527,7 @@ func TestRegisterManagementRoutesDoesNotServeNeoTaskInternalMethodsLocally(t *te
 	}
 	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, nil)
 
-	for _, method := range []string{"createTask", "getTask", "listTasks", "updateTask", "deleteTask"} {
+	for _, method := range []string{"createTask", "getTask", "listTasks", "updateTask", "deleteTask", "getThreadLinkInfo", "threadDisplayCostInfo"} {
 		t.Run(method, func(t *testing.T) {
 			proxyCalled = false
 			req := httptest.NewRequest(http.MethodPost, "/api/internal?"+method, bytes.NewBufferString(`{"method":"`+method+`","params":{"taskID":"task-local","title":"Run the build"}}`))
@@ -1574,79 +1542,6 @@ func TestRegisterManagementRoutesDoesNotServeNeoTaskInternalMethodsLocally(t *te
 				t.Fatalf("%s should not be served locally or call upstream without a configured proxy", method)
 			}
 		})
-	}
-}
-
-func TestRegisterManagementRoutesServesLocalThreadLinkInfoWithNormalizedOwnership(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	r := gin.New()
-	enabled := true
-	proxyCalled := false
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		proxyCalled = true
-		w.WriteHeader(http.StatusTeapot)
-	}))
-	defer upstream.Close()
-
-	dir := t.TempDir()
-	oldStoreDir := neoAmpThreadStoreDir
-	neoAmpThreadStoreDir = func() string { return dir }
-	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
-
-	threadID := "T-019e1046-656d-7132-879f-390ded941c16"
-	raw := []byte(`{
-		"id": "` + threadID + `",
-		"title": "resume me locally",
-		"creatorUserID": "user_123",
-		"ownerUserId": "user_123"
-	}`)
-	if err := os.WriteFile(filepath.Join(dir, threadID+".json"), raw, 0o600); err != nil {
-		t.Fatalf("write local thread: %v", err)
-	}
-
-	m := &AmpModule{
-		restrictToLocalhost: false,
-		neoRuntime: newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
-			UpstreamURL: upstream.URL,
-			NeoLocalRuntime: config.AmpNeoLocalRuntime{
-				Enabled: &enabled,
-			},
-		}}),
-	}
-	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, nil)
-
-	req := httptest.NewRequest(http.MethodGet, "/api/internal?getThreadLinkInfo&thread="+threadID, nil)
-	rec := httptest.NewRecorder()
-	r.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
-	}
-	if proxyCalled {
-		t.Fatal("getThreadLinkInfo should be served locally")
-	}
-	var response map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
-		t.Fatalf("response JSON error: %v", err)
-	}
-	if response["ok"] != true {
-		t.Fatalf("unexpected response: %#v", response)
-	}
-	result := mapValue(response["result"])
-	if stringValue(result["id"]) != threadID {
-		t.Fatalf("thread link info id = %#v, want %q", result["id"], threadID)
-	}
-	if stringValue(result["creatorUserID"]) != neoLocalOwnerUserID {
-		t.Fatalf("creatorUserID = %#v, want %q", result["creatorUserID"], neoLocalOwnerUserID)
-	}
-	if stringValue(result["ownerUserId"]) != neoLocalOwnerUserID {
-		t.Fatalf("ownerUserId = %#v, want %q", result["ownerUserId"], neoLocalOwnerUserID)
-	}
-	if stringValue(result["title"]) != "resume me locally" {
-		t.Fatalf("title = %#v, want %q", result["title"], "resume me locally")
-	}
-	if _, ok := loadNeoLocalThread(threadID); !ok {
-		t.Fatal("expected local thread to remain readable after normalization")
 	}
 }
 

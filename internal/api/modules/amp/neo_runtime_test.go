@@ -11723,6 +11723,76 @@ func TestNeoRuntimeChecksCloudBeforeUsingUsefulLocalCloudCache(t *testing.T) {
 	}
 }
 
+func TestNeoRuntimeUsesSuccessfulCloudThreadEvenWhenLocalCacheHasMoreMessages(t *testing.T) {
+	dir := t.TempDir()
+	oldStoreDir := neoAmpThreadStoreDir
+	neoAmpThreadStoreDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
+
+	threadID := "T-019e65c0-0310-77a8-b233-4b84d9c0612b"
+	localThread := map[string]any{
+		"id":        threadID,
+		"title":     "local cache with extra messages",
+		"agentMode": "smart",
+		"updatedAt": "2026-05-27T10:00:00Z",
+		"messages": []any{
+			map[string]any{"role": "user", "messageId": "M-local-1", "content": []any{map[string]any{"type": "text", "text": "local one"}}},
+			map[string]any{"role": "assistant", "messageId": "M-local-2", "content": []any{map[string]any{"type": "text", "text": "local two"}}},
+		},
+	}
+	rawLocal, err := json.Marshal(localThread)
+	if err != nil {
+		t.Fatalf("marshal local thread: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, threadID+".json"), rawLocal, 0o600); err != nil {
+		t.Fatalf("write local thread: %v", err)
+	}
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/internal" || r.URL.RawQuery != "getThread" {
+			t.Fatalf("request path = %s?%s", r.URL.Path, r.URL.RawQuery)
+		}
+		writeNeoJSON(w, http.StatusOK, map[string]any{
+			"ok": true,
+			"result": map[string]any{
+				"thread": map[string]any{
+					"id": threadID,
+					"data": map[string]any{
+						"id":        threadID,
+						"title":     "authoritative cloud thread",
+						"agentMode": "deep",
+						"updatedAt": "2026-05-26T10:00:00Z",
+						"messages": []any{
+							map[string]any{"role": "user", "messageId": "M-cloud-1", "content": []any{map[string]any{"type": "text", "text": "cloud one"}}},
+						},
+					},
+				},
+			},
+		})
+	}))
+	defer upstream.Close()
+
+	thread, ok := loadNeoThread(context.Background(), &config.Config{
+		AmpCode: config.AmpCode{UpstreamURL: upstream.URL, UpstreamAPIKey: "secret"},
+	}, threadID)
+	if !ok {
+		t.Fatal("loadNeoThread returned not ok")
+	}
+	if got := stringValue(thread["title"]); got != "authoritative cloud thread" {
+		t.Fatalf("title = %q, want authoritative cloud thread", got)
+	}
+	if got := len(arrayValue(thread["messages"])); got != 1 {
+		t.Fatalf("message count = %d, want cloud count 1", got)
+	}
+	cached, ok := loadNeoLocalThread(threadID)
+	if !ok {
+		t.Fatal("expected cloud thread to replace local cache")
+	}
+	if got := stringValue(cached["title"]); got != "authoritative cloud thread" {
+		t.Fatalf("cached title = %q, want authoritative cloud thread", got)
+	}
+}
+
 func TestNeoSystemPromptFiltersDisabledSkills(t *testing.T) {
 	prompt := neoSystemPrompt(neoInferenceRequest{
 		Capabilities: map[string]any{

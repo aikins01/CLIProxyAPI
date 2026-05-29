@@ -185,9 +185,6 @@ func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *ha
 		if m.tryServeNeoLocalAttachment(c) {
 			return
 		}
-		if m.tryServeNeoLocalThreadUsage(c) {
-			return
-		}
 		if m.tryServeNeoLegacyThreadRun(c) {
 			return
 		}
@@ -429,8 +426,6 @@ func neoLocalInternalMethodSupported(method string) bool {
 var neoLocalInternalMethods = []string{
 	"loadPlugins",
 	"getUserInfo",
-	"getThreadLinkInfo",
-	"threadDisplayCostInfo",
 	"getUserFreeTierStatus",
 	"notices",
 	"logNoticeAction",
@@ -486,10 +481,6 @@ func neoLocalInternalResponse(ctx context.Context, cfg *config.Config, r *http.R
 			"workspaceId":       "local-workspace",
 			"mysteriousMessage": nil,
 		}}
-	case "getThreadLinkInfo":
-		return gin.H{"ok": true, "result": neoLocalThreadLinkInfoResult(ctx, cfg, r)}
-	case "threadDisplayCostInfo":
-		return gin.H{"ok": true, "result": neoLocalThreadDisplayCostInfoResult(cfg, r)}
 	case "getUserFreeTierStatus":
 		return gin.H{"ok": true, "result": gin.H{}}
 	case "notices":
@@ -503,71 +494,6 @@ func neoLocalInternalResponse(ctx context.Context, cfg *config.Config, r *http.R
 	default:
 		return gin.H{"ok": true, "result": nil}
 	}
-}
-
-func neoLocalThreadDisplayCostInfoResult(cfg *config.Config, r *http.Request) gin.H {
-	threadID := neoLocalInternalThreadID(r)
-	result := gin.H{"totalCostUSD": nil}
-	if threadID == "" {
-		result["costBreakdownURL"] = nil
-		return result
-	}
-	base := "https://ampcode.com"
-	if cfg != nil && neoRuntimeEnabled(cfg) {
-		base = neoLocalRequestBaseURL(r)
-	} else if cfg != nil && strings.TrimSpace(cfg.AmpCode.UpstreamURL) != "" {
-		base = strings.TrimRight(strings.TrimSpace(cfg.AmpCode.UpstreamURL), "/")
-	}
-	result["costBreakdownURL"] = base + "/threads/" + url.PathEscape(threadID) + "/usage"
-	return result
-}
-
-func neoLocalInternalThreadID(r *http.Request) string {
-	if r == nil {
-		return ""
-	}
-	if r.URL != nil {
-		query := r.URL.Query()
-		if threadID := firstNonEmptyString(query.Get("threadID"), query.Get("threadId"), query.Get("thread"), query.Get("id")); threadID != "" {
-			return threadID
-		}
-	}
-	if params := neoLocalInternalParams(r); len(params) > 0 {
-		return firstNonEmptyString(params["threadID"], params["threadId"], params["thread"], params["id"])
-	}
-	return ""
-}
-
-func neoLocalInternalParams(r *http.Request) map[string]any {
-	payload := neoLocalInternalPayload(r)
-	if len(payload) == 0 {
-		return nil
-	}
-	return mapValue(payload["params"])
-}
-
-func neoLocalThreadLinkInfoResult(ctx context.Context, cfg *config.Config, r *http.Request) gin.H {
-	threadID := neoLocalInternalThreadID(r)
-	result := gin.H{
-		"creatorUserID": neoLocalOwnerUserID,
-		"ownerUserId":   neoLocalOwnerUserID,
-	}
-	if threadID == "" {
-		return result
-	}
-	if thread, ok := loadNeoLocalThread(threadID); ok {
-		normalizeNeoThreadOwnership(thread)
-		normalizeNeoThreadAgentMode(thread)
-		result["id"] = firstNonEmptyString(thread["id"], threadID)
-		result["creatorUserID"] = firstNonEmptyString(thread["creatorUserID"], neoLocalOwnerUserID)
-		result["ownerUserId"] = firstNonEmptyString(thread["ownerUserId"], neoLocalOwnerUserID)
-		if title := stringValue(thread["title"]); title != "" {
-			result["title"] = title
-		}
-		return result
-	}
-	result["id"] = threadID
-	return result
 }
 
 // registerProviderAliases registers /api/provider/{provider}/... routes

@@ -12,7 +12,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"html"
 	"image"
 	_ "image/gif"
 	_ "image/jpeg"
@@ -7418,164 +7417,6 @@ func neoStoreLocalThreadCache(threadID string, thread map[string]any, modTime ti
 	neoLocalThreadCache.Unlock()
 }
 
-func (m *AmpModule) tryServeNeoLocalThreadUsage(c *gin.Context) bool {
-	if m == nil || c == nil || c.Request == nil || c.Request.URL == nil {
-		return false
-	}
-	if m.getProxy() != nil {
-		return false
-	}
-	threadID, ok := neoThreadUsagePath(c.Request.URL.Path)
-	if !ok {
-		return false
-	}
-	cfg := m.neoThreadConfigSnapshot()
-	if cfg == nil || !neoRuntimeEnabled(cfg) {
-		return false
-	}
-	if c.Request.Method != http.MethodGet && c.Request.Method != http.MethodHead {
-		c.JSON(http.StatusMethodNotAllowed, gin.H{"error": "method_not_allowed"})
-		return true
-	}
-	thread, found := loadNeoThread(c.Request.Context(), cfg, threadID)
-	if !found {
-		c.JSON(http.StatusNotFound, gin.H{"error": "thread-not-found", "threadID": threadID})
-		return true
-	}
-	payload := neoLocalThreadUsagePayload(threadID, thread, c.Request)
-	if c.Request.Method == http.MethodHead {
-		c.Status(http.StatusOK)
-		return true
-	}
-	if strings.Contains(c.GetHeader("Accept"), "text/html") {
-		c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(neoLocalThreadUsageHTML(payload)))
-		return true
-	}
-	c.JSON(http.StatusOK, payload)
-	return true
-}
-
-func neoThreadUsagePath(path string) (string, bool) {
-	path = strings.TrimPrefix(path, "/api")
-	path = strings.Trim(path, "/")
-	if !strings.HasPrefix(path, "threads/") || !strings.HasSuffix(path, "/usage") {
-		return "", false
-	}
-	threadID := strings.TrimSuffix(strings.TrimPrefix(path, "threads/"), "/usage")
-	threadID = strings.Trim(threadID, "/")
-	if threadID == "" || strings.Contains(threadID, "/") || !neoThreadIDExactPattern.MatchString(threadID) {
-		return "", false
-	}
-	return threadID, true
-}
-
-func neoLocalThreadUsagePayload(threadID string, thread map[string]any, r *http.Request) gin.H {
-	summary := neoThreadUsageSummary(thread)
-	return gin.H{
-		"threadID":         threadID,
-		"threadId":         threadID,
-		"title":            stringValue(thread["title"]),
-		"totalCostUSD":     nil,
-		"costBreakdown":    gin.H{"freeUSD": 0, "paidUSD": 0},
-		"costBreakdownURL": neoLocalRequestBaseURL(r) + "/threads/" + url.PathEscape(threadID) + "/usage",
-		"usage":            summary,
-		"generatedAt":      time.Now().UTC().Format(time.RFC3339Nano),
-	}
-}
-
-func neoThreadUsageSummary(thread map[string]any) gin.H {
-	var inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens, maxInputTokens int
-	models := map[string]bool{}
-	for _, raw := range arrayValue(thread["messages"]) {
-		message := mapValue(raw)
-		usage := mapValue(message["usage"])
-		if len(usage) == 0 {
-			continue
-		}
-		inputTokens += numberFrom(usage["inputTokens"], usage["input_tokens"], usage["prompt_tokens"], usage["promptTokenCount"])
-		outputTokens += numberFrom(usage["outputTokens"], usage["output_tokens"], usage["completion_tokens"], usage["candidatesTokenCount"])
-		cacheCreationTokens += numberFrom(usage["cacheCreationInputTokens"], usage["cache_creation_input_tokens"])
-		cacheReadTokens += numberFrom(usage["cacheReadInputTokens"], usage["cache_read_input_tokens"], usage["cachedContentTokenCount"], nestedNumberFrom(usage["prompt_tokens_details"], "cached_tokens"))
-		if value := numberFrom(usage["maxInputTokens"], usage["max_input_tokens"]); value > maxInputTokens {
-			maxInputTokens = value
-		}
-		if model := strings.TrimSpace(stringValue(usage["model"])); model != "" {
-			models[model] = true
-		}
-	}
-	modelList := make([]string, 0, len(models))
-	for model := range models {
-		modelList = append(modelList, model)
-	}
-	sort.Strings(modelList)
-	totalInputTokens := inputTokens + cacheCreationTokens + cacheReadTokens
-	return gin.H{
-		"inputTokens":              inputTokens,
-		"outputTokens":             outputTokens,
-		"cacheCreationInputTokens": cacheCreationTokens,
-		"cacheReadInputTokens":     cacheReadTokens,
-		"totalInputTokens":         totalInputTokens,
-		"totalTokens":              totalInputTokens + outputTokens,
-		"maxInputTokens":           maxInputTokens,
-		"models":                   modelList,
-	}
-}
-
-func neoLocalThreadUsageHTML(payload gin.H) string {
-	usage := mapValue(payload["usage"])
-	title := strings.TrimSpace(stringValue(payload["title"]))
-	if title == "" {
-		title = stringValue(payload["threadID"])
-	}
-	models := make([]string, 0, len(stringArrayValue(usage["models"])))
-	for _, model := range stringArrayValue(usage["models"]) {
-		if value := stringValue(model); value != "" {
-			models = append(models, value)
-		}
-	}
-	return fmt.Sprintf(`<!doctype html>
-<html>
-<head><meta charset="utf-8"><title>Thread Usage</title></head>
-<body>
-<h1>Thread Usage</h1>
-<p><strong>%s</strong></p>
-<dl>
-<dt>Input tokens</dt><dd>%d</dd>
-<dt>Output tokens</dt><dd>%d</dd>
-<dt>Cache creation input tokens</dt><dd>%d</dd>
-<dt>Cache read input tokens</dt><dd>%d</dd>
-<dt>Total tokens</dt><dd>%d</dd>
-<dt>Cost</dt><dd>Unavailable in local runtime</dd>
-<dt>Models</dt><dd>%s</dd>
-</dl>
-</body>
-</html>`,
-		html.EscapeString(title),
-		numberFrom(usage["inputTokens"]),
-		numberFrom(usage["outputTokens"]),
-		numberFrom(usage["cacheCreationInputTokens"]),
-		numberFrom(usage["cacheReadInputTokens"]),
-		numberFrom(usage["totalTokens"]),
-		html.EscapeString(strings.Join(models, ", ")),
-	)
-}
-
-func neoLocalRequestBaseURL(r *http.Request) string {
-	scheme := "http"
-	if r != nil {
-		if forwarded := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")); forwarded != "" {
-			scheme = strings.TrimSpace(strings.Split(forwarded, ",")[0])
-		} else if r.TLS != nil {
-			scheme = "https"
-		}
-	}
-	host := "127.0.0.1"
-	if r != nil && strings.TrimSpace(r.Host) != "" {
-		host = r.Host
-	}
-	return scheme + "://" + host
-}
-
 type neoLegacyRunPath struct {
 	action   string
 	threadID string
@@ -8063,10 +7904,6 @@ func (m *AmpModule) canServeNeoLocalManagement(r *http.Request) bool {
 		cfg := m.neoThreadConfigSnapshot()
 		return cfg != nil && neoRuntimeEnabled(cfg)
 	}
-	if _, ok := neoThreadUsagePath(r.URL.Path); ok {
-		cfg := m.neoThreadConfigSnapshot()
-		return cfg != nil && neoRuntimeEnabled(cfg)
-	}
 	if _, ok := neoLegacyRunRequestPath(r.URL.Path); ok {
 		cfg := m.neoThreadConfigSnapshot()
 		return cfg != nil && neoRuntimeEnabled(cfg)
@@ -8265,11 +8102,9 @@ func loadNeoThread(ctx context.Context, cfg *config.Config, threadID string) (ma
 		if ok {
 			normalizeNeoThreadAgentMode(cloud)
 			normalizeNeoThreadCurrentInference(cloud)
-			if preferNeoIncomingThread(local, cloud) {
-				cacheThread := markNeoCloudCachedThread(cloneNeoJSONMap(cloud))
-				cacheNeoLocalThread(cacheThread)
-				return cloud, true
-			}
+			cacheThread := markNeoCloudCachedThread(cloneNeoJSONMap(cloud))
+			cacheNeoLocalThread(cacheThread)
+			return cloud, true
 		}
 	}
 	if localOK && neoThreadHasUsefulContent(local) {
@@ -8294,53 +8129,6 @@ func neoThreadHasUsefulContent(thread map[string]any) bool {
 		return neoThreadHasUsefulContent(data)
 	}
 	return false
-}
-
-func preferNeoIncomingThread(existing, incoming map[string]any) bool {
-	if len(incoming) == 0 {
-		return false
-	}
-	if len(existing) == 0 {
-		return true
-	}
-	incomingUseful := neoThreadHasUsefulContent(incoming)
-	existingUseful := neoThreadHasUsefulContent(existing)
-	if incomingUseful && !existingUseful {
-		return true
-	}
-	if existingUseful && !incomingUseful {
-		return false
-	}
-	incomingCount := neoThreadMessageCount(incoming)
-	existingCount := neoThreadMessageCount(existing)
-	if incomingCount != existingCount {
-		return incomingCount > existingCount
-	}
-	if neoThreadMapAgentMode(existing) == "" && neoThreadMapAgentMode(incoming) != "" {
-		return true
-	}
-	return neoThreadUpdatedMillis(incoming) >= neoThreadUpdatedMillis(existing)
-}
-
-func neoThreadMessageCount(thread map[string]any) int {
-	if len(thread) == 0 {
-		return 0
-	}
-	count := 0
-	if rawMessages, exists := thread["messages"]; exists {
-		count = neoBinaryThreadMessageCount(arrayValue(rawMessages))
-	} else {
-		count = firstNonZero(
-			numberFrom(thread["messageCount"]),
-			numberFrom(mapValue(thread["summaryStats"])["messageCount"]),
-		)
-	}
-	if data := mapValue(thread["data"]); len(data) > 0 {
-		if dataCount := neoThreadMessageCount(data); dataCount > count {
-			count = dataCount
-		}
-	}
-	return count
 }
 
 func cacheNeoLocalThread(thread map[string]any) {
