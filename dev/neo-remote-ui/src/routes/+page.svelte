@@ -256,6 +256,7 @@
   const maxComposerImages = 8;
   const maxComposerImageBytes = 45 * 1024 * 1024;
   const maxQueuedMessages = 5;
+  const defaultAgentMode = 'deep';
   const agentModeOptions = ['smart', 'large', 'rush', 'deep', 'nostromo', 'agg-man'];
   const visibleAgentModeOptions = ['smart', 'large', 'rush', 'deep', 'nostromo'];
   const agentModeLabels: Record<string, string> = {
@@ -652,22 +653,35 @@
     disconnect();
     connection = 'connecting';
     const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
-    const runtimeKey = encodeURIComponent(apiKey.trim());
-    const authQuery = runtimeKey ? `&auth_token=${runtimeKey}` : '';
-    const url = `${scheme}://${location.host}/gateway/threadActor/?rvt-method=getOrCreate&rvt-key=${encodeURIComponent(threadId)}&rvt-skip-ready-wait=true${authQuery}`;
+    const runtimeKey = apiKey.trim();
+    const bootstrapAgentMode = normalizeAgentMode(options.agentMode || defaultAgentMode);
+    const params = new URLSearchParams({
+      'rvt-method': 'getOrCreate',
+      'rvt-key': threadId,
+      'rvt-skip-ready-wait': 'true'
+    });
+    if (options.bootstrapExecutor) {
+      params.set('rvt-input', encodeGatewayInput({
+        threadId,
+        agentMode: bootstrapAgentMode,
+        executorType: 'local-client'
+      }));
+    }
+    if (runtimeKey) params.set('auth_token', runtimeKey);
+    const url = `${scheme}://${location.host}/gateway/threadActor/?${params.toString()}`;
     socket = new WebSocket(url, ['rivet', 'rivet_encoding.4', 'rivet_skip_ready_wait']);
     socket.addEventListener('open', () => {
       connection = 'connected';
       sendFrame({ type: 'client_resume', version });
       if (options.bootstrapExecutor) {
-        sendFrame({ type: 'agent-mode', mode: options.agentMode || 'smart' });
+        sendFrame({ type: 'agent-mode', mode: bootstrapAgentMode });
         sendFrame(options.reasoningEffort ? { type: 'reasoning-effort', effort: options.reasoningEffort } : { type: 'reasoning-effort' });
         sendFrame({ type: 'environment', env: options.environment ?? {} });
         sendFrame({
           type: 'client_spawn_executor',
           requestId: `spawn-${crypto.randomUUID()}`,
           threadId,
-          agentMode: options.agentMode || 'smart',
+          agentMode: bootstrapAgentMode,
           reasoningEffort: options.reasoningEffort || undefined,
           environment: options.environment ?? {},
           workingDirectory: options.workingDirectory || undefined
@@ -1958,7 +1972,16 @@
 
   function normalizeAgentMode(mode: string) {
     const normalized = mode.trim().toLowerCase();
-    return agentModeOptions.includes(normalized) ? normalized : 'smart';
+    return agentModeOptions.includes(normalized) ? normalized : defaultAgentMode;
+  }
+
+  function encodeGatewayInput(value: Record<string, unknown>) {
+    const bytes = new TextEncoder().encode(JSON.stringify(value));
+    let binary = '';
+    for (let index = 0; index < bytes.length; index += 0x8000) {
+      binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000));
+    }
+    return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
   }
 
   function reasoningEffortOptionsForMode(mode: string) {
@@ -2008,7 +2031,7 @@
   }
 
   function currentComposerMode() {
-    return normalizeAgentMode(detail?.agentMode || selectedSummary?.agentMode || 'smart');
+    return normalizeAgentMode(detail?.agentMode || selectedSummary?.agentMode || defaultAgentMode);
   }
 
   function currentComposerReasoningEffort() {
@@ -2303,7 +2326,7 @@
         || stringFrom(settings.agentMode)
         || stringFrom(meta.agentMode)
         || agentModeFromMessages(messages)
-        || 'smart'
+        || defaultAgentMode
     );
   }
 
