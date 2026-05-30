@@ -205,18 +205,19 @@ func (rt *neoRuntime) start() error {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", rt.handleHTTP)
-	rt.server = &http.Server{
+	server := &http.Server{
 		Addr:              net.JoinHostPort(rt.host, fmt.Sprintf("%d", rt.port)),
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
+	rt.server = server
 	ctx, cleanup := context.WithCancel(context.Background())
 	rt.cleanup = cleanup
 	rt.started = true
 
 	go func() {
-		log.Infof("amp neo local runtime listening on http://%s", rt.server.Addr)
-		if err := rt.server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Infof("amp neo local runtime listening on http://%s", server.Addr)
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Warnf("amp neo local runtime stopped: %v", err)
 		}
 	}()
@@ -234,15 +235,17 @@ func (rt *neoRuntime) stop(ctx context.Context) error {
 
 func (rt *neoRuntime) shutdown(ctx context.Context) error {
 	return rt.stopWithOptions(ctx, neoRuntimeStopOptions{
-		stopExecutors:  false,
-		transportClose: true,
+		stopExecutors:       false,
+		transportClose:      true,
+		flushLocalSnapshots: true,
 	})
 }
 
 type neoRuntimeStopOptions struct {
-	stopExecutors  bool
-	closeReason    string
-	transportClose bool
+	stopExecutors       bool
+	closeReason         string
+	transportClose      bool
+	flushLocalSnapshots bool
 }
 
 func (rt *neoRuntime) stopWithOptions(ctx context.Context, options neoRuntimeStopOptions) error {
@@ -262,6 +265,9 @@ func (rt *neoRuntime) stopWithOptions(ctx context.Context, options neoRuntimeSto
 	server := rt.server
 	rt.server = nil
 	err := server.Shutdown(ctx)
+	if options.flushLocalSnapshots {
+		rt.store.syncLocalThreadSnapshots()
+	}
 	rt.store.disposeAll(options.stopExecutors, options.closeReason, options.transportClose)
 	return err
 }
@@ -1217,6 +1223,21 @@ func (s *neoActorStore) disposeAll(stopExecutors bool, closeReason string, trans
 	s.mu.Unlock()
 	for _, actor := range actors {
 		actor.disposeWithOptions(stopExecutors, closeReason, transportClose)
+	}
+}
+
+func (s *neoActorStore) syncLocalThreadSnapshots() {
+	if s == nil {
+		return
+	}
+	s.mu.RLock()
+	actors := make([]*neoActor, 0, len(s.actors))
+	for _, actor := range s.actors {
+		actors = append(actors, actor)
+	}
+	s.mu.RUnlock()
+	for _, actor := range actors {
+		actor.syncLocalThreadSnapshotNow()
 	}
 }
 
@@ -7379,27 +7400,67 @@ func writeNeoLocalThreadSnapshot(snapshot neoCloudThreadSnapshot) error {
 	if !neoThreadIDExactPattern.MatchString(snapshot.threadID) {
 		return fmt.Errorf("invalid thread id %q", snapshot.threadID)
 	}
-	dir := neoAmpThreadStoreDir()
-	if dir == "" {
-		return errors.New("amp thread store directory unavailable")
-	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
 	thread := neoCloudThread(snapshot)
 	if len(snapshot.actorKV) > 0 {
 		thread["actorKV"] = cloneMap(snapshot.actorKV)
 	}
-	raw, err := json.MarshalIndent(thread, "", "  ")
+	path, err := writeNeoLocalThreadFile(snapshot.threadID, thread)
 	if err != nil {
-		return err
-	}
-	path := filepath.Join(dir, snapshot.threadID+".json")
-	if err := os.WriteFile(path, append(raw, '\n'), 0o600); err != nil {
 		return err
 	}
 	neoInvalidateLocalThreadCache(snapshot.threadID)
 	log.Debugf("amp neo local runtime thread store sync complete thread=%s path=%s", snapshot.threadID, path)
+	return nil
+}
+
+func writeNeoLocalThreadFile(threadID string, thread map[string]any) (string, error) {
+	dir := neoAmpThreadStoreDir()
+	if dir == "" {
+		return "", errors.New("amp thread store directory unavailable")
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	raw, err := json.MarshalIndent(thread, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	path := filepath.Join(dir, threadID+".json")
+	return path, writeNeoAtomicFile(path, append(raw, '\n'), 0o600)
+}
+
+func writeNeoAtomicFile(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	closed := false
+	cleanup := true
+	defer func() {
+		if !closed {
+			_ = tmp.Close()
+		}
+		if cleanup {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		return err
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		closed = true
+		return err
+	}
+	closed = true
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	cleanup = false
 	return nil
 }
 
@@ -7979,24 +8040,14 @@ func cacheNeoLocalThread(thread map[string]any) {
 	normalizeNeoThreadCurrentInference(thread)
 	normalizeNeoThreadMessageShapes(thread)
 	normalizeNeoThreadCompactionSummaryOrder(thread)
-	dir := neoAmpThreadStoreDir()
-	if dir == "" {
-		return
-	}
-	raw, err := json.MarshalIndent(thread, "", "  ")
+	path, err := writeNeoLocalThreadFile(threadID, thread)
 	if err != nil {
-		return
-	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return
-	}
-	if err := os.WriteFile(filepath.Join(dir, threadID+".json"), append(raw, '\n'), 0o600); err != nil {
 		log.Debugf("amp neo cloud thread cache write failed thread=%s: %v", threadID, err)
 		return
 	}
 	// Refresh the in-memory cache to match the freshly written file so a
 	// subsequent open serves the updated document without re-reading from disk.
-	if info, err := os.Stat(filepath.Join(dir, threadID+".json")); err == nil {
+	if info, err := os.Stat(path); err == nil {
 		neoStoreLocalThreadCache(threadID, thread, info.ModTime(), info.Size())
 	} else {
 		neoInvalidateLocalThreadCache(threadID)

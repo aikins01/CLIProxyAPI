@@ -1343,6 +1343,61 @@ func TestNeoRuntimeShutdownClosesActorWebSocketsAsTransportFailure(t *testing.T)
 	}
 }
 
+func TestNeoRuntimeShutdownFlushesLocalThreadSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	oldStoreDir := neoAmpThreadStoreDir
+	neoAmpThreadStoreDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
+
+	port := freeTCPPortForTest(t)
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
+		Host: "127.0.0.1",
+		Port: port,
+	}}})
+	if err := rt.start(); err != nil {
+		t.Fatalf("start runtime: %v", err)
+	}
+
+	threadID := "T-shutdown-flush"
+	actor := rt.store.ensureThreadActor(threadID)
+	actor.mu.Lock()
+	actor.currentAgentMode = "deep"
+	actor.currentReasoningEffort = "xhigh"
+	actor.settings = map[string]any{"agentMode": "deep", "reasoning.effort": "xhigh"}
+	actor.messages = []neoMessage{{
+		ThreadID:        threadID,
+		MessageID:       "M-0000000000000000000001",
+		Role:            "user",
+		Content:         []any{map[string]any{"type": "text", "text": "persist me before restart"}},
+		AgentMode:       "deep",
+		ReasoningEffort: "xhigh",
+		Seq:             1,
+	}}
+	actor.seq = 1
+	actor.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := rt.shutdown(ctx); err != nil {
+		t.Fatalf("shutdown runtime: %v", err)
+	}
+
+	thread, ok := loadNeoLocalThread(threadID)
+	if !ok {
+		t.Fatal("shutdown did not write local thread snapshot")
+	}
+	if got := stringValue(thread["agentMode"]); got != "deep" {
+		t.Fatalf("agentMode = %q, want deep", got)
+	}
+	messages := arrayValue(thread["messages"])
+	if len(messages) != 1 || !strings.Contains(fmt.Sprint(messages[0]), "persist me before restart") {
+		t.Fatalf("messages = %#v, want persisted user message", messages)
+	}
+	if _, err := os.Stat(filepath.Join(dir, threadID+".json")); err != nil {
+		t.Fatalf("snapshot stat: %v", err)
+	}
+}
+
 func TestNeoRuntimeShutdownPreservesSpawnedExecutors(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("sleep command and signal 0 are Unix-specific")
