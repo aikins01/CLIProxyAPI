@@ -1445,20 +1445,38 @@
       executorStatuses = [status, ...executorStatuses.filter((item) => item.id !== status.id)].slice(0, 5);
       return;
     }
-    if (type === 'executor_filesystem_read_directory' || type === 'executor_filesystem_read_file') {
-      pushRuntimeEvent(type === 'executor_filesystem_read_directory' ? 'fs dir' : 'fs file', filesystemRequestDetail(message));
+    if (
+      type === 'executor_filesystem_read_directory' ||
+      type === 'executor_filesystem_read_file' ||
+      type === 'client_filesystem_read_directory' ||
+      type === 'client_filesystem_read_file'
+    ) {
+      const side = type.startsWith('client_') ? 'client' : 'executor';
+      pushRuntimeEvent(
+        `${side} ${type.includes('read_directory') ? 'fs dir' : 'fs file'}`,
+        filesystemRequestDetail(message)
+      );
       return;
     }
-    if (type === 'client_filesystem_read_directory_result' || type === 'client_filesystem_read_file_result') {
-      pushRuntimeEvent(type === 'client_filesystem_read_directory_result' ? 'fs dir result' : 'fs file result', filesystemResultDetail(message));
+    if (
+      type === 'client_filesystem_read_directory_result' ||
+      type === 'client_filesystem_read_file_result' ||
+      type === 'executor_filesystem_read_directory_result' ||
+      type === 'executor_filesystem_read_file_result'
+    ) {
+      const side = type.startsWith('client_') ? 'client' : 'executor';
+      pushRuntimeEvent(
+        `${side} ${type.includes('read_directory') ? 'fs dir result' : 'fs file result'}`,
+        filesystemResultDetail(message)
+      );
       return;
     }
-    if (type === 'executor_git_command') {
-      pushRuntimeEvent('git', gitRequestDetail(message));
+    if (type === 'executor_git_command' || type === 'client_git_command') {
+      pushRuntimeEvent(`${type.startsWith('client_') ? 'client' : 'executor'} git`, gitRequestDetail(message));
       return;
     }
-    if (type === 'client_git_command_result') {
-      pushRuntimeEvent('git result', gitResultDetail(message));
+    if (type === 'client_git_command_result' || type === 'executor_git_command_result') {
+      pushRuntimeEvent(`${type.startsWith('client_') ? 'client' : 'executor'} git result`, gitResultDetail(message));
       return;
     }
     if (type === 'executor_error') {
