@@ -1095,7 +1095,7 @@ func TestNeoRuntimeGatewayWebSocketGetOrCreate(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
 	t.Cleanup(server.Close)
 
-	dialer := websocket.Dialer{Subprotocols: []string{"rivet", "rivet_encoding.4", "rivet_skip_ready_wait"}}
+	dialer := websocket.Dialer{Subprotocols: []string{"rivet", "rivet_encoding.4"}}
 	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/gateway/thread-actor/?rvt-method=getOrCreate&rvt-key=T-gateway"
 	conn, resp, err := dialer.Dial(wsURL, nil)
 	if err != nil {
@@ -1121,7 +1121,7 @@ func TestNeoRuntimeGatewayThreadActorAliasesReuseBinaryNamedActor(t *testing.T) 
 	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
 	t.Cleanup(server.Close)
 
-	dialer := websocket.Dialer{Subprotocols: []string{"rivet", "rivet_encoding.4", "rivet_skip_ready_wait"}}
+	dialer := websocket.Dialer{Subprotocols: []string{"rivet", "rivet_encoding.4"}}
 	compatURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/gateway/threadActor/?rvt-method=getOrCreate&rvt-key=T-gateway-alias"
 	compatConn, resp, err := dialer.Dial(compatURL, nil)
 	if err != nil {
@@ -1173,7 +1173,7 @@ func TestNeoRuntimeGatewayWebSocketGetRehydratesPersistedLocalThread(t *testing.
 	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
 	t.Cleanup(server.Close)
 
-	dialer := websocket.Dialer{Subprotocols: []string{"rivet", "rivet_encoding.4", "rivet_skip_ready_wait"}}
+	dialer := websocket.Dialer{Subprotocols: []string{"rivet", "rivet_encoding.4"}}
 	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/gateway/threadActor/?rvt-method=get&rvt-key=" + url.QueryEscape(threadID)
 	conn, resp, err := dialer.Dial(wsURL, nil)
 	if err != nil {
@@ -1227,7 +1227,7 @@ func TestNeoRuntimeGatewayWebSocketGetRehydratesEmptyLocalNeoThread(t *testing.T
 	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
 	t.Cleanup(server.Close)
 
-	dialer := websocket.Dialer{Subprotocols: []string{"rivet", "rivet_encoding.4", "rivet_skip_ready_wait"}}
+	dialer := websocket.Dialer{Subprotocols: []string{"rivet", "rivet_encoding.4"}}
 	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/gateway/threadActor/?rvt-method=get&rvt-key=" + url.QueryEscape(threadID)
 	conn, resp, err := dialer.Dial(wsURL, nil)
 	if err != nil {
@@ -1292,7 +1292,7 @@ func TestNeoRuntimeGatewayWebSocketGetDoesNotCreateMissingThreadActor(t *testing
 	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
 	t.Cleanup(server.Close)
 
-	dialer := websocket.Dialer{Subprotocols: []string{"rivet", "rivet_encoding.4", "rivet_skip_ready_wait"}}
+	dialer := websocket.Dialer{Subprotocols: []string{"rivet", "rivet_encoding.4"}}
 	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/gateway/threadActor/?rvt-method=get&rvt-key=T-missing-gateway-get"
 	conn, resp, err := dialer.Dial(wsURL, nil)
 	if conn != nil {
@@ -1431,6 +1431,82 @@ func TestNeoRuntimeGatewayWebSocketJSONRPCTransport(t *testing.T) {
 	}
 	if !sawConnected || !sawResponse {
 		t.Fatalf("jsonrpc websocket sawConnected=%v sawResponse=%v", sawConnected, sawResponse)
+	}
+}
+
+func TestNeoRuntimeGatewayWebSocketJSONRPCSkipReadyWaitSubprotocolDefersSnapshot(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-jsonrpc-skip-ready-subprotocol"
+	actor, _ := rt.store.upsert(map[string]any{"name": "threadActor", "key": threadID, "input": map[string]any{"threadId": threadID}}, true)
+	actor.mu.Lock()
+	actor.messages = []neoMessage{
+		{ThreadID: threadID, MessageID: "M-old", Role: "user", Content: []any{map[string]any{"type": "text", "text": "old"}}, Seq: 1},
+		{ThreadID: threadID, MessageID: "M-new", Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "new"}}, Seq: 2},
+	}
+	actor.seq = 3
+	actor.mu.Unlock()
+
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	t.Cleanup(server.Close)
+
+	dialer := websocket.Dialer{Subprotocols: []string{"rivet", "rivet_conn_params.%7B%22transport%22%3A%22json-rpc%22%7D", "rivet_encoding.4", "rivet_skip_ready_wait"}}
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/gateway/threadActor/?rvt-method=getOrCreate&rvt-key=" + url.QueryEscape(threadID)
+	conn, resp, err := dialer.Dial(wsURL, nil)
+	if err != nil {
+		status := 0
+		if resp != nil {
+			status = resp.StatusCode
+		}
+		t.Fatalf("gateway websocket dial failed status=%d err=%v", status, err)
+	}
+	defer conn.Close()
+
+	if err := conn.WriteJSON(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      "resume-1",
+		"method":  "client_resume",
+		"params":  map[string]any{"version": 1},
+	}); err != nil {
+		t.Fatalf("write jsonrpc client_resume: %v", err)
+	}
+
+	var sawResponse bool
+	var sawNew bool
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && (!sawResponse || !sawNew) {
+		_ = conn.SetReadDeadline(time.Now().Add(time.Until(deadline)))
+		_, payload, errRead := conn.ReadMessage()
+		if errRead != nil {
+			if netErr, ok := errRead.(net.Error); ok && netErr.Timeout() {
+				break
+			}
+			t.Fatalf("read resumed jsonrpc websocket message: %v", errRead)
+		}
+		var frame map[string]any
+		if err := json.Unmarshal(payload, &frame); err != nil {
+			t.Fatalf("resumed jsonrpc websocket JSON error: %v", err)
+		}
+		if _, hasRawType := frame["type"]; hasRawType {
+			t.Fatalf("jsonrpc websocket received raw protocol frame after resume: %#v", frame)
+		}
+		if frame["id"] == "resume-1" {
+			sawResponse = true
+			continue
+		}
+		if frame["method"] != "message_added" {
+			continue
+		}
+		params := mapValue(frame["params"])
+		messageID := stringValue(mapValue(params["message"])["messageId"])
+		if messageID == "M-old" {
+			t.Fatalf("resume replayed message at or before requested version: %#v", frame)
+		}
+		if messageID == "M-new" {
+			sawNew = true
+		}
+	}
+	if !sawResponse || !sawNew {
+		t.Fatalf("jsonrpc client_resume sawResponse=%v sawNew=%v", sawResponse, sawNew)
 	}
 }
 
@@ -2226,7 +2302,7 @@ func TestNeoRuntimeSnapshotThreadRelationshipsIncludesSeq(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
 	t.Cleanup(server.Close)
 
-	dialer := websocket.Dialer{Subprotocols: []string{"rivet", "rivet_encoding.4", "rivet_skip_ready_wait"}}
+	dialer := websocket.Dialer{Subprotocols: []string{"rivet", "rivet_encoding.4"}}
 	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/gateway/threadActor/?rvt-method=getOrCreate&rvt-key=T-seq"
 	conn, resp, err := dialer.Dial(wsURL, nil)
 	if err != nil {
@@ -2615,7 +2691,7 @@ func TestNeoRuntimeSnapshotIncludesThreadStatusAndCompactionRecords(t *testing.T
 	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
 	t.Cleanup(server.Close)
 
-	dialer := websocket.Dialer{Subprotocols: []string{"rivet", "rivet_encoding.4", "rivet_skip_ready_wait"}}
+	dialer := websocket.Dialer{Subprotocols: []string{"rivet", "rivet_encoding.4"}}
 	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/gateway/threadActor/?rvt-method=getOrCreate&rvt-key=" + url.QueryEscape(threadID)
 	conn, resp, err := dialer.Dial(wsURL, nil)
 	if err != nil {
@@ -3408,7 +3484,7 @@ func TestNeoRuntimeResumeReplaysCancelledEvent(t *testing.T) {
 
 func dialNeoActorWebSocket(t *testing.T, serverURL, threadID string) *websocket.Conn {
 	t.Helper()
-	dialer := websocket.Dialer{Subprotocols: []string{"rivet", "rivet_encoding.4", "rivet_skip_ready_wait"}}
+	dialer := websocket.Dialer{Subprotocols: []string{"rivet", "rivet_encoding.4"}}
 	wsURL := "ws" + strings.TrimPrefix(serverURL, "http") + "/gateway/threadActor/?rvt-method=getOrCreate&rvt-key=" + url.QueryEscape(threadID)
 	var conn *websocket.Conn
 	var resp *http.Response

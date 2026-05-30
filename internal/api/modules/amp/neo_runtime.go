@@ -687,7 +687,12 @@ func isNeoMessagesRequestPath(path string) bool {
 	return path == "/request/messages" || strings.HasSuffix(path, "/request/messages")
 }
 
-func neoSkipReadyWaitRequested(r *http.Request) bool {
+func neoSkipReadyWaitRequested(r *http.Request, protocols []string) bool {
+	for _, protocol := range protocols {
+		if strings.EqualFold(strings.TrimSpace(protocol), "rivet_skip_ready_wait") {
+			return true
+		}
+	}
 	if r == nil || r.URL == nil {
 		return false
 	}
@@ -879,7 +884,7 @@ func (rt *neoRuntime) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	if underlying := conn.UnderlyingConn(); underlying != nil {
 		defer rt.unregisterConnection(underlying)
 	}
-	actor.open(socket, !neoSkipReadyWaitRequested(r))
+	actor.open(socket, !neoSkipReadyWaitRequested(r, protocols))
 	defer actor.close(socket)
 	defer conn.Close()
 
