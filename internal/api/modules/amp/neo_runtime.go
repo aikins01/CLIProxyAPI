@@ -10832,6 +10832,9 @@ func (a *neoActor) handleCompactionEvent(msg map[string]any) {
 		record, ok := neoCompactionRecord(msg, time.Now().UTC().Format(time.RFC3339Nano))
 		a.mu.Lock()
 		a.compacting = false
+		if a.currentInference != nil {
+			a.currentInference.preflightCompactionChecked = true
+		}
 		if ok {
 			a.upsertCompactionRecordLocked(record)
 		}

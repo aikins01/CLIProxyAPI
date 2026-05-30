@@ -1906,6 +1906,66 @@ func TestNeoRuntimeShutdownDoesNotRepeatStartedCompactionPreflight(t *testing.T)
 	}
 }
 
+func TestNeoRuntimeShutdownDoesNotRepeatBinaryCompletedCompaction(t *testing.T) {
+	useTempNeoThreadStore(t)
+
+	port := freeTCPPortForTest(t)
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
+		Host: "127.0.0.1",
+		Port: port,
+	}}})
+	if err := rt.start(); err != nil {
+		t.Fatalf("start runtime: %v", err)
+	}
+
+	threadID := "T-shutdown-binary-completed-compaction"
+	actor := rt.store.ensureThreadActor(threadID)
+	actor.mu.Lock()
+	actor.currentAgentMode = "deep"
+	actor.currentReasoningEffort = "xhigh"
+	actor.settings = map[string]any{"agentMode": "deep", "reasoning.effort": "xhigh"}
+	actor.messages = []neoMessage{{
+		ThreadID:        threadID,
+		MessageID:       "M-0000000000000000000001",
+		Role:            "user",
+		Content:         []any{map[string]any{"type": "text", "text": "start work"}},
+		AgentMode:       "deep",
+		ReasoningEffort: "xhigh",
+		Seq:             1,
+	}, {
+		ThreadID:  threadID,
+		MessageID: "M-0000000000000000000002",
+		Role:      "assistant",
+		Content:   []any{map[string]any{"type": "text", "text": "partial answer"}},
+		State:     map[string]any{"type": "streaming"},
+		Seq:       2,
+	}}
+	actor.currentInference = &neoInferenceInflight{messageID: "M-0000000000000000000002", agentMode: "deep", reasoningEffort: "xhigh", tools: []string{"shell_command"}}
+	actor.compacting = true
+	actor.seq = 2
+	actor.mu.Unlock()
+
+	actor.handle(map[string]any{"type": "compaction_complete", "cutMessageId": "M-0000000000000000000001", "createdAt": "2026-05-30T00:00:00Z"})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := rt.shutdown(ctx); err != nil {
+		t.Fatalf("shutdown runtime: %v", err)
+	}
+
+	thread, ok := loadNeoLocalThread(threadID)
+	if !ok {
+		t.Fatal("shutdown did not write local thread snapshot")
+	}
+	pending := mapValue(thread["pendingInference"])
+	if stringValue(pending["agentMode"]) != "deep" || stringValue(pending["reasoningEffort"]) != "xhigh" {
+		t.Fatalf("pendingInference = %#v, want deep/xhigh resume marker", pending)
+	}
+	if !boolValue(pending["preflightCompactionChecked"]) {
+		t.Fatalf("pendingInference = %#v, want completed compaction preflight marker", pending)
+	}
+}
+
 func TestNeoRuntimeShutdownPreservesSpawnedExecutors(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("sleep command and signal 0 are Unix-specific")
