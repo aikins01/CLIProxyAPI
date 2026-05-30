@@ -172,6 +172,17 @@
     label: string;
     detail: string;
   };
+  type RuntimeTrace = {
+    id: string;
+    name: string;
+    status: string;
+    detail: string;
+    startedAt: string;
+    endedAt: string;
+    eventCount: number;
+    latestEvent: string;
+    attributes: Record<string, unknown>;
+  };
   type ToolLease = {
     toolCallId: string;
     toolName: string;
@@ -253,6 +264,7 @@
   let executorInfo = $state<Record<string, unknown>>({});
   let executorStatuses = $state<ExecutorStatus[]>([]);
   let runtimeEvents = $state<RuntimeEvent[]>([]);
+  let runtimeTraces = $state<RuntimeTrace[]>([]);
   let inferenceTools = $state<{ messageId: string; agentMode: string; tools: string[] } | null>(null);
   let toolLeases = $state<ToolLease[]>([]);
   let draftPreview = $state('');
@@ -272,7 +284,7 @@
   let manualTranscriptScrollVersion = 0;
   let transcriptFollowPinned = true;
   const devSignalCount = $derived.by(() => {
-    let count = artifacts.length + executorStatuses.length + runtimeEvents.length + toolLeases.length;
+    let count = artifacts.length + executorStatuses.length + runtimeEvents.length + runtimeTraces.length + toolLeases.length;
     if (inferenceTools) count += 1;
     if (retryNotice) count += 1;
     return count;
@@ -531,6 +543,7 @@
     executorInfo = {};
     executorStatuses = [];
     runtimeEvents = [];
+    runtimeTraces = [];
     inferenceTools = null;
     toolLeases = [];
     draftPreview = '';
@@ -1581,6 +1594,22 @@
       pushRuntimeEvent('plugin', pluginMessageDetail(message.message ?? message));
       return;
     }
+    if (type === 'trace:start') {
+      applyTraceStart(message);
+      return;
+    }
+    if (type === 'trace:event') {
+      applyTraceEvent(message);
+      return;
+    }
+    if (type === 'trace:attributes') {
+      applyTraceAttributes(message);
+      return;
+    }
+    if (type === 'trace:end') {
+      applyTraceEnd(message);
+      return;
+    }
     if (type === 'error') {
       activeError = { message: message.message, code: message.code };
       return;
@@ -2117,6 +2146,114 @@
   function pushRuntimeEvent(label: string, detail: string) {
     const id = `${label}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     runtimeEvents = [{ id, label, detail: detail || label }, ...runtimeEvents].slice(0, 8);
+  }
+
+  function applyTraceStart(message: Incoming) {
+    const span = asRecord(message.span);
+    const id = stringFrom(span.id);
+    if (!id) return;
+    const existing = runtimeTraces.find((trace) => trace.id === id);
+    const events = Array.isArray(span.events) ? span.events : [];
+    const latestEvent = existing?.latestEvent || traceEventLabel(events[events.length - 1]);
+    const next: RuntimeTrace = {
+      id,
+      name: traceNameFromSpan(span, id),
+      status: stringFrom(span.endTime) ? 'done' : existing?.status || 'running',
+      detail: '',
+      startedAt: stringFrom(span.startTime) || existing?.startedAt || '',
+      endedAt: stringFrom(span.endTime) || existing?.endedAt || '',
+      eventCount: Math.max(existing?.eventCount ?? 0, events.length),
+      latestEvent,
+      attributes: { ...(existing?.attributes ?? {}), ...asRecord(span.attributes) }
+    };
+    next.detail = runtimeTraceDetail(next);
+    upsertRuntimeTrace(next);
+  }
+
+  function applyTraceEvent(message: Incoming) {
+    const id = traceIdFromMessage(message);
+    if (!id) return;
+    const existing = runtimeTraces.find((trace) => trace.id === id);
+    if (!existing) return;
+    const next = {
+      ...existing,
+      eventCount: existing.eventCount + 1,
+      latestEvent: traceEventLabel(message.event ?? message.value)
+    };
+    next.detail = runtimeTraceDetail(next);
+    upsertRuntimeTrace(next);
+  }
+
+  function applyTraceAttributes(message: Incoming) {
+    const id = traceIdFromMessage(message);
+    if (!id) return;
+    const existing = runtimeTraces.find((trace) => trace.id === id);
+    if (!existing) return;
+    const next = {
+      ...existing,
+      attributes: { ...existing.attributes, ...asRecord(message.attributes) }
+    };
+    next.detail = runtimeTraceDetail(next);
+    upsertRuntimeTrace(next);
+  }
+
+  function applyTraceEnd(message: Incoming) {
+    const span = asRecord(message.span);
+    const id = traceIdFromMessage(message);
+    if (!id) return;
+    const existing = runtimeTraces.find((trace) => trace.id === id);
+    if (!existing) return;
+    const next = {
+      ...existing,
+      name: traceNameFromSpan(span, existing.name),
+      status: 'done',
+      endedAt: stringFrom(span.endTime) || existing.endedAt
+    };
+    next.detail = runtimeTraceDetail(next);
+    upsertRuntimeTrace(next);
+  }
+
+  function upsertRuntimeTrace(trace: RuntimeTrace) {
+    runtimeTraces = [trace, ...runtimeTraces.filter((item) => item.id !== trace.id)].slice(0, 6);
+  }
+
+  function traceIdFromMessage(message: Incoming) {
+    if (typeof message.span === 'string') return message.span;
+    const span = asRecord(message.span);
+    return stringFrom(span.id ?? message.spanID ?? message.spanId ?? message.id);
+  }
+
+  function traceNameFromSpan(span: Record<string, unknown>, fallback: string) {
+    return firstString(span.name, span.label, span.operation, span.type, fallback);
+  }
+
+  function traceEventLabel(raw: unknown) {
+    const item = asRecord(raw);
+    return firstString(raw, item.name, item.type, item.label, item.message, objectSummary(item));
+  }
+
+  function runtimeTraceDetail(trace: RuntimeTrace) {
+    const parts = [
+      trace.latestEvent,
+      trace.eventCount > 0 ? `${trace.eventCount} event${trace.eventCount === 1 ? '' : 's'}` : '',
+      objectSummary(trace.attributes),
+      traceDurationLabel(trace.startedAt, trace.endedAt)
+    ].filter(Boolean);
+    return parts.slice(0, 3).join(' · ');
+  }
+
+  function traceDurationLabel(startedAt: string, endedAt: string) {
+    if (!startedAt) return '';
+    const started = Date.parse(startedAt);
+    if (!Number.isFinite(started)) return '';
+    const ended = endedAt ? Date.parse(endedAt) : Date.now();
+    if (!Number.isFinite(ended) || ended < started) return '';
+    const seconds = Math.max(0, Math.round((ended - started) / 1000));
+    if (seconds < 1) return '<1s';
+    if (seconds < 60) return `${seconds}s`;
+    const minutes = Math.floor(seconds / 60);
+    const remainder = seconds % 60;
+    return remainder > 0 ? `${minutes}m ${remainder}s` : `${minutes}m`;
   }
 
   function runtimeEventDetail(message: Incoming, fields: string[]) {
@@ -4525,7 +4662,7 @@
     </section>
   {/if}
 
-  {#if devMode && (inferenceTools || toolLeases.length > 0 || executorStatuses.length > 0 || runtimeEvents.length > 0 || retryNotice)}
+  {#if devMode && (inferenceTools || toolLeases.length > 0 || executorStatuses.length > 0 || runtimeEvents.length > 0 || runtimeTraces.length > 0 || retryNotice)}
     <section class="runtime-section">
       <h2>Runtime activity</h2>
       <div class="runtime-list">
@@ -4548,6 +4685,12 @@
           <p class="runtime-pill">
             <span>{status.status}</span>
             {status.message || objectSummary(status.details) || status.id}
+          </p>
+        {/each}
+        {#each runtimeTraces as trace (trace.id)}
+          <p class="runtime-pill">
+            <span>{trace.status === 'done' ? 'trace' : 'trace running'}</span>
+            {trace.name}{trace.detail ? ` · ${trace.detail}` : ''}
           </p>
         {/each}
         {#each runtimeEvents as event (event.id)}
