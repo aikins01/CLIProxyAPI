@@ -1445,6 +1445,22 @@
       executorStatuses = [status, ...executorStatuses.filter((item) => item.id !== status.id)].slice(0, 5);
       return;
     }
+    if (type === 'executor_filesystem_read_directory' || type === 'executor_filesystem_read_file') {
+      pushRuntimeEvent(type === 'executor_filesystem_read_directory' ? 'fs dir' : 'fs file', filesystemRequestDetail(message));
+      return;
+    }
+    if (type === 'client_filesystem_read_directory_result' || type === 'client_filesystem_read_file_result') {
+      pushRuntimeEvent(type === 'client_filesystem_read_directory_result' ? 'fs dir result' : 'fs file result', filesystemResultDetail(message));
+      return;
+    }
+    if (type === 'executor_git_command') {
+      pushRuntimeEvent('git', gitRequestDetail(message));
+      return;
+    }
+    if (type === 'client_git_command_result') {
+      pushRuntimeEvent('git result', gitResultDetail(message));
+      return;
+    }
     if (type === 'executor_error') {
       activeError = { message: message.message, code: message.code };
       return;
@@ -1985,6 +2001,41 @@
       .map((field) => stringFrom(message[field]))
       .filter(Boolean);
     return parts.join(' · ') || objectSummary(asRecord(message));
+  }
+
+  function runtimeEventRequestId(message: Incoming) {
+    return stringFrom(message.requestId ?? message.requestID ?? message.id);
+  }
+
+  function filesystemRequestDetail(message: Incoming) {
+    const path = filePathFromURI(stringFrom(message.path ?? message.uri ?? message.url));
+    const requestId = runtimeEventRequestId(message);
+    return [path, requestId].filter(Boolean).join(' · ') || objectSummary(asRecord(message));
+  }
+
+  function filesystemResultDetail(message: Incoming) {
+    const requestId = runtimeEventRequestId(message);
+    const content = stringFrom(message.content ?? message.text ?? message.error);
+    const length = content ? `${content.length} chars` : '';
+    return [requestId, length].filter(Boolean).join(' · ') || objectSummary(asRecord(message));
+  }
+
+  function gitRequestDetail(message: Incoming) {
+    const args = Array.isArray(message.args) ? message.args.map(stringFrom).filter(Boolean).join(' ') : '';
+    const operation = asRecord(message.operation);
+    const op = stringFrom(operation.type ?? message.command ?? message.cmd);
+    const requestId = runtimeEventRequestId(message);
+    return [args || op, requestId].filter(Boolean).join(' · ') || objectSummary(asRecord(message));
+  }
+
+  function gitResultDetail(message: Incoming) {
+    const requestId = runtimeEventRequestId(message);
+    const exitCode = stringFrom(message.exitCode ?? message.exit_code);
+    const stdout = stringFrom(message.stdout).trim();
+    const stderr = stringFrom(message.stderr).trim();
+    const preview = stdout || stderr || stringFrom(message.error);
+    const status = exitCode ? `exit ${exitCode}` : valueLabel(message.ok);
+    return [requestId, status, preview.slice(0, 120)].filter(Boolean).join(' · ') || objectSummary(asRecord(message));
   }
 
   function pluginMessageDetail(raw: unknown) {
