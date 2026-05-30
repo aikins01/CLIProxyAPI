@@ -2978,7 +2978,6 @@ func (a *neoActor) handleProtocolThreadTruncated(msg map[string]any) {
 
 	a.mu.Lock()
 	seq := a.protocolSeqLocked(msg)
-	a.sortMessagesBySeqLocked()
 	index := a.messageIndexLocked(truncateFromMessage)
 	if index >= 0 {
 		trimmed := make([]neoMessage, index)

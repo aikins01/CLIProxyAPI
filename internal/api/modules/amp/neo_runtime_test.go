@@ -2489,7 +2489,7 @@ func TestNeoActorProtocolInferenceToolsUsesOfficialPayload(t *testing.T) {
 	}
 }
 
-func TestNeoActorProtocolThreadTruncatedUsesSeqOrder(t *testing.T) {
+func TestNeoActorProtocolThreadTruncatedUsesArrayOrderLikeBinary(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	actor := newNeoActor(rt, "actor-test", "threadActor", "T-test", "T-test", neoActorRecord("actor-test", "threadActor", "T-test"), nil)
 	actor.mu.Lock()
@@ -2509,8 +2509,8 @@ func TestNeoActorProtocolThreadTruncatedUsesSeqOrder(t *testing.T) {
 
 	actor.mu.Lock()
 	defer actor.mu.Unlock()
-	if len(actor.messages) != 1 || actor.messages[0].MessageID != "M-early" {
-		t.Fatalf("messages after seq truncation = %#v, want only M-early", actor.messages)
+	if len(actor.messages) != 1 || actor.messages[0].MessageID != "M-late" {
+		t.Fatalf("messages after protocol truncation = %#v, want current array prefix", actor.messages)
 	}
 	if len(actor.relationships) != 1 || numberFrom(actor.relationships[0]["messageIndex"]) != 0 {
 		t.Fatalf("relationships after truncation = %#v, want only pre-cut relationship", actor.relationships)
