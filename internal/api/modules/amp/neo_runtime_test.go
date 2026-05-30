@@ -7080,7 +7080,7 @@ func TestNeoActorFiltersAmpBuiltInToolsByMode(t *testing.T) {
 		"docs_read":              {Name: "docs_read"},
 		"render_agg_man":         {Name: "render_agg_man"},
 		"diff":                   {Name: "diff"},
-		"tb__gemini-oracle":      {Name: "tb__gemini-oracle"},
+		"tb__gemini-oracle":      {Name: "tb__gemini-oracle", Meta: map[string]any{"source": map[string]any{"toolbox": "/tmp/oracle"}}},
 		"code_review":            {Name: "code_review", Meta: map[string]any{"deferred": true}},
 		"deferred_custom":        {Name: "deferred_custom", Meta: map[string]any{"deferred": true}},
 	}
@@ -7172,6 +7172,26 @@ func TestNeoActorAllowsExternalToolsNamedLikeBuiltins(t *testing.T) {
 	}
 	if names["Read"] {
 		t.Fatalf("builtin Read tool bypassed deep mode filtering: %#v", names)
+	}
+}
+
+func TestNeoActorFiltersUnknownNoSourceToolsLikeBinary(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	actor.tools = map[string]neoToolSpec{
+		"not_in_binary_mode_table": {Name: "not_in_binary_mode_table"},
+		"external_custom":          {Name: "external_custom", Meta: map[string]any{"source": map[string]any{"plugin": "custom-plugin"}}},
+	}
+
+	names := map[string]bool{}
+	for _, tool := range actor.inferenceRequestLocked("smart", "", "").Tools {
+		names[tool.Name] = true
+	}
+	if names["not_in_binary_mode_table"] {
+		t.Fatalf("unknown no-source tool bypassed binary mode filtering: %#v", names)
+	}
+	if !names["external_custom"] {
+		t.Fatalf("external custom tool was filtered despite plugin source: %#v", names)
 	}
 }
 
@@ -7321,7 +7341,7 @@ func TestNeoActorAppliesToolEnableDisableSettings(t *testing.T) {
 		"read_thread":             {Name: "read_thread"},
 		"shell_command":           {Name: "shell_command"},
 		"mcp__git_server__search": {Name: "mcp__git_server__search", Meta: map[string]any{"source": map[string]any{"mcp": "git-server"}}},
-		"tb__gemini-oracle":       {Name: "tb__gemini-oracle"},
+		"tb__gemini-oracle":       {Name: "tb__gemini-oracle", Meta: map[string]any{"source": map[string]any{"toolbox": "/tmp/oracle"}}},
 	}
 	namesFor := func(mode string) map[string]bool {
 		request := actor.inferenceRequestLocked(mode, "", "")
@@ -7357,6 +7377,37 @@ func TestNeoActorAppliesToolEnableDisableSettings(t *testing.T) {
 	}
 	if !promptNames["read_thread"] || promptNames["shell_command"] || promptNames["mcp__git_server__search"] {
 		t.Fatalf("toolNamesLocked did not apply JSON tools.enable settings: %#v", promptNames)
+	}
+}
+
+func TestNeoToolSettingsSupportBinaryBraceGlobs(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	actor.tools = map[string]neoToolSpec{
+		"read_thread":   {Name: "read_thread"},
+		"shell_command": {Name: "shell_command"},
+		"apply_patch":   {Name: "apply_patch"},
+	}
+
+	actor.settings = map[string]any{"tools.disable": []any{"shell_{command,other}"}}
+	names := map[string]bool{}
+	for _, tool := range actor.inferenceRequestLocked("deep", "", "").Tools {
+		names[tool.Name] = true
+	}
+	if names["shell_command"] {
+		t.Fatalf("brace glob did not disable shell_command: %#v", names)
+	}
+	if !names["read_thread"] || !names["apply_patch"] {
+		t.Fatalf("brace glob disabled unrelated tools: %#v", names)
+	}
+
+	actor.settings = map[string]any{"tools.enable": []any{"{read,find}_thread"}}
+	names = map[string]bool{}
+	for _, tool := range actor.inferenceRequestLocked("deep", "", "").Tools {
+		names[tool.Name] = true
+	}
+	if !names["read_thread"] || names["shell_command"] || names["apply_patch"] {
+		t.Fatalf("brace glob enable settings mismatch: %#v", names)
 	}
 }
 

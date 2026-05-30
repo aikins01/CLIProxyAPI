@@ -120,15 +120,13 @@ var (
 		"deep":  toolSet("code_review"),
 	}
 	neoKnownModeTools = toolSet(
-		"Read", "Grep", "glob", "Glob", "finder", "file_tree", "Bash", "create_file", "edit_file", "delete_file", "get_diagnostics",
+		"Read", "finder", "Bash", "create_file", "edit_file",
 		"web_search", "read_web_page", "read_mcp_resource", "chart", "read_thread", "find_thread", "skill", "oracle",
-		"handoff", "librarian", "Task", "task_list", "todo_write", "todo_read", "view_media", "look_at", "painter",
-		"shell_command", "apply_patch", "send_message_to_aggman", "code_review", "search_documents", "get_document", "docs_list", "docs_read", "docs_write",
+		"librarian", "Task", "view_media", "painter",
+		"shell_command", "apply_patch", "send_message_to_aggman", "code_review", "docs_list", "docs_read", "docs_write",
 		"render_agg_man", "create_project", "create_thread", "archive_thread", "unarchive_thread", "send_message_to_thread",
 		"slack_write", "slack_read", "github_repo_ci_status", "read_github", "search_github", "commit_search",
-		"list_directory_github", "list_repositories", "glob_github", "diff", "run_terminal_command", "read_file",
-		"read_bitbucket_enterprise", "list_directory_bitbucket_enterprise", "list_repositories_bitbucket_enterprise",
-		"glob_bitbucket_enterprise", "search_bitbucket_enterprise", "diff_bitbucket_enterprise", "commit_search_bitbucket_enterprise",
+		"list_directory_github", "list_repositories", "glob_github", "diff",
 	)
 )
 
@@ -12699,8 +12697,7 @@ func neoToolAllowedForMode(agentMode, name string) bool {
 		allowlist = neoModeToolAllowlist["smart"]
 	}
 	if !neoKnownModeTools[name] {
-		// MCP/plugin/custom tools are not in Amp's built-in mode tables.
-		return true
+		return false
 	}
 	return allowlist[name]
 }
@@ -12933,12 +12930,83 @@ func neoToolPatternMatches(candidate, pattern string) bool {
 	if pattern == "*" || candidate == pattern {
 		return true
 	}
+	if strings.Contains(pattern, "{") {
+		for _, expanded := range neoExpandBracePattern(pattern, 128) {
+			if expanded != pattern && neoToolPatternMatches(candidate, expanded) {
+				return true
+			}
+		}
+	}
 	if strings.ContainsAny(pattern, "*?[") {
 		if ok, err := filepath.Match(pattern, candidate); err == nil && ok {
 			return true
 		}
 	}
 	return false
+}
+
+func neoExpandBracePattern(pattern string, limit int) []string {
+	if limit <= 0 {
+		return []string{pattern}
+	}
+	start := strings.Index(pattern, "{")
+	if start < 0 {
+		return []string{pattern}
+	}
+	depth := 0
+	end := -1
+	for i := start; i < len(pattern); i++ {
+		switch pattern[i] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				end = i
+				break
+			}
+		}
+	}
+	if end < 0 {
+		return []string{pattern}
+	}
+	alts := neoSplitBraceAlternatives(pattern[start+1 : end])
+	if len(alts) == 0 {
+		return []string{pattern}
+	}
+	out := make([]string, 0, len(alts))
+	for _, alt := range alts {
+		for _, expanded := range neoExpandBracePattern(pattern[:start]+alt+pattern[end+1:], limit-len(out)) {
+			out = append(out, expanded)
+			if len(out) >= limit {
+				return out
+			}
+		}
+	}
+	return out
+}
+
+func neoSplitBraceAlternatives(value string) []string {
+	depth := 0
+	start := 0
+	out := []string{}
+	for i := 0; i < len(value); i++ {
+		switch value[i] {
+		case '{':
+			depth++
+		case '}':
+			if depth > 0 {
+				depth--
+			}
+		case ',':
+			if depth == 0 {
+				out = append(out, value[start:i])
+				start = i + 1
+			}
+		}
+	}
+	out = append(out, value[start:])
+	return out
 }
 
 func (a *neoActor) toolNamesLocked(agentMode string) []string {
