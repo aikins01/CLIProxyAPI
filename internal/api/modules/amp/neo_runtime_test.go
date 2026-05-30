@@ -6814,6 +6814,56 @@ func TestNeoActorHandlesGuidanceDiscovery(t *testing.T) {
 	}
 }
 
+func TestNeoActorGuidanceDiscoveryAppendsToSnapshot(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+
+	actor.handle(map[string]any{
+		"type":       "executor_guidance_snapshot",
+		"snapshotId": "snapshot-1",
+		"files": []any{map[string]any{
+			"content": "Root AGENTS guidance",
+			"uri":     "file:///Users/test/project/AGENTS.md",
+			"hash":    "root-hash",
+		}},
+		"isLast": false,
+	})
+	actor.handle(map[string]any{
+		"type":       "executor_guidance_snapshot",
+		"snapshotId": "snapshot-1",
+		"files": []any{map[string]any{
+			"content": "Nested AGENTS guidance",
+			"uri":     "file:///Users/test/project/src/AGENTS.md",
+			"hash":    "nested-hash",
+		}},
+		"isLast": true,
+	})
+	actor.handle(map[string]any{
+		"type":       "executor_guidance_discovery",
+		"toolCallId": "TU-guidance",
+		"files": []any{map[string]any{
+			"content": "Discovered AGENTS guidance",
+			"uri":     "file:///Users/test/project/docs/AGENTS.md",
+			"hash":    "discovered-hash",
+		}},
+		"isLast": true,
+	})
+
+	actor.mu.Lock()
+	files := arrayValue(actor.guidanceSnapshot["files"])
+	request := actor.inferenceRequestLocked("deep", "xhigh", "")
+	actor.mu.Unlock()
+	if len(files) != 3 {
+		t.Fatalf("guidance files = %#v", files)
+	}
+	prompt := neoSystemPrompt(request, neoModelRoute{Provider: "openai", Model: "gpt-5.5"})
+	for _, want := range []string{"Root AGENTS guidance", "Nested AGENTS guidance", "Discovered AGENTS guidance"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, prompt)
+		}
+	}
+}
+
 func TestNeoActorHandlesClientEditMessage(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)

@@ -2790,24 +2790,39 @@ func (a *neoActor) updateGuidanceSnapshot(msg map[string]any) {
 	incomingToolCallID := stringValue(snapshot["toolCallId"])
 
 	a.mu.Lock()
-	// Detect chunk continuation: same snapshotId or same toolCallId as the
-	// previously stored chunk means the binary is streaming more files in
-	// the same snapshot/discovery; accumulate rather than overwrite. The
-	// schemas are disjoint (snapshot has snapshotId, discovery has
-	// toolCallId), so guard sameDiscovery against accidentally merging
-	// into a stale snapshot state by requiring the prior chunk had no
-	// snapshotId.
 	priorSnapshotID := stringValue(a.guidanceSnapshot["snapshotId"])
-	priorToolCallID := stringValue(a.guidanceSnapshot["toolCallId"])
+	if msgType == "executor_guidance_discovery" {
+		if len(incomingFiles) > 0 {
+			existing := arrayValue(a.guidanceSnapshot["files"])
+			combined := make([]any, 0, len(existing)+len(incomingFiles))
+			combined = append(combined, existing...)
+			combined = append(combined, incomingFiles...)
+			a.guidanceSnapshot["files"] = combined
+		}
+		if incomingToolCallID != "" {
+			a.guidanceSnapshot["lastDiscoveryToolCallId"] = incomingToolCallID
+		}
+		a.guidanceSnapshot["lastDiscoveryComplete"] = boolValue(snapshot["isLast"])
+		textLen := len(neoGuidanceText(a.guidanceSnapshot))
+		inventoryLen := len(neoGuidanceInventory(a.guidanceSnapshot))
+		filesLen := len(neoGuidanceFiles(a.guidanceSnapshot))
+		a.mu.Unlock()
+
+		log.Debugf("amp neo local runtime guidance discovery text_len=%d inventory=%d files=%d keys=%s", textLen, inventoryLen, filesLen, strings.Join(sortedMapKeys(snapshot), ","))
+		return
+	}
+
 	sameSnapshot := incomingSnapshotID != "" && incomingSnapshotID == priorSnapshotID
-	sameDiscovery := msgType == "executor_guidance_discovery" && incomingToolCallID != "" && incomingToolCallID == priorToolCallID && priorSnapshotID == ""
+	if incomingSnapshotID != "" && !sameSnapshot {
+		a.guidanceSnapshot = map[string]any{}
+	}
 	for key, value := range snapshot {
-		if key == "files" && (sameSnapshot || sameDiscovery) {
+		if key == "files" && sameSnapshot {
 			continue
 		}
 		a.guidanceSnapshot[key] = value
 	}
-	if (sameSnapshot || sameDiscovery) && len(incomingFiles) > 0 {
+	if sameSnapshot && len(incomingFiles) > 0 {
 		existing := arrayValue(a.guidanceSnapshot["files"])
 		combined := make([]any, 0, len(existing)+len(incomingFiles))
 		combined = append(combined, existing...)
@@ -2816,9 +2831,10 @@ func (a *neoActor) updateGuidanceSnapshot(msg map[string]any) {
 	}
 	textLen := len(neoGuidanceText(a.guidanceSnapshot))
 	inventoryLen := len(neoGuidanceInventory(a.guidanceSnapshot))
+	filesLen := len(neoGuidanceFiles(a.guidanceSnapshot))
 	a.mu.Unlock()
 
-	log.Debugf("amp neo local runtime guidance snapshot text_len=%d inventory=%d files=%d keys=%s", textLen, inventoryLen, len(neoGuidanceFiles(a.guidanceSnapshot)), strings.Join(sortedMapKeys(snapshot), ","))
+	log.Debugf("amp neo local runtime guidance snapshot text_len=%d inventory=%d files=%d keys=%s", textLen, inventoryLen, filesLen, strings.Join(sortedMapKeys(snapshot), ","))
 }
 
 func (a *neoActor) updateSkillSnapshot(msg map[string]any) {
