@@ -21405,6 +21405,9 @@ func runToText(run any) string {
 			return value
 		}
 	}
+	if value := firstNonEmptyString(nestedValue(m["error"], "message"), m["error"]); value != "" {
+		return value
+	}
 	if images := neoToolRunImages(m); len(images) > 0 {
 		return neoImageToolText(stringValue(m["toolName"]), len(images))
 	}
@@ -21566,6 +21569,8 @@ func neoReadImageResultBlock(result map[string]any) (map[string]any, bool) {
 func neoToolRunTextResult(value any) string {
 	texts := make([]string, 0)
 	switch typed := value.(type) {
+	case map[string]any:
+		return neoToolRunTextResult(typed["content"])
 	case []any:
 		for _, raw := range typed {
 			if text := neoTypedTextBlockText(mapValue(raw)); text != "" {

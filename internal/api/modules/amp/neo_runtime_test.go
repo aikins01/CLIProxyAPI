@@ -14434,6 +14434,67 @@ func TestNeoToolRunTextResultMatchesBinaryTypedTextBlocks(t *testing.T) {
 	}
 }
 
+func TestNeoToolRunTextResultUnwrapsContentObject(t *testing.T) {
+	run := map[string]any{
+		"status": "done",
+		"result": map[string]any{
+			"content": []any{
+				map[string]any{"type": "text", "text": `<loaded_skill name="code-review">`},
+				map[string]any{"type": "text", "text": "# code-review Skill"},
+			},
+		},
+	}
+
+	if got := runToText(run); got != "<loaded_skill name=\"code-review\">\n# code-review Skill" {
+		t.Fatalf("runToText = %q", got)
+	}
+}
+
+func TestNeoToolRunTextResultUsesNestedErrorMessage(t *testing.T) {
+	run := map[string]any{
+		"status": "error",
+		"error":  map[string]any{"message": "Subagent stopped after reaching the maximum of 24 turns."},
+	}
+
+	if got := runToText(run); got != "Subagent stopped after reaching the maximum of 24 turns." {
+		t.Fatalf("runToText = %q", got)
+	}
+}
+
+func TestNeoActorLoadedSkillResultObjectAddsDeferredTool(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	actor.tools = map[string]neoToolSpec{
+		"skill":         {Name: "skill"},
+		"shell_command": {Name: "shell_command"},
+	}
+	actor.pendingTools["TU-skill"] = neoPendingTool{ID: "TU-skill", Name: "skill", AgentMode: "deep"}
+
+	actor.receiveToolResult(map[string]any{
+		"type":       "executor_tool_result",
+		"toolCallId": "TU-skill",
+		"run": map[string]any{
+			"status": "done",
+			"result": map[string]any{
+				"content": []any{
+					map[string]any{"type": "text", "text": `<loaded_skill name="code-review">`},
+					map[string]any{"type": "text", "text": "# code-review Skill"},
+				},
+			},
+		},
+	})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	found := false
+	for _, tool := range actor.inferenceRequestLocked("deep", "", "").Tools {
+		found = found || tool.Name == "code_review"
+	}
+	if !found {
+		t.Fatalf("loaded skill result did not add code_review tool; history = %#v", actor.history)
+	}
+}
+
 func TestNeoActorPersistsToolApprovalQueueAndPreservesNestedMetadata(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
