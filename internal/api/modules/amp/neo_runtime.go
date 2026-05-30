@@ -2779,11 +2779,18 @@ func (a *neoActor) registerTools(raw any) {
 		if name == "" {
 			continue
 		}
+		meta := mapValue(m["meta"])
+		if _, exists := meta["source"]; !exists {
+			if source, ok := m["source"]; ok && source != nil {
+				meta = cloneMap(meta)
+				meta["source"] = source
+			}
+		}
 		a.tools[name] = neoToolSpec{
 			Name:                   name,
 			Description:            stringValue(m["description"]),
 			InputSchema:            firstMap(m["inputSchema"], m["input_schema"], m["parameters"]),
-			Meta:                   mapValue(m["meta"]),
+			Meta:                   meta,
 			OpenAICustomToolConfig: neoOpenAICustomToolConfigFromTool(m),
 		}
 	}
@@ -12480,7 +12487,18 @@ func neoToolIncludedForMode(agentMode string, tool neoToolSpec, settings map[str
 	if deferred, _ := tool.Meta["deferred"].(bool); deferred {
 		return neoDeferredToolAllowedForMode(agentMode, tool.Name) && neoToolAllowedBySettings(tool, settings)
 	}
+	if neoToolHasExternalSource(tool) {
+		return neoToolAllowedBySettings(tool, settings)
+	}
 	return neoToolAllowedForMode(agentMode, tool.Name) && neoToolAllowedBySettings(tool, settings)
+}
+
+func neoToolHasExternalSource(tool neoToolSpec) bool {
+	source := mapValue(tool.Meta["source"])
+	if len(source) == 0 {
+		return false
+	}
+	return stringValue(source["mcp"]) != "" || stringValue(source["toolbox"]) != "" || stringValue(source["plugin"]) != ""
 }
 
 func neoApplyScaffoldToolCustomization(tools []neoToolSpec, settings map[string]any) []neoToolSpec {

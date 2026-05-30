@@ -6720,6 +6720,31 @@ func TestNeoActorFiltersAmpBuiltInToolsByMode(t *testing.T) {
 		[]string{"Grep", "glob", "Glob", "get_diagnostics", "look_at", "handoff", "task_list", "todo_write", "file_tree", "code_review", "deferred_custom", "docs_read"})
 }
 
+func TestNeoActorAllowsExternalToolsNamedLikeBuiltins(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	actor.registerTools([]any{
+		map[string]any{"name": "Bash", "source": map[string]any{"plugin": "test-plugin"}},
+		map[string]any{"name": "Read", "source": "builtin"},
+	})
+
+	source := mapValue(actor.tools["Bash"].Meta["source"])
+	if source["plugin"] != "test-plugin" {
+		t.Fatalf("top-level source was not preserved in tool meta: %#v", actor.tools["Bash"].Meta)
+	}
+
+	names := map[string]bool{}
+	for _, tool := range actor.inferenceRequestLocked("deep", "", "").Tools {
+		names[tool.Name] = true
+	}
+	if !names["Bash"] {
+		t.Fatalf("external Bash tool was filtered by built-in mode table: %#v", names)
+	}
+	if names["Read"] {
+		t.Fatalf("builtin Read tool bypassed deep mode filtering: %#v", names)
+	}
+}
+
 func TestNeoCodeReviewIsDeferredOnlyLikeBinary(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
