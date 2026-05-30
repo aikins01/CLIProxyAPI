@@ -189,7 +189,7 @@ func TestRegisterManagementRoutesServesExistingNeoThreadActorLocallyWithoutProxy
 	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
 
 	threadID := "T-019e65c0-0310-77a8-b233-4b84d9c0612c"
-	rawThread := []byte(`{"id":"` + threadID + `","title":"local resume","agentMode":"deep","messages":[{"messageId":"M-user","role":"user","content":[{"type":"text","text":"resume locally"}]}]}`)
+	rawThread := []byte(`{"id":"` + threadID + `","title":"local resume","agentMode":"deep","meta":{"usesThreadActors":true,"cliProxyAPILocalNeo":true},"messages":[{"messageId":"M-user","role":"user","content":[{"type":"text","text":"resume locally"}]}]}`)
 	if err := os.WriteFile(filepath.Join(dir, threadID+".json"), rawThread, 0o600); err != nil {
 		t.Fatalf("write local thread: %v", err)
 	}
@@ -474,7 +474,7 @@ func TestRegisterManagementRoutesServesExistingNeoThreadActorLocallyWithProxy(t 
 	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
 
 	threadID := "T-019e65c0-0310-77a8-b233-4b84d9c0612b"
-	rawThread := []byte(`{"id":"` + threadID + `","title":"deep resume","agentMode":"deep","messages":[{"messageId":"M-user","role":"user","agentMode":"deep","reasoningEffort":"xhigh","content":[{"type":"text","text":"resume this thread"}]}]}`)
+	rawThread := []byte(`{"id":"` + threadID + `","title":"deep resume","agentMode":"deep","meta":{"usesThreadActors":true,"cliProxyAPILocalNeo":true},"messages":[{"messageId":"M-user","role":"user","agentMode":"deep","reasoningEffort":"xhigh","content":[{"type":"text","text":"resume this thread"}]}]}`)
 	if err := os.WriteFile(filepath.Join(dir, threadID+".json"), rawThread, 0o600); err != nil {
 		t.Fatalf("write local thread: %v", err)
 	}
@@ -508,6 +508,95 @@ func TestRegisterManagementRoutesServesExistingNeoThreadActorLocallyWithProxy(t 
 	}
 	if response["agentMode"] != "deep" || stringValue(response["wsToken"]) == "" || stringValue(response["ownerUserId"]) != neoLocalOwnerUserID {
 		t.Fatalf("unexpected local thread actor response: %#v", response)
+	}
+}
+
+func TestRegisterManagementRoutesPassesUnmarkedLocalThreadActorUpstreamWithProxy(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	enabled := true
+
+	dir := t.TempDir()
+	oldStoreDir := neoAmpThreadStoreDir
+	neoAmpThreadStoreDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
+
+	threadID := "T-019e65c0-0310-77a8-b233-4b84d9c0612b"
+	rawThread := []byte(`{"id":"` + threadID + `","title":"unmarked local copy","agentMode":"deep","messages":[{"messageId":"M-user","role":"user","agentMode":"deep","content":[{"type":"text","text":"do not hijack"}]}]}`)
+	if err := os.WriteFile(filepath.Join(dir, threadID+".json"), rawThread, 0o600); err != nil {
+		t.Fatalf("write local thread: %v", err)
+	}
+
+	threadActorRequests := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/thread-actors/"+threadID {
+			t.Fatalf("unexpected upstream request path=%s query=%s", r.URL.Path, r.URL.RawQuery)
+		}
+		threadActorRequests++
+		writeNeoJSON(w, http.StatusOK, map[string]any{
+			"threadId":          threadID,
+			"wsToken":           "upstream-token",
+			"ownerUserId":       "upstream-user",
+			"threadVersion":     3,
+			"usesDtw":           true,
+			"usesThreadActors":  true,
+			"executorType":      "upstream",
+			"agentMode":         "deep",
+			"cloudOnlyResponse": true,
+		})
+	}))
+	defer upstream.Close()
+
+	m := &AmpModule{
+		restrictToLocalhost: false,
+		neoRuntime: newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+			UpstreamURL:    upstream.URL,
+			UpstreamAPIKey: "secret",
+			NeoLocalRuntime: config.AmpNeoLocalRuntime{
+				Enabled: &enabled,
+			},
+		}}),
+	}
+	proxy, _ := createReverseProxy(upstream.URL, NewStaticSecretSource(""))
+	m.setProxy(proxy)
+	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, nil)
+
+	localServer := httptest.NewServer(r)
+	defer localServer.Close()
+
+	req, err := http.NewRequest(http.MethodPost, localServer.URL+"/api/thread-actors/"+threadID, bytes.NewBufferString(`{}`))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Amp-Client-Application", "CLI")
+	req.Header.Set("X-Amp-Client-Type", "cli")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do request: %v", err)
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Fatalf("close response body: %v", err)
+		}
+	}()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", resp.StatusCode, string(body))
+	}
+	if threadActorRequests != 1 {
+		t.Fatalf("threadActorRequests = %d, want 1", threadActorRequests)
+	}
+	var response map[string]any
+	if err := json.Unmarshal(body, &response); err != nil {
+		t.Fatalf("response JSON error: %v", err)
+	}
+	if response["cloudOnlyResponse"] != true || stringValue(response["wsToken"]) != "upstream-token" {
+		t.Fatalf("unexpected upstream response: %#v", response)
 	}
 }
 

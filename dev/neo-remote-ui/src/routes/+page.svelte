@@ -2351,7 +2351,10 @@
       ? thread.messages.map(normalizeMessage).filter(Boolean) as NeoMessage[]
       : [];
     const env = asRecord(thread.env);
-    const agentMode = threadAgentModeFrom(thread, messages);
+    const agentMode = threadAgentModeFrom(thread, messages, { allowThreadActorFallback: false });
+    if (!agentMode) {
+      throw new Error('agent mode could not be determined from thread');
+    }
     const records = Array.isArray(thread.compactionRecords)
       ? thread.compactionRecords.map(asRecord)
       : [];
@@ -2535,16 +2538,17 @@
     return '';
   }
 
-  function threadAgentModeFrom(raw: Record<string, unknown>, messages: unknown[] = []) {
-    const settings = asRecord(raw.settings);
-    const meta = asRecord(raw.meta);
-    return normalizeAgentMode(
-      stringFrom(raw.agentMode)
-        || stringFrom(settings.agentMode)
-        || stringFrom(meta.agentMode)
-        || agentModeFromMessages(messages)
-        || defaultAgentMode
-    );
+  function threadAgentModeFrom(
+    raw: Record<string, unknown>,
+    messages: unknown[] = [],
+    options: { allowThreadActorFallback?: boolean } = {}
+  ) {
+    const mode = stringFrom(raw.agentMode) || agentModeFromMessages(messages);
+    if (mode) return normalizeAgentMode(mode);
+    if (options.allowThreadActorFallback !== false && threadCanUseLocalRuntime(raw)) {
+      return defaultAgentMode;
+    }
+    return '';
   }
 
   function normalizeMessage(raw: unknown): NeoMessage | null {

@@ -269,7 +269,7 @@ func TestLoadNeoLocalThreadRewritesAgentModeForBinaryLoader(t *testing.T) {
 	}
 }
 
-func TestLoadNeoLocalThreadWritesSmartAgentModeFallbackForBinaryLoader(t *testing.T) {
+func TestLoadNeoLocalThreadDoesNotGuessAgentModeForUnmarkedThread(t *testing.T) {
 	dir := t.TempDir()
 	oldStoreDir := neoAmpThreadStoreDir
 	neoAmpThreadStoreDir = func() string { return dir }
@@ -284,8 +284,8 @@ func TestLoadNeoLocalThreadWritesSmartAgentModeFallbackForBinaryLoader(t *testin
 	if !ok {
 		t.Fatal("loadNeoLocalThread returned false")
 	}
-	if got := stringValue(thread["agentMode"]); got != "smart" {
-		t.Fatalf("agentMode = %q, want smart", got)
+	if _, exists := thread["agentMode"]; exists {
+		t.Fatalf("agentMode was guessed for unmarked thread: %#v", thread["agentMode"])
 	}
 
 	persistedRaw, err := os.ReadFile(filepath.Join(dir, threadID+".json"))
@@ -296,8 +296,8 @@ func TestLoadNeoLocalThreadWritesSmartAgentModeFallbackForBinaryLoader(t *testin
 	if err := json.Unmarshal(persistedRaw, &persisted); err != nil {
 		t.Fatalf("decode rewritten local thread: %v", err)
 	}
-	if got := stringValue(persisted["agentMode"]); got != "smart" {
-		t.Fatalf("persisted agentMode = %q, want smart", got)
+	if _, exists := persisted["agentMode"]; exists {
+		t.Fatalf("persisted agentMode was guessed for unmarked thread: %#v", persisted["agentMode"])
 	}
 }
 
@@ -983,7 +983,7 @@ func TestNeoRuntimeGatewayThreadActorImportRoute(t *testing.T) {
 	t.Cleanup(server.Close)
 
 	threadID := "T-019e1046-656d-7132-879f-390ded941c16"
-	body := bytes.NewBufferString(`{"thread":{"id":"` + threadID + `","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}}`)
+	body := bytes.NewBufferString(`{"thread":{"id":"` + threadID + `","agentMode":"smart","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}}`)
 	req, err := http.NewRequest(http.MethodPost, server.URL+"/gateway/threadActor/request/import?rvt-method=getOrCreate&rvt-key="+url.QueryEscape(threadID), body)
 	if err != nil {
 		t.Fatalf("new import request: %v", err)
@@ -1018,6 +1018,32 @@ func TestNeoRuntimeGatewayThreadActorImportRoute(t *testing.T) {
 	actor.mu.Unlock()
 	if messageCount != 1 {
 		t.Fatalf("imported message count = %d, want 1", messageCount)
+	}
+}
+
+func TestNeoRuntimeGatewayThreadActorImportRejectsMissingAgentModeLikeBinary(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	t.Cleanup(server.Close)
+
+	threadID := "T-019e1046-656d-7132-879f-390ded941c17"
+	body := bytes.NewBufferString(`{"thread":{"id":"` + threadID + `","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}}`)
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/gateway/threadActor/request/import?rvt-method=getOrCreate&rvt-key="+url.QueryEscape(threadID), body)
+	if err != nil {
+		t.Fatalf("new import request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post import request: %v", err)
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("import status=%d body=%s", resp.StatusCode, respBody)
+	}
+	if !strings.Contains(string(respBody), "agent mode could not be determined from thread") {
+		t.Fatalf("import response missing binary-style error: %s", respBody)
 	}
 }
 
@@ -11242,7 +11268,8 @@ func TestNeoActorRestoresApprovalQueueFromBlockedToolResultOnImport(t *testing.T
 	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
 
 	if err := actor.importThreadLocalOnly(map[string]any{
-		"id": "T-test",
+		"id":        "T-test",
+		"agentMode": "smart",
 		"messages": []any{
 			map[string]any{
 				"role":            "assistant",
@@ -12221,7 +12248,7 @@ func TestNeoRuntimeThreadImportDerivesModeFromMessages(t *testing.T) {
 	}
 }
 
-func TestNeoRuntimeThreadImportDerivesModeFromMetaForBinarySwitch(t *testing.T) {
+func TestNeoRuntimeThreadImportDoesNotDeriveModeFromMetaLikeBinary(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	actor := rt.store.ensureThreadActor("T-import-meta-mode")
 	actor.currentAgentMode = "smart"
@@ -12235,14 +12262,8 @@ func TestNeoRuntimeThreadImportDerivesModeFromMetaForBinarySwitch(t *testing.T) 
 			map[string]any{"role": "user", "messageId": "M-user", "content": []any{map[string]any{"type": "text", "text": "meta carries mode"}}},
 		},
 	}
-	if err := actor.importThreadLocalOnly(thread); err != nil {
-		t.Fatalf("importThreadLocalOnly error: %v", err)
-	}
-
-	actor.mu.Lock()
-	defer actor.mu.Unlock()
-	if actor.currentAgentMode != "deep" || actor.settings["agentMode"] != "deep" || actor.currentReasoningEffort != "medium" || actor.settings["reasoning.effort"] != "medium" {
-		t.Fatalf("imported meta mode/effort = current:%q/%q settings:%#v", actor.currentAgentMode, actor.currentReasoningEffort, actor.settings)
+	if err := actor.importThreadLocalOnly(thread); err == nil || !strings.Contains(err.Error(), "agent mode could not be determined from thread") {
+		t.Fatalf("importThreadLocalOnly error = %v, want binary-style missing mode error", err)
 	}
 }
 
@@ -12278,7 +12299,7 @@ func TestNeoRuntimeThreadActorResumeKeepsImportedMode(t *testing.T) {
 	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
 
 	threadID := "T-resume-mode"
-	if err := os.WriteFile(filepath.Join(dir, threadID+".json"), []byte(`{"id":"`+threadID+`","agentMode":"deep","messages":[{"role":"user","messageId":"M-user","agentMode":"smart","reasoningEffort":"high","content":[{"type":"text","text":"keep top-level deep"}]}]}`), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, threadID+".json"), []byte(`{"id":"`+threadID+`","agentMode":"deep","meta":{"usesThreadActors":true,"cliProxyAPILocalNeo":true},"messages":[{"role":"user","messageId":"M-user","agentMode":"smart","reasoningEffort":"high","content":[{"type":"text","text":"keep top-level deep"}]}]}`), 0o600); err != nil {
 		t.Fatalf("write local thread: %v", err)
 	}
 

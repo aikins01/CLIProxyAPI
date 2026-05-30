@@ -7893,7 +7893,26 @@ func neoThreadIsCloudCached(thread map[string]any) bool {
 }
 
 func neoThreadLocalBridgeEligible(thread map[string]any) bool {
-	return neoThreadHasUsefulContent(thread) && !neoThreadIsCloudCached(thread)
+	return neoThreadHasUsefulContent(thread) && !neoThreadIsCloudCached(thread) && neoThreadHasLocalRuntimeMarker(thread)
+}
+
+func neoThreadHasLocalRuntimeMarker(thread map[string]any) bool {
+	if len(thread) == 0 {
+		return false
+	}
+	meta := mapValue(thread["meta"])
+	if boolValue(meta["usesThreadActors"]) ||
+		boolValue(meta["usesDtw"]) ||
+		boolValue(meta["ampcodeConnectorLocalNeo"]) ||
+		boolValue(meta["cliProxyAPILocalNeo"]) ||
+		boolValue(meta["ampcodeLocalRuntime"]) ||
+		strings.EqualFold(stringValue(meta["ampcodeConnectorMode"]), "local-neo") {
+		return true
+	}
+	if data := mapValue(thread["data"]); len(data) > 0 {
+		return neoThreadHasLocalRuntimeMarker(data)
+	}
+	return false
 }
 
 // neoInvalidateLocalThreadCache drops any cached parse for the thread, forcing the
@@ -7937,7 +7956,10 @@ func normalizeNeoThreadAgentMode(thread map[string]any) bool {
 			changed = true
 		}
 	}
-	mode := firstNonEmptyString(neoThreadMapAgentMode(thread), nestedString(thread["data"], "agentMode"), "smart")
+	mode := firstNonEmptyString(neoThreadMapAgentMode(thread), nestedString(thread["data"], "agentMode"))
+	if mode == "" {
+		return changed
+	}
 	if stringValue(thread["agentMode"]) != mode {
 		thread["agentMode"] = mode
 		changed = true
@@ -9575,9 +9597,9 @@ func (a *neoActor) importThreadWithSync(thread map[string]any, syncCloud bool) e
 		messages = append(messages, message)
 	}
 
-	agentMode := firstNonEmptyString(thread["agentMode"], nestedString(thread["settings"], "agentMode"), nestedString(thread["meta"], "agentMode"), neoImportedThreadAgentMode(messages))
+	agentMode := firstNonEmptyString(thread["agentMode"], neoImportedThreadAgentMode(messages))
 	if agentMode == "" {
-		agentMode = "smart"
+		return errors.New("agent mode could not be determined from thread")
 	}
 	title := stringValue(thread["title"])
 	if title == "" {
