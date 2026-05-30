@@ -264,6 +264,7 @@
     | null = null;
   let transcriptScrollScheduled = false;
   let programmaticScrollUntil = 0;
+  let programmaticScrollKind: 'follow' | 'preserve' | '' = '';
   let manualTranscriptScrollVersion = 0;
   const devSignalCount = $derived.by(() => {
     let count = artifacts.length + executorStatuses.length + runtimeEvents.length + toolLeases.length;
@@ -363,6 +364,7 @@
     const scroller = pageScroller();
     if (!scroller) return;
     programmaticScrollUntil = Date.now() + 250;
+    programmaticScrollKind = 'follow';
     scroller.scrollTo({ top: scroller.scrollHeight, behavior });
     newActivityBelow = false;
   }
@@ -371,6 +373,7 @@
     const scroller = pageScroller();
     if (!scroller) return;
     programmaticScrollUntil = Date.now() + 250;
+    programmaticScrollKind = 'preserve';
     scroller.scrollTop = Math.max(0, top);
   }
 
@@ -411,7 +414,11 @@
   }
 
   function handlePageScroll() {
-    if (Date.now() <= programmaticScrollUntil) return;
+    if (Date.now() <= programmaticScrollUntil) {
+      if (programmaticScrollKind === 'preserve') return;
+      if (programmaticScrollKind === 'follow' && isNearTranscriptBottom()) return;
+    }
+    programmaticScrollKind = '';
     manualTranscriptScrollVersion += 1;
     if (isNearTranscriptBottom()) newActivityBelow = false;
   }

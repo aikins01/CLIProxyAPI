@@ -7441,6 +7441,51 @@ func TestInferNeoOpenAIStreamFallsBackToNonStreamOnEmptyProviderVariants(t *test
 	}
 }
 
+func TestInferNeoOpenAIStreamDoesNotFallbackAfterPartialContent(t *testing.T) {
+	streamCalls := 0
+	nonStreamCalls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/provider/openai/v1/responses" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		payload := readNeoJSON(r.Body)
+		if payload["stream"] == true {
+			streamCalls++
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"partial\"}\n\n"))
+			_, _ = w.Write([]byte("event: error\ndata: {\"message\":\"stream error: stream disconnected before completion: stream closed before response.completed\"}\n\n"))
+			return
+		}
+
+		nonStreamCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"fallback text"}]}]}`))
+	}))
+	defer upstream.Close()
+
+	deltaCalls := 0
+	_, err := inferNeoLocalStream(testNeoRuntimeForServer(t, upstream), neoInferenceRequest{
+		ThreadID:        "T-test",
+		AgentMode:       "deep",
+		ReasoningEffort: "xhigh",
+		Settings:        map[string]any{"internal.model": "openai/gpt-test"},
+		History:         []neoHistoryMessage{{Role: "user", Text: "hi"}},
+	}, func(delta neoInferenceDelta) {
+		if delta.Text == "partial" {
+			deltaCalls++
+		}
+	})
+	if err == nil {
+		t.Fatal("expected partial stream error")
+	}
+	if streamCalls != 1 || nonStreamCalls != 0 {
+		t.Fatalf("streamCalls=%d nonStreamCalls=%d, want 1/0", streamCalls, nonStreamCalls)
+	}
+	if deltaCalls != 1 {
+		t.Fatalf("deltaCalls=%d, want 1 streamed delta before error", deltaCalls)
+	}
+}
+
 func TestInferNeoAnthropicStreamFallsBackToNonStreamOnEmptyPayload(t *testing.T) {
 	streamCalls := 0
 	nonStreamCalls := 0

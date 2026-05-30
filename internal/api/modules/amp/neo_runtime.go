@@ -13589,7 +13589,7 @@ func inferNeoAnthropicStream(rt *neoRuntime, request neoInferenceRequest, route 
 		err = stream(streamBody)
 	}
 	if err != nil {
-		if isNeoLocalEmptyStreamError(err) {
+		if !sawContent && isNeoLocalEmptyStreamError(err) {
 			return inferNeoAnthropic(rt, request, route)
 		}
 		return neoInferenceResult{}, err
@@ -14020,7 +14020,7 @@ func inferNeoOpenAIResponsesStream(rt *neoRuntime, request neoInferenceRequest, 
 		return nil
 	})
 	if err != nil {
-		if isNeoLocalEmptyStreamError(err) {
+		if !sawContent && isNeoLocalEmptyStreamError(err) {
 			return inferNeoOpenAI(rt, request, route)
 		}
 		return neoInferenceResult{}, err
@@ -14179,7 +14179,7 @@ func inferNeoOpenAIChatStreamProvider(rt *neoRuntime, request neoInferenceReques
 		return nil
 	}, neoOpenAICompatibleProviderHeaders(provider, request))
 	if err != nil {
-		if isNeoLocalEmptyStreamError(err) {
+		if !sawContent && isNeoLocalEmptyStreamError(err) {
 			return inferNeoOpenAI(rt, request, route)
 		}
 		return neoInferenceResult{}, err
@@ -14257,7 +14257,7 @@ func inferNeoGoogleStream(rt *neoRuntime, request neoInferenceRequest, route neo
 		return nil
 	})
 	if err != nil {
-		if isNeoLocalEmptyStreamError(err) {
+		if !sawContent && isNeoLocalEmptyStreamError(err) {
 			return inferNeoGoogle(rt, request, route)
 		}
 		return neoInferenceResult{}, err
