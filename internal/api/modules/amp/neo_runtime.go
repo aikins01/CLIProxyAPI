@@ -6725,7 +6725,7 @@ func (a *neoActor) syncLocalThreadSnapshotNow() {
 }
 
 func (a *neoActor) syncLocalThreadSnapshotForShutdownNow() {
-	snapshot, ok := a.threadSnapshot()
+	snapshot, ok := a.threadSnapshotWithOptions(true)
 	if !ok {
 		return
 	}
@@ -6761,6 +6761,10 @@ func (a *neoActor) syncCloudLoop() {
 }
 
 func (a *neoActor) threadSnapshot() (neoCloudThreadSnapshot, bool) {
+	return a.threadSnapshotWithOptions(false)
+}
+
+func (a *neoActor) threadSnapshotWithOptions(markCompactingPreflightChecked bool) (neoCloudThreadSnapshot, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -6775,6 +6779,9 @@ func (a *neoActor) threadSnapshot() (neoCloudThreadSnapshot, bool) {
 	if a.currentInference != nil {
 		clone := *a.currentInference
 		clone.tools = append([]string(nil), a.currentInference.tools...)
+		if markCompactingPreflightChecked && a.compacting {
+			clone.preflightCompactionChecked = true
+		}
 		inflight = &clone
 	}
 	var pending *neoInferenceInflight
