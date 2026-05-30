@@ -1895,7 +1895,7 @@ func (a *neoActor) handleForSocket(socket *neoSocket, msg map[string]any) any {
 			a.broadcast(payload)
 		}
 	case "executor_plugin_message":
-		a.broadcast(map[string]any{"type": "plugin_message", "message": msg["message"]})
+		a.broadcast(map[string]any{"type": "plugin_message", "message": normalizeNeoExecutorPluginMessage(msg)})
 	case "plugin_message":
 		a.handleProtocolPluginMessage(msg)
 	case "executor_artifact_upsert":
@@ -2122,6 +2122,21 @@ func (a *neoActor) handleProtocolPluginMessage(msg map[string]any) {
 		return
 	}
 	a.broadcast(map[string]any{"type": "plugin_message", "message": message})
+}
+
+func normalizeNeoExecutorPluginMessage(msg map[string]any) any {
+	rawMessage := msg["message"]
+	invocation, exists := msg["invocation"]
+	if !exists {
+		return rawMessage
+	}
+	message, ok := asMap(rawMessage)
+	if !ok {
+		return rawMessage
+	}
+	out := cloneNeoJSONMap(message)
+	out["invocation"] = cloneNeoJSONValue(invocation)
+	return out
 }
 
 func (a *neoActor) handleProtocolArtifactsSnapshot(msg map[string]any) {
@@ -20536,6 +20551,9 @@ func normalizeNeoProtocolPluginMessage(raw any) (map[string]any, bool) {
 		if params, exists := message["params"]; exists {
 			out["params"] = cloneNeoJSONValue(params)
 		}
+		if invocation, exists := message["invocation"]; exists {
+			out["invocation"] = cloneNeoJSONValue(invocation)
+		}
 		return out, true
 	case "response":
 		id := stringValue(message["id"])
@@ -20555,13 +20573,15 @@ func normalizeNeoProtocolPluginMessage(raw any) (map[string]any, bool) {
 		if event == "" {
 			return nil, false
 		}
-		data, exists := message["data"]
-		if !exists {
-			return nil, false
+		out := map[string]any{"type": "event", "event": event}
+		if data, exists := message["data"]; exists {
+			out["data"] = cloneNeoJSONValue(data)
 		}
-		out := map[string]any{"type": "event", "event": event, "data": cloneNeoJSONValue(data)}
 		if span, ok := message["span"].(string); ok {
 			out["span"] = span
+		}
+		if invocation, exists := message["invocation"]; exists {
+			out["invocation"] = cloneNeoJSONValue(invocation)
 		}
 		return out, true
 	default:

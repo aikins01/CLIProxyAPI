@@ -6047,6 +6047,110 @@ func TestHandledNeoInboundTypesCoverCurrentBinaryProtocolSwitch(t *testing.T) {
 	}
 }
 
+func TestNormalizeNeoProtocolPluginMessagePreservesInvocation(t *testing.T) {
+	message, ok := normalizeNeoProtocolPluginMessage(map[string]any{
+		"type":   "request",
+		"id":     "req-1",
+		"method": "tool.execute",
+		"params": map[string]any{
+			"name":     "code_review",
+			"threadID": "T-1",
+		},
+		"invocation": map[string]any{
+			"requestId": "parent-1",
+			"toolUseID": "toolu-1",
+		},
+	})
+	if !ok {
+		t.Fatal("plugin request did not normalize")
+	}
+	invocation, ok := message["invocation"].(map[string]any)
+	if !ok {
+		t.Fatalf("invocation = %#v, want map", message["invocation"])
+	}
+	if got := invocation["requestId"]; got != "parent-1" {
+		t.Fatalf("invocation requestId = %#v, want parent-1", got)
+	}
+	if got := invocation["toolUseID"]; got != "toolu-1" {
+		t.Fatalf("invocation toolUseID = %#v, want toolu-1", got)
+	}
+	params, ok := message["params"].(map[string]any)
+	if !ok {
+		t.Fatalf("params = %#v, want map", message["params"])
+	}
+	if got := params["name"]; got != "code_review" {
+		t.Fatalf("params name = %#v, want code_review", got)
+	}
+}
+
+func TestNormalizeNeoProtocolPluginEventPreservesInvocation(t *testing.T) {
+	message, ok := normalizeNeoProtocolPluginMessage(map[string]any{
+		"type":  "event",
+		"event": "ui.notify",
+		"data":  map[string]any{"message": "done"},
+		"invocation": map[string]any{
+			"kind": "tool",
+			"id":   "req-1",
+		},
+	})
+	if !ok {
+		t.Fatal("plugin event did not normalize")
+	}
+	invocation, ok := message["invocation"].(map[string]any)
+	if !ok {
+		t.Fatalf("event invocation = %#v, want map", message["invocation"])
+	}
+	if got := invocation["kind"]; got != "tool" {
+		t.Fatalf("event invocation kind = %#v, want tool", got)
+	}
+	if got := invocation["id"]; got != "req-1" {
+		t.Fatalf("event invocation id = %#v, want req-1", got)
+	}
+}
+
+func TestNormalizeNeoProtocolPluginEventAllowsMissingData(t *testing.T) {
+	message, ok := normalizeNeoProtocolPluginMessage(map[string]any{
+		"type":  "event",
+		"event": "plugins.ready",
+	})
+	if !ok {
+		t.Fatal("plugin event without data did not normalize")
+	}
+	if _, exists := message["data"]; exists {
+		t.Fatalf("event unexpectedly added data: %#v", message)
+	}
+}
+
+func TestNormalizeNeoExecutorPluginMessageRestoresOuterInvocation(t *testing.T) {
+	message := normalizeNeoExecutorPluginMessage(map[string]any{
+		"type": "executor_plugin_message",
+		"message": map[string]any{
+			"type":   "request",
+			"id":     "req-1",
+			"method": "tool.execute",
+			"params": map[string]any{"name": "plugin_tool"},
+		},
+		"invocation": map[string]any{
+			"requestId": "owner-1",
+		},
+	})
+	normalized, ok := message.(map[string]any)
+	if !ok {
+		t.Fatalf("normalized message = %#v, want map", message)
+	}
+	invocation, ok := normalized["invocation"].(map[string]any)
+	if !ok {
+		t.Fatalf("normalized invocation = %#v, want map", normalized["invocation"])
+	}
+	if got := invocation["requestId"]; got != "owner-1" {
+		t.Fatalf("outer invocation requestId = %#v, want owner-1", got)
+	}
+	params := mapValue(normalized["params"])
+	if got := params["name"]; got != "plugin_tool" {
+		t.Fatalf("params name = %#v, want plugin_tool", got)
+	}
+}
+
 func TestNeoExecutorStatusNormalizesLikeBinary(t *testing.T) {
 	invalid := normalizeNeoExecutorStatus(map[string]any{"type": "executor_status", "status": "not-valid"})
 	if invalid["status"] != "starting" {
