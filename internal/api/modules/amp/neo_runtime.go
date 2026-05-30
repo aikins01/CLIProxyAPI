@@ -3718,11 +3718,17 @@ func (a *neoActor) handleBinaryInferenceCompleted(msg map[string]any) {
 }
 
 func (a *neoActor) appendManualBashInvocation(msg map[string]any) {
+	args, run, hidden, hiddenSet, ok := normalizeNeoClientManualBashInvocation(msg)
+	if !ok {
+		return
+	}
 	block := map[string]any{
 		"type":    "manual_bash_invocation",
-		"args":    cloneMap(mapValue(msg["args"])),
-		"toolRun": cloneMap(firstMap(msg["toolRun"], msg["run"])),
-		"hidden":  boolValue(msg["hidden"]),
+		"args":    args,
+		"toolRun": run,
+	}
+	if hiddenSet {
+		block["hidden"] = hidden
 	}
 	message := neoMessage{
 		ThreadID:  a.threadID,
@@ -3740,6 +3746,59 @@ func (a *neoActor) appendManualBashInvocation(msg map[string]any) {
 
 	a.broadcast(event)
 	a.syncCloudAsync()
+}
+
+func normalizeNeoClientManualBashInvocation(msg map[string]any) (map[string]any, map[string]any, bool, bool, bool) {
+	args := mapValue(msg["args"])
+	cmd, ok := args["cmd"].(string)
+	if !ok {
+		return nil, nil, false, false, false
+	}
+	cmd = strings.TrimSpace(cmd)
+	if cmd == "" {
+		return nil, nil, false, false, false
+	}
+	argsOut := map[string]any{"cmd": cmd}
+	if rawArgs, exists := args["args"]; exists {
+		items := arrayValue(rawArgs)
+		if items == nil {
+			return nil, nil, false, false, false
+		}
+		values := make([]any, 0, len(items))
+		for _, item := range items {
+			value, ok := item.(string)
+			if !ok {
+				return nil, nil, false, false, false
+			}
+			values = append(values, value)
+		}
+		argsOut["args"] = values
+	}
+	if rawCWD, exists := args["cwd"]; exists {
+		cwd, ok := rawCWD.(string)
+		if !ok {
+			return nil, nil, false, false, false
+		}
+		argsOut["cwd"] = cwd
+	}
+	run := firstMap(msg["run"], msg["toolRun"])
+	if len(run) == 0 {
+		return nil, nil, false, false, false
+	}
+	if _, ok := run["status"].(string); !ok {
+		return nil, nil, false, false, false
+	}
+	hidden := false
+	hiddenSet := false
+	if rawHidden, exists := msg["hidden"]; exists {
+		value, ok := rawHidden.(bool)
+		if !ok {
+			return nil, nil, false, false, false
+		}
+		hidden = value
+		hiddenSet = true
+	}
+	return argsOut, cloneNeoJSONMap(run), hidden, hiddenSet, true
 }
 
 func (a *neoActor) appendBinaryManualBashInvocation(msg map[string]any) {

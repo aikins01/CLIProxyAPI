@@ -6546,7 +6546,7 @@ func TestNeoActorManualBashInvocationUsesBinarySchema(t *testing.T) {
 
 	actor.handle(map[string]any{
 		"type":   "client_append_manual_bash_invocation",
-		"args":   map[string]any{"cmd": "git", "args": []any{"status"}},
+		"args":   map[string]any{"cmd": " git ", "args": []any{"status"}, "cwd": "/tmp/work"},
 		"run":    map[string]any{"status": "done", "result": "clean"},
 		"hidden": true,
 	})
@@ -6564,8 +6564,75 @@ func TestNeoActorManualBashInvocationUsesBinarySchema(t *testing.T) {
 	if stringValue(block["type"]) != "manual_bash_invocation" || stringValue(mapValue(block["args"])["cmd"]) != "git" || stringValue(mapValue(block["toolRun"])["result"]) != "clean" {
 		t.Fatalf("manual bash block = %#v", block)
 	}
+	if got := stringValue(mapValue(block["args"])["cwd"]); got != "/tmp/work" {
+		t.Fatalf("manual bash cwd = %q", got)
+	}
 	if _, exists := block["run"]; exists {
 		t.Fatalf("manual bash block should use toolRun, not run: %#v", block)
+	}
+}
+
+func TestNeoActorManualBashInvocationRejectsInvalidClientPayloadLikeBinary(t *testing.T) {
+	cases := []struct {
+		name string
+		msg  map[string]any
+	}{
+		{
+			name: "blank cmd",
+			msg: map[string]any{
+				"type": "client_append_manual_bash_invocation",
+				"args": map[string]any{"cmd": " \t "},
+				"run":  map[string]any{"status": "done"},
+			},
+		},
+		{
+			name: "non string arg",
+			msg: map[string]any{
+				"type": "client_append_manual_bash_invocation",
+				"args": map[string]any{"cmd": "git", "args": []any{"status", 1}},
+				"run":  map[string]any{"status": "done"},
+			},
+		},
+		{
+			name: "non string cwd",
+			msg: map[string]any{
+				"type": "client_append_manual_bash_invocation",
+				"args": map[string]any{"cmd": "git", "cwd": 123},
+				"run":  map[string]any{"status": "done"},
+			},
+		},
+		{
+			name: "missing run status",
+			msg: map[string]any{
+				"type": "client_append_manual_bash_invocation",
+				"args": map[string]any{"cmd": "git"},
+				"run":  map[string]any{"result": "clean"},
+			},
+		},
+		{
+			name: "non boolean hidden",
+			msg: map[string]any{
+				"type":   "client_append_manual_bash_invocation",
+				"args":   map[string]any{"cmd": "git"},
+				"run":    map[string]any{"status": "done"},
+				"hidden": "yes",
+			},
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			rt := newNeoRuntime(&config.Config{})
+			actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+
+			actor.handle(tt.msg)
+
+			actor.mu.Lock()
+			defer actor.mu.Unlock()
+			if len(actor.messages) != 0 {
+				t.Fatalf("invalid manual bash payload was stored: %#v", actor.messages)
+			}
+		})
 	}
 }
 
