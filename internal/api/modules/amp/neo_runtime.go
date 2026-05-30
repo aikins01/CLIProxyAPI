@@ -5713,11 +5713,11 @@ func (a *neoActor) maybeCompactBeforeInference(agentMode, reasoningEffort, paren
 	a.rememberReplayEventLocked(addedEvent)
 	a.mu.Unlock()
 
+	a.syncLocalThreadSnapshotNow()
 	a.broadcast(addedEvent)
 	a.broadcast(neoProtocolCompactionCompletePayload(cutMessageID))
 	a.broadcast(map[string]any{"type": "compaction_records", "records": neoProtocolCompactionRecordList(records)})
 	a.dispatchNotification("thread", "compaction_complete", map[string]any{"cutMessageId": cutMessageID})
-	a.syncLocalThreadSnapshotNow()
 	a.syncCloudAsync()
 }
 
