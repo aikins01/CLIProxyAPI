@@ -14240,7 +14240,7 @@ func neoBuiltinDeferredToolSpec(name string) neoToolSpec {
 func neoCodeReviewToolSpec() neoToolSpec {
 	return neoToolSpec{
 		Name:        "code_review",
-		Description: "Review code changes, diffs, outstanding changes, or modified files. Use when asked to review changes, check code quality, analyze uncommitted work, or perform a code review.\nIt takes in a description of the diff or code change that can be used to generate the full diff, which is then reviewed.\nPass \"thinking\": \"high\" for a thorough review with high reasoning depth. Defaults to \"low\" for a faster review.",
+		Description: "Review code changes, diffs, outstanding changes, or modified files. Use when asked to review changes, check code quality, analyze uncommitted work, or perform a code review.\n\nIt takes in a description of the diff or code change that can be used to generate the full diff, which is then reviewed. When using this tool, do not invoke `git diff` or any other tool to generate the diff but just pass a natural language description of how to compute the diff in the diff_description argument.\n\nPass \"thinking\": \"high\" for a thorough review with high reasoning depth. Defaults to \"low\" for a faster review.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{

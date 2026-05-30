@@ -8217,13 +8217,10 @@ func TestNeoLoadedCodeReviewSkillAddsBuiltinDeferredToolLikeBinary(t *testing.T)
 	if _, ok := codeReview.InputSchema["properties"].(map[string]any); !ok {
 		t.Fatalf("code_review input schema missing properties: %#v", codeReview.InputSchema)
 	}
-	for _, want := range []string{"It takes in a description of the diff", `Pass "thinking": "high"`, `Defaults to "low" for a faster review.`} {
+	for _, want := range []string{"It takes in a description of the diff", "do not invoke `git diff`", `Pass "thinking": "high"`, `Defaults to "low" for a faster review.`} {
 		if !strings.Contains(codeReview.Description, want) {
 			t.Fatalf("code_review description missing %q: %s", want, codeReview.Description)
 		}
-	}
-	if strings.Contains(codeReview.Description, "do not invoke `git diff`") {
-		t.Fatalf("code_review description drifted from binary: %s", codeReview.Description)
 	}
 
 	names := map[string]bool{}
