@@ -439,6 +439,9 @@
   }
 
   function handlePageScroll() {
+    if (transcriptScrollScheduled && transcriptScrollPlan?.kind === 'preserve') {
+      return;
+    }
     if (Date.now() <= programmaticScrollUntil) {
       if (programmaticScrollKind === 'preserve') return;
       if (programmaticScrollKind === 'follow' && isTranscriptPinnedToBottom()) return;
