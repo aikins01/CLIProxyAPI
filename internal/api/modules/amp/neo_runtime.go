@@ -6081,6 +6081,8 @@ func normalizeNeoExecutorToolRun(ctx context.Context, rt *neoRuntime, pending ne
 	case "painter", "render_agg_man", "view_media", "look_at":
 		return normalizeNeoImageToolRun(pending, run)
 	default:
+		// Thread reader/search tools are Amp-owned: the local runtime only leases
+		// them to the executor and records the executor's result unchanged.
 		return run
 	}
 }

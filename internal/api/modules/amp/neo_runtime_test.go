@@ -8163,6 +8163,51 @@ func TestNeoActorQueuesSteeredUserMessageAhead(t *testing.T) {
 	}
 }
 
+func TestNeoActorLeasesThreadToolsInsteadOfServingLocalSnapshots(t *testing.T) {
+	dir := t.TempDir()
+	oldStoreDir := neoAmpThreadStoreDir
+	neoAmpThreadStoreDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
+
+	currentThreadID := "T-019e65c0-0310-77a8-b233-4b84d9c0612f"
+	targetThreadID := "T-019e65c0-0310-77a8-b233-4b84d9c06130"
+	rawThread := []byte(`{"id":"` + targetThreadID + `","title":"local target","messages":[{"messageId":"M-local","role":"user","content":[{"type":"text","text":"local thread content must not be served"}]}]}`)
+	if err := os.WriteFile(filepath.Join(dir, targetThreadID+".json"), rawThread, 0o600); err != nil {
+		t.Fatalf("write local thread: %v", err)
+	}
+
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", currentThreadID, currentThreadID, neoActorRecord("actor-test", "thread-actor", currentThreadID), nil)
+	actor.finishAssistantMessage("M-assistant", neoInferenceResult{
+		ToolCalls: []neoToolCall{
+			{ID: "TU-read", Name: "read_thread", Input: map[string]any{"threadID": targetThreadID}},
+			{ID: "TU-find", Name: "find_thread", Input: map[string]any{"query": "local target"}},
+		},
+	}, "deep", "xhigh")
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.pendingTools) != 2 {
+		t.Fatalf("pending tools = %#v, want read_thread and find_thread leases", actor.pendingTools)
+	}
+	for _, toolID := range []string{"TU-read", "TU-find"} {
+		if _, ok := actor.pendingTools[toolID]; !ok {
+			t.Fatalf("missing pending thread tool lease %s: %#v", toolID, actor.pendingTools)
+		}
+	}
+	for _, message := range actor.messages {
+		if message.Role != "user" {
+			continue
+		}
+		for _, raw := range message.Content {
+			block := mapValue(raw)
+			if stringValue(block["type"]) == "tool_result" {
+				t.Fatalf("thread tool was served locally instead of leased: %#v", message)
+			}
+		}
+	}
+}
+
 func TestNeoActorPassesReadThreadToolResultThrough(t *testing.T) {
 	dir := t.TempDir()
 	oldStoreDir := neoAmpThreadStoreDir
