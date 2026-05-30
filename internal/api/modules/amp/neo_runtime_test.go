@@ -2418,7 +2418,16 @@ func dialNeoActorWebSocket(t *testing.T, serverURL, threadID string) *websocket.
 	t.Helper()
 	dialer := websocket.Dialer{Subprotocols: []string{"rivet", "rivet_encoding.4", "rivet_skip_ready_wait"}}
 	wsURL := "ws" + strings.TrimPrefix(serverURL, "http") + "/gateway/threadActor/?rvt-method=getOrCreate&rvt-key=" + url.QueryEscape(threadID)
-	conn, resp, err := dialer.Dial(wsURL, nil)
+	var conn *websocket.Conn
+	var resp *http.Response
+	var err error
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+		conn, resp, err = dialer.Dial(wsURL, nil)
+		if err == nil {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
 	if err != nil {
 		status := 0
 		if resp != nil {
