@@ -7028,6 +7028,15 @@ func (a *neoActor) receiveToolResult(msg map[string]any) {
 	a.mu.Unlock()
 
 	run = normalizeNeoExecutorToolRun(context.Background(), a.runtime, pending, run, a.threadID)
+	if normalizedRun, guidanceFiles := neoExtractGuidanceFromToolRun(run); len(guidanceFiles) > 0 {
+		run = normalizedRun
+		a.updateGuidanceSnapshot(map[string]any{
+			"type":       "executor_guidance_discovery",
+			"toolCallId": toolCallID,
+			"files":      guidanceFiles,
+			"isLast":     true,
+		})
+	}
 
 	a.mu.Lock()
 	_, event := a.storeMessageEventLocked(neoMessage{
@@ -7077,6 +7086,25 @@ func normalizeNeoExecutorToolRun(ctx context.Context, rt *neoRuntime, pending ne
 		// them to the executor and records the executor's result unchanged.
 		return run
 	}
+}
+
+func neoExtractGuidanceFromToolRun(run map[string]any) (map[string]any, []any) {
+	if stringValue(run["status"]) != "done" {
+		return run, nil
+	}
+	result, ok := asMap(run["result"])
+	if !ok {
+		return run, nil
+	}
+	files := arrayValue(result["discoveredGuidanceFiles"])
+	if len(files) == 0 {
+		return run, nil
+	}
+	normalizedRun := cloneNeoJSONMap(run)
+	normalizedResult := cloneNeoJSONMap(result)
+	delete(normalizedResult, "discoveredGuidanceFiles")
+	normalizedRun["result"] = normalizedResult
+	return normalizedRun, cloneNeoJSONArray(files)
 }
 
 func normalizeNeoImageToolRun(pending neoPendingTool, run map[string]any) map[string]any {

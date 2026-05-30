@@ -14409,7 +14409,7 @@ func TestNeoActorToolResultAcceptsToolRunAlias(t *testing.T) {
 	}
 }
 
-func TestNeoToolResultPreservesDiscoveredGuidanceFiles(t *testing.T) {
+func TestNeoToolResultExtractsDiscoveredGuidanceFiles(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
 	actor.pendingTools["TU-guidance"] = neoPendingTool{ID: "TU-guidance", Name: "Read", AgentMode: "rush", MessageID: "M-assistant"}
@@ -14436,8 +14436,22 @@ func TestNeoToolResultPreservesDiscoveredGuidanceFiles(t *testing.T) {
 	}
 	run := mapValue(mapValue(actor.messages[0].Content[0])["run"])
 	result := mapValue(run["result"])
-	if files := arrayValue(result["discoveredGuidanceFiles"]); len(files) != 1 {
-		t.Fatalf("discoveredGuidanceFiles = %#v, want preserved", result["discoveredGuidanceFiles"])
+	if _, exists := result["discoveredGuidanceFiles"]; exists {
+		t.Fatalf("discoveredGuidanceFiles should be stripped from stored tool result: %#v", result)
+	}
+	if got := stringValue(result["output"]); got != "read complete" {
+		t.Fatalf("tool result output = %q, want read complete", got)
+	}
+	if strings.Contains(runToText(run), "discoveredGuidanceFiles") || strings.Contains(runToText(run), "guidance") {
+		t.Fatalf("tool history text leaked discovered guidance files: %s", runToText(run))
+	}
+	files := arrayValue(actor.guidanceSnapshot["files"])
+	if len(files) != 1 {
+		t.Fatalf("guidance files = %#v, want extracted file", files)
+	}
+	file := mapValue(files[0])
+	if stringValue(file["uri"]) != "file:///tmp/project/AGENTS.md" || stringValue(file["content"]) != "guidance" {
+		t.Fatalf("extracted guidance file = %#v", file)
 	}
 }
 
