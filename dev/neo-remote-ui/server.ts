@@ -9,7 +9,7 @@ const host = process.env.HOST || '0.0.0.0';
 const port = Number(process.env.PORT || 3000);
 const runtimeUpstream = process.env.CLIPROXY_UPSTREAM || '';
 const publicScheme = process.env.PUBLIC_SCHEME || 'https';
-const runtimePrefixes = ['/api', '/threads', '/gateway', '/actors'];
+const runtimePrefixes = ['/api', '/threads', '/gateway', '/actors', '/metadata'];
 const { handler } = (await import(new URL('./build/handler.js', import.meta.url).href)) as { handler: AppHandler };
 
 function shouldProxyRuntime(url = '') {
