@@ -7856,6 +7856,71 @@ func TestNeoCodeReviewIsDeferredOnlyLikeBinary(t *testing.T) {
 	}
 }
 
+func TestNeoLoadedCodeReviewSkillAddsBuiltinDeferredToolLikeBinary(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	actor.tools = map[string]neoToolSpec{
+		"skill":         {Name: "skill"},
+		"shell_command": {Name: "shell_command"},
+	}
+	actor.history = []neoHistoryMessage{{
+		Role:     "tool",
+		ToolName: "skill",
+		Text:     `<loaded_skill name="code-review"><skill_tools><tool name="code_review"></tool></skill_tools></loaded_skill>`,
+	}}
+
+	request := actor.inferenceRequestLocked("deep", "", "")
+	tools := map[string]neoToolSpec{}
+	for _, tool := range request.Tools {
+		tools[tool.Name] = tool
+	}
+	codeReview, ok := tools["code_review"]
+	if !ok {
+		t.Fatalf("loaded code-review skill did not add code_review tool: %#v", tools)
+	}
+	if deferred, _ := codeReview.Meta["deferred"].(bool); !deferred {
+		t.Fatalf("code_review meta = %#v, want deferred", codeReview.Meta)
+	}
+	if got := stringValue(codeReview.Meta["source"]); got != "builtin" {
+		t.Fatalf("code_review source = %q, want builtin", got)
+	}
+	if _, ok := codeReview.InputSchema["properties"].(map[string]any); !ok {
+		t.Fatalf("code_review input schema missing properties: %#v", codeReview.InputSchema)
+	}
+
+	names := map[string]bool{}
+	for _, name := range actor.toolNamesLocked("deep") {
+		names[name] = true
+	}
+	if !names["code_review"] {
+		t.Fatalf("inference tool names missing synthesized code_review: %#v", names)
+	}
+}
+
+func TestNeoCodeReviewSkillMustBeLoadedBeforeBuiltinToolAppears(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	actor.tools = map[string]neoToolSpec{
+		"skill": {Name: "skill", Meta: map[string]any{"skillNames": []any{"code-review"}}},
+	}
+	actor.capabilities["skills"] = []any{map[string]any{"name": "code-review", "description": "Review code"}}
+
+	for _, tool := range actor.inferenceRequestLocked("deep", "", "").Tools {
+		if tool.Name == "code_review" {
+			t.Fatalf("code_review appeared before the code-review skill was loaded: %#v", actor.inferenceRequestLocked("deep", "", "").Tools)
+		}
+	}
+
+	actor.history = []neoHistoryMessage{{Role: "tool", ToolName: "skill", Text: "<skill><name>code-review</name></skill>"}}
+	found := false
+	for _, tool := range actor.inferenceRequestLocked("deep", "", "").Tools {
+		found = found || tool.Name == "code_review"
+	}
+	if !found {
+		t.Fatal("deep skill loaded form did not add code_review")
+	}
+}
+
 func TestNeoActorAppliesScaffoldToolCustomization(t *testing.T) {
 	useTempNeoThreadStore(t)
 	path := filepath.Join(t.TempDir(), "scaffold.yaml")

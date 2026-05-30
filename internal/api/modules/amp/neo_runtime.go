@@ -106,6 +106,9 @@ var (
 	neoUUIDExactPattern           = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 	neoGitHashPattern             = regexp.MustCompile(`^[0-9a-fA-F]{7,64}$`)
 	neoMCPServerPattern           = regexp.MustCompile(`[\s-]+`)
+	neoLoadedSkillNamePattern     = regexp.MustCompile(`(?is)<loaded_skill\s+name=["']([^"']+)["'][^>]*>`)
+	neoDeepSkillNamePattern       = regexp.MustCompile(`(?is)<skill>\s*<name>\s*([^<]+?)\s*</name>`)
+	neoPlainLoadedSkillPattern    = regexp.MustCompile(`(?im)^Loaded skill:\s*([A-Za-z0-9_.-]+)\s*$`)
 	neoAmpThreadStoreDir          = defaultNeoAmpThreadStoreDir
 	neoAmpTaskStoreMu             sync.Mutex
 	neoInboundMessageHookMu       sync.RWMutex
@@ -133,6 +136,9 @@ var (
 		"slack_write", "slack_read", "github_repo_ci_status", "read_github", "search_github", "commit_search",
 		"list_directory_github", "list_repositories", "glob_github", "diff",
 	)
+	neoLoadedSkillBuiltinTools = map[string]string{
+		"code_review": "code-review",
+	}
 )
 
 type neoRuntime struct {
@@ -10102,13 +10108,7 @@ func sortedMapKeys(m map[string]any) []string {
 
 func (a *neoActor) inferenceRequestLocked(agentMode, reasoningEffort, parentToolCallID string) neoInferenceRequest {
 	history := scopedNeoHistory(a.history, parentToolCallID)
-	tools := make([]neoToolSpec, 0, len(a.tools))
-	for _, tool := range a.tools {
-		if !neoToolIncludedForMode(agentMode, tool, a.settings) {
-			continue
-		}
-		tools = append(tools, tool)
-	}
+	tools := a.toolsForModeLocked(agentMode, history)
 	sort.Slice(tools, func(i, j int) bool { return tools[i].Name < tools[j].Name })
 	tools = neoApplyScaffoldToolCustomization(tools, a.settings)
 	environment := cloneMap(a.environment)
@@ -10139,6 +10139,73 @@ func scopedNeoHistory(history []neoHistoryMessage, parentToolCallID string) []ne
 		}
 	}
 	return out
+}
+
+func (a *neoActor) toolsForModeLocked(agentMode string, history []neoHistoryMessage) []neoToolSpec {
+	tools := make([]neoToolSpec, 0, len(a.tools)+len(neoLoadedSkillBuiltinTools))
+	seen := map[string]bool{}
+	for _, tool := range a.tools {
+		if !neoToolIncludedForMode(agentMode, tool, a.settings) {
+			continue
+		}
+		tools = append(tools, tool)
+		seen[tool.Name] = true
+	}
+	loadedSkills := neoLoadedSkillNamesFromHistory(history)
+	if len(loadedSkills) == 0 {
+		return tools
+	}
+	for toolName, skillName := range neoLoadedSkillBuiltinTools {
+		if !loadedSkills[skillName] || seen[toolName] {
+			continue
+		}
+		tool := neoBuiltinDeferredToolSpec(toolName)
+		if !neoToolIncludedForMode(agentMode, tool, a.settings) {
+			continue
+		}
+		tools = append(tools, tool)
+		seen[toolName] = true
+	}
+	return tools
+}
+
+func neoLoadedSkillNamesFromHistory(history []neoHistoryMessage) map[string]bool {
+	loaded := map[string]bool{}
+	for _, message := range history {
+		if message.Role != "tool" {
+			continue
+		}
+		if message.ToolName != "" && message.ToolName != neoSkillToolName {
+			continue
+		}
+		neoAddLoadedSkillNames(loaded, message.Text)
+		for _, block := range message.Content {
+			text := stringValue(mapValue(block)["text"])
+			neoAddLoadedSkillNames(loaded, text)
+		}
+	}
+	return loaded
+}
+
+func neoAddLoadedSkillNames(loaded map[string]bool, text string) {
+	if strings.TrimSpace(text) == "" {
+		return
+	}
+	for _, match := range neoLoadedSkillNamePattern.FindAllStringSubmatch(text, -1) {
+		if name := strings.TrimSpace(match[1]); name != "" {
+			loaded[name] = true
+		}
+	}
+	for _, match := range neoDeepSkillNamePattern.FindAllStringSubmatch(text, -1) {
+		if name := strings.TrimSpace(match[1]); name != "" {
+			loaded[name] = true
+		}
+	}
+	for _, match := range neoPlainLoadedSkillPattern.FindAllStringSubmatch(text, -1) {
+		if name := strings.TrimSpace(match[1]); name != "" {
+			loaded[name] = true
+		}
+	}
 }
 
 // stateSnapshotResponse builds a JSON-serializable snapshot of actor state
@@ -13951,6 +14018,64 @@ func neoToolHasExternalSource(tool neoToolSpec) bool {
 	return stringValue(source["mcp"]) != "" || stringValue(source["toolbox"]) != "" || stringValue(source["plugin"]) != ""
 }
 
+func neoBuiltinDeferredToolSpec(name string) neoToolSpec {
+	switch name {
+	case "code_review":
+		return neoCodeReviewToolSpec()
+	default:
+		return neoToolSpec{Name: name, Meta: map[string]any{"source": "builtin", "deferred": true}}
+	}
+}
+
+func neoCodeReviewToolSpec() neoToolSpec {
+	return neoToolSpec{
+		Name:        "code_review",
+		Description: "Review code changes, diffs, outstanding changes, or modified files. Use when asked to review changes, check code quality, analyze uncommitted work, or perform a code review.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"diff_description": map[string]any{
+					"type":        "string",
+					"description": "A description of the diff or code change that can be used to generate the full diff. This can include a git or bash command to generate the diff or a description of the diff which can then be used to generate the git or bash command to generate the full diff.",
+				},
+				"files": map[string]any{
+					"type":        "array",
+					"items":       map[string]any{"type": "string"},
+					"description": "Specific files to focus the review on. If empty, all changed files covered by the diff description are reviewed.",
+				},
+				"instructions": map[string]any{
+					"type":        "string",
+					"description": "Additional instructions to guide the review agent.",
+				},
+				"checkScope": map[string]any{
+					"type":        "string",
+					"description": "A directory to search for checks. If empty, includes all checks.",
+				},
+				"checkFilter": map[string]any{
+					"type":        "array",
+					"items":       map[string]any{"type": "string"},
+					"description": "A list of specific check names to run. If empty, includes all checks in scope.",
+				},
+				"checksOnly": map[string]any{
+					"type":        "boolean",
+					"description": "If true, skips the main review agent and only runs checks.",
+				},
+				"thinking": map[string]any{
+					"type":        "string",
+					"enum":        []any{"low", "high"},
+					"description": "Controls review depth. \"low\" (default) performs a faster review with less reasoning depth. \"high\" performs a thorough review with high reasoning.",
+				},
+			},
+			"required": []any{"diff_description"},
+		},
+		Meta: map[string]any{
+			"source":     "builtin",
+			"deferred":   true,
+			"skillNames": []any{"code-review"},
+		},
+	}
+}
+
 func neoApplyScaffoldToolCustomization(tools []neoToolSpec, settings map[string]any) []neoToolSpec {
 	custom := neoLoadScaffoldCustomization(settings, false, nil, nil)
 	if custom == nil {
@@ -14224,11 +14349,9 @@ func neoSplitBraceAlternatives(value string) []string {
 }
 
 func (a *neoActor) toolNamesLocked(agentMode string) []string {
-	names := make([]string, 0, len(a.tools))
-	for _, tool := range a.tools {
-		if !neoToolIncludedForMode(agentMode, tool, a.settings) {
-			continue
-		}
+	tools := a.toolsForModeLocked(agentMode, a.history)
+	names := make([]string, 0, len(tools))
+	for _, tool := range tools {
 		names = append(names, tool.Name)
 	}
 	sort.Strings(names)
