@@ -6575,12 +6575,17 @@ func (a *neoActor) maybeCompactBeforeInference(agentMode, reasoningEffort, paren
 	settings := cloneMap(a.settings)
 	compactionMessagesWindow, compactionOffset := neoCompactionWindow(a.messages, a.compactionRecords)
 	inferenceRoute := applyNeoModelMapping(a.runtime, selectNeoModelRoute(agentMode, settings))
+	request := a.inferenceRequestLocked(agentMode, reasoningEffort, parentToolCallID)
+	estimatedInputTokens := neoEstimateInferenceInputTokens(request, inferenceRoute)
+	if messageTokens := neoEstimateMessageTokens(compactionMessagesWindow); messageTokens > estimatedInputTokens {
+		estimatedInputTokens = messageTokens
+	}
 	maxInput := neoEffectiveMaxInputTokens(agentMode, inferenceRoute.Model)
 	if maxInput <= 0 {
 		maxInput = neoCompactionFallbackMaxInput
 	}
 	thresholdPercent := neoCompactionThresholdPercent(settings)
-	if !neoCompactionShouldRun(compactionMessagesWindow, maxInput, thresholdPercent) {
+	if !neoCompactionShouldRunForTokens(compactionMessagesWindow, estimatedInputTokens, maxInput, thresholdPercent) {
 		a.mu.Unlock()
 		return
 	}
@@ -6591,7 +6596,7 @@ func (a *neoActor) maybeCompactBeforeInference(agentMode, reasoningEffort, paren
 		return
 	}
 	cutMessageID := a.messages[cutIndex].MessageID
-	compactionMessages := cloneNeoMessages(a.messages)
+	compactionMessages := cloneNeoMessages(compactionMessagesWindow)
 	threadID := a.threadID
 	a.compacting = true
 	a.mu.Unlock()
@@ -6672,6 +6677,10 @@ func (a *neoActor) markCurrentInferencePreflightChecked(generation int, messageI
 }
 
 func neoCompactionShouldRun(messages []neoMessage, maxInputTokens int, thresholdPercent float64) bool {
+	return neoCompactionShouldRunForTokens(messages, neoEstimateMessageTokens(messages), maxInputTokens, thresholdPercent)
+}
+
+func neoCompactionShouldRunForTokens(messages []neoMessage, estimatedInputTokens, maxInputTokens int, thresholdPercent float64) bool {
 	if len(messages) < neoCompactionMinMessages {
 		return false
 	}
@@ -6685,7 +6694,7 @@ func neoCompactionShouldRun(messages []neoMessage, maxInputTokens int, threshold
 		thresholdPercent = 100
 	}
 	threshold := float64(maxInputTokens) * thresholdPercent / 100
-	return float64(neoEstimateMessageTokens(messages)) >= threshold
+	return float64(estimatedInputTokens) >= threshold
 }
 
 func neoCompactionThresholdPercent(settings map[string]any) float64 {
@@ -10413,6 +10422,29 @@ func neoContextAnalysisHistoryRole(role string) string {
 	}
 }
 
+func neoEstimateInferenceInputTokens(request neoInferenceRequest, route neoModelRoute) int {
+	tokens := neoEstimateTextTokens(neoSystemPrompt(request, route))
+	for _, message := range request.History {
+		tokens += neoEstimateJSONTokens(message)
+	}
+	tokens += neoEstimateToolsTokens(route, request.Tools)
+	return tokens
+}
+
+func neoEstimateToolsTokens(route neoModelRoute, tools []neoToolSpec) int {
+	if len(tools) == 0 {
+		return 0
+	}
+	switch route.Provider {
+	case "openai", "xai", "cerebras", "fireworks", "baseten", "moonshotai", "openrouter", "groq":
+		return neoEstimateJSONTokens(openAINeoTools(tools))
+	case "google":
+		return neoEstimateJSONTokens(googleNeoTools(tools))
+	default:
+		return neoEstimateJSONTokens(anthropicNeoTools(tools))
+	}
+}
+
 func neoContextAnalysisToolsSection(tools []neoToolSpec, route neoModelRoute, maxContextTokens int) map[string]any {
 	if len(tools) == 0 {
 		return nil
@@ -10421,15 +10453,7 @@ func neoContextAnalysisToolsSection(tools []neoToolSpec, route neoModelRoute, ma
 	for _, tool := range tools {
 		children = append(children, neoContextAnalysisSection(tool.Name, neoEstimateJSONTokens(tool), maxContextTokens, nil))
 	}
-	tokens := 0
-	switch route.Provider {
-	case "openai", "xai", "cerebras", "fireworks", "baseten", "moonshotai", "openrouter", "groq":
-		tokens = neoEstimateJSONTokens(openAINeoTools(tools))
-	case "google":
-		tokens = neoEstimateJSONTokens(googleNeoTools(tools))
-	default:
-		tokens = neoEstimateJSONTokens(anthropicNeoTools(tools))
-	}
+	tokens := neoEstimateToolsTokens(route, tools)
 	return neoContextAnalysisSection("Tools", tokens, maxContextTokens, children)
 }
 
@@ -13748,25 +13772,33 @@ func (a *neoActor) toolResultRunLocked(toolCallID string) (map[string]any, any) 
 }
 
 func (a *neoActor) rebuildHistoryLocked() {
+	a.history = neoHistoryFromStoredMessages(a.messages, a.compactionRecords)
+}
+
+func neoHistoryFromStoredMessages(messages []neoMessage, records []map[string]any) []neoHistoryMessage {
 	toolNames := map[string]string{}
-	messages := a.messages
 	// honor compaction: if a summary block exists in an info message, truncate
 	// the prior history and replace it with a synthetic assistant message
-	// containing the summary text. mirrors the Amp binary's Mb()/x6 logic.
-	if cutIndex, summaryText, ok := neoCompactionSummary(messages); ok {
+	// containing the summary text. otherwise, use the latest compaction record
+	// cut message as the boundary, matching the binary transcript rebuild.
+	recordIndex, recordOK := neoLatestCompactionRecordMessageIndex(messages, records)
+	if cutIndex, summaryText, ok := neoCompactionSummary(messages); ok && (!recordOK || recordIndex <= cutIndex+1) {
 		history := make([]neoHistoryMessage, 0, len(messages)-cutIndex+1)
 		history = append(history, neoHistoryMessage{Role: "assistant", Text: summaryText})
 		for _, message := range messages[cutIndex+1:] {
 			history = append(history, neoHistoryMessageFromStored(message, toolNames)...)
 		}
-		a.history = history
-		return
+		return history
 	}
-	history := make([]neoHistoryMessage, 0, len(messages))
-	for _, message := range messages {
+	start := 0
+	if recordOK {
+		start = recordIndex
+	}
+	history := make([]neoHistoryMessage, 0, len(messages)-start)
+	for _, message := range messages[start:] {
 		history = append(history, neoHistoryMessageFromStored(message, toolNames)...)
 	}
-	a.history = history
+	return history
 }
 
 // neoCompactionSummary returns the index of the most recent info message that

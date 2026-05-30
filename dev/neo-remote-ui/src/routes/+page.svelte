@@ -974,7 +974,8 @@
     const params = new URLSearchParams({
       'rvt-method': 'getOrCreate',
       'rvt-key': threadId,
-      'rvt-skip-ready-wait': 'true'
+      'rvt-skip-ready-wait': 'true',
+      'cliproxy-client': 'neo-remote-ui'
     });
     if (options.bootstrapExecutor) {
       params.set('rvt-input', encodeGatewayInput({

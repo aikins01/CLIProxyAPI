@@ -423,6 +423,186 @@ func TestRegisterManagementRoutesNeoRuntimeBridgeUsesManagementAuth(t *testing.T
 	}
 }
 
+func TestRegisterManagementRoutesProxiesNeoRuntimeBridgeWhenRuntimeDisabled(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	upstreamRequests := 0
+	seenPaths := map[string]int{}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequests++
+		seenPaths[r.URL.Path]++
+		writeNeoJSON(w, http.StatusOK, map[string]any{"source": "upstream"})
+	}))
+	defer upstream.Close()
+
+	r := gin.New()
+	m := &AmpModule{restrictToLocalhost: false}
+	proxy, err := createReverseProxy(upstream.URL, NewStaticSecretSource(""))
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	m.setProxy(proxy)
+	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, nil)
+
+	localServer := httptest.NewServer(r)
+	defer localServer.Close()
+
+	paths := []string{
+		"/metadata",
+		"/gateway/threadActor/?rvt-method=get&rvt-key=T-upstream",
+		"/actors?name=threadActor&key=T-upstream",
+	}
+	for _, path := range paths {
+		t.Run(path, func(t *testing.T) {
+			resp, err := http.Get(localServer.URL + path)
+			if err != nil {
+				t.Fatalf("bridge request: %v", err)
+			}
+			defer resp.Body.Close()
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("read bridge response: %v", err)
+			}
+
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, body=%s", resp.StatusCode, string(body))
+			}
+			var response map[string]any
+			if err := json.Unmarshal(body, &response); err != nil {
+				t.Fatalf("response JSON error: %v", err)
+			}
+			if response["source"] != "upstream" {
+				t.Fatalf("unexpected response: %#v", response)
+			}
+		})
+	}
+	if upstreamRequests != len(paths) {
+		t.Fatalf("upstreamRequests = %d, want %d", upstreamRequests, len(paths))
+	}
+	for _, path := range []string{"/metadata", "/gateway/threadActor/", "/actors"} {
+		if seenPaths[path] != 1 {
+			t.Fatalf("upstream path %s count = %d, want 1; seen=%#v", path, seenPaths[path], seenPaths)
+		}
+	}
+}
+
+func TestRegisterManagementRoutesServesAmpBinaryNeoRuntimeBridgeLocally(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	runtimeRequests := 0
+	runtimeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		runtimeRequests++
+		writeNeoJSON(w, http.StatusOK, map[string]any{"source": "runtime"})
+	}))
+	defer runtimeServer.Close()
+	runtimeURL, err := url.Parse(runtimeServer.URL)
+	if err != nil {
+		t.Fatalf("parse runtime URL: %v", err)
+	}
+	host, portText, err := net.SplitHostPort(runtimeURL.Host)
+	if err != nil {
+		t.Fatalf("split runtime host: %v", err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatalf("parse runtime port: %v", err)
+	}
+
+	upstreamRequests := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequests++
+		writeNeoJSON(w, http.StatusOK, map[string]any{"source": "upstream"})
+	}))
+	defer upstream.Close()
+
+	r := gin.New()
+	m := &AmpModule{
+		restrictToLocalhost: false,
+		neoRuntime:          &neoRuntime{host: host, port: port},
+	}
+	proxy, err := createReverseProxy(upstream.URL, NewStaticSecretSource(""))
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	m.setProxy(proxy)
+	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, nil)
+
+	localServer := httptest.NewServer(r)
+	defer localServer.Close()
+
+	paths := []string{
+		"/metadata",
+		"/gateway/threadActor/?rvt-method=get&rvt-key=T-upstream",
+		"/actors?name=threadActor&key=T-upstream",
+	}
+	for _, path := range paths {
+		t.Run(path, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodGet, localServer.URL+path, nil)
+			if err != nil {
+				t.Fatalf("build amp binary bridge request: %v", err)
+			}
+			req.Header.Set("User-Agent", "RivetKit/2.3.0-rc.9 Bun/1.3.14")
+			if strings.HasPrefix(path, "/gateway/") {
+				req.Header.Set("User-Agent", "undici")
+				req.Header.Set("Sec-WebSocket-Protocol", "rivet, rivet_encoding.bare, rivet_skip_ready_wait")
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("amp binary bridge request: %v", err)
+			}
+			defer resp.Body.Close()
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("read amp binary bridge response: %v", err)
+			}
+
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("amp binary bridge status = %d, body=%s", resp.StatusCode, string(body))
+			}
+			var response map[string]any
+			if err := json.Unmarshal(body, &response); err != nil {
+				t.Fatalf("amp binary bridge response JSON error: %v", err)
+			}
+			if response["source"] != "runtime" {
+				t.Fatalf("unexpected amp binary bridge response: %#v", response)
+			}
+		})
+	}
+	if upstreamRequests != 0 {
+		t.Fatalf("upstreamRequests = %d, want 0", upstreamRequests)
+	}
+	if runtimeRequests != len(paths) {
+		t.Fatalf("runtimeRequests = %d, want %d", runtimeRequests, len(paths))
+	}
+
+	resp, err := http.Get(localServer.URL + "/metadata?cliproxy-client=neo-remote-ui")
+	if err != nil {
+		t.Fatalf("local bridge request: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read local bridge response: %v", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("local bridge status = %d, body=%s", resp.StatusCode, string(body))
+	}
+	if upstreamRequests != 0 {
+		t.Fatalf("local bridge should not call upstream; upstreamRequests = %d", upstreamRequests)
+	}
+	if runtimeRequests != len(paths)+1 {
+		t.Fatalf("runtimeRequests = %d, want %d", runtimeRequests, len(paths)+1)
+	}
+	var response map[string]any
+	if err := json.Unmarshal(body, &response); err != nil {
+		t.Fatalf("local bridge response JSON error: %v", err)
+	}
+	if response["source"] != "runtime" {
+		t.Fatalf("unexpected local bridge response: %#v", response)
+	}
+}
+
 func TestRegisterManagementRoutesCanForceLocalNeoThreadActorsWithProxy(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()

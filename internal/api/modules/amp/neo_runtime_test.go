@@ -736,6 +736,206 @@ func TestNeoRuntimeSkipsAutoCompactionAfterImportedRecordCut(t *testing.T) {
 	}
 }
 
+func TestNeoRuntimeAutoCompactionUsesFullInputPressure(t *testing.T) {
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.URL.Path != "/api/provider/openai/v1/chat/completions" {
+			t.Fatalf("unexpected compaction path %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"full input pressure summary"}}]}`))
+	}))
+	t.Cleanup(upstream.Close)
+	parsed, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+	_, portString, err := net.SplitHostPort(parsed.Host)
+	if err != nil {
+		t.Fatalf("parse upstream host: %v", err)
+	}
+	port, err := strconv.Atoi(portString)
+	if err != nil {
+		t.Fatalf("parse upstream port: %v", err)
+	}
+
+	enabled := true
+	rt := newNeoRuntime(&config.Config{
+		Host: "127.0.0.1",
+		Port: port,
+		AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
+			Enabled:         &enabled,
+			CompactionModel: "openai/gpt-5.4",
+		}},
+	})
+	threadID := "T-full-input-compact"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+	actor.settings["internal.model"] = "openai/gpt-oss-120b"
+	actor.tools["large_context_tool"] = neoToolSpec{
+		Name:        "large_context_tool",
+		Description: strings.Repeat("tool schema context ", 20000),
+		Meta:        map[string]any{"source": map[string]any{"toolbox": "test"}},
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"value": map[string]any{"type": "string", "description": strings.Repeat("schema detail ", 20000)},
+			},
+		},
+	}
+	actor.mu.Lock()
+	for i := 0; i < 30; i++ {
+		role := "user"
+		if i%2 == 1 {
+			role = "assistant"
+		}
+		actor.storeMessageLocked(neoMessage{ThreadID: threadID, MessageID: fmt.Sprintf("M-%022d", i), Role: role, Content: []any{map[string]any{"type": "text", "text": fmt.Sprintf("message %02d", i)}}})
+	}
+	if neoCompactionShouldRun(actor.messages, neoEffectiveMaxInputTokens("smart", "openai/gpt-oss-120b"), 65) {
+		actor.mu.Unlock()
+		t.Fatal("message-only compaction unexpectedly crossed threshold")
+	}
+	actor.currentInference = &neoInferenceInflight{messageID: "M-0000000000000000000029", agentMode: "smart", reasoningEffort: "medium"}
+	actor.rebuildHistoryLocked()
+	actor.syncRunning = true
+	generation := actor.generation
+	actor.mu.Unlock()
+
+	actor.maybeCompactBeforeInference("smart", "medium", "", generation)
+	actor.mu.Lock()
+	actor.syncRunning = false
+	actor.syncPending = false
+	actor.mu.Unlock()
+	waitForNeoActorSyncIdle(t, actor)
+
+	if calls != 1 {
+		t.Fatalf("compaction calls = %d, want 1 from full input pressure", calls)
+	}
+}
+
+func TestNeoRuntimeAutoCompactionUsesLatestRecordWindow(t *testing.T) {
+	dir := t.TempDir()
+	oldStoreDir := neoAmpThreadStoreDir
+	neoAmpThreadStoreDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
+
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.URL.Path != "/api/provider/openai/v1/chat/completions" {
+			t.Fatalf("unexpected compaction path %s", r.URL.Path)
+		}
+		payload := readNeoJSON(r.Body)
+		renderedMessages := fmt.Sprint(arrayValue(payload["messages"]))
+		if strings.Contains(renderedMessages, "message 00 before compacted record") {
+			t.Fatalf("compaction prompt replayed compacted prefix: %s", renderedMessages)
+		}
+		for _, want := range []string{"message 10 cut record boundary", "message 39 retained tail"} {
+			if !strings.Contains(renderedMessages, want) {
+				t.Fatalf("compaction prompt missing %q: %s", want, renderedMessages)
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"record-window summary"}}]}`))
+	}))
+	t.Cleanup(upstream.Close)
+	parsed, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+	_, portString, err := net.SplitHostPort(parsed.Host)
+	if err != nil {
+		t.Fatalf("parse upstream host: %v", err)
+	}
+	port, err := strconv.Atoi(portString)
+	if err != nil {
+		t.Fatalf("parse upstream port: %v", err)
+	}
+
+	enabled := true
+	rt := newNeoRuntime(&config.Config{
+		Host: "127.0.0.1",
+		Port: port,
+		AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
+			Enabled:         &enabled,
+			CompactionModel: "openai/gpt-5.4",
+		}},
+	})
+	threadID := "T-record-window-compact"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+	actor.settings["internal.compactionThresholdPercent"] = 0
+	longText := strings.Repeat("record window context ", 200)
+	actor.mu.Lock()
+	for i := 0; i < 40; i++ {
+		role := "user"
+		if i%2 == 1 {
+			role = "assistant"
+		}
+		label := fmt.Sprintf("message %02d", i)
+		if i == 0 {
+			label += " before compacted record"
+		}
+		if i == 10 {
+			label += " cut record boundary"
+		}
+		if i == 39 {
+			label += " retained tail"
+		}
+		actor.storeMessageLocked(neoMessage{ThreadID: threadID, MessageID: fmt.Sprintf("M-%022d", i), Role: role, Content: []any{map[string]any{"type": "text", "text": label + " " + longText}}})
+	}
+	actor.compactionRecords = []map[string]any{{"cutMessageId": "M-0000000000000000000010", "createdAt": "2026-05-30T00:00:00Z"}}
+	actor.currentInference = &neoInferenceInflight{messageID: "M-0000000000000000000039", agentMode: "smart", reasoningEffort: "medium"}
+	actor.rebuildHistoryLocked()
+	actor.syncRunning = true
+	generation := actor.generation
+	actor.mu.Unlock()
+
+	actor.maybeCompactBeforeInference("smart", "medium", "", generation)
+	actor.mu.Lock()
+	actor.syncRunning = false
+	actor.syncPending = false
+	actor.mu.Unlock()
+	waitForNeoActorSyncIdle(t, actor)
+	if calls != 1 {
+		t.Fatalf("compaction calls = %d, want 1", calls)
+	}
+}
+
+func TestNeoActorHistoryHonorsCompactionRecordWithoutSummary(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-record-history"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+	for i := 0; i < 5; i++ {
+		role := "user"
+		if i%2 == 1 {
+			role = "assistant"
+		}
+		label := fmt.Sprintf("message %02d", i)
+		if i == 0 {
+			label += " compacted prefix"
+		}
+		if i == 2 {
+			label += " cut boundary"
+		}
+		if i == 4 {
+			label += " retained tail"
+		}
+		actor.messages = append(actor.messages, neoMessage{ThreadID: threadID, MessageID: fmt.Sprintf("M-%022d", i), Role: role, Content: []any{map[string]any{"type": "text", "text": label}}})
+	}
+	actor.compactionRecords = []map[string]any{{"cutMessageId": "M-0000000000000000000002", "createdAt": "2026-05-30T00:00:00Z"}}
+
+	actor.rebuildHistoryLocked()
+	historyText := fmt.Sprint(actor.history)
+	if strings.Contains(historyText, "message 00 compacted prefix") {
+		t.Fatalf("history replayed compacted prefix: %#v", actor.history)
+	}
+	for _, want := range []string{"message 02 cut boundary", "message 04 retained tail"} {
+		if !strings.Contains(historyText, want) {
+			t.Fatalf("history missing %q: %#v", want, actor.history)
+		}
+	}
+}
+
 func TestNeoCompactionWindowUsesLatestBinaryCutRecord(t *testing.T) {
 	messages := make([]neoMessage, 0, 30)
 	for i := 0; i < 30; i++ {
