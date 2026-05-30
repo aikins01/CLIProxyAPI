@@ -239,7 +239,11 @@ func (rt *neoRuntime) stop(ctx context.Context) error {
 		rt.cleanup()
 		rt.cleanup = nil
 	}
-	return rt.server.Shutdown(ctx)
+	server := rt.server
+	rt.server = nil
+	err := server.Shutdown(ctx)
+	rt.store.disposeAll()
+	return err
 }
 
 func (rt *neoRuntime) updateConfig(cfg *config.Config) error {
@@ -845,7 +849,7 @@ func (s *neoActorStore) actorForGatewayRequest(r *http.Request) *neoActor {
 	s.mu.RUnlock()
 
 	method := strings.TrimSpace(q.Get("rvt-method"))
-	if strings.EqualFold(method, "get") {
+	if strings.EqualFold(method, "get") || strings.EqualFold(method, "getOrCreate") {
 		if actor := s.persistedThreadActorForGatewayTarget(target, key); actor != nil {
 			return actor
 		}
@@ -1173,6 +1177,23 @@ func (s *neoActorStore) delete(id string) {
 		}
 	}
 	delete(s.actors, id)
+}
+
+func (s *neoActorStore) disposeAll() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	actors := make([]*neoActor, 0, len(s.actors))
+	for _, actor := range s.actors {
+		actors = append(actors, actor)
+	}
+	s.actors = map[string]*neoActor{}
+	s.byNameKey = map[string]string{}
+	s.mu.Unlock()
+	for _, actor := range actors {
+		actor.dispose()
+	}
 }
 
 func (s *neoActorStore) pruneIdle(now time.Time, ttl time.Duration) int {

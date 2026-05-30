@@ -1128,6 +1128,12 @@ func (s *Server) Start() error {
 func (s *Server) Stop(ctx context.Context) error {
 	log.Debug("Stopping API server...")
 
+	if s.ampModule != nil {
+		if err := s.ampModule.Shutdown(ctx); err != nil {
+			log.Errorf("failed to stop amp module: %v", err)
+		}
+	}
+
 	if s.keepAliveEnabled {
 		select {
 		case s.keepAliveStop <- struct{}{}:

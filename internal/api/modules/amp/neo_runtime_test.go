@@ -998,6 +998,37 @@ func TestNeoRuntimeGatewayWebSocketGetRehydratesPersistedLocalThread(t *testing.
 	}
 }
 
+func TestNeoRuntimeGatewayGetOrCreateRehydratesPersistedLocalThreadBeforeOpen(t *testing.T) {
+	useTempNeoThreadStore(t)
+	threadID := "T-gateway-get-or-create-rehydrate"
+	if err := os.WriteFile(filepath.Join(neoAmpThreadStoreDir(), threadID+".json"), []byte(`{
+		"id":"`+threadID+`",
+		"agentMode":"deep",
+		"meta":{"cliProxyAPILocalNeo":true},
+		"messages":[{"role":"user","messageId":"M-0000000000000000000001","agentMode":"deep","content":[{"type":"text","text":"resume getOrCreate after restart"}]}]
+	}`), 0o600); err != nil {
+		t.Fatalf("write local thread: %v", err)
+	}
+
+	rt := newNeoRuntime(&config.Config{})
+	req := httptest.NewRequest(http.MethodGet, "/gateway/threadActor/?rvt-method=getOrCreate&rvt-key="+url.QueryEscape(threadID), nil)
+	actor := rt.store.actorForGatewayRequest(req)
+	if actor == nil {
+		t.Fatal("gateway getOrCreate did not rehydrate persisted local thread actor")
+	}
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.messages) != 1 {
+		t.Fatalf("rehydrated message count = %d, want 1", len(actor.messages))
+	}
+	if actor.currentAgentMode != "deep" {
+		t.Fatalf("agent mode = %q, want deep", actor.currentAgentMode)
+	}
+	if !strings.Contains(fmt.Sprint(actor.messages[0].Content), "resume getOrCreate after restart") {
+		t.Fatalf("rehydrated message = %#v", actor.messages[0])
+	}
+}
+
 func TestNeoRuntimeGatewayWebSocketGetDoesNotCreateMissingThreadActor(t *testing.T) {
 	useTempNeoThreadStore(t)
 	rt := newNeoRuntime(&config.Config{})
@@ -1143,6 +1174,51 @@ func TestNeoRuntimeGatewayWebSocketJSONRPCTransport(t *testing.T) {
 	}
 	if !sawConnected || !sawResponse {
 		t.Fatalf("jsonrpc websocket sawConnected=%v sawResponse=%v", sawConnected, sawResponse)
+	}
+}
+
+func TestNeoRuntimeStopClosesActorWebSockets(t *testing.T) {
+	port := freeTCPPortForTest(t)
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
+		Host: "127.0.0.1",
+		Port: port,
+	}}})
+	if err := rt.start(); err != nil {
+		t.Fatalf("start runtime: %v", err)
+	}
+
+	threadID := "T-stop-closes-websocket"
+	dialer := websocket.Dialer{Subprotocols: []string{"rivet", "rivet_encoding.4", "rivet_skip_ready_wait"}}
+	wsURL := fmt.Sprintf("ws://127.0.0.1:%d/gateway/threadActor/?rvt-method=getOrCreate&rvt-key=%s", port, url.QueryEscape(threadID))
+	var conn *websocket.Conn
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+		nextConn, _, err := dialer.Dial(wsURL, nil)
+		if err == nil {
+			conn = nextConn
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if conn == nil {
+		t.Fatal("gateway websocket did not connect")
+	}
+	defer conn.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := rt.stop(ctx); err != nil {
+		t.Fatalf("stop runtime: %v", err)
+	}
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for {
+		_ = conn.SetReadDeadline(deadline)
+		if _, _, err := conn.ReadMessage(); err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				t.Fatalf("websocket was not closed by runtime stop: %v", err)
+			}
+			return
+		}
 	}
 }
 

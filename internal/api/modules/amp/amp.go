@@ -338,6 +338,18 @@ func (m *AmpModule) applyNeoRuntime(cfg *config.Config) {
 	m.neoRuntime = rt
 }
 
+func (m *AmpModule) Shutdown(ctx context.Context) error {
+	if m == nil || m.neoRuntime == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	err := m.neoRuntime.stop(ctx)
+	m.neoRuntime = nil
+	return err
+}
+
 func (m *AmpModule) neoThreadConfigSnapshot() *config.Config {
 	if m == nil {
 		return nil
