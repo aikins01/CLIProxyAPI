@@ -53,6 +53,55 @@ func init() {
 	buildinfo.BuildDate = BuildDate
 }
 
+func detectDefaultConfigPath() string {
+	if configured := strings.TrimSpace(DefaultConfigPath); configured != "" {
+		return configured
+	}
+	executablePath, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	paths := []string{executablePath}
+	if resolved, errEval := filepath.EvalSymlinks(executablePath); errEval == nil && resolved != executablePath {
+		paths = append(paths, resolved)
+	}
+	return homebrewConfigPathForExecutable(paths, os.Stat)
+}
+
+func homebrewConfigPathForExecutable(executablePaths []string, stat func(string) (fs.FileInfo, error)) string {
+	if stat == nil {
+		stat = os.Stat
+	}
+	for _, executablePath := range executablePaths {
+		cleaned := filepath.Clean(executablePath)
+		for _, prefix := range []string{"/opt/homebrew", "/usr/local"} {
+			if !isHomebrewCliproxyExecutable(cleaned, prefix) {
+				continue
+			}
+			candidate := filepath.Join(prefix, "etc", "cliproxyapi.conf")
+			if info, err := stat(candidate); err == nil && !info.IsDir() {
+				return candidate
+			}
+		}
+	}
+	return ""
+}
+
+func isHomebrewCliproxyExecutable(executablePath, prefix string) bool {
+	if executablePath == "" || prefix == "" {
+		return false
+	}
+	for _, base := range []string{
+		filepath.Join(prefix, "opt", "cliproxyapi"),
+		filepath.Join(prefix, "Cellar", "cliproxyapi"),
+	} {
+		if executablePath == base || strings.HasPrefix(executablePath, base+string(os.PathSeparator)) {
+			return true
+		}
+	}
+	return false
+}
+
 // main is the entry point of the application.
 // It parses command-line flags, loads configuration, and starts the appropriate
 // service based on the provided flags (login, codex-login, or server mode).
@@ -89,7 +138,7 @@ func main() {
 	flag.BoolVar(&antigravityLogin, "antigravity-login", false, "Login to Antigravity using OAuth")
 	flag.BoolVar(&kimiLogin, "kimi-login", false, "Login to Kimi using OAuth")
 	flag.StringVar(&projectID, "project_id", "", "Project ID (Gemini only, not required)")
-	flag.StringVar(&configPath, "config", DefaultConfigPath, "Configure File Path")
+	flag.StringVar(&configPath, "config", detectDefaultConfigPath(), "Configure File Path")
 	flag.StringVar(&vertexImport, "vertex-import", "", "Import Vertex service account key JSON file")
 	flag.StringVar(&vertexImportPrefix, "vertex-import-prefix", "", "Prefix for Vertex model namespacing (use with -vertex-import)")
 	flag.StringVar(&password, "password", "", "")
