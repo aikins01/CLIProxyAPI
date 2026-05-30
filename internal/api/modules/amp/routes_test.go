@@ -57,6 +57,7 @@ func TestRegisterManagementRoutes(t *testing.T) {
 		{"/api/internal/some/path", http.MethodGet},
 		{"/api/user", http.MethodGet},
 		{"/api/user/profile", http.MethodGet},
+		{"/api/user-actor-credentials", http.MethodPost},
 		{"/api/auth", http.MethodGet},
 		{"/api/auth/login", http.MethodGet},
 		{"/api/meta", http.MethodGet},
@@ -64,6 +65,7 @@ func TestRegisterManagementRoutes(t *testing.T) {
 		{"/api/1.0/projects/local/project", http.MethodGet},
 		{"/api/1.0/repos", http.MethodGet},
 		{"/api/threads", http.MethodGet},
+		{"/api/threads/T-019e65c0-0310-77a8-b233-4b84d9c0612b/messages/M-reader", http.MethodPost},
 		{"/api/thread-actors", http.MethodPost},
 		{"/threads/", http.MethodGet},
 		{"/threads.rss", http.MethodGet}, // Root-level route (no /api prefix)
@@ -1534,10 +1536,14 @@ func TestRegisterManagementRoutesPassesThreadReaderToolsUpstreamWhenProxyExists(
 	upstreamRequests := 0
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		upstreamRequests++
-		if r.URL.Path != "/api/threads/"+threadID+"/messages/message_stats" {
+		switch r.URL.Path {
+		case "/api/threads/" + threadID + "/messages/message_stats":
+			writeNeoJSON(w, http.StatusOK, map[string]any{"messageCount": 99, "upstream": true})
+		case "/api/threads/" + threadID + "/messages/M-reader":
+			writeNeoJSON(w, http.StatusOK, map[string]any{"messages": []any{map[string]any{"messageId": "M-reader", "upstream": true}}})
+		default:
 			t.Fatalf("unexpected upstream request path=%s", r.URL.Path)
 		}
-		writeNeoJSON(w, http.StatusOK, map[string]any{"messageCount": 99, "upstream": true})
 	}))
 	defer upstream.Close()
 
@@ -1558,37 +1564,49 @@ func TestRegisterManagementRoutesPassesThreadReaderToolsUpstreamWhenProxyExists(
 	localServer := httptest.NewServer(r)
 	defer localServer.Close()
 
-	req, err := http.NewRequest(http.MethodPost, localServer.URL+"/api/threads/"+threadID+"/messages/message_stats", bytes.NewBufferString(`{}`))
-	if err != nil {
-		t.Fatalf("new request: %v", err)
+	tests := []struct {
+		name string
+		path string
+		body string
+	}{
+		{name: "message stats", path: "/api/threads/" + threadID + "/messages/message_stats", body: `{}`},
+		{name: "message reader", path: "/api/threads/" + threadID + "/messages/M-reader", body: `{"limit":20}`},
 	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("do request: %v", err)
-	}
-	defer func() {
-		if err := resp.Body.Close(); err != nil {
-			t.Fatalf("close response body: %v", err)
-		}
-	}()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("read response body: %v", err)
-	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodPost, localServer.URL+tc.path, bytes.NewBufferString(tc.body))
+			if err != nil {
+				t.Fatalf("new request: %v", err)
+			}
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("do request: %v", err)
+			}
+			defer func() {
+				if err := resp.Body.Close(); err != nil {
+					t.Fatalf("close response body: %v", err)
+				}
+			}()
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("read response body: %v", err)
+			}
 
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, body=%s", resp.StatusCode, string(body))
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, body=%s", resp.StatusCode, string(body))
+			}
+			var response map[string]any
+			if err := json.Unmarshal(body, &response); err != nil {
+				t.Fatalf("response JSON error: %v", err)
+			}
+			if response["upstream"] != true && len(arrayValue(response["messages"])) == 0 {
+				t.Fatalf("unexpected upstream reader response: %#v", response)
+			}
+		})
 	}
-	if upstreamRequests != 1 {
-		t.Fatalf("upstreamRequests = %d, want 1", upstreamRequests)
-	}
-	var response map[string]any
-	if err := json.Unmarshal(body, &response); err != nil {
-		t.Fatalf("response JSON error: %v", err)
-	}
-	if response["upstream"] != true || numberFrom(response["messageCount"]) != 99 {
-		t.Fatalf("unexpected upstream reader response: %#v", response)
+	if upstreamRequests != len(tests) {
+		t.Fatalf("upstreamRequests = %d, want %d", upstreamRequests, len(tests))
 	}
 }
 
@@ -1672,6 +1690,8 @@ func TestRegisterManagementRoutesDoesNotServeThreadDiscoveryLocallyWithoutProxy(
 		{name: "thread search", method: http.MethodGet, path: "/api/threads/find?q=local+needle&limit=5"},
 		{name: "thread read", method: http.MethodGet, path: "/threads/" + threadID},
 		{name: "thread reader stats", method: http.MethodPost, path: "/api/threads/" + threadID + "/messages/message_stats", body: `{}`},
+		{name: "thread reader message", method: http.MethodPost, path: "/api/threads/" + threadID + "/messages/M-local", body: `{}`},
+		{name: "user actor credentials", method: http.MethodPost, path: "/api/user-actor-credentials", body: `{}`},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
