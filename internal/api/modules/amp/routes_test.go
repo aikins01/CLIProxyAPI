@@ -138,6 +138,82 @@ func TestRegisterManagementRoutesLocalNeoThreadActorsWithoutProxy(t *testing.T) 
 	}
 }
 
+func TestRegisterManagementRoutesDoesNotSynthesizeUnknownNeoThreadActorWithoutProxy(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	enabled := true
+	dir := t.TempDir()
+	oldStoreDir := neoAmpThreadStoreDir
+	neoAmpThreadStoreDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
+
+	m := &AmpModule{
+		restrictToLocalhost: false,
+		neoRuntime: newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+			NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled},
+		}}),
+	}
+
+	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, nil)
+
+	threadID := "T-019e65c0-0310-77a8-b233-4b84d9c0612b"
+	req := httptest.NewRequest(http.MethodPost, "/api/thread-actors/"+threadID, bytes.NewBufferString(`{}`))
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	m.neoRuntime.store.mu.RLock()
+	defer m.neoRuntime.store.mu.RUnlock()
+	for _, actor := range m.neoRuntime.store.actors {
+		if actor.threadID == threadID || actor.key == threadID {
+			t.Fatalf("unknown thread actor was synthesized locally: %#v", actor.record)
+		}
+	}
+}
+
+func TestRegisterManagementRoutesServesExistingNeoThreadActorLocallyWithoutProxy(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	enabled := true
+
+	dir := t.TempDir()
+	oldStoreDir := neoAmpThreadStoreDir
+	neoAmpThreadStoreDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
+
+	threadID := "T-019e65c0-0310-77a8-b233-4b84d9c0612c"
+	rawThread := []byte(`{"id":"` + threadID + `","title":"local resume","agentMode":"deep","messages":[{"messageId":"M-user","role":"user","content":[{"type":"text","text":"resume locally"}]}]}`)
+	if err := os.WriteFile(filepath.Join(dir, threadID+".json"), rawThread, 0o600); err != nil {
+		t.Fatalf("write local thread: %v", err)
+	}
+
+	m := &AmpModule{
+		restrictToLocalhost: false,
+		neoRuntime: newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+			NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled},
+		}}),
+	}
+
+	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/thread-actors/"+threadID, bytes.NewBufferString(`{}`))
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	var response map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("response JSON error: %v", err)
+	}
+	if response["agentMode"] != "deep" || stringValue(response["wsToken"]) == "" {
+		t.Fatalf("unexpected local thread actor response: %#v", response)
+	}
+}
+
 func TestRegisterManagementRoutesLocalNeoThreadActorsReturnAuthenticatedWsToken(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()

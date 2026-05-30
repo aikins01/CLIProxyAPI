@@ -7639,7 +7639,8 @@ func (m *AmpModule) tryServeNeoLocalThreadActor(c *gin.Context) bool {
 	if !ok || m.neoRuntime == nil {
 		return false
 	}
-	if m.getProxy() != nil && !m.shouldServeNeoLocalThreadActor(threadID) {
+	hasProxy := m.getProxy() != nil
+	if hasProxy && !m.shouldServeNeoLocalThreadActor(threadID) {
 		return false
 	}
 	if c.Request.Method != http.MethodPost {
@@ -7648,6 +7649,16 @@ func (m *AmpModule) tryServeNeoLocalThreadActor(c *gin.Context) bool {
 	}
 
 	body := readNeoJSON(c.Request.Body)
+	if !hasProxy {
+		bodyThreadID := strings.TrimSpace(threadID)
+		if bodyThreadID == "" {
+			bodyThreadID = findThreadID(body)
+		}
+		if bodyThreadID != "" && !m.shouldServeNeoLocalThreadActor(bodyThreadID) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "amp upstream proxy not available"})
+			return true
+		}
+	}
 	response, status := m.neoRuntime.localThreadActorManagementResponse(c.Request.Context(), body, threadID)
 	c.JSON(status, response)
 	return true
