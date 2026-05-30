@@ -941,6 +941,7 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		}
 
 		if s.server != nil {
+			s.server.ClosePublicListeners()
 			if err := s.server.ShutdownAmpModule(ctx); err != nil {
 				log.Errorf("failed to stop amp module: %v", err)
 				shutdownErr = err
