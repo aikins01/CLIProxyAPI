@@ -40,6 +40,53 @@ func TestNeoRuntimeEnabledIsOptIn(t *testing.T) {
 	}
 }
 
+func TestNeoRuntimeStartRetriesUntilPortIsReleased(t *testing.T) {
+	held, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("hold tcp port: %v", err)
+	}
+	port := held.Addr().(*net.TCPAddr).Port
+
+	oldInterval := neoRuntimeBindRetryInterval
+	oldTimeout := neoRuntimeBindRetryTimeout
+	neoRuntimeBindRetryInterval = 10 * time.Millisecond
+	neoRuntimeBindRetryTimeout = 750 * time.Millisecond
+	t.Cleanup(func() {
+		neoRuntimeBindRetryInterval = oldInterval
+		neoRuntimeBindRetryTimeout = oldTimeout
+	})
+
+	released := make(chan struct{})
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		_ = held.Close()
+		close(released)
+	}()
+
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
+		Host: "127.0.0.1",
+		Port: port,
+	}}})
+	if err := rt.start(); err != nil {
+		t.Fatalf("start runtime after delayed port release: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = rt.stop(ctx)
+	})
+	<-released
+
+	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/metadata", port))
+	if err != nil {
+		t.Fatalf("metadata after retry bind: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("metadata status = %d, want 200", resp.StatusCode)
+	}
+}
+
 func TestNeoRuntimeActorLifecycleHTTP(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 

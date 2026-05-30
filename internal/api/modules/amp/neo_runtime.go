@@ -31,6 +31,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	regexp2 "github.com/dlclark/regexp2"
@@ -71,6 +72,12 @@ const (
 	neoJSONRPCFrameKey               = "__neo_jsonrpc_frame"
 	neoJSONRPCRequestIDKey           = "__neo_jsonrpc_request_id"
 	neoMaxQueuedMessages             = 5
+)
+
+var (
+	neoRuntimeListen            = net.Listen
+	neoRuntimeBindRetryInterval = 50 * time.Millisecond
+	neoRuntimeBindRetryTimeout  = 3 * time.Second
 )
 
 // neoLocalThreadCacheEntry memoizes a parsed local thread document keyed by the
@@ -203,10 +210,16 @@ func (rt *neoRuntime) start() error {
 		return nil
 	}
 
+	addr := net.JoinHostPort(rt.host, fmt.Sprintf("%d", rt.port))
+	listener, err := neoRuntimeListenWithRetry("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("listen on amp neo local runtime %s: %w", addr, err)
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", rt.handleHTTP)
 	server := &http.Server{
-		Addr:              net.JoinHostPort(rt.host, fmt.Sprintf("%d", rt.port)),
+		Addr:              addr,
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
@@ -217,13 +230,42 @@ func (rt *neoRuntime) start() error {
 
 	go func() {
 		log.Infof("amp neo local runtime listening on http://%s", server.Addr)
-		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Warnf("amp neo local runtime stopped: %v", err)
+		if errServe := server.Serve(listener); errServe != nil && !errors.Is(errServe, http.ErrServerClosed) {
+			log.Warnf("amp neo local runtime stopped: %v", errServe)
 		}
 	}()
 	go rt.actorPruneLoop(ctx)
 
 	return nil
+}
+
+func neoRuntimeListenWithRetry(network, addr string) (net.Listener, error) {
+	deadline := time.Now().Add(neoRuntimeBindRetryTimeout)
+	var lastErr error
+	for {
+		listener, err := neoRuntimeListen(network, addr)
+		if err == nil {
+			return listener, nil
+		}
+		lastErr = err
+		if !neoRuntimeBindRetryable(err) || neoRuntimeBindRetryTimeout <= 0 || !time.Now().Before(deadline) {
+			return nil, lastErr
+		}
+		sleep := neoRuntimeBindRetryInterval
+		if sleep <= 0 {
+			sleep = 10 * time.Millisecond
+		}
+		if remaining := time.Until(deadline); remaining < sleep {
+			sleep = remaining
+		}
+		if sleep > 0 {
+			time.Sleep(sleep)
+		}
+	}
+}
+
+func neoRuntimeBindRetryable(err error) bool {
+	return errors.Is(err, syscall.EADDRINUSE)
 }
 
 func (rt *neoRuntime) stop(ctx context.Context) error {
