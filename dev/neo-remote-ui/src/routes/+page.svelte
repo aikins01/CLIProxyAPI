@@ -5830,16 +5830,6 @@
     font-size: 13px;
     -webkit-overflow-scrolling: touch;
   }
-  .sheet__body dl { display: grid; gap: 14px; margin: 0; }
-  .sheet__body dt { margin-bottom: 4px; color: var(--neo-ink); font-size: 13px; font-weight: 600; }
-  .sheet__body dd {
-    display: flex;
-    align-items: center;
-    gap: 7px;
-    margin: 0;
-    color: var(--neo-muted);
-    font-size: 13px;
-  }
   .sheet__body .cli-command {
     display: block;
     border: 1px solid var(--neo-border);
@@ -7454,17 +7444,6 @@
     flex-direction: column;
     gap: 16px;
   }
-  .inspector-card__actions { display: flex; align-items: center; justify-content: flex-end; gap: 4px; margin: 0; }
-  .inspector-card__actions button:not(.icon-button) {
-    border: 1px solid var(--neo-border-strong);
-    background: transparent;
-    color: var(--neo-ink);
-    border-radius: 6px;
-    padding: 4px 10px;
-    cursor: pointer;
-    font-size: 12px;
-  }
-
   /* Single-line field rows: icon + value, matching ampcode's 12px / 16px compact list. */
   .inspector-fields {
     display: flex;
@@ -7591,11 +7570,6 @@
   }
   .cli-row__copy--ok { color: var(--neo-success) !important; }
   .status-ok { color: var(--neo-success) !important; }
-  .mono-line {
-    display: block !important;
-    overflow-wrap: anywhere;
-    font-family: var(--neo-mono);
-  }
   .runtime-section {
     border-top: 1px solid var(--neo-border);
     padding-top: 12px;
@@ -7633,19 +7607,6 @@
     text-transform: uppercase;
     letter-spacing: 0;
   }
-  .runtime-pill--link {
-    color: var(--neo-ink);
-    font: inherit;
-    font-family: var(--neo-mono);
-    font-size: 12px;
-    text-align: left;
-    width: 100%;
-    cursor: pointer;
-    word-break: break-all;
-    transition: background-color 150ms cubic-bezier(0.4, 0, 0.2, 1), border-color 150ms cubic-bezier(0.4, 0, 0.2, 1);
-  }
-  .runtime-pill--link:hover { background: var(--neo-card-hover); border-color: var(--neo-border-strong); }
-
   /* Compact, scrollable relationships list */
   .runtime-section--relationships h2 { display: flex; align-items: center; gap: 6px; }
   .runtime-section__count {
