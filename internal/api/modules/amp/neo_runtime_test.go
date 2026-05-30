@@ -1224,7 +1224,7 @@ func TestNeoRuntimeStopClosesActorWebSockets(t *testing.T) {
 	}
 }
 
-func TestNeoRuntimeShutdownClosesActorWebSocketsAsGoingAway(t *testing.T) {
+func TestNeoRuntimeShutdownClosesActorWebSocketsAsTransportFailure(t *testing.T) {
 	port := freeTCPPortForTest(t)
 	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
 		Host: "127.0.0.1",
@@ -1234,7 +1234,7 @@ func TestNeoRuntimeShutdownClosesActorWebSocketsAsGoingAway(t *testing.T) {
 		t.Fatalf("start runtime: %v", err)
 	}
 
-	threadID := "T-shutdown-going-away"
+	threadID := "T-shutdown-transport-failure"
 	conn := dialNeoActorWebSocket(t, fmt.Sprintf("http://127.0.0.1:%d", port), threadID)
 	defer conn.Close()
 
@@ -1263,11 +1263,8 @@ func TestNeoRuntimeShutdownClosesActorWebSocketsAsGoingAway(t *testing.T) {
 		}
 		break
 	}
-	if closeErr.Code != websocket.CloseGoingAway {
-		t.Fatalf("shutdown close code = %d, want %d", closeErr.Code, websocket.CloseGoingAway)
-	}
-	if closeErr.Text != "WebSocket connection closed during shutdown" {
-		t.Fatalf("shutdown close reason = %q", closeErr.Text)
+	if closeErr.Code == websocket.CloseGoingAway {
+		t.Fatalf("shutdown close code = %d, want transport failure so Amp treats restart as reconnectable", closeErr.Code)
 	}
 }
 

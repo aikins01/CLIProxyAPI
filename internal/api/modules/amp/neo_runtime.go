@@ -234,14 +234,15 @@ func (rt *neoRuntime) stop(ctx context.Context) error {
 
 func (rt *neoRuntime) shutdown(ctx context.Context) error {
 	return rt.stopWithOptions(ctx, neoRuntimeStopOptions{
-		stopExecutors: false,
-		closeReason:   "WebSocket connection closed during shutdown",
+		stopExecutors:  false,
+		transportClose: true,
 	})
 }
 
 type neoRuntimeStopOptions struct {
-	stopExecutors bool
-	closeReason   string
+	stopExecutors  bool
+	closeReason    string
+	transportClose bool
 }
 
 func (rt *neoRuntime) stopWithOptions(ctx context.Context, options neoRuntimeStopOptions) error {
@@ -261,7 +262,7 @@ func (rt *neoRuntime) stopWithOptions(ctx context.Context, options neoRuntimeSto
 	server := rt.server
 	rt.server = nil
 	err := server.Shutdown(ctx)
-	rt.store.disposeAll(options.stopExecutors, options.closeReason)
+	rt.store.disposeAll(options.stopExecutors, options.closeReason, options.transportClose)
 	return err
 }
 
@@ -1198,7 +1199,7 @@ func (s *neoActorStore) delete(id string) {
 	delete(s.actors, id)
 }
 
-func (s *neoActorStore) disposeAll(stopExecutors bool, closeReason string) {
+func (s *neoActorStore) disposeAll(stopExecutors bool, closeReason string, transportClose bool) {
 	if s == nil {
 		return
 	}
@@ -1211,7 +1212,7 @@ func (s *neoActorStore) disposeAll(stopExecutors bool, closeReason string) {
 	s.byNameKey = map[string]string{}
 	s.mu.Unlock()
 	for _, actor := range actors {
-		actor.disposeWithOptions(stopExecutors, closeReason)
+		actor.disposeWithOptions(stopExecutors, closeReason, transportClose)
 	}
 }
 
@@ -1400,10 +1401,10 @@ func (a *neoActor) close(socket *neoSocket) {
 }
 
 func (a *neoActor) dispose() {
-	a.disposeWithOptions(true, "Actor stopped")
+	a.disposeWithOptions(true, "Actor stopped", false)
 }
 
-func (a *neoActor) disposeWithOptions(stopExecutors bool, closeReason string) {
+func (a *neoActor) disposeWithOptions(stopExecutors bool, closeReason string, transportClose bool) {
 	a.mu.Lock()
 	sockets := a.socketListLocked()
 	a.sockets = map[*neoSocket]struct{}{}
@@ -1411,7 +1412,11 @@ func (a *neoActor) disposeWithOptions(stopExecutors bool, closeReason string) {
 	a.spawnedExecutors = map[string]*neoSpawnedExecutor{}
 	a.mu.Unlock()
 	for _, socket := range sockets {
-		socket.close(websocket.CloseGoingAway, closeReason)
+		if transportClose {
+			socket.closeTransport()
+		} else {
+			socket.close(websocket.CloseGoingAway, closeReason)
+		}
 	}
 	if stopExecutors {
 		for _, executor := range executors {
@@ -12556,6 +12561,15 @@ func (s *neoSocket) close(code int, reason string) {
 	defer s.mu.Unlock()
 	message := websocket.FormatCloseMessage(code, reason)
 	_ = s.conn.WriteControl(websocket.CloseMessage, message, time.Now().Add(time.Second))
+	_ = s.conn.Close()
+}
+
+func (s *neoSocket) closeTransport() {
+	if s == nil || s.conn == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	_ = s.conn.Close()
 }
 
