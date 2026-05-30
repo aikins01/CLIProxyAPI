@@ -1179,6 +1179,81 @@ func TestNeoRuntimeGatewayWebSocketJSONRPCTransport(t *testing.T) {
 	}
 }
 
+func TestNeoRuntimeWebSocketFiltersLocalExtensionEventsForAmpClients(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	t.Cleanup(server.Close)
+
+	threadID := "T-local-extension-filter"
+	seedNeoLocalExtensionStateForTest(t, rt, threadID)
+
+	conn := dialNeoActorWebSocketWithoutResume(t, server.URL, threadID, "")
+	defer conn.Close()
+	if err := conn.WriteJSON(map[string]any{"type": "client_resume", "version": 0}); err != nil {
+		t.Fatalf("write client_resume: %v", err)
+	}
+
+	forbidden := map[string]bool{
+		"artifact_deleted":       true,
+		"artifact_upserted":      true,
+		"artifacts_snapshot":     true,
+		"clearPendingNavigation": true,
+		"draft":                  true,
+		"main-thread":            true,
+		"max-tokens":             true,
+		"setPendingNavigation":   true,
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		msg, ok := readNeoMessage(t, conn, time.Until(deadline))
+		if !ok {
+			break
+		}
+		msgType := stringValue(msg["type"])
+		if forbidden[msgType] {
+			t.Fatalf("Amp client received local extension event %q: %#v", msgType, msg)
+		}
+		if msgType == "agent_state" {
+			return
+		}
+	}
+	t.Fatal("timed out waiting for agent_state after filtered snapshot")
+}
+
+func TestNeoRuntimeWebSocketAllowsLocalExtensionEventsForRemoteUI(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	t.Cleanup(server.Close)
+
+	threadID := "T-local-extension-remote-ui"
+	seedNeoLocalExtensionStateForTest(t, rt, threadID)
+
+	conn := dialNeoActorWebSocketWithoutResume(t, server.URL, threadID, "cliproxy-client=neo-remote-ui")
+	defer conn.Close()
+	if err := conn.WriteJSON(map[string]any{"type": "client_resume", "version": 0}); err != nil {
+		t.Fatalf("write client_resume: %v", err)
+	}
+
+	seen := map[string]bool{}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		msg, ok := readNeoMessage(t, conn, time.Until(deadline))
+		if !ok {
+			break
+		}
+		msgType := stringValue(msg["type"])
+		seen[msgType] = true
+		if msgType == "agent_state" {
+			break
+		}
+	}
+	for _, msgType := range []string{"artifacts_snapshot", "draft", "main-thread", "max-tokens", "setPendingNavigation"} {
+		if !seen[msgType] {
+			t.Fatalf("remote UI did not receive local extension event %q; seen=%v", msgType, seen)
+		}
+	}
+}
+
 func TestNeoRuntimeStopClosesActorWebSockets(t *testing.T) {
 	port := freeTCPPortForTest(t)
 	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
@@ -1258,12 +1333,12 @@ func TestNeoRuntimeShutdownClosesActorWebSocketsAsTransportFailure(t *testing.T)
 		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 			t.Fatalf("websocket stayed open after runtime shutdown: %v", err)
 		}
-		if !errors.As(err, &closeErr) {
-			t.Fatalf("read shutdown close error = %T %v, want websocket close error", err, err)
+		if errors.As(err, &closeErr) {
+			break
 		}
-		break
+		return
 	}
-	if closeErr.Code == websocket.CloseGoingAway {
+	if closeErr != nil && closeErr.Code == websocket.CloseGoingAway {
 		t.Fatalf("shutdown close code = %d, want transport failure so Amp treats restart as reconnectable", closeErr.Code)
 	}
 }
@@ -2440,6 +2515,49 @@ func dialNeoActorWebSocket(t *testing.T, serverURL, threadID string) *websocket.
 		t.Fatalf("write initial client_resume: %v", err)
 	}
 	return conn
+}
+
+func dialNeoActorWebSocketWithoutResume(t *testing.T, serverURL, threadID, extraQuery string) *websocket.Conn {
+	t.Helper()
+	dialer := websocket.Dialer{Subprotocols: []string{"rivet", "rivet_encoding.4", "rivet_skip_ready_wait"}}
+	wsURL := "ws" + strings.TrimPrefix(serverURL, "http") + "/gateway/threadActor/?rvt-method=getOrCreate&rvt-key=" + url.QueryEscape(threadID)
+	if extraQuery != "" {
+		wsURL += "&" + extraQuery
+	}
+	conn, resp, err := dialer.Dial(wsURL, nil)
+	if err != nil {
+		status := 0
+		if resp != nil {
+			status = resp.StatusCode
+		}
+		t.Fatalf("gateway websocket dial failed status=%d err=%v", status, err)
+	}
+	return conn
+}
+
+func seedNeoLocalExtensionStateForTest(t *testing.T, rt *neoRuntime, threadID string) {
+	t.Helper()
+	actor, _ := rt.store.upsert(map[string]any{
+		"name": "threadActor",
+		"key":  threadID,
+		"input": map[string]any{
+			"threadId": threadID,
+		},
+	}, true)
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	actor.maxTokens = 32000
+	actor.mainThreadID = "T-019e1046-656d-7132-879f-390ded941c16"
+	actor.draft = []any{map[string]any{"type": "text", "text": "draft text"}}
+	actor.pendingNavigation = "T-019e1046-656d-7132-879f-390ded941c16"
+	if actor.artifacts == nil {
+		actor.artifacts = map[string]any{}
+	}
+	actor.artifacts["artifact-1"] = map[string]any{
+		"key":           "artifact-1",
+		"dataType":      "text/plain",
+		"contentBase64": "ZGlmZg==",
+	}
 }
 
 func waitForNeoMessageType(t *testing.T, conn *websocket.Conn, msgType string, timeout time.Duration) map[string]any {

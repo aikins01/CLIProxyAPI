@@ -657,7 +657,8 @@
     const params = new URLSearchParams({
       'rvt-method': 'getOrCreate',
       'rvt-key': threadId,
-      'rvt-skip-ready-wait': 'true'
+      'rvt-skip-ready-wait': 'true',
+      'cliproxy-client': 'neo-remote-ui'
     });
     const runtimeKey = apiKey.trim();
     if (runtimeKey) params.set('auth_token', runtimeKey);

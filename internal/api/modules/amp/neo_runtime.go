@@ -713,7 +713,11 @@ func (rt *neoRuntime) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		_ = conn.WriteControl(websocket.PongMessage, []byte(data), time.Time{})
 		return nil
 	})
-	socket := &neoSocket{conn: conn, jsonRPC: neoJSONRPCTransportRequested(r, protocols)}
+	socket := &neoSocket{
+		conn:            conn,
+		jsonRPC:         neoJSONRPCTransportRequested(r, protocols),
+		localExtensions: neoLocalRuntimeExtensionsRequested(r),
+	}
 	actor.open(socket, !neoSkipReadyWaitRequested(r))
 	defer actor.close(socket)
 	defer conn.Close()
@@ -12492,10 +12496,11 @@ func (a *neoActor) approvalToolIDsLocked() []string {
 }
 
 type neoSocket struct {
-	mu           sync.Mutex
-	conn         *websocket.Conn
-	snapshotSent bool
-	jsonRPC      bool
+	mu              sync.Mutex
+	conn            *websocket.Conn
+	snapshotSent    bool
+	jsonRPC         bool
+	localExtensions bool
 }
 
 func (s *neoSocket) markSnapshotSent() {
@@ -12534,8 +12539,21 @@ func (s *neoSocket) isJSONRPC() bool {
 	return s.jsonRPC
 }
 
+func (s *neoSocket) allowsLocalExtensions() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.localExtensions
+}
+
 func (s *neoSocket) send(payload any) {
 	cleaned := normalizeNeoOutboundJSON(payload)
+	if !s.allowsLocalExtensions() && neoOutboundLocalExtensionOnly(cleaned) {
+		log.Debugf("amp neo local runtime WS skip local extension %s", neoProtocolSummary(cleaned))
+		return
+	}
 	if s.isJSONRPC() {
 		if frame, ok := neoJSONRPCNotification(cleaned); ok {
 			data, err := json.Marshal(frame)
@@ -12553,6 +12571,30 @@ func (s *neoSocket) send(payload any) {
 	}
 	log.Debugf("amp neo local runtime WS send %s", neoProtocolSummary(cleaned))
 	s.sendText(string(data))
+}
+
+func neoLocalRuntimeExtensionsRequested(r *http.Request) bool {
+	if r == nil || r.URL == nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("cliproxy-client")), "neo-remote-ui")
+}
+
+func neoOutboundLocalExtensionOnly(payload any) bool {
+	msg := mapValue(payload)
+	switch stringValue(msg["type"]) {
+	case "artifact_deleted",
+		"artifact_upserted",
+		"artifacts_snapshot",
+		"clearPendingNavigation",
+		"draft",
+		"main-thread",
+		"max-tokens",
+		"setPendingNavigation":
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *neoSocket) sendJSONRPCResponse(id any, result any) {
