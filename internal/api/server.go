@@ -1135,17 +1135,12 @@ func (s *Server) Stop(ctx context.Context) error {
 		}
 	}
 
-	if s.muxHTTPListener != nil {
-		_ = s.muxHTTPListener.Close()
-	}
-	closeListeners(s.muxBaseListeners, "")
+	s.ClosePublicListeners()
 
 	// Close public listeners before stopping the local Amp runtime so reconnecting
 	// clients see a transport outage instead of a live proxy returning 503.
-	if s.ampModule != nil {
-		if err := s.ampModule.Shutdown(ctx); err != nil {
-			log.Errorf("failed to stop amp module: %v", err)
-		}
+	if err := s.ShutdownAmpModule(ctx); err != nil {
+		log.Errorf("failed to stop amp module: %v", err)
 	}
 
 	// Shutdown the HTTP server.
@@ -1155,6 +1150,25 @@ func (s *Server) Stop(ctx context.Context) error {
 
 	log.Debug("API server stopped")
 	return nil
+}
+
+// ClosePublicListeners stops accepting new public API connections while leaving
+// active requests for the HTTP server shutdown path.
+func (s *Server) ClosePublicListeners() {
+	if s == nil {
+		return
+	}
+	if s.muxHTTPListener != nil {
+		_ = s.muxHTTPListener.Close()
+	}
+	closeListeners(s.muxBaseListeners, "")
+}
+
+func (s *Server) ShutdownAmpModule(ctx context.Context) error {
+	if s == nil || s.ampModule == nil {
+		return nil
+	}
+	return s.ampModule.Shutdown(ctx)
 }
 
 // corsMiddleware returns a Gin middleware handler that adds CORS headers
