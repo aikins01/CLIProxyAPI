@@ -53,6 +53,7 @@ const (
 	defaultNeoExecutorConnectTimeout = 90 * time.Second
 	defaultNeoTitleModel             = "claude-haiku-4-5-20251001"
 	defaultNeoCompactionModel        = "gpt-5.4"
+	defaultNeoUnknownModeModel       = "claude-sonnet-4-5-20250929"
 	defaultNeoCompactionReasoning    = "xhigh"
 	neoCloudGzipBytes                = 10 * 1024 * 1024
 	neoReplayEventLimit              = 512
@@ -12806,6 +12807,8 @@ func selectNeoModelRoute(agentMode string, settings map[string]any) neoModelRout
 	}
 	agentMode = strings.ToLower(strings.TrimSpace(agentMode))
 	switch agentMode {
+	case "", "smart":
+		return neoModelRoute{Provider: "anthropic", Model: "claude-opus-4-7"}
 	case "deep":
 		return neoModelRoute{Provider: "openai", Model: "gpt-5.5"}
 	case "rush":
@@ -12817,7 +12820,7 @@ func selectNeoModelRoute(agentMode string, settings map[string]any) neoModelRout
 	case "nostromo":
 		return neoModelRoute{Provider: "openai", Model: "amp-nostromo-v1"}
 	default:
-		return neoModelRoute{Provider: "anthropic", Model: "claude-opus-4-7"}
+		return neoModelRoute{Provider: "anthropic", Model: defaultNeoUnknownModeModel}
 	}
 }
 

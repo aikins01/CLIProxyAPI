@@ -4474,10 +4474,19 @@ func TestSelectNeoModelRouteDefaultsAggManToOpus46(t *testing.T) {
 	}
 }
 
-func TestSelectNeoModelRouteDefaultsUnknownModeToSmartRoute(t *testing.T) {
+func TestSelectNeoModelRouteDefaultsSmartToOpus47(t *testing.T) {
+	for _, mode := range []string{"", "smart", "SMART"} {
+		got := selectNeoModelRoute(mode, nil)
+		if got.Provider != "anthropic" || got.Model != "claude-opus-4-7" {
+			t.Fatalf("mode %q route = %+v, want anthropic/claude-opus-4-7", mode, got)
+		}
+	}
+}
+
+func TestSelectNeoModelRouteDefaultsUnknownModeToBinaryFallback(t *testing.T) {
 	got := selectNeoModelRoute("frontier", nil)
-	if got.Provider != "anthropic" || got.Model != "claude-opus-4-7" {
-		t.Fatalf("route = %+v, want smart fallback route", got)
+	if got.Provider != "anthropic" || got.Model != defaultNeoUnknownModeModel {
+		t.Fatalf("route = %+v, want anthropic/%s", got, defaultNeoUnknownModeModel)
 	}
 }
 
