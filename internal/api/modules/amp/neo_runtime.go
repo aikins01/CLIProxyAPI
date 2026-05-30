@@ -17159,6 +17159,12 @@ func neoSafeLogPart(value string) string {
 
 const neoSkillToolName = "skill"
 
+const (
+	neoBuiltinSkillsBaseDir              = "builtin:///skills"
+	neoBuiltinCodeReviewSkillDescription = `Perform a formal code review. Use ONLY when the user explicitly requests the code-review skill/tool. Do NOT use when "review" appears in other contexts like "review changes for context", "review what happened", or "review commits to find a bug" — those are requests to read/understand code, not to perform a formal code review.`
+	neoBuiltinSetupTmuxSkillDescription  = "Configure tmux for optimal Amp CLI compatibility. Use when setting up tmux, troubleshooting tmux issues (images, clipboard, Shift+Enter), or asked to check/fix tmux configuration."
+)
+
 // These prompt families mirror Amp's bundled Neo prompt selector. The gzip
 // payloads are exact prompt snapshots extracted from the upstream Amp binary;
 // the hand-written prompt functions below remain as defensive fallbacks.
@@ -18385,7 +18391,7 @@ func addNeoPromptSkills(value any, add func(neoPromptSkill)) {
 	switch v := value.(type) {
 	case string:
 		if name := strings.TrimSpace(v); name != "" {
-			add(neoPromptSkill{Name: name})
+			add(neoBuiltinPromptSkill(name))
 		}
 	case []string:
 		for _, item := range v {
@@ -18397,6 +18403,30 @@ func addNeoPromptSkills(value any, add func(neoPromptSkill)) {
 		}
 	case map[string]any:
 		add(neoPromptSkillFromMap(v))
+	}
+}
+
+func neoBuiltinPromptSkill(name string) neoPromptSkill {
+	name = strings.TrimSpace(name)
+	switch name {
+	case "code-review":
+		return neoNamedBuiltinPromptSkill(name, neoBuiltinCodeReviewSkillDescription)
+	case "setup-tmux":
+		return neoNamedBuiltinPromptSkill(name, neoBuiltinSetupTmuxSkillDescription)
+	default:
+		return neoPromptSkill{Name: name}
+	}
+}
+
+func neoNamedBuiltinPromptSkill(name, description string) neoPromptSkill {
+	return neoPromptSkill{
+		Name:        name,
+		Description: description,
+		BaseDir:     neoBuiltinSkillsBaseDir,
+		Frontmatter: map[string]any{
+			"name":        name,
+			"description": description,
+		},
 	}
 }
 

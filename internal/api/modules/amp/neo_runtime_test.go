@@ -7064,6 +7064,15 @@ func TestNeoSystemPromptIncludesSkillNames(t *testing.T) {
 	if !strings.Contains(prompt, "<available_skills>") || !strings.Contains(prompt, "<name>code-review</name>") || !strings.Contains(prompt, "<name>craft-docs</name>") {
 		t.Fatalf("prompt missing skill names:\n%s", prompt)
 	}
+	for _, want := range []string{
+		"Perform a formal code review. Use ONLY when the user explicitly requests",
+		"<location>builtin:///skills/SKILL.md</location>",
+		"<location>craft-docs/SKILL.md</location>",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing binary builtin skill fallback %q:\n%s", want, prompt)
+		}
+	}
 	if strings.Contains(prompt, "Available skills: code-review") {
 		t.Fatalf("prompt should use Amp's structured skills block, not the old flat hint:\n%s", prompt)
 	}
