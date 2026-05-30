@@ -882,6 +882,76 @@ func TestNeoRuntimeAutoCompactionUsesObservedProviderUsage(t *testing.T) {
 	}
 }
 
+func TestNeoRuntimeAutoCompactionDoesNotRequireMinimumMessagesForObservedUsage(t *testing.T) {
+	dir := t.TempDir()
+	oldStoreDir := neoAmpThreadStoreDir
+	neoAmpThreadStoreDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
+
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.URL.Path != "/api/provider/openai/v1/chat/completions" {
+			t.Fatalf("unexpected compaction path %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"observed compact summary"}}]}`))
+	}))
+	t.Cleanup(upstream.Close)
+	parsed, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+	_, portString, err := net.SplitHostPort(parsed.Host)
+	if err != nil {
+		t.Fatalf("parse upstream host: %v", err)
+	}
+	port, err := strconv.Atoi(portString)
+	if err != nil {
+		t.Fatalf("parse upstream port: %v", err)
+	}
+
+	enabled := true
+	rt := newNeoRuntime(&config.Config{
+		Host: "127.0.0.1",
+		Port: port,
+		AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
+			Enabled:         &enabled,
+			CompactionModel: "openai/gpt-5.4",
+		}},
+	})
+	threadID := "T-observed-short-compact"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+	actor.mu.Lock()
+	for i := 0; i < neoCompactionMinMessages/2; i++ {
+		role := "user"
+		usage := map[string]any(nil)
+		if i%2 == 1 {
+			role = "assistant"
+		}
+		if i == neoCompactionMinMessages/2-1 {
+			usage = map[string]any{"totalInputTokens": neoCompactionDefaultTokenLimit, "outputTokens": 1}
+		}
+		actor.storeMessageLocked(neoMessage{ThreadID: threadID, MessageID: fmt.Sprintf("M-%022d", i), Role: role, Content: []any{map[string]any{"type": "text", "text": fmt.Sprintf("short message %02d", i)}}, Usage: usage})
+	}
+	actor.currentInference = &neoInferenceInflight{messageID: "M-current", agentMode: "smart", reasoningEffort: "medium"}
+	actor.rebuildHistoryLocked()
+	actor.syncRunning = true
+	generation := actor.generation
+	actor.mu.Unlock()
+
+	actor.maybeCompactBeforeInference("smart", "medium", "", generation)
+	actor.mu.Lock()
+	actor.syncRunning = false
+	actor.syncPending = false
+	actor.mu.Unlock()
+	waitForNeoActorSyncIdle(t, actor)
+
+	if calls != 1 {
+		t.Fatalf("compaction calls = %d, want 1 from observed provider usage without minimum message gate", calls)
+	}
+}
+
 func TestNeoRuntimeAutoCompactionUsesLatestRecordWindow(t *testing.T) {
 	dir := t.TempDir()
 	oldStoreDir := neoAmpThreadStoreDir
@@ -1119,7 +1189,7 @@ func TestNeoCompactionThresholdPercentSettingMatchesBinary(t *testing.T) {
 		{ThreadID: "T-threshold", MessageID: "M-0000000000000000000000", Role: "user", Content: []any{map[string]any{"type": "text", "text": "short"}}},
 	}
 	if neoCompactionShouldRun(shortHistory, 1000, 0) {
-		t.Fatal("threshold percent 0 should still honor the minimum message count gate")
+		t.Fatal("threshold percent 0 should still need enough messages for a safe cut")
 	}
 
 	longHistory := make([]neoMessage, 0, neoCompactionMinMessages)

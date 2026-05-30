@@ -6718,7 +6718,7 @@ func neoCompactionShouldRun(messages []neoMessage, maxInputTokens int, threshold
 }
 
 func neoCompactionShouldRunForTokens(messages []neoMessage, estimatedInputTokens, maxInputTokens int, thresholdPercent float64) bool {
-	if len(messages) < neoCompactionMinMessages {
+	if len(messages) <= neoCompactionTailMessages+1 && !neoCompactionCanAppendSummaryOnly(messages) {
 		return false
 	}
 	threshold := neoCompactionThresholdTokens(maxInputTokens, thresholdPercent)
