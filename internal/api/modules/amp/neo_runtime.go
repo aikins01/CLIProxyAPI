@@ -283,6 +283,14 @@ func (rt *neoRuntime) shutdown(ctx context.Context) error {
 	})
 }
 
+func (rt *neoRuntime) rebind(ctx context.Context) error {
+	return rt.stopWithOptions(ctx, neoRuntimeStopOptions{
+		stopExecutors:       true,
+		transportClose:      true,
+		flushLocalSnapshots: true,
+	})
+}
+
 type neoRuntimeStopOptions struct {
 	stopExecutors       bool
 	closeReason         string
@@ -311,6 +319,7 @@ func (rt *neoRuntime) stopWithOptions(ctx context.Context, options neoRuntimeSto
 		if errors.Is(err, http.ErrServerClosed) {
 			err = nil
 		}
+		rt.store.closeAllSockets(options.closeReason, true)
 		if options.flushLocalSnapshots {
 			rt.store.syncLocalThreadSnapshots()
 		}
@@ -1279,6 +1288,21 @@ func (s *neoActorStore) disposeAll(stopExecutors bool, closeReason string, trans
 	}
 }
 
+func (s *neoActorStore) closeAllSockets(closeReason string, transportClose bool) {
+	if s == nil {
+		return
+	}
+	s.mu.RLock()
+	actors := make([]*neoActor, 0, len(s.actors))
+	for _, actor := range s.actors {
+		actors = append(actors, actor)
+	}
+	s.mu.RUnlock()
+	for _, actor := range actors {
+		actor.closeSocketsWithOptions(closeReason, transportClose)
+	}
+}
+
 func (s *neoActorStore) syncLocalThreadSnapshots() {
 	if s == nil {
 		return
@@ -1494,21 +1518,30 @@ func (a *neoActor) dispose() {
 
 func (a *neoActor) disposeWithOptions(stopExecutors bool, closeReason string, transportClose bool) {
 	a.mu.Lock()
-	sockets := a.socketListLocked()
-	a.sockets = map[*neoSocket]struct{}{}
 	executors := a.spawnedExecutorListLocked()
 	a.spawnedExecutors = map[string]*neoSpawnedExecutor{}
+	a.mu.Unlock()
+	a.closeSocketsWithOptions(closeReason, transportClose)
+	if stopExecutors {
+		for _, executor := range executors {
+			executor.stop()
+		}
+	}
+}
+
+func (a *neoActor) closeSocketsWithOptions(closeReason string, transportClose bool) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	sockets := a.socketListLocked()
+	a.sockets = map[*neoSocket]struct{}{}
 	a.mu.Unlock()
 	for _, socket := range sockets {
 		if transportClose {
 			socket.closeTransport()
 		} else {
 			socket.close(websocket.CloseGoingAway, closeReason)
-		}
-	}
-	if stopExecutors {
-		for _, executor := range executors {
-			executor.stop()
 		}
 	}
 }

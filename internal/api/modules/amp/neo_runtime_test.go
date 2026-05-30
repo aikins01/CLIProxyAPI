@@ -1613,6 +1613,56 @@ func TestNeoRuntimeBridgeShutdownClosesWebSocketAsTransportFailure(t *testing.T)
 	}
 }
 
+func TestAmpModuleNeoRuntimeRebindClosesWebSocketsAsTransportFailure(t *testing.T) {
+	enabled := true
+	port1 := freeTCPPortForTest(t)
+	port2 := freeTCPPortForTest(t)
+	m := &AmpModule{}
+	m.applyNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
+		Enabled: &enabled,
+		Host:    "127.0.0.1",
+		Port:    port1,
+	}}})
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = m.Shutdown(ctx)
+	})
+
+	threadID := "T-rebind-transport-failure"
+	conn := dialNeoActorWebSocket(t, fmt.Sprintf("http://127.0.0.1:%d", port1), threadID)
+	defer conn.Close()
+
+	m.applyNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
+		Enabled: &enabled,
+		Host:    "127.0.0.1",
+		Port:    port2,
+	}}})
+
+	var closeErr *websocket.CloseError
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for {
+		_ = conn.SetReadDeadline(deadline)
+		_, _, err := conn.ReadMessage()
+		if err == nil {
+			if time.Now().After(deadline) {
+				t.Fatal("rebound websocket stayed open after runtime rebind")
+			}
+			continue
+		}
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			t.Fatalf("rebound websocket stayed open after runtime rebind: %v", err)
+		}
+		if errors.As(err, &closeErr) {
+			break
+		}
+		return
+	}
+	if closeErr != nil && closeErr.Code == websocket.CloseGoingAway {
+		t.Fatalf("rebind close code = %d, want transport failure so Amp treats runtime rebind as reconnectable", closeErr.Code)
+	}
+}
+
 func TestNeoRuntimeShutdownFlushesLocalThreadSnapshot(t *testing.T) {
 	dir := t.TempDir()
 	oldStoreDir := neoAmpThreadStoreDir

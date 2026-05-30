@@ -323,7 +323,7 @@ func (m *AmpModule) applyNeoRuntime(cfg *config.Config) {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
-		if err := m.neoRuntime.stop(ctx); err != nil {
+		if err := m.neoRuntime.rebind(ctx); err != nil {
 			log.Warnf("amp neo local runtime restart stop failed: %v", err)
 		}
 		m.neoRuntime = nil
