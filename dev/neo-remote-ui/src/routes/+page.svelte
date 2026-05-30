@@ -242,6 +242,7 @@
   let reconnectTimer: number | null = null;
   let reconnectResetTimer: number | null = null;
   let reconnectAttempts = 0;
+  let resumeVersion = 0;
   let pingTimer: number | null = null;
   let lastServerFrameAt = 0;
   let lastPingTickAt = 0;
@@ -427,8 +428,9 @@
     const top = scroller?.scrollTop ?? window.scrollY;
     const manualScrollVersion = manualTranscriptScrollVersion;
     const pinnedNow = isTranscriptPinnedToBottom();
-    transcriptFollowPinned = pinnedNow;
-    const shouldFollow = Boolean(options.forceFollow) || pinnedNow;
+    const wasFollowing = transcriptFollowPinned;
+    if (pinnedNow) transcriptFollowPinned = true;
+    const shouldFollow = Boolean(options.forceFollow) || (wasFollowing && pinnedNow);
     if (shouldFollow) {
       transcriptScrollPlan = { kind: 'follow', top, manualScrollVersion, force: Boolean(options.forceFollow) };
     } else {
@@ -600,6 +602,7 @@
     retryNotice = '';
     newActivityBelow = false;
     transcriptFollowPinned = true;
+    resumeVersion = 0;
   }
 
   async function submitKey() {
@@ -913,7 +916,7 @@
     reconnectTimer = window.setTimeout(() => {
       reconnectTimer = null;
       if (generation !== socketGeneration || selectedThreadId !== threadId) return;
-      connect(threadId, version, options, true);
+      connect(threadId, resumeVersion || version, options, true);
     }, delay);
   }
 
@@ -959,6 +962,8 @@
       clearReconnectResetTimer();
       reconnectAttempts = 0;
     }
+    const initialResumeVersion = Number.isFinite(version) ? Math.max(0, Math.trunc(version)) : 0;
+    resumeVersion = Math.max(resumeVersion, initialResumeVersion);
     const generation = socketGeneration + 1;
     socketGeneration = generation;
     connection = 'connecting';
@@ -989,7 +994,7 @@
       connection = 'connected';
       clearConnectionError();
       startPingTimer(nextSocket, threadId, version, options, generation);
-      sendFrame({ type: 'client_resume', version });
+      sendFrame({ type: 'client_resume', version: resumeVersion });
       if (options.bootstrapExecutor) {
         const bootstrapReasoningEffort = normalizeReasoningEffortForMode(bootstrapAgentMode, options.reasoningEffort || '');
         sendThreadModeFrames(bootstrapAgentMode, bootstrapReasoningEffort);
@@ -1463,6 +1468,7 @@
   }
 
   function applyIncoming(message: Incoming) {
+    advanceResumeVersion(message);
     const type = String(message.type ?? '');
     if (type === 'message_added') {
       const next = normalizeMessage(message.message);
@@ -1800,7 +1806,7 @@
     const current = nextMessages[index];
     const blocks = Array.isArray(delta.blocks) ? (delta.blocks as ContentBlock[]) : [];
     const blockIndex = typeof delta.blockIndex === 'number' ? delta.blockIndex : current.content.length;
-    const content = [...current.content];
+    const content = Array.isArray(current.content) ? [...current.content] : [];
     for (let offset = 0; offset < blocks.length; offset += 1) {
       const incoming = blocks[offset];
       const targetIndex = blockIndex + offset;
@@ -1831,11 +1837,12 @@
     for (let i = 0; i < nextMessages.length; i += 1) {
       const message = nextMessages[i];
       if (message.role !== 'user') continue;
-      const index = message.content.findIndex((block) => block.type === 'tool_result' && toolResultUseID(block) === toolCallId);
+      const messageContent = Array.isArray(message.content) ? message.content : [];
+      const index = messageContent.findIndex((block) => block.type === 'tool_result' && toolResultUseID(block) === toolCallId);
       if (index >= 0) {
         messageIndex = i;
         blockIndex = index;
-        existingBlock = message.content[index];
+        existingBlock = messageContent[index];
         break;
       }
     }
@@ -1847,7 +1854,7 @@
 
     if (messageIndex >= 0) {
       const current = nextMessages[messageIndex];
-      const content = [...current.content];
+      const content = Array.isArray(current.content) ? [...current.content] : [];
       content[blockIndex] = block;
       nextMessages[messageIndex] = { ...current, content };
     } else {
@@ -1933,7 +1940,12 @@
     if (emptyToolProgress(next)) return cloneProgressValue(existing);
     if (emptyToolProgress(existing)) return cloneProgressValue(next);
     if (Array.isArray(existing) && Array.isArray(next)) {
-      return [...cloneProgressValue(existing) as unknown[], ...cloneProgressValue(next) as unknown[]];
+      const existingClone = cloneProgressValue(existing);
+      const nextClone = cloneProgressValue(next);
+      return [
+        ...(Array.isArray(existingClone) ? existingClone : []),
+        ...(Array.isArray(nextClone) ? nextClone : [])
+      ];
     }
     if (existing && next && typeof existing === 'object' && typeof next === 'object' && !Array.isArray(existing) && !Array.isArray(next)) {
       const out: Record<string, unknown> = { ...asRecord(cloneProgressValue(existing)) };
@@ -2882,6 +2894,12 @@
   function mergeUsage(current?: Record<string, unknown>, incoming?: Record<string, unknown>) {
     const next = { ...(current ?? {}), ...(incoming ?? {}) };
     return Object.keys(next).length > 0 ? next : undefined;
+  }
+
+  function advanceResumeVersion(message: Incoming) {
+    const seq = finiteNumberFrom(message.seq);
+    if (seq === undefined) return;
+    resumeVersion = Math.max(resumeVersion, Math.trunc(seq));
   }
 
   // Strip the "Continuing work from thread T-..." sentence so the user message bubble
