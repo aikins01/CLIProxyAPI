@@ -272,12 +272,20 @@ func TestRegisterManagementRoutesNeoRuntimeBridgeUsesManagementAuth(t *testing.T
 	var sawRivetEncoding bool
 	var sawRivetKey bool
 	var sawMetadataPath bool
+	var sawForwardedHost bool
+	var sawForwardedProto bool
 	runtimeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		runtimeRequests++
 		sawAuthToken = r.URL.Query().Get("auth_token") != ""
 		sawAuthorization = r.Header.Get("Authorization") != ""
 		sawRivetHeader = r.Header.Get("X-Rivet-Token") != ""
 		sawRivetToken = r.URL.Query().Get("rvt-token") != ""
+		if r.Header.Get("X-Forwarded-Host") == "127.0.0.1:8333" {
+			sawForwardedHost = true
+		}
+		if r.Header.Get("X-Forwarded-Proto") == "http" {
+			sawForwardedProto = true
+		}
 		for _, header := range r.Header.Values("Sec-WebSocket-Protocol") {
 			if strings.Contains(header, "rivet_token.") {
 				sawRivetSubprotocol = true
@@ -352,6 +360,7 @@ func TestRegisterManagementRoutesNeoRuntimeBridgeUsesManagementAuth(t *testing.T
 	if err != nil {
 		t.Fatalf("auth request build: %v", err)
 	}
+	authReq.Host = "127.0.0.1:8333"
 	authReq.Header.Set("Authorization", "Bearer local-key")
 	authReq.Header.Set("X-Rivet-Token", "local-key")
 	authReq.Header.Set("Sec-WebSocket-Protocol", "rivet, rivet_token.local-key, rivet_encoding.json")
@@ -387,6 +396,12 @@ func TestRegisterManagementRoutesNeoRuntimeBridgeUsesManagementAuth(t *testing.T
 	}
 	if !sawRivetKey {
 		t.Fatalf("rvt-key did not reach runtime")
+	}
+	if !sawForwardedHost {
+		t.Fatalf("X-Forwarded-Host did not preserve public bridge host")
+	}
+	if !sawForwardedProto {
+		t.Fatalf("X-Forwarded-Proto did not preserve public bridge scheme")
 	}
 
 	metadataReq, err := http.NewRequest(http.MethodGet, server.URL+"/metadata", nil)

@@ -303,9 +303,22 @@ func (m *AmpModule) serveNeoRuntimeBridge(c *gin.Context) {
 	}
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	proxy.Director = func(req *http.Request) {
+		originalHost := strings.TrimSpace(req.Host)
+		originalProto := "http"
+		if forwardedProto := strings.TrimSpace(req.Header.Get("X-Forwarded-Proto")); forwardedProto != "" && !neoRequestHostIsLoopback(originalHost) {
+			originalProto = strings.Split(forwardedProto, ",")[0]
+		} else if req.TLS != nil {
+			originalProto = "https"
+		}
 		req.URL.Scheme = target.Scheme
 		req.URL.Host = target.Host
 		req.Host = target.Host
+		if originalHost != "" && strings.TrimSpace(req.Header.Get("X-Forwarded-Host")) == "" {
+			req.Header.Set("X-Forwarded-Host", originalHost)
+		}
+		if strings.TrimSpace(req.Header.Get("X-Forwarded-Proto")) == "" {
+			req.Header.Set("X-Forwarded-Proto", originalProto)
+		}
 		stripNeoRuntimeBridgeCredentials(req)
 	}
 	proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {

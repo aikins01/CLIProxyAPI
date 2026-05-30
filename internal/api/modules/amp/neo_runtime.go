@@ -375,6 +375,7 @@ func (rt *neoRuntime) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == http.MethodGet && r.URL.Path == "/metadata":
 		writeNeoJSON(w, http.StatusOK, map[string]any{
+			"clientEndpoint":  neoRuntimeClientEndpoint(r),
 			"runtime":         "engine",
 			"version":         "2.3.0-rc.4",
 			"git_sha":         "local-cliproxyapi",
@@ -707,6 +708,42 @@ func runtimeHost() string {
 
 func runtimeArch() string {
 	return runtime.GOARCH
+}
+
+func neoRuntimeClientEndpoint(r *http.Request) string {
+	scheme := "http"
+	host := "127.0.0.1"
+	if r != nil {
+		if forwardedHost := strings.TrimSpace(r.Header.Get("X-Forwarded-Host")); forwardedHost != "" {
+			host = strings.TrimSpace(strings.Split(forwardedHost, ",")[0])
+		} else if strings.TrimSpace(r.Host) != "" {
+			host = strings.TrimSpace(r.Host)
+		}
+		if forwarded := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")); forwarded != "" && !neoRequestHostIsLoopback(host) {
+			scheme = strings.TrimSpace(strings.Split(forwarded, ",")[0])
+		} else if r.TLS != nil {
+			scheme = "https"
+		}
+	}
+	if scheme == "" {
+		scheme = "http"
+	}
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	return scheme + "://" + host
+}
+
+func neoRequestHostIsLoopback(host string) bool {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return false
+	}
+	if parsedHost, _, err := net.SplitHostPort(host); err == nil {
+		host = parsedHost
+	}
+	host = strings.Trim(host, "[]")
+	return strings.EqualFold(host, "localhost") || host == "127.0.0.1" || host == "::1"
 }
 
 func isNeoSkillsPath(path string) bool {

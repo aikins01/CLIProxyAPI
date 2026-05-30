@@ -40,6 +40,47 @@ func TestNeoRuntimeEnabledIsOptIn(t *testing.T) {
 	}
 }
 
+func TestNeoRuntimeMetadataIncludesClientEndpoint(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+
+	tests := []struct {
+		name           string
+		host           string
+		forwardedProto string
+		forwardedHost  string
+		want           string
+	}{
+		{name: "public forwarded endpoint", host: "neo.aikins.test", forwardedProto: "https", forwardedHost: "neo.aikins.xyz", want: "https://neo.aikins.xyz"},
+		{name: "localhost stays http", host: "127.0.0.1:8317", forwardedProto: "https", want: "http://127.0.0.1:8317"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/metadata", nil)
+			req.Host = tc.host
+			if tc.forwardedProto != "" {
+				req.Header.Set("X-Forwarded-Proto", tc.forwardedProto)
+			}
+			if tc.forwardedHost != "" {
+				req.Header.Set("X-Forwarded-Host", tc.forwardedHost)
+			}
+			rec := httptest.NewRecorder()
+
+			rt.handleHTTP(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("metadata status = %d, body=%s", rec.Code, rec.Body.String())
+			}
+			var response map[string]any
+			if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+				t.Fatalf("metadata JSON error: %v", err)
+			}
+			if got := stringValue(response["clientEndpoint"]); got != tc.want {
+				t.Fatalf("clientEndpoint = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestNeoRuntimeStartRetriesUntilPortIsReleased(t *testing.T) {
 	held, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
