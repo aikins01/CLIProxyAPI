@@ -1096,7 +1096,7 @@ func TestNeoRuntimeGatewayWebSocketGetOrCreate(t *testing.T) {
 	t.Cleanup(server.Close)
 
 	dialer := websocket.Dialer{Subprotocols: []string{"rivet", "rivet_encoding.4", "rivet_skip_ready_wait"}}
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/gateway/threadActor/?rvt-method=getOrCreate&rvt-key=T-gateway"
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/gateway/thread-actor/?rvt-method=getOrCreate&rvt-key=T-gateway"
 	conn, resp, err := dialer.Dial(wsURL, nil)
 	if err != nil {
 		status := 0
@@ -1110,9 +1110,46 @@ func TestNeoRuntimeGatewayWebSocketGetOrCreate(t *testing.T) {
 	if got := conn.Subprotocol(); got != "rivet" {
 		t.Fatalf("subprotocol = %q, want rivet", got)
 	}
-	actors := rt.store.findActors(url.Values{"name": []string{"threadActor"}, "key": []string{"T-gateway"}})
+	actors := rt.store.findActors(url.Values{"name": []string{"thread-actor"}, "key": []string{"T-gateway"}})
 	if len(actors) != 1 {
 		t.Fatalf("gateway actor count = %d, actors=%#v", len(actors), actors)
+	}
+}
+
+func TestNeoRuntimeGatewayThreadActorAliasesReuseBinaryNamedActor(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	t.Cleanup(server.Close)
+
+	dialer := websocket.Dialer{Subprotocols: []string{"rivet", "rivet_encoding.4", "rivet_skip_ready_wait"}}
+	binaryURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/gateway/thread-actor/?rvt-method=getOrCreate&rvt-key=T-gateway-alias"
+	binaryConn, resp, err := dialer.Dial(binaryURL, nil)
+	if err != nil {
+		status := 0
+		if resp != nil {
+			status = resp.StatusCode
+		}
+		t.Fatalf("binary gateway websocket dial failed status=%d err=%v", status, err)
+	}
+	defer binaryConn.Close()
+
+	compatURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/gateway/threadActor/?rvt-method=getOrCreate&rvt-key=T-gateway-alias"
+	compatConn, resp, err := dialer.Dial(compatURL, nil)
+	if err != nil {
+		status := 0
+		if resp != nil {
+			status = resp.StatusCode
+		}
+		t.Fatalf("compat gateway websocket dial failed status=%d err=%v", status, err)
+	}
+	defer compatConn.Close()
+
+	actors := rt.store.findActors(url.Values{"key": []string{"T-gateway-alias"}})
+	if len(actors) != 1 {
+		t.Fatalf("gateway alias actor count = %d, actors=%#v", len(actors), actors)
+	}
+	if name := stringValue(actors[0]["name"]); name != "thread-actor" {
+		t.Fatalf("gateway actor name = %q, want binary name thread-actor", name)
 	}
 }
 

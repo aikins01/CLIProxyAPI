@@ -712,7 +712,7 @@
     });
     const runtimeKey = apiKey.trim();
     if (runtimeKey) params.set('auth_token', runtimeKey);
-    const response = await fetch(`/gateway/threadActor/request/import?${params.toString()}`, {
+    const response = await fetch(`/gateway/thread-actor/request/import?${params.toString()}`, {
       method: 'POST',
       headers: headers(),
       body: JSON.stringify({ thread })
@@ -979,7 +979,7 @@
       }));
     }
     if (runtimeKey) params.set('auth_token', runtimeKey);
-    const url = `${scheme}://${location.host}/gateway/threadActor/?${params.toString()}`;
+    const url = `${scheme}://${location.host}/gateway/thread-actor/?${params.toString()}`;
     const nextSocket = new WebSocket(url, ['rivet', 'rivet_encoding.4', 'rivet_skip_ready_wait']);
     socket = nextSocket;
     const activeSocket = () => socket === nextSocket && generation === socketGeneration && selectedThreadId === threadId;
