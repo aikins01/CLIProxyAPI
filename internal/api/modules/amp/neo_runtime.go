@@ -1331,11 +1331,12 @@ type neoActor struct {
 // generated so resuming clients can recover the in-flight `inference_tools`
 // frame and the agent_state context.
 type neoInferenceInflight struct {
-	messageID        string
-	agentMode        string
-	reasoningEffort  string
-	parentToolCallID string
-	tools            []string
+	messageID                  string
+	agentMode                  string
+	reasoningEffort            string
+	parentToolCallID           string
+	tools                      []string
+	preflightCompactionChecked bool
 }
 
 func cloneNeoInferenceInflight(inflight *neoInferenceInflight) *neoInferenceInflight {
@@ -5637,6 +5638,14 @@ func (a *neoActor) runInference(agentMode, reasoningEffort string) {
 }
 
 func (a *neoActor) runInferenceForParent(agentMode, reasoningEffort, parentToolCallID string) {
+	a.runInferenceForParentWithOptions(agentMode, reasoningEffort, parentToolCallID, neoInferenceRunOptions{})
+}
+
+type neoInferenceRunOptions struct {
+	skipPreflightCompaction bool
+}
+
+func (a *neoActor) runInferenceForParentWithOptions(agentMode, reasoningEffort, parentToolCallID string, options neoInferenceRunOptions) {
 	reasoningEffort = normalizeNeoReasoningEffortForMode(agentMode, reasoningEffort)
 	a.mu.Lock()
 	a.generation++
@@ -5647,11 +5656,12 @@ func (a *neoActor) runInferenceForParent(agentMode, reasoningEffort, parentToolC
 	a.agentState = "working"
 	tools := a.toolNamesLocked(agentMode)
 	a.currentInference = &neoInferenceInflight{
-		messageID:        assistantID,
-		agentMode:        agentMode,
-		reasoningEffort:  reasoningEffort,
-		parentToolCallID: parentToolCallID,
-		tools:            append([]string(nil), tools...),
+		messageID:                  assistantID,
+		agentMode:                  agentMode,
+		reasoningEffort:            reasoningEffort,
+		parentToolCallID:           parentToolCallID,
+		tools:                      append([]string(nil), tools...),
+		preflightCompactionChecked: options.skipPreflightCompaction,
 	}
 	a.mu.Unlock()
 
@@ -5659,7 +5669,14 @@ func (a *neoActor) runInferenceForParent(agentMode, reasoningEffort, parentToolC
 	a.broadcast(withNeoParentToolCallID(map[string]any{"type": "inference_tools", "messageId": assistantID, "agentMode": agentMode, "tools": tools}, parentToolCallID))
 	a.handleProtocolDelta(withNeoParentToolCallID(neoAssistantDeltaPayload(assistantID, []any{}, 0, "start", nil), parentToolCallID))
 
-	a.maybeCompactBeforeInference(agentMode, reasoningEffort, parentToolCallID, generation)
+	if !options.skipPreflightCompaction {
+		a.maybeCompactBeforeInference(agentMode, reasoningEffort, parentToolCallID, generation)
+		a.mu.Lock()
+		if a.currentInference != nil && a.currentInference.messageID == assistantID {
+			a.currentInference.preflightCompactionChecked = true
+		}
+		a.mu.Unlock()
+	}
 	a.mu.Lock()
 	if generation != a.generation {
 		a.mu.Unlock()
@@ -6553,11 +6570,16 @@ func (a *neoActor) syncCloudAsync() {
 	if a == nil {
 		return
 	}
-	a.mu.Lock()
-	if a.threadID == "" {
-		a.mu.Unlock()
+	storeDir := neoAmpThreadStoreDir()
+	snapshot, ok := a.threadSnapshot()
+	if !ok {
 		return
 	}
+	if err := writeNeoLocalThreadSnapshotToDir(snapshot, storeDir); err != nil {
+		log.Warnf("amp neo local runtime thread store sync failed thread=%s: %v", snapshot.threadID, err)
+	}
+
+	a.mu.Lock()
 	if a.syncRunning {
 		a.syncPending = true
 		a.mu.Unlock()
@@ -6565,6 +6587,14 @@ func (a *neoActor) syncCloudAsync() {
 	}
 	a.syncRunning = true
 	a.mu.Unlock()
+
+	if _, ok := a.cloudThreadSnapshot(snapshot); !ok {
+		a.mu.Lock()
+		a.syncRunning = false
+		a.syncPending = false
+		a.mu.Unlock()
+		return
+	}
 
 	go a.syncCloudLoop()
 }
@@ -6596,10 +6626,6 @@ func (a *neoActor) syncCloudLoop() {
 	for {
 		snapshot, ok := a.threadSnapshot()
 		if ok {
-			if err := writeNeoLocalThreadSnapshot(snapshot); err != nil {
-				log.Warnf("amp neo local runtime thread store sync failed thread=%s: %v", snapshot.threadID, err)
-			}
-
 			if cloudSnapshot, ok := a.cloudThreadSnapshot(snapshot); ok {
 				if err := uploadNeoCloudThread(cloudSnapshot); err != nil {
 					log.Warnf("amp neo local runtime cloud sync failed thread=%s: %v", snapshot.threadID, err)
@@ -7454,6 +7480,10 @@ func defaultNeoAmpThreadStoreDir() string {
 }
 
 func writeNeoLocalThreadSnapshot(snapshot neoCloudThreadSnapshot) error {
+	return writeNeoLocalThreadSnapshotToDir(snapshot, neoAmpThreadStoreDir())
+}
+
+func writeNeoLocalThreadSnapshotToDir(snapshot neoCloudThreadSnapshot, dir string) error {
 	if !neoThreadIDExactPattern.MatchString(snapshot.threadID) {
 		return fmt.Errorf("invalid thread id %q", snapshot.threadID)
 	}
@@ -7464,7 +7494,7 @@ func writeNeoLocalThreadSnapshot(snapshot neoCloudThreadSnapshot) error {
 	if snapshot.pendingInference != nil {
 		thread["pendingInference"] = neoInferenceInflightThreadMap(snapshot.pendingInference)
 	}
-	path, err := writeNeoLocalThreadFile(snapshot.threadID, thread)
+	path, err := writeNeoLocalThreadFileInDir(dir, snapshot.threadID, thread)
 	if err != nil {
 		return err
 	}
@@ -7475,6 +7505,10 @@ func writeNeoLocalThreadSnapshot(snapshot neoCloudThreadSnapshot) error {
 
 func writeNeoLocalThreadFile(threadID string, thread map[string]any) (string, error) {
 	dir := neoAmpThreadStoreDir()
+	return writeNeoLocalThreadFileInDir(dir, threadID, thread)
+}
+
+func writeNeoLocalThreadFileInDir(dir, threadID string, thread map[string]any) (string, error) {
 	if dir == "" {
 		return "", errors.New("amp thread store directory unavailable")
 	}
@@ -8566,6 +8600,9 @@ func neoInferenceInflightThreadMap(inflight *neoInferenceInflight) map[string]an
 		}
 		out["tools"] = tools
 	}
+	if inflight.preflightCompactionChecked {
+		out["preflightCompactionChecked"] = true
+	}
 	return out
 }
 
@@ -8575,11 +8612,12 @@ func neoInferenceInflightFromThread(raw any) *neoInferenceInflight {
 		return nil
 	}
 	parsed := &neoInferenceInflight{
-		messageID:        firstNonEmptyString(inflight["messageId"], inflight["messageID"], inflight["protocolMessageID"]),
-		agentMode:        stringValue(inflight["agentMode"]),
-		reasoningEffort:  firstNonEmptyString(inflight["reasoningEffort"], inflight["reasoning_effort"]),
-		parentToolCallID: firstNonEmptyString(inflight["parentToolCallId"], inflight["parentToolUseId"], inflight["parent_tool_use_id"]),
-		tools:            stringSliceFromAny(inflight["tools"]),
+		messageID:                  firstNonEmptyString(inflight["messageId"], inflight["messageID"], inflight["protocolMessageID"]),
+		agentMode:                  stringValue(inflight["agentMode"]),
+		reasoningEffort:            firstNonEmptyString(inflight["reasoningEffort"], inflight["reasoning_effort"]),
+		parentToolCallID:           firstNonEmptyString(inflight["parentToolCallId"], inflight["parentToolUseId"], inflight["parent_tool_use_id"]),
+		tools:                      stringSliceFromAny(inflight["tools"]),
+		preflightCompactionChecked: boolValue(firstNonNil(inflight["preflightCompactionChecked"], inflight["compactionChecked"])),
 	}
 	if parsed.messageID == "" && parsed.agentMode == "" && parsed.reasoningEffort == "" && parsed.parentToolCallID == "" && len(parsed.tools) == 0 {
 		return nil
@@ -10507,9 +10545,10 @@ func (a *neoActor) processPendingInferenceIfReady() bool {
 		effort = a.reasoningEffortForModeLocked(mode)
 	}
 	parentToolCallID := pending.parentToolCallID
+	skipPreflightCompaction := pending.preflightCompactionChecked
 	a.mu.Unlock()
 
-	go a.runInferenceForParent(mode, effort, parentToolCallID)
+	go a.runInferenceForParentWithOptions(mode, effort, parentToolCallID, neoInferenceRunOptions{skipPreflightCompaction: skipPreflightCompaction})
 	return true
 }
 
@@ -15347,6 +15386,7 @@ const neoSkillToolName = "skill"
 // the hand-written prompt functions below remain as defensive fallbacks.
 const (
 	neoPromptFamilyRush      = "rush"
+	neoPromptFamilyAggMan    = "agg-man"
 	neoPromptFamilyGPT       = "gpt"
 	neoPromptFamilyGPT5Codex = "gpt-5-codex"
 	neoPromptFamilyDeepGPT54 = "deep-gpt5.4"
@@ -15359,6 +15399,39 @@ const (
 )
 
 const (
+	neoPromptFamilyAggManGzip = "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"
 	neoPromptFamilyRushGzip = "H4sIAAAAAAAC/41XXY/buBV9968gkIduAduz275Nnmab7SJomhSdZBdBUaxpibK5pkiVpMZRf33PuaQkuw3QfZiBLJGX9+Pccw8/" +
 		"h1HpaNRTP+zVZ/7wrcpno8ZkokpnfgveqGuIlzToxuzVG+PsCz5yVeq1cyZl1YQYTZNVGHMTeqy3+SwrOnPld5jrRqdyCE65EIa0" +
 		"37x6pf4UfI66yZud+lFjdcRZbpJ9DT6ZL1l5Y1oDl4LCOpV0Z9y0x/o/ByyOrfU6TioaOJTs0XFfa5RpbU5bZfvBmd74rGKxns/a" +
@@ -15876,6 +15949,9 @@ func decodeNeoUpstreamPrompt(encoded string) (string, error) {
 
 func neoPromptFamily(agentMode string, route neoModelRoute) string {
 	agentMode = strings.ToLower(strings.TrimSpace(agentMode))
+	if agentMode == neoPromptFamilyAggMan {
+		return neoPromptFamilyAggMan
+	}
 	if agentMode == neoPromptFamilyRush {
 		return neoPromptFamilyRush
 	}
@@ -16078,6 +16154,8 @@ func neoBasePrompt(request neoInferenceRequest, route neoModelRoute) string {
 		return custom
 	}
 	switch neoPromptFamily(request.AgentMode, route) {
+	case neoPromptFamilyAggMan:
+		return neoUpstreamPrompt(neoPromptFamilyAggMan, neoPromptFamilyAggManGzip, neoDefaultPrompt)
 	case neoPromptFamilyRush:
 		return neoUpstreamPrompt(neoPromptFamilyRush, neoPromptFamilyRushGzip, neoRushPrompt)
 	case neoPromptFamilyDeep:

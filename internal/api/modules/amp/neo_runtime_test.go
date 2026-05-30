@@ -1562,7 +1562,7 @@ func TestNeoRuntimeShutdownFlushesLocalThreadSnapshot(t *testing.T) {
 		State:     map[string]any{"type": "streaming"},
 		Seq:       2,
 	}}
-	actor.currentInference = &neoInferenceInflight{messageID: "M-0000000000000000000002", agentMode: "deep", reasoningEffort: "xhigh", tools: []string{"shell_command"}}
+	actor.currentInference = &neoInferenceInflight{messageID: "M-0000000000000000000002", agentMode: "deep", reasoningEffort: "xhigh", tools: []string{"shell_command"}, preflightCompactionChecked: true}
 	actor.seq = 2
 	actor.mu.Unlock()
 
@@ -1589,6 +1589,9 @@ func TestNeoRuntimeShutdownFlushesLocalThreadSnapshot(t *testing.T) {
 	pending := mapValue(thread["pendingInference"])
 	if stringValue(pending["agentMode"]) != "deep" || stringValue(pending["reasoningEffort"]) != "xhigh" {
 		t.Fatalf("pendingInference = %#v, want deep/xhigh resume marker", pending)
+	}
+	if !boolValue(pending["preflightCompactionChecked"]) {
+		t.Fatalf("pendingInference = %#v, want preflight compaction marker", pending)
 	}
 	if _, err := os.Stat(filepath.Join(dir, threadID+".json")); err != nil {
 		t.Fatalf("snapshot stat: %v", err)
@@ -5980,6 +5983,7 @@ func TestNeoPromptFamilyMatchesBinarySelector(t *testing.T) {
 		route     neoModelRoute
 		want      string
 	}{
+		{name: "agg man mode", agentMode: "agg-man", route: neoModelRoute{Provider: "openai", Model: "gpt-5.5"}, want: neoPromptFamilyAggMan},
 		{name: "rush mode", agentMode: "rush", route: neoModelRoute{Provider: "openai", Model: "gpt-5.5"}, want: neoPromptFamilyRush},
 		{name: "deep gpt55", agentMode: "deep", route: neoModelRoute{Provider: "openai", Model: "gpt-5.5"}, want: neoPromptFamilyDeep},
 		{name: "deep gpt54", agentMode: "deep", route: neoModelRoute{Provider: "openai", Model: "gpt-5.4"}, want: neoPromptFamilyDeepGPT54},
@@ -6008,6 +6012,12 @@ func TestNeoSystemPromptUsesBinaryPromptFamilies(t *testing.T) {
 		route   neoModelRoute
 		want    []string
 	}{
+		{
+			name:    "agg man",
+			request: neoInferenceRequest{AgentMode: "agg-man"},
+			route:   neoModelRoute{Provider: "openai", Model: "gpt-5.5"},
+			want:    []string{"You are Agg Man, Amp's platform control-plane assistant.", "Use find_thread to discover relevant threads and read_thread before making claims", "workflow: \"code_review\"", "workflow: \"merge_changes\""},
+		},
 		{
 			name:    "codex",
 			request: neoInferenceRequest{AgentMode: "smart"},
@@ -6085,7 +6095,7 @@ func TestNeoSystemPromptIncludesSendMessageWorkflowGuidance(t *testing.T) {
 		}
 	}
 
-	withoutTool := neoSystemPrompt(neoInferenceRequest{AgentMode: "agg-man"}, neoModelRoute{Provider: "openai", Model: "gpt-5.5"})
+	withoutTool := neoSystemPrompt(neoInferenceRequest{AgentMode: "smart"}, neoModelRoute{Provider: "openai", Model: "gpt-5.5"})
 	if strings.Contains(withoutTool, `workflow: "merge_changes"`) {
 		t.Fatalf("prompt without send_message_to_thread tool should not include workflow guidance:\n%s", withoutTool)
 	}
@@ -11696,7 +11706,7 @@ func TestNeoActorImportRestoresPendingInference(t *testing.T) {
 			map[string]any{"messageId": "M-user", "role": "user", "content": []any{map[string]any{"type": "text", "text": "continue after restart"}}},
 			map[string]any{"messageId": "M-assistant", "role": "assistant", "state": map[string]any{"type": "cancelled"}, "content": []any{map[string]any{"type": "text", "text": "partial"}}},
 		},
-		"pendingInference": map[string]any{"messageId": "M-assistant", "agentMode": "deep", "reasoningEffort": "xhigh", "parentToolCallId": "TU-parent", "tools": []any{"shell_command"}},
+		"pendingInference": map[string]any{"messageId": "M-assistant", "agentMode": "deep", "reasoningEffort": "xhigh", "parentToolCallId": "TU-parent", "tools": []any{"shell_command"}, "preflightCompactionChecked": true},
 	}
 	if err := actor.importThreadLocalOnly(thread); err != nil {
 		t.Fatalf("import thread: %v", err)
@@ -11706,6 +11716,9 @@ func TestNeoActorImportRestoresPendingInference(t *testing.T) {
 	}
 	if actor.pendingInference.agentMode != "deep" || actor.pendingInference.reasoningEffort != "xhigh" || actor.pendingInference.parentToolCallID != "TU-parent" {
 		t.Fatalf("pendingInference = %#v, want deep/xhigh with parent", actor.pendingInference)
+	}
+	if !actor.pendingInference.preflightCompactionChecked {
+		t.Fatalf("pendingInference = %#v, want preflight compaction marker", actor.pendingInference)
 	}
 	if actor.currentInference != nil {
 		t.Fatalf("currentInference = %#v, want nil until retry starts", actor.currentInference)
