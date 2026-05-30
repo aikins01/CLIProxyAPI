@@ -1125,6 +1125,86 @@ func TestNeoRuntimeAutoCompactionFallsBackForToolLoopWithoutUserTail(t *testing.
 	}
 }
 
+func TestNeoRuntimeAutoCompactionRunsForToolContinuation(t *testing.T) {
+	dir := t.TempDir()
+	oldStoreDir := neoAmpThreadStoreDir
+	neoAmpThreadStoreDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
+
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.URL.Path != "/api/provider/openai/v1/chat/completions" {
+			t.Fatalf("unexpected compaction path %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"tool continuation summary"}}]}`))
+	}))
+	t.Cleanup(upstream.Close)
+	parsed, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+	_, portString, err := net.SplitHostPort(parsed.Host)
+	if err != nil {
+		t.Fatalf("parse upstream host: %v", err)
+	}
+	port, err := strconv.Atoi(portString)
+	if err != nil {
+		t.Fatalf("parse upstream port: %v", err)
+	}
+
+	enabled := true
+	rt := newNeoRuntime(&config.Config{
+		Host: "127.0.0.1",
+		Port: port,
+		AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
+			Enabled:         &enabled,
+			CompactionModel: "openai/gpt-5.4",
+		}},
+	})
+	threadID := "T-tool-continuation-compact"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+	actor.settings["internal.compactionThresholdPercent"] = 0
+	actor.mu.Lock()
+	for i := 0; i < 30; i++ {
+		role := "user"
+		content := []any{map[string]any{"type": "text", "text": fmt.Sprintf("message %02d", i)}}
+		if i%2 == 1 {
+			role = "assistant"
+			content = []any{map[string]any{"type": "tool_use", "id": fmt.Sprintf("TU-%022d", i), "name": "Bash", "input": map[string]any{"cmd": "echo step"}}}
+		}
+		actor.storeMessageLocked(neoMessage{ThreadID: threadID, MessageID: fmt.Sprintf("M-%022d", i), Role: role, Content: content})
+	}
+	actor.currentInference = &neoInferenceInflight{messageID: "M-current", agentMode: "smart", reasoningEffort: "medium", parentToolCallID: "TU-parent"}
+	actor.rebuildHistoryLocked()
+	actor.syncRunning = true
+	generation := actor.generation
+	actor.mu.Unlock()
+
+	actor.maybeCompactBeforeInference("smart", "medium", "TU-parent", generation)
+	actor.mu.Lock()
+	actor.syncRunning = false
+	actor.syncPending = false
+	actor.mu.Unlock()
+	waitForNeoActorSyncIdle(t, actor)
+
+	if calls != 1 {
+		t.Fatalf("compaction calls = %d, want 1", calls)
+	}
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.messages) != 31 {
+		t.Fatalf("message count after compaction = %d, want original messages plus summary", len(actor.messages))
+	}
+	if len(actor.compactionRecords) != 1 {
+		t.Fatalf("compaction records = %#v, want one record", actor.compactionRecords)
+	}
+	if !strings.Contains(fmt.Sprint(actor.history), "tool continuation summary") {
+		t.Fatalf("history after compaction = %#v, want continuation summary", actor.history)
+	}
+}
+
 func TestNeoActorHistoryHonorsCompactionRecordWithoutSummary(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	threadID := "T-record-history"

@@ -6581,7 +6581,7 @@ func (a *neoActor) runInferenceForParentWithOptions(agentMode, reasoningEffort, 
 }
 
 func (a *neoActor) maybeCompactBeforeInference(agentMode, reasoningEffort, parentToolCallID string, generation int) {
-	if a == nil || a.runtime == nil || parentToolCallID != "" {
+	if a == nil || a.runtime == nil {
 		return
 	}
 	cfg := a.runtime.configSnapshot()
