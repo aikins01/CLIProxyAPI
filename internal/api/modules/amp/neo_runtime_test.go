@@ -14034,6 +14034,27 @@ func TestNeoRuntimeThreadActorCreationPreservesBinaryMetadata(t *testing.T) {
 	}
 }
 
+func TestNeoRuntimeThreadActorCredentialsDoNotInventUpstreamRoutingFields(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	response, status := rt.localThreadActorManagementResponse(context.Background(), map[string]any{
+		"agentMode":        "deep",
+		"usesThreadActors": true,
+	}, "")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d response=%#v", status, response)
+	}
+	for _, key := range []string{"threadId", "wsToken", "ownerUserId", "threadVersion"} {
+		if response[key] == nil || response[key] == "" {
+			t.Fatalf("missing binary-required credential field %q in %#v", key, response)
+		}
+	}
+	for _, key := range []string{"poolName", "capability", "userId"} {
+		if _, exists := response[key]; exists {
+			t.Fatalf("local thread actor credentials should not include %s: %#v", key, response)
+		}
+	}
+}
+
 func TestNeoRuntimeThreadImportVersionAllocatesFutureSeq(t *testing.T) {
 	dir := t.TempDir()
 	oldStoreDir := neoAmpThreadStoreDir

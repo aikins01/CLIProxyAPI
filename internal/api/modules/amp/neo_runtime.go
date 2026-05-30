@@ -8239,13 +8239,10 @@ func (rt *neoRuntime) localThreadActorManagementResponse(ctx context.Context, bo
 	}
 	baseResponse := map[string]any{
 		"threadId":      threadID,
-		"userId":        neoLocalOwnerUserID,
 		"ownerUserId":   neoLocalOwnerUserID,
 		"threadVersion": threadVersion,
 		"agentMode":     agentMode,
 		"wsToken":       wsToken,
-		"capability":    "write",
-		"poolName":      "local",
 	}
 
 	if requestedThreadID != "" && executorType != "" {
