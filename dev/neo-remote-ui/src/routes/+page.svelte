@@ -2680,7 +2680,8 @@
       .map((block) => {
         if (block.type === 'text') return block.text ?? '';
         if (block.type === 'thinking') return block.thinking ? `Thinking: ${block.thinking}` : '';
-        if (block.type === 'tool_use') return `Using ${block.name ?? 'tool'}`;
+        if (block.type === 'redacted_thinking') return 'Thinking: redacted';
+        if (block.type === 'tool_use' || block.type === 'server_tool_use') return `Using ${block.name ?? 'tool'}`;
         if (isImageBlock(block)) return imageBlockName(block) ? `[image: ${imageBlockName(block)}]` : '[image]';
         return '';
       })
@@ -3222,7 +3223,8 @@
 
   function isRenderableWorkBlock(block: ContentBlock) {
     if (block.type === 'thinking') return Boolean(block.thinking) || plausibleBlockTimeMillis(block.startTime) > 0;
-    if (block.type === 'tool_use') return true;
+    if (block.type === 'redacted_thinking') return Boolean(block.data) || plausibleBlockTimeMillis(block.startTime) > 0;
+    if (block.type === 'tool_use' || block.type === 'server_tool_use') return true;
     if (block.type === 'manual_bash_invocation') return !isHiddenBlock(block);
     if (block.type === 'tool_result') {
       return Boolean(blockContentPreview(block) || toolResultUseID(block) || Object.keys(toolResultRun(block)).length > 0);
@@ -3234,7 +3236,7 @@
     if (block.type !== 'text' || !block.text) return false;
     if (plausibleBlockTimeMillis(block.startTime) <= 0 && plausibleBlockTimeMillis(block.finalTime) <= 0) return false;
     if (message.state?.stopReason === 'tool_use') return true;
-    return message.content.slice(blockIndex + 1).some((next) => next.type === 'tool_use');
+    return message.content.slice(blockIndex + 1).some((next) => next.type === 'tool_use' || next.type === 'server_tool_use');
   }
 
   function workDurationLabel(blocks: ContentBlock[], live = false) {
@@ -3248,6 +3250,11 @@
     const end = ends.length > 0 ? Math.max(...ends) : streaming ? Date.now() : 0;
     if (end <= start) return '';
     return `Worked for ${formatWorkDuration(end - start)}`;
+  }
+
+  function thinkingText(block: ContentBlock) {
+    if (block.type === 'redacted_thinking') return 'Redacted thinking';
+    return block.thinking ?? '';
   }
 
   function traceTimeLabel(block: ContentBlock) {
@@ -3401,8 +3408,8 @@
     const flush = () => { if (buf.length) { rows.push({ kind: 'explore', tools: buf }); buf = []; } };
     const results = collectToolResults(blocks);
     for (const b of blocks) {
-      if (b.type === 'thinking') {
-        if (b.thinking?.trim()) {
+      if (b.type === 'thinking' || b.type === 'redacted_thinking') {
+        if (thinkingText(b).trim()) {
           flush();
           rows.push({ kind: 'thinking', block: b });
         }
@@ -3413,7 +3420,7 @@
         flush();
         rows.push({ kind: 'progress', block: b });
       }
-      else if (b.type === 'tool_use') {
+      else if (b.type === 'tool_use' || b.type === 'server_tool_use') {
         const cat = toolCategoryForBlock(b);
         const result = toolResultForBlock(results, b);
         if (cat === 'explore') buf.push({ block: b, result });
@@ -4052,7 +4059,7 @@
 {/snippet}
 
 {#snippet traceBlock(block: ContentBlock)}
-  {#if block.type === 'thinking' && block.thinking}
+  {#if (block.type === 'thinking' || block.type === 'redacted_thinking') && thinkingText(block)}
     <details class="trace-block trace-block--thinking">
       <summary class="trace-time-anchor" data-time={traceTimeLabel(block)}>
         <ChevronRight size={14} class="trace-block__chevron" />
@@ -4060,9 +4067,9 @@
         <span>thinking</span>
         <small>{blockStatus(block)}</small>
       </summary>
-      <p>{block.thinking}</p>
+      <p>{thinkingText(block)}</p>
     </details>
-  {:else if block.type === 'tool_use'}
+  {:else if block.type === 'tool_use' || block.type === 'server_tool_use'}
     <details class="trace-block trace-block--tool">
       <summary class="trace-time-anchor" data-time={traceTimeLabel(block)}>
         <ChevronRight size={14} class="trace-block__chevron" />
@@ -4119,8 +4126,8 @@
     <div class="work-group__body">
       {#each groupWorkBlocks(blocks) as row, index (index)}
         {#if row.kind === 'thinking'}
-          {#if row.block.thinking}
-            <div class="trace-thinking md">{@html renderMarkdown(stripThinkingTitle(row.block.thinking))}</div>
+          {#if thinkingText(row.block)}
+            <div class="trace-thinking md">{@html renderMarkdown(stripThinkingTitle(thinkingText(row.block)))}</div>
           {/if}
         {:else if row.kind === 'progress'}
           {#if row.block.text}
