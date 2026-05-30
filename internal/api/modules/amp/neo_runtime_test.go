@@ -7337,7 +7337,7 @@ func TestNeoActorAppliesToolEnableDisableSettings(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
 	actor.tools = map[string]neoToolSpec{
-		"Read":                    {Name: "Read"},
+		"Read":                    {Name: "Read", Meta: map[string]any{"source": "builtin"}},
 		"read_thread":             {Name: "read_thread"},
 		"shell_command":           {Name: "shell_command"},
 		"mcp__git_server__search": {Name: "mcp__git_server__search", Meta: map[string]any{"source": map[string]any{"mcp": "git-server"}}},
@@ -7370,13 +7370,13 @@ func TestNeoActorAppliesToolEnableDisableSettings(t *testing.T) {
 		t.Fatalf("enable settings allowed unselected tools: %#v", enabledNames)
 	}
 
-	actor.settings = map[string]any{"tools.enable": `["read_thread"]`}
+	actor.settings = map[string]any{"tools.enable": []string{"read_thread"}}
 	promptNames := map[string]bool{}
 	for _, name := range actor.toolNamesLocked("deep") {
 		promptNames[name] = true
 	}
 	if !promptNames["read_thread"] || promptNames["shell_command"] || promptNames["mcp__git_server__search"] {
-		t.Fatalf("toolNamesLocked did not apply JSON tools.enable settings: %#v", promptNames)
+		t.Fatalf("toolNamesLocked did not apply tools.enable settings: %#v", promptNames)
 	}
 }
 
@@ -7408,6 +7408,44 @@ func TestNeoToolSettingsSupportBinaryBraceGlobs(t *testing.T) {
 	}
 	if !names["read_thread"] || names["shell_command"] || names["apply_patch"] {
 		t.Fatalf("brace glob enable settings mismatch: %#v", names)
+	}
+}
+
+func TestNeoToolSettingsBuiltinPatternRequiresBuiltinSource(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	actor.tools = map[string]neoToolSpec{
+		"Read": {Name: "Read"},
+		"Bash": {Name: "Bash", Meta: map[string]any{"source": "builtin"}},
+	}
+	actor.settings = map[string]any{"tools.disable": []any{"builtin:Read", "builtin:Bash"}}
+
+	names := map[string]bool{}
+	for _, tool := range actor.inferenceRequestLocked("smart", "", "").Tools {
+		names[tool.Name] = true
+	}
+	if !names["Read"] {
+		t.Fatalf("builtin: pattern matched no-source Read, unlike the binary: %#v", names)
+	}
+	if names["Bash"] {
+		t.Fatalf("builtin: pattern did not match source=builtin tool: %#v", names)
+	}
+}
+
+func TestNeoToolSettingsMCPServerNormalizationMatchesBinary(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	actor.tools = map[string]neoToolSpec{
+		"mcp__git_server__search": {Name: "mcp__git_server__search", Meta: map[string]any{"source": map[string]any{"mcp": "git--server"}}},
+	}
+	actor.settings = map[string]any{"tools.enable": []any{"mcp__git--server__search"}}
+
+	names := map[string]bool{}
+	for _, tool := range actor.inferenceRequestLocked("deep", "", "").Tools {
+		names[tool.Name] = true
+	}
+	if !names["mcp__git_server__search"] {
+		t.Fatalf("MCP source server normalization did not match binary behavior: %#v", names)
 	}
 }
 

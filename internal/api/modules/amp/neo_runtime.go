@@ -101,6 +101,7 @@ var (
 	neoBinaryThreadIDExactPattern = regexp.MustCompile(`^T-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 	neoCloudThreadIDPattern       = regexp.MustCompile(`^T-([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$`)
 	neoMessageIDPattern           = regexp.MustCompile(`^M-[0-9A-Za-z]{22}$`)
+	neoMCPServerPattern           = regexp.MustCompile(`[\s-]+`)
 	neoAmpThreadStoreDir          = defaultNeoAmpThreadStoreDir
 	neoAmpTaskStoreMu             sync.Mutex
 	neoInboundMessageHookMu       sync.RWMutex
@@ -12829,29 +12830,23 @@ func neoToolSettingPatterns(settings map[string]any, key string) []string {
 	case []string:
 		out := make([]string, 0, len(value))
 		for _, item := range value {
-			if trimmed := strings.TrimSpace(item); trimmed != "" {
-				out = append(out, trimmed)
+			if item != "" {
+				out = append(out, item)
 			}
 		}
 		return out
 	case []any:
 		out := make([]string, 0, len(value))
 		for _, item := range value {
-			if trimmed := strings.TrimSpace(stringValue(item)); trimmed != "" {
-				out = append(out, trimmed)
+			text, ok := item.(string)
+			if !ok {
+				return nil
+			}
+			if text != "" {
+				out = append(out, text)
 			}
 		}
 		return out
-	case string:
-		text := strings.TrimSpace(value)
-		if text == "" {
-			return nil
-		}
-		var decoded []any
-		if strings.HasPrefix(text, "[") && json.Unmarshal([]byte(text), &decoded) == nil {
-			return neoToolSettingPatterns(map[string]any{key: decoded}, key)
-		}
-		return []string{text}
 	default:
 		return nil
 	}
@@ -12885,16 +12880,13 @@ func neoToolPatternCandidates(tool neoToolSpec) []string {
 		out = append(out, value)
 	}
 	add(tool.Name)
-	if neoKnownModeTools[tool.Name] {
-		add("builtin:" + tool.Name)
-	}
 	source := tool.Meta["source"]
 	if stringValue(source) == "builtin" {
 		add("builtin:" + tool.Name)
 	}
 	if sourceMap := mapValue(source); len(sourceMap) > 0 {
 		if server := stringValue(sourceMap["mcp"]); server != "" {
-			normalized := strings.NewReplacer(" ", "_", "-", "_").Replace(server)
+			normalized := neoNormalizeMCPServerName(server)
 			if parsed, ok := neoParseMCPToolName(tool.Name); ok {
 				add(parsed.tool)
 				if parsed.server == normalized {
@@ -12911,6 +12903,10 @@ func neoToolPatternCandidates(tool neoToolSpec) []string {
 		add("mcp__" + parsed.server + "__" + parsed.tool)
 	}
 	return out
+}
+
+func neoNormalizeMCPServerName(name string) string {
+	return neoMCPServerPattern.ReplaceAllString(name, "_")
 }
 
 type neoMCPToolName struct {
