@@ -503,7 +503,33 @@ func TestNeoRuntimeAutoCompactsLargeLocalHistory(t *testing.T) {
 	actor.rebuildHistoryLocked()
 	actor.mu.Unlock()
 
+	actor.mu.Lock()
+	actor.syncRunning = true
+	actor.mu.Unlock()
 	actor.maybeCompactBeforeInference("smart", "medium", "", actor.generation)
+	rawStored, err := os.ReadFile(filepath.Join(dir, threadID+".json"))
+	if err != nil {
+		t.Fatalf("compaction should synchronously persist local thread before async sync: %v", err)
+	}
+	var storedThread map[string]any
+	if err := json.Unmarshal(rawStored, &storedThread); err != nil {
+		t.Fatalf("stored compacted thread JSON: %v", err)
+	}
+	storedMessages := arrayValue(storedThread["messages"])
+	summaryIndex := 30 - neoCompactionTailMessages
+	if len(storedMessages) <= summaryIndex+1 {
+		t.Fatalf("stored messages after compaction = %d, want at least %d", len(storedMessages), summaryIndex+2)
+	}
+	if got := stringValue(mapValue(storedMessages[summaryIndex])["role"]); got != "info" {
+		t.Fatalf("stored summary role at cut boundary = %q, want info", got)
+	}
+	if got := stringValue(mapValue(storedMessages[summaryIndex+1])["protocolMessageID"]); got != "M-0000000000000000000022" {
+		t.Fatalf("stored cut message after summary = %q, want M-0000000000000000000022", got)
+	}
+	actor.mu.Lock()
+	actor.syncRunning = false
+	actor.syncPending = false
+	actor.mu.Unlock()
 	waitForNeoActorSyncIdle(t, actor)
 
 	actor.mu.Lock()
@@ -519,7 +545,6 @@ func TestNeoRuntimeAutoCompactsLargeLocalHistory(t *testing.T) {
 		actor.mu.Unlock()
 		t.Fatalf("old transcript prefix was removed: first message = %#v", actor.messages[0])
 	}
-	summaryIndex := 30 - neoCompactionTailMessages
 	summaryMessage := actor.messages[summaryIndex]
 	if summaryMessage.Role != "info" || stringValue(mapValue(summaryMessage.Content[0])["type"]) != "summary" {
 		actor.mu.Unlock()

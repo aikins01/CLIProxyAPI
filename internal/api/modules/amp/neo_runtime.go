@@ -5717,6 +5717,7 @@ func (a *neoActor) maybeCompactBeforeInference(agentMode, reasoningEffort, paren
 	a.broadcast(neoProtocolCompactionCompletePayload(cutMessageID))
 	a.broadcast(map[string]any{"type": "compaction_records", "records": neoProtocolCompactionRecordList(records)})
 	a.dispatchNotification("thread", "compaction_complete", map[string]any{"cutMessageId": cutMessageID})
+	a.syncLocalThreadSnapshotNow()
 	a.syncCloudAsync()
 }
 
@@ -6404,6 +6405,16 @@ func (a *neoActor) syncCloudAsync() {
 	a.mu.Unlock()
 
 	go a.syncCloudLoop()
+}
+
+func (a *neoActor) syncLocalThreadSnapshotNow() {
+	snapshot, ok := a.threadSnapshot()
+	if !ok {
+		return
+	}
+	if err := writeNeoLocalThreadSnapshot(snapshot); err != nil {
+		log.Warnf("amp neo local runtime thread store sync failed thread=%s: %v", snapshot.threadID, err)
+	}
 }
 
 func (a *neoActor) syncCloudLoop() {
@@ -8097,7 +8108,6 @@ func neoThreadMessagesAgentMode(raw any) string {
 
 func neoCloudThread(snapshot neoCloudThreadSnapshot) map[string]any {
 	messages := append([]neoMessage(nil), snapshot.messages...)
-	sort.Slice(messages, func(i, j int) bool { return messages[i].Seq < messages[j].Seq })
 
 	cloudMessages := make([]any, 0, len(messages))
 	version := snapshot.seq
