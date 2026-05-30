@@ -1598,6 +1598,70 @@ func TestNeoRuntimeShutdownFlushesLocalThreadSnapshot(t *testing.T) {
 	}
 }
 
+func TestNeoRuntimeShutdownDoesNotResumeUncheckedCurrentInference(t *testing.T) {
+	useTempNeoThreadStore(t)
+
+	port := freeTCPPortForTest(t)
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
+		Host: "127.0.0.1",
+		Port: port,
+	}}})
+	if err := rt.start(); err != nil {
+		t.Fatalf("start runtime: %v", err)
+	}
+
+	threadID := "T-shutdown-unchecked-current-inference"
+	actor := rt.store.ensureThreadActor(threadID)
+	actor.mu.Lock()
+	actor.currentAgentMode = "deep"
+	actor.currentReasoningEffort = "xhigh"
+	actor.settings = map[string]any{"agentMode": "deep", "reasoning.effort": "xhigh"}
+	actor.messages = []neoMessage{{
+		ThreadID:        threadID,
+		MessageID:       "M-0000000000000000000001",
+		Role:            "user",
+		Content:         []any{map[string]any{"type": "text", "text": "start work"}},
+		AgentMode:       "deep",
+		ReasoningEffort: "xhigh",
+		Seq:             1,
+	}, {
+		ThreadID:  threadID,
+		MessageID: "M-0000000000000000000002",
+		Role:      "assistant",
+		Content:   []any{map[string]any{"type": "text", "text": "partial answer"}},
+		State:     map[string]any{"type": "streaming"},
+		Seq:       2,
+	}}
+	actor.currentInference = &neoInferenceInflight{messageID: "M-0000000000000000000002", agentMode: "deep", reasoningEffort: "xhigh", tools: []string{"shell_command"}}
+	actor.seq = 2
+	actor.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := rt.shutdown(ctx); err != nil {
+		t.Fatalf("shutdown runtime: %v", err)
+	}
+
+	thread, ok := loadNeoLocalThread(threadID)
+	if !ok {
+		t.Fatal("shutdown did not write local thread snapshot")
+	}
+	if _, exists := thread["currentInference"]; exists {
+		t.Fatalf("currentInference was not dropped on reload: %#v", thread["currentInference"])
+	}
+	if _, exists := thread["pendingInference"]; exists {
+		t.Fatalf("pendingInference was created without compaction marker: %#v", thread["pendingInference"])
+	}
+	messages := arrayValue(thread["messages"])
+	if len(messages) != 2 {
+		t.Fatalf("messages = %#v, want user and cancelled assistant", messages)
+	}
+	assistant := mapValue(messages[1])
+	if stringValue(mapValue(assistant["state"])["type"]) != "cancelled" {
+		t.Fatalf("assistant state = %#v, want cancelled", assistant["state"])
+	}
+}
+
 func TestNeoRuntimeShutdownPreservesSpawnedExecutors(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("sleep command and signal 0 are Unix-specific")

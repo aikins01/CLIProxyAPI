@@ -5678,11 +5678,16 @@ func (a *neoActor) runInferenceForParentWithOptions(agentMode, reasoningEffort, 
 
 	if !options.skipPreflightCompaction {
 		a.maybeCompactBeforeInference(agentMode, reasoningEffort, parentToolCallID, generation)
+		checked := false
 		a.mu.Lock()
 		if a.currentInference != nil && a.currentInference.messageID == assistantID {
 			a.currentInference.preflightCompactionChecked = true
+			checked = true
 		}
 		a.mu.Unlock()
+		if checked {
+			a.syncLocalThreadSnapshotNow()
+		}
 	}
 	a.mu.Lock()
 	if generation != a.generation {
@@ -6621,7 +6626,7 @@ func (a *neoActor) syncLocalThreadSnapshotForShutdownNow() {
 	if !ok {
 		return
 	}
-	if snapshot.pendingInference == nil && snapshot.currentInference != nil {
+	if snapshot.pendingInference == nil && snapshot.currentInference != nil && snapshot.currentInference.preflightCompactionChecked {
 		snapshot.pendingInference = cloneNeoInferenceInflight(snapshot.currentInference)
 	}
 	if err := writeNeoLocalThreadSnapshot(snapshot); err != nil {
