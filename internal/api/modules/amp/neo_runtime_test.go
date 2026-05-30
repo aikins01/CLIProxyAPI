@@ -8194,27 +8194,30 @@ func TestNeoActorLeasesThreadToolsInsteadOfServingLocalSnapshots(t *testing.T) {
 		},
 	}, "deep", "xhigh")
 
-	actor.mu.Lock()
-	defer actor.mu.Unlock()
-	if len(actor.pendingTools) != 2 {
-		t.Fatalf("pending tools = %#v, want read_thread and find_thread leases", actor.pendingTools)
-	}
-	for _, toolID := range []string{"TU-read", "TU-find"} {
-		if _, ok := actor.pendingTools[toolID]; !ok {
-			t.Fatalf("missing pending thread tool lease %s: %#v", toolID, actor.pendingTools)
+	func() {
+		actor.mu.Lock()
+		defer actor.mu.Unlock()
+		if len(actor.pendingTools) != 2 {
+			t.Fatalf("pending tools = %#v, want read_thread and find_thread leases", actor.pendingTools)
 		}
-	}
-	for _, message := range actor.messages {
-		if message.Role != "user" {
-			continue
-		}
-		for _, raw := range message.Content {
-			block := mapValue(raw)
-			if stringValue(block["type"]) == "tool_result" {
-				t.Fatalf("thread tool was served locally instead of leased: %#v", message)
+		for _, toolID := range []string{"TU-read", "TU-find"} {
+			if _, ok := actor.pendingTools[toolID]; !ok {
+				t.Fatalf("missing pending thread tool lease %s: %#v", toolID, actor.pendingTools)
 			}
 		}
-	}
+		for _, message := range actor.messages {
+			if message.Role != "user" {
+				continue
+			}
+			for _, raw := range message.Content {
+				block := mapValue(raw)
+				if stringValue(block["type"]) == "tool_result" {
+					t.Fatalf("thread tool was served locally instead of leased: %#v", message)
+				}
+			}
+		}
+	}()
+	waitForNeoActorSyncIdle(t, actor)
 }
 
 func TestNeoActorPassesReadThreadToolResultThrough(t *testing.T) {
