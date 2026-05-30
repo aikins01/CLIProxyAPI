@@ -1008,6 +1008,7 @@ func (s *neoActorStore) actorForGatewayRequest(r *http.Request) *neoActor {
 	}
 	q := r.URL.Query()
 	target := neoGatewayTargetFromPath(r.URL.Path)
+	canonicalTarget := neoCanonicalActorName(target)
 	key := strings.TrimSpace(q.Get("rvt-key"))
 
 	s.mu.RLock()
@@ -1018,7 +1019,7 @@ func (s *neoActorStore) actorForGatewayRequest(r *http.Request) *neoActor {
 		}
 	}
 	if key != "" {
-		if id := s.byNameKey[target+"\x00"+key]; id != "" {
+		if id := s.byNameKey[canonicalTarget+"\x00"+key]; id != "" {
 			if actor := s.actors[id]; actor != nil {
 				s.mu.RUnlock()
 				return actor
@@ -1042,7 +1043,7 @@ func (s *neoActorStore) actorForGatewayRequest(r *http.Request) *neoActor {
 	if !strings.EqualFold(method, "getOrCreate") || target == "" || key == "" {
 		return nil
 	}
-	body := map[string]any{"name": target, "key": key}
+	body := map[string]any{"name": canonicalTarget, "key": key}
 	if input := decodeNeoGatewayInput(q.Get("rvt-input")); input != nil {
 		body["input"] = input
 	} else if threadID := neoThreadIDPattern.FindString(key); threadID != "" {
@@ -1081,6 +1082,13 @@ func (s *neoActorStore) persistedThreadActorForGatewayTarget(target, key string)
 
 func neoGatewayThreadActorTarget(target string) bool {
 	return target == "threadActor" || target == "thread-actor"
+}
+
+func neoCanonicalActorName(name string) string {
+	if neoGatewayThreadActorTarget(name) {
+		return "thread-actor"
+	}
+	return name
 }
 
 func neoThreadIDFromGatewayKey(key string) string {
@@ -1221,9 +1229,10 @@ func (s *neoActorStore) findActors(q url.Values) []map[string]any {
 	}
 
 	name := q.Get("name")
+	canonicalName := neoCanonicalActorName(name)
 	key, hasKey := q["key"]
 	if name != "" && hasKey {
-		id := s.byNameKey[name+"\x00"+firstString(key)]
+		id := s.byNameKey[canonicalName+"\x00"+firstString(key)]
 		if actor := s.actors[id]; actor != nil {
 			return []map[string]any{actor.record}
 		}
@@ -1232,7 +1241,7 @@ func (s *neoActorStore) findActors(q url.Values) []map[string]any {
 
 	out := make([]map[string]any, 0, len(s.actors))
 	for _, actor := range s.actors {
-		if name == "" || actor.name == name {
+		if name == "" || neoCanonicalActorName(actor.name) == canonicalName {
 			out = append(out, actor.record)
 		}
 	}
@@ -1250,6 +1259,7 @@ func (s *neoActorStore) upsert(body map[string]any, reuse bool) (*neoActor, bool
 	if name == "" {
 		name = "thread-actor"
 	}
+	name = neoCanonicalActorName(name)
 	key := stringValue(body["key"])
 	if reuse && key != "" {
 		if id := s.byNameKey[name+"\x00"+key]; id != "" {
@@ -1267,6 +1277,9 @@ func (s *neoActorStore) upsert(body map[string]any, reuse bool) (*neoActor, bool
 	s.actors[id] = actor
 	if key != "" {
 		s.byNameKey[name+"\x00"+key] = id
+		if neoGatewayThreadActorTarget(name) {
+			s.byNameKey["threadActor\x00"+key] = id
+		}
 	}
 	// auto-import persisted local thread state for fresh actors backed by a
 	// valid thread id, so local Neo threads survive Amp/runtime restarts.
