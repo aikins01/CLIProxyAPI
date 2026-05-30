@@ -2,11 +2,13 @@ package api
 
 import (
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -83,6 +85,42 @@ func TestHealthz(t *testing.T) {
 			t.Fatalf("expected empty body for HEAD request, got %q", rr.Body.String())
 		}
 	})
+}
+
+func TestServerListenWithRetryRetriesAddressInUse(t *testing.T) {
+	prevListen := serverListen
+	prevInterval := serverBindRetryInterval
+	prevTimeout := serverBindRetryTimeout
+	t.Cleanup(func() {
+		serverListen = prevListen
+		serverBindRetryInterval = prevInterval
+		serverBindRetryTimeout = prevTimeout
+	})
+
+	serverBindRetryInterval = time.Millisecond
+	serverBindRetryTimeout = 100 * time.Millisecond
+
+	attempts := 0
+	serverListen = func(network, addr string) (net.Listener, error) {
+		attempts++
+		if attempts < 3 {
+			return nil, &net.OpError{Op: "listen", Net: network, Addr: nil, Err: syscall.EADDRINUSE}
+		}
+		return net.Listen(network, "127.0.0.1:0")
+	}
+
+	listener, err := serverListenWithRetry("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen with retry returned error: %v", err)
+	}
+	defer func() {
+		if errClose := listener.Close(); errClose != nil {
+			t.Fatalf("close listener: %v", errClose)
+		}
+	}()
+	if attempts != 3 {
+		t.Fatalf("attempts = %d, want 3", attempts)
+	}
 }
 
 func TestManagementUsageRequiresManagementAuthAndPopsArray(t *testing.T) {

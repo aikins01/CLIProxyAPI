@@ -20,6 +20,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -48,6 +49,12 @@ import (
 )
 
 const oauthCallbackSuccessHTML = `<html><head><meta charset="utf-8"><title>Authentication successful</title><script>setTimeout(function(){window.close();},5000);</script></head><body><h1>Authentication successful!</h1><p>You can close this window.</p><p>This window will close automatically in 5 seconds.</p></body></html>`
+
+var (
+	serverListen            = net.Listen
+	serverBindRetryInterval = 50 * time.Millisecond
+	serverBindRetryTimeout  = 10 * time.Second
+)
 
 type serverOptionConfig struct {
 	extraMiddleware      []gin.HandlerFunc
@@ -1018,13 +1025,13 @@ func (s *Server) Start() error {
 	}
 
 	addr := s.server.Addr
-	listener, errListen := net.Listen("tcp", addr)
+	listener, errListen := serverListenWithRetry("tcp", addr)
 	if errListen != nil {
 		return fmt.Errorf("failed to start HTTP server: %v", errListen)
 	}
 	listeners := []net.Listener{listener}
 	for _, companionAddr := range loopbackCompanionListenAddrs(addr) {
-		companionListener, errCompanion := net.Listen("tcp", companionAddr)
+		companionListener, errCompanion := serverListenWithRetry("tcp", companionAddr)
 		if errCompanion != nil {
 			log.Warnf("failed to start loopback companion listener on %s: %v", companionAddr, errCompanion)
 			continue
@@ -1115,6 +1122,35 @@ func (s *Server) Start() error {
 		}
 		return nil
 	}
+}
+
+func serverListenWithRetry(network, addr string) (net.Listener, error) {
+	deadline := time.Now().Add(serverBindRetryTimeout)
+	var lastErr error
+	for {
+		listener, err := serverListen(network, addr)
+		if err == nil {
+			return listener, nil
+		}
+		lastErr = err
+		if !serverBindRetryable(err) || serverBindRetryTimeout <= 0 || !time.Now().Before(deadline) {
+			return nil, lastErr
+		}
+		sleep := serverBindRetryInterval
+		if sleep <= 0 {
+			sleep = 10 * time.Millisecond
+		}
+		if remaining := time.Until(deadline); remaining < sleep {
+			sleep = remaining
+		}
+		if sleep > 0 {
+			time.Sleep(sleep)
+		}
+	}
+}
+
+func serverBindRetryable(err error) bool {
+	return errors.Is(err, syscall.EADDRINUSE)
 }
 
 // Stop gracefully shuts down the API server without interrupting any
