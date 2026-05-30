@@ -697,25 +697,7 @@
     return { limit };
   }
 
-  function threadRuntimeMeta(thread: Record<string, unknown>) {
-    const data = asRecord(thread.data);
-    return { ...asRecord(data.meta), ...asRecord(thread.meta) };
-  }
-
   function threadCanUseLocalRuntime(thread: Record<string, unknown>) {
-    const data = asRecord(thread.data);
-    const meta = threadRuntimeMeta(thread);
-    if (
-      thread.usesThreadActors === true ||
-      data.usesThreadActors === true ||
-      meta.usesThreadActors === true ||
-      meta.cliProxyAPILocalNeo === true ||
-      meta.ampcodeConnectorLocalNeo === true ||
-      meta.ampcodeLocalRuntime === true ||
-      stringFrom(meta.ampcodeConnectorMode) === 'local-neo'
-    ) {
-      return true;
-    }
     const messages = Array.isArray(thread.messages) ? thread.messages : [];
     return Boolean(threadMapAgentMode(thread, messages));
   }
@@ -2932,9 +2914,7 @@
   }
 
   function threadMapAgentMode(raw: Record<string, unknown>, messages: unknown[] = []): string {
-    const settings = asRecord(raw.settings);
-    const meta = asRecord(raw.meta);
-    const mode = firstString(raw.agentMode, settings.agentMode, meta.agentMode);
+    const mode = stringFrom(raw.agentMode);
     if (mode) return mode;
     const data = asRecord(raw.data);
     if (Object.keys(data).length > 0) {
@@ -2942,7 +2922,10 @@
       const nestedMode: string = threadMapAgentMode(data, nestedMessages);
       if (nestedMode) return nestedMode;
     }
-    return agentModeFromMessages(messages);
+    const messageMode = agentModeFromMessages(messages);
+    if (messageMode) return messageMode;
+    const meta = asRecord(raw.meta);
+    return meta.usesThreadActors === true ? defaultAgentMode : '';
   }
 
   function threadAgentModeFrom(

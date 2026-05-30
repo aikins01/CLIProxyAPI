@@ -14334,7 +14334,7 @@ func TestNeoRuntimeThreadImportClearsLocalPendingInferenceWhenAssistantCompleted
 	}
 }
 
-func TestNeoRuntimeThreadImportDerivesModeFromThreadMetadata(t *testing.T) {
+func TestNeoRuntimeThreadImportDoesNotDeriveModeFromSettingsOrMetaLikeBinary(t *testing.T) {
 	cases := []struct {
 		name   string
 		thread map[string]any
@@ -14367,21 +14367,70 @@ func TestNeoRuntimeThreadImportDerivesModeFromThreadMetadata(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			rt := newNeoRuntime(&config.Config{})
 			actor := rt.store.ensureThreadActor(stringValue(tc.thread["id"]))
-			actor.currentAgentMode = "smart"
-			actor.currentReasoningEffort = "high"
-			actor.settings = map[string]any{"agentMode": "smart", "reasoning.effort": "high"}
-
 			tc.thread["messages"] = []any{
 				map[string]any{"role": "user", "messageId": "M-user", "content": []any{map[string]any{"type": "text", "text": "thread metadata carries mode"}}},
 			}
+			err := actor.importThreadLocalOnly(tc.thread)
+			if err == nil || !strings.Contains(err.Error(), "agent mode could not be determined from thread") {
+				t.Fatalf("importThreadLocalOnly error = %v, want binary-style missing mode error", err)
+			}
+		})
+	}
+}
+
+func TestNeoRuntimeThreadImportUsesBinaryAgentModeFallbacks(t *testing.T) {
+	cases := []struct {
+		name     string
+		thread   map[string]any
+		wantMode string
+	}{
+		{
+			name: "last_user_message",
+			thread: map[string]any{
+				"id": "T-import-message-mode",
+				"messages": []any{
+					map[string]any{"role": "user", "messageId": "M-user", "agentMode": "deep", "reasoningEffort": "xhigh", "content": []any{map[string]any{"type": "text", "text": "message carries mode"}}},
+				},
+			},
+			wantMode: "deep",
+		},
+		{
+			name: "thread_actor_meta",
+			thread: map[string]any{
+				"id":   "T-import-thread-actor-meta-mode",
+				"meta": map[string]any{"usesThreadActors": true},
+				"messages": []any{
+					map[string]any{"role": "user", "messageId": "M-user", "content": []any{map[string]any{"type": "text", "text": "meta carries thread actor marker"}}},
+				},
+			},
+			wantMode: "smart",
+		},
+		{
+			name: "nested_data_agent_mode",
+			thread: map[string]any{
+				"id": "T-import-nested-data-mode",
+				"data": map[string]any{
+					"agentMode": "deep",
+					"messages": []any{
+						map[string]any{"role": "user", "messageId": "M-user", "content": []any{map[string]any{"type": "text", "text": "nested data carries mode"}}},
+					},
+				},
+			},
+			wantMode: "deep",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rt := newNeoRuntime(&config.Config{})
+			actor := rt.store.ensureThreadActor(stringValue(tc.thread["id"]))
 			if err := actor.importThreadLocalOnly(tc.thread); err != nil {
 				t.Fatalf("importThreadLocalOnly error: %v", err)
 			}
 
 			actor.mu.Lock()
 			defer actor.mu.Unlock()
-			if actor.currentAgentMode != "deep" || actor.settings["agentMode"] != "deep" {
-				t.Fatalf("imported mode = current:%q settings:%#v, want deep", actor.currentAgentMode, actor.settings)
+			if actor.currentAgentMode != tc.wantMode || actor.settings["agentMode"] != tc.wantMode {
+				t.Fatalf("imported mode = current:%q settings:%#v, want %s", actor.currentAgentMode, actor.settings, tc.wantMode)
 			}
 		})
 	}

@@ -8718,7 +8718,7 @@ func neoThreadMapAgentMode(thread map[string]any) string {
 	if len(thread) == 0 {
 		return ""
 	}
-	if mode := firstNonEmptyString(thread["agentMode"], nestedString(thread["settings"], "agentMode"), nestedString(thread["meta"], "agentMode")); mode != "" {
+	if mode := stringValue(thread["agentMode"]); mode != "" {
 		return mode
 	}
 	if data := mapValue(thread["data"]); len(data) > 0 {
@@ -8728,6 +8728,9 @@ func neoThreadMapAgentMode(thread map[string]any) string {
 	}
 	if mode := neoThreadMessagesAgentMode(thread["messages"]); mode != "" {
 		return mode
+	}
+	if boolValue(nestedValue(thread["meta"], "usesThreadActors")) {
+		return "smart"
 	}
 	return ""
 }
