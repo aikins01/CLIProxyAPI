@@ -1720,19 +1720,8 @@
   }
 
   function toolProgressRun(progress: unknown, existingRun: Record<string, unknown>): Record<string, unknown> | null {
-    const progressMap = asRecord(progress);
-    if (stringFrom(progressMap.type) === 'snapshot') {
-      const snapshot = cloneRecord(asRecord(progressMap.value));
-      const status = stringFrom(snapshot.status).trim().toLowerCase();
-      if (status) {
-        if (isTerminalToolStatus(status) || status === 'in-progress') {
-          snapshot.status = status;
-          return snapshot;
-        }
-        return null;
-      }
-    }
-
+    const decodedProgress = decodeRivetProgress(progress);
+    const progressMap = asRecord(decodedProgress);
     const status = stringFrom(progressMap.status).trim().toLowerCase();
     if (status) {
       if (isTerminalToolStatus(status) || status === 'in-progress') {
@@ -1742,12 +1731,44 @@
     }
 
     const existingProgress = existingRun.progress;
-    const merged = emptyToolProgress(progress)
+    const merged = emptyToolProgress(decodedProgress)
       ? cloneProgressValue(existingProgress)
-      : mergeToolProgress(existingProgress, progress);
+      : mergeToolProgress(existingProgress, decodedProgress);
     const run: Record<string, unknown> = { status: 'in-progress' };
     if (!emptyToolProgress(merged)) run.progress = merged;
     return run;
+  }
+
+  function decodeRivetProgress(progress: unknown): unknown {
+    const record = asRecord(progress);
+    const type = stringFrom(record.type);
+    if (!type) return progress;
+    if (type === 'snapshot' && 'value' in record) {
+      return decodeRivetProgressValue(record.value);
+    }
+    if (type === 'delta' && Array.isArray(record.blocks)) {
+      const text = rivetTextBlocks(record.blocks);
+      if (text === undefined) return undefined;
+      try {
+        return JSON.parse(text);
+      } catch {
+        return text;
+      }
+    }
+    return progress;
+  }
+
+  function decodeRivetProgressValue(value: unknown): unknown {
+    return Array.isArray(value) ? rivetTextBlocks(value) : value;
+  }
+
+  function rivetTextBlocks(blocks: unknown[]) {
+    const text = blocks.map((block) => {
+      const record = asRecord(block);
+      if (record.type !== 'text') return '';
+      return stringFrom(record.text);
+    }).join('');
+    return text.length > 0 ? text : undefined;
   }
 
   function isTerminalToolStatus(status: string) {
@@ -3646,9 +3667,11 @@
   function codeReviewActions(block?: ContentBlock, result?: ContentBlock) {
     const run = toolResultRun(result);
     const nestedResult = asRecord(run.result);
-    const progress = asRecord(run.progress);
+    const decodedProgress = decodeRivetProgress(run.progress);
+    const progress = asRecord(decodedProgress);
     const main = firstRecord(nestedResult.main, progress.main);
     const checks = firstRecord(nestedResult.checks, progress.checks);
+    const outputLines = stringFrom(progress.output).split('\n').map((line) => line.trim()).filter(Boolean);
     const status = toolResultStatus(result);
     const reviewKind = codeReviewSummaryName(block);
     const actions: string[] = [];
@@ -3684,6 +3707,9 @@
       }
     }
 
+    if (actions.length === 0) {
+      for (const line of outputLines) add(line);
+    }
     if (stringFrom(main.status).trim().toLowerCase() === 'done' && totalChecks > 0 && completedChecks < totalChecks) {
       add('Main review complete, running checks...');
     }
