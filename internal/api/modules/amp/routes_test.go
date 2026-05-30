@@ -1526,6 +1526,8 @@ func TestRegisterManagementRoutesPassesThreadGETsUpstreamWhenProxyExists(t *test
 			writeNeoJSON(w, http.StatusOK, map[string]any{
 				"threads": []any{map[string]any{"id": threadID, "title": "upstream search"}},
 			})
+		case "/api/threads/" + threadID:
+			writeNeoJSON(w, http.StatusOK, map[string]any{"id": threadID, "title": "upstream api thread"})
 		case "/threads/" + threadID:
 			writeNeoJSON(w, http.StatusOK, map[string]any{"id": threadID, "title": "upstream thread"})
 		default:
@@ -1558,8 +1560,10 @@ func TestRegisterManagementRoutesPassesThreadGETsUpstreamWhenProxyExists(t *test
 		wantTitle  string
 	}{
 		{name: "find web", path: "/api/threads/find?q=local+needle&limit=5", wantTitle: "upstream search"},
+		{name: "api thread web", path: "/api/threads/" + threadID, wantTitle: "upstream api thread"},
 		{name: "thread web", path: "/threads/" + threadID, wantTitle: "upstream thread"},
 		{name: "find amp", path: "/api/threads/find?q=local+needle&limit=5", ampHeaders: true, wantTitle: "upstream search"},
+		{name: "api thread amp", path: "/api/threads/" + threadID, ampHeaders: true, wantTitle: "upstream api thread"},
 		{name: "thread amp", path: "/threads/" + threadID, ampHeaders: true, wantTitle: "upstream thread"},
 	}
 	for _, tc := range tests {
@@ -1780,6 +1784,7 @@ func TestRegisterManagementRoutesDoesNotServeThreadDiscoveryLocallyWithoutProxy(
 		{name: "internal list threads", method: http.MethodPost, path: "/api/internal?listThreads", body: `{"method":"listThreads","params":{"limit":20}}`},
 		{name: "internal get thread", method: http.MethodPost, path: "/api/internal?getThread", body: `{"method":"getThread","params":{"thread":"` + threadID + `"}}`},
 		{name: "thread search", method: http.MethodGet, path: "/api/threads/find?q=local+needle&limit=5"},
+		{name: "api thread read", method: http.MethodGet, path: "/api/threads/" + threadID},
 		{name: "thread read", method: http.MethodGet, path: "/threads/" + threadID},
 		{name: "thread reader stats", method: http.MethodPost, path: "/api/threads/" + threadID + "/messages/message_stats", body: `{}`},
 		{name: "thread reader message", method: http.MethodPost, path: "/api/threads/" + threadID + "/messages/M-local", body: `{}`},
