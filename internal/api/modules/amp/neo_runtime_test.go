@@ -10927,6 +10927,66 @@ func TestNeoActorLeasesThreadToolsInsteadOfServingLocalSnapshots(t *testing.T) {
 	waitForNeoActorSyncIdle(t, actor)
 }
 
+func TestNeoToolInputThreadIDMatchesBinaryParser(t *testing.T) {
+	t.Setenv("AMP_URL", "https://ampcode.com")
+	threadID := "T-019e65c0-0310-77a8-b233-4b84d9c06130"
+
+	tests := []struct {
+		name  string
+		input map[string]any
+		want  string
+	}{
+		{
+			name:  "exact thread id",
+			input: map[string]any{"threadID": threadID},
+			want:  threadID,
+		},
+		{
+			name:  "surrounding punctuation",
+			input: map[string]any{"threadID": "<" + threadID + ">"},
+			want:  threadID,
+		},
+		{
+			name:  "amp url",
+			input: map[string]any{"threadID": "https://ampcode.com/threads/" + threadID},
+			want:  threadID,
+		},
+		{
+			name:  "amp app subdomain url",
+			input: map[string]any{"threadID": "https://workspace.ampcode.app/thread/" + threadID},
+			want:  threadID,
+		},
+		{
+			name:  "leading at is invalid",
+			input: map[string]any{"threadID": "@" + threadID},
+			want:  "",
+		},
+		{
+			name:  "embedded thread id text is invalid",
+			input: map[string]any{"threadID": "please read " + threadID},
+			want:  "",
+		},
+		{
+			name:  "non amp url is invalid",
+			input: map[string]any{"threadID": "https://example.com/threads/" + threadID},
+			want:  "",
+		},
+		{
+			name:  "uppercase uuid is invalid",
+			input: map[string]any{"threadID": "T-019E65C0-0310-77A8-B233-4B84D9C06130"},
+			want:  "",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := neoToolInputThreadID(tc.input); got != tc.want {
+				t.Fatalf("neoToolInputThreadID() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestNeoActorPassesReadThreadToolResultThrough(t *testing.T) {
 	dir := t.TempDir()
 	oldStoreDir := neoAmpThreadStoreDir

@@ -99,6 +99,7 @@ var (
 	neoThreadIDPattern            = regexp.MustCompile(`T-[0-9A-Za-z][0-9A-Za-z-]*`)
 	neoThreadIDExactPattern       = regexp.MustCompile(`^T-[0-9A-Za-z][0-9A-Za-z-]*$`)
 	neoBinaryThreadIDExactPattern = regexp.MustCompile(`^T-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+	neoBinaryThreadInputTrim      = regexp.MustCompile("^[<(\"'`]+|[>\")'`,.]+$")
 	neoCloudThreadIDPattern       = regexp.MustCompile(`^T-([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$`)
 	neoMessageIDPattern           = regexp.MustCompile(`^M-[0-9A-Za-z]{22}$`)
 	neoEditIDPattern              = regexp.MustCompile(`^E-[0-9A-Za-z]{22}$`)
@@ -7281,17 +7282,44 @@ func normalizeNeoToolRunImage(value any) (map[string]any, bool) {
 
 func neoToolInputThreadID(input map[string]any) string {
 	raw := firstNonEmptyString(input["threadID"], input["threadId"], input["thread_id"])
-	raw = strings.TrimSpace(strings.TrimPrefix(raw, "@"))
+	raw = strings.TrimSpace(neoBinaryThreadInputTrim.ReplaceAllString(raw, ""))
 	if raw == "" {
 		return ""
 	}
-	if !neoThreadIDExactPattern.MatchString(raw) {
-		raw = findThreadID(raw)
+	if neoBinaryThreadIDExactPattern.MatchString(raw) {
+		return raw
 	}
-	if !neoThreadIDExactPattern.MatchString(raw) {
+	threadURL, err := url.Parse(raw)
+	if err != nil || threadURL == nil || !threadURL.IsAbs() || !neoBinaryThreadURLHostAllowed(threadURL.Hostname()) {
 		return ""
 	}
-	return raw
+	pathParts := strings.Split(threadURL.Path, "/")
+	for i := len(pathParts) - 1; i >= 0; i-- {
+		part := pathParts[i]
+		if neoBinaryThreadIDExactPattern.MatchString(part) {
+			return part
+		}
+	}
+	return ""
+}
+
+func neoBinaryThreadURLHostAllowed(host string) bool {
+	host = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	if host == "" {
+		return false
+	}
+	if envURL := strings.TrimSpace(os.Getenv("AMP_URL")); envURL != "" {
+		if parsed, err := url.Parse(envURL); err == nil && parsed != nil {
+			if envHost := strings.TrimSuffix(strings.ToLower(parsed.Hostname()), "."); envHost != "" && host == envHost {
+				return true
+			}
+		}
+	}
+	return host == "ampcode.com" ||
+		host == "ampcode.app" ||
+		strings.HasSuffix(host, ".ampcode.app") ||
+		host == "ampcodedev.org" ||
+		strings.HasSuffix(host, ".ampcodedev.org")
 }
 
 func (a *neoActor) revokeToolLease(msg map[string]any) {
