@@ -145,15 +145,18 @@ type neoRuntime struct {
 	started     bool
 	cleanup     context.CancelFunc
 	modelMapper ModelMapper
+	connMu      sync.Mutex
+	connections map[net.Conn]struct{}
 }
 
 func newNeoRuntime(cfg *config.Config) *neoRuntime {
 	host, port := neoRuntimeAddress(cfg)
 	rt := &neoRuntime{
-		cfg:   cfg,
-		host:  host,
-		port:  port,
-		store: newNeoActorStore(),
+		cfg:         cfg,
+		host:        host,
+		port:        port,
+		store:       newNeoActorStore(),
+		connections: map[net.Conn]struct{}{},
 	}
 	rt.store.runtime = rt
 	return rt
@@ -225,6 +228,7 @@ func (rt *neoRuntime) start() error {
 		Addr:              addr,
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
+		ConnState:         rt.trackConnectionState,
 	}
 	rt.server = server
 	ctx, cleanup := context.WithCancel(context.Background())
@@ -323,6 +327,7 @@ func (rt *neoRuntime) stopWithOptions(ctx context.Context, options neoRuntimeSto
 			err = nil
 		}
 		rt.store.closeAllSockets(options.closeReason, true)
+		rt.closeTrackedConnections()
 		if options.flushLocalSnapshots {
 			rt.store.syncLocalThreadSnapshots()
 		}
@@ -334,7 +339,52 @@ func (rt *neoRuntime) stopWithOptions(ctx context.Context, options neoRuntimeSto
 		rt.store.syncLocalThreadSnapshots()
 	}
 	rt.store.disposeAll(options.stopExecutors, options.closeReason, options.transportClose)
+	rt.closeTrackedConnections()
 	return err
+}
+
+func (rt *neoRuntime) trackConnectionState(conn net.Conn, state http.ConnState) {
+	if rt == nil || conn == nil {
+		return
+	}
+	switch state {
+	case http.StateNew, http.StateActive, http.StateIdle, http.StateHijacked:
+		rt.connMu.Lock()
+		if rt.connections == nil {
+			rt.connections = map[net.Conn]struct{}{}
+		}
+		rt.connections[conn] = struct{}{}
+		rt.connMu.Unlock()
+	case http.StateClosed:
+		rt.unregisterConnection(conn)
+	}
+}
+
+func (rt *neoRuntime) unregisterConnection(conn net.Conn) {
+	if rt == nil || conn == nil {
+		return
+	}
+	rt.connMu.Lock()
+	delete(rt.connections, conn)
+	rt.connMu.Unlock()
+}
+
+func (rt *neoRuntime) closeTrackedConnections() {
+	if rt == nil {
+		return
+	}
+	rt.connMu.Lock()
+	connections := make([]net.Conn, 0, len(rt.connections))
+	for conn := range rt.connections {
+		connections = append(connections, conn)
+	}
+	rt.connections = map[net.Conn]struct{}{}
+	rt.connMu.Unlock()
+	for _, conn := range connections {
+		if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			log.Debugf("amp neo local runtime connection close failed: %v", err)
+		}
+	}
 }
 
 func (rt *neoRuntime) updateConfig(cfg *config.Config) error {
@@ -825,6 +875,9 @@ func (rt *neoRuntime) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		conn:            conn,
 		jsonRPC:         neoJSONRPCTransportRequested(r, protocols),
 		localExtensions: neoLocalRuntimeExtensionsRequested(r),
+	}
+	if underlying := conn.UnderlyingConn(); underlying != nil {
+		defer rt.unregisterConnection(underlying)
 	}
 	actor.open(socket, !neoSkipReadyWaitRequested(r))
 	defer actor.close(socket)

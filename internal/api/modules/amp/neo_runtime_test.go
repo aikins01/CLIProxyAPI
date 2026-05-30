@@ -3475,13 +3475,21 @@ func readNeoMessage(t *testing.T, conn *websocket.Conn, timeout time.Duration) (
 func waitForNeoActorSyncIdle(t *testing.T, actor *neoActor) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
+	var idleSince time.Time
 	for time.Now().Before(deadline) {
 		actor.mu.Lock()
 		running := actor.syncRunning
 		pending := actor.syncPending
 		actor.mu.Unlock()
 		if !running && !pending {
-			return
+			if idleSince.IsZero() {
+				idleSince = time.Now()
+			}
+			if time.Since(idleSince) >= 25*time.Millisecond {
+				return
+			}
+		} else {
+			idleSince = time.Time{}
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -11239,9 +11247,6 @@ func TestNeoActorQueuedDequeueEventUsesQueuedMessageID(t *testing.T) {
 
 	if err := conn.WriteJSON(map[string]any{"type": "agent_state", "state": "running_tools"}); err != nil {
 		t.Fatalf("write running state: %v", err)
-	}
-	if err := conn.WriteJSON(map[string]any{"type": "executor_connected", "executorId": "executor-test", "registeredToolCount": 0}); err != nil {
-		t.Fatalf("write executor_connected: %v", err)
 	}
 	if err := conn.WriteJSON(map[string]any{
 		"type": "user:message-queue:enqueue",
