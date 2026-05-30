@@ -2471,11 +2471,7 @@ func (a *neoActor) executorToolsBootstrapComplete(msg map[string]any) {
 	a.executorResumeBootstrap = false
 	a.mu.Unlock()
 	a.sendExecutorConnected(nil, resumeBootstrap)
-	if !a.processRetryIfReady() {
-		if !a.processPendingInferenceIfReady() {
-			a.processQueue()
-		}
-	}
+	a.drainReadyWork()
 }
 
 func (a *neoActor) executorConnected(msg map[string]any) {
@@ -2501,11 +2497,7 @@ func (a *neoActor) executorConnected(msg map[string]any) {
 	}
 	a.broadcast(payload)
 	a.broadcastObservers()
-	if !a.processRetryIfReady() {
-		if !a.processPendingInferenceIfReady() {
-			a.processQueue()
-		}
-	}
+	a.drainReadyWork()
 }
 
 func (a *neoActor) executorDisconnected(msg map[string]any) {
@@ -10324,6 +10316,7 @@ func (a *neoActor) importThreadWithSync(thread map[string]any, syncCloud bool) e
 	a.mu.Unlock()
 
 	a.sendSnapshot(nil, 0)
+	a.drainReadyWork()
 	if syncCloud {
 		a.syncCloudAsync()
 	}
@@ -10611,6 +10604,14 @@ func (a *neoActor) steerQueuedMessage(messageID string) {
 	a.syncCloudAsync()
 	if shouldProcess {
 		a.processQueue()
+	}
+}
+
+func (a *neoActor) drainReadyWork() {
+	if !a.processRetryIfReady() {
+		if !a.processPendingInferenceIfReady() {
+			a.processQueue()
+		}
 	}
 }
 

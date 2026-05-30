@@ -12121,6 +12121,91 @@ func TestNeoActorImportRestoresPendingInference(t *testing.T) {
 	}
 }
 
+func TestNeoActorImportRunsPendingInferenceWhenExecutorAlreadyReady(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var startedOnce sync.Once
+	var releaseOnce sync.Once
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/provider/openai/v1/responses" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		startedOnce.Do(func() { close(started) })
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, _ := w.(http.Flusher)
+		_, _ = w.Write([]byte(`data: {"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"resumed"}` + "\n\n"))
+		if flusher != nil {
+			flusher.Flush()
+		}
+		select {
+		case <-release:
+		case <-time.After(2 * time.Second):
+		}
+		_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1},"output":[]}}` + "\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}))
+	t.Cleanup(upstream.Close)
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+
+	rt := testNeoRuntimeForServer(t, upstream)
+	threadID := "T-019e6541-06ae-75d7-b10e-d893170fa62c"
+	actor := newNeoActor(rt, "actor-ready-import", "thread-actor", threadID, threadID, neoActorRecord("actor-ready-import", "thread-actor", threadID), nil)
+	actor.mu.Lock()
+	actor.executorID = "neo-ready"
+	actor.executorReady = true
+	actor.executorBootstrapComplete = true
+	actor.mu.Unlock()
+
+	thread := map[string]any{
+		"id":        threadID,
+		"agentMode": "deep",
+		"messages": []any{
+			map[string]any{"messageId": "M-user", "role": "user", "agentMode": "deep", "reasoningEffort": "xhigh", "content": []any{map[string]any{"type": "text", "text": "continue after restart"}}},
+			map[string]any{"messageId": "M-cancelled", "role": "assistant", "state": map[string]any{"type": "cancelled"}, "content": []any{map[string]any{"type": "text", "text": "partial"}}},
+		},
+		"pendingInference": map[string]any{"messageId": "M-cancelled", "agentMode": "deep", "reasoningEffort": "xhigh", "preflightCompactionChecked": true},
+	}
+	if err := actor.importThreadLocalOnly(thread); err != nil {
+		t.Fatalf("import thread: %v", err)
+	}
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("pending inference did not start after import")
+	}
+	actor.mu.Lock()
+	state := actor.agentState
+	pending := actor.pendingInference
+	current := actor.currentInference
+	actor.mu.Unlock()
+	if pending != nil {
+		t.Fatalf("pendingInference = %#v, want consumed", pending)
+	}
+	if current == nil || current.agentMode != "deep" || current.reasoningEffort != "xhigh" {
+		t.Fatalf("currentInference = %#v, want resumed deep/xhigh inference", current)
+	}
+	if state != "working" && state != "streaming" {
+		t.Fatalf("agentState = %q, want resumed work", state)
+	}
+
+	releaseOnce.Do(func() { close(release) })
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		actor.mu.Lock()
+		done := actor.currentInference == nil && actor.agentState == "idle"
+		actor.mu.Unlock()
+		if done {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("resumed inference did not finish")
+}
+
 func TestNeoLocalThreadLoadRepairsLocalCompactionSummaryOrder(t *testing.T) {
 	useTempNeoThreadStore(t)
 	threadID := "T-019e6541-06ae-75d7-b10e-d893170fa62c"
