@@ -7682,6 +7682,38 @@ func TestNeoActorAllowsExternalToolsNamedLikeBuiltins(t *testing.T) {
 	}
 }
 
+func TestNeoActorPreservesBinaryTopLevelToolMetadata(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	actor.registerTools([]any{
+		map[string]any{"name": "code_review", "source": "builtin", "deferred": true},
+		map[string]any{"name": "plugin_custom", "pluginName": "custom-plugin"},
+		map[string]any{"name": "skill", "skillNames": []any{"code-review"}},
+	})
+
+	if deferred, _ := actor.tools["code_review"].Meta["deferred"].(bool); !deferred {
+		t.Fatalf("top-level deferred was not preserved: %#v", actor.tools["code_review"].Meta)
+	}
+	if source := stringValue(actor.tools["code_review"].Meta["source"]); source != "builtin" {
+		t.Fatalf("top-level source was not preserved: %#v", actor.tools["code_review"].Meta)
+	}
+	pluginSource := mapValue(actor.tools["plugin_custom"].Meta["source"])
+	if pluginSource["plugin"] != "custom-plugin" {
+		t.Fatalf("pluginName did not become plugin source: %#v", actor.tools["plugin_custom"].Meta)
+	}
+	if names := neoSkillNamesFromAny(actor.tools["skill"].Meta["skillNames"]); len(names) != 1 || names[0] != "code-review" {
+		t.Fatalf("top-level skillNames were not preserved: %#v", actor.tools["skill"].Meta)
+	}
+
+	names := map[string]bool{}
+	for _, tool := range actor.inferenceRequestLocked("smart", "", "").Tools {
+		names[tool.Name] = true
+	}
+	if !names["code_review"] || !names["plugin_custom"] || !names["skill"] {
+		t.Fatalf("binary top-level metadata did not affect tool inclusion: %#v", names)
+	}
+}
+
 func TestNeoActorFiltersUnknownNoSourceToolsLikeBinary(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)

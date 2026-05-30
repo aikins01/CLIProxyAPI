@@ -3111,13 +3111,7 @@ func (a *neoActor) registerTools(raw any) {
 		if name == "" {
 			continue
 		}
-		meta := mapValue(m["meta"])
-		if _, exists := meta["source"]; !exists {
-			if source, ok := m["source"]; ok && source != nil {
-				meta = cloneMap(meta)
-				meta["source"] = source
-			}
-		}
+		meta := neoRegisteredToolMeta(m)
 		a.tools[name] = neoToolSpec{
 			Name:                   name,
 			Description:            stringValue(m["description"]),
@@ -3126,6 +3120,33 @@ func (a *neoActor) registerTools(raw any) {
 			OpenAICustomToolConfig: neoOpenAICustomToolConfigFromTool(m),
 		}
 	}
+}
+
+func neoRegisteredToolMeta(tool map[string]any) map[string]any {
+	meta := mapValue(tool["meta"])
+	set := func(key string, value any) {
+		if value == nil {
+			return
+		}
+		if _, exists := meta[key]; exists {
+			return
+		}
+		meta = cloneMap(meta)
+		meta[key] = value
+	}
+	set("source", tool["source"])
+	if _, exists := meta["source"]; !exists {
+		if pluginName := firstNonEmptyString(tool["pluginName"], tool["plugin_name"]); pluginName != "" {
+			set("source", map[string]any{"plugin": pluginName})
+		}
+	}
+	if pluginName := firstNonEmptyString(tool["pluginName"], tool["plugin_name"]); pluginName != "" {
+		set("pluginName", pluginName)
+	}
+	for _, key := range []string{"deferred", "skillNames"} {
+		set(key, tool[key])
+	}
+	return meta
 }
 
 func (a *neoActor) unregisterTools(raw any) {
