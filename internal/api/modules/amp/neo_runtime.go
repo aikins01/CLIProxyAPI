@@ -17598,7 +17598,7 @@ func googleNeoUserParts(msg neoHistoryMessage) []any {
 				parts = append(parts, map[string]any{"inlineData": map[string]any{"mimeType": fallbackString(mediaType, "image/png"), "data": data}})
 			} else if imageURL := neoImageURL(block); imageURL != "" {
 				parts = append(parts, map[string]any{"text": label})
-				parts = append(parts, map[string]any{"fileData": map[string]any{"fileUri": imageURL, "mimeType": stringValue(block["media_type"])}})
+				parts = append(parts, map[string]any{"fileData": map[string]any{"fileUri": imageURL, "mimeType": fallbackString(neoImageMediaType(block), "image/png")}})
 			}
 		default:
 			if text := neoAttachmentFallbackText(block); text != "" {
@@ -17649,7 +17649,7 @@ func neoImageURL(block map[string]any) string {
 func neoImageBase64(block map[string]any) (string, string) {
 	source := mapValue(block["source"])
 	data := firstNonEmptyString(block["data"], block["base64"], block["b64_json"], block["contentBase64"], source["data"], source["base64"], source["b64_json"], source["contentBase64"])
-	mediaType := firstNonEmptyString(block["media_type"], block["mediaType"], block["mime_type"], block["mimeType"], source["media_type"], source["mediaType"], source["mime_type"], source["mimeType"])
+	mediaType := neoImageMediaType(block)
 	if data == "" {
 		for _, nested := range []map[string]any{source, mapValue(block["base64"]), mapValue(source["base64"]), mapValue(block["image"]), mapValue(source["image"])} {
 			if len(nested) == 0 {
@@ -17674,6 +17674,11 @@ func neoImageBase64(block map[string]any) (string, string) {
 		}
 	}
 	return data, mediaType
+}
+
+func neoImageMediaType(block map[string]any) string {
+	source := mapValue(block["source"])
+	return firstNonEmptyString(block["media_type"], block["mediaType"], block["mime_type"], block["mimeType"], source["media_type"], source["mediaType"], source["mime_type"], source["mimeType"])
 }
 
 func neoAttachedImageText(block map[string]any) string {

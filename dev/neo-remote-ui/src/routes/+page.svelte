@@ -613,7 +613,7 @@
     apiKey = key;
     persistAPIKey();
     try {
-      const result = await rpc('listThreads', neoThreadListParams(false, 80));
+      const result = await rpc('listThreads', neoThreadListParams(80));
       const rawThreads = Array.isArray(result?.threads) ? result.threads : [];
       threads = rawThreads.map(threadSummaryFromAPI).filter(Boolean) as ThreadSummary[];
       isAuthenticated = true;
@@ -693,8 +693,8 @@
     return data?.result ?? data;
   }
 
-  function neoThreadListParams(includeArchived: boolean, limit: number): Record<string, unknown> {
-    return { includeArchived, limit, usesThreadActors: true };
+  function neoThreadListParams(limit: number): Record<string, unknown> {
+    return { limit };
   }
 
   function threadRuntimeMeta(thread: Record<string, unknown>) {
@@ -705,7 +705,7 @@
   function threadCanUseLocalRuntime(thread: Record<string, unknown>) {
     const data = asRecord(thread.data);
     const meta = threadRuntimeMeta(thread);
-    return Boolean(
+    if (
       thread.usesThreadActors === true ||
       data.usesThreadActors === true ||
       meta.usesThreadActors === true ||
@@ -713,7 +713,11 @@
       meta.ampcodeConnectorLocalNeo === true ||
       meta.ampcodeLocalRuntime === true ||
       stringFrom(meta.ampcodeConnectorMode) === 'local-neo'
-    );
+    ) {
+      return true;
+    }
+    const messages = Array.isArray(thread.messages) ? thread.messages : [];
+    return Boolean(threadMapAgentMode(thread, messages));
   }
 
   async function importThreadIntoRuntime(threadId: string, thread: Record<string, unknown>) {
@@ -769,7 +773,7 @@
     loadingThreads = true;
     lastError = '';
     try {
-      const result = await rpc('listThreads', neoThreadListParams(true, 120));
+      const result = await rpc('listThreads', neoThreadListParams(120));
       const rawThreads = Array.isArray(result?.threads) ? result.threads : [];
       threads = rawThreads.map(threadSummaryFromAPI).filter(Boolean) as ThreadSummary[];
       const targetThreadId = preferredThreadId || selectedThreadId || '';
@@ -1380,10 +1384,12 @@
       name: attachment.name,
       filename: attachment.name,
       mediaType: attachment.mediaType,
+      media_type: attachment.mediaType,
       sourcePath: attachment.name || attachmentUrl || 'image',
       source: {
         type: 'base64',
         mediaType: attachment.mediaType,
+        media_type: attachment.mediaType,
         data
       },
       attachmentUrl

@@ -7486,6 +7486,35 @@ func TestNeoProviderMessagesNormalizeInternalImageMediaType(t *testing.T) {
 	}
 }
 
+func TestNeoProviderMessagesPreserveURLImageMediaTypeForGemini(t *testing.T) {
+	msg := neoHistoryMessage{
+		Role: "user",
+		Content: []any{
+			map[string]any{
+				"type": "image",
+				"source": map[string]any{
+					"type":      "url",
+					"url":       "https://example.test/shot.png",
+					"mediaType": "image/png",
+				},
+			},
+		},
+	}
+
+	google := googleNeoContents([]neoHistoryMessage{msg}, "")
+	parts := arrayValue(mapValue(google[0])["parts"])
+	if len(parts) != 2 {
+		t.Fatalf("google parts = %#v", parts)
+	}
+	fileData := mapValue(mapValue(parts[1])["fileData"])
+	if got := stringValue(fileData["fileUri"]); got != "https://example.test/shot.png" {
+		t.Fatalf("fileUri = %q", got)
+	}
+	if got := stringValue(fileData["mimeType"]); got != "image/png" {
+		t.Fatalf("mimeType = %q, fileData=%#v", got, fileData)
+	}
+}
+
 func TestNeoProviderMessagesNormalizeNestedImageBase64Envelope(t *testing.T) {
 	msg := neoHistoryMessage{
 		Role: "user",
