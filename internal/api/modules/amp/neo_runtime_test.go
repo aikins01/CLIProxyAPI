@@ -10633,6 +10633,96 @@ func TestNeoLocalThreadLoadDropsStaleCurrentInference(t *testing.T) {
 	}
 }
 
+func TestNeoLocalThreadLoadRepairsLocalCompactionSummaryOrder(t *testing.T) {
+	useTempNeoThreadStore(t)
+	threadID := "T-019e6541-06ae-75d7-b10e-d893170fa62c"
+	raw := []byte(`{
+		"id": "` + threadID + `",
+		"agentMode": "deep",
+		"meta": {"cliProxyAPILocalNeo": true},
+		"compactionRecords": [{"cutMessageId": "M-0000000000000000000002", "createdAt": "2026-05-30T00:00:00Z"}],
+		"messages": [
+			{"messageId": "M-0000000000000000000001", "role": "user", "content": [{"type": "text", "text": "old context"}]},
+			{"messageId": "M-0000000000000000000002", "role": "user", "content": [{"type": "text", "text": "cut context"}]},
+			{"messageId": "M-0000000000000000000003", "role": "assistant", "state": {"type": "complete", "stopReason": "end_turn"}, "content": [{"type": "text", "text": "tail context"}]},
+			{"messageId": "M-0000000000000000000004", "role": "info", "content": [{"type": "summary", "summary": {"type": "message", "summary": "compacted context"}}]}
+		]
+	}`)
+	path := filepath.Join(neoAmpThreadStoreDir(), threadID+".json")
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatalf("write thread: %v", err)
+	}
+
+	thread, ok := loadNeoLocalThread(threadID)
+	if !ok {
+		t.Fatal("thread was not loaded")
+	}
+	messages := arrayValue(thread["messages"])
+	if got := firstNonEmptyString(mapValue(messages[1])["messageId"], mapValue(messages[1])["protocolMessageID"]); got != "M-0000000000000000000004" {
+		t.Fatalf("summary message was not moved before cut: %q in %#v", got, messages)
+	}
+	if got := firstNonEmptyString(mapValue(messages[2])["messageId"], mapValue(messages[2])["protocolMessageID"]); got != "M-0000000000000000000002" {
+		t.Fatalf("cut message moved incorrectly: %q in %#v", got, messages)
+	}
+
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", threadID, threadID, neoActorRecord("actor-test", "thread-actor", threadID), nil)
+	if err := actor.importThreadLocalOnly(thread); err != nil {
+		t.Fatalf("importThreadLocalOnly error: %v", err)
+	}
+	actor.mu.Lock()
+	historyText := fmt.Sprint(actor.history)
+	actor.mu.Unlock()
+	if !strings.Contains(historyText, "compacted context") || !strings.Contains(historyText, "cut context") || !strings.Contains(historyText, "tail context") {
+		t.Fatalf("history after repaired compaction lost retained context: %s", historyText)
+	}
+	if strings.Contains(historyText, "old context") {
+		t.Fatalf("history after repaired compaction leaked old context: %s", historyText)
+	}
+
+	persistedRaw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read persisted thread: %v", err)
+	}
+	var persisted map[string]any
+	if err := json.Unmarshal(persistedRaw, &persisted); err != nil {
+		t.Fatalf("decode persisted thread: %v", err)
+	}
+	persistedMessages := arrayValue(persisted["messages"])
+	if got := firstNonEmptyString(mapValue(persistedMessages[1])["messageId"], mapValue(persistedMessages[1])["protocolMessageID"]); got != "M-0000000000000000000004" {
+		t.Fatalf("repaired compaction order was not persisted: %q", got)
+	}
+}
+
+func TestNeoLocalThreadLoadLeavesUpstreamCompactionOrderUntouched(t *testing.T) {
+	useTempNeoThreadStore(t)
+	threadID := "T-019e6541-06ae-75d7-b10e-d893170fa62d"
+	raw := []byte(`{
+		"id": "` + threadID + `",
+		"agentMode": "deep",
+		"compactionRecords": [{"cutMessageId": "M-0000000000000000000002", "createdAt": "2026-05-30T00:00:00Z"}],
+		"messages": [
+			{"messageId": "M-0000000000000000000001", "role": "user", "content": [{"type": "text", "text": "old context"}]},
+			{"messageId": "M-0000000000000000000002", "role": "user", "content": [{"type": "text", "text": "cut context"}]},
+			{"messageId": "M-0000000000000000000003", "role": "assistant", "state": {"type": "complete", "stopReason": "end_turn"}, "content": [{"type": "text", "text": "tail context"}]},
+			{"messageId": "M-0000000000000000000004", "role": "info", "content": [{"type": "summary", "summary": {"type": "message", "summary": "compacted context"}}]}
+		]
+	}`)
+	path := filepath.Join(neoAmpThreadStoreDir(), threadID+".json")
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatalf("write thread: %v", err)
+	}
+
+	thread, ok := loadNeoLocalThread(threadID)
+	if !ok {
+		t.Fatal("thread was not loaded")
+	}
+	messages := arrayValue(thread["messages"])
+	if got := firstNonEmptyString(mapValue(messages[3])["messageId"], mapValue(messages[3])["protocolMessageID"]); got != "M-0000000000000000000004" {
+		t.Fatalf("upstream-shaped thread summary order changed: %q in %#v", got, messages)
+	}
+}
+
 func TestNeoActorThreadSnapshotDropsStaleCurrentInference(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
@@ -10924,12 +11014,16 @@ func TestNeoMessageFromImportedThreadMatchesBinaryAssistantAndInfoImport(t *test
 		"role":      "info",
 		"messageId": "M-info",
 		"content": []any{
-			map[string]any{"type": "summary", "text": "skip"},
-			map[string]any{"type": "manual_bash_invocation", "args": map[string]any{"cmd": "git status"}},
+			map[string]any{"type": "summary", "summary": map[string]any{"type": "message", "summary": "kept for local history"}},
+			map[string]any{"type": "manual_bash_invocation", "args": map[string]any{"cmd": "git status"}, "toolRun": map[string]any{"status": "done"}},
 		},
 	}, 2)
-	if len(info.Content) != 1 || stringValue(mapValue(info.Content[0])["type"]) != "manual_bash_invocation" {
-		t.Fatalf("info content = %#v, want only manual bash invocation", info.Content)
+	if len(info.Content) != 2 || stringValue(mapValue(info.Content[0])["type"]) != "summary" || stringValue(mapValue(info.Content[1])["type"]) != "manual_bash_invocation" {
+		t.Fatalf("info content = %#v, want summary retained internally plus manual bash invocation", info.Content)
+	}
+	protocolContent := arrayValue(info.protocol()["content"])
+	if len(protocolContent) != 1 || stringValue(mapValue(protocolContent[0])["type"]) != "manual_bash_invocation" {
+		t.Fatalf("protocol info content = %#v, want only manual bash invocation", protocolContent)
 	}
 }
 

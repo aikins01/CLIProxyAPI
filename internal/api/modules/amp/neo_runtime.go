@@ -6785,7 +6785,8 @@ func neoBinaryImportedContent(role string, content []any) []any {
 	}
 	filtered := make([]any, 0, len(content))
 	for _, block := range content {
-		if stringValue(mapValue(block)["type"]) == "manual_bash_invocation" {
+		switch stringValue(mapValue(block)["type"]) {
+		case "manual_bash_invocation", "summary":
 			filtered = append(filtered, block)
 		}
 	}
@@ -7344,6 +7345,9 @@ func loadNeoLocalThread(threadID string) (map[string]any, bool) {
 	if normalizeNeoThreadMessageShapes(thread) {
 		changed = true
 	}
+	if normalizeNeoThreadCompactionSummaryOrder(thread) {
+		changed = true
+	}
 	if changed {
 		// Persist normalization back to disk (this also refreshes the cache via
 		// cacheNeoLocalThread using the post-write file stat).
@@ -7872,6 +7876,7 @@ func cacheNeoLocalThread(thread map[string]any) {
 	normalizeNeoThreadAgentMode(thread)
 	normalizeNeoThreadCurrentInference(thread)
 	normalizeNeoThreadMessageShapes(thread)
+	normalizeNeoThreadCompactionSummaryOrder(thread)
 	dir := neoAmpThreadStoreDir()
 	if dir == "" {
 		return
@@ -8056,6 +8061,111 @@ func normalizeNeoThreadMessageShapes(thread map[string]any) bool {
 		thread["messages"] = out
 	}
 	return changed
+}
+
+func normalizeNeoThreadCompactionSummaryOrder(thread map[string]any) bool {
+	if len(thread) == 0 {
+		return false
+	}
+	changed := false
+	if data := mapValue(thread["data"]); len(data) > 0 {
+		if normalizeNeoThreadCompactionSummaryOrder(data) {
+			thread["data"] = data
+			changed = true
+		}
+	}
+	if !neoThreadHasLocalRuntimeMarker(thread) {
+		return changed
+	}
+	messages := arrayValue(thread["messages"])
+	if len(messages) < 2 {
+		return changed
+	}
+	cutIDs := neoCompactionRecordCutIDsPresent(firstArray(thread["compactionRecords"], thread["compaction_records"]), messages)
+	summaryIDs := neoSummaryMessageIDs(messages)
+	pairCount := len(cutIDs)
+	if len(summaryIDs) < pairCount {
+		pairCount = len(summaryIDs)
+	}
+	for i := 1; i <= pairCount; i++ {
+		if moveNeoRawMessageBeforeID(&messages, summaryIDs[len(summaryIDs)-i], cutIDs[len(cutIDs)-i]) {
+			changed = true
+		}
+	}
+	if changed {
+		thread["messages"] = messages
+	}
+	return changed
+}
+
+func neoCompactionRecordCutIDsPresent(rawRecords []any, messages []any) []string {
+	ids := make([]string, 0, len(rawRecords))
+	for _, rawRecord := range rawRecords {
+		cutID := messageIDValue(mapValue(rawRecord)["cutMessageId"])
+		if cutID == "" || neoRawMessageIndexByID(messages, cutID) < 0 {
+			continue
+		}
+		ids = append(ids, cutID)
+	}
+	return ids
+}
+
+func neoSummaryMessageIDs(messages []any) []string {
+	ids := make([]string, 0)
+	for _, raw := range messages {
+		message := mapValue(raw)
+		if stringValue(message["role"]) != "info" {
+			continue
+		}
+		hasSummary := false
+		for _, rawBlock := range arrayValue(message["content"]) {
+			block := mapValue(rawBlock)
+			if stringValue(block["type"]) != "summary" {
+				continue
+			}
+			if neoCompactionSummaryText(mapValue(block["summary"])) != "" {
+				hasSummary = true
+				break
+			}
+		}
+		if !hasSummary {
+			continue
+		}
+		if messageID := firstNonEmptyString(message["protocolMessageID"], message["messageId"], message["messageID"], message["id"]); messageID != "" {
+			ids = append(ids, messageID)
+		}
+	}
+	return ids
+}
+
+func moveNeoRawMessageBeforeID(messages *[]any, messageID, beforeID string) bool {
+	if messages == nil || messageID == "" || beforeID == "" || messageID == beforeID {
+		return false
+	}
+	current := *messages
+	messageIndex := neoRawMessageIndexByID(current, messageID)
+	beforeIndex := neoRawMessageIndexByID(current, beforeID)
+	if messageIndex < 0 || beforeIndex < 0 || messageIndex <= beforeIndex {
+		return false
+	}
+	item := current[messageIndex]
+	without := append([]any{}, current[:messageIndex]...)
+	without = append(without, current[messageIndex+1:]...)
+	next := append([]any{}, without[:beforeIndex]...)
+	next = append(next, item)
+	next = append(next, without[beforeIndex:]...)
+	*messages = next
+	return true
+}
+
+func neoRawMessageIndexByID(messages []any, messageID string) int {
+	for i, raw := range messages {
+		message := mapValue(raw)
+		if firstNonEmptyString(message["protocolMessageID"], message["messageId"], message["messageID"], message["id"]) == messageID {
+			return i
+		}
+	}
+	return -1
 }
 
 func neoThreadContainsMessageID(thread map[string]any, messageID string) bool {
