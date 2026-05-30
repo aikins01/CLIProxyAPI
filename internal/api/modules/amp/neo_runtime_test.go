@@ -4978,10 +4978,12 @@ func TestNeoSystemPromptUsesRushModeInstructions(t *testing.T) {
 
 func TestNeoSystemPromptUsesExpandedModeFamilies(t *testing.T) {
 	headingGuidance := "Use a few information-dense H1-H3 headings for important updates and navigation; each should state a takeaway, not merely organize content."
+	communicationGuidance := "Communicate so the user can tell whether the work makes sense. This applies to plans, in-progress decisions, blockers, and final summaries."
+	mermaidGuidance := "Only write Mermaid syntax for diagrams if the user explicitly asks for Mermaid diagrams."
 	closedDiagram := "╰────────╯\n```"
 
 	deep := neoSystemPrompt(neoInferenceRequest{AgentMode: "deep"}, neoModelRoute{Provider: "openai", Model: "gpt-5.5"})
-	for _, want := range []string{"## Discovery Discipline", "## Verification", "## Working with the user", headingGuidance, closedDiagram} {
+	for _, want := range []string{"## Discovery Discipline", "## Verification", "## Working with the user", communicationGuidance, headingGuidance, mermaidGuidance, closedDiagram} {
 		if !strings.Contains(deep, want) {
 			t.Fatalf("deep prompt missing %q:\n%s", want, deep)
 		}
