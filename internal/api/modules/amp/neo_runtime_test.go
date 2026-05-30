@@ -582,6 +582,7 @@ func TestNeoRuntimeAutoCompactsLargeLocalHistory(t *testing.T) {
 	threadID := "T-auto-compact"
 	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
 	actor.settings["internal.model"] = "openai/local-small"
+	actor.settings["internal.compactionThresholdPercent"] = 0
 	longText := strings.Repeat("important context ", 300)
 	actor.mu.Lock()
 	for i := 0; i < 30; i++ {
@@ -1069,9 +1070,19 @@ func TestNeoCompactionThresholdPercentSettingMatchesBinary(t *testing.T) {
 	if neoCompactionShouldRun(longHistory, 1000000, 100) {
 		t.Fatal("threshold percent 100 should defer compaction until history reaches the full input budget")
 	}
+	defaultThresholdPercent := neoCompactionThresholdPercent(nil)
+	if neoCompactionShouldRunForTokens(longHistory, neoCompactionDefaultTokenLimit-1, 300000, defaultThresholdPercent) {
+		t.Fatal("default binary threshold should defer below 100000 estimated context tokens")
+	}
+	if !neoCompactionShouldRunForTokens(longHistory, neoCompactionDefaultTokenLimit, 300000, defaultThresholdPercent) {
+		t.Fatal("default binary threshold should compact at 100000 estimated context tokens")
+	}
 
-	if got := neoCompactionThresholdPercent(map[string]any{}); got != 65 {
-		t.Fatalf("default threshold percent = %v, want 65", got)
+	if got := neoCompactionThresholdPercent(map[string]any{}); got != -1 {
+		t.Fatalf("default threshold percent = %v, want -1 sentinel for binary token limit", got)
+	}
+	if got := neoCompactionThresholdTokens(300000, -1); got != neoCompactionDefaultTokenLimit {
+		t.Fatalf("default threshold tokens = %v, want %d", got, neoCompactionDefaultTokenLimit)
 	}
 	if got := neoCompactionThresholdPercent(map[string]any{"internal.compactionThresholdPercent": 0}); got != 0 {
 		t.Fatalf("explicit zero threshold percent = %v, want 0", got)

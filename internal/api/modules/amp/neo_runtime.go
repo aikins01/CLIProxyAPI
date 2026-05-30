@@ -63,6 +63,7 @@ const (
 	neoWSReadLimit                   = 16 * 1024 * 1024
 	neoCompactionMinMessages         = 24
 	neoCompactionTailMessages        = 8
+	neoCompactionDefaultTokenLimit   = 100000
 	neoCompactionFallbackMaxInput    = 32 * 1024
 	neoCompactionTranscriptMaxBytes  = 240 * 1024
 	neoCompactionApproxCharsPerToken = 4
@@ -6696,30 +6697,34 @@ func neoCompactionShouldRunForTokens(messages []neoMessage, estimatedInputTokens
 	if len(messages) < neoCompactionMinMessages {
 		return false
 	}
+	threshold := neoCompactionThresholdTokens(maxInputTokens, thresholdPercent)
+	return float64(estimatedInputTokens) >= threshold
+}
+
+func neoCompactionThresholdTokens(maxInputTokens int, thresholdPercent float64) float64 {
+	if thresholdPercent < 0 {
+		return neoCompactionDefaultTokenLimit
+	}
 	if maxInputTokens <= 0 {
 		maxInputTokens = neoCompactionFallbackMaxInput
-	}
-	if thresholdPercent < 0 {
-		thresholdPercent = 65
 	}
 	if thresholdPercent > 100 {
 		thresholdPercent = 100
 	}
-	threshold := float64(maxInputTokens) * thresholdPercent / 100
-	return float64(estimatedInputTokens) >= threshold
+	return float64(maxInputTokens) * thresholdPercent / 100
 }
 
 func neoCompactionThresholdPercent(settings map[string]any) float64 {
 	raw, ok := settings["internal.compactionThresholdPercent"]
 	if !ok {
-		return 65
+		return -1
 	}
 	percent, ok := neoNumberSettingFloat(raw)
 	if !ok {
-		return 65
+		return -1
 	}
 	if percent < 0 {
-		return 65
+		return -1
 	}
 	if percent > 100 {
 		return 100
