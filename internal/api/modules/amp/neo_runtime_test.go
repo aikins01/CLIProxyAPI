@@ -7522,6 +7522,18 @@ func TestNeoSystemPromptUsesBinaryPromptFamilies(t *testing.T) {
 			want:    []string{"You are Agg Man, Amp's platform control-plane assistant.", "Use find_thread to discover relevant threads and read_thread before making claims", "workflow: \"code_review\"", "workflow: \"merge_changes\""},
 		},
 		{
+			name:    "deep",
+			request: neoInferenceRequest{AgentMode: "deep"},
+			route:   neoModelRoute{Provider: "openai", Model: "gpt-5.5"},
+			want:    []string{"You are Amp, an autonomous coding agent.", "Use finder for complex, multi-step codebase discovery", neoGitCommitMultilinePromptLine, headingGuidance, closedDiagram},
+		},
+		{
+			name:    "deep gpt54",
+			request: neoInferenceRequest{AgentMode: "deep"},
+			route:   neoModelRoute{Provider: "openai", Model: "gpt-5.4"},
+			want:    []string{"You are Amp. You and the user share the same workspace", "Pull in external references when uncertainty or risk is meaningful", "- " + neoGitCommitMultilinePromptLine, headingGuidance, closedDiagram},
+		},
+		{
 			name:    "codex",
 			request: neoInferenceRequest{AgentMode: "smart"},
 			route:   neoModelRoute{Provider: "openai", Model: "gpt-5-codex"},
