@@ -549,6 +549,7 @@ func TestNeoRuntimeAutoCompactsLargeLocalHistory(t *testing.T) {
 		}
 		actor.storeMessageLocked(neoMessage{ThreadID: threadID, MessageID: fmt.Sprintf("M-%022d", i), Role: role, Content: []any{map[string]any{"type": "text", "text": fmt.Sprintf("message %02d %s", i, longText)}}})
 	}
+	actor.currentInference = &neoInferenceInflight{messageID: "M-0000000000000000000029", agentMode: "smart", reasoningEffort: "medium"}
 	actor.rebuildHistoryLocked()
 	actor.mu.Unlock()
 
@@ -568,6 +569,9 @@ func TestNeoRuntimeAutoCompactsLargeLocalHistory(t *testing.T) {
 	summaryIndex := 30 - neoCompactionTailMessages
 	if len(storedMessages) <= summaryIndex+1 {
 		t.Fatalf("stored messages after compaction = %d, want at least %d", len(storedMessages), summaryIndex+2)
+	}
+	if !boolValue(mapValue(storedThread["currentInference"])["preflightCompactionChecked"]) {
+		t.Fatalf("stored currentInference = %#v, want compaction checked marker", storedThread["currentInference"])
 	}
 	if got := stringValue(mapValue(storedMessages[summaryIndex])["role"]); got != "info" {
 		t.Fatalf("stored summary role at cut boundary = %q, want info", got)
@@ -1682,7 +1686,7 @@ func TestNeoRuntimeShutdownFlushesLocalThreadSnapshot(t *testing.T) {
 	}
 }
 
-func TestNeoRuntimeShutdownDoesNotResumeUncheckedCurrentInference(t *testing.T) {
+func TestNeoRuntimeShutdownResumesUncheckedCurrentInference(t *testing.T) {
 	useTempNeoThreadStore(t)
 
 	port := freeTCPPortForTest(t)
@@ -1733,8 +1737,12 @@ func TestNeoRuntimeShutdownDoesNotResumeUncheckedCurrentInference(t *testing.T) 
 	if _, exists := thread["currentInference"]; exists {
 		t.Fatalf("currentInference was not dropped on reload: %#v", thread["currentInference"])
 	}
-	if _, exists := thread["pendingInference"]; exists {
-		t.Fatalf("pendingInference was created without compaction marker: %#v", thread["pendingInference"])
+	pending := mapValue(thread["pendingInference"])
+	if stringValue(pending["agentMode"]) != "deep" || stringValue(pending["reasoningEffort"]) != "xhigh" {
+		t.Fatalf("pendingInference = %#v, want unchecked deep/xhigh resume marker", pending)
+	}
+	if boolValue(pending["preflightCompactionChecked"]) {
+		t.Fatalf("pendingInference = %#v, want preflight compaction to run after restart", pending)
 	}
 	messages := arrayValue(thread["messages"])
 	if len(messages) != 2 {
@@ -11835,8 +11843,9 @@ func TestNeoLocalThreadLoadCancelsStaleLocalCurrentInference(t *testing.T) {
 	if stringValue(mapValue(persistedAssistant["state"])["type"]) != "cancelled" {
 		t.Fatalf("persisted assistant state = %#v, want cancelled", persistedAssistant["state"])
 	}
-	if _, exists := persisted["pendingInference"]; exists {
-		t.Fatalf("pendingInference was created without compaction marker: %#v", persisted["pendingInference"])
+	persistedPending := mapValue(persisted["pendingInference"])
+	if stringValue(persistedPending["agentMode"]) != "deep" || boolValue(persistedPending["preflightCompactionChecked"]) {
+		t.Fatalf("persisted pendingInference = %#v, want unchecked deep resume marker", persistedPending)
 	}
 }
 
@@ -11917,6 +11926,57 @@ func TestNeoLocalThreadLoadRemovesEmptyStaleLocalCurrentInference(t *testing.T) 
 	messages := arrayValue(thread["messages"])
 	if len(messages) != 1 || messageIDValue(mapValue(messages[0])["messageId"]) != "M-user" {
 		t.Fatalf("messages = %#v, want empty stale assistant removed", messages)
+	}
+	pending := mapValue(thread["pendingInference"])
+	if stringValue(pending["agentMode"]) != "deep" || boolValue(pending["preflightCompactionChecked"]) {
+		t.Fatalf("pendingInference = %#v, want unchecked deep resume marker", pending)
+	}
+}
+
+func TestNeoLocalThreadLoadPromotesCheckedCurrentInferenceWithEmptyAssistant(t *testing.T) {
+	useTempNeoThreadStore(t)
+	threadID := "T-019e6541-06ae-75d7-b10e-d893170fa62c"
+	raw := []byte(`{
+		"id": "` + threadID + `",
+		"agentMode": "deep",
+		"meta": {"cliProxyAPILocalNeo": true},
+		"messages": [
+			{"messageId": "M-user", "role": "user", "content": [{"type": "text", "text": "continue after compaction"}]},
+			{"messageId": "M-empty", "role": "assistant", "state": {"type": "streaming"}, "content": []}
+		],
+		"currentInference": {"messageId": "M-empty", "agentMode": "deep", "reasoningEffort": "xhigh", "tools": ["shell_command"], "preflightCompactionChecked": true}
+	}`)
+	path := filepath.Join(neoAmpThreadStoreDir(), threadID+".json")
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatalf("write thread: %v", err)
+	}
+
+	thread, ok := loadNeoLocalThread(threadID)
+	if !ok {
+		t.Fatal("thread was not loaded")
+	}
+	if _, exists := thread["currentInference"]; exists {
+		t.Fatalf("currentInference was not dropped: %#v", thread["currentInference"])
+	}
+	pending := mapValue(thread["pendingInference"])
+	if stringValue(pending["agentMode"]) != "deep" || stringValue(pending["reasoningEffort"]) != "xhigh" || !boolValue(pending["preflightCompactionChecked"]) {
+		t.Fatalf("pendingInference = %#v, want checked deep/xhigh retry marker", pending)
+	}
+	messages := arrayValue(thread["messages"])
+	if len(messages) != 1 || messageIDValue(mapValue(messages[0])["messageId"]) != "M-user" {
+		t.Fatalf("messages = %#v, want empty stale assistant removed", messages)
+	}
+
+	persistedRaw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read persisted thread: %v", err)
+	}
+	var persisted map[string]any
+	if err := json.Unmarshal(persistedRaw, &persisted); err != nil {
+		t.Fatalf("decode persisted thread: %v", err)
+	}
+	if !boolValue(mapValue(persisted["pendingInference"])["preflightCompactionChecked"]) {
+		t.Fatalf("persisted pendingInference = %#v, want checked retry marker", persisted["pendingInference"])
 	}
 }
 

@@ -5731,14 +5731,7 @@ func (a *neoActor) runInferenceForParentWithOptions(agentMode, reasoningEffort, 
 
 	if !options.skipPreflightCompaction {
 		a.maybeCompactBeforeInference(agentMode, reasoningEffort, parentToolCallID, generation)
-		checked := false
-		a.mu.Lock()
-		if a.currentInference != nil && a.currentInference.messageID == assistantID {
-			a.currentInference.preflightCompactionChecked = true
-			checked = true
-		}
-		a.mu.Unlock()
-		if checked {
+		if a.markCurrentInferencePreflightChecked(generation, assistantID) {
 			a.syncLocalThreadSnapshotNow()
 		}
 	}
@@ -5895,7 +5888,11 @@ func (a *neoActor) maybeCompactBeforeInference(agentMode, reasoningEffort, paren
 		log.Warnf("amp neo local runtime compaction failed thread=%s: %v", threadID, err)
 		a.mu.Lock()
 		a.compacting = false
+		if generation == a.generation && a.currentInference != nil {
+			a.currentInference.preflightCompactionChecked = true
+		}
 		a.mu.Unlock()
+		a.syncLocalThreadSnapshotNow()
 		a.broadcast(map[string]any{"type": "compaction_complete"})
 		return
 	}
@@ -5903,7 +5900,11 @@ func (a *neoActor) maybeCompactBeforeInference(agentMode, reasoningEffort, paren
 	if summary == "" {
 		a.mu.Lock()
 		a.compacting = false
+		if generation == a.generation && a.currentInference != nil {
+			a.currentInference.preflightCompactionChecked = true
+		}
 		a.mu.Unlock()
+		a.syncLocalThreadSnapshotNow()
 		a.broadcast(map[string]any{"type": "compaction_complete"})
 		return
 	}
@@ -5917,6 +5918,9 @@ func (a *neoActor) maybeCompactBeforeInference(agentMode, reasoningEffort, paren
 		return
 	}
 	summaryMessage.Seq = a.nextSeqLocked()
+	if a.currentInference != nil {
+		a.currentInference.preflightCompactionChecked = true
+	}
 	updated := make([]neoMessage, 0, len(a.messages)+1)
 	updated = append(updated, a.messages[:cutIndex]...)
 	updated = append(updated, summaryMessage)
@@ -5937,6 +5941,19 @@ func (a *neoActor) maybeCompactBeforeInference(agentMode, reasoningEffort, paren
 	a.broadcast(map[string]any{"type": "compaction_records", "records": neoProtocolCompactionRecordList(records)})
 	a.dispatchNotification("thread", "compaction_complete", map[string]any{"cutMessageId": cutMessageID})
 	a.syncCloudAsync()
+}
+
+func (a *neoActor) markCurrentInferencePreflightChecked(generation int, messageID string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if generation != a.generation || a.currentInference == nil {
+		return false
+	}
+	if messageID != "" && a.currentInference.messageID != messageID {
+		return false
+	}
+	a.currentInference.preflightCompactionChecked = true
+	return true
 }
 
 func neoCompactionShouldRun(messages []neoMessage, maxInputTokens int, thresholdPercent float64) bool {
@@ -6679,7 +6696,7 @@ func (a *neoActor) syncLocalThreadSnapshotForShutdownNow() {
 	if !ok {
 		return
 	}
-	if snapshot.pendingInference == nil && snapshot.currentInference != nil && snapshot.currentInference.preflightCompactionChecked {
+	if snapshot.pendingInference == nil && snapshot.currentInference != nil {
 		snapshot.pendingInference = cloneNeoInferenceInflight(snapshot.currentInference)
 	}
 	if err := writeNeoLocalThreadSnapshot(snapshot); err != nil {
@@ -8338,9 +8355,6 @@ func normalizeNeoThreadPendingInferenceFromCurrent(thread, inference map[string]
 		return false
 	}
 	if len(mapValue(thread["pendingInference"])) > 0 {
-		return false
-	}
-	if !boolValue(firstNonNil(inference["preflightCompactionChecked"], inference["compactionChecked"])) {
 		return false
 	}
 	pending := cloneMap(inference)
