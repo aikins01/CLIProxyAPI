@@ -1135,13 +1135,11 @@ func (s *Server) Stop(ctx context.Context) error {
 		}
 	}
 
-	s.ClosePublicListeners()
-
-	// Close public listeners before stopping the local Amp runtime so reconnecting
-	// clients see a transport outage instead of a live proxy returning 503.
 	if err := s.ShutdownAmpModule(ctx); err != nil {
 		log.Errorf("failed to stop amp module: %v", err)
 	}
+
+	s.ClosePublicListeners()
 
 	// Shutdown the HTTP server.
 	if err := s.server.Shutdown(ctx); err != nil {
