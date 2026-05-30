@@ -13837,6 +13837,52 @@ func TestNeoRuntimeThreadActorMarkPersistsImportedMeta(t *testing.T) {
 	}
 }
 
+func TestNeoRuntimeThreadActorCreationPreservesBinaryMetadata(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	parentThreadID := "T-019e1046-656d-7132-879f-390ded941c16"
+
+	response, status := rt.localThreadActorManagementResponse(context.Background(), map[string]any{
+		"agentMode":      "deep",
+		"parentThreadID": parentThreadID,
+		"repositoryURL":  "https://github.com/router-for-me/CLIProxyAPI",
+		"threadMeta": map[string]any{
+			"visibility": "private",
+			"agentMode":  "deep",
+		},
+		"agentModeDisplay": map[string]any{
+			"label": "Review",
+			"color": "red",
+		},
+	}, "")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d response=%#v", status, response)
+	}
+	threadID := stringValue(response["threadId"])
+	if !neoThreadIDExactPattern.MatchString(threadID) {
+		t.Fatalf("threadId = %q", threadID)
+	}
+	actor := rt.store.ensureThreadActor(threadID)
+
+	actor.mu.Lock()
+	meta := cloneMap(actor.meta)
+	relationships := actor.protocolRelationshipListLocked()
+	actor.mu.Unlock()
+
+	if stringValue(meta["visibility"]) != "private" || stringValue(meta["repositoryURL"]) != "https://github.com/router-for-me/CLIProxyAPI" {
+		t.Fatalf("meta = %#v", meta)
+	}
+	if stringValue(mapValue(meta["agentModeDisplay"])["label"]) != "Review" {
+		t.Fatalf("agentModeDisplay meta = %#v", meta)
+	}
+	if len(relationships) != 1 {
+		t.Fatalf("relationships = %#v", relationships)
+	}
+	relationship := mapValue(relationships[0])
+	if stringValue(relationship["threadID"]) != parentThreadID || stringValue(relationship["type"]) != "mention" || stringValue(relationship["role"]) != "parent" {
+		t.Fatalf("relationship = %#v", relationship)
+	}
+}
+
 func TestNeoRuntimeThreadImportVersionAllocatesFutureSeq(t *testing.T) {
 	dir := t.TempDir()
 	oldStoreDir := neoAmpThreadStoreDir

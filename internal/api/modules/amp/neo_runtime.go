@@ -8202,6 +8202,7 @@ func (rt *neoRuntime) localThreadActorManagementResponse(ctx context.Context, bo
 		actor.bootstrapExecutorType = executorType
 		actor.meta = neoThreadActorImportedMeta(actor.meta)
 	}
+	actor.applyThreadActorCreationMetadataLocked(body)
 	agentMode := actor.currentAgentMode
 	threadVersion := actor.seq
 	if threadVersion <= 0 {
@@ -8266,6 +8267,41 @@ func (rt *neoRuntime) localThreadActorManagementResponse(ctx context.Context, bo
 		return baseResponse, http.StatusCreated
 	}
 	return baseResponse, http.StatusOK
+}
+
+func (a *neoActor) applyThreadActorCreationMetadataLocked(body map[string]any) {
+	if a == nil || len(body) == 0 {
+		return
+	}
+	if a.meta == nil {
+		a.meta = map[string]any{}
+	}
+	if threadMeta := mapValue(body["threadMeta"]); len(threadMeta) > 0 {
+		for key, value := range threadMeta {
+			a.meta[key] = cloneNeoJSONValue(value)
+		}
+	}
+	if repositoryURL := strings.TrimSpace(stringValue(body["repositoryURL"])); repositoryURL != "" {
+		a.meta["repositoryURL"] = repositoryURL
+	}
+	if agent := mapValue(body["agent"]); len(agent) > 0 {
+		a.meta["agent"] = cloneMap(agent)
+	}
+	if agentModeDisplay := mapValue(body["agentModeDisplay"]); len(agentModeDisplay) > 0 {
+		a.meta["agentModeDisplay"] = cloneMap(agentModeDisplay)
+	}
+
+	if relationship, ok := normalizeNeoThreadRelationship(body["relationship"]); ok {
+		a.upsertRelationshipLocked(relationship)
+		return
+	}
+	parentThreadID := strings.TrimSpace(firstNonEmptyString(body["parentThreadID"], body["parentThreadId"], body["parent_thread_id"]))
+	if parentThreadID == "" {
+		return
+	}
+	if relationship, ok := neoProtocolThreadRelationship(parentThreadID, "mention", "parent", time.Now().UnixMilli(), ""); ok {
+		a.upsertRelationshipLocked(relationship)
+	}
 }
 
 func loadNeoThread(threadID string) (map[string]any, bool) {
