@@ -4311,38 +4311,40 @@ func normalizeNeoProtocolImageBlock(block map[string]any) (map[string]any, bool)
 	sourceType := stringValue(source["type"])
 	out := cloneNeoJSONMap(block)
 	out["type"] = "image"
+	var normalizedSource map[string]any
 	switch sourceType {
 	case "base64":
 		data, mediaType := neoImageBase64(block)
-		if data == "" {
+		if data == "" || !neoProtocolImageMediaType(mediaType) {
 			return nil, false
 		}
-		if !neoProtocolImageMediaType(mediaType) {
-			mediaType = "image/png"
-		}
-		out["source"] = map[string]any{"type": "base64", "mediaType": mediaType, "data": data}
+		normalizedSource = map[string]any{"type": "base64", "mediaType": mediaType, "data": data}
 	case "url":
 		url := stringValue(source["url"])
 		if url == "" {
 			return nil, false
 		}
-		out["source"] = map[string]any{"type": "url", "url": url}
+		normalizedSource = map[string]any{"type": "url", "url": url}
 	default:
 		url := firstNonEmptyString(block["url"], block["uri"], block["href"], block["attachmentUrl"])
 		if url != "" {
-			out["source"] = map[string]any{"type": "url", "url": url}
+			normalizedSource = map[string]any{"type": "url", "url": url}
 			break
 		}
 		if data, mediaType := neoImageBase64(block); data != "" {
 			if !neoProtocolImageMediaType(mediaType) {
-				mediaType = "image/png"
+				return nil, false
 			}
-			out["source"] = map[string]any{"type": "base64", "mediaType": mediaType, "data": data}
+			normalizedSource = map[string]any{"type": "base64", "mediaType": mediaType, "data": data}
 		}
 	}
-	sourcePath := firstNonEmptyString(block["sourcePath"], block["source_path"], block["path"], block["filePath"], block["filename"], block["name"], block["attachmentUrl"], block["url"], block["uri"], mapValue(out["source"])["url"])
+	if len(normalizedSource) == 0 {
+		return nil, false
+	}
+	out["source"] = normalizedSource
+	sourcePath := firstNonEmptyString(block["sourcePath"], block["source_path"], block["path"], block["filePath"], block["filename"], block["name"], block["attachmentUrl"], block["url"], block["uri"], normalizedSource["url"])
 	if sourcePath == "" {
-		sourcePath = "image"
+		return nil, false
 	}
 	out["sourcePath"] = sourcePath
 	return out, true
@@ -5301,12 +5303,31 @@ func neoQueuedMessageFromBinaryDelta(msg map[string]any, queue bool) neoQueuedMe
 
 func neoContentFromBinaryValue(raw any) []any {
 	if content := arrayValue(raw); content != nil {
-		return normalizeNeoProtocolContent("user", cloneArray(content), false)
+		return normalizeNeoBinaryUserContent(content)
 	}
 	if text := stringValue(raw); text != "" {
 		return []any{map[string]any{"type": "text", "text": text}}
 	}
 	return []any{}
+}
+
+func normalizeNeoBinaryUserContent(content []any) []any {
+	out := make([]any, 0, len(content))
+	for _, rawBlock := range content {
+		block := mapValue(rawBlock)
+		if stringValue(block["type"]) == "image" {
+			if normalized, ok := normalizeNeoProtocolImageBlock(block); ok {
+				out = append(out, normalized)
+			} else if len(block) > 0 {
+				out = append(out, cloneNeoJSONMap(block))
+			}
+			continue
+		}
+		if normalized, ok := normalizeNeoProtocolUserBlock(rawBlock); ok {
+			out = append(out, normalized)
+		}
+	}
+	return out
 }
 
 func (a *neoActor) hasUserTurnLocked() bool {

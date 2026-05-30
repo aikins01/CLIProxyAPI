@@ -14341,6 +14341,24 @@ func TestNeoRuntimeProtocolMessagesNormalizeContentLikeBinary(t *testing.T) {
 	}
 
 	actor.handle(map[string]any{"type": "message_added", "message": map[string]any{
+		"messageId": "M-user-invalid-image",
+		"role":      "user",
+		"content": []any{
+			map[string]any{"type": "text", "text": "kept"},
+			map[string]any{"type": "image", "source": map[string]any{"type": "base64", "mediaType": "image/svg+xml", "data": "abcd"}},
+			map[string]any{"type": "image", "source": map[string]any{"type": "base64", "data": "abcd"}},
+			map[string]any{"type": "image", "source": map[string]any{"type": "base64", "mediaType": "image/png", "data": "abcd"}},
+			map[string]any{"type": "image", "source": map[string]any{"type": "unknown"}},
+		},
+	}})
+	actor.mu.Lock()
+	invalidUser := actor.messages[2]
+	actor.mu.Unlock()
+	if len(invalidUser.Content) != 1 || stringValue(mapValue(invalidUser.Content[0])["text"]) != "kept" {
+		t.Fatalf("invalid image blocks were not filtered like binary schema: %#v", invalidUser.Content)
+	}
+
+	actor.handle(map[string]any{"type": "message_added", "message": map[string]any{
 		"messageId": "M-info",
 		"role":      "info",
 		"content": []any{
@@ -14349,7 +14367,7 @@ func TestNeoRuntimeProtocolMessagesNormalizeContentLikeBinary(t *testing.T) {
 		},
 	}})
 	actor.mu.Lock()
-	info := actor.messages[2]
+	info := actor.messages[3]
 	beforeInvalid := len(actor.messages)
 	actor.mu.Unlock()
 	if len(info.Content) != 1 || stringValue(mapValue(info.Content[0])["type"]) != "manual_bash_invocation" {
