@@ -6353,14 +6353,26 @@ func (a *neoActor) rejectEdit(editID, message string) {
 }
 
 func (a *neoActor) startUserMessage(user neoQueuedMessage) {
-	a.mu.Lock()
-	message, mode, effort := a.storeQueuedUserMessageLocked(user, false)
-	a.mu.Unlock()
+	message, mode, effort, cleanupEvents := a.appendStartedUserMessage(user)
 
+	for _, event := range cleanupEvents {
+		a.broadcast(event)
+	}
 	a.broadcast(neoMessageAddedPayload(message))
+	if len(cleanupEvents) > 0 {
+		a.syncCloudAsync()
+	}
 	a.ensureThreadTitle(user.Content)
 	a.syncCloudAsync()
 	go a.runInference(mode, effort)
+}
+
+func (a *neoActor) appendStartedUserMessage(user neoQueuedMessage) (neoMessage, string, string, []map[string]any) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	cleanupEvents := a.cleanupPriorAssistantForBinaryDeltaLocked("user:interrupted", nil)
+	message, mode, effort := a.storeQueuedUserMessageLocked(user, false)
+	return message, mode, effort, cleanupEvents
 }
 
 func (a *neoActor) storeQueuedUserMessageLocked(user neoQueuedMessage, preserveMessageFields bool) (neoMessage, string, string) {

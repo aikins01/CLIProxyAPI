@@ -10619,6 +10619,61 @@ func TestNeoActorClientAppendUserMessageUsesBinarySchema(t *testing.T) {
 	}
 }
 
+func TestNeoActorClientAppendUserMessageCancelsDanglingBinaryOwnedToolUse(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	actor.messages = []neoMessage{{
+		ThreadID:  "T-test",
+		MessageID: "M-assistant",
+		Role:      "assistant",
+		Content: []any{map[string]any{
+			"type":     "tool_use",
+			"id":       "TU-review",
+			"name":     "code_review",
+			"input":    map[string]any{"diff_description": "review the current diff"},
+			"complete": true,
+		}},
+		State: map[string]any{"type": "complete", "stopReason": "tool_use"},
+		Seq:   1,
+	}}
+	actor.rebuildHistoryLocked()
+
+	message, _, _, cleanupEvents := actor.appendStartedUserMessage(neoQueuedMessage{
+		MessageID: "M-0000000000000000000001",
+		Content:   []any{map[string]any{"type": "text", "text": "go on"}},
+	})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if message.MessageID != "M-0000000000000000000001" {
+		t.Fatalf("started message = %#v", message)
+	}
+	if len(cleanupEvents) != 1 || cleanupEvents[0]["type"] != "message_added" {
+		t.Fatalf("cleanup events = %#v, want synthetic cancelled tool result", cleanupEvents)
+	}
+	if len(actor.messages) != 3 {
+		t.Fatalf("messages = %#v", actor.messages)
+	}
+	resultMessage := actor.messages[1]
+	resultBlock := mapValue(resultMessage.Content[0])
+	if resultMessage.Role != "user" || resultBlock["toolUseID"] != "TU-review" {
+		t.Fatalf("synthetic result message = %#v", resultMessage)
+	}
+	run := mapValue(resultBlock["run"])
+	if stringValue(run["status"]) != "cancelled" || stringValue(run["reason"]) != "user:interrupted" {
+		t.Fatalf("synthetic cancelled run = %#v", run)
+	}
+	if textFromBlocks(actor.messages[2].Content) != "go on" {
+		t.Fatalf("new user message = %#v", actor.messages[2])
+	}
+	if len(actor.history) != 3 || actor.history[1].ToolCallID != "TU-review" || actor.history[2].Role != "user" {
+		t.Fatalf("history = %#v", actor.history)
+	}
+	if !strings.Contains(actor.history[1].Text, "The user interrupted this tool call") {
+		t.Fatalf("cancelled history text = %q", actor.history[1].Text)
+	}
+}
+
 func TestNeoActorClientAppendUserMessageRejectsInvalidPayloadLikeBinary(t *testing.T) {
 	cases := []struct {
 		name string
