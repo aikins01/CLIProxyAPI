@@ -1635,6 +1635,10 @@ func TestRegisterManagementRoutesPassesThreadReaderToolsUpstreamWhenProxyExists(
 		switch r.URL.Path {
 		case "/api/threads/" + threadID + "/messages/message_stats":
 			writeNeoJSON(w, http.StatusOK, map[string]any{"messageCount": 99, "upstream": true})
+		case "/api/threads/" + threadID + "/messages/read_messages":
+			writeNeoJSON(w, http.StatusOK, map[string]any{"content": "upstream read_messages", "upstream": true})
+		case "/api/threads/" + threadID + "/messages/search_messages":
+			writeNeoJSON(w, http.StatusOK, map[string]any{"matches": []any{"upstream search_messages"}, "upstream": true})
 		case "/api/threads/" + threadID + "/messages/M-reader":
 			writeNeoJSON(w, http.StatusOK, map[string]any{"messages": []any{map[string]any{"messageId": "M-reader", "upstream": true}}})
 		default:
@@ -1666,6 +1670,8 @@ func TestRegisterManagementRoutesPassesThreadReaderToolsUpstreamWhenProxyExists(
 		body string
 	}{
 		{name: "message stats", path: "/api/threads/" + threadID + "/messages/message_stats", body: `{}`},
+		{name: "binary read messages", path: "/api/threads/" + threadID + "/messages/read_messages", body: `{"startIndex":0,"limit":20}`},
+		{name: "binary search messages", path: "/api/threads/" + threadID + "/messages/search_messages", body: `{"query":"local","startIndex":0,"endIndex":3}`},
 		{name: "message reader", path: "/api/threads/" + threadID + "/messages/M-reader", body: `{"limit":20}`},
 	}
 	for _, tc := range tests {
@@ -1787,6 +1793,8 @@ func TestRegisterManagementRoutesDoesNotServeThreadDiscoveryLocallyWithoutProxy(
 		{name: "api thread read", method: http.MethodGet, path: "/api/threads/" + threadID},
 		{name: "thread read", method: http.MethodGet, path: "/threads/" + threadID},
 		{name: "thread reader stats", method: http.MethodPost, path: "/api/threads/" + threadID + "/messages/message_stats", body: `{}`},
+		{name: "thread reader read messages", method: http.MethodPost, path: "/api/threads/" + threadID + "/messages/read_messages", body: `{"startIndex":0,"limit":20}`},
+		{name: "thread reader search messages", method: http.MethodPost, path: "/api/threads/" + threadID + "/messages/search_messages", body: `{"query":"local needle","startIndex":0,"endIndex":3}`},
 		{name: "thread reader message", method: http.MethodPost, path: "/api/threads/" + threadID + "/messages/M-local", body: `{}`},
 		{name: "user actor credentials", method: http.MethodPost, path: "/api/user-actor-credentials", body: `{}`},
 	}
