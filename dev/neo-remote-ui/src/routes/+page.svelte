@@ -229,7 +229,11 @@
   let socket: WebSocket | null = null;
   let socketGeneration = 0;
   let reconnectTimer: number | null = null;
+  let reconnectResetTimer: number | null = null;
   let reconnectAttempts = 0;
+  let pingTimer: number | null = null;
+  let lastServerFrameAt = 0;
+  let lastPingTickAt = 0;
   let lastError = $state('');
   let queuedCount = $state(0);
   let activeError = $state<Record<string, unknown> | null>(null);
@@ -276,7 +280,11 @@
   const maxComposerImageEncodedBytes = 5_138_022;
   const maxComposerImageBytes = Math.floor(maxComposerImageEncodedBytes / 4) * 3;
   const maxQueuedMessages = 5;
-  const maxReconnectAttempts = 6;
+  const reconnectDelayMs = 1_000;
+  const maxReconnectDelayMs = 30_000;
+  const maxReconnectAttempts = 124;
+  const reconnectAttemptsResetMs = 30_000;
+  const pingIntervalMs = 30_000;
   const defaultAgentMode = 'smart';
   const composerImageAccept = 'image/png,image/jpeg,image/gif,image/webp,.png,.jpg,.jpeg,.gif,.webp';
   const composerImageMediaTypes = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
@@ -822,6 +830,28 @@
     }
   }
 
+  function clearReconnectResetTimer() {
+    if (reconnectResetTimer !== null) {
+      window.clearTimeout(reconnectResetTimer);
+      reconnectResetTimer = null;
+    }
+  }
+
+  function scheduleReconnectAttemptsReset() {
+    clearReconnectResetTimer();
+    reconnectResetTimer = window.setTimeout(() => {
+      reconnectResetTimer = null;
+      reconnectAttempts = 0;
+    }, reconnectAttemptsResetMs);
+  }
+
+  function clearPingTimer() {
+    if (pingTimer !== null) {
+      window.clearInterval(pingTimer);
+      pingTimer = null;
+    }
+  }
+
   function clearConnectionError() {
     if (/websocket/i.test(lastError)) lastError = '';
   }
@@ -834,7 +864,8 @@
       return;
     }
 
-    const delay = Math.min(750 * 2 ** reconnectAttempts, 8000);
+    const jitter = 0.8 + Math.random() * 0.4;
+    const delay = Math.min(reconnectDelayMs * 2 ** reconnectAttempts, maxReconnectDelayMs) * jitter;
     reconnectAttempts += 1;
     connection = 'connecting';
     reconnectTimer = window.setTimeout(() => {
@@ -844,13 +875,48 @@
     }, delay);
   }
 
+  function startPingTimer(activeSocket: WebSocket, threadId: string, version: number, options: ConnectOptions, generation: number) {
+    clearPingTimer();
+    lastServerFrameAt = Date.now();
+    lastPingTickAt = lastServerFrameAt;
+    pingTimer = window.setInterval(() => {
+      if (socket !== activeSocket || generation !== socketGeneration || selectedThreadId !== threadId) {
+        clearPingTimer();
+        return;
+      }
+      const now = Date.now();
+      if (now - lastPingTickAt > pingIntervalMs * 3) {
+        lastServerFrameAt = now;
+        lastPingTickAt = now;
+        return;
+      }
+      lastPingTickAt = now;
+      if (activeSocket.readyState !== WebSocket.OPEN) return;
+      if (now - lastServerFrameAt > pingIntervalMs * 2) {
+        try {
+          activeSocket.close(4000, 'Pong timeout');
+        } catch {
+          socket = null;
+          connection = 'offline';
+          scheduleReconnect(threadId, version, options, generation);
+        }
+        return;
+      }
+      activeSocket.send('ping');
+    }, pingIntervalMs);
+  }
+
   function connect(threadId: string, version = 0, options: ConnectOptions = {}, reconnecting = false) {
     if (!threadId || typeof WebSocket === 'undefined') return;
     clearReconnectTimer();
+    clearPingTimer();
     const previousSocket = socket;
     socket = null;
     if (previousSocket) previousSocket.close();
-    if (!reconnecting) reconnectAttempts = 0;
+    if (!reconnecting) {
+      clearReconnectResetTimer();
+      reconnectAttempts = 0;
+    }
     const generation = socketGeneration + 1;
     socketGeneration = generation;
     connection = 'connecting';
@@ -877,9 +943,10 @@
     const activeSocket = () => socket === nextSocket && generation === socketGeneration && selectedThreadId === threadId;
     nextSocket.addEventListener('open', () => {
       if (!activeSocket()) return;
-      reconnectAttempts = 0;
+      scheduleReconnectAttemptsReset();
       connection = 'connected';
       clearConnectionError();
+      startPingTimer(nextSocket, threadId, version, options, generation);
       sendFrame({ type: 'client_resume', version });
       if (options.bootstrapExecutor) {
         sendFrame({
@@ -900,6 +967,8 @@
     });
     nextSocket.addEventListener('close', () => {
       if (!activeSocket()) return;
+      clearReconnectResetTimer();
+      clearPingTimer();
       socket = null;
       connection = 'offline';
       scheduleReconnect(threadId, version, options, generation);
@@ -911,6 +980,7 @@
     });
     nextSocket.addEventListener('message', (event) => {
       if (!activeSocket()) return;
+      lastServerFrameAt = Date.now();
       if (event.data === 'pong') return;
       try {
         const decoded = JSON.parse(String(event.data));
@@ -928,6 +998,8 @@
 
   function disconnect() {
     clearReconnectTimer();
+    clearReconnectResetTimer();
+    clearPingTimer();
     socketGeneration += 1;
     const closingSocket = socket;
     socket = null;
