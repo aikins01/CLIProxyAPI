@@ -128,3 +128,19 @@ func TestApplyHomeOverlayForcesUsageStatisticsEnabled(t *testing.T) {
 		t.Fatal("expected home overlay to preserve local home settings")
 	}
 }
+
+func TestNewServiceShutdownContextStartsFreshAtCallTime(t *testing.T) {
+	original := serviceShutdownTimeout
+	serviceShutdownTimeout = time.Millisecond
+	t.Cleanup(func() {
+		serviceShutdownTimeout = original
+	})
+
+	time.Sleep(2 * time.Millisecond)
+	ctx, cancel := newServiceShutdownContext()
+	defer cancel()
+
+	if err := ctx.Err(); err != nil {
+		t.Fatalf("new shutdown context was already expired: %v", err)
+	}
+}

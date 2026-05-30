@@ -98,6 +98,12 @@ type Service struct {
 	homeCancel context.CancelFunc
 }
 
+var serviceShutdownTimeout = 30 * time.Second
+
+func newServiceShutdownContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), serviceShutdownTimeout)
+}
+
 // RegisterUsagePlugin registers a usage plugin on the global usage manager.
 // This allows external code to monitor API usage and token consumption.
 //
@@ -736,9 +742,9 @@ func (s *Service) Run(ctx context.Context) error {
 		redisqueue.SetUsageStatisticsEnabled(true)
 	}
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer shutdownCancel()
 	defer func() {
+		shutdownCtx, shutdownCancel := newServiceShutdownContext()
+		defer shutdownCancel()
 		if err := s.Shutdown(shutdownCtx); err != nil {
 			log.Errorf("service shutdown returned error: %v", err)
 		}
@@ -981,7 +987,7 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		// no legacy clients to persist
 
 		if s.server != nil {
-			shutdownCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			shutdownCtx, cancel := context.WithTimeout(ctx, serviceShutdownTimeout)
 			defer cancel()
 			if err := s.server.Stop(shutdownCtx); err != nil {
 				log.Errorf("error stopping API server: %v", err)
