@@ -3155,6 +3155,7 @@ func (a *neoActor) handleProtocolToolLease(msg map[string]any) {
 		return
 	}
 	args := normalizeNeoToolCallInput(toolName, mapValue(msg["args"]))
+	toolName = normalizeNeoToolCallName(toolName)
 	agentMode := firstNonEmptyString(msg["agentMode"], a.currentAgentMode)
 	reasoningEffort := firstNonEmptyString(msg["reasoningEffort"], a.currentReasoningEffort)
 	a.pendingTools[toolCallID] = neoPendingTool{
@@ -5711,13 +5712,15 @@ func (a *neoActor) runInferenceForParent(agentMode, reasoningEffort, parentToolC
 			if input == nil {
 				input = map[string]any{}
 			}
+			input = normalizeNeoToolCallInput(delta.ToolCall.Name, input)
+			toolName := normalizeNeoToolCallName(delta.ToolCall.Name)
 			toolID := fallbackString(delta.ToolCall.ID, newNeoToolCallID())
 			toolStartTime := toolBlockStartTimes[toolID]
 			if toolStartTime == 0 {
 				toolStartTime = time.Now().UnixMilli()
 				toolBlockStartTimes[toolID] = toolStartTime
 			}
-			block := neoToolUseBlock(neoToolCall{ID: toolID, Name: delta.ToolCall.Name, Input: input, CustomInputField: delta.ToolCall.CustomInputField}, delta.ToolCall.Complete)
+			block := neoToolUseBlock(neoToolCall{ID: toolID, Name: toolName, Input: input, CustomInputField: delta.ToolCall.CustomInputField}, delta.ToolCall.Complete)
 			if !delta.ToolCall.Complete {
 				previousJSON := partialToolJSONByID[toolID]
 				partialJSONDelta := delta.ToolCall.PartialJSONDelta
@@ -13199,12 +13202,23 @@ func normalizeNeoToolCalls(calls []neoToolCall) []neoToolCall {
 			call.ID = newNeoToolCallID()
 		}
 		call.Input = normalizeNeoToolCallInput(call.Name, call.Input)
+		call.Name = normalizeNeoToolCallName(call.Name)
 		normalized = append(normalized, call)
 	}
 	return normalized
 }
 
+func normalizeNeoToolCallName(name string) string {
+	if name == "run_terminal_command" {
+		return "Bash"
+	}
+	return name
+}
+
 func normalizeNeoToolCallInput(name string, input map[string]any) map[string]any {
+	if name == "run_terminal_command" {
+		return normalizeNeoRunTerminalCommandInput(input)
+	}
 	if normalizedNeoToolName(name) != "codereview" || len(input) == 0 {
 		return input
 	}
@@ -13223,6 +13237,25 @@ func normalizeNeoToolCallInput(name string, input map[string]any) map[string]any
 		if value, ok := normalized[key]; ok && !boolValue(value) {
 			delete(normalized, key)
 		}
+	}
+	return normalized
+}
+
+func normalizeNeoRunTerminalCommandInput(input map[string]any) map[string]any {
+	normalized := cloneMap(input)
+	cmd := ""
+	if value, ok := input["cmd"].(string); ok {
+		cmd = value
+	} else if value, ok := input["command"].(string); ok {
+		cmd = value
+	}
+	normalized["cmd"] = cmd
+	if value, ok := input["cwd"].(string); ok {
+		normalized["cwd"] = value
+	} else if value, ok := input["workdir"].(string); ok {
+		normalized["cwd"] = value
+	} else {
+		delete(normalized, "cwd")
 	}
 	return normalized
 }

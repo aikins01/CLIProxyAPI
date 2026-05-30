@@ -3182,6 +3182,29 @@ func TestNeoActorProtocolToolLeaseNormalizesOfficialPayload(t *testing.T) {
 	}
 }
 
+func TestNeoActorProtocolToolLeaseNormalizesRunTerminalCommandLikeBinary(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019e0e6e-f3f1-7087-b5dd-748f66f8c25e"
+	actor, _ := rt.store.upsert(map[string]any{"name": "threadActor", "key": threadID, "input": map[string]any{"threadId": threadID}}, true)
+	assistantID := newNeoMessageID()
+	toolCallID := newNeoToolCallID()
+	actor.mu.Lock()
+	actor.currentInference = &neoInferenceInflight{messageID: assistantID, agentMode: "smart"}
+	actor.mu.Unlock()
+
+	actor.handle(map[string]any{"type": "tool_lease", "toolCallId": toolCallID, "toolName": "run_terminal_command", "args": map[string]any{"command": "pwd", "workdir": "/tmp/work"}})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	pending := actor.pendingTools[toolCallID]
+	if pending.Name != "Bash" {
+		t.Fatalf("pending tool name = %q, want Bash", pending.Name)
+	}
+	if stringValue(pending.Input["cmd"]) != "pwd" || stringValue(pending.Input["cwd"]) != "/tmp/work" {
+		t.Fatalf("pending input = %#v, want cmd/cwd from command/workdir", pending.Input)
+	}
+}
+
 func TestNeoActorProtocolAbortedDeltaDropsPartialAssistant(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	actor := newNeoActor(rt, "actor-test", "threadActor", "T-test", "T-test", neoActorRecord("actor-test", "threadActor", "T-test"), nil)
@@ -6654,6 +6677,42 @@ func TestNeoActorAppliesScaffoldToolCustomization(t *testing.T) {
 	goal := mapValue(properties["goal"])
 	if stringValue(goal["type"]) != "string" {
 		t.Fatalf("Task schema = %#v", request.Tools[0].InputSchema)
+	}
+}
+
+func TestNormalizeNeoToolCallsMapsRunTerminalCommandLikeBinary(t *testing.T) {
+	toolCallID := newNeoToolCallID()
+	calls := normalizeNeoToolCalls([]neoToolCall{{
+		ID:   toolCallID,
+		Name: "run_terminal_command",
+		Input: map[string]any{
+			"command": "pwd",
+			"workdir": "/tmp/work",
+			"extra":   true,
+		},
+	}, {
+		ID:   newNeoToolCallID(),
+		Name: "run_terminal_command",
+		Input: map[string]any{
+			"cmd":     "git status",
+			"command": "pwd",
+			"cwd":     "/repo",
+			"workdir": "/tmp/work",
+		},
+	}})
+	if len(calls) != 2 {
+		t.Fatalf("normalized calls = %d, want 2", len(calls))
+	}
+	first := calls[0]
+	if first.ID != toolCallID || first.Name != "Bash" {
+		t.Fatalf("first call = %#v, want same id and Bash name", first)
+	}
+	if stringValue(first.Input["cmd"]) != "pwd" || stringValue(first.Input["cwd"]) != "/tmp/work" || first.Input["extra"] != true {
+		t.Fatalf("first input = %#v, want command/workdir normalized to cmd/cwd", first.Input)
+	}
+	second := calls[1]
+	if second.Name != "Bash" || stringValue(second.Input["cmd"]) != "git status" || stringValue(second.Input["cwd"]) != "/repo" {
+		t.Fatalf("second call = %#v, want existing cmd/cwd to win", second)
 	}
 }
 
