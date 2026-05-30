@@ -270,6 +270,7 @@
   let programmaticScrollUntil = 0;
   let programmaticScrollKind: 'follow' | 'preserve' | '' = '';
   let manualTranscriptScrollVersion = 0;
+  let transcriptFollowPinned = true;
   const devSignalCount = $derived.by(() => {
     let count = artifacts.length + executorStatuses.length + runtimeEvents.length + toolLeases.length;
     if (inferenceTools) count += 1;
@@ -364,8 +365,8 @@
     return scroller.scrollHeight - (scroller.scrollTop + window.innerHeight);
   }
 
-  function isNearTranscriptBottom() {
-    return pageDistanceFromBottom() <= 180;
+  function isTranscriptPinnedToBottom() {
+    return pageDistanceFromBottom() <= 24;
   }
 
   function scrollTranscriptToBottom(behavior: ScrollBehavior = 'auto') {
@@ -373,6 +374,7 @@
     if (!scroller) return;
     programmaticScrollUntil = Date.now() + 250;
     programmaticScrollKind = 'follow';
+    transcriptFollowPinned = true;
     scroller.scrollTo({ top: scroller.scrollHeight, behavior });
     newActivityBelow = false;
   }
@@ -395,7 +397,7 @@
     transcriptScrollScheduled = false;
     if (!plan) return;
     if (plan.kind === 'follow') {
-      if (!plan.force && manualTranscriptScrollVersion !== plan.manualScrollVersion && !isNearTranscriptBottom()) {
+      if (!plan.force && manualTranscriptScrollVersion !== plan.manualScrollVersion && !isTranscriptPinnedToBottom()) {
         newActivityBelow = true;
         return;
       }
@@ -411,7 +413,7 @@
     const scroller = pageScroller();
     const top = scroller?.scrollTop ?? window.scrollY;
     const manualScrollVersion = manualTranscriptScrollVersion;
-    const shouldFollow = Boolean(options.forceFollow) || isNearTranscriptBottom();
+    const shouldFollow = Boolean(options.forceFollow) || transcriptFollowPinned || isTranscriptPinnedToBottom();
     if (shouldFollow) {
       transcriptScrollPlan = { kind: 'follow', top, manualScrollVersion, force: Boolean(options.forceFollow) };
     } else {
@@ -424,11 +426,12 @@
   function handlePageScroll() {
     if (Date.now() <= programmaticScrollUntil) {
       if (programmaticScrollKind === 'preserve') return;
-      if (programmaticScrollKind === 'follow' && isNearTranscriptBottom()) return;
+      if (programmaticScrollKind === 'follow' && isTranscriptPinnedToBottom()) return;
     }
     programmaticScrollKind = '';
     manualTranscriptScrollVersion += 1;
-    if (isNearTranscriptBottom()) newActivityBelow = false;
+    transcriptFollowPinned = isTranscriptPinnedToBottom();
+    if (transcriptFollowPinned) newActivityBelow = false;
   }
 
   function jumpToLatest() {
@@ -536,6 +539,7 @@
     maxTokensLabel = '';
     retryNotice = '';
     newActivityBelow = false;
+    transcriptFollowPinned = true;
   }
 
   async function submitKey() {
