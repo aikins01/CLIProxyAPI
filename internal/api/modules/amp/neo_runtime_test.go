@@ -814,6 +814,74 @@ func TestNeoRuntimeAutoCompactionUsesFullInputPressure(t *testing.T) {
 	}
 }
 
+func TestNeoRuntimeAutoCompactionUsesObservedProviderUsage(t *testing.T) {
+	dir := t.TempDir()
+	oldStoreDir := neoAmpThreadStoreDir
+	neoAmpThreadStoreDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
+
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.URL.Path != "/api/provider/openai/v1/chat/completions" {
+			t.Fatalf("unexpected compaction path %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"observed usage summary"}}]}`))
+	}))
+	t.Cleanup(upstream.Close)
+	parsed, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+	_, portString, err := net.SplitHostPort(parsed.Host)
+	if err != nil {
+		t.Fatalf("parse upstream host: %v", err)
+	}
+	port, err := strconv.Atoi(portString)
+	if err != nil {
+		t.Fatalf("parse upstream port: %v", err)
+	}
+
+	enabled := true
+	rt := newNeoRuntime(&config.Config{
+		Host: "127.0.0.1",
+		Port: port,
+		AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
+			Enabled:         &enabled,
+			CompactionModel: "openai/gpt-5.4",
+		}},
+	})
+	threadID := "T-observed-usage-compact"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+	actor.mu.Lock()
+	for i := 0; i < 30; i++ {
+		role := "user"
+		usage := map[string]any(nil)
+		if i%2 == 1 {
+			role = "assistant"
+		}
+		if i == 29 {
+			usage = map[string]any{"totalInputTokens": neoCompactionDefaultTokenLimit, "outputTokens": 1}
+		}
+		actor.storeMessageLocked(neoMessage{ThreadID: threadID, MessageID: fmt.Sprintf("M-%022d", i), Role: role, Content: []any{map[string]any{"type": "text", "text": fmt.Sprintf("short message %02d", i)}}, Usage: usage})
+	}
+	if neoCompactionShouldRun(actor.messages, neoEffectiveMaxInputTokens("smart", "gpt-5.5"), neoCompactionThresholdPercent(nil)) {
+		actor.mu.Unlock()
+		t.Fatal("message-only compaction unexpectedly crossed the default binary threshold")
+	}
+	actor.currentInference = &neoInferenceInflight{messageID: "M-current", agentMode: "smart", reasoningEffort: "medium"}
+	actor.rebuildHistoryLocked()
+	generation := actor.generation
+	actor.mu.Unlock()
+
+	actor.maybeCompactBeforeInference("smart", "medium", "", generation)
+
+	if calls != 1 {
+		t.Fatalf("compaction calls = %d, want 1 from observed provider usage", calls)
+	}
+}
+
 func TestNeoRuntimeAutoCompactionUsesLatestRecordWindow(t *testing.T) {
 	dir := t.TempDir()
 	oldStoreDir := neoAmpThreadStoreDir
@@ -1092,6 +1160,37 @@ func TestNeoCompactionThresholdPercentSettingMatchesBinary(t *testing.T) {
 	}
 	if got := neoCompactionThresholdPercent(map[string]any{"internal.compactionThresholdPercent": json.Number("75.5")}); got != 75.5 {
 		t.Fatalf("decimal threshold percent = %v, want 75.5", got)
+	}
+}
+
+func TestNeoCompactionUsageTokensMatchesBinaryFormula(t *testing.T) {
+	if got := neoCompactionUsageTokens(map[string]any{
+		"input_tokens":                90_000,
+		"cache_creation_input_tokens": 4_000,
+		"cache_read_input_tokens":     5_000,
+		"output_tokens":               1_000,
+	}); got != 100_000 {
+		t.Fatalf("raw anthropic-style usage tokens = %d, want 100000", got)
+	}
+	if got := neoCompactionUsageTokens(map[string]any{
+		"totalInputTokens": 100_000,
+		"outputTokens":     32,
+	}); got != 100_032 {
+		t.Fatalf("normalized usage tokens = %d, want 100032", got)
+	}
+	if got := neoCompactionUsageTokens(map[string]any{
+		"input_tokens":         90_000,
+		"input_tokens_details": map[string]any{"cached_tokens": 9_000},
+		"output_tokens":        1_000,
+	}); got != 100_000 {
+		t.Fatalf("openai detail fallback usage tokens = %d, want 100000", got)
+	}
+	if got := neoCompactionObservedUsageTokens([]neoMessage{
+		{Role: "assistant", Usage: map[string]any{"totalInputTokens": 50_000, "outputTokens": 1}},
+		{Role: "user", Content: []any{map[string]any{"type": "text", "text": "next"}}},
+		{Role: "assistant", Usage: map[string]any{"totalInputTokens": 101_000}},
+	}); got != 101_000 {
+		t.Fatalf("observed usage tokens = %d, want latest assistant usage", got)
 	}
 }
 
@@ -2634,6 +2733,38 @@ func TestNeoRuntimeGatewayThreadActorContextAnalysisRoute(t *testing.T) {
 	}
 	if !foundConversation {
 		t.Fatalf("context analysis missing conversation section: %#v", sections)
+	}
+}
+
+func TestNeoRuntimeGatewayThreadActorContextAnalysisDoesNotCreateBlankActor(t *testing.T) {
+	dir := t.TempDir()
+	oldStoreDir := neoAmpThreadStoreDir
+	neoAmpThreadStoreDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
+
+	rt := newNeoRuntime(&config.Config{})
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	t.Cleanup(server.Close)
+
+	threadID := "T-019e1046-656d-7132-879f-390ded941c19"
+	req, err := http.NewRequest(http.MethodGet, server.URL+"/gateway/threadActor/request/context-analysis?rvt-key="+url.QueryEscape(threadID), nil)
+	if err != nil {
+		t.Fatalf("new context analysis request: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("get context analysis: %v", err)
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("context analysis status=%d body=%s, want 404", resp.StatusCode, respBody)
+	}
+	rt.store.mu.RLock()
+	actorCount := len(rt.store.actors)
+	rt.store.mu.RUnlock()
+	if actorCount != 0 {
+		t.Fatalf("context analysis created %d actor(s), want none", actorCount)
 	}
 }
 

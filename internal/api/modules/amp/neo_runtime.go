@@ -630,8 +630,8 @@ func (rt *neoRuntime) contextAnalysisActorForRequest(r *http.Request) *neoActor 
 	}
 	target := neoGatewayTargetFromPath(r.URL.Path)
 	key := strings.TrimSpace(r.URL.Query().Get("rvt-key"))
-	if (target == "threadActor" || target == "thread-actor") && neoThreadIDExactPattern.MatchString(key) {
-		return rt.store.ensureThreadActor(key)
+	if actor := rt.store.persistedThreadActorForGatewayTarget(target, key); actor != nil {
+		return actor
 	}
 	return nil
 }
@@ -6602,6 +6602,9 @@ func (a *neoActor) maybeCompactBeforeInference(agentMode, reasoningEffort, paren
 	if messageTokens := neoEstimateMessageTokens(compactionMessagesWindow); messageTokens > estimatedInputTokens {
 		estimatedInputTokens = messageTokens
 	}
+	if observedTokens := neoCompactionObservedUsageTokens(compactionMessagesWindow); observedTokens > estimatedInputTokens {
+		estimatedInputTokens = observedTokens
+	}
 	maxInput := neoEffectiveMaxInputTokens(agentMode, inferenceRoute.Model)
 	if maxInput <= 0 {
 		maxInput = neoCompactionFallbackMaxInput
@@ -6720,6 +6723,43 @@ func neoCompactionShouldRunForTokens(messages []neoMessage, estimatedInputTokens
 	}
 	threshold := neoCompactionThresholdTokens(maxInputTokens, thresholdPercent)
 	return float64(estimatedInputTokens) >= threshold
+}
+
+func neoCompactionObservedUsageTokens(messages []neoMessage) int {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role != "assistant" || len(messages[i].Usage) == 0 {
+			continue
+		}
+		return neoCompactionUsageTokens(messages[i].Usage)
+	}
+	return 0
+}
+
+func neoCompactionUsageTokens(usage map[string]any) int {
+	if len(usage) == 0 {
+		return 0
+	}
+	totalInput := numberFrom(usage["totalInputTokens"], usage["total_input_tokens"])
+	output := numberFrom(usage["outputTokens"], usage["output_tokens"], usage["completion_tokens"], usage["candidatesTokenCount"])
+	if _, ok := usage["totalInputTokens"]; ok {
+		return totalInput + output
+	}
+	if _, ok := usage["total_input_tokens"]; ok {
+		return totalInput + output
+	}
+	input := numberFrom(usage["inputTokens"], usage["input_tokens"], usage["prompt_tokens"], usage["promptTokenCount"])
+	cacheCreation := numberFrom(usage["cacheCreationInputTokens"], usage["cache_creation_input_tokens"])
+	cacheRead := numberFrom(usage["cacheReadInputTokens"], usage["cache_read_input_tokens"], usage["cachedContentTokenCount"])
+	if cacheRead == 0 {
+		cacheRead = nestedNumberFrom(usage["prompt_tokens_details"], "cached_tokens")
+	}
+	if cacheRead == 0 {
+		cacheRead = nestedNumberFrom(usage["input_tokens_details"], "cached_tokens")
+	}
+	if input > 0 || cacheCreation > 0 || cacheRead > 0 {
+		return input + cacheCreation + cacheRead + output
+	}
+	return numberFrom(usage["total_tokens"], usage["totalTokenCount"])
 }
 
 func neoCompactionThresholdTokens(maxInputTokens int, thresholdPercent float64) float64 {
