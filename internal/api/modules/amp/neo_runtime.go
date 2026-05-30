@@ -2590,16 +2590,11 @@ func (a *neoActor) spawnExecutor(msg map[string]any) {
 	}
 
 	a.mu.Lock()
-	threadID := firstNonEmptyString(msg["threadID"], msg["threadId"], msg["thread_id"], a.threadID, a.key)
-	agentMode := firstNonEmptyString(msg["agentMode"], nestedString(msg["settings"], "agentMode"), a.agentModeLocked())
-	reasoningEffort := firstNonEmptyString(msg["reasoningEffort"], msg["reasoning_effort"], nestedString(msg["settings"], "reasoning.effort"), a.reasoningEffortForModeLocked(agentMode))
+	threadID := firstNonEmptyString(a.threadID, a.key)
+	agentMode := a.agentModeLocked()
+	reasoningEffort := a.reasoningEffortForModeLocked(agentMode)
 	reasoningEffort = normalizeNeoReasoningEffortForMode(agentMode, reasoningEffort)
 	environment := cloneMap(a.environment)
-	if env := mapValue(msg["environment"]); len(env) > 0 {
-		for key, value := range env {
-			environment[key] = value
-		}
-	}
 	ready := a.executorReady
 	executorID := a.executorID
 	var existing *neoSpawnedExecutor
@@ -2631,7 +2626,7 @@ func (a *neoActor) spawnExecutor(msg map[string]any) {
 		return
 	}
 
-	workDir := neoHeadlessWorkingDirectory(msg, environment)
+	workDir := neoHeadlessWorkingDirectory(neoHeadlessExecutorSpawnOptions(msg), environment)
 	logPath := neoHeadlessExecutorLogPath(threadID, spawnID)
 	args := neoHeadlessExecutorArgs(threadID, agentMode, reasoningEffort)
 	cmd := exec.Command(command, args...)
@@ -2685,6 +2680,14 @@ func (a *neoActor) spawnExecutor(msg map[string]any) {
 	a.broadcastExecutorStatus(spawnID, "running", "Waiting for local Amp headless executor to connect.", map[string]any{"reasonCode": "waiting_for_executor_connect", "pid": spawned.pid(), "threadId": threadID, "logFile": omitEmpty(logPath)})
 	go a.waitSpawnedExecutor(spawnID, spawned, logFile)
 	go a.watchSpawnedExecutorConnectTimeout(spawnID, spawned, neoExecutorConnectTimeout(cfg))
+}
+
+func neoHeadlessExecutorSpawnOptions(msg map[string]any) map[string]any {
+	return map[string]any{
+		"repositoryURL":           msg["repositoryURL"],
+		"additionalRepositories":  msg["additionalRepositories"],
+		"additional_repositories": msg["additional_repositories"],
+	}
 }
 
 func neoHeadlessExecutorArgs(threadID, agentMode, reasoningEffort string) []string {

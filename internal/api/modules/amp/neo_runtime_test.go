@@ -4342,6 +4342,10 @@ func TestNeoActorSpawnExecutorStartsHeadlessAmp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EvalSymlinks workDir error: %v", err)
 	}
+	ignoredWorkDir := filepath.Join(dir, "ignored-workspace")
+	if err := os.MkdirAll(ignoredWorkDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll ignoredWorkDir error: %v", err)
+	}
 
 	script := filepath.Join(dir, "amp")
 	if err := os.WriteFile(script, []byte(`#!/bin/sh
@@ -4369,7 +4373,15 @@ sleep 5
 	actor.settings = map[string]any{"agentMode": "deep", "reasoning.effort": "xhigh"}
 	t.Cleanup(actor.dispose)
 
-	actor.handle(map[string]any{"type": "client_spawn_executor", "requestId": "spawn-test"})
+	actor.handle(map[string]any{
+		"type":             "client_spawn_executor",
+		"requestId":        "spawn-test",
+		"threadID":         "T-overridden-thread",
+		"agentMode":        "rush",
+		"reasoningEffort":  "none",
+		"workingDirectory": ignoredWorkDir,
+		"environment":      map[string]any{"workingDirectory": ignoredWorkDir},
+	})
 
 	var content string
 	deadline := time.Now().Add(2 * time.Second)
