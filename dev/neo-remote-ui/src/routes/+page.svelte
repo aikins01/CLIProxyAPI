@@ -167,6 +167,11 @@
     message: string;
     details: Record<string, unknown>;
   };
+  type RuntimeEvent = {
+    id: string;
+    label: string;
+    detail: string;
+  };
   type ToolLease = {
     toolCallId: string;
     toolName: string;
@@ -243,6 +248,7 @@
   let executorConnected = $state(false);
   let executorInfo = $state<Record<string, unknown>>({});
   let executorStatuses = $state<ExecutorStatus[]>([]);
+  let runtimeEvents = $state<RuntimeEvent[]>([]);
   let inferenceTools = $state<{ messageId: string; agentMode: string; tools: string[] } | null>(null);
   let toolLeases = $state<ToolLease[]>([]);
   let draftPreview = $state('');
@@ -260,7 +266,7 @@
   let programmaticScrollUntil = 0;
   let manualTranscriptScrollVersion = 0;
   const devSignalCount = $derived.by(() => {
-    let count = artifacts.length + executorStatuses.length + toolLeases.length;
+    let count = artifacts.length + executorStatuses.length + runtimeEvents.length + toolLeases.length;
     if (inferenceTools) count += 1;
     if (retryNotice) count += 1;
     return count;
@@ -506,6 +512,7 @@
     executorConnected = false;
     executorInfo = {};
     executorStatuses = [];
+    runtimeEvents = [];
     inferenceTools = null;
     toolLeases = [];
     draftPreview = '';
@@ -1442,6 +1449,20 @@
       activeError = { message: message.message, code: message.code };
       return;
     }
+    if (type === 'executor_workspace_maybe_changed') {
+      pushRuntimeEvent('workspace', runtimeEventDetail(message, ['toolName', 'toolCallId', 'reason', 'message']));
+      return;
+    }
+    if (type === 'executor_tool_approval_response') {
+      const id = stringFrom(message.toolCallId ?? message.toolUseId ?? message.id);
+      if (id) toolApprovals = toolApprovals.filter((approval) => approval.toolCallId !== id);
+      pushRuntimeEvent('approval', runtimeEventDetail(message, ['response', 'status', 'toolName', 'toolCallId']));
+      return;
+    }
+    if (type === 'plugin_message') {
+      pushRuntimeEvent('plugin', pluginMessageDetail(message.message ?? message));
+      return;
+    }
     if (type === 'error') {
       activeError = { message: message.message, code: message.code };
       return;
@@ -1952,6 +1973,23 @@
       message: stringFrom(item.message),
       details: asRecord(item.details)
     };
+  }
+
+  function pushRuntimeEvent(label: string, detail: string) {
+    const id = `${label}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    runtimeEvents = [{ id, label, detail: detail || label }, ...runtimeEvents].slice(0, 8);
+  }
+
+  function runtimeEventDetail(message: Incoming, fields: string[]) {
+    const parts = fields
+      .map((field) => stringFrom(message[field]))
+      .filter(Boolean);
+    return parts.join(' · ') || objectSummary(asRecord(message));
+  }
+
+  function pluginMessageDetail(raw: unknown) {
+    const item = asRecord(raw);
+    return firstString(item.message, item.text, item.title, item.name, raw, objectSummary(item));
   }
 
   function artifactsFromAny(raw: unknown): RuntimeArtifact[] {
@@ -4283,7 +4321,7 @@
     </section>
   {/if}
 
-  {#if devMode && (inferenceTools || toolLeases.length > 0 || executorStatuses.length > 0 || retryNotice)}
+  {#if devMode && (inferenceTools || toolLeases.length > 0 || executorStatuses.length > 0 || runtimeEvents.length > 0 || retryNotice)}
     <section class="runtime-section">
       <h2>Runtime activity</h2>
       <div class="runtime-list">
@@ -4306,6 +4344,12 @@
           <p class="runtime-pill">
             <span>{status.status}</span>
             {status.message || objectSummary(status.details) || status.id}
+          </p>
+        {/each}
+        {#each runtimeEvents as event (event.id)}
+          <p class="runtime-pill">
+            <span>{event.label}</span>
+            {event.detail}
           </p>
         {/each}
       </div>
