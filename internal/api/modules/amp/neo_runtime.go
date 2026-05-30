@@ -7282,7 +7282,10 @@ func (a *neoActor) syncLocalThreadSnapshotNow() {
 }
 
 func (a *neoActor) syncLocalThreadSnapshotForShutdownNow() {
-	snapshot, ok := a.threadSnapshotWithOptions(true)
+	snapshot, ok := a.threadSnapshotWithOptions(neoThreadSnapshotOptions{
+		markCompactingPreflightChecked:  true,
+		preserveMissingCurrentInference: true,
+	})
 	if !ok {
 		return
 	}
@@ -7318,10 +7321,15 @@ func (a *neoActor) syncCloudLoop() {
 }
 
 func (a *neoActor) threadSnapshot() (neoCloudThreadSnapshot, bool) {
-	return a.threadSnapshotWithOptions(false)
+	return a.threadSnapshotWithOptions(neoThreadSnapshotOptions{})
 }
 
-func (a *neoActor) threadSnapshotWithOptions(markCompactingPreflightChecked bool) (neoCloudThreadSnapshot, bool) {
+type neoThreadSnapshotOptions struct {
+	markCompactingPreflightChecked  bool
+	preserveMissingCurrentInference bool
+}
+
+func (a *neoActor) threadSnapshotWithOptions(options neoThreadSnapshotOptions) (neoCloudThreadSnapshot, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -7330,13 +7338,14 @@ func (a *neoActor) threadSnapshotWithOptions(markCompactingPreflightChecked bool
 	}
 	messages := cloneNeoMessages(a.messages)
 	var inflight *neoInferenceInflight
-	if a.currentInference != nil && a.messageIndexLocked(a.currentInference.messageID) < 0 {
+	preserveMissingCurrent := options.preserveMissingCurrentInference || a.shouldPreserveMissingCurrentInferenceLocked()
+	if a.currentInference != nil && a.messageIndexLocked(a.currentInference.messageID) < 0 && !preserveMissingCurrent {
 		a.currentInference = nil
 	}
 	if a.currentInference != nil {
 		clone := *a.currentInference
 		clone.tools = append([]string(nil), a.currentInference.tools...)
-		if markCompactingPreflightChecked && a.compacting {
+		if options.markCompactingPreflightChecked && a.compacting {
 			clone.preflightCompactionChecked = true
 		}
 		inflight = &clone
@@ -7370,6 +7379,21 @@ func (a *neoActor) threadSnapshotWithOptions(markCompactingPreflightChecked bool
 		currentInference:  inflight,
 		pendingInference:  pending,
 	}, true
+}
+
+func (a *neoActor) shouldPreserveMissingCurrentInferenceLocked() bool {
+	if a == nil || a.currentInference == nil {
+		return false
+	}
+	if a.compacting {
+		return true
+	}
+	switch normalizeNeoAgentState(a.agentState) {
+	case "working", "streaming", "awaiting_approval":
+		return true
+	default:
+		return false
+	}
 }
 
 func (a *neoActor) cloudThreadSnapshot(snapshot neoCloudThreadSnapshot) (neoCloudThreadSnapshot, bool) {
@@ -10275,7 +10299,7 @@ func (a *neoActor) sendSnapshot(socket *neoSocket, sinceSeq int) {
 	spawnedExecutorStatuses := a.spawnedExecutorStatusListLocked()
 	relationships := a.threadProtocolRelationshipsLocked(allMessages)
 	var inflightInference *neoInferenceInflight
-	if a.currentInference != nil && a.messageIndexLocked(a.currentInference.messageID) < 0 {
+	if a.currentInference != nil && a.messageIndexLocked(a.currentInference.messageID) < 0 && !a.shouldPreserveMissingCurrentInferenceLocked() {
 		a.currentInference = nil
 	}
 	if a.currentInference != nil {

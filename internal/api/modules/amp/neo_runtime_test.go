@@ -13163,6 +13163,60 @@ func TestNeoActorThreadSnapshotDropsStaleCurrentInference(t *testing.T) {
 	}
 }
 
+func TestNeoActorThreadSnapshotKeepsActiveCurrentInferenceBeforeAssistantMessage(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	actor.agentState = "working"
+	actor.messages = []neoMessage{{ThreadID: "T-test", MessageID: "M-user", Role: "user", Content: []any{map[string]any{"type": "text", "text": "hello"}}, Seq: 1}}
+	actor.currentInference = &neoInferenceInflight{messageID: "M-assistant", agentMode: "deep", reasoningEffort: "xhigh", tools: []string{"shell_command"}}
+
+	snapshot, ok := actor.threadSnapshot()
+	if !ok {
+		t.Fatal("snapshot failed")
+	}
+	if snapshot.currentInference == nil || snapshot.currentInference.messageID != "M-assistant" {
+		t.Fatalf("snapshot currentInference = %#v, want active inference kept", snapshot.currentInference)
+	}
+	if actor.currentInference == nil || actor.currentInference.messageID != "M-assistant" {
+		t.Fatalf("actor currentInference = %#v, want active inference kept", actor.currentInference)
+	}
+	if thread := neoCloudThread(snapshot); thread["currentInference"] != nil {
+		t.Fatalf("cloud thread retained currentInference before assistant message exists: %#v", thread["currentInference"])
+	}
+}
+
+func TestNeoActorShutdownSnapshotPreservesMissingCurrentInferenceAsPending(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019e6541-06ae-75d7-b10e-d893170fa62c"
+	actor := newNeoActor(rt, "actor-test", "thread-actor", threadID, threadID, neoActorRecord("actor-test", "thread-actor", threadID), nil)
+	actor.agentState = "working"
+	actor.compacting = true
+	actor.messages = []neoMessage{{ThreadID: threadID, MessageID: "M-user", Role: "user", Content: []any{map[string]any{"type": "text", "text": "continue"}}, Seq: 1}}
+	actor.currentInference = &neoInferenceInflight{messageID: "M-assistant", agentMode: "deep", reasoningEffort: "xhigh", tools: []string{"shell_command"}}
+
+	actor.syncLocalThreadSnapshotForShutdownNow()
+
+	raw, err := os.ReadFile(filepath.Join(neoAmpThreadStoreDir(), threadID+".json"))
+	if err != nil {
+		t.Fatalf("read shutdown snapshot: %v", err)
+	}
+	var thread map[string]any
+	if err := json.Unmarshal(raw, &thread); err != nil {
+		t.Fatalf("decode shutdown snapshot: %v", err)
+	}
+	if _, exists := thread["currentInference"]; exists {
+		t.Fatalf("currentInference was persisted during shutdown: %#v", thread["currentInference"])
+	}
+	pending := mapValue(thread["pendingInference"])
+	if stringValue(pending["messageId"]) != "M-assistant" ||
+		stringValue(pending["agentMode"]) != "deep" ||
+		stringValue(pending["reasoningEffort"]) != "xhigh" ||
+		!boolValue(pending["preflightCompactionChecked"]) {
+		t.Fatalf("pendingInference = %#v, want checked deep/xhigh resume marker", pending)
+	}
+}
+
 func TestNeoActorThreadSnapshotPreservesCurrentInferenceCompactionMarker(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
