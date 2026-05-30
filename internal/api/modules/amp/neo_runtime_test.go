@@ -901,6 +901,91 @@ func TestNeoRuntimeAutoCompactionUsesLatestRecordWindow(t *testing.T) {
 	}
 }
 
+func TestNeoRuntimeAutoCompactionFallsBackForToolLoopWithoutUserTail(t *testing.T) {
+	dir := t.TempDir()
+	oldStoreDir := neoAmpThreadStoreDir
+	neoAmpThreadStoreDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
+
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.URL.Path != "/api/provider/openai/v1/chat/completions" {
+			t.Fatalf("unexpected compaction path %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"tool-loop summary"}}]}`))
+	}))
+	t.Cleanup(upstream.Close)
+	parsed, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+	_, portString, err := net.SplitHostPort(parsed.Host)
+	if err != nil {
+		t.Fatalf("parse upstream host: %v", err)
+	}
+	port, err := strconv.Atoi(portString)
+	if err != nil {
+		t.Fatalf("parse upstream port: %v", err)
+	}
+
+	enabled := true
+	rt := newNeoRuntime(&config.Config{
+		Host: "127.0.0.1",
+		Port: port,
+		AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
+			Enabled:         &enabled,
+			CompactionModel: "openai/gpt-5.4",
+		}},
+	})
+	threadID := "T-tool-loop-compact"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+	actor.settings["internal.compactionThresholdPercent"] = 0
+	actor.mu.Lock()
+	actor.storeMessageLocked(neoMessage{ThreadID: threadID, MessageID: "M-0000000000000000000000", Role: "user", Content: []any{map[string]any{"type": "text", "text": "start a long tool loop"}}})
+	for i := 1; i < 30; i++ {
+		messageID := fmt.Sprintf("M-%022d", i)
+		toolUseID := fmt.Sprintf("TU-%022d", i)
+		if i%2 == 1 {
+			actor.storeMessageLocked(neoMessage{ThreadID: threadID, MessageID: messageID, Role: "assistant", Content: []any{map[string]any{"type": "tool_use", "id": toolUseID, "name": "Bash", "input": map[string]any{"cmd": "echo step"}}}})
+			continue
+		}
+		actor.storeMessageLocked(neoMessage{ThreadID: threadID, MessageID: messageID, Role: "user", Content: []any{map[string]any{"type": "tool_result", "toolUseID": fmt.Sprintf("TU-%022d", i-1), "run": map[string]any{"status": "done", "result": "step complete"}}}})
+	}
+	actor.currentInference = &neoInferenceInflight{messageID: "M-current", agentMode: "smart", reasoningEffort: "medium"}
+	actor.rebuildHistoryLocked()
+	actor.syncRunning = true
+	generation := actor.generation
+	actor.mu.Unlock()
+
+	actor.maybeCompactBeforeInference("smart", "medium", "", generation)
+	actor.mu.Lock()
+	actor.syncRunning = false
+	actor.syncPending = false
+	actor.mu.Unlock()
+	waitForNeoActorSyncIdle(t, actor)
+
+	if calls != 1 {
+		t.Fatalf("compaction calls = %d, want 1", calls)
+	}
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.messages) != 31 {
+		t.Fatalf("message count after compaction = %d, want original messages plus summary", len(actor.messages))
+	}
+	summary := actor.messages[len(actor.messages)-1]
+	if summary.Role != "info" || stringValue(mapValue(summary.Content[0])["type"]) != "summary" {
+		t.Fatalf("last message = %#v, want summary marker appended after tool loop", summary)
+	}
+	if len(actor.compactionRecords) != 1 || stringValue(actor.compactionRecords[0]["cutMessageId"]) != summary.MessageID {
+		t.Fatalf("compaction records = %#v, want record anchored to summary message", actor.compactionRecords)
+	}
+	if len(actor.history) != 1 || actor.history[0].Role != "assistant" || !strings.Contains(actor.history[0].Text, "tool-loop summary") {
+		t.Fatalf("history after compaction = %#v, want only synthetic summary", actor.history)
+	}
+}
+
 func TestNeoActorHistoryHonorsCompactionRecordWithoutSummary(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	threadID := "T-record-history"

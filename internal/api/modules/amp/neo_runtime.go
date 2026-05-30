@@ -6590,12 +6590,20 @@ func (a *neoActor) maybeCompactBeforeInference(agentMode, reasoningEffort, paren
 		return
 	}
 	cutRelativeIndex := neoCompactionCutIndex(compactionMessagesWindow)
+	appendSummaryOnly := false
+	if cutRelativeIndex <= 0 && neoCompactionCanAppendSummaryOnly(compactionMessagesWindow) {
+		cutRelativeIndex = len(compactionMessagesWindow)
+		appendSummaryOnly = true
+	}
 	cutIndex := compactionOffset + cutRelativeIndex
-	if cutIndex <= 0 || cutIndex >= len(a.messages) {
+	if cutIndex <= 0 || cutIndex > len(a.messages) || (!appendSummaryOnly && cutIndex >= len(a.messages)) {
 		a.mu.Unlock()
 		return
 	}
-	cutMessageID := a.messages[cutIndex].MessageID
+	cutMessageID := ""
+	if cutIndex < len(a.messages) {
+		cutMessageID = a.messages[cutIndex].MessageID
+	}
 	compactionMessages := cloneNeoMessages(compactionMessagesWindow)
 	threadID := a.threadID
 	a.compacting = true
@@ -6631,7 +6639,7 @@ func (a *neoActor) maybeCompactBeforeInference(agentMode, reasoningEffort, paren
 
 	summaryMessage := neoCompactionSummaryMessage(threadID, summary)
 	a.mu.Lock()
-	if generation != a.generation || cutIndex >= len(a.messages) || a.messages[cutIndex].MessageID != cutMessageID {
+	if generation != a.generation || cutIndex > len(a.messages) || (cutMessageID != "" && (cutIndex >= len(a.messages) || a.messages[cutIndex].MessageID != cutMessageID)) {
 		a.compacting = false
 		a.mu.Unlock()
 		a.broadcast(map[string]any{"type": "compaction_complete"})
@@ -6647,7 +6655,11 @@ func (a *neoActor) maybeCompactBeforeInference(agentMode, reasoningEffort, paren
 	updated = append(updated, a.messages[cutIndex:]...)
 	a.messages = updated
 	a.rebuildHistoryLocked()
-	record := map[string]any{"cutMessageId": cutMessageID, "createdAt": time.Now().UTC().Format(time.RFC3339Nano)}
+	recordCutMessageID := cutMessageID
+	if recordCutMessageID == "" {
+		recordCutMessageID = summaryMessage.MessageID
+	}
+	record := map[string]any{"cutMessageId": recordCutMessageID, "createdAt": time.Now().UTC().Format(time.RFC3339Nano)}
 	a.compacting = false
 	a.upsertCompactionRecordLocked(record)
 	records := a.compactionRecordListLocked()
@@ -6657,9 +6669,9 @@ func (a *neoActor) maybeCompactBeforeInference(agentMode, reasoningEffort, paren
 
 	a.syncLocalThreadSnapshotNow()
 	a.broadcast(addedEvent)
-	a.broadcast(neoProtocolCompactionCompletePayload(cutMessageID))
+	a.broadcast(neoProtocolCompactionCompletePayload(recordCutMessageID))
 	a.broadcast(map[string]any{"type": "compaction_records", "records": neoProtocolCompactionRecordList(records)})
-	a.dispatchNotification("thread", "compaction_complete", map[string]any{"cutMessageId": cutMessageID})
+	a.dispatchNotification("thread", "compaction_complete", map[string]any{"cutMessageId": recordCutMessageID})
 	a.syncCloudAsync()
 }
 
@@ -6777,6 +6789,10 @@ func neoCompactionCutIndex(messages []neoMessage) int {
 		return 0
 	}
 	return cutIndex
+}
+
+func neoCompactionCanAppendSummaryOnly(messages []neoMessage) bool {
+	return len(messages) >= neoCompactionMinMessages
 }
 
 func neoCompactionCanStartTail(message neoMessage) bool {
