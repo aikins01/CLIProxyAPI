@@ -8005,8 +8005,21 @@ func (m *AmpModule) tryServeNeoLocalThreadActor(c *gin.Context) bool {
 	if !ok || m.neoRuntime == nil {
 		return false
 	}
+	var body map[string]any
+	bodyLoaded := false
+	loadBody := func() map[string]any {
+		if !bodyLoaded {
+			body = readAndRestoreNeoJSONBody(c.Request)
+			bodyLoaded = true
+		}
+		return body
+	}
 	hasProxy := m.getProxy() != nil
-	if hasProxy && !m.shouldServeNeoLocalThreadActor(threadID) {
+	candidateThreadID := strings.TrimSpace(threadID)
+	if candidateThreadID == "" && c.Request.Method == http.MethodPost {
+		candidateThreadID = findThreadID(loadBody())
+	}
+	if hasProxy && !m.shouldServeNeoLocalThreadActor(candidateThreadID) {
 		return false
 	}
 	if c.Request.Method != http.MethodPost {
@@ -8014,7 +8027,9 @@ func (m *AmpModule) tryServeNeoLocalThreadActor(c *gin.Context) bool {
 		return true
 	}
 
-	body := readNeoJSON(c.Request.Body)
+	if !bodyLoaded {
+		body = readNeoJSON(c.Request.Body)
+	}
 	if !hasProxy {
 		bodyThreadID := strings.TrimSpace(threadID)
 		if bodyThreadID == "" {
@@ -19122,6 +19137,26 @@ func readNeoJSON(r io.Reader) map[string]any {
 		return map[string]any{}
 	}
 	return payload
+}
+
+func readAndRestoreNeoJSONBody(r *http.Request) map[string]any {
+	if r == nil || r.Body == nil {
+		return map[string]any{}
+	}
+	data, err := io.ReadAll(r.Body)
+	if err != nil {
+		r.Body = io.NopCloser(bytes.NewReader(nil))
+		return map[string]any{}
+	}
+	r.Body = io.NopCloser(bytes.NewReader(data))
+	if len(bytes.TrimSpace(data)) == 0 {
+		return map[string]any{}
+	}
+	var body map[string]any
+	if err := json.Unmarshal(data, &body); err != nil {
+		return map[string]any{}
+	}
+	return body
 }
 
 func parseWebSocketProtocols(header string) []string {
