@@ -588,13 +588,16 @@ func TestNeoCompactionThresholdPercentSettingMatchesBinary(t *testing.T) {
 	}
 
 	if got := neoCompactionThresholdPercent(map[string]any{}); got != 65 {
-		t.Fatalf("default threshold percent = %d, want 65", got)
+		t.Fatalf("default threshold percent = %v, want 65", got)
 	}
 	if got := neoCompactionThresholdPercent(map[string]any{"internal.compactionThresholdPercent": 0}); got != 0 {
-		t.Fatalf("explicit zero threshold percent = %d, want 0", got)
+		t.Fatalf("explicit zero threshold percent = %v, want 0", got)
 	}
 	if got := neoCompactionThresholdPercent(map[string]any{"internal.compactionThresholdPercent": 120}); got != 100 {
-		t.Fatalf("clamped threshold percent = %d, want 100", got)
+		t.Fatalf("clamped threshold percent = %v, want 100", got)
+	}
+	if got := neoCompactionThresholdPercent(map[string]any{"internal.compactionThresholdPercent": json.Number("75.5")}); got != 75.5 {
+		t.Fatalf("decimal threshold percent = %v, want 75.5", got)
 	}
 }
 

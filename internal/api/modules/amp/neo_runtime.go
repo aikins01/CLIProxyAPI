@@ -5721,7 +5721,7 @@ func (a *neoActor) maybeCompactBeforeInference(agentMode, reasoningEffort, paren
 	a.syncCloudAsync()
 }
 
-func neoCompactionShouldRun(messages []neoMessage, maxInputTokens int, thresholdPercent int) bool {
+func neoCompactionShouldRun(messages []neoMessage, maxInputTokens int, thresholdPercent float64) bool {
 	if len(messages) < neoCompactionMinMessages {
 		return false
 	}
@@ -5734,16 +5734,19 @@ func neoCompactionShouldRun(messages []neoMessage, maxInputTokens int, threshold
 	if thresholdPercent > 100 {
 		thresholdPercent = 100
 	}
-	threshold := maxInputTokens * thresholdPercent / 100
-	return neoEstimateMessageTokens(messages) >= threshold
+	threshold := float64(maxInputTokens) * thresholdPercent / 100
+	return float64(neoEstimateMessageTokens(messages)) >= threshold
 }
 
-func neoCompactionThresholdPercent(settings map[string]any) int {
+func neoCompactionThresholdPercent(settings map[string]any) float64 {
 	raw, ok := settings["internal.compactionThresholdPercent"]
 	if !ok {
 		return 65
 	}
-	percent := numberFrom(raw)
+	percent, ok := neoNumberSettingFloat(raw)
+	if !ok {
+		return 65
+	}
 	if percent < 0 {
 		return 65
 	}
@@ -17965,42 +17968,48 @@ func isNeoNumberSetting(value any) bool {
 }
 
 func validNeoCompactionThresholdPercentSetting(value any) bool {
-	var number float64
-	switch typed := value.(type) {
-	case int:
-		number = float64(typed)
-	case int8:
-		number = float64(typed)
-	case int16:
-		number = float64(typed)
-	case int32:
-		number = float64(typed)
-	case int64:
-		number = float64(typed)
-	case uint:
-		number = float64(typed)
-	case uint8:
-		number = float64(typed)
-	case uint16:
-		number = float64(typed)
-	case uint32:
-		number = float64(typed)
-	case uint64:
-		number = float64(typed)
-	case float32:
-		number = float64(typed)
-	case float64:
-		number = typed
-	case json.Number:
-		parsed, err := typed.Float64()
-		if err != nil {
-			return false
-		}
-		number = parsed
-	default:
+	number, ok := neoNumberSettingFloat(value)
+	if !ok {
 		return false
 	}
 	return number >= 0 && number <= 100
+}
+
+func neoNumberSettingFloat(value any) (float64, bool) {
+	switch typed := value.(type) {
+	case int:
+		return float64(typed), true
+	case int8:
+		return float64(typed), true
+	case int16:
+		return float64(typed), true
+	case int32:
+		return float64(typed), true
+	case int64:
+		return float64(typed), true
+	case uint:
+		return float64(typed), true
+	case uint8:
+		return float64(typed), true
+	case uint16:
+		return float64(typed), true
+	case uint32:
+		return float64(typed), true
+	case uint64:
+		return float64(typed), true
+	case float32:
+		return float64(typed), true
+	case float64:
+		return typed, true
+	case json.Number:
+		parsed, err := typed.Float64()
+		if err != nil {
+			return 0, false
+		}
+		return parsed, true
+	default:
+		return 0, false
+	}
 }
 
 func normalizedNeoThreadStatus(status string) string {
