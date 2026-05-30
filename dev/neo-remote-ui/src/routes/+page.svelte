@@ -745,15 +745,6 @@
     } catch {
       // Cost display info is advisory; message usage still drives the context label.
     }
-    try {
-      const response = await fetch(`/api/threads/${encodeURIComponent(threadId)}/usage`, {
-        headers: headers({ ampClient: true })
-      });
-      if (!response.ok) return;
-      applyThreadUsageInfo(threadId, await response.json());
-    } catch {
-      // Usage snapshots are refreshed opportunistically; live deltas keep usage current.
-    }
   }
 
   function applyThreadUsageInfo(threadId: string, raw: unknown) {
@@ -3177,7 +3168,7 @@
   }
 
   function costURL(cost: ThreadDetail['cost'], thread: ThreadDetail | null) {
-    return cost?.url || thread?.costBreakdownURL || (thread?.id ? `/threads/${encodeURIComponent(thread.id)}/usage` : '');
+    return cost?.url || thread?.costBreakdownURL || '';
   }
 
   // Render a diff label like "+42 -7 ~7" with colored numbers
