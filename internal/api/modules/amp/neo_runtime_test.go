@@ -1465,6 +1465,43 @@ func TestNeoRuntimeShutdownClosesActorWebSocketsAsTransportFailure(t *testing.T)
 	}
 }
 
+func TestNeoRuntimeShutdownTransportCloseIgnoresCanceledContext(t *testing.T) {
+	port := freeTCPPortForTest(t)
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
+		Host: "127.0.0.1",
+		Port: port,
+	}}})
+	if err := rt.start(); err != nil {
+		t.Fatalf("start runtime: %v", err)
+	}
+
+	threadID := "T-shutdown-canceled-context"
+	conn := dialNeoActorWebSocket(t, fmt.Sprintf("http://127.0.0.1:%d", port), threadID)
+	defer conn.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := rt.shutdown(ctx); err != nil {
+		t.Fatalf("shutdown runtime with canceled context: %v", err)
+	}
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for {
+		_ = conn.SetReadDeadline(deadline)
+		_, _, err := conn.ReadMessage()
+		if err == nil {
+			if time.Now().After(deadline) {
+				t.Fatal("websocket stayed open after canceled-context runtime shutdown")
+			}
+			continue
+		}
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			t.Fatalf("websocket stayed open after canceled-context runtime shutdown: %v", err)
+		}
+		return
+	}
+}
+
 func TestNeoRuntimeBridgeShutdownClosesWebSocketAsTransportFailure(t *testing.T) {
 	port := freeTCPPortForTest(t)
 	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{

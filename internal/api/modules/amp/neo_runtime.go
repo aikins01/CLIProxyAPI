@@ -264,6 +264,17 @@ func (rt *neoRuntime) stopWithOptions(ctx context.Context, options neoRuntimeSto
 	}
 	server := rt.server
 	rt.server = nil
+	if options.transportClose {
+		err := server.Close()
+		if errors.Is(err, http.ErrServerClosed) {
+			err = nil
+		}
+		if options.flushLocalSnapshots {
+			rt.store.syncLocalThreadSnapshots()
+		}
+		rt.store.disposeAll(options.stopExecutors, options.closeReason, options.transportClose)
+		return err
+	}
 	err := server.Shutdown(ctx)
 	if options.flushLocalSnapshots {
 		rt.store.syncLocalThreadSnapshots()
