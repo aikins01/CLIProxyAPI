@@ -554,7 +554,7 @@
       threads = rawThreads.map(threadSummaryFromAPI).filter(Boolean) as ThreadSummary[];
       isAuthenticated = true;
       lastError = '';
-      const targetThreadId = threadIdFromURL() || selectedThreadId || threads[0]?.id || '';
+      const targetThreadId = threadIdFromURL() || selectedThreadId || '';
       if (targetThreadId) {
         void openThread(targetThreadId, { replaceURL: true });
       }
@@ -717,7 +717,7 @@
       const result = await rpc('listThreads', neoThreadListParams(true, 120));
       const rawThreads = Array.isArray(result?.threads) ? result.threads : [];
       threads = rawThreads.map(threadSummaryFromAPI).filter(Boolean) as ThreadSummary[];
-      const targetThreadId = preferredThreadId || selectedThreadId || threads[0]?.id || '';
+      const targetThreadId = preferredThreadId || selectedThreadId || '';
       if (targetThreadId) {
         void openThread(targetThreadId, { replaceURL: true });
       }

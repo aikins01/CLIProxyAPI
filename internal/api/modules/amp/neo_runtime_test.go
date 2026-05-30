@@ -1000,6 +1000,50 @@ func TestNeoRuntimeGatewayWebSocketGetRehydratesPersistedLocalThread(t *testing.
 	}
 }
 
+func TestNeoRuntimeGatewayWebSocketGetRehydratesEmptyLocalNeoThread(t *testing.T) {
+	useTempNeoThreadStore(t)
+	threadID := "T-gateway-get-rehydrate-empty"
+	if err := os.WriteFile(filepath.Join(neoAmpThreadStoreDir(), threadID+".json"), []byte(`{
+		"id":"`+threadID+`",
+		"agentMode":"rush",
+		"meta":{"cliProxyAPILocalNeo":true},
+		"messages":[]
+	}`), 0o600); err != nil {
+		t.Fatalf("write local thread: %v", err)
+	}
+
+	rt := newNeoRuntime(&config.Config{})
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	t.Cleanup(server.Close)
+
+	dialer := websocket.Dialer{Subprotocols: []string{"rivet", "rivet_encoding.4", "rivet_skip_ready_wait"}}
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/gateway/threadActor/?rvt-method=get&rvt-key=" + url.QueryEscape(threadID)
+	conn, resp, err := dialer.Dial(wsURL, nil)
+	if err != nil {
+		status := 0
+		if resp != nil {
+			status = resp.StatusCode
+		}
+		t.Fatalf("gateway websocket get dial failed status=%d err=%v", status, err)
+	}
+	defer conn.Close()
+
+	actors := rt.store.findActors(url.Values{"name": []string{"threadActor"}, "key": []string{threadID}})
+	if len(actors) != 1 {
+		t.Fatalf("gateway actor count = %d, actors=%#v", len(actors), actors)
+	}
+	actor := rt.store.get(firstNonEmptyString(actors[0]["actor_id"], actors[0]["id"]))
+	if actor == nil {
+		t.Fatal("gateway actor not stored")
+	}
+	actor.mu.Lock()
+	mode := actor.currentAgentMode
+	actor.mu.Unlock()
+	if mode != "rush" {
+		t.Fatalf("rehydrated mode = %q, want rush", mode)
+	}
+}
+
 func TestNeoRuntimeGatewayGetOrCreateRehydratesPersistedLocalThreadBeforeOpen(t *testing.T) {
 	useTempNeoThreadStore(t)
 	threadID := "T-gateway-get-or-create-rehydrate"
@@ -1340,6 +1384,66 @@ func TestNeoRuntimeShutdownClosesActorWebSocketsAsTransportFailure(t *testing.T)
 	}
 	if closeErr != nil && closeErr.Code == websocket.CloseGoingAway {
 		t.Fatalf("shutdown close code = %d, want transport failure so Amp treats restart as reconnectable", closeErr.Code)
+	}
+}
+
+func TestNeoRuntimeBridgeShutdownClosesWebSocketAsTransportFailure(t *testing.T) {
+	port := freeTCPPortForTest(t)
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
+		Host: "127.0.0.1",
+		Port: port,
+	}}})
+	if err := rt.start(); err != nil {
+		t.Fatalf("start runtime: %v", err)
+	}
+
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	m := &AmpModule{neoRuntime: rt}
+	r.Any("/gateway/*path", func(c *gin.Context) { m.serveNeoRuntimeBridge(c) })
+	server := httptest.NewServer(r)
+	defer server.Close()
+
+	threadID := "T-bridge-shutdown-transport-failure"
+	dialer := websocket.Dialer{Subprotocols: []string{"rivet", "rivet_encoding.4", "rivet_skip_ready_wait"}}
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/gateway/threadActor/?rvt-method=getOrCreate&rvt-key=" + url.QueryEscape(threadID)
+	conn, resp, err := dialer.Dial(wsURL, nil)
+	if err != nil {
+		status := 0
+		if resp != nil {
+			status = resp.StatusCode
+		}
+		t.Fatalf("bridge websocket dial failed status=%d err=%v", status, err)
+	}
+	defer conn.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := rt.shutdown(ctx); err != nil {
+		t.Fatalf("shutdown runtime: %v", err)
+	}
+
+	var closeErr *websocket.CloseError
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for {
+		_ = conn.SetReadDeadline(deadline)
+		_, _, err := conn.ReadMessage()
+		if err == nil {
+			if time.Now().After(deadline) {
+				t.Fatal("bridge websocket stayed open after runtime shutdown")
+			}
+			continue
+		}
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			t.Fatalf("bridge websocket stayed open after runtime shutdown: %v", err)
+		}
+		if errors.As(err, &closeErr) {
+			break
+		}
+		return
+	}
+	if closeErr != nil && closeErr.Code == websocket.CloseGoingAway {
+		t.Fatalf("bridge shutdown close code = %d, want transport failure so Amp treats restart as reconnectable", closeErr.Code)
 	}
 }
 
@@ -4402,6 +4506,183 @@ func TestNeoAmpBinarySpawnPathBootstrapSmoke(t *testing.T) {
 	actor.mu.Lock()
 	defer actor.mu.Unlock()
 	t.Fatalf("spawned amp binary did not bootstrap: ready=%v bootstrap=%v executorID=%q activeError=%#v\n%s%s%s", actor.executorReady, actor.executorBootstrapComplete, actor.executorID, actor.activeError, requestLogForTest(&requestsMu, requests), readSpawnLogsForTest(testHome), recorder.report())
+}
+
+func TestNeoAmpBinarySpawnedExecutorReconnectsAfterRuntimeRestart(t *testing.T) {
+	command := strings.TrimSpace(os.Getenv("AMP_BINARY_E2E"))
+	if command == "" {
+		t.Skip("set AMP_BINARY_E2E to an amp binary path, or 1 to use ~/.amp/bin/amp")
+	}
+	if command == "1" {
+		home, err := os.UserHomeDir()
+		if err != nil || home == "" {
+			t.Fatalf("UserHomeDir error: %v", err)
+		}
+		command = filepath.Join(home, ".amp", "bin", "amp")
+	}
+	if info, err := os.Stat(command); err != nil || info.IsDir() {
+		t.Fatalf("amp binary %q is not executable: %v", command, err)
+	}
+
+	runtimePort := freeTCPPortForTest(t)
+	testHome := t.TempDir()
+	workDir := t.TempDir()
+	settingsPath := filepath.Join(testHome, "settings.json")
+	if err := os.WriteFile(settingsPath, []byte(`{"amp.url":"http://127.0.0.1:1","amp.permissions":[],"amp.mcpServers":{},"amp.skills.path":""}`), 0o600); err != nil {
+		t.Fatalf("write settings file: %v", err)
+	}
+	t.Setenv("HOME", testHome)
+	t.Setenv("AMP_SETTINGS_FILE", settingsPath)
+	t.Setenv("AMP_LOG_LEVEL", "debug")
+
+	threadID := "T-019e1cd4-bde0-778f-84f9-61259c2605e8"
+	storeDir := t.TempDir()
+	oldStoreDir := neoAmpThreadStoreDir
+	neoAmpThreadStoreDir = func() string { return storeDir }
+	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
+
+	var (
+		currentRTMu sync.Mutex
+		currentRT   *neoRuntime
+		requestsMu  sync.Mutex
+		requests    []string
+	)
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestsMu.Lock()
+		requests = append(requests, r.Method+" "+r.URL.RequestURI())
+		requestsMu.Unlock()
+		currentRTMu.Lock()
+		rt := currentRT
+		currentRTMu.Unlock()
+		if r.URL.Path == "/api/thread-actors" && r.Method == http.MethodPost && rt != nil {
+			response, status := rt.localThreadActorManagementResponse(r.Context(), readNeoJSON(r.Body), "")
+			writeNeoJSON(w, status, response)
+			return
+		}
+		if r.URL.Path == "/api/internal" && r.URL.RawQuery == "loadPlugins" {
+			writeNeoJSON(w, http.StatusOK, map[string]any{"ok": true, "result": []any{}})
+			return
+		}
+		if r.URL.Path == "/api/internal" && r.URL.RawQuery == "getUserInfo" {
+			writeNeoJSON(w, http.StatusOK, map[string]any{"ok": true, "result": map[string]any{"id": "U-local-test", "email": "local@example.com", "workspaceID": "W-local-test"}})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(proxy.Close)
+	parsedProxyURL, err := url.Parse(proxy.URL)
+	if err != nil {
+		t.Fatalf("parse proxy URL: %v", err)
+	}
+	proxyHost, proxyPortText, err := net.SplitHostPort(parsedProxyURL.Host)
+	if err != nil {
+		t.Fatalf("split proxy URL host: %v", err)
+	}
+	proxyPort, err := strconv.Atoi(proxyPortText)
+	if err != nil {
+		t.Fatalf("parse proxy URL port: %v", err)
+	}
+	newRuntime := func() *neoRuntime {
+		rt := newNeoRuntime(&config.Config{
+			SDKConfig: config.SDKConfig{APIKeys: []string{"local-key"}},
+			Host:      proxyHost,
+			Port:      proxyPort,
+			AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
+				Host:            "127.0.0.1",
+				Port:            runtimePort,
+				ExecutorCommand: command,
+			}},
+		})
+		currentRTMu.Lock()
+		currentRT = rt
+		currentRTMu.Unlock()
+		if err := rt.start(); err != nil {
+			t.Fatalf("start runtime: %v", err)
+		}
+		return rt
+	}
+
+	rt := newRuntime()
+	actor := rt.store.ensureThreadActor(threadID)
+	actor.updateSettings(map[string]any{"agentMode": "rush"})
+	actor.updateEnvironment(map[string]any{"workingDirectory": workDir})
+	client := dialNeoActorWebSocket(t, fmt.Sprintf("http://127.0.0.1:%d", runtimePort), threadID)
+	if err := client.WriteJSON(map[string]any{"type": "client_spawn_executor", "requestId": "spawn-binary-restart"}); err != nil {
+		t.Fatalf("write client_spawn_executor: %v", err)
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		actor.mu.Lock()
+		ready := actor.executorReady
+		bootstrapComplete := actor.executorBootstrapComplete
+		actor.mu.Unlock()
+		if ready && bootstrapComplete {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	actor.mu.Lock()
+	ready := actor.executorReady
+	bootstrapComplete := actor.executorBootstrapComplete
+	var spawned *neoSpawnedExecutor
+	for _, candidate := range actor.spawnedExecutors {
+		spawned = candidate
+		break
+	}
+	actor.mu.Unlock()
+	if !ready || !bootstrapComplete || spawned == nil || spawned.cmd == nil || spawned.cmd.Process == nil {
+		t.Fatalf("spawned amp binary did not bootstrap before restart: ready=%v bootstrap=%v spawned=%v\n%s%s", ready, bootstrapComplete, spawned != nil, requestLogForTest(&requestsMu, requests), readSpawnLogsForTest(testHome))
+	}
+	t.Cleanup(func() {
+		spawned.stop()
+		if spawned.cmd != nil {
+			_ = spawned.cmd.Wait()
+		}
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	if err := rt.shutdown(ctx); err != nil {
+		cancel()
+		t.Fatalf("shutdown runtime: %v", err)
+	}
+	cancel()
+	_ = client.Close()
+	if err := spawned.cmd.Process.Signal(syscall.Signal(0)); err != nil {
+		t.Fatalf("spawned executor died during runtime shutdown: %v\n%s", err, readSpawnLogsForTest(testHome))
+	}
+
+	rt = newRuntime()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = rt.stop(ctx)
+	}()
+
+	deadline = time.Now().Add(12 * time.Second)
+	for time.Now().Before(deadline) {
+		actors := rt.store.findActors(url.Values{"name": []string{"threadActor"}, "key": []string{threadID}})
+		for _, record := range actors {
+			id := firstNonEmptyString(record["actor_id"], record["id"])
+			reconnected := rt.store.get(id)
+			if reconnected == nil {
+				continue
+			}
+			reconnected.mu.Lock()
+			ready := reconnected.executorReady
+			bootstrapComplete := reconnected.executorBootstrapComplete
+			executorID := reconnected.executorID
+			reconnected.mu.Unlock()
+			if ready && bootstrapComplete && executorID != "" {
+				return
+			}
+		}
+		if err := spawned.cmd.Process.Signal(syscall.Signal(0)); err != nil {
+			t.Fatalf("spawned executor exited before reconnecting: %v\n%s%s", err, requestLogForTest(&requestsMu, requests), readSpawnLogsForTest(testHome))
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("spawned executor did not reconnect after runtime restart\n%s%s", requestLogForTest(&requestsMu, requests), readSpawnLogsForTest(testHome))
 }
 
 func freeTCPPortForTest(t *testing.T) int {

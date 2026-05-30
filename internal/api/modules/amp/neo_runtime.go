@@ -8099,7 +8099,7 @@ func neoThreadIsCloudCached(thread map[string]any) bool {
 }
 
 func neoThreadLocalBridgeEligible(thread map[string]any) bool {
-	return neoThreadHasUsefulContent(thread) && !neoThreadIsCloudCached(thread) && neoThreadHasLocalRuntimeMarker(thread)
+	return !neoThreadIsCloudCached(thread) && neoThreadHasLocalRuntimeMarker(thread)
 }
 
 func neoThreadHasLocalRuntimeMarker(thread map[string]any) bool {
