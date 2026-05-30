@@ -463,11 +463,9 @@ func (fh *FallbackHandler) WrapHandler(handler gin.HandlerFunc) gin.HandlerFunc 
 			return true
 		}
 
-		// If no providers available, fallback to ampcode.com
+		// If this request came from the local Neo runtime, keep inference local.
+		// Normal Amp binary provider requests can still fall back to ampcode.com.
 		if len(providers) == 0 {
-			if proxyToAmp() {
-				return
-			}
 			if c.GetHeader(localNeoInferenceHeader) == "1" {
 				logAmpRouting(RouteTypeNoProvider, modelName, "", "", requestPath)
 				c.AbortWithStatusJSON(http.StatusBadGateway, gin.H{
@@ -475,6 +473,9 @@ func (fh *FallbackHandler) WrapHandler(handler gin.HandlerFunc) gin.HandlerFunc 
 					"message": "Amp Neo local inference has no local provider for requested model",
 					"model":   modelName,
 				})
+				return
+			}
+			if proxyToAmp() {
 				return
 			}
 

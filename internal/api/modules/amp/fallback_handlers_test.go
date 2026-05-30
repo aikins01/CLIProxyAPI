@@ -78,18 +78,12 @@ func TestFallbackHandler_ModelMapping_PreservesThinkingSuffixAndRewritesResponse
 	}
 }
 
-func TestFallbackHandler_LocalNeoInferenceFallsBackToAmpProxy(t *testing.T) {
+func TestFallbackHandler_LocalNeoInferenceFailsClosedBeforeAmpProxy(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	type capturedRequest struct {
-		path    string
-		headers http.Header
-		body    []byte
-	}
-	gotRequest := make(chan capturedRequest, 1)
+	upstreamRequests := make(chan struct{}, 1)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		gotRequest <- capturedRequest{path: r.URL.Path, headers: r.Header.Clone(), body: body}
+		upstreamRequests <- struct{}{}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":"amp-upstream"}`))
 	}))
@@ -122,25 +116,17 @@ func TestFallbackHandler_LocalNeoInferenceFallsBackToAmpProxy(t *testing.T) {
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(resp.Body)
 
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != http.StatusBadGateway {
 		t.Fatalf("status=%d body=%s", resp.StatusCode, respBody)
 	}
-	if !bytes.Contains(respBody, []byte(`"amp-upstream"`)) {
-		t.Fatalf("expected upstream response, got %s", respBody)
+	if !bytes.Contains(respBody, []byte(`local_neo_provider_unavailable`)) {
+		t.Fatalf("expected local Neo fail-closed response, got %s", respBody)
 	}
 
-	got := <-gotRequest
-	if got.path != "/api/provider/openai/v1/chat/completions" {
-		t.Fatalf("upstream path = %q", got.path)
-	}
-	if got.headers.Get(localNeoInferenceHeader) != "" {
-		t.Fatalf("local Neo header leaked upstream: %q", got.headers.Get(localNeoInferenceHeader))
-	}
-	if got.headers.Get("X-Api-Key") != "amp-secret" {
-		t.Fatalf("X-Api-Key = %q", got.headers.Get("X-Api-Key"))
-	}
-	if !bytes.Contains(got.body, []byte(`"definitely-not-a-local-provider-model"`)) {
-		t.Fatalf("upstream body = %s", got.body)
+	select {
+	case <-upstreamRequests:
+		t.Fatal("local Neo inference request unexpectedly fell back to amp proxy")
+	default:
 	}
 }
 
@@ -256,7 +242,6 @@ func TestFallbackHandlerMultipartModelFallsBackToAmpProxy(t *testing.T) {
 		t.Fatalf("new request: %v", err)
 	}
 	req.Header.Set("Content-Type", writer.FormDataContentType())
-	req.Header.Set(localNeoInferenceHeader, "1")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("request fallback route: %v", err)
