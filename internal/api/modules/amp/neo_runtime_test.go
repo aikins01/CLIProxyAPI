@@ -2912,6 +2912,37 @@ func TestNeoClientToolApprovalResponseMatchesBinarySchema(t *testing.T) {
 	}
 }
 
+func TestNeoNotificationAndErrorDismissClientFramesMatchBinarySchema(t *testing.T) {
+	notification, ok := normalizeNeoClientNotificationSubscription(map[string]any{
+		"type":      "client_upsert_notification_subscription",
+		"threadURL": "https://ampcode.com/threads/T-test",
+		"subscription": map[string]any{
+			"endpoint": "https://push.example.test/sub",
+			"keys":     map[string]any{"auth": "auth-token", "p256dh": "public-key", "ignored": "value"},
+			"ignored":  true,
+		},
+	})
+	if !ok {
+		t.Fatal("valid notification subscription was rejected")
+	}
+	keys := mapValue(mapValue(notification["subscription"])["keys"])
+	if keys["auth"] != "auth-token" || keys["p256dh"] != "public-key" {
+		t.Fatalf("notification keys = %#v", notification)
+	}
+	if _, exists := keys["ignored"]; exists {
+		t.Fatalf("notification kept unknown keys field: %#v", notification)
+	}
+	if _, ok := normalizeNeoClientNotificationSubscription(map[string]any{"subscription": map[string]any{"endpoint": "not-a-url", "keys": map[string]any{"auth": "a", "p256dh": "p"}}, "threadURL": "https://ampcode.com/t"}); ok {
+		t.Fatal("invalid notification endpoint was accepted")
+	}
+	if _, ok := normalizeNeoClientDismissActiveError(map[string]any{"type": "client_dismiss_active_error", "seq": "1"}); ok {
+		t.Fatal("string seq was accepted for client_dismiss_active_error")
+	}
+	if dismiss, ok := normalizeNeoClientDismissActiveError(map[string]any{"type": "client_dismiss_active_error", "seq": float64(1)}); !ok || numberFrom(dismiss["seq"]) != 1 {
+		t.Fatalf("valid dismiss active error was rejected: %#v ok=%v", dismiss, ok)
+	}
+}
+
 func TestNeoRuntimeFilesystemBridgeNormalizesBothDirections(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
@@ -2925,20 +2956,72 @@ func TestNeoRuntimeFilesystemBridgeNormalizesBothDirections(t *testing.T) {
 	waitForNeoMessageType(t, client, "agent_state", 2*time.Second)
 	waitForNeoMessageType(t, executor, "agent_state", 2*time.Second)
 
-	if err := executor.WriteJSON(map[string]any{"type": "executor_filesystem_read_file", "requestID": "fs-1", "path": "file:///tmp/a.txt", "max_bytes": 42}); err != nil {
+	if err := executor.WriteJSON(map[string]any{"type": "executor_filesystem_read_file", "requestId": "fs-1", "uri": "file:///tmp/a.txt"}); err != nil {
 		t.Fatalf("write executor filesystem request: %v", err)
 	}
 	request := waitForNeoMessageType(t, client, "client_filesystem_read_file", 2*time.Second)
-	if request["requestId"] != "fs-1" || request["uri"] != "file:///tmp/a.txt" || numberFrom(request["maxBytes"]) != 42 {
+	if request["requestId"] != "fs-1" || request["uri"] != "file:///tmp/a.txt" {
 		t.Fatalf("filesystem request = %#v", request)
 	}
+	if _, exists := request["maxBytes"]; exists {
+		t.Fatalf("filesystem request kept non-binary maxBytes field: %#v", request)
+	}
 
-	if err := client.WriteJSON(map[string]any{"type": "client_filesystem_read_file_result", "requestId": "fs-1", "content": "hello"}); err != nil {
+	if err := client.WriteJSON(map[string]any{"type": "client_filesystem_read_file_result", "requestId": "fs-1", "ok": true, "contentBase64": "aGVsbG8="}); err != nil {
 		t.Fatalf("write client filesystem result: %v", err)
 	}
 	result := waitForNeoMessageType(t, executor, "executor_filesystem_read_file_result", 2*time.Second)
-	if result["requestId"] != "fs-1" || result["content"] != "hello" {
+	if result["requestId"] != "fs-1" || result["ok"] != true || result["contentBase64"] != "aGVsbG8=" {
 		t.Fatalf("filesystem result = %#v", result)
+	}
+}
+
+func TestNeoFilesystemAndGitBridgeMatchesBinarySchema(t *testing.T) {
+	if _, ok := normalizeNeoFilesystemRequest("client_filesystem_read_file", map[string]any{"requestID": "fs-1", "uri": "file:///tmp/a.txt"}); ok {
+		t.Fatal("requestID alias was accepted for filesystem request")
+	}
+	if _, ok := normalizeNeoFilesystemRequest("client_filesystem_read_file", map[string]any{"requestId": "fs-1", "path": "file:///tmp/a.txt"}); ok {
+		t.Fatal("path alias was accepted for filesystem request")
+	}
+
+	directoryResult, ok := normalizeNeoFilesystemDirectoryResult("executor_filesystem_read_directory_result", map[string]any{
+		"requestId": "fs-dir",
+		"ok":        true,
+		"entries":   []any{[]any{"README.md", "file", map[string]any{"mtimeMs": float64(123)}}},
+	})
+	if !ok {
+		t.Fatal("valid directory result was rejected")
+	}
+	entries := arrayValue(directoryResult["entries"])
+	if len(entries) != 1 || stringValue(arrayValue(entries[0])[0]) != "README.md" {
+		t.Fatalf("directory result entries = %#v", directoryResult)
+	}
+	if _, ok := normalizeNeoFilesystemDirectoryResult("executor_filesystem_read_directory_result", map[string]any{"requestId": "fs-dir", "ok": false, "entries": []any{}}); ok {
+		t.Fatal("directory result without error was accepted")
+	}
+	if _, ok := normalizeNeoFilesystemFileResult("executor_filesystem_read_file_result", map[string]any{"requestId": "fs-file", "ok": true, "content": "legacy"}); ok {
+		t.Fatal("content alias was accepted for filesystem file result")
+	}
+
+	gitCommand, ok := normalizeNeoClientGitCommand(map[string]any{"requestId": "git-1", "operation": map[string]any{"type": "file_diff", "path": "main.go", "changeType": "modified", "full": false}})
+	if !ok {
+		t.Fatal("valid client git command was rejected")
+	}
+	if stringValue(mapValue(gitCommand["operation"])["path"]) != "main.go" {
+		t.Fatalf("git command operation = %#v", gitCommand)
+	}
+	if _, ok := normalizeNeoClientGitCommand(map[string]any{"requestId": "git-2", "args": []any{"status"}}); ok {
+		t.Fatal("client git args were accepted outside binary operation schema")
+	}
+	executorGit, ok := normalizeNeoExecutorGitCommand(map[string]any{"requestId": "git-3", "args": []any{"status"}, "max_output_bytes": 128})
+	if !ok {
+		t.Fatal("executor git command with unknown max_output_bytes key should still parse after stripping unknowns")
+	}
+	if _, exists := executorGit["maxOutputBytes"]; exists {
+		t.Fatalf("max_output_bytes alias populated maxOutputBytes: %#v", executorGit)
+	}
+	if _, ok := normalizeNeoGitCommandResult("client_git_command_result", map[string]any{"requestId": "git-4", "ok": true, "exitCode": 0, "stdout": "", "stderr": "", "error": map[string]any{"code": "INTERNAL_ERROR", "message": "bad"}}); ok {
+		t.Fatal("git ok result with error was accepted")
 	}
 }
 
@@ -2992,6 +3075,58 @@ func TestNeoRuntimeGitCommandMatchesCurrentBinaryProtocol(t *testing.T) {
 	}
 }
 
+func TestNeoGitDiffRangeSnapshotMatchesBinaryOperation(t *testing.T) {
+	repo := t.TempDir()
+	run := func(args ...string) string {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return string(out)
+	}
+	run("init")
+	run("config", "user.email", "test@example.test")
+	run("config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(repo, "app.txt"), []byte("old\n"), 0o600); err != nil {
+		t.Fatalf("write app.txt: %v", err)
+	}
+	run("add", "app.txt")
+	run("commit", "-m", "base")
+	baseHash := strings.TrimSpace(run("rev-parse", "HEAD"))
+	if err := os.WriteFile(filepath.Join(repo, "app.txt"), []byte("new\n"), 0o600); err != nil {
+		t.Fatalf("modify app.txt: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "extra.txt"), []byte("extra\n"), 0o600); err != nil {
+		t.Fatalf("write extra.txt: %v", err)
+	}
+
+	result := neoRunClientGitCommand(repo, map[string]any{"type": "diff_range_snapshot", "baseHash": baseHash}, 0)
+	if result["ok"] != true || numberFrom(result["exitCode"]) != 0 {
+		t.Fatalf("diff range result = %#v", result)
+	}
+	var snapshot map[string]any
+	if err := json.Unmarshal([]byte(stringValue(result["stdout"])), &snapshot); err != nil {
+		t.Fatalf("diff range snapshot JSON: %v payload=%q", err, stringValue(result["stdout"]))
+	}
+	if snapshot["available"] != true || snapshot["baseRefHead"] != baseHash {
+		t.Fatalf("diff range snapshot metadata = %#v", snapshot)
+	}
+	files := arrayValue(snapshot["files"])
+	seen := map[string]map[string]any{}
+	for _, raw := range files {
+		file := mapValue(raw)
+		seen[stringValue(file["path"])] = file
+	}
+	if stringValue(seen["app.txt"]["changeType"]) != "modified" || !strings.Contains(stringValue(seen["app.txt"]["diff"]), "+new") || !strings.Contains(stringValue(seen["app.txt"]["oldContent"]), "old") {
+		t.Fatalf("app.txt diff range file = %#v", seen["app.txt"])
+	}
+	if stringValue(seen["extra.txt"]["changeType"]) != "untracked" || !strings.Contains(stringValue(seen["extra.txt"]["newContent"]), "extra") {
+		t.Fatalf("extra.txt diff range file = %#v", seen["extra.txt"])
+	}
+}
+
 func TestNeoRuntimeGitBridgeAndWorkspaceMessageTypes(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
@@ -3002,7 +3137,7 @@ func TestNeoRuntimeGitBridgeAndWorkspaceMessageTypes(t *testing.T) {
 	defer conn.Close()
 	waitForNeoMessageType(t, conn, "agent_state", 2*time.Second)
 
-	if err := conn.WriteJSON(map[string]any{"type": "executor_git_command", "requestID": "git-raw", "args": []any{"status"}, "max_output_bytes": 128}); err != nil {
+	if err := conn.WriteJSON(map[string]any{"type": "executor_git_command", "requestId": "git-raw", "args": []any{"status"}, "maxOutputBytes": 128}); err != nil {
 		t.Fatalf("write executor_git_command: %v", err)
 	}
 	rawRequest := waitForNeoMessageType(t, conn, "executor_git_command", 2*time.Second)
@@ -6716,6 +6851,14 @@ func TestNeoActorManualBashInvocationRejectsInvalidClientPayloadLikeBinary(t *te
 				"type": "client_append_manual_bash_invocation",
 				"args": map[string]any{"cmd": "git"},
 				"run":  map[string]any{"result": "clean"},
+			},
+		},
+		{
+			name: "toolRun alias",
+			msg: map[string]any{
+				"type":    "client_append_manual_bash_invocation",
+				"args":    map[string]any{"cmd": "git"},
+				"toolRun": map[string]any{"status": "done"},
 			},
 		},
 		{

@@ -104,6 +104,7 @@ var (
 	neoEditIDPattern              = regexp.MustCompile(`^E-[0-9A-Za-z]{22}$`)
 	neoToolCallIDPattern          = regexp.MustCompile(`^TU-[0-9A-Za-z]{22}$`)
 	neoUUIDExactPattern           = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+	neoGitHashPattern             = regexp.MustCompile(`^[0-9a-fA-F]{7,64}$`)
 	neoMCPServerPattern           = regexp.MustCompile(`[\s-]+`)
 	neoAmpThreadStoreDir          = defaultNeoAmpThreadStoreDir
 	neoAmpTaskStoreMu             sync.Mutex
@@ -1633,7 +1634,10 @@ func (a *neoActor) handleForSocket(socket *neoSocket, msg map[string]any) {
 
 	switch msgType {
 	case "client_resume":
-		version := intValue(msg["version"])
+		version, ok := neoClientNumber(msg["version"])
+		if !ok {
+			return
+		}
 		if version <= 0 && socket != nil && socket.hasSnapshotSent() {
 			return
 		}
@@ -1772,35 +1776,53 @@ func (a *neoActor) handleForSocket(socket *neoSocket, msg map[string]any) {
 	case "edit_rejected", "observers", "executor_workspace_maybe_changed":
 		a.broadcast(msg)
 	case "client_filesystem_read_directory":
-		a.forwardFilesystemRequest("directory", msg)
+		if payload, ok := normalizeNeoFilesystemRequest("executor_filesystem_read_directory", msg); ok {
+			a.broadcast(payload)
+		}
 	case "client_filesystem_read_file":
-		a.forwardFilesystemRequest("file", msg)
+		if payload, ok := normalizeNeoFilesystemRequest("executor_filesystem_read_file", msg); ok {
+			a.broadcast(payload)
+		}
 	case "client_git_command":
-		a.handleClientGitCommand(msg)
+		if payload, ok := normalizeNeoClientGitCommand(msg); ok {
+			a.handleClientGitCommand(payload)
+		}
 	case "executor_filesystem_read_directory":
-		a.forwardFilesystemRequest("directory", msg)
+		if payload, ok := normalizeNeoFilesystemRequest("client_filesystem_read_directory", msg); ok {
+			a.broadcast(payload)
+		}
 	case "executor_filesystem_read_file":
-		a.forwardFilesystemRequest("file", msg)
+		if payload, ok := normalizeNeoFilesystemRequest("client_filesystem_read_file", msg); ok {
+			a.broadcast(payload)
+		}
 	case "executor_git_command":
-		a.forwardGitCommandRequest(msg)
+		if payload, ok := normalizeNeoExecutorGitCommand(msg); ok {
+			a.broadcast(payload)
+		}
 	case "executor_filesystem_read_directory_result":
-		msg["type"] = "client_filesystem_read_directory_result"
-		a.broadcast(msg)
+		if payload, ok := normalizeNeoFilesystemDirectoryResult("client_filesystem_read_directory_result", msg); ok {
+			a.broadcast(payload)
+		}
 	case "executor_filesystem_read_file_result":
-		msg["type"] = "client_filesystem_read_file_result"
-		a.broadcast(msg)
+		if payload, ok := normalizeNeoFilesystemFileResult("client_filesystem_read_file_result", msg); ok {
+			a.broadcast(payload)
+		}
 	case "executor_git_command_result":
-		msg["type"] = "client_git_command_result"
-		a.broadcast(msg)
+		if payload, ok := normalizeNeoGitCommandResult("client_git_command_result", msg); ok {
+			a.broadcast(payload)
+		}
 	case "client_filesystem_read_directory_result":
-		msg["type"] = "executor_filesystem_read_directory_result"
-		a.broadcast(msg)
+		if payload, ok := normalizeNeoFilesystemDirectoryResult("executor_filesystem_read_directory_result", msg); ok {
+			a.broadcast(payload)
+		}
 	case "client_filesystem_read_file_result":
-		msg["type"] = "executor_filesystem_read_file_result"
-		a.broadcast(msg)
+		if payload, ok := normalizeNeoFilesystemFileResult("executor_filesystem_read_file_result", msg); ok {
+			a.broadcast(payload)
+		}
 	case "client_git_command_result":
-		msg["type"] = "executor_git_command_result"
-		a.broadcast(msg)
+		if payload, ok := normalizeNeoGitCommandResult("executor_git_command_result", msg); ok {
+			a.broadcast(payload)
+		}
 	case "executor_plugin_message":
 		a.broadcast(map[string]any{"type": "plugin_message", "message": msg["message"]})
 	case "plugin_message":
@@ -1852,7 +1874,9 @@ func (a *neoActor) handleForSocket(socket *neoSocket, msg map[string]any) {
 	case "environment":
 		a.updateEnvironmentFromBinary(msg)
 	case "client_dismiss_active_error":
-		a.clearActiveError(msg)
+		if payload, ok := normalizeNeoClientDismissActiveError(msg); ok {
+			a.clearActiveError(payload)
+		}
 	case "client_mark_message_read":
 		if messageID := protocolMessageIDValue(msg["messageId"]); messageID != "" {
 			a.markMessageRead(messageID, true)
@@ -1862,7 +1886,9 @@ func (a *neoActor) handleForSocket(socket *neoSocket, msg map[string]any) {
 			a.markMessageRead(messageID, false)
 		}
 	case "client_upsert_notification_subscription":
-		a.upsertNotificationSubscription(msg)
+		if payload, ok := normalizeNeoClientNotificationSubscription(msg); ok {
+			a.upsertNotificationSubscription(payload)
+		}
 	case "client_spawn_executor":
 		if payload, ok := normalizeNeoClientSpawnExecutor(msg); ok {
 			a.spawnExecutor(payload)
@@ -3884,8 +3910,8 @@ func normalizeNeoClientManualBashInvocation(msg map[string]any) (map[string]any,
 		}
 		argsOut["cwd"] = cwd
 	}
-	run := firstMap(msg["run"], msg["toolRun"])
-	if len(run) == 0 {
+	run, ok := asMap(msg["run"])
+	if !ok {
 		return nil, nil, false, false, false
 	}
 	if _, ok := run["status"].(string); !ok {
@@ -11456,6 +11482,18 @@ func (a *neoActor) clearActiveError(msg map[string]any) {
 	a.broadcast(map[string]any{"type": "error_cleared", "seq": seq})
 }
 
+func normalizeNeoClientDismissActiveError(msg map[string]any) (map[string]any, bool) {
+	out := map[string]any{"type": "client_dismiss_active_error"}
+	if value, exists := msg["seq"]; exists {
+		seq, ok := neoClientNumber(value)
+		if !ok {
+			return nil, false
+		}
+		out["seq"] = seq
+	}
+	return out, true
+}
+
 func (a *neoActor) upsertArtifact(raw any, toolCallID string) {
 	artifact := normalizeNeoArtifact(raw, toolCallID)
 	key := stringValue(artifact["key"])
@@ -11567,78 +11605,390 @@ func (a *neoActor) deleteArtifact(key string) {
 	a.syncCloudAsync()
 }
 
-// forwardFilesystemRequest relays a filesystem read request from either side.
-func (a *neoActor) forwardFilesystemRequest(kind string, msg map[string]any) {
-	requestID := firstNonEmptyString(msg["requestId"], msg["requestID"], msg["id"])
-	uri := firstNonEmptyString(msg["uri"], msg["path"], msg["file"], msg["directory"])
-	fromExecutor := strings.HasPrefix(stringValue(msg["type"]), "executor_")
-	outboundType := "executor_filesystem_read_directory"
-	if kind == "file" {
-		outboundType = "executor_filesystem_read_file"
+func normalizeNeoFilesystemRequest(outboundType string, msg map[string]any) (map[string]any, bool) {
+	requestID, ok := neoRequiredString(msg["requestId"])
+	if !ok {
+		return nil, false
 	}
-	if fromExecutor {
-		outboundType = "client_filesystem_read_directory"
-		if kind == "file" {
-			outboundType = "client_filesystem_read_file"
+	uri, ok := msg["uri"].(string)
+	if !ok {
+		return nil, false
+	}
+	return map[string]any{"type": outboundType, "requestId": requestID, "uri": uri}, true
+}
+
+func normalizeNeoFilesystemDirectoryResult(outboundType string, msg map[string]any) (map[string]any, bool) {
+	requestID, ok := neoRequiredString(msg["requestId"])
+	if !ok {
+		return nil, false
+	}
+	okValue, ok := msg["ok"].(bool)
+	if !ok {
+		return nil, false
+	}
+	out := map[string]any{"type": outboundType, "requestId": requestID, "ok": okValue}
+	if okValue {
+		entries, ok := normalizeNeoFilesystemEntries(msg["entries"])
+		if !ok {
+			return nil, false
 		}
+		if _, exists := msg["error"]; exists {
+			return nil, false
+		}
+		out["entries"] = entries
+		return out, true
 	}
-	payload := map[string]any{"type": outboundType, "requestId": requestID, "uri": uri}
-	if rng, ok := msg["range"]; ok && rng != nil {
-		payload["range"] = rng
+	if _, exists := msg["entries"]; exists {
+		return nil, false
 	}
-	if max := firstNonNil(msg["maxBytes"], msg["max_bytes"], msg["limit"]); max != nil {
-		payload["maxBytes"] = max
+	errPayload, ok := normalizeNeoFilesystemError(msg["error"])
+	if !ok {
+		return nil, false
 	}
-	a.broadcast(payload)
+	out["error"] = errPayload
+	return out, true
+}
+
+func normalizeNeoFilesystemFileResult(outboundType string, msg map[string]any) (map[string]any, bool) {
+	requestID, ok := neoRequiredString(msg["requestId"])
+	if !ok {
+		return nil, false
+	}
+	okValue, ok := msg["ok"].(bool)
+	if !ok {
+		return nil, false
+	}
+	out := map[string]any{"type": outboundType, "requestId": requestID, "ok": okValue}
+	if okValue {
+		content, ok := msg["contentBase64"].(string)
+		if !ok {
+			return nil, false
+		}
+		if _, exists := msg["error"]; exists {
+			return nil, false
+		}
+		out["contentBase64"] = content
+		return out, true
+	}
+	if _, exists := msg["contentBase64"]; exists {
+		return nil, false
+	}
+	errPayload, ok := normalizeNeoFilesystemError(msg["error"])
+	if !ok {
+		return nil, false
+	}
+	out["error"] = errPayload
+	return out, true
+}
+
+func normalizeNeoFilesystemEntries(raw any) ([]any, bool) {
+	items, ok := raw.([]any)
+	if !ok {
+		return nil, false
+	}
+	out := make([]any, 0, len(items))
+	for _, item := range items {
+		entry, ok := normalizeNeoFilesystemEntry(item)
+		if !ok {
+			return nil, false
+		}
+		out = append(out, entry)
+	}
+	return out, true
+}
+
+func normalizeNeoFilesystemEntry(raw any) ([]any, bool) {
+	entry, ok := raw.([]any)
+	if !ok || len(entry) < 2 || len(entry) > 3 {
+		return nil, false
+	}
+	path, ok := entry[0].(string)
+	if !ok {
+		return nil, false
+	}
+	entryType, ok := entry[1].(string)
+	if !ok || (entryType != "file" && entryType != "directory") {
+		return nil, false
+	}
+	out := []any{path, entryType}
+	if len(entry) == 3 {
+		if entry[2] == nil {
+			out = append(out, nil)
+			return out, true
+		}
+		meta, ok := normalizeNeoFilesystemEntryMetadata(entry[2])
+		if !ok {
+			return nil, false
+		}
+		out = append(out, meta)
+	}
+	return out, true
+}
+
+func normalizeNeoFilesystemEntryMetadata(raw any) (map[string]any, bool) {
+	meta, ok := asMap(raw)
+	if !ok {
+		return nil, false
+	}
+	out := map[string]any{}
+	if value, exists := meta["mtimeMs"]; exists {
+		number, ok := neoNumberSettingFloat(value)
+		if !ok || number < 0 {
+			return nil, false
+		}
+		out["mtimeMs"] = value
+	}
+	return out, true
+}
+
+func normalizeNeoFilesystemError(raw any) (map[string]any, bool) {
+	errPayload, ok := asMap(raw)
+	if !ok {
+		return nil, false
+	}
+	code, ok := errPayload["code"].(string)
+	if !ok || !validNeoFilesystemErrorCode(code) {
+		return nil, false
+	}
+	message, ok := errPayload["message"].(string)
+	if !ok {
+		return nil, false
+	}
+	return map[string]any{"code": code, "message": message}, true
+}
+
+func validNeoFilesystemErrorCode(code string) bool {
+	switch code {
+	case "INVALID_URI", "EXECUTOR_NOT_CONNECTED", "NOT_FOUND", "NOT_DIRECTORY", "IS_DIRECTORY", "ACCESS_DENIED", "INTERNAL_ERROR":
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeNeoClientGitCommand(msg map[string]any) (map[string]any, bool) {
+	requestID, ok := neoRequiredString(msg["requestId"])
+	if !ok {
+		return nil, false
+	}
+	operation, ok := normalizeNeoGitOperation(msg["operation"])
+	if !ok {
+		return nil, false
+	}
+	return map[string]any{"type": "client_git_command", "requestId": requestID, "operation": operation}, true
+}
+
+func normalizeNeoExecutorGitCommand(msg map[string]any) (map[string]any, bool) {
+	requestID, ok := neoRequiredString(msg["requestId"])
+	if !ok {
+		return nil, false
+	}
+	args, ok := normalizeNeoStringArray(msg["args"], true)
+	if !ok {
+		return nil, false
+	}
+	out := map[string]any{"type": "executor_git_command", "requestId": requestID, "args": args}
+	if value, exists := msg["maxOutputBytes"]; exists {
+		number, ok := neoClientNumber(value)
+		if !ok || number <= 0 {
+			return nil, false
+		}
+		out["maxOutputBytes"] = number
+	}
+	if value, exists := msg["operation"]; exists {
+		operation, ok := normalizeNeoGitOperation(value)
+		if !ok {
+			return nil, false
+		}
+		out["operation"] = operation
+	}
+	return out, true
+}
+
+func normalizeNeoGitOperation(raw any) (map[string]any, bool) {
+	operation, ok := asMap(raw)
+	if !ok {
+		return nil, false
+	}
+	operationType, ok := operation["type"].(string)
+	if !ok {
+		return nil, false
+	}
+	switch operationType {
+	case "repository_root", "head", "branch", "status", "status_snapshot", "comparison_base_ref", "comparison_base_head", "ahead_count", "behind_count", "ahead_commits":
+		return map[string]any{"type": operationType}, true
+	case "diff_range_snapshot":
+		baseHash, ok := operation["baseHash"].(string)
+		if !ok || !neoGitHashPattern.MatchString(baseHash) {
+			return nil, false
+		}
+		out := map[string]any{"type": operationType, "baseHash": baseHash}
+		if value, exists := operation["headHash"]; exists {
+			headHash, ok := value.(string)
+			if !ok || !neoGitHashPattern.MatchString(headHash) {
+				return nil, false
+			}
+			out["headHash"] = headHash
+		}
+		return out, true
+	case "file_diff":
+		path, ok := operation["path"].(string)
+		if !ok || path == "" {
+			return nil, false
+		}
+		changeType, ok := operation["changeType"].(string)
+		if !ok || !validNeoGitChangeType(changeType) {
+			return nil, false
+		}
+		full, ok := operation["full"].(bool)
+		if !ok {
+			return nil, false
+		}
+		return map[string]any{"type": operationType, "path": path, "changeType": changeType, "full": full}, true
+	default:
+		return nil, false
+	}
+}
+
+func validNeoGitChangeType(changeType string) bool {
+	switch changeType {
+	case "added", "modified", "deleted", "renamed", "copied", "type_changed", "unmerged", "untracked":
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeNeoGitCommandResult(outboundType string, msg map[string]any) (map[string]any, bool) {
+	requestID, ok := neoRequiredString(msg["requestId"])
+	if !ok {
+		return nil, false
+	}
+	okValue, ok := msg["ok"].(bool)
+	if !ok {
+		return nil, false
+	}
+	out := map[string]any{"type": outboundType, "requestId": requestID, "ok": okValue}
+	if okValue {
+		exitCode, ok := neoClientNumber(msg["exitCode"])
+		if !ok || exitCode < 0 {
+			return nil, false
+		}
+		stdout, ok := msg["stdout"].(string)
+		if !ok {
+			return nil, false
+		}
+		stderr, ok := msg["stderr"].(string)
+		if !ok {
+			return nil, false
+		}
+		if _, exists := msg["error"]; exists {
+			return nil, false
+		}
+		out["exitCode"] = exitCode
+		out["stdout"] = stdout
+		out["stderr"] = stderr
+		return out, true
+	}
+	if value, exists := msg["exitCode"]; exists {
+		exitCode, ok := neoClientNumber(value)
+		if !ok || exitCode < 0 {
+			return nil, false
+		}
+		out["exitCode"] = exitCode
+	}
+	if value, exists := msg["stdout"]; exists {
+		stdout, ok := value.(string)
+		if !ok {
+			return nil, false
+		}
+		out["stdout"] = stdout
+	}
+	if value, exists := msg["stderr"]; exists {
+		stderr, ok := value.(string)
+		if !ok {
+			return nil, false
+		}
+		out["stderr"] = stderr
+	}
+	errPayload, ok := normalizeNeoGitError(msg["error"])
+	if !ok {
+		return nil, false
+	}
+	out["error"] = errPayload
+	return out, true
+}
+
+func normalizeNeoGitError(raw any) (map[string]any, bool) {
+	errPayload, ok := asMap(raw)
+	if !ok {
+		return nil, false
+	}
+	code, ok := errPayload["code"].(string)
+	if !ok || !validNeoGitErrorCode(code) {
+		return nil, false
+	}
+	message, ok := errPayload["message"].(string)
+	if !ok {
+		return nil, false
+	}
+	return map[string]any{"code": code, "message": message}, true
+}
+
+func validNeoGitErrorCode(code string) bool {
+	switch code {
+	case "EXECUTOR_NOT_CONNECTED", "INVALID_ARGS", "INTERNAL_ERROR":
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeNeoStringArray(raw any, requireNonEmpty bool) ([]any, bool) {
+	items, ok := raw.([]any)
+	if !ok || (requireNonEmpty && len(items) == 0) {
+		return nil, false
+	}
+	out := make([]any, 0, len(items))
+	for _, item := range items {
+		value, ok := item.(string)
+		if !ok {
+			return nil, false
+		}
+		out = append(out, value)
+	}
+	return out, true
+}
+
+func neoRequiredString(raw any) (string, bool) {
+	value, ok := raw.(string)
+	if !ok || value == "" {
+		return "", false
+	}
+	return value, true
 }
 
 func (a *neoActor) handleClientGitCommand(msg map[string]any) {
-	requestID := firstNonEmptyString(msg["requestId"], msg["requestID"], msg["id"])
-	if requestID == "" {
+	requestID, ok := neoRequiredString(msg["requestId"])
+	if !ok {
 		return
 	}
 	operation := cloneMap(mapValue(msg["operation"]))
-	args := stringSliceFromAny(msg["args"])
-	maxOutputBytes := numberFrom(msg["maxOutputBytes"], msg["max_output_bytes"])
 	a.mu.Lock()
 	environment := cloneMap(a.environment)
 	a.mu.Unlock()
 	cwd := neoHeadlessWorkingDirectory(msg, environment)
 
 	go func() {
-		result := neoRunClientGitCommand(cwd, operation, args, maxOutputBytes)
+		result := neoRunClientGitCommand(cwd, operation, 0)
 		result["type"] = "client_git_command_result"
 		result["requestId"] = requestID
 		a.broadcast(result)
 	}()
 }
 
-func (a *neoActor) forwardGitCommandRequest(msg map[string]any) {
-	requestID := firstNonEmptyString(msg["requestId"], msg["requestID"], msg["id"])
-	args := stringSliceFromAny(msg["args"])
-	if len(args) == 0 {
-		if generated, ok := neoGitArgsForOperation(mapValue(msg["operation"])); ok {
-			args = generated
-		}
-	}
-	payload := map[string]any{"type": "executor_git_command", "requestId": requestID, "args": args}
-	if max := firstNonNil(msg["maxOutputBytes"], msg["max_output_bytes"], msg["limit"]); max != nil {
-		payload["maxOutputBytes"] = max
-	}
-	if operation := cloneMap(mapValue(msg["operation"])); len(operation) > 0 {
-		payload["operation"] = operation
-	}
-	a.broadcast(payload)
-}
-
-func neoRunClientGitCommand(cwd string, operation map[string]any, args []string, maxOutputBytes int) map[string]any {
-	if len(operation) > 0 {
-		return neoRunGitOperation(cwd, operation, maxOutputBytes)
-	}
-	if len(args) == 0 {
-		return neoGitCommandError("INVALID_ARGS", "Git command arguments must be non-empty")
-	}
-	return neoRunGitCommand(cwd, args, maxOutputBytes, false)
+func neoRunClientGitCommand(cwd string, operation map[string]any, maxOutputBytes int) map[string]any {
+	return neoRunGitOperation(cwd, operation, maxOutputBytes)
 }
 
 func neoRunGitOperation(cwd string, operation map[string]any, maxOutputBytes int) map[string]any {
@@ -11668,6 +12018,8 @@ func neoRunGitOperation(cwd string, operation map[string]any, maxOutputBytes int
 		return neoRunGitAheadBehindCount(cwd, false)
 	case "ahead_commits":
 		return neoRunGitAheadCommits(cwd)
+	case "diff_range_snapshot":
+		return neoRunGitDiffRangeSnapshot(cwd, operation, maxOutputBytes)
 	case "file_diff":
 		return neoRunGitFileDiff(cwd, operation, maxOutputBytes)
 	default:
@@ -11750,6 +12102,218 @@ func neoRunGitAheadCommits(cwd string) map[string]any {
 		return neoGitCommandOK(1, "", "comparison base not found\n")
 	}
 	return neoRunGitCommand(cwd, []string{"log", "-z", "--reverse", "--max-count=20", "--format=%H%x00%s", base.mergeBaseHead + "..HEAD"}, 0, false)
+}
+
+type neoGitDiffRangeEntry struct {
+	path         string
+	previousPath string
+	changeType   string
+}
+
+func neoRunGitDiffRangeSnapshot(cwd string, operation map[string]any, maxOutputBytes int) map[string]any {
+	capturedAt := time.Now().UnixMilli()
+	rootResult := neoRunGitCommand(cwd, []string{"rev-parse", "--show-toplevel"}, 0, false)
+	if numberFrom(rootResult["exitCode"]) != 0 {
+		return neoGitSnapshotResult(neoUnavailableGitSnapshot(capturedAt, "not a git repository"))
+	}
+	root := strings.TrimSpace(stringValue(rootResult["stdout"]))
+	baseHash := stringValue(operation["baseHash"])
+	headHash := stringValue(operation["headHash"])
+	diffArgs := []string{"diff", "--no-color", "--no-ext-diff", "--name-status", "-z", "--find-renames"}
+	if headHash != "" {
+		diffArgs = append(diffArgs, baseHash+".."+headHash)
+	} else {
+		diffArgs = append(diffArgs, baseHash)
+	}
+	diffResult := neoRunGitCommand(root, diffArgs, 0, false)
+	if numberFrom(diffResult["exitCode"]) != 0 {
+		return neoGitSnapshotResult(neoUnavailableGitSnapshot(capturedAt, "failed to read git diff range"))
+	}
+	entries := neoParseGitNameStatusZ(stringValue(diffResult["stdout"]))
+	seen := map[string]bool{}
+	for _, entry := range entries {
+		seen[entry.path] = true
+	}
+	if headHash == "" {
+		statusResult := neoRunGitCommand(root, []string{"status", "--porcelain=v1", "--untracked-files=all", "-z"}, 0, false)
+		if numberFrom(statusResult["exitCode"]) == 0 {
+			for _, entry := range neoParseGitPorcelainZ(stringValue(statusResult["stdout"])) {
+				if entry.changeType == "untracked" && !seen[entry.path] {
+					entries = append(entries, neoGitDiffRangeEntry{path: entry.path, changeType: "untracked"})
+				}
+			}
+		}
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].path < entries[j].path })
+
+	files := make([]any, 0, len(entries))
+	for _, entry := range entries {
+		diff := neoGitDiffRangeFileDiff(root, entry, baseHash, headHash, false, maxOutputBytes)
+		fullFileDiff := neoGitDiffRangeFileDiff(root, entry, baseHash, headHash, true, maxOutputBytes)
+		file := map[string]any{
+			"path":         entry.path,
+			"previousPath": omitEmpty(entry.previousPath),
+			"changeType":   entry.changeType,
+			"created":      entry.changeType == "added" || entry.changeType == "untracked",
+			"diffToken":    neoGitDiffRangeToken(entry, baseHash, headHash, diff),
+			"diff":         diff,
+			"fullFileDiff": fullFileDiff,
+			"diffStat":     neoGitDiffStat(diff),
+		}
+		if entry.changeType != "added" && entry.changeType != "untracked" {
+			if oldContent := neoGitShowFile(root, baseHash, fallbackString(entry.previousPath, entry.path), maxOutputBytes); oldContent != "" {
+				file["oldContent"] = oldContent
+			}
+		}
+		if entry.changeType != "deleted" {
+			if newContent := neoGitDiffRangeNewContent(root, headHash, entry.path, maxOutputBytes); newContent != "" {
+				file["newContent"] = newContent
+			}
+		}
+		files = append(files, file)
+	}
+
+	branchResult := neoRunGitCommand(root, []string{"symbolic-ref", "--short", "HEAD"}, 0, false)
+	headResult := neoRunGitCommand(root, []string{"rev-parse", "--verify", "HEAD"}, 0, false)
+	head := headHash
+	if head == "" {
+		head = strings.TrimSpace(stringValue(headResult["stdout"]))
+	}
+	snapshot := map[string]any{
+		"provider":       "git",
+		"capturedAt":     capturedAt,
+		"available":      true,
+		"repositoryRoot": root,
+		"repositoryName": filepath.Base(root),
+		"branch":         nullableString(strings.TrimSpace(stringValue(branchResult["stdout"]))),
+		"head":           nullableString(head),
+		"diffHash":       neoGitDiffHash(files),
+		"baseRefHead":    baseHash,
+		"files":          files,
+	}
+	return neoGitSnapshotResult(snapshot)
+}
+
+func neoGitSnapshotResult(snapshot map[string]any) map[string]any {
+	raw, err := json.Marshal(snapshot)
+	if err != nil {
+		return neoGitCommandError("INTERNAL_ERROR", err.Error())
+	}
+	return neoGitCommandOK(0, string(raw), "")
+}
+
+func neoParseGitNameStatusZ(raw string) []neoGitDiffRangeEntry {
+	parts := strings.Split(raw, "\x00")
+	entries := make([]neoGitDiffRangeEntry, 0, len(parts)/2)
+	for i := 0; i < len(parts); {
+		status := strings.TrimSpace(parts[i])
+		i++
+		if status == "" {
+			continue
+		}
+		changeType := neoGitNameStatusChangeType(status)
+		if changeType == "renamed" || changeType == "copied" {
+			if i+1 >= len(parts) {
+				break
+			}
+			previousPath := parts[i]
+			path := parts[i+1]
+			i += 2
+			if path != "" {
+				entries = append(entries, neoGitDiffRangeEntry{path: path, previousPath: previousPath, changeType: changeType})
+			}
+			continue
+		}
+		if i >= len(parts) {
+			break
+		}
+		path := parts[i]
+		i++
+		if path != "" {
+			entries = append(entries, neoGitDiffRangeEntry{path: path, changeType: changeType})
+		}
+	}
+	return entries
+}
+
+func neoGitNameStatusChangeType(status string) string {
+	switch status[0] {
+	case 'A':
+		return "added"
+	case 'D':
+		return "deleted"
+	case 'R':
+		return "renamed"
+	case 'C':
+		return "copied"
+	case 'T':
+		return "type_changed"
+	case 'U':
+		return "unmerged"
+	default:
+		return "modified"
+	}
+}
+
+func neoGitDiffRangeFileDiff(root string, entry neoGitDiffRangeEntry, baseHash, headHash string, full bool, maxOutputBytes int) string {
+	if entry.changeType == "untracked" {
+		args := []string{"-c", "core.quotepath=false", "diff", "--no-color", "--no-ext-diff", "--no-index"}
+		if full {
+			args = append(args, "--unified=999999")
+		}
+		args = append(args, "--", os.DevNull, entry.path)
+		result := neoRunGitCommand(root, args, maxOutputBytes, true)
+		return stringValue(result["stdout"])
+	}
+	args := []string{"-c", "core.quotepath=false", "diff", "--no-color", "--no-ext-diff"}
+	if full {
+		args = append(args, "--unified=999999")
+	}
+	if headHash != "" {
+		args = append(args, baseHash+".."+headHash)
+	} else {
+		args = append(args, baseHash)
+	}
+	args = append(args, "--", entry.path)
+	result := neoRunGitCommand(root, args, maxOutputBytes, false)
+	if numberFrom(result["exitCode"]) != 0 {
+		return ""
+	}
+	return stringValue(result["stdout"])
+}
+
+func neoGitShowFile(root, revision, path string, maxOutputBytes int) string {
+	if revision == "" || path == "" {
+		return ""
+	}
+	result := neoRunGitCommand(root, []string{"show", revision + ":" + path}, maxOutputBytes, false)
+	if numberFrom(result["exitCode"]) != 0 {
+		return ""
+	}
+	return stringValue(result["stdout"])
+}
+
+func neoGitDiffRangeNewContent(root, revision, path string, maxOutputBytes int) string {
+	if revision != "" {
+		return neoGitShowFile(root, revision, path, maxOutputBytes)
+	}
+	if path == "" || strings.Contains(path, "\x00") {
+		return ""
+	}
+	raw, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(path)))
+	if err != nil {
+		return ""
+	}
+	return neoTrimGitOutput(string(raw), maxOutputBytes)
+}
+
+func neoGitDiffRangeToken(entry neoGitDiffRangeEntry, baseHash, headHash, diff string) string {
+	hash := sha256.New()
+	for _, value := range []string{entry.path, entry.previousPath, entry.changeType, baseHash, headHash, diff} {
+		hash.Write([]byte(value))
+		hash.Write([]byte{0})
+	}
+	return hex.EncodeToString(hash.Sum(nil))
 }
 
 func neoRunGitFileDiff(cwd string, operation map[string]any, maxOutputBytes int) map[string]any {
@@ -12123,6 +12687,46 @@ func (a *neoActor) upsertNotificationSubscription(msg map[string]any) {
 	}
 	a.notificationSubs[id] = subscription
 	a.mu.Unlock()
+}
+
+func normalizeNeoClientNotificationSubscription(msg map[string]any) (map[string]any, bool) {
+	subscription, ok := asMap(msg["subscription"])
+	if !ok {
+		return nil, false
+	}
+	endpoint, ok := subscription["endpoint"].(string)
+	if !ok || !validNeoURL(endpoint) {
+		return nil, false
+	}
+	keys, ok := asMap(subscription["keys"])
+	if !ok {
+		return nil, false
+	}
+	auth, ok := neoRequiredString(keys["auth"])
+	if !ok {
+		return nil, false
+	}
+	p256dh, ok := neoRequiredString(keys["p256dh"])
+	if !ok {
+		return nil, false
+	}
+	threadURL, ok := neoRequiredString(msg["threadURL"])
+	if !ok {
+		return nil, false
+	}
+	return map[string]any{
+		"type":      "client_upsert_notification_subscription",
+		"threadURL": threadURL,
+		"subscription": map[string]any{
+			"endpoint": endpoint,
+			"keys":     map[string]any{"auth": auth, "p256dh": p256dh},
+		},
+	}, true
+}
+
+func validNeoURL(raw string) bool {
+	parsed, err := url.Parse(raw)
+	return err == nil && parsed.Scheme != "" && parsed.Host != ""
 }
 
 // archiving tracks the official top-level archived flag separately from
@@ -20868,6 +21472,25 @@ func numberFrom(values ...any) int {
 		}
 	}
 	return 0
+}
+
+func neoClientNumber(value any) (int, bool) {
+	switch typed := value.(type) {
+	case int:
+		return typed, true
+	case int64:
+		return int(typed), true
+	case float64:
+		return int(typed), true
+	case json.Number:
+		parsed, err := typed.Int64()
+		if err != nil {
+			return 0, false
+		}
+		return int(parsed), true
+	default:
+		return 0, false
+	}
 }
 
 func nestedNumberFrom(value any, key string) int {
