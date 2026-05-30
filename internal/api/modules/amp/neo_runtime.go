@@ -226,6 +226,25 @@ func (rt *neoRuntime) start() error {
 }
 
 func (rt *neoRuntime) stop(ctx context.Context) error {
+	return rt.stopWithOptions(ctx, neoRuntimeStopOptions{
+		stopExecutors: true,
+		closeReason:   "Actor stopped",
+	})
+}
+
+func (rt *neoRuntime) shutdown(ctx context.Context) error {
+	return rt.stopWithOptions(ctx, neoRuntimeStopOptions{
+		stopExecutors: false,
+		closeReason:   "WebSocket connection closed during shutdown",
+	})
+}
+
+type neoRuntimeStopOptions struct {
+	stopExecutors bool
+	closeReason   string
+}
+
+func (rt *neoRuntime) stopWithOptions(ctx context.Context, options neoRuntimeStopOptions) error {
 	if rt == nil {
 		return nil
 	}
@@ -242,7 +261,7 @@ func (rt *neoRuntime) stop(ctx context.Context) error {
 	server := rt.server
 	rt.server = nil
 	err := server.Shutdown(ctx)
-	rt.store.disposeAll()
+	rt.store.disposeAll(options.stopExecutors, options.closeReason)
 	return err
 }
 
@@ -1179,7 +1198,7 @@ func (s *neoActorStore) delete(id string) {
 	delete(s.actors, id)
 }
 
-func (s *neoActorStore) disposeAll() {
+func (s *neoActorStore) disposeAll(stopExecutors bool, closeReason string) {
 	if s == nil {
 		return
 	}
@@ -1192,7 +1211,7 @@ func (s *neoActorStore) disposeAll() {
 	s.byNameKey = map[string]string{}
 	s.mu.Unlock()
 	for _, actor := range actors {
-		actor.dispose()
+		actor.disposeWithOptions(stopExecutors, closeReason)
 	}
 }
 
@@ -1381,6 +1400,10 @@ func (a *neoActor) close(socket *neoSocket) {
 }
 
 func (a *neoActor) dispose() {
+	a.disposeWithOptions(true, "Actor stopped")
+}
+
+func (a *neoActor) disposeWithOptions(stopExecutors bool, closeReason string) {
 	a.mu.Lock()
 	sockets := a.socketListLocked()
 	a.sockets = map[*neoSocket]struct{}{}
@@ -1388,10 +1411,12 @@ func (a *neoActor) dispose() {
 	a.spawnedExecutors = map[string]*neoSpawnedExecutor{}
 	a.mu.Unlock()
 	for _, socket := range sockets {
-		_ = socket.conn.Close()
+		socket.close(websocket.CloseGoingAway, closeReason)
 	}
-	for _, executor := range executors {
-		executor.stop()
+	if stopExecutors {
+		for _, executor := range executors {
+			executor.stop()
+		}
 	}
 }
 
@@ -12521,6 +12546,17 @@ func (s *neoSocket) sendText(text string) {
 	if err := s.conn.WriteMessage(websocket.TextMessage, []byte(text)); err != nil {
 		log.Debugf("amp neo local runtime WS send failed: %v", err)
 	}
+}
+
+func (s *neoSocket) close(code int, reason string) {
+	if s == nil || s.conn == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	message := websocket.FormatCloseMessage(code, reason)
+	_ = s.conn.WriteControl(websocket.CloseMessage, message, time.Now().Add(time.Second))
+	_ = s.conn.Close()
 }
 
 func pruneNilJSON(value any) any {

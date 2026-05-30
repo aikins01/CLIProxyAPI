@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -19,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1219,6 +1221,95 @@ func TestNeoRuntimeStopClosesActorWebSockets(t *testing.T) {
 			}
 			return
 		}
+	}
+}
+
+func TestNeoRuntimeShutdownClosesActorWebSocketsAsGoingAway(t *testing.T) {
+	port := freeTCPPortForTest(t)
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
+		Host: "127.0.0.1",
+		Port: port,
+	}}})
+	if err := rt.start(); err != nil {
+		t.Fatalf("start runtime: %v", err)
+	}
+
+	threadID := "T-shutdown-going-away"
+	conn := dialNeoActorWebSocket(t, fmt.Sprintf("http://127.0.0.1:%d", port), threadID)
+	defer conn.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := rt.shutdown(ctx); err != nil {
+		t.Fatalf("shutdown runtime: %v", err)
+	}
+
+	var closeErr *websocket.CloseError
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for {
+		_ = conn.SetReadDeadline(deadline)
+		_, _, err := conn.ReadMessage()
+		if err == nil {
+			if time.Now().After(deadline) {
+				t.Fatal("websocket stayed open after runtime shutdown")
+			}
+			continue
+		}
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			t.Fatalf("websocket stayed open after runtime shutdown: %v", err)
+		}
+		if !errors.As(err, &closeErr) {
+			t.Fatalf("read shutdown close error = %T %v, want websocket close error", err, err)
+		}
+		break
+	}
+	if closeErr.Code != websocket.CloseGoingAway {
+		t.Fatalf("shutdown close code = %d, want %d", closeErr.Code, websocket.CloseGoingAway)
+	}
+	if closeErr.Text != "WebSocket connection closed during shutdown" {
+		t.Fatalf("shutdown close reason = %q", closeErr.Text)
+	}
+}
+
+func TestNeoRuntimeShutdownPreservesSpawnedExecutors(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("sleep command and signal 0 are Unix-specific")
+	}
+	port := freeTCPPortForTest(t)
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
+		Host: "127.0.0.1",
+		Port: port,
+	}}})
+	if err := rt.start(); err != nil {
+		t.Fatalf("start runtime: %v", err)
+	}
+
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Skipf("sleep command unavailable: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+
+	threadID := "T-shutdown-preserve-executor"
+	actor := rt.store.ensureThreadActor(threadID)
+	actor.mu.Lock()
+	actor.spawnedExecutors["spawn-preserve"] = &neoSpawnedExecutor{
+		spawnID:  "spawn-preserve",
+		threadID: threadID,
+		cmd:      cmd,
+	}
+	actor.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := rt.shutdown(ctx); err != nil {
+		t.Fatalf("shutdown runtime: %v", err)
+	}
+	if err := cmd.Process.Signal(syscall.Signal(0)); err != nil {
+		t.Fatalf("spawned executor was not preserved across shutdown: %v", err)
 	}
 }
 

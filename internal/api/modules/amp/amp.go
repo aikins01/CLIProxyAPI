@@ -345,7 +345,7 @@ func (m *AmpModule) Shutdown(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	err := m.neoRuntime.stop(ctx)
+	err := m.neoRuntime.shutdown(ctx)
 	m.neoRuntime = nil
 	return err
 }
