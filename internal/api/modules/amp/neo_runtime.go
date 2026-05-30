@@ -15398,7 +15398,7 @@ func withNeoAnthropicAdaptiveThinking(body map[string]any) map[string]any {
 	copyThinking["display"] = "summarized"
 	copyBody["thinking"] = copyThinking
 
-	effort := "high"
+	effort := "medium"
 	if budget := numberFrom(thinkingBody["budget_tokens"]); budget > 0 {
 		if level, ok := thinking.ConvertBudgetToLevel(budget); ok {
 			if mapped, ok := neoAnthropicAdaptiveEffortFromLevel(level); ok && mapped != "" {
@@ -18144,12 +18144,9 @@ func neoAnthropicAdaptiveEffort(model, effort string) string {
 	case "low", "medium", "high", "xhigh", "max":
 		return strings.ToLower(strings.TrimSpace(effort))
 	case "auto":
-		return "high"
+		return "medium"
 	default:
-		if strings.TrimSpace(model) == "claude-opus-4-7" {
-			return "medium"
-		}
-		return "high"
+		return "medium"
 	}
 }
 

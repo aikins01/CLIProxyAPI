@@ -8966,8 +8966,10 @@ func TestNeoApplyAnthropicThinkingUsesAdaptiveEffortForAmpOpusModels(t *testing.
 		{name: "smart opus 4.7 effort", model: "claude-opus-4-7", fallback: "xhigh", want: "xhigh"},
 		{name: "smart opus 4.8 effort", model: "claude-opus-4-8", fallback: "xhigh", want: "xhigh"},
 		{name: "opus 4.7 default", model: "claude-opus-4-7", fallback: "", want: "medium"},
-		{name: "large opus 4.6 default", model: "claude-opus-4-6", fallback: "", want: "high"},
-		{name: "large opus 4.6 1m default", model: "claude-opus-4-6-1m", fallback: "", want: "high"},
+		{name: "large opus 4.6 default", model: "claude-opus-4-6", fallback: "", want: "medium"},
+		{name: "large opus 4.6 1m default", model: "claude-opus-4-6-1m", fallback: "", want: "medium"},
+		{name: "adaptive auto follows binary invalid fallback", model: "claude-opus-4-8", fallback: "auto", want: "medium"},
+		{name: "adaptive invalid follows binary fallback", model: "claude-opus-4-8", fallback: "not-valid", want: "medium"},
 	}
 
 	for _, tt := range tests {
