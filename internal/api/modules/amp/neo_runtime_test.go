@@ -10986,6 +10986,89 @@ func TestNeoLocalThreadLoadDropsStaleCurrentInference(t *testing.T) {
 	}
 }
 
+func TestNeoLocalThreadLoadCancelsStaleLocalCurrentInference(t *testing.T) {
+	useTempNeoThreadStore(t)
+	threadID := "T-019e6541-06ae-75d7-b10e-d893170fa62c"
+	raw := []byte(`{
+		"id": "` + threadID + `",
+		"agentMode": "deep",
+		"meta": {"cliProxyAPILocalNeo": true},
+		"messages": [
+			{"messageId": "M-user", "role": "user", "content": [{"type": "text", "text": "hello"}]},
+			{"messageId": "M-assistant", "role": "assistant", "state": {"type": "streaming"}, "content": [{"type": "text", "text": "partial"}]}
+		],
+		"currentInference": {"messageId": "M-assistant", "agentMode": "deep", "tools": ["shell_command"]}
+	}`)
+	path := filepath.Join(neoAmpThreadStoreDir(), threadID+".json")
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatalf("write thread: %v", err)
+	}
+
+	thread, ok := loadNeoLocalThread(threadID)
+	if !ok {
+		t.Fatal("thread was not loaded")
+	}
+	if _, exists := thread["currentInference"]; exists {
+		t.Fatalf("currentInference was not dropped: %#v", thread["currentInference"])
+	}
+	messages := arrayValue(thread["messages"])
+	if len(messages) != 2 {
+		t.Fatalf("messages = %#v, want stale assistant preserved as cancelled", messages)
+	}
+	assistant := mapValue(messages[1])
+	if stringValue(mapValue(assistant["state"])["type"]) != "cancelled" {
+		t.Fatalf("assistant state = %#v, want cancelled", assistant["state"])
+	}
+
+	persistedRaw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read persisted thread: %v", err)
+	}
+	var persisted map[string]any
+	if err := json.Unmarshal(persistedRaw, &persisted); err != nil {
+		t.Fatalf("decode persisted thread: %v", err)
+	}
+	if _, exists := persisted["currentInference"]; exists {
+		t.Fatalf("stale currentInference was re-cached: %#v", persisted["currentInference"])
+	}
+	persistedMessages := arrayValue(persisted["messages"])
+	persistedAssistant := mapValue(persistedMessages[1])
+	if stringValue(mapValue(persistedAssistant["state"])["type"]) != "cancelled" {
+		t.Fatalf("persisted assistant state = %#v, want cancelled", persistedAssistant["state"])
+	}
+}
+
+func TestNeoLocalThreadLoadRemovesEmptyStaleLocalCurrentInference(t *testing.T) {
+	useTempNeoThreadStore(t)
+	threadID := "T-019e6541-06ae-75d7-b10e-d893170fa62c"
+	raw := []byte(`{
+		"id": "` + threadID + `",
+		"agentMode": "deep",
+		"meta": {"cliProxyAPILocalNeo": true},
+		"messages": [
+			{"messageId": "M-user", "role": "user", "content": [{"type": "text", "text": "hello"}]},
+			{"messageId": "M-empty", "role": "assistant", "state": {"type": "streaming"}, "content": []}
+		],
+		"currentInference": {"messageId": "M-empty", "agentMode": "deep", "tools": ["shell_command"]}
+	}`)
+	path := filepath.Join(neoAmpThreadStoreDir(), threadID+".json")
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatalf("write thread: %v", err)
+	}
+
+	thread, ok := loadNeoLocalThread(threadID)
+	if !ok {
+		t.Fatal("thread was not loaded")
+	}
+	if _, exists := thread["currentInference"]; exists {
+		t.Fatalf("currentInference was not dropped: %#v", thread["currentInference"])
+	}
+	messages := arrayValue(thread["messages"])
+	if len(messages) != 1 || messageIDValue(mapValue(messages[0])["messageId"]) != "M-user" {
+		t.Fatalf("messages = %#v, want empty stale assistant removed", messages)
+	}
+}
+
 func TestNeoLocalThreadLoadRepairsLocalCompactionSummaryOrder(t *testing.T) {
 	useTempNeoThreadStore(t)
 	threadID := "T-019e6541-06ae-75d7-b10e-d893170fa62c"

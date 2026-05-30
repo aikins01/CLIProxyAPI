@@ -8106,8 +8106,52 @@ func normalizeNeoThreadCurrentInference(thread map[string]any) bool {
 	if messageID == "" || !neoThreadContainsMessageID(thread, messageID) {
 		delete(thread, "currentInference")
 		changed = true
+	} else if neoThreadHasLocalRuntimeMarker(thread) {
+		if normalizeNeoThreadStaleCurrentInferenceMessage(thread, messageID) {
+			changed = true
+		}
+		delete(thread, "currentInference")
+		changed = true
 	}
 	return changed
+}
+
+func normalizeNeoThreadStaleCurrentInferenceMessage(thread map[string]any, messageID string) bool {
+	messages := arrayValue(thread["messages"])
+	index := neoRawMessageIndexByID(messages, messageID)
+	if index < 0 {
+		return false
+	}
+	message := mapValue(messages[index])
+	if stringValue(message["role"]) != "assistant" {
+		return false
+	}
+	if stringValue(mapValue(message["state"])["type"]) != "streaming" {
+		return false
+	}
+	content := arrayValue(message["content"])
+	if len(content) == 0 {
+		trimmed := make([]any, 0, len(messages)-1)
+		trimmed = append(trimmed, messages[:index]...)
+		trimmed = append(trimmed, messages[index+1:]...)
+		thread["messages"] = trimmed
+		return true
+	}
+	normalized := cloneMap(message)
+	normalizedContent := cloneArray(content)
+	for i, rawBlock := range normalizedContent {
+		block := cloneMap(mapValue(rawBlock))
+		if stringValue(block["type"]) == "tool_use" && !neoToolUseBlockComplete(block) {
+			normalizedContent[i] = neoCompleteInterruptedToolUseBlock(block)
+			continue
+		}
+		normalizedContent[i] = block
+	}
+	normalized["content"] = normalizedContent
+	normalized["state"] = map[string]any{"type": "cancelled"}
+	messages[index] = normalized
+	thread["messages"] = messages
+	return true
 }
 
 func normalizeNeoThreadMessageShapes(thread map[string]any) bool {
