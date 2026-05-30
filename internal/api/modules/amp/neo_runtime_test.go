@@ -13692,22 +13692,56 @@ func TestNeoRuntimeThreadImportClearsLocalPendingInferenceWhenAssistantCompleted
 	}
 }
 
-func TestNeoRuntimeThreadImportDoesNotDeriveModeFromMetaLikeBinary(t *testing.T) {
-	rt := newNeoRuntime(&config.Config{})
-	actor := rt.store.ensureThreadActor("T-import-meta-mode")
-	actor.currentAgentMode = "smart"
-	actor.currentReasoningEffort = "high"
-	actor.settings = map[string]any{"agentMode": "smart", "reasoning.effort": "high"}
-
-	thread := map[string]any{
-		"id":   "T-import-meta-mode",
-		"meta": map[string]any{"agentMode": "deep"},
-		"messages": []any{
-			map[string]any{"role": "user", "messageId": "M-user", "content": []any{map[string]any{"type": "text", "text": "meta carries mode"}}},
+func TestNeoRuntimeThreadImportDerivesModeFromThreadMetadata(t *testing.T) {
+	cases := []struct {
+		name   string
+		thread map[string]any
+	}{
+		{
+			name: "settings",
+			thread: map[string]any{
+				"id":       "T-import-settings-mode",
+				"settings": map[string]any{"agentMode": "deep"},
+			},
+		},
+		{
+			name: "meta",
+			thread: map[string]any{
+				"id":   "T-import-meta-mode",
+				"meta": map[string]any{"agentMode": "deep"},
+			},
+		},
+		{
+			name: "nested_data",
+			thread: map[string]any{
+				"id": "T-import-data-mode",
+				"data": map[string]any{
+					"settings": map[string]any{"agentMode": "deep"},
+				},
+			},
 		},
 	}
-	if err := actor.importThreadLocalOnly(thread); err == nil || !strings.Contains(err.Error(), "agent mode could not be determined from thread") {
-		t.Fatalf("importThreadLocalOnly error = %v, want binary-style missing mode error", err)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rt := newNeoRuntime(&config.Config{})
+			actor := rt.store.ensureThreadActor(stringValue(tc.thread["id"]))
+			actor.currentAgentMode = "smart"
+			actor.currentReasoningEffort = "high"
+			actor.settings = map[string]any{"agentMode": "smart", "reasoning.effort": "high"}
+
+			tc.thread["messages"] = []any{
+				map[string]any{"role": "user", "messageId": "M-user", "content": []any{map[string]any{"type": "text", "text": "thread metadata carries mode"}}},
+			}
+			if err := actor.importThreadLocalOnly(tc.thread); err != nil {
+				t.Fatalf("importThreadLocalOnly error: %v", err)
+			}
+
+			actor.mu.Lock()
+			defer actor.mu.Unlock()
+			if actor.currentAgentMode != "deep" || actor.settings["agentMode"] != "deep" {
+				t.Fatalf("imported mode = current:%q settings:%#v, want deep", actor.currentAgentMode, actor.settings)
+			}
+		})
 	}
 }
 

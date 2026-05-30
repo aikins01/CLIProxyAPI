@@ -10081,7 +10081,7 @@ func (a *neoActor) importThreadWithSync(thread map[string]any, syncCloud bool) e
 		messages = append(messages, message)
 	}
 
-	agentMode := firstNonEmptyString(thread["agentMode"], neoImportedThreadAgentMode(messages))
+	agentMode := firstNonEmptyString(neoThreadMapAgentMode(thread), neoImportedThreadAgentMode(messages))
 	if agentMode == "" {
 		return errors.New("agent mode could not be determined from thread")
 	}

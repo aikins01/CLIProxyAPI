@@ -2887,12 +2887,26 @@
     return '';
   }
 
+  function threadMapAgentMode(raw: Record<string, unknown>, messages: unknown[] = []): string {
+    const settings = asRecord(raw.settings);
+    const meta = asRecord(raw.meta);
+    const mode = firstString(raw.agentMode, settings.agentMode, meta.agentMode);
+    if (mode) return mode;
+    const data = asRecord(raw.data);
+    if (Object.keys(data).length > 0) {
+      const nestedMessages = Array.isArray(data.messages) ? data.messages : messages;
+      const nestedMode: string = threadMapAgentMode(data, nestedMessages);
+      if (nestedMode) return nestedMode;
+    }
+    return agentModeFromMessages(messages);
+  }
+
   function threadAgentModeFrom(
     raw: Record<string, unknown>,
     messages: unknown[] = [],
     options: { allowThreadActorFallback?: boolean } = {}
   ) {
-    const mode = stringFrom(raw.agentMode) || agentModeFromMessages(messages);
+    const mode = threadMapAgentMode(raw, messages);
     if (mode) return normalizeAgentMode(mode);
     if (options.allowThreadActorFallback !== false && threadCanUseLocalRuntime(raw)) {
       return defaultAgentMode;
