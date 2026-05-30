@@ -1559,6 +1559,14 @@ func TestNeoRuntimeShutdownPreservesSpawnedExecutors(t *testing.T) {
 	}
 }
 
+func TestNeoConfigureSpawnedExecutorProcessDetachesFromServiceGroup(t *testing.T) {
+	cmd := exec.Command("amp", "--headless", "T-detach")
+	neoConfigureSpawnedExecutorProcess(cmd)
+	if !neoSpawnedExecutorDetachedForTest(cmd) {
+		t.Fatal("spawned executor was not configured to survive service process group shutdown")
+	}
+}
+
 func TestNeoRuntimeEnsureThreadActorIndexesGatewayThreadActorName(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	threadID := "T-index-gateway"

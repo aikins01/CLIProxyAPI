@@ -2519,6 +2519,7 @@ func (a *neoActor) spawnExecutor(msg map[string]any) {
 	logPath := neoHeadlessExecutorLogPath(threadID, spawnID)
 	args := neoHeadlessExecutorArgs(threadID, agentMode, reasoningEffort)
 	cmd := exec.Command(command, args...)
+	neoConfigureSpawnedExecutorProcess(cmd)
 	if workDir != "" {
 		cmd.Dir = workDir
 	}
