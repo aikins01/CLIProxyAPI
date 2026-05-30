@@ -7187,6 +7187,65 @@ func TestInferNeoAnthropicStreamMatchesBinaryRequestEnvelope(t *testing.T) {
 	}
 }
 
+func TestInferNeoAnthropicStreamPreservesCitationDeltas(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/provider/anthropic/v1/messages" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		payload := readNeoJSON(r.Body)
+		if payload["stream"] != true {
+			t.Fatalf("stream = %#v, want true", payload["stream"])
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: message_start\n" +
+			`data: {"type":"message_start","message":{"usage":{"input_tokens":3}}}` + "\n\n" +
+			"event: content_block_start\n" +
+			`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}` + "\n\n" +
+			"event: content_block_delta\n" +
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"cited answer"}}` + "\n\n" +
+			"event: content_block_delta\n" +
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"citations_delta","citation":{"type":"char_location","cited_text":"source","document_index":0,"document_title":"doc.md","start_char_index":0,"end_char_index":6}}}` + "\n\n" +
+			"event: content_block_delta\n" +
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"compaction_delta","text":"provider-side compaction progress"}}` + "\n\n" +
+			"event: message_stop\n" +
+			`data: {"type":"message_stop"}` + "\n\n"))
+	}))
+	defer upstream.Close()
+
+	result, err := inferNeoLocalStream(testNeoRuntimeForServer(t, upstream), neoInferenceRequest{
+		ThreadID:  "T-test",
+		AgentMode: "smart",
+		Settings:  map[string]any{"internal.model": "anthropic/claude-test"},
+		History:   []neoHistoryMessage{{Role: "user", Text: "hi"}},
+	}, nil)
+	if err != nil {
+		t.Fatalf("inferNeoLocalStream error: %v", err)
+	}
+	if result.Text != "cited answer" {
+		t.Fatalf("text=%q, want cited answer", result.Text)
+	}
+	if len(result.TextCitations) != 1 {
+		t.Fatalf("citations=%#v, want one citation", result.TextCitations)
+	}
+	citation := mapValue(result.TextCitations[0])
+	if stringValue(citation["type"]) != "char_location" || stringValue(citation["document_title"]) != "doc.md" {
+		t.Fatalf("citation=%#v", citation)
+	}
+
+	actor := newNeoActor(newNeoRuntime(&config.Config{}), "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	actor.finishAssistantMessageWithOptions("M-assistant", result, "smart", "", false, "")
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.messages) != 1 {
+		t.Fatalf("messages=%#v", actor.messages)
+	}
+	block := mapValue(actor.messages[0].Content[0])
+	citations := arrayValue(block["citations"])
+	if len(citations) != 1 || stringValue(mapValue(citations[0])["document_title"]) != "doc.md" {
+		t.Fatalf("text block citations=%#v", block["citations"])
+	}
+}
+
 func TestInferNeoAnthropicUsesBinaryDefaultMaxTokens(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/provider/anthropic/v1/messages" {

@@ -5873,7 +5873,11 @@ func (a *neoActor) finishAssistantMessageWithOptions(messageID string, result ne
 		blocks = append(blocks, block)
 	}
 	if result.Text != "" {
-		blocks = append(blocks, map[string]any{"type": "text", "text": result.Text})
+		textBlock := map[string]any{"type": "text", "text": result.Text}
+		if len(result.TextCitations) > 0 {
+			textBlock["citations"] = cloneNeoJSONArray(result.TextCitations)
+		}
+		blocks = append(blocks, textBlock)
 	}
 	for _, call := range normalizedCalls {
 		blocks = append(blocks, neoToolUseBlock(call, true))
@@ -12651,6 +12655,7 @@ type neoInferenceResult struct {
 	Provider       string
 	Model          string
 	Text           string
+	TextCitations  []any
 	ToolCalls      []neoToolCall
 	Usage          map[string]any
 	ThinkingBlocks []neoThinkingBlock
@@ -13016,6 +13021,7 @@ func inferNeoAnthropic(rt *neoRuntime, request neoInferenceRequest, route neoMod
 	}
 	content, _ := jsonBody["content"].([]any)
 	var text strings.Builder
+	textCitations := make([]any, 0)
 	toolCalls := make([]neoToolCall, 0)
 	thinkingBlocks := make([]neoThinkingBlock, 0)
 	for _, raw := range content {
@@ -13023,6 +13029,9 @@ func inferNeoAnthropic(rt *neoRuntime, request neoInferenceRequest, route neoMod
 		switch stringValue(item["type"]) {
 		case "text":
 			text.WriteString(stringValue(item["text"]))
+			if citations := arrayValue(item["citations"]); len(citations) > 0 {
+				textCitations = append(textCitations, cloneNeoJSONArray(citations)...)
+			}
 		case "tool_use":
 			name := stringValue(item["name"])
 			if name != "" {
@@ -13036,7 +13045,7 @@ func inferNeoAnthropic(rt *neoRuntime, request neoInferenceRequest, route neoMod
 			})
 		}
 	}
-	return neoInferenceResult{Provider: route.Provider, Model: route.Model, Text: text.String(), ToolCalls: toolCalls, Usage: mapValue(jsonBody["usage"]), ThinkingBlocks: thinkingBlocks}, nil
+	return neoInferenceResult{Provider: route.Provider, Model: route.Model, Text: text.String(), TextCitations: textCitations, ToolCalls: toolCalls, Usage: mapValue(jsonBody["usage"]), ThinkingBlocks: thinkingBlocks}, nil
 }
 
 func inferNeoOpenAI(rt *neoRuntime, request neoInferenceRequest, route neoModelRoute) (neoInferenceResult, error) {
@@ -13173,6 +13182,7 @@ func inferNeoAnthropicStream(rt *neoRuntime, request neoInferenceRequest, route 
 		name      string
 		input     map[string]any
 		text      strings.Builder
+		citations []any
 		args      strings.Builder
 		thinking  strings.Builder
 		signature string
@@ -13223,6 +13233,9 @@ func inferNeoAnthropicStream(rt *neoRuntime, request neoInferenceRequest, route 
 						if onDelta != nil {
 							onDelta(neoInferenceDelta{Text: text, BlockIndex: index, Usage: usage})
 						}
+					}
+					if citations := arrayValue(contentBlock["citations"]); len(citations) > 0 {
+						block.citations = append(block.citations, cloneNeoJSONArray(citations)...)
 					}
 				case "tool_use":
 					block.id = neoStableToolCallID(stringValue(contentBlock["id"]))
@@ -13292,6 +13305,12 @@ func inferNeoAnthropicStream(rt *neoRuntime, request neoInferenceRequest, route 
 							onDelta(neoInferenceDelta{ThinkingSignature: sig, BlockIndex: index, Usage: usage})
 						}
 					}
+				case "citations_delta":
+					block.blockType = "text"
+					if citation := mapValue(delta["citation"]); len(citation) > 0 {
+						block.citations = append(block.citations, cloneNeoJSONMap(citation))
+					}
+				case "compaction_delta":
 				}
 			case "error":
 				return fmt.Errorf("local provider stream error: %s", data)
@@ -13333,12 +13352,17 @@ func inferNeoAnthropicStream(rt *neoRuntime, request neoInferenceRequest, route 
 	sort.Ints(order)
 	toolCalls := make([]neoToolCall, 0)
 	thinkingBlocks := make([]neoThinkingBlock, 0)
+	textCitations := make([]any, 0)
 	for _, index := range order {
 		block := blocks[index]
 		if block == nil {
 			continue
 		}
 		switch block.blockType {
+		case "text":
+			if len(block.citations) > 0 {
+				textCitations = append(textCitations, cloneNeoJSONArray(block.citations)...)
+			}
 		case "tool_use":
 			if block.name == "" {
 				continue
@@ -13356,7 +13380,7 @@ func inferNeoAnthropicStream(rt *neoRuntime, request neoInferenceRequest, route 
 			})
 		}
 	}
-	return neoInferenceResult{Provider: route.Provider, Model: route.Model, Text: fullText.String(), ToolCalls: toolCalls, Usage: usage, ThinkingBlocks: thinkingBlocks}, nil
+	return neoInferenceResult{Provider: route.Provider, Model: route.Model, Text: fullText.String(), TextCitations: textCitations, ToolCalls: toolCalls, Usage: usage, ThinkingBlocks: thinkingBlocks}, nil
 }
 
 func inferNeoOpenAIStream(rt *neoRuntime, request neoInferenceRequest, route neoModelRoute, onDelta neoStreamCallback) (neoInferenceResult, error) {
