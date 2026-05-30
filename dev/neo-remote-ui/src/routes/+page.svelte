@@ -991,19 +991,16 @@
       startPingTimer(nextSocket, threadId, version, options, generation);
       sendFrame({ type: 'client_resume', version });
       if (options.bootstrapExecutor) {
+        const bootstrapReasoningEffort = normalizeReasoningEffortForMode(bootstrapAgentMode, options.reasoningEffort || '');
+        sendThreadModeFrames(bootstrapAgentMode, bootstrapReasoningEffort);
         sendFrame({
           type: 'client_update_thread_settings',
-          settings: threadSettingsPayload(bootstrapAgentMode, options.reasoningEffort || '')
+          settings: threadSettingsPayload(bootstrapAgentMode, bootstrapReasoningEffort)
         });
         sendFrame({ type: 'environment', env: options.environment ?? {} });
         sendFrame({
           type: 'client_spawn_executor',
-          requestId: `spawn-${crypto.randomUUID()}`,
-          threadId,
-          agentMode: bootstrapAgentMode,
-          reasoningEffort: options.reasoningEffort || undefined,
-          environment: options.environment ?? {},
-          workingDirectory: options.workingDirectory || undefined
+          requestId: `spawn-${crypto.randomUUID()}`
         });
       }
     });
@@ -2380,7 +2377,7 @@
       type: 'client_tool_approval_response',
       toolCallId: approval.toolCallId,
       accepted: false,
-      denyFeedback: 'Denied from the browser'
+      input: { denyFeedback: 'Denied from the browser' }
     });
     toolApprovals = toolApprovals.filter((item) => item.toolCallId !== approval.toolCallId);
   }
@@ -2574,9 +2571,18 @@
   function threadSettingsPayload(mode: string, effort: string) {
     const agentMode = normalizeAgentMode(mode);
     const reasoningEffort = normalizeReasoningEffortForMode(agentMode, effort);
-    const settings: Record<string, unknown> = { agentMode };
+    const settings: Record<string, unknown> = {};
     if (reasoningEffort) settings['reasoning.effort'] = reasoningEffort;
     return settings;
+  }
+
+  function sendThreadModeFrames(mode: string, effort: string) {
+    const agentMode = normalizeAgentMode(mode);
+    const reasoningEffort = normalizeReasoningEffortForMode(agentMode, effort);
+    sendFrame({ type: 'agent-mode', mode: agentMode });
+    if (reasoningEffort) {
+      sendFrame({ type: 'reasoning-effort', effort: reasoningEffort });
+    }
   }
 
   function encodeGatewayInput(value: Record<string, unknown>) {
@@ -2673,6 +2679,7 @@
     const agentMode = normalizeAgentMode(mode);
     const reasoningEffort = normalizeReasoningEffortForMode(agentMode, effort);
     applyLocalThreadSettings(agentMode, reasoningEffort);
+    sendThreadModeFrames(agentMode, reasoningEffort);
     sendFrame({ type: 'client_update_thread_settings', settings: threadSettingsPayload(agentMode, reasoningEffort) });
   }
 

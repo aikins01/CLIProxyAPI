@@ -2775,7 +2775,7 @@ func TestNeoRuntimeAcceptsBatchedClientFrames(t *testing.T) {
 	waitForNeoMessageType(t, conn, "agent_state", 2*time.Second)
 	waitForNeoMessageType(t, conn, "observers", 2*time.Second)
 
-	batch := []byte(`[{"type":"client_set_thread_title","title":"Batch Title"},{"type":"client_update_thread_settings","settings":{"agentMode":"rush"}}]`)
+	batch := []byte(`[{"type":"client_set_thread_title","title":"Batch Title"},{"type":"agent-mode","mode":"rush"}]`)
 	if err := conn.WriteMessage(websocket.TextMessage, batch); err != nil {
 		t.Fatalf("write batched frame: %v", err)
 	}
@@ -2801,6 +2801,115 @@ func TestNeoRuntimeAcceptsBatchedClientFrames(t *testing.T) {
 		t.Fatalf("batched frame was not fully applied: title=%v settings=%v", sawTitle, sawSettings)
 	}
 	waitForNeoActorSyncIdle(t, rt.store.ensureThreadActor(threadID))
+}
+
+func TestNeoClientThreadSettingsMatchesBinarySchema(t *testing.T) {
+	settings, ok := normalizeNeoClientThreadSettings(map[string]any{
+		"agentMode":                  "rush",
+		"reasoning.effort":           "max",
+		"openai.speed":               "fast",
+		"anthropic.provider":         "vertex",
+		"anthropic.thinking.enabled": true,
+		"agent.skipTitleGenerationIfMessageContains": []any{"literal"},
+		"tools.disable":                       []any{"Bash"},
+		"internal.model":                      map[string]any{"smart": "claude-sonnet"},
+		"internal.compactionThresholdPercent": float64(42),
+	})
+	if !ok {
+		t.Fatal("valid client thread settings were rejected")
+	}
+	if _, exists := settings["agentMode"]; exists {
+		t.Fatalf("client thread settings kept unknown agentMode key: %#v", settings)
+	}
+	if settings["reasoning.effort"] != "max" || settings["openai.speed"] != "fast" {
+		t.Fatalf("client thread settings lost valid values: %#v", settings)
+	}
+
+	if _, ok := normalizeNeoClientThreadSettings(map[string]any{"reasoning.effort": "turbo"}); ok {
+		t.Fatal("invalid client reasoning effort was accepted")
+	}
+	if _, ok := normalizeNeoClientThreadSettings(map[string]any{"tools.disable": []any{"Bash", 1}}); ok {
+		t.Fatal("invalid client string array setting was accepted")
+	}
+}
+
+func TestNeoClientSpawnExecutorMatchesBinarySchema(t *testing.T) {
+	spawn, ok := normalizeNeoClientSpawnExecutor(map[string]any{
+		"type":          "client_spawn_executor",
+		"requestId":     "spawn-test",
+		"threadId":      "T-local-only",
+		"agentMode":     "deep",
+		"environment":   map[string]any{"workingDirectory": "/tmp/ignored"},
+		"repositoryURL": "https://example.test/repo.git",
+		"projectID":     "019e6541-06ae-75d7-b10e-d893170fa62c",
+		"additionalRepositories": []any{
+			map[string]any{"type": "git", "name": "tools", "url": "https://example.test/tools.git", "ignored": true},
+			map[string]any{"type": "drive", "driveName": "docs", "name": "Docs", "namespace": "team"},
+		},
+	})
+	if !ok {
+		t.Fatal("valid client spawn executor frame was rejected")
+	}
+	for _, key := range []string{"threadId", "agentMode", "environment"} {
+		if _, exists := spawn[key]; exists {
+			t.Fatalf("client spawn executor kept unknown key %q: %#v", key, spawn)
+		}
+	}
+	repositories := arrayValue(spawn["additionalRepositories"])
+	if len(repositories) != 2 {
+		t.Fatalf("additionalRepositories len = %d, want 2", len(repositories))
+	}
+	if _, exists := mapValue(repositories[0])["ignored"]; exists {
+		t.Fatalf("client spawn executor kept unknown repository key: %#v", repositories[0])
+	}
+
+	if _, ok := normalizeNeoClientSpawnExecutor(map[string]any{"projectID": "not-a-uuid"}); ok {
+		t.Fatal("invalid projectID was accepted")
+	}
+	if _, ok := normalizeNeoClientSpawnExecutor(map[string]any{"additionalRepositories": []any{map[string]any{"type": "drive", "driveName": "", "name": "Docs", "namespace": "team"}}}); ok {
+		t.Fatal("invalid drive repository was accepted")
+	}
+}
+
+func TestNeoClientToolApprovalResponseMatchesBinarySchema(t *testing.T) {
+	toolCallID := "TU-" + strings.Repeat("0", 22)
+	response, ok := normalizeNeoClientToolApprovalResponse(map[string]any{
+		"type":         "client_tool_approval_response",
+		"toolCallId":   toolCallID,
+		"accepted":     false,
+		"denyFeedback": "top-level feedback is local-only",
+		"input": map[string]any{
+			"denyFeedback": "use a safer command",
+			"askAnswers":   map[string]any{"confirm": "no"},
+			"ignored":      true,
+		},
+	})
+	if !ok {
+		t.Fatal("valid client tool approval response was rejected")
+	}
+	if response["toolCallId"] != toolCallID || response["accepted"] != false {
+		t.Fatalf("tool approval response lost required fields: %#v", response)
+	}
+	input := mapValue(response["input"])
+	if input["denyFeedback"] != "use a safer command" {
+		t.Fatalf("tool approval response did not keep input denyFeedback: %#v", response)
+	}
+	if _, exists := input["ignored"]; exists {
+		t.Fatalf("tool approval response kept unknown input key: %#v", input)
+	}
+	if _, exists := response["denyFeedback"]; exists {
+		t.Fatalf("tool approval response kept top-level denyFeedback: %#v", response)
+	}
+
+	if _, ok := normalizeNeoClientToolApprovalResponse(map[string]any{"toolUseId": toolCallID, "accepted": true}); ok {
+		t.Fatal("toolUseId alias was accepted for client approval response")
+	}
+	if _, ok := normalizeNeoClientToolApprovalResponse(map[string]any{"toolCallId": "TU-short", "accepted": true}); ok {
+		t.Fatal("malformed toolCallId was accepted")
+	}
+	if _, ok := normalizeNeoClientToolApprovalResponse(map[string]any{"toolCallId": toolCallID, "accepted": "true"}); ok {
+		t.Fatal("non-boolean accepted value was accepted")
+	}
 }
 
 func TestNeoRuntimeFilesystemBridgeNormalizesBothDirections(t *testing.T) {

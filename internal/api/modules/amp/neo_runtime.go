@@ -102,6 +102,8 @@ var (
 	neoCloudThreadIDPattern       = regexp.MustCompile(`^T-([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$`)
 	neoMessageIDPattern           = regexp.MustCompile(`^M-[0-9A-Za-z]{22}$`)
 	neoEditIDPattern              = regexp.MustCompile(`^E-[0-9A-Za-z]{22}$`)
+	neoToolCallIDPattern          = regexp.MustCompile(`^TU-[0-9A-Za-z]{22}$`)
+	neoUUIDExactPattern           = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 	neoMCPServerPattern           = regexp.MustCompile(`[\s-]+`)
 	neoAmpThreadStoreDir          = defaultNeoAmpThreadStoreDir
 	neoAmpTaskStoreMu             sync.Mutex
@@ -1640,7 +1642,9 @@ func (a *neoActor) handleForSocket(socket *neoSocket, msg map[string]any) {
 			socket.markSnapshotSent()
 		}
 	case "client_update_thread_settings":
-		a.updateSettings(mapValue(msg["settings"]))
+		if settings, ok := normalizeNeoClientThreadSettings(msg["settings"]); ok {
+			a.updateSettings(settings)
+		}
 	case "thread_settings":
 		a.updateSettings(sanitizeNeoThreadSettings(mapValue(msg["settings"])))
 	case "executor_connect":
@@ -1730,7 +1734,9 @@ func (a *neoActor) handleForSocket(socket *neoSocket, msg map[string]any) {
 	case "tool_approval_queue":
 		a.handleProtocolToolApprovalQueue(msg)
 	case "client_tool_approval_response":
-		a.handleToolApprovalResponse(msg)
+		if payload, ok := normalizeNeoClientToolApprovalResponse(msg); ok {
+			a.handleToolApprovalResponse(payload)
+		}
 	case "executor_tool_approval_response":
 		a.handleToolApprovalResponse(msg)
 	case "agent_state":
@@ -1858,7 +1864,9 @@ func (a *neoActor) handleForSocket(socket *neoSocket, msg map[string]any) {
 	case "client_upsert_notification_subscription":
 		a.upsertNotificationSubscription(msg)
 	case "client_spawn_executor":
-		a.spawnExecutor(msg)
+		if payload, ok := normalizeNeoClientSpawnExecutor(msg); ok {
+			a.spawnExecutor(payload)
+		}
 	case "client_append_manual_bash_invocation":
 		a.appendManualBashInvocation(msg)
 	case "client_retry":
@@ -2591,6 +2599,90 @@ func (a *neoActor) executorConnectRejected(msg map[string]any) {
 		"details": map[string]any{"reasonCode": "executor_connect_rejected"},
 	}))
 	a.broadcastObservers()
+}
+
+func normalizeNeoClientSpawnExecutor(msg map[string]any) (map[string]any, bool) {
+	out := map[string]any{"type": "client_spawn_executor"}
+	if value, exists := msg["requestId"]; exists {
+		requestID, ok := value.(string)
+		if !ok {
+			return nil, false
+		}
+		out["requestId"] = requestID
+	}
+	if value, exists := msg["repositoryURL"]; exists {
+		repositoryURL, ok := value.(string)
+		if !ok {
+			return nil, false
+		}
+		out["repositoryURL"] = repositoryURL
+	}
+	if value, exists := msg["projectID"]; exists {
+		projectID, ok := value.(string)
+		if !ok || !neoUUIDExactPattern.MatchString(projectID) {
+			return nil, false
+		}
+		out["projectID"] = projectID
+	}
+	if value, exists := msg["additionalRepositories"]; exists {
+		repositories, ok := normalizeNeoClientAdditionalRepositories(value)
+		if !ok {
+			return nil, false
+		}
+		out["additionalRepositories"] = repositories
+	}
+	return out, true
+}
+
+func normalizeNeoClientAdditionalRepositories(raw any) ([]any, bool) {
+	items, ok := raw.([]any)
+	if !ok {
+		return nil, false
+	}
+	out := make([]any, 0, len(items))
+	for _, item := range items {
+		repository, ok := normalizeNeoClientAdditionalRepository(mapValue(item))
+		if !ok {
+			return nil, false
+		}
+		out = append(out, repository)
+	}
+	return out, true
+}
+
+func normalizeNeoClientAdditionalRepository(repo map[string]any) (map[string]any, bool) {
+	repoType := stringValue(repo["type"])
+	if repoType == "drive" {
+		driveName, ok := repo["driveName"].(string)
+		if !ok || driveName == "" {
+			return nil, false
+		}
+		name, ok := repo["name"].(string)
+		if !ok {
+			return nil, false
+		}
+		namespace, ok := repo["namespace"].(string)
+		if !ok {
+			return nil, false
+		}
+		return map[string]any{"type": "drive", "driveName": driveName, "name": name, "namespace": namespace}, true
+	}
+	if repoType != "" && repoType != "git" {
+		return nil, false
+	}
+	name, ok := repo["name"].(string)
+	if !ok {
+		return nil, false
+	}
+	url, ok := repo["url"].(string)
+	if !ok {
+		return nil, false
+	}
+	out := map[string]any{"name": name, "url": url}
+	if repoType == "git" {
+		out["type"] = "git"
+	}
+	return out, true
 }
 
 func (a *neoActor) spawnExecutor(msg map[string]any) {
@@ -19185,6 +19277,131 @@ func sanitizeNeoThreadSettings(settings map[string]any) map[string]any {
 	return out
 }
 
+func normalizeNeoClientThreadSettings(raw any) (map[string]any, bool) {
+	settings, ok := asMap(raw)
+	if !ok {
+		return nil, false
+	}
+	out := map[string]any{}
+	for key, value := range settings {
+		switch key {
+		case "agent.skipTitleGenerationIfMessageContains", "tools.disable", "tools.enable":
+			items, ok := normalizeNeoClientStringArraySetting(value)
+			if !ok {
+				return nil, false
+			}
+			out[key] = items
+		case "anthropic.thinking.enabled", "anthropic.interleavedThinking.enabled":
+			enabled, ok := value.(bool)
+			if !ok {
+				return nil, false
+			}
+			out[key] = enabled
+		case "anthropic.temperature":
+			if !isNeoNumberSetting(value) {
+				return nil, false
+			}
+			out[key] = value
+		case "anthropic.provider":
+			provider, ok := value.(string)
+			if !ok || !validNeoAnthropicProvider(provider) {
+				return nil, false
+			}
+			out[key] = provider
+		case "anthropic.speed":
+			speed, ok := value.(string)
+			if !ok || !validNeoAnthropicSpeed(speed) {
+				return nil, false
+			}
+			out[key] = speed
+		case "openai.speed":
+			speed, ok := value.(string)
+			if !ok || !validNeoOpenAISpeed(speed) {
+				return nil, false
+			}
+			out[key] = speed
+		case "painter.model":
+			model, ok := value.(string)
+			if !ok || model == "" {
+				return nil, false
+			}
+			out[key] = model
+		case "reasoning.effort":
+			effort, ok := value.(string)
+			if !ok || !validNeoReasoningEffortSetting(effort) {
+				return nil, false
+			}
+			out[key] = effort
+		case "internal.compactionThresholdPercent":
+			if !validNeoCompactionThresholdPercentSetting(value) {
+				return nil, false
+			}
+			out[key] = value
+		case "internal.model":
+			model, ok := normalizeNeoClientInternalModelSetting(value)
+			if !ok {
+				return nil, false
+			}
+			out[key] = model
+		case "internal.oracleReasoningEffort":
+			effort, ok := value.(string)
+			if !ok || !validNeoOracleReasoningEffort(effort) {
+				return nil, false
+			}
+			out[key] = effort
+		case "gemini.thinkingLevel":
+			level, ok := value.(string)
+			if !ok || !validNeoGeminiThinkingLevel(level) {
+				return nil, false
+			}
+			out[key] = level
+		}
+	}
+	return out, true
+}
+
+func normalizeNeoClientStringArraySetting(value any) ([]any, bool) {
+	items, ok := value.([]any)
+	if !ok {
+		return nil, false
+	}
+	out := make([]any, 0, len(items))
+	for _, item := range items {
+		text, ok := item.(string)
+		if !ok {
+			return nil, false
+		}
+		out = append(out, text)
+	}
+	return out, true
+}
+
+func normalizeNeoClientInternalModelSetting(value any) (any, bool) {
+	if model, ok := value.(string); ok {
+		return model, true
+	}
+	if models, ok := value.(map[string]string); ok {
+		out := make(map[string]any, len(models))
+		for key, item := range models {
+			out[key] = item
+		}
+		return out, true
+	}
+	models, ok := asMap(value)
+	if !ok {
+		return nil, false
+	}
+	out := make(map[string]any, len(models))
+	for key, item := range models {
+		model, ok := item.(string)
+		if !ok {
+			return nil, false
+		}
+		out[key] = model
+	}
+	return out, true
+}
+
 func deleteInvalidNeoSetting(settings map[string]any, key string, valid func(string) bool) {
 	if _, exists := settings[key]; exists && !valid(stringValue(settings[key])) {
 		delete(settings, key)
@@ -19667,6 +19884,88 @@ func normalizeNeoToolApprovalResponse(msg map[string]any) map[string]any {
 		out["input"] = input
 	}
 	return out
+}
+
+func normalizeNeoClientToolApprovalResponse(msg map[string]any) (map[string]any, bool) {
+	toolCallID, ok := neoClientToolCallIDValue(msg["toolCallId"])
+	if !ok {
+		return nil, false
+	}
+	accepted, ok := msg["accepted"].(bool)
+	if !ok {
+		return nil, false
+	}
+	out := map[string]any{
+		"type":       "executor_tool_approval_response",
+		"toolCallId": toolCallID,
+		"accepted":   accepted,
+	}
+	if rawInput, exists := msg["input"]; exists {
+		input, ok := normalizeNeoClientToolApprovalInput(rawInput)
+		if !ok {
+			return nil, false
+		}
+		if len(input) > 0 {
+			out["input"] = input
+		}
+	}
+	return out, true
+}
+
+func neoClientToolCallIDValue(raw any) (string, bool) {
+	toolCallID, ok := raw.(string)
+	if !ok || !neoToolCallIDPattern.MatchString(toolCallID) {
+		return "", false
+	}
+	return toolCallID, true
+}
+
+func normalizeNeoClientToolApprovalInput(raw any) (map[string]any, bool) {
+	input, ok := asMap(raw)
+	if !ok {
+		return nil, false
+	}
+	out := map[string]any{}
+	for key, value := range input {
+		switch key {
+		case "askAnswers":
+			answers, ok := normalizeNeoClientStringRecord(value)
+			if !ok {
+				return nil, false
+			}
+			out[key] = answers
+		case "denyFeedback":
+			feedback, ok := value.(string)
+			if !ok {
+				return nil, false
+			}
+			out[key] = feedback
+		}
+	}
+	return out, true
+}
+
+func normalizeNeoClientStringRecord(value any) (map[string]any, bool) {
+	if items, ok := value.(map[string]string); ok {
+		out := make(map[string]any, len(items))
+		for key, item := range items {
+			out[key] = item
+		}
+		return out, true
+	}
+	items, ok := asMap(value)
+	if !ok {
+		return nil, false
+	}
+	out := make(map[string]any, len(items))
+	for key, item := range items {
+		text, ok := item.(string)
+		if !ok {
+			return nil, false
+		}
+		out[key] = text
+	}
+	return out, true
 }
 
 func normalizeNeoToolApprovalInput(msg map[string]any) map[string]any {
