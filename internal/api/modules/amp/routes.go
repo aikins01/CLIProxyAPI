@@ -250,7 +250,7 @@ func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *ha
 	engine.GET("/news.rss", append(rootMiddleware, proxyHandler)...)
 
 	neoRuntimeBridgeHandler := func(c *gin.Context) {
-		if !m.shouldServeNeoRuntimeBridge() {
+		if !m.shouldServeNeoRuntimeBridge(c.Request) {
 			proxyHandler(c)
 			return
 		}
@@ -296,8 +296,8 @@ func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *ha
 	})
 }
 
-func (m *AmpModule) shouldServeNeoRuntimeBridge() bool {
-	return m != nil && m.neoRuntime != nil
+func (m *AmpModule) shouldServeNeoRuntimeBridge(r *http.Request) bool {
+	return m != nil && m.neoRuntime != nil && neoRuntimeBridgeRequest(r)
 }
 
 func (m *AmpModule) serveNeoRuntimeBridge(c *gin.Context) {

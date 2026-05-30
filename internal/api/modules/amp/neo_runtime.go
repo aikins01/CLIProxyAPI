@@ -8871,7 +8871,7 @@ func (m *AmpModule) canServeNeoLocalManagement(r *http.Request) bool {
 	if _, ok := neoThreadActorManagementPath(r.URL.Path); ok && m.neoRuntime != nil {
 		return true
 	}
-	if neoRuntimeBridgePath(r.URL.Path) && m.neoRuntime != nil {
+	if neoRuntimeBridgeRequest(r) && m.neoRuntime != nil {
 		return true
 	}
 	if _, ok := neoAttachmentRequestPath(r.URL.Path); ok {
@@ -8884,9 +8884,104 @@ func (m *AmpModule) canServeNeoLocalManagement(r *http.Request) bool {
 	return false
 }
 
-func neoRuntimeBridgePath(path string) bool {
-	path = "/" + strings.Trim(path, "/")
-	return path == "/metadata" || path == "/gateway" || strings.HasPrefix(path, "/gateway/") || path == "/actors" || strings.HasPrefix(path, "/actors/")
+func neoRuntimeBridgeRequest(r *http.Request) bool {
+	if r == nil || r.URL == nil {
+		return false
+	}
+	path := "/" + strings.Trim(r.URL.Path, "/")
+	switch {
+	case path == "/metadata":
+		return r.Method == http.MethodGet
+	case path == "/actors":
+		return r.Method == http.MethodGet || r.Method == http.MethodPut || r.Method == http.MethodPost
+	case strings.HasPrefix(path, "/actors/"):
+		return neoRuntimeActorsBridgeRequest(r, path)
+	case strings.HasPrefix(path, "/gateway/"):
+		return neoRuntimeGatewayBridgeRequest(r, path)
+	default:
+		return false
+	}
+}
+
+func neoRuntimeActorsBridgeRequest(r *http.Request, path string) bool {
+	if r == nil || r.URL == nil {
+		return false
+	}
+	if _, _, ok := neoActorKVKeyPath(r.URL.EscapedPath()); ok {
+		return true
+	}
+	if isNeoSkillsPath(path) {
+		return r.Method == http.MethodGet || r.Method == http.MethodPost
+	}
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	return len(parts) == 2 && r.Method == http.MethodDelete
+}
+
+func neoRuntimeGatewayBridgeRequest(r *http.Request, path string) bool {
+	if r == nil || r.URL == nil {
+		return false
+	}
+	switch {
+	case isNeoThreadImportPath(path):
+		return r.Method == http.MethodPost
+	case isNeoContextAnalysisRequestPath(path):
+		return r.Method == http.MethodGet
+	case isNeoDynamicReloadPath(path):
+		return r.Method == http.MethodPut
+	case isNeoStateRequestPath(path):
+		return r.Method == http.MethodGet
+	case isNeoMessagesRequestPath(path):
+		return r.Method == http.MethodGet
+	case isNeoSkillsPath(path):
+		return r.Method == http.MethodGet || r.Method == http.MethodPost
+	}
+	if neoRuntimeBridgeRivetQuery(r.URL.Query()) {
+		return true
+	}
+	return strings.EqualFold(r.Header.Get("Upgrade"), "websocket") && neoRuntimeBridgeRivetHeaders(r)
+}
+
+func neoRuntimeBridgeRivetQuery(q url.Values) bool {
+	for _, key := range []string{
+		"rvt-method",
+		"rvt-key",
+		"rvt-input",
+		"rvt-namespace",
+		"rvt-runner",
+		"rvt-region",
+		"rvt-crash-policy",
+		"rvt-skip-ready-wait",
+		"rvt-token",
+	} {
+		if strings.TrimSpace(q.Get(key)) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func neoRuntimeBridgeRivetHeaders(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	for _, key := range []string{
+		"x-rivet-actor",
+		"x-rivet-target",
+		"x-rivet-encoding",
+		"x-rivet-conn-params",
+		"x-rivet-skip-ready-wait",
+		"x-rivet-token",
+	} {
+		if strings.TrimSpace(r.Header.Get(key)) != "" {
+			return true
+		}
+	}
+	for _, protocol := range parseWebSocketProtocols(r.Header.Get("Sec-WebSocket-Protocol")) {
+		if strings.EqualFold(protocol, "rivet") || strings.HasPrefix(protocol, "rivet_") {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *AmpModule) tryServeNeoLocalThreadActor(c *gin.Context) bool {

@@ -450,7 +450,11 @@ func TestRegisterManagementRoutesProxiesNeoRuntimeBridgeWhenRuntimeDisabled(t *t
 	paths := []string{
 		"/metadata",
 		"/gateway/threadActor/?rvt-method=get&rvt-key=T-upstream",
+		"/gateway/actor-local/request/state",
+		"/gateway/actor-local/request/messages",
 		"/actors?name=threadActor&key=T-upstream",
+		"/actors/actor-local/kv/keys/state",
+		"/actors/actor-local/skills",
 	}
 	for _, path := range paths {
 		t.Run(path, func(t *testing.T) {
@@ -600,6 +604,157 @@ func TestRegisterManagementRoutesServesAmpBinaryNeoRuntimeBridgeLocally(t *testi
 	}
 	if response["source"] != "runtime" {
 		t.Fatalf("unexpected local bridge response: %#v", response)
+	}
+}
+
+func TestRegisterManagementRoutesPassesUnknownNeoRuntimeBridgePathsUpstreamWithProxy(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	runtimeRequests := 0
+	runtimeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		runtimeRequests++
+		writeNeoJSON(w, http.StatusOK, map[string]any{"source": "runtime"})
+	}))
+	defer runtimeServer.Close()
+	runtimeURL, err := url.Parse(runtimeServer.URL)
+	if err != nil {
+		t.Fatalf("parse runtime URL: %v", err)
+	}
+	host, portText, err := net.SplitHostPort(runtimeURL.Host)
+	if err != nil {
+		t.Fatalf("split runtime host: %v", err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatalf("parse runtime port: %v", err)
+	}
+
+	upstreamRequests := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequests++
+		writeNeoJSON(w, http.StatusOK, map[string]any{"source": "upstream"})
+	}))
+	defer upstream.Close()
+
+	r := gin.New()
+	m := &AmpModule{
+		restrictToLocalhost: false,
+		neoRuntime:          &neoRuntime{host: host, port: port},
+	}
+	proxy, err := createReverseProxy(upstream.URL, NewStaticSecretSource(""))
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	m.setProxy(proxy)
+	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, nil)
+
+	localServer := httptest.NewServer(r)
+	defer localServer.Close()
+
+	for _, tc := range []struct {
+		method string
+		path   string
+	}{
+		{http.MethodGet, "/gateway"},
+		{http.MethodGet, "/gateway/static/asset.js"},
+		{http.MethodGet, "/gateway/threadActor/unhandled"},
+		{http.MethodPost, "/gateway/threadActor/request/state"},
+		{http.MethodGet, "/actors/actor-local/unhandled"},
+	} {
+		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
+			req, err := http.NewRequest(tc.method, localServer.URL+tc.path, nil)
+			if err != nil {
+				t.Fatalf("build request: %v", err)
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("request: %v", err)
+			}
+			defer resp.Body.Close()
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("read response: %v", err)
+			}
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, body=%s", resp.StatusCode, string(body))
+			}
+			var response map[string]any
+			if err := json.Unmarshal(body, &response); err != nil {
+				t.Fatalf("response JSON error: %v", err)
+			}
+			if response["source"] != "upstream" {
+				t.Fatalf("unexpected response: %#v", response)
+			}
+		})
+	}
+	if runtimeRequests != 0 {
+		t.Fatalf("runtimeRequests = %d, want 0", runtimeRequests)
+	}
+	if upstreamRequests != 5 {
+		t.Fatalf("upstreamRequests = %d, want 5", upstreamRequests)
+	}
+}
+
+func TestRegisterManagementRoutesRejectsUnknownNeoRuntimeBridgePathsWithoutProxy(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	runtimeRequests := 0
+	runtimeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		runtimeRequests++
+		writeNeoJSON(w, http.StatusOK, map[string]any{"source": "runtime"})
+	}))
+	defer runtimeServer.Close()
+	runtimeURL, err := url.Parse(runtimeServer.URL)
+	if err != nil {
+		t.Fatalf("parse runtime URL: %v", err)
+	}
+	host, portText, err := net.SplitHostPort(runtimeURL.Host)
+	if err != nil {
+		t.Fatalf("split runtime host: %v", err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatalf("parse runtime port: %v", err)
+	}
+
+	r := gin.New()
+	m := &AmpModule{
+		restrictToLocalhost: false,
+		neoRuntime:          &neoRuntime{host: host, port: port},
+	}
+	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, nil)
+
+	localServer := httptest.NewServer(r)
+	defer localServer.Close()
+
+	resp, err := http.Get(localServer.URL + "/metadata")
+	if err != nil {
+		t.Fatalf("metadata request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("metadata status = %d, body=%s", resp.StatusCode, string(body))
+	}
+
+	for _, path := range []string{
+		"/gateway/static/asset.js",
+		"/actors/actor-local/unhandled",
+	} {
+		t.Run(path, func(t *testing.T) {
+			resp, err := http.Get(localServer.URL + path)
+			if err != nil {
+				t.Fatalf("request: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusServiceUnavailable {
+				body, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status = %d, want 503; body=%s", resp.StatusCode, string(body))
+			}
+		})
+	}
+	if runtimeRequests != 1 {
+		t.Fatalf("runtimeRequests = %d, want only metadata request", runtimeRequests)
 	}
 }
 
