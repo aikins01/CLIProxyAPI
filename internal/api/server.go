@@ -1135,18 +1135,16 @@ func (s *Server) Stop(ctx context.Context) error {
 		}
 	}
 
-	if s.muxHTTPListener != nil {
-		_ = s.muxHTTPListener.Close()
-	}
-	closeListeners(s.muxBaseListeners, "")
-
-	// Close public listeners before stopping the local Amp runtime so reconnecting
-	// clients see a transport outage instead of a live proxy returning 503.
 	if s.ampModule != nil {
 		if err := s.ampModule.Shutdown(ctx); err != nil {
 			log.Errorf("failed to stop amp module: %v", err)
 		}
 	}
+
+	if s.muxHTTPListener != nil {
+		_ = s.muxHTTPListener.Close()
+	}
+	closeListeners(s.muxBaseListeners, "")
 
 	// Shutdown the HTTP server.
 	if err := s.server.Shutdown(ctx); err != nil {
