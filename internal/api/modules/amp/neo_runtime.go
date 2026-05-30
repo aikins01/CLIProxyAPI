@@ -12895,7 +12895,11 @@ func parseNeoModelRoute(value string) neoModelRoute {
 		case "anthropic", "claude":
 			route = neoModelRoute{Provider: "anthropic", Model: model}
 		default:
-			route = neoModelRoute{Provider: providerForNeoModel(model), Model: model}
+			if neoOpenAICompatibleProvider(provider) {
+				route = neoModelRoute{Provider: provider, Model: model}
+			} else {
+				route = neoModelRoute{Provider: providerForNeoModel(model), Model: model}
+			}
 		}
 	} else {
 		route = neoModelRoute{Provider: providerForNeoModel(value), Model: value}

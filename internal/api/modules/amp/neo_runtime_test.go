@@ -4528,6 +4528,10 @@ func TestParseNeoModelRoutePreservesBinarySlashModelNames(t *testing.T) {
 		{raw: "z-ai/glm-4.6", provider: "openrouter", model: "z-ai/glm-4.6"},
 		{raw: "qwen/qwen3-coder", provider: "openrouter", model: "qwen/qwen3-coder"},
 		{raw: "openai:gpt-5.5", provider: "openai", model: "gpt-5.5"},
+		{raw: "openrouter/anthropic/claude-sonnet-4-5", provider: "openrouter", model: "anthropic/claude-sonnet-4-5"},
+		{raw: "fireworks/custom-model", provider: "fireworks", model: "custom-model"},
+		{raw: "groq/openai/gpt-oss-120b", provider: "groq", model: "openai/gpt-oss-120b"},
+		{raw: "vertexai/gemini-3.1-pro-preview", provider: "google", model: "gemini-3.1-pro-preview"},
 	} {
 		t.Run(tc.raw, func(t *testing.T) {
 			got := parseNeoModelRoute(tc.raw)
@@ -4535,6 +4539,33 @@ func TestParseNeoModelRoutePreservesBinarySlashModelNames(t *testing.T) {
 				t.Fatalf("route = %+v, want %s/%s", got, tc.provider, tc.model)
 			}
 		})
+	}
+}
+
+func TestInferNeoLocalPreservesExplicitOpenAICompatibleProvider(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/provider/openrouter/v1/chat/completions" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		payload := readNeoJSON(r.Body)
+		if payload["model"] != "anthropic/claude-sonnet-4-5" {
+			t.Fatalf("model = %#v, want explicit OpenRouter model; payload=%#v", payload["model"], payload)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":2,"completion_tokens":1}}`))
+	}))
+	defer upstream.Close()
+
+	result, err := inferNeoLocal(testNeoRuntimeForServer(t, upstream), neoInferenceRequest{
+		AgentMode: "smart",
+		Settings:  map[string]any{"internal.model": "openrouter/anthropic/claude-sonnet-4-5"},
+		History:   []neoHistoryMessage{{Role: "user", Text: "hello"}},
+	})
+	if err != nil {
+		t.Fatalf("inferNeoLocal error: %v", err)
+	}
+	if result.Provider != "openrouter" || result.Model != "anthropic/claude-sonnet-4-5" || result.Text != "ok" {
+		t.Fatalf("result = %+v, want explicit OpenRouter route", result)
 	}
 }
 
