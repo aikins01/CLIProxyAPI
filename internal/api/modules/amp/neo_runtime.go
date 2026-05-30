@@ -11720,11 +11720,7 @@ func neoCompactionSummary(messages []neoMessage) (int, string, bool) {
 			if stringValue(block["type"]) != "summary" {
 				continue
 			}
-			summary := mapValue(block["summary"])
-			if stringValue(summary["type"]) != "message" {
-				continue
-			}
-			text := strings.TrimSpace(stringValue(summary["summary"]))
+			text := neoCompactionSummaryText(mapValue(block["summary"]))
 			if text == "" {
 				continue
 			}
@@ -11732,6 +11728,19 @@ func neoCompactionSummary(messages []neoMessage) (int, string, bool) {
 		}
 	}
 	return 0, "", false
+}
+
+func neoCompactionSummaryText(summary map[string]any) string {
+	switch stringValue(summary["type"]) {
+	case "message":
+		return strings.TrimSpace(stringValue(summary["summary"]))
+	case "thread":
+		threadID := strings.TrimSpace(stringValue(summary["thread"]))
+		if threadID != "" {
+			return "Summary thread: " + threadID
+		}
+	}
+	return ""
 }
 
 // neoHistoryMessageFromStored converts a stored neoMessage into the inference

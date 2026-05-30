@@ -3056,7 +3056,7 @@
       assistantStart = '';
     };
 
-    const pushCompactionAfter = (message: NeoMessage) => {
+    const pushCompactionBefore = (message: NeoMessage) => {
       const cutMessageId = message.messageId;
       if (!cutMessageIds.has(cutMessageId) || emittedCompactions.has(cutMessageId)) return;
       flushAssistant();
@@ -3065,18 +3065,26 @@
     };
 
     for (const message of messages) {
+      if (isCompactionSummaryMessage(message)) {
+        if (cutMessageIds.size === 0 && !emittedCompactions.has(message.messageId)) {
+          flushAssistant();
+          emittedCompactions.add(message.messageId);
+          items.push({ kind: 'compaction', cutMessageId: message.messageId, key: `compaction-summary-${message.messageId}` });
+        }
+        continue;
+      }
+
       if (shouldSkipInfoTranscriptMessage(message)) continue;
+      pushCompactionBefore(message);
 
       if (isHumanUserMessage(message)) {
         flushAssistant();
         items.push({ kind: 'user', message, key: `user-${message.messageId}` });
-        pushCompactionAfter(message);
         continue;
       }
 
       if (!assistantStart) assistantStart = message.messageId;
       assistantMessages.push(message);
-      pushCompactionAfter(message);
     }
 
     flushAssistant();
@@ -3085,6 +3093,16 @@
 
   function compactionCutMessageId(record: Record<string, unknown>) {
     return stringFrom(record.cutMessageId ?? record.cut_message_id ?? record.messageId ?? record.message_id);
+  }
+
+  function isCompactionSummaryMessage(message: NeoMessage) {
+    if (message.role !== 'info') return false;
+    return message.content.some((block) => {
+      if (block.type !== 'summary') return false;
+      const summary = asRecord(block.summary);
+      const type = stringFrom(summary.type);
+      return type === 'message' || type === 'thread';
+    });
   }
 
   function shouldSkipInfoTranscriptMessage(message: NeoMessage) {

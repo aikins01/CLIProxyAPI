@@ -657,6 +657,31 @@ func TestNeoCompactionHistoryHonorsLatestSummaryBoundary(t *testing.T) {
 	}
 }
 
+func TestNeoCompactionHistorySupportsThreadSummaryBlocks(t *testing.T) {
+	messages := []neoMessage{
+		{ThreadID: "T-compaction-thread", MessageID: "M-old", Role: "user", Content: []any{map[string]any{"type": "text", "text": "old context"}}},
+		{ThreadID: "T-compaction-thread", MessageID: "M-summary", Role: "info", Content: []any{map[string]any{
+			"type": "summary",
+			"summary": map[string]any{
+				"type":   "thread",
+				"thread": "T-summary-source",
+			},
+		}}},
+		{ThreadID: "T-compaction-thread", MessageID: "M-new", Role: "user", Content: []any{map[string]any{"type": "text", "text": "new context"}}},
+	}
+
+	history := neoCompactionHistory(messages)
+	if len(history) != 2 {
+		t.Fatalf("compaction history length = %d, want 2: %#v", len(history), history)
+	}
+	if history[0].Role != "assistant" || history[0].Text != "Summary thread: T-summary-source" {
+		t.Fatalf("thread summary history prefix = %#v", history[0])
+	}
+	if strings.Contains(fmt.Sprint(history), "old context") {
+		t.Fatalf("thread summary compaction leaked transcript before summary: %#v", history)
+	}
+}
+
 func TestNeoRuntimeEditRerunAnnouncesInferenceBeforeCompaction(t *testing.T) {
 	dir := t.TempDir()
 	oldStoreDir := neoAmpThreadStoreDir
