@@ -944,6 +944,141 @@ func TestNeoRuntimeGatewayWebSocketGetOrCreate(t *testing.T) {
 	}
 }
 
+func TestNeoRuntimeGatewayWebSocketGetRehydratesPersistedLocalThread(t *testing.T) {
+	useTempNeoThreadStore(t)
+	threadID := "T-gateway-get-rehydrate"
+	if err := os.WriteFile(filepath.Join(neoAmpThreadStoreDir(), threadID+".json"), []byte(`{
+		"id":"`+threadID+`",
+		"agentMode":"deep",
+		"meta":{"cliProxyAPILocalNeo":true},
+		"messages":[{"role":"user","messageId":"M-0000000000000000000001","agentMode":"deep","content":[{"type":"text","text":"resume after restart"}]}]
+	}`), 0o600); err != nil {
+		t.Fatalf("write local thread: %v", err)
+	}
+
+	rt := newNeoRuntime(&config.Config{})
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	t.Cleanup(server.Close)
+
+	dialer := websocket.Dialer{Subprotocols: []string{"rivet", "rivet_encoding.4", "rivet_skip_ready_wait"}}
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/gateway/threadActor/?rvt-method=get&rvt-key=" + url.QueryEscape(threadID)
+	conn, resp, err := dialer.Dial(wsURL, nil)
+	if err != nil {
+		status := 0
+		if resp != nil {
+			status = resp.StatusCode
+		}
+		t.Fatalf("gateway websocket get dial failed status=%d err=%v", status, err)
+	}
+	defer conn.Close()
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+
+	for {
+		_, payload, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("read rehydrated snapshot: %v", err)
+		}
+		var msg map[string]any
+		if err := json.Unmarshal(payload, &msg); err != nil {
+			t.Fatalf("snapshot JSON error: %v", err)
+		}
+		if msg["type"] != "message_added" {
+			continue
+		}
+		message := mapValue(msg["message"])
+		if stringValue(message["messageId"]) != "M-0000000000000000000001" || !strings.Contains(fmt.Sprint(message["content"]), "resume after restart") {
+			t.Fatalf("rehydrated message = %#v", message)
+		}
+		break
+	}
+
+	actors := rt.store.findActors(url.Values{"name": []string{"threadActor"}, "key": []string{threadID}})
+	if len(actors) != 1 {
+		t.Fatalf("gateway actor count = %d, actors=%#v", len(actors), actors)
+	}
+}
+
+func TestNeoRuntimeGatewayWebSocketGetDoesNotCreateMissingThreadActor(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	t.Cleanup(server.Close)
+
+	dialer := websocket.Dialer{Subprotocols: []string{"rivet", "rivet_encoding.4", "rivet_skip_ready_wait"}}
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/gateway/threadActor/?rvt-method=get&rvt-key=T-missing-gateway-get"
+	conn, resp, err := dialer.Dial(wsURL, nil)
+	if conn != nil {
+		_ = conn.Close()
+	}
+	if err == nil {
+		t.Fatal("gateway websocket get unexpectedly created a missing thread actor")
+	}
+	if resp == nil || resp.StatusCode != http.StatusNotFound {
+		status := 0
+		if resp != nil {
+			status = resp.StatusCode
+		}
+		t.Fatalf("gateway websocket get missing status = %d err=%v, want 404", status, err)
+	}
+}
+
+func TestNeoRuntimeGatewayWebSocketGetAllowsExecutorReconnectForPersistedThread(t *testing.T) {
+	useTempNeoThreadStore(t)
+	threadID := "T-gateway-get-executor"
+	if err := os.WriteFile(filepath.Join(neoAmpThreadStoreDir(), threadID+".json"), []byte(`{
+		"id":"`+threadID+`",
+		"agentMode":"smart",
+		"meta":{"cliProxyAPILocalNeo":true},
+		"messages":[{"role":"user","messageId":"M-0000000000000000000001","agentMode":"smart","content":[{"type":"text","text":"executor reconnect"}]}]
+	}`), 0o600); err != nil {
+		t.Fatalf("write local thread: %v", err)
+	}
+
+	rt := newNeoRuntime(&config.Config{})
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	t.Cleanup(server.Close)
+
+	dialer := websocket.Dialer{Subprotocols: []string{"rivet", "rivet_conn_params.%7B%22transport%22%3A%22json-rpc%22%7D", "rivet_encoding.4", "rivet_skip_ready_wait"}}
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/gateway/threadActor/?rvt-method=get&rvt-key=" + url.QueryEscape(threadID)
+	conn, resp, err := dialer.Dial(wsURL, nil)
+	if err != nil {
+		status := 0
+		if resp != nil {
+			status = resp.StatusCode
+		}
+		t.Fatalf("gateway websocket get executor dial failed status=%d err=%v", status, err)
+	}
+	defer conn.Close()
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+
+	if err := conn.WriteJSON(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      "req-1",
+		"method":  "executor_connect",
+		"params": map[string]any{
+			"clientId":     "executor-after-restart",
+			"executorType": "local-client",
+		},
+	}); err != nil {
+		t.Fatalf("write executor_connect: %v", err)
+	}
+
+	for {
+		var frame map[string]any
+		if err := conn.ReadJSON(&frame); err != nil {
+			t.Fatalf("read executor reconnect frame: %v", err)
+		}
+		if frame["method"] != "executor_connected" {
+			continue
+		}
+		params := mapValue(frame["params"])
+		if params["executorId"] != "executor-after-restart" {
+			t.Fatalf("executor_connected params = %#v", params)
+		}
+		return
+	}
+}
+
 func TestNeoRuntimeGatewayWebSocketJSONRPCTransport(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))

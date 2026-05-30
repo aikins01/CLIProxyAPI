@@ -844,7 +844,13 @@ func (s *neoActorStore) actorForGatewayRequest(r *http.Request) *neoActor {
 	}
 	s.mu.RUnlock()
 
-	if !strings.EqualFold(q.Get("rvt-method"), "getOrCreate") || target == "" || key == "" {
+	method := strings.TrimSpace(q.Get("rvt-method"))
+	if strings.EqualFold(method, "get") {
+		if actor := s.persistedThreadActorForGatewayTarget(target, key); actor != nil {
+			return actor
+		}
+	}
+	if !strings.EqualFold(method, "getOrCreate") || target == "" || key == "" {
 		return nil
 	}
 	body := map[string]any{"name": target, "key": key}
@@ -855,6 +861,47 @@ func (s *neoActorStore) actorForGatewayRequest(r *http.Request) *neoActor {
 	}
 	actor, _ := s.upsert(body, true)
 	return actor
+}
+
+func (s *neoActorStore) persistedThreadActorForGatewayTarget(target, key string) *neoActor {
+	if s == nil || !neoGatewayThreadActorTarget(target) {
+		return nil
+	}
+	threadID := neoThreadIDFromGatewayKey(key)
+	if threadID == "" {
+		return nil
+	}
+	thread, ok := loadNeoThread(threadID)
+	if !ok || len(thread) == 0 {
+		return nil
+	}
+	actor := s.ensureThreadActor(threadID)
+	actor.mu.Lock()
+	hydrated := actor.hasLocalThreadStateLocked()
+	actor.mu.Unlock()
+	if hydrated {
+		return actor
+	}
+	if err := actor.importThreadLocalOnly(thread); err != nil {
+		log.Debugf("amp neo local runtime gateway get import failed thread=%s: %v", threadID, err)
+		s.delete(actor.id)
+		return nil
+	}
+	return actor
+}
+
+func neoGatewayThreadActorTarget(target string) bool {
+	return target == "threadActor" || target == "thread-actor"
+}
+
+func neoThreadIDFromGatewayKey(key string) string {
+	for _, part := range strings.Split(key, ",") {
+		part = strings.TrimSpace(part)
+		if neoThreadIDExactPattern.MatchString(part) {
+			return part
+		}
+	}
+	return ""
 }
 
 func neoGatewayTargetFromPath(path string) string {
