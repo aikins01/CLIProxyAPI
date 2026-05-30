@@ -1434,6 +1434,69 @@ func TestNeoRuntimeGatewayWebSocketJSONRPCTransport(t *testing.T) {
 	}
 }
 
+func TestNeoRuntimeGatewayWebSocketJSONRPCSpawnExecutorReturnsStatus(t *testing.T) {
+	missingCommand := filepath.Join(t.TempDir(), "missing-amp")
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{ExecutorCommand: missingCommand}}})
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	t.Cleanup(server.Close)
+
+	threadID := "T-019e6541-06ae-75d7-b10e-d893170fa62c"
+	dialer := websocket.Dialer{Subprotocols: []string{"rivet", "rivet_conn_params.%7B%22transport%22%3A%22json-rpc%22%7D", "rivet_encoding.4", "rivet_skip_ready_wait"}}
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/gateway/threadActor/?rvt-method=getOrCreate&rvt-key=" + url.QueryEscape(threadID)
+	conn, resp, err := dialer.Dial(wsURL, nil)
+	if err != nil {
+		status := 0
+		if resp != nil {
+			status = resp.StatusCode
+		}
+		t.Fatalf("gateway websocket dial failed status=%d err=%v", status, err)
+	}
+	defer conn.Close()
+
+	if err := conn.WriteJSON(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      "spawn-1",
+		"method":  "client_spawn_executor",
+		"params":  map[string]any{"requestId": "spawn-jsonrpc"},
+	}); err != nil {
+		t.Fatalf("write jsonrpc client_spawn_executor: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		_ = conn.SetReadDeadline(time.Now().Add(time.Until(deadline)))
+		_, payload, err := conn.ReadMessage()
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				break
+			}
+			t.Fatalf("read jsonrpc spawn frame: %v", err)
+		}
+		var frame map[string]any
+		if err := json.Unmarshal(payload, &frame); err != nil {
+			t.Fatalf("jsonrpc spawn frame JSON error: %v", err)
+		}
+		if _, hasRawType := frame["type"]; hasRawType {
+			t.Fatalf("jsonrpc websocket received raw protocol frame: %#v", frame)
+		}
+		if frame["id"] != "spawn-1" {
+			continue
+		}
+		result := mapValue(frame["result"])
+		if result["type"] != "executor_status" {
+			t.Fatalf("spawn response result = %#v, want executor_status", result)
+		}
+		if result["status"] != "failed" {
+			t.Fatalf("spawn response status = %#v, want failed: %#v", result["status"], result)
+		}
+		if result["spawnId"] != "spawn-jsonrpc" {
+			t.Fatalf("spawn response spawnId = %#v, want spawn-jsonrpc: %#v", result["spawnId"], result)
+		}
+		return
+	}
+	t.Fatal("timed out waiting for jsonrpc client_spawn_executor response")
+}
+
 func TestNeoRuntimeGatewayWebSocketJSONRPCSkipReadyWaitSubprotocolDefersSnapshot(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	threadID := "T-jsonrpc-skip-ready-subprotocol"

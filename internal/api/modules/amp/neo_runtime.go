@@ -926,9 +926,9 @@ func (rt *neoRuntime) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			if hook != nil {
 				hook(actor, cloneMap(msg))
 			}
-			actor.handleForSocket(socket, msg)
+			result := actor.handleForSocket(socket, msg)
 			if hasRequestID {
-				socket.sendJSONRPCResponse(requestID, nil)
+				socket.sendJSONRPCResponse(requestID, result)
 			}
 		}
 	}
@@ -1698,7 +1698,7 @@ func (a *neoActor) handle(msg map[string]any) {
 	a.handleForSocket(nil, msg)
 }
 
-func (a *neoActor) handleForSocket(socket *neoSocket, msg map[string]any) {
+func (a *neoActor) handleForSocket(socket *neoSocket, msg map[string]any) any {
 	a.touch()
 	msgType := stringValue(msg["type"])
 	log.Debugf("amp neo local runtime WS recv %s", msgType)
@@ -1707,10 +1707,10 @@ func (a *neoActor) handleForSocket(socket *neoSocket, msg map[string]any) {
 	case "client_resume":
 		version, ok := neoClientNumber(msg["version"])
 		if !ok {
-			return
+			return nil
 		}
 		if version <= 0 && socket != nil && socket.hasSnapshotSent() {
-			return
+			return nil
 		}
 		a.sendSnapshot(socket, version)
 		if socket != nil {
@@ -1739,7 +1739,7 @@ func (a *neoActor) handleForSocket(socket *neoSocket, msg map[string]any) {
 	case "executor_tools_bootstrap_complete":
 		a.executorToolsBootstrapComplete(msg)
 	case "executor_tool_lease_ack":
-		return
+		return nil
 	case "executor_connected":
 		a.executorConnected(msg)
 	case "executor_disconnected":
@@ -1962,7 +1962,7 @@ func (a *neoActor) handleForSocket(socket *neoSocket, msg map[string]any) {
 		}
 	case "client_spawn_executor":
 		if payload, ok := normalizeNeoClientSpawnExecutor(msg); ok {
-			a.spawnExecutor(payload)
+			return a.spawnExecutor(payload)
 		}
 	case "client_append_manual_bash_invocation":
 		a.appendManualBashInvocation(msg)
@@ -1983,6 +1983,7 @@ func (a *neoActor) handleForSocket(socket *neoSocket, msg map[string]any) {
 	default:
 		log.Debugf("amp neo local runtime ignored message %s", msgType)
 	}
+	return nil
 }
 
 func (a *neoActor) updateSettings(settings map[string]any) {
@@ -2782,7 +2783,7 @@ func normalizeNeoClientAdditionalRepository(repo map[string]any) (map[string]any
 	return out, true
 }
 
-func (a *neoActor) spawnExecutor(msg map[string]any) {
+func (a *neoActor) spawnExecutor(msg map[string]any) map[string]any {
 	spawnID := firstNonEmptyString(msg["spawnId"], msg["requestId"])
 	if spawnID == "" {
 		spawnID = "spawn-" + randomBase62(12)
@@ -2806,23 +2807,19 @@ func (a *neoActor) spawnExecutor(msg map[string]any) {
 	a.mu.Unlock()
 
 	if !neoThreadIDExactPattern.MatchString(threadID) {
-		a.broadcastExecutorStatus(spawnID, "failed", "Cannot spawn Amp headless executor without a valid thread ID.", map[string]any{"reasonCode": "environment_missing"})
-		return
+		return a.broadcastExecutorStatus(spawnID, "failed", "Cannot spawn Amp headless executor without a valid thread ID.", map[string]any{"reasonCode": "environment_missing"})
 	}
 	if ready {
-		a.broadcastExecutorStatus(spawnID, "running", "Executor is already connected.", map[string]any{"reasonCode": "executor_connected", "executorId": executorID})
-		return
+		return a.broadcastExecutorStatus(spawnID, "running", "Executor is already connected.", map[string]any{"reasonCode": "executor_connected", "executorId": executorID})
 	}
 	if existing != nil {
-		a.broadcastExecutorStatus(spawnID, "running", "Headless executor is already starting for this thread.", map[string]any{"reasonCode": "waiting_for_executor_connect", "pid": existing.pid(), "threadId": threadID})
-		return
+		return a.broadcastExecutorStatus(spawnID, "running", "Headless executor is already starting for this thread.", map[string]any{"reasonCode": "waiting_for_executor_connect", "pid": existing.pid(), "threadId": threadID})
 	}
 
 	cfg := a.runtime.configSnapshot()
 	command, err := neoAmpExecutorCommand(cfg)
 	if err != nil {
-		a.broadcastExecutorStatus(spawnID, "failed", err.Error(), map[string]any{"reasonCode": "spawn_failed"})
-		return
+		return a.broadcastExecutorStatus(spawnID, "failed", err.Error(), map[string]any{"reasonCode": "spawn_failed"})
 	}
 
 	workDir := neoHeadlessWorkingDirectory(neoHeadlessExecutorSpawnOptions(msg), environment)
@@ -2857,8 +2854,7 @@ func (a *neoActor) spawnExecutor(msg map[string]any) {
 		if logFile != nil {
 			_ = logFile.Close()
 		}
-		a.broadcastExecutorStatus(spawnID, "failed", "Failed to start local Amp headless executor: "+err.Error(), map[string]any{"reasonCode": "spawn_failed", "command": command, "args": args})
-		return
+		return a.broadcastExecutorStatus(spawnID, "failed", "Failed to start local Amp headless executor: "+err.Error(), map[string]any{"reasonCode": "spawn_failed", "command": command, "args": args})
 	}
 
 	spawned := &neoSpawnedExecutor{
@@ -2876,9 +2872,10 @@ func (a *neoActor) spawnExecutor(msg map[string]any) {
 	a.spawnedExecutors[spawnID] = spawned
 	a.mu.Unlock()
 
-	a.broadcastExecutorStatus(spawnID, "running", "Waiting for local Amp headless executor to connect.", map[string]any{"reasonCode": "waiting_for_executor_connect", "pid": spawned.pid(), "threadId": threadID, "logFile": omitEmpty(logPath)})
+	status := a.broadcastExecutorStatus(spawnID, "running", "Waiting for local Amp headless executor to connect.", map[string]any{"reasonCode": "waiting_for_executor_connect", "pid": spawned.pid(), "threadId": threadID, "logFile": omitEmpty(logPath)})
 	go a.waitSpawnedExecutor(spawnID, spawned, logFile)
 	go a.watchSpawnedExecutorConnectTimeout(spawnID, spawned, neoExecutorConnectTimeout(cfg))
+	return status
 }
 
 func neoHeadlessExecutorSpawnOptions(msg map[string]any) map[string]any {
@@ -2962,14 +2959,16 @@ func neoExecutorConnectTimeout(cfg *config.Config) time.Duration {
 	return defaultNeoExecutorConnectTimeout
 }
 
-func (a *neoActor) broadcastExecutorStatus(spawnID, status, message string, details map[string]any) {
-	a.broadcast(normalizeNeoExecutorStatus(map[string]any{
+func (a *neoActor) broadcastExecutorStatus(spawnID, status, message string, details map[string]any) map[string]any {
+	payload := normalizeNeoExecutorStatus(map[string]any{
 		"type":    "executor_status",
 		"spawnId": spawnID,
 		"status":  status,
 		"message": message,
 		"details": details,
-	}))
+	})
+	a.broadcast(payload)
+	return payload
 }
 
 func (a *neoActor) updateEnvironment(environment map[string]any) {
