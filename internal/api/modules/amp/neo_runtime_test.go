@@ -589,6 +589,84 @@ func TestNeoRuntimeAutoCompactsLargeLocalHistory(t *testing.T) {
 	}
 }
 
+func TestNeoRuntimeSkipsAutoCompactionAfterImportedRecordCut(t *testing.T) {
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"should not compact"}}]}`))
+	}))
+	t.Cleanup(upstream.Close)
+	parsed, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+	_, portString, err := net.SplitHostPort(parsed.Host)
+	if err != nil {
+		t.Fatalf("parse upstream host: %v", err)
+	}
+	port, err := strconv.Atoi(portString)
+	if err != nil {
+		t.Fatalf("parse upstream port: %v", err)
+	}
+
+	enabled := true
+	rt := newNeoRuntime(&config.Config{
+		Host: "127.0.0.1",
+		Port: port,
+		AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
+			Enabled:         &enabled,
+			CompactionModel: "openai/gpt-5.4",
+		}},
+	})
+	threadID := "T-record-cut-compact"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+	actor.settings["internal.compactionThresholdPercent"] = 0
+	longText := strings.Repeat("already compacted context ", 300)
+	actor.mu.Lock()
+	for i := 0; i < 30; i++ {
+		role := "user"
+		if i%2 == 1 {
+			role = "assistant"
+		}
+		actor.storeMessageLocked(neoMessage{ThreadID: threadID, MessageID: fmt.Sprintf("M-%022d", i), Role: role, Content: []any{map[string]any{"type": "text", "text": fmt.Sprintf("message %02d %s", i, longText)}}})
+	}
+	actor.compactionRecords = []map[string]any{{"cutMessageId": "M-0000000000000000000022", "createdAt": "2026-05-30T00:00:00Z"}}
+	actor.rebuildHistoryLocked()
+	generation := actor.generation
+	actor.mu.Unlock()
+
+	actor.maybeCompactBeforeInference("smart", "medium", "", generation)
+
+	if calls != 0 {
+		t.Fatalf("compaction calls = %d, want 0 because latest binary cut record bounds the compacted window", calls)
+	}
+}
+
+func TestNeoCompactionWindowUsesLatestBinaryCutRecord(t *testing.T) {
+	messages := make([]neoMessage, 0, 30)
+	for i := 0; i < 30; i++ {
+		role := "user"
+		if i%2 == 1 {
+			role = "assistant"
+		}
+		messages = append(messages, neoMessage{ThreadID: "T-compaction-record-window", MessageID: fmt.Sprintf("M-%022d", i), Role: role, Content: []any{map[string]any{"type": "text", "text": fmt.Sprintf("message %02d", i)}}})
+	}
+	window, offset := neoCompactionWindow(messages, []map[string]any{{"cutMessageId": "M-0000000000000000000022", "createdAt": "2026-05-30T00:00:00Z"}})
+	if offset != 22 || len(window) != 8 || window[0].MessageID != "M-0000000000000000000022" {
+		t.Fatalf("record-bounded window offset=%d len=%d first=%q, want offset 22 len 8 starting at cut", offset, len(window), window[0].MessageID)
+	}
+
+	summary := neoCompactionSummaryMessage("T-compaction-record-window", "older summary")
+	withSummary := append([]neoMessage{}, messages[:12]...)
+	withSummary = append(withSummary, summary)
+	withSummary = append(withSummary, messages[12:]...)
+	window, offset = neoCompactionWindow(withSummary, []map[string]any{{"cutMessageId": "M-0000000000000000000024", "createdAt": "2026-05-30T00:00:00Z"}})
+	if offset != 25 || len(window) != 6 || window[0].MessageID != "M-0000000000000000000024" {
+		t.Fatalf("latest record should win over older summary: offset=%d len=%d first=%q", offset, len(window), window[0].MessageID)
+	}
+}
+
 func TestNeoCompactionThresholdPercentSettingMatchesBinary(t *testing.T) {
 	shortHistory := []neoMessage{
 		{ThreadID: "T-threshold", MessageID: "M-0000000000000000000000", Role: "user", Content: []any{map[string]any{"type": "text", "text": "short"}}},

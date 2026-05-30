@@ -5783,7 +5783,7 @@ func (a *neoActor) maybeCompactBeforeInference(agentMode, reasoningEffort, paren
 		return
 	}
 	settings := cloneMap(a.settings)
-	compactionMessagesWindow, compactionOffset := neoCompactionWindow(a.messages)
+	compactionMessagesWindow, compactionOffset := neoCompactionWindow(a.messages, a.compactionRecords)
 	inferenceRoute := applyNeoModelMapping(a.runtime, selectNeoModelRoute(agentMode, settings))
 	maxInput := neoEffectiveMaxInputTokens(agentMode, inferenceRoute.Model)
 	if maxInput <= 0 {
@@ -5892,14 +5892,39 @@ func neoCompactionThresholdPercent(settings map[string]any) float64 {
 	return percent
 }
 
-func neoCompactionWindow(messages []neoMessage) ([]neoMessage, int) {
+func neoCompactionWindow(messages []neoMessage, records []map[string]any) ([]neoMessage, int) {
+	start := 0
 	if cutIndex, _, ok := neoCompactionSummary(messages); ok {
-		start := cutIndex + 1
-		if start >= 0 && start <= len(messages) {
-			return messages[start:], start
-		}
+		start = cutIndex + 1
+	}
+	if recordIndex, ok := neoLatestCompactionRecordMessageIndex(messages, records); ok && recordIndex > start {
+		start = recordIndex
+	}
+	if start > 0 && start <= len(messages) {
+		return messages[start:], start
 	}
 	return messages, 0
+}
+
+func neoLatestCompactionRecordMessageIndex(messages []neoMessage, records []map[string]any) (int, bool) {
+	if len(messages) == 0 || len(records) == 0 {
+		return 0, false
+	}
+	cutIDs := map[string]struct{}{}
+	for _, record := range records {
+		if cutID := protocolMessageIDValue(record["cutMessageId"]); cutID != "" {
+			cutIDs[cutID] = struct{}{}
+		}
+	}
+	if len(cutIDs) == 0 {
+		return 0, false
+	}
+	for index := len(messages) - 1; index >= 0; index-- {
+		if _, ok := cutIDs[messages[index].MessageID]; ok {
+			return index, true
+		}
+	}
+	return 0, false
 }
 
 func neoEstimateMessageTokens(messages []neoMessage) int {
