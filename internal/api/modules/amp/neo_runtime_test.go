@@ -11687,6 +11687,58 @@ func TestNeoLocalThreadLoadCancelsStaleLocalCurrentInference(t *testing.T) {
 	if stringValue(mapValue(persistedAssistant["state"])["type"]) != "cancelled" {
 		t.Fatalf("persisted assistant state = %#v, want cancelled", persistedAssistant["state"])
 	}
+	if _, exists := persisted["pendingInference"]; exists {
+		t.Fatalf("pendingInference was created without compaction marker: %#v", persisted["pendingInference"])
+	}
+}
+
+func TestNeoLocalThreadLoadPromotesCompactionCheckedCurrentInference(t *testing.T) {
+	useTempNeoThreadStore(t)
+	threadID := "T-019e6541-06ae-75d7-b10e-d893170fa62c"
+	raw := []byte(`{
+		"id": "` + threadID + `",
+		"agentMode": "deep",
+		"meta": {"cliProxyAPILocalNeo": true},
+		"messages": [
+			{"messageId": "M-user", "role": "user", "content": [{"type": "text", "text": "hello"}]},
+			{"messageId": "M-assistant", "role": "assistant", "state": {"type": "streaming"}, "content": [{"type": "text", "text": "partial"}]}
+		],
+		"currentInference": {"messageId": "M-assistant", "agentMode": "deep", "reasoningEffort": "xhigh", "tools": ["shell_command"], "preflightCompactionChecked": true}
+	}`)
+	path := filepath.Join(neoAmpThreadStoreDir(), threadID+".json")
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatalf("write thread: %v", err)
+	}
+
+	thread, ok := loadNeoLocalThread(threadID)
+	if !ok {
+		t.Fatal("thread was not loaded")
+	}
+	if _, exists := thread["currentInference"]; exists {
+		t.Fatalf("currentInference was not dropped: %#v", thread["currentInference"])
+	}
+	pending := mapValue(thread["pendingInference"])
+	if stringValue(pending["agentMode"]) != "deep" || stringValue(pending["reasoningEffort"]) != "xhigh" || !boolValue(pending["preflightCompactionChecked"]) {
+		t.Fatalf("pendingInference = %#v, want deep/xhigh with preflight marker", pending)
+	}
+	messages := arrayValue(thread["messages"])
+	assistant := mapValue(messages[1])
+	if stringValue(mapValue(assistant["state"])["type"]) != "cancelled" {
+		t.Fatalf("assistant state = %#v, want cancelled", assistant["state"])
+	}
+
+	persistedRaw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read persisted thread: %v", err)
+	}
+	var persisted map[string]any
+	if err := json.Unmarshal(persistedRaw, &persisted); err != nil {
+		t.Fatalf("decode persisted thread: %v", err)
+	}
+	persistedPending := mapValue(persisted["pendingInference"])
+	if !boolValue(persistedPending["preflightCompactionChecked"]) {
+		t.Fatalf("persisted pendingInference = %#v, want preflight marker", persistedPending)
+	}
 }
 
 func TestNeoLocalThreadLoadRemovesEmptyStaleLocalCurrentInference(t *testing.T) {
@@ -11858,6 +11910,23 @@ func TestNeoActorThreadSnapshotDropsStaleCurrentInference(t *testing.T) {
 	}
 	if thread := neoCloudThread(snapshot); thread["currentInference"] != nil {
 		t.Fatalf("cloud thread retained currentInference: %#v", thread["currentInference"])
+	}
+}
+
+func TestNeoActorThreadSnapshotPreservesCurrentInferenceCompactionMarker(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	actor.messages = []neoMessage{{ThreadID: "T-test", MessageID: "M-assistant", Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "partial"}}, State: map[string]any{"type": "streaming"}, Seq: 1}}
+	actor.currentInference = &neoInferenceInflight{messageID: "M-assistant", agentMode: "deep", reasoningEffort: "xhigh", tools: []string{"shell_command"}, preflightCompactionChecked: true}
+
+	snapshot, ok := actor.threadSnapshot()
+	if !ok {
+		t.Fatal("snapshot failed")
+	}
+	thread := neoCloudThread(snapshot)
+	inference := mapValue(thread["currentInference"])
+	if !boolValue(inference["preflightCompactionChecked"]) {
+		t.Fatalf("currentInference = %#v, want preflight marker", inference)
 	}
 }
 

@@ -8263,6 +8263,9 @@ func normalizeNeoThreadCurrentInference(thread map[string]any) bool {
 		delete(thread, "currentInference")
 		changed = true
 	} else if neoThreadHasLocalRuntimeMarker(thread) {
+		if normalizeNeoThreadPendingInferenceFromCurrent(thread, inference) {
+			changed = true
+		}
 		if normalizeNeoThreadStaleCurrentInferenceMessage(thread, messageID) {
 			changed = true
 		}
@@ -8270,6 +8273,24 @@ func normalizeNeoThreadCurrentInference(thread map[string]any) bool {
 		changed = true
 	}
 	return changed
+}
+
+func normalizeNeoThreadPendingInferenceFromCurrent(thread, inference map[string]any) bool {
+	if len(thread) == 0 || len(inference) == 0 {
+		return false
+	}
+	if len(mapValue(thread["pendingInference"])) > 0 {
+		return false
+	}
+	if !boolValue(firstNonNil(inference["preflightCompactionChecked"], inference["compactionChecked"])) {
+		return false
+	}
+	pending := cloneMap(inference)
+	if len(pending) == 0 {
+		return false
+	}
+	thread["pendingInference"] = pending
+	return true
 }
 
 func normalizeNeoThreadStaleCurrentInferenceMessage(thread map[string]any, messageID string) bool {
@@ -8568,17 +8589,7 @@ func neoCloudThread(snapshot neoCloudThreadSnapshot) map[string]any {
 		thread["~debug"] = cloneMap(snapshot.debug)
 	}
 	if snapshot.currentInference != nil && neoMessagesContainID(messages, snapshot.currentInference.messageID) {
-		toolsList := make([]any, 0, len(snapshot.currentInference.tools))
-		for _, name := range snapshot.currentInference.tools {
-			toolsList = append(toolsList, name)
-		}
-		thread["currentInference"] = map[string]any{
-			"messageId":        snapshot.currentInference.messageID,
-			"agentMode":        snapshot.currentInference.agentMode,
-			"reasoningEffort":  snapshot.currentInference.reasoningEffort,
-			"parentToolCallId": snapshot.currentInference.parentToolCallID,
-			"tools":            toolsList,
-		}
+		thread["currentInference"] = neoInferenceInflightThreadMap(snapshot.currentInference)
 	}
 	return thread
 }
