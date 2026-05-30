@@ -118,7 +118,7 @@ var (
 		"smart":    toolSet("Read", "finder", "Bash", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource"),
 		"large":    toolSet("Read", "finder", "Bash", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource"),
 		"rush":     toolSet("finder", "shell_command", "apply_patch", "web_search", "read_web_page", "read_mcp_resource", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "painter"),
-		"agg-man":  toolSet("find_thread", "read_thread", "web_search", "read_web_page", "docs_list", "docs_read", "docs_write", "render_agg_man", "create_project", "create_thread", "archive_thread", "unarchive_thread", "send_message_to_thread", "slack_write", "slack_read", "github_repo_ci_status", "read_github", "search_github", "commit_search", "list_directory_github", "list_repositories", "glob_github", "diff"),
+		"agg-man":  toolSet("find_thread", "read_thread", "web_search", "read_web_page", "docs_list", "docs_read", "docs_write", "render_agg_man", "create_project", "create_thread", "archive_thread", "archive_threads", "unarchive_thread", "send_message_to_thread", "slack_write", "slack_read", "github_repo_ci_status", "read_github", "search_github", "commit_search", "list_directory_github", "list_repositories", "glob_github", "diff"),
 		"deep":     toolSet("shell_command", "apply_patch", "web_search", "read_web_page", "chart", "Task", "skill", "read_thread", "find_thread", "librarian", "oracle", "finder", "view_media", "painter", "send_message_to_aggman"),
 		"nostromo": toolSet("Read", "finder", "Bash", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "apply_patch", "shell_command", "chart", "send_message_to_aggman"),
 	}
@@ -132,7 +132,7 @@ var (
 		"web_search", "read_web_page", "read_mcp_resource", "chart", "read_thread", "find_thread", "skill", "oracle",
 		"librarian", "Task", "view_media", "painter",
 		"shell_command", "apply_patch", "send_message_to_aggman", "code_review", "docs_list", "docs_read", "docs_write",
-		"render_agg_man", "create_project", "create_thread", "archive_thread", "unarchive_thread", "send_message_to_thread",
+		"render_agg_man", "create_project", "create_thread", "archive_thread", "archive_threads", "unarchive_thread", "send_message_to_thread",
 		"slack_write", "slack_read", "github_repo_ci_status", "read_github", "search_github", "commit_search",
 		"list_directory_github", "list_repositories", "glob_github", "diff",
 	)
@@ -14030,7 +14030,7 @@ func neoBuiltinDeferredToolSpec(name string) neoToolSpec {
 func neoCodeReviewToolSpec() neoToolSpec {
 	return neoToolSpec{
 		Name:        "code_review",
-		Description: "Review code changes, diffs, outstanding changes, or modified files. Use when asked to review changes, check code quality, analyze uncommitted work, or perform a code review.",
+		Description: "Review code changes, diffs, outstanding changes, or modified files. Use when asked to review changes, check code quality, analyze uncommitted work, or perform a code review.\nIt takes in a description of the diff or code change that can be used to generate the full diff, which is then reviewed. When using this tool, do not invoke `git diff` or any other tool to generate the diff but just pass a natural language description of how to compute the diff in the diff_description argument.\nPass \"thinking\": \"high\" for a thorough review with high reasoning depth. Defaults to \"low\" for a faster review.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -21403,10 +21403,24 @@ func runToText(run any) string {
 		if text := neoToolRunTextResult(result); text != "" {
 			return text
 		}
+		if neoStructuredToolResult(result) {
+			if raw, err := json.Marshal(result); err == nil {
+				return string(raw)
+			}
+		}
 		return fmt.Sprint(result)
 	}
 	raw, _ := json.Marshal(m)
 	return string(raw)
+}
+
+func neoStructuredToolResult(result any) bool {
+	switch result.(type) {
+	case map[string]any, []any, []map[string]any:
+		return true
+	default:
+		return false
+	}
 }
 
 func neoCancelledToolRunText(run map[string]any) string {

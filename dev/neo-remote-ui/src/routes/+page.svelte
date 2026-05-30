@@ -3668,6 +3668,11 @@
     return n === 'codereview' || n.includes('codereview');
   }
 
+  function isThreadExploreToolName(name: string) {
+    const n = normalizedToolName(name);
+    return n.includes('readthread') || n.includes('findthread') || n.includes('searchthread') || n.includes('threadsearch');
+  }
+
   function toolCategory(name: string): ToolCategory {
     const n = normalizedToolName(name);
     // Order matters — check most specific first
@@ -3678,7 +3683,7 @@
     if (n.includes('subagent') || n === 'task' || n === 'agent' || n.includes('spawn')) return 'task';
     if (n.includes('web')) return 'web';
     // Thread reads/searches aggregate into the Explored summary (matches ampcode's "Explored N threads/searches")
-    if (n.includes('thread') || n.includes('skill') || n.includes('search') || n.includes('grep') || n.includes('ripgrep')) return 'explore';
+    if (isThreadExploreToolName(name) || n.includes('skill') || n.includes('search') || n.includes('grep') || n.includes('ripgrep')) return 'explore';
     if (n.includes('read') || n.includes('view') || n === 'cat') return 'explore';
     if (n.includes('list') || n.includes('glob') || n.includes('find') || n === 'tree' || n === 'ls' || n.includes('explore') || n.includes('directory')) return 'explore';
     return 'other';
@@ -3704,7 +3709,6 @@
     const n = normalizedToolName(name);
     if (n.includes('findthread') || n.includes('searchthread') || n.includes('threadsearch')) return 'search';
     if (n.includes('readthread')) return 'thread';
-    if (n.includes('thread')) return 'thread';
     if (n.includes('search') || n.includes('grep') || n.includes('ripgrep')) return 'search';
     if (n.includes('list') || n.includes('glob') || n.includes('find') || n === 'tree' || n === 'ls' || n.includes('directory')) return 'list';
     if (n.includes('skill')) return 'skill';

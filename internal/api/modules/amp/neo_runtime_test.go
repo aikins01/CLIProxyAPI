@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"sort"
 	"strconv"
@@ -7691,6 +7692,7 @@ func TestNeoActorFiltersAmpBuiltInToolsByMode(t *testing.T) {
 		"docs_read":              {Name: "docs_read"},
 		"render_agg_man":         {Name: "render_agg_man"},
 		"diff":                   {Name: "diff"},
+		"archive_threads":        {Name: "archive_threads"},
 		"tb__gemini-oracle":      {Name: "tb__gemini-oracle", Meta: map[string]any{"source": map[string]any{"toolbox": "/tmp/oracle"}}},
 		"code_review":            {Name: "code_review", Meta: map[string]any{"deferred": true}},
 		"deferred_custom":        {Name: "deferred_custom", Meta: map[string]any{"deferred": true}},
@@ -7752,7 +7754,7 @@ func TestNeoActorFiltersAmpBuiltInToolsByMode(t *testing.T) {
 
 	aggNames := requestNames("agg-man")
 	assertMode("agg-man", aggNames,
-		[]string{"read_thread", "web_search", "docs_read", "render_agg_man", "diff", "tb__gemini-oracle"},
+		[]string{"read_thread", "web_search", "docs_read", "render_agg_man", "diff", "archive_threads", "tb__gemini-oracle"},
 		[]string{"Read", "Grep", "glob", "Glob", "Task", "shell_command", "chart", "view_media", "todo_write", "file_tree", "delete_file", "search_documents", "get_document", "code_review", "deferred_custom"})
 
 	nostromoNames := requestNames("nostromo")
@@ -7886,6 +7888,11 @@ func TestNeoLoadedCodeReviewSkillAddsBuiltinDeferredToolLikeBinary(t *testing.T)
 	}
 	if _, ok := codeReview.InputSchema["properties"].(map[string]any); !ok {
 		t.Fatalf("code_review input schema missing properties: %#v", codeReview.InputSchema)
+	}
+	for _, want := range []string{"do not invoke `git diff`", `Pass "thinking": "high"`} {
+		if !strings.Contains(codeReview.Description, want) {
+			t.Fatalf("code_review description missing %q: %s", want, codeReview.Description)
+		}
 	}
 
 	names := map[string]bool{}
@@ -11992,6 +11999,118 @@ func TestNeoActorBinaryToolDataStoresRawImageRun(t *testing.T) {
 	}
 }
 
+func TestNeoActorBinaryCodeReviewToolDataPreservesCheckRun(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	actor.messages = []neoMessage{{
+		ThreadID:  "T-test",
+		MessageID: "M-assistant",
+		Role:      "assistant",
+		Content: []any{map[string]any{
+			"type": "tool_use",
+			"id":   "TU-review",
+			"name": "code_review",
+			"input": map[string]any{
+				"diff_description": "Review uncommitted changes.",
+				"checkFilter":      []any{"repo-convention-fit"},
+				"thinking":         "high",
+			},
+		}},
+		State: map[string]any{"type": "complete", "stopReason": "tool_use"},
+		Seq:   1,
+	}}
+	actor.rebuildHistoryLocked()
+
+	progressRun := map[string]any{
+		"status": "in-progress",
+		"result": map[string]any{
+			"main": map[string]any{"status": "in-progress"},
+			"checks": map[string]any{
+				"builtin:///checks/repo-convention-fit.md": map[string]any{"status": "in-progress", "message": "Running check..."},
+			},
+		},
+		"progress": map[string]any{"output": "Main review running\nCheck repo-convention-fit: running\n"},
+	}
+	actor.handle(map[string]any{"type": "tool:data", "toolUse": "TU-review", "data": progressRun})
+
+	actor.mu.Lock()
+	if len(actor.messages) != 2 {
+		actor.mu.Unlock()
+		t.Fatalf("messages after progress = %#v", actor.messages)
+	}
+	progressMessage := actor.messages[1]
+	if progressMessage.CompletionStatus != "tool_progress" {
+		actor.mu.Unlock()
+		t.Fatalf("progress completion status = %q", progressMessage.CompletionStatus)
+	}
+	progressBlock := mapValue(progressMessage.Content[0])
+	if !reflect.DeepEqual(mapValue(progressBlock["run"]), progressRun) {
+		actor.mu.Unlock()
+		t.Fatalf("progress run changed: %#v", progressBlock["run"])
+	}
+	if len(actor.history) != 1 {
+		actor.mu.Unlock()
+		t.Fatalf("progress leaked into history: %#v", actor.history)
+	}
+	actor.mu.Unlock()
+
+	finalRun := map[string]any{
+		"status": "done",
+		"result": map[string]any{
+			"main": map[string]any{
+				"status": "done",
+				"review": map[string]any{"comments": []any{}},
+			},
+			"checks": map[string]any{
+				"builtin:///checks/repo-convention-fit.md": map[string]any{
+					"status": "done",
+					"result": map[string]any{
+						"check": map[string]any{"name": "repo-convention-fit"},
+						"result": map[string]any{
+							"name":          "repo-convention-fit",
+							"status":        "completed",
+							"issuesFound":   float64(1),
+							"filesAnalyzed": float64(2),
+							"linesAnalyzed": float64(42),
+						},
+						"issues": []any{map[string]any{"problem": "formatting drift"}},
+					},
+				},
+			},
+		},
+		"progress": map[string]any{"output": "Main review complete\nCheck repo-convention-fit: 1 issue found\n"},
+		"~debug":   map[string]any{"checks": []any{map[string]any{"model": "claude-haiku-4-5"}}},
+	}
+	actor.handle(map[string]any{"type": "tool:data", "toolUse": "TU-review", "data": finalRun})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.messages) != 2 {
+		t.Fatalf("messages after final = %#v", actor.messages)
+	}
+	finalMessage := actor.messages[1]
+	if finalMessage.CompletionStatus != "" {
+		t.Fatalf("final completion status = %q", finalMessage.CompletionStatus)
+	}
+	finalBlock := mapValue(finalMessage.Content[0])
+	if !reflect.DeepEqual(mapValue(finalBlock["run"]), finalRun) {
+		t.Fatalf("final run changed: %#v", finalBlock["run"])
+	}
+	if len(actor.history) != 2 || actor.history[1].ToolCallID != "TU-review" || actor.history[1].ToolName != "code_review" {
+		t.Fatalf("history = %#v", actor.history)
+	}
+	historyText := actor.history[1].Text
+	for _, want := range []string{`"main":{"review":{"comments":[]}`, `"checks":{"builtin:///checks/repo-convention-fit.md"`, `"issuesFound":1`} {
+		if !strings.Contains(historyText, want) {
+			t.Fatalf("history text missing %q: %s", want, historyText)
+		}
+	}
+	if strings.Contains(historyText, "map[") {
+		t.Fatalf("history text used Go map formatting: %s", historyText)
+	}
+}
+
 func TestNeoActorBinaryToolDataSanitizesReducerPayload(t *testing.T) {
 	useTempNeoThreadStore(t)
 	rt := newNeoRuntime(&config.Config{})
@@ -14078,6 +14197,26 @@ func TestNeoImageToolResultAcceptsBinaryResultArray(t *testing.T) {
 	}
 	if got := runToText(run); got != "generated 1 image" {
 		t.Fatalf("runToText = %q, want generated image text", got)
+	}
+}
+
+func TestNeoStructuredToolResultHistoryTextUsesJSON(t *testing.T) {
+	run := map[string]any{
+		"status": "done",
+		"result": map[string]any{
+			"main":   map[string]any{"status": "done"},
+			"checks": map[string]any{"repo-convention-fit": map[string]any{"status": "done"}},
+		},
+	}
+	text := runToText(run)
+	if !strings.Contains(text, `"main":{"status":"done"}`) || !strings.Contains(text, `"checks":{"repo-convention-fit":{"status":"done"}}`) {
+		t.Fatalf("runToText = %q, want structured JSON for model history", text)
+	}
+	if strings.Contains(text, "map[") {
+		t.Fatalf("runToText used Go map formatting: %q", text)
+	}
+	if got := runToText(map[string]any{"status": "done", "result": "plain output"}); got != "plain output" {
+		t.Fatalf("plain result runToText = %q, want unquoted plain output", got)
 	}
 }
 
