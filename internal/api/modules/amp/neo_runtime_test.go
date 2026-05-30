@@ -1372,8 +1372,16 @@ func TestNeoRuntimeShutdownFlushesLocalThreadSnapshot(t *testing.T) {
 		AgentMode:       "deep",
 		ReasoningEffort: "xhigh",
 		Seq:             1,
+	}, {
+		ThreadID:  threadID,
+		MessageID: "M-0000000000000000000002",
+		Role:      "assistant",
+		Content:   []any{map[string]any{"type": "text", "text": "partial answer"}},
+		State:     map[string]any{"type": "streaming"},
+		Seq:       2,
 	}}
-	actor.seq = 1
+	actor.currentInference = &neoInferenceInflight{messageID: "M-0000000000000000000002", agentMode: "deep", reasoningEffort: "xhigh", tools: []string{"shell_command"}}
+	actor.seq = 2
 	actor.mu.Unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -1390,8 +1398,15 @@ func TestNeoRuntimeShutdownFlushesLocalThreadSnapshot(t *testing.T) {
 		t.Fatalf("agentMode = %q, want deep", got)
 	}
 	messages := arrayValue(thread["messages"])
-	if len(messages) != 1 || !strings.Contains(fmt.Sprint(messages[0]), "persist me before restart") {
+	if len(messages) != 2 || !strings.Contains(fmt.Sprint(messages[0]), "persist me before restart") {
 		t.Fatalf("messages = %#v, want persisted user message", messages)
+	}
+	if got := stringValue(mapValue(mapValue(messages[1])["state"])["type"]); got != "cancelled" {
+		t.Fatalf("interrupted assistant state = %q, want cancelled", got)
+	}
+	pending := mapValue(thread["pendingInference"])
+	if stringValue(pending["agentMode"]) != "deep" || stringValue(pending["reasoningEffort"]) != "xhigh" {
+		t.Fatalf("pendingInference = %#v, want deep/xhigh resume marker", pending)
 	}
 	if _, err := os.Stat(filepath.Join(dir, threadID+".json")); err != nil {
 		t.Fatalf("snapshot stat: %v", err)
@@ -2224,6 +2239,7 @@ func TestNeoRuntimeAcceptsBatchedClientFrames(t *testing.T) {
 	if !sawTitle || !sawSettings {
 		t.Fatalf("batched frame was not fully applied: title=%v settings=%v", sawTitle, sawSettings)
 	}
+	waitForNeoActorSyncIdle(t, rt.store.ensureThreadActor(threadID))
 }
 
 func TestNeoRuntimeFilesystemBridgeNormalizesBothDirections(t *testing.T) {
@@ -9683,6 +9699,7 @@ func TestNeoActorQueuedDequeueEventUsesQueuedMessageID(t *testing.T) {
 	if got := stringValue(dequeued["queuedMessageId"]); got != messageID {
 		t.Fatalf("dequeued queuedMessageId = %q, want message id %q: %#v", got, messageID, dequeued)
 	}
+	waitForNeoActorSyncIdle(t, rt.store.ensureThreadActor("T-queued-dequeue"))
 }
 
 func TestNeoSendMessageToThreadWorkflowPromptsMatchBinary(t *testing.T) {
@@ -11239,6 +11256,33 @@ func TestNeoLocalThreadLoadRemovesEmptyStaleLocalCurrentInference(t *testing.T) 
 	messages := arrayValue(thread["messages"])
 	if len(messages) != 1 || messageIDValue(mapValue(messages[0])["messageId"]) != "M-user" {
 		t.Fatalf("messages = %#v, want empty stale assistant removed", messages)
+	}
+}
+
+func TestNeoActorImportRestoresPendingInference(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019e6541-06ae-75d7-b10e-d893170fa62c"
+	actor := newNeoActor(rt, "actor-pending", "thread-actor", threadID, threadID, neoActorRecord("actor-pending", "thread-actor", threadID), nil)
+	thread := map[string]any{
+		"id":        threadID,
+		"agentMode": "deep",
+		"messages": []any{
+			map[string]any{"messageId": "M-user", "role": "user", "content": []any{map[string]any{"type": "text", "text": "continue after restart"}}},
+			map[string]any{"messageId": "M-assistant", "role": "assistant", "state": map[string]any{"type": "cancelled"}, "content": []any{map[string]any{"type": "text", "text": "partial"}}},
+		},
+		"pendingInference": map[string]any{"messageId": "M-assistant", "agentMode": "deep", "reasoningEffort": "xhigh", "parentToolCallId": "TU-parent", "tools": []any{"shell_command"}},
+	}
+	if err := actor.importThreadLocalOnly(thread); err != nil {
+		t.Fatalf("import thread: %v", err)
+	}
+	if actor.pendingInference == nil {
+		t.Fatal("pendingInference was not restored")
+	}
+	if actor.pendingInference.agentMode != "deep" || actor.pendingInference.reasoningEffort != "xhigh" || actor.pendingInference.parentToolCallID != "TU-parent" {
+		t.Fatalf("pendingInference = %#v, want deep/xhigh with parent", actor.pendingInference)
+	}
+	if actor.currentInference != nil {
+		t.Fatalf("currentInference = %#v, want nil until retry starts", actor.currentInference)
 	}
 }
 

@@ -1237,7 +1237,7 @@ func (s *neoActorStore) syncLocalThreadSnapshots() {
 	}
 	s.mu.RUnlock()
 	for _, actor := range actors {
-		actor.syncLocalThreadSnapshotNow()
+		actor.syncLocalThreadSnapshotForShutdownNow()
 	}
 }
 
@@ -1336,6 +1336,15 @@ type neoInferenceInflight struct {
 	reasoningEffort  string
 	parentToolCallID string
 	tools            []string
+}
+
+func cloneNeoInferenceInflight(inflight *neoInferenceInflight) *neoInferenceInflight {
+	if inflight == nil {
+		return nil
+	}
+	clone := *inflight
+	clone.tools = append([]string(nil), inflight.tools...)
+	return &clone
 }
 
 type neoReplayEvent struct {
@@ -6508,6 +6517,7 @@ type neoCloudThreadSnapshot struct {
 	compactionRecords []any
 	relationships     []any
 	currentInference  *neoInferenceInflight
+	pendingInference  *neoInferenceInflight
 }
 
 func (a *neoActor) syncCloudAsync() {
@@ -6534,6 +6544,19 @@ func (a *neoActor) syncLocalThreadSnapshotNow() {
 	snapshot, ok := a.threadSnapshot()
 	if !ok {
 		return
+	}
+	if err := writeNeoLocalThreadSnapshot(snapshot); err != nil {
+		log.Warnf("amp neo local runtime thread store sync failed thread=%s: %v", snapshot.threadID, err)
+	}
+}
+
+func (a *neoActor) syncLocalThreadSnapshotForShutdownNow() {
+	snapshot, ok := a.threadSnapshot()
+	if !ok {
+		return
+	}
+	if snapshot.pendingInference == nil && snapshot.currentInference != nil {
+		snapshot.pendingInference = cloneNeoInferenceInflight(snapshot.currentInference)
 	}
 	if err := writeNeoLocalThreadSnapshot(snapshot); err != nil {
 		log.Warnf("amp neo local runtime thread store sync failed thread=%s: %v", snapshot.threadID, err)
@@ -6584,6 +6607,10 @@ func (a *neoActor) threadSnapshot() (neoCloudThreadSnapshot, bool) {
 		clone.tools = append([]string(nil), a.currentInference.tools...)
 		inflight = &clone
 	}
+	var pending *neoInferenceInflight
+	if a.pendingInference != nil {
+		pending = cloneNeoInferenceInflight(a.pendingInference)
+	}
 	return neoCloudThreadSnapshot{
 		threadID:          a.threadID,
 		seq:               a.lastSeqLocked(),
@@ -6607,6 +6634,7 @@ func (a *neoActor) threadSnapshot() (neoCloudThreadSnapshot, bool) {
 		compactionRecords: cloneNeoJSONArray(a.compactionRecordListLocked()),
 		relationships:     cloneNeoJSONArray(a.relationshipListLocked()),
 		currentInference:  inflight,
+		pendingInference:  pending,
 	}, true
 }
 
@@ -7403,6 +7431,9 @@ func writeNeoLocalThreadSnapshot(snapshot neoCloudThreadSnapshot) error {
 	thread := neoCloudThread(snapshot)
 	if len(snapshot.actorKV) > 0 {
 		thread["actorKV"] = cloneMap(snapshot.actorKV)
+	}
+	if snapshot.pendingInference != nil {
+		thread["pendingInference"] = neoInferenceInflightThreadMap(snapshot.pendingInference)
 	}
 	path, err := writeNeoLocalThreadFile(snapshot.threadID, thread)
 	if err != nil {
@@ -8480,6 +8511,51 @@ func neoCloudThread(snapshot neoCloudThreadSnapshot) map[string]any {
 		}
 	}
 	return thread
+}
+
+func neoInferenceInflightThreadMap(inflight *neoInferenceInflight) map[string]any {
+	if inflight == nil {
+		return nil
+	}
+	out := map[string]any{}
+	if inflight.messageID != "" {
+		out["messageId"] = inflight.messageID
+	}
+	if inflight.agentMode != "" {
+		out["agentMode"] = inflight.agentMode
+	}
+	if inflight.reasoningEffort != "" {
+		out["reasoningEffort"] = inflight.reasoningEffort
+	}
+	if inflight.parentToolCallID != "" {
+		out["parentToolCallId"] = inflight.parentToolCallID
+	}
+	if len(inflight.tools) > 0 {
+		tools := make([]any, 0, len(inflight.tools))
+		for _, name := range inflight.tools {
+			tools = append(tools, name)
+		}
+		out["tools"] = tools
+	}
+	return out
+}
+
+func neoInferenceInflightFromThread(raw any) *neoInferenceInflight {
+	inflight := mapValue(raw)
+	if len(inflight) == 0 {
+		return nil
+	}
+	parsed := &neoInferenceInflight{
+		messageID:        firstNonEmptyString(inflight["messageId"], inflight["messageID"], inflight["protocolMessageID"]),
+		agentMode:        stringValue(inflight["agentMode"]),
+		reasoningEffort:  firstNonEmptyString(inflight["reasoningEffort"], inflight["reasoning_effort"]),
+		parentToolCallID: firstNonEmptyString(inflight["parentToolCallId"], inflight["parentToolUseId"], inflight["parent_tool_use_id"]),
+		tools:            stringSliceFromAny(inflight["tools"]),
+	}
+	if parsed.messageID == "" && parsed.agentMode == "" && parsed.reasoningEffort == "" && parsed.parentToolCallID == "" && len(parsed.tools) == 0 {
+		return nil
+	}
+	return parsed
 }
 
 func neoMessagesContainID(messages []neoMessage, messageID string) bool {
@@ -9943,6 +10019,7 @@ func (a *neoActor) importThreadWithSync(thread map[string]any, syncCloud bool) e
 	maxTokens := firstNonNil(thread["maxTokens"], thread["max_tokens"], nestedValue(thread["settings"], "maxTokens"))
 	mainThreadID := firstNonEmptyString(thread["mainThreadID"], thread["mainThreadId"], thread["mainThread"], nestedString(thread["settings"], "mainThreadID"))
 	queuedMessages := neoQueuedMessagesFromThread(thread["queuedMessages"])
+	pendingInference := neoInferenceInflightFromThread(thread["pendingInference"])
 	approvalQueue := neoRestoredApprovalQueue(messages)
 	version := numberFrom(thread["v"])
 	for _, message := range messages {
@@ -9953,6 +10030,14 @@ func (a *neoActor) importThreadWithSync(thread map[string]any, syncCloud bool) e
 	nextSeq := version + 1
 	if nextSeq < 1 {
 		nextSeq = 1
+	}
+	if pendingInference != nil {
+		if pendingInference.agentMode == "" {
+			pendingInference.agentMode = agentMode
+		}
+		if !neoReasoningEffortAllowedForMode(pendingInference.agentMode, pendingInference.reasoningEffort) {
+			pendingInference.reasoningEffort = defaultNeoReasoningEffort(pendingInference.agentMode)
+		}
 	}
 
 	a.mu.Lock()
@@ -9978,7 +10063,8 @@ func (a *neoActor) importThreadWithSync(thread map[string]any, syncCloud bool) e
 	a.relationships = relationships
 	a.pendingTools = map[string]neoPendingTool{}
 	a.approvalQueue = approvalQueue
-	a.pendingInference = nil
+	a.currentInference = nil
+	a.pendingInference = pendingInference
 	a.replayEvents = nil
 	a.activeError = nil
 	a.activeErrorSeq = 0
