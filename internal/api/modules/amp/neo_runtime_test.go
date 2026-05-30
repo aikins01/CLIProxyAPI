@@ -958,7 +958,7 @@ func TestNeoRuntimeEditRerunAnnouncesInferenceBeforeCompaction(t *testing.T) {
 	if err := conn.WriteJSON(map[string]any{
 		"type":      "client_edit_message",
 		"messageId": "M-0000000000000000000028",
-		"editId":    "edit-rerun",
+		"editId":    "E-0000000000000000000001",
 		"content":   []any{map[string]any{"type": "text", "text": "edited rerun prompt"}},
 	}); err != nil {
 		t.Fatalf("write client_edit_message: %v", err)
@@ -3020,8 +3020,8 @@ func TestNeoRuntimeResumeReplaysEditAndTruncationEvents(t *testing.T) {
 	actor, _ := rt.store.upsert(map[string]any{"name": "threadActor", "key": threadID, "input": map[string]any{"threadId": threadID}}, true)
 	actor.mu.Lock()
 	actor.messages = []neoMessage{
-		{ThreadID: threadID, MessageID: "M-user", Role: "user", Content: []any{map[string]any{"type": "text", "text": "old"}}, Seq: 1},
-		{ThreadID: threadID, MessageID: "M-assistant", Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "stale"}}, Seq: 2},
+		{ThreadID: threadID, MessageID: "M-0000000000000000000001", Role: "user", Content: []any{map[string]any{"type": "text", "text": "old"}}, Seq: 1},
+		{ThreadID: threadID, MessageID: "M-0000000000000000000002", Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "stale"}}, Seq: 2},
 	}
 	actor.seq = 3
 	actor.rebuildHistoryLocked()
@@ -3029,8 +3029,8 @@ func TestNeoRuntimeResumeReplaysEditAndTruncationEvents(t *testing.T) {
 
 	actor.editMessage(map[string]any{
 		"type":      "client_edit_message",
-		"messageId": "M-user",
-		"editId":    "edit-1",
+		"messageId": "M-0000000000000000000001",
+		"editId":    "E-0000000000000000000001",
 		"content":   []any{map[string]any{"type": "text", "text": "edited"}},
 	})
 
@@ -3054,8 +3054,8 @@ func TestNeoRuntimeResumeReplaysEditAndTruncationEvents(t *testing.T) {
 	}
 
 	truncated := waitForNeoMessageType(t, conn, "thread_truncated", 2*time.Second)
-	if got := stringValue(truncated["truncateFromMessage"]); got != "M-assistant" {
-		t.Fatalf("truncateFromMessage = %q, want M-assistant: %#v", got, truncated)
+	if got := stringValue(truncated["truncateFromMessage"]); got != "M-0000000000000000000002" {
+		t.Fatalf("truncateFromMessage = %q, want assistant message id: %#v", got, truncated)
 	}
 	if numberFrom(truncated["seq"]) <= numberFrom(updated["seq"]) {
 		t.Fatalf("thread_truncated seq should follow message_updated: update=%#v truncate=%#v", updated, truncated)
@@ -7007,8 +7007,8 @@ func TestNeoActorHandlesClientEditMessage(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
 	actor.messages = []neoMessage{
-		{ThreadID: "T-test", MessageID: "M-user", Role: "user", Content: []any{map[string]any{"type": "text", "text": "old"}}, AgentMode: "smart", Seq: 1},
-		{ThreadID: "T-test", MessageID: "M-assistant", Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "answer"}}, Seq: 2},
+		{ThreadID: "T-test", MessageID: "M-0000000000000000000001", Role: "user", Content: []any{map[string]any{"type": "text", "text": "old"}}, AgentMode: "smart", Seq: 1},
+		{ThreadID: "T-test", MessageID: "M-0000000000000000000002", Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "answer"}}, Seq: 2},
 	}
 	actor.history = []neoHistoryMessage{
 		{Role: "user", Text: "old"},
@@ -7018,8 +7018,8 @@ func TestNeoActorHandlesClientEditMessage(t *testing.T) {
 
 	actor.handle(map[string]any{
 		"type":            "client_edit_message",
-		"messageId":       "M-user",
-		"editId":          "E-edit",
+		"messageId":       "M-0000000000000000000001",
+		"editId":          "E-0000000000000000000001",
 		"content":         []any{map[string]any{"type": "text", "text": "edited"}},
 		"agentMode":       "deep",
 		"reasoningEffort": "xhigh",
@@ -9284,7 +9284,7 @@ func TestNeoRuntimeWebSocketStreamingEventSequenceMatchesAmpActor(t *testing.T) 
 	}
 	if err := conn.WriteJSON(map[string]any{
 		"type":            "client_append_user_msg",
-		"messageId":       "M-user",
+		"messageId":       "M-0000000000000000000001",
 		"agentMode":       "deep",
 		"reasoningEffort": "xhigh",
 		"content":         []any{map[string]any{"type": "text", "text": "hi"}},
@@ -9482,7 +9482,7 @@ func TestNeoRuntimeWebSocketStreamingToolArgumentsUseAmpDeltaShape(t *testing.T)
 	}
 	if err := conn.WriteJSON(map[string]any{
 		"type":      "client_append_user_msg",
-		"messageId": "M-user",
+		"messageId": "M-0000000000000000000001",
 		"agentMode": "deep",
 		"content":   []any{map[string]any{"type": "text", "text": "hi"}},
 	}); err != nil {
@@ -9574,7 +9574,7 @@ func TestNeoRuntimeWebSocketStreamsAnthropicThinkingAndTextIndexes(t *testing.T)
 	}
 	if err := conn.WriteJSON(map[string]any{
 		"type":            "client_append_user_msg",
-		"messageId":       "M-user",
+		"messageId":       "M-0000000000000000000001",
 		"agentMode":       "smart",
 		"reasoningEffort": "max",
 		"content":         []any{map[string]any{"type": "text", "text": "hi"}},
@@ -9723,7 +9723,7 @@ func collectNeoOpenAIStreamBlockIndexes(t *testing.T, agentMode, toolName string
 	}
 	if err := conn.WriteJSON(map[string]any{
 		"type":      "client_append_user_msg",
-		"messageId": "M-user",
+		"messageId": "M-0000000000000000000001",
 		"agentMode": agentMode,
 		"content":   []any{map[string]any{"type": "text", "text": "hi"}},
 	}); err != nil {
@@ -9912,12 +9912,12 @@ func TestNeoActorQueuesSteeredUserMessageAhead(t *testing.T) {
 	actor.agentState = "running"
 	actor.executorReady = true
 	actor.queue = []neoQueuedMessage{
-		{MessageID: "M-first", Content: []any{map[string]any{"type": "text", "text": "first"}}},
+		{MessageID: "M-0000000000000000000001", Content: []any{map[string]any{"type": "text", "text": "first"}}},
 	}
 
 	actor.receiveUserMessage(map[string]any{
 		"type":      "client_append_user_msg",
-		"messageId": "M-steer",
+		"messageId": "M-0000000000000000000002",
 		"content":   []any{map[string]any{"type": "text", "text": "now"}},
 		"steer":     true,
 	})
@@ -9927,8 +9927,252 @@ func TestNeoActorQueuesSteeredUserMessageAhead(t *testing.T) {
 	if len(actor.queue) != 2 {
 		t.Fatalf("queue len = %d", len(actor.queue))
 	}
-	if actor.queue[0].MessageID != "M-steer" || !actor.queue[0].Steer {
+	if actor.queue[0].MessageID != "M-0000000000000000000002" || !actor.queue[0].Steer {
 		t.Fatalf("queue after steered append = %#v", actor.queue)
+	}
+}
+
+func TestNeoActorClientAppendUserMessageUsesBinarySchema(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	actor.agentState = "running"
+	actor.executorReady = true
+
+	actor.receiveUserMessage(map[string]any{
+		"type":            "client_append_user_msg",
+		"messageId":       "M-0000000000000000000001",
+		"content":         []any{map[string]any{"type": "text", "text": "now", "extra": "strip"}},
+		"agentMode":       "deep",
+		"reasoningEffort": "xhigh",
+		"userState":       map[string]any{"currentlyVisibleFiles": []any{"file:///tmp/main.go"}, "runningTerminalCommands": []any{"go test ./..."}},
+		"steer":           true,
+		"meta":            map[string]any{"sentAt": 1},
+		"fileMentions":    map[string]any{"stale": true},
+	})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.queue) != 1 {
+		t.Fatalf("queue = %#v", actor.queue)
+	}
+	queued := actor.queue[0]
+	if queued.MessageID != "M-0000000000000000000001" || queued.AgentMode != "deep" || queued.ReasoningEffort != "xhigh" || !queued.Steer {
+		t.Fatalf("queued message = %#v", queued)
+	}
+	if len(queued.Meta) != 0 || len(queued.FileMentions) != 0 {
+		t.Fatalf("client-only unknown fields should be stripped: meta=%#v fileMentions=%#v", queued.Meta, queued.FileMentions)
+	}
+	block := mapValue(queued.Content[0])
+	if _, exists := block["extra"]; exists {
+		t.Fatalf("text block unknown field was preserved: %#v", block)
+	}
+	if files := arrayValue(mapValue(queued.UserState)["currentlyVisibleFiles"]); len(files) != 1 || files[0] != "file:///tmp/main.go" {
+		t.Fatalf("user state = %#v", queued.UserState)
+	}
+}
+
+func TestNeoActorClientAppendUserMessageRejectsInvalidPayloadLikeBinary(t *testing.T) {
+	cases := []struct {
+		name string
+		msg  map[string]any
+	}{
+		{
+			name: "missing message id",
+			msg: map[string]any{
+				"type":    "client_append_user_msg",
+				"content": []any{map[string]any{"type": "text", "text": "hi"}},
+			},
+		},
+		{
+			name: "invalid message id",
+			msg: map[string]any{
+				"type":      "client_append_user_msg",
+				"messageId": "M-local-not-binary",
+				"content":   []any{map[string]any{"type": "text", "text": "hi"}},
+			},
+		},
+		{
+			name: "non array content",
+			msg: map[string]any{
+				"type":      "client_append_user_msg",
+				"messageId": "M-0000000000000000000001",
+				"content":   "hi",
+			},
+		},
+		{
+			name: "tool result content",
+			msg: map[string]any{
+				"type":      "client_append_user_msg",
+				"messageId": "M-0000000000000000000001",
+				"content":   []any{map[string]any{"type": "tool_result", "toolUseID": "TU-0000000000000000000001", "run": map[string]any{"status": "done"}}},
+			},
+		},
+		{
+			name: "invalid text hidden",
+			msg: map[string]any{
+				"type":      "client_append_user_msg",
+				"messageId": "M-0000000000000000000001",
+				"content":   []any{map[string]any{"type": "text", "text": "hi", "hidden": "yes"}},
+			},
+		},
+		{
+			name: "image missing mediaType",
+			msg: map[string]any{
+				"type":      "client_append_user_msg",
+				"messageId": "M-0000000000000000000001",
+				"content": []any{map[string]any{
+					"type":       "image",
+					"sourcePath": "image.png",
+					"source":     map[string]any{"type": "base64", "media_type": "image/png", "data": "AA=="},
+				}},
+			},
+		},
+		{
+			name: "invalid agent mode",
+			msg: map[string]any{
+				"type":      "client_append_user_msg",
+				"messageId": "M-0000000000000000000001",
+				"agentMode": "turbo",
+				"content":   []any{map[string]any{"type": "text", "text": "hi"}},
+			},
+		},
+		{
+			name: "invalid reasoning effort",
+			msg: map[string]any{
+				"type":            "client_append_user_msg",
+				"messageId":       "M-0000000000000000000001",
+				"reasoningEffort": "HIGH",
+				"content":         []any{map[string]any{"type": "text", "text": "hi"}},
+			},
+		},
+		{
+			name: "invalid steer",
+			msg: map[string]any{
+				"type":      "client_append_user_msg",
+				"messageId": "M-0000000000000000000001",
+				"content":   []any{map[string]any{"type": "text", "text": "hi"}},
+				"steer":     "true",
+			},
+		},
+		{
+			name: "invalid user state",
+			msg: map[string]any{
+				"type":      "client_append_user_msg",
+				"messageId": "M-0000000000000000000001",
+				"content":   []any{map[string]any{"type": "text", "text": "hi"}},
+				"userState": map[string]any{"activeEditor": "file:///tmp/main.go"},
+			},
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			rt := newNeoRuntime(&config.Config{})
+			actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+			actor.agentState = "running"
+			actor.executorReady = true
+
+			actor.receiveUserMessage(tt.msg)
+
+			actor.mu.Lock()
+			defer actor.mu.Unlock()
+			if len(actor.queue) != 0 || len(actor.messages) != 0 {
+				t.Fatalf("invalid client message mutated state: queue=%#v messages=%#v", actor.queue, actor.messages)
+			}
+		})
+	}
+}
+
+func TestNeoActorClientEditMessageRejectsInvalidPayloadLikeBinary(t *testing.T) {
+	cases := []struct {
+		name string
+		msg  map[string]any
+	}{
+		{
+			name: "invalid edit id",
+			msg: map[string]any{
+				"type":      "client_edit_message",
+				"messageId": "M-0000000000000000000001",
+				"editId":    "edit-1",
+				"content":   []any{map[string]any{"type": "text", "text": "edited"}},
+			},
+		},
+		{
+			name: "invalid message id",
+			msg: map[string]any{
+				"type":      "client_edit_message",
+				"messageId": "M-user",
+				"editId":    "E-0000000000000000000001",
+				"content":   []any{map[string]any{"type": "text", "text": "edited"}},
+			},
+		},
+		{
+			name: "invalid content",
+			msg: map[string]any{
+				"type":      "client_edit_message",
+				"messageId": "M-0000000000000000000001",
+				"editId":    "E-0000000000000000000001",
+				"content":   []any{map[string]any{"type": "tool_result", "toolUseID": "TU-0000000000000000000001", "run": map[string]any{"status": "done"}}},
+			},
+		},
+		{
+			name: "invalid mode",
+			msg: map[string]any{
+				"type":      "client_edit_message",
+				"messageId": "M-0000000000000000000001",
+				"editId":    "E-0000000000000000000001",
+				"agentMode": "turbo",
+				"content":   []any{map[string]any{"type": "text", "text": "edited"}},
+			},
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			rt := newNeoRuntime(&config.Config{})
+			actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+			actor.messages = []neoMessage{
+				{ThreadID: "T-test", MessageID: "M-0000000000000000000001", Role: "user", Content: []any{map[string]any{"type": "text", "text": "old"}}, Seq: 1},
+				{ThreadID: "T-test", MessageID: "M-0000000000000000000002", Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "answer"}}, Seq: 2},
+			}
+
+			actor.handle(tt.msg)
+
+			actor.mu.Lock()
+			defer actor.mu.Unlock()
+			if len(actor.messages) != 2 || textFromBlocks(actor.messages[0].Content) != "old" {
+				t.Fatalf("invalid edit mutated messages: %#v", actor.messages)
+			}
+		})
+	}
+}
+
+func TestNeoActorClientThreadCommandsUseBinarySchema(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	actor.title = "Old"
+	actor.queue = []neoQueuedMessage{{MessageID: "M-0000000000000000000001", Content: []any{map[string]any{"type": "text", "text": "queued"}}}}
+	actor.messages = []neoMessage{{ThreadID: "T-test", MessageID: "M-0000000000000000000002", Role: "user", Content: []any{map[string]any{"type": "text", "text": "read"}}}}
+
+	actor.handle(map[string]any{"type": "client_set_thread_title", "title": "   "})
+	actor.handle(map[string]any{"type": "client_set_thread_title", "title": strings.Repeat("x", 257)})
+	actor.handle(map[string]any{"type": "client_remove_queued_msg", "queuedMessageId": "queued-1"})
+	actor.handle(map[string]any{"type": "client_mark_message_read", "messageId": "M-user"})
+
+	actor.mu.Lock()
+	if actor.title != "Old" || len(actor.queue) != 1 || actor.messages[0].ReadAt != "" {
+		t.Fatalf("invalid client commands mutated state: title=%q queue=%#v messages=%#v", actor.title, actor.queue, actor.messages)
+	}
+	actor.mu.Unlock()
+
+	actor.handle(map[string]any{"type": "client_set_thread_title", "title": "  New title  "})
+	actor.handle(map[string]any{"type": "client_mark_message_read", "messageId": "M-0000000000000000000002"})
+	actor.handle(map[string]any{"type": "client_remove_queued_msg", "queuedMessageId": "M-0000000000000000000001"})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.title != "New title" || len(actor.queue) != 0 || actor.messages[0].ReadAt == "" {
+		t.Fatalf("valid client commands were not applied: title=%q queue=%#v messages=%#v", actor.title, actor.queue, actor.messages)
 	}
 }
 
@@ -10082,11 +10326,11 @@ func TestNeoActorHandlesMessageReadState(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
 	actor.messages = []neoMessage{
-		{ThreadID: "T-test", MessageID: "M-user", Role: "user", Content: []any{map[string]any{"type": "text", "text": "hello"}}, Seq: 1},
+		{ThreadID: "T-test", MessageID: "M-0000000000000000000001", Role: "user", Content: []any{map[string]any{"type": "text", "text": "hello"}}, Seq: 1},
 	}
 	actor.seq = 2
 
-	actor.handle(map[string]any{"type": "client_mark_message_read", "messageId": "M-user"})
+	actor.handle(map[string]any{"type": "client_mark_message_read", "messageId": "M-0000000000000000000001"})
 
 	actor.mu.Lock()
 	readAt := actor.messages[0].ReadAt
@@ -10098,7 +10342,7 @@ func TestNeoActorHandlesMessageReadState(t *testing.T) {
 		t.Fatalf("protocol readAt = %#v, want %q", got, readAt)
 	}
 
-	actor.handle(map[string]any{"type": "client_mark_message_unread", "messageId": "M-user"})
+	actor.handle(map[string]any{"type": "client_mark_message_unread", "messageId": "M-0000000000000000000001"})
 
 	actor.mu.Lock()
 	defer actor.mu.Unlock()
@@ -10723,7 +10967,7 @@ func TestNeoActorQueuedRemovalEventUsesQueuedMessageID(t *testing.T) {
 		t.Fatalf("queued message id = %q, wrapper=%q: %#v", messageID, stringValue(item["id"]), added)
 	}
 
-	if err := conn.WriteJSON(map[string]any{"type": "client_remove_queued_msg", "queuedMessageId": wrapperID}); err != nil {
+	if err := conn.WriteJSON(map[string]any{"type": "client_remove_queued_msg", "queuedMessageId": messageID}); err != nil {
 		t.Fatalf("write remove queued: %v", err)
 	}
 	removed := waitForNeoMessageType(t, conn, "queued_message_removed", 2*time.Second)

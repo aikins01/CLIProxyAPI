@@ -1384,6 +1384,17 @@
     return `${size} B`;
   }
 
+  function randomBase62(length: number) {
+    const alphabet = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+    const bytes = new Uint8Array(length);
+    crypto.getRandomValues(bytes);
+    return Array.from(bytes, (byte) => alphabet[byte % alphabet.length]).join('');
+  }
+
+  function newMessageId() {
+    return `M-${randomBase62(22)}`;
+  }
+
   async function sendMessage() {
     const text = composer.trim();
     const attachments = composerAttachments;
@@ -1406,7 +1417,7 @@
       composerUploadActive = false;
       return;
     }
-    const messageId = `M-local-${crypto.randomUUID()}`;
+    const messageId = newMessageId();
     const content: ContentBlock[] = [
       ...(text ? [{ type: 'text', text }] : []),
       ...imageBlocks

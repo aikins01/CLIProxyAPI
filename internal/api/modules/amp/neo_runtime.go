@@ -101,6 +101,7 @@ var (
 	neoBinaryThreadIDExactPattern = regexp.MustCompile(`^T-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 	neoCloudThreadIDPattern       = regexp.MustCompile(`^T-([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$`)
 	neoMessageIDPattern           = regexp.MustCompile(`^M-[0-9A-Za-z]{22}$`)
+	neoEditIDPattern              = regexp.MustCompile(`^E-[0-9A-Za-z]{22}$`)
 	neoMCPServerPattern           = regexp.MustCompile(`[\s-]+`)
 	neoAmpThreadStoreDir          = defaultNeoAmpThreadStoreDir
 	neoAmpTaskStoreMu             sync.Mutex
@@ -1821,11 +1822,17 @@ func (a *neoActor) handleForSocket(socket *neoSocket, msg map[string]any) {
 	case "client_cancel":
 		a.cancel()
 	case "client_remove_queued_msg":
-		a.removeQueuedMessage(stringValue(msg["queuedMessageId"]))
+		if queuedMessageID := protocolMessageIDValue(msg["queuedMessageId"]); queuedMessageID != "" {
+			a.removeQueuedMessage(queuedMessageID)
+		}
 	case "client_steer_queued_msg":
-		a.steerQueuedMessage(stringValue(msg["queuedMessageId"]))
+		if queuedMessageID := protocolMessageIDValue(msg["queuedMessageId"]); queuedMessageID != "" {
+			a.steerQueuedMessage(queuedMessageID)
+		}
 	case "client_set_thread_title":
-		a.setTitle(stringValue(msg["title"]))
+		if title, ok := normalizeNeoClientThreadTitle(msg["title"]); ok {
+			a.setTitle(title)
+		}
 	case "title":
 		a.updateTitleFromBinary(msg)
 	case "agent-mode":
@@ -1841,9 +1848,13 @@ func (a *neoActor) handleForSocket(socket *neoSocket, msg map[string]any) {
 	case "client_dismiss_active_error":
 		a.clearActiveError(msg)
 	case "client_mark_message_read":
-		a.markMessageRead(stringValue(msg["messageId"]), true)
+		if messageID := protocolMessageIDValue(msg["messageId"]); messageID != "" {
+			a.markMessageRead(messageID, true)
+		}
 	case "client_mark_message_unread":
-		a.markMessageRead(stringValue(msg["messageId"]), false)
+		if messageID := protocolMessageIDValue(msg["messageId"]); messageID != "" {
+			a.markMessageRead(messageID, false)
+		}
 	case "client_upsert_notification_subscription":
 		a.upsertNotificationSubscription(msg)
 	case "client_spawn_executor":
@@ -5246,20 +5257,9 @@ func stringSliceFromAny(raw any) []string {
 }
 
 func (a *neoActor) receiveUserMessage(msg map[string]any) {
-	content := normalizeNeoProtocolContent("user", arrayValue(msg["content"]), false)
-	user := neoQueuedMessage{
-		MessageID:       fallbackString(msg["messageId"], newNeoMessageID()),
-		Content:         content,
-		UserState:       msg["userState"],
-		FileMentions:    mapValue(msg["fileMentions"]),
-		Meta:            mapValue(msg["meta"]),
-		CreatedAt:       time.Now().UTC().Format(time.RFC3339Nano),
-		AgentMode:       stringValue(msg["agentMode"]),
-		ReasoningEffort: stringValue(msg["reasoningEffort"]),
-		Steer:           boolValue(msg["steer"]),
-	}
-	if len(user.Content) == 0 {
-		user.Content = []any{map[string]any{"type": "text", "text": fmt.Sprint(msg["content"])}}
+	user, ok := normalizeNeoClientAppendUserMessage(msg)
+	if !ok {
+		return
 	}
 
 	a.mu.Lock()
@@ -5279,6 +5279,308 @@ func (a *neoActor) receiveUserMessage(msg map[string]any) {
 	}
 	a.mu.Unlock()
 	a.startUserMessage(user)
+}
+
+func normalizeNeoClientAppendUserMessage(msg map[string]any) (neoQueuedMessage, bool) {
+	messageID := protocolMessageIDValue(msg["messageId"])
+	if messageID == "" {
+		return neoQueuedMessage{}, false
+	}
+	content, ok := normalizeNeoClientUserContent(msg["content"])
+	if !ok {
+		return neoQueuedMessage{}, false
+	}
+	agentMode, ok := normalizeNeoClientAgentMode(msg, "agentMode")
+	if !ok {
+		return neoQueuedMessage{}, false
+	}
+	reasoningEffort, ok := normalizeNeoClientReasoningEffort(msg, "reasoningEffort")
+	if !ok {
+		return neoQueuedMessage{}, false
+	}
+	userState, ok := normalizeNeoClientUserState(msg, "userState")
+	if !ok {
+		return neoQueuedMessage{}, false
+	}
+	steer := false
+	if raw, exists := msg["steer"]; exists {
+		value, ok := raw.(bool)
+		if !ok {
+			return neoQueuedMessage{}, false
+		}
+		steer = value
+	}
+	return neoQueuedMessage{
+		MessageID:       messageID,
+		Content:         content,
+		UserState:       userState,
+		CreatedAt:       time.Now().UTC().Format(time.RFC3339Nano),
+		AgentMode:       agentMode,
+		ReasoningEffort: reasoningEffort,
+		Steer:           steer,
+	}, true
+}
+
+func normalizeNeoClientUserContent(raw any) ([]any, bool) {
+	content, ok := raw.([]any)
+	if !ok {
+		return nil, false
+	}
+	out := make([]any, 0, len(content))
+	for _, rawBlock := range content {
+		block := mapValue(rawBlock)
+		if len(block) == 0 {
+			return nil, false
+		}
+		var (
+			normalized map[string]any
+			blockOK    bool
+		)
+		switch stringValue(block["type"]) {
+		case "text":
+			normalized, blockOK = normalizeNeoClientTextBlock(block)
+		case "image":
+			normalized, blockOK = normalizeNeoClientImageBlock(block)
+		default:
+			return nil, false
+		}
+		if !blockOK {
+			return nil, false
+		}
+		out = append(out, normalized)
+	}
+	return out, true
+}
+
+func normalizeNeoClientTextBlock(block map[string]any) (map[string]any, bool) {
+	text, ok := block["text"].(string)
+	if !ok {
+		return nil, false
+	}
+	out := map[string]any{"type": "text", "text": text}
+	if raw, exists := block["hidden"]; exists {
+		hidden, ok := raw.(bool)
+		if !ok {
+			return nil, false
+		}
+		out["hidden"] = hidden
+	}
+	if raw, exists := block["blockState"]; exists {
+		blockState, ok := raw.(string)
+		if !ok || !neoClientBlockState(blockState) {
+			return nil, false
+		}
+		out["blockState"] = blockState
+	}
+	return out, true
+}
+
+func normalizeNeoClientImageBlock(block map[string]any) (map[string]any, bool) {
+	source, ok := asMap(block["source"])
+	if !ok {
+		return nil, false
+	}
+	sourceType, ok := source["type"].(string)
+	if !ok {
+		return nil, false
+	}
+	var normalizedSource map[string]any
+	switch sourceType {
+	case "base64":
+		mediaType, ok := source["mediaType"].(string)
+		if !ok || !neoProtocolImageMediaType(mediaType) {
+			return nil, false
+		}
+		data, ok := source["data"].(string)
+		if !ok {
+			return nil, false
+		}
+		normalizedSource = map[string]any{"type": "base64", "mediaType": mediaType, "data": data}
+	case "url":
+		url, ok := source["url"].(string)
+		if !ok {
+			return nil, false
+		}
+		normalizedSource = map[string]any{"type": "url", "url": url}
+	default:
+		return nil, false
+	}
+	sourcePath, ok := block["sourcePath"].(string)
+	if !ok {
+		return nil, false
+	}
+	out := cloneNeoJSONMap(block)
+	out["type"] = "image"
+	out["source"] = normalizedSource
+	out["sourcePath"] = sourcePath
+	return out, true
+}
+
+func neoClientBlockState(blockState string) bool {
+	switch blockState {
+	case "start", "streaming", "complete":
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeNeoClientAgentMode(msg map[string]any, key string) (string, bool) {
+	raw, exists := msg[key]
+	if !exists {
+		return "", true
+	}
+	mode, ok := raw.(string)
+	if !ok || !validNeoClientAgentMode(mode) {
+		return "", false
+	}
+	return mode, true
+}
+
+func validNeoClientAgentMode(mode string) bool {
+	_, ok := neoModeToolAllowlist[mode]
+	return ok
+}
+
+func neoClientEditIDValue(raw any) string {
+	editID, ok := raw.(string)
+	if !ok || !neoEditIDPattern.MatchString(editID) {
+		return ""
+	}
+	return editID
+}
+
+func normalizeNeoClientReasoningEffort(msg map[string]any, key string) (string, bool) {
+	raw, exists := msg[key]
+	if !exists {
+		return "", true
+	}
+	effort, ok := raw.(string)
+	if !ok || normalizeNeoProtocolReasoningEffort(effort) != effort {
+		return "", false
+	}
+	return effort, true
+}
+
+func normalizeNeoClientThreadTitle(raw any) (string, bool) {
+	title, ok := raw.(string)
+	if !ok {
+		return "", false
+	}
+	title = strings.TrimSpace(title)
+	if title == "" || len([]rune(title)) > 256 {
+		return "", false
+	}
+	return title, true
+}
+
+func normalizeNeoClientUserState(msg map[string]any, key string) (any, bool) {
+	raw, exists := msg[key]
+	if !exists {
+		return nil, true
+	}
+	state, ok := asMap(raw)
+	if !ok {
+		return nil, false
+	}
+	if !neoClientStringArray(state["currentlyVisibleFiles"]) {
+		return nil, false
+	}
+	if commands, exists := state["runningTerminalCommands"]; exists && !neoClientStringArray(commands) {
+		return nil, false
+	}
+	if cursorLocation, exists := state["cursorLocation"]; exists && !neoClientPosition(cursorLocation) {
+		return nil, false
+	}
+	if line, exists := state["cursorLocationLine"]; exists {
+		if _, ok := line.(string); !ok {
+			return nil, false
+		}
+	}
+	if selectionRange, exists := state["selectionRange"]; exists && !neoClientSelectionRange(selectionRange) {
+		return nil, false
+	}
+	if aggmanContext, exists := state["aggmanContext"]; exists && !neoClientAggmanContext(aggmanContext) {
+		return nil, false
+	}
+	return cloneNeoJSONMap(state), true
+}
+
+func neoClientStringArray(raw any) bool {
+	switch items := raw.(type) {
+	case []any:
+		for _, item := range items {
+			if _, ok := item.(string); !ok {
+				return false
+			}
+		}
+		return true
+	case []string:
+		return true
+	default:
+		return false
+	}
+}
+
+func neoClientPosition(raw any) bool {
+	position, ok := asMap(raw)
+	if !ok {
+		return false
+	}
+	return neoClientInteger(position["line"]) && neoClientInteger(position["column"])
+}
+
+func neoClientInteger(raw any) bool {
+	switch value := raw.(type) {
+	case int:
+		return true
+	case int64:
+		return true
+	case float64:
+		return value == float64(int64(value))
+	case json.Number:
+		_, err := value.Int64()
+		return err == nil
+	default:
+		return false
+	}
+}
+
+func neoClientSelectionRange(raw any) bool {
+	selectionRange, ok := asMap(raw)
+	if !ok {
+		return false
+	}
+	return neoClientPosition(selectionRange["start"]) && neoClientPosition(selectionRange["end"])
+}
+
+func neoClientAggmanContext(raw any) bool {
+	context, ok := asMap(raw)
+	if !ok {
+		return false
+	}
+	if _, ok := context["currentURL"].(string); !ok {
+		return false
+	}
+	if rawProjects, exists := context["availableProjects"]; exists {
+		projects, ok := rawProjects.([]any)
+		if !ok {
+			return false
+		}
+		for _, rawProject := range projects {
+			project, ok := asMap(rawProject)
+			if !ok {
+				return false
+			}
+			if _, ok := project["name"].(string); !ok {
+				return false
+			}
+			if _, ok := project["repositoryURL"].(string); !ok {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func (a *neoActor) handleBinaryUserMessage(msg map[string]any) {
@@ -5703,14 +6005,24 @@ func (a *neoActor) discardBinaryQueuedMessage(queueID string) {
 }
 
 func (a *neoActor) editMessage(msg map[string]any) {
-	messageID := stringValue(msg["messageId"])
-	editID := stringValue(msg["editId"])
-	content := arrayValue(msg["content"])
-	if content == nil {
-		content = []any{}
-	}
+	messageID := protocolMessageIDValue(msg["messageId"])
+	editID := neoClientEditIDValue(msg["editId"])
 	if messageID == "" {
-		a.rejectEdit(editID, "Missing messageId")
+		return
+	}
+	if editID == "" {
+		return
+	}
+	content, ok := normalizeNeoClientUserContent(msg["content"])
+	if !ok {
+		return
+	}
+	agentMode, ok := normalizeNeoClientAgentMode(msg, "agentMode")
+	if !ok {
+		return
+	}
+	reasoningEffort, ok := normalizeNeoClientReasoningEffort(msg, "reasoningEffort")
+	if !ok {
 		return
 	}
 
@@ -5736,11 +6048,11 @@ func (a *neoActor) editMessage(msg map[string]any) {
 	a.generation++
 	updated := a.messages[index]
 	updated.Content = content
-	if mode := stringValue(msg["agentMode"]); mode != "" {
-		updated.AgentMode = mode
+	if agentMode != "" {
+		updated.AgentMode = agentMode
 	}
-	if effort := stringValue(msg["reasoningEffort"]); effort != "" {
-		updated.ReasoningEffort = effort
+	if reasoningEffort != "" {
+		updated.ReasoningEffort = reasoningEffort
 	}
 	if updated.CreatedAt == "" {
 		updated.CreatedAt = time.Now().UTC().Format(time.RFC3339Nano)
