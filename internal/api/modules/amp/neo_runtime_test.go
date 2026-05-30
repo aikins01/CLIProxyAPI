@@ -13396,6 +13396,58 @@ func TestNeoRuntimeThreadImportDerivesModeFromMessages(t *testing.T) {
 	}
 }
 
+func TestNeoRuntimeThreadImportPreservesLocalPendingInferenceAcrossStaleImport(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := rt.store.ensureThreadActor("T-import-pending")
+	assistantID := "M-0000000000000000000002"
+	actor.pendingInference = &neoInferenceInflight{messageID: assistantID, agentMode: "deep", reasoningEffort: "xhigh", tools: []string{"Bash"}}
+
+	thread := map[string]any{
+		"id":        "T-import-pending",
+		"agentMode": "deep",
+		"messages": []any{
+			map[string]any{"role": "user", "messageId": "M-user", "agentMode": "deep", "reasoningEffort": "xhigh", "content": []any{map[string]any{"type": "text", "text": "resume this after restart"}}},
+		},
+	}
+	if err := actor.importThreadLocalOnly(thread); err != nil {
+		t.Fatalf("importThreadLocalOnly error: %v", err)
+	}
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.pendingInference == nil {
+		t.Fatal("pending inference was cleared by stale import")
+	}
+	if actor.pendingInference.messageID != assistantID || actor.pendingInference.agentMode != "deep" || actor.pendingInference.reasoningEffort != "xhigh" {
+		t.Fatalf("pending inference = %#v, want preserved deep/xhigh assistant", actor.pendingInference)
+	}
+}
+
+func TestNeoRuntimeThreadImportClearsLocalPendingInferenceWhenAssistantCompleted(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := rt.store.ensureThreadActor("T-import-complete")
+	assistantID := "M-0000000000000000000002"
+	actor.pendingInference = &neoInferenceInflight{messageID: assistantID, agentMode: "deep", reasoningEffort: "xhigh"}
+
+	thread := map[string]any{
+		"id":        "T-import-complete",
+		"agentMode": "deep",
+		"messages": []any{
+			map[string]any{"role": "user", "messageId": "M-user", "agentMode": "deep", "content": []any{map[string]any{"type": "text", "text": "done"}}},
+			map[string]any{"role": "assistant", "messageId": assistantID, "content": []any{map[string]any{"type": "text", "text": "finished"}}, "state": map[string]any{"type": "complete", "stopReason": "end_turn"}},
+		},
+	}
+	if err := actor.importThreadLocalOnly(thread); err != nil {
+		t.Fatalf("importThreadLocalOnly error: %v", err)
+	}
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.pendingInference != nil {
+		t.Fatalf("pending inference after completed import = %#v, want nil", actor.pendingInference)
+	}
+}
+
 func TestNeoRuntimeThreadImportDoesNotDeriveModeFromMetaLikeBinary(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	actor := rt.store.ensureThreadActor("T-import-meta-mode")

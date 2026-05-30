@@ -10042,6 +10042,15 @@ func (a *neoActor) importThreadWithSync(thread map[string]any, syncCloud bool) e
 	}
 
 	a.mu.Lock()
+	if pendingInference == nil && neoShouldPreservePendingInferenceOnImport(a.pendingInference, messages) {
+		pendingInference = cloneNeoInferenceInflight(a.pendingInference)
+		if pendingInference.agentMode == "" {
+			pendingInference.agentMode = agentMode
+		}
+		if !neoReasoningEffortAllowedForMode(pendingInference.agentMode, pendingInference.reasoningEffort) {
+			pendingInference.reasoningEffort = defaultNeoReasoningEffort(pendingInference.agentMode)
+		}
+	}
 	a.threadID = threadID
 	a.key = fallbackString(a.key, threadID)
 	if syncCloud {
@@ -10108,6 +10117,22 @@ func (a *neoActor) importThreadWithSync(thread map[string]any, syncCloud bool) e
 		a.syncCloudAsync()
 	}
 	return nil
+}
+
+func neoShouldPreservePendingInferenceOnImport(existing *neoInferenceInflight, imported []neoMessage) bool {
+	if existing == nil || strings.TrimSpace(existing.messageID) == "" {
+		return false
+	}
+	for _, message := range imported {
+		if message.MessageID != existing.messageID {
+			continue
+		}
+		if message.Role != "assistant" {
+			return false
+		}
+		return stringValue(mapValue(message.State)["type"]) == "cancelled"
+	}
+	return true
 }
 
 func neoImportedThreadAgentMode(messages []neoMessage) string {
