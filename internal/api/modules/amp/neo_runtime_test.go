@@ -8200,7 +8200,7 @@ func TestNeoActorPassesFindThreadToolResultThrough(t *testing.T) {
 }
 
 func TestNeoFindThreadToolRunPassesThrough(t *testing.T) {
-	run := normalizeNeoLocalThreadToolRun(context.Background(), nil, neoPendingTool{
+	run := normalizeNeoExecutorToolRun(context.Background(), nil, neoPendingTool{
 		Name:  "find_thread",
 		Input: map[string]any{"query": "T-search-target", "limit": "5"},
 	}, map[string]any{
@@ -10810,7 +10810,7 @@ func TestNeoToolResultPreservesDiscoveredGuidanceFiles(t *testing.T) {
 }
 
 func TestNeoImageToolResultPreservesImagesAndCompactsHistoryText(t *testing.T) {
-	run := normalizeNeoLocalThreadToolRun(context.Background(), nil, neoPendingTool{
+	run := normalizeNeoExecutorToolRun(context.Background(), nil, neoPendingTool{
 		Name:  "render_agg_man",
 		Input: map[string]any{"prompt": "draw the mascot"},
 	}, map[string]any{
@@ -10846,7 +10846,7 @@ func TestNeoImageToolResultPreservesImagesAndCompactsHistoryText(t *testing.T) {
 		t.Fatalf("runToText = %q, want compact image text", got)
 	}
 
-	viewRun := normalizeNeoLocalThreadToolRun(context.Background(), nil, neoPendingTool{Name: "view_media"}, map[string]any{
+	viewRun := normalizeNeoExecutorToolRun(context.Background(), nil, neoPendingTool{Name: "view_media"}, map[string]any{
 		"status": "done",
 		"image":  map[string]any{"url": "https://example.test/image.png"},
 	}, "T-current")
@@ -10856,7 +10856,7 @@ func TestNeoImageToolResultPreservesImagesAndCompactsHistoryText(t *testing.T) {
 }
 
 func TestNeoImageToolResultAcceptsBinaryResultArray(t *testing.T) {
-	run := normalizeNeoLocalThreadToolRun(context.Background(), nil, neoPendingTool{
+	run := normalizeNeoExecutorToolRun(context.Background(), nil, neoPendingTool{
 		Name:  "painter",
 		Input: map[string]any{"prompt": "draw a ship"},
 	}, map[string]any{
@@ -10884,7 +10884,7 @@ func TestNeoImageToolResultAcceptsBinaryResultArray(t *testing.T) {
 }
 
 func TestNeoImageToolResultReplaysImageContentToProviders(t *testing.T) {
-	run := normalizeNeoLocalThreadToolRun(context.Background(), nil, neoPendingTool{Name: "view_media"}, map[string]any{
+	run := normalizeNeoExecutorToolRun(context.Background(), nil, neoPendingTool{Name: "view_media"}, map[string]any{
 		"status": "done",
 		"result": []any{
 			map[string]any{"type": "text", "text": "Viewed image: /tmp/chart.png"},

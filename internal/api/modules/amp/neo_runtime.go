@@ -1981,7 +1981,7 @@ func (a *neoActor) normalizeToolRunForPending(pending neoPendingTool, run map[st
 	if !neoToolRunTerminal(run) {
 		return run
 	}
-	return normalizeNeoLocalThreadToolRun(context.Background(), a.runtime, pending, run, a.threadID)
+	return normalizeNeoExecutorToolRun(context.Background(), a.runtime, pending, run, a.threadID)
 }
 
 func (a *neoActor) storeToolResultEventLocked(ref neoStoredToolUseRef, block map[string]any, completionStatus string) (neoMessage, map[string]any) {
@@ -6035,7 +6035,7 @@ func (a *neoActor) receiveToolResult(msg map[string]any) {
 	}
 	a.mu.Unlock()
 
-	run = normalizeNeoLocalThreadToolRun(context.Background(), a.runtime, pending, run, a.threadID)
+	run = normalizeNeoExecutorToolRun(context.Background(), a.runtime, pending, run, a.threadID)
 
 	a.mu.Lock()
 	_, event := a.storeMessageEventLocked(neoMessage{
@@ -6076,7 +6076,7 @@ func (a *neoActor) receiveToolResult(msg map[string]any) {
 	}
 }
 
-func normalizeNeoLocalThreadToolRun(ctx context.Context, rt *neoRuntime, pending neoPendingTool, run map[string]any, currentThreadID string) map[string]any {
+func normalizeNeoExecutorToolRun(ctx context.Context, rt *neoRuntime, pending neoPendingTool, run map[string]any, currentThreadID string) map[string]any {
 	switch pending.Name {
 	case "painter", "render_agg_man", "view_media", "look_at":
 		return normalizeNeoImageToolRun(pending, run)
@@ -7610,6 +7610,9 @@ func (m *AmpModule) canServeNeoLocalManagement(r *http.Request) bool {
 	if m == nil || r == nil || r.URL == nil {
 		return false
 	}
+	// Keep Amp-owned thread discovery and thread reads on the upstream path.
+	// Local management exceptions are only the Neo actor bridge and local web
+	// attachments needed to run inference through the local runtime.
 	if _, ok := neoThreadActorManagementPath(r.URL.Path); ok && m.neoRuntime != nil {
 		return true
 	}
