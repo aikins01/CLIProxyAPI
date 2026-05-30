@@ -283,6 +283,7 @@
   let programmaticScrollKind: 'follow' | 'preserve' | '' = '';
   let manualTranscriptScrollVersion = 0;
   let transcriptFollowPinned = true;
+  let transcriptTouchStartY = 0;
   const devSignalCount = $derived.by(() => {
     let count = artifacts.length + executorStatuses.length + runtimeEvents.length + runtimeTraces.length + toolLeases.length;
     if (inferenceTools) count += 1;
@@ -425,7 +426,9 @@
     const scroller = pageScroller();
     const top = scroller?.scrollTop ?? window.scrollY;
     const manualScrollVersion = manualTranscriptScrollVersion;
-    const shouldFollow = Boolean(options.forceFollow) || transcriptFollowPinned || isTranscriptPinnedToBottom();
+    const pinnedNow = isTranscriptPinnedToBottom();
+    transcriptFollowPinned = pinnedNow;
+    const shouldFollow = Boolean(options.forceFollow) || pinnedNow;
     if (shouldFollow) {
       transcriptScrollPlan = { kind: 'follow', top, manualScrollVersion, force: Boolean(options.forceFollow) };
     } else {
@@ -444,6 +447,39 @@
     manualTranscriptScrollVersion += 1;
     transcriptFollowPinned = isTranscriptPinnedToBottom();
     if (transcriptFollowPinned) newActivityBelow = false;
+  }
+
+  function markTranscriptDetachedByUser() {
+    programmaticScrollKind = '';
+    programmaticScrollUntil = 0;
+    manualTranscriptScrollVersion += 1;
+    transcriptFollowPinned = false;
+  }
+
+  function handleTranscriptWheel(event: WheelEvent) {
+    if (event.deltaY < -2) markTranscriptDetachedByUser();
+  }
+
+  function handleTranscriptTouchStart(event: TouchEvent) {
+    transcriptTouchStartY = event.touches[0]?.clientY ?? 0;
+  }
+
+  function handleTranscriptTouchMove(event: TouchEvent) {
+    const y = event.touches[0]?.clientY ?? 0;
+    if (transcriptTouchStartY > 0 && y - transcriptTouchStartY > 6) markTranscriptDetachedByUser();
+  }
+
+  function isEditableTarget(target: EventTarget | null) {
+    if (!(target instanceof HTMLElement)) return false;
+    const tag = target.tagName.toLowerCase();
+    return tag === 'input' || tag === 'textarea' || tag === 'select' || target.isContentEditable;
+  }
+
+  function handleTranscriptKeydown(event: KeyboardEvent) {
+    if (isEditableTarget(event.target)) return;
+    if (event.key === 'PageUp' || event.key === 'Home' || event.key === 'ArrowUp' || (event.key === ' ' && event.shiftKey)) {
+      markTranscriptDetachedByUser();
+    }
   }
 
   function jumpToLatest() {
@@ -490,10 +526,18 @@
     };
     addEventListener('popstate', handlePopState);
     addEventListener('keydown', handleEscape);
+    addEventListener('keydown', handleTranscriptKeydown);
+    addEventListener('wheel', handleTranscriptWheel, { passive: true });
+    addEventListener('touchstart', handleTranscriptTouchStart, { passive: true });
+    addEventListener('touchmove', handleTranscriptTouchMove, { passive: true });
     addEventListener('scroll', handlePageScroll, { passive: true });
     return () => {
       removeEventListener('popstate', handlePopState);
       removeEventListener('keydown', handleEscape);
+      removeEventListener('keydown', handleTranscriptKeydown);
+      removeEventListener('wheel', handleTranscriptWheel);
+      removeEventListener('touchstart', handleTranscriptTouchStart);
+      removeEventListener('touchmove', handleTranscriptTouchMove);
       removeEventListener('scroll', handlePageScroll);
       clearComposerAttachments();
       disconnect();
