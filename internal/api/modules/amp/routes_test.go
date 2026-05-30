@@ -55,6 +55,7 @@ func TestRegisterManagementRoutes(t *testing.T) {
 	}{
 		{"/api/internal", http.MethodGet},
 		{"/api/internal/some/path", http.MethodGet},
+		{"/api/internal/github-proxy/repos/local", http.MethodGet},
 		{"/api/user", http.MethodGet},
 		{"/api/user/profile", http.MethodGet},
 		{"/api/user-actor-credentials", http.MethodPost},
@@ -70,8 +71,10 @@ func TestRegisterManagementRoutes(t *testing.T) {
 		{"/threads/", http.MethodGet},
 		{"/threads.rss", http.MethodGet}, // Root-level route (no /api prefix)
 		{"/api/otel", http.MethodGet},
+		{"/api/v2/spans", http.MethodPost},
 		{"/api/tab", http.MethodGet},
 		{"/api/tab/some/path", http.MethodGet},
+		{"/api/durable-thread-workers/T-worker", http.MethodGet},
 		{"/auth", http.MethodGet},           // Root-level auth route
 		{"/auth/cli-login", http.MethodGet}, // CLI login flow
 		{"/auth/callback", http.MethodGet},  // OAuth callback
