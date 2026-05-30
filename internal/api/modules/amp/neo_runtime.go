@@ -116,14 +116,15 @@ var (
 	neoInboundMessageHookMu       sync.RWMutex
 	neoInboundMessageHook         func(actor *neoActor, msg map[string]any)
 	errNeoLocalEmptyStream        = errors.New("local provider stream closed before first payload")
-	neoModeToolAllowlist          = map[string]map[string]bool{
-		"smart":    toolSet("Read", "finder", "Bash", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource"),
-		"large":    toolSet("Read", "finder", "Bash", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource"),
-		"rush":     toolSet("finder", "shell_command", "apply_patch", "web_search", "read_web_page", "read_mcp_resource", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "painter"),
-		"agg-man":  toolSet("find_thread", "read_thread", "web_search", "read_web_page", "docs_list", "docs_read", "docs_write", "render_agg_man", "create_project", "create_thread", "archive_thread", "archive_threads", "unarchive_thread", "send_message_to_thread", "slack_write", "slack_read", "github_repo_ci_status", "read_github", "search_github", "commit_search", "list_directory_github", "list_repositories", "glob_github", "diff"),
-		"deep":     toolSet("shell_command", "apply_patch", "web_search", "read_web_page", "chart", "Task", "skill", "read_thread", "find_thread", "librarian", "oracle", "finder", "view_media", "painter", "send_message_to_aggman"),
-		"nostromo": toolSet("Read", "finder", "Bash", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "apply_patch", "shell_command", "chart", "send_message_to_aggman"),
+	neoModeToolOrder              = map[string][]string{
+		"smart":    toolList("Read", "finder", "Bash", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource"),
+		"large":    toolList("Read", "finder", "Bash", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource"),
+		"rush":     toolList("finder", "shell_command", "apply_patch", "web_search", "read_web_page", "read_mcp_resource", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "painter"),
+		"agg-man":  toolList("find_thread", "read_thread", "web_search", "read_web_page", "docs_list", "docs_read", "docs_write", "render_agg_man", "create_project", "create_thread", "archive_thread", "archive_threads", "unarchive_thread", "send_message_to_thread", "slack_write", "slack_read", "github_repo_ci_status", "read_github", "search_github", "commit_search", "list_directory_github", "list_repositories", "glob_github", "diff"),
+		"deep":     toolList("shell_command", "apply_patch", "web_search", "read_web_page", "chart", "Task", "skill", "read_thread", "find_thread", "librarian", "oracle", "finder", "view_media", "painter", "send_message_to_aggman"),
+		"nostromo": toolList("Read", "finder", "Bash", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "shell_command", "apply_patch", "chart", "send_message_to_aggman"),
 	}
+	neoModeToolAllowlist         = orderedToolSets(neoModeToolOrder)
 	neoModeDeferredToolAllowlist = map[string]map[string]bool{
 		"smart": toolSet("code_review"),
 		"large": toolSet("code_review"),
@@ -1474,6 +1475,7 @@ type neoActor struct {
 	capabilities              map[string]any
 	guidanceSnapshot          map[string]any
 	tools                     map[string]neoToolSpec
+	toolOrder                 []string
 	skillSnapshot             map[string]any
 	messages                  []neoMessage
 	history                   []neoHistoryMessage
@@ -2627,6 +2629,7 @@ func (a *neoActor) executorConnect(msg map[string]any) {
 	a.executorResumeBootstrap = false
 	a.executorBootstrapComplete = false
 	a.tools = map[string]neoToolSpec{}
+	a.toolOrder = nil
 	a.guidanceSnapshot = map[string]any{}
 	a.skillSnapshot = map[string]any{}
 	a.capabilities = mapValue(msg["capabilities"])
@@ -3128,11 +3131,17 @@ func (a *neoActor) registerTools(raw any) {
 	tools, _ := raw.([]any)
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.tools == nil {
+		a.tools = map[string]neoToolSpec{}
+	}
 	for _, item := range tools {
 		m := mapValue(item)
 		name := stringValue(m["name"])
 		if name == "" {
 			continue
+		}
+		if _, exists := a.tools[name]; !exists {
+			a.toolOrder = append(a.toolOrder, name)
 		}
 		meta := neoRegisteredToolMeta(m)
 		a.tools[name] = neoToolSpec{
@@ -3177,8 +3186,20 @@ func (a *neoActor) unregisterTools(raw any) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	for _, name := range names {
-		delete(a.tools, stringValue(name))
+		toolName := stringValue(name)
+		delete(a.tools, toolName)
+		a.toolOrder = removeNeoString(a.toolOrder, toolName)
 	}
+}
+
+func removeNeoString(values []string, target string) []string {
+	filtered := values[:0]
+	for _, value := range values {
+		if value != target {
+			filtered = append(filtered, value)
+		}
+	}
+	return filtered
 }
 
 func neoOpenAICustomToolConfigFromTool(tool map[string]any) map[string]any {
@@ -10242,7 +10263,21 @@ func scopedNeoHistory(history []neoHistoryMessage, parentToolCallID string) []ne
 func (a *neoActor) toolsForModeLocked(agentMode string, history []neoHistoryMessage) []neoToolSpec {
 	tools := make([]neoToolSpec, 0, len(a.tools)+len(neoLoadedSkillBuiltinTools))
 	seen := map[string]bool{}
-	for _, tool := range a.tools {
+	for _, name := range neoToolOrderForMode(agentMode) {
+		tool, ok := a.tools[name]
+		if !ok || seen[tool.Name] {
+			continue
+		}
+		if !neoToolIncludedForMode(agentMode, tool, a.settings) {
+			continue
+		}
+		tools = append(tools, tool)
+		seen[tool.Name] = true
+	}
+	for _, tool := range a.registeredToolsInOrderLocked() {
+		if seen[tool.Name] {
+			continue
+		}
 		if !neoToolIncludedForMode(agentMode, tool, a.settings) {
 			continue
 		}
@@ -10265,6 +10300,48 @@ func (a *neoActor) toolsForModeLocked(agentMode string, history []neoHistoryMess
 		seen[toolName] = true
 	}
 	return tools
+}
+
+func neoToolOrderForMode(agentMode string) []string {
+	agentMode = strings.ToLower(strings.TrimSpace(agentMode))
+	if agentMode == "" {
+		agentMode = "smart"
+	}
+	order := neoModeToolOrder[agentMode]
+	if len(order) == 0 {
+		order = neoModeToolOrder["smart"]
+	}
+	return order
+}
+
+func (a *neoActor) registeredToolsInOrderLocked() []neoToolSpec {
+	if len(a.tools) == 0 {
+		return nil
+	}
+	out := make([]neoToolSpec, 0, len(a.tools))
+	seen := map[string]bool{}
+	for _, name := range a.toolOrder {
+		tool, ok := a.tools[name]
+		if !ok || seen[name] {
+			continue
+		}
+		out = append(out, tool)
+		seen[name] = true
+	}
+	if len(seen) == len(a.tools) {
+		return out
+	}
+	names := make([]string, 0, len(a.tools)-len(seen))
+	for name := range a.tools {
+		if !seen[name] {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		out = append(out, a.tools[name])
+	}
+	return out
 }
 
 func neoLoadedSkillNamesFromHistory(history []neoHistoryMessage) map[string]bool {
@@ -14090,6 +14167,18 @@ func toolSet(names ...string) map[string]bool {
 	out := make(map[string]bool, len(names))
 	for _, name := range names {
 		out[name] = true
+	}
+	return out
+}
+
+func toolList(names ...string) []string {
+	return names
+}
+
+func orderedToolSets(lists map[string][]string) map[string]map[string]bool {
+	out := make(map[string]map[string]bool, len(lists))
+	for mode, names := range lists {
+		out[mode] = toolSet(names...)
 	}
 	return out
 }

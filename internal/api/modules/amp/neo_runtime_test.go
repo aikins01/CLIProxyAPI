@@ -8068,6 +8068,29 @@ func TestNeoActorFiltersAmpBuiltInToolsByMode(t *testing.T) {
 		[]string{"Grep", "glob", "Glob", "get_diagnostics", "look_at", "handoff", "task_list", "todo_write", "file_tree", "code_review", "deferred_custom", "docs_read"})
 }
 
+func TestNeoActorToolsForModeFollowBinaryModeOrder(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	binaryNostromoOrder := []string{
+		"Read", "finder", "Bash", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "shell_command", "apply_patch", "chart", "send_message_to_aggman",
+	}
+	rawTools := []any{map[string]any{"name": "external_tool", "source": map[string]any{"plugin": "test"}}}
+	for i := len(binaryNostromoOrder) - 1; i >= 0; i-- {
+		rawTools = append(rawTools, map[string]any{"name": binaryNostromoOrder[i]})
+	}
+	actor.registerTools(rawTools)
+
+	tools := actor.toolsForModeLocked("nostromo", nil)
+	names := make([]string, 0, len(tools))
+	for _, tool := range tools {
+		names = append(names, tool.Name)
+	}
+	want := append(append([]string(nil), binaryNostromoOrder...), "external_tool")
+	if !reflect.DeepEqual(names, want) {
+		t.Fatalf("nostromo tool order = %#v, want %#v", names, want)
+	}
+}
+
 func TestNeoActorAllowsExternalToolsNamedLikeBuiltins(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
