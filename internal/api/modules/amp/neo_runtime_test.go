@@ -7633,7 +7633,9 @@ func TestNeoSystemPromptMatchesBinaryEnvironmentThreadContext(t *testing.T) {
 
 	for _, want := range []string{
 		"# Environment",
+		"# Environment\n\nHere is useful information about the environment you are running in:",
 		"Working directory: /Users/test/project",
+		"Working directory: /Users/test/project\n\nWorkspace root: /Users/test/project",
 		"Operating system: darwin (26.4.1) on arm64",
 		"Repository: github.com/router-for-me/CLIProxyAPI",
 		"Amp Thread URL: http://127.0.0.1:8317/threads/T-019e1055-055c-705b-ae36-73d934ec6a89",
@@ -8001,7 +8003,7 @@ func TestNeoSystemPromptUsesExecutorGuidanceSnapshot(t *testing.T) {
 	if !strings.Contains(prompt, "You are Amp") {
 		t.Fatalf("prompt missing base actor prompt:\n%s", prompt)
 	}
-	if !strings.Contains(prompt, "# AGENTS.md instructions for /Users/test/.config") || !strings.Contains(prompt, "<INSTRUCTIONS>\nAmp upstream executor guidance\n</INSTRUCTIONS>") {
+	if !strings.Contains(prompt, "# AGENTS.md instructions for /Users/test/.config\n\n<INSTRUCTIONS>\nAmp upstream executor guidance\n</INSTRUCTIONS>") {
 		t.Fatalf("prompt missing executor guidance:\n%s", prompt)
 	}
 	for _, want := range []string{
@@ -8049,11 +8051,11 @@ func TestNeoGuidanceBlocksUseBinaryGuidanceLabels(t *testing.T) {
 	}, false), "\n\n")
 
 	for _, want := range []string{
-		"Contents of AGENTS.md (project instructions):\n<instructions>\nProject guidance\n</instructions>",
-		"Contents of AGENTS.md (user's private global instructions for all projects):\n<instructions>\nGlobal guidance\n</instructions>",
-		"Contents of AGENTS.local.md (user's private project instructions, not checked in):\n<instructions>\nLocal guidance\n</instructions>",
-		"Contents of AGENTS.md (system-wide global instructions for all projects):\n<instructions>\nSystem guidance\n</instructions>",
-		"Contents of AGENTS.md (directory-specific instructions for /Users/test/project/src):\n<instructions>\nSubtree guidance\n</instructions>",
+		"Contents of AGENTS.md (project instructions):\n\n<instructions>\nProject guidance\n</instructions>",
+		"Contents of AGENTS.md (user's private global instructions for all projects):\n\n<instructions>\nGlobal guidance\n</instructions>",
+		"Contents of AGENTS.local.md (user's private project instructions, not checked in):\n\n<instructions>\nLocal guidance\n</instructions>",
+		"Contents of AGENTS.md (system-wide global instructions for all projects):\n\n<instructions>\nSystem guidance\n</instructions>",
+		"Contents of AGENTS.md (directory-specific instructions for /Users/test/project/src):\n\n<instructions>\nSubtree guidance\n</instructions>",
 	} {
 		if !strings.Contains(blocks, want) {
 			t.Fatalf("guidance blocks missing %q:\n%s", want, blocks)

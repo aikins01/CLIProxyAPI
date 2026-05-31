@@ -18300,7 +18300,7 @@ func neoGuidanceBlocks(request neoInferenceRequest, deep bool) []string {
 	if len(files) > 0 {
 		for _, file := range files {
 			if deep {
-				blocks = append(blocks, "# AGENTS.md instructions for "+neoGuidanceScope(file.URI)+"\n<INSTRUCTIONS>\n"+file.Content+"\n</INSTRUCTIONS>")
+				blocks = append(blocks, "# AGENTS.md instructions for "+neoGuidanceScope(file.URI)+"\n\n<INSTRUCTIONS>\n"+file.Content+"\n</INSTRUCTIONS>")
 				continue
 			}
 			name := neoGuidanceName(file.URI)
@@ -18308,15 +18308,15 @@ func neoGuidanceBlocks(request neoInferenceRequest, deep bool) []string {
 			if strings.EqualFold(strings.TrimSpace(file.Kind), "subtree") {
 				label = "directory-specific instructions for " + neoGuidanceScope(file.URI)
 			}
-			blocks = append(blocks, "Contents of "+name+" ("+label+"):\n<instructions>\n"+file.Content+"\n</instructions>")
+			blocks = append(blocks, "Contents of "+name+" ("+label+"):\n\n<instructions>\n"+file.Content+"\n</instructions>")
 		}
 		return blocks
 	}
 	if guidance := neoGuidanceText(request.Guidance); guidance != "" {
 		if deep {
-			blocks = append(blocks, "# AGENTS.md instructions for /\n<INSTRUCTIONS>\n"+guidance+"\n</INSTRUCTIONS>")
+			blocks = append(blocks, "# AGENTS.md instructions for /\n\n<INSTRUCTIONS>\n"+guidance+"\n</INSTRUCTIONS>")
 		} else {
-			blocks = append(blocks, "Contents of AGENTS.md ("+neoGuidanceClassification("", "")+"):\n<instructions>\n"+guidance+"\n</instructions>")
+			blocks = append(blocks, "Contents of AGENTS.md ("+neoGuidanceClassification("", "")+"):\n\n<instructions>\n"+guidance+"\n</instructions>")
 		}
 	}
 	return blocks
@@ -18324,7 +18324,7 @@ func neoGuidanceBlocks(request neoInferenceRequest, deep bool) []string {
 
 func neoGuidanceOverview(deep bool) string {
 	if deep {
-		return "Files called AGENTS.md pass along human guidance to you, the agent. Such guidance can include coding standards, explanations of the project layout, steps for building or testing, and other instructions to be followed.\nEach AGENTS.md governs the entire directory that contains it and every child directory beneath it. Whenever you change a file, you must comply with every AGENTS.md whose scope covers that file. Naming conventions, stylistic rules, and similar directives are restricted to code within that scope unless the document explicitly states otherwise.\nApply only the parts of these guidance files that are relevant to the current files and task; they define constraints, not extra work to perform by default.\nAGENTS.md instructions are delivered dynamically in the conversation context, you don't have to read or search for them. They appear with a header \"# AGENTS.md instructions for [path]\" followed by <INSTRUCTIONS> tags. The contents of AGENTS.md files at the root and directories up to the CWD are included automatically. When working in subdirectories, check for any additional AGENTS.md files that may apply."
+		return "Files called AGENTS.md pass along human guidance to you, the agent. Such guidance can include coding standards, explanations of the project layout, steps for building or testing, and other instructions to be followed.\n\nEach AGENTS.md governs the entire directory that contains it and every child directory beneath it. Whenever you change a file, you must comply with every AGENTS.md whose scope covers that file. Naming conventions, stylistic rules, and similar directives are restricted to code within that scope unless the document explicitly states otherwise.\n\nApply only the parts of these guidance files that are relevant to the current files and task; they define constraints, not extra work to perform by default.\n\nAGENTS.md instructions are delivered dynamically in the conversation context, you don't have to read or search for them. They appear with a header \"# AGENTS.md instructions for [path]\" followed by <INSTRUCTIONS> tags. The contents of AGENTS.md files at the root and directories up to the CWD are included automatically. When working in subdirectories, check for any additional AGENTS.md files that may apply."
 	}
 	return "AGENTS.md guidance files are delivered dynamically in the conversation context after file operations (Read, create_file) and user file mentions. They appear with a descriptive header like \"Contents of [path] (directory-specific instructions for [scope]):\" followed by <instructions> tags. These guidance files provide directory-specific instructions that take precedence for files in that directory and should be followed carefully. Apply only the parts of these guidance files that are relevant to the current files and task; they define constraints, not extra work to perform by default."
 }
@@ -18465,7 +18465,7 @@ func neoEnvironmentBlock(request neoInferenceRequest, deep bool) string {
 			lines = append(lines, "## Directory listing\nList of files (top-level only) in the user's workspace:\n"+listing)
 		}
 	}
-	return strings.Join(lines, "\n")
+	return strings.Join(lines, "\n\n")
 }
 
 func neoAmpThreadURL(baseURL, threadID string) string {
