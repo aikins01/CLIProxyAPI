@@ -4666,10 +4666,12 @@ func normalizeNeoProtocolImageBlock(block map[string]any) (map[string]any, bool)
 	}
 	out["source"] = normalizedSource
 	sourcePath := firstNonEmptyString(block["sourcePath"], block["source_path"], block["path"], block["filePath"], block["filename"], block["name"], block["attachmentUrl"], block["url"], block["uri"], normalizedSource["url"])
-	if sourcePath == "" {
-		return nil, false
+	if sourcePath != "" {
+		out["sourcePath"] = sourcePath
+	} else {
+		delete(out, "sourcePath")
+		delete(out, "source_path")
 	}
-	out["sourcePath"] = sourcePath
 	return out, true
 }
 
@@ -5640,8 +5642,8 @@ func normalizeNeoClientImageBlock(block map[string]any) (map[string]any, bool) {
 	var normalizedSource map[string]any
 	switch sourceType {
 	case "base64":
-		mediaType, ok := source["mediaType"].(string)
-		if !ok || !neoProtocolImageMediaType(mediaType) {
+		mediaType := firstNonEmptyString(source["mediaType"], source["media_type"], source["mimeType"], source["mime_type"])
+		if !neoProtocolImageMediaType(mediaType) {
 			return nil, false
 		}
 		data, ok := source["data"].(string)
@@ -5658,14 +5660,30 @@ func normalizeNeoClientImageBlock(block map[string]any) (map[string]any, bool) {
 	default:
 		return nil, false
 	}
-	sourcePath, ok := block["sourcePath"].(string)
-	if !ok {
+	sourcePathValue := firstNonNil(block["sourcePath"], block["source_path"])
+	sourcePath := ""
+	if sourcePathValue != nil {
+		var ok bool
+		sourcePath, ok = sourcePathValue.(string)
+		if !ok {
+			return nil, false
+		}
+	}
+	if sourcePath == "" {
+		sourcePath = firstNonEmptyString(block["path"], block["filePath"], block["file_path"], block["filename"], block["name"], normalizedSource["url"])
+	}
+	if sourcePath == "" && sourceType == "url" {
 		return nil, false
 	}
 	out := cloneNeoJSONMap(block)
 	out["type"] = "image"
 	out["source"] = normalizedSource
-	out["sourcePath"] = sourcePath
+	if sourcePath != "" {
+		out["sourcePath"] = sourcePath
+	} else {
+		delete(out, "sourcePath")
+		delete(out, "source_path")
+	}
 	return out, true
 }
 

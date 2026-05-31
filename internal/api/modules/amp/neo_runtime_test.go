@@ -11342,14 +11342,14 @@ func TestNeoActorClientAppendUserMessageRejectsInvalidPayloadLikeBinary(t *testi
 			},
 		},
 		{
-			name: "image missing mediaType",
+			name: "image missing media type",
 			msg: map[string]any{
 				"type":      "client_append_user_msg",
 				"messageId": "M-0000000000000000000001",
 				"content": []any{map[string]any{
 					"type":       "image",
 					"sourcePath": "image.png",
-					"source":     map[string]any{"type": "base64", "media_type": "image/png", "data": "AA=="},
+					"source":     map[string]any{"type": "base64", "data": "AA=="},
 				}},
 			},
 		},
@@ -11406,6 +11406,51 @@ func TestNeoActorClientAppendUserMessageRejectsInvalidPayloadLikeBinary(t *testi
 				t.Fatalf("invalid client message mutated state: queue=%#v messages=%#v", actor.queue, actor.messages)
 			}
 		})
+	}
+}
+
+func TestNeoClientUserContentAcceptsBinaryImagePayload(t *testing.T) {
+	content, ok := normalizeNeoClientUserContent([]any{
+		map[string]any{
+			"type":        "image",
+			"source_path": "shot.png",
+			"source":      map[string]any{"type": "base64", "media_type": "image/png", "data": "AA=="},
+		},
+		map[string]any{
+			"type":   "image",
+			"source": map[string]any{"type": "base64", "media_type": "image/jpeg", "data": "BB=="},
+		},
+	})
+	if !ok {
+		t.Fatal("binary-shaped image content was rejected")
+	}
+	if len(content) != 2 {
+		t.Fatalf("content = %#v", content)
+	}
+	first := mapValue(content[0])
+	firstSource := mapValue(first["source"])
+	if stringValue(first["sourcePath"]) != "shot.png" || stringValue(firstSource["mediaType"]) != "image/png" || stringValue(firstSource["data"]) != "AA==" {
+		t.Fatalf("first normalized image = %#v", first)
+	}
+	second := mapValue(content[1])
+	secondSource := mapValue(second["source"])
+	if _, exists := second["sourcePath"]; exists {
+		t.Fatalf("source_path is optional in binary image schema but was synthesized: %#v", second)
+	}
+	if stringValue(secondSource["mediaType"]) != "image/jpeg" || stringValue(secondSource["data"]) != "BB==" {
+		t.Fatalf("second normalized image = %#v", second)
+	}
+
+	msg := neoHistoryMessage{Role: "user", Content: content}
+	anthropic := anthropicNeoMessages([]neoHistoryMessage{msg})
+	anthropicContent := arrayValue(mapValue(anthropic[0])["content"])
+	if len(anthropicContent) != 4 {
+		t.Fatalf("anthropic content = %#v", anthropicContent)
+	}
+	firstAnthropicSource := mapValue(mapValue(anthropicContent[1])["source"])
+	secondAnthropicSource := mapValue(mapValue(anthropicContent[3])["source"])
+	if stringValue(firstAnthropicSource["media_type"]) != "image/png" || stringValue(secondAnthropicSource["media_type"]) != "image/jpeg" {
+		t.Fatalf("anthropic image sources = %#v / %#v", firstAnthropicSource, secondAnthropicSource)
 	}
 }
 
@@ -16309,8 +16354,16 @@ func TestNeoRuntimeProtocolMessagesNormalizeContentLikeBinary(t *testing.T) {
 	actor.mu.Lock()
 	invalidUser := actor.messages[2]
 	actor.mu.Unlock()
-	if len(invalidUser.Content) != 1 || stringValue(mapValue(invalidUser.Content[0])["text"]) != "kept" {
+	if len(invalidUser.Content) != 2 || stringValue(mapValue(invalidUser.Content[0])["text"]) != "kept" {
 		t.Fatalf("invalid image blocks were not filtered like binary schema: %#v", invalidUser.Content)
+	}
+	keptImage := mapValue(invalidUser.Content[1])
+	keptSource := mapValue(keptImage["source"])
+	if stringValue(keptSource["mediaType"]) != "image/png" || stringValue(keptSource["data"]) != "abcd" {
+		t.Fatalf("valid image with optional source_path was not kept: %#v", keptImage)
+	}
+	if _, exists := keptImage["sourcePath"]; exists {
+		t.Fatalf("binary source_path is optional but was synthesized: %#v", keptImage)
 	}
 
 	actor.handle(map[string]any{"type": "message_added", "message": map[string]any{
