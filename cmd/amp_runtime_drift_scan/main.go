@@ -49,13 +49,14 @@ func run(args []string, stdout, stderr io.Writer) int {
 	captureDir := flags.String("capture-dir", defaultCaptureDir(), "Neo provider request capture directory to scan")
 	sinceRaw := flags.String("since", "", "only scan files modified at or after this RFC3339 timestamp")
 	sinceFile := flags.String("since-file", "", "only scan files and timestamped thread messages at or after this file's modification time")
+	sinceHomebrewRuntime := flags.Bool("since-homebrew-runtime", false, "only scan data at or after the Homebrew cliproxyapi.real replacement time")
 	allowMissing := flags.Bool("allow-missing", true, "treat missing scan directories as empty")
 	jsonOutput := flags.Bool("json", false, "print findings as JSON")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
 
-	since, err := parseSinceCutoff(*sinceRaw, *sinceFile)
+	since, err := parseSinceCutoff(*sinceRaw, *sinceFile, *sinceHomebrewRuntime)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 2
@@ -93,7 +94,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-func parseSinceCutoff(sinceRaw, sinceFile string) (time.Time, error) {
+func parseSinceCutoff(sinceRaw, sinceFile string, sinceHomebrewRuntime bool) (time.Time, error) {
 	var since time.Time
 	if strings.TrimSpace(sinceRaw) != "" {
 		parsed, err := time.Parse(time.RFC3339, strings.TrimSpace(sinceRaw))
@@ -112,7 +113,28 @@ func parseSinceCutoff(sinceRaw, sinceFile string) (time.Time, error) {
 			since = fileTime
 		}
 	}
+	if sinceHomebrewRuntime {
+		fileTime, err := fileModTime(homebrewRuntimeBinaryPath())
+		if err != nil {
+			return time.Time{}, fmt.Errorf("stat -since-homebrew-runtime: %w", err)
+		}
+		if since.IsZero() || fileTime.After(since) {
+			since = fileTime
+		}
+	}
 	return since, nil
+}
+
+func fileModTime(path string) (time.Time, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return info.ModTime(), nil
+}
+
+var homebrewRuntimeBinaryPath = func() string {
+	return filepath.Join(string(os.PathSeparator), "opt", "homebrew", "opt", "cliproxyapi", "bin", "cliproxyapi.real")
 }
 
 func defaultThreadDir() string {
