@@ -315,12 +315,15 @@ func scanThreadCompactionDrift(file, threadID string, thread map[string]any, mes
 		return nil
 	}
 	var findings []driftFinding
-	for _, rawRecord := range firstArray(thread["compactionRecords"], thread["compaction_records"]) {
+	compactionRecords := firstArray(thread["compactionRecords"], thread["compaction_records"])
+	compactionTimes := make([]time.Time, 0, len(compactionRecords))
+	for _, rawRecord := range compactionRecords {
 		record := mapValue(rawRecord)
 		recordCreatedAt, ok := parseTimeValue(record["createdAt"], record["created_at"])
 		if !ok {
 			continue
 		}
+		compactionTimes = append(compactionTimes, recordCreatedAt)
 		if !since.IsZero() && recordCreatedAt.Before(since) {
 			continue
 		}
@@ -343,7 +346,49 @@ func scanThreadCompactionDrift(file, threadID string, thread map[string]any, mes
 			Detail:    fmt.Sprintf("smart compaction observed %d tokens below 75%% threshold %.0f at %s", observedTokens, thresholdTokens, recordCreatedAt.Format(time.RFC3339Nano)),
 		})
 	}
+	for _, rawMessage := range messages {
+		message := mapValue(rawMessage)
+		if !strings.EqualFold(stringValue(message["role"]), "assistant") {
+			continue
+		}
+		messageCreatedAt, ok := parseTimeValue(message["createdAt"], message["created_at"], message["timestamp"])
+		if !ok {
+			continue
+		}
+		if !since.IsZero() && messageCreatedAt.Before(since) {
+			continue
+		}
+		usage := mapValue(message["usage"])
+		if len(usage) == 0 {
+			continue
+		}
+		observedTokens := compactionUsageTokens(usage)
+		thresholdTokens := smartCompactionObservedThresholdTokens(usage, modelContextWindows, smartModel)
+		if observedTokens <= 0 || thresholdTokens <= 0 || float64(observedTokens) < thresholdTokens {
+			continue
+		}
+		if hasCompactionAtOrAfter(compactionTimes, messageCreatedAt) {
+			continue
+		}
+		findings = append(findings, driftFinding{
+			Source:    "thread",
+			File:      file,
+			ThreadID:  threadID,
+			MessageID: firstNonEmptyString(message["messageId"], message["messageID"], message["id"]),
+			ToolName:  "compaction",
+			Detail:    fmt.Sprintf("smart usage observed %d tokens at or above 75%% threshold %.0f with no later compaction record", observedTokens, thresholdTokens),
+		})
+	}
 	return findings
+}
+
+func hasCompactionAtOrAfter(compactionTimes []time.Time, messageCreatedAt time.Time) bool {
+	for _, compactedAt := range compactionTimes {
+		if !compactedAt.Before(messageCreatedAt) {
+			return true
+		}
+	}
+	return false
 }
 
 func smartModeThread(thread map[string]any, messages []any) bool {

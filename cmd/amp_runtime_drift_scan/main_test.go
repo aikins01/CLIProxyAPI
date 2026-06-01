@@ -197,6 +197,74 @@ func TestScanThreadDirIgnoresSmartCompactionAtThreshold(t *testing.T) {
 	}
 }
 
+func TestScanThreadDirFindsMissingSmartCompactionAtThreshold(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "T-smart.json"), map[string]any{
+		"id":        "T-smart",
+		"agentMode": "smart",
+		"messages": []any{
+			map[string]any{
+				"createdAt": "2026-06-01T20:00:00Z",
+				"messageId": "M-assistant",
+				"role":      "assistant",
+				"usage": map[string]any{
+					"model":            "claude-opus-4-8",
+					"totalInputTokens": 248_999,
+					"outputTokens":     1,
+					"maxInputTokens":   300_000,
+				},
+			},
+		},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, modelContextWindows: testModelContextWindows(), allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 1 {
+		t.Fatalf("findings = %#v, want 1", findings)
+	}
+	if findings[0].ToolName != "compaction" || findings[0].MessageID != "M-assistant" {
+		t.Fatalf("finding = %#v", findings[0])
+	}
+	if !strings.Contains(findings[0].Detail, "no later compaction record") {
+		t.Fatalf("detail = %q", findings[0].Detail)
+	}
+}
+
+func TestScanThreadDirIgnoresSmartUsageWithLaterCompaction(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "T-smart.json"), map[string]any{
+		"id":        "T-smart",
+		"agentMode": "smart",
+		"messages": []any{
+			map[string]any{
+				"createdAt": "2026-06-01T20:00:00Z",
+				"messageId": "M-assistant",
+				"role":      "assistant",
+				"usage": map[string]any{
+					"model":            "claude-opus-4-8",
+					"totalInputTokens": 248_999,
+					"outputTokens":     1,
+					"maxInputTokens":   300_000,
+				},
+			},
+		},
+		"compactionRecords": []any{map[string]any{
+			"createdAt":    "2026-06-01T20:00:10Z",
+			"cutMessageId": "M-summary",
+		}},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, modelContextWindows: testModelContextWindows(), allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("findings = %#v, want none", findings)
+	}
+}
+
 func TestScanThreadDirSinceFiltersOldCompactionRecords(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "T-smart.json")
@@ -232,6 +300,40 @@ func TestScanThreadDirSinceFiltersOldCompactionRecords(t *testing.T) {
 	}
 	if len(findings) != 0 {
 		t.Fatalf("findings = %#v, want none because the compaction record predates -since", findings)
+	}
+}
+
+func TestScanThreadDirSinceFiltersOldUncompactedUsage(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "T-smart.json")
+	writeJSONFile(t, path, map[string]any{
+		"id":        "T-smart",
+		"agentMode": "smart",
+		"messages": []any{
+			map[string]any{
+				"createdAt": "2026-06-01T19:59:40Z",
+				"messageId": "M-assistant",
+				"role":      "assistant",
+				"usage": map[string]any{
+					"model":            "claude-opus-4-8",
+					"totalInputTokens": 248_999,
+					"outputTokens":     1,
+				},
+			},
+		},
+	})
+	fileTime := time.Date(2026, 6, 1, 20, 5, 0, 0, time.UTC)
+	if err := os.Chtimes(path, fileTime, fileTime); err != nil {
+		t.Fatal(err)
+	}
+	since := time.Date(2026, 6, 1, 20, 1, 0, 0, time.UTC)
+
+	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, modelContextWindows: testModelContextWindows(), since: since, allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("findings = %#v, want none because the usage predates -since", findings)
 	}
 }
 

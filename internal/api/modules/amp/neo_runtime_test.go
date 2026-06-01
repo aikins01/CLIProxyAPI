@@ -13042,6 +13042,85 @@ func TestInferNeoAnthropicStreamMatchesBinaryRequestEnvelope(t *testing.T) {
 	}
 }
 
+func TestInferNeoAnthropicStreamRejectsMaxTokensStopReason(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/provider/anthropic/v1/messages" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: message_start\n" +
+			`data: {"type":"message_start","message":{"usage":{"input_tokens":3}}}` + "\n\n" +
+			"event: content_block_start\n" +
+			`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_create","name":"create_file","input":{}}}` + "\n\n" +
+			"event: content_block_delta\n" +
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"/tmp/setup.c\""}}` + "\n\n" +
+			"event: message_delta\n" +
+			`data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"input_tokens":3,"output_tokens":32000}}` + "\n\n" +
+			"event: message_stop\n" +
+			`data: {"type":"message_stop"}` + "\n\n" +
+			"data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	deltaCalls := 0
+	_, err := inferNeoLocalStream(testNeoRuntimeForServer(t, upstream), neoInferenceRequest{
+		ThreadID:  "T-test",
+		AgentMode: "smart",
+		Settings:  map[string]any{"internal.model": "anthropic/claude-test"},
+		History:   []neoHistoryMessage{{Role: "user", Text: "hi"}},
+		Tools:     []neoToolSpec{{Name: "create_file", Description: "create a file", InputSchema: map[string]any{"type": "object"}}},
+	}, func(delta neoInferenceDelta) {
+		if delta.ToolCall != nil {
+			deltaCalls++
+		}
+	})
+	if err == nil || !strings.Contains(err.Error(), "max_tokens") {
+		t.Fatalf("error = %v, want max_tokens", err)
+	}
+	if deltaCalls == 0 {
+		t.Fatalf("deltaCalls=%d, want partial tool delta before max_tokens error", deltaCalls)
+	}
+}
+
+func TestInferNeoAnthropicStreamKeepsMalformedToolArgumentsIncomplete(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/provider/anthropic/v1/messages" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: message_start\n" +
+			`data: {"type":"message_start","message":{"usage":{"input_tokens":3}}}` + "\n\n" +
+			"event: content_block_start\n" +
+			`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_create","name":"create_file","input":{}}}` + "\n\n" +
+			"event: content_block_delta\n" +
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"/tmp/setup.c\""}}` + "\n\n" +
+			"event: message_delta\n" +
+			`data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"input_tokens":3,"output_tokens":12}}` + "\n\n" +
+			"event: message_stop\n" +
+			`data: {"type":"message_stop"}` + "\n\n" +
+			"data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	result, err := inferNeoLocalStream(testNeoRuntimeForServer(t, upstream), neoInferenceRequest{
+		ThreadID:  "T-test",
+		AgentMode: "smart",
+		Settings:  map[string]any{"internal.model": "anthropic/claude-test"},
+		History:   []neoHistoryMessage{{Role: "user", Text: "hi"}},
+		Tools:     []neoToolSpec{{Name: "create_file", Description: "create a file", InputSchema: map[string]any{"type": "object"}}},
+	}, nil)
+	if err != nil {
+		t.Fatalf("inferNeoLocalStream error: %v", err)
+	}
+	if len(result.ToolCalls) != 1 {
+		t.Fatalf("tool calls = %#v, want one", result.ToolCalls)
+	}
+	call := result.ToolCalls[0]
+	if !call.Incomplete || call.PartialJSON != `{"path":"/tmp/setup.c"` || stringValue(call.InputIncomplete["path"]) != "/tmp/setup.c" {
+		t.Fatalf("tool call = %#v, want incomplete partial JSON", call)
+	}
+}
+
 func TestInferNeoAnthropicStreamPreservesCitationDeltas(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/provider/anthropic/v1/messages" {

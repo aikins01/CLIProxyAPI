@@ -16658,6 +16658,7 @@ func inferNeoAnthropicStream(rt *neoRuntime, request neoInferenceRequest, route 
 	order := make([]int, 0)
 	var fullText strings.Builder
 	var usage map[string]any
+	stopReason := ""
 	sawContent := false
 
 	ensureBlock := func(index int) *partialBlock {
@@ -16683,8 +16684,12 @@ func inferNeoAnthropicStream(rt *neoRuntime, request neoInferenceRequest, route 
 			case "message_start":
 				usage = mergeNeoUsage(usage, mapValue(mapValue(payload["message"])["usage"]))
 			case "message_delta":
+				delta := mapValue(payload["delta"])
+				if reason := stringValue(delta["stop_reason"]); reason != "" {
+					stopReason = reason
+				}
 				usage = mergeNeoUsage(usage, mapValue(payload["usage"]))
-				usage = mergeNeoUsage(usage, mapValue(mapValue(payload["delta"])["usage"]))
+				usage = mergeNeoUsage(usage, mapValue(delta["usage"]))
 			case "content_block_start":
 				index := numberFrom(payload["index"])
 				contentBlock := mapValue(payload["content_block"])
@@ -16811,6 +16816,9 @@ func inferNeoAnthropicStream(rt *neoRuntime, request neoInferenceRequest, route 
 		}
 		return neoInferenceResult{}, err
 	}
+	if strings.EqualFold(strings.TrimSpace(stopReason), "max_tokens") {
+		return neoInferenceResult{}, fmt.Errorf("local provider stream incomplete: %s", stopReason)
+	}
 	if !sawContent {
 		return inferNeoAnthropic(rt, request, route)
 	}
@@ -16834,10 +16842,23 @@ func inferNeoAnthropicStream(rt *neoRuntime, request neoInferenceRequest, route 
 				continue
 			}
 			input := block.input
+			partialJSON := ""
+			inputIncomplete := map[string]any(nil)
+			incomplete := false
 			if block.args.Len() > 0 {
-				input = parseToolArguments(block.args.String())
+				input, partialJSON, inputIncomplete, incomplete = parseOpenAIResponsesFunctionArguments(block.args.String())
 			}
-			toolCalls = append(toolCalls, neoToolCall{ID: fallbackString(block.id, newNeoToolCallID()), Name: block.name, Input: input})
+			if input == nil {
+				input = map[string]any{}
+			}
+			toolCalls = append(toolCalls, neoToolCall{
+				ID:              fallbackString(block.id, newNeoToolCallID()),
+				Name:            block.name,
+				Input:           input,
+				PartialJSON:     partialJSON,
+				InputIncomplete: inputIncomplete,
+				Incomplete:      incomplete,
+			})
 		case "thinking":
 			thinkingBlocks = append(thinkingBlocks, neoThinkingBlock{
 				Thinking:  block.thinking.String(),
