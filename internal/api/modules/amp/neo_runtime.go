@@ -6791,7 +6791,7 @@ func (a *neoActor) maybeCompactAfterInference(agentMode, reasoningEffort, parent
 		a.mu.Unlock()
 		return false
 	}
-	thresholdTokens := neoCompactionThresholdTokensForSettings(maxInput, settings)
+	thresholdTokens := neoCompactionObservedThresholdTokensForSettings(agentMode, inferenceRoute, maxInput, settings)
 	sourceMessages := a.messages[:finalIndex]
 	compactionMessagesWindow, compactionOffset := neoCompactionWindow(sourceMessages, a.compactionRecords)
 	if float64(observedTokens) < thresholdTokens {
@@ -7031,6 +7031,20 @@ func neoCompactionThresholdTokens(maxInputTokens int, thresholdPercent float64) 
 func neoCompactionThresholdTokensForSettings(maxInputTokens int, settings map[string]any) float64 {
 	if threshold, ok := neoCompactionContextTokenThreshold(settings); ok {
 		return threshold
+	}
+	return neoCompactionThresholdTokens(maxInputTokens, neoCompactionThresholdPercent(settings))
+}
+
+func neoCompactionObservedThresholdTokensForSettings(agentMode string, route neoModelRoute, maxInputTokens int, settings map[string]any) float64 {
+	if threshold, ok := neoCompactionContextTokenThreshold(settings); ok {
+		return threshold
+	}
+	if strings.EqualFold(strings.TrimSpace(agentMode), "smart") {
+		maxContextTokens := neoEffectiveContextWindow(agentMode, route.Model)
+		if maxContextTokens <= 0 {
+			maxContextTokens = maxInputTokens
+		}
+		return neoCompactionThresholdTokens(maxContextTokens, neoCompactionPreflightThresholdPercent(settings))
 	}
 	return neoCompactionThresholdTokens(maxInputTokens, neoCompactionThresholdPercent(settings))
 }

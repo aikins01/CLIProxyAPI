@@ -880,7 +880,7 @@ func TestNeoRuntimeAutoCompactionUsesObservedProviderUsage(t *testing.T) {
 			role = "assistant"
 		}
 		if i == 29 {
-			usage = map[string]any{"totalInputTokens": neoCompactionDefaultTokenLimit, "outputTokens": 1}
+			usage = map[string]any{"totalInputTokens": 250_000, "outputTokens": 1}
 		}
 		actor.storeMessageLocked(neoMessage{ThreadID: threadID, MessageID: fmt.Sprintf("M-%022d", i), Role: role, Content: []any{map[string]any{"type": "text", "text": fmt.Sprintf("short message %02d", i)}}, Usage: usage})
 	}
@@ -1140,7 +1140,7 @@ func TestNeoRuntimeSmartPreflightCompactionUsesSeventyFivePercentContextWindow(t
 	}
 }
 
-func TestNeoRuntimeSmartAnthropicPostResponseCompactionUsesBinaryObservedThreshold(t *testing.T) {
+func TestNeoRuntimeSmartAnthropicPostResponseCompactionUsesSeventyFivePercentContextWindow(t *testing.T) {
 	dir := t.TempDir()
 	oldStoreDir := neoAmpThreadStoreDir
 	neoAmpThreadStoreDir = func() string { return dir }
@@ -1182,52 +1182,63 @@ func TestNeoRuntimeSmartAnthropicPostResponseCompactionUsesBinaryObservedThresho
 			CompactionModel: "openai/gpt-5.4",
 		}},
 	})
-	threadID := "T-smart-anthropic-observed-100k"
-	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
-	actor.settings["internal.model"] = "anthropic/claude-opus-4-8"
-	finalMessageID := "M-0000000000000000000029"
-	observedTokens := 100_441 + 151
-	preflightThreshold := neoCompactionPreflightThresholdTokensForSettings(neoEffectiveContextWindow("smart", "claude-opus-4-8"), nil)
-	if got := neoCompactionThresholdTokensForSettings(300_000, nil); got != neoCompactionDefaultTokenLimit {
-		t.Fatalf("post-response threshold = %v, want %d", got, neoCompactionDefaultTokenLimit)
-	}
-	if observedTokens >= int(preflightThreshold) {
-		t.Fatalf("test setup observed tokens = %d, want below smart 75%% preflight threshold %v", observedTokens, preflightThreshold)
-	}
 
-	actor.mu.Lock()
-	for i := 0; i < 30; i++ {
-		role := "user"
-		usage := map[string]any(nil)
-		if i%2 == 1 {
-			role = "assistant"
-		}
-		if i == 29 {
-			usage = map[string]any{
-				"totalInputTokens": 100_441,
-				"outputTokens":     151,
-				"maxInputTokens":   300_000,
+	newActor := func(threadID string, inputTokens, outputTokens int) (*neoActor, string) {
+		actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+		actor.settings["internal.model"] = "anthropic/claude-opus-4-8"
+		finalMessageID := "M-0000000000000000000029"
+		actor.mu.Lock()
+		for i := 0; i < 30; i++ {
+			role := "user"
+			usage := map[string]any(nil)
+			if i%2 == 1 {
+				role = "assistant"
 			}
+			if i == 29 {
+				usage = map[string]any{
+					"totalInputTokens": inputTokens,
+					"outputTokens":     outputTokens,
+					"maxInputTokens":   300_000,
+				}
+			}
+			actor.storeMessageLocked(neoMessage{ThreadID: threadID, MessageID: fmt.Sprintf("M-%022d", i), Role: role, Content: []any{map[string]any{"type": "text", "text": fmt.Sprintf("short message %02d", i)}}, Usage: usage})
 		}
-		actor.storeMessageLocked(neoMessage{ThreadID: threadID, MessageID: fmt.Sprintf("M-%022d", i), Role: role, Content: []any{map[string]any{"type": "text", "text": fmt.Sprintf("short message %02d", i)}}, Usage: usage})
+		actor.currentInference = &neoInferenceInflight{messageID: finalMessageID, agentMode: "smart", reasoningEffort: "medium"}
+		actor.rebuildHistoryLocked()
+		actor.mu.Unlock()
+		return actor, finalMessageID
 	}
-	actor.currentInference = &neoInferenceInflight{messageID: finalMessageID, agentMode: "smart", reasoningEffort: "medium"}
-	actor.rebuildHistoryLocked()
-	actor.mu.Unlock()
 
-	if !actor.maybeCompactAfterInference("smart", "medium", "", finalMessageID) {
-		t.Fatal("smart Anthropic post-response compaction did not run at the binary observed-usage threshold")
+	threshold := neoCompactionObservedThresholdTokensForSettings("smart", neoModelRoute{Provider: "anthropic", Model: "claude-opus-4-8"}, 300_000, nil)
+	if threshold != 249000 {
+		t.Fatalf("smart observed threshold = %v, want 249000", threshold)
+	}
+	if got := neoCompactionThresholdTokensForSettings(300_000, nil); got != neoCompactionDefaultTokenLimit {
+		t.Fatalf("binary default threshold = %v, want %d", got, neoCompactionDefaultTokenLimit)
+	}
+
+	belowActor, belowMessageID := newActor("T-smart-anthropic-observed-below-75", 100_441, 151)
+	if belowActor.maybeCompactAfterInference("smart", "medium", "", belowMessageID) {
+		t.Fatal("smart Anthropic post-response compaction ran below the 75% context threshold")
+	}
+	if calls != 0 {
+		t.Fatalf("compaction calls = %d, want 0 below smart 75%% threshold", calls)
+	}
+
+	atThresholdActor, atThresholdMessageID := newActor("T-smart-anthropic-observed-at-75", 248_999, 1)
+	if !atThresholdActor.maybeCompactAfterInference("smart", "medium", "", atThresholdMessageID) {
+		t.Fatal("smart Anthropic post-response compaction did not run at the 75% context threshold")
 	}
 	if calls != 1 {
 		t.Fatalf("compaction calls = %d, want 1", calls)
 	}
-	actor.mu.Lock()
-	defer actor.mu.Unlock()
-	if len(actor.compactionRecords) != 1 {
-		t.Fatalf("compactionRecords = %#v, want one record", actor.compactionRecords)
+	atThresholdActor.mu.Lock()
+	defer atThresholdActor.mu.Unlock()
+	if len(atThresholdActor.compactionRecords) != 1 {
+		t.Fatalf("compactionRecords = %#v, want one record", atThresholdActor.compactionRecords)
 	}
-	if len(actor.history) == 0 || !strings.Contains(actor.history[0].Text, "smart observed summary") {
-		t.Fatalf("history = %#v, want compacted summary prefix", actor.history)
+	if len(atThresholdActor.history) == 0 || !strings.Contains(atThresholdActor.history[0].Text, "smart observed summary") {
+		t.Fatalf("history = %#v, want compacted summary prefix", atThresholdActor.history)
 	}
 }
 
@@ -1269,8 +1280,8 @@ func TestNeoRuntimePostResponseCompactionUsesBinaryProviderBeforeModelMapping(t 
 			NeoLocalRuntime:    config.AmpNeoLocalRuntime{Enabled: &enabled},
 		},
 	})
-	rt.setModelMapper(staticNeoModelMapper{"claude-opus-4-7": "openai/gpt-5.4"})
-	threadID := "T-anthropic-mapped-compact"
+	rt.setModelMapper(staticNeoModelMapper{"claude-opus-4-6": "openai/gpt-5.4"})
+	threadID := "T-anthropic-large-mapped-compact"
 	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
 	finalMessageID := "M-0000000000000000000029"
 	actor.mu.Lock()
@@ -1290,11 +1301,11 @@ func TestNeoRuntimePostResponseCompactionUsesBinaryProviderBeforeModelMapping(t 
 		}
 		actor.storeMessageLocked(neoMessage{ThreadID: threadID, MessageID: fmt.Sprintf("M-%022d", i), Role: role, Content: []any{map[string]any{"type": "text", "text": fmt.Sprintf("short message %02d", i)}}, Usage: usage})
 	}
-	actor.currentInference = &neoInferenceInflight{messageID: finalMessageID, agentMode: "smart", reasoningEffort: "medium"}
+	actor.currentInference = &neoInferenceInflight{messageID: finalMessageID, agentMode: "large", reasoningEffort: "medium"}
 	actor.rebuildHistoryLocked()
 	actor.mu.Unlock()
 
-	if !actor.maybeCompactAfterInference("smart", "medium", "", finalMessageID) {
+	if !actor.maybeCompactAfterInference("large", "medium", "", finalMessageID) {
 		t.Fatal("compaction did not run for binary Anthropic mode after local model mapping")
 	}
 	if calls != 1 {
@@ -1438,7 +1449,7 @@ func TestNeoRuntimePostResponseCompactionExcludesTriggeringAssistantMessage(t *t
 		Provider: "openai",
 		Model:    "gpt-5.5",
 		Text:     "final answer after huge request",
-		Usage:    map[string]any{"totalInputTokens": neoCompactionDefaultTokenLimit, "outputTokens": 1},
+		Usage:    map[string]any{"totalInputTokens": 250_000, "outputTokens": 1},
 	}, "smart", "medium", false, "")
 
 	actor.mu.Lock()
@@ -1512,7 +1523,7 @@ func TestNeoRuntimePostResponseCompactionDoesNotRepeatAfterRestart(t *testing.T)
 		Provider: "openai",
 		Model:    "gpt-5.5",
 		Text:     "final answer after huge request",
-		Usage:    map[string]any{"totalInputTokens": neoCompactionDefaultTokenLimit, "outputTokens": 1},
+		Usage:    map[string]any{"totalInputTokens": 250_000, "outputTokens": 1},
 	}, "smart", "medium", false, "")
 	if calls != 1 {
 		t.Fatalf("compaction calls before restart = %d, want 1", calls)
@@ -1602,7 +1613,7 @@ func TestNeoRuntimePostResponseCompactionCanReplaceShortHistory(t *testing.T) {
 		Provider: "openai",
 		Model:    "gpt-5.5",
 		Text:     "short final answer",
-		Usage:    map[string]any{"totalInputTokens": neoCompactionDefaultTokenLimit, "outputTokens": 1},
+		Usage:    map[string]any{"totalInputTokens": 250_000, "outputTokens": 1},
 	}, "smart", "medium", false, "")
 
 	if calls != 1 {
@@ -1736,7 +1747,7 @@ func TestNeoRuntimeAutoCompactionIgnoresObservedUsageBeforeLatestRecord(t *testi
 			role = "assistant"
 		}
 		if i == 29 {
-			usage = map[string]any{"totalInputTokens": neoCompactionDefaultTokenLimit, "outputTokens": 1}
+			usage = map[string]any{"totalInputTokens": 250_000, "outputTokens": 1}
 		}
 		actor.storeMessageLocked(neoMessage{
 			ThreadID:  threadID,
@@ -1808,7 +1819,7 @@ func TestNeoRuntimeAutoCompactionDoesNotRequireMinimumMessagesForObservedUsage(t
 			role = "assistant"
 		}
 		if i == neoCompactionMinMessages/2-1 {
-			usage = map[string]any{"totalInputTokens": neoCompactionDefaultTokenLimit, "outputTokens": 1}
+			usage = map[string]any{"totalInputTokens": 250_000, "outputTokens": 1}
 		}
 		actor.storeMessageLocked(neoMessage{ThreadID: threadID, MessageID: fmt.Sprintf("M-%022d", i), Role: role, Content: []any{map[string]any{"type": "text", "text": fmt.Sprintf("short message %02d", i)}}, Usage: usage})
 	}
