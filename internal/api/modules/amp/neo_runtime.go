@@ -6791,7 +6791,7 @@ func (a *neoActor) maybeCompactAfterInference(agentMode, reasoningEffort, parent
 		a.mu.Unlock()
 		return false
 	}
-	thresholdTokens := neoCompactionObservedThresholdTokensForSettings(agentMode, inferenceRoute, maxInput, settings)
+	thresholdTokens := neoCompactionObservedThresholdTokensForSettings(agentMode, binaryInferenceRoute, maxInput, settings)
 	sourceMessages := a.messages[:finalIndex]
 	compactionMessagesWindow, compactionOffset := neoCompactionWindow(sourceMessages, a.compactionRecords)
 	if float64(observedTokens) < thresholdTokens {

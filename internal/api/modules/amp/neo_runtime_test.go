@@ -1245,6 +1245,83 @@ func TestNeoRuntimeSmartAnthropicPostResponseCompactionUsesSeventyFivePercentCon
 	}
 }
 
+func TestNeoRuntimeSmartPostResponseCompactionThresholdUsesBinaryRouteBeforeModelMapping(t *testing.T) {
+	dir := t.TempDir()
+	oldStoreDir := neoAmpThreadStoreDir
+	neoAmpThreadStoreDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
+
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.URL.Path != "/api/provider/openai/v1/chat/completions" {
+			t.Fatalf("unexpected mapped compaction path %s", r.URL.Path)
+		}
+		payload := readNeoJSON(r.Body)
+		if payload["model"] != "gpt-5.4" {
+			t.Fatalf("compaction model = %#v, want gpt-5.4", payload["model"])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"mapped smart summary"}}]}`))
+	}))
+	t.Cleanup(upstream.Close)
+	parsed, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+	_, portString, err := net.SplitHostPort(parsed.Host)
+	if err != nil {
+		t.Fatalf("parse upstream host: %v", err)
+	}
+	port, err := strconv.Atoi(portString)
+	if err != nil {
+		t.Fatalf("parse upstream port: %v", err)
+	}
+
+	enabled := true
+	rt := newNeoRuntime(&config.Config{
+		Host: "127.0.0.1",
+		Port: port,
+		AmpCode: config.AmpCode{
+			ForceModelMappings: true,
+			NeoLocalRuntime: config.AmpNeoLocalRuntime{
+				Enabled:         &enabled,
+				CompactionModel: "openai/gpt-5.4",
+			},
+		},
+	})
+	rt.setModelMapper(staticNeoModelMapper{"claude-opus-4-7": "openai/gpt-5.5"})
+	threadID := "T-smart-mapped-observed-binary-threshold"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+	finalMessageID := "M-0000000000000000000029"
+	actor.mu.Lock()
+	for i := 0; i < 30; i++ {
+		role := "user"
+		usage := map[string]any(nil)
+		if i%2 == 1 {
+			role = "assistant"
+		}
+		if i == 29 {
+			usage = map[string]any{
+				"totalInputTokens": 250_000,
+				"outputTokens":     1,
+				"maxInputTokens":   272_000,
+			}
+		}
+		actor.storeMessageLocked(neoMessage{ThreadID: threadID, MessageID: fmt.Sprintf("M-%022d", i), Role: role, Content: []any{map[string]any{"type": "text", "text": fmt.Sprintf("short message %02d", i)}}, Usage: usage})
+	}
+	actor.currentInference = &neoInferenceInflight{messageID: finalMessageID, agentMode: "smart", reasoningEffort: "medium"}
+	actor.rebuildHistoryLocked()
+	actor.mu.Unlock()
+
+	if !actor.maybeCompactAfterInference("smart", "medium", "", finalMessageID) {
+		t.Fatal("smart mapped post-response compaction did not use the binary smart route threshold")
+	}
+	if calls != 1 {
+		t.Fatalf("compaction calls = %d, want 1", calls)
+	}
+}
+
 func TestNeoRuntimePostResponseCompactionUsesBinaryProviderBeforeModelMapping(t *testing.T) {
 	dir := t.TempDir()
 	oldStoreDir := neoAmpThreadStoreDir
