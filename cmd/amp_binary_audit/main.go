@@ -6057,8 +6057,10 @@ func lifecycleChecklist(snapshot Snapshot, diff auditDiff, full bool) []lifecycl
 		Trigger: "tool run status markers changed",
 		Commands: []string{
 			`go test -count=1 -run 'TestNeoActor.*ToolResult|TestNeoActor.*ToolProgress|TestNeoHistoryConvertsNonTerminalToolResultLikeBinary|TestOpenAINeoMessagesSkipsFullyInterruptedToolOnlyAssistant' ./internal/api/modules/amp`,
+			`go run ./cmd/amp_runtime_drift_scan -since-homebrew-runtime -json`,
 		},
 		Files: []string{
+			"cmd/amp_runtime_drift_scan",
 			"internal/api/modules/amp/neo_runtime.go",
 			"internal/api/modules/amp/neo_runtime_test.go",
 			"dev/neo-remote-ui/src/routes/+page.svelte",
@@ -6111,9 +6113,11 @@ func lifecycleChecklist(snapshot Snapshot, diff auditDiff, full bool) []lifecycl
 		Trigger: "compaction rules, guidance, system-prompt fingerprints, model limits, or mode model routes changed",
 		Commands: []string{
 			`go run ./cmd/amp_binary_audit -prompt-diff-excerpts`,
+			`go run ./cmd/amp_runtime_drift_scan -since-homebrew-runtime -json`,
 			`go test -count=1 -run 'TestNeo.*Compaction|TestInferNeo.*Compaction|TestOpenAIResponsesCompact|TestResponsesWebsocketCompaction|TestInputContainsFullTranscriptDetectsCompactionItem' ./internal/api/modules/amp ./sdk/api/handlers/openai`,
 		},
 		Files: []string{
+			"cmd/amp_runtime_drift_scan",
 			"internal/api/modules/amp/neo_runtime.go",
 			"sdk/api/handlers/openai/openai_responses_compact_test.go",
 			"sdk/api/handlers/openai/openai_responses_websocket_test.go",
@@ -6126,9 +6130,11 @@ func lifecycleChecklist(snapshot Snapshot, diff auditDiff, full bool) []lifecycl
 		Trigger: "tool/code-review/skills/painter fingerprints or related settings changed",
 		Commands: []string{
 			`go run ./cmd/amp_binary_audit -prompt-diff-excerpts`,
+			`go run ./cmd/amp_runtime_drift_scan -since-homebrew-runtime -json`,
 			`go test -count=1 -run 'TestNeo.*Tool|TestNeo.*CodeReview|TestNeo.*Skill|TestNeo.*Image|TestImages' ./internal/api/modules/amp ./sdk/api/handlers/openai`,
 		},
 		Files: []string{
+			"cmd/amp_runtime_drift_scan",
 			"internal/api/modules/amp/neo_runtime.go",
 			"internal/api/modules/amp/routes.go",
 			"sdk/api/handlers/openai/openai_images_handlers_test.go",

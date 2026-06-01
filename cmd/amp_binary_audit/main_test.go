@@ -1490,8 +1490,10 @@ func TestLifecycleChecklistToolRunStatusChangeRunsRemoteWeb(t *testing.T) {
 
 	checks := lifecycleChecklist(Snapshot{}, diff, false)
 	check := lifecycleCheckByArea(t, checks, "remote web control surface")
+	toolRunCheck := lifecycleCheckByArea(t, checks, "tool run status mapping")
 
 	assertContains(t, check.Commands, `bun run --cwd dev/neo-remote-ui smoke`)
+	assertContains(t, toolRunCheck.Commands, `go run ./cmd/amp_runtime_drift_scan -since-homebrew-runtime -json`)
 	assertContains(t, lifecycleCheckAreas(checks), "streaming assistant and tool edits")
 }
 
@@ -2050,6 +2052,7 @@ func TestLifecycleChecklistModelLimitChangeRunsCompactionChecks(t *testing.T) {
 
 	assertContains(t, areas, "model routing, modes, and reasoning")
 	assertContains(t, areas, "compaction and continuation prompts")
+	assertContains(t, lifecycleCheckByArea(t, checks, "compaction and continuation prompts").Commands, `go run ./cmd/amp_runtime_drift_scan -since-homebrew-runtime -json`)
 	assertContains(t, lifecycleCheckByArea(t, checks, "compaction and continuation prompts").Commands, `go test -count=1 -run 'TestNeo.*Compaction|TestInferNeo.*Compaction|TestOpenAIResponsesCompact|TestResponsesWebsocketCompaction|TestInputContainsFullTranscriptDetectsCompactionItem' ./internal/api/modules/amp ./sdk/api/handlers/openai`)
 }
 
@@ -2535,6 +2538,7 @@ func TestLifecycleChecklistProviderHeaderChangeRunsProviderChecks(t *testing.T) 
 
 	assertContains(t, areas, "provider protocol headers and betas")
 	assertContains(t, areas, "compaction and continuation prompts")
+	assertContains(t, lifecycleCheckByArea(t, checks, "compaction and continuation prompts").Commands, `go run ./cmd/amp_runtime_drift_scan -since-homebrew-runtime -json`)
 	assertContains(t, lifecycleCheckByArea(t, checks, "compaction and continuation prompts").Commands, `go test -count=1 -run 'TestNeo.*Compaction|TestInferNeo.*Compaction|TestOpenAIResponsesCompact|TestResponsesWebsocketCompaction|TestInputContainsFullTranscriptDetectsCompactionItem' ./internal/api/modules/amp ./sdk/api/handlers/openai`)
 }
 
@@ -2554,6 +2558,7 @@ func TestLifecycleChecklistToolProviderFeatureChangesRunToolChecks(t *testing.T)
 
 			check := lifecycleCheckByArea(t, lifecycleChecklist(Snapshot{}, diff, false), "tools, code review, skills, and images")
 
+			assertContains(t, check.Commands, `go run ./cmd/amp_runtime_drift_scan -since-homebrew-runtime -json`)
 			assertContains(t, check.Commands, `go test -count=1 -run 'TestNeo.*Tool|TestNeo.*CodeReview|TestNeo.*Skill|TestNeo.*Image|TestImages' ./internal/api/modules/amp ./sdk/api/handlers/openai`)
 		})
 	}
