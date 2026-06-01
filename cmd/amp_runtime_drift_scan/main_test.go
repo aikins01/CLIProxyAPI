@@ -178,6 +178,198 @@ func TestScanThreadDirIgnoresCustomRawInputTool(t *testing.T) {
 	}
 }
 
+func TestScanThreadDirFindsDanglingCompleteToolUseBeforeUserMessage(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "T-test.json"), map[string]any{
+		"id": "T-test",
+		"messages": []any{
+			map[string]any{
+				"messageId": "M-assistant",
+				"role":      "assistant",
+				"state":     map[string]any{"type": "complete", "stopReason": "tool_use"},
+				"content": []any{map[string]any{
+					"type":     "tool_use",
+					"id":       "TU-review",
+					"name":     "code_review",
+					"complete": true,
+					"input":    map[string]any{"diff_description": "review current diff"},
+				}},
+			},
+			map[string]any{
+				"messageId": "M-user",
+				"role":      "user",
+				"content":   []any{map[string]any{"type": "text", "text": "go on"}},
+			},
+		},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 1 {
+		t.Fatalf("findings = %#v, want 1", findings)
+	}
+	if findings[0].Source != "thread" || findings[0].ToolName != "code_review" || findings[0].CallID != "TU-review" {
+		t.Fatalf("finding = %#v", findings[0])
+	}
+	if !strings.Contains(findings[0].Detail, "no matching tool_result") {
+		t.Fatalf("detail = %q", findings[0].Detail)
+	}
+}
+
+func TestScanThreadDirFindsDanglingCompleteToolUseBeforeAssistantMessage(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "T-test.json"), map[string]any{
+		"id": "T-test",
+		"messages": []any{
+			map[string]any{
+				"messageId": "M-tool",
+				"role":      "assistant",
+				"state":     map[string]any{"type": "complete", "stopReason": "tool_use"},
+				"content": []any{map[string]any{
+					"type":     "tool_use",
+					"id":       "TU-shell",
+					"name":     "shell_command",
+					"complete": true,
+					"input":    map[string]any{"cmd": "pwd"},
+				}},
+			},
+			map[string]any{
+				"messageId": "M-answer",
+				"role":      "assistant",
+				"state":     map[string]any{"type": "complete", "stopReason": "end_turn"},
+				"content":   []any{map[string]any{"type": "text", "text": "done"}},
+			},
+		},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 1 {
+		t.Fatalf("findings = %#v, want 1", findings)
+	}
+	if findings[0].CallID != "TU-shell" || !strings.Contains(findings[0].Detail, "later assistant message") {
+		t.Fatalf("finding = %#v", findings[0])
+	}
+}
+
+func TestScanThreadDirIgnoresTrailingPendingToolUse(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "T-test.json"), map[string]any{
+		"id": "T-test",
+		"messages": []any{
+			map[string]any{
+				"messageId": "M-assistant",
+				"role":      "assistant",
+				"state":     map[string]any{"type": "complete", "stopReason": "tool_use"},
+				"content": []any{map[string]any{
+					"type":     "tool_use",
+					"id":       "TU-shell",
+					"name":     "shell_command",
+					"complete": true,
+					"input":    map[string]any{"cmd": "pwd"},
+				}},
+			},
+		},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("findings = %#v, want none for trailing pending tool", findings)
+	}
+}
+
+func TestScanThreadDirIgnoresToolUseWithMatchingResultBeforeContinuation(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "T-test.json"), map[string]any{
+		"id": "T-test",
+		"messages": []any{
+			map[string]any{
+				"messageId": "M-assistant",
+				"role":      "assistant",
+				"state":     map[string]any{"type": "complete", "stopReason": "tool_use"},
+				"content": []any{map[string]any{
+					"type":     "tool_use",
+					"id":       "TU-shell",
+					"name":     "shell_command",
+					"complete": true,
+					"input":    map[string]any{"cmd": "pwd"},
+				}},
+			},
+			map[string]any{
+				"messageId": "M-result",
+				"role":      "user",
+				"content": []any{map[string]any{
+					"type":      "tool_result",
+					"toolUseID": "TU-shell",
+					"run":       map[string]any{"status": "done", "result": "/tmp"},
+				}},
+			},
+			map[string]any{
+				"messageId": "M-user",
+				"role":      "user",
+				"content":   []any{map[string]any{"type": "text", "text": "thanks"}},
+			},
+		},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("findings = %#v, want none", findings)
+	}
+}
+
+func TestScanThreadDirSinceFiltersOldDanglingToolTrigger(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "T-test.json")
+	writeJSONFile(t, path, map[string]any{
+		"id": "T-test",
+		"messages": []any{
+			map[string]any{
+				"createdAt": "2026-06-01T18:00:00Z",
+				"messageId": "M-assistant",
+				"role":      "assistant",
+				"state":     map[string]any{"type": "complete", "stopReason": "tool_use"},
+				"content": []any{map[string]any{
+					"type":     "tool_use",
+					"id":       "TU-shell",
+					"name":     "shell_command",
+					"complete": true,
+					"input":    map[string]any{"cmd": "pwd"},
+				}},
+			},
+			map[string]any{
+				"createdAt": "2026-06-01T18:01:00Z",
+				"messageId": "M-user",
+				"role":      "user",
+				"content":   []any{map[string]any{"type": "text", "text": "go on"}},
+			},
+		},
+	})
+	fileTime := time.Date(2026, 6, 1, 19, 0, 0, 0, time.UTC)
+	if err := os.Chtimes(path, fileTime, fileTime); err != nil {
+		t.Fatal(err)
+	}
+	since := time.Date(2026, 6, 1, 18, 30, 0, 0, time.UTC)
+
+	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, since: since, allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("findings = %#v, want none because continuation predates -since", findings)
+	}
+}
+
 func TestScanThreadDirSinceFiltersOldThreadMessages(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "T-test.json")

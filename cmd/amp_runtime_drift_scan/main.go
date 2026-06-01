@@ -268,6 +268,7 @@ func scanThreadDir(dir string, since time.Time, allowMissing bool, modelContextW
 		threadID := stringValue(thread["id"])
 		messages := arrayValue(thread["messages"])
 		findings = append(findings, scanThreadCompactionDrift(file, threadID, thread, messages, since, modelContextWindows, smartModel)...)
+		findings = append(findings, scanThreadDanglingToolUseDrift(file, threadID, messages, since)...)
 		toolNames := map[string]string{}
 		for _, rawMessage := range messages {
 			for _, rawBlock := range arrayValue(mapValue(rawMessage)["content"]) {
@@ -322,6 +323,87 @@ func scanThreadDir(dir string, since time.Time, allowMissing bool, modelContextW
 		}
 	}
 	return findings, nil
+}
+
+type pendingThreadToolUse struct {
+	messageID string
+	toolID    string
+	toolName  string
+}
+
+func scanThreadDanglingToolUseDrift(file, threadID string, messages []any, since time.Time) []driftFinding {
+	pending := map[string]pendingThreadToolUse{}
+	var findings []driftFinding
+	for _, rawMessage := range messages {
+		message := mapValue(rawMessage)
+		role := strings.ToLower(strings.TrimSpace(stringValue(message["role"])))
+		if role == "user" {
+			for _, rawBlock := range arrayValue(message["content"]) {
+				block := mapValue(rawBlock)
+				if stringValue(block["type"]) != "tool_result" {
+					continue
+				}
+				toolID := firstNonEmptyString(block["toolUseID"], block["toolUseId"], block["tool_use_id"], block["toolCallId"], block["id"])
+				if toolID != "" {
+					delete(pending, toolID)
+				}
+			}
+			if threadUserMessageHasNonToolResultContent(message) {
+				findings = appendDanglingToolUseFindings(findings, file, threadID, pending, message, "later user message", since)
+				pending = map[string]pendingThreadToolUse{}
+			}
+			continue
+		}
+		if role != "assistant" {
+			continue
+		}
+		findings = appendDanglingToolUseFindings(findings, file, threadID, pending, message, "later assistant message", since)
+		pending = map[string]pendingThreadToolUse{}
+		for _, rawBlock := range arrayValue(message["content"]) {
+			block := mapValue(rawBlock)
+			if !completedToolUseBlock(message, block) {
+				continue
+			}
+			toolID := firstNonEmptyString(block["id"], block["toolUseID"], block["toolUseId"], block["tool_use_id"], block["toolCallId"])
+			if toolID == "" {
+				continue
+			}
+			pending[toolID] = pendingThreadToolUse{
+				messageID: firstNonEmptyString(message["messageId"], message["messageID"], message["id"]),
+				toolID:    toolID,
+				toolName:  stringValue(block["name"]),
+			}
+		}
+	}
+	return findings
+}
+
+func appendDanglingToolUseFindings(findings []driftFinding, file, threadID string, pending map[string]pendingThreadToolUse, triggerMessage map[string]any, trigger string, since time.Time) []driftFinding {
+	if len(pending) == 0 || threadMessageBeforeSince(triggerMessage, since) {
+		return findings
+	}
+	for _, item := range pending {
+		findings = append(findings, driftFinding{
+			Source:    "thread",
+			File:      file,
+			ThreadID:  threadID,
+			MessageID: item.messageID,
+			CallID:    item.toolID,
+			ToolName:  normalizeToolName(item.toolName),
+			Detail:    "complete tool_use has no matching tool_result before " + trigger,
+		})
+	}
+	return findings
+}
+
+func threadUserMessageHasNonToolResultContent(message map[string]any) bool {
+	for _, rawBlock := range arrayValue(message["content"]) {
+		block := mapValue(rawBlock)
+		if stringValue(block["type"]) != "tool_result" {
+			return true
+		}
+	}
+	return false
 }
 
 func scanThreadCompactionDrift(file, threadID string, thread map[string]any, messages []any, since time.Time, modelContextWindows map[string]int, smartModel string) []driftFinding {
