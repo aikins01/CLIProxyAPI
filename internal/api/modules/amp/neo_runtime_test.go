@@ -2370,6 +2370,38 @@ func TestNeoCompactionRulesMatchAuditBaseline(t *testing.T) {
 	}
 }
 
+func TestNeoCompactionSmartObservedThresholdIsIntentionalOverrideOfBinaryDefault(t *testing.T) {
+	baseline := ampBinaryParityBaselineForTest(t)
+	binaryDefaultThreshold := 0
+	for _, rule := range baseline.Signals.CompactionRules {
+		if rule.Name == "anthropic-tool-runner" && rule.Provider == "anthropic" && rule.Trigger == "observed-usage" {
+			binaryDefaultThreshold = rule.DefaultThresholdTokens
+			break
+		}
+	}
+	if binaryDefaultThreshold == 0 {
+		t.Fatal("Amp binary parity baseline has no Anthropic observed compaction threshold")
+	}
+
+	smartRoute := neoModelRoute{Provider: "anthropic", Model: "claude-opus-4-8"}
+	smartThreshold := neoCompactionObservedThresholdTokensForSettings("smart", smartRoute, 300_000, nil)
+	smartPreflightThreshold := neoCompactionPreflightThresholdTokensForSettings(neoEffectiveContextWindow("smart", smartRoute.Model), nil)
+	if smartThreshold != smartPreflightThreshold {
+		t.Fatalf("smart observed threshold = %v, want smart preflight threshold %v", smartThreshold, smartPreflightThreshold)
+	}
+	if smartThreshold == float64(binaryDefaultThreshold) {
+		t.Fatalf("smart observed threshold unexpectedly matches binary default %d", binaryDefaultThreshold)
+	}
+	if emptyModeThreshold := neoCompactionObservedThresholdTokensForSettings("", smartRoute, 300_000, nil); emptyModeThreshold != smartThreshold {
+		t.Fatalf("empty-mode smart observed threshold = %v, want %v", emptyModeThreshold, smartThreshold)
+	}
+
+	largeThreshold := neoCompactionObservedThresholdTokensForSettings("large", neoModelRoute{Provider: "anthropic", Model: "claude-opus-4-6"}, 300_000, nil)
+	if largeThreshold != float64(binaryDefaultThreshold) {
+		t.Fatalf("large observed threshold = %v, want binary default %d", largeThreshold, binaryDefaultThreshold)
+	}
+}
+
 func TestNeoCompactionTriggerMatchesAuditBaselineAgentModeRoutes(t *testing.T) {
 	baseline := ampBinaryParityBaselineForTest(t)
 	if len(baseline.Signals.AgentModeRoutes) == 0 {
