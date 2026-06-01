@@ -104,6 +104,10 @@
     | { kind: 'user'; message: NeoMessage; key: string }
     | { kind: 'assistant'; messages: NeoMessage[]; key: string }
     | { kind: 'compaction'; cutMessageId: string; key: string };
+  type TranscriptAnchor = {
+    key: string;
+    offset: number;
+  };
 
   type ThreadSummary = {
     id: string;
@@ -277,13 +281,13 @@
   let newActivityBelow = $state(false);
   let transcriptScrollPlan:
     | { kind: 'follow'; top: number; manualScrollVersion: number; force: boolean }
-    | { kind: 'preserve'; top: number; manualScrollVersion: number }
+    | { kind: 'preserve'; top: number; manualScrollVersion: number; anchor: TranscriptAnchor | null }
     | null = null;
   let transcriptScrollScheduled = false;
   let programmaticScrollUntil = 0;
   let programmaticScrollKind: 'follow' | 'preserve' | '' = '';
   let manualTranscriptScrollVersion = 0;
-  let transcriptFollowPinned = true;
+  let transcriptUserDetached = false;
   let transcriptTouchStartY = 0;
   const devSignalCount = $derived.by(() => {
     let count = artifacts.length + executorStatuses.length + runtimeEvents.length + runtimeTraces.length + toolLeases.length;
@@ -388,7 +392,7 @@
     if (!scroller) return;
     programmaticScrollUntil = Date.now() + 250;
     programmaticScrollKind = 'follow';
-    transcriptFollowPinned = true;
+    transcriptUserDetached = false;
     scroller.scrollTo({ top: scroller.scrollHeight, behavior });
     newActivityBelow = false;
   }
@@ -399,6 +403,51 @@
     programmaticScrollUntil = Date.now() + 250;
     programmaticScrollKind = 'preserve';
     scroller.scrollTop = Math.max(0, top);
+  }
+
+  function transcriptViewportTop() {
+    if (typeof document === 'undefined') return 0;
+    const topbar = document.querySelector<HTMLElement>('.neo-topbar');
+    return (topbar?.getBoundingClientRect().bottom ?? 0) + 8;
+  }
+
+  function transcriptElementByKey(key: string) {
+    if (typeof document === 'undefined') return null;
+    for (const element of document.querySelectorAll<HTMLElement>('[data-transcript-key]')) {
+      if (element.dataset.transcriptKey === key) return element;
+    }
+    return null;
+  }
+
+  function captureTranscriptAnchor(): TranscriptAnchor | null {
+    if (typeof document === 'undefined') return null;
+    const viewportTop = transcriptViewportTop();
+    for (const element of document.querySelectorAll<HTMLElement>('[data-transcript-key]')) {
+      const rect = element.getBoundingClientRect();
+      if (rect.bottom >= viewportTop + 1) {
+        const key = element.dataset.transcriptKey;
+        return key ? { key, offset: rect.top - viewportTop } : null;
+      }
+    }
+    return null;
+  }
+
+  function restoreTranscriptAnchor(anchor: TranscriptAnchor | null, fallbackTop: number) {
+    const scroller = pageScroller();
+    if (!scroller || !anchor) {
+      restoreTranscriptScrollTop(fallbackTop);
+      return;
+    }
+    const element = transcriptElementByKey(anchor.key);
+    if (!element) {
+      restoreTranscriptScrollTop(fallbackTop);
+      return;
+    }
+    programmaticScrollUntil = Date.now() + 250;
+    programmaticScrollKind = 'preserve';
+    const viewportTop = transcriptViewportTop();
+    const rect = element.getBoundingClientRect();
+    scroller.scrollTop += rect.top - viewportTop - anchor.offset;
   }
 
   async function flushTranscriptScrollPlan() {
@@ -419,7 +468,7 @@
       return;
     }
     if (manualTranscriptScrollVersion !== plan.manualScrollVersion) return;
-    restoreTranscriptScrollTop(plan.top);
+    restoreTranscriptAnchor(plan.anchor, plan.top);
   }
 
   function planTranscriptScroll(options: { forceFollow?: boolean; markNewActivity?: boolean } = {}) {
@@ -428,13 +477,15 @@
     const top = scroller?.scrollTop ?? window.scrollY;
     const manualScrollVersion = manualTranscriptScrollVersion;
     const pinnedNow = isTranscriptPinnedToBottom();
-    const wasFollowing = transcriptFollowPinned;
-    if (pinnedNow) transcriptFollowPinned = true;
-    const shouldFollow = Boolean(options.forceFollow) || (wasFollowing && pinnedNow);
+    const detached = transcriptUserDetached;
+    if (pinnedNow) {
+      transcriptUserDetached = false;
+    }
+    const shouldFollow = Boolean(options.forceFollow) || (!detached && pinnedNow);
     if (shouldFollow) {
       transcriptScrollPlan = { kind: 'follow', top, manualScrollVersion, force: Boolean(options.forceFollow) };
     } else {
-      transcriptScrollPlan = { kind: 'preserve', top, manualScrollVersion };
+      transcriptScrollPlan = { kind: 'preserve', top, manualScrollVersion, anchor: captureTranscriptAnchor() };
       if (options.markNewActivity !== false) newActivityBelow = true;
     }
     void flushTranscriptScrollPlan();
@@ -450,15 +501,16 @@
     }
     programmaticScrollKind = '';
     manualTranscriptScrollVersion += 1;
-    transcriptFollowPinned = isTranscriptPinnedToBottom();
-    if (transcriptFollowPinned) newActivityBelow = false;
+    const pinned = isTranscriptPinnedToBottom();
+    transcriptUserDetached = !pinned;
+    if (pinned) newActivityBelow = false;
   }
 
   function markTranscriptDetachedByUser() {
     programmaticScrollKind = '';
     programmaticScrollUntil = 0;
     manualTranscriptScrollVersion += 1;
-    transcriptFollowPinned = false;
+    transcriptUserDetached = true;
   }
 
   function handleTranscriptWheel(event: WheelEvent) {
@@ -601,7 +653,7 @@
     maxTokensLabel = '';
     retryNotice = '';
     newActivityBelow = false;
-    transcriptFollowPinned = true;
+    transcriptUserDetached = false;
     resumeVersion = 0;
   }
 
@@ -779,6 +831,19 @@
     await openThread(threadId);
   }
 
+  async function showThreadTailPreview(threadId: string) {
+    try {
+      const result = await rpc('getThreadTail', { thread: threadId, limit: 5 });
+      if (selectedThreadId !== threadId) return;
+      const thread = normalizeThreadPayload(result);
+      const previewDetail = threadDetailFromAPI(thread);
+      detail = previewDetail;
+      compactionRecords = previewDetail.compactionRecords ?? [];
+    } catch {
+      // The full thread load below is authoritative for import and resume.
+    }
+  }
+
   async function startNewThread() {
     if (!apiKey.trim() || newThreadStarting) return;
 
@@ -844,7 +909,9 @@
     resetRuntimeState();
     disconnect();
     try {
+      await showThreadTailPreview(threadId);
       const result = await rpc('getThread', { thread: threadId });
+      if (selectedThreadId !== threadId) return;
       const thread = normalizeThreadPayload(result);
       detail = threadDetailFromAPI(thread);
       compactionRecords = detail.compactionRecords ?? [];
@@ -859,12 +926,15 @@
       void refreshThreadUsageInfo(threadId);
       connect(threadId, Number(thread?.v ?? detail.messages.length));
     } catch (error) {
+      if (selectedThreadId !== threadId) return;
       lastError = error instanceof Error ? error.message : String(error);
-      detail = threadDetailFromSummary(threads.find((thread) => thread.id === threadId));
+      detail = detail?.id === threadId ? detail : threadDetailFromSummary(threads.find((thread) => thread.id === threadId));
       connection = 'offline';
       executorConnected = false;
     } finally {
-      loadingThread = false;
+      if (selectedThreadId === threadId) {
+        loadingThread = false;
+      }
     }
   }
 
@@ -2043,7 +2113,7 @@
   }
 
   function queuedMessageKey(queued: QueuedMessage) {
-    return queued.messageId || queued.id;
+    return queued.id || queued.messageId;
   }
 
   function queuedMessageMatches(queued: QueuedMessage, id: string) {
@@ -2100,7 +2170,11 @@
   function removeQueuedMessage(queued: QueuedMessage) {
     const key = queuedMessageKey(queued);
     if (!key) return;
-    sendFrame({ type: 'client_remove_queued_msg', queuedMessageId: key });
+    if (queued.id) {
+      sendFrame({ type: 'user:message-queue:discard', id: queued.id });
+    } else {
+      sendFrame({ type: 'client_remove_queued_msg', queuedMessageId: key });
+    }
     queuedMessages = queuedMessages.filter((item) => !queuedMessageMatches(item, key));
     queuedCount = queuedMessages.length;
   }
@@ -2127,7 +2201,11 @@
       }
     }
     for (const queued of queuedMessages) {
-      sendFrame({ type: 'client_remove_queued_msg', queuedMessageId: queuedMessageKey(queued) });
+      if (queued.id) {
+        sendFrame({ type: 'user:message-queue:discard', id: queued.id });
+      } else {
+        sendFrame({ type: 'client_remove_queued_msg', queuedMessageId: queuedMessageKey(queued) });
+      }
     }
     queuedMessages = [];
     queuedCount = 0;
@@ -2811,8 +2889,7 @@
     if (total !== undefined) return total;
     const input = finiteNumberFrom(usage.inputTokens, usage.input_tokens, usage.prompt_tokens, usage.promptTokenCount, usage.input);
     const cacheCreation = finiteNumberFrom(usage.cacheCreationInputTokens, usage.cache_creation_input_tokens);
-    const details = asRecord(usage.prompt_tokens_details);
-    const cacheRead = finiteNumberFrom(usage.cacheReadInputTokens, usage.cache_read_input_tokens, usage.cachedContentTokenCount, details.cached_tokens);
+    const cacheRead = finiteNumberFrom(usage.cacheReadInputTokens, usage.cache_read_input_tokens, usage.cachedContentTokenCount);
     if (input === undefined && cacheCreation === undefined && cacheRead === undefined) return undefined;
     return (input ?? 0) + (cacheCreation ?? 0) + (cacheRead ?? 0);
   }
@@ -5093,17 +5170,17 @@
           {/if}
           {#each transcriptItems as item (item.key)}
             {#if item.kind === 'user'}
-              <article class="message message--user" data-message-id={item.message.messageId}>
+              <article class="message message--user" data-message-id={item.message.messageId} data-transcript-key={item.key}>
                 {@render userBubble(item.message.content)}
               </article>
             {:else if item.kind === 'compaction'}
-              <div class="compaction-row" data-cut-message-id={item.cutMessageId}>
+              <div class="compaction-row" data-cut-message-id={item.cutMessageId} data-transcript-key={item.key}>
                 <span class="compaction-row__line"></span>
                 <span class="compaction-row__label">Compacted</span>
                 <span class="compaction-row__line"></span>
               </div>
             {:else if assistantTurnSegments(item.messages).length > 0}
-              <article class="message" data-message-id={item.key}>
+              <article class="message" data-message-id={item.key} data-transcript-key={item.key}>
                 <div class="message__agent">
                   <div>
                     {#each assistantTurnSegments(item.messages) as segment (segment.key)}

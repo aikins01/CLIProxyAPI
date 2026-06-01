@@ -1,8 +1,12 @@
 package amp
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/gin-gonic/gin"
 )
 
 func TestRewriteModelInResponse_TopLevel(t *testing.T) {
@@ -124,6 +128,57 @@ func TestRewriteStreamChunk_PreservesThinkingWithSignatureInjection(t *testing.T
 	// Signature should be injected into both thinking and tool_use blocks
 	if count := strings.Count(string(result), `"signature":""`); count != 2 {
 		t.Fatalf("expected 2 signature injections, but got %d in %s", count, string(result))
+	}
+}
+
+func TestLooksLikeSSEChunkDetectsEventStreamFrames(t *testing.T) {
+	tests := []struct {
+		name string
+		data string
+		want bool
+	}{
+		{name: "data frame", data: "data: {\"type\":\"message_delta\"}\n\n", want: true},
+		{name: "event frame", data: "event: content_block_delta\n", want: true},
+		{name: "whitespace before frame", data: "  data: {\"ok\":true}\n", want: true},
+		{name: "json field named data", data: "{\"data\":\"not an SSE frame\"}", want: false},
+		{name: "plain text mention", data: "this line mentions data: but is not a frame", want: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := looksLikeSSEChunk([]byte(tc.data)); got != tc.want {
+				t.Fatalf("looksLikeSSEChunk() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestResponseRewriterWriteDetectsHeaderlessSSEAndRewritesChunk(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.GET("/stream", func(c *gin.Context) {
+		rw := NewResponseRewriter(c.Writer, "gpt-5.2-codex")
+		c.Header("Content-Type", "application/octet-stream")
+		_, err := rw.Write([]byte("data: {\"response\":{\"model\":\"gpt-5.3-codex\"}}\n\n"))
+		if err != nil {
+			c.String(http.StatusInternalServerError, err.Error())
+			return
+		}
+		rw.Flush()
+	})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/stream", nil)
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"model":"gpt-5.2-codex"`) {
+		t.Fatalf("SSE chunk was not rewritten after frame detection: %s", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "gpt-5.3-codex") {
+		t.Fatalf("SSE chunk leaked mapped model: %s", rec.Body.String())
 	}
 }
 

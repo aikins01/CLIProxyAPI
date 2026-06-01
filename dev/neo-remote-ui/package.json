@@ -8,7 +8,8 @@
     "build": "vite build",
     "start": "HOST=0.0.0.0 PORT=${PORT:-3000} node server.ts",
     "preview": "vite preview --host 127.0.0.1",
-    "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json"
+    "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+    "smoke": "bun run build && node smoke.mjs"
   },
   "devDependencies": {
     "@sveltejs/adapter-node": "^5.0.0",

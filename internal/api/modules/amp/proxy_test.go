@@ -275,6 +275,130 @@ func TestReverseProxy_InjectsHeaders(t *testing.T) {
 	}
 }
 
+func TestReverseProxy_PreservesActorEngineBasicAuth(t *testing.T) {
+	gotHeaders := make(chan http.Header, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeaders <- r.Header.Clone()
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`ok`))
+	}))
+	defer upstream.Close()
+
+	proxy, err := createReverseProxy(upstream.URL, NewStaticSecretSource("secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxy.ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+
+	req, err := http.NewRequest(http.MethodGet, srv.URL+"/actors/metadata", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Basic actor-token")
+	req.Header.Set("X-Api-Key", "local-client-key")
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+
+	hdr := <-gotHeaders
+	if hdr.Get("Authorization") != "Basic actor-token" {
+		t.Fatalf("Authorization = %q, want actor Basic auth", hdr.Get("Authorization"))
+	}
+	if hdr.Get("X-Api-Key") != "" {
+		t.Fatalf("X-Api-Key = %q, want stripped for actor engine", hdr.Get("X-Api-Key"))
+	}
+}
+
+func TestReverseProxy_PreservesActorEngineBearerAuth(t *testing.T) {
+	gotHeaders := make(chan http.Header, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeaders <- r.Header.Clone()
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`ok`))
+	}))
+	defer upstream.Close()
+
+	proxy, err := createReverseProxy(upstream.URL, NewStaticSecretSource("secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxy.ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+
+	req, err := http.NewRequest(http.MethodGet, srv.URL+"/actors/metadata", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer actor-token")
+	req.Header.Set("X-Api-Key", "local-client-key")
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+
+	hdr := <-gotHeaders
+	if hdr.Get("Authorization") != "Bearer actor-token" {
+		t.Fatalf("Authorization = %q, want actor Bearer auth", hdr.Get("Authorization"))
+	}
+	if hdr.Get("X-Api-Key") != "" {
+		t.Fatalf("X-Api-Key = %q, want stripped for actor engine", hdr.Get("X-Api-Key"))
+	}
+}
+
+func TestReverseProxy_DoesNotInjectAPIKeyForActorEngineWebsocketToken(t *testing.T) {
+	gotHeaders := make(chan http.Header, 1)
+	gotQuery := make(chan string, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeaders <- r.Header.Clone()
+		gotQuery <- r.URL.RawQuery
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`ok`))
+	}))
+	defer upstream.Close()
+
+	proxy, err := createReverseProxy(upstream.URL, NewStaticSecretSource("secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxy.ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+
+	req, err := http.NewRequest(http.MethodGet, srv.URL+"/actors/gateway/threadActor/websocket/?rvt-token=actor-token&rvt-method=getOrCreate", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Sec-WebSocket-Protocol", "rivet, rivet_token.actor-token, rivet_encoding.json")
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+
+	hdr := <-gotHeaders
+	if hdr.Get("Authorization") != "" {
+		t.Fatalf("Authorization = %q, want none for actor websocket token", hdr.Get("Authorization"))
+	}
+	if hdr.Get("X-Api-Key") != "" {
+		t.Fatalf("X-Api-Key = %q, want stripped for actor websocket token", hdr.Get("X-Api-Key"))
+	}
+	if query := <-gotQuery; !strings.Contains(query, "rvt-token=actor-token") {
+		t.Fatalf("query = %q, missing actor rvt-token", query)
+	}
+}
+
 func TestReverseProxy_EmptySecret(t *testing.T) {
 	gotHeaders := make(chan http.Header, 1)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

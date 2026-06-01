@@ -23,10 +23,11 @@ import (
 )
 
 const (
-	defaultImagesMainModel = "gpt-5.4-mini"
-	defaultImagesToolModel = "gpt-image-2"
-	imagesGenerationsPath  = "/v1/images/generations"
-	imagesEditsPath        = "/v1/images/edits"
+	defaultImagesMainModel    = "gpt-5.4-mini"
+	defaultImagesToolModel    = "gpt-image-2"
+	imagesGenerationsPath     = "/v1/images/generations"
+	imagesEditsPath           = "/v1/images/edits"
+	ampImageGenerationFeature = "amp.image-generation"
 )
 
 type imageCallResult struct {
@@ -36,6 +37,15 @@ type imageCallResult struct {
 	Size          string
 	Background    string
 	Quality       string
+}
+
+func setAmpFeatureHeaderIfMissing(c *gin.Context, feature string) {
+	if c == nil || c.Request == nil || strings.TrimSpace(feature) == "" {
+		return
+	}
+	if strings.TrimSpace(c.Request.Header.Get("X-Amp-Feature")) == "" {
+		c.Request.Header.Set("X-Amp-Feature", feature)
+	}
 }
 
 type sseFrameAccumulator struct {
@@ -582,6 +592,7 @@ func buildImagesResponsesRequest(prompt string, images []string, toolJSON []byte
 
 func (h *OpenAIAPIHandler) collectImagesFromResponses(c *gin.Context, responsesReq []byte, responseFormat string) {
 	c.Header("Content-Type", "application/json")
+	setAmpFeatureHeaderIfMissing(c, ampImageGenerationFeature)
 
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 	cliCtx = handlers.WithDisallowFreeAuth(cliCtx)
@@ -776,6 +787,7 @@ func (h *OpenAIAPIHandler) streamImagesFromResponses(c *gin.Context, responsesRe
 		})
 		return
 	}
+	setAmpFeatureHeaderIfMissing(c, ampImageGenerationFeature)
 
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 	cliCtx = handlers.WithDisallowFreeAuth(cliCtx)

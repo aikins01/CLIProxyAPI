@@ -70,6 +70,8 @@ func createReverseProxy(upstreamURL string, secretSource SecretSource) (*httputi
 	proxy.Director = func(req *http.Request) {
 		originalDirector(req)
 		req.Host = parsed.Host
+		actorRequest := actorEngineRequest(req)
+		actorAuthorization := actorEngineAuthorization(req)
 
 		// Remove client's Authorization header - it was only used for CLI Proxy API authentication
 		// We will set our own Authorization using the configured upstream-api-key
@@ -96,6 +98,14 @@ func createReverseProxy(upstreamURL string, secretSource SecretSource) (*httputi
 		// Note: We do NOT filter Anthropic-Beta headers in the proxy path
 		// Users going through ampcode.com proxy are paying for the service and should get all features
 		// including 1M context window (context-1m-2025-08-07)
+
+		if actorAuthorization != "" {
+			req.Header.Set("Authorization", actorAuthorization)
+			return
+		}
+		if actorRequest {
+			return
+		}
 
 		// Inject API key from secret source (only uses upstream-api-key from config)
 		if key, err := secretSource.Get(req.Context()); err == nil && key != "" {
@@ -201,6 +211,49 @@ func createReverseProxy(upstreamURL string, secretSource SecretSource) (*httputi
 	}
 
 	return proxy, nil
+}
+
+func actorEngineAuthorization(req *http.Request) string {
+	if req == nil || req.URL == nil {
+		return ""
+	}
+	if !actorEnginePath(req.URL.Path) {
+		return ""
+	}
+	authorization := strings.TrimSpace(req.Header.Get("Authorization"))
+	scheme, _, ok := strings.Cut(authorization, " ")
+	if !ok {
+		return ""
+	}
+	switch strings.ToLower(strings.TrimSpace(scheme)) {
+	case "basic", "bearer":
+	default:
+		return ""
+	}
+	return authorization
+}
+
+func actorEngineRequest(req *http.Request) bool {
+	if req == nil || req.URL == nil || !actorEnginePath(req.URL.Path) {
+		return false
+	}
+	if actorEngineAuthorization(req) != "" {
+		return true
+	}
+	if strings.TrimSpace(req.URL.Query().Get("rvt-token")) != "" {
+		return true
+	}
+	for _, protocol := range req.Header.Values("Sec-WebSocket-Protocol") {
+		if strings.Contains(strings.ToLower(protocol), "rivet_token.") {
+			return true
+		}
+	}
+	return false
+}
+
+func actorEnginePath(path string) bool {
+	normalized := "/" + strings.Trim(path, "/")
+	return normalized == "/actors" || strings.HasPrefix(normalized, "/actors/")
 }
 
 // isStreamingResponse detects if the response is streaming (SSE only)

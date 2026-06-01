@@ -137,6 +137,10 @@ func (m *AmpModule) managementAvailabilityMiddleware() gin.HandlerFunc {
 func wrapManagementAuth(auth gin.HandlerFunc, prefixes ...string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		path := c.Request.URL.Path
+		if actorEngineRequest(c.Request) {
+			c.Next()
+			return
+		}
 		for _, prefix := range prefixes {
 			if strings.HasPrefix(path, prefix) && (len(path) == len(prefix) || path[len(prefix)] == '/') {
 				c.Next()
@@ -239,8 +243,8 @@ func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *ha
 	}
 	// Add clientAPIKeyMiddleware after auth for per-client upstream routing
 	rootMiddleware = append(rootMiddleware, clientAPIKeyMiddleware())
-	engine.GET("/threads", append(rootMiddleware, proxyHandler)...)
-	engine.GET("/threads/*path", append(rootMiddleware, proxyHandler)...)
+	engine.Any("/threads", append(rootMiddleware, proxyHandler)...)
+	engine.Any("/threads/*path", append(rootMiddleware, proxyHandler)...)
 	engine.GET("/docs", append(rootMiddleware, proxyHandler)...)
 	engine.GET("/docs/*path", append(rootMiddleware, proxyHandler)...)
 	engine.GET("/settings", append(rootMiddleware, proxyHandler)...)

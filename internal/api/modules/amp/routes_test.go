@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -21,6 +22,17 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 )
+
+func requireNeoBinaryV7ThreadID(t *testing.T, threadID string) {
+	t.Helper()
+	if !neoBinaryThreadIDExactPattern.MatchString(threadID) {
+		t.Fatalf("threadId = %q, want binary UUID thread id", threadID)
+	}
+	parts := strings.Split(strings.TrimPrefix(threadID, "T-"), "-")
+	if len(parts) != 5 || !strings.HasPrefix(parts[2], "7") {
+		t.Fatalf("threadId = %q, want UUIDv7-shaped binary thread id", threadID)
+	}
+}
 
 func TestRegisterManagementRoutes(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -106,6 +118,305 @@ func TestRegisterManagementRoutes(t *testing.T) {
 	}
 }
 
+func TestRegisterManagementRoutesProxiesAuditBaselineAmpOwnedMethods(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	enabled := true
+	m := &AmpModule{
+		restrictToLocalhost: false,
+		neoRuntime: newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+			NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled},
+		}}),
+	}
+	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, nil)
+
+	samples := map[string]string{
+		"/api/telemetry":              "/api/telemetry",
+		"/api/user-actor-credentials": "/api/user-actor-credentials",
+		"/threads":                    "/threads",
+		"/threads/runs":               "/threads/runs",
+	}
+	baseline := ampBinaryParityBaselineForTest(t)
+	for _, route := range baseline.Signals.RouteMethods {
+		if route.Scope != "amp-owned" {
+			continue
+		}
+		path := samples[route.Name]
+		if path == "" {
+			t.Fatalf("Amp binary baseline exposes amp-owned route %q without an explicit proxy sample", route.Name)
+		}
+		for _, method := range route.Methods {
+			t.Run(method+" "+route.Name, func(t *testing.T) {
+				req := httptest.NewRequest(method, path, bytes.NewBufferString(`{}`))
+				req.Header.Set("Content-Type", "application/json")
+				rec := httptest.NewRecorder()
+				r.ServeHTTP(rec, req)
+
+				if rec.Code == http.StatusNotFound {
+					t.Fatalf("%s %s was not registered for Amp-owned upstream proxying", method, path)
+				}
+				if rec.Code != http.StatusServiceUnavailable {
+					t.Fatalf("%s %s status = %d, want 503 from missing upstream proxy; body=%s", method, path, rec.Code, rec.Body.String())
+				}
+			})
+		}
+	}
+}
+
+func TestRegisterManagementRoutesAmpOwnedRouteCoverageDoesNotServeLocally(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	enabled := true
+	m := &AmpModule{
+		restrictToLocalhost: false,
+		neoRuntime: newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+			NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled},
+		}}),
+	}
+	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, nil)
+
+	samples := map[string]struct {
+		method string
+		path   string
+	}{
+		"/api/internal/github-proxy/": {method: http.MethodGet, path: "/api/internal/github-proxy/repos/local"},
+		"/api/telemetry":              {method: http.MethodPost, path: "/api/telemetry"},
+		"/api/threads/":               {method: http.MethodGet, path: "/api/threads/T-local"},
+		"/api/threads/find?":          {method: http.MethodGet, path: "/api/threads/find?q=local"},
+		"/api/user-actor-credentials": {method: http.MethodPost, path: "/api/user-actor-credentials"},
+		"/auth":                       {method: http.MethodGet, path: "/auth"},
+		"/auth/callback":              {method: http.MethodGet, path: "/auth/callback?code=local"},
+		"/auth/cli-login?authToken=":  {method: http.MethodGet, path: "/auth/cli-login?authToken=local"},
+		"/docs":                       {method: http.MethodGet, path: "/docs"},
+		"/threads":                    {method: http.MethodGet, path: "/threads"},
+		"/threads/":                   {method: http.MethodGet, path: "/threads/T-local"},
+		"/threads/runs":               {method: http.MethodPost, path: "/threads/runs"},
+	}
+	baseline := ampBinaryParityBaselineForTest(t)
+	checked := 0
+	for _, route := range baseline.Signals.RouteCoverage {
+		if route.Scope != "amp-owned" {
+			continue
+		}
+		sample, ok := samples[route.Name]
+		if !ok {
+			t.Fatalf("Amp binary baseline exposes amp-owned route %q without an explicit local ownership sample", route.Name)
+		}
+		checked++
+		t.Run(route.Name, func(t *testing.T) {
+			req := httptest.NewRequest(sample.method, sample.path, bytes.NewBufferString(`{}`))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			r.ServeHTTP(rec, req)
+
+			if rec.Code == http.StatusNotFound {
+				t.Fatalf("%s %s was not registered for Amp-owned upstream proxying", sample.method, sample.path)
+			}
+			if rec.Code != http.StatusServiceUnavailable {
+				t.Fatalf("%s %s status = %d, want 503 from missing upstream proxy; body=%s", sample.method, sample.path, rec.Code, rec.Body.String())
+			}
+		})
+	}
+	if checked != len(samples) {
+		t.Fatalf("checked %d amp-owned route coverage entries, want %d; update local/upstream ownership samples for the Amp binary baseline", checked, len(samples))
+	}
+}
+
+func TestRegisterManagementRoutesServesAuditBaselineActorRuntimeRoutesLocally(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	runtimeRequests := 0
+	runtimeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		runtimeRequests++
+		writeNeoJSON(w, http.StatusOK, map[string]any{"source": "runtime", "path": r.URL.Path})
+	}))
+	defer runtimeServer.Close()
+	runtimeURL, err := url.Parse(runtimeServer.URL)
+	if err != nil {
+		t.Fatalf("parse runtime URL: %v", err)
+	}
+	host, portText, err := net.SplitHostPort(runtimeURL.Host)
+	if err != nil {
+		t.Fatalf("split runtime host: %v", err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatalf("parse runtime port: %v", err)
+	}
+
+	dir := t.TempDir()
+	oldStoreDir := neoAmpThreadStoreDir
+	neoAmpThreadStoreDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
+
+	existingThreadID := "T-019e65c0-0310-77a8-b233-4b84d9c0612d"
+	rawThread := []byte(`{"id":"` + existingThreadID + `","title":"local actor","agentMode":"deep","meta":{"usesThreadActors":true,"cliProxyAPILocalNeo":true},"messages":[{"messageId":"M-user","role":"user","content":[{"type":"text","text":"resume locally"}]}]}`)
+	if err := os.WriteFile(filepath.Join(dir, existingThreadID+".json"), rawThread, 0o600); err != nil {
+		t.Fatalf("write local thread: %v", err)
+	}
+
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+		NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled},
+	}})
+	rt.host = host
+	rt.port = port
+
+	r := gin.New()
+	m := &AmpModule{
+		restrictToLocalhost: false,
+		neoRuntime:          rt,
+	}
+	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, nil)
+	localServer := httptest.NewServer(r)
+	defer localServer.Close()
+
+	type routeSample struct {
+		method       string
+		path         string
+		body         string
+		expectBridge bool
+	}
+	samples := map[string][]routeSample{
+		"/actors": {
+			{method: http.MethodPost, path: "/actors", body: `{}`, expectBridge: true},
+			{method: http.MethodPut, path: "/actors", body: `{}`, expectBridge: true},
+		},
+		"/actors/": {
+			{method: http.MethodGet, path: "/actors/A-audit/kv/keys/state", expectBridge: true},
+			{method: http.MethodDelete, path: "/actors/A-audit", expectBridge: true},
+		},
+		"/actors?actor_ids=": {
+			{method: http.MethodGet, path: "/actors?actor_ids=A-audit", expectBridge: true},
+		},
+		"/actors?name=": {
+			{method: http.MethodGet, path: "/actors?name=threadActor&key=T-audit", expectBridge: true},
+		},
+		"/api/thread-actors": {
+			{method: http.MethodPost, path: "/api/thread-actors", body: `{"agentMode":"deep","usesThreadActors":true}`},
+		},
+		"/api/thread-actors/": {
+			{method: http.MethodPost, path: "/api/thread-actors/" + existingThreadID, body: `{}`},
+		},
+		"/gateway/": {
+			{method: http.MethodGet, path: "/gateway/threadActor/?rvt-method=get&rvt-key=T-audit", expectBridge: true},
+		},
+		"/metadata": {
+			{method: http.MethodGet, path: "/metadata", expectBridge: true},
+		},
+	}
+
+	baseline := ampBinaryParityBaselineForTest(t)
+	checked := 0
+	for _, route := range baseline.Signals.RouteCoverage {
+		if route.Scope != "local-runtime" {
+			continue
+		}
+		routeSamples, ok := samples[route.Name]
+		if !ok {
+			continue
+		}
+		checked++
+		for _, sample := range routeSamples {
+			t.Run(sample.method+" "+route.Name, func(t *testing.T) {
+				beforeRuntimeRequests := runtimeRequests
+				req, err := http.NewRequest(sample.method, localServer.URL+sample.path, strings.NewReader(sample.body))
+				if err != nil {
+					t.Fatalf("build request: %v", err)
+				}
+				if sample.body != "" {
+					req.Header.Set("Content-Type", "application/json")
+				}
+				resp, err := http.DefaultClient.Do(req)
+				if err != nil {
+					t.Fatalf("request: %v", err)
+				}
+				defer resp.Body.Close()
+				body, err := io.ReadAll(resp.Body)
+				if err != nil {
+					t.Fatalf("read response: %v", err)
+				}
+
+				if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+					t.Fatalf("%s %s status = %d, body=%s", sample.method, sample.path, resp.StatusCode, string(body))
+				}
+				if sample.expectBridge && runtimeRequests != beforeRuntimeRequests+1 {
+					t.Fatalf("%s %s runtimeRequests = %d, want %d", sample.method, sample.path, runtimeRequests, beforeRuntimeRequests+1)
+				}
+				if !sample.expectBridge && runtimeRequests != beforeRuntimeRequests {
+					t.Fatalf("%s %s unexpectedly hit runtime bridge", sample.method, sample.path)
+				}
+			})
+		}
+	}
+	if checked != len(samples) {
+		t.Fatalf("checked %d actor runtime route coverage entries, want %d; update local/upstream ownership samples for the Amp binary baseline", checked, len(samples))
+	}
+}
+
+func TestRegisterManagementRoutesRemoteWebRoutesDoNotSynthesizeLocalThreadData(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	enabled := true
+
+	dir := t.TempDir()
+	oldStoreDir := neoAmpThreadStoreDir
+	neoAmpThreadStoreDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
+
+	threadID := "T-019e65c0-0310-77a8-b233-4b84d9c06131"
+	rawThread := []byte(`{"id":"` + threadID + `","title":"remote web must not read this local thread","agentMode":"deep","messages":[{"messageId":"M-local","role":"user","content":[{"type":"text","text":"remote-web-local-leak-marker"}]}]}`)
+	if err := os.WriteFile(filepath.Join(dir, threadID+".json"), rawThread, 0o600); err != nil {
+		t.Fatalf("write local thread: %v", err)
+	}
+
+	m := &AmpModule{
+		restrictToLocalhost: false,
+		neoRuntime: newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+			UpstreamURL:    "https://ampcode.test",
+			UpstreamAPIKey: "secret",
+			NeoLocalRuntime: config.AmpNeoLocalRuntime{
+				Enabled: &enabled,
+			},
+		}}),
+	}
+	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, nil)
+
+	samples := map[string]string{
+		"/api/internal":  "/api/internal",
+		"/api/internal?": "/api/internal?listThreads",
+	}
+	baseline := ampBinaryParityBaselineForTest(t)
+	checked := 0
+	for _, route := range baseline.Signals.RouteMethods {
+		if route.Scope != "remote-web" {
+			continue
+		}
+		path := samples[route.Name]
+		if path == "" {
+			t.Fatalf("Amp binary baseline exposes remote-web route %q without an explicit local synthesis policy sample", route.Name)
+		}
+		checked++
+		for _, method := range route.Methods {
+			t.Run(method+" "+route.Name, func(t *testing.T) {
+				req := httptest.NewRequest(method, path, bytes.NewBufferString(`{"method":"listThreads","params":{"limit":20}}`))
+				req.Header.Set("Content-Type", "application/json")
+				rec := httptest.NewRecorder()
+				r.ServeHTTP(rec, req)
+
+				if rec.Code != http.StatusServiceUnavailable {
+					t.Fatalf("%s %s status = %d, want 503 without upstream proxy; body=%s", method, path, rec.Code, rec.Body.String())
+				}
+				if body := rec.Body.String(); strings.Contains(body, "remote-web-local-leak-marker") || strings.Contains(body, "remote web must not read this local thread") {
+					t.Fatalf("remote-web route synthesized local thread data: %s", body)
+				}
+			})
+		}
+	}
+	if checked == 0 {
+		t.Fatal("Amp binary parity baseline has no remote-web route methods")
+	}
+}
+
 func TestRegisterManagementRoutesLocalNeoThreadActorsWithoutProxy(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
@@ -132,9 +443,7 @@ func TestRegisterManagementRoutesLocalNeoThreadActorsWithoutProxy(t *testing.T) 
 		t.Fatalf("response JSON error: %v", err)
 	}
 	threadID := stringValue(response["threadId"])
-	if !neoThreadIDExactPattern.MatchString(threadID) {
-		t.Fatalf("threadId = %#v", response["threadId"])
-	}
+	requireNeoBinaryV7ThreadID(t, threadID)
 	if stringValue(response["wsToken"]) == "" || stringValue(response["ownerUserId"]) == "" || numberFrom(response["threadVersion"]) == 0 {
 		t.Fatalf("missing required thread actor fields: %#v", response)
 	}
@@ -695,6 +1004,261 @@ func TestRegisterManagementRoutesPassesUnknownNeoRuntimeBridgePathsUpstreamWithP
 	}
 }
 
+func TestRegisterManagementRoutesPassesRemoteStyleActorEnginePathsUpstreamWithProxy(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	runtimeRequests := 0
+	runtimeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		runtimeRequests++
+		writeNeoJSON(w, http.StatusOK, map[string]any{"source": "runtime"})
+	}))
+	defer runtimeServer.Close()
+	runtimeURL, err := url.Parse(runtimeServer.URL)
+	if err != nil {
+		t.Fatalf("parse runtime URL: %v", err)
+	}
+	host, portText, err := net.SplitHostPort(runtimeURL.Host)
+	if err != nil {
+		t.Fatalf("split runtime host: %v", err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatalf("parse runtime port: %v", err)
+	}
+
+	var upstreamPaths []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamPaths = append(upstreamPaths, r.URL.RequestURI())
+		writeNeoJSON(w, http.StatusOK, map[string]any{"source": "upstream"})
+	}))
+	defer upstream.Close()
+
+	r := gin.New()
+	m := &AmpModule{
+		restrictToLocalhost: false,
+		neoRuntime:          &neoRuntime{host: host, port: port},
+	}
+	proxy, err := createReverseProxy(upstream.URL, NewStaticSecretSource(""))
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	m.setProxy(proxy)
+	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, nil)
+
+	localServer := httptest.NewServer(r)
+	defer localServer.Close()
+
+	for _, path := range []string{
+		"/actors/metadata",
+		"/actors/actors?name=threadActor&key=T-upstream",
+		"/actors/gateway/threadActor/?rvt-method=get&rvt-key=T-upstream",
+	} {
+		t.Run(path, func(t *testing.T) {
+			resp, err := http.Get(localServer.URL + path)
+			if err != nil {
+				t.Fatalf("request: %v", err)
+			}
+			defer resp.Body.Close()
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("read response: %v", err)
+			}
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, body=%s", resp.StatusCode, string(body))
+			}
+			var response map[string]any
+			if err := json.Unmarshal(body, &response); err != nil {
+				t.Fatalf("response JSON error: %v", err)
+			}
+			if response["source"] != "upstream" {
+				t.Fatalf("unexpected response: %#v", response)
+			}
+		})
+	}
+	if runtimeRequests != 0 {
+		t.Fatalf("runtimeRequests = %d, want 0", runtimeRequests)
+	}
+	if len(upstreamPaths) != 3 {
+		t.Fatalf("upstreamPaths = %#v, want three actor engine requests", upstreamPaths)
+	}
+	for _, want := range []string{
+		"/actors/metadata",
+		"/actors/actors?name=threadActor&key=T-upstream",
+		"/actors/gateway/threadActor/?rvt-method=get&rvt-key=T-upstream",
+	} {
+		if !slices.Contains(upstreamPaths, want) {
+			t.Fatalf("upstream paths = %#v, missing %s", upstreamPaths, want)
+		}
+	}
+}
+
+func TestRegisterManagementRoutesBypassesManagementAuthForActorEngineAuthorization(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	gotHeaders := make(chan http.Header, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/actors/metadata" {
+			t.Fatalf("unexpected upstream path %s", r.URL.Path)
+		}
+		gotHeaders <- r.Header.Clone()
+		writeNeoJSON(w, http.StatusOK, map[string]any{"source": "upstream"})
+	}))
+	defer upstream.Close()
+
+	r := gin.New()
+	m := &AmpModule{restrictToLocalhost: false}
+	proxy, err := createReverseProxy(upstream.URL, NewStaticSecretSource("secret"))
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	m.setProxy(proxy)
+	auth := func(c *gin.Context) {
+		token := strings.TrimSpace(c.GetHeader("Authorization"))
+		token = strings.TrimSpace(strings.TrimPrefix(token, "Bearer "))
+		if token != "amp-local-key" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing auth"})
+			return
+		}
+		c.Set("userApiKey", token)
+		c.Next()
+	}
+	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, auth)
+
+	server := httptest.NewServer(r)
+	defer server.Close()
+
+	req, err := http.NewRequest(http.MethodGet, server.URL+"/actors/metadata?namespace=default", nil)
+	if err != nil {
+		t.Fatalf("create request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer actor-token")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, body=%s", resp.StatusCode, body)
+	}
+	hdr := <-gotHeaders
+	if hdr.Get("Authorization") != "Bearer actor-token" {
+		t.Fatalf("Authorization = %q, want actor Bearer auth", hdr.Get("Authorization"))
+	}
+	if hdr.Get("X-Api-Key") != "" {
+		t.Fatalf("X-Api-Key = %q, want stripped for actor engine", hdr.Get("X-Api-Key"))
+	}
+}
+
+func TestRegisterManagementRoutesRequiresManagementAuthForActorEngineWithoutActorCredentials(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	upstreamRequests := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequests++
+		writeNeoJSON(w, http.StatusOK, map[string]any{"source": "upstream"})
+	}))
+	defer upstream.Close()
+
+	r := gin.New()
+	m := &AmpModule{restrictToLocalhost: false}
+	proxy, err := createReverseProxy(upstream.URL, NewStaticSecretSource("secret"))
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	m.setProxy(proxy)
+	auth := func(c *gin.Context) {
+		token := strings.TrimSpace(c.GetHeader("Authorization"))
+		token = strings.TrimSpace(strings.TrimPrefix(token, "Bearer "))
+		if token != "amp-local-key" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing auth"})
+			return
+		}
+		c.Set("userApiKey", token)
+		c.Next()
+	}
+	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, auth)
+
+	server := httptest.NewServer(r)
+	defer server.Close()
+
+	resp, err := http.Get(server.URL + "/actors/metadata")
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, body=%s", resp.StatusCode, body)
+	}
+	if upstreamRequests != 0 {
+		t.Fatalf("upstreamRequests = %d, want 0", upstreamRequests)
+	}
+}
+
+func TestRegisterManagementRoutesBypassesManagementAuthForActorEngineWebsocketToken(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	gotPath := make(chan string, 1)
+	gotHeaders := make(chan http.Header, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath <- r.URL.RequestURI()
+		gotHeaders <- r.Header.Clone()
+		writeNeoJSON(w, http.StatusOK, map[string]any{"source": "upstream"})
+	}))
+	defer upstream.Close()
+
+	r := gin.New()
+	m := &AmpModule{restrictToLocalhost: false}
+	proxy, err := createReverseProxy(upstream.URL, NewStaticSecretSource("secret"))
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	m.setProxy(proxy)
+	auth := func(c *gin.Context) {
+		token := strings.TrimSpace(c.GetHeader("Authorization"))
+		token = strings.TrimSpace(strings.TrimPrefix(token, "Bearer "))
+		if token != "amp-local-key" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing auth"})
+			return
+		}
+		c.Set("userApiKey", token)
+		c.Next()
+	}
+	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, auth)
+
+	server := httptest.NewServer(r)
+	defer server.Close()
+
+	req, err := http.NewRequest(http.MethodGet, server.URL+"/actors/gateway/threadActor/websocket/?rvt-token=actor-token&rvt-method=getOrCreate", nil)
+	if err != nil {
+		t.Fatalf("create request: %v", err)
+	}
+	req.Header.Set("Sec-WebSocket-Protocol", "rivet, rivet_token.actor-token, rivet_encoding.json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, body=%s", resp.StatusCode, body)
+	}
+	if path := <-gotPath; !strings.HasPrefix(path, "/actors/gateway/threadActor/websocket/") {
+		t.Fatalf("upstream path = %q, want actor websocket path", path)
+	}
+	hdr := <-gotHeaders
+	if hdr.Get("Authorization") != "" {
+		t.Fatalf("Authorization = %q, want none for actor websocket token", hdr.Get("Authorization"))
+	}
+	if hdr.Get("X-Api-Key") != "" {
+		t.Fatalf("X-Api-Key = %q, want stripped for actor websocket token", hdr.Get("X-Api-Key"))
+	}
+}
+
 func TestRegisterManagementRoutesRejectsUnknownNeoRuntimeBridgePathsWithoutProxy(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -755,6 +1319,64 @@ func TestRegisterManagementRoutesRejectsUnknownNeoRuntimeBridgePathsWithoutProxy
 	}
 	if runtimeRequests != 1 {
 		t.Fatalf("runtimeRequests = %d, want only metadata request", runtimeRequests)
+	}
+}
+
+func TestRegisterManagementRoutesServesNewNeoThreadActorLocallyWithProxy(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	enabled := true
+	proxyCalled := false
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxyCalled = true
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	defer upstream.Close()
+
+	m := &AmpModule{
+		restrictToLocalhost: false,
+		neoRuntime: newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+			UpstreamURL: upstream.URL,
+			NeoLocalRuntime: config.AmpNeoLocalRuntime{
+				Enabled: &enabled,
+			},
+		}}),
+	}
+	proxy, _ := createReverseProxy(upstream.URL, NewStaticSecretSource(""))
+	m.setProxy(proxy)
+	auth := func(c *gin.Context) {
+		token := strings.TrimSpace(strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer "))
+		if token != "local-key" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing auth"})
+			return
+		}
+		c.Set("userApiKey", token)
+		c.Next()
+	}
+	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, auth)
+
+	body := bytes.NewBufferString(`{"agentMode":"deep","usesThreadActors":true}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/thread-actors", body)
+	req.Header.Set("Authorization", "Bearer local-key")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if proxyCalled {
+		t.Fatal("new thread actor request should be served locally")
+	}
+	var response map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("response JSON error: %v", err)
+	}
+	requireNeoBinaryV7ThreadID(t, stringValue(response["threadId"]))
+	if response["agentMode"] != "deep" || response["wsToken"] != "local-key" {
+		t.Fatalf("unexpected local thread actor response: %#v", response)
+	}
+	if response["usesDtw"] != true || response["usesThreadActors"] != true {
+		t.Fatalf("thread actor flags = %#v", response)
 	}
 }
 
@@ -1000,6 +1622,95 @@ func TestRegisterManagementRoutesPassesUnmarkedLocalThreadActorUpstreamWithProxy
 		t.Fatalf("response JSON error: %v", err)
 	}
 	if response["cloudOnlyResponse"] != true || stringValue(response["wsToken"]) != "upstream-token" {
+		t.Fatalf("unexpected upstream response: %#v", response)
+	}
+}
+
+func TestRegisterManagementRoutesPassesUnimportableLocalThreadActorUpstreamWithProxy(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	enabled := true
+
+	dir := t.TempDir()
+	oldStoreDir := neoAmpThreadStoreDir
+	neoAmpThreadStoreDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
+
+	threadID := "T-019e65c0-0310-77a8-b233-4b84d9c0612f"
+	rawThread := []byte(`{"id":"` + threadID + `","title":"stale local marker","meta":{"cliProxyAPILocalNeo":true},"messages":[{"messageId":"M-user","role":"user","content":[{"type":"text","text":"missing mode should not become smart"}]}]}`)
+	if err := os.WriteFile(filepath.Join(dir, threadID+".json"), rawThread, 0o600); err != nil {
+		t.Fatalf("write local thread: %v", err)
+	}
+
+	threadActorRequests := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/thread-actors/"+threadID {
+			t.Fatalf("unexpected upstream request path=%s query=%s", r.URL.Path, r.URL.RawQuery)
+		}
+		threadActorRequests++
+		writeNeoJSON(w, http.StatusOK, map[string]any{
+			"threadId":          threadID,
+			"wsToken":           "upstream-token",
+			"ownerUserId":       "upstream-user",
+			"threadVersion":     7,
+			"usesDtw":           true,
+			"usesThreadActors":  true,
+			"executorType":      "upstream",
+			"agentMode":         "deep",
+			"cloudOnlyResponse": true,
+		})
+	}))
+	defer upstream.Close()
+
+	m := &AmpModule{
+		restrictToLocalhost: false,
+		neoRuntime: newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+			UpstreamURL:    upstream.URL,
+			UpstreamAPIKey: "secret",
+			NeoLocalRuntime: config.AmpNeoLocalRuntime{
+				Enabled: &enabled,
+			},
+		}}),
+	}
+	proxy, _ := createReverseProxy(upstream.URL, NewStaticSecretSource(""))
+	m.setProxy(proxy)
+	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, nil)
+
+	localServer := httptest.NewServer(r)
+	defer localServer.Close()
+
+	req, err := http.NewRequest(http.MethodPost, localServer.URL+"/api/thread-actors/"+threadID, bytes.NewBufferString(`{}`))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Amp-Client-Application", "CLI")
+	req.Header.Set("X-Amp-Client-Type", "cli")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do request: %v", err)
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Fatalf("close response body: %v", err)
+		}
+	}()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", resp.StatusCode, string(body))
+	}
+	if threadActorRequests != 1 {
+		t.Fatalf("threadActorRequests = %d, want 1", threadActorRequests)
+	}
+	var response map[string]any
+	if err := json.Unmarshal(body, &response); err != nil {
+		t.Fatalf("response JSON error: %v", err)
+	}
+	if response["cloudOnlyResponse"] != true || stringValue(response["agentMode"]) != "deep" {
 		t.Fatalf("unexpected upstream response: %#v", response)
 	}
 }
@@ -1375,6 +2086,112 @@ func TestRegisterManagementRoutesServesNeoAttachmentsLocally(t *testing.T) {
 	r.ServeHTTP(headRec, headReq)
 	if headRec.Code != http.StatusOK || headRec.Body.Len() != 0 {
 		t.Fatalf("head response = status %d body %q", headRec.Code, headRec.Body.String())
+	}
+}
+
+func TestRegisterManagementRoutesServesNeoAttachmentUploadAliasesLocally(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+
+	dir := t.TempDir()
+	oldStoreDir := neoAmpThreadStoreDir
+	neoAmpThreadStoreDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
+
+	enabled := true
+	m := &AmpModule{
+		restrictToLocalhost: false,
+		neoRuntime: newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+			NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled},
+		}}),
+	}
+	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/attachments", bytes.NewBufferString(`{"contentBase64":"aGVsbG8=","media_type":"image/png"}`))
+	req.Host = "127.0.0.1:8317"
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("upload status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	var response map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("upload response JSON error: %v", err)
+	}
+	attachmentURL := stringValue(response["url"])
+	parsed, err := url.Parse(attachmentURL)
+	if err != nil {
+		t.Fatalf("parse attachment URL %q: %v", attachmentURL, err)
+	}
+
+	getReq := httptest.NewRequest(http.MethodGet, parsed.RequestURI(), nil)
+	getRec := httptest.NewRecorder()
+	r.ServeHTTP(getRec, getReq)
+	if getRec.Code != http.StatusOK || getRec.Body.String() != "hello" {
+		t.Fatalf("get response = status %d body %q", getRec.Code, getRec.Body.String())
+	}
+	if got := getRec.Header().Get("Content-Type"); got != "image/png" {
+		t.Fatalf("attachment content-type = %q", got)
+	}
+}
+
+func TestRegisterManagementRoutesNeoAttachmentURLUsesForwardedPublicHost(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+
+	dir := t.TempDir()
+	oldStoreDir := neoAmpThreadStoreDir
+	neoAmpThreadStoreDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpThreadStoreDir = oldStoreDir })
+
+	enabled := true
+	m := &AmpModule{
+		restrictToLocalhost: false,
+		neoRuntime: newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+			NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled},
+		}}),
+	}
+	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/attachments", bytes.NewBufferString(`{"data":"aGVsbG8=","mediaType":"image/png"}`))
+	req.Host = "100.74.232.68:8317"
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Forwarded-Host", "neo.aikins.xyz")
+	req.Header.Set("X-Forwarded-Proto", "https")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("upload status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	var response map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("upload response JSON error: %v", err)
+	}
+	attachmentURL := stringValue(response["url"])
+	parsed, err := url.Parse(attachmentURL)
+	if err != nil {
+		t.Fatalf("parse attachment URL %q: %v", attachmentURL, err)
+	}
+	if parsed.Scheme != "https" || parsed.Host != "neo.aikins.xyz" || !strings.HasPrefix(parsed.Path, "/api/attachments/") {
+		t.Fatalf("attachment URL = %q", attachmentURL)
+	}
+}
+
+func TestRegisterManagementRoutesNeoAttachmentURLKeepsLoopbackHTTP(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/api/attachments", nil)
+	req.Host = "127.0.0.1:8317"
+	req.Header.Set("X-Forwarded-Proto", "https")
+
+	attachmentURL := neoLocalAttachmentURL(req, "AbCdEfGhIjKlMnOp")
+	parsed, err := url.Parse(attachmentURL)
+	if err != nil {
+		t.Fatalf("parse attachment URL %q: %v", attachmentURL, err)
+	}
+	if parsed.Scheme != "http" || parsed.Host != "127.0.0.1:8317" || parsed.Path != "/api/attachments/AbCdEfGhIjKlMnOp" {
+		t.Fatalf("attachment URL = %q", attachmentURL)
 	}
 }
 
@@ -2288,6 +3105,7 @@ func TestRegisterManagementRoutesDoesNotServeThreadDiscoveryLocallyWithoutProxy(
 		{name: "internal list threads", method: http.MethodPost, path: "/api/internal?listThreads", body: `{"method":"listThreads","params":{"limit":20}}`},
 		{name: "internal load threads", method: http.MethodPost, path: "/api/internal?loadThreads", body: `{"method":"loadThreads","params":{"threads":["` + threadID + `"]}}`},
 		{name: "internal get thread", method: http.MethodPost, path: "/api/internal?getThread", body: `{"method":"getThread","params":{"thread":"` + threadID + `"}}`},
+		{name: "internal get thread tail", method: http.MethodPost, path: "/api/internal?getThreadTail", body: `{"method":"getThreadTail","params":{"thread":"` + threadID + `","limit":10}}`},
 		{name: "internal load thread tail", method: http.MethodPost, path: "/api/internal?loadThreadTail", body: `{"method":"loadThreadTail","params":{"thread":"` + threadID + `","limit":10}}`},
 		{name: "internal read thread", method: http.MethodPost, path: "/api/internal?readThread", body: `{"method":"readThread","params":{"thread":"` + threadID + `"}}`},
 		{name: "thread search", method: http.MethodGet, path: "/api/threads/find?q=local+needle&limit=5"},

@@ -27,7 +27,8 @@ export default defineConfig({
       '/api': runtimeProxy(),
       '/threads': runtimeProxy(),
       '/gateway': runtimeProxy(true),
-      '/actors': runtimeProxy(true)
+      '/actors': runtimeProxy(true),
+      '/metadata': runtimeProxy()
     }
   }
 });

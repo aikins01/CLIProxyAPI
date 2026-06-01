@@ -13,7 +13,8 @@ const runtimePrefixes = ['/api', '/threads', '/gateway', '/actors', '/metadata']
 const { handler } = (await import(new URL('./build/handler.js', import.meta.url).href)) as { handler: AppHandler };
 
 function shouldProxyRuntime(url = '') {
-  return runtimePrefixes.some((prefix) => url === prefix || url.startsWith(`${prefix}/`));
+  const [pathname = ''] = url.split(/[?#]/, 1);
+  return runtimePrefixes.some((prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`));
 }
 
 function proxyHeaders(headers: IncomingMessage['headers'], targetHost: string) {

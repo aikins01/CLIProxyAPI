@@ -459,10 +459,13 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 	}
 }
 
-// StartNonStreamingKeepAlive emits blank lines every 5 seconds while waiting for a non-streaming response.
+// StartNonStreamingKeepAlive emits blank lines while waiting for a non-streaming response.
 // It returns a stop function that must be called before writing the final response.
 func (h *BaseAPIHandler) StartNonStreamingKeepAlive(c *gin.Context, ctx context.Context) func() {
 	if h == nil || c == nil {
+		return func() {}
+	}
+	if isAmpStrictJSONRequest(c) {
 		return func() {}
 	}
 	interval := NonStreamingKeepAliveInterval(h.Cfg)
@@ -504,6 +507,23 @@ func (h *BaseAPIHandler) StartNonStreamingKeepAlive(c *gin.Context, ctx context.
 		})
 		wg.Wait()
 	}
+}
+
+func isAmpStrictJSONRequest(c *gin.Context) bool {
+	if c == nil || c.Request == nil {
+		return false
+	}
+	headers := c.Request.Header
+	if strings.TrimSpace(headers.Get("X-CLIProxyAPI-Local-Neo-Inference")) == "1" {
+		return true
+	}
+	if strings.TrimSpace(headers.Get("X-Amp-Client-Application")) != "" ||
+		strings.TrimSpace(headers.Get("X-Amp-Client-Type")) != "" ||
+		strings.TrimSpace(headers.Get("X-Amp-Client-Version")) != "" {
+		return true
+	}
+	feature := strings.ToLower(strings.TrimSpace(headers.Get("X-Amp-Feature")))
+	return strings.HasPrefix(feature, "amp.")
 }
 
 // appendAPIResponse preserves any previously captured API response and appends new data.
