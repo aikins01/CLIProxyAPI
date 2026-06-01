@@ -7039,7 +7039,8 @@ func neoCompactionObservedThresholdTokensForSettings(agentMode string, route neo
 	if threshold, ok := neoCompactionContextTokenThreshold(settings); ok {
 		return threshold
 	}
-	if strings.EqualFold(strings.TrimSpace(agentMode), "smart") {
+	mode := strings.ToLower(strings.TrimSpace(agentMode))
+	if mode == "" || mode == "smart" {
 		maxContextTokens := neoEffectiveContextWindow(agentMode, route.Model)
 		if maxContextTokens <= 0 {
 			maxContextTokens = maxInputTokens

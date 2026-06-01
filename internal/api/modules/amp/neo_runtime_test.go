@@ -1213,6 +1213,9 @@ func TestNeoRuntimeSmartAnthropicPostResponseCompactionUsesSeventyFivePercentCon
 	if threshold != 249000 {
 		t.Fatalf("smart observed threshold = %v, want 249000", threshold)
 	}
+	if threshold := neoCompactionObservedThresholdTokensForSettings("", neoModelRoute{Provider: "anthropic", Model: "claude-opus-4-8"}, 300_000, nil); threshold != 249000 {
+		t.Fatalf("empty-mode smart observed threshold = %v, want 249000", threshold)
+	}
 	if got := neoCompactionThresholdTokensForSettings(300_000, nil); got != neoCompactionDefaultTokenLimit {
 		t.Fatalf("binary default threshold = %v, want %d", got, neoCompactionDefaultTokenLimit)
 	}
