@@ -149,7 +149,7 @@ func TestScanThreadDirFindsEarlySmartCompaction(t *testing.T) {
 		}},
 	})
 
-	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, allowMissing: true})
+	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, modelContextWindows: testModelContextWindows(), allowMissing: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -188,7 +188,7 @@ func TestScanThreadDirIgnoresSmartCompactionAtThreshold(t *testing.T) {
 		}},
 	})
 
-	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, allowMissing: true})
+	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, modelContextWindows: testModelContextWindows(), allowMissing: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -226,7 +226,7 @@ func TestScanThreadDirSinceFiltersOldCompactionRecords(t *testing.T) {
 	}
 	since := time.Date(2026, 6, 1, 20, 1, 0, 0, time.UTC)
 
-	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, since: since, allowMissing: true})
+	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, modelContextWindows: testModelContextWindows(), since: since, allowMissing: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -261,12 +261,113 @@ func TestScanThreadDirIgnoresCustomSmartCompactionThreshold(t *testing.T) {
 		}},
 	})
 
-	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, allowMissing: true})
+	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, modelContextWindows: testModelContextWindows(), allowMissing: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(findings) != 0 {
 		t.Fatalf("findings = %#v, want none for custom threshold", findings)
+	}
+}
+
+func TestScanThreadDirLoadsModelContextFromBaseline(t *testing.T) {
+	dir := t.TempDir()
+	baselinePath := filepath.Join(dir, "baseline.json")
+	writeJSONFile(t, baselinePath, map[string]any{
+		"signals": map[string]any{
+			"agent_mode_routes": []any{map[string]any{
+				"name":  "smart",
+				"model": "claude-opus-4-7",
+			}},
+			"model_limits": []any{map[string]any{
+				"name":           "claude-opus-4-8",
+				"context_window": 332_000,
+			}},
+		},
+	})
+	writeJSONFile(t, filepath.Join(dir, "T-smart.json"), map[string]any{
+		"id":        "T-smart",
+		"agentMode": "smart",
+		"messages": []any{
+			map[string]any{
+				"createdAt": "2026-06-01T19:59:40.358042Z",
+				"messageId": "M-assistant",
+				"role":      "assistant",
+				"usage": map[string]any{
+					"model":            "claude-opus-4-8",
+					"totalInputTokens": 101_599,
+					"outputTokens":     317,
+					"maxInputTokens":   300_000,
+				},
+			},
+		},
+		"compactionRecords": []any{map[string]any{
+			"createdAt":    "2026-06-01T20:00:09.138603Z",
+			"cutMessageId": "M-summary",
+		}},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, baselinePath: baselinePath, allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 1 {
+		t.Fatalf("findings = %#v, want 1", findings)
+	}
+	if !strings.Contains(findings[0].Detail, "below 75% threshold 249000") {
+		t.Fatalf("detail = %q", findings[0].Detail)
+	}
+}
+
+func TestScanThreadDirUsesSmartRouteForMappedUsageModel(t *testing.T) {
+	dir := t.TempDir()
+	baselinePath := filepath.Join(dir, "baseline.json")
+	writeJSONFile(t, baselinePath, map[string]any{
+		"signals": map[string]any{
+			"agent_mode_routes": []any{map[string]any{
+				"name":  "smart",
+				"model": "claude-opus-4-7",
+			}},
+			"model_limits": []any{
+				map[string]any{
+					"name":           "claude-opus-4-7",
+					"context_window": 332_000,
+				},
+				map[string]any{
+					"name":           "gpt-5.5",
+					"context_window": 400_000,
+				},
+			},
+		},
+	})
+	writeJSONFile(t, filepath.Join(dir, "T-smart.json"), map[string]any{
+		"id":        "T-smart",
+		"agentMode": "smart",
+		"messages": []any{
+			map[string]any{
+				"createdAt": "2026-06-01T20:06:05.421894Z",
+				"messageId": "M-assistant",
+				"role":      "assistant",
+				"usage": map[string]any{
+					"model":            "gpt-5.5",
+					"totalInputTokens": 250_000,
+					"outputTokens":     1,
+					"maxInputTokens":   272_000,
+				},
+			},
+		},
+		"compactionRecords": []any{map[string]any{
+			"createdAt":    "2026-06-01T20:06:05.423556Z",
+			"cutMessageId": "M-summary",
+		}},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, baselinePath: baselinePath, allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("findings = %#v, want none because mapped usage should use the smart route threshold", findings)
 	}
 }
 
@@ -301,6 +402,10 @@ func TestScanCaptureDirFindsBareReadThreadDone(t *testing.T) {
 	if findings[0].Source != "provider-capture" || findings[0].ToolName != "read_thread" || findings[0].CallID != "TU-read" {
 		t.Fatalf("finding = %#v", findings[0])
 	}
+}
+
+func testModelContextWindows() map[string]int {
+	return map[string]int{"claude-opus-4-8": 332_000}
 }
 
 func TestRunReturnsNonZeroWhenDriftFound(t *testing.T) {

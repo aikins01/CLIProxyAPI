@@ -14,11 +14,14 @@ import (
 )
 
 type scanOptions struct {
-	threadDir    string
-	captureDir   string
-	since        time.Time
-	allowMissing bool
-	jsonOutput   bool
+	threadDir           string
+	captureDir          string
+	baselinePath        string
+	modelContextWindows map[string]int
+	smartModel          string
+	since               time.Time
+	allowMissing        bool
+	jsonOutput          bool
 }
 
 type driftFinding struct {
@@ -47,6 +50,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	flags.SetOutput(stderr)
 	threadDir := flags.String("thread-dir", defaultThreadDir(), "Amp local thread JSON directory to scan")
 	captureDir := flags.String("capture-dir", defaultCaptureDir(), "Neo provider request capture directory to scan")
+	baselinePath := flags.String("baseline", defaultBaselinePath(), "Amp binary parity baseline JSON used for model context windows")
 	sinceRaw := flags.String("since", "", "only scan files modified at or after this RFC3339 timestamp")
 	sinceFile := flags.String("since-file", "", "only scan files and timestamped thread messages at or after this file's modification time")
 	sinceHomebrewRuntime := flags.Bool("since-homebrew-runtime", false, "only scan data at or after the Homebrew cliproxyapi.real replacement time")
@@ -65,6 +69,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	findings, err := scanRuntimeDrift(scanOptions{
 		threadDir:    *threadDir,
 		captureDir:   *captureDir,
+		baselinePath: *baselinePath,
 		since:        since,
 		allowMissing: *allowMissing,
 		jsonOutput:   *jsonOutput,
@@ -153,10 +158,36 @@ func defaultCaptureDir() string {
 	return filepath.Join(home, ".cli-proxy-api", "logs", "neo-provider-requests")
 }
 
+func defaultBaselinePath() string {
+	if cwd, err := os.Getwd(); err == nil {
+		for dir := cwd; ; dir = filepath.Dir(dir) {
+			candidate := filepath.Join(dir, "dev", "amp-binary-parity-baseline.json")
+			if _, err := os.Stat(candidate); err == nil {
+				return candidate
+			}
+			parent := filepath.Dir(dir)
+			if parent == dir {
+				break
+			}
+		}
+	}
+	return filepath.Join("dev", "amp-binary-parity-baseline.json")
+}
+
 func scanRuntimeDrift(options scanOptions) ([]driftFinding, error) {
+	modelContextWindows := options.modelContextWindows
+	smartModel := strings.TrimSpace(options.smartModel)
+	if modelContextWindows == nil && strings.TrimSpace(options.baselinePath) != "" {
+		loaded, loadedSmartModel, err := loadBaselineModelContext(options.baselinePath)
+		if err != nil {
+			return nil, err
+		}
+		modelContextWindows = loaded
+		smartModel = loadedSmartModel
+	}
 	findings := []driftFinding{}
 	if strings.TrimSpace(options.threadDir) != "" {
-		threadFindings, err := scanThreadDir(options.threadDir, options.since, options.allowMissing)
+		threadFindings, err := scanThreadDir(options.threadDir, options.since, options.allowMissing, modelContextWindows, smartModel)
 		if err != nil {
 			return nil, err
 		}
@@ -181,7 +212,45 @@ func scanRuntimeDrift(options scanOptions) ([]driftFinding, error) {
 	return findings, nil
 }
 
-func scanThreadDir(dir string, since time.Time, allowMissing bool) ([]driftFinding, error) {
+func loadBaselineModelContext(path string) (map[string]int, string, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, "", fmt.Errorf("read baseline model limits: %w", err)
+	}
+	var baseline struct {
+		Signals struct {
+			AgentModeRoutes []struct {
+				Name  string `json:"name"`
+				Model string `json:"model"`
+			} `json:"agent_mode_routes"`
+			ModelLimits []struct {
+				Name          string `json:"name"`
+				ContextWindow int    `json:"context_window"`
+			} `json:"model_limits"`
+		} `json:"signals"`
+	}
+	if err := json.Unmarshal(raw, &baseline); err != nil {
+		return nil, "", fmt.Errorf("parse baseline model limits: %w", err)
+	}
+	windows := map[string]int{}
+	for _, limit := range baseline.Signals.ModelLimits {
+		name := strings.TrimSpace(limit.Name)
+		if name == "" || limit.ContextWindow <= 0 {
+			continue
+		}
+		windows[name] = limit.ContextWindow
+	}
+	smartModel := ""
+	for _, route := range baseline.Signals.AgentModeRoutes {
+		if strings.EqualFold(strings.TrimSpace(route.Name), "smart") {
+			smartModel = strings.TrimSpace(route.Model)
+			break
+		}
+	}
+	return windows, smartModel, nil
+}
+
+func scanThreadDir(dir string, since time.Time, allowMissing bool, modelContextWindows map[string]int, smartModel string) ([]driftFinding, error) {
 	files, err := scanJSONFiles(dir, since, allowMissing)
 	if err != nil {
 		return nil, err
@@ -198,7 +267,7 @@ func scanThreadDir(dir string, since time.Time, allowMissing bool) ([]driftFindi
 		}
 		threadID := stringValue(thread["id"])
 		messages := arrayValue(thread["messages"])
-		findings = append(findings, scanThreadCompactionDrift(file, threadID, thread, messages, since)...)
+		findings = append(findings, scanThreadCompactionDrift(file, threadID, thread, messages, since, modelContextWindows, smartModel)...)
 		toolNames := map[string]string{}
 		for _, rawMessage := range messages {
 			for _, rawBlock := range arrayValue(mapValue(rawMessage)["content"]) {
@@ -241,7 +310,7 @@ func scanThreadDir(dir string, since time.Time, allowMissing bool) ([]driftFindi
 	return findings, nil
 }
 
-func scanThreadCompactionDrift(file, threadID string, thread map[string]any, messages []any, since time.Time) []driftFinding {
+func scanThreadCompactionDrift(file, threadID string, thread map[string]any, messages []any, since time.Time, modelContextWindows map[string]int, smartModel string) []driftFinding {
 	if !smartModeThread(thread, messages) || threadHasCustomCompactionThreshold(thread) {
 		return nil
 	}
@@ -260,7 +329,7 @@ func scanThreadCompactionDrift(file, threadID string, thread map[string]any, mes
 			continue
 		}
 		observedTokens := compactionUsageTokens(usage)
-		thresholdTokens := smartCompactionObservedThresholdTokens(usage)
+		thresholdTokens := smartCompactionObservedThresholdTokens(usage, modelContextWindows, smartModel)
 		if observedTokens <= 0 || thresholdTokens <= 0 || float64(observedTokens) >= thresholdTokens {
 			continue
 		}
@@ -362,9 +431,18 @@ func compactionUsageTokens(usage map[string]any) int {
 	return numberValue(usage["total_tokens"], usage["totalTokenCount"])
 }
 
-func smartCompactionObservedThresholdTokens(usage map[string]any) float64 {
+func smartCompactionObservedThresholdTokens(usage map[string]any, modelContextWindows map[string]int, smartModel string) float64 {
 	model := strings.TrimSpace(stringValue(usage["model"]))
-	contextWindow := smartCompactionContextWindowForModel(model)
+	contextWindow := 0
+	if smartUsageModelIsBinaryAnthropic(model) {
+		contextWindow = modelContextWindows[model]
+	}
+	if contextWindow <= 0 && strings.TrimSpace(smartModel) != "" {
+		contextWindow = modelContextWindows[strings.TrimSpace(smartModel)]
+	}
+	if contextWindow <= 0 {
+		contextWindow = modelContextWindows[model]
+	}
 	if contextWindow <= 0 {
 		contextWindow = numberValue(usage["contextWindow"], usage["context_window"])
 	}
@@ -377,13 +455,9 @@ func smartCompactionObservedThresholdTokens(usage map[string]any) float64 {
 	return float64(contextWindow) * 75 / 100
 }
 
-func smartCompactionContextWindowForModel(model string) int {
-	switch model {
-	case "claude-opus-4-7", "claude-opus-4-8":
-		return 332000
-	default:
-		return 0
-	}
+func smartUsageModelIsBinaryAnthropic(model string) bool {
+	model = strings.ToLower(strings.TrimSpace(model))
+	return strings.HasPrefix(model, "claude-opus-")
 }
 
 func parseTimeValue(values ...any) (time.Time, bool) {
