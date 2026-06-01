@@ -113,7 +113,7 @@ func defaultCaptureDir() string {
 }
 
 func scanRuntimeDrift(options scanOptions) ([]driftFinding, error) {
-	var findings []driftFinding
+	findings := []driftFinding{}
 	if strings.TrimSpace(options.threadDir) != "" {
 		threadFindings, err := scanThreadDir(options.threadDir, options.since, options.allowMissing)
 		if err != nil {
@@ -171,6 +171,9 @@ func scanThreadDir(dir string, since time.Time, allowMissing bool) ([]driftFindi
 		}
 		for _, rawMessage := range messages {
 			message := mapValue(rawMessage)
+			if threadMessageBeforeSince(message, since) {
+				continue
+			}
 			messageID := firstNonEmptyString(message["messageId"], message["messageID"], message["id"])
 			for _, rawBlock := range arrayValue(message["content"]) {
 				block := mapValue(rawBlock)
@@ -194,6 +197,24 @@ func scanThreadDir(dir string, since time.Time, allowMissing bool) ([]driftFindi
 		}
 	}
 	return findings, nil
+}
+
+func threadMessageBeforeSince(message map[string]any, since time.Time) bool {
+	if since.IsZero() {
+		return false
+	}
+	for _, key := range []string{"createdAt", "timestamp", "created_at"} {
+		raw := strings.TrimSpace(stringValue(message[key]))
+		if raw == "" {
+			continue
+		}
+		createdAt, err := time.Parse(time.RFC3339Nano, raw)
+		if err != nil {
+			continue
+		}
+		return createdAt.Before(since)
+	}
+	return false
 }
 
 func scanCaptureDir(dir string, since time.Time, allowMissing bool) ([]driftFinding, error) {
