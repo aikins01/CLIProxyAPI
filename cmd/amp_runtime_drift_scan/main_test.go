@@ -125,6 +125,151 @@ func TestScanThreadDirSinceFiltersOldThreadMessages(t *testing.T) {
 	}
 }
 
+func TestScanThreadDirFindsEarlySmartCompaction(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "T-smart.json"), map[string]any{
+		"id":        "T-smart",
+		"agentMode": "smart",
+		"messages": []any{
+			map[string]any{
+				"createdAt": "2026-06-01T19:59:40.358042Z",
+				"messageId": "M-assistant",
+				"role":      "assistant",
+				"usage": map[string]any{
+					"model":            "claude-opus-4-8",
+					"totalInputTokens": 101_599,
+					"outputTokens":     317,
+					"maxInputTokens":   300_000,
+				},
+			},
+		},
+		"compactionRecords": []any{map[string]any{
+			"createdAt":    "2026-06-01T20:00:09.138603Z",
+			"cutMessageId": "M-summary",
+		}},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 1 {
+		t.Fatalf("findings = %#v, want 1", findings)
+	}
+	if findings[0].ToolName != "compaction" || findings[0].MessageID != "M-assistant" || findings[0].CallID != "M-summary" {
+		t.Fatalf("finding = %#v", findings[0])
+	}
+	if !strings.Contains(findings[0].Detail, "below 75% threshold 249000") {
+		t.Fatalf("detail = %q", findings[0].Detail)
+	}
+}
+
+func TestScanThreadDirIgnoresSmartCompactionAtThreshold(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "T-smart.json"), map[string]any{
+		"id":        "T-smart",
+		"agentMode": "smart",
+		"messages": []any{
+			map[string]any{
+				"createdAt": "2026-06-01T20:00:00Z",
+				"messageId": "M-assistant",
+				"role":      "assistant",
+				"usage": map[string]any{
+					"model":            "claude-opus-4-8",
+					"totalInputTokens": 248_999,
+					"outputTokens":     1,
+					"maxInputTokens":   300_000,
+				},
+			},
+		},
+		"compactionRecords": []any{map[string]any{
+			"createdAt":    "2026-06-01T20:00:10Z",
+			"cutMessageId": "M-summary",
+		}},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("findings = %#v, want none", findings)
+	}
+}
+
+func TestScanThreadDirSinceFiltersOldCompactionRecords(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "T-smart.json")
+	writeJSONFile(t, path, map[string]any{
+		"id":        "T-smart",
+		"agentMode": "smart",
+		"messages": []any{
+			map[string]any{
+				"createdAt": "2026-06-01T19:59:40Z",
+				"messageId": "M-assistant",
+				"role":      "assistant",
+				"usage": map[string]any{
+					"model":            "claude-opus-4-8",
+					"totalInputTokens": 101_599,
+					"outputTokens":     317,
+				},
+			},
+		},
+		"compactionRecords": []any{map[string]any{
+			"createdAt":    "2026-06-01T20:00:09Z",
+			"cutMessageId": "M-summary",
+		}},
+	})
+	fileTime := time.Date(2026, 6, 1, 20, 5, 0, 0, time.UTC)
+	if err := os.Chtimes(path, fileTime, fileTime); err != nil {
+		t.Fatal(err)
+	}
+	since := time.Date(2026, 6, 1, 20, 1, 0, 0, time.UTC)
+
+	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, since: since, allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("findings = %#v, want none because the compaction record predates -since", findings)
+	}
+}
+
+func TestScanThreadDirIgnoresCustomSmartCompactionThreshold(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "T-smart.json"), map[string]any{
+		"id":        "T-smart",
+		"agentMode": "smart",
+		"settings": map[string]any{
+			"compactionControl": map[string]any{"contextTokenThreshold": 100_000},
+		},
+		"messages": []any{
+			map[string]any{
+				"createdAt": "2026-06-01T20:00:00Z",
+				"messageId": "M-assistant",
+				"role":      "assistant",
+				"usage": map[string]any{
+					"model":            "claude-opus-4-8",
+					"totalInputTokens": 101_599,
+					"outputTokens":     317,
+				},
+			},
+		},
+		"compactionRecords": []any{map[string]any{
+			"createdAt":    "2026-06-01T20:00:10Z",
+			"cutMessageId": "M-summary",
+		}},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("findings = %#v, want none for custom threshold", findings)
+	}
+}
+
 func TestScanCaptureDirFindsBareReadThreadDone(t *testing.T) {
 	dir := t.TempDir()
 	writeJSONFile(t, filepath.Join(dir, "capture.json"), map[string]any{
@@ -175,7 +320,7 @@ func TestRunReturnsNonZeroWhenDriftFound(t *testing.T) {
 	if code != 2 {
 		t.Fatalf("code = %d stderr=%s stdout=%s", code, stderr.String(), stdout.String())
 	}
-	if !strings.Contains(stdout.String(), "bare terminal tool-result drift") {
+	if !strings.Contains(stdout.String(), "runtime drift") {
 		t.Fatalf("stdout = %s", stdout.String())
 	}
 }

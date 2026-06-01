@@ -80,9 +80,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 			return 1
 		}
 	} else if len(findings) == 0 {
-		fmt.Fprintln(stdout, "no bare terminal tool-result drift found")
+		fmt.Fprintln(stdout, "no runtime drift found")
 	} else {
-		fmt.Fprintf(stdout, "found %d bare terminal tool-result drift(s):\n", len(findings))
+		fmt.Fprintf(stdout, "found %d runtime drift(s):\n", len(findings))
 		for _, finding := range findings {
 			fmt.Fprintf(stdout, "- %s %s %s %s: %s\n", finding.Source, finding.ToolName, finding.CallID, finding.File, finding.Detail)
 		}
@@ -198,6 +198,7 @@ func scanThreadDir(dir string, since time.Time, allowMissing bool) ([]driftFindi
 		}
 		threadID := stringValue(thread["id"])
 		messages := arrayValue(thread["messages"])
+		findings = append(findings, scanThreadCompactionDrift(file, threadID, thread, messages, since)...)
 		toolNames := map[string]string{}
 		for _, rawMessage := range messages {
 			for _, rawBlock := range arrayValue(mapValue(rawMessage)["content"]) {
@@ -240,19 +241,172 @@ func scanThreadDir(dir string, since time.Time, allowMissing bool) ([]driftFindi
 	return findings, nil
 }
 
+func scanThreadCompactionDrift(file, threadID string, thread map[string]any, messages []any, since time.Time) []driftFinding {
+	if !smartModeThread(thread, messages) || threadHasCustomCompactionThreshold(thread) {
+		return nil
+	}
+	var findings []driftFinding
+	for _, rawRecord := range firstArray(thread["compactionRecords"], thread["compaction_records"]) {
+		record := mapValue(rawRecord)
+		recordCreatedAt, ok := parseTimeValue(record["createdAt"], record["created_at"])
+		if !ok {
+			continue
+		}
+		if !since.IsZero() && recordCreatedAt.Before(since) {
+			continue
+		}
+		message, usage := latestAssistantUsageBefore(messages, recordCreatedAt)
+		if len(usage) == 0 {
+			continue
+		}
+		observedTokens := compactionUsageTokens(usage)
+		thresholdTokens := smartCompactionObservedThresholdTokens(usage)
+		if observedTokens <= 0 || thresholdTokens <= 0 || float64(observedTokens) >= thresholdTokens {
+			continue
+		}
+		findings = append(findings, driftFinding{
+			Source:    "thread",
+			File:      file,
+			ThreadID:  threadID,
+			MessageID: firstNonEmptyString(message["messageId"], message["messageID"], message["id"]),
+			CallID:    firstNonEmptyString(record["cutMessageId"], record["cut_message_id"]),
+			ToolName:  "compaction",
+			Detail:    fmt.Sprintf("smart compaction observed %d tokens below 75%% threshold %.0f at %s", observedTokens, thresholdTokens, recordCreatedAt.Format(time.RFC3339Nano)),
+		})
+	}
+	return findings
+}
+
+func smartModeThread(thread map[string]any, messages []any) bool {
+	mode := strings.ToLower(strings.TrimSpace(firstNonEmptyString(thread["agentMode"], thread["agent_mode"], nestedValue(thread, "settings", "agentMode"), nestedValue(thread, "settings", "agent_mode"), nestedValue(thread, "data", "agentMode"))))
+	if mode == "" {
+		for _, rawMessage := range messages {
+			message := mapValue(rawMessage)
+			if strings.EqualFold(stringValue(message["role"]), "user") {
+				if candidate := strings.ToLower(strings.TrimSpace(firstNonEmptyString(message["agentMode"], message["agent_mode"]))); candidate != "" {
+					mode = candidate
+					break
+				}
+			}
+		}
+	}
+	return mode == "" || mode == "smart"
+}
+
+func threadHasCustomCompactionThreshold(thread map[string]any) bool {
+	settings := mapValue(thread["settings"])
+	if len(settings) == 0 {
+		settings = mapValue(nestedValue(thread, "data", "settings"))
+	}
+	if len(settings) == 0 {
+		return false
+	}
+	if _, ok := settings["internal.compactionThresholdPercent"]; ok {
+		return true
+	}
+	if _, ok := settings["compactionControl.contextTokenThreshold"]; ok {
+		return true
+	}
+	if _, ok := settings["compaction.contextTokenThreshold"]; ok {
+		return true
+	}
+	control := mapValue(settings["compactionControl"])
+	if len(control) == 0 {
+		control = mapValue(settings["compaction_control"])
+	}
+	_, ok := control["contextTokenThreshold"]
+	return ok
+}
+
+func latestAssistantUsageBefore(messages []any, before time.Time) (map[string]any, map[string]any) {
+	var latestMessage map[string]any
+	var latestUsage map[string]any
+	var latestCreatedAt time.Time
+	for _, rawMessage := range messages {
+		message := mapValue(rawMessage)
+		if !strings.EqualFold(stringValue(message["role"]), "assistant") {
+			continue
+		}
+		createdAt, ok := parseTimeValue(message["createdAt"], message["created_at"], message["timestamp"])
+		if !ok || !createdAt.Before(before) {
+			continue
+		}
+		usage := mapValue(message["usage"])
+		if len(usage) == 0 {
+			continue
+		}
+		if latestUsage == nil || createdAt.After(latestCreatedAt) {
+			latestMessage = message
+			latestUsage = usage
+			latestCreatedAt = createdAt
+		}
+	}
+	return latestMessage, latestUsage
+}
+
+func compactionUsageTokens(usage map[string]any) int {
+	totalInput := numberValue(usage["totalInputTokens"], usage["total_input_tokens"])
+	output := numberValue(usage["outputTokens"], usage["output_tokens"], usage["completion_tokens"], usage["candidatesTokenCount"])
+	if _, ok := usage["totalInputTokens"]; ok {
+		return totalInput + output
+	}
+	if _, ok := usage["total_input_tokens"]; ok {
+		return totalInput + output
+	}
+	input := numberValue(usage["inputTokens"], usage["input_tokens"], usage["prompt_tokens"], usage["promptTokenCount"])
+	cacheCreation := numberValue(usage["cacheCreationInputTokens"], usage["cache_creation_input_tokens"])
+	cacheRead := numberValue(usage["cacheReadInputTokens"], usage["cache_read_input_tokens"], usage["cachedContentTokenCount"])
+	if input > 0 || cacheCreation > 0 || cacheRead > 0 {
+		return input + cacheCreation + cacheRead + output
+	}
+	return numberValue(usage["total_tokens"], usage["totalTokenCount"])
+}
+
+func smartCompactionObservedThresholdTokens(usage map[string]any) float64 {
+	model := strings.TrimSpace(stringValue(usage["model"]))
+	contextWindow := smartCompactionContextWindowForModel(model)
+	if contextWindow <= 0 {
+		contextWindow = numberValue(usage["contextWindow"], usage["context_window"])
+	}
+	if contextWindow <= 0 {
+		contextWindow = numberValue(usage["maxInputTokens"], usage["max_input_tokens"])
+	}
+	if contextWindow <= 0 {
+		return 0
+	}
+	return float64(contextWindow) * 75 / 100
+}
+
+func smartCompactionContextWindowForModel(model string) int {
+	switch model {
+	case "claude-opus-4-7", "claude-opus-4-8":
+		return 332000
+	default:
+		return 0
+	}
+}
+
+func parseTimeValue(values ...any) (time.Time, bool) {
+	for _, value := range values {
+		text := strings.TrimSpace(stringValue(value))
+		if text == "" {
+			continue
+		}
+		if parsed, err := time.Parse(time.RFC3339Nano, text); err == nil {
+			return parsed, true
+		}
+		if parsed, err := time.Parse(time.RFC3339, text); err == nil {
+			return parsed, true
+		}
+	}
+	return time.Time{}, false
+}
+
 func threadMessageBeforeSince(message map[string]any, since time.Time) bool {
 	if since.IsZero() {
 		return false
 	}
-	for _, key := range []string{"createdAt", "timestamp", "created_at"} {
-		raw := strings.TrimSpace(stringValue(message[key]))
-		if raw == "" {
-			continue
-		}
-		createdAt, err := time.Parse(time.RFC3339Nano, raw)
-		if err != nil {
-			continue
-		}
+	if createdAt, ok := parseTimeValue(message["createdAt"], message["timestamp"], message["created_at"]); ok {
 		return createdAt.Before(since)
 	}
 	return false
@@ -437,6 +591,41 @@ func firstNonEmptyString(values ...any) string {
 		}
 	}
 	return ""
+}
+
+func numberValue(values ...any) int {
+	for _, value := range values {
+		switch v := value.(type) {
+		case float64:
+			return int(v)
+		case float32:
+			return int(v)
+		case int:
+			return v
+		case int64:
+			return int(v)
+		case int32:
+			return int(v)
+		case json.Number:
+			if i, err := v.Int64(); err == nil {
+				return int(i)
+			}
+			if f, err := v.Float64(); err == nil {
+				return int(f)
+			}
+		case string:
+			if strings.TrimSpace(v) == "" {
+				continue
+			}
+			if parsed, err := json.Number(strings.TrimSpace(v)).Int64(); err == nil {
+				return int(parsed)
+			}
+			if parsed, err := json.Number(strings.TrimSpace(v)).Float64(); err == nil {
+				return int(parsed)
+			}
+		}
+	}
+	return 0
 }
 
 func nestedValue(root map[string]any, path ...string) any {
