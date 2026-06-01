@@ -48,20 +48,17 @@ func run(args []string, stdout, stderr io.Writer) int {
 	threadDir := flags.String("thread-dir", defaultThreadDir(), "Amp local thread JSON directory to scan")
 	captureDir := flags.String("capture-dir", defaultCaptureDir(), "Neo provider request capture directory to scan")
 	sinceRaw := flags.String("since", "", "only scan files modified at or after this RFC3339 timestamp")
+	sinceFile := flags.String("since-file", "", "only scan files and timestamped thread messages at or after this file's modification time")
 	allowMissing := flags.Bool("allow-missing", true, "treat missing scan directories as empty")
 	jsonOutput := flags.Bool("json", false, "print findings as JSON")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
 
-	var since time.Time
-	if strings.TrimSpace(*sinceRaw) != "" {
-		parsed, err := time.Parse(time.RFC3339, strings.TrimSpace(*sinceRaw))
-		if err != nil {
-			fmt.Fprintf(stderr, "parse -since: %v\n", err)
-			return 2
-		}
-		since = parsed
+	since, err := parseSinceCutoff(*sinceRaw, *sinceFile)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
 	}
 
 	findings, err := scanRuntimeDrift(scanOptions{
@@ -94,6 +91,28 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	return 0
+}
+
+func parseSinceCutoff(sinceRaw, sinceFile string) (time.Time, error) {
+	var since time.Time
+	if strings.TrimSpace(sinceRaw) != "" {
+		parsed, err := time.Parse(time.RFC3339, strings.TrimSpace(sinceRaw))
+		if err != nil {
+			return time.Time{}, fmt.Errorf("parse -since: %w", err)
+		}
+		since = parsed
+	}
+	if strings.TrimSpace(sinceFile) != "" {
+		info, err := os.Stat(strings.TrimSpace(sinceFile))
+		if err != nil {
+			return time.Time{}, fmt.Errorf("stat -since-file: %w", err)
+		}
+		fileTime := info.ModTime()
+		if since.IsZero() || fileTime.After(since) {
+			since = fileTime
+		}
+	}
+	return since, nil
 }
 
 func defaultThreadDir() string {

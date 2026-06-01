@@ -194,6 +194,48 @@ func TestRunJSONNoFindingsPrintsArray(t *testing.T) {
 	}
 }
 
+func TestRunSinceFileUsesMarkerModTime(t *testing.T) {
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "cliproxyapi.real")
+	if err := os.WriteFile(marker, []byte("marker"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	markerTime := time.Date(2026, 6, 1, 19, 35, 4, 0, time.UTC)
+	if err := os.Chtimes(marker, markerTime, markerTime); err != nil {
+		t.Fatal(err)
+	}
+	writeJSONFile(t, filepath.Join(dir, "T-test.json"), map[string]any{
+		"id": "T-test",
+		"messages": []any{
+			map[string]any{
+				"messageId": "M-assistant",
+				"role":      "assistant",
+				"content":   []any{map[string]any{"type": "tool_use", "id": "TU-shell", "name": "shell_command"}},
+			},
+			map[string]any{
+				"createdAt": "2026-06-01T18:28:59.003825Z",
+				"messageId": "M-result",
+				"role":      "user",
+				"content": []any{map[string]any{
+					"type":      "tool_result",
+					"toolUseID": "TU-shell",
+					"run":       map[string]any{"status": "done"},
+				}},
+			},
+		},
+	})
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := run([]string{"-thread-dir", dir, "-capture-dir", filepath.Join(dir, "missing"), "-since-file", marker, "-json"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("code = %d stderr=%s stdout=%s", code, stderr.String(), stdout.String())
+	}
+	if strings.TrimSpace(stdout.String()) != "[]" {
+		t.Fatalf("stdout = %q, want []", stdout.String())
+	}
+}
+
 func writeJSONFile(t *testing.T, path string, value any) {
 	t.Helper()
 	raw, err := json.Marshal(value)
