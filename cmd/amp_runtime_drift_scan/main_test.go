@@ -83,6 +83,101 @@ func TestScanThreadDirIgnoresNonPayloadRequiredEmptyResult(t *testing.T) {
 	}
 }
 
+func TestScanThreadDirFindsCompleteToolUseWithMalformedJSONFallbackInput(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "T-test.json"), map[string]any{
+		"id": "T-test",
+		"messages": []any{
+			map[string]any{
+				"messageId": "M-assistant",
+				"role":      "assistant",
+				"state":     map[string]any{"type": "complete", "stopReason": "tool_use"},
+				"content": []any{map[string]any{
+					"type":     "tool_use",
+					"id":       "TU-create",
+					"name":     "create_file",
+					"complete": true,
+					"input":    map[string]any{"input": `{"path":"/tmp/setup.c"`},
+				}},
+			},
+		},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 1 {
+		t.Fatalf("findings = %#v, want 1", findings)
+	}
+	if findings[0].Source != "thread" || findings[0].ToolName != "create_file" || findings[0].CallID != "TU-create" {
+		t.Fatalf("finding = %#v", findings[0])
+	}
+	if !strings.Contains(findings[0].Detail, "malformed JSON fallback") {
+		t.Fatalf("detail = %q", findings[0].Detail)
+	}
+}
+
+func TestScanThreadDirIgnoresIncompleteToolUsePartialJSON(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "T-test.json"), map[string]any{
+		"id": "T-test",
+		"messages": []any{
+			map[string]any{
+				"messageId": "M-assistant",
+				"role":      "assistant",
+				"state":     map[string]any{"type": "streaming"},
+				"content": []any{map[string]any{
+					"type":             "tool_use",
+					"id":               "TU-create",
+					"name":             "create_file",
+					"complete":         false,
+					"input":            map[string]any{"path": "/tmp/setup.c"},
+					"inputPartialJSON": map[string]any{"json": `{"path":"/tmp/setup.c"`},
+				}},
+			},
+		},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("findings = %#v, want none", findings)
+	}
+}
+
+func TestScanThreadDirIgnoresCustomRawInputTool(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "T-test.json"), map[string]any{
+		"id": "T-test",
+		"messages": []any{
+			map[string]any{
+				"messageId": "M-assistant",
+				"role":      "assistant",
+				"state":     map[string]any{"type": "complete", "stopReason": "tool_use"},
+				"content": []any{map[string]any{
+					"type":     "tool_use",
+					"id":       "TU-custom",
+					"name":     "apply_patch",
+					"complete": true,
+					"input":    map[string]any{"input": `{"not closed"`},
+					"metadata": map[string]any{"openAICustomTool": map[string]any{"inputField": "input"}},
+				}},
+			},
+		},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("findings = %#v, want none for custom raw-input tool", findings)
+	}
+}
+
 func TestScanThreadDirSinceFiltersOldThreadMessages(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "T-test.json")
@@ -503,6 +598,37 @@ func TestScanCaptureDirFindsBareReadThreadDone(t *testing.T) {
 	}
 	if findings[0].Source != "provider-capture" || findings[0].ToolName != "read_thread" || findings[0].CallID != "TU-read" {
 		t.Fatalf("finding = %#v", findings[0])
+	}
+}
+
+func TestScanCaptureDirFindsMalformedFunctionCallArguments(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "capture.json"), map[string]any{
+		"threadID": "T-test",
+		"body": map[string]any{
+			"input": []any{
+				map[string]any{
+					"type":      "function_call",
+					"call_id":   "TU-create",
+					"name":      "create_file",
+					"arguments": `{"input":"{\"path\":\"/tmp/setup.c\""}`,
+				},
+			},
+		},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{captureDir: dir, allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 1 {
+		t.Fatalf("findings = %#v, want 1", findings)
+	}
+	if findings[0].Source != "provider-capture" || findings[0].ToolName != "create_file" || findings[0].CallID != "TU-create" {
+		t.Fatalf("finding = %#v", findings[0])
+	}
+	if !strings.Contains(findings[0].Detail, "malformed function_call arguments") {
+		t.Fatalf("detail = %q", findings[0].Detail)
 	}
 }
 

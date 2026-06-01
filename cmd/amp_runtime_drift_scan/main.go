@@ -288,21 +288,35 @@ func scanThreadDir(dir string, since time.Time, allowMissing bool, modelContextW
 			messageID := firstNonEmptyString(message["messageId"], message["messageID"], message["id"])
 			for _, rawBlock := range arrayValue(message["content"]) {
 				block := mapValue(rawBlock)
-				if stringValue(block["type"]) != "tool_result" {
-					continue
-				}
-				toolID := firstNonEmptyString(block["toolUseID"], block["toolUseId"], block["tool_use_id"], block["toolCallId"], block["id"])
-				toolName := firstNonEmptyString(block["name"], toolNames[toolID])
-				if bareTerminalDoneForPayloadRequiredTool(toolName, mapValue(block["run"])) {
-					findings = append(findings, driftFinding{
-						Source:    "thread",
-						File:      file,
-						ThreadID:  threadID,
-						MessageID: messageID,
-						CallID:    toolID,
-						ToolName:  normalizeToolName(toolName),
-						Detail:    `terminal "done" has no result/output payload`,
-					})
+				switch stringValue(block["type"]) {
+				case "tool_use":
+					toolID := firstNonEmptyString(block["id"], block["toolUseID"], block["toolUseId"], block["tool_use_id"], block["toolCallId"])
+					toolName := stringValue(block["name"])
+					if preview, ok := completedToolUseMalformedJSONFallback(message, block); ok {
+						findings = append(findings, driftFinding{
+							Source:    "thread",
+							File:      file,
+							ThreadID:  threadID,
+							MessageID: messageID,
+							CallID:    toolID,
+							ToolName:  normalizeToolName(toolName),
+							Detail:    "complete tool_use input contains malformed JSON fallback string: " + preview,
+						})
+					}
+				case "tool_result":
+					toolID := firstNonEmptyString(block["toolUseID"], block["toolUseId"], block["tool_use_id"], block["toolCallId"], block["id"])
+					toolName := firstNonEmptyString(block["name"], toolNames[toolID])
+					if bareTerminalDoneForPayloadRequiredTool(toolName, mapValue(block["run"])) {
+						findings = append(findings, driftFinding{
+							Source:    "thread",
+							File:      file,
+							ThreadID:  threadID,
+							MessageID: messageID,
+							CallID:    toolID,
+							ToolName:  normalizeToolName(toolName),
+							Detail:    `terminal "done" has no result/output payload`,
+						})
+					}
 				}
 			}
 		}
@@ -558,6 +572,16 @@ func scanCaptureDir(dir string, since time.Time, allowMissing bool) ([]driftFind
 			if callID != "" {
 				toolNames[callID] = stringValue(item["name"])
 			}
+			if preview, ok := functionCallMalformedJSONFallback(item["arguments"]); ok {
+				findings = append(findings, driftFinding{
+					Source:   "provider-capture",
+					File:     file,
+					ThreadID: stringValue(capture["threadID"]),
+					CallID:   callID,
+					ToolName: normalizeToolName(stringValue(item["name"])),
+					Detail:   "model input contains malformed function_call arguments: " + preview,
+				})
+			}
 		}
 		for _, rawItem := range inputs {
 			item := mapValue(rawItem)
@@ -580,6 +604,85 @@ func scanCaptureDir(dir string, since time.Time, allowMissing bool) ([]driftFind
 		}
 	}
 	return findings, nil
+}
+
+func completedToolUseMalformedJSONFallback(message, block map[string]any) (string, bool) {
+	if !completedToolUseBlock(message, block) || hasCustomRawInputMetadata(block) {
+		return "", false
+	}
+	return malformedJSONFallbackInput(mapValue(block["input"]))
+}
+
+func completedToolUseBlock(message, block map[string]any) bool {
+	if stringValue(block["type"]) != "tool_use" {
+		return false
+	}
+	if _, exists := block["inputPartialJSON"]; exists {
+		return false
+	}
+	if _, exists := block["inputPartialJSONDelta"]; exists {
+		return false
+	}
+	if value, exists := block["complete"]; exists {
+		return boolValue(value)
+	}
+	if strings.EqualFold(stringValue(block["blockState"]), "complete") {
+		return true
+	}
+	state := mapValue(message["state"])
+	return strings.EqualFold(stringValue(state["type"]), "complete") && strings.EqualFold(stringValue(state["stopReason"]), "tool_use")
+}
+
+func hasCustomRawInputMetadata(block map[string]any) bool {
+	metadata := mapValue(block["metadata"])
+	if len(metadata) == 0 {
+		return false
+	}
+	return len(mapValue(metadata["openAICustomTool"])) > 0
+}
+
+func functionCallMalformedJSONFallback(arguments any) (string, bool) {
+	if input := mapValue(arguments); len(input) > 0 {
+		return malformedJSONFallbackInput(input)
+	}
+	text := strings.TrimSpace(stringValue(arguments))
+	if text == "" || !looksLikeJSON(text) {
+		return "", false
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(text), &decoded); err != nil {
+		return clipFindingText(text), true
+	}
+	return malformedJSONFallbackInput(decoded)
+}
+
+func malformedJSONFallbackInput(input map[string]any) (string, bool) {
+	if len(input) != 1 {
+		return "", false
+	}
+	text := strings.TrimSpace(stringValue(input["input"]))
+	if text == "" || !looksLikeJSON(text) {
+		return "", false
+	}
+	var decoded any
+	if err := json.Unmarshal([]byte(text), &decoded); err == nil {
+		return "", false
+	}
+	return clipFindingText(text), true
+}
+
+func looksLikeJSON(text string) bool {
+	text = strings.TrimSpace(text)
+	return strings.HasPrefix(text, "{") || strings.HasPrefix(text, "[")
+}
+
+func clipFindingText(text string) string {
+	text = strings.TrimSpace(text)
+	const limit = 120
+	if len(text) <= limit {
+		return text
+	}
+	return text[:limit] + "..."
 }
 
 func scanJSONFiles(dir string, since time.Time, allowMissing bool) ([]string, error) {
@@ -700,6 +803,17 @@ func stringValue(value any) string {
 		return v.String()
 	default:
 		return ""
+	}
+}
+
+func boolValue(value any) bool {
+	switch v := value.(type) {
+	case bool:
+		return v
+	case string:
+		return strings.EqualFold(strings.TrimSpace(v), "true")
+	default:
+		return false
 	}
 }
 
