@@ -60,7 +60,7 @@ var neoTaskExposureDescription string
 type neoSubagentDef struct {
 	Key             string
 	DisplayName     string
-	Route           neoModelRoute // zero Model => inherit the parent thread's model
+	Route           neoModelRoute // zero Model => inherit the resolved model from config/settings
 	IncludeTools    []string
 	SystemPrompt    string // may contain {{WORKING_DIR}} / {{WORKSPACE_ROOT}}
 	ReasoningEffort string
@@ -99,7 +99,7 @@ var neoSubagentDefs = map[string]neoSubagentDef{
 	"Task": {
 		Key:          "task-subagent",
 		DisplayName:  "Task",
-		Route:        neoModelRoute{}, // inherits the parent thread's model
+		Route:        neoModelRoute{}, // inherits the resolved model from config/settings
 		IncludeTools: []string{"Read", "Bash", "edit_file", "create_file", "read_web_page", "web_search", "finder", "skill", "view_media"},
 		SystemPrompt: neoTaskSubagentPrompt,
 		MaxTurns:     30,
@@ -240,7 +240,7 @@ func (a *neoActor) executeSubagentRun(name string, input map[string]any, parentT
 	workspaceRoot := firstNonEmptyString(a.environment["workspaceRoot"], workingDir)
 	route := def.Route
 	if route.Model == "" {
-		route = selectNeoModelRoute(a.currentAgentMode, a.settings)
+		route = selectNeoModelRouteWithConfig(a.runtime, a.currentAgentMode, a.settings)
 	}
 	agentMode := a.currentAgentMode
 	tools := a.resolveSubagentToolsLocked(def.IncludeTools)
