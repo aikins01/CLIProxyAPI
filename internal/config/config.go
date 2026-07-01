@@ -276,6 +276,9 @@ type AmpCode struct {
 	// UpstreamAPIKey optionally overrides the Authorization header when proxying Amp upstream calls.
 	UpstreamAPIKey string `yaml:"upstream-api-key" json:"upstream-api-key"`
 
+	// UpstreamClientVersionOverride optionally rewrites X-Amp-Client-Version on upstream Amp calls.
+	UpstreamClientVersionOverride string `yaml:"upstream-client-version-override,omitempty" json:"upstream-client-version-override,omitempty"`
+
 	// UpstreamAPIKeys maps client API keys (from top-level api-keys) to upstream API keys.
 	// When a request is authenticated with one of the APIKeys, the corresponding UpstreamAPIKey
 	// is used for the upstream Amp request.
@@ -295,6 +298,13 @@ type AmpCode struct {
 	// When false (default), local API keys are used first if available.
 	ForceModelMappings bool `yaml:"force-model-mappings" json:"force-model-mappings"`
 
+	// ModelFallbacks defines on-failure model fallbacks for Amp CLI requests. Unlike
+	// ModelMappings (which redirect unconditionally / by availability), these apply only
+	// when the requested model's provider returns a transient quota/unavailable error
+	// (e.g. Gemini code review hitting a billing cap): the model is then routed to the
+	// fallback target for a short cooldown before the original is retried.
+	ModelFallbacks []AmpModelMapping `yaml:"model-fallbacks" json:"model-fallbacks"`
+
 	// CompactionCaptureDir writes candidate Amp provider compaction request bodies
 	// to this directory for parity debugging. Empty disables capture.
 	CompactionCaptureDir string `yaml:"compaction-capture-dir,omitempty" json:"compaction-capture-dir,omitempty"`
@@ -303,6 +313,14 @@ type AmpCode struct {
 	// when amp.url points at this proxy. Amp Neo derives localhost:6420 from a
 	// local amp.url and expects this companion runtime for interactive threads.
 	NeoLocalRuntime AmpNeoLocalRuntime `yaml:"neo-local-runtime,omitempty" json:"neo-local-runtime,omitempty"`
+
+	WebLocalInference AmpWebLocalInference `yaml:"web-local-inference,omitempty" json:"web-local-inference,omitempty"`
+}
+
+type AmpWebLocalInference struct {
+	Enabled        bool     `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	AllowedOrigins []string `yaml:"allowed-origins,omitempty" json:"allowed-origins,omitempty"`
+	BaseURL        string   `yaml:"base-url,omitempty" json:"base-url,omitempty"`
 }
 
 // AmpNeoLocalRuntime controls the local Amp Neo actor/runtime listener.
@@ -339,6 +357,13 @@ type AmpNeoLocalRuntime struct {
 	// compaction model optionally overrides the model used for local Neo summary
 	// compaction. defaults to gpt-5.4.
 	CompactionModel string `yaml:"compaction-model,omitempty" json:"compaction-model,omitempty"`
+
+	// ModeModels optionally overrides the inference model per agent mode
+	// (e.g. smart: anthropic/claude-fable-5). the Amp CLI strips the
+	// internal.model thread setting for non-employee accounts, so per-mode
+	// model overrides must be applied server-side. explicit internal.model
+	// thread settings still take precedence when present.
+	ModeModels map[string]string `yaml:"mode-models,omitempty" json:"mode-models,omitempty"`
 }
 
 // AmpUpstreamAPIKeyEntry maps a set of client API keys to a specific upstream API key.
@@ -760,6 +785,11 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// Sanitize Claude key headers
 	cfg.SanitizeClaudeKeys()
+
+	cfg.AmpCode.UpstreamURL = strings.TrimSpace(cfg.AmpCode.UpstreamURL)
+	cfg.AmpCode.UpstreamAPIKey = strings.TrimSpace(cfg.AmpCode.UpstreamAPIKey)
+	cfg.AmpCode.UpstreamClientVersionOverride = strings.TrimSpace(cfg.AmpCode.UpstreamClientVersionOverride)
+	cfg.AmpCode.CompactionCaptureDir = strings.TrimSpace(cfg.AmpCode.CompactionCaptureDir)
 
 	// Sanitize OpenAI compatibility providers: drop entries without base-url
 	cfg.SanitizeOpenAICompatibility()

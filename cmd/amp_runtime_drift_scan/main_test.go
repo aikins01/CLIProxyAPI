@@ -83,6 +83,608 @@ func TestScanThreadDirIgnoresNonPayloadRequiredEmptyResult(t *testing.T) {
 	}
 }
 
+func TestScanThreadDirFindsNonTerminalToolResultWithoutProgressStatus(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "T-test.json"), map[string]any{
+		"id": "T-test",
+		"messages": []any{
+			map[string]any{
+				"messageId": "M-assistant",
+				"role":      "assistant",
+				"content": []any{map[string]any{
+					"type": "tool_use",
+					"id":   "TU-review",
+					"name": "code_review",
+				}},
+			},
+			map[string]any{
+				"messageId": "M-progress",
+				"role":      "user",
+				"content": []any{map[string]any{
+					"type":      "tool_result",
+					"toolUseID": "TU-review",
+					"run":       map[string]any{"status": "in-progress", "progress": map[string]any{"phase": "checks"}},
+				}},
+			},
+		},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 1 {
+		t.Fatalf("findings = %#v, want 1", findings)
+	}
+	if findings[0].Source != "thread" || findings[0].ToolName != "code_review" || findings[0].CallID != "TU-review" {
+		t.Fatalf("finding = %#v", findings[0])
+	}
+	if !strings.Contains(findings[0].Detail, "completionStatus=tool_progress") {
+		t.Fatalf("detail = %q", findings[0].Detail)
+	}
+}
+
+func TestScanThreadDirFindsCancelledAssistantStreamingBlocks(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "T-test.json"), map[string]any{
+		"id": "T-test",
+		"messages": []any{
+			map[string]any{
+				"messageId": "M-assistant",
+				"role":      "assistant",
+				"state":     map[string]any{"type": "cancelled"},
+				"content": []any{
+					map[string]any{"type": "thinking", "blockState": "streaming"},
+					map[string]any{"type": "text", "blockState": "streaming", "text": "partial"},
+				},
+			},
+		},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 1 {
+		t.Fatalf("findings = %#v, want 1", findings)
+	}
+	if findings[0].ToolName != "streaming_state" || findings[0].MessageID != "M-assistant" {
+		t.Fatalf("finding = %#v", findings[0])
+	}
+	if !strings.Contains(findings[0].Detail, "cancelled assistant") {
+		t.Fatalf("detail = %q", findings[0].Detail)
+	}
+}
+
+func TestScanThreadDirFindsCancelledAssistantNonTerminalToolBlock(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "T-test.json"), map[string]any{
+		"id": "T-test",
+		"messages": []any{
+			map[string]any{
+				"messageId": "M-assistant",
+				"role":      "assistant",
+				"state":     map[string]any{"type": "cancelled"},
+				"content": []any{
+					map[string]any{"type": "thinking", "blockState": "complete"},
+					map[string]any{"type": "text", "blockState": "complete", "text": "partial"},
+					map[string]any{"type": "tool_use", "id": "TU-cancelled", "name": "Bash"},
+				},
+			},
+		},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 1 {
+		t.Fatalf("findings = %#v, want 1", findings)
+	}
+	if findings[0].ToolName != "streaming_state" || findings[0].CallID != "tool_use" {
+		t.Fatalf("finding = %#v", findings[0])
+	}
+	if !strings.Contains(findings[0].Detail, "non-terminal tool child") {
+		t.Fatalf("detail = %q", findings[0].Detail)
+	}
+}
+
+func TestScanThreadDirIgnoresCancelledAssistantTerminalToolBlock(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "T-test.json"), map[string]any{
+		"id": "T-test",
+		"messages": []any{
+			map[string]any{
+				"messageId": "M-assistant",
+				"role":      "assistant",
+				"state":     map[string]any{"type": "cancelled"},
+				"content": []any{
+					map[string]any{"type": "tool_use", "id": "TU-cancelled", "name": "Bash", "blockState": "cancelled"},
+					map[string]any{"type": "server_tool_use", "id": "TU-done", "name": "read_thread", "complete": true},
+				},
+			},
+		},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("findings = %#v, want none", findings)
+	}
+}
+
+func TestScanThreadDirIgnoresLiveAssistantStreamingBlocks(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "T-test.json"), map[string]any{
+		"id": "T-test",
+		"messages": []any{
+			map[string]any{
+				"messageId": "M-assistant",
+				"role":      "assistant",
+				"state":     map[string]any{"type": "streaming"},
+				"content": []any{
+					map[string]any{"type": "thinking", "blockState": "streaming"},
+				},
+			},
+		},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("findings = %#v, want none", findings)
+	}
+}
+
+func TestScanThreadDirFindsCurrentInferenceMissingAgentMode(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "T-test.json"), map[string]any{
+		"id":   "T-test",
+		"meta": map[string]any{"cliProxyAPILocalNeo": true},
+		"messages": []any{
+			map[string]any{
+				"messageId": "M-assistant",
+				"role":      "assistant",
+				"state":     map[string]any{"type": "streaming"},
+				"content": []any{
+					map[string]any{"type": "text", "blockState": "streaming", "text": "partial"},
+				},
+			},
+		},
+		"currentInference": map[string]any{"messageId": "M-assistant"},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, threadScope: "local-runtime", allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 1 {
+		t.Fatalf("findings = %#v, want 1", findings)
+	}
+	if findings[0].ToolName != "inference_state" || findings[0].CallID != "currentInference" {
+		t.Fatalf("finding = %#v", findings[0])
+	}
+	if !strings.Contains(findings[0].Detail, "agentMode is missing") {
+		t.Fatalf("detail = %q", findings[0].Detail)
+	}
+}
+
+func TestScanThreadDirFindsCurrentInferenceReferencingCancelledAssistant(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "T-test.json"), map[string]any{
+		"id":   "T-test",
+		"meta": map[string]any{"cliProxyAPILocalNeo": true},
+		"messages": []any{
+			map[string]any{
+				"messageId": "M-assistant",
+				"role":      "assistant",
+				"state":     map[string]any{"type": "cancelled"},
+				"content": []any{
+					map[string]any{"type": "text", "blockState": "complete", "text": "partial"},
+				},
+			},
+		},
+		"currentInference": map[string]any{"messageId": "M-assistant", "agentMode": "deep"},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, threadScope: "local-runtime", allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 1 {
+		t.Fatalf("findings = %#v, want 1", findings)
+	}
+	if findings[0].ToolName != "inference_state" || findings[0].CallID != "currentInference" || findings[0].MessageID != "M-assistant" {
+		t.Fatalf("finding = %#v", findings[0])
+	}
+	if !strings.Contains(findings[0].Detail, "cancelled assistant") {
+		t.Fatalf("detail = %q", findings[0].Detail)
+	}
+}
+
+func TestScanThreadDirIgnoresPendingInferenceReferencingCancelledAssistant(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "T-test.json"), map[string]any{
+		"id":   "T-test",
+		"meta": map[string]any{"cliProxyAPILocalNeo": true},
+		"messages": []any{
+			map[string]any{
+				"messageId": "M-assistant",
+				"role":      "assistant",
+				"state":     map[string]any{"type": "cancelled"},
+				"content": []any{
+					map[string]any{"type": "text", "blockState": "complete", "text": "partial"},
+				},
+			},
+		},
+		"pendingInference": map[string]any{"messageId": "M-assistant", "agentMode": "deep"},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, threadScope: "local-runtime", allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("findings = %#v, want none", findings)
+	}
+}
+
+func TestScanThreadDirFindsCompactingWithoutInference(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "T-test.json"), map[string]any{
+		"id":         "T-test",
+		"meta":       map[string]any{"cliProxyAPILocalNeo": true},
+		"messages":   []any{},
+		"compacting": true,
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, threadScope: "local-runtime", allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 1 {
+		t.Fatalf("findings = %#v, want 1", findings)
+	}
+	if findings[0].ToolName != "inference_state" || findings[0].CallID != "compacting" {
+		t.Fatalf("finding = %#v", findings[0])
+	}
+}
+
+func TestScanThreadDirIgnoresValidPendingInferenceWithoutMessageID(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "T-test.json"), map[string]any{
+		"id":               "T-test",
+		"meta":             map[string]any{"cliProxyAPILocalNeo": true},
+		"messages":         []any{},
+		"pendingInference": map[string]any{"agentMode": "smart", "reasoningEffort": "medium"},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, threadScope: "local-runtime", allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("findings = %#v, want none", findings)
+	}
+}
+
+func TestScanThreadDirLocalRuntimeScopeIgnoresAmpOwnedThreads(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "T-amp-owned.json"), map[string]any{
+		"id": "T-amp-owned",
+		"messages": []any{
+			map[string]any{
+				"messageId": "M-assistant",
+				"role":      "assistant",
+				"state":     map[string]any{"type": "cancelled"},
+				"content": []any{
+					map[string]any{"type": "text", "blockState": "streaming", "text": "partial"},
+				},
+			},
+		},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, threadScope: "local-runtime", allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("findings = %#v, want none for unmarked Amp-owned thread", findings)
+	}
+}
+
+func TestScanThreadDirLocalRuntimeScopeFindsLocalNeoThreads(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "T-local.json"), map[string]any{
+		"id":   "T-local",
+		"meta": map[string]any{"cliProxyAPILocalNeo": true},
+		"messages": []any{
+			map[string]any{
+				"messageId": "M-assistant",
+				"role":      "assistant",
+				"state":     map[string]any{"type": "cancelled"},
+				"content": []any{
+					map[string]any{"type": "text", "blockState": "streaming", "text": "partial"},
+				},
+			},
+		},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, threadScope: "local-runtime", allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 1 {
+		t.Fatalf("findings = %#v, want 1", findings)
+	}
+	if findings[0].ThreadID != "T-local" || findings[0].ToolName != "streaming_state" {
+		t.Fatalf("finding = %#v", findings[0])
+	}
+}
+
+func TestScanThreadDirThreadFilterFindsOnlyRequestedThread(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "T-other.json"), map[string]any{
+		"id": "T-other",
+		"messages": []any{
+			map[string]any{
+				"messageId": "M-other",
+				"role":      "assistant",
+				"state":     map[string]any{"type": "cancelled"},
+				"content": []any{
+					map[string]any{"type": "text", "blockState": "streaming", "text": "other"},
+				},
+			},
+		},
+	})
+	writeJSONFile(t, filepath.Join(dir, "T-target.json"), map[string]any{
+		"id": "T-target",
+		"messages": []any{
+			map[string]any{
+				"messageId": "M-target",
+				"role":      "assistant",
+				"state":     map[string]any{"type": "cancelled"},
+				"content": []any{
+					map[string]any{"type": "text", "blockState": "streaming", "text": "target"},
+				},
+			},
+		},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, threadID: "T-target", allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 1 {
+		t.Fatalf("findings = %#v, want 1", findings)
+	}
+	if findings[0].ThreadID != "T-target" || findings[0].MessageID != "M-target" {
+		t.Fatalf("finding = %#v", findings[0])
+	}
+}
+
+func TestScanThreadDirIgnoresNonTerminalToolProgressMessage(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "T-test.json"), map[string]any{
+		"id": "T-test",
+		"messages": []any{
+			map[string]any{
+				"messageId": "M-progress",
+				"role":      "user",
+				"content": []any{map[string]any{
+					"type":      "tool_result",
+					"toolUseID": "TU-review",
+					"run":       map[string]any{"status": "blocked-on-user"},
+				}},
+				"completionStatus": "tool_progress",
+			},
+		},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("findings = %#v, want none", findings)
+	}
+}
+
+func TestScanThreadDirIgnoresPayloadRequiredStatusOnlyDoneProgressMessage(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "T-test.json"), map[string]any{
+		"id": "T-test",
+		"messages": []any{
+			map[string]any{
+				"messageId": "M-assistant",
+				"role":      "assistant",
+				"content": []any{map[string]any{
+					"type":  "tool_use",
+					"id":    "TU-review",
+					"name":  "shell_command",
+					"input": map[string]any{"command": "amp review"},
+				}},
+			},
+			map[string]any{
+				"messageId": "M-progress",
+				"role":      "user",
+				"content": []any{map[string]any{
+					"type":      "tool_result",
+					"toolUseID": "TU-review",
+					"run":       map[string]any{"status": "done"},
+				}},
+				"completionStatus": "tool_progress",
+			},
+		},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("findings = %#v, want none", findings)
+	}
+}
+
+func TestScanThreadDirSinceFiltersOldNonTerminalToolResult(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "T-test.json")
+	writeJSONFile(t, path, map[string]any{
+		"id": "T-test",
+		"messages": []any{
+			map[string]any{
+				"createdAt": "2026-06-01T18:00:00Z",
+				"messageId": "M-progress",
+				"role":      "user",
+				"content": []any{map[string]any{
+					"type":      "tool_result",
+					"toolUseID": "TU-review",
+					"run":       map[string]any{"status": "queued"},
+				}},
+			},
+		},
+	})
+	fileTime := time.Date(2026, 6, 1, 19, 0, 0, 0, time.UTC)
+	if err := os.Chtimes(path, fileTime, fileTime); err != nil {
+		t.Fatal(err)
+	}
+	since := time.Date(2026, 6, 1, 18, 30, 0, 0, time.UTC)
+
+	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, since: since, allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("findings = %#v, want none because the progress message predates -since", findings)
+	}
+}
+
+func TestScanThreadDirFindsMalformedQueuedMessage(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "T-test.json"), map[string]any{
+		"id": "T-test",
+		"queuedMessages": []any{
+			map[string]any{
+				"id": "queued-1",
+				"queuedMessage": map[string]any{
+					"role":      "assistant",
+					"messageId": 41,
+					"content":   "queued",
+				},
+				"steer": "true",
+			},
+		},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 4 {
+		t.Fatalf("findings = %#v, want 4", findings)
+	}
+	details := findingDetails(findings)
+	for _, want := range []string{
+		"queuedMessage role is not user",
+		"queuedMessage.messageId is missing or non-string",
+		"queuedMessage.content is missing or non-array",
+		"queuedMessages steer is present but not boolean",
+	} {
+		if !strings.Contains(details, want) {
+			t.Fatalf("details = %q, missing %q", details, want)
+		}
+	}
+}
+
+func TestScanThreadDirFindsLegacyFlatQueuedMessage(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "T-test.json"), map[string]any{
+		"id": "T-test",
+		"queuedMessages": []any{
+			map[string]any{
+				"id":        "queued-1",
+				"role":      "user",
+				"messageId": "M-queued",
+				"content":   []any{map[string]any{"type": "text", "text": "queued"}},
+			},
+		},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 1 {
+		t.Fatalf("findings = %#v, want 1", findings)
+	}
+	if findings[0].ToolName != "queued_message" || !strings.Contains(findings[0].Detail, "not wrapped") {
+		t.Fatalf("finding = %#v", findings[0])
+	}
+}
+
+func TestScanThreadDirIgnoresValidQueuedMessage(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "T-test.json"), map[string]any{
+		"id": "T-test",
+		"queuedMessages": []any{
+			map[string]any{
+				"id": "queued-1",
+				"queuedMessage": map[string]any{
+					"role":      "user",
+					"messageId": "M-queued",
+					"content":   []any{map[string]any{"type": "text", "text": "queued"}},
+				},
+				"steer": true,
+			},
+		},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("findings = %#v, want none", findings)
+	}
+}
+
+func TestScanThreadDirSinceFiltersOldQueuedMessage(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "T-test.json")
+	writeJSONFile(t, path, map[string]any{
+		"id": "T-test",
+		"queuedMessages": []any{
+			map[string]any{
+				"id": "queued-1",
+				"queuedMessage": map[string]any{
+					"createdAt": "2026-06-01T18:00:00Z",
+					"role":      "assistant",
+					"messageId": 41,
+					"content":   "queued",
+				},
+			},
+		},
+	})
+	fileTime := time.Date(2026, 6, 1, 19, 0, 0, 0, time.UTC)
+	if err := os.Chtimes(path, fileTime, fileTime); err != nil {
+		t.Fatal(err)
+	}
+	since := time.Date(2026, 6, 1, 18, 30, 0, 0, time.UTC)
+
+	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, since: since, allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("findings = %#v, want none because the queued message predates -since", findings)
+	}
+}
+
 func TestScanThreadDirFindsCompleteToolUseWithMalformedJSONFallbackInput(t *testing.T) {
 	dir := t.TempDir()
 	writeJSONFile(t, filepath.Join(dir, "T-test.json"), map[string]any{
@@ -253,6 +855,43 @@ func TestScanThreadDirFindsDanglingCompleteToolUseBeforeAssistantMessage(t *test
 	}
 	if findings[0].CallID != "TU-shell" || !strings.Contains(findings[0].Detail, "later assistant message") {
 		t.Fatalf("finding = %#v", findings[0])
+	}
+}
+
+func TestScanThreadDirIgnoresReviewModeDanglingToolUse(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "T-test.json"), map[string]any{
+		"id":        "T-test",
+		"agentMode": "review",
+		"meta":      map[string]any{"ampcodeLocalRuntime": true},
+		"messages": []any{
+			map[string]any{
+				"messageId": "M-tool",
+				"role":      "assistant",
+				"state":     map[string]any{"type": "complete", "stopReason": "tool_use"},
+				"content": []any{map[string]any{
+					"type":     "tool_use",
+					"id":       "TU-check",
+					"name":     "run_check",
+					"complete": true,
+					"input":    map[string]any{"checkName": "repo-convention-fit"},
+				}},
+			},
+			map[string]any{
+				"messageId": "M-answer",
+				"role":      "assistant",
+				"state":     map[string]any{"type": "complete", "stopReason": "end_turn"},
+				"content":   []any{map[string]any{"type": "text", "text": "done"}},
+			},
+		},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, threadScope: "local-runtime", allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("findings = %#v, want none", findings)
 	}
 }
 
@@ -793,6 +1432,232 @@ func TestScanCaptureDirFindsBareReadThreadDone(t *testing.T) {
 	}
 }
 
+func TestScanCaptureDirRequiresProviderRequestSummary(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "capture.json"), map[string]any{
+		"threadID": "T-test",
+		"body": map[string]any{
+			"input": []any{
+				map[string]any{"role": "system", "content": "system prompt"},
+				map[string]any{"role": "user", "content": "hello"},
+			},
+		},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{captureDir: dir, allowMissing: true, requireCaptureSummary: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 1 {
+		t.Fatalf("findings = %#v, want 1", findings)
+	}
+	if findings[0].Source != "provider-capture" || findings[0].ToolName != "provider_request" || findings[0].Detail != "provider capture missing request summary" {
+		t.Fatalf("finding = %#v", findings[0])
+	}
+}
+
+func TestScanCaptureDirAcceptsProviderRequestSummary(t *testing.T) {
+	dir := t.TempDir()
+	body := map[string]any{
+		"input": []any{
+			map[string]any{"role": "system", "content": "system prompt"},
+			map[string]any{"role": "user", "content": "hello"},
+		},
+		"tools": []any{map[string]any{"type": "function", "name": "read_thread"}},
+	}
+	writeJSONFile(t, filepath.Join(dir, "capture.json"), map[string]any{
+		"threadID": "T-test",
+		"summary":  providerCaptureSummaryForScan(body),
+		"body":     body,
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{captureDir: dir, allowMissing: true, requireCaptureSummary: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("findings = %#v, want none", findings)
+	}
+}
+
+func TestScanCaptureDirFindsNonTerminalFunctionCallOutput(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "capture.json"), map[string]any{
+		"threadID": "T-test",
+		"body": map[string]any{
+			"input": []any{
+				map[string]any{
+					"type":    "function_call",
+					"call_id": "TU-review",
+					"name":    "code_review",
+				},
+				map[string]any{
+					"type":    "function_call_output",
+					"call_id": "TU-review",
+					"output":  `{"status":"cancellation-requested"}`,
+				},
+			},
+		},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{captureDir: dir, allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 1 {
+		t.Fatalf("findings = %#v, want 1", findings)
+	}
+	if findings[0].Source != "provider-capture" || findings[0].ToolName != "code_review" || findings[0].CallID != "TU-review" {
+		t.Fatalf("finding = %#v", findings[0])
+	}
+	if !strings.Contains(findings[0].Detail, "non-terminal tool_result status") {
+		t.Fatalf("detail = %q", findings[0].Detail)
+	}
+}
+
+func TestScanCaptureDirFindsNonTerminalAnthropicToolResult(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "capture.json"), map[string]any{
+		"threadID": "T-test",
+		"body": map[string]any{
+			"messages": []any{
+				map[string]any{
+					"role": "assistant",
+					"content": []any{map[string]any{
+						"type": "tool_use",
+						"id":   "TU-review",
+						"name": "code_review",
+					}},
+				},
+				map[string]any{
+					"role": "user",
+					"content": []any{map[string]any{
+						"type":        "tool_result",
+						"tool_use_id": "TU-review",
+						"content":     `{"status":"blocked-on-user"}`,
+					}},
+				},
+			},
+		},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{captureDir: dir, allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 1 {
+		t.Fatalf("findings = %#v, want 1", findings)
+	}
+	if findings[0].Source != "provider-capture" || findings[0].ToolName != "code_review" || findings[0].CallID != "TU-review" {
+		t.Fatalf("finding = %#v", findings[0])
+	}
+}
+
+func TestScanCaptureDirFindsDanglingFunctionCallBeforeMessage(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "capture.json"), map[string]any{
+		"threadID": "T-test",
+		"body": map[string]any{
+			"input": []any{
+				map[string]any{
+					"type":    "function_call",
+					"call_id": "TU-read",
+					"name":    "read_thread",
+				},
+				map[string]any{
+					"role":    "user",
+					"content": "continue",
+				},
+			},
+		},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{captureDir: dir, allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 1 {
+		t.Fatalf("findings = %#v, want 1", findings)
+	}
+	if findings[0].Source != "provider-capture" || findings[0].ToolName != "read_thread" || findings[0].CallID != "TU-read" {
+		t.Fatalf("finding = %#v", findings[0])
+	}
+	if !strings.Contains(findings[0].Detail, "no matching tool result") {
+		t.Fatalf("detail = %q", findings[0].Detail)
+	}
+}
+
+func TestScanCaptureDirFindsDanglingAnthropicToolUseBeforeUserText(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "capture.json"), map[string]any{
+		"provider": "anthropic",
+		"threadID": "T-test",
+		"body": map[string]any{
+			"messages": []any{
+				map[string]any{
+					"role": "assistant",
+					"content": []any{map[string]any{
+						"type": "tool_use",
+						"id":   "TU-review",
+						"name": "code_review",
+					}},
+				},
+				map[string]any{
+					"role": "user",
+					"content": []any{map[string]any{
+						"type": "text",
+						"text": "continue",
+					}},
+				},
+			},
+		},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{captureDir: dir, allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 1 {
+		t.Fatalf("findings = %#v, want 1", findings)
+	}
+	if findings[0].Source != "provider-capture" || findings[0].ToolName != "code_review" || findings[0].CallID != "TU-review" {
+		t.Fatalf("finding = %#v", findings[0])
+	}
+}
+
+func TestScanCaptureDirIgnoresPairedProviderToolCalls(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "capture.json"), map[string]any{
+		"threadID": "T-test",
+		"body": map[string]any{
+			"input": []any{
+				map[string]any{
+					"type":    "function_call",
+					"call_id": "TU-read",
+					"name":    "read_thread",
+				},
+				map[string]any{
+					"type":    "function_call_output",
+					"call_id": "TU-read",
+					"output":  `{"status":"done","result":"ok"}`,
+				},
+				map[string]any{
+					"role":    "user",
+					"content": "continue",
+				},
+			},
+		},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{captureDir: dir, allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("findings = %#v, want none", findings)
+	}
+}
+
 func TestScanCaptureDirFindsMalformedFunctionCallArguments(t *testing.T) {
 	dir := t.TempDir()
 	writeJSONFile(t, filepath.Join(dir, "capture.json"), map[string]any{
@@ -821,6 +1686,197 @@ func TestScanCaptureDirFindsMalformedFunctionCallArguments(t *testing.T) {
 	}
 	if !strings.Contains(findings[0].Detail, "malformed function_call arguments") {
 		t.Fatalf("detail = %q", findings[0].Detail)
+	}
+}
+
+func TestScanCaptureDirFindsMalformedAnthropicToolUseInput(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "capture.json"), map[string]any{
+		"provider": "anthropic",
+		"threadID": "T-test",
+		"body": map[string]any{
+			"messages": []any{map[string]any{
+				"role": "assistant",
+				"content": []any{map[string]any{
+					"type":  "tool_use",
+					"id":    "TU-create",
+					"name":  "create_file",
+					"input": map[string]any{"input": `{"path":"/tmp/setup.c"`},
+				}},
+			}},
+		},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{captureDir: dir, allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 1 {
+		t.Fatalf("findings = %#v, want 1", findings)
+	}
+	if findings[0].Source != "provider-capture" || findings[0].ToolName != "create_file" || findings[0].CallID != "TU-create" {
+		t.Fatalf("finding = %#v", findings[0])
+	}
+	if !strings.Contains(findings[0].Detail, "malformed tool_use input") {
+		t.Fatalf("detail = %q", findings[0].Detail)
+	}
+}
+
+func TestScanCaptureDirIgnoresCustomRawAnthropicToolUseInput(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "capture.json"), map[string]any{
+		"provider": "anthropic",
+		"threadID": "T-test",
+		"body": map[string]any{
+			"messages": []any{map[string]any{
+				"role": "assistant",
+				"content": []any{map[string]any{
+					"type":  "tool_use",
+					"id":    "TU-raw",
+					"name":  "custom_raw",
+					"input": map[string]any{"input": `{"raw":`},
+					"metadata": map[string]any{
+						"openAICustomTool": map[string]any{"type": "custom"},
+					},
+				}},
+			}},
+		},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{captureDir: dir, allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("findings = %#v, want none for custom raw input", findings)
+	}
+}
+
+func TestScanCaptureDirFindsAnthropicBase64ImageMissingMediaType(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "capture.json"), map[string]any{
+		"provider": "anthropic",
+		"threadID": "T-test",
+		"body": map[string]any{
+			"messages": []any{map[string]any{
+				"role": "user",
+				"content": []any{map[string]any{
+					"type": "image",
+					"source": map[string]any{
+						"type": "base64",
+						"data": "iVBORw0KGgo=",
+					},
+				}},
+			}},
+		},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{captureDir: dir, allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 1 {
+		t.Fatalf("findings = %#v, want 1", findings)
+	}
+	if findings[0].ToolName != "image_attachment" || findings[0].ThreadID != "T-test" {
+		t.Fatalf("finding = %#v", findings[0])
+	}
+	if !strings.Contains(findings[0].Detail, "missing media_type") {
+		t.Fatalf("detail = %q", findings[0].Detail)
+	}
+}
+
+func TestScanCaptureDirFindsAnthropicBase64ImageCamelMediaTypeOnly(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "capture.json"), map[string]any{
+		"provider": "anthropic",
+		"threadID": "T-test",
+		"body": map[string]any{
+			"messages": []any{map[string]any{
+				"role": "user",
+				"content": []any{map[string]any{
+					"type": "image",
+					"source": map[string]any{
+						"type":      "base64",
+						"mediaType": "image/png",
+						"data":      "iVBORw0KGgo=",
+					},
+				}},
+			}},
+		},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{captureDir: dir, allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 1 {
+		t.Fatalf("findings = %#v, want 1", findings)
+	}
+	if findings[0].ToolName != "image_attachment" {
+		t.Fatalf("finding = %#v", findings[0])
+	}
+}
+
+func TestScanCaptureDirIgnoresAnthropicBase64ImageWithMediaType(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "capture.json"), map[string]any{
+		"provider": "anthropic",
+		"threadID": "T-test",
+		"body": map[string]any{
+			"messages": []any{map[string]any{
+				"role": "user",
+				"content": []any{map[string]any{
+					"type": "image",
+					"source": map[string]any{
+						"type":       "base64",
+						"media_type": "image/png",
+						"data":       "iVBORw0KGgo=",
+					},
+				}},
+			}},
+		},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{captureDir: dir, allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("findings = %#v, want none", findings)
+	}
+}
+
+func TestScanCaptureDirThreadFilterFindsOnlyRequestedThread(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "other.json"), map[string]any{
+		"threadID": "T-other",
+		"body": map[string]any{
+			"input": []any{
+				map[string]any{"type": "function_call", "call_id": "TU-other", "name": "read_thread"},
+				map[string]any{"type": "function_call_output", "call_id": "TU-other", "output": `{"status":"done"}`},
+			},
+		},
+	})
+	writeJSONFile(t, filepath.Join(dir, "target.json"), map[string]any{
+		"threadID": "T-target",
+		"body": map[string]any{
+			"input": []any{
+				map[string]any{"type": "function_call", "call_id": "TU-target", "name": "read_thread"},
+				map[string]any{"type": "function_call_output", "call_id": "TU-target", "output": `{"status":"done"}`},
+			},
+		},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{captureDir: dir, threadID: "T-target", allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 1 {
+		t.Fatalf("findings = %#v, want 1", findings)
+	}
+	if findings[0].ThreadID != "T-target" || findings[0].CallID != "TU-target" {
+		t.Fatalf("finding = %#v", findings[0])
 	}
 }
 
@@ -861,6 +1917,72 @@ func TestRunJSONNoFindingsPrintsArray(t *testing.T) {
 	}
 	if strings.TrimSpace(stdout.String()) != "[]" {
 		t.Fatalf("stdout = %q, want []", stdout.String())
+	}
+}
+
+func TestSummarizeFindingsGroupsTokenSpecificCompactionDetails(t *testing.T) {
+	summary := summarizeFindings([]driftFinding{
+		{
+			Source:   "thread",
+			ToolName: "compaction",
+			Detail:   "smart usage observed 249061 tokens at or above 75% threshold 249000 with no later compaction record",
+		},
+		{
+			Source:   "thread",
+			ToolName: "compaction",
+			Detail:   "smart usage observed 250127 tokens at or above 75% threshold 249000 with no later compaction record",
+		},
+		{
+			Source:   "thread",
+			ToolName: "compaction",
+			Detail:   "smart compaction observed 100592 tokens below 75% threshold 249000 at 2026-06-01T15:42:09.062188Z",
+		},
+	})
+
+	if len(summary) != 2 {
+		t.Fatalf("summary = %#v, want 2 groups", summary)
+	}
+	if summary[0].Count != 2 || summary[0].Category != "smart usage at/above compaction threshold without later compaction" {
+		t.Fatalf("first summary = %#v", summary[0])
+	}
+	if summary[1].Count != 1 || summary[1].Category != "smart compaction below threshold" {
+		t.Fatalf("second summary = %#v", summary[1])
+	}
+}
+
+func TestRunSummaryOutputGroupsFindings(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "capture-a.json"), map[string]any{
+		"threadID": "T-test",
+		"body": map[string]any{
+			"input": []any{
+				map[string]any{"type": "function_call", "call_id": "TU-a", "name": "read_thread"},
+				map[string]any{"type": "function_call_output", "call_id": "TU-a", "output": `{"status":"done"}`},
+			},
+		},
+	})
+	writeJSONFile(t, filepath.Join(dir, "capture-b.json"), map[string]any{
+		"threadID": "T-test",
+		"body": map[string]any{
+			"input": []any{
+				map[string]any{"type": "function_call", "call_id": "TU-b", "name": "read_thread"},
+				map[string]any{"type": "function_call_output", "call_id": "TU-b", "output": `{"status":"done"}`},
+			},
+		},
+	})
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := run([]string{"-thread-dir", filepath.Join(dir, "missing"), "-capture-dir", dir, "-summary"}, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("code = %d stderr=%s stdout=%s", code, stderr.String(), stdout.String())
+	}
+	output := stdout.String()
+	if !strings.Contains(output, "found 2 runtime drift(s) in 1 group(s):") {
+		t.Fatalf("stdout = %q", output)
+	}
+	if !strings.Contains(output, "- 2 provider-capture read_thread: terminal done missing result/output payload") {
+		t.Fatalf("stdout = %q", output)
 	}
 }
 
@@ -950,6 +2072,65 @@ func TestRunSinceHomebrewRuntimeUsesReplacementModTime(t *testing.T) {
 	if strings.TrimSpace(stdout.String()) != "[]" {
 		t.Fatalf("stdout = %q, want []", stdout.String())
 	}
+}
+
+func TestRunSinceHomebrewRuntimeFallsBackToInstalledBinaryModTime(t *testing.T) {
+	dir := t.TempDir()
+	installed := filepath.Join(dir, "cliproxyapi")
+	if err := os.WriteFile(installed, []byte("marker"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	markerTime := time.Date(2026, 6, 1, 19, 35, 4, 0, time.UTC)
+	if err := os.Chtimes(installed, markerTime, markerTime); err != nil {
+		t.Fatal(err)
+	}
+	oldHomebrewRuntimeBinaryPath := homebrewRuntimeBinaryPath
+	oldHomebrewRuntimeFallbackBinaryPath := homebrewRuntimeFallbackBinaryPath
+	homebrewRuntimeBinaryPath = func() string { return filepath.Join(dir, "missing.real") }
+	homebrewRuntimeFallbackBinaryPath = func() string { return installed }
+	t.Cleanup(func() {
+		homebrewRuntimeBinaryPath = oldHomebrewRuntimeBinaryPath
+		homebrewRuntimeFallbackBinaryPath = oldHomebrewRuntimeFallbackBinaryPath
+	})
+
+	writeJSONFile(t, filepath.Join(dir, "T-test.json"), map[string]any{
+		"id": "T-test",
+		"messages": []any{
+			map[string]any{
+				"messageId": "M-assistant",
+				"role":      "assistant",
+				"content":   []any{map[string]any{"type": "tool_use", "id": "TU-shell", "name": "shell_command"}},
+			},
+			map[string]any{
+				"createdAt": "2026-06-01T18:28:59.003825Z",
+				"messageId": "M-result",
+				"role":      "user",
+				"content": []any{map[string]any{
+					"type":      "tool_result",
+					"toolUseID": "TU-shell",
+					"run":       map[string]any{"status": "done"},
+				}},
+			},
+		},
+	})
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := run([]string{"-thread-dir", dir, "-capture-dir", filepath.Join(dir, "missing"), "-since-homebrew-runtime", "-json"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("code = %d stderr=%s stdout=%s", code, stderr.String(), stdout.String())
+	}
+	if strings.TrimSpace(stdout.String()) != "[]" {
+		t.Fatalf("stdout = %q, want []", stdout.String())
+	}
+}
+
+func findingDetails(findings []driftFinding) string {
+	var details []string
+	for _, finding := range findings {
+		details = append(details, finding.Detail)
+	}
+	return strings.Join(details, "\n")
 }
 
 func writeJSONFile(t *testing.T, path string, value any) {

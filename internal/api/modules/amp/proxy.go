@@ -58,6 +58,17 @@ func (rc *readCloser) Close() error               { return rc.c.Close() }
 // createReverseProxy creates a reverse proxy handler for Amp upstream
 // with automatic gzip decompression via ModifyResponse
 func createReverseProxy(upstreamURL string, secretSource SecretSource) (*httputil.ReverseProxy, error) {
+	return createReverseProxyWithClientVersionOverride(upstreamURL, secretSource, "")
+}
+
+func createReverseProxyWithClientVersionOverride(upstreamURL string, secretSource SecretSource, clientVersionOverride string) (*httputil.ReverseProxy, error) {
+	clientVersionOverride = strings.TrimSpace(clientVersionOverride)
+	return createReverseProxyWithClientVersionProvider(upstreamURL, secretSource, func() string {
+		return clientVersionOverride
+	})
+}
+
+func createReverseProxyWithClientVersionProvider(upstreamURL string, secretSource SecretSource, clientVersionProvider func() string) (*httputil.ReverseProxy, error) {
 	parsed, err := url.Parse(upstreamURL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid amp upstream url: %w", err)
@@ -93,6 +104,12 @@ func createReverseProxy(upstreamURL string, secretSource SecretSource) (*httputi
 		// Preserve correlation headers for debugging
 		if req.Header.Get("X-Request-ID") == "" {
 			// Could generate one here if needed
+		}
+
+		if clientVersionProvider != nil {
+			if version := strings.TrimSpace(clientVersionProvider()); version != "" {
+				req.Header.Set("X-Amp-Client-Version", version)
+			}
 		}
 
 		// Note: We do NOT filter Anthropic-Beta headers in the proxy path
@@ -233,8 +250,33 @@ func actorEngineAuthorization(req *http.Request) string {
 	return authorization
 }
 
+// actorEngineMetadataRequest matches RivetKit's pre-connection metadata discovery.
+// The client fetches this WITHOUT a token before it has an actor or connection, so it
+// cannot satisfy the authenticated engine-routing checks below. It must still reach the
+// local engine; otherwise the client's retry-forever metadata lookup never resolves and
+// the thread transport loops on connect_failed. Newer binaries probe /actors/metadata
+// in manager mode and /metadata once they adopt the discovered engine endpoint; both
+// only expose a non-sensitive engine descriptor, so routing them unauthenticated is safe.
+func actorEngineMetadataRequest(req *http.Request) bool {
+	if req == nil || req.Method != http.MethodGet || req.URL == nil {
+		return false
+	}
+	switch "/" + strings.Trim(req.URL.Path, "/") {
+	case "/metadata", "/actors/metadata":
+		return true
+	default:
+		return false
+	}
+}
+
 func actorEngineRequest(req *http.Request) bool {
-	if req == nil || req.URL == nil || !actorEnginePath(req.URL.Path) {
+	if req == nil || req.URL == nil {
+		return false
+	}
+	if actorEngineMetadataRequest(req) {
+		return true
+	}
+	if !actorEnginePath(req.URL.Path) {
 		return false
 	}
 	if actorEngineAuthorization(req) != "" {
@@ -253,7 +295,10 @@ func actorEngineRequest(req *http.Request) bool {
 
 func actorEnginePath(path string) bool {
 	normalized := "/" + strings.Trim(path, "/")
-	return normalized == "/actors" || strings.HasPrefix(normalized, "/actors/")
+	// /gateway is the rivetkit engine transport the client uses once it adopts the
+	// discovered engine endpoint (engine mode); /actors is the manager-mode prefix.
+	return normalized == "/actors" || strings.HasPrefix(normalized, "/actors/") ||
+		normalized == "/gateway" || strings.HasPrefix(normalized, "/gateway/")
 }
 
 // isStreamingResponse detects if the response is streaming (SSE only)

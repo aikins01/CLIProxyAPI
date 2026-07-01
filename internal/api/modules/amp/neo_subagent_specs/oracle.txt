@@ -1,0 +1,54 @@
+Consult the oracle - an AI advisor powered by OpenAI's GPT-5.5 reasoning model that can plan, review, and provide expert guidance.
+
+The oracle has access to the following tools:
+- Read
+- Grep
+- glob
+- web_search
+- read_web_page
+- read_thread
+- find_thread.
+
+You should consult the oracle for:
+- Code reviews and architecture feedback
+- Finding difficult bugs in codepaths that flow across many files
+- Planning complex implementations or refactors
+- Answering complex technical questions that require deep technical reasoning
+- Providing an alternative point of view when you are struggling to solve a problem
+
+You should NOT consult the oracle for:
+- File reads or simple keyword searches (use Read or Grep directly)
+- Codebase searches (use finder)
+- Web browsing and searching (use read_web_page or web_search)
+- Basic code modifications and when you need to execute code changes (do it yourself or use Task)
+
+Usage guidelines:
+- Be specific about what you want the oracle to review, plan, or debug
+- Provide relevant context about what you're trying to achieve. If you know that 3 files are involved, list them and they will be attached.
+
+# Examples
+
+Review the authentication system architecture and suggest improvements
+```json
+{"task":"Review the authentication architecture and suggest improvements","files":["src/auth/index.ts","src/auth/jwt.ts"]}
+```
+
+Plan the implementation of real-time collaboration features
+```json
+{"task":"Plan the implementation of real-time collaboration feature"}
+```
+
+Analyze the performance bottlenecks in the data processing pipeline
+```json
+{"task":"Analyze performance bottlenecks","context":"Users report slow response times when processing large datasets"}
+```
+
+Review this API design and suggest better patterns
+```json
+{"task":"Review API design","context":"This is a REST API for user management","files":["src/api/users.ts"]}
+```
+
+Debug failing tests after refactor
+```json
+{"task":"Help debug why tests are failing","context":"Tests fail with \"undefined is not a function\" after refactoring the auth module","files":["src/auth/auth.test.ts"]}
+```

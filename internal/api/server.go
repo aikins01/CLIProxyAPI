@@ -1219,12 +1219,20 @@ func corsMiddleware() gin.HandlerFunc {
 		c.Header("Access-Control-Allow-Headers", "*")
 
 		if c.Request.Method == "OPTIONS" {
+			if ampLocalInferencePreflightPath(c.Request.URL.Path) {
+				c.Next()
+				return
+			}
 			c.AbortWithStatus(http.StatusNoContent)
 			return
 		}
 
 		c.Next()
 	}
+}
+
+func ampLocalInferencePreflightPath(path string) bool {
+	return ampmodule.AmpWebLocalInferencePath(path)
 }
 
 func (s *Server) applyAccessConfig(oldCfg, newCfg *config.Config) {

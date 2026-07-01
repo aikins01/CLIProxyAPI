@@ -33,6 +33,7 @@ type AmpModule struct {
 	accessManager    *sdkaccess.Manager
 	authMiddleware_  gin.HandlerFunc
 	modelMapper      *DefaultModelMapper
+	fallbackMapper   *DefaultModelMapper
 	neoRuntime       *neoRuntime
 	enabled          bool
 	registerOnce     sync.Once
@@ -73,6 +74,9 @@ func (m *AmpModule) registerFallbackHandler(handler *FallbackHandler, captureDir
 		return nil
 	}
 	handler.SetCompactionCaptureDir(captureDir)
+	if m.fallbackMapper != nil {
+		handler.SetFallbackMapper(m.fallbackMapper)
+	}
 	m.fallbackMu.Lock()
 	m.fallbackHandlers = append(m.fallbackHandlers, handler)
 	m.fallbackMu.Unlock()
@@ -159,6 +163,8 @@ func (m *AmpModule) Register(ctx modules.Context) error {
 	m.registerOnce.Do(func() {
 		// Initialize model mapper from config (for routing unavailable models to alternatives)
 		m.modelMapper = NewModelMapper(settings.ModelMappings)
+		// On-failure fallback mapper (e.g. Gemini code review -> Claude on quota errors)
+		m.fallbackMapper = NewModelMapper(settings.ModelFallbacks)
 
 		// Store initial config for partial reload comparison
 		m.lastConfig = new(settings)
@@ -229,9 +235,12 @@ func (m *AmpModule) OnConfigUpdated(cfg *config.Config) error {
 	m.applyNeoRuntime(cfg)
 
 	newUpstreamURL := strings.TrimSpace(newSettings.UpstreamURL)
+	newClientVersionOverride := strings.TrimSpace(newSettings.UpstreamClientVersionOverride)
 	oldUpstreamURL := ""
+	oldClientVersionOverride := ""
 	if oldSettings != nil {
 		oldUpstreamURL = strings.TrimSpace(oldSettings.UpstreamURL)
+		oldClientVersionOverride = strings.TrimSpace(oldSettings.UpstreamClientVersionOverride)
 	}
 
 	if !m.enabled && newUpstreamURL != "" {
@@ -248,6 +257,9 @@ func (m *AmpModule) OnConfigUpdated(cfg *config.Config) error {
 		} else if m.enabled {
 			log.Warnf("amp model mapper not initialized, skipping model mapping update")
 		}
+		if m.fallbackMapper != nil {
+			m.fallbackMapper.UpdateMappings(newSettings.ModelFallbacks)
+		}
 	}
 
 	if m.enabled {
@@ -255,9 +267,10 @@ func (m *AmpModule) OnConfigUpdated(cfg *config.Config) error {
 		if newUpstreamURL == "" && oldUpstreamURL != "" {
 			m.setProxy(nil)
 			m.enabled = false
-		} else if oldUpstreamURL != "" && newUpstreamURL != oldUpstreamURL && newUpstreamURL != "" {
+		} else if oldUpstreamURL != "" && newUpstreamURL != "" &&
+			(newUpstreamURL != oldUpstreamURL || newClientVersionOverride != oldClientVersionOverride) {
 			// Recreate proxy with new URL
-			proxy, err := createReverseProxy(newUpstreamURL, m.secretSource)
+			proxy, err := createReverseProxyWithClientVersionProvider(newUpstreamURL, m.secretSource, ampUpstreamClientVersionProvider(&newSettings))
 			if err != nil {
 				log.Errorf("amp config: failed to create proxy for new upstream URL %s: %v", newUpstreamURL, err)
 			} else {
@@ -319,6 +332,7 @@ func (m *AmpModule) applyNeoRuntime(cfg *config.Config) {
 				log.Warnf("amp neo local runtime config update failed: %v", err)
 			}
 			m.neoRuntime.setModelMapper(m.modelMapper)
+			m.neoRuntime.setSecretSource(m.secretSource)
 			return
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -331,6 +345,7 @@ func (m *AmpModule) applyNeoRuntime(cfg *config.Config) {
 
 	rt := newNeoRuntime(cfg)
 	rt.setModelMapper(m.modelMapper)
+	rt.setSecretSource(m.secretSource)
 	if err := rt.start(); err != nil {
 		log.Warnf("amp neo local runtime start failed: %v", err)
 		return
@@ -389,11 +404,14 @@ func (m *AmpModule) enableUpstreamProxy(upstreamURL string, settings *config.Amp
 		m.secretSource = mappedSource
 	}
 
-	proxy, err := createReverseProxy(upstreamURL, m.secretSource)
+	proxy, err := createReverseProxyWithClientVersionProvider(upstreamURL, m.secretSource, ampUpstreamClientVersionProvider(settings))
 	if err != nil {
 		return err
 	}
 
+	if m.neoRuntime != nil {
+		m.neoRuntime.setSecretSource(m.secretSource)
+	}
 	m.setProxy(proxy)
 	m.enabled = true
 
@@ -404,7 +422,11 @@ func (m *AmpModule) enableUpstreamProxy(upstreamURL string, settings *config.Amp
 // hasModelMappingsChanged compares old and new model mappings.
 func (m *AmpModule) hasModelMappingsChanged(old *config.AmpCode, new *config.AmpCode) bool {
 	if old == nil {
-		return len(new.ModelMappings) > 0
+		return len(new.ModelMappings) > 0 || len(new.ModelFallbacks) > 0
+	}
+
+	if ampModelMappingListChanged(old.ModelFallbacks, new.ModelFallbacks) {
+		return true
 	}
 
 	if len(old.ModelMappings) != len(new.ModelMappings) {
@@ -432,6 +454,29 @@ func (m *AmpModule) hasModelMappingsChanged(old *config.AmpCode, new *config.Amp
 		}
 	}
 
+	return false
+}
+
+// ampModelMappingListChanged reports whether two model-mapping lists differ in any
+// from/to/regex entry (order-independent).
+func ampModelMappingListChanged(old, new []config.AmpModelMapping) bool {
+	if len(old) != len(new) {
+		return true
+	}
+	type info struct {
+		to    string
+		regex bool
+	}
+	oldMap := make(map[string]info, len(old))
+	for _, mapping := range old {
+		oldMap[strings.TrimSpace(mapping.From)] = info{to: strings.TrimSpace(mapping.To), regex: mapping.Regex}
+	}
+	for _, mapping := range new {
+		from := strings.TrimSpace(mapping.From)
+		if oldVal, exists := oldMap[from]; !exists || oldVal.to != strings.TrimSpace(mapping.To) || oldVal.regex != mapping.Regex {
+			return true
+		}
+	}
 	return false
 }
 

@@ -1,0 +1,32 @@
+The Librarian is a codebase-understanding subagent for
+repositories outside the local workspace.
+
+It can read public GitHub repositories, connected private GitHub repositories, and connected
+Bitbucket Enterprise repositories.
+
+Use this when you need deep understanding of existing code across one or more repositories:
+- explaining architecture, flows, or subsystem design
+- finding where a feature is implemented in an external codebase
+- comparing patterns across repositories
+- understanding how code evolved through commit history
+- reading or diffing files in a remote repository
+
+Do not use this for:
+- local workspace reads or searches
+- code modifications or implementations
+- simple local lookups when a direct local tool is enough
+- questions unrelated to understanding existing repositories
+
+Guidance:
+- name the repository or project when you know it
+- ask a specific question or describe the feature or codepath you want understood
+- include context about what you are trying to achieve
+- expect a thorough answer suitable for sharing
+- return the answer in full rather than summarizing it
+
+Examples:
+- "How does authentication work in the Kubernetes codebase?"
+- "Explain the architecture of the React rendering system"
+- "Compare how different web frameworks handle routing"
+- "What changed in commit abc123 in my private repository?"
+- "Read the README from the main API repo on our Bitbucket Enterprise instance"

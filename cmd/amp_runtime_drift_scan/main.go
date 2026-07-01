@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -14,14 +15,17 @@ import (
 )
 
 type scanOptions struct {
-	threadDir           string
-	captureDir          string
-	baselinePath        string
-	modelContextWindows map[string]int
-	smartModel          string
-	since               time.Time
-	allowMissing        bool
-	jsonOutput          bool
+	threadDir             string
+	captureDir            string
+	baselinePath          string
+	threadScope           string
+	threadID              string
+	modelContextWindows   map[string]int
+	smartModel            string
+	since                 time.Time
+	allowMissing          bool
+	jsonOutput            bool
+	requireCaptureSummary bool
 }
 
 type driftFinding struct {
@@ -51,11 +55,15 @@ func run(args []string, stdout, stderr io.Writer) int {
 	threadDir := flags.String("thread-dir", defaultThreadDir(), "Amp local thread JSON directory to scan")
 	captureDir := flags.String("capture-dir", defaultCaptureDir(), "Neo provider request capture directory to scan")
 	baselinePath := flags.String("baseline", defaultBaselinePath(), "Amp binary parity baseline JSON used for model context windows")
+	threadScope := flags.String("thread-scope", "local-runtime", "thread files to scan: local-runtime or all")
+	threadID := flags.String("thread", "", "only scan one Amp thread ID across thread files and provider captures")
 	sinceRaw := flags.String("since", "", "only scan files modified at or after this RFC3339 timestamp")
 	sinceFile := flags.String("since-file", "", "only scan files and timestamped thread messages at or after this file's modification time")
 	sinceHomebrewRuntime := flags.Bool("since-homebrew-runtime", false, "only scan data at or after the Homebrew cliproxyapi.real replacement time")
 	allowMissing := flags.Bool("allow-missing", true, "treat missing scan directories as empty")
 	jsonOutput := flags.Bool("json", false, "print findings as JSON")
+	summaryOutput := flags.Bool("summary", false, "print grouped finding summary instead of individual findings")
+	requireCaptureSummary := flags.Bool("require-capture-summary", false, "flag provider captures missing compact summary metadata")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
@@ -67,12 +75,15 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 
 	findings, err := scanRuntimeDrift(scanOptions{
-		threadDir:    *threadDir,
-		captureDir:   *captureDir,
-		baselinePath: *baselinePath,
-		since:        since,
-		allowMissing: *allowMissing,
-		jsonOutput:   *jsonOutput,
+		threadDir:             *threadDir,
+		captureDir:            *captureDir,
+		baselinePath:          *baselinePath,
+		threadScope:           *threadScope,
+		threadID:              *threadID,
+		since:                 since,
+		allowMissing:          *allowMissing,
+		jsonOutput:            *jsonOutput,
+		requireCaptureSummary: *requireCaptureSummary,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "scan runtime drift: %v\n", err)
@@ -86,6 +97,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 	} else if len(findings) == 0 {
 		fmt.Fprintln(stdout, "no runtime drift found")
+	} else if *summaryOutput {
+		printFindingSummary(stdout, findings)
 	} else {
 		fmt.Fprintf(stdout, "found %d runtime drift(s):\n", len(findings))
 		for _, finding := range findings {
@@ -97,6 +110,90 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	return 0
+}
+
+type findingSummary struct {
+	Count    int
+	Source   string
+	ToolName string
+	Category string
+}
+
+func printFindingSummary(stdout io.Writer, findings []driftFinding) {
+	summary := summarizeFindings(findings)
+	fmt.Fprintf(stdout, "found %d runtime drift(s) in %d group(s):\n", len(findings), len(summary))
+	for _, item := range summary {
+		fmt.Fprintf(stdout, "- %d %s %s: %s\n", item.Count, item.Source, item.ToolName, item.Category)
+	}
+}
+
+func summarizeFindings(findings []driftFinding) []findingSummary {
+	type summaryKey struct {
+		source   string
+		toolName string
+		category string
+	}
+	counts := map[summaryKey]int{}
+	for _, finding := range findings {
+		key := summaryKey{
+			source:   finding.Source,
+			toolName: finding.ToolName,
+			category: findingCategory(finding.Detail),
+		}
+		counts[key]++
+	}
+	summary := make([]findingSummary, 0, len(counts))
+	for key, count := range counts {
+		summary = append(summary, findingSummary{
+			Count:    count,
+			Source:   key.source,
+			ToolName: key.toolName,
+			Category: key.category,
+		})
+	}
+	sort.Slice(summary, func(i, j int) bool {
+		if summary[i].Count != summary[j].Count {
+			return summary[i].Count > summary[j].Count
+		}
+		if summary[i].Source != summary[j].Source {
+			return summary[i].Source < summary[j].Source
+		}
+		if summary[i].ToolName != summary[j].ToolName {
+			return summary[i].ToolName < summary[j].ToolName
+		}
+		return summary[i].Category < summary[j].Category
+	})
+	return summary
+}
+
+func findingCategory(detail string) string {
+	detail = strings.TrimSpace(detail)
+	switch {
+	case strings.HasPrefix(detail, "smart usage observed ") && strings.Contains(detail, " with no later compaction record"):
+		return "smart usage at/above compaction threshold without later compaction"
+	case strings.HasPrefix(detail, "smart compaction observed "):
+		return "smart compaction below threshold"
+	case strings.HasPrefix(detail, "currentInference ") || strings.HasPrefix(detail, "pendingInference "):
+		return "invalid persisted inference state"
+	case detail == "thread compacting persisted without current or pending inference":
+		return "invalid persisted inference state"
+	case strings.HasPrefix(detail, "complete tool_use has no matching tool_result before "):
+		return "complete tool_use missing matching tool_result"
+	case strings.HasPrefix(detail, "model input contains tool call with no matching tool result before "):
+		return "provider tool call missing matching tool result"
+	case strings.HasPrefix(detail, "model input contains non-terminal tool_result status "):
+		return "provider input contains non-terminal tool_result"
+	case strings.HasPrefix(detail, "non-terminal tool_result status "):
+		return "thread contains non-terminal tool_result"
+	case detail == `terminal "done" has no result/output payload` || detail == `model input contains terminal "done" with no result/output payload`:
+		return "terminal done missing result/output payload"
+	case strings.HasPrefix(detail, "provider capture summary "):
+		return "provider capture summary mismatch"
+	case detail == "provider capture missing request summary":
+		return "provider capture missing request summary"
+	default:
+		return detail
+	}
 }
 
 func parseSinceCutoff(sinceRaw, sinceFile string, sinceHomebrewRuntime bool) (time.Time, error) {
@@ -120,6 +217,9 @@ func parseSinceCutoff(sinceRaw, sinceFile string, sinceHomebrewRuntime bool) (ti
 	}
 	if sinceHomebrewRuntime {
 		fileTime, err := fileModTime(homebrewRuntimeBinaryPath())
+		if err != nil && errors.Is(err, os.ErrNotExist) {
+			fileTime, err = fileModTime(homebrewRuntimeFallbackBinaryPath())
+		}
 		if err != nil {
 			return time.Time{}, fmt.Errorf("stat -since-homebrew-runtime: %w", err)
 		}
@@ -142,6 +242,10 @@ var homebrewRuntimeBinaryPath = func() string {
 	return filepath.Join(string(os.PathSeparator), "opt", "homebrew", "opt", "cliproxyapi", "bin", "cliproxyapi.real")
 }
 
+var homebrewRuntimeFallbackBinaryPath = func() string {
+	return filepath.Join(string(os.PathSeparator), "opt", "homebrew", "opt", "cliproxyapi", "bin", "cliproxyapi")
+}
+
 func defaultThreadDir() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -151,11 +255,17 @@ func defaultThreadDir() string {
 }
 
 func defaultCaptureDir() string {
+	if dir := strings.TrimSpace(os.Getenv("CLIPROXYAPI_NEO_PROVIDER_REQUEST_CAPTURE_DIR")); dir != "" {
+		return dir
+	}
+	if dir := strings.TrimSpace(os.Getenv("CLIPROXY_NEO_PROVIDER_REQUEST_DUMP_DIR")); dir != "" {
+		return dir
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return ""
 	}
-	return filepath.Join(home, ".cli-proxy-api", "logs", "neo-provider-requests")
+	return filepath.Join(home, ".config", "cliproxyapi", "neo-provider-requests")
 }
 
 func defaultBaselinePath() string {
@@ -187,14 +297,14 @@ func scanRuntimeDrift(options scanOptions) ([]driftFinding, error) {
 	}
 	findings := []driftFinding{}
 	if strings.TrimSpace(options.threadDir) != "" {
-		threadFindings, err := scanThreadDir(options.threadDir, options.since, options.allowMissing, modelContextWindows, smartModel)
+		threadFindings, err := scanThreadDir(options.threadDir, options.since, options.allowMissing, normalizeThreadScope(options.threadScope), strings.TrimSpace(options.threadID), modelContextWindows, smartModel)
 		if err != nil {
 			return nil, err
 		}
 		findings = append(findings, threadFindings...)
 	}
 	if strings.TrimSpace(options.captureDir) != "" {
-		captureFindings, err := scanCaptureDir(options.captureDir, options.since, options.allowMissing)
+		captureFindings, err := scanCaptureDir(options.captureDir, options.since, options.allowMissing, strings.TrimSpace(options.threadID), options.requireCaptureSummary)
 		if err != nil {
 			return nil, err
 		}
@@ -210,6 +320,14 @@ func scanRuntimeDrift(options scanOptions) ([]driftFinding, error) {
 		return findings[i].MessageID < findings[j].MessageID
 	})
 	return findings, nil
+}
+
+func normalizeThreadScope(scope string) string {
+	scope = strings.TrimSpace(strings.ToLower(scope))
+	if scope == "" {
+		return "all"
+	}
+	return scope
 }
 
 func loadBaselineModelContext(path string) (map[string]int, string, error) {
@@ -250,10 +368,13 @@ func loadBaselineModelContext(path string) (map[string]int, string, error) {
 	return windows, smartModel, nil
 }
 
-func scanThreadDir(dir string, since time.Time, allowMissing bool, modelContextWindows map[string]int, smartModel string) ([]driftFinding, error) {
+func scanThreadDir(dir string, since time.Time, allowMissing bool, threadScope, onlyThreadID string, modelContextWindows map[string]int, smartModel string) ([]driftFinding, error) {
 	files, err := scanJSONFiles(dir, since, allowMissing)
 	if err != nil {
 		return nil, err
+	}
+	if threadScope != "all" && threadScope != "local-runtime" {
+		return nil, fmt.Errorf("invalid thread-scope %q", threadScope)
 	}
 	var findings []driftFinding
 	for _, file := range files {
@@ -265,10 +386,21 @@ func scanThreadDir(dir string, since time.Time, allowMissing bool, modelContextW
 		if err := json.Unmarshal(raw, &thread); err != nil {
 			return nil, fmt.Errorf("%s: %w", file, err)
 		}
-		threadID := stringValue(thread["id"])
+		threadID := firstNonEmptyString(thread["id"], nestedValue(thread, "data", "id"))
+		if onlyThreadID != "" && threadID != onlyThreadID {
+			continue
+		}
+		if threadScope == "local-runtime" && !threadLocalRuntimeMarked(thread) {
+			continue
+		}
 		messages := arrayValue(thread["messages"])
 		findings = append(findings, scanThreadCompactionDrift(file, threadID, thread, messages, since, modelContextWindows, smartModel)...)
-		findings = append(findings, scanThreadDanglingToolUseDrift(file, threadID, messages, since)...)
+		findings = append(findings, scanThreadCancelledStreamingBlockDrift(file, threadID, messages, since)...)
+		findings = append(findings, scanThreadInferenceStateDrift(file, threadID, thread, messages)...)
+		if !threadReviewMode(thread) {
+			findings = append(findings, scanThreadDanglingToolUseDrift(file, threadID, messages, since)...)
+		}
+		findings = append(findings, scanThreadQueuedMessageDrift(file, threadID, thread, since)...)
 		toolNames := map[string]string{}
 		for _, rawMessage := range messages {
 			for _, rawBlock := range arrayValue(mapValue(rawMessage)["content"]) {
@@ -307,7 +439,19 @@ func scanThreadDir(dir string, since time.Time, allowMissing bool, modelContextW
 				case "tool_result":
 					toolID := firstNonEmptyString(block["toolUseID"], block["toolUseId"], block["tool_use_id"], block["toolCallId"], block["id"])
 					toolName := firstNonEmptyString(block["name"], toolNames[toolID])
-					if bareTerminalDoneForPayloadRequiredTool(toolName, mapValue(block["run"])) {
+					run := mapValue(block["run"])
+					if status := nonTerminalToolRunStatus(run); status != "" && !toolProgressCompletionStatus(message) {
+						findings = append(findings, driftFinding{
+							Source:    "thread",
+							File:      file,
+							ThreadID:  threadID,
+							MessageID: messageID,
+							CallID:    toolID,
+							ToolName:  normalizeToolName(toolName),
+							Detail:    fmt.Sprintf("non-terminal tool_result status %q persisted without completionStatus=tool_progress", status),
+						})
+					}
+					if bareTerminalDoneForPayloadRequiredTool(toolName, run) && !toolProgressCompletionStatus(message) {
 						findings = append(findings, driftFinding{
 							Source:    "thread",
 							File:      file,
@@ -323,6 +467,172 @@ func scanThreadDir(dir string, since time.Time, allowMissing bool, modelContextW
 		}
 	}
 	return findings, nil
+}
+
+func threadLocalRuntimeMarked(thread map[string]any) bool {
+	if len(thread) == 0 {
+		return false
+	}
+	meta := mapValue(thread["meta"])
+	if boolValue(meta["usesThreadActors"]) ||
+		boolValue(meta["usesDtw"]) ||
+		boolValue(meta["ampcodeConnectorLocalNeo"]) ||
+		boolValue(meta["cliProxyAPILocalNeo"]) ||
+		boolValue(meta["ampcodeLocalRuntime"]) ||
+		strings.EqualFold(stringValue(meta["ampcodeConnectorMode"]), "local-neo") {
+		return true
+	}
+	if data := mapValue(thread["data"]); len(data) > 0 {
+		return threadLocalRuntimeMarked(data)
+	}
+	return false
+}
+
+func threadReviewMode(thread map[string]any) bool {
+	mode := firstNonEmptyString(thread["agentMode"], nestedValue(thread, "settings", "agentMode"), nestedValue(thread, "data", "agentMode"), nestedValue(thread, "data", "settings", "agentMode"))
+	return strings.EqualFold(strings.TrimSpace(mode), "review")
+}
+
+func scanThreadCancelledStreamingBlockDrift(file, threadID string, messages []any, since time.Time) []driftFinding {
+	var findings []driftFinding
+	for _, rawMessage := range messages {
+		message := mapValue(rawMessage)
+		if threadMessageBeforeSince(message, since) {
+			continue
+		}
+		if !strings.EqualFold(stringValue(message["role"]), "assistant") {
+			continue
+		}
+		if !strings.EqualFold(stringValue(mapValue(message["state"])["type"]), "cancelled") {
+			continue
+		}
+		streamingTypes := make([]string, 0)
+		nonTerminalToolTypes := make([]string, 0)
+		for _, rawBlock := range arrayValue(message["content"]) {
+			block := mapValue(rawBlock)
+			blockType := strings.TrimSpace(stringValue(block["type"]))
+			if blockType == "" {
+				blockType = "unknown"
+			}
+			if strings.EqualFold(stringValue(block["blockState"]), "streaming") {
+				streamingTypes = append(streamingTypes, blockType)
+				continue
+			}
+			if cancelledMessageToolBlockStillLive(block) {
+				nonTerminalToolTypes = append(nonTerminalToolTypes, blockType)
+			}
+		}
+		messageID := firstNonEmptyString(message["messageId"], message["messageID"], message["id"])
+		if len(streamingTypes) > 0 {
+			findings = append(findings, driftFinding{
+				Source:    "thread",
+				File:      file,
+				ThreadID:  threadID,
+				MessageID: messageID,
+				CallID:    strings.Join(streamingTypes, ","),
+				ToolName:  "streaming_state",
+				Detail:    "cancelled assistant message retains streaming child blockState",
+			})
+		}
+		if len(nonTerminalToolTypes) > 0 {
+			findings = append(findings, driftFinding{
+				Source:    "thread",
+				File:      file,
+				ThreadID:  threadID,
+				MessageID: messageID,
+				CallID:    strings.Join(nonTerminalToolTypes, ","),
+				ToolName:  "streaming_state",
+				Detail:    "cancelled assistant message retains non-terminal tool child blockState",
+			})
+		}
+	}
+	return findings
+}
+
+func cancelledMessageToolBlockStillLive(block map[string]any) bool {
+	blockType := strings.TrimSpace(stringValue(block["type"]))
+	if blockType != "tool_use" && blockType != "server_tool_use" {
+		return false
+	}
+	if boolValue(block["complete"]) {
+		return false
+	}
+	return !terminalToolBlockState(stringValue(block["blockState"]))
+}
+
+func terminalToolBlockState(state string) bool {
+	switch strings.TrimSpace(strings.ToLower(state)) {
+	case "aborted", "cancelled", "complete", "done", "error", "failed", "rejected-by-user":
+		return true
+	default:
+		return false
+	}
+}
+
+func scanThreadInferenceStateDrift(file, threadID string, thread map[string]any, messages []any) []driftFinding {
+	var findings []driftFinding
+	messageByID := threadMessagesByID(messages)
+	for _, key := range []string{"currentInference", "pendingInference"} {
+		inference := mapValue(thread[key])
+		if len(inference) == 0 {
+			continue
+		}
+		messageID := firstNonEmptyString(inference["messageId"], inference["messageID"], inference["message_id"], inference["id"])
+		agentMode := strings.TrimSpace(firstNonEmptyString(inference["agentMode"], inference["agent_mode"], inference["mode"]))
+		if agentMode == "" {
+			findings = append(findings, driftFinding{
+				Source:    "thread",
+				File:      file,
+				ThreadID:  threadID,
+				MessageID: messageID,
+				CallID:    key,
+				ToolName:  "inference_state",
+				Detail:    key + " agentMode is missing or non-string",
+			})
+		}
+		if key != "currentInference" || messageID == "" {
+			continue
+		}
+		message := messageByID[messageID]
+		if len(message) == 0 {
+			continue
+		}
+		if strings.EqualFold(stringValue(message["role"]), "assistant") && strings.EqualFold(stringValue(mapValue(message["state"])["type"]), "cancelled") {
+			findings = append(findings, driftFinding{
+				Source:    "thread",
+				File:      file,
+				ThreadID:  threadID,
+				MessageID: messageID,
+				CallID:    key,
+				ToolName:  "inference_state",
+				Detail:    key + " references cancelled assistant message",
+			})
+		}
+	}
+	if boolValue(thread["compacting"]) && len(mapValue(thread["currentInference"])) == 0 && len(mapValue(thread["pendingInference"])) == 0 {
+		findings = append(findings, driftFinding{
+			Source:   "thread",
+			File:     file,
+			ThreadID: threadID,
+			CallID:   "compacting",
+			ToolName: "inference_state",
+			Detail:   "thread compacting persisted without current or pending inference",
+		})
+	}
+	return findings
+}
+
+func threadMessagesByID(messages []any) map[string]map[string]any {
+	out := map[string]map[string]any{}
+	for _, rawMessage := range messages {
+		message := mapValue(rawMessage)
+		messageID := firstNonEmptyString(message["messageId"], message["messageID"], message["message_id"], message["id"])
+		if messageID == "" {
+			continue
+		}
+		out[messageID] = message
+	}
+	return out
 }
 
 type pendingThreadToolUse struct {
@@ -404,6 +714,66 @@ func threadUserMessageHasNonToolResultContent(message map[string]any) bool {
 		}
 	}
 	return false
+}
+
+func scanThreadQueuedMessageDrift(file, threadID string, thread map[string]any, since time.Time) []driftFinding {
+	items := firstArray(thread["queuedMessages"], thread["queued_messages"])
+	if len(items) == 0 {
+		return nil
+	}
+	var findings []driftFinding
+	for index, rawItem := range items {
+		item := mapValue(rawItem)
+		message := mapValue(item["queuedMessage"])
+		if len(message) == 0 {
+			findings = append(findings, queueDriftFinding(file, threadID, index, item, "queuedMessages item is not wrapped in queuedMessage"))
+			continue
+		}
+		if queuedMessageBeforeSince(message, since) {
+			continue
+		}
+		if firstNonEmptyString(item["id"]) == "" {
+			findings = append(findings, queueDriftFinding(file, threadID, index, item, "queuedMessages item id is missing or non-string"))
+		}
+		if !strings.EqualFold(strings.TrimSpace(stringValue(message["role"])), "user") {
+			findings = append(findings, queueDriftFinding(file, threadID, index, item, "queuedMessage role is not user"))
+		}
+		if firstNonEmptyString(message["messageId"], message["messageID"]) == "" {
+			findings = append(findings, queueDriftFinding(file, threadID, index, item, "queuedMessage.messageId is missing or non-string"))
+		}
+		if arrayValue(message["content"]) == nil {
+			findings = append(findings, queueDriftFinding(file, threadID, index, item, "queuedMessage.content is missing or non-array"))
+		}
+		if steer, exists := item["steer"]; exists {
+			if _, ok := steer.(bool); !ok {
+				findings = append(findings, queueDriftFinding(file, threadID, index, item, "queuedMessages steer is present but not boolean"))
+			}
+		}
+	}
+	return findings
+}
+
+func queuedMessageBeforeSince(message map[string]any, since time.Time) bool {
+	if since.IsZero() {
+		return false
+	}
+	if createdAt, ok := parseTimeValue(message["createdAt"], message["timestamp"], message["created_at"]); ok {
+		return createdAt.Before(since)
+	}
+	return false
+}
+
+func queueDriftFinding(file, threadID string, index int, item map[string]any, detail string) driftFinding {
+	message := mapValue(item["queuedMessage"])
+	return driftFinding{
+		Source:    "thread",
+		File:      file,
+		ThreadID:  threadID,
+		MessageID: firstNonEmptyString(message["messageId"], message["messageID"], item["queuedMessageId"], item["queuedMessageID"]),
+		CallID:    firstNonEmptyString(item["id"], item["queuedMessageId"], item["queuedMessageID"], fmt.Sprintf("queuedMessages[%d]", index)),
+		ToolName:  "queued_message",
+		Detail:    detail,
+	}
 }
 
 func scanThreadCompactionDrift(file, threadID string, thread map[string]any, messages []any, since time.Time, modelContextWindows map[string]int, smartModel string) []driftFinding {
@@ -627,7 +997,7 @@ func threadMessageBeforeSince(message map[string]any, since time.Time) bool {
 	return false
 }
 
-func scanCaptureDir(dir string, since time.Time, allowMissing bool) ([]driftFinding, error) {
+func scanCaptureDir(dir string, since time.Time, allowMissing bool, onlyThreadID string, requireCaptureSummary bool) ([]driftFinding, error) {
 	files, err := scanJSONFiles(dir, since, allowMissing)
 	if err != nil {
 		return nil, err
@@ -642,12 +1012,41 @@ func scanCaptureDir(dir string, since time.Time, allowMissing bool) ([]driftFind
 		if err := json.Unmarshal(raw, &capture); err != nil {
 			return nil, fmt.Errorf("%s: %w", file, err)
 		}
+		threadID := captureThreadID(capture)
+		if onlyThreadID != "" && threadID != onlyThreadID {
+			continue
+		}
 		body := mapValue(capture["body"])
+		if requireCaptureSummary {
+			findings = append(findings, scanProviderCaptureSummaryDrift(file, threadID, capture, body)...)
+		}
 		inputs := firstArray(body["input"], body["messages"])
+		findings = append(findings, scanProviderAnthropicImageDrift(file, threadID, capture, inputs)...)
+		findings = append(findings, scanProviderDanglingToolUseDrift(file, threadID, inputs)...)
 		toolNames := map[string]string{}
 		for _, rawItem := range inputs {
 			item := mapValue(rawItem)
 			if stringValue(item["type"]) != "function_call" {
+				for _, rawBlock := range arrayValue(item["content"]) {
+					block := mapValue(rawBlock)
+					if stringValue(block["type"]) != "tool_use" {
+						continue
+					}
+					callID := firstNonEmptyString(block["id"], block["tool_use_id"], block["toolUseID"], block["toolUseId"], block["toolCallId"])
+					if callID != "" {
+						toolNames[callID] = stringValue(block["name"])
+					}
+					if preview, ok := providerToolUseMalformedJSONFallback(block); ok {
+						findings = append(findings, driftFinding{
+							Source:   "provider-capture",
+							File:     file,
+							ThreadID: threadID,
+							CallID:   callID,
+							ToolName: normalizeToolName(stringValue(block["name"])),
+							Detail:   "model input contains malformed tool_use input: " + preview,
+						})
+					}
+				}
 				continue
 			}
 			callID := firstNonEmptyString(item["call_id"], item["callId"], item["id"])
@@ -658,7 +1057,7 @@ func scanCaptureDir(dir string, since time.Time, allowMissing bool) ([]driftFind
 				findings = append(findings, driftFinding{
 					Source:   "provider-capture",
 					File:     file,
-					ThreadID: stringValue(capture["threadID"]),
+					ThreadID: threadID,
 					CallID:   callID,
 					ToolName: normalizeToolName(stringValue(item["name"])),
 					Detail:   "model input contains malformed function_call arguments: " + preview,
@@ -667,29 +1066,361 @@ func scanCaptureDir(dir string, since time.Time, allowMissing bool) ([]driftFind
 		}
 		for _, rawItem := range inputs {
 			item := mapValue(rawItem)
-			if stringValue(item["type"]) != "function_call_output" {
-				continue
-			}
-			callID := firstNonEmptyString(item["call_id"], item["callId"], item["id"])
-			toolName := toolNames[callID]
-			run := decodeRunOutput(item["output"])
-			if bareTerminalDoneForPayloadRequiredTool(toolName, run) {
-				findings = append(findings, driftFinding{
-					Source:   "provider-capture",
-					File:     file,
-					ThreadID: stringValue(capture["threadID"]),
-					CallID:   callID,
-					ToolName: normalizeToolName(toolName),
-					Detail:   `model input contains terminal "done" with no result/output payload`,
-				})
+			switch stringValue(item["type"]) {
+			case "function_call_output":
+				callID := firstNonEmptyString(item["call_id"], item["callId"], item["id"])
+				toolName := toolNames[callID]
+				run := decodeRunOutput(item["output"])
+				findings = appendProviderToolRunFindings(findings, file, threadID, callID, toolName, run)
+			default:
+				for _, rawBlock := range arrayValue(item["content"]) {
+					block := mapValue(rawBlock)
+					if stringValue(block["type"]) != "tool_result" {
+						continue
+					}
+					callID := firstNonEmptyString(block["tool_use_id"], block["toolUseID"], block["toolUseId"], block["toolCallId"], block["id"])
+					toolName := firstNonEmptyString(block["name"], toolNames[callID])
+					run := decodeToolResultRun(block)
+					findings = appendProviderToolRunFindings(findings, file, threadID, callID, toolName, run)
+				}
 			}
 		}
 	}
 	return findings, nil
 }
 
+func scanProviderCaptureSummaryDrift(file, threadID string, capture, body map[string]any) []driftFinding {
+	expected := providerCaptureSummaryForScan(body)
+	if len(expected) == 0 {
+		return nil
+	}
+	summary := mapValue(capture["summary"])
+	if len(summary) == 0 {
+		return []driftFinding{{
+			Source:   "provider-capture",
+			File:     file,
+			ThreadID: threadID,
+			ToolName: "provider_request",
+			Detail:   "provider capture missing request summary",
+		}}
+	}
+	var findings []driftFinding
+	for _, key := range []string{"bodySHA256", "systemSHA256"} {
+		want := stringValue(expected[key])
+		if want == "" {
+			continue
+		}
+		if got := stringValue(summary[key]); got != want {
+			findings = append(findings, providerCaptureSummaryFinding(file, threadID, fmt.Sprintf("provider capture summary %s mismatch", key)))
+		}
+	}
+	for _, key := range []string{"inputCount", "systemBytes"} {
+		want, ok := expected[key]
+		if !ok {
+			continue
+		}
+		if numberValue(summary[key]) != numberValue(want) {
+			findings = append(findings, providerCaptureSummaryFinding(file, threadID, fmt.Sprintf("provider capture summary %s mismatch", key)))
+		}
+	}
+	if wantTools := stringSliceValue(expected["toolNames"]); len(wantTools) > 0 {
+		gotTools := stringSliceValue(summary["toolNames"])
+		if strings.Join(gotTools, "\x00") != strings.Join(wantTools, "\x00") {
+			findings = append(findings, providerCaptureSummaryFinding(file, threadID, "provider capture summary toolNames mismatch"))
+		}
+	}
+	return findings
+}
+
+func providerCaptureSummaryFinding(file, threadID, detail string) driftFinding {
+	return driftFinding{
+		Source:   "provider-capture",
+		File:     file,
+		ThreadID: threadID,
+		ToolName: "provider_request",
+		Detail:   detail,
+	}
+}
+
+func providerCaptureSummaryForScan(body map[string]any) map[string]any {
+	if len(body) == 0 {
+		return nil
+	}
+	summary := map[string]any{}
+	if hash := providerCaptureHashForScan(body); hash != "" {
+		summary["bodySHA256"] = hash
+	}
+	if count := providerCaptureInputCountForScan(body); count > 0 {
+		summary["inputCount"] = count
+	}
+	if system := providerCaptureSystemTextForScan(body); system != "" {
+		summary["systemSHA256"] = providerCaptureHashForScan(system)
+		summary["systemBytes"] = len([]byte(system))
+	}
+	if tools := providerCaptureToolNamesForScan(body); len(tools) > 0 {
+		summary["toolNames"] = tools
+	}
+	return summary
+}
+
+func providerCaptureHashForScan(value any) string {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(raw)
+	return fmt.Sprintf("%x", sum[:])
+}
+
+func providerCaptureInputCountForScan(body map[string]any) int {
+	for _, key := range []string{"input", "messages", "contents"} {
+		if items := arrayValue(body[key]); len(items) > 0 {
+			return len(items)
+		}
+	}
+	return 0
+}
+
+func providerCaptureSystemTextForScan(body map[string]any) string {
+	parts := make([]string, 0, 2)
+	if text := providerCaptureTextForScan(body["instructions"]); text != "" {
+		parts = append(parts, text)
+	}
+	if text := providerCaptureTextForScan(body["system"]); text != "" {
+		parts = append(parts, text)
+	}
+	for _, raw := range firstArray(body["input"], body["messages"]) {
+		item := mapValue(raw)
+		switch strings.ToLower(strings.TrimSpace(stringValue(item["role"]))) {
+		case "system", "developer":
+			if text := providerCaptureTextForScan(item["content"]); text != "" {
+				parts = append(parts, text)
+			}
+		}
+	}
+	return strings.Join(parts, "\n")
+}
+
+func providerCaptureTextForScan(value any) string {
+	switch v := value.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case []any:
+		parts := make([]string, 0, len(v))
+		for _, item := range v {
+			if text := providerCaptureTextForScan(item); text != "" {
+				parts = append(parts, text)
+			}
+		}
+		return strings.Join(parts, "\n")
+	case map[string]any:
+		parts := make([]string, 0, 2)
+		for _, key := range []string{"text", "content", "input"} {
+			if text := providerCaptureTextForScan(v[key]); text != "" {
+				parts = append(parts, text)
+			}
+		}
+		return strings.Join(parts, "\n")
+	default:
+		return ""
+	}
+}
+
+func providerCaptureToolNamesForScan(body map[string]any) []string {
+	seen := map[string]struct{}{}
+	var add func(any)
+	add = func(value any) {
+		switch v := value.(type) {
+		case []any:
+			for _, item := range v {
+				add(item)
+			}
+		case map[string]any:
+			if name := strings.TrimSpace(stringValue(v["name"])); name != "" {
+				seen[name] = struct{}{}
+			}
+			if fn := mapValue(v["function"]); len(fn) > 0 {
+				add(fn)
+			}
+			if declarations := arrayValue(v["functionDeclarations"]); len(declarations) > 0 {
+				add(declarations)
+			}
+		}
+	}
+	add(body["tools"])
+	names := make([]string, 0, len(seen))
+	for name := range seen {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+type pendingProviderToolUse struct {
+	callID   string
+	toolName string
+}
+
+func scanProviderDanglingToolUseDrift(file, threadID string, inputs []any) []driftFinding {
+	pending := map[string]pendingProviderToolUse{}
+	var findings []driftFinding
+	for _, rawItem := range inputs {
+		item := mapValue(rawItem)
+		itemType := stringValue(item["type"])
+		switch itemType {
+		case "function_call":
+			if _, malformed := functionCallMalformedJSONFallback(item["arguments"]); malformed {
+				continue
+			}
+			callID := firstNonEmptyString(item["call_id"], item["callId"], item["id"])
+			if callID != "" {
+				pending[callID] = pendingProviderToolUse{callID: callID, toolName: stringValue(item["name"])}
+			}
+			continue
+		case "function_call_output":
+			callID := firstNonEmptyString(item["call_id"], item["callId"], item["id"])
+			if callID != "" {
+				delete(pending, callID)
+			}
+			continue
+		}
+
+		role := strings.ToLower(strings.TrimSpace(stringValue(item["role"])))
+		switch role {
+		case "user":
+			for _, rawBlock := range arrayValue(item["content"]) {
+				block := mapValue(rawBlock)
+				if stringValue(block["type"]) != "tool_result" {
+					continue
+				}
+				callID := firstNonEmptyString(block["tool_use_id"], block["toolUseID"], block["toolUseId"], block["toolCallId"], block["id"])
+				if callID != "" {
+					delete(pending, callID)
+				}
+			}
+			if threadUserMessageHasNonToolResultContent(item) {
+				findings = appendProviderDanglingToolUseFindings(findings, file, threadID, pending, "later user message")
+				pending = map[string]pendingProviderToolUse{}
+			}
+		case "assistant":
+			findings = appendProviderDanglingToolUseFindings(findings, file, threadID, pending, "later assistant message")
+			pending = map[string]pendingProviderToolUse{}
+			for _, rawBlock := range arrayValue(item["content"]) {
+				block := mapValue(rawBlock)
+				if stringValue(block["type"]) != "tool_use" {
+					continue
+				}
+				if hasCustomRawInputMetadata(block) {
+					continue
+				}
+				if _, malformed := providerToolUseMalformedJSONFallback(block); malformed {
+					continue
+				}
+				callID := firstNonEmptyString(block["id"], block["tool_use_id"], block["toolUseID"], block["toolUseId"], block["toolCallId"])
+				if callID != "" {
+					pending[callID] = pendingProviderToolUse{callID: callID, toolName: stringValue(block["name"])}
+				}
+			}
+		default:
+			if len(arrayValue(item["content"])) == 0 {
+				findings = appendProviderDanglingToolUseFindings(findings, file, threadID, pending, "later provider input item")
+				pending = map[string]pendingProviderToolUse{}
+			}
+		}
+	}
+	return appendProviderDanglingToolUseFindings(findings, file, threadID, pending, "end of provider input")
+}
+
+func appendProviderDanglingToolUseFindings(findings []driftFinding, file, threadID string, pending map[string]pendingProviderToolUse, trigger string) []driftFinding {
+	for _, item := range pending {
+		findings = append(findings, driftFinding{
+			Source:   "provider-capture",
+			File:     file,
+			ThreadID: threadID,
+			CallID:   item.callID,
+			ToolName: normalizeToolName(item.toolName),
+			Detail:   "model input contains tool call with no matching tool result before " + trigger,
+		})
+	}
+	return findings
+}
+
+func captureThreadID(capture map[string]any) string {
+	return firstNonEmptyString(capture["threadID"], capture["threadId"], capture["thread_id"], nestedValue(capture, "metadata", "threadID"), nestedValue(capture, "metadata", "threadId"))
+}
+
+func scanProviderAnthropicImageDrift(file, threadID string, capture map[string]any, inputs []any) []driftFinding {
+	provider := strings.ToLower(strings.TrimSpace(firstNonEmptyString(capture["provider"], nestedValue(capture, "metadata", "provider"))))
+	if provider != "" && !strings.Contains(provider, "anthropic") {
+		return nil
+	}
+	var findings []driftFinding
+	for itemIndex, rawItem := range inputs {
+		item := mapValue(rawItem)
+		for blockIndex, rawBlock := range arrayValue(item["content"]) {
+			block := mapValue(rawBlock)
+			if stringValue(block["type"]) != "image" {
+				continue
+			}
+			source := mapValue(block["source"])
+			if stringValue(source["type"]) != "base64" || firstNonEmptyString(source["data"], source["base64"]) == "" {
+				continue
+			}
+			if strings.TrimSpace(stringValue(source["media_type"])) != "" {
+				continue
+			}
+			findings = append(findings, driftFinding{
+				Source:   "provider-capture",
+				File:     file,
+				ThreadID: threadID,
+				CallID:   fmt.Sprintf("messages[%d].content[%d]", itemIndex, blockIndex),
+				ToolName: "image_attachment",
+				Detail:   "anthropic base64 image source missing media_type",
+			})
+		}
+	}
+	return findings
+}
+
+func appendProviderToolRunFindings(findings []driftFinding, file, threadID, callID, toolName string, run map[string]any) []driftFinding {
+	if status := nonTerminalToolRunStatus(run); status != "" {
+		findings = append(findings, driftFinding{
+			Source:   "provider-capture",
+			File:     file,
+			ThreadID: threadID,
+			CallID:   callID,
+			ToolName: normalizeToolName(toolName),
+			Detail:   fmt.Sprintf("model input contains non-terminal tool_result status %q", status),
+		})
+	}
+	if bareTerminalDoneForPayloadRequiredTool(toolName, run) {
+		findings = append(findings, driftFinding{
+			Source:   "provider-capture",
+			File:     file,
+			ThreadID: threadID,
+			CallID:   callID,
+			ToolName: normalizeToolName(toolName),
+			Detail:   `model input contains terminal "done" with no result/output payload`,
+		})
+	}
+	return findings
+}
+
 func completedToolUseMalformedJSONFallback(message, block map[string]any) (string, bool) {
 	if !completedToolUseBlock(message, block) || hasCustomRawInputMetadata(block) {
+		return "", false
+	}
+	return malformedJSONFallbackInput(mapValue(block["input"]))
+}
+
+func providerToolUseMalformedJSONFallback(block map[string]any) (string, bool) {
+	if stringValue(block["type"]) != "tool_use" || hasCustomRawInputMetadata(block) {
+		return "", false
+	}
+	if _, exists := block["inputPartialJSON"]; exists {
+		return "", false
+	}
+	if _, exists := block["inputPartialJSONDelta"]; exists {
 		return "", false
 	}
 	return malformedJSONFallbackInput(mapValue(block["input"]))
@@ -811,6 +1542,31 @@ func decodeRunOutput(value any) map[string]any {
 	return mapValue(decoded)
 }
 
+func decodeToolResultRun(block map[string]any) map[string]any {
+	if run := mapValue(block["run"]); len(run) > 0 {
+		return run
+	}
+	if run := decodeRunOutput(block["content"]); len(run) > 0 {
+		return run
+	}
+	return decodeRunOutput(block["output"])
+}
+
+func nonTerminalToolRunStatus(run map[string]any) string {
+	status := strings.ToLower(strings.TrimSpace(stringValue(run["status"])))
+	switch status {
+	case "in-progress", "queued", "blocked-on-user", "cancellation-requested":
+		return status
+	default:
+		return ""
+	}
+}
+
+func toolProgressCompletionStatus(message map[string]any) bool {
+	status := firstNonEmptyString(message["completionStatus"], message["completion_status"])
+	return strings.EqualFold(strings.TrimSpace(status), "tool_progress")
+}
+
 func bareTerminalDoneForPayloadRequiredTool(toolName string, run map[string]any) bool {
 	if _, ok := payloadRequiredTools[normalizeToolName(toolName)]; !ok {
 		return false
@@ -886,6 +1642,17 @@ func stringValue(value any) string {
 	default:
 		return ""
 	}
+}
+
+func stringSliceValue(value any) []string {
+	items := arrayValue(value)
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		if text := strings.TrimSpace(stringValue(item)); text != "" {
+			out = append(out, text)
+		}
+	}
+	return out
 }
 
 func boolValue(value any) bool {

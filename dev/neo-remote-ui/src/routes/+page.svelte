@@ -88,6 +88,7 @@
   type NeoMessage = {
     threadId?: string;
     messageId: string;
+    protocolMessageID?: string;
     role: 'user' | 'assistant' | 'system' | string;
     content: ContentBlock[];
     state?: { type?: string; stopReason?: string };
@@ -289,6 +290,8 @@
   let manualTranscriptScrollVersion = 0;
   let transcriptUserDetached = false;
   let transcriptTouchStartY = 0;
+  let workGroupOpenOverrides = $state<Record<string, boolean>>({});
+  const workGroupToggleIntents = new Set<string>();
   const devSignalCount = $derived.by(() => {
     let count = artifacts.length + executorStatuses.length + runtimeEvents.length + runtimeTraces.length + toolLeases.length;
     if (inferenceTools) count += 1;
@@ -411,9 +414,20 @@
     return (topbar?.getBoundingClientRect().bottom ?? 0) + 8;
   }
 
+  function transcriptViewportBottom() {
+    if (typeof window === 'undefined') return 0;
+    const footer = document.querySelector<HTMLElement>('.composer-footer');
+    const footerTop = footer?.getBoundingClientRect().top;
+    return (footerTop && footerTop > 0 ? footerTop : window.innerHeight) - 8;
+  }
+
+  function transcriptAnchorElements() {
+    if (typeof document === 'undefined') return [];
+    return Array.from(document.querySelectorAll<HTMLElement>('[data-transcript-key]'));
+  }
+
   function transcriptElementByKey(key: string) {
-    if (typeof document === 'undefined') return null;
-    for (const element of document.querySelectorAll<HTMLElement>('[data-transcript-key]')) {
+    for (const element of transcriptAnchorElements()) {
       if (element.dataset.transcriptKey === key) return element;
     }
     return null;
@@ -422,14 +436,26 @@
   function captureTranscriptAnchor(): TranscriptAnchor | null {
     if (typeof document === 'undefined') return null;
     const viewportTop = transcriptViewportTop();
-    for (const element of document.querySelectorAll<HTMLElement>('[data-transcript-key]')) {
+    let containing: TranscriptAnchor | null = null;
+    let below: TranscriptAnchor | null = null;
+    let containerFallback: TranscriptAnchor | null = null;
+    for (const element of transcriptAnchorElements()) {
       const rect = element.getBoundingClientRect();
-      if (rect.bottom >= viewportTop + 1) {
-        const key = element.dataset.transcriptKey;
-        return key ? { key, offset: rect.top - viewportTop } : null;
+      const key = element.dataset.transcriptKey;
+      if (!key || rect.height <= 0 || rect.bottom < viewportTop + 1) continue;
+      const hasAnchorChild = transcriptElementHasAnchorChild(element);
+      if (rect.top <= viewportTop + 1 && rect.bottom >= viewportTop + 1) {
+        const anchor = { key, offset: rect.top - viewportTop };
+        if (hasAnchorChild) {
+          if (!containerFallback) containerFallback = anchor;
+        } else {
+          containing = anchor;
+        }
+        continue;
       }
+      if (!below && rect.top > viewportTop && !hasAnchorChild) below = { key, offset: rect.top - viewportTop };
     }
-    return null;
+    return containing ?? below ?? containerFallback;
   }
 
   function restoreTranscriptAnchor(anchor: TranscriptAnchor | null, fallbackTop: number) {
@@ -448,6 +474,42 @@
     const viewportTop = transcriptViewportTop();
     const rect = element.getBoundingClientRect();
     scroller.scrollTop += rect.top - viewportTop - anchor.offset;
+  }
+
+  function transcriptElementHasAnchorChild(element: HTMLElement) {
+    return Boolean(element.querySelector('[data-transcript-key]'));
+  }
+
+  function transcriptElementShouldYieldToChildAnchor(element: HTMLElement) {
+    if (element instanceof HTMLDetailsElement && !element.open) return false;
+    return transcriptElementHasAnchorChild(element);
+  }
+
+  function firstTranscriptElementBelowViewport() {
+    const viewportBottom = transcriptViewportBottom();
+    for (const element of transcriptAnchorElements()) {
+      const key = element.dataset.transcriptKey;
+      const rect = element.getBoundingClientRect();
+      if (!key || rect.height <= 0 || transcriptElementShouldYieldToChildAnchor(element)) continue;
+      if (rect.top >= viewportBottom - 1 && rect.bottom > viewportBottom) return element;
+    }
+    return null;
+  }
+
+  function scrollTranscriptElementToTop(element: HTMLElement, behavior: ScrollBehavior = 'smooth') {
+    const scroller = pageScroller();
+    if (!scroller) return;
+    programmaticScrollUntil = Date.now() + 350;
+    programmaticScrollKind = 'follow';
+    transcriptUserDetached = false;
+    const viewportTop = transcriptViewportTop();
+    const top = scroller.scrollTop + element.getBoundingClientRect().top - viewportTop;
+    scroller.scrollTo({ top: Math.max(0, top), behavior });
+    window.setTimeout(refreshNewActivityBelow, behavior === 'smooth' ? 400 : 0);
+  }
+
+  function refreshNewActivityBelow() {
+    newActivityBelow = !isTranscriptPinnedToBottom() && Boolean(firstTranscriptElementBelowViewport());
   }
 
   async function flushTranscriptScrollPlan() {
@@ -540,7 +602,35 @@
   }
 
   function jumpToLatest() {
+    const target = firstTranscriptElementBelowViewport();
+    if (target) {
+      scrollTranscriptElementToTop(target);
+      return;
+    }
     scrollTranscriptToBottom('smooth');
+  }
+
+  function workGroupOpenState(anchorKey: string, live: boolean) {
+    if (anchorKey && Object.hasOwn(workGroupOpenOverrides, anchorKey)) return workGroupOpenOverrides[anchorKey];
+    return live;
+  }
+
+  function workRowAnchorKey(anchorKey: string, index: number) {
+    return anchorKey ? `${anchorKey}-row-${index}` : undefined;
+  }
+
+  function markWorkGroupToggleIntent(anchorKey: string, event?: KeyboardEvent) {
+    if (!anchorKey) return;
+    if (event && event.key !== 'Enter' && event.key !== ' ') return;
+    workGroupToggleIntents.add(anchorKey);
+  }
+
+  function handleWorkGroupToggle(anchorKey: string, event: Event) {
+    if (!anchorKey || !workGroupToggleIntents.has(anchorKey)) return;
+    workGroupToggleIntents.delete(anchorKey);
+    const target = event.currentTarget;
+    if (!(target instanceof HTMLDetailsElement)) return;
+    workGroupOpenOverrides = { ...workGroupOpenOverrides, [anchorKey]: target.open };
   }
   // Thread-reference marker derived from current messages (messages stream in after initial detail load).
   // Use the thread title as the displayed "Instructions:" sentence, matching ampcode.
@@ -654,6 +744,8 @@
     retryNotice = '';
     newActivityBelow = false;
     transcriptUserDetached = false;
+    workGroupOpenOverrides = {};
+    workGroupToggleIntents.clear();
     resumeVersion = 0;
   }
 
@@ -1561,6 +1653,9 @@
     }
     if (type === 'agent_state') {
       agentState = String(message.state ?? 'idle');
+      if (agentState.trim().toLowerCase() === 'idle') {
+        clearLiveRuntimeIndicators();
+      }
       if (detail && (message.agentMode != null || message.reasoningEffort != null)) {
         const nextMode = normalizeAgentMode(stringFrom(message.agentMode) || detail.agentMode);
         const nextEffort = normalizeReasoningEffortForMode(
@@ -1808,7 +1903,7 @@
     if (type === 'cancelled') {
       toolApprovals = [];
       toolLeases = [];
-      retryNotice = '';
+      clearLiveRuntimeIndicators();
       return;
     }
     if (type === 'retry_scheduled') {
@@ -1830,6 +1925,7 @@
     const index = detail.messages.findIndex((item) => item.messageId === message.messageId);
     if (index === -1) {
       detail = { ...detail, messages: [...detail.messages, message] };
+      clearLiveRuntimeIndicatorsForTerminalAssistant(message);
       return;
     }
     const next = [...detail.messages];
@@ -1837,6 +1933,29 @@
     const state = Object.keys(message.state ?? {}).length > 0 ? message.state : next[index].state;
     next[index] = replace ? { ...message, state, usage } : { ...next[index], ...message, state, usage };
     detail = { ...detail, messages: next };
+    clearLiveRuntimeIndicatorsForTerminalAssistant(next[index]);
+  }
+
+  function clearLiveRuntimeIndicatorsForTerminalAssistant(message: NeoMessage) {
+    if (message.role !== 'assistant') return;
+    const state = message.state?.type ?? '';
+    const normalizedState = state.trim().toLowerCase();
+    if (!isTerminalAssistantState(normalizedState)) return;
+    if (normalizedState === 'cancelled' || normalizedState === 'aborted') {
+      clearLiveRuntimeIndicators();
+      return;
+    }
+    if (message.state?.stopReason === 'tool_use') return;
+    if (message.content.some((block) => block.type === 'tool_use' && toolUseBlockRunning(block))) return;
+    clearLiveRuntimeIndicators();
+  }
+
+  function clearLiveRuntimeIndicators() {
+    agentState = 'idle';
+    compactionActive = false;
+    retryNotice = '';
+    inferenceTools = null;
+    executorStatuses = executorStatuses.filter((item) => !isLiveRuntimeStatus(item.status));
   }
 
   function truncateMessagesFromEvent(message: Incoming) {
@@ -2601,6 +2720,22 @@
     return labels[normalized] || '';
   }
 
+  function isLiveRuntimeStatus(state: string) {
+    return [
+      'auto_compacting',
+      'compacting',
+      'sending',
+      'waiting_for_executor',
+      'starting',
+      'working',
+      'thinking',
+      'streaming',
+      'running_tools',
+      'tool_running',
+      'awaiting_approval'
+    ].includes(state.trim().toLowerCase());
+  }
+
   function liveTranscriptVerb() {
     if (!detail) return '';
     const messages = detail.messages;
@@ -2608,24 +2743,45 @@
       const message = messages[index];
       if (message.role !== 'assistant') continue;
       const state = message.state?.type ?? '';
-      if (!['generating', 'streaming', 'start'].includes(state)) {
+      if (isTerminalAssistantState(state)) break;
+      const liveState = isLiveAssistantState(state);
+      if (!liveState) {
         const verb = binaryVerbForAgentState(state);
         if (verb) return verb;
       }
-      if (message.state?.stopReason === 'tool_use') return 'Running tools';
+      if (liveState && message.state?.stopReason === 'tool_use') return 'Running tools';
 
       const runningTool = message.content.some((block) => {
         if (block.type !== 'tool_use') return false;
-        return block.blockState !== 'complete' && block.blockState !== 'done';
+        return toolUseBlockRunning(block);
       });
       if (runningTool) return 'Running tools';
 
       const streamingBlock = message.content.find((block) => block.blockState === 'streaming');
-      if (streamingBlock?.type === 'thinking' || streamingBlock?.thinking) return 'Thinking';
-      if (['generating', 'streaming', 'start'].includes(state)) return 'Streaming';
+      if (liveState && (streamingBlock?.type === 'thinking' || streamingBlock?.thinking)) return 'Thinking';
+      if (liveState) return 'Streaming';
       break;
     }
     return '';
+  }
+
+  function isLiveAssistantState(state: string) {
+    return ['generating', 'streaming', 'tool_use', 'start'].includes(state);
+  }
+
+  function isTerminalAssistantState(state: string) {
+    return ['aborted', 'cancelled', 'complete'].includes(state);
+  }
+
+  function toolUseBlockRunning(block: ContentBlock) {
+    if (block.complete) return false;
+    return !isTerminalBlockState(block.blockState ?? '');
+  }
+
+  function isTerminalBlockState(state: string) {
+    return ['aborted', 'cancelled', 'complete', 'done', 'error', 'failed', 'rejected-by-user'].includes(
+      state.trim().toLowerCase()
+    );
   }
 
   function composerStatusMain() {
@@ -3060,16 +3216,35 @@
     const messageId = stringFrom(item.messageId ?? item.id);
     if (!messageId) return null;
     const usage = asRecord(item.usage);
+    const state = asRecord(item.state);
     return {
       threadId: stringFrom(item.threadId),
       messageId,
+      protocolMessageID: stringFrom(item.protocolMessageID ?? item.protocolMessageId),
       role: stringFrom(item.role) || 'assistant',
-      content: Array.isArray(item.content) ? item.content.map((part) => asRecord(part) as ContentBlock) : [],
-      state: asRecord(item.state),
+      content: normalizeMessageContent(item.content, state),
+      state,
       agentMode: stringFrom(item.agentMode),
       reasoningEffort: stringFrom(item.reasoningEffort),
       ...(Object.keys(usage).length > 0 ? { usage } : {})
     };
+  }
+
+  function normalizeMessageContent(content: unknown, state: Record<string, unknown>) {
+    if (!Array.isArray(content)) return [];
+    const stateType = stringFrom(state.type).trim().toLowerCase();
+    return content.map((part) => {
+      const block = asRecord(part) as ContentBlock;
+      if (
+        stateType === 'cancelled' &&
+        (block.type === 'tool_use' || block.type === 'server_tool_use') &&
+        !block.complete &&
+        !block.blockState
+      ) {
+        return { ...block, blockState: 'cancelled' };
+      }
+      return block;
+    });
   }
 
   function textFromBlocks(blocks: ContentBlock[]) {
@@ -3441,6 +3616,7 @@
     let assistantStart = '';
     const cutMessageIds = new Set(records.map(compactionCutMessageId).filter(Boolean));
     const emittedCompactions = new Set<string>();
+    let pendingCompactions: string[] = [];
 
     const flushAssistant = () => {
       if (assistantMessages.length === 0) return;
@@ -3453,26 +3629,35 @@
       assistantStart = '';
     };
 
-    const pushCompactionBefore = (message: NeoMessage) => {
-      const cutMessageId = message.messageId;
-      if (!cutMessageIds.has(cutMessageId) || emittedCompactions.has(cutMessageId)) return;
+    const pushCompaction = (cutMessageId: string, keyPrefix = 'compaction') => {
+      if (!cutMessageId || emittedCompactions.has(cutMessageId)) return;
       flushAssistant();
       emittedCompactions.add(cutMessageId);
-      items.push({ kind: 'compaction', cutMessageId, key: `compaction-${cutMessageId}` });
+      items.push({ kind: 'compaction', cutMessageId, key: `${keyPrefix}-${cutMessageId}` });
+    };
+
+    const pushPendingCompactions = () => {
+      for (const cutMessageId of pendingCompactions) pushCompaction(cutMessageId);
+      pendingCompactions = [];
     };
 
     for (const message of messages) {
+      const matchedCompactionId = compactionLookupMessageIds(message).find((messageId) => cutMessageIds.has(messageId)) ?? '';
       if (isCompactionSummaryMessage(message)) {
-        if (cutMessageIds.size === 0 && !emittedCompactions.has(message.messageId)) {
-          flushAssistant();
-          emittedCompactions.add(message.messageId);
-          items.push({ kind: 'compaction', cutMessageId: message.messageId, key: `compaction-summary-${message.messageId}` });
+        if (matchedCompactionId) {
+          pendingCompactions.push(matchedCompactionId);
+        } else if (cutMessageIds.size === 0 && !emittedCompactions.has(message.messageId)) {
+          pendingCompactions.push(message.messageId);
         }
         continue;
       }
 
-      if (shouldSkipInfoTranscriptMessage(message)) continue;
-      pushCompactionBefore(message);
+      if (shouldSkipInfoTranscriptMessage(message)) {
+        if (matchedCompactionId) pendingCompactions.push(matchedCompactionId);
+        continue;
+      }
+      pushPendingCompactions();
+      if (matchedCompactionId) pushCompaction(matchedCompactionId);
 
       if (isHumanUserMessage(message)) {
         flushAssistant();
@@ -3485,11 +3670,16 @@
     }
 
     flushAssistant();
+    pushPendingCompactions();
     return items;
   }
 
   function compactionCutMessageId(record: Record<string, unknown>) {
     return stringFrom(record.cutMessageId ?? record.cut_message_id ?? record.messageId ?? record.message_id);
+  }
+
+  function compactionLookupMessageIds(message: NeoMessage) {
+    return Array.from(new Set([stringFrom(message.protocolMessageID), message.messageId].filter(Boolean)));
   }
 
   function isCompactionSummaryMessage(message: NeoMessage) {
@@ -3600,7 +3790,7 @@
   }
 
   function assistantTurnStreaming(messages: NeoMessage[]) {
-    return messages.some((message) => ['generating', 'streaming', 'tool_use', 'start'].includes(message.state?.type ?? ''));
+    return messages.some((message) => isLiveAssistantState(message.state?.type ?? ''));
   }
 
   function messageSegments(message: NeoMessage): MessageSegment[] {
@@ -3726,7 +3916,8 @@
   }
 
   function blockStatus(block: ContentBlock) {
-    return block.blockState === 'complete' ? 'done' : block.blockState || 'running';
+    if (block.complete || block.blockState === 'complete' || block.blockState === 'done') return 'done';
+    return block.blockState || 'running';
   }
 
   function toolTitle(block: ContentBlock) {
@@ -4531,11 +4722,19 @@
   {/if}
 {/snippet}
 
-{#snippet workGroup(blocks: ContentBlock[], live = false)}
+{#snippet workGroup(blocks: ContentBlock[], live = false, anchorKey = '')}
   {@const duration = workDurationLabel(blocks, live)}
-  <details class="work-group" open={live}>
+  <details
+    class="work-group"
+    data-transcript-key={anchorKey || undefined}
+    open={workGroupOpenState(anchorKey, live)}
+    ontoggle={(event) => handleWorkGroupToggle(anchorKey, event)}
+  >
     <!-- Ampcode parity: the "Worked for X minutes" header has no hover timestamp. -->
-    <summary>
+    <summary
+      onclick={() => markWorkGroupToggleIntent(anchorKey)}
+      onkeydown={(event) => markWorkGroupToggleIntent(anchorKey, event)}
+    >
       <span class="work-group__line"></span>
       <span class="work-group__button">
         {#if duration}
@@ -4551,14 +4750,14 @@
       {#each groupWorkBlocks(blocks) as row, index (index)}
         {#if row.kind === 'thinking'}
           {#if thinkingText(row.block)}
-            <div class="trace-thinking md">{@html renderMarkdown(stripThinkingTitle(thinkingText(row.block)))}</div>
+            <div class="trace-thinking md" data-transcript-key={workRowAnchorKey(anchorKey, index)}>{@html renderMarkdown(stripThinkingTitle(thinkingText(row.block)))}</div>
           {/if}
         {:else if row.kind === 'progress'}
           {#if row.block.text}
-            <div class="trace-thinking trace-thinking--progress trace-time-anchor md" data-time={traceTimeLabel(row.block)}>{@html renderMarkdown(stripThinkingTitle(row.block.text))}</div>
+            <div class="trace-thinking trace-thinking--progress trace-time-anchor md" data-time={traceTimeLabel(row.block)} data-transcript-key={workRowAnchorKey(anchorKey, index)}>{@html renderMarkdown(stripThinkingTitle(row.block.text))}</div>
           {/if}
         {:else if row.kind === 'explore'}
-          <details class="trace-row trace-row--explore">
+          <details class="trace-row trace-row--explore" data-transcript-key={workRowAnchorKey(anchorKey, index)}>
             <summary class="trace-time-anchor" data-time={traceTimeLabelForToolEntries(row.tools)}>
               <span class="trace-row__label">Explored</span>
               <span class="trace-row__sub">{exploreSummary(row.tools)}</span>
@@ -4586,7 +4785,7 @@
           </details>
         {:else if row.kind === 'edit'}
           {@const stats = patchStats(displayPatchFromBlock(row.block))}
-          <details class="trace-row trace-row--edit">
+          <details class="trace-row trace-row--edit" data-transcript-key={workRowAnchorKey(anchorKey, index)}>
             <summary class="trace-time-anchor" data-time={traceTimeLabel(row.block)}>
               <span class="trace-row__label">Edited</span>
               <span class="trace-row__file">{editTarget(row.block)}</span>
@@ -4607,7 +4806,7 @@
           {@const commandExitLabel = Number.isFinite(commandExitCode) ? `exit code ${commandExitCode}` : 'exit code -1'}
           {@const commandOutput = toolResultPreview(row.result)}
           {@const commandFullText = commandText(row.block) || prettyToolLabel(row.block.name || 'command')}
-          <details class="trace-row trace-row--cmd" class:trace-row--failed={commandFailed}>
+          <details class="trace-row trace-row--cmd" class:trace-row--failed={commandFailed} data-transcript-key={workRowAnchorKey(anchorKey, index)}>
             <summary class="trace-time-anchor" data-time={traceTimeLabelForRow(row.block, row.result)}><code class="trace-row__cmd"><span class="trace-row__prompt">$</span><span class="trace-row__cmd-text">{commandFullText}</span></code><ChevronRight size={12} class="trace-row__chevron" /></summary>
             <div class="code-panel code-panel--cmd">
               <div class="code-panel__head">
@@ -4625,7 +4824,7 @@
           {@const painterImages = painterImagesFromResult(row.result)}
           {@const painterText = toolResultPreview(row.result)}
           {@const prompt = painterPrompt(row.block, row.result)}
-          <details class="trace-row trace-row--painter" open={painterImages.length > 0}>
+          <details class="trace-row trace-row--painter" open={painterImages.length > 0} data-transcript-key={workRowAnchorKey(anchorKey, index)}>
             <summary class="trace-time-anchor" data-time={traceTimeLabelForRow(row.block, row.result)}>
               <span class="trace-row__label">{painterTitle(row.block)}</span>
               {#if prompt}
@@ -4662,7 +4861,7 @@
           </details>
         {:else if row.kind === 'review'}
           {@const review = codeReviewActions(row.block, row.result)}
-          <details class="trace-row trace-row--review" open={toolResultStatus(row.result) === 'in-progress' || toolResultStatus(row.result) === 'queued'}>
+          <details class="trace-row trace-row--review" open={toolResultStatus(row.result) === 'in-progress' || toolResultStatus(row.result) === 'queued'} data-transcript-key={workRowAnchorKey(anchorKey, index)}>
             <summary class="trace-time-anchor" data-time={traceTimeLabelForRow(row.block, row.result)}>
               <span class="trace-row__label">{codeReviewTitle(row.result)}</span>
               <span class="trace-row__sub">{review.summary}</span>
@@ -4680,7 +4879,7 @@
         {:else}
           {@const ranLabel = prettyToolLabel(row.block.name || '')}
           {@const ranSub = ranLabel === 'Ran tool' ? ranToolName(row.block) : toolSubtitle(row.block)}
-          <details class="trace-row trace-row--ran">
+          <details class="trace-row trace-row--ran" data-transcript-key={workRowAnchorKey(anchorKey, index)}>
             <summary class="trace-time-anchor" data-time={traceTimeLabel(row.block)}>
               <span class="trace-row__label">{ranLabel}</span>
               {#if ranSub}
@@ -5185,9 +5384,9 @@
                   <div>
                     {#each assistantTurnSegments(item.messages) as segment (segment.key)}
                       {#if segment.kind === 'work'}
-                        {@render workGroup(segment.blocks, segment.live)}
+                        {@render workGroup(segment.blocks, segment.live, segment.key)}
                       {:else}
-                        <div class:streaming-text={assistantTurnStreaming(item.messages)} class="md">{@html renderMarkdown(segment.block.text ?? '')}</div>
+                        <div class:streaming-text={assistantTurnStreaming(item.messages)} class="md" data-transcript-key={segment.key}>{@html renderMarkdown(segment.block.text ?? '')}</div>
                       {/if}
                     {/each}
                   </div>

@@ -1,8 +1,11 @@
 package amp
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -22,6 +25,8 @@ import (
 // clientAPIKeyContextKey is the context key used to pass the client API key
 // from gin.Context to the request context for SecretSource lookup.
 type clientAPIKeyContextKey struct{}
+
+const neoInternalClientAPIKeyHeader = "X-Cliproxy-Internal-Client-API-Key"
 
 // clientAPIKeyMiddleware injects the authenticated client API key from gin.Context["userApiKey"]
 // into the request context so that SecretSource can look it up for per-client upstream routing.
@@ -98,6 +103,11 @@ func (m *AmpModule) localhostOnlyMiddleware() gin.HandlerFunc {
 // This overwrites any global CORS headers set by the server.
 func noCORSMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if c.GetBool(ampWebLocalInferenceCORSContextKey) {
+			c.Next()
+			return
+		}
+
 		// Remove CORS headers to prevent cross-origin access from browsers
 		c.Header("Access-Control-Allow-Origin", "")
 		c.Header("Access-Control-Allow-Methods", "")
@@ -119,7 +129,7 @@ func noCORSMiddleware() gin.HandlerFunc {
 func (m *AmpModule) managementAvailabilityMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if m.getProxy() == nil {
-			if m.canServeNeoLocalManagement(c.Request) {
+			if m.canServeNeoLocalManagement(c) {
 				c.Next()
 				return
 			}
@@ -137,37 +147,100 @@ func (m *AmpModule) managementAvailabilityMiddleware() gin.HandlerFunc {
 func wrapManagementAuth(auth gin.HandlerFunc, prefixes ...string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		path := c.Request.URL.Path
-		if actorEngineRequest(c.Request) {
+		if !c.GetBool(ampWebLocalInferenceCORSContextKey) && actorEngineRequest(c.Request) {
 			c.Next()
 			return
 		}
-		for _, prefix := range prefixes {
-			if strings.HasPrefix(path, prefix) && (len(path) == len(prefix) || path[len(prefix)] == '/') {
-				c.Next()
-				return
-			}
+		if managementPathMatches(path, prefixes...) {
+			c.Next()
+			return
 		}
 		auth(c)
 	}
 }
 
+func wrapLocalConnectionManagementAuth(auth gin.HandlerFunc, prefixes ...string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if !c.GetBool(ampWebLocalInferenceCORSContextKey) && strings.TrimSpace(c.GetHeader("Origin")) == "" && managementPathMatches(c.Request.URL.Path, prefixes...) && requestRemoteAddrIsLocalConnection(c.Request) {
+			c.Next()
+			return
+		}
+		auth(c)
+	}
+}
+
+func managementPathMatches(path string, prefixes ...string) bool {
+	for _, prefix := range prefixes {
+		if strings.HasPrefix(path, prefix) && (len(path) == len(prefix) || path[len(prefix)] == '/') {
+			return true
+		}
+	}
+	return false
+}
+
+func requestRemoteAddrIsLocalConnection(r *http.Request) bool {
+	ip := requestRemoteAddrIP(r)
+	if ip == nil {
+		return false
+	}
+	if ip.IsUnspecified() {
+		return false
+	}
+	if ip.IsLoopback() {
+		return true
+	}
+	localIP := requestLocalAddrIP(r)
+	return localIP != nil && ip.Equal(localIP)
+}
+
+func requestRemoteAddrIP(r *http.Request) net.IP {
+	if r == nil {
+		return nil
+	}
+	return requestAddrIP(r.RemoteAddr)
+}
+
+func requestLocalAddrIP(r *http.Request) net.IP {
+	if r == nil {
+		return nil
+	}
+	addr, _ := r.Context().Value(http.LocalAddrContextKey).(net.Addr)
+	if addr == nil {
+		return nil
+	}
+	return requestAddrIP(addr.String())
+}
+
+func requestAddrIP(addr string) net.IP {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	host = strings.Trim(host, "[]")
+	if zoneIndex := strings.LastIndex(host, "%"); zoneIndex >= 0 {
+		host = host[:zoneIndex]
+	}
+	return net.ParseIP(host)
+}
+
 // registerManagementRoutes registers Amp management proxy routes
-// These routes proxy through to the Amp control plane for OAuth, user management, etc.
 // Uses dynamic middleware and proxy getter for hot-reload support.
 // The auth middleware validates Authorization header against configured API keys.
 func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *handlers.BaseAPIHandler, auth gin.HandlerFunc) {
+	engine.GET("/ampcode/local-inference.user.js", m.serveWebLocalInferenceUserscript)
+
 	ampAPI := engine.Group("/api")
 
 	// Always disable CORS for management routes to prevent browser-based attacks
-	ampAPI.Use(m.managementAvailabilityMiddleware(), noCORSMiddleware())
+	ampAPI.Use(m.webLocalInferenceCORSMiddleware(), m.webLocalInferenceQueryAuthMiddleware(), m.managementAvailabilityMiddleware(), noCORSMiddleware())
 
-	// Apply dynamic localhost-only restriction (hot-reloadable via m.IsRestrictedToLocalhost())
+	// Apply the configured management host restriction before API-key auth.
 	ampAPI.Use(m.localhostOnlyMiddleware())
 
-	// Apply authentication middleware - requires valid API key in Authorization header
+	// Apply API-key auth, bypassing /api/internal only for loopback or same-address local connections.
 	var authWithBypass gin.HandlerFunc
 	if auth != nil {
-		ampAPI.Use(auth)
+		ampAPI.Use(wrapLocalConnectionManagementAuth(auth, "/api/internal"))
 		authWithBypass = wrapManagementAuth(auth, "/threads", "/auth", "/docs", "/settings")
 	}
 
@@ -197,9 +270,18 @@ func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *ha
 			}
 		}()
 
+		if m.tryServeNeoWebLocalInternalRPC(c) {
+			return
+		}
+		if m.tryServeNeoLocalInternalRPC(c) {
+			return
+		}
 		proxy := m.getProxy()
 		if proxy == nil {
 			c.JSON(503, gin.H{"error": "amp upstream proxy not available"})
+			return
+		}
+		if m.tryServeNeoLocalThreadSearchFallback(c, proxy) {
 			return
 		}
 		proxy.ServeHTTP(c.Writer, c.Request)
@@ -237,7 +319,7 @@ func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *ha
 
 	// Root-level routes that AMP CLI expects without /api prefix
 	// These need the same security middleware as the /api/* routes (dynamic for hot-reload)
-	rootMiddleware := []gin.HandlerFunc{m.managementAvailabilityMiddleware(), noCORSMiddleware(), m.localhostOnlyMiddleware()}
+	rootMiddleware := []gin.HandlerFunc{m.webLocalInferenceCORSMiddleware(), m.webLocalInferenceQueryAuthMiddleware(), m.managementAvailabilityMiddleware(), noCORSMiddleware(), m.localhostOnlyMiddleware()}
 	if authWithBypass != nil {
 		rootMiddleware = append(rootMiddleware, authWithBypass)
 	}
@@ -264,6 +346,7 @@ func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *ha
 	engine.Any("/gateway/*path", append(rootMiddleware, neoRuntimeBridgeHandler)...)
 	engine.Any("/actors", append(rootMiddleware, neoRuntimeBridgeHandler)...)
 	engine.Any("/actors/*path", append(rootMiddleware, neoRuntimeBridgeHandler)...)
+	engine.OPTIONS("/metadata", append(rootMiddleware, neoRuntimeBridgeHandler)...)
 	engine.GET("/metadata", append(rootMiddleware, neoRuntimeBridgeHandler)...)
 
 	// Root-level auth routes for CLI login flow
@@ -300,6 +383,271 @@ func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *ha
 	})
 }
 
+func (m *AmpModule) tryServeNeoLocalThreadSearchFallback(c *gin.Context, proxy *httputil.ReverseProxy) bool {
+	if m == nil || m.neoRuntime == nil || c == nil || c.Request == nil || c.Request.URL == nil || proxy == nil {
+		return false
+	}
+	if c.Request.Method != http.MethodGet || "/"+strings.Trim(c.Request.URL.Path, "/") != "/api/threads/find" {
+		return false
+	}
+	if !neoRuntimeEnabled(m.neoThreadConfigSnapshot()) {
+		return false
+	}
+
+	searchQuery := c.Request.URL.Query()
+	threadSearchProxy := *proxy
+	originalModifyResponse := proxy.ModifyResponse
+	threadSearchProxy.ModifyResponse = func(resp *http.Response) error {
+		if originalModifyResponse != nil {
+			if err := originalModifyResponse(resp); err != nil {
+				return err
+			}
+		}
+		if resp.StatusCode != http.StatusRequestTimeout || resp.Body == nil {
+			return nil
+		}
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return err
+		}
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			log.Debugf("amp thread search upstream timeout body close failed: %v", closeErr)
+		}
+		if neoThreadSearchTimeBudgetExceeded(body) {
+			if response, ok := m.neoRuntime.localThreadSearchResponse(searchQuery); ok {
+				fallbackBody, err := json.Marshal(response)
+				if err != nil {
+					return err
+				}
+				resp.StatusCode = http.StatusOK
+				resp.Status = strconv.Itoa(http.StatusOK) + " " + http.StatusText(http.StatusOK)
+				resp.Body = io.NopCloser(bytes.NewReader(fallbackBody))
+				resp.ContentLength = int64(len(fallbackBody))
+				resp.Header.Del("Content-Encoding")
+				resp.Header.Set("Content-Length", strconv.FormatInt(resp.ContentLength, 10))
+				resp.Header.Set("Content-Type", "application/json")
+				return nil
+			}
+		}
+		resp.Body = io.NopCloser(bytes.NewReader(body))
+		resp.ContentLength = int64(len(body))
+		resp.Header.Set("Content-Length", strconv.FormatInt(resp.ContentLength, 10))
+		return nil
+	}
+	threadSearchProxy.ServeHTTP(c.Writer, c.Request)
+	return true
+}
+
+func neoThreadSearchTimeBudgetExceeded(body []byte) bool {
+	var response struct {
+		Code  string `json:"code"`
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &response); err != nil {
+		return false
+	}
+	return response.Code == "time-budget-exceeded" || response.Error.Code == "time-budget-exceeded"
+}
+
+func (m *AmpModule) tryServeNeoWebLocalInternalRPC(c *gin.Context) bool {
+	if !c.GetBool(ampWebLocalInferenceCORSContextKey) {
+		return false
+	}
+	method, params, ok := neoWebLocalInternalRPCRequest(c.Request)
+	if !ok || m == nil || m.neoRuntime == nil {
+		return false
+	}
+	response, status, ok := m.neoRuntime.neoWebLocalInternalRPCResponse(method, params)
+	if !ok {
+		return false
+	}
+	writeNeoJSON(c.Writer, status, response)
+	return true
+}
+
+func (m *AmpModule) canServeNeoWebLocalInternalRPC(c *gin.Context) bool {
+	if c == nil || !c.GetBool(ampWebLocalInferenceCORSContextKey) {
+		return false
+	}
+	method, params, ok := neoWebLocalInternalRPCRequest(c.Request)
+	if !ok || m == nil || m.neoRuntime == nil || m.neoRuntime.store == nil {
+		return false
+	}
+	cfg := m.neoThreadConfigSnapshot()
+	if cfg == nil || !neoRuntimeEnabled(cfg) {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(method)) {
+	case "listthreads":
+		return true
+	case "loadthreads":
+		return len(neoInternalRPCThreadIDs(params)) > 0
+	default:
+		threadID := neoInternalRPCThreadID(params)
+		if !neoThreadIDExactPattern.MatchString(threadID) {
+			return false
+		}
+		actor := m.neoRuntime.store.lookupThreadActor(threadID)
+		return actor != nil && actor.hasLocalThreadBootstrapState()
+	}
+}
+
+func neoWebLocalInternalRPCRequest(r *http.Request) (string, map[string]any, bool) {
+	if r == nil || r.URL == nil || r.Method != http.MethodPost {
+		return "", nil, false
+	}
+	if strings.TrimSpace(r.Header.Get(ampWebLocalInferenceHeader)) == "" {
+		return "", nil, false
+	}
+	if "/"+strings.Trim(r.URL.Path, "/") != "/api/internal" {
+		return "", nil, false
+	}
+	body := readAndRestoreNeoJSONBody(r)
+	method := strings.TrimSpace(stringValue(body["method"]))
+	if method == "" {
+		method = neoInternalQueryMethod(r.URL.RawQuery)
+	}
+	if !neoWebLocalInternalRPCSupported(method) {
+		return "", nil, false
+	}
+	return method, mapValue(body["params"]), true
+}
+
+func neoWebLocalInternalRPCSupported(method string) bool {
+	if neoLocalInternalRPCSupported(method) {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(method)) {
+	case "listthreads", "loadthreads", "getthread", "readthread", "getthreadtail", "loadthreadtail", "getthreadmeta":
+		return true
+	default:
+		return false
+	}
+}
+
+func (m *AmpModule) tryServeNeoLocalInternalRPC(c *gin.Context) bool {
+	method, params, ok := neoLocalInternalRPCRequest(c.Request)
+	if !ok {
+		return false
+	}
+	threadID := neoInternalRPCThreadID(params)
+	if !neoThreadIDExactPattern.MatchString(threadID) {
+		return false
+	}
+	actor := m.neoLocalInternalRPCActor(threadID)
+	if actor == nil {
+		return false
+	}
+	response, status, ok := actor.neoLocalInternalRPCResponse(method, params)
+	if !ok {
+		return false
+	}
+	writeNeoJSON(c.Writer, status, response)
+	return true
+}
+
+func neoLocalInternalRPCRequest(r *http.Request) (string, map[string]any, bool) {
+	if r == nil || r.URL == nil || r.Method != http.MethodPost {
+		return "", nil, false
+	}
+	if "/"+strings.Trim(r.URL.Path, "/") != "/api/internal" {
+		return "", nil, false
+	}
+	body := readAndRestoreNeoJSONBody(r)
+	method := strings.TrimSpace(stringValue(body["method"]))
+	if method == "" {
+		method = neoInternalQueryMethod(r.URL.RawQuery)
+	}
+	if !neoLocalInternalRPCSupported(method) {
+		return "", nil, false
+	}
+	return method, mapValue(body["params"]), true
+}
+
+func neoLocalInternalRPCSupported(method string) bool {
+	switch strings.ToLower(strings.TrimSpace(method)) {
+	case "getthreadlabels", "setthreadlabels", "addthreadlabels", "archivethread":
+		return true
+	default:
+		return false
+	}
+}
+
+func neoInternalRPCThreadID(params map[string]any) string {
+	return firstNonEmptyString(
+		params["thread"], params["threadID"], params["threadId"], params["thread_id"],
+		findThreadID(params),
+	)
+}
+
+func neoInternalRPCThreadIDs(params map[string]any) []string {
+	if len(params) == 0 {
+		return nil
+	}
+	rawThreads := firstNonNil(params["threads"], params["threadIDs"], params["threadIds"], params["thread_ids"])
+	candidates := stringArrayValue(rawThreads)
+	if len(candidates) == 0 {
+		if threadID := neoInternalRPCThreadID(params); threadID != "" {
+			candidates = []any{threadID}
+		}
+	}
+	out := make([]string, 0, len(candidates))
+	seen := map[string]struct{}{}
+	for _, rawThreadID := range candidates {
+		threadID := strings.TrimSpace(stringValue(rawThreadID))
+		if !neoThreadIDExactPattern.MatchString(threadID) {
+			continue
+		}
+		if _, exists := seen[threadID]; exists {
+			continue
+		}
+		seen[threadID] = struct{}{}
+		out = append(out, threadID)
+	}
+	return out
+}
+
+func (m *AmpModule) neoLocalInternalRPCActor(threadID string) *neoActor {
+	if m == nil || m.neoRuntime == nil || m.neoRuntime.store == nil || !neoThreadIDExactPattern.MatchString(threadID) {
+		return nil
+	}
+	cfg := m.neoThreadConfigSnapshot()
+	if !neoRuntimeEnabled(cfg) {
+		return nil
+	}
+	actor := m.neoRuntime.store.lookupThreadActor(threadID)
+	if actor == nil || !actor.hasLocalThreadBootstrapState() {
+		return nil
+	}
+	return actor
+}
+
+func neoInternalQueryMethod(rawQuery string) string {
+	rawQuery = strings.TrimSpace(rawQuery)
+	if rawQuery == "" {
+		return ""
+	}
+	if !strings.ContainsAny(rawQuery, "=&") {
+		if decoded, err := url.QueryUnescape(rawQuery); err == nil {
+			rawQuery = decoded
+		}
+		return strings.TrimSpace(rawQuery)
+	}
+	values, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return ""
+	}
+	if method := strings.TrimSpace(values.Get("method")); method != "" {
+		return method
+	}
+	if _, ok := values["getThread"]; ok {
+		return "getThread"
+	}
+	return ""
+}
+
 func (m *AmpModule) shouldServeNeoRuntimeBridge(r *http.Request) bool {
 	return m != nil && m.neoRuntime != nil && neoRuntimeBridgeRequest(r)
 }
@@ -309,6 +657,7 @@ func (m *AmpModule) serveNeoRuntimeBridge(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "amp neo local runtime not available"})
 		return
 	}
+	clientAPIKey := getClientAPIKeyFromContext(c.Request.Context())
 	target := &url.URL{
 		Scheme: "http",
 		Host:   net.JoinHostPort(m.neoRuntime.host, strconv.Itoa(m.neoRuntime.port)),
@@ -325,6 +674,14 @@ func (m *AmpModule) serveNeoRuntimeBridge(c *gin.Context) {
 		req.URL.Scheme = target.Scheme
 		req.URL.Host = target.Host
 		req.Host = target.Host
+		// Newer Amp binaries move the metadata probe and gateway transport under
+		// /actors/; rewrite those back to the legacy paths the local engine serves.
+		if req.URL != nil {
+			if stripped := neoStripActorsRivetPrefix(req.URL.Path); stripped != req.URL.Path {
+				req.URL.Path = stripped
+				req.URL.RawPath = ""
+			}
+		}
 		if originalHost != "" && strings.TrimSpace(req.Header.Get("X-Forwarded-Host")) == "" {
 			req.Header.Set("X-Forwarded-Host", originalHost)
 		}
@@ -332,6 +689,9 @@ func (m *AmpModule) serveNeoRuntimeBridge(c *gin.Context) {
 			req.Header.Set("X-Forwarded-Proto", originalProto)
 		}
 		stripNeoRuntimeBridgeCredentials(req)
+		if clientAPIKey != "" {
+			req.Header.Set(neoInternalClientAPIKeyHeader, clientAPIKey)
+		}
 	}
 	proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
 		log.WithError(err).Warn("amp neo local runtime bridge failed")
@@ -344,6 +704,26 @@ func (m *AmpModule) serveNeoRuntimeBridge(c *gin.Context) {
 	proxy.ServeHTTP(c.Writer, c.Request)
 }
 
+func neoThreadIDFromBridgeRequest(r *http.Request) string {
+	if r == nil || r.URL == nil {
+		return ""
+	}
+	q := r.URL.Query()
+	for _, value := range []string{q.Get("rvt-key"), q.Get("key")} {
+		if threadID := neoThreadIDFromGatewayKey(value); threadID != "" {
+			return threadID
+		}
+	}
+	if input := decodeNeoGatewayInput(q.Get("rvt-input")); input != nil {
+		for _, candidate := range []any{input, mapValue(input)["input"], parseJSONString(mapValue(input)["input"])} {
+			if threadID := findThreadID(candidate); neoThreadIDExactPattern.MatchString(threadID) {
+				return threadID
+			}
+		}
+	}
+	return ""
+}
+
 func stripNeoRuntimeBridgeCredentials(req *http.Request) {
 	if req == nil {
 		return
@@ -352,6 +732,7 @@ func stripNeoRuntimeBridgeCredentials(req *http.Request) {
 	req.Header.Del("X-Api-Key")
 	req.Header.Del("X-Goog-Api-Key")
 	req.Header.Del("X-Rivet-Token")
+	req.Header.Del(neoInternalClientAPIKeyHeader)
 	if protocols := stripNeoCredentialSubprotocols(req.Header.Get("Sec-WebSocket-Protocol")); protocols != "" {
 		req.Header.Set("Sec-WebSocket-Protocol", protocols)
 	} else {
@@ -364,6 +745,7 @@ func stripNeoRuntimeBridgeCredentials(req *http.Request) {
 	query.Del("auth_token")
 	query.Del("access_token")
 	query.Del("rvt-token")
+	query.Del(ampWebLocalInferenceAPIKeyQuery)
 	req.URL.RawQuery = query.Encode()
 }
 
@@ -470,7 +852,7 @@ func (m *AmpModule) registerProviderAliases(engine *gin.Engine, baseHandler *han
 	v1betaAmp := provider.Group("/v1beta")
 	{
 		v1betaAmp.GET("/models", geminiHandlers.GeminiModels)
-		v1betaAmp.POST("/models/*action", fallbackHandler.WrapHandler(geminiHandlers.GeminiHandler))
+		v1betaAmp.POST("/models/*action", fallbackHandler.WrapHandler(withMappedGeminiAction(geminiHandlers.GeminiHandler)))
 		v1betaAmp.GET("/models/*action", geminiHandlers.GeminiGetHandler)
 	}
 }
