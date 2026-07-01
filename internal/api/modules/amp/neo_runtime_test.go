@@ -7731,6 +7731,136 @@ func TestNeoActorToolProgressTerminalSnapshotCompletesMessage(t *testing.T) {
 	if len(actor.history) != 1 || actor.history[0].ToolCallID != "TU-shell" || actor.history[0].Text != "workspace" {
 		t.Fatalf("history = %#v, want terminal tool result", actor.history)
 	}
+	protocolBlock := mapValue(arrayValue(message.protocol()["content"])[0])
+	if stringValue(protocolBlock["status"]) != "done" || stringValue(protocolBlock["output"]) != "workspace" {
+		t.Fatalf("protocol tool result block = %#v, want visible done output", protocolBlock)
+	}
+	if _, exists := protocolBlock["completionStatus"]; exists {
+		t.Fatalf("protocol tool result block leaked completionStatus: %#v", protocolBlock)
+	}
+}
+
+func TestNeoMessageProtocolUserContentNormalizesBeforeToolDisplay(t *testing.T) {
+	message := neoMessage{
+		ThreadID:  "T-test",
+		MessageID: "M-user",
+		Role:      "user",
+		Content: []any{
+			map[string]any{"type": "text", "text": "hello", "extra": "kept"},
+			map[string]any{"type": "debug", "text": "drop me"},
+			map[string]any{"type": "tool_result", "toolUseId": "TU-choice", "run": map[string]any{"status": "done", "result": map[string]any{"exitCode": 0, "output": "User selected option 2: Bravo"}}, "userInput": map[string]any{"accepted": true, "unknown": "drop"}},
+		},
+	}
+
+	content := arrayValue(message.protocol()["content"])
+	if len(content) != 2 {
+		t.Fatalf("protocol content = %#v, want normalized text plus tool result", content)
+	}
+	text := mapValue(content[0])
+	if stringValue(text["type"]) != "text" || stringValue(text["text"]) != "hello" {
+		t.Fatalf("text block = %#v", text)
+	}
+	tool := mapValue(content[1])
+	if stringValue(tool["toolUseID"]) != "TU-choice" || stringValue(tool["status"]) != "done" || stringValue(tool["output"]) != "User selected option 2: Bravo" {
+		t.Fatalf("tool result block = %#v", tool)
+	}
+	if _, exists := tool["toolUseId"]; exists {
+		t.Fatalf("tool result leaked alias field: %#v", tool)
+	}
+	userInput := mapValue(tool["userInput"])
+	if boolValue(userInput["accepted"]) != true || userInput["unknown"] != nil {
+		t.Fatalf("userInput = %#v, want normalized accepted only", userInput)
+	}
+}
+
+func TestNeoMessageProtocolUserContentPreservesLegacyToolResult(t *testing.T) {
+	message := neoMessage{
+		ThreadID:  "T-test",
+		MessageID: "M-user",
+		Role:      "user",
+		Content: []any{
+			map[string]any{"type": "debug", "text": "drop me"},
+			map[string]any{"type": "tool_result", "toolUseID": "TU-legacy", "content": "tool output"},
+		},
+	}
+
+	content := arrayValue(message.protocol()["content"])
+	if len(content) != 1 {
+		t.Fatalf("protocol content = %#v, want legacy tool result only", content)
+	}
+	legacy := mapValue(content[0])
+	if stringValue(legacy["toolUseID"]) != "TU-legacy" || stringValue(legacy["content"]) != "tool output" {
+		t.Fatalf("legacy tool result = %#v", legacy)
+	}
+	if _, exists := legacy["status"]; exists {
+		t.Fatalf("legacy tool result should not synthesize status without run: %#v", legacy)
+	}
+}
+
+func TestNeoProtocolToolResultDisplayErrorText(t *testing.T) {
+	block := neoProtocolToolResultDisplayBlock(map[string]any{
+		"type":      "tool_result",
+		"toolUseID": "TU-choice",
+		"run": map[string]any{
+			"status": "rejected-by-user",
+			"reason": "User rejected option 2: Bravo",
+		},
+	})
+
+	if stringValue(block["status"]) != "error" || stringValue(block["error"]) != "User rejected option 2: Bravo" {
+		t.Fatalf("display block = %#v, want visible error text", block)
+	}
+}
+
+func TestNeoProtocolToolResultDisplayDoesNotSynthesizeJSONText(t *testing.T) {
+	doneBlock := neoProtocolToolResultDisplayBlock(map[string]any{
+		"type":      "tool_result",
+		"toolUseID": "TU-done",
+		"run":       map[string]any{"status": "done"},
+	})
+	if stringValue(doneBlock["status"]) != "done" {
+		t.Fatalf("done block status = %#v", doneBlock)
+	}
+	if _, exists := doneBlock["output"]; exists {
+		t.Fatalf("done block synthesized output without display text: %#v", doneBlock)
+	}
+
+	errorBlock := neoProtocolToolResultDisplayBlock(map[string]any{
+		"type":      "tool_result",
+		"toolUseID": "TU-error",
+		"run":       map[string]any{"status": "error"},
+	})
+	if stringValue(errorBlock["status"]) != "error" {
+		t.Fatalf("error block status = %#v", errorBlock)
+	}
+	if _, exists := errorBlock["error"]; exists {
+		t.Fatalf("error block synthesized error without display text: %#v", errorBlock)
+	}
+}
+
+func TestNeoProtocolToolResultStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "done", in: "done", want: "done"},
+		{name: "error", in: "error", want: "error"},
+		{name: "rejected", in: "rejected-by-user", want: "error"},
+		{name: "cancelled", in: "cancelled", want: "cancelled"},
+		{name: "in progress", in: "in-progress", want: "running"},
+		{name: "cancellation requested", in: "cancellation-requested", want: "running"},
+		{name: "queued", in: "queued", want: "pending"},
+		{name: "blocked", in: "blocked-on-user", want: "pending"},
+		{name: "trim and case", in: " DONE ", want: "done"},
+		{name: "unknown", in: "waiting", want: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := neoProtocolToolResultStatus(tc.in); got != tc.want {
+				t.Fatalf("neoProtocolToolResultStatus(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
 }
 
 func TestNeoActorProtocolErrorAndCancelClearRuntimeState(t *testing.T) {
@@ -12781,9 +12911,12 @@ func TestNeoReviewModeRouteAndPrompt(t *testing.T) {
 	for _, want := range []string{
 		// recovered amp-classic review-agent body
 		"You are an expert senior engineer",
+		"Review adversarially",
 		"git diff --merge-base origin/HEAD HEAD",
 		"more than 100 changed files or is more than 10,000 lines",
 		// bridge to the gaac893 run_check/submit_review protocol
+		"look for .agents/checks/*.md",
+		"set checkName to frontmatter.name",
 		"run_check exactly once per check",
 		"submit_review tool; call it exactly once",
 		"empty comments array",
@@ -18505,6 +18638,10 @@ func TestNeoActorBinaryToolDataAcceptsTopLevelPluginResult(t *testing.T) {
 	if len(actor.history) != 2 || actor.history[1].Role != "tool" || actor.history[1].Text != "User selected option 2: Bravo" {
 		t.Fatalf("history = %#v", actor.history)
 	}
+	protocolBlock := mapValue(arrayValue(actor.messages[1].protocol()["content"])[0])
+	if stringValue(protocolBlock["status"]) != "done" || stringValue(protocolBlock["output"]) != "User selected option 2: Bravo" {
+		t.Fatalf("protocol tool result block = %#v", protocolBlock)
+	}
 	if _, exists := actor.pendingTools["TU-choice"]; exists {
 		t.Fatalf("pending tool was not cleared: %#v", actor.pendingTools)
 	}
@@ -21607,6 +21744,10 @@ func TestNeoActorToolResultAcceptsTopLevelPluginResult(t *testing.T) {
 	}
 	if len(actor.messages) != 1 || runToText(mapValue(actor.messages[0].Content[0])["run"]) != "User selected option 2: Bravo" {
 		t.Fatalf("tool result message = %#v", actor.messages)
+	}
+	protocolBlock := mapValue(arrayValue(actor.messages[0].protocol()["content"])[0])
+	if stringValue(protocolBlock["status"]) != "done" || stringValue(protocolBlock["output"]) != "User selected option 2: Bravo" {
+		t.Fatalf("protocol tool result block = %#v", protocolBlock)
 	}
 	if _, exists := actor.pendingTools["TU-choice"]; exists {
 		t.Fatalf("pending tool was not cleared: %#v", actor.pendingTools)

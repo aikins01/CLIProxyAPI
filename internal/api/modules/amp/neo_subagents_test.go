@@ -118,6 +118,10 @@ func TestNeoSubagentInputText(t *testing.T) {
 	if strings.Contains(uriOnlyRunCheck, "<content>") {
 		t.Fatalf("uri-only run_check unexpectedly embedded content:\n%s", uriOnlyRunCheck)
 	}
+	runCheckDef, ok := neoSubagentDefFor("run_check")
+	if !ok || !strings.Contains(runCheckDef.SystemPrompt, "Evaluate adversarially within the check's criteria") {
+		t.Fatalf("run_check system prompt missing adversarial check guidance")
+	}
 }
 
 func TestNeoRunCheckToolSpecAcceptsInstructions(t *testing.T) {

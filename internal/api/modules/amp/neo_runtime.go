@@ -5284,6 +5284,87 @@ func neoProtocolInfoContent(content []any) []any {
 	return normalizeNeoProtocolContent("info", content, false)
 }
 
+func neoProtocolUserContent(content []any) []any {
+	out := make([]any, 0, len(content))
+	for _, raw := range content {
+		block, ok := normalizeNeoProtocolUserBlock(raw)
+		if !ok {
+			rawBlock := mapValue(raw)
+			if stringValue(rawBlock["type"]) == "tool_result" {
+				out = append(out, cloneNeoJSONMap(rawBlock))
+			}
+			continue
+		}
+		if stringValue(block["type"]) == "tool_result" {
+			out = append(out, neoProtocolToolResultDisplayBlock(block))
+			continue
+		}
+		out = append(out, block)
+	}
+	return out
+}
+
+func neoProtocolToolResultDisplayBlock(block map[string]any) map[string]any {
+	out := cloneNeoJSONMap(block)
+	run := neoPromoteToolRunOutput(mapValue(out["run"]))
+	if len(run) == 0 {
+		return out
+	}
+	status := neoProtocolToolResultStatus(stringValue(run["status"]))
+	if status == "" {
+		return out
+	}
+	out["status"] = status
+	if status == "done" {
+		if output := neoProtocolToolRunDisplayText(run); output != "" {
+			out["output"] = output
+		}
+	}
+	if status == "error" {
+		if errText := neoProtocolToolRunDisplayText(run); errText != "" {
+			out["error"] = errText
+		}
+	}
+	return out
+}
+
+func neoProtocolToolRunDisplayText(run map[string]any) string {
+	if value := firstNonEmptyString(run["output"], run["displayMessage"], run["message"], run["reason"], run["text"], nestedValue(run["error"], "message"), run["error"]); value != "" {
+		return value
+	}
+	if images := neoToolRunImages(run); len(images) > 0 {
+		return neoImageToolText(stringValue(run["toolName"]), len(images))
+	}
+	result, exists := run["result"]
+	if !exists {
+		return ""
+	}
+	if image, ok := neoReadImageResultBlock(mapValue(result)); ok {
+		return neoToolImageLabel(image)
+	}
+	if text := stringValue(result); text != "" {
+		return text
+	}
+	return neoToolRunTextResult(result)
+}
+
+func neoProtocolToolResultStatus(status string) string {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "done":
+		return "done"
+	case "error", "rejected-by-user":
+		return "error"
+	case "cancelled":
+		return "cancelled"
+	case "in-progress", "cancellation-requested":
+		return "running"
+	case "queued", "blocked-on-user":
+		return "pending"
+	default:
+		return ""
+	}
+}
+
 func normalizeNeoProtocolAssistantBlock(raw any, delta bool) (map[string]any, bool) {
 	block := mapValue(raw)
 	if len(block) == 0 {
@@ -5401,6 +5482,9 @@ func normalizeNeoProtocolToolResultBlock(block map[string]any) (map[string]any, 
 	out["type"] = "tool_result"
 	out["toolUseID"] = toolUseID
 	out["run"] = cloneNeoJSONMap(run)
+	delete(out, "toolUseId")
+	delete(out, "tool_use_id")
+	delete(out, "toolCallId")
 	if userInput, ok := normalizeNeoProtocolToolResultUserInput(out["userInput"]); ok {
 		out["userInput"] = userInput
 	} else {
@@ -17942,6 +18026,8 @@ func (m neoMessage) protocol() map[string]any {
 	content := m.Content
 	if m.Role == "info" {
 		content = neoProtocolInfoContent(m.Content)
+	} else if m.Role == "user" {
+		content = neoProtocolUserContent(m.Content)
 	}
 	out := map[string]any{
 		"threadId":  m.ThreadID,
