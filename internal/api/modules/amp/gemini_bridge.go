@@ -28,23 +28,10 @@ func createGeminiBridgeHandler(handler gin.HandlerFunc) gin.HandlerFunc {
 			// Extract everything after modelsPrefix
 			actionPart := path[idx+len(modelsPrefix):]
 
-			// Check if model was mapped by FallbackHandler
-			if mappedModel, exists := c.Get(MappedModelContextKey); exists {
-				if strModel, ok := mappedModel.(string); ok && strModel != "" {
-					// Replace the model part in the action
-					// actionPart is like "model-name:method"
-					if colonIdx := strings.Index(actionPart, ":"); colonIdx > 0 {
-						method := actionPart[colonIdx:] // ":method"
-						actionPart = strModel + method
-					}
-				}
-			}
+			actionPart = mappedGeminiAction(actionPart, c)
 
 			// Set this as the :action parameter that the Gemini handler expects
-			c.Params = append(c.Params, gin.Param{
-				Key:   "action",
-				Value: actionPart,
-			})
+			setGeminiActionParam(c, actionPart)
 
 			// Call the handler
 			handler(c)
@@ -62,4 +49,39 @@ func createGeminiBridgeHandler(handler gin.HandlerFunc) gin.HandlerFunc {
 			},
 		})
 	}
+}
+
+func withMappedGeminiAction(handler gin.HandlerFunc) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if action := c.Param("action"); action != "" {
+			setGeminiActionParam(c, mappedGeminiAction(action, c))
+		}
+		handler(c)
+	}
+}
+
+func mappedGeminiAction(action string, c *gin.Context) string {
+	action = strings.TrimPrefix(action, "/")
+	mappedModel, exists := c.Get(MappedModelContextKey)
+	if !exists {
+		return action
+	}
+	strModel, ok := mappedModel.(string)
+	if !ok || strModel == "" {
+		return action
+	}
+	if colonIdx := strings.Index(action, ":"); colonIdx > 0 {
+		return strModel + action[colonIdx:]
+	}
+	return action
+}
+
+func setGeminiActionParam(c *gin.Context, action string) {
+	for i := range c.Params {
+		if c.Params[i].Key == "action" {
+			c.Params[i].Value = action
+			return
+		}
+	}
+	c.Params = append(c.Params, gin.Param{Key: "action", Value: action})
 }

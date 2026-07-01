@@ -267,6 +267,8 @@ func logAmpRouting(routeType AmpRouteType, requestedModel, resolvedModel, provid
 type FallbackHandler struct {
 	getProxy               func() *httputil.ReverseProxy
 	modelMapper            ModelMapper
+	fallbackMapper         ModelMapper
+	failureBreaker         *neoModelFailureBreaker
 	forceModelMappings     func() bool
 	compactionCaptureDirMu sync.RWMutex
 	compactionCaptureDir   string
@@ -289,6 +291,7 @@ func NewFallbackHandlerWithMapper(getProxy func() *httputil.ReverseProxy, mapper
 	return &FallbackHandler{
 		getProxy:           getProxy,
 		modelMapper:        mapper,
+		failureBreaker:     newNeoModelFailureBreaker(0),
 		forceModelMappings: forceModelMappings,
 	}
 }
@@ -296,6 +299,14 @@ func NewFallbackHandlerWithMapper(getProxy func() *httputil.ReverseProxy, mapper
 // SetModelMapper sets the model mapper for this handler (allows late binding)
 func (fh *FallbackHandler) SetModelMapper(mapper ModelMapper) {
 	fh.modelMapper = mapper
+}
+
+// SetFallbackMapper sets the on-failure fallback mapper for this handler (late binding).
+func (fh *FallbackHandler) SetFallbackMapper(mapper ModelMapper) {
+	fh.fallbackMapper = mapper
+	if fh.failureBreaker == nil {
+		fh.failureBreaker = newNeoModelFailureBreaker(0)
+	}
 }
 
 // SetCompactionCaptureDir updates the optional directory used to capture Amp
@@ -401,6 +412,16 @@ func (fh *FallbackHandler) WrapHandler(handler gin.HandlerFunc) gin.HandlerFunc 
 			return mappedModel, mappedProviders
 		}
 
+		ampProviderRequest := localNeoAmpProviderRequest(c)
+		fallbackTarget := fh.fallbackTargetFor(modelName, normalizedModel)
+		if fallbackTarget != "" && !ampProviderRequest {
+			if fh.failureBreaker.tripped(normalizedModel) {
+				log.Debugf("amp model fallback: %s in cooldown, routing to %s", normalizedModel, fallbackTarget)
+				fh.routeFallbackModel(c, handler, modelName, fallbackTarget, requestPath, bodyBytes)
+				return
+			}
+		}
+
 		// Track resolved model for logging (may change if mapping is applied)
 		resolvedModel := normalizedModel
 		usedMapping := false
@@ -463,10 +484,19 @@ func (fh *FallbackHandler) WrapHandler(handler gin.HandlerFunc) gin.HandlerFunc 
 			return true
 		}
 
-		// If this request came from the local Neo runtime, keep inference local.
-		// Normal Amp binary provider requests can still fall back to ampcode.com.
+		// Local Neo keeps third-party misses local and may use configured fallback.
+		// The local Neo amp provider is the Amp credits route, so those requests
+		// intentionally ignore fallback overrides and can proxy upstream.
 		if len(providers) == 0 {
-			if c.GetHeader(localNeoInferenceHeader) == "1" {
+			// A configured on-failure fallback also covers "no local provider at all"
+			// (e.g. the Gemini Vertex auth was removed): route to the fallback model
+			// rather than spending Amp credits on ampcode.com. This keeps inference local.
+			if fallbackTarget != "" && !ampProviderRequest {
+				log.Warnf("amp model fallback: no local provider for %s; routing to %s instead of amp credits", normalizedModel, fallbackTarget)
+				fh.routeFallbackModel(c, handler, modelName, fallbackTarget, requestPath, bodyBytes)
+				return
+			}
+			if c.GetHeader(localNeoInferenceHeader) == "1" && !ampProviderRequest {
 				logAmpRouting(RouteTypeNoProvider, modelName, "", "", requestPath)
 				c.AbortWithStatusJSON(http.StatusBadGateway, gin.H{
 					"error":   "local_neo_provider_unavailable",
@@ -508,7 +538,14 @@ func (fh *FallbackHandler) WrapHandler(handler gin.HandlerFunc) gin.HandlerFunc 
 			// Wrap with ResponseRewriter for local providers too, because upstream
 			// proxies (e.g. NewAPI) may return a different model name and lack
 			// Amp-required fields like thinking.signature.
-			rewriter := NewResponseRewriter(c.Writer, modelName)
+			originalWriter := c.Writer
+			var probeWriter *neoFallbackProbeWriter
+			targetWriter := c.Writer
+			if fallbackTarget != "" {
+				probeWriter = newNeoFallbackProbeWriter(c.Writer)
+				targetWriter = probeWriter
+			}
+			rewriter := NewResponseRewriter(targetWriter, modelName)
 			rewriter.suppressThinking = providerName != "claude"
 			c.Writer = rewriter
 			// Filter Anthropic-Beta header only for local handling paths
@@ -516,12 +553,34 @@ func (fh *FallbackHandler) WrapHandler(handler gin.HandlerFunc) gin.HandlerFunc 
 			c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 			handler(c)
 			rewriter.Flush()
+			if probeWriter != nil {
+				c.Writer = originalWriter
+				if probeWriter.shouldFallback() {
+					fh.failureBreaker.trip(normalizedModel)
+					log.Warnf("amp model fallback: %s returned %d; routing to %s for %s", normalizedModel, probeWriter.Status(), fallbackTarget, fh.failureBreaker.cooldown)
+					fh.routeFallbackModel(c, handler, modelName, fallbackTarget, requestPath, bodyBytes)
+					return
+				}
+				probeWriter.finish()
+			}
 		} else {
 			// No provider, no mapping, no proxy: fall back to the wrapped handler so it can return an error response
 			c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 			handler(c)
 		}
 	}
+}
+
+// Local Neo amp provider requests are credits-based and intentionally bypass
+// fallback overrides, unlike third-party providers that may be unavailable locally.
+func localNeoAmpProviderRequest(c *gin.Context) bool {
+	if c == nil {
+		return false
+	}
+	if c.GetHeader(localNeoInferenceHeader) != "1" {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(c.Param("provider")), "amp")
 }
 
 // filterAntropicBetaHeader filters Anthropic-Beta header to remove features requiring special subscription
@@ -563,6 +622,7 @@ func extractModelFromRequest(body []byte, c *gin.Context) string {
 	// For Gemini requests, model is in the URL path
 	// Standard format: /models/{model}:generateContent -> :action parameter
 	if action := c.Param("action"); action != "" {
+		action = strings.TrimPrefix(action, "/")
 		// Split by colon to get model name (e.g., "gemini-pro:generateContent" -> "gemini-pro")
 		parts := strings.Split(action, ":")
 		if len(parts) > 0 && parts[0] != "" {

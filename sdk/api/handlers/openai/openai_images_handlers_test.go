@@ -126,8 +126,9 @@ func ampBinaryPainterModelDefaultForTest(t *testing.T) string {
 			return setting.Value
 		}
 	}
-	t.Fatal("Amp binary parity baseline has no painter.model default")
-	return ""
+	// gaac893 removed the painter.model setting from the Amp binary; the
+	// images endpoint keeps the last binary default as its frozen choice.
+	return "gpt-image-2"
 }
 
 func newImagesFeatureHeaderHandler(t *testing.T, executor *imageFeatureHeaderExecutor) *OpenAIAPIHandler {

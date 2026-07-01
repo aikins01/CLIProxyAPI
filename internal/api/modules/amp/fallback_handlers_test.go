@@ -130,6 +130,223 @@ func TestFallbackHandler_LocalNeoInferenceFailsClosedBeforeAmpProxy(t *testing.T
 	}
 }
 
+func TestFallbackHandler_LocalNeoAmpProviderFallsBackToAmpProxy(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	upstreamRequests := make(chan http.Header, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequests <- r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"amp-upstream"}`))
+	}))
+	defer upstream.Close()
+
+	proxy, err := createReverseProxy(upstream.URL, NewStaticSecretSource("amp-secret"))
+	if err != nil {
+		t.Fatalf("create reverse proxy: %v", err)
+	}
+	fallback := NewFallbackHandlerWithMapper(func() *httputil.ReverseProxy { return proxy }, nil, nil)
+
+	r := gin.New()
+	r.POST("/api/provider/:provider/v1/chat/completions", fallback.WrapHandler(func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"unexpected": true})
+	}))
+	server := httptest.NewServer(r)
+	defer server.Close()
+
+	reqBody := []byte(`{"model":"amp-nostromo-v1","messages":[{"role":"user","content":"hi"}]}`)
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/api/provider/amp/v1/chat/completions", bytes.NewReader(reqBody))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(localNeoInferenceHeader, "1")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request fallback route: %v", err)
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d body=%s", resp.StatusCode, respBody)
+	}
+	if !bytes.Contains(respBody, []byte(`amp-upstream`)) {
+		t.Fatalf("expected amp upstream response, got %s", respBody)
+	}
+
+	select {
+	case headers := <-upstreamRequests:
+		if headers.Get(localNeoInferenceHeader) != "" {
+			t.Fatalf("%s should be stripped before upstream proxy", localNeoInferenceHeader)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("local Neo amp provider request did not reach amp proxy")
+	}
+}
+
+func TestFallbackHandler_LocalNeoAmpProviderIgnoresModelFallback(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	upstreamBodies := make(chan []byte, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		upstreamBodies <- body
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"amp-upstream"}`))
+	}))
+	defer upstream.Close()
+
+	proxy, err := createReverseProxy(upstream.URL, NewStaticSecretSource("amp-secret"))
+	if err != nil {
+		t.Fatalf("create reverse proxy: %v", err)
+	}
+	fallback := NewFallbackHandlerWithMapper(func() *httputil.ReverseProxy { return proxy }, nil, nil)
+	fallback.SetFallbackMapper(stubFallbackMapper{target: "gpt-5.5"})
+	fallback.failureBreaker.trip("amp-nostromo-v1")
+
+	r := gin.New()
+	r.POST("/api/provider/:provider/v1/chat/completions", fallback.WrapHandler(func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"unexpected": true})
+	}))
+	server := httptest.NewServer(r)
+	defer server.Close()
+
+	reqBody := []byte(`{"model":"amp-nostromo-v1","messages":[{"role":"user","content":"hi"}]}`)
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/api/provider/amp/v1/chat/completions", bytes.NewReader(reqBody))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(localNeoInferenceHeader, "1")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request fallback route: %v", err)
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d body=%s", resp.StatusCode, respBody)
+	}
+	if !bytes.Contains(respBody, []byte(`amp-upstream`)) {
+		t.Fatalf("expected amp upstream response, got %s", respBody)
+	}
+
+	select {
+	case body := <-upstreamBodies:
+		if !bytes.Contains(body, []byte(`amp-nostromo-v1`)) || bytes.Contains(body, []byte(`gpt-5.5`)) {
+			t.Fatalf("upstream body = %s", body)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("local Neo amp provider request did not reach amp proxy")
+	}
+}
+
+func TestFallbackHandler_AmpProviderWithoutLocalNeoUsesModelFallback(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	upstreamCalls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"amp-upstream"}`))
+	}))
+	defer upstream.Close()
+
+	proxy, err := createReverseProxy(upstream.URL, NewStaticSecretSource("amp-secret"))
+	if err != nil {
+		t.Fatalf("create reverse proxy: %v", err)
+	}
+	fallback := NewFallbackHandlerWithMapper(func() *httputil.ReverseProxy { return proxy }, nil, nil)
+	fallback.SetFallbackMapper(stubFallbackMapper{target: "gpt-5.5"})
+
+	var handlerBody []byte
+	seenMappedModel := ""
+	r := gin.New()
+	r.POST("/api/provider/:provider/v1/chat/completions", fallback.WrapHandler(func(c *gin.Context) {
+		var errRead error
+		handlerBody, errRead = io.ReadAll(c.Request.Body)
+		if errRead != nil {
+			t.Fatalf("read handler body: %v", errRead)
+		}
+		if mapped, ok := c.Get(MappedModelContextKey); ok {
+			seenMappedModel, _ = mapped.(string)
+		}
+		c.JSON(http.StatusOK, gin.H{"id": "fallback-handler", "model": "gpt-5.5"})
+	}))
+	server := httptest.NewServer(r)
+	defer server.Close()
+
+	reqBody := []byte(`{"model":"amp-nostromo-v1","messages":[{"role":"user","content":"hi"}]}`)
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/api/provider/amp/v1/chat/completions", bytes.NewReader(reqBody))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request fallback route: %v", err)
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d body=%s", resp.StatusCode, respBody)
+	}
+	if seenMappedModel != "gpt-5.5" {
+		t.Fatalf("mapped model = %q, want gpt-5.5", seenMappedModel)
+	}
+	if !bytes.Contains(handlerBody, []byte(`gpt-5.5`)) || bytes.Contains(handlerBody, []byte(`amp-nostromo-v1`)) {
+		t.Fatalf("handler body = %s", handlerBody)
+	}
+	if upstreamCalls != 0 {
+		t.Fatalf("amp proxy calls = %d, want fallback handler path", upstreamCalls)
+	}
+}
+
+func TestFallbackHandlerGeminiWildcardActionStripsLeadingSlashBeforeMapping(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient("test-client-gemini-wildcard-action", "gemini", []*registry.ModelInfo{
+		{ID: "test-gemini-flash", OwnedBy: "google", Type: "gemini"},
+	})
+	defer reg.UnregisterClient("test-client-gemini-wildcard-action")
+
+	mapper := NewModelMapper([]config.AmpModelMapping{
+		{From: "gemini-3-flash-preview", To: "test-gemini-flash"},
+	})
+	fallback := NewFallbackHandlerWithMapper(func() *httputil.ReverseProxy { return nil }, mapper, func() bool { return true })
+
+	seenMappedModel := ""
+	seenAction := ""
+	r := gin.New()
+	r.POST("/api/provider/google/v1beta/models/*action", fallback.WrapHandler(withMappedGeminiAction(func(c *gin.Context) {
+		if mapped, ok := c.Get(MappedModelContextKey); ok {
+			seenMappedModel, _ = mapped.(string)
+		}
+		seenAction = c.Param("action")
+		c.Status(http.StatusNoContent)
+	})))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/provider/google/v1beta/models/gemini-3-flash-preview:generateContent", bytes.NewReader([]byte(`{"contents":[]}`)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(localNeoInferenceHeader, "1")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	if seenMappedModel != "test-gemini-flash" {
+		t.Fatalf("mapped model = %q, want test-gemini-flash", seenMappedModel)
+	}
+	if seenAction != "test-gemini-flash:generateContent" {
+		t.Fatalf("action = %q, want test-gemini-flash:generateContent", seenAction)
+	}
+}
+
 func TestFallbackHandler_LocalAuthUnavailableDoesNotFallbackToAmpProxy(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

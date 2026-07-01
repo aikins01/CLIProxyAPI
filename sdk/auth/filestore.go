@@ -138,9 +138,15 @@ func (s *FileTokenStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error)
 			return walkErr
 		}
 		if d.IsDir() {
+			if path != dir && shouldSkipAuthWalkDir(path, dir) {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		if !strings.HasSuffix(strings.ToLower(d.Name()), ".json") {
+			return nil
+		}
+		if shouldSkipAuthJSONFile(path, dir) {
 			return nil
 		}
 		auth, err := s.readAuthFile(path, dir)
@@ -156,6 +162,38 @@ func (s *FileTokenStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error)
 		return nil, err
 	}
 	return entries, nil
+}
+
+func shouldSkipAuthWalkDir(path, baseDir string) bool {
+	rel, err := filepath.Rel(baseDir, path)
+	if err != nil || rel == "." || strings.ContainsRune(rel, filepath.Separator) {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(rel)) {
+	case ".git", "logs", "log", "tmp", "temp", "cache", "caches":
+		return true
+	default:
+		return false
+	}
+}
+
+func shouldSkipAuthJSONFile(path, baseDir string) bool {
+	name := strings.ToLower(filepath.Base(path))
+	if strings.HasPrefix(name, "neo-provider-request-") {
+		return true
+	}
+	if baseDir == "" {
+		return false
+	}
+	rel, err := filepath.Rel(baseDir, path)
+	if err != nil {
+		return false
+	}
+	root := strings.Split(rel, string(filepath.Separator))[0]
+	if shouldSkipAuthWalkDir(filepath.Join(baseDir, root), baseDir) {
+		return true
+	}
+	return false
 }
 
 // Delete removes the auth file.

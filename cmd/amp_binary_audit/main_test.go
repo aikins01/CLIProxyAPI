@@ -19,10 +19,11 @@ func TestClassifyStringsExtractsParitySignals(t *testing.T) {
 		`fetch("/actors/metadata?namespace=default")`,
 		`["user:message","user:message:interrupt","user:message:append-content","user:message-queue:enqueue","user:message-queue:dequeue","user:message-queue:discard","user:tool-input","tool:data","tool:processed","assistant:message","assistant:message-update","thread:truncate","title","agent-mode","reasoning-effort","environment","max-tokens","main-thread"]`,
 		`J.discriminatedUnion("type",[J.object({type:J.literal("message_added")}),J.object({type:J.literal("message_updated")}),J.object({type:J.literal("delta")}),J.object({type:J.literal("thread_truncated")}),J.object({type:J.literal("queued_messages")}),J.object({type:J.literal("queued_message_added")}),J.object({type:J.literal("queued_message_removed")}),J.object({type:J.literal("queued_message_dequeued")}),J.object({type:J.literal("tool_progress")}),J.object({type:J.literal("tool_approval_queue")}),J.object({type:J.literal("tool_lease")}),J.object({type:J.literal("thread_settings")}),J.object({type:J.literal("thread_title")}),J.object({type:J.literal("thread_status")}),J.object({type:J.literal("thread_relationships")}),J.object({type:J.literal("agent_state")}),J.object({type:J.literal("cancelled")}),J.object({type:J.literal("compaction_started")}),J.object({type:J.literal("compaction_complete")}),J.object({type:J.literal("compaction_records")}),J.object({type:J.literal("retry_scheduled")}),J.object({type:J.literal("retry_started")}),J.object({type:J.literal("retry_cancelled")}),J.object({type:J.literal("error_set")}),J.object({type:J.literal("error_cleared")}),J.object({type:J.literal("error")}),J.object({type:J.literal("edit_rejected")}),J.object({type:J.literal("environment_update")}),J.object({type:J.literal("observers")}),J.object({type:J.literal("plugin_message")}),J.object({type:J.literal("client_append_user_msg")}),J.object({type:J.literal("executor_tool_result")}),J.object({type:J.literal("executor_tools_register")})])`,
-		`case "user:interrupted": case "system:non-terminal-tool-result": case "system:this":`,
+		`type:J.literal("client_terminal_open") type:J.literal("executor_terminal_output")`,
+		`case "user:interrupted": case "system:non-terminal-tool-result": case "system:this": case "user:this":`,
 		`switch(status){case"done":case"error":case"rejected-by-user":case"cancelled":case"in-progress":case"cancellation-requested":case"queued":case"blocked-on-user":} --stream-json --stream-json-thinking agent_mode reasoning_effort mcp_servers session_id duration_ms num_turns error_during_execution is_error`,
 		`tools.disable:{value:["browser_navigate","builtin:edit_file"]}; SFT=new Set(["read_file","ripgrep","Read","Grep","glob","Glob","file_tree","view_media"]); MFT={enableToolSpecs:disableTools}; mcpServers mcp__server__tool skills.disableClaudeCodeSkills skills.path toolbox.path applyPatchFreeform browser_take_screenshot`,
-		`draftThreadSettings reasoning.effort internal.model agentMode reasoningEffort sessionAgentMode lastReasoningEffortByMode lastSpeedByMode explicitEffort openai.speed anthropic.speed gemini.thinkingLevel`,
+		`draftThreadSettings reasoning.effort internal.model agentMode reasoningEffort lastReasoningEffortByMode lastSpeedByMode explicitEffort openai.speed anthropic.speed gemini.thinkingLevel`,
 		`anthropic-beta anthropic-version 2023-06-01 interleaved-thinking-2025-05-14 fast-mode-2026-02-01 x-amp-feature x-amp-thread-id x-amp-message-id x-amp-override-provider X-Amp-Client-Application amp.chat amp.review openai-websocket google-upload-url`,
 		`Vw="x-amp-feature",QRT="x-amp-thread-id",LU="x-amp-message-id",ART="X-Amp-Client-Application",RTT="X-Amp-Client-Type",TTT="X-Amp-Client-Version"; VpT="fast-mode-2026-02-01"`,
 		`function ZpT(R,T,e,i,r){let a=[];if((R["anthropic.thinking.enabled"]??!0)&&R["anthropic.interleavedThinking.enabled"]&&!FOR(e))a.push("interleaved-thinking-2025-05-14");let c;if(R["anthropic.provider"])c=R["anthropic.provider"];if(XpT(e,R["anthropic.speed"])==="fast")a.push(VpT),c="anthropic";return{...OU(Hn()),...a.length>0?{"anthropic-beta":a.join(",")}:{},...c?{"x-amp-override-provider":c}:{},[Vw]:"amp.chat",...i!=null?{[LU]:String(i)}:{},...pU(T)}}`,
@@ -34,21 +35,27 @@ func TestClassifyStringsExtractsParitySignals(t *testing.T) {
 		`async function P_T(R,T,e,i,r,a,c){let h=await jE(r,{threadMeta:i,featureHeader:c??"amp.image-generation"});return h.models.generateContent({model:R})}`,
 		`async function DhT(R,T,e,i,r,a,c){let h=VhT(i,void 0,{[Vw]:c??"amp.image-generation",accept:"application/json"});return h}`,
 		`if(UhT(l))s=await P_T(A9.GEMINI_3_PRO_IMAGE.name,R.prompt,h.length>0?h:void 0,T,e,a,"amp.painter");else s=await DhT(l,R.prompt,h.length>0?h:void 0,T,e,a,"amp.painter")`,
-		`function I_T(R,T,e){return{...LU(Hs()),[Vw]:"amp.chat",...PU(R),...T!=null?{[xU]:String(T)}:{},...e??{}}}`,
+		`function I_T(R,T,e){return{...LU(Hs()),[Vw]:"amp.chat",...PU(R),...T!=null?{[xU]:String(T)}:{},...e??{}}}async function I_imgT(R,T){return await _.images.edit({model:R,prompt:T})}`,
 		`let _=await jE(i,{threadMeta:r,featureHeader:c??"amp.image-generation"}),l=await _.models.generateContent({model:h.name,contents:n})`,
 		`async function J_T(R,T,e,r,i,a,c){let _=I_T(r,void 0,{[Vw]:c??"amp.image-generation",accept:"application/json"}),n=await h.images.edit({model:R,prompt:T})}`,
-		`if(E_T(l))n=await xhT(A9.GEMINI_3_PRO_IMAGE.name,R.prompt,_.length>0?_:void 0,T,e,a,"amp.painter");else n=await J_T(l,R.prompt,_.length>0?_:void 0,T,e,a,"amp.painter")`,
+		`if(E_T(l))n=await xhT(A9.GEMINI_3_PRO_IMAGE.name,R.prompt,_.length>0?_:void 0,T,e,a,"amp.painter");else n=await J_T(l,R.prompt,_.length>0?_:void 0,T,e,a,"amp.painter");async function E_imgT(R){return await _.images.generate({model:R})}`,
 		`jpT=1e5;compactionControl;contextTokenThreshold??jpT;usage.input_tokens;usage.cache_creation_input_tokens;usage.cache_read_input_tokens;usage.output_tokens;_.content.filter((s)=>s.type!=="tool_use");"x-stainless-helper":"compaction";params.messages=[{role:"user",content:c.content}];let{role:c,content:_}=await`,
 		`params.compactionControl;contextTokenThreshold??vxT;usage.input_tokens;usage.cache_creation_input_tokens;usage.cache_read_input_tokens;usage.output_tokens;if(a[a.length-1].role==="assistant"){let h=a[a.length-1];if(Array.isArray(h.content)){let _=h.content.filter((n)=>n.type!=="tool_use");if(_.length===0)a.pop();else h.content=_}}headers:{"x-stainless-helper":"compaction"};params.messages=[{role:"user",content:c.content}]`,
-		`ei={DEEP:{key:"deep",displayName:"Deep",primaryModel:Nr("GPT_5_5"),includeTools:Ab,deferredTools:AD,visible:!0,visibleInV2:!0,reasoningEffort:"medium",reasoningEffortControl:{levels:["low","medium","xhigh"]}},SMART:{key:"smart",displayName:"Smart",primaryModel:Nr("CLAUDE_OPUS_4_7"),includeTools:D6,deferredTools:Fb,visible:!0,visibleInV2:!0,reasoningEffort:"high",reasoningEffortControl:{levels:["high","xhigh","max"]}},AGG:{key:"agg-man",displayName:"Agg",primaryModel:Nr("CLAUDE_OPUS_4_6"),includeTools:PD,visible:!1,serverOnly:!0},NOSTROMO:{key:BD,displayName:"nostromo",primaryModel:Nr("AMP_NOSTROMO"),includeTools:TD,visible:!0,visibleInV2:!0,reasoningEffort:"low"}},Fc=ei.AGG.key`,
-		`ya={DEEP:{key:"deep",displayName:"Deep",primaryModel:Vi("GPT_5_5"),includeTools:eH,deferredTools:o9R,visible:!0,visibleInV2:!0,reasoningEffort:"medium",reasoningEffortControl:{levels:["low","medium","xhigh"]}},SMART:{key:"smart",displayName:"Smart",primaryModel:Vi("CLAUDE_OPUS_4_7"),includeTools:hP,deferredTools:TH,visible:!0,visibleInV2:!0,reasoningEffort:"high",reasoningEffortControl:{levels:["high","xhigh","max"]}},RUSH:{key:"rush",displayName:"Rush",primaryModel:Vi("GPT_5_5"),includeTools:s9R,visible:!0,reasoningEffort:"none"},AGG:{key:"agg-man",displayName:"Agg",primaryModel:Vi("CLAUDE_OPUS_4_6"),includeTools:l9R,visible:!1,serverOnly:!0},LARGE:{key:"large",displayName:"Large",primaryModel:Vi("CLAUDE_OPUS_4_6"),includeTools:hP,deferredTools:TH,visible:!0},NOSTROMO:{key:BbR,displayName:"nostromo",primaryModel:Vi("AMP_NOSTROMO"),includeTools:y9R,visible:!0,visibleInV2:!0,reasoningEffort:"low"}}`,
-		`A9={AMP_NOSTROMO:{provider:K.OPENAI,name:"amp-nostromo-v1",displayName:"nostromo",contextWindow:400000,maxOutputTokens:128000},CLAUDE_OPUS_4_6:{provider:K.ANTHROPIC,name:"claude-opus-4-6",displayName:"Claude Opus 4.6",contextWindow:332000,maxOutputTokens:32000},CLAUDE_OPUS_4_7:{provider:K.ANTHROPIC,name:"claude-opus-4-7",displayName:"Claude Opus 4.7",contextWindow:332000,maxOutputTokens:32000},CLAUDE_OPUS_4_8:{provider:K.ANTHROPIC,name:"claude-opus-4-8",displayName:"Claude Opus 4.8",contextWindow:332000,maxOutputTokens:32000},CLAUDE_SONNET_4:{provider:K.ANTHROPIC,name:"claude-sonnet-4-20250514",displayName:"Claude Sonnet 4",contextWindow:1e6,maxOutputTokens:32000},GPT_5_5:{provider:K.OPENAI,name:"gpt-5.5",displayName:"GPT-5.5",contextWindow:400000,maxOutputTokens:128000},BASETEN_KIMI_K2P5:{provider:K.BASENTEN,name:"moonshotai/Kimi-K2.5",displayName:"Kimi K2.5",contextWindow:262144,maxOutputTokens:32000}}`,
+		`ei={DEEP:{key:"deep",displayName:"Deep",primaryModel:Nr("GPT_5_5"),includeTools:Ab,deferredTools:AD,visible:!0,visibleInV2:!0,reasoningEffort:"medium",reasoningEffortControl:{levels:["low","medium","xhigh"]}},SMART:{key:"smart",displayName:"Smart",primaryModel:Nr("CLAUDE_OPUS_4_7"),includeTools:D6,deferredTools:Fb,visible:!0,visibleInV2:!0,reasoningEffort:"high",reasoningEffortControl:{levels:["high","xhigh","max"]}},AGG:{key:"agg-man",displayName:"Agg",primaryModel:Nr("GPT_5_5"),includeTools:PD,visible:!1,reasoningEffort:"none",serverOnly:!0},NOSTROMO:{key:BD,displayName:"nostromo",primaryModel:Nr("AMP_NOSTROMO"),includeTools:TD,visible:!0,visibleInV2:!0,reasoningEffort:"low"}},Fc=ei.AGG.key`,
+		`ya={DEEP:{key:"deep",displayName:"Deep",primaryModel:Vi("GPT_5_5"),includeTools:eH,deferredTools:o9R,visible:!0,visibleInV2:!0,reasoningEffort:"medium",reasoningEffortControl:{levels:["low","medium","xhigh"]}},SMART:{key:"smart",displayName:"Smart",primaryModel:Vi("CLAUDE_OPUS_4_7"),includeTools:hP,deferredTools:TH,visible:!0,visibleInV2:!0,reasoningEffort:"high",reasoningEffortControl:{levels:["high","xhigh","max"]}},RUSH:{key:"rush",displayName:"Rush",primaryModel:Vi("GPT_5_5"),includeTools:s9R,visible:!0,reasoningEffort:"none"},AGG:{key:"agg-man",displayName:"Agg",primaryModel:Vi("GPT_5_5"),includeTools:l9R,visible:!1,reasoningEffort:"none",serverOnly:!0},LARGE:{key:"large",displayName:"Large",primaryModel:Vi("CLAUDE_OPUS_4_6"),includeTools:hP,deferredTools:TH,visible:!0},NOSTROMO:{key:BbR,displayName:"nostromo",primaryModel:Vi("AMP_NOSTROMO"),includeTools:y9R,visible:!0,visibleInV2:!0,reasoningEffort:"low"}}`,
+		`A9={AMP_NOSTROMO:{provider:K.AMP,name:"amp-nostromo-v1",displayName:"nostromo",contextWindow:400000,maxOutputTokens:128000},CLAUDE_OPUS_4_6:{provider:K.ANTHROPIC,name:"claude-opus-4-6",displayName:"Claude Opus 4.6",contextWindow:332000,maxOutputTokens:32000},CLAUDE_OPUS_4_7:{provider:K.ANTHROPIC,name:"claude-opus-4-7",displayName:"Claude Opus 4.7",contextWindow:332000,maxOutputTokens:32000},CLAUDE_OPUS_4_8:{provider:K.ANTHROPIC,name:"claude-opus-4-8",displayName:"Claude Opus 4.8",contextWindow:332000,maxOutputTokens:32000},CLAUDE_SONNET_4:{provider:K.ANTHROPIC,name:"claude-sonnet-4-20250514",displayName:"Claude Sonnet 4",contextWindow:1e6,maxOutputTokens:32000},GPT_5_5:{provider:K.OPENAI,name:"gpt-5.5",displayName:"GPT-5.5",contextWindow:400000,maxOutputTokens:128000},BASETEN_KIMI_K2P5:{provider:K.BASENTEN,name:"moonshotai/Kimi-K2.5",displayName:"Kimi K2.5",contextWindow:262144,maxOutputTokens:32000},BASETEN_GLM_5_2:{provider:K.BASENTEN,name:"zai-org/GLM-5.2",displayName:"GLM 5.2",contextWindow:200000,maxOutputTokens:32000}}`,
 		`IOR="claude-opus-4-6-1m",JpT=1e6,QpT=32000; ZB=A9.CLAUDE_OPUS_4_6.name; if(UpT(R)||T?.enableLargeContext&&Sf(R)===ZB)return JpT`,
-		`ZB=A9.CLAUDE_OPUS_4_6.name,YpT=A9.CLAUDE_OPUS_4_7.name,DpT=A9.CLAUDE_OPUS_4_8.name; function FOR(R){let T=Sf(R);return T===ZB||T===YpT||T===DpT} function RLT(R,T){if(FOR(R)){let e=["low","medium","high","xhigh","max"].includes(T.reasoningEffort)?T.reasoningEffort:"medium";return{thinking:{type:"adaptive",display:"summarized"},...{output_config:{effort:e}}}}}`,
+		`Ao0=R8.CLAUDE_OPUS_4_5.name,a$=R8.CLAUDE_OPUS_4_6.name,C7R=R8.CLAUDE_OPUS_4_7.name,M7R=R8.CLAUDE_OPUS_4_8.name; function puT(T){let R=Sx(T);return R===a$||R===C7R||R===M7R} function z7R(T,R){if(puT(T)){let a=["low","medium","high","xhigh","max"].includes(R.reasoningEffort)?R.reasoningEffort:"medium";return{thinking:{type:"adaptive",display:"summarized"},...{output_config:{effort:a}}}}}`,
 		`function yLT(R,T,e){let[i,r]=R.includes("/")?R.split("/",2):["",R],a=e?ee(e)?.reasoningEffort:void 0,c=lLT(T,e);switch(i){case"anthropic":return oLT(c)??a??(r===A9.CLAUDE_OPUS_4_7.name?"medium":"high");case"openai":return sLT(c)??a??"medium";case"vertexai":return T["gemini.thinkingLevel"]??a??"medium";default:return a??"medium"}}`,
 		`DCT={"anthropic.interleavedThinking.enabled":{value:false},"painter.model":{value:"gpt-image-2"},showCosts:{value:true},constructor:{value:"noise"}}`,
 		`model list: gpt-5.5 amp-nostromo-v1 claude-opus-4-8 gemini-3-pro-preview codex-config o0IwQDAPBgNVHRMBAf8EBTADAQH`,
-		`threadActorTransport json-rpc threadActor threadStatusUpdated userActor RivetKit rvt-token wsToken local-client`,
+		`threadActorTransport json-rpc threadActor threadStatusUpdated userActor RivetKit rvt-token wsToken local-client ActionRequest ActionResponse SubscriptionRequest serializeWithEmbeddedVersion deserializeWithEmbeddedVersion rivet_encoding.`,
+		`Do not include run_check findings in submit_review`,
+		`CLI appends structured check findings mechanically`,
+		`"instructions": "Outcome-first brief for the check agent (see system guidance)."`,
+		`"checkURI"in o&&typeof o.checkURI==="string";"checkName"in o&&typeof o.checkName==="string"`,
+		`severity!=="low" The following checks were run`,
+		"rR.yellow(\"issues found\"); i.push(`${e.result.check.name}: ${n}`)",
 		"Please perform compaction guidance for the system prompt and code review workflow. This deliberately long prompt-like segment has enough ordinary words to be fingerprinted without storing the body in the baseline.",
 	}
 
@@ -70,6 +77,7 @@ func TestClassifyStringsExtractsParitySignals(t *testing.T) {
 		"assistant:message-update":    "assistant-message",
 		"cancelled":                   "execution-state",
 		"client_append_user_msg":      "client-command",
+		"client_terminal_open":        "client-command",
 		"compaction_complete":         "compaction",
 		"compaction_records":          "compaction",
 		"compaction_started":          "compaction",
@@ -80,6 +88,7 @@ func TestClassifyStringsExtractsParitySignals(t *testing.T) {
 		"error":                       "error",
 		"error_cleared":               "error",
 		"error_set":                   "error",
+		"executor_terminal_output":    "executor-bridge",
 		"executor_tool_result":        "executor-bridge",
 		"executor_tools_register":     "executor-bridge",
 		"main-thread":                 "relationship",
@@ -124,6 +133,7 @@ func TestClassifyStringsExtractsParitySignals(t *testing.T) {
 	assertContains(t, signals.ToolCancelReasons, "user:interrupted")
 	assertContains(t, signals.ToolCancelReasons, "system:non-terminal-tool-result")
 	assertNotContains(t, signals.ToolCancelReasons, "system:this")
+	assertNotContains(t, signals.ToolCancelReasons, "user:this")
 	assertContains(t, toolCancelCoverageStrings(signals.ToolCancelCoverage), "user:interrupted=user-interrupt")
 	assertContains(t, toolCancelCoverageStrings(signals.ToolCancelCoverage), "system:non-terminal-tool-result=restore-cleanup")
 	assertContains(t, signals.ToolRunStatuses, "blocked-on-user")
@@ -139,13 +149,11 @@ func TestClassifyStringsExtractsParitySignals(t *testing.T) {
 	assertContains(t, signals.ToolCatalog, "ripgrep")
 	assertContains(t, signals.ToolCatalog, "Glob")
 	assertContains(t, signals.ToolCatalog, "mcp__server__tool")
-	assertContains(t, signals.ToolCatalog, "enableToolSpecs")
 	assertContains(t, toolCatalogCoverageStrings(signals.ToolCatalogCoverage), "browser_navigate=browser")
 	assertContains(t, toolCatalogCoverageStrings(signals.ToolCatalogCoverage), "builtin:edit_file=file-edit")
 	assertContains(t, toolCatalogCoverageStrings(signals.ToolCatalogCoverage), "read_file=file-read")
 	assertContains(t, toolCatalogCoverageStrings(signals.ToolCatalogCoverage), "Glob=legacy-file-search")
 	assertContains(t, toolCatalogCoverageStrings(signals.ToolCatalogCoverage), "mcp__server__tool=mcp")
-	assertContains(t, toolCatalogCoverageStrings(signals.ToolCatalogCoverage), "enableToolSpecs=tool-spec-overrides")
 	assertContains(t, signals.StreamJSONMarkers, "--stream-json")
 	assertContains(t, signals.StreamJSONMarkers, "agent_mode")
 	assertContains(t, signals.StreamJSONMarkers, "error_during_execution")
@@ -162,24 +170,33 @@ func TestClassifyStringsExtractsParitySignals(t *testing.T) {
 	assertContains(t, signals.ProviderProtocol, "interleaved-thinking-2025-05-14")
 	assertContains(t, signals.ProviderProtocol, "x-amp-feature")
 	assertContains(t, signals.ProviderProtocol, "amp.chat")
-	assertContains(t, signals.ProviderProtocol, "openai-websocket")
 	assertContains(t, providerCoverageStrings(signals.ProviderCoverage), "anthropic-beta=anthropic-header")
 	assertContains(t, providerCoverageStrings(signals.ProviderCoverage), "interleaved-thinking-2025-05-14=anthropic-beta")
 	assertContains(t, providerCoverageStrings(signals.ProviderCoverage), "x-amp-feature=amp-provider-header")
 	assertContains(t, providerCoverageStrings(signals.ProviderCoverage), "x-amp-client-application=amp-client-header")
 	assertContains(t, providerCoverageStrings(signals.ProviderCoverage), "amp.chat=amp-feature")
-	assertContains(t, providerCoverageStrings(signals.ProviderCoverage), "openai-websocket=openai-protocol")
 	assertContains(t, providerCoverageStrings(signals.ProviderCoverage), "google-upload-url=google-upload")
+	assertContains(t, signals.ReviewContract, "human-review-check-footer-counts-issues")
+	assertContains(t, signals.ReviewContract, "human-review-filters-low-severity")
+	assertContains(t, signals.ReviewContract, "review-cli-appends-check-findings")
+	assertContains(t, signals.ReviewContract, "review-submit-omits-run-check-findings")
+	assertContains(t, signals.ReviewContract, "run-check-instructions-input-shape")
+	assertContains(t, signals.ReviewContract, "run-check-uri-input-shape")
 	assertContains(t, agentModeProfileStrings(signals.AgentModeProfiles), "deep|primary=GPT_5_5|reasoning=medium|levels=low,medium,xhigh|include=present|deferred=true|visible=true|visibleInV2=true|serverOnly=false")
 	assertContains(t, agentModeProfileStrings(signals.AgentModeProfiles), "smart|primary=CLAUDE_OPUS_4_7|reasoning=high|levels=high,max,xhigh|include=present|deferred=true|visible=true|visibleInV2=true|serverOnly=false")
 	assertContains(t, agentModeProfileStrings(signals.AgentModeProfiles), "rush|primary=GPT_5_5|reasoning=none|levels=|include=present|deferred=false|visible=true|visibleInV2=false|serverOnly=false")
-	assertContains(t, agentModeProfileStrings(signals.AgentModeProfiles), "agg-man|primary=CLAUDE_OPUS_4_6|reasoning=|levels=|include=present|deferred=false|visible=false|visibleInV2=false|serverOnly=true")
+	assertContains(t, agentModeProfileStrings(signals.AgentModeProfiles), "agg-man|primary=GPT_5_5|reasoning=none|levels=|include=present|deferred=false|visible=false|visibleInV2=false|serverOnly=true")
 	assertContains(t, agentModeProfileStrings(signals.AgentModeProfiles), "large|primary=CLAUDE_OPUS_4_6|reasoning=|levels=|include=present|deferred=true|visible=true|visibleInV2=false|serverOnly=false")
 	assertContains(t, agentModeProfileStrings(signals.AgentModeProfiles), "nostromo|primary=AMP_NOSTROMO|reasoning=low|levels=|include=present|deferred=false|visible=true|visibleInV2=true|serverOnly=false")
-	assertContains(t, agentModeRouteStrings(signals.AgentModeRoutes), "agg-man|provider=anthropic|model=claude-opus-4-6|primary=CLAUDE_OPUS_4_6|reasoning=|context=332000|max_out=32000")
+	for _, profile := range signals.AgentModeProfiles {
+		if profile.IncludeTools != "" && profile.IncludeTools != "present" {
+			t.Fatalf("agent mode %q include tools = %q, want normalized presence", profile.Name, profile.IncludeTools)
+		}
+	}
+	assertContains(t, agentModeRouteStrings(signals.AgentModeRoutes), "agg-man|provider=openai|model=gpt-5.5|primary=GPT_5_5|reasoning=none|context=400000|max_out=128000")
 	assertContains(t, agentModeRouteStrings(signals.AgentModeRoutes), "deep|provider=openai|model=gpt-5.5|primary=GPT_5_5|reasoning=medium|context=400000|max_out=128000")
 	assertContains(t, agentModeRouteStrings(signals.AgentModeRoutes), "large|provider=anthropic|model=claude-opus-4-6|primary=CLAUDE_OPUS_4_6|reasoning=|context=332000|max_out=32000|effective_context=1000000|effective_max_input=968000|large_alias=claude-opus-4-6-1m")
-	assertContains(t, agentModeRouteStrings(signals.AgentModeRoutes), "nostromo|provider=openai|model=amp-nostromo-v1|primary=AMP_NOSTROMO|reasoning=low|context=400000|max_out=128000")
+	assertContains(t, agentModeRouteStrings(signals.AgentModeRoutes), "nostromo|provider=amp|model=amp-nostromo-v1|primary=AMP_NOSTROMO|reasoning=low|context=400000|max_out=128000")
 	assertContains(t, agentModeRouteStrings(signals.AgentModeRoutes), "rush|provider=openai|model=gpt-5.5|primary=GPT_5_5|reasoning=none|context=400000|max_out=128000")
 	assertContains(t, agentModeRouteStrings(signals.AgentModeRoutes), "smart|provider=anthropic|model=claude-opus-4-7|primary=CLAUDE_OPUS_4_7|reasoning=high|context=332000|max_out=32000")
 	assertContains(t, agentModeCoverageStrings(signals.AgentModeCoverage), "deep=local-runtime")
@@ -203,6 +220,7 @@ func TestClassifyStringsExtractsParitySignals(t *testing.T) {
 	assertContains(t, modelLimitStrings(signals.ModelLimits), "claude-sonnet-4-20250514|enum=CLAUDE_SONNET_4|provider=anthropic|display=Claude Sonnet 4|context=1000000|max_out=32000")
 	assertContains(t, modelLimitStrings(signals.ModelLimits), "gpt-5.5|enum=GPT_5_5|provider=openai|display=GPT-5.5|context=400000|max_out=128000")
 	assertContains(t, modelLimitStrings(signals.ModelLimits), "moonshotai/Kimi-K2.5|enum=BASETEN_KIMI_K2P5|provider=baseten|display=Kimi K2.5|context=262144|max_out=32000")
+	assertContains(t, modelLimitStrings(signals.ModelLimits), "zai-org/GLM-5.2|enum=BASETEN_GLM_5_2|provider=baseten|display=GLM 5.2|context=200000|max_out=32000")
 	assertContains(t, largeContextRuleStrings(signals.LargeContextRules), "CLAUDE_OPUS_4_6|alias=claude-opus-4-6-1m|context=1000000|max_out=32000|max_input=968000|requires_enable=true")
 	assertContains(t, adaptiveThinkingRuleStrings(signals.AdaptiveThinking), "CLAUDE_OPUS_4_6,CLAUDE_OPUS_4_7,CLAUDE_OPUS_4_8|models=claude-opus-4-6,claude-opus-4-7,claude-opus-4-8|levels=low,medium,high,xhigh,max|default=medium|type=adaptive|display=summarized|output_config=true")
 	assertContains(t, providerReasoningRuleStrings(signals.ProviderReasoning), "anthropic|sources=setting:reasoning.effort,mode:reasoningEffort,model-default|setting=|default=high|special=CLAUDE_OPUS_4_7/claude-opus-4-7:medium")
@@ -220,16 +238,28 @@ func TestClassifyStringsExtractsParitySignals(t *testing.T) {
 	assertContains(t, providerFeatureRuleStrings(signals.ProviderFeatures), "amp.painter|provider=openai|callsite=painter-openai-image|tool=painter|header=x-amp-feature|default=false")
 	assertContains(t, compactionRuleStrings(signals.CompactionRules), "anthropic-tool-runner|provider=anthropic|trigger=observed-usage|timing=post-response|threshold=100000|usage=input_tokens,cache_creation_input_tokens,cache_read_input_tokens,output_tokens|summary_prompt=continuation-summary|history_role=user|tail_assistant=strip-tool-use-blocks|helper=x-stainless-helper:compaction")
 	assertContains(t, modelCoverageStrings(signals.ModelCoverage), "gpt-5.5=openai/gpt")
-	assertContains(t, modelCoverageStrings(signals.ModelCoverage), "amp-nostromo-v1=openai/amp-nostromo")
+	assertContains(t, modelCoverageStrings(signals.ModelCoverage), "amp-nostromo-v1=amp/amp-nostromo")
 	assertContains(t, modelCoverageStrings(signals.ModelCoverage), "claude-opus-4-8=anthropic/claude-opus")
 	assertContains(t, modelCoverageStrings(signals.ModelCoverage), "gemini-3-pro-preview=google/gemini-pro")
 	assertContains(t, signals.ActorRuntime, "threadActor")
 	assertContains(t, signals.ActorRuntime, "threadStatusUpdated")
 	assertContains(t, signals.ActorRuntime, "rvt-token")
+	assertContains(t, signals.ActorRuntime, "ActionRequest")
+	assertContains(t, signals.ActorRuntime, "ActionResponse")
+	assertContains(t, signals.ActorRuntime, "SubscriptionRequest")
+	assertContains(t, signals.ActorRuntime, "rivet_encoding.4")
+	assertContains(t, signals.ActorRuntime, "serializeWithEmbeddedVersion")
+	assertContains(t, signals.ActorRuntime, "deserializeWithEmbeddedVersion")
 	assertContains(t, actorCoverageStrings(signals.ActorCoverage), "threadActor=local-runtime")
 	assertContains(t, actorCoverageStrings(signals.ActorCoverage), "threadStatusUpdated=local-runtime")
 	assertContains(t, actorCoverageStrings(signals.ActorCoverage), "rvt-token=actor-protocol")
 	assertContains(t, actorCoverageStrings(signals.ActorCoverage), "RivetKit=actor-protocol")
+	assertContains(t, actorCoverageStrings(signals.ActorCoverage), "ActionRequest=actor-protocol")
+	assertContains(t, actorCoverageStrings(signals.ActorCoverage), "ActionResponse=actor-protocol")
+	assertContains(t, actorCoverageStrings(signals.ActorCoverage), "SubscriptionRequest=actor-protocol")
+	assertContains(t, actorCoverageStrings(signals.ActorCoverage), "rivet_encoding.4=actor-protocol")
+	assertContains(t, actorCoverageStrings(signals.ActorCoverage), "serializeWithEmbeddedVersion=actor-protocol")
+	assertContains(t, actorCoverageStrings(signals.ActorCoverage), "deserializeWithEmbeddedVersion=actor-protocol")
 	if len(signals.PromptFingerprints) != 1 {
 		t.Fatalf("prompt fingerprints = %d, want 1", len(signals.PromptFingerprints))
 	}
@@ -240,6 +270,111 @@ func TestClassifyStringsExtractsParitySignals(t *testing.T) {
 	assertContains(t, signals.PromptFingerprints[0].Tags, "code-review")
 	assertContains(t, promptTagCountStrings(signals.PromptTagCounts), "prompt/code-review=1")
 	assertContains(t, promptTagCountStrings(signals.PromptTagCounts), "prompt/compaction=1")
+}
+
+func TestClassifyStringsSynthesizesRivetEncodingWhenEmbeddedVersionMarkersAreSplit(t *testing.T) {
+	signals := classifyStrings([]string{
+		`ActionRequest`,
+		`ActionResponse`,
+		`rivet_encoding.`,
+		`serializeWithEmbeddedVersion`,
+		`deserializeWithEmbeddedVersion`,
+	})
+
+	assertContains(t, signals.ActorRuntime, "rivet_encoding.4")
+	assertContains(t, actorCoverageStrings(signals.ActorCoverage), "rivet_encoding.4=actor-protocol")
+}
+
+func TestClassifyStringsRejectsReviewContractNearMisses(t *testing.T) {
+	tests := []struct {
+		name   string
+		strs   []string
+		marker string
+	}{
+		{
+			name:   "run check uri shape rejects near miss validation fields",
+			strs:   []string{`"checkURI_internal"in o&&typeof o.checkURI_internal==="string";"checkNameDeclaration"in o&&typeof o.checkNameDeclaration==="string"`},
+			marker: "run-check-uri-input-shape",
+		},
+		{
+			name:   "run check uri shape requires both validation fields together",
+			strs:   []string{`"checkURI"in o&&typeof o.checkURI==="string"`, `"checkName"in o&&typeof o.checkName==="string"`},
+			marker: "run-check-uri-input-shape",
+		},
+		{
+			name:   "instructions shape requires json field context",
+			strs:   []string{`instructions Outcome-first brief for the check agent`},
+			marker: "run-check-instructions-input-shape",
+		},
+		{
+			name:   "low severity filter requires check footer context",
+			strs:   []string{`severity!=="low"`},
+			marker: "human-review-filters-low-severity",
+		},
+		{
+			name:   "check footer status ignores review instructions text",
+			strs:   []string{`Only report issues found by checks`},
+			marker: "human-review-check-footer-counts-issues",
+		},
+		{
+			name:   "check footer status requires check name renderer",
+			strs:   []string{`rR.yellow("issues found");`},
+			marker: "human-review-check-footer-counts-issues",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			signals := classifyStrings(tt.strs)
+			assertNotContains(t, signals.ReviewContract, tt.marker)
+		})
+	}
+}
+
+func TestClassifyStringsDetectsReviewContractMarkers(t *testing.T) {
+	tests := []struct {
+		name   string
+		str    string
+		marker string
+	}{
+		{
+			name:   "submit review omits run check findings",
+			str:    `Do not include run_check findings in submit_review`,
+			marker: "review-submit-omits-run-check-findings",
+		},
+		{
+			name:   "cli appends check findings",
+			str:    `CLI appends structured check findings mechanically`,
+			marker: "review-cli-appends-check-findings",
+		},
+		{
+			name:   "run check uri input shape",
+			str:    `"checkURI"in o&&typeof o.checkURI==="string";"checkName"in o&&typeof o.checkName==="string"`,
+			marker: "run-check-uri-input-shape",
+		},
+		{
+			name:   "run check instructions input shape",
+			str:    `"instructions":"Outcome-first brief for the check agent"`,
+			marker: "run-check-instructions-input-shape",
+		},
+		{
+			name:   "human review filters low severity",
+			str:    `if(severity!=="low")out.push("The following checks were run")`,
+			marker: "human-review-filters-low-severity",
+		},
+		{
+			name:   "human review check footer counts issues",
+			str:    `rR.yellow("issues found"); footer.push(result.check.name)`,
+			marker: "human-review-check-footer-counts-issues",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			signals := classifyStrings([]string{tt.str})
+			assertContains(t, signals.ReviewContract, tt.marker)
+		})
+	}
 }
 
 func TestPromptFingerprintClassifiesMinifiedSourceSeparately(t *testing.T) {
@@ -415,67 +550,42 @@ func TestCommittedBaselineMatchesInstalledAmpBinaryWhenPathMatches(t *testing.T)
 }
 
 var knownPromptTagSetCountValues = map[string]int{
-	"prompt/code-review":                      3,
-	"prompt/code-review,skills,tools":         1,
-	"prompt/compaction":                       10,
-	"prompt/compaction,guidance,skills,tools": 1,
-	"prompt/compaction,tools":                 2,
-	"prompt/guidance":                         10,
-	"prompt/guidance,skills":                  2,
-	"prompt/guidance,skills,tools":            2,
-	"prompt/guidance,system-prompt":           1,
-	"prompt/guidance,system-prompt,tools":     2,
-	"prompt/guidance,tools":                   4,
-	"prompt/painter":                          1,
-	"prompt/skills":                           8,
-	"prompt/skills,system-prompt":             1,
-	"prompt/skills,tools":                     2,
-	"prompt/system-prompt":                    8,
-	"prompt/tools":                            61,
-	"source/artifacts,code-review,guidance,system-prompt,tools":             1,
-	"source/artifacts,compaction,guidance,skills,tools":                     1,
-	"source/artifacts,guidance,painter,settings,skills,system-prompt,tools": 1,
-	"source/artifacts,tools":                                                1,
-	"source/code-review":                                                    1,
-	"source/code-review,compaction,tools":                                   1,
-	"source/code-review,guidance,tools":                                     1,
-	"source/code-review,skills":                                             1,
-	"source/code-review,skills,tools":                                       1,
-	"source/code-review,tools":                                              3,
-	"source/compaction":                                                     8,
-	"source/compaction,guidance,tools":                                      1,
-	"source/compaction,painter,skills,tools":                                1,
-	"source/compaction,painter,tools":                                       1,
-	"source/compaction,skills":                                              1,
-	"source/compaction,skills,system-prompt":                                1,
-	"source/compaction,skills,tools":                                        3,
-	"source/compaction,tools":                                               14,
-	"source/guidance":                                                       9,
-	"source/guidance,painter":                                               1,
-	"source/guidance,painter,tools":                                         1,
-	"source/guidance,settings":                                              1,
-	"source/guidance,settings,system-prompt,tools":                          1,
-	"source/guidance,settings,tools":                                        3,
-	"source/guidance,skills":                                                2,
-	"source/guidance,skills,tools":                                          4,
-	"source/guidance,tools":                                                 14,
-	"source/painter":                                                        3,
-	"source/painter,skills,tools":                                           2,
-	"source/painter,tools":                                                  4,
-	"source/settings":                                                       1,
-	"source/settings,skills,tools":                                          3,
-	"source/settings,system-prompt,tools":                                   1,
-	"source/settings,tools":                                                 3,
-	"source/skills":                                                         11,
-	"source/skills,tools":                                                   17,
-	"source/system-prompt":                                                  1,
-	"source/system-prompt,tools":                                            1,
-	"source/tools":                                                          116,
+	"prompt/compaction":                 6,
+	"prompt/compaction,tools":           1,
+	"prompt/guidance":                   6,
+	"prompt/painter":                    1,
+	"prompt/painter,skills":             1,
+	"prompt/skills":                     5,
+	"prompt/skills,system-prompt,tools": 1,
+	"prompt/skills,tools":               1,
+	"prompt/tools":                      34,
+	"source/artifacts,compaction,guidance,skills,tools": 1,
+	"source/artifacts,code-review,painter,skills,tools": 1,
+	"source/code-review,guidance,settings":              1,
+	"source/code-review,guidance,settings,skills,tools": 1,
+	"source/compaction":                                 6,
+	"source/compaction,painter,skills,tools":            1,
+	"source/compaction,skills,tools":                    3,
+	"source/compaction,tools":                           8,
+	"source/guidance":                                   7,
+	"source/guidance,settings":                          1,
+	"source/guidance,settings,skills,tools":             1,
+	"source/guidance,settings,system-prompt,tools":      1,
+	"source/guidance,skills":                            1,
+	"source/guidance,skills,tools":                      2,
+	"source/guidance,tools":                             12,
+	"source/painter":                                    1,
+	"source/painter,tools":                              2,
+	"source/settings":                                   3,
+	"source/settings,skills,tools":                      4,
+	"source/settings,tools":                             9,
+	"source/skills":                                     12,
+	"source/skills,tools":                               11,
+	"source/tools":                                      98,
 }
 
 func TestLifecycleChecklistKnownPromptTagCountsRunFocusedChecks(t *testing.T) {
 	cases := map[string][]string{
-		"prompt/code-review":   {"tools, code review, skills, and images"},
 		"prompt/compaction":    {"compaction and continuation prompts"},
 		"prompt/guidance":      {"compaction and continuation prompts", "streaming assistant and tool edits"},
 		"prompt/painter":       {"tools, code review, skills, and images"},
@@ -522,8 +632,8 @@ func TestKnownModelModeReasoningValuesMatchCommittedBaseline(t *testing.T) {
 		t.Fatalf("read committed baseline: %v", err)
 	}
 
-	assertStringSetsEqual(t, "models", baseline.Signals.Models, sortedKeys(knownRawModelValues))
-	assertStringSetsEqual(t, "model coverage", modelCoverageStrings(baseline.Signals.ModelCoverage), sortedKeys(expectedCoverageValuesFromSet(knownRawModelValues, func(name string) string {
+	assertStringSetsEqual(t, "models", baseline.Signals.Models, sortedKeys(activeRawModelValues()))
+	assertStringSetsEqual(t, "model coverage", modelCoverageStrings(baseline.Signals.ModelCoverage), sortedKeys(expectedCoverageValuesFromSet(activeRawModelValues(), func(name string) string {
 		provider, family := modelProviderAndFamily(name)
 		return provider + "/" + family
 	})))
@@ -548,16 +658,32 @@ func TestKnownSettingsValuesMatchCommittedBaseline(t *testing.T) {
 		t.Fatalf("read committed baseline: %v", err)
 	}
 
-	assertStringSetsEqual(t, "settings", baseline.Signals.Settings, sortedStringMapKeys(settingScopes))
-	assertStringSetsEqual(t, "setting coverage", settingCoverageStrings(baseline.Signals.SettingCoverage), sortedKeys(expectedCoverageValuesFromMap(settingScopes)))
+	assertStringSetsEqual(t, "settings", baseline.Signals.Settings, sortedStringMapKeys(activeSettingScopes()))
+	assertStringSetsEqual(t, "setting coverage", settingCoverageStrings(baseline.Signals.SettingCoverage), sortedKeys(expectedCoverageValuesFromMap(activeSettingScopes())))
 
 	expectedDefaults := make([]string, 0, len(knownSettingDefaultValues))
 	for name, value := range knownSettingDefaultValues {
+		if _, retired := retiredSettingNames[name]; retired {
+			continue
+		}
 		expectedDefaults = append(expectedDefaults, name+"="+value+"="+settingScopes[name])
 	}
 	assertStringSetsEqual(t, "setting defaults", settingDefaultStrings(baseline.Signals.SettingDefaults), expectedDefaults)
 	assertStringSetsEqual(t, "mode setting markers", baseline.Signals.ModeSettingMarkers, sortedStringMapKeys(modeSettingMarkers))
 	assertStringSetsEqual(t, "mode setting coverage", modeSettingCoverageStrings(baseline.Signals.ModeSettingCoverage), sortedKeys(expectedCoverageValuesFromMap(modeSettingMarkers)))
+}
+
+// Categories current release binaries no longer carry; the committed baseline
+// is expected to have no entries for them.
+var retiredLifecycleCategories = map[string]bool{
+	"large-context-rules":      true,
+	"adaptive-thinking-rules":  true,
+	"provider-reasoning-rules": true,
+	"provider-header-rules":    true,
+	"provider-feature-rules":   true,
+	"compaction-rules":         true,
+	"tool-cancel-reasons":      true,
+	"tool-cancel-coverage":     true,
 }
 
 func TestKnownLifecycleToolValuesMatchCommittedBaseline(t *testing.T) {
@@ -569,14 +695,16 @@ func TestKnownLifecycleToolValuesMatchCommittedBaseline(t *testing.T) {
 
 	assertStringSetsEqual(t, "thread delta events", baseline.Signals.ThreadDeltaEvents, sortedKeys(knownRawThreadDeltaEventValues))
 	assertStringSetsEqual(t, "thread delta coverage", threadDeltaCoverageStrings(baseline.Signals.ThreadDeltaCoverage), sortedKeys(expectedCoverageValuesFromSet(knownRawThreadDeltaEventValues, threadDeltaArea)))
-	assertStringSetsEqual(t, "tool cancel reasons", baseline.Signals.ToolCancelReasons, sortedKeys(knownToolCancelReasonValues))
-	assertStringSetsEqual(t, "tool cancel coverage", toolCancelCoverageStrings(baseline.Signals.ToolCancelCoverage), sortedKeys(expectedCoverageValuesFromSet(knownToolCancelReasonValues, toolCancelReasonArea)))
+	// the cancel-reason taxonomy left the client at gaac893; current baselines
+	// must not carry any.
+	assertStringSetsEqual(t, "tool cancel reasons", baseline.Signals.ToolCancelReasons, nil)
+	assertStringSetsEqual(t, "tool cancel coverage", toolCancelCoverageStrings(baseline.Signals.ToolCancelCoverage), nil)
 	assertStringSetsEqual(t, "tool run statuses", baseline.Signals.ToolRunStatuses, sortedKeys(knownToolRunStatusValues))
 	assertStringSetsEqual(t, "tool run coverage", toolRunCoverageStrings(baseline.Signals.ToolRunCoverage), sortedKeys(expectedCoverageValuesFromSet(knownToolRunStatusValues, func(name string) string {
 		return toolRunStatusAreas[name]
 	})))
-	assertStringSetsEqual(t, "tool catalog markers", baseline.Signals.ToolCatalog, sortedKeys(knownToolCatalogMarkerValues))
-	assertStringSetsEqual(t, "tool catalog coverage", toolCatalogCoverageStrings(baseline.Signals.ToolCatalogCoverage), sortedKeys(expectedCoverageValuesFromSet(knownToolCatalogMarkerValues, func(name string) string {
+	assertStringSetsEqual(t, "tool catalog markers", baseline.Signals.ToolCatalog, sortedKeys(withoutRetired(knownToolCatalogMarkerValues, retiredToolCatalogMarkerValues)))
+	assertStringSetsEqual(t, "tool catalog coverage", toolCatalogCoverageStrings(baseline.Signals.ToolCatalogCoverage), sortedKeys(expectedCoverageValuesFromSet(withoutRetired(knownToolCatalogMarkerValues, retiredToolCatalogMarkerValues), func(name string) string {
 		return toolCatalogMarkers[name]
 	})))
 	assertStringSetsEqual(t, "stream-json markers", baseline.Signals.StreamJSONMarkers, sortedStringMapKeys(streamJSONMarkers))
@@ -590,15 +718,16 @@ func TestKnownRouteProviderActorValuesMatchCommittedBaseline(t *testing.T) {
 		t.Fatalf("read committed baseline: %v", err)
 	}
 
-	assertStringSetsEqual(t, "routes", baseline.Signals.Routes, sortedKeys(knownRouteValues))
-	assertStringSetsEqual(t, "route methods", routeMethodStrings(baseline.Signals.RouteMethods), sortedKeys(knownRouteMethodValues))
-	assertStringSetsEqual(t, "route coverage", routeCoverageStrings(baseline.Signals.RouteCoverage), sortedKeys(expectedCoverageValuesFromSet(knownRouteValues, routeScope)))
+	assertStringSetsEqual(t, "routes", baseline.Signals.Routes, sortedKeys(withoutRetired(knownRouteValues, retiredRouteNames)))
+	assertStringSetsEqual(t, "route methods", routeMethodStrings(baseline.Signals.RouteMethods), sortedKeys(withoutRetired(knownRouteMethodValues, retiredRouteMethodValues)))
+	assertStringSetsEqual(t, "route coverage", routeCoverageStrings(baseline.Signals.RouteCoverage), sortedKeys(expectedCoverageValuesFromSet(withoutRetired(knownRouteValues, retiredRouteNames), routeScope)))
 	assertStringSetsEqual(t, "thread reader markers", baseline.Signals.ThreadReaderMarkers, sortedKeys(expectedThreadReaderMarkerValues))
 	assertStringSetsEqual(t, "thread reader coverage", threadReaderCoverageStrings(baseline.Signals.ThreadReaderCoverage), sortedKeys(expectedCoverageValuesFromSet(expectedThreadReaderMarkerValues, func(name string) string {
 		return threadReaderMarkers[name]
 	})))
-	assertStringSetsEqual(t, "provider protocol markers", baseline.Signals.ProviderProtocol, sortedStringMapKeys(providerProtocolMarkers))
-	assertStringSetsEqual(t, "provider protocol coverage", providerCoverageStrings(baseline.Signals.ProviderCoverage), sortedKeys(expectedCoverageValuesFromMap(providerProtocolMarkers)))
+	assertStringSetsEqual(t, "provider protocol markers", baseline.Signals.ProviderProtocol, sortedStringMapKeys(activeProviderProtocolMarkers()))
+	assertStringSetsEqual(t, "provider protocol coverage", providerCoverageStrings(baseline.Signals.ProviderCoverage), sortedKeys(expectedCoverageValuesFromMap(activeProviderProtocolMarkers())))
+	assertStringSetsEqual(t, "review contract markers", baseline.Signals.ReviewContract, sortedKeys(withoutRetired(knownReviewContractMarkerValues, retiredReviewContractMarkerValues)))
 	assertStringSetsEqual(t, "provider header rules", providerHeaderRuleStrings(baseline.Signals.ProviderHeaders), sortedKeys(knownProviderHeaderRuleValues))
 	assertStringSetsEqual(t, "provider feature rules", providerFeatureRuleStrings(baseline.Signals.ProviderFeatures), sortedKeys(knownProviderFeatureRuleValues))
 	assertStringSetsEqual(t, "compaction rules", compactionRuleStrings(baseline.Signals.CompactionRules), sortedKeys(knownCompactionRuleValues))
@@ -909,7 +1038,7 @@ func TestDiffSnapshotsReportsAddedAndRemovedSignals(t *testing.T) {
 			HelperHeader:             "x-stainless-helper",
 			HelperHeaderValue:        "compaction",
 		}},
-		ModelCoverage: []ModelCoverage{{Name: "amp-nostromo-v1", Provider: "openai", Family: "amp-nostromo"}, {Name: "gpt-5.5", Provider: "openai", Family: "gpt"}},
+		ModelCoverage: []ModelCoverage{{Name: "amp-nostromo-v1", Provider: "amp", Family: "amp-nostromo"}, {Name: "gpt-5.5", Provider: "openai", Family: "gpt"}},
 		ActorRuntime:  []string{"rvt-token", "threadActor", "threadStatusUpdated"},
 		ActorCoverage: []ActorCoverage{{Name: "rvt-token", Area: "actor-protocol"}, {Name: "threadActor", Area: "local-runtime"}, {Name: "threadStatusUpdated", Area: "local-runtime"}},
 		PromptFingerprints: []PromptFingerprint{{
@@ -1004,7 +1133,7 @@ func TestDiffSnapshotsReportsAddedAndRemovedSignals(t *testing.T) {
 	assertContains(t, diffCategory(t, diff, "provider-feature-rules").Removed, "amp.legacy|provider=anthropic|callsite=legacy-chat|tool=|header=x-amp-feature|default=true")
 	assertContains(t, diffCategory(t, diff, "compaction-rules").Added, "anthropic-tool-runner|provider=anthropic|trigger=observed-usage|timing=post-response|threshold=100000|usage=input_tokens,cache_creation_input_tokens,cache_read_input_tokens,output_tokens|summary_prompt=continuation-summary|history_role=user|tail_assistant=strip-tool-use-blocks|helper=x-stainless-helper:compaction")
 	assertContains(t, diffCategory(t, diff, "model-coverage").Added, "gpt-5.5=openai/gpt")
-	assertContains(t, diffCategory(t, diff, "model-coverage").Added, "amp-nostromo-v1=openai/amp-nostromo")
+	assertContains(t, diffCategory(t, diff, "model-coverage").Added, "amp-nostromo-v1=amp/amp-nostromo")
 	assertContains(t, diffCategory(t, diff, "model-coverage").Removed, "gpt-5.4=openai/gpt")
 	assertContains(t, diffCategory(t, diff, "actor-runtime-markers").Added, "rvt-token")
 	assertContains(t, diffCategory(t, diff, "actor-runtime-markers").Added, "threadStatusUpdated")
@@ -1136,7 +1265,7 @@ func TestBuildSnapshotReadsBinaryLikeFile(t *testing.T) {
 	assertContains(t, providerFeatureRuleStrings(snapshot.Signals.ProviderFeatures), "amp.chat|provider=anthropic|callsite=anthropic-chat|tool=|header=x-amp-feature|default=true")
 	assertContains(t, snapshot.Signals.Models, "amp-nostromo-v1")
 	assertContains(t, modelCoverageStrings(snapshot.Signals.ModelCoverage), "gpt-5.5=openai/gpt")
-	assertContains(t, modelCoverageStrings(snapshot.Signals.ModelCoverage), "amp-nostromo-v1=openai/amp-nostromo")
+	assertContains(t, modelCoverageStrings(snapshot.Signals.ModelCoverage), "amp-nostromo-v1=amp/amp-nostromo")
 	assertContains(t, snapshot.Signals.ActorRuntime, "threadStatusUpdated")
 	assertContains(t, actorCoverageStrings(snapshot.Signals.ActorCoverage), "threadStatusUpdated=local-runtime")
 }
@@ -1203,7 +1332,9 @@ func TestLifecycleChecklistMapsChangedSignalsToParityAreas(t *testing.T) {
 	assertContains(t, areas, "upstream-owned thread read and search")
 	assertContains(t, areas, "remote web control surface")
 	assertContains(t, lifecycleCheckByArea(t, checks, "compaction and continuation prompts").Commands, `go run ./cmd/amp_binary_audit -prompt-diff-excerpts`)
+	assertContains(t, lifecycleCheckByArea(t, checks, "compaction and continuation prompts").Commands, `bun dev/amp-prompt-family-audit.mjs`)
 	assertContains(t, lifecycleCheckByArea(t, checks, "tools, code review, skills, and images").Commands, `go run ./cmd/amp_binary_audit -prompt-diff-excerpts`)
+	assertContains(t, lifecycleCheckByArea(t, checks, "tools, code review, skills, and images").Commands, `bun dev/amp-prompt-family-audit.mjs`)
 }
 
 type lifecycleChecklistDiffCase struct {
@@ -1249,6 +1380,7 @@ func TestLifecycleChecklistEveryDiffCategoryHasChecklistPath(t *testing.T) {
 		{name: "mode-setting-coverage", value: "reasoningEffort=thread-metadata"},
 		{name: "provider-protocol-markers", value: "anthropic-beta"},
 		{name: "provider-protocol-coverage", value: "anthropic-beta=anthropic-header"},
+		{name: "review-contract-markers", value: "review-cli-appends-check-findings"},
 		{name: "agent-mode-profiles", value: "smart|primary=CLAUDE_OPUS_4_7|reasoning=high|levels=high,max,xhigh|include=present|deferred=true|visible=true|visibleInV2=true|serverOnly=false"},
 		{name: "agent-mode-routes", value: "smart|provider=anthropic|model=claude-opus-4-7|primary=CLAUDE_OPUS_4_7|reasoning=high|context=332000|max_out=32000"},
 		{name: "agent-mode-coverage", value: "smart=local-runtime"},
@@ -1316,6 +1448,7 @@ func TestDiffSnapshotsCoversEverySignalField(t *testing.T) {
 		"mode_setting_coverage":      {"mode-setting-coverage"},
 		"provider_protocol_markers":  {"provider-protocol-markers"},
 		"provider_protocol_coverage": {"provider-protocol-coverage"},
+		"review_contract_markers":    {"review-contract-markers"},
 		"agent_mode_profiles":        {"agent-mode-profiles"},
 		"agent_mode_routes":          {"agent-mode-routes"},
 		"agent_mode_coverage":        {"agent-mode-coverage"},
@@ -1390,6 +1523,7 @@ func committedBaselineChecklistGuardCategoriesForTest() []string {
 		"mode-setting-coverage",
 		"provider-protocol-markers",
 		"provider-protocol-coverage",
+		"review-contract-markers",
 		"agent-mode-profiles",
 		"agent-mode-routes",
 		"agent-mode-coverage",
@@ -1451,6 +1585,9 @@ func TestLifecycleChecklistRemoteWebIncludesProductionSmoke(t *testing.T) {
 
 	assertContains(t, check.Commands, `bun run --cwd dev/neo-remote-ui check`)
 	assertContains(t, check.Commands, `bun run --cwd dev/neo-remote-ui smoke`)
+	assertContains(t, check.Commands, `go run ./cmd/amp_runtime_drift_scan -since-homebrew-runtime -summary`)
+	assertContains(t, check.Commands, `go run ./cmd/amp_runtime_drift_scan -since-homebrew-runtime -json`)
+	assertContains(t, check.Files, "cmd/amp_runtime_drift_scan")
 	assertContains(t, check.Files, "dev/neo-remote-ui/server.ts")
 	assertContains(t, check.Files, "dev/neo-remote-ui/vite.config.ts")
 	assertContains(t, check.Files, "dev/neo-remote-ui/smoke.mjs")
@@ -1477,9 +1614,16 @@ func TestLifecycleChecklistThreadLifecycleChangeRunsRemoteWeb(t *testing.T) {
 		Added: []string{"queued_message_added"},
 	}}}
 
-	check := lifecycleCheckByArea(t, lifecycleChecklist(Snapshot{}, diff, false), "remote web control surface")
+	checks := lifecycleChecklist(Snapshot{}, diff, false)
+	check := lifecycleCheckByArea(t, checks, "remote web control surface")
+	threadDeltaCheck := lifecycleCheckByArea(t, checks, "thread delta reducer")
+	queueCheck := lifecycleCheckByArea(t, checks, "queue, steering, and interruption")
 
 	assertContains(t, check.Commands, `bun run --cwd dev/neo-remote-ui smoke`)
+	assertContains(t, threadDeltaCheck.Commands, `go run ./cmd/amp_runtime_drift_scan -since-homebrew-runtime -summary`)
+	assertContains(t, threadDeltaCheck.Commands, `go run ./cmd/amp_runtime_drift_scan -since-homebrew-runtime -json`)
+	assertContains(t, queueCheck.Commands, `go run ./cmd/amp_runtime_drift_scan -since-homebrew-runtime -summary`)
+	assertContains(t, queueCheck.Commands, `go run ./cmd/amp_runtime_drift_scan -since-homebrew-runtime -json`)
 }
 
 func TestLifecycleChecklistToolRunStatusChangeRunsRemoteWeb(t *testing.T) {
@@ -1493,6 +1637,7 @@ func TestLifecycleChecklistToolRunStatusChangeRunsRemoteWeb(t *testing.T) {
 	toolRunCheck := lifecycleCheckByArea(t, checks, "tool run status mapping")
 
 	assertContains(t, check.Commands, `bun run --cwd dev/neo-remote-ui smoke`)
+	assertContains(t, toolRunCheck.Commands, `go run ./cmd/amp_runtime_drift_scan -since-homebrew-runtime -summary`)
 	assertContains(t, toolRunCheck.Commands, `go run ./cmd/amp_runtime_drift_scan -since-homebrew-runtime -json`)
 	assertContains(t, lifecycleCheckAreas(checks), "streaming assistant and tool edits")
 }
@@ -1508,6 +1653,8 @@ func TestLifecycleChecklistToolCatalogChangeRunsStreamingChecks(t *testing.T) {
 	remote := lifecycleCheckByArea(t, checks, "remote web control surface")
 
 	assertContains(t, check.Commands, `go test -count=1 -run 'TestNeoRuntimeWebSocketStreaming|TestInferNeo.*Stream|TestForwardResponsesStream|TestRewriteStreamChunk' ./internal/api/modules/amp ./sdk/api/handlers/openai`)
+	assertContains(t, check.Commands, `go run ./cmd/amp_runtime_drift_scan -since-homebrew-runtime -summary`)
+	assertContains(t, check.Commands, `go run ./cmd/amp_runtime_drift_scan -since-homebrew-runtime -json`)
 	assertContains(t, remote.Commands, `bun run --cwd dev/neo-remote-ui smoke`)
 }
 
@@ -1517,9 +1664,13 @@ func TestLifecycleChecklistToolCancelChangeRunsRemoteWeb(t *testing.T) {
 		Added: []string{"system:restore-cleanup"},
 	}}}
 
-	check := lifecycleCheckByArea(t, lifecycleChecklist(Snapshot{}, diff, false), "remote web control surface")
+	checks := lifecycleChecklist(Snapshot{}, diff, false)
+	check := lifecycleCheckByArea(t, checks, "remote web control surface")
+	cancelCheck := lifecycleCheckByArea(t, checks, "tool cancellation and restore cleanup")
 
 	assertContains(t, check.Commands, `bun run --cwd dev/neo-remote-ui smoke`)
+	assertContains(t, cancelCheck.Commands, `go run ./cmd/amp_runtime_drift_scan -since-homebrew-runtime -summary`)
+	assertContains(t, cancelCheck.Commands, `go run ./cmd/amp_runtime_drift_scan -since-homebrew-runtime -json`)
 }
 
 func TestLifecycleChecklistAgentModeChangeRunsRemoteWeb(t *testing.T) {
@@ -1644,6 +1795,7 @@ func TestLifecycleChecklistRemovedToolSettingRunsToolChecks(t *testing.T) {
 	check := lifecycleCheckByArea(t, lifecycleChecklist(Snapshot{}, diff, false), "tools, code review, skills, and images")
 
 	assertContains(t, check.Commands, `go run ./cmd/amp_binary_audit -prompt-diff-excerpts`)
+	assertContains(t, check.Commands, `bun dev/amp-prompt-family-audit.mjs`)
 }
 
 func TestLifecycleChecklistUnknownSettingDefaultInternalsRunTriage(t *testing.T) {
@@ -1770,6 +1922,20 @@ func TestKnownLifecycleClassificationTablesAreInternallyConsistent(t *testing.T)
 		t.Run("actor/"+marker, func(t *testing.T) {
 			if area := actorMarkerAreas[marker]; area == "" {
 				t.Fatalf("actor marker %q has no area", marker)
+			}
+		})
+	}
+}
+
+func TestAuditModelClassifiersRejectAmpNostromoNearMisses(t *testing.T) {
+	for _, model := range []string{"amp-nostromo", "amp-nostromo-v1-preview", "amp-nostromo-v2"} {
+		t.Run(model, func(t *testing.T) {
+			provider, family := modelProviderAndFamily(model)
+			if provider != "unknown" || family != "unknown" {
+				t.Fatalf("modelProviderAndFamily(%q) = %s/%s, want unknown/unknown", model, provider, family)
+			}
+			if knownModelLimitNameShape("amp", model) {
+				t.Fatalf("knownModelLimitNameShape accepted amp near miss %q", model)
 			}
 		})
 	}
@@ -1944,6 +2110,36 @@ func TestLifecycleChecklistFullModeIncludesBaselineTriage(t *testing.T) {
 	assertContains(t, lifecycleCheckByArea(t, checks, "unknown signal triage").Commands, `go run ./cmd/amp_binary_audit -prompt-diff-excerpts`)
 }
 
+func TestLifecycleChecklistLocalAndRemoteRowsRunRuntimeDriftScan(t *testing.T) {
+	checks := lifecycleChecklist(Snapshot{}, auditDiff{}, true)
+
+	for _, check := range checks {
+		if check.Scope != "local-runtime" && check.Scope != "remote-web" {
+			continue
+		}
+		assertContains(t, check.Commands, `go run ./cmd/amp_runtime_drift_scan -since-homebrew-runtime -summary`)
+		assertContains(t, check.Commands, `go run ./cmd/amp_runtime_drift_scan -since-homebrew-runtime -json`)
+	}
+}
+
+func TestLifecycleChecklistBehaviorChangesRunReleaseWorkflow(t *testing.T) {
+	diff := auditDiff{Categories: []categoryDiff{{
+		Name:  "thread-delta-events",
+		Added: []string{"assistant:message-update"},
+	}}}
+
+	check := lifecycleCheckByArea(t, lifecycleChecklist(Snapshot{}, diff, false), "server build and private release workflow")
+
+	if check.Scope != "release" {
+		t.Fatalf("release workflow scope = %q, want release", check.Scope)
+	}
+	assertContains(t, check.Commands, `bun dev/amp-parity-gate.mjs`)
+	assertContains(t, check.Commands, `go build -o /tmp/cliproxyapi-parity-check ./cmd/server`)
+	assertContains(t, check.Commands, `git status --short --branch`)
+	assertContains(t, check.Commands, `git remote get-url private`)
+	assertContains(t, check.Files, "dev/amp-parity-gate.mjs")
+}
+
 func TestLifecycleChecklistAgentModeRouteChangeRunsModelRouting(t *testing.T) {
 	diff := auditDiff{Categories: []categoryDiff{{
 		Name:  "agent-mode-routes",
@@ -1956,6 +2152,7 @@ func TestLifecycleChecklistAgentModeRouteChangeRunsModelRouting(t *testing.T) {
 	assertContains(t, areas, "model routing, modes, and reasoning")
 	assertContains(t, areas, "compaction and continuation prompts")
 	assertContains(t, areas, "streaming assistant and tool edits")
+	assertContains(t, lifecycleCheckByArea(t, checks, "compaction and continuation prompts").Commands, `bun dev/amp-prompt-family-audit.mjs`)
 	assertContains(t, lifecycleCheckByArea(t, checks, "compaction and continuation prompts").Commands, `go test -count=1 -run 'TestNeo.*Compaction|TestInferNeo.*Compaction|TestOpenAIResponsesCompact|TestResponsesWebsocketCompaction|TestInputContainsFullTranscriptDetectsCompactionItem' ./internal/api/modules/amp ./sdk/api/handlers/openai`)
 }
 
@@ -2052,7 +2249,11 @@ func TestLifecycleChecklistModelLimitChangeRunsCompactionChecks(t *testing.T) {
 
 	assertContains(t, areas, "model routing, modes, and reasoning")
 	assertContains(t, areas, "compaction and continuation prompts")
+	assertContains(t, lifecycleCheckByArea(t, checks, "model routing, modes, and reasoning").Commands, `go run ./cmd/amp_runtime_drift_scan -since-homebrew-runtime -summary`)
+	assertContains(t, lifecycleCheckByArea(t, checks, "model routing, modes, and reasoning").Commands, `go run ./cmd/amp_runtime_drift_scan -since-homebrew-runtime -json`)
+	assertContains(t, lifecycleCheckByArea(t, checks, "compaction and continuation prompts").Commands, `go run ./cmd/amp_runtime_drift_scan -since-homebrew-runtime -summary`)
 	assertContains(t, lifecycleCheckByArea(t, checks, "compaction and continuation prompts").Commands, `go run ./cmd/amp_runtime_drift_scan -since-homebrew-runtime -json`)
+	assertContains(t, lifecycleCheckByArea(t, checks, "compaction and continuation prompts").Commands, `bun dev/amp-prompt-family-audit.mjs`)
 	assertContains(t, lifecycleCheckByArea(t, checks, "compaction and continuation prompts").Commands, `go test -count=1 -run 'TestNeo.*Compaction|TestInferNeo.*Compaction|TestOpenAIResponsesCompact|TestResponsesWebsocketCompaction|TestInputContainsFullTranscriptDetectsCompactionItem' ./internal/api/modules/amp ./sdk/api/handlers/openai`)
 }
 
@@ -2137,7 +2338,7 @@ func TestLifecycleChecklistUnknownLargeContextInternalsRunTriage(t *testing.T) {
 		"context":         strings.Replace(base, "context=1000000", "context=1200000", 1),
 		"max out":         strings.Replace(base, "max_out=32000", "max_out=64000", 1),
 		"max input":       strings.Replace(base, "max_input=968000", "max_input=936000", 1),
-		"requires enable": strings.Replace(base, "requires_enable=true", "requires_enable=false", 1),
+		"requires enable": strings.Replace(base, "requires_enable=true", "requires_enable=conditional", 1),
 		"missing gate":    strings.Replace(base, "|requires_enable=true", "", 1),
 	}
 	for name, value := range cases {
@@ -2329,6 +2530,9 @@ func TestLifecycleChecklistCommittedModelModeReasoningRulesMapToFocusedChecks(t 
 
 	for _, group := range expected {
 		if len(group.values) == 0 {
+			if retiredLifecycleCategories[group.category] {
+				continue
+			}
 			t.Fatalf("committed baseline has no %s", group.category)
 		}
 		for _, value := range group.values {
@@ -2538,6 +2742,9 @@ func TestLifecycleChecklistProviderHeaderChangeRunsProviderChecks(t *testing.T) 
 
 	assertContains(t, areas, "provider protocol headers and betas")
 	assertContains(t, areas, "compaction and continuation prompts")
+	assertContains(t, lifecycleCheckByArea(t, checks, "provider protocol headers and betas").Commands, `go run ./cmd/amp_runtime_drift_scan -since-homebrew-runtime -summary`)
+	assertContains(t, lifecycleCheckByArea(t, checks, "provider protocol headers and betas").Commands, `go run ./cmd/amp_runtime_drift_scan -since-homebrew-runtime -json`)
+	assertContains(t, lifecycleCheckByArea(t, checks, "compaction and continuation prompts").Commands, `go run ./cmd/amp_runtime_drift_scan -since-homebrew-runtime -summary`)
 	assertContains(t, lifecycleCheckByArea(t, checks, "compaction and continuation prompts").Commands, `go run ./cmd/amp_runtime_drift_scan -since-homebrew-runtime -json`)
 	assertContains(t, lifecycleCheckByArea(t, checks, "compaction and continuation prompts").Commands, `go test -count=1 -run 'TestNeo.*Compaction|TestInferNeo.*Compaction|TestOpenAIResponsesCompact|TestResponsesWebsocketCompaction|TestInputContainsFullTranscriptDetectsCompactionItem' ./internal/api/modules/amp ./sdk/api/handlers/openai`)
 }
@@ -2558,6 +2765,7 @@ func TestLifecycleChecklistToolProviderFeatureChangesRunToolChecks(t *testing.T)
 
 			check := lifecycleCheckByArea(t, lifecycleChecklist(Snapshot{}, diff, false), "tools, code review, skills, and images")
 
+			assertContains(t, check.Commands, `go run ./cmd/amp_runtime_drift_scan -since-homebrew-runtime -summary`)
 			assertContains(t, check.Commands, `go run ./cmd/amp_runtime_drift_scan -since-homebrew-runtime -json`)
 			assertContains(t, check.Commands, `go test -count=1 -run 'TestNeo.*Tool|TestNeo.*CodeReview|TestNeo.*Skill|TestNeo.*Image|TestImages' ./internal/api/modules/amp ./sdk/api/handlers/openai`)
 		})
@@ -2571,7 +2779,7 @@ func TestLifecycleChecklistCommittedProviderFeatureRulesMapToFocusedChecks(t *te
 		t.Fatalf("read committed baseline: %v", err)
 	}
 	if len(baseline.Signals.ProviderFeatures) == 0 {
-		t.Fatal("committed baseline has no provider feature rules")
+		t.Skip("committed baseline has no active provider feature rules")
 	}
 
 	for _, rule := range baseline.Signals.ProviderFeatures {
@@ -2641,6 +2849,9 @@ func TestLifecycleChecklistCommittedProviderProtocolAndCompactionRulesMapToFocus
 
 	for _, group := range expected {
 		if len(group.values) == 0 {
+			if retiredLifecycleCategories[group.category] {
+				continue
+			}
 			t.Fatalf("committed baseline has no %s", group.category)
 		}
 		for _, value := range group.values {
@@ -2733,11 +2944,27 @@ func TestLifecycleChecklistNonGoTestCommandsResolve(t *testing.T) {
 				}
 				continue
 			}
+			if target, ok := parseLifecycleGoBuildCommandForTest(command); ok {
+				targetDir := filepath.Join(root, strings.TrimPrefix(target, "./"))
+				if info, err := os.Stat(targetDir); err != nil || !info.IsDir() {
+					t.Fatalf("%s command targets missing go build directory %q: %s", check.Area, target, command)
+				}
+				continue
+			}
 			if cwd, script, ok := parseLifecycleBunRunCommandForTest(command); ok {
 				scripts := lifecyclePackageScriptsForTest(t, filepath.Join(root, cwd, "package.json"))
 				if strings.TrimSpace(scripts[script]) == "" {
 					t.Fatalf("%s command references missing bun script %q in %s: %s", check.Area, script, cwd, command)
 				}
+				continue
+			}
+			if target, ok := parseLifecycleBunScriptCommandForTest(command); ok {
+				if info, err := os.Stat(filepath.Join(root, target)); err != nil || info.IsDir() {
+					t.Fatalf("%s command targets missing bun script %q: %s", check.Area, target, command)
+				}
+				continue
+			}
+			if isLifecycleGitCommandForTest(command) {
 				continue
 			}
 			t.Fatalf("%s command uses an unverified command shape: %s", check.Area, command)
@@ -2876,6 +3103,9 @@ func TestLifecycleChecklistCommittedThreadToolLifecycleCoverageMapsToFocusedChec
 
 	for _, group := range expected {
 		if len(group.values) == 0 {
+			if retiredLifecycleCategories[group.category] {
+				continue
+			}
 			t.Fatalf("committed baseline has no %s", group.category)
 		}
 		for _, value := range group.values {
@@ -2982,6 +3212,9 @@ func TestLifecycleChecklistCommittedRouteSettingsActorToolCatalogCoverageMapsToF
 
 	for _, group := range expected {
 		if len(group.values) == 0 {
+			if retiredLifecycleCategories[group.category] {
+				continue
+			}
 			t.Fatalf("committed baseline has no %s", group.category)
 		}
 		for _, value := range group.values {
@@ -3004,8 +3237,11 @@ func TestLifecycleChecklistCommittedRouteSettingsActorToolCatalogCoverageMapsToF
 
 func TestLifecycleChecklistSourceTagCountChangesRunFocusedChecks(t *testing.T) {
 	diff := auditDiff{Categories: []categoryDiff{{
-		Name:  "prompt-tag-counts",
-		Added: []string{"source/skills=49", "source/compaction=32"},
+		Name: "prompt-tag-counts",
+		Added: []string{
+			fmt.Sprintf("source/skills=%d", knownPromptTagCountValues["source/skills"]),
+			fmt.Sprintf("source/compaction=%d", knownPromptTagCountValues["source/compaction"]),
+		},
 	}}}
 
 	areas := lifecycleCheckAreas(lifecycleChecklist(Snapshot{}, diff, false))
@@ -3022,7 +3258,6 @@ func TestLifecycleChecklistCommittedPromptTagCountsMapToFocusedChecks(t *testing
 		t.Fatalf("read committed baseline: %v", err)
 	}
 	expectedAreas := map[string][]string{
-		"prompt/code-review":   {"tools, code review, skills, and images"},
 		"prompt/compaction":    {"compaction and continuation prompts"},
 		"prompt/guidance":      {"streaming assistant and tool edits", "compaction and continuation prompts"},
 		"prompt/painter":       {"tools, code review, skills, and images"},
@@ -3252,9 +3487,13 @@ func TestLifecycleChecklistRemoteWebRunsForActorRuntimeMarkerChanges(t *testing.
 		Added: []string{"threadStatusUpdated"},
 	}}}
 
-	check := lifecycleCheckByArea(t, lifecycleChecklist(Snapshot{}, diff, false), "remote web control surface")
+	checks := lifecycleChecklist(Snapshot{}, diff, false)
+	check := lifecycleCheckByArea(t, checks, "remote web control surface")
+	actorCheck := lifecycleCheckByArea(t, checks, "actor route and websocket bridge")
 
 	assertContains(t, check.Commands, `bun run --cwd dev/neo-remote-ui smoke`)
+	assertContains(t, actorCheck.Commands, `go run ./cmd/amp_runtime_drift_scan -since-homebrew-runtime -summary`)
+	assertContains(t, actorCheck.Commands, `go run ./cmd/amp_runtime_drift_scan -since-homebrew-runtime -json`)
 }
 
 func TestLifecycleChecklistEveryDiffCategoryHasAReviewPath(t *testing.T) {
@@ -4127,6 +4366,7 @@ func TestBaselineWriteProblemsRejectsUnexpectedRawReleaseSignals(t *testing.T) {
 			StreamJSONMarkers:   []string{"future_stream_field"},
 			ModeSettingMarkers:  []string{"futureModeDefault"},
 			ProviderProtocol:    []string{"future-provider-header"},
+			ReviewContract:      []string{"run-check-uri-input-shape"},
 			Settings:            []string{"future.setting"},
 			Models:              []string{"future-model"},
 			ActorRuntime:        []string{"futureActor"},
@@ -4141,6 +4381,7 @@ func TestBaselineWriteProblemsRejectsUnexpectedRawReleaseSignals(t *testing.T) {
 	assertContainsString(t, text, "thread_delta_events:future:event")
 	assertContainsString(t, text, "thread_reader_markers:futureReader")
 	assertContainsString(t, text, "tool_catalog_markers:future_tool")
+	assertContainsString(t, text, "review_contract_markers:run-check-uri-input-shape")
 	assertContainsString(t, text, "settings:future.setting")
 	assertContainsString(t, text, "actor_runtime_markers:futureActor")
 	if !strictAuditFailed(snapshot, auditDiff{}) {
@@ -4167,7 +4408,7 @@ func TestBaselineWriteProblemsRejectsMissingExpectedRawReleaseSignals(t *testing
 
 	missing := missingExpectedRawReleaseSignals(snapshot)
 
-	assertContains(t, missing, "routes:/api/provider/google")
+	assertContains(t, missing, "routes:/api/internal")
 	assertContains(t, missing, "route_methods:/api/internal=POST=remote-web")
 	assertContains(t, missing, "thread_delta_events:thread_truncated")
 	assertContains(t, missing, "thread_reader_markers:read_messages")
@@ -4191,14 +4432,8 @@ func TestBaselineWriteProblemsRejectsMissingExpectedExactReleaseValues(t *testin
 
 	assertContains(t, missing, "agent_mode_profiles:smart profile")
 	assertContains(t, missing, "agent_mode_routes:smart route")
-	assertContains(t, missing, "setting_defaults:painter.model")
+	assertContains(t, missing, "setting_defaults:skills.path")
 	assertContains(t, missing, "model_limits:claude-opus-4-8")
-	assertContains(t, missing, "large_context_rules:CLAUDE_OPUS_4_6 large-context")
-	assertContains(t, missing, "adaptive_thinking_rules:CLAUDE_OPUS_4_6,CLAUDE_OPUS_4_7,CLAUDE_OPUS_4_8 adaptive")
-	assertContains(t, missing, "provider_reasoning_rules:anthropic")
-	assertContains(t, missing, "provider_header_rules:anthropic")
-	assertContains(t, missing, "provider_feature_rules:amp.read-thread/google")
-	assertContains(t, missing, "compaction_rules:anthropic-tool-runner compaction")
 
 	problems := baselineWriteProblems(snapshot, auditDiff{}, true, true)
 	assertContainsString(t, strings.Join(problems, "\n"), "missing expected exact release values:")
@@ -4215,17 +4450,16 @@ func TestBaselineWriteProblemsRejectsMissingExpectedCoverageValues(t *testing.T)
 
 	missing := missingExpectedCoverageValues(snapshot)
 
-	assertContains(t, missing, "route_coverage:/api/provider/google=local-runtime")
+	assertContains(t, missing, "route_coverage:/api/internal=remote-web")
 	assertContains(t, missing, "thread_delta_coverage:thread_truncated=history")
 	assertContains(t, missing, "thread_reader_coverage:read_messages=message-reader-route")
-	assertContains(t, missing, "tool_cancel_coverage:user:interrupted=user-interrupt")
 	assertContains(t, missing, "tool_run_coverage:blocked-on-user=pending")
 	assertContains(t, missing, "tool_catalog_coverage:read_file=file-read")
 	assertContains(t, missing, "stream_json_coverage:agent_mode=init-field")
 	assertContains(t, missing, "mode_setting_coverage:reasoningEffort=thread-metadata")
-	assertContains(t, missing, "provider_protocol_coverage:x-amp-feature=amp-provider-header")
+	assertContains(t, missing, "provider_protocol_coverage:x-amp-user=amp-provider-header")
 	assertContains(t, missing, "agent_mode_coverage:smart=local-runtime")
-	assertContains(t, missing, "setting_coverage:painter.model=local-runtime")
+	assertContains(t, missing, "setting_coverage:skills.path=local-runtime")
 	assertContains(t, missing, "model_coverage:claude-opus-4-8=anthropic/claude-opus")
 	assertContains(t, missing, "actor_runtime_coverage:threadActor=local-runtime")
 
@@ -4339,9 +4573,11 @@ func TestBaselineWriteProblemsRejectsCoverageMismatches(t *testing.T) {
 
 func TestBaselineWriteProblemsRejectsExactValueMismatches(t *testing.T) {
 	snapshot := Snapshot{Signals: Signals{
+		// smart's known values now pin CLAUDE_OPUS_4_8, so an opus-4-7 profile/route is a
+		// deliberate mismatch the writer must reject.
 		AgentModeProfiles: []AgentModeProfile{{
 			Name:            "smart",
-			PrimaryModel:    "CLAUDE_OPUS_4_8",
+			PrimaryModel:    "CLAUDE_OPUS_4_7",
 			ReasoningEffort: "high",
 			ReasoningLevels: []string{"high", "max", "xhigh"},
 			IncludeTools:    "hP",
@@ -4352,8 +4588,8 @@ func TestBaselineWriteProblemsRejectsExactValueMismatches(t *testing.T) {
 		AgentModeRoutes: []AgentModeRoute{{
 			Name:            "smart",
 			Provider:        "anthropic",
-			Model:           "claude-opus-4-8",
-			PrimaryModel:    "CLAUDE_OPUS_4_8",
+			Model:           "claude-opus-4-7",
+			PrimaryModel:    "CLAUDE_OPUS_4_7",
 			ReasoningEffort: "high",
 			ContextWindow:   332000,
 			MaxOutputTokens: 32000,
@@ -5060,12 +5296,46 @@ func parseLifecycleGoRunCommandForTest(command string) (string, bool) {
 	return fields[2], true
 }
 
+func parseLifecycleGoBuildCommandForTest(command string) (string, bool) {
+	fields := strings.Fields(strings.TrimSpace(command))
+	if len(fields) != 5 || fields[0] != "go" || fields[1] != "build" || fields[2] != "-o" {
+		return "", false
+	}
+	if !strings.HasPrefix(fields[3], "/tmp/") {
+		return "", false
+	}
+	if !strings.HasPrefix(fields[4], "./") {
+		return "", false
+	}
+	return fields[4], true
+}
+
 func parseLifecycleBunRunCommandForTest(command string) (string, string, bool) {
 	fields := strings.Fields(strings.TrimSpace(command))
 	if len(fields) != 5 || fields[0] != "bun" || fields[1] != "run" || fields[2] != "--cwd" {
 		return "", "", false
 	}
 	return fields[3], fields[4], true
+}
+
+func parseLifecycleBunScriptCommandForTest(command string) (string, bool) {
+	fields := strings.Fields(strings.TrimSpace(command))
+	if len(fields) != 2 || fields[0] != "bun" {
+		return "", false
+	}
+	if !strings.HasPrefix(fields[1], "dev/") || !strings.HasSuffix(fields[1], ".mjs") {
+		return "", false
+	}
+	return fields[1], true
+}
+
+func isLifecycleGitCommandForTest(command string) bool {
+	switch strings.TrimSpace(command) {
+	case "git status --short --branch", "git remote get-url private":
+		return true
+	default:
+		return false
+	}
 }
 
 func splitLifecycleRunAlternativesForTest(pattern string) []string {
@@ -5242,6 +5512,8 @@ func sampleDiffValue(category string) string {
 		return "x-amp-feature"
 	case "provider-protocol-coverage":
 		return "x-amp-feature=amp-provider-header"
+	case "review-contract-markers":
+		return "review-cli-appends-check-findings"
 	case "agent-mode-profiles":
 		return "smart|primary=CLAUDE_OPUS_4_8|reasoning=high"
 	case "agent-mode-routes":

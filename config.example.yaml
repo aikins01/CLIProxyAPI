@@ -302,6 +302,9 @@ nonstream-keepalive-interval: 0
 #   upstream-url: "https://ampcode.com"
 #   # Optional: Override API key for Amp upstream (otherwise uses env or file)
 #   upstream-api-key: ""
+#   # Optional: Rewrite X-Amp-Client-Version for Amp-owned upstream APIs/tools.
+#   # Set to "auto" to use the latest known @ampcode/cli version when running an older binary through this proxy.
+#   upstream-client-version-override: ""
 #   # Per-client upstream API key mapping
 #   # Maps client API keys (from top-level api-keys) to different Amp upstream API keys.
 #   # Useful when different clients need to use different Amp accounts/quotas.
@@ -336,6 +339,16 @@ nonstream-keepalive-interval: 0
 #     title-model: "claude-haiku-4-5-20251001"
 #     # optional: summarize old thread context when local Neo history gets large
 #     compaction-model: "gpt-5.4"
+#   # optional browser bridge for using ampcode.com web UI with local Neo inference.
+#   # Install /ampcode/local-inference.user.js in Tampermonkey, set the local API key
+#   # in browser localStorage, and keep this disabled unless you intentionally use it.
+#   # For Safari and mobile, use a trusted HTTPS URL here, such as Tailscale Serve.
+#   web-local-inference:
+#     enabled: false
+#     base-url: "http://127.0.0.1:8317"
+#     allowed-origins:
+#       - "https://ampcode.com"
+#       - "https://www.ampcode.com"
 #   # Amp Model Mappings
 #   # Route unavailable Amp models to alternative models available in your local proxy.
 #   # Useful when Amp CLI requests models you don't have access to (e.g., Claude Opus 4.5)
@@ -347,6 +360,20 @@ nonstream-keepalive-interval: 0
 #       to: "gemini-claude-sonnet-4-5-thinking"
 #     - from: "claude-haiku-4-5-20251001"
 #       to: "gemini-2.5-flash"
+#
+#   # model-fallbacks: on-FAILURE fallbacks (distinct from model-mappings, which redirect
+#   # unconditionally / by availability). A fallback only kicks in when the requested
+#   # model's provider returns a transient quota/unavailable error (HTTP 429/503): the
+#   # model is then routed to the target for a short cooldown before the original is
+#   # retried. Useful for Amp's Gemini subagents (code review = gemini-3.1-pro,
+#   # search/read_thread/media = gemini-3-flash) hitting a Vertex/AI-Studio quota cap.
+#   model-fallbacks:
+#     - from: '^gemini-3(\.1)?-pro(-preview)?$'    # code review
+#       to: claude-opus-4-8(xhigh)
+#       regex: true
+#     - from: '^gemini-3(\.5)?-flash(-preview)?$'  # search / read_thread / media analysis
+#       to: claude-sonnet-4-6
+#       regex: true
 
 # Global OAuth model name aliases (per channel)
 # These aliases rename model IDs for both model listing and request routing.

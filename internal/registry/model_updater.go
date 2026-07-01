@@ -320,6 +320,7 @@ func applyAmpBinaryModelOverrides(data *staticModelsJSON) {
 	setModelLimits(data.Claude, "claude-opus-4-6", 332000, 32000)
 	setModelLimits(data.Claude, "claude-opus-4-7", 332000, 32000)
 	data.Claude = upsertModelInfoPreserveOrder(data.Claude, ampBinaryClaudeOpus48Model())
+	data.Claude = upsertModelInfoPreserveOrder(data.Claude, claudeFable5Model())
 
 	for _, models := range [][]*ModelInfo{data.CodexFree, data.CodexTeam, data.CodexPlus, data.CodexPro} {
 		setModelLimits(models, "gpt-5.4", 400000, 128000)
@@ -369,6 +370,29 @@ func ampBinaryClaudeOpus48Model() *ModelInfo {
 		Description:         "Premium model combining maximum intelligence with practical performance",
 		ContextLength:       332000,
 		MaxCompletionTokens: 32000,
+		Thinking: &ThinkingSupport{
+			Min:         1024,
+			Max:         128000,
+			ZeroAllowed: true,
+			Levels:      []string{"low", "medium", "high", "xhigh", "max"},
+		},
+	}
+}
+
+// claudeFable5Model registers Claude Fable 5 for local provider routing.
+// the gaac893 Amp binary registers it natively (CLAUDE_FABLE_5: context 1M,
+// max output 128000); this mirrors that entry for the local registry.
+func claudeFable5Model() *ModelInfo {
+	return &ModelInfo{
+		ID:                  "claude-fable-5",
+		Object:              "model",
+		Created:             1781136000,
+		OwnedBy:             "anthropic",
+		Type:                "claude",
+		DisplayName:         "Claude Fable 5",
+		Description:         "Most powerful Claude model, a tier above Opus",
+		ContextLength:       1000000,
+		MaxCompletionTokens: 128000,
 		Thinking: &ThinkingSupport{
 			Min:         1024,
 			Max:         128000,

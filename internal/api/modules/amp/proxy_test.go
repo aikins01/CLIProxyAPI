@@ -53,6 +53,36 @@ func TestCreateReverseProxy_InvalidURL(t *testing.T) {
 	}
 }
 
+func TestCreateReverseProxy_PreservesAmpClientVersionWithoutOverride(t *testing.T) {
+	proxy, err := createReverseProxy("https://ampcode.test", NewStaticSecretSource("key"))
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "http://proxy.local/api/internal?webSearch2", nil)
+	req.Header.Set("X-Amp-Client-Version", "0.0.1779896748-g596c49")
+
+	proxy.Director(req)
+
+	if got := req.Header.Get("X-Amp-Client-Version"); got != "0.0.1779896748-g596c49" {
+		t.Fatalf("X-Amp-Client-Version = %q", got)
+	}
+}
+
+func TestCreateReverseProxy_OverridesAmpClientVersionWhenConfigured(t *testing.T) {
+	proxy, err := createReverseProxyWithClientVersionOverride("https://ampcode.test", NewStaticSecretSource("key"), " 0.0.1780359918-g778c3a ")
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "http://proxy.local/api/internal?webSearch2", nil)
+	req.Header.Set("X-Amp-Client-Version", "0.0.1779896748-g596c49")
+
+	proxy.Director(req)
+
+	if got := req.Header.Get("X-Amp-Client-Version"); got != "0.0.1780359918-g778c3a" {
+		t.Fatalf("X-Amp-Client-Version = %q", got)
+	}
+}
+
 func TestModifyResponse_GzipScenarios(t *testing.T) {
 	proxy, err := createReverseProxy("http://example.com", NewStaticSecretSource("k"))
 	if err != nil {
@@ -805,5 +835,106 @@ func TestFilterBetaFeatures(t *testing.T) {
 				t.Errorf("filterBetaFeatures() = %q, want %q", result, tt.expected)
 			}
 		})
+	}
+}
+
+// Newer Amp/RivetKit binaries perform a mandatory, token-less metadata discovery at
+// GET /actors/metadata before connecting (the probe moved from /metadata). The local
+// engine must answer it unauthenticated, otherwise the client's retry-forever lookup
+// loops on connect_failed and the thread transport never establishes. The hole must
+// stay scoped to exactly that GET so other actor paths still require a token.
+func TestActorEngineRequest_RoutesUnauthenticatedMetadataDiscovery(t *testing.T) {
+	meta := httptest.NewRequest(http.MethodGet, "http://localhost:8317/actors/metadata?namespace=default", nil)
+	if !actorEngineMetadataRequest(meta) {
+		t.Fatal("actorEngineMetadataRequest must match GET /actors/metadata")
+	}
+	if !actorEngineRequest(meta) {
+		t.Fatal("unauthenticated GET /actors/metadata must route to the local engine")
+	}
+
+	for _, tc := range []struct {
+		name string
+		req  *http.Request
+	}{
+		{"non-metadata actor path", httptest.NewRequest(http.MethodGet, "http://localhost:8317/actors/T-123", nil)},
+		{"metadata wrong method", httptest.NewRequest(http.MethodPost, "http://localhost:8317/actors/metadata", nil)},
+		{"deeper metadata path", httptest.NewRequest(http.MethodGet, "http://localhost:8317/actors/x/metadata", nil)},
+	} {
+		if actorEngineMetadataRequest(tc.req) {
+			t.Errorf("%s: must not be treated as metadata discovery", tc.name)
+		}
+		if actorEngineRequest(tc.req) {
+			t.Errorf("%s: must still require engine auth/token", tc.name)
+		}
+	}
+}
+
+// The engine must serve the discovery descriptor on both the legacy /metadata path
+// and the new /actors/metadata path, including the clientEndpoint the RivetKit client
+// reads to resolve its connection endpoint.
+func TestNeoRuntimeServesActorsMetadataDiscovery(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	for _, path := range []string{"/metadata", "/actors/metadata"} {
+		req := httptest.NewRequest(http.MethodGet, "http://localhost:8317"+path+"?namespace=default", nil)
+		rec := httptest.NewRecorder()
+		rt.handleHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: status = %d, want 200 (body=%s)", path, rec.Code, rec.Body.String())
+		}
+		// clientEndpoint lets the RivetKit client resolve its connection endpoint;
+		// clientToken is what it then attaches (as rvt-token) to authenticate the WS.
+		for _, field := range []string{"clientEndpoint", "clientToken"} {
+			if !strings.Contains(rec.Body.String(), field) {
+				t.Fatalf("%s: metadata response missing %s: %s", path, field, rec.Body.String())
+			}
+		}
+	}
+}
+
+// Newer Amp binaries prefix the engine transport with /actors/. The bridge must map
+// those back to the legacy paths the local engine speaks, while leaving actor CRUD
+// paths untouched.
+func TestNeoStripActorsRivetPrefix(t *testing.T) {
+	cases := map[string]string{
+		"/actors/metadata":                          "/metadata",
+		"/actors/gateway":                           "/gateway",
+		"/actors/gateway/threadActor/websocket/":    "/gateway/threadActor/websocket/",
+		"/actors/gateway/threadActor/request/state": "/gateway/threadActor/request/state",
+		"/metadata":                                 "/metadata",
+		"/gateway/threadActor/":                     "/gateway/threadActor/",
+		"/actors":                                   "/actors",
+		"/actors/T-123":                             "/actors/T-123",
+		"/actors/actors":                            "/actors/actors",
+	}
+	for in, want := range cases {
+		if got := neoStripActorsRivetPrefix(in); got != want {
+			t.Errorf("neoStripActorsRivetPrefix(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// Once the client adopts the discovered engine endpoint it talks the rivetkit engine
+// transport directly via /gateway/ (carrying its rvt-token). That path must bypass
+// management auth like the /actors-prefixed manager transport, while the token-less
+// metadata probe is allowed on both /metadata and /actors/metadata.
+func TestActorEngineRequest_RoutesEngineModeGatewayTransport(t *testing.T) {
+	bypass := []string{
+		"http://localhost:8317/gateway/threadActor/websocket/?rvt-method=get&rvt-key=T-x&rvt-token=local-neo",
+		"http://localhost:8317/metadata?namespace=default",
+		"http://localhost:8317/actors/metadata?namespace=default",
+	}
+	for _, raw := range bypass {
+		req := httptest.NewRequest(http.MethodGet, raw, nil)
+		if !actorEngineRequest(req) {
+			t.Errorf("expected engine routing (auth bypass) for %s", raw)
+		}
+	}
+
+	// A gateway transport request with no rivet credential must still require auth — a
+	// healthy client always carries its token once connected, so token-less probes are
+	// not part of the local-neo flow.
+	tokenless := httptest.NewRequest(http.MethodGet, "http://localhost:8317/gateway/threadActor/websocket/?rvt-method=get&rvt-key=T-x", nil)
+	if actorEngineRequest(tokenless) {
+		t.Error("token-less /gateway request must not bypass management auth")
 	}
 }

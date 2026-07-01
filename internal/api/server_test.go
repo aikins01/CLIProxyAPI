@@ -87,6 +87,50 @@ func TestHealthz(t *testing.T) {
 	})
 }
 
+func TestCORSMiddlewareAnswersGeneralPreflight(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(corsMiddleware())
+	hit := false
+	r.OPTIONS("/v1/models", func(c *gin.Context) {
+		hit = true
+		c.Status(http.StatusTeapot)
+	})
+
+	req := httptest.NewRequest(http.MethodOptions, "/v1/models", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNoContent)
+	}
+	if hit {
+		t.Fatal("route handler was unexpectedly reached")
+	}
+}
+
+func TestCORSMiddlewareLetsAmpLocalInferencePreflightReachRoute(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(corsMiddleware())
+	hit := false
+	r.OPTIONS("/api/thread-actors", func(c *gin.Context) {
+		hit = true
+		c.Status(http.StatusTeapot)
+	})
+
+	req := httptest.NewRequest(http.MethodOptions, "/api/thread-actors", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusTeapot {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusTeapot)
+	}
+	if !hit {
+		t.Fatal("route handler was not reached")
+	}
+}
+
 func TestServerListenWithRetryRetriesAddressInUse(t *testing.T) {
 	prevListen := serverListen
 	prevInterval := serverBindRetryInterval
