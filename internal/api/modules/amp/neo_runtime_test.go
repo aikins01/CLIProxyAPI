@@ -2,7 +2,9 @@ package amp
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -3058,6 +3060,64 @@ func TestNeoWebLocalInferenceSocketRequiresOptInOrigin(t *testing.T) {
 	}
 }
 
+func TestNeoApplyWebLocalInferenceBootstrapQueryAppliesThreadDefaults(t *testing.T) {
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+		NeoLocalRuntime: config.AmpNeoLocalRuntime{
+			Enabled:           &enabled,
+			ForceThreadActors: true,
+		},
+		WebLocalInference: config.AmpWebLocalInference{
+			Enabled:        true,
+			AllowedOrigins: []string{"https://ampcode.com"},
+		},
+	}})
+	threadID := "T-12121212-1212-4121-8121-121212121212"
+	actor, _ := rt.store.upsert(map[string]any{
+		"name": "threadActor",
+		"key":  threadID,
+		"input": map[string]any{
+			"threadId": threadID,
+		},
+	}, true)
+	workingDirectory := t.TempDir()
+	expectedWorkingDirectory := neoExistingDirectory(workingDirectory)
+	rawURL := "/gateway/threadActor/websocket/?rvt-method=get&rvt-key=" + threadID +
+		"&cliproxy-bootstrap-executor=true" +
+		"&cliproxy-working-directory=" + url.QueryEscape(workingDirectory) +
+		"&cliproxy-agent-mode=deep" +
+		"&cliproxy-reasoning-effort=xhigh"
+	req := httptest.NewRequest(http.MethodGet, rawURL, nil)
+	req.Header.Set("Origin", "https://ampcode.com")
+	req.Header.Set(neoInternalClientAPIKeyHeader, "local-key")
+
+	neoApplyWebLocalInferenceBootstrapQuery(req, actor)
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if got := stringValue(actor.environment["workingDirectory"]); got != expectedWorkingDirectory {
+		t.Fatalf("workingDirectory = %q, want %q", got, expectedWorkingDirectory)
+	}
+	if got := stringValue(actor.environment["workspaceRoot"]); got != expectedWorkingDirectory {
+		t.Fatalf("workspaceRoot = %q, want %q", got, expectedWorkingDirectory)
+	}
+	if actor.currentAgentMode != "deep" {
+		t.Fatalf("currentAgentMode = %q, want deep", actor.currentAgentMode)
+	}
+	if actor.currentReasoningEffort != "xhigh" {
+		t.Fatalf("currentReasoningEffort = %q, want xhigh", actor.currentReasoningEffort)
+	}
+	if got := stringValue(actor.settings["agentMode"]); got != "deep" {
+		t.Fatalf("settings agentMode = %q, want deep", got)
+	}
+	if got := stringValue(actor.settings["reasoning.effort"]); got != "xhigh" {
+		t.Fatalf("settings reasoning.effort = %q, want xhigh", got)
+	}
+	if actor.bootstrapExecutorType != "local-client" {
+		t.Fatalf("bootstrapExecutorType = %q, want local-client", actor.bootstrapExecutorType)
+	}
+}
+
 func TestNeoRuntimeWebLocalInferenceOriginBootstrapsExecutor(t *testing.T) {
 	dir := t.TempDir()
 	missingCommand := filepath.Join(dir, "missing-amp")
@@ -3161,6 +3221,14 @@ func TestNeoRuntimeWebLocalInferenceThreadActorUsesRivetActionProtocol(t *testin
 }
 
 func TestNeoRuntimeWebLocalInferenceReplaysCurrentExecutorState(t *testing.T) {
+	pidDir := filepath.Join(t.TempDir(), "pids")
+	if err := os.MkdirAll(pidDir, 0o700); err != nil {
+		t.Fatalf("mkdir pid dir: %v", err)
+	}
+	oldPIDDir := neoHeadlessPIDDir
+	neoHeadlessPIDDir = func() string { return pidDir }
+	t.Cleanup(func() { neoHeadlessPIDDir = oldPIDDir })
+
 	enabled := true
 	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
 		NeoLocalRuntime: config.AmpNeoLocalRuntime{
@@ -3173,6 +3241,9 @@ func TestNeoRuntimeWebLocalInferenceReplaysCurrentExecutorState(t *testing.T) {
 		},
 	}})
 	threadID := "T-77777777-7777-4777-8777-777777777777"
+	if err := os.WriteFile(filepath.Join(pidDir, threadID+".pid"), []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
+		t.Fatalf("write pid file: %v", err)
+	}
 	actor, _ := rt.store.upsert(map[string]any{
 		"name": "threadActor",
 		"key":  threadID,
@@ -3226,6 +3297,126 @@ func TestNeoRuntimeWebLocalInferenceReplaysCurrentExecutorState(t *testing.T) {
 		if name == "executor_connected" {
 			t.Fatal("web local observer received executor_connected")
 		}
+	}
+}
+
+func TestNeoRuntimeWebLocalInferenceBootstrapReplacesLegacyExecutor(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses POSIX shell script")
+	}
+	dir := t.TempDir()
+	pidDir := filepath.Join(dir, "pids")
+	if err := os.MkdirAll(pidDir, 0o700); err != nil {
+		t.Fatalf("mkdir pid dir: %v", err)
+	}
+	oldPIDDir := neoHeadlessPIDDir
+	neoHeadlessPIDDir = func() string { return pidDir }
+	t.Cleanup(func() { neoHeadlessPIDDir = oldPIDDir })
+
+	command := filepath.Join(dir, "amp")
+	startedLog := filepath.Join(dir, "started.log")
+	if err := os.WriteFile(command, []byte("#!/bin/sh\nprintf 'started %s\\n' \"$*\" > \"$TEST_STARTED_LOG\"\nsleep 5\n"), 0o755); err != nil {
+		t.Fatalf("write fake amp: %v", err)
+	}
+	t.Setenv("TEST_STARTED_LOG", startedLog)
+
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+		NeoLocalRuntime: config.AmpNeoLocalRuntime{
+			Enabled:           &enabled,
+			ForceThreadActors: true,
+			ExecutorCommand:   command,
+		},
+		WebLocalInference: config.AmpWebLocalInference{
+			Enabled:        true,
+			AllowedOrigins: []string{"https://ampcode.com"},
+		},
+	}})
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	t.Cleanup(server.Close)
+
+	threadID := "T-33333333-3333-4333-8333-333333333333"
+	actor, _ := rt.store.upsert(map[string]any{
+		"name": "threadActor",
+		"key":  threadID,
+		"input": map[string]any{
+			"threadId": threadID,
+		},
+	}, true)
+	actor.mu.Lock()
+	actor.executorID = "legacy-executor"
+	actor.executorReady = true
+	actor.executorBootstrapComplete = true
+	actor.mu.Unlock()
+	t.Cleanup(actor.stopSpawnedExecutors)
+
+	dialer := websocket.Dialer{Subprotocols: []string{"rivet", "rivet_encoding.4", "rivet_skip_ready_wait"}}
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/gateway/threadActor/websocket/?rvt-method=get&rvt-key=" + threadID + "&rvt-skip-ready-wait=true&cliproxy-bootstrap-executor=true"
+	headers := http.Header{
+		"Origin":                      []string{"https://ampcode.com"},
+		neoInternalClientAPIKeyHeader: []string{"local-key"},
+	}
+	conn, resp, err := dialer.Dial(wsURL, headers)
+	if err != nil {
+		status := 0
+		if resp != nil {
+			status = resp.StatusCode
+		}
+		t.Fatalf("gateway websocket dial failed status=%d err=%v", status, err)
+	}
+	defer conn.Close()
+
+	waitForNeoRivetBareInit(t, conn, 2*time.Second)
+	status := waitForNeoRivetBareEventTypeWhere(t, conn, "executor_status", 2*time.Second, func(msg map[string]any) bool {
+		reasonCode := stringValue(mapValue(msg["details"])["reasonCode"])
+		return reasonCode == "waiting_for_executor_connect" || reasonCode == "executor_connected"
+	})
+	if mapValue(status["details"])["reasonCode"] == "executor_connected" {
+		t.Fatalf("bootstrap reused legacy executor instead of spawning managed headless: %#v", status)
+	}
+
+	actor.mu.Lock()
+	executorID := actor.executorID
+	executorReady := actor.executorReady
+	actor.mu.Unlock()
+	if executorID != "" || executorReady {
+		t.Fatalf("legacy executor still marked ready id=%q ready=%v", executorID, executorReady)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		data, err := os.ReadFile(startedLog)
+		if err == nil && strings.Contains(string(data), "--headless "+threadID) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("fake amp start log = %q err=%v", data, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestNeoActorReplaceExecutorKeepsLegacyExecutorWhenSpawnFails(t *testing.T) {
+	missingCommand := filepath.Join(t.TempDir(), "missing-amp")
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{ExecutorCommand: missingCommand}}})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test-thread", "T-test-thread", neoActorRecord("actor-test", "thread-actor", "T-test-thread"), nil)
+	actor.executorID = "legacy-executor"
+	actor.executorReady = true
+	actor.executorBootstrapComplete = true
+	t.Cleanup(actor.dispose)
+
+	status := actor.spawnExecutor(map[string]any{
+		"type":                    "client_spawn_executor",
+		"requestId":               "spawn-test",
+		"replaceExistingExecutor": true,
+	})
+	if stringValue(status["status"]) != "failed" {
+		t.Fatalf("status = %#v, want failed spawn", status)
+	}
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.executorID != "legacy-executor" || !actor.executorReady || !actor.executorBootstrapComplete {
+		t.Fatalf("legacy executor was cleared after failed replacement: id=%q ready=%v bootstrap=%v", actor.executorID, actor.executorReady, actor.executorBootstrapComplete)
 	}
 }
 
@@ -5291,6 +5482,67 @@ func TestNeoUserActorReceivesThreadStatusUpdatedOnThreadActorCreation(t *testing
 	t.Fatal("did not receive threadStatusUpdated notification for created thread")
 }
 
+func TestNeoActorClientCreateThreadNotifiesSidebarForSparseChild(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	t.Cleanup(server.Close)
+
+	dialer := websocket.Dialer{Subprotocols: []string{"rivet", "rivet_conn_params.%7B%22transport%22%3A%22json-rpc%22%7D", "rivet_encoding.4", "rivet_skip_ready_wait"}}
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/gateway/userActor/?rvt-method=getOrCreate&rvt-key=user-local"
+	conn, resp, err := dialer.Dial(wsURL, nil)
+	if err != nil {
+		status := 0
+		if resp != nil {
+			status = resp.StatusCode
+		}
+		t.Fatalf("gateway userActor websocket dial failed status=%d err=%v", status, err)
+	}
+	defer conn.Close()
+
+	parentID := "T-019e1046-656d-7132-879f-390ded941c18"
+	childID := "T-019e1046-656d-7132-879f-390ded941c19"
+	parent := rt.store.ensureThreadActor(parentID)
+	parent.handleCreateThread(map[string]any{"type": "client_create_thread", "threadId": childID})
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		_ = conn.SetReadDeadline(time.Now().Add(time.Until(deadline)))
+		_, payload, err := conn.ReadMessage()
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				break
+			}
+			t.Fatalf("read userActor creation notification: %v", err)
+		}
+		var frame map[string]any
+		if err := json.Unmarshal(payload, &frame); err != nil {
+			t.Fatalf("userActor creation notification JSON error: %v", err)
+		}
+		if frame["method"] != "threadStatusUpdated" {
+			continue
+		}
+		params := mapValue(frame["params"])
+		if params["threadId"] != childID {
+			continue
+		}
+		if params["title"] != "Untitled" || params["state"] != "idle" || params["parentThreadID"] != parentID {
+			t.Fatalf("child threadStatusUpdated params = %#v", params)
+		}
+		if strings.TrimSpace(stringValue(params["lastUserMessageAt"])) == "" {
+			t.Fatalf("child threadStatusUpdated missing lastUserMessageAt: %#v", params)
+		}
+
+		recents := rt.neoWebLocalSidebarRecentThreads(10)
+		for _, raw := range recents {
+			if stringValue(mapValue(raw)["id"]) == childID {
+				return
+			}
+		}
+		t.Fatalf("sidebar recents missing sparse child thread %s: %#v", childID, recents)
+	}
+	t.Fatal("did not receive threadStatusUpdated notification for sparse child thread")
+}
+
 func TestNeoRuntimeUserActorGetConnectCreatesLocalActor(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
@@ -5376,6 +5628,33 @@ func TestNeoRuntimeThreadActorGatewayImportsMarkedCloudThread(t *testing.T) {
 	}
 	if len(actor.messages) != 1 || textFromBlocks(actor.messages[0].Content) != "resume through gateway" {
 		t.Fatalf("imported messages = %#v", actor.messages)
+	}
+}
+
+func TestNeoRuntimeThreadActorGatewayGetUsesRVTInputThreadID(t *testing.T) {
+	enabled := true
+	threadID := "T-019e65c0-0310-77a8-b233-4b84d9c06138"
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+		NeoLocalRuntime: config.AmpNeoLocalRuntime{
+			Enabled:           &enabled,
+			ForceThreadActors: true,
+		},
+	}})
+
+	rawInput, err := json.Marshal(map[string]any{"threadId": threadID})
+	if err != nil {
+		t.Fatalf("marshal gateway input: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "http://localhost:8317/gateway/threadActor/connect?rvt-method=get&rvt-key=actor-key&rvt-input="+url.QueryEscape(base64.RawURLEncoding.EncodeToString(rawInput)), nil)
+	actor := rt.store.actorForGatewayRequest(req)
+	if actor == nil {
+		t.Fatal("threadActor gateway lookup did not use rvt-input thread id")
+	}
+	if actor.threadID != threadID {
+		t.Fatalf("actor threadID = %q, want %q", actor.threadID, threadID)
+	}
+	if actor.key != threadID {
+		t.Fatalf("actor key = %q, want %q", actor.key, threadID)
 	}
 }
 
@@ -7731,6 +8010,136 @@ func TestNeoActorToolProgressTerminalSnapshotCompletesMessage(t *testing.T) {
 	if len(actor.history) != 1 || actor.history[0].ToolCallID != "TU-shell" || actor.history[0].Text != "workspace" {
 		t.Fatalf("history = %#v, want terminal tool result", actor.history)
 	}
+	protocolBlock := mapValue(arrayValue(message.protocol()["content"])[0])
+	if stringValue(protocolBlock["status"]) != "done" || stringValue(protocolBlock["output"]) != "workspace" {
+		t.Fatalf("protocol tool result block = %#v, want visible done output", protocolBlock)
+	}
+	if _, exists := protocolBlock["completionStatus"]; exists {
+		t.Fatalf("protocol tool result block leaked completionStatus: %#v", protocolBlock)
+	}
+}
+
+func TestNeoMessageProtocolUserContentNormalizesBeforeToolDisplay(t *testing.T) {
+	message := neoMessage{
+		ThreadID:  "T-test",
+		MessageID: "M-user",
+		Role:      "user",
+		Content: []any{
+			map[string]any{"type": "text", "text": "hello", "extra": "kept"},
+			map[string]any{"type": "debug", "text": "drop me"},
+			map[string]any{"type": "tool_result", "toolUseId": "TU-choice", "run": map[string]any{"status": "done", "result": map[string]any{"exitCode": 0, "output": "User selected option 2: Bravo"}}, "userInput": map[string]any{"accepted": true, "unknown": "drop"}},
+		},
+	}
+
+	content := arrayValue(message.protocol()["content"])
+	if len(content) != 2 {
+		t.Fatalf("protocol content = %#v, want normalized text plus tool result", content)
+	}
+	text := mapValue(content[0])
+	if stringValue(text["type"]) != "text" || stringValue(text["text"]) != "hello" {
+		t.Fatalf("text block = %#v", text)
+	}
+	tool := mapValue(content[1])
+	if stringValue(tool["toolUseID"]) != "TU-choice" || stringValue(tool["status"]) != "done" || stringValue(tool["output"]) != "User selected option 2: Bravo" {
+		t.Fatalf("tool result block = %#v", tool)
+	}
+	if _, exists := tool["toolUseId"]; exists {
+		t.Fatalf("tool result leaked alias field: %#v", tool)
+	}
+	userInput := mapValue(tool["userInput"])
+	if boolValue(userInput["accepted"]) != true || userInput["unknown"] != nil {
+		t.Fatalf("userInput = %#v, want normalized accepted only", userInput)
+	}
+}
+
+func TestNeoMessageProtocolUserContentPreservesLegacyToolResult(t *testing.T) {
+	message := neoMessage{
+		ThreadID:  "T-test",
+		MessageID: "M-user",
+		Role:      "user",
+		Content: []any{
+			map[string]any{"type": "debug", "text": "drop me"},
+			map[string]any{"type": "tool_result", "toolUseID": "TU-legacy", "content": "tool output"},
+		},
+	}
+
+	content := arrayValue(message.protocol()["content"])
+	if len(content) != 1 {
+		t.Fatalf("protocol content = %#v, want legacy tool result only", content)
+	}
+	legacy := mapValue(content[0])
+	if stringValue(legacy["toolUseID"]) != "TU-legacy" || stringValue(legacy["content"]) != "tool output" {
+		t.Fatalf("legacy tool result = %#v", legacy)
+	}
+	if _, exists := legacy["status"]; exists {
+		t.Fatalf("legacy tool result should not synthesize status without run: %#v", legacy)
+	}
+}
+
+func TestNeoProtocolToolResultDisplayErrorText(t *testing.T) {
+	block := neoProtocolToolResultDisplayBlock(map[string]any{
+		"type":      "tool_result",
+		"toolUseID": "TU-choice",
+		"run": map[string]any{
+			"status": "rejected-by-user",
+			"reason": "User rejected option 2: Bravo",
+		},
+	})
+
+	if stringValue(block["status"]) != "error" || stringValue(block["error"]) != "User rejected option 2: Bravo" {
+		t.Fatalf("display block = %#v, want visible error text", block)
+	}
+}
+
+func TestNeoProtocolToolResultDisplayDoesNotSynthesizeJSONText(t *testing.T) {
+	doneBlock := neoProtocolToolResultDisplayBlock(map[string]any{
+		"type":      "tool_result",
+		"toolUseID": "TU-done",
+		"run":       map[string]any{"status": "done"},
+	})
+	if stringValue(doneBlock["status"]) != "done" {
+		t.Fatalf("done block status = %#v", doneBlock)
+	}
+	if _, exists := doneBlock["output"]; exists {
+		t.Fatalf("done block synthesized output without display text: %#v", doneBlock)
+	}
+
+	errorBlock := neoProtocolToolResultDisplayBlock(map[string]any{
+		"type":      "tool_result",
+		"toolUseID": "TU-error",
+		"run":       map[string]any{"status": "error"},
+	})
+	if stringValue(errorBlock["status"]) != "error" {
+		t.Fatalf("error block status = %#v", errorBlock)
+	}
+	if _, exists := errorBlock["error"]; exists {
+		t.Fatalf("error block synthesized error without display text: %#v", errorBlock)
+	}
+}
+
+func TestNeoProtocolToolResultStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "done", in: "done", want: "done"},
+		{name: "error", in: "error", want: "error"},
+		{name: "rejected", in: "rejected-by-user", want: "error"},
+		{name: "cancelled", in: "cancelled", want: "cancelled"},
+		{name: "in progress", in: "in-progress", want: "running"},
+		{name: "cancellation requested", in: "cancellation-requested", want: "running"},
+		{name: "queued", in: "queued", want: "pending"},
+		{name: "blocked", in: "blocked-on-user", want: "pending"},
+		{name: "trim and case", in: " DONE ", want: "done"},
+		{name: "unknown", in: "waiting", want: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := neoProtocolToolResultStatus(tc.in); got != tc.want {
+				t.Fatalf("neoProtocolToolResultStatus(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
 }
 
 func TestNeoActorProtocolErrorAndCancelClearRuntimeState(t *testing.T) {
@@ -7956,13 +8365,14 @@ func TestNeoActorSpawnExecutorStartsHeadlessAmp(t *testing.T) {
 {
   printf 'args:'
   for arg in "$@"; do printf ' [%s]' "$arg"; done
-  printf '\nAMP_URL=%s\nAMP_API_KEY=%s\nAMP_EXECUTOR=%s\nAMP_PWD=%s\nAMP_THREAD_ID=%s\nRIVET_ENDPOINT=%s\nRIVET_PUBLIC_ENDPOINT=%s\n' "$AMP_URL" "$AMP_API_KEY" "$AMP_EXECUTOR" "$AMP_PWD" "$AMP_THREAD_ID" "$RIVET_ENDPOINT" "$RIVET_PUBLIC_ENDPOINT"
+  printf '\nAMP_URL=%s\nAMP_API_KEY=%s\nAMP_EXECUTOR=%s\nAMP_REMOTE_CONTROL_TERMINAL=%s\nAMP_PWD=%s\nAMP_THREAD_ID=%s\nRIVET_ENDPOINT=%s\nRIVET_PUBLIC_ENDPOINT=%s\n' "$AMP_URL" "$AMP_API_KEY" "$AMP_EXECUTOR" "$AMP_REMOTE_CONTROL_TERMINAL" "$AMP_PWD" "$AMP_THREAD_ID" "$RIVET_ENDPOINT" "$RIVET_PUBLIC_ENDPOINT"
 } > "$TEST_SPAWN_LOG"
 sleep 5
 `), 0o755); err != nil {
 		t.Fatalf("WriteFile script error: %v", err)
 	}
 	t.Setenv("TEST_SPAWN_LOG", logPath)
+	t.Setenv("AMP_REMOTE_CONTROL_TERMINAL", "0")
 
 	rt := newNeoRuntime(&config.Config{
 		SDKConfig: config.SDKConfig{APIKeys: []string{"local-key"}},
@@ -8005,6 +8415,7 @@ sleep 5
 		"AMP_URL=http://127.0.0.1:8317",
 		"AMP_API_KEY=local-key",
 		"AMP_EXECUTOR=1",
+		"AMP_REMOTE_CONTROL_TERMINAL=1",
 		"AMP_PWD=" + realWorkDir,
 		"AMP_THREAD_ID=T-test-thread",
 		"RIVET_ENDPOINT=http://127.0.0.1:6420",
@@ -8019,6 +8430,137 @@ sleep 5
 	defer actor.mu.Unlock()
 	if len(actor.spawnedExecutors) != 1 {
 		t.Fatalf("spawnedExecutors len = %d, want 1", len(actor.spawnedExecutors))
+	}
+}
+
+func TestPrependMissingPathDirs(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses POSIX PATH syntax")
+	}
+	got := prependMissingPathDirs("/usr/bin:/bin", []string{"/opt/homebrew/bin", "/usr/bin", "", "/usr/local/bin"})
+	want := "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+	if got != want {
+		t.Fatalf("path = %q, want %q", got, want)
+	}
+}
+
+func TestNeoHeadlessExecutorPathAddsExecutorAndUserBinDirs(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses POSIX PATH syntax")
+	}
+	oldLoginShellPath := neoHeadlessLoginShellPath
+	neoHeadlessLoginShellPath = func([]string) string { return "" }
+	t.Cleanup(func() { neoHeadlessLoginShellPath = oldLoginShellPath })
+	home := t.TempDir()
+	executorDir := filepath.Join(home, "custom-amp", "bin")
+	userDirs := []string{
+		filepath.Join(home, ".amp", "bin"),
+		filepath.Join(home, ".bun", "bin"),
+		filepath.Join(home, ".local", "bin"),
+		filepath.Join(home, ".local", "share", "mise", "shims"),
+		filepath.Join(home, "Library", "Python", "3.11", "bin"),
+	}
+	for _, dir := range append([]string{executorDir}, userDirs...) {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("MkdirAll %s error: %v", dir, err)
+		}
+	}
+	executor := filepath.Join(executorDir, "amp")
+	if err := os.WriteFile(executor, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile executor error: %v", err)
+	}
+	t.Setenv("HOME", home)
+
+	path := neoHeadlessExecutorPath([]string{"PATH=/usr/bin:/bin"}, executor)
+	parts := filepath.SplitList(path)
+	indexOf := func(needle string) int {
+		for i, part := range parts {
+			if part == needle {
+				return i
+			}
+		}
+		return -1
+	}
+	baseIndex := indexOf("/usr/bin")
+	if baseIndex < 0 {
+		t.Fatalf("PATH %q missing base /usr/bin", path)
+	}
+	if indexOf(executorDir) < 0 || indexOf(executorDir) > baseIndex {
+		t.Fatalf("PATH %q should prefer executor directory before base PATH", path)
+	}
+	for _, want := range append([]string{executorDir}, userDirs...) {
+		index := indexOf(want)
+		if index < 0 {
+			t.Fatalf("PATH %q missing %s", path, want)
+		}
+		if index > baseIndex {
+			t.Fatalf("PATH %q should prefer fallback dir %s before base PATH", path, want)
+		}
+	}
+}
+
+func TestNeoHeadlessExecutorPathUsesLoginShellPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses POSIX PATH syntax")
+	}
+	home := t.TempDir()
+	executorDir := filepath.Join(home, "custom-amp", "bin")
+	loginDir := filepath.Join(home, "login", "bin")
+	bunDir := filepath.Join(home, ".bun", "bin")
+	for _, dir := range []string{executorDir, loginDir, bunDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("MkdirAll %s error: %v", dir, err)
+		}
+	}
+	executor := filepath.Join(executorDir, "amp")
+	if err := os.WriteFile(executor, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile executor error: %v", err)
+	}
+	t.Setenv("HOME", home)
+	oldLoginShellPath := neoHeadlessLoginShellPath
+	neoHeadlessLoginShellPath = func([]string) string { return loginDir + string(os.PathListSeparator) + "/usr/bin" }
+	t.Cleanup(func() { neoHeadlessLoginShellPath = oldLoginShellPath })
+
+	path := neoHeadlessExecutorPath([]string{"PATH=/bin"}, executor)
+	parts := filepath.SplitList(path)
+	indexOf := func(needle string) int {
+		for i, part := range parts {
+			if part == needle {
+				return i
+			}
+		}
+		return -1
+	}
+	if indexOf(executorDir) < 0 || indexOf(loginDir) < 0 || indexOf(bunDir) < 0 {
+		t.Fatalf("PATH %q missing executor/login/fallback dirs", path)
+	}
+	if indexOf(executorDir) > indexOf(loginDir) {
+		t.Fatalf("PATH %q should keep executor dir before login shell PATH", path)
+	}
+	if indexOf(loginDir) > indexOf("/usr/bin") {
+		t.Fatalf("PATH %q should preserve login shell PATH ordering", path)
+	}
+	if indexOf(bunDir) < indexOf("/usr/bin") {
+		t.Fatalf("PATH %q should append fallback user dirs after login shell PATH", path)
+	}
+	if indexOf("/bin") >= 0 {
+		t.Fatalf("PATH %q used base PATH despite login shell PATH", path)
+	}
+}
+
+func TestNeoDiscoverHeadlessLoginShellPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses POSIX shell script")
+	}
+	dir := t.TempDir()
+	shell := filepath.Join(dir, "shell")
+	if err := os.WriteFile(shell, []byte("#!/bin/sh\nPATH=/login/bin:/usr/bin\nexport PATH\nprintf 'startup noise\\n'\neval \"$2\"\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile shell error: %v", err)
+	}
+
+	got := neoDiscoverHeadlessLoginShellPath([]string{"SHELL=" + shell})
+	if got != "/login/bin:/usr/bin" {
+		t.Fatalf("login shell PATH = %q", got)
 	}
 }
 
@@ -12781,9 +13323,12 @@ func TestNeoReviewModeRouteAndPrompt(t *testing.T) {
 	for _, want := range []string{
 		// recovered amp-classic review-agent body
 		"You are an expert senior engineer",
+		"Review adversarially",
 		"git diff --merge-base origin/HEAD HEAD",
 		"more than 100 changed files or is more than 10,000 lines",
 		// bridge to the gaac893 run_check/submit_review protocol
+		"look for .agents/checks/*.md",
+		"set checkName to frontmatter.name",
 		"run_check exactly once per check",
 		"submit_review tool; call it exactly once",
 		"empty comments array",
@@ -16864,6 +17409,44 @@ func TestNeoToolInputThreadIDMatchesBinaryParser(t *testing.T) {
 	}
 }
 
+func TestNeoActorToolResultAfterTerminalProgressSnapshotKeepsResultText(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "threadActor", "T-test", "T-test", neoActorRecord("actor-test", "threadActor", "T-test"), nil)
+	actor.messages = []neoMessage{{
+		ThreadID:  "T-test",
+		MessageID: "M-assistant",
+		Role:      "assistant",
+		Content:   []any{map[string]any{"type": "tool_use", "id": "TU-choice", "name": "ask_user_choice", "input": map[string]any{"question": "pick one"}}},
+		Seq:       1,
+	}}
+	actor.rebuildHistoryLocked()
+	actor.pendingTools["TU-choice"] = neoPendingTool{ID: "TU-choice", Name: "ask_user_choice"}
+
+	// The executor sends a terminal progress snapshot without the result payload
+	// immediately before the real executor_tool_result.
+	actor.handleToolProgress(map[string]any{"type": "tool_progress", "toolCallId": "TU-choice", "progress": map[string]any{"type": "snapshot", "value": map[string]any{"status": "done"}}})
+	actor.receiveToolResult(map[string]any{
+		"type":       "executor_tool_result",
+		"toolCallId": "TU-choice",
+		"run":        map[string]any{"status": "done", "result": "User selected option 2: Sushi"},
+	})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	toolEntries := make([]neoHistoryMessage, 0, 1)
+	for _, msg := range actor.history {
+		if msg.Role == "tool" && msg.ToolCallID == "TU-choice" {
+			toolEntries = append(toolEntries, msg)
+		}
+	}
+	if len(toolEntries) != 1 {
+		t.Fatalf("tool history entries = %#v, want exactly one for TU-choice", toolEntries)
+	}
+	if toolEntries[0].Text != "User selected option 2: Sushi" {
+		t.Fatalf("history text = %q, want the executor result text, not the bare snapshot run", toolEntries[0].Text)
+	}
+}
+
 func TestNeoActorPassesReadThreadToolResultThrough(t *testing.T) {
 	dir := t.TempDir()
 	oldStoreDir := neoAmpDataDir
@@ -18504,6 +19087,10 @@ func TestNeoActorBinaryToolDataAcceptsTopLevelPluginResult(t *testing.T) {
 	}
 	if len(actor.history) != 2 || actor.history[1].Role != "tool" || actor.history[1].Text != "User selected option 2: Bravo" {
 		t.Fatalf("history = %#v", actor.history)
+	}
+	protocolBlock := mapValue(arrayValue(actor.messages[1].protocol()["content"])[0])
+	if stringValue(protocolBlock["status"]) != "done" || stringValue(protocolBlock["output"]) != "User selected option 2: Bravo" {
+		t.Fatalf("protocol tool result block = %#v", protocolBlock)
 	}
 	if _, exists := actor.pendingTools["TU-choice"]; exists {
 		t.Fatalf("pending tool was not cleared: %#v", actor.pendingTools)
@@ -21608,6 +22195,10 @@ func TestNeoActorToolResultAcceptsTopLevelPluginResult(t *testing.T) {
 	if len(actor.messages) != 1 || runToText(mapValue(actor.messages[0].Content[0])["run"]) != "User selected option 2: Bravo" {
 		t.Fatalf("tool result message = %#v", actor.messages)
 	}
+	protocolBlock := mapValue(arrayValue(actor.messages[0].protocol()["content"])[0])
+	if stringValue(protocolBlock["status"]) != "done" || stringValue(protocolBlock["output"]) != "User selected option 2: Bravo" {
+		t.Fatalf("protocol tool result block = %#v", protocolBlock)
+	}
 	if _, exists := actor.pendingTools["TU-choice"]; exists {
 		t.Fatalf("pending tool was not cleared: %#v", actor.pendingTools)
 	}
@@ -23390,6 +23981,34 @@ func TestNeoRuntimeThreadActorManagementUsesExistingModeWhenRequestOmitsMode(t *
 	}
 }
 
+func TestNeoRuntimeThreadActorManagementModeOnlyRequestPreservesExistingEffort(t *testing.T) {
+	dir := t.TempDir()
+	oldStoreDir := neoAmpDataDir
+	neoAmpDataDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpDataDir = oldStoreDir })
+
+	threadID := "T-existing-deep-effort"
+	rt := newNeoRuntime(&config.Config{})
+	actor := rt.store.ensureThreadActor(threadID)
+	actor.mu.Lock()
+	actor.currentAgentMode = "deep"
+	actor.currentReasoningEffort = "xhigh"
+	actor.settings["agentMode"] = "deep"
+	actor.settings["reasoning.effort"] = "xhigh"
+	actor.messages = []neoMessage{{Role: "user", AgentMode: "deep", ReasoningEffort: "xhigh"}}
+	actor.mu.Unlock()
+
+	response, status := rt.localThreadActorManagementResponse(context.Background(), map[string]any{"agentMode": "deep"}, threadID)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d response=%#v", status, response)
+	}
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.currentAgentMode != "deep" || actor.currentReasoningEffort != "xhigh" || actor.settings["reasoning.effort"] != "xhigh" {
+		t.Fatalf("mode-only management request downgraded effort: current=%q/%q settings=%#v", actor.currentAgentMode, actor.currentReasoningEffort, actor.settings)
+	}
+}
+
 func TestNeoActorThreadSnapshotIncludesArtifacts(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
@@ -23876,5 +24495,78 @@ func TestFallbackHandlerLocalNeoInferenceFailsClosedWithoutAmpProxy(t *testing.T
 	}
 	if !strings.Contains(rec.Body.String(), "local_neo_provider_unavailable") {
 		t.Fatalf("expected fail-closed local Neo error, got %s", rec.Body.String())
+	}
+}
+
+func TestReadAndRestoreNeoJSONBodyDecodesGzipRequests(t *testing.T) {
+	payload := map[string]any{"method": "readThread", "params": map[string]any{"id": "T-test"}}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	var compressed bytes.Buffer
+	gz := gzip.NewWriter(&compressed)
+	if _, err := gz.Write(raw); err != nil {
+		t.Fatalf("gzip write: %v", err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+	gzipBytes := compressed.Bytes()
+	req := httptest.NewRequest(http.MethodPost, "/api/internal?readThread", bytes.NewReader(gzipBytes))
+	req.Header.Set("Content-Encoding", "gzip")
+
+	body, err := readAndRestoreNeoJSONBody(req)
+	if err != nil {
+		t.Fatalf("read restored body: %v", err)
+	}
+	if got := stringValue(body["method"]); got != "readThread" {
+		t.Fatalf("method = %q, want %q", got, "readThread")
+	}
+	params := mapValue(body["params"])
+	if got := stringValue(params["id"]); got != "T-test" {
+		t.Fatalf("params.id = %q, want %q", got, "T-test")
+	}
+	restored, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("read restored body: %v", err)
+	}
+	if !bytes.Equal(restored, gzipBytes) {
+		t.Fatalf("restored body must remain the original gzip payload for proxy fall-through")
+	}
+}
+
+func TestReadAndRestoreNeoJSONBodyRejectsInvalidGzipRequests(t *testing.T) {
+	raw := []byte{0x1f, 0x8b, '{', '}'}
+	req := httptest.NewRequest(http.MethodPost, "/api/internal?readThread", bytes.NewReader(raw))
+	req.Header.Set("Content-Encoding", "gzip")
+
+	body, err := readAndRestoreNeoJSONBody(req)
+	if err == nil || !strings.Contains(err.Error(), "decode gzip JSON body") {
+		t.Fatalf("err = %v, want gzip decode error", err)
+	}
+	if len(body) != 0 {
+		t.Fatalf("body = %#v, want empty map", body)
+	}
+	restored, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("read restored body: %v", err)
+	}
+	if !bytes.Equal(restored, raw) {
+		t.Fatalf("restored body must remain the original invalid gzip payload")
+	}
+}
+
+func TestReadAndRestoreNeoJSONBodyRejectsGzipEncodingMismatch(t *testing.T) {
+	raw := []byte(`{"method":"readThread"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/internal?readThread", bytes.NewReader(raw))
+	req.Header.Set("Content-Encoding", "gzip")
+
+	body, err := readAndRestoreNeoJSONBody(req)
+	if err == nil || !strings.Contains(err.Error(), "missing gzip header") {
+		t.Fatalf("err = %v, want gzip header mismatch", err)
+	}
+	if len(body) != 0 {
+		t.Fatalf("body = %#v, want empty map", body)
 	}
 }

@@ -306,7 +306,7 @@ func TestWebLocalInferenceCORSAllowsOnlyConfiguredActorOriginsAndPaths(t *testin
 		t.Fatalf("enabled web-local-inference internal preflight status = %d, want %d", internalRec.Code, http.StatusNoContent)
 	}
 
-	for _, path := range []string{"/metadata", "/actors/metadata", "/gateway/thread-actor/"} {
+	for _, path := range []string{"/metadata", "/actors/metadata", "/gateway/thread-actor/", "/_app/remote/3abror/createProjectThread"} {
 		t.Run("root preflight "+path, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodOptions, path, nil)
 			req.Header.Set("Origin", "https://ampcode.com")
@@ -339,6 +339,7 @@ func TestWebLocalInferenceCORSAllowsOnlyConfiguredActorOriginsAndPaths(t *testin
 		origin string
 	}{
 		{name: "unowned path", path: "/api/user", origin: "https://ampcode.com"},
+		{name: "nested remote near miss", path: "/_app/remote/3abror/nested/createProjectThread", origin: "https://ampcode.com"},
 		{name: "unconfigured origin", path: "/api/thread-actors", origin: "https://example.com"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -404,7 +405,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 	body := rec.Body.String()
 	for _, want := range []string{
 		"// ==UserScript==",
-		"@version 0.1.21",
+		"@version 0.1.27",
 		"@match https://ampcode.com/*",
 		"@updateURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
 		"@downloadURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
@@ -416,27 +417,35 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"menuIntegrationCount",
 		"commandPaletteIntegrationCount",
 		"localThreadPickerOpenCount",
+		"removedLocalThreadControlCount",
 		"lastPatchedThreadActorBaseURL",
 		"lastPatchedThreadID",
 		"threadActorConfig",
 		"executorConnected",
 		"local-client",
 		"cliproxyapi.ampLocalInference.apiKey",
-		"globalThis.sessionStorage.setItem(apiKeyStorageKey, apiKey)",
+		"storedLocalAPIKey",
+		`return globalThis.sessionStorage.getItem(apiKeyStorageKey) || ""`,
+		`const promptedAPIKey = (globalThis.prompt("CLIProxyAPI API key") || "").trim()`,
+		"globalThis.sessionStorage.setItem(apiKeyStorageKey, promptedAPIKey)",
 		"cliproxyapi.ampLocalInference.workingDirectory",
 		"cliproxyapi.ampLocalInference.localThreadIDs",
 		"cliproxyapi.ampLocalInference.threadWorkingDirectories",
 		"cliproxyapi.ampLocalInference.threadSettings",
+		"lastObservedThreadID",
+		"observedThreadID",
+		"normalizeExplicitReasoningEffort",
 		"lastInheritedWorkingDirectory",
 		"remoteShellCreateCount",
 		"lastLocalThreadAgentMode",
 		"lastVisibleThreadModeBadge",
 		"lastLocalThreadChoice",
 		"cliproxy-api-key",
+		"cliproxy-working-directory",
+		"cliproxy-agent-mode",
+		"cliproxy-reasoning-effort",
 		"bridgeRequestBody",
 		"bodyNeedsTextBridge",
-		"createLocalThread",
-		"createRemoteThreadShell",
 		"responseThreadID",
 		"reasoning.effort",
 		"visibleThreadModeOptions",
@@ -446,13 +455,9 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"showLocalThreadPicker",
 		"buildLocalThreadChoiceButton",
 		"appendMenuItemChevron",
-		"openLocalThreadFromMenu",
-		"Local thread: ",
 		"Deep 2",
 		"removeStaleLocalThreadButton",
-		"installLocalThreadKeyboardShortcut",
-		"installThreadMenuIntegration",
-		"installCommandPaletteIntegration",
+		"removeInjectedLocalThreadControls",
 		"threadMenuLooksLikeThreadMenu",
 		"commandPaletteLooksLikePalette",
 		"stripCommandPaletteShortcut",
@@ -460,17 +465,39 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"Generate Diagnostic Report",
 		"plainThreadWorkingDirectory",
 		"devalueThreadWorkingDirectory",
+		"TextDecoder",
+		"matches.length === 1",
 		"internalAPIPath",
-		"newThread",
 		"workingDirectory",
 		`prompt("CLIProxyAPI API key")`,
 		`"Bearer " + apiKey`,
 		"gatewayActorPath",
 		"threadActorAPIPath",
+		"threadActorCreatePath",
+		"threadActorInstancePath",
+		"svelteKitRemoteEndpoint",
+		"svelteKitRemotePath",
+		"createProjectThreadRemotePath",
+		"refreshLocalSidebarProjects",
+		"mergeDevalueSidebarProjects",
+		"cachedLocalSidebarRecentThreads",
+		"appendDevalueSidebarValue",
+		"devalueSidebarThreadIDs",
+		"localSidebarRecentThreadCount",
+		"remoteCreateProjectThreadWorkingDirectory",
+		"rememberRemoteCreateProjectThread",
+		"/_app/remote/",
+		"createProjectThread",
+		"prewarmProjectThread",
 		"shouldBridgeHTTP",
+		"pathThreadID",
 		"request.clone().text()",
 		`duplex = "half"`,
 		"activeThreadID",
+		"threadIDFromGatewayURL",
+		"firstThreadIDFromValue",
+		"firstThreadIDFromText",
+		"rvt-input",
 		"sameLocalHTTPBase",
 		"sameLocalWebSocketBase",
 		"diagnostics",
@@ -485,6 +512,27 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Fatalf("userscript missing %q:\n%s", want, body)
 		}
+	}
+	for _, unwanted := range []string{
+		"installLocalThreadKeyboardShortcut();",
+		"installThreadMenuIntegration();",
+		"installCommandPaletteIntegration();",
+		"handleNewThreadIntent();",
+		"path.endsWith(\"/listThreadListSidebar\")",
+		"path.endsWith(\"/listUserExecutorDaemons\")",
+		"\n\t\tcreateLocalThread,\n",
+		"\n\t\tpromptLocalThread,\n",
+		"\n\t\topenLocalThreadFromMenu,\n",
+	} {
+		if strings.Contains(body, unwanted) {
+			t.Fatalf("userscript still activates obsolete local thread control %q:\n%s", unwanted, body)
+		}
+	}
+	if got := strings.Count(body, "refreshLocalSidebarProjects();"); got != 2 {
+		t.Fatalf("refreshLocalSidebarProjects call count = %d, want 2", got)
+	}
+	if !strings.Contains(body, `headers: localFetchHeaders("", false)`) {
+		t.Fatalf("background sidebar refresh should not prompt for API key:\n%s", body)
 	}
 }
 
@@ -797,6 +845,20 @@ func TestWebLocalInferenceCanBootstrapRemoteShellThreadLocallyWithProxy(t *testi
 		t.Fatalf("actor mode/effort = %q/%q, want deep/xhigh", actor.currentAgentMode, actor.currentReasoningEffort)
 	}
 
+	invalidBodyThreadID := "T-019f03e0-bfa6-7595-9206-d5715ab49f2f"
+	invalidBodyReq := httptest.NewRequest(http.MethodPost, "/api/thread-actors/"+invalidBodyThreadID+"?"+ampWebLocalInferenceAPIKeyQuery+"=local-key", bytes.NewReader([]byte{0x1f, 0x8b, '{', '}'}))
+	invalidBodyReq.Header.Set("Content-Type", "application/json")
+	invalidBodyReq.Header.Set("Origin", "https://ampcode.com")
+	invalidBodyReq.Header.Set(ampWebLocalInferenceHeader, "1")
+	invalidBodyRec := httptest.NewRecorder()
+	r.ServeHTTP(invalidBodyRec, invalidBodyReq)
+	if invalidBodyRec.Code != http.StatusBadRequest {
+		t.Fatalf("invalid body bootstrap status = %d, want %d; body=%s", invalidBodyRec.Code, http.StatusBadRequest, invalidBodyRec.Body.String())
+	}
+	if actor := m.neoRuntime.store.lookupThreadActor(invalidBodyThreadID); actor != nil {
+		t.Fatal("invalid body actor was created")
+	}
+
 	invalidModeThreadID := "T-019f03e0-bfa6-7595-9206-d5715ab49f2d"
 	invalidModeReq := httptest.NewRequest(http.MethodPost, "/api/thread-actors/"+invalidModeThreadID+"?"+ampWebLocalInferenceAPIKeyQuery+"=local-key", bytes.NewBufferString(`{"executorType":"local-client","usesThreadActors":true,"settings":{"agentMode":"bogus","reasoning.effort":"xhigh"}}`))
 	invalidModeReq.Header.Set("Content-Type", "application/json")
@@ -934,6 +996,29 @@ func TestWebLocalInferenceInternalRPCRequiresAPIKey(t *testing.T) {
 	r.ServeHTTP(authRec, authReq)
 	if authRec.Code != http.StatusOK {
 		t.Fatalf("authenticated internal RPC status = %d, want %d; body=%s", authRec.Code, http.StatusOK, authRec.Body.String())
+	}
+}
+
+func TestInternalRPCRequestsTreatInvalidGzipAsMatchedError(t *testing.T) {
+	raw := []byte{0x1f, 0x8b, '{', '}'}
+	webReq := httptest.NewRequest(http.MethodPost, "/api/internal?readThread", bytes.NewReader(raw))
+	webReq.Header.Set(ampWebLocalInferenceHeader, "1")
+	_, _, matched, err := neoWebLocalInternalRPCRequestWithError(webReq)
+	if !matched || err == nil || !strings.Contains(err.Error(), "decode gzip JSON body") {
+		t.Fatalf("web-local matched=%v err=%v, want matched gzip error", matched, err)
+	}
+	webRestored, errRead := io.ReadAll(webReq.Body)
+	if errRead != nil {
+		t.Fatalf("read restored web-local body: %v", errRead)
+	}
+	if !bytes.Equal(webRestored, raw) {
+		t.Fatalf("web-local body was not restored: %v", webRestored)
+	}
+
+	localReq := httptest.NewRequest(http.MethodPost, "/api/internal?getThreadLabels", bytes.NewReader(raw))
+	_, _, matched, err = neoLocalInternalRPCRequestWithError(localReq)
+	if !matched || err == nil || !strings.Contains(err.Error(), "decode gzip JSON body") {
+		t.Fatalf("local matched=%v err=%v, want matched gzip error", matched, err)
 	}
 }
 
@@ -1432,6 +1517,345 @@ func TestWebLocalInferenceInternalRPCServesLocalThreadWithoutProxy(t *testing.T)
 	if plainRec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("unmarked getThread status = %d, want %d; body=%s", plainRec.Code, http.StatusServiceUnavailable, plainRec.Body.String())
 	}
+}
+
+func TestNeoDecodeSvelteKitCreateProjectThreadPayloadCaptured(t *testing.T) {
+	decoded, err := neoDecodeSvelteKitRemotePayload("W3siY29udGVudCI6MSwiYWdlbnRNb2RlIjo1LCJzcGF3bkV4ZWN1dG9yIjo2LCJ0aHJlYWRJRCI6NywicHJvamVjdElEIjo4LCJyZWFzb25pbmdFZmZvcnQiOjl9LFsyXSx7InR5cGUiOjMsInRleHQiOjR9LCJ0ZXh0IiwiRm9sbG93aW5nIEBULTAxOWYxZjYyLTc5OTYtNzY4Ny1hYzMzLTg5MDZhMGQzZDU3MSIsImRlZXAiLHRydWUsIlQtMDE5ZjIwYjItNWUwNS03NTAxLThkZGQtOTk0ZTE1MWVlOTUxIiwiNzU2MTZjM2ItZjRkZS00OGI3LThiODMtYzFhZjY5NzhhMDM0IiwibWVkaXVtIl0")
+	if err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	request := mapValue(decoded)
+	if stringValue(request["agentMode"]) != "deep" || stringValue(request["reasoningEffort"]) != "medium" || request["spawnExecutor"] != true {
+		t.Fatalf("decoded mode/effort/spawn = %#v", request)
+	}
+	if got := stringValue(request["threadID"]); got != "T-019f20b2-5e05-7501-8ddd-994e151ee951" {
+		t.Fatalf("threadID = %q", got)
+	}
+	if got := stringValue(request["projectID"]); got != "75616c3b-f4de-48b7-8b83-c1af6978a034" {
+		t.Fatalf("projectID = %q", got)
+	}
+	if got := textFromBlocks(arrayValue(request["content"])); got != "Following @T-019f1f62-7996-7687-ac33-8906a0d3d571" {
+		t.Fatalf("content text = %q", got)
+	}
+}
+
+func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	dataDir := t.TempDir()
+	oldStoreDir := neoAmpDataDir
+	neoAmpDataDir = func() string { return dataDir }
+	t.Cleanup(func() { neoAmpDataDir = oldStoreDir })
+	r := gin.New()
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+		NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled},
+	}})
+	m := &AmpModule{
+		restrictToLocalhost: false,
+		neoRuntime:          rt,
+		lastConfig: &config.AmpCode{
+			WebLocalInference: config.AmpWebLocalInference{Enabled: true},
+		},
+	}
+	auth := func(c *gin.Context) {
+		token := strings.TrimSpace(c.GetHeader("Authorization"))
+		token = strings.TrimSpace(strings.TrimPrefix(token, "Bearer "))
+		if token != "local-key" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing auth"})
+			return
+		}
+		c.Set("userApiKey", token)
+		c.Next()
+	}
+	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, auth)
+
+	workDir := t.TempDir()
+	expectedWorkDir := neoExistingDirectory(workDir)
+	projectID := "75616c3b-f4de-48b7-8b83-c1af6978a034"
+	parentThreadID := "T-019f1f62-7996-7687-ac33-8906a0d3d571"
+	if _, status := rt.localThreadActorManagementResponse(context.Background(), map[string]any{
+		"threadId":         parentThreadID,
+		"workingDirectory": workDir,
+		"workspaceRoot":    workDir,
+		"threadMeta":       map[string]any{"projectID": projectID},
+	}, ""); status != http.StatusOK {
+		t.Fatalf("seed parent status = %d", status)
+	}
+
+	threadID := "T-019f20b2-5e05-7501-8ddd-994e151ee951"
+	requestBody := neoSvelteKitRemoteCommandBodyForTest(t, map[string]any{
+		"content":         []any{map[string]any{"type": "text", "text": "Following @" + parentThreadID}},
+		"agentMode":       "deep",
+		"spawnExecutor":   true,
+		"threadID":        threadID,
+		"projectID":       projectID,
+		"reasoningEffort": "medium",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/_app/remote/3abror/createProjectThread?"+ampWebLocalInferenceAPIKeyQuery+"=local-key", strings.NewReader(requestBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", "https://ampcode.com")
+	req.Header.Set(ampWebLocalInferenceHeader, "1")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("create remote status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	createEnvelope := decodeSvelteKitRemoteEnvelopeForTest(t, rec.Body.Bytes())
+	createResult := mapValue(createEnvelope["_"])
+	if createResult["ok"] != true || stringValue(createResult["threadID"]) != threadID {
+		t.Fatalf("create result = %#v", createResult)
+	}
+
+	actor := rt.store.lookupThreadActor(threadID)
+	if actor == nil {
+		t.Fatal("created thread actor not found")
+	}
+	actor.mu.Lock()
+	environment := cloneMap(actor.environment)
+	queue := append([]neoQueuedMessage(nil), actor.queue...)
+	agentMode := actor.currentAgentMode
+	reasoningEffort := actor.currentReasoningEffort
+	meta := cloneMap(actor.meta)
+	actor.mu.Unlock()
+	if got := stringValue(environment["workingDirectory"]); got != expectedWorkDir {
+		t.Fatalf("workingDirectory = %q, want %q", got, expectedWorkDir)
+	}
+	if len(queue) != 1 || textFromBlocks(queue[0].Content) != "Following @"+parentThreadID {
+		t.Fatalf("queue = %#v", queue)
+	}
+	if agentMode != "deep" || reasoningEffort != "medium" {
+		t.Fatalf("mode/effort = %q/%q", agentMode, reasoningEffort)
+	}
+	if stringValue(meta["projectID"]) != projectID || stringValue(meta["ampcodeConnectorMode"]) != "local-neo" {
+		t.Fatalf("meta = %#v", meta)
+	}
+
+	projectOnlyThreadID := "T-019f20b2-5e05-7501-8ddd-994e151ee952"
+	projectOnlyBody := neoSvelteKitRemoteCommandBodyForTest(t, map[string]any{
+		"content":         []any{map[string]any{"type": "text", "text": "Use selected project only"}},
+		"agentMode":       "smart",
+		"spawnExecutor":   true,
+		"threadID":        projectOnlyThreadID,
+		"projectID":       projectID,
+		"reasoningEffort": "high",
+	})
+	projectOnlyReq := httptest.NewRequest(http.MethodPost, "/_app/remote/3abror/createProjectThread?"+ampWebLocalInferenceAPIKeyQuery+"=local-key", strings.NewReader(projectOnlyBody))
+	projectOnlyReq.Header.Set("Content-Type", "application/json")
+	projectOnlyReq.Header.Set("Origin", "https://ampcode.com")
+	projectOnlyReq.Header.Set(ampWebLocalInferenceHeader, "1")
+	projectOnlyRec := httptest.NewRecorder()
+	r.ServeHTTP(projectOnlyRec, projectOnlyReq)
+	if projectOnlyRec.Code != http.StatusOK {
+		t.Fatalf("project-only create status = %d, body=%s", projectOnlyRec.Code, projectOnlyRec.Body.String())
+	}
+	projectOnlyActor := rt.store.lookupThreadActor(projectOnlyThreadID)
+	if projectOnlyActor == nil {
+		t.Fatal("project-only thread actor not found")
+	}
+	projectOnlyActor.mu.Lock()
+	projectOnlyEnvironment := cloneMap(projectOnlyActor.environment)
+	projectOnlyActor.mu.Unlock()
+	if got := stringValue(projectOnlyEnvironment["workingDirectory"]); got != expectedWorkDir {
+		t.Fatalf("project-only workingDirectory = %q, want %q", got, expectedWorkDir)
+	}
+
+	missingDirectoryThreadID := "T-019f20b2-5e05-7501-8ddd-994e151ee953"
+	missingDirectoryBody := neoSvelteKitRemoteCommandBodyForTest(t, map[string]any{
+		"content":       []any{map[string]any{"type": "text", "text": "No directory source"}},
+		"spawnExecutor": true,
+		"threadID":      missingDirectoryThreadID,
+	})
+	missingDirectoryReq := httptest.NewRequest(http.MethodPost, "/_app/remote/3abror/createProjectThread?"+ampWebLocalInferenceAPIKeyQuery+"=local-key", strings.NewReader(missingDirectoryBody))
+	missingDirectoryReq.Header.Set("Content-Type", "application/json")
+	missingDirectoryReq.Header.Set("Origin", "https://ampcode.com")
+	missingDirectoryReq.Header.Set(ampWebLocalInferenceHeader, "1")
+	missingDirectoryRec := httptest.NewRecorder()
+	r.ServeHTTP(missingDirectoryRec, missingDirectoryReq)
+	if missingDirectoryRec.Code != http.StatusOK {
+		t.Fatalf("missing-directory create status = %d, body=%s", missingDirectoryRec.Code, missingDirectoryRec.Body.String())
+	}
+	missingDirectoryEnvelope := decodeSvelteKitRemoteEnvelopeForTest(t, missingDirectoryRec.Body.Bytes())
+	missingDirectoryResult := mapValue(missingDirectoryEnvelope["_"])
+	if missingDirectoryResult["ok"] != false {
+		t.Fatalf("missing-directory result = %#v, want ok false", missingDirectoryResult)
+	}
+	if actor := rt.store.lookupThreadActor(missingDirectoryThreadID); actor != nil {
+		t.Fatal("missing-directory thread actor was created")
+	}
+
+	listReq := httptest.NewRequest(http.MethodGet, "/_app/remote/3abror/listThreadListSidebar?"+ampWebLocalInferenceAPIKeyQuery+"=local-key", nil)
+	listReq.Header.Set("Origin", "https://ampcode.com")
+	listReq.Header.Set(ampWebLocalInferenceHeader, "1")
+	listRec := httptest.NewRecorder()
+	r.ServeHTTP(listRec, listReq)
+	if listRec.Code != http.StatusOK {
+		t.Fatalf("sidebar status = %d, body=%s", listRec.Code, listRec.Body.String())
+	}
+	sidebarEnvelope := decodeSvelteKitRemoteEnvelopeForTest(t, listRec.Body.Bytes())
+	queryCache := mapValue(sidebarEnvelope["q"])
+	queryValue := mapValue(mapValue(queryCache["3abror/listThreadListSidebar/"])["v"])
+	if len(arrayValue(queryValue["projects"])) == 0 || len(arrayValue(queryValue["recentThreads"])) == 0 {
+		t.Fatalf("sidebar query value = %#v", queryValue)
+	}
+	var sawProject, sawThread bool
+	for _, rawProject := range arrayValue(queryValue["projects"]) {
+		project := mapValue(rawProject)
+		if stringValue(project["id"]) == projectID && stringValue(project["workingDirectory"]) == expectedWorkDir {
+			sawProject = true
+		}
+	}
+	for _, rawThread := range arrayValue(queryValue["recentThreads"]) {
+		thread := mapValue(rawThread)
+		if stringValue(thread["id"]) == threadID && thread["hasExecutor"] == true {
+			sawThread = true
+		}
+	}
+	if !sawProject || !sawThread {
+		t.Fatalf("sidebar missing project/thread sawProject=%v sawThread=%v value=%#v", sawProject, sawThread, queryValue)
+	}
+}
+
+func TestWebLocalInferenceRemotePrewarmRejectsMalformedPayload(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	dataDir := t.TempDir()
+	oldStoreDir := neoAmpDataDir
+	neoAmpDataDir = func() string { return dataDir }
+	t.Cleanup(func() { neoAmpDataDir = oldStoreDir })
+	r := gin.New()
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+		NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled},
+	}})
+	m := &AmpModule{
+		restrictToLocalhost: false,
+		neoRuntime:          rt,
+		lastConfig: &config.AmpCode{
+			WebLocalInference: config.AmpWebLocalInference{Enabled: true},
+		},
+	}
+	auth := func(c *gin.Context) {
+		token := strings.TrimSpace(c.GetHeader("Authorization"))
+		token = strings.TrimSpace(strings.TrimPrefix(token, "Bearer "))
+		if token != "local-key" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing auth"})
+			return
+		}
+		c.Set("userApiKey", token)
+		c.Next()
+	}
+	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, auth)
+
+	req := httptest.NewRequest(http.MethodPost, "/_app/remote/3abror/prewarmProjectThread?"+ampWebLocalInferenceAPIKeyQuery+"=local-key", strings.NewReader(`{"payload":"%%%","refreshes":[]}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", "https://ampcode.com")
+	req.Header.Set(ampWebLocalInferenceHeader, "1")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("prewarm status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+
+	envelope := decodeSvelteKitRemoteEnvelopeForTest(t, rec.Body.Bytes())
+	result := mapValue(envelope["_"])
+	if result["ok"] != false {
+		t.Fatalf("prewarm result = %#v, want ok false", result)
+	}
+	errorBody := mapValue(result["error"])
+	if !strings.Contains(stringValue(errorBody["message"]), "invalid SvelteKit remote payload encoding") {
+		t.Fatalf("error = %#v", errorBody)
+	}
+}
+
+func TestWebLocalInferenceRemoteSidebarIncludesWorkingDirectoryHint(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	dataDir := t.TempDir()
+	oldStoreDir := neoAmpDataDir
+	neoAmpDataDir = func() string { return dataDir }
+	t.Cleanup(func() { neoAmpDataDir = oldStoreDir })
+	r := gin.New()
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+		NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled},
+	}})
+	m := &AmpModule{
+		restrictToLocalhost: false,
+		neoRuntime:          rt,
+		lastConfig: &config.AmpCode{
+			WebLocalInference: config.AmpWebLocalInference{Enabled: true},
+		},
+	}
+	auth := func(c *gin.Context) {
+		token := strings.TrimSpace(c.GetHeader("Authorization"))
+		token = strings.TrimSpace(strings.TrimPrefix(token, "Bearer "))
+		if token != "local-key" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing auth"})
+			return
+		}
+		c.Set("userApiKey", token)
+		c.Next()
+	}
+	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, auth)
+
+	workDir := t.TempDir()
+	expectedWorkDir := neoExistingDirectory(workDir)
+	req := httptest.NewRequest(http.MethodGet, "/_app/remote/3abror/listThreadListSidebar?"+ampWebLocalInferenceAPIKeyQuery+"=local-key&cliproxy-working-directory="+url.QueryEscape(workDir), nil)
+	req.Header.Set("Origin", "https://ampcode.com")
+	req.Header.Set(ampWebLocalInferenceHeader, "1")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("sidebar status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+
+	sidebarEnvelope := decodeSvelteKitRemoteEnvelopeForTest(t, rec.Body.Bytes())
+	queryCache := mapValue(sidebarEnvelope["q"])
+	queryValue := mapValue(mapValue(queryCache["3abror/listThreadListSidebar/"])["v"])
+	projects := arrayValue(queryValue["projects"])
+	if len(projects) != 1 {
+		t.Fatalf("projects = %#v, want exactly hinted project", projects)
+	}
+	project := mapValue(projects[0])
+	expectedID := neoDeterministicLocalProjectID(filepath.Base(expectedWorkDir), neoFileURLForDirectory(expectedWorkDir), expectedWorkDir)
+	if stringValue(project["id"]) != expectedID || stringValue(project["workingDirectory"]) != expectedWorkDir || stringValue(project["name"]) != filepath.Base(expectedWorkDir) {
+		t.Fatalf("project = %#v, want id=%q workingDirectory=%q", project, expectedID, expectedWorkDir)
+	}
+	if threads := arrayValue(queryValue["recentThreads"]); len(threads) != 0 {
+		t.Fatalf("recentThreads = %#v, want none for fresh hinted project", threads)
+	}
+}
+
+func neoSvelteKitRemoteCommandBodyForTest(t *testing.T, value any) string {
+	t.Helper()
+	data, err := neoSvelteKitDevalueString(value)
+	if err != nil {
+		t.Fatalf("encode devalue: %v", err)
+	}
+	raw := base64.StdEncoding.EncodeToString([]byte(data))
+	body, err := json.Marshal(map[string]any{"payload": raw, "refreshes": []any{}})
+	if err != nil {
+		t.Fatalf("marshal remote body: %v", err)
+	}
+	return string(body)
+}
+
+func decodeSvelteKitRemoteEnvelopeForTest(t *testing.T, raw []byte) map[string]any {
+	t.Helper()
+	var envelope map[string]any
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		t.Fatalf("decode remote envelope JSON: %v", err)
+	}
+	if envelope["type"] != "result" {
+		t.Fatalf("remote envelope = %#v", envelope)
+	}
+	var values []any
+	if err := json.Unmarshal([]byte(stringValue(envelope["data"])), &values); err != nil {
+		t.Fatalf("decode remote data devalue JSON: %v", err)
+	}
+	decoded, ok := neoDecodeSvelteKitDevalueIndex(values, 0, map[int]bool{})
+	if !ok {
+		t.Fatalf("decode remote data failed: %#v", values)
+	}
+	return mapValue(decoded)
 }
 
 func TestRegisterManagementRoutesLocalNeoThreadActorsWithoutProxy(t *testing.T) {
@@ -2457,6 +2881,66 @@ func TestRegisterManagementRoutesServesNewNeoThreadActorLocallyWithProxy(t *test
 	}
 	if response["usesDtw"] != true || response["usesThreadActors"] != true {
 		t.Fatalf("thread actor flags = %#v", response)
+	}
+}
+
+func TestRegisterManagementRoutesPassesMalformedThreadActorCreateUpstreamWithProxy(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	enabled := true
+	proxyCalled := false
+	var upstreamBody string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxyCalled = true
+		data, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read upstream body: %v", err)
+		}
+		upstreamBody = string(data)
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	defer upstream.Close()
+
+	m := &AmpModule{
+		restrictToLocalhost: false,
+		neoRuntime: newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+			UpstreamURL: upstream.URL,
+			NeoLocalRuntime: config.AmpNeoLocalRuntime{
+				Enabled: &enabled,
+			},
+		}}),
+	}
+	proxy, _ := createReverseProxy(upstream.URL, NewStaticSecretSource(""))
+	m.setProxy(proxy)
+	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, nil)
+
+	requestBody := `{"agentMode":`
+	localServer := httptest.NewServer(r)
+	defer localServer.Close()
+	req, err := http.NewRequest(http.MethodPost, localServer.URL+"/api/thread-actors", bytes.NewBufferString(requestBody))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do request: %v", err)
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Fatalf("close response body: %v", err)
+		}
+	}()
+
+	if resp.StatusCode != http.StatusTeapot {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, body=%s", resp.StatusCode, string(body))
+	}
+	if !proxyCalled {
+		t.Fatal("malformed unclassified thread-actor create should be passed upstream")
+	}
+	if upstreamBody != requestBody {
+		t.Fatalf("upstream body = %q, want %q", upstreamBody, requestBody)
 	}
 }
 

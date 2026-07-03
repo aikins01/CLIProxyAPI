@@ -47,6 +47,82 @@ func TestNeoSubagentRegistryMatchesBinary(t *testing.T) {
 	}
 }
 
+func captureNeoSubagentRouteForTest(t *testing.T, toolName, name string, cfg *config.Config, agentMode string, settings map[string]any) neoModelRoute {
+	t.Helper()
+	rt := newNeoRuntime(cfg)
+	actor := newNeoActor(rt, "actor-"+name, "thread-actor", "T-"+name, "T-"+name, neoActorRecord("actor-"+name, "thread-actor", "T-"+name), nil)
+	actor.currentAgentMode = agentMode
+	actor.settings = settings
+
+	var seen []neoModelRoute
+	rt.inferStream = func(_ *neoRuntime, req neoInferenceRequest, _ neoStreamCallback) (neoInferenceResult, error) {
+		if req.ModelRouteOverride == nil {
+			t.Fatalf("%s subagent missing model route override", req.ParentToolCallID)
+		}
+		seen = append(seen, *req.ModelRouteOverride)
+		return neoInferenceResult{Text: "done"}, nil
+	}
+
+	input := map[string]any{"prompt": "delegate"}
+	if toolName == "oracle" {
+		input = map[string]any{"task": "advise"}
+	}
+	if _, err := actor.executeSubagentRun(toolName, input, "TU-"+name, "M-1", actor.generation, 0, ""); err != nil {
+		t.Fatalf("%s subagent failed: %v", toolName, err)
+	}
+	if len(seen) != 1 {
+		t.Fatalf("%s routes = %#v, want exactly one route", toolName, seen)
+	}
+	return seen[0]
+}
+
+func TestNeoTaskSubagentInheritsConfigModeModel(t *testing.T) {
+	cases := []struct {
+		name      string
+		cfg       *config.Config
+		agentMode string
+		settings  map[string]any
+		provider  string
+		model     string
+	}{
+		{
+			name:      "configured-smart",
+			cfg:       &config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{ModeModels: map[string]string{"smart": "anthropic/claude-fable-5"}}}},
+			agentMode: "smart",
+			provider:  "anthropic",
+			model:     "claude-fable-5",
+		},
+		{name: "default-smart", cfg: &config.Config{}, agentMode: "smart", provider: "anthropic", model: "claude-opus-4-8"},
+		{name: "default-deep", cfg: &config.Config{}, agentMode: "deep", provider: "openai", model: "gpt-5.5"},
+		{
+			name:      "explicit-model",
+			cfg:       &config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{ModeModels: map[string]string{"smart": "anthropic/claude-fable-5"}}}},
+			agentMode: "smart",
+			settings:  map[string]any{"internal.model": map[string]any{"smart": "openai/gpt-5.5"}},
+			provider:  "openai",
+			model:     "gpt-5.5",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := captureNeoSubagentRouteForTest(t, "Task", tc.name, tc.cfg, tc.agentMode, tc.settings)
+			if got.Provider != tc.provider || got.Model != tc.model {
+				t.Fatalf("Task route = %#v, want %s/%s", got, tc.provider, tc.model)
+			}
+		})
+	}
+}
+
+func TestNeoOracleSubagentIgnoresConfigModeModel(t *testing.T) {
+	cfg := &config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
+		ModeModels: map[string]string{"smart": "anthropic/claude-fable-5"},
+	}}}
+	got := captureNeoSubagentRouteForTest(t, "oracle", "oracle-mode", cfg, "smart", nil)
+	if got.Provider != "openai" || got.Model != "gpt-5.5" {
+		t.Fatalf("oracle route = %#v, want fixed route openai/gpt-5.5", got)
+	}
+}
+
 func TestIsNeoLocalSubagentTool(t *testing.T) {
 	for _, name := range []string{"finder", "oracle", "librarian", "Task"} {
 		if !isNeoLocalSubagentTool(name) {
@@ -117,6 +193,10 @@ func TestNeoSubagentInputText(t *testing.T) {
 	}
 	if strings.Contains(uriOnlyRunCheck, "<content>") {
 		t.Fatalf("uri-only run_check unexpectedly embedded content:\n%s", uriOnlyRunCheck)
+	}
+	runCheckDef, ok := neoSubagentDefFor("run_check")
+	if !ok || !strings.Contains(runCheckDef.SystemPrompt, "Evaluate adversarially within the check's criteria") {
+		t.Fatalf("run_check system prompt missing adversarial check guidance")
 	}
 }
 

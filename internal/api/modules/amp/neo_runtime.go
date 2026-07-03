@@ -68,6 +68,7 @@ const (
 	neoActorIdleTTL                  = 30 * time.Minute
 	neoActorPruneInterval            = 5 * time.Minute
 	neoWSReadLimit                   = 16 * 1024 * 1024
+	neoHeadlessLoginShellPathTimeout = 3 * time.Second
 	neoCompactionMinMessages         = 24
 	neoCompactionTailMessages        = 8
 	neoCompactionDefaultTokenLimit   = 100000
@@ -88,6 +89,8 @@ const (
 	neoRivetBareVersion              = 4
 	neoMaxQueuedMessages             = 5
 )
+
+var neoHeadlessLoginShellPath = neoDiscoverHeadlessLoginShellPath
 
 var (
 	neoRuntimeListen            = net.Listen
@@ -982,10 +985,12 @@ func (rt *neoRuntime) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		socket.sendRivetInit(actor.id)
 	}
 	actor.open(socket, !rivetAction && !neoSkipReadyWaitRequested(r, protocols))
+	neoApplyWebLocalInferenceBootstrapQuery(r, actor)
 	if neoWebLocalInferenceBootstrapExecutorRequested(r, actor) && actor.webLocalInferenceBootstrapNeeded() {
 		actor.spawnExecutor(map[string]any{
-			"type":      "client_spawn_executor",
-			"requestId": "web-local-inference-" + randomBase62(12),
+			"type":                    "client_spawn_executor",
+			"requestId":               "web-local-inference-" + randomBase62(12),
+			"replaceExistingExecutor": true,
 		})
 	}
 	if webLocalInferenceSocket {
@@ -1399,6 +1404,7 @@ func (s *neoActorStore) actorForGatewayRequest(r *http.Request) *neoActor {
 	target := neoGatewayTargetFromPath(r.URL.Path)
 	canonicalTarget := neoCanonicalActorName(target)
 	key := strings.TrimSpace(q.Get("rvt-key"))
+	requestedThreadID := neoThreadIDFromBridgeRequest(r)
 
 	s.mu.RLock()
 	if target != "" {
@@ -1425,7 +1431,7 @@ func (s *neoActorStore) actorForGatewayRequest(r *http.Request) *neoActor {
 
 	method := strings.TrimSpace(q.Get("rvt-method"))
 	if (strings.EqualFold(method, "get") || strings.EqualFold(method, "getOrCreate")) && neoGatewayThreadActorTarget(target) {
-		if threadID := neoThreadIDFromGatewayKey(key); threadID != "" {
+		if threadID := requestedThreadID; threadID != "" {
 			if s.runtime != nil && s.runtime.tryImportNeoCloudLocalThreadActor(neoRequestContextWithClientAPIKey(r), threadID) {
 				return s.lookupThreadActor(threadID)
 			}
@@ -1447,7 +1453,7 @@ func (s *neoActorStore) actorForGatewayRequest(r *http.Request) *neoActor {
 	body := map[string]any{"name": canonicalTarget, "key": key}
 	if input := decodeNeoGatewayInput(q.Get("rvt-input")); input != nil {
 		body["input"] = input
-	} else if threadID := neoThreadIDPattern.FindString(key); threadID != "" {
+	} else if threadID := requestedThreadID; threadID != "" {
 		body["input"] = map[string]any{"threadId": threadID}
 	}
 	actor, _ := s.upsert(body, true)
@@ -1471,6 +1477,57 @@ func neoWebLocalInferenceBootstrapExecutorRequested(r *http.Request, actor *neoA
 	}
 	value := strings.TrimSpace(r.URL.Query().Get("cliproxy-bootstrap-executor"))
 	return value == "1" || strings.EqualFold(value, "true")
+}
+
+func neoApplyWebLocalInferenceBootstrapQuery(r *http.Request, actor *neoActor) {
+	if !neoWebLocalInferenceBootstrapExecutorRequested(r, actor) {
+		return
+	}
+	query := r.URL.Query()
+	workingDirectory := neoExistingDirectory(query.Get("cliproxy-working-directory"))
+	agentMode := strings.ToLower(strings.TrimSpace(query.Get("cliproxy-agent-mode")))
+	reasoningEffort := strings.ToLower(strings.TrimSpace(query.Get("cliproxy-reasoning-effort")))
+	if agentMode != "" && !validNeoClientAgentMode(agentMode) {
+		agentMode = ""
+	}
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	modeDefaultAllowed := !actor.hasUserTurnLocked() && stringValue(actor.settings["agentMode"]) == ""
+	if workingDirectory != "" {
+		if actor.environment == nil {
+			actor.environment = map[string]any{}
+		}
+		actor.environment["workingDirectory"] = workingDirectory
+		actor.environment["workspaceRoot"] = workingDirectory
+	}
+	if agentMode != "" && modeDefaultAllowed {
+		actor.currentAgentMode = agentMode
+		actor.currentReasoningEffort = defaultNeoReasoningEffort(agentMode)
+		if actor.settings == nil {
+			actor.settings = map[string]any{}
+		}
+		actor.settings["agentMode"] = agentMode
+		if actor.currentReasoningEffort == "" {
+			delete(actor.settings, "reasoning.effort")
+		} else {
+			actor.settings["reasoning.effort"] = actor.currentReasoningEffort
+		}
+	}
+	mode := agentMode
+	if mode == "" {
+		mode = actor.agentModeLocked()
+	}
+	if reasoningEffort != "" && modeDefaultAllowed && neoReasoningEffortAllowedForMode(mode, reasoningEffort) {
+		actor.currentReasoningEffort = reasoningEffort
+		if actor.settings == nil {
+			actor.settings = map[string]any{}
+		}
+		actor.settings["reasoning.effort"] = reasoningEffort
+	}
+	if strings.TrimSpace(actor.bootstrapExecutorType) == "" {
+		actor.bootstrapExecutorType = "local-client"
+	}
 }
 
 func neoWebLocalInferenceSocketRequested(r *http.Request, actor *neoActor) bool {
@@ -2308,6 +2365,9 @@ func (a *neoActor) handleForSocket(socket *neoSocket, msg map[string]any) any {
 	if socket != nil && socket.isWebLocalObserver() && neoInboundWebLocalObserverBlockedMessage(msgType) {
 		log.Debugf("amp neo local runtime ignored web local observer executor message %s", msgType)
 		return nil
+	}
+	if socket != nil && neoInboundExecutorMessage(msgType) {
+		socket.markExecutor()
 	}
 	log.Debugf("amp neo local runtime WS recv %s", msgType)
 
@@ -3469,10 +3529,6 @@ func (a *neoActor) webLocalInferenceBootstrapNeeded() bool {
 		return false
 	}
 	a.mu.Lock()
-	if a.executorReady {
-		a.mu.Unlock()
-		return false
-	}
 	threadID := firstNonEmptyString(a.threadID, a.key)
 	for _, spawned := range a.spawnedExecutors {
 		if spawned != nil && spawned.threadID == threadID {
@@ -3514,7 +3570,8 @@ func (a *neoActor) spawnExecutor(msg map[string]any) map[string]any {
 	if !neoThreadIDExactPattern.MatchString(threadID) {
 		return a.broadcastExecutorStatus(spawnID, "failed", "Cannot spawn Amp headless executor without a valid thread ID.", map[string]any{"reasonCode": "environment_missing"})
 	}
-	if ready {
+	replaceExisting := boolValue(msg["replaceExistingExecutor"])
+	if ready && !replaceExisting {
 		return a.broadcastExecutorStatus(spawnID, "running", "Executor is already connected.", map[string]any{"reasonCode": "executor_connected", "executorId": executorID})
 	}
 	if existing != nil {
@@ -3527,6 +3584,13 @@ func (a *neoActor) spawnExecutor(msg map[string]any) map[string]any {
 		return a.broadcastExecutorStatus(spawnID, "failed", err.Error(), map[string]any{"reasonCode": "spawn_failed"})
 	}
 
+	replaceExecutorConnection := func() {}
+	if ready && replaceExisting {
+		if replacement := a.prepareExecutorConnectionReplacement("Replacing executor with local Amp headless executor"); replacement != nil {
+			replaceExecutorConnection = replacement
+		}
+	}
+
 	workDir := neoHeadlessWorkingDirectory(neoHeadlessExecutorSpawnOptions(msg), environment)
 	logPath := neoHeadlessExecutorLogPath(threadID, spawnID)
 	args := neoHeadlessExecutorArgs(threadID, agentMode, reasoningEffort)
@@ -3535,7 +3599,7 @@ func (a *neoActor) spawnExecutor(msg map[string]any) map[string]any {
 	if workDir != "" {
 		cmd.Dir = workDir
 	}
-	cmd.Env = neoHeadlessExecutorEnv(os.Environ(), cfg, threadID, workDir, logPath)
+	cmd.Env = neoHeadlessExecutorEnv(os.Environ(), cfg, threadID, workDir, logPath, command)
 
 	var logFile *os.File
 	if logPath != "" {
@@ -3561,6 +3625,7 @@ func (a *neoActor) spawnExecutor(msg map[string]any) map[string]any {
 		}
 		return a.broadcastExecutorStatus(spawnID, "failed", "Failed to start local Amp headless executor: "+err.Error(), map[string]any{"reasonCode": "spawn_failed", "command": command, "args": args})
 	}
+	replaceExecutorConnection()
 
 	spawned := &neoSpawnedExecutor{
 		spawnID:   spawnID,
@@ -3588,6 +3653,50 @@ func neoHeadlessExecutorSpawnOptions(msg map[string]any) map[string]any {
 		"repositoryURL":           msg["repositoryURL"],
 		"additionalRepositories":  msg["additionalRepositories"],
 		"additional_repositories": msg["additional_repositories"],
+	}
+}
+
+func (a *neoActor) replaceExecutorConnection(reason string) {
+	if replacement := a.prepareExecutorConnectionReplacement(reason); replacement != nil {
+		replacement()
+	}
+}
+
+func (a *neoActor) prepareExecutorConnectionReplacement(reason string) func() {
+	if a == nil {
+		return nil
+	}
+	sockets := a.socketList()
+	executorSockets := make([]*neoSocket, 0, len(sockets))
+	for _, socket := range sockets {
+		if socket.isExecutor() {
+			executorSockets = append(executorSockets, socket)
+		}
+	}
+	a.mu.Lock()
+	oldExecutorID := a.executorID
+	hadExecutor := oldExecutorID != "" || a.executorReady || a.executorBootstrapComplete
+	a.mu.Unlock()
+	if !hadExecutor && len(executorSockets) == 0 {
+		return nil
+	}
+	return func() {
+		cleared := false
+		a.mu.Lock()
+		if a.executorID == oldExecutorID {
+			a.executorID = ""
+			a.executorReady = false
+			a.executorBootstrapComplete = false
+			a.executorResumeBootstrap = false
+			cleared = hadExecutor
+		}
+		a.mu.Unlock()
+		for _, socket := range executorSockets {
+			socket.close(websocket.CloseGoingAway, reason)
+		}
+		if cleared || len(executorSockets) > 0 {
+			a.broadcastObservers()
+		}
 	}
 }
 
@@ -5284,6 +5393,87 @@ func neoProtocolInfoContent(content []any) []any {
 	return normalizeNeoProtocolContent("info", content, false)
 }
 
+func neoProtocolUserContent(content []any) []any {
+	out := make([]any, 0, len(content))
+	for _, raw := range content {
+		block, ok := normalizeNeoProtocolUserBlock(raw)
+		if !ok {
+			rawBlock := mapValue(raw)
+			if stringValue(rawBlock["type"]) == "tool_result" {
+				out = append(out, cloneNeoJSONMap(rawBlock))
+			}
+			continue
+		}
+		if stringValue(block["type"]) == "tool_result" {
+			out = append(out, neoProtocolToolResultDisplayBlock(block))
+			continue
+		}
+		out = append(out, block)
+	}
+	return out
+}
+
+func neoProtocolToolResultDisplayBlock(block map[string]any) map[string]any {
+	out := cloneNeoJSONMap(block)
+	run := neoPromoteToolRunOutput(mapValue(out["run"]))
+	if len(run) == 0 {
+		return out
+	}
+	status := neoProtocolToolResultStatus(stringValue(run["status"]))
+	if status == "" {
+		return out
+	}
+	out["status"] = status
+	if status == "done" {
+		if output := neoProtocolToolRunDisplayText(run); output != "" {
+			out["output"] = output
+		}
+	}
+	if status == "error" {
+		if errText := neoProtocolToolRunDisplayText(run); errText != "" {
+			out["error"] = errText
+		}
+	}
+	return out
+}
+
+func neoProtocolToolRunDisplayText(run map[string]any) string {
+	if value := firstNonEmptyString(run["output"], run["displayMessage"], run["message"], run["reason"], run["text"], nestedValue(run["error"], "message"), run["error"]); value != "" {
+		return value
+	}
+	if images := neoToolRunImages(run); len(images) > 0 {
+		return neoImageToolText(stringValue(run["toolName"]), len(images))
+	}
+	result, exists := run["result"]
+	if !exists {
+		return ""
+	}
+	if image, ok := neoReadImageResultBlock(mapValue(result)); ok {
+		return neoToolImageLabel(image)
+	}
+	if text := stringValue(result); text != "" {
+		return text
+	}
+	return neoToolRunTextResult(result)
+}
+
+func neoProtocolToolResultStatus(status string) string {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "done":
+		return "done"
+	case "error", "rejected-by-user":
+		return "error"
+	case "cancelled":
+		return "cancelled"
+	case "in-progress", "cancellation-requested":
+		return "running"
+	case "queued", "blocked-on-user":
+		return "pending"
+	default:
+		return ""
+	}
+}
+
 func normalizeNeoProtocolAssistantBlock(raw any, delta bool) (map[string]any, bool) {
 	block := mapValue(raw)
 	if len(block) == 0 {
@@ -5401,6 +5591,9 @@ func normalizeNeoProtocolToolResultBlock(block map[string]any) (map[string]any, 
 	out["type"] = "tool_result"
 	out["toolUseID"] = toolUseID
 	out["run"] = cloneNeoJSONMap(run)
+	delete(out, "toolUseId")
+	delete(out, "tool_use_id")
+	delete(out, "toolCallId")
 	if userInput, ok := normalizeNeoProtocolToolResultUserInput(out["userInput"]); ok {
 		out["userInput"] = userInput
 	} else {
@@ -8410,7 +8603,7 @@ func (a *neoActor) receiveToolResult(msg map[string]any) {
 		CreatedAt:       time.Now().UTC().Format(time.RFC3339Nano),
 		ParentToolUseID: pending.ParentToolCallID,
 	})
-	a.history = append(a.history, neoHistoryMessage{Role: "tool", ToolCallID: toolCallID, ToolName: pending.Name, Text: runToTextForTool(pending.Name, run), Content: neoToolRunHistoryContent(run), ParentToolUseID: pending.ParentToolCallID})
+	a.rebuildHistoryLocked()
 	remaining := len(a.pendingTools)
 	ready := a.executorReady
 	if remaining == 0 && !ready {
@@ -10751,7 +10944,12 @@ func (m *AmpModule) canServeNeoLocalManagement(c *gin.Context) bool {
 	if m.canServeNeoWebLocalInternalRPC(c) {
 		return true
 	}
-	if _, params, ok := neoLocalInternalRPCRequest(r); ok && m.neoLocalInternalRPCActor(neoInternalRPCThreadID(params)) != nil {
+	if m.canServeNeoWebLocalRemote(c) {
+		return true
+	}
+	if _, params, matched, err := neoLocalInternalRPCRequestWithError(r); err != nil {
+		return matched
+	} else if matched && m.neoLocalInternalRPCActor(neoInternalRPCThreadID(params)) != nil {
 		return true
 	}
 	if _, ok := neoAttachmentRequestPath(r.URL.Path); ok {
@@ -10904,10 +11102,14 @@ func (m *AmpModule) tryServeNeoLocalThreadActor(c *gin.Context) bool {
 		return false
 	}
 	var body map[string]any
+	var bodyErr error
 	bodyLoaded := false
 	loadBody := func() map[string]any {
 		if !bodyLoaded {
-			body = readAndRestoreNeoJSONBody(c.Request)
+			body, bodyErr = readAndRestoreNeoJSONBody(c.Request)
+			if bodyErr != nil {
+				log.WithError(bodyErr).Debug("amp local thread actor body decode failed")
+			}
 			bodyLoaded = true
 		}
 		return body
@@ -10923,13 +11125,22 @@ func (m *AmpModule) tryServeNeoLocalThreadActor(c *gin.Context) bool {
 			serveLocalThreadActor = m.shouldServeNeoLocalExistingThreadActorBootstrap(candidateThreadID, loadBody())
 		}
 	}
-	if hasProxy && !serveLocalThreadActor && candidateThreadID != "" && m.shouldServeNeoLocalNewThreadActor() && c.GetBool(ampWebLocalInferenceCORSContextKey) && strings.TrimSpace(c.GetHeader(ampWebLocalInferenceHeader)) != "" && c.Request.Method == http.MethodPost && neoThreadActorBootstrapBody(loadBody()) {
+	webLocalThreadActorBootstrapRequested := hasProxy && !serveLocalThreadActor && candidateThreadID != "" && m.shouldServeNeoLocalNewThreadActor() && c.GetBool(ampWebLocalInferenceCORSContextKey) && strings.TrimSpace(c.GetHeader(ampWebLocalInferenceHeader)) != "" && c.Request.Method == http.MethodPost
+	if webLocalThreadActorBootstrapRequested && neoThreadActorBootstrapBody(loadBody()) {
 		serveLocalThreadActor = true
 	}
 	if hasProxy && !serveLocalThreadActor {
-		if candidateThreadID != "" || !m.shouldServeNeoLocalNewThreadActor() {
+		if bodyErr != nil {
+			if !webLocalThreadActorBootstrapRequested {
+				return false
+			}
+		} else if candidateThreadID != "" || !m.shouldServeNeoLocalNewThreadActor() {
 			return false
 		}
+	}
+	if bodyErr != nil && c.Request.Method == http.MethodPost {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_json_body", "message": "invalid JSON body for local thread actor", "detail": bodyErr.Error()})
+		return true
 	}
 	if c.Request.Method != http.MethodPost {
 		c.JSON(http.StatusMethodNotAllowed, gin.H{"error": "method_not_allowed"})
@@ -10937,7 +11148,11 @@ func (m *AmpModule) tryServeNeoLocalThreadActor(c *gin.Context) bool {
 	}
 
 	if !bodyLoaded {
-		body = readNeoJSON(c.Request.Body)
+		body = loadBody()
+	}
+	if bodyErr != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_json_body", "message": "invalid JSON body for local thread actor", "detail": bodyErr.Error()})
+		return true
 	}
 	if !hasProxy {
 		bodyThreadID := strings.TrimSpace(threadID)
@@ -11038,6 +11253,322 @@ func neoThreadActorManagementPath(path string) (string, bool) {
 	return threadID, true
 }
 
+func (m *AmpModule) canServeNeoWebLocalRemote(c *gin.Context) bool {
+	if m == nil || m.neoRuntime == nil || c == nil || c.Request == nil || c.Request.URL == nil {
+		return false
+	}
+	if !c.GetBool(ampWebLocalInferenceCORSContextKey) || strings.TrimSpace(c.GetHeader(ampWebLocalInferenceHeader)) == "" {
+		return false
+	}
+	if _, _, ok := neoWebLocalRemoteEndpoint(c.Request.URL.Path); !ok {
+		return false
+	}
+	cfg := m.neoThreadConfigSnapshot()
+	return cfg != nil && neoRuntimeEnabled(cfg)
+}
+
+func (m *AmpModule) tryServeNeoWebLocalRemote(c *gin.Context) bool {
+	if !m.canServeNeoWebLocalRemote(c) {
+		return false
+	}
+	endpoint, remoteID, ok := neoWebLocalRemoteEndpoint(c.Request.URL.Path)
+	if !ok {
+		return false
+	}
+	switch endpoint {
+	case "createProjectThread":
+		if c.Request.Method != http.MethodPost {
+			writeNeoSvelteKitRemoteCommand(c.Writer, http.StatusOK, neoWebLocalRemoteCommandError("method not allowed"))
+			return true
+		}
+		request, err := neoSvelteKitRemoteCommandRequest(c.Request)
+		if err != nil {
+			writeNeoSvelteKitRemoteCommand(c.Writer, http.StatusOK, neoWebLocalRemoteCommandError(err.Error()))
+			return true
+		}
+		result := m.neoRuntime.neoWebLocalCreateProjectThread(c.Request.Context(), c.Request.URL.Query(), request)
+		writeNeoSvelteKitRemoteCommand(c.Writer, http.StatusOK, result)
+		return true
+	case "prewarmProjectThread":
+		if c.Request.Method != http.MethodPost {
+			writeNeoSvelteKitRemoteCommand(c.Writer, http.StatusOK, neoWebLocalRemoteCommandError("method not allowed"))
+			return true
+		}
+		request, err := neoSvelteKitRemoteCommandRequest(c.Request)
+		if err != nil {
+			writeNeoSvelteKitRemoteCommand(c.Writer, http.StatusOK, neoWebLocalRemoteCommandError(err.Error()))
+			return true
+		}
+		threadID := firstNonEmptyString(request["threadID"], request["threadId"], request["id"])
+		if !neoThreadIDExactPattern.MatchString(threadID) {
+			threadID = "T-" + randomUUIDLike()
+		}
+		writeNeoSvelteKitRemoteCommand(c.Writer, http.StatusOK, map[string]any{"ok": true, "threadID": threadID})
+		return true
+	case "listThreadListSidebar":
+		value := m.neoRuntime.neoWebLocalThreadListSidebar(c.Request.URL.Query())
+		writeNeoSvelteKitRemoteQuery(c.Writer, http.StatusOK, neoSvelteKitRemoteQueryKey(remoteID, c.Request), value)
+		return true
+	case "listUserExecutorDaemons":
+		writeNeoSvelteKitRemoteQuery(c.Writer, http.StatusOK, neoSvelteKitRemoteQueryKey(remoteID, c.Request), []any{})
+		return true
+	default:
+		return false
+	}
+}
+
+func neoWebLocalRemoteEndpoint(path string) (string, string, bool) {
+	path = "/" + strings.Trim(path, "/")
+	const prefix = "/_app/remote/"
+	if !strings.HasPrefix(path, prefix) {
+		return "", "", false
+	}
+	remoteID := strings.TrimPrefix(path, prefix)
+	if remoteID == "" || strings.Contains(remoteID, "//") {
+		return "", "", false
+	}
+	_, endpoint, ok := strings.Cut(remoteID, "/")
+	if !ok || endpoint == "" || strings.Contains(endpoint, "/") {
+		return "", "", false
+	}
+	switch endpoint {
+	case "createProjectThread", "listThreadListSidebar", "listUserExecutorDaemons", "prewarmProjectThread":
+		return endpoint, remoteID, true
+	default:
+		return "", "", false
+	}
+}
+
+func neoSvelteKitRemoteQueryKey(remoteID string, r *http.Request) string {
+	payload := ""
+	if r != nil && r.URL != nil {
+		payload = r.URL.Query().Get("payload")
+	}
+	return remoteID + "/" + payload
+}
+
+func neoSvelteKitRemoteCommandRequest(r *http.Request) (map[string]any, error) {
+	if r == nil {
+		return nil, errors.New("missing request")
+	}
+	body, err := readAndRestoreNeoJSONBody(r)
+	if err != nil {
+		return nil, err
+	}
+	payload := strings.TrimSpace(stringValue(body["payload"]))
+	if payload == "" {
+		return nil, errors.New("missing SvelteKit remote payload")
+	}
+	decoded, err := neoDecodeSvelteKitRemotePayload(payload)
+	if err != nil {
+		return nil, err
+	}
+	request := mapValue(decoded)
+	if len(request) == 0 {
+		return nil, errors.New("SvelteKit remote payload is not an object")
+	}
+	return request, nil
+}
+
+func neoDecodeSvelteKitRemotePayload(payload string) (any, error) {
+	raw, err := neoDecodeSvelteKitRemotePayloadBase64(payload)
+	if err != nil {
+		return nil, err
+	}
+	var values []any
+	if err := json.Unmarshal(raw, &values); err != nil {
+		return nil, fmt.Errorf("decode SvelteKit remote devalue payload: %w", err)
+	}
+	decoded, ok := neoDecodeSvelteKitDevalueIndex(values, 0, map[int]bool{})
+	if !ok {
+		return nil, errors.New("invalid SvelteKit remote devalue payload")
+	}
+	return decoded, nil
+}
+
+func neoDecodeSvelteKitRemotePayloadBase64(payload string) ([]byte, error) {
+	payload = strings.TrimSpace(payload)
+	if payload == "" {
+		return nil, errors.New("missing SvelteKit remote payload")
+	}
+	padded := payload
+	for len(padded)%4 != 0 {
+		padded += "="
+	}
+	for _, candidate := range []struct {
+		encoding *base64.Encoding
+		value    string
+	}{
+		{base64.RawURLEncoding, payload},
+		{base64.URLEncoding, padded},
+		{base64.RawStdEncoding, payload},
+		{base64.StdEncoding, padded},
+	} {
+		if raw, err := candidate.encoding.DecodeString(candidate.value); err == nil {
+			return raw, nil
+		}
+	}
+	return nil, errors.New("invalid SvelteKit remote payload encoding")
+}
+
+func neoDecodeSvelteKitDevalueIndex(values []any, index int, stack map[int]bool) (any, bool) {
+	if index < 0 || index >= len(values) || stack[index] {
+		return nil, false
+	}
+	stack[index] = true
+	defer delete(stack, index)
+	switch value := values[index].(type) {
+	case []any:
+		out := make([]any, 0, len(value))
+		for _, rawRef := range value {
+			ref, ok := neoSvelteKitDevalueRef(rawRef)
+			if !ok {
+				out = append(out, nil)
+				continue
+			}
+			decoded, _ := neoDecodeSvelteKitDevalueIndex(values, ref, stack)
+			out = append(out, decoded)
+		}
+		return out, true
+	case map[string]any:
+		out := make(map[string]any, len(value))
+		for key, rawRef := range value {
+			ref, ok := neoSvelteKitDevalueRef(rawRef)
+			if !ok {
+				out[key] = nil
+				continue
+			}
+			decoded, _ := neoDecodeSvelteKitDevalueIndex(values, ref, stack)
+			out[key] = decoded
+		}
+		return out, true
+	default:
+		return value, true
+	}
+}
+
+func neoSvelteKitDevalueRef(raw any) (int, bool) {
+	switch value := raw.(type) {
+	case int:
+		return value, value >= 0
+	case int64:
+		return int(value), value >= 0 && int64(int(value)) == value
+	case float64:
+		index := int(value)
+		return index, value >= 0 && float64(index) == value
+	default:
+		return 0, false
+	}
+}
+
+func writeNeoSvelteKitRemoteCommand(w http.ResponseWriter, status int, result map[string]any) {
+	writeNeoSvelteKitRemoteResult(w, status, map[string]any{"_": result})
+}
+
+func writeNeoSvelteKitRemoteQuery(w http.ResponseWriter, status int, key string, value any) {
+	writeNeoSvelteKitRemoteResult(w, status, map[string]any{
+		"_": value,
+		"q": map[string]any{key: map[string]any{"v": value}},
+	})
+}
+
+func writeNeoSvelteKitRemoteResult(w http.ResponseWriter, status int, value any) {
+	data, err := neoSvelteKitDevalueString(value)
+	if err != nil {
+		writeNeoJSON(w, http.StatusInternalServerError, map[string]any{"type": "error", "error": err.Error()})
+		return
+	}
+	writeNeoJSON(w, status, map[string]any{"type": "result", "data": data})
+}
+
+func neoWebLocalRemoteCommandError(message string) map[string]any {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		message = "local Amp web request failed"
+	}
+	return map[string]any{"ok": false, "error": map[string]any{"message": message, "needsGitHubReconnect": false}}
+}
+
+func neoSvelteKitDevalueString(value any) (string, error) {
+	builder := &neoSvelteKitDevalueBuilder{}
+	builder.add(value)
+	raw, err := json.Marshal(builder.values)
+	if err != nil {
+		return "", err
+	}
+	return string(raw), nil
+}
+
+type neoSvelteKitDevalueBuilder struct {
+	values []any
+}
+
+func (b *neoSvelteKitDevalueBuilder) add(value any) int {
+	if value == nil {
+		return b.append(nil)
+	}
+	switch typed := value.(type) {
+	case string, bool, int, int64, float64, float32, json.Number:
+		return b.append(typed)
+	case []any:
+		index := b.append([]any{})
+		out := make([]any, 0, len(typed))
+		for _, item := range typed {
+			out = append(out, b.add(item))
+		}
+		b.values[index] = out
+		return index
+	case map[string]any:
+		return b.addMap(typed)
+	}
+	reflected := reflect.ValueOf(value)
+	if !reflected.IsValid() {
+		return b.append(nil)
+	}
+	switch reflected.Kind() {
+	case reflect.Map:
+		if reflected.Type().Key().Kind() != reflect.String {
+			return b.append(fmt.Sprint(value))
+		}
+		mapped := make(map[string]any, reflected.Len())
+		for _, key := range reflected.MapKeys() {
+			mapped[key.String()] = reflected.MapIndex(key).Interface()
+		}
+		return b.addMap(mapped)
+	case reflect.Slice, reflect.Array:
+		index := b.append([]any{})
+		out := make([]any, 0, reflected.Len())
+		for i := 0; i < reflected.Len(); i++ {
+			out = append(out, b.add(reflected.Index(i).Interface()))
+		}
+		b.values[index] = out
+		return index
+	default:
+		return b.append(value)
+	}
+}
+
+func (b *neoSvelteKitDevalueBuilder) addMap(value map[string]any) int {
+	index := b.append(map[string]any{})
+	out := make(map[string]any, len(value))
+	keys := make([]string, 0, len(value))
+	for key := range value {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		out[key] = b.add(value[key])
+	}
+	b.values[index] = out
+	return index
+}
+
+func (b *neoSvelteKitDevalueBuilder) append(value any) int {
+	index := len(b.values)
+	b.values = append(b.values, value)
+	return index
+}
+
 func (rt *neoRuntime) localThreadActorManagementResponse(ctx context.Context, body map[string]any, requestedThreadID string) (map[string]any, int) {
 	if rt == nil {
 		return map[string]any{"error": "neo_runtime_unavailable"}, http.StatusServiceUnavailable
@@ -11083,8 +11614,12 @@ func (rt *neoRuntime) localThreadActorManagementResponse(ctx context.Context, bo
 		actor.environment["workspaceRoot"] = requestedWorkingDirectory
 	}
 	if requestedAgentMode != "" {
+		previousEffort := actor.reasoningEffortForModeLocked(requestedAgentMode)
 		actor.currentAgentMode = requestedAgentMode
-		actor.currentReasoningEffort = defaultNeoReasoningEffort(requestedAgentMode)
+		actor.currentReasoningEffort = previousEffort
+		if actor.currentReasoningEffort == "" {
+			actor.currentReasoningEffort = defaultNeoReasoningEffort(requestedAgentMode)
+		}
 		if actor.settings == nil {
 			actor.settings = map[string]any{}
 		}
@@ -11220,6 +11755,500 @@ func (rt *neoRuntime) localThreadActorManagementResponse(ctx context.Context, bo
 	return baseResponse, http.StatusOK
 }
 
+func (rt *neoRuntime) neoWebLocalCreateProjectThread(ctx context.Context, query url.Values, request map[string]any) map[string]any {
+	threadID := firstNonEmptyString(request["threadID"], request["threadId"], request["id"])
+	if threadID == "" {
+		threadID = "T-" + randomUUIDLike()
+	}
+	if !neoThreadIDExactPattern.MatchString(threadID) {
+		return neoWebLocalRemoteCommandError("invalid thread ID")
+	}
+	agentMode := strings.ToLower(strings.TrimSpace(firstNonEmptyString(request["agentMode"], request["mode"])))
+	if agentMode != "" && !validNeoClientAgentMode(agentMode) {
+		agentMode = ""
+	}
+	reasoningEffort := strings.ToLower(strings.TrimSpace(firstNonEmptyString(request["reasoningEffort"], request["reasoning_effort"])))
+	if agentMode != "" && reasoningEffort != "" && !neoReasoningEffortAllowedForMode(agentMode, reasoningEffort) {
+		reasoningEffort = ""
+	}
+	projectID := strings.TrimSpace(firstNonEmptyString(request["projectID"], request["projectId"], request["project_id"]))
+	if projectID != "" && !neoUUIDExactPattern.MatchString(projectID) {
+		projectID = ""
+	}
+	prompt := strings.TrimSpace(neoWebLocalProjectThreadContentText(request["content"]))
+	workingDirectory := rt.neoWebLocalResolveWorkingDirectory(query, request, prompt, projectID)
+	if boolValue(request["spawnExecutor"]) && workingDirectory == "" {
+		return neoWebLocalRemoteCommandError("working directory is required for local executor bootstrap")
+	}
+
+	settings := map[string]any{}
+	if agentMode != "" {
+		settings["agentMode"] = agentMode
+	}
+	if reasoningEffort != "" {
+		settings["reasoning.effort"] = reasoningEffort
+	}
+	threadMeta := map[string]any{
+		"cliProxyAPILocalNeo":      true,
+		"ampcodeConnectorLocalNeo": true,
+		"ampcodeLocalRuntime":      true,
+		"ampcodeConnectorMode":     "local-neo",
+		"usesDtw":                  true,
+		"usesThreadActors":         true,
+		"agentMode":                omitEmpty(agentMode),
+		"reasoningEffort":          omitEmpty(reasoningEffort),
+		"projectID":                omitEmpty(projectID),
+	}
+	body := map[string]any{
+		"threadId":         threadID,
+		"threadID":         threadID,
+		"agentMode":        omitEmpty(agentMode),
+		"reasoningEffort":  omitEmpty(reasoningEffort),
+		"usesThreadActors": true,
+		"settings":         settings,
+		"threadMeta":       threadMeta,
+		"projectID":        omitEmpty(projectID),
+	}
+	if boolValue(request["spawnExecutor"]) {
+		body["executorType"] = "local-client"
+	}
+	if workingDirectory != "" {
+		body["workingDirectory"] = workingDirectory
+		body["workspaceRoot"] = workingDirectory
+	}
+	if prompt != "" {
+		body["prompt"] = prompt
+	}
+
+	response, status := rt.localThreadActorManagementResponse(ctx, body, threadID)
+	if status < 200 || status >= 300 {
+		message := firstNonEmptyString(response["error"], response["message"])
+		if message == "" {
+			message = http.StatusText(status)
+		}
+		return neoWebLocalRemoteCommandError(message)
+	}
+	createdThreadID := firstNonEmptyString(response["threadID"], response["threadId"], threadID)
+	return map[string]any{"ok": true, "threadID": createdThreadID}
+}
+
+func neoWebLocalProjectThreadContentText(content any) string {
+	switch value := content.(type) {
+	case string:
+		return value
+	case []any:
+		parts := make([]string, 0, len(value))
+		for _, item := range value {
+			block := mapValue(item)
+			if text := strings.TrimSpace(firstNonEmptyString(block["text"], block["content"])); text != "" {
+				parts = append(parts, text)
+			}
+		}
+		return strings.Join(parts, "\n")
+	case map[string]any:
+		return firstNonEmptyString(value["text"], value["content"])
+	default:
+		return ""
+	}
+}
+
+func (rt *neoRuntime) neoWebLocalResolveWorkingDirectory(query url.Values, request map[string]any, prompt, projectID string) string {
+	if query != nil {
+		if dir := neoExistingDirectory(query.Get("cliproxy-working-directory")); dir != "" {
+			return dir
+		}
+	}
+	if dir := neoThreadActorRequestedWorkingDirectory(request); dir != "" {
+		return dir
+	}
+	for _, threadID := range neoThreadIDsInText(prompt) {
+		if dir := rt.neoWebLocalThreadWorkingDirectory(threadID); dir != "" {
+			return dir
+		}
+	}
+	if projectID != "" {
+		if dir := rt.neoWebLocalProjectWorkingDirectory(projectID); dir != "" {
+			return dir
+		}
+	}
+	return ""
+}
+
+func neoThreadIDsInText(text string) []string {
+	matches := neoThreadIDPattern.FindAllString(text, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(matches))
+	seen := map[string]struct{}{}
+	for _, match := range matches {
+		match = strings.Trim(match, "<>\"'`),. ")
+		if !neoThreadIDExactPattern.MatchString(match) {
+			continue
+		}
+		if _, exists := seen[match]; exists {
+			continue
+		}
+		seen[match] = struct{}{}
+		out = append(out, match)
+	}
+	return out
+}
+
+func (rt *neoRuntime) neoWebLocalThreadWorkingDirectory(threadID string) string {
+	if rt == nil || !neoThreadIDExactPattern.MatchString(threadID) {
+		return ""
+	}
+	if rt.store != nil {
+		if actor := rt.store.lookupThreadActor(threadID); actor != nil {
+			actor.mu.Lock()
+			environment := cloneMap(actor.environment)
+			actor.mu.Unlock()
+			if dir := neoExistingDirectory(neoWorkingDirectoryFromEnvironment(environment)); dir != "" {
+				return dir
+			}
+		}
+	}
+	if rt.localThreadSnapshotsEnabled() {
+		if thread, ok := loadNeoThreadFromDir(threadID, rt.threadDir); ok {
+			return neoExistingDirectory(neoWorkingDirectoryFromThread(thread))
+		}
+	}
+	return ""
+}
+
+func (rt *neoRuntime) neoWebLocalProjectWorkingDirectory(projectID string) string {
+	if rt == nil || projectID == "" {
+		return ""
+	}
+	if rt.store != nil {
+		for _, actor := range rt.store.threadActors(0) {
+			actor.mu.Lock()
+			meta := cloneMap(actor.meta)
+			environment := cloneMap(actor.environment)
+			actor.mu.Unlock()
+			if neoThreadProjectID(meta) == projectID {
+				if dir := neoExistingDirectory(neoWorkingDirectoryFromEnvironment(environment)); dir != "" {
+					return dir
+				}
+			}
+		}
+	}
+	if !rt.localThreadSnapshotsEnabled() {
+		return ""
+	}
+	entries, err := os.ReadDir(rt.threadDir)
+	if err != nil {
+		return ""
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		threadID := strings.TrimSuffix(entry.Name(), ".json")
+		thread, ok := loadNeoThreadFromDir(threadID, rt.threadDir)
+		if !ok || neoThreadProjectID(mapValue(thread["meta"])) != projectID {
+			continue
+		}
+		if dir := neoExistingDirectory(neoWorkingDirectoryFromThread(thread)); dir != "" {
+			return dir
+		}
+	}
+	return ""
+}
+
+func neoThreadProjectID(meta map[string]any) string {
+	projectID := strings.TrimSpace(firstNonEmptyString(meta["projectID"], meta["projectId"], meta["project_id"]))
+	if !neoUUIDExactPattern.MatchString(projectID) {
+		return ""
+	}
+	return projectID
+}
+
+func (rt *neoRuntime) neoWebLocalThreadListSidebar(query url.Values) map[string]any {
+	return map[string]any{
+		"projects":      rt.neoWebLocalSidebarProjects(neoExistingDirectory(query.Get("cliproxy-working-directory"))),
+		"recentThreads": rt.neoWebLocalSidebarRecentThreads(50),
+		"orbs":          []any{},
+	}
+}
+
+func (rt *neoRuntime) neoWebLocalSidebarRecentThreads(limit int) []any {
+	if rt == nil {
+		return []any{}
+	}
+	threads := make([]any, 0)
+	seen := map[string]struct{}{}
+	if rt.store != nil {
+		for _, actor := range rt.store.threadActors(limit) {
+			thread, ok := actor.neoWebLocalThreadDocument()
+			if !ok {
+				continue
+			}
+			threadID := firstNonEmptyString(thread["id"], findThreadID(thread))
+			if threadID == "" {
+				continue
+			}
+			seen[threadID] = struct{}{}
+			threads = append(threads, neoWebLocalSidebarThread(thread))
+		}
+	}
+	if rt.localThreadSnapshotsEnabled() && (limit <= 0 || len(threads) < limit) {
+		entries, err := os.ReadDir(rt.threadDir)
+		if err == nil {
+			for _, entry := range entries {
+				if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+					continue
+				}
+				threadID := strings.TrimSuffix(entry.Name(), ".json")
+				if _, exists := seen[threadID]; exists {
+					continue
+				}
+				thread, ok := loadNeoThreadFromDir(threadID, rt.threadDir)
+				if !ok {
+					continue
+				}
+				seen[threadID] = struct{}{}
+				threads = append(threads, neoWebLocalSidebarThread(thread))
+				if limit > 0 && len(threads) >= limit {
+					break
+				}
+			}
+		}
+	}
+	sort.SliceStable(threads, func(i, j int) bool {
+		left := numberFrom(mapValue(threads[i])["created"])
+		right := numberFrom(mapValue(threads[j])["created"])
+		if left != right {
+			return left > right
+		}
+		return stringValue(mapValue(threads[i])["id"]) < stringValue(mapValue(threads[j])["id"])
+	})
+	if limit > 0 && len(threads) > limit {
+		threads = threads[:limit]
+	}
+	return threads
+}
+
+func neoWebLocalSidebarThread(thread map[string]any) map[string]any {
+	threadID := firstNonEmptyString(thread["id"], findThreadID(thread))
+	createdMs := int64(numberFrom(thread["created"]))
+	if createdMs <= 0 {
+		createdMs = time.Now().UnixMilli()
+	}
+	updatedAt := firstNonEmptyString(thread["updatedAt"], thread["lastUserMessageAt"])
+	if updatedAt == "" {
+		updatedAt = time.UnixMilli(createdMs).UTC().Format(time.RFC3339Nano)
+	}
+	meta := neoThreadActorImportedMeta(mapValue(thread["meta"]))
+	messages := arrayValue(thread["messages"])
+	queued := arrayValue(thread["queuedMessages"])
+	environment := mapValue(thread["env"])
+	version := numberFrom(thread["v"])
+	if version <= 0 {
+		version = 1
+	}
+	return map[string]any{
+		"id":                threadID,
+		"threadId":          threadID,
+		"v":                 version,
+		"created":           createdMs,
+		"updatedAt":         updatedAt,
+		"firstSyncAt":       updatedAt,
+		"creatorUserID":     neoLocalOwnerUserID,
+		"meta":              meta,
+		"title":             fallbackString(stringValue(thread["title"]), "Untitled"),
+		"archived":          boolValue(thread["archived"]),
+		"pinned":            false,
+		"messageCount":      len(messages) + len(queued),
+		"env":               environment,
+		"labels":            []any{},
+		"hasExecutor":       true,
+		"executorConnected": true,
+		"hasUnreadMessages": false,
+		"summaryStats":      map[string]any{},
+		"creator":           map[string]any{"id": neoLocalOwnerUserID, "name": "Local Amp"},
+	}
+}
+
+func (rt *neoRuntime) neoWebLocalSidebarProjects(extraWorkingDirectories ...string) []any {
+	if rt == nil {
+		return []any{}
+	}
+	byID := map[string]map[string]any{}
+	add := func(project map[string]any) {
+		id := strings.TrimSpace(stringValue(project["id"]))
+		if id == "" {
+			return
+		}
+		if _, exists := byID[id]; !exists {
+			byID[id] = project
+		}
+	}
+	if rt.store != nil {
+		for _, actor := range rt.store.threadActors(0) {
+			thread, ok := actor.neoWebLocalThreadDocument()
+			if !ok {
+				actor.mu.Lock()
+				thread = map[string]any{"meta": cloneMap(actor.meta), "env": neoCloudEnvironment(actor.environment)}
+				actor.mu.Unlock()
+			}
+			add(neoWebLocalProjectFromThread(thread))
+		}
+	}
+	if rt.localThreadSnapshotsEnabled() {
+		entries, err := os.ReadDir(rt.threadDir)
+		if err == nil {
+			for _, entry := range entries {
+				if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+					continue
+				}
+				threadID := strings.TrimSuffix(entry.Name(), ".json")
+				thread, ok := loadNeoThreadFromDir(threadID, rt.threadDir)
+				if ok {
+					add(neoWebLocalProjectFromThread(thread))
+				}
+			}
+		}
+	}
+	for _, dir := range extraWorkingDirectories {
+		if dir == "" {
+			continue
+		}
+		add(neoWebLocalProjectFromThread(map[string]any{"workingDirectory": dir, "workspaceRoot": dir}))
+	}
+	projects := make([]any, 0, len(byID))
+	for _, project := range byID {
+		projects = append(projects, project)
+	}
+	sort.SliceStable(projects, func(i, j int) bool {
+		left := mapValue(projects[i])
+		right := mapValue(projects[j])
+		if stringValue(left["name"]) != stringValue(right["name"]) {
+			return stringValue(left["name"]) < stringValue(right["name"])
+		}
+		return stringValue(left["id"]) < stringValue(right["id"])
+	})
+	return projects
+}
+
+func neoWebLocalProjectFromThread(thread map[string]any) map[string]any {
+	if len(thread) == 0 {
+		return nil
+	}
+	meta := mapValue(thread["meta"])
+	dir := neoWorkingDirectoryFromThread(thread)
+	repositoryURL := strings.TrimSpace(firstNonEmptyString(thread["repositoryURL"], meta["repositoryURL"], meta["repoURL"]))
+	if repositoryURL == "" && dir != "" {
+		repositoryURL = neoFileURLForDirectory(dir)
+	}
+	dirName := ""
+	if dir != "" {
+		dirName = filepath.Base(dir)
+	}
+	name := strings.TrimSpace(firstNonEmptyString(meta["projectName"], meta["name"], thread["projectName"], dirName, neoProjectNameFromRepositoryURL(repositoryURL)))
+	if name == "." || name == string(filepath.Separator) {
+		name = "local"
+	}
+	if name == "" && repositoryURL == "" {
+		return nil
+	}
+	projectID := neoThreadProjectID(meta)
+	if projectID == "" {
+		projectID = neoDeterministicLocalProjectID(name, repositoryURL, dir)
+	}
+	project := map[string]any{
+		"id":            projectID,
+		"projectID":     projectID,
+		"name":          fallbackString(name, "local"),
+		"namespace":     fallbackString(firstNonEmptyString(meta["namespace"], meta["projectNamespace"]), "local"),
+		"repositoryURL": repositoryURL,
+	}
+	if dir != "" {
+		project["workingDirectory"] = dir
+	}
+	return project
+}
+
+func neoWorkingDirectoryFromThread(thread map[string]any) string {
+	if len(thread) == 0 {
+		return ""
+	}
+	for _, candidate := range []any{
+		thread["workingDirectory"],
+		thread["workspaceRoot"],
+		mapValue(thread["workspace"]),
+	} {
+		if dir := neoExistingDirectory(candidate); dir != "" {
+			return dir
+		}
+	}
+	if dir := neoWorkingDirectoryFromEnvironment(mapValue(thread["env"])); dir != "" {
+		return dir
+	}
+	if data := mapValue(thread["data"]); len(data) > 0 {
+		return neoWorkingDirectoryFromThread(data)
+	}
+	return ""
+}
+
+func neoWorkingDirectoryFromEnvironment(environment map[string]any) string {
+	if len(environment) == 0 {
+		return ""
+	}
+	initial := mapValue(environment["initial"])
+	for _, candidate := range []any{
+		environment["workingDirectory"],
+		environment["working_directory"],
+		environment["cwd"],
+		environment["workspaceRoot"],
+		initial["workingDirectory"],
+		initial["working_directory"],
+		initial["cwd"],
+		initial["workspaceRoot"],
+	} {
+		if dir := neoExistingDirectory(candidate); dir != "" {
+			return dir
+		}
+	}
+	for _, rawTrees := range []any{environment["trees"], initial["trees"]} {
+		for _, rawTree := range arrayValue(rawTrees) {
+			if dir := neoExistingDirectory(rawTree); dir != "" {
+				return dir
+			}
+		}
+	}
+	return ""
+}
+
+func neoFileURLForDirectory(dir string) string {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return ""
+	}
+	return (&url.URL{Scheme: "file", Path: dir}).String()
+}
+
+func neoProjectNameFromRepositoryURL(repositoryURL string) string {
+	repositoryURL = strings.TrimSpace(repositoryURL)
+	if repositoryURL == "" {
+		return ""
+	}
+	if parsed, err := url.Parse(repositoryURL); err == nil && parsed.Path != "" {
+		repositoryURL = parsed.Path
+	}
+	repositoryURL = strings.TrimSuffix(strings.Trim(repositoryURL, "/"), ".git")
+	return filepath.Base(repositoryURL)
+}
+
+func neoDeterministicLocalProjectID(parts ...string) string {
+	key := strings.Join(parts, "\x00")
+	if strings.Trim(key, "\x00") == "" {
+		key = "local"
+	}
+	return googleuuid.NewSHA1(googleuuid.NameSpaceURL, []byte(key)).String()
+}
+
 func neoThreadActorRequestedWorkingDirectory(body map[string]any) string {
 	environment := mapValue(body["environment"])
 	candidates := []any{
@@ -11236,6 +12265,9 @@ func neoThreadActorRequestedWorkingDirectory(body map[string]any) string {
 		if dir := neoExistingDirectory(candidate); dir != "" {
 			return dir
 		}
+	}
+	if dir := neoWorkingDirectoryFromEnvironment(environment); dir != "" {
+		return dir
 	}
 	return ""
 }
@@ -15732,13 +16764,23 @@ func (a *neoActor) handleCreateThread(msg map[string]any) {
 		a.broadcast(map[string]any{"type": "error", "message": "invalid_thread_id", "threadId": threadID, "code": "INVALID_THREAD_ID"})
 		return
 	}
+	var created *neoActor
 	if a.runtime != nil && a.runtime.store != nil {
-		_ = a.runtime.store.ensureThreadActor(threadID)
+		created = a.runtime.store.ensureThreadActor(threadID)
 	}
 	relationshipType := neoActiveThreadRelationshipType(msg)
-	relationship, ok := neoProtocolThreadRelationship(threadID, relationshipType, "child", time.Now().UnixMilli(), stringValue(msg["comment"]))
+	createdAt := time.Now().UnixMilli()
+	relationship, ok := neoProtocolThreadRelationship(threadID, relationshipType, "child", createdAt, stringValue(msg["comment"]))
 	if !ok {
 		return
+	}
+	if created != nil {
+		if parentRelationship, ok := neoProtocolThreadRelationship(a.threadID, relationshipType, "parent", createdAt, stringValue(msg["comment"])); ok {
+			created.mu.Lock()
+			created.upsertRelationshipLocked(parentRelationship)
+			created.touchLocked()
+			created.mu.Unlock()
+		}
 	}
 	payload := map[string]any{
 		"type":          "thread_relationships",
@@ -15746,6 +16788,10 @@ func (a *neoActor) handleCreateThread(msg map[string]any) {
 	}
 	payload["seq"] = a.recordRelationshipEvent(payload)
 	a.broadcast(payload)
+	if created != nil && a.runtime != nil && a.runtime.store != nil {
+		a.runtime.store.broadcastThreadStatusUpdated(created)
+		created.syncCloudAsync()
+	}
 	a.dispatchNotification("thread", "thread_created", map[string]any{"threadId": threadID, "kind": relationship["type"]})
 	a.syncCloudAsync()
 }
@@ -15774,15 +16820,25 @@ func (a *neoActor) handleForkThread(msg map[string]any) {
 		a.broadcast(map[string]any{"type": "error", "message": "invalid_thread_id", "threadId": forkID, "code": "INVALID_THREAD_ID"})
 		return
 	}
+	var forked *neoActor
 	if a.runtime != nil && a.runtime.store != nil {
-		_ = a.runtime.store.ensureThreadActor(forkID)
+		forked = a.runtime.store.ensureThreadActor(forkID)
 	}
-	relationship, ok := neoProtocolThreadRelationship(forkID, "fork", "child", time.Now().UnixMilli(), stringValue(msg["comment"]))
+	createdAt := time.Now().UnixMilli()
+	relationship, ok := neoProtocolThreadRelationship(forkID, "fork", "child", createdAt, stringValue(msg["comment"]))
 	if !ok {
 		return
 	}
 	if forkPoint := stringValue(msg["forkMessageId"]); forkPoint != "" {
 		relationship["comment"] = "forked from " + forkPoint
+	}
+	if forked != nil {
+		if parentRelationship, ok := neoProtocolThreadRelationship(a.threadID, "fork", "parent", createdAt, stringValue(relationship["comment"])); ok {
+			forked.mu.Lock()
+			forked.upsertRelationshipLocked(parentRelationship)
+			forked.touchLocked()
+			forked.mu.Unlock()
+		}
 	}
 	payload := map[string]any{
 		"type":          "thread_relationships",
@@ -15790,6 +16846,10 @@ func (a *neoActor) handleForkThread(msg map[string]any) {
 	}
 	payload["seq"] = a.recordRelationshipEvent(payload)
 	a.broadcast(payload)
+	if forked != nil && a.runtime != nil && a.runtime.store != nil {
+		a.runtime.store.broadcastThreadStatusUpdated(forked)
+		forked.syncCloudAsync()
+	}
 	a.dispatchNotification("thread", "thread_forked", map[string]any{"threadId": forkID, "comment": relationship["comment"]})
 	a.syncCloudAsync()
 }
@@ -17293,6 +18353,7 @@ type neoSocket struct {
 	rivetConnection  string
 	localExtensions  bool
 	webLocalObserver bool
+	executor         bool
 	clientAPIKey     string
 }
 
@@ -17312,6 +18373,24 @@ func (s *neoSocket) markSnapshotSent() {
 	s.mu.Lock()
 	s.snapshotSent = true
 	s.mu.Unlock()
+}
+
+func (s *neoSocket) markExecutor() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.executor = true
+	s.mu.Unlock()
+}
+
+func (s *neoSocket) isExecutor() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.executor
 }
 
 func (s *neoSocket) hasSnapshotSent() bool {
@@ -17942,6 +19021,8 @@ func (m neoMessage) protocol() map[string]any {
 	content := m.Content
 	if m.Role == "info" {
 		content = neoProtocolInfoContent(m.Content)
+	} else if m.Role == "user" {
+		content = neoProtocolUserContent(m.Content)
 	}
 	out := map[string]any{
 		"threadId":  m.ThreadID,
@@ -20506,14 +21587,15 @@ func neoAmpExecutorCommand(cfg *config.Config) (string, error) {
 	return "", fmt.Errorf("amp binary not found; set ampcode.neo-local-runtime.executor-command")
 }
 
-func neoHeadlessExecutorEnv(base []string, cfg *config.Config, threadID, workDir, logPath string) []string {
+func neoHeadlessExecutorEnv(base []string, cfg *config.Config, threadID, workDir, logPath, executorCommand string) []string {
 	updates := map[string]string{
-		"AMP_EXECUTOR":          "1",
-		"AMP_URL":               neoProxyBaseURL(cfg),
-		"AMP_THREAD_ID":         threadID,
-		"AMP_CURRENT_THREAD_ID": threadID,
-		"AMP_SKIP_UPDATE_CHECK": "1",
-		"AMP_HEADLESS_OAUTH":    "1",
+		"AMP_EXECUTOR":                "1",
+		"AMP_URL":                     neoProxyBaseURL(cfg),
+		"AMP_THREAD_ID":               threadID,
+		"AMP_CURRENT_THREAD_ID":       threadID,
+		"AMP_SKIP_UPDATE_CHECK":       "1",
+		"AMP_HEADLESS_OAUTH":          "1",
+		"AMP_REMOTE_CONTROL_TERMINAL": "1",
 		// Rivetkit / runtime location used by the bundled JS client.
 		"AMP_GATEWAY_URL":       neoRuntimeBaseURL(cfg),
 		"AMP_RUNTIME_URL":       neoRuntimeBaseURL(cfg),
@@ -20522,6 +21604,9 @@ func neoHeadlessExecutorEnv(base []string, cfg *config.Config, threadID, workDir
 		"RIVET_PUBLIC_ENDPOINT": neoRuntimeBaseURL(cfg),
 		"RIVETKIT_ENGINE_URL":   neoRuntimeBaseURL(cfg),
 		"RIVET_THREAD_ID":       threadID,
+	}
+	if path := neoHeadlessExecutorPath(base, executorCommand); path != "" {
+		updates["PATH"] = path
 	}
 	if key := firstConfiguredAPIKey(cfg); key != "" {
 		updates["AMP_API_KEY"] = key
@@ -20533,6 +21618,276 @@ func neoHeadlessExecutorEnv(base []string, cfg *config.Config, threadID, workDir
 		updates["AMP_LOG_FILE"] = logPath
 	}
 	return appendEnvOverrides(base, updates)
+}
+
+func neoHeadlessExecutorPath(base []string, executorCommand string) string {
+	pathValue := neoHeadlessLoginShellPath(base)
+	executorDir := neoHeadlessExecutorCommandDir(executorCommand)
+	fallbackDirs := neoHeadlessExecutorPathDirs()
+	if pathValue == "" {
+		pathValue = envValueFromList(base, "PATH")
+		if executorDir != "" {
+			fallbackDirs = append([]string{executorDir}, fallbackDirs...)
+		}
+		return prependMissingPathDirs(pathValue, fallbackDirs)
+	}
+	if executorDir != "" {
+		pathValue = prependMissingPathDirs(pathValue, []string{executorDir})
+	}
+	return appendMissingPathDirs(pathValue, fallbackDirs)
+}
+
+func neoHeadlessExecutorPathDirs() []string {
+	candidates := make([]string, 0, 24)
+	candidates = append(candidates, neoHeadlessUserBinDirs()...)
+	candidates = append(candidates, neoHeadlessSystemBinDirs()...)
+	out := make([]string, 0, len(candidates))
+	seen := map[string]struct{}{}
+	for _, candidate := range candidates {
+		dir := neoExistingPathDir(candidate)
+		if dir == "" {
+			continue
+		}
+		if _, exists := seen[dir]; exists {
+			continue
+		}
+		seen[dir] = struct{}{}
+		out = append(out, dir)
+	}
+	return out
+}
+
+func neoDiscoverHeadlessLoginShellPath(base []string) string {
+	shell := neoHeadlessLoginShell(base)
+	if shell == "" {
+		return ""
+	}
+	const startMarker = "__CLIPROXY_HEADLESS_PATH_START__"
+	const endMarker = "__CLIPROXY_HEADLESS_PATH_END__"
+	tmp, errTemp := os.CreateTemp("", "cliproxy-headless-path-*")
+	if errTemp != nil {
+		return ""
+	}
+	tmpPath := tmp.Name()
+	if errClose := tmp.Close(); errClose != nil {
+		defer func() { _ = os.Remove(tmpPath) }()
+		return ""
+	}
+	defer func() { _ = os.Remove(tmpPath) }()
+	ctx, cancel := context.WithTimeout(context.Background(), neoHeadlessLoginShellPathTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, shell, "-lic", "printf '%s%s%s\n' '"+startMarker+"' \"$PATH\" '"+endMarker+"' > \"$CLIPROXY_HEADLESS_PATH_FILE\"")
+	env := base
+	if len(env) == 0 {
+		env = os.Environ()
+	} else {
+		env = append([]string{}, base...)
+	}
+	cmd.Env = append(env, "CLIPROXY_HEADLESS_PATH_FILE="+tmpPath)
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	if errRun := cmd.Run(); errRun != nil {
+		return ""
+	}
+	output, errRead := os.ReadFile(tmpPath)
+	if errRead != nil {
+		return ""
+	}
+	text := string(output)
+	start := strings.LastIndex(text, startMarker)
+	if start < 0 {
+		return ""
+	}
+	start += len(startMarker)
+	end := strings.Index(text[start:], endMarker)
+	if end < 0 {
+		return ""
+	}
+	return strings.TrimSpace(text[start : start+end])
+}
+
+func neoHeadlessLoginShell(base []string) string {
+	for _, candidate := range []string{envValueFromList(base, "SHELL"), os.Getenv("SHELL")} {
+		if shell := neoExistingExecutablePath(candidate); shell != "" {
+			return shell
+		}
+	}
+	candidates := []string{"/bin/bash", "/bin/sh"}
+	if runtime.GOOS == "darwin" {
+		candidates = []string{"/bin/zsh", "/bin/bash", "/bin/sh"}
+	}
+	for _, candidate := range candidates {
+		if shell := neoExistingExecutablePath(candidate); shell != "" {
+			return shell
+		}
+	}
+	return ""
+}
+
+func neoExistingExecutablePath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" || !filepath.IsAbs(path) {
+		return ""
+	}
+	info, errStat := os.Stat(path)
+	if errStat != nil || info.IsDir() || info.Mode()&0o111 == 0 {
+		return ""
+	}
+	return path
+}
+
+func neoHeadlessExecutorCommandDir(command string) string {
+	command = neoExpandHomePath(command)
+	if command == "" {
+		return ""
+	}
+	if !filepath.IsAbs(command) && !strings.ContainsAny(command, `/\`) {
+		resolved, err := exec.LookPath(command)
+		if err != nil {
+			return ""
+		}
+		command = resolved
+	} else if !filepath.IsAbs(command) {
+		absolute, err := filepath.Abs(command)
+		if err != nil {
+			return ""
+		}
+		command = absolute
+	}
+	info, err := os.Stat(command)
+	if err != nil || info.IsDir() {
+		return ""
+	}
+	return filepath.Dir(command)
+}
+
+func neoHeadlessUserBinDirs() []string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return nil
+	}
+	candidates := []string{
+		filepath.Join(home, ".amp", "bin"),
+		filepath.Join(home, ".bun", "bin"),
+		filepath.Join(home, ".local", "bin"),
+		filepath.Join(home, "bin"),
+		filepath.Join(home, ".deno", "bin"),
+		filepath.Join(home, ".cargo", "bin"),
+		filepath.Join(home, ".pyenv", "shims"),
+		filepath.Join(home, ".asdf", "shims"),
+		filepath.Join(home, ".local", "share", "mise", "shims"),
+		filepath.Join(home, ".config", "mise", "shims"),
+		filepath.Join(home, "go", "bin"),
+		filepath.Join(home, "Library", "pnpm"),
+		filepath.Join(home, ".yarn", "bin"),
+	}
+	if matches, err := filepath.Glob(filepath.Join(home, "Library", "Python", "*", "bin")); err == nil {
+		candidates = append(candidates, matches...)
+	}
+	return candidates
+}
+
+func neoHeadlessSystemBinDirs() []string {
+	return []string{
+		"/opt/homebrew/bin",
+		"/opt/homebrew/sbin",
+		"/usr/local/bin",
+		"/usr/local/sbin",
+	}
+}
+
+func neoExistingPathDir(path string) string {
+	path = filepath.Clean(neoExpandHomePath(path))
+	if path == "." || path == string(filepath.Separator) {
+		return ""
+	}
+	info, err := os.Stat(path)
+	if err != nil || !info.IsDir() {
+		return ""
+	}
+	return path
+}
+
+func neoExpandHomePath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" || path[0] != '~' {
+		return path
+	}
+	if len(path) > 1 && path[1] != '/' && path[1] != '\\' {
+		return path
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return path
+	}
+	remainder := strings.TrimLeft(path[1:], `/\`)
+	if remainder == "" {
+		return home
+	}
+	remainder = strings.ReplaceAll(remainder, `\`, `/`)
+	return filepath.Join(home, filepath.FromSlash(remainder))
+}
+
+func envValueFromList(base []string, key string) string {
+	for _, item := range base {
+		itemKey, value, ok := strings.Cut(item, "=")
+		if ok && itemKey == key {
+			return value
+		}
+	}
+	return ""
+}
+
+func prependMissingPathDirs(pathValue string, dirs []string) string {
+	seen := map[string]struct{}{}
+	parts := []string{}
+	if pathValue != "" {
+		for _, part := range filepath.SplitList(pathValue) {
+			if part == "" {
+				continue
+			}
+			seen[part] = struct{}{}
+			parts = append(parts, part)
+		}
+	}
+	for i := len(dirs) - 1; i >= 0; i-- {
+		dir := strings.TrimSpace(dirs[i])
+		if dir == "" {
+			continue
+		}
+		if _, exists := seen[dir]; exists {
+			continue
+		}
+		seen[dir] = struct{}{}
+		parts = append([]string{dir}, parts...)
+	}
+	return strings.Join(parts, string(os.PathListSeparator))
+}
+
+func appendMissingPathDirs(pathValue string, dirs []string) string {
+	seen := map[string]struct{}{}
+	parts := []string{}
+	if pathValue != "" {
+		for _, part := range filepath.SplitList(pathValue) {
+			if part == "" {
+				continue
+			}
+			seen[part] = struct{}{}
+			parts = append(parts, part)
+		}
+	}
+	for _, dir := range dirs {
+		dir = strings.TrimSpace(dir)
+		if dir == "" {
+			continue
+		}
+		if _, exists := seen[dir]; exists {
+			continue
+		}
+		seen[dir] = struct{}{}
+		parts = append(parts, dir)
+	}
+	return strings.Join(parts, string(os.PathListSeparator))
 }
 
 func appendEnvOverrides(base []string, updates map[string]string) []string {
@@ -25010,24 +26365,51 @@ func readNeoJSON(r io.Reader) map[string]any {
 	return payload
 }
 
-func readAndRestoreNeoJSONBody(r *http.Request) map[string]any {
+func readAndRestoreNeoJSONBody(r *http.Request) (map[string]any, error) {
 	if r == nil || r.Body == nil {
-		return map[string]any{}
+		return map[string]any{}, nil
 	}
 	data, err := io.ReadAll(r.Body)
 	if err != nil {
 		r.Body = io.NopCloser(bytes.NewReader(nil))
-		return map[string]any{}
+		return map[string]any{}, fmt.Errorf("read JSON body: %w", err)
 	}
 	r.Body = io.NopCloser(bytes.NewReader(data))
 	if len(bytes.TrimSpace(data)) == 0 {
-		return map[string]any{}
+		return map[string]any{}, nil
+	}
+	decoded := data
+	gzipMagic := len(data) >= 2 && data[0] == 0x1f && data[1] == 0x8b
+	gzipEncoded := false
+	for _, encoding := range strings.Split(strings.ToLower(r.Header.Get("Content-Encoding")), ",") {
+		if strings.TrimSpace(encoding) == "gzip" {
+			gzipEncoded = true
+			break
+		}
+	}
+	if gzipEncoded && !gzipMagic {
+		return map[string]any{}, errors.New("gzip JSON body missing gzip header")
+	}
+	if gzipEncoded || gzipMagic {
+		gz, err := gzip.NewReader(bytes.NewReader(data))
+		if err != nil {
+			return map[string]any{}, fmt.Errorf("decode gzip JSON body: %w", err)
+		}
+		inflated, readErr := io.ReadAll(gz)
+		closeErr := gz.Close()
+		if readErr != nil {
+			return map[string]any{}, fmt.Errorf("read gzip JSON body: %w", readErr)
+		}
+		if closeErr != nil {
+			return map[string]any{}, fmt.Errorf("close gzip JSON body: %w", closeErr)
+		}
+		decoded = inflated
 	}
 	var body map[string]any
-	if err := json.Unmarshal(data, &body); err != nil {
-		return map[string]any{}
+	if err := json.Unmarshal(decoded, &body); err != nil {
+		return map[string]any{}, fmt.Errorf("decode JSON body: %w", err)
 	}
-	return body
+	return body, nil
 }
 
 func parseWebSocketProtocols(header string) []string {
