@@ -69,7 +69,7 @@ type neoSubagentDef struct {
 
 // neoSubagentDefs maps the model-facing tool name to its definition. Keys match
 // the names the binary advertises and the model calls. Models/includeTools come
-// from the binary `_7` registry (finder→haiku, oracle→gpt-5.5, librarian→sonnet).
+// from Amp subagent routing (finder→haiku, oracle→gpt-5.5, librarian→gpt-5.5).
 var neoSubagentDefs = map[string]neoSubagentDef{
 	"finder": {
 		Key:          "finder",
@@ -88,13 +88,23 @@ var neoSubagentDefs = map[string]neoSubagentDef{
 		ReasoningEffort: "high",
 		MaxTurns:        24,
 	},
+	"advisor": {
+		Key:             "advisor",
+		DisplayName:     "Advisor",
+		Route:           neoModelRoute{Provider: "openai", Model: "gpt-5.5"},
+		IncludeTools:    []string{"Read", "Grep", "glob", "web_search", "read_web_page", "read_thread", "find_thread"},
+		SystemPrompt:    neoOracleSubagentPrompt,
+		ReasoningEffort: "high",
+		MaxTurns:        24,
+	},
 	"librarian": {
-		Key:          "librarian",
-		DisplayName:  "Librarian",
-		Route:        neoModelRoute{Provider: "anthropic", Model: "claude-sonnet-4-6"},
-		IncludeTools: []string{"read_github", "search_github", "commit_search", "diff", "list_directory_github", "list_repositories", "glob_github"},
-		SystemPrompt: neoLibrarianSubagentPrompt,
-		MaxTurns:     16,
+		Key:             "librarian",
+		DisplayName:     "Librarian",
+		Route:           neoModelRoute{Provider: "openai", Model: "gpt-5.5"},
+		IncludeTools:    []string{"read_github", "search_github", "commit_search", "diff", "list_directory_github", "list_repositories", "glob_github"},
+		SystemPrompt:    neoLibrarianSubagentPrompt,
+		ReasoningEffort: "none",
+		MaxTurns:        16,
 	},
 	"Task": {
 		Key:          "task-subagent",
@@ -137,7 +147,8 @@ func isNeoLocalSubagentTool(toolName string) bool {
 // mirror the binary's exactly.
 func neoSubagentExposureSpec(toolName string) (neoToolSpec, bool) {
 	meta := map[string]any{"source": "neo-subagent"}
-	switch strings.TrimSpace(toolName) {
+	name := strings.TrimSpace(toolName)
+	switch name {
 	case "finder":
 		return neoToolSpec{
 			Name:        "finder",
@@ -152,9 +163,9 @@ func neoSubagentExposureSpec(toolName string) (neoToolSpec, bool) {
 			},
 			Meta: meta,
 		}, true
-	case "oracle":
+	case "oracle", "advisor":
 		return neoToolSpec{
-			Name:        "oracle",
+			Name:        name,
 			Description: neoOracleExposureDescription,
 			InputSchema: map[string]any{
 				"type": "object",
@@ -245,6 +256,9 @@ func (a *neoActor) executeSubagentRun(name string, input map[string]any, parentT
 	agentMode := a.currentAgentMode
 	tools := a.resolveSubagentToolsLocked(def.IncludeTools)
 	settings := cloneMap(a.settings)
+	if def.ReasoningEffort != "" {
+		settings["reasoning.effort"] = def.ReasoningEffort
+	}
 	environment := cloneMap(a.environment)
 	maxTokens := a.maxTokens
 	a.mu.Unlock()
@@ -592,7 +606,7 @@ func (a *neoActor) subagentGenerationStale(generation int) bool {
 // message of the subagent conversation, matching how the binary seeds each one.
 func neoSubagentInputText(toolName string, input map[string]any) string {
 	switch toolName {
-	case "oracle":
+	case "oracle", "advisor":
 		var b strings.Builder
 		if task := stringValue(input["task"]); task != "" {
 			b.WriteString(task)

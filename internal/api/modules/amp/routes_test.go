@@ -518,6 +518,8 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"installThreadMenuIntegration();",
 		"installCommandPaletteIntegration();",
 		"handleNewThreadIntent();",
+		"mergeSidebarResponse",
+		`svelteKitRemoteEndpoint(sourceURL.pathname) === "listThreadListSidebar"`,
 		"path.endsWith(\"/listThreadListSidebar\")",
 		"path.endsWith(\"/listUserExecutorDaemons\")",
 		"\n\t\tcreateLocalThread,\n",

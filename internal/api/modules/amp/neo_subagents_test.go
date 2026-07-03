@@ -23,7 +23,8 @@ func TestNeoSubagentRegistryMatchesBinary(t *testing.T) {
 	}{
 		{"finder", "anthropic", "claude-haiku-4-5-20251001", "", []string{"Grep", "glob", "Read"}},
 		{"oracle", "openai", "gpt-5.5", "high", []string{"Read", "Grep", "glob", "web_search", "read_web_page", "read_thread", "find_thread"}},
-		{"librarian", "anthropic", "claude-sonnet-4-6", "", []string{"read_github", "search_github", "commit_search", "diff", "list_directory_github", "list_repositories", "glob_github"}},
+		{"advisor", "openai", "gpt-5.5", "high", []string{"Read", "Grep", "glob", "web_search", "read_web_page", "read_thread", "find_thread"}},
+		{"librarian", "openai", "gpt-5.5", "none", []string{"read_github", "search_github", "commit_search", "diff", "list_directory_github", "list_repositories", "glob_github"}},
 		// Task inherits the parent model (empty route) and includes finder (a nested subagent).
 		{"Task", "", "", "", []string{"Read", "Bash", "edit_file", "create_file", "read_web_page", "web_search", "finder", "skill", "view_media"}},
 	}
@@ -64,7 +65,7 @@ func captureNeoSubagentRouteForTest(t *testing.T, toolName, name string, cfg *co
 	}
 
 	input := map[string]any{"prompt": "delegate"}
-	if toolName == "oracle" {
+	if toolName == "oracle" || toolName == "advisor" {
 		input = map[string]any{"task": "advise"}
 	}
 	if _, err := actor.executeSubagentRun(toolName, input, "TU-"+name, "M-1", actor.generation, 0, ""); err != nil {
@@ -123,8 +124,78 @@ func TestNeoOracleSubagentIgnoresConfigModeModel(t *testing.T) {
 	}
 }
 
+func TestNeoAdvisorSubagentMatchesOracleRouting(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-advisor", "thread-actor", "T-advisor", "T-advisor", neoActorRecord("actor-advisor", "thread-actor", "T-advisor"), nil)
+	actor.currentAgentMode = "smart"
+	actor.settings = map[string]any{"reasoning.effort": "medium"}
+	actor.registerTools([]any{
+		map[string]any{"name": "Read"},
+		map[string]any{"name": "Grep"},
+		map[string]any{"name": "glob"},
+		map[string]any{"name": "web_search"},
+		map[string]any{"name": "read_web_page"},
+		map[string]any{"name": "read_thread"},
+		map[string]any{"name": "find_thread"},
+	})
+
+	var seen []neoInferenceRequest
+	rt.inferStream = func(_ *neoRuntime, req neoInferenceRequest, _ neoStreamCallback) (neoInferenceResult, error) {
+		seen = append(seen, req)
+		return neoInferenceResult{Text: "done"}, nil
+	}
+
+	if _, err := actor.executeSubagentRun("advisor", map[string]any{"task": "review routing", "context": "same as oracle"}, "TU-advisor", "M-1", actor.generation, 0, ""); err != nil {
+		t.Fatalf("advisor subagent failed: %v", err)
+	}
+	if len(seen) != 1 {
+		t.Fatalf("advisor requests = %#v, want exactly one", seen)
+	}
+	route := seen[0].ModelRouteOverride
+	if route == nil || route.Provider != "openai" || route.Model != "gpt-5.5" {
+		t.Fatalf("advisor route = %#v, want openai/gpt-5.5", route)
+	}
+	if seen[0].ReasoningEffort != "high" || stringValue(seen[0].Settings["reasoning.effort"]) != "high" {
+		t.Fatalf("advisor effort request=%q settings=%#v, want high", seen[0].ReasoningEffort, seen[0].Settings)
+	}
+	toolNames := make([]string, 0, len(seen[0].Tools))
+	for _, tool := range seen[0].Tools {
+		toolNames = append(toolNames, tool.Name)
+	}
+	if strings.Join(toolNames, ",") != "Read,Grep,glob,web_search,read_web_page,read_thread,find_thread" {
+		t.Fatalf("advisor tools = %#v", toolNames)
+	}
+}
+
+func TestNeoLibrarianSubagentUsesGPT55None(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-librarian", "thread-actor", "T-librarian", "T-librarian", neoActorRecord("actor-librarian", "thread-actor", "T-librarian"), nil)
+	actor.currentAgentMode = "smart"
+	actor.settings = map[string]any{"reasoning.effort": "high"}
+
+	var seen []neoInferenceRequest
+	rt.inferStream = func(_ *neoRuntime, req neoInferenceRequest, _ neoStreamCallback) (neoInferenceResult, error) {
+		seen = append(seen, req)
+		return neoInferenceResult{Text: "done"}, nil
+	}
+
+	if _, err := actor.executeSubagentRun("librarian", map[string]any{"query": "how does routing work"}, "TU-librarian", "M-1", actor.generation, 0, ""); err != nil {
+		t.Fatalf("librarian subagent failed: %v", err)
+	}
+	if len(seen) != 1 {
+		t.Fatalf("librarian requests = %#v, want exactly one", seen)
+	}
+	route := seen[0].ModelRouteOverride
+	if route == nil || route.Provider != "openai" || route.Model != "gpt-5.5" {
+		t.Fatalf("librarian route = %#v, want openai/gpt-5.5", route)
+	}
+	if seen[0].ReasoningEffort != "none" || stringValue(seen[0].Settings["reasoning.effort"]) != "none" {
+		t.Fatalf("librarian effort request=%q settings=%#v, want none", seen[0].ReasoningEffort, seen[0].Settings)
+	}
+}
+
 func TestIsNeoLocalSubagentTool(t *testing.T) {
-	for _, name := range []string{"finder", "oracle", "librarian", "Task"} {
+	for _, name := range []string{"finder", "oracle", "advisor", "librarian", "Task"} {
 		if !isNeoLocalSubagentTool(name) {
 			t.Fatalf("%s should be a local subagent tool", name)
 		}
@@ -149,6 +220,14 @@ func TestNeoSubagentInputText(t *testing.T) {
 		if !strings.Contains(oracle, want) {
 			t.Fatalf("oracle input missing %q:\n%s", want, oracle)
 		}
+	}
+	advisor := neoSubagentInputText("advisor", map[string]any{
+		"task":    "review the auth design",
+		"context": "files attached",
+		"files":   []any{"a.go", "b.go"},
+	})
+	if advisor != oracle {
+		t.Fatalf("advisor input = %q, want oracle-equivalent %q", advisor, oracle)
 	}
 	if got := neoSubagentInputText("librarian", map[string]any{"query": "how does routing work"}); got != "how does routing work" {
 		t.Fatalf("librarian input = %q", got)
@@ -540,7 +619,7 @@ func TestNeoSubagentNestedRecursion(t *testing.T) {
 	}
 }
 
-func TestNeoSubagentRunsSyntheticReadThreadWhenExecutorOmitsIt(t *testing.T) {
+func TestNeoSubagentRunsSyntheticReadThreadAgentWhenExecutorOmitsIt(t *testing.T) {
 	currentThreadID := "T-019e65c0-0310-77a8-b233-4b84d9c0612f"
 	targetThreadID := "T-019e65c0-0310-77a8-b233-4b84d9c06130"
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -548,23 +627,36 @@ func TestNeoSubagentRunsSyntheticReadThreadWhenExecutorOmitsIt(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{UpstreamURL: upstream.URL, UpstreamAPIKey: "secret"}})
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{UpstreamURL: upstream.URL}})
+	rt.setSecretSource(NewStaticSecretSource("secret"))
 	var mu sync.Mutex
 	oracleTurns := 0
+	readTurns := 0
 	sawSyntheticTool := false
-	sawReadExtraction := false
+	sawReadAgent := false
 	rt.inferStream = func(_ *neoRuntime, req neoInferenceRequest, _ neoStreamCallback) (neoInferenceResult, error) {
 		mu.Lock()
 		defer mu.Unlock()
-		if req.DisableSystemPrompt {
-			sawReadExtraction = true
-			if req.ModelRouteOverride == nil || req.ModelRouteOverride.Model != "gemini-3-flash-preview" {
-				t.Fatalf("read_thread extraction route = %#v", req.ModelRouteOverride)
+		if req.ProviderFeature == "amp.read-thread" {
+			sawReadAgent = true
+			switch readTurns {
+			case 0:
+				neoReadThreadAssertAgentRequest(t, req)
+				if strings.Contains(req.History[0].Text, "subagent thread content") {
+					t.Fatalf("read_thread initial history included whole thread content: %#v", req.History)
+				}
+				readTurns++
+				return neoInferenceResult{ToolCalls: []neoToolCall{{ID: "TU-read-search", Name: "search_thread_messages", Input: map[string]any{"query": "subagent context"}}}}, nil
+			case 1:
+				if !strings.Contains(neoHistoryTestText(req.History), "subagent thread content") {
+					t.Fatalf("read_thread search history = %#v", req.History)
+				}
+				readTurns++
+				return neoInferenceResult{ToolCalls: []neoToolCall{{ID: "TU-read-messages", Name: "read_thread_messages", Input: map[string]any{"latest": true, "count": 1}}}}, nil
+			default:
+				readTurns++
+				return neoInferenceResult{Text: `{"relevantContent":"subagent extracted context"}`}, nil
 			}
-			if !strings.Contains(req.History[0].Text, "subagent thread content") {
-				t.Fatalf("read_thread extraction history = %#v", req.History)
-			}
-			return neoInferenceResult{Text: `{"relevantContent":"subagent extracted context"}`}, nil
 		}
 		oracleTurns++
 		if oracleTurns == 1 {
@@ -605,13 +697,14 @@ func TestNeoSubagentRunsSyntheticReadThreadWhenExecutorOmitsIt(t *testing.T) {
 	if !sawSyntheticTool {
 		t.Fatal("oracle did not receive synthetic read_thread")
 	}
-	if !sawReadExtraction {
-		t.Fatal("read_thread extraction did not run locally")
+	if !sawReadAgent {
+		t.Fatal("read_thread agent did not run locally")
 	}
 	actor.mu.Lock()
 	_, stillPending := actor.pendingTools[parent.ID]
 	var toolText string
 	var childReadResult string
+	var internalReadMessages int
 	for i := len(actor.history) - 1; i >= 0; i-- {
 		if actor.history[i].Role == "tool" && actor.history[i].ToolCallID == parent.ID {
 			toolText = actor.history[i].Text
@@ -620,6 +713,9 @@ func TestNeoSubagentRunsSyntheticReadThreadWhenExecutorOmitsIt(t *testing.T) {
 	}
 	for _, message := range actor.messages {
 		if message.ParentToolUseID != parent.ID || message.MessageID != toolResultMessageID("read-thread-call-1") {
+			if message.ParentToolUseID == "read-thread-call-1" {
+				internalReadMessages++
+			}
 			continue
 		}
 		childReadResult = runToText(mapValue(mapValue(message.Content[0])["run"]))
@@ -633,6 +729,9 @@ func TestNeoSubagentRunsSyntheticReadThreadWhenExecutorOmitsIt(t *testing.T) {
 	}
 	if !strings.Contains(childReadResult, "subagent extracted context") {
 		t.Fatalf("child read_thread result = %q, want persisted child result", childReadResult)
+	}
+	if internalReadMessages != 4 {
+		t.Fatalf("internal read_thread messages = %d, want search/read tool use and result messages", internalReadMessages)
 	}
 }
 

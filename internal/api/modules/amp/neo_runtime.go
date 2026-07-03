@@ -127,9 +127,9 @@ var (
 		"large":    toolList("finder", "Bash", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "archive_current_thread", "send_message_to_agg"),
 		"rush":     toolList("finder", "shell_command", "shell_command_status", "apply_patch", "web_search", "read_web_page", "read_mcp_resource", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "painter", "archive_current_thread", "send_message_to_agg"),
 		"agg-man":  toolList("find_thread", "read_thread", "web_search", "read_web_page", "docs_list", "docs_read", "docs_write", "create_project", "list_agent_modes", "create_thread", "archive_thread", "archive_threads", "unarchive_thread", "send_message_to_thread", "publish_thread_artifacts", "slack_write", "slack_read", "github_repo_ci_status", "read_github", "search_github", "commit_search", "list_directory_github", "list_repositories", "glob_github", "diff"),
-		"deep":     toolList("shell_command", "shell_command_status", "apply_patch", "web_search", "read_web_page", "Task", "skill", "read_thread", "find_thread", "librarian", "oracle", "finder", "view_media", "painter", "archive_current_thread", "send_message_to_agg"),
+		"deep":     toolList("shell_command", "shell_command_status", "apply_patch", "web_search", "read_web_page", "Task", "skill", "read_thread", "find_thread", "librarian", "oracle", "advisor", "finder", "view_media", "painter", "archive_current_thread", "send_message_to_agg"),
 		"review":   toolList("shell_command", "run_check", "submit_review"),
-		"nostromo": toolList("finder", "Bash", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "archive_current_thread", "send_message_to_agg", "shell_command", "shell_command_status", "apply_patch"),
+		"nostromo": toolList("finder", "Bash", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "archive_current_thread", "send_message_to_agg", "shell_command", "shell_command_status", "apply_patch", "advisor"),
 	}
 	neoModeToolAllowlist = orderedToolSets(neoModeToolOrder)
 	// gaac893 emptied every mode's deferredTools (the code_review deferred tool
@@ -139,7 +139,7 @@ var (
 	neoKnownModeTools            = toolSet(
 		"finder", "Bash", "create_file", "edit_file",
 		"web_search", "read_web_page", "read_mcp_resource", "read_thread", "find_thread", "skill", "oracle",
-		"librarian", "Task", "view_media", "painter",
+		"librarian", "Task", "advisor", "view_media", "painter",
 		"shell_command", "shell_command_status", "apply_patch", "archive_current_thread", "send_message_to_agg", "run_check", "submit_review", "docs_list", "docs_read", "docs_write",
 		"create_project", "list_agent_modes", "create_thread", "archive_thread", "archive_threads", "unarchive_thread", "send_message_to_thread", "publish_thread_artifacts",
 		"slack_write", "slack_read", "github_repo_ci_status", "read_github", "search_github", "commit_search",
@@ -3373,6 +3373,7 @@ func (a *neoActor) executorConnected(msg map[string]any) {
 	if executorID == "" {
 		executorID = "local-executor"
 	}
+	a.touchLocked()
 	a.executorID = executorID
 	a.executorReady = true
 	a.executorBootstrapComplete = true
@@ -3396,6 +3397,7 @@ func (a *neoActor) executorConnected(msg map[string]any) {
 
 func (a *neoActor) executorDisconnected(msg map[string]any) {
 	a.mu.Lock()
+	a.touchLocked()
 	a.executorReady = false
 	a.executorID = ""
 	pending := a.pendingToolIDsLocked()
@@ -3405,6 +3407,9 @@ func (a *neoActor) executorDisconnected(msg map[string]any) {
 	a.approvalQueue = nil
 	a.agentState = "idle"
 	a.mu.Unlock()
+	if a.runtime != nil && a.runtime.store != nil {
+		a.runtime.store.broadcastThreadStatusUpdated(a)
+	}
 
 	for _, toolCallID := range pending {
 		a.broadcast(map[string]any{"type": "executor_tool_lease_revoked", "toolCallId": toolCallID, "reason": "executor_disconnected"})
@@ -17051,7 +17056,7 @@ func (a *neoActor) maybeBroadcastThreadStatusUpdated(payload any) {
 	}
 	msg := mapValue(payload)
 	switch stringValue(msg["type"]) {
-	case "agent_state", "thread_relationships", "thread_status", "thread_title":
+	case "agent_state", "executor_connected", "thread_relationships", "thread_status", "thread_title":
 		a.runtime.store.broadcastThreadStatusUpdated(a)
 	}
 }

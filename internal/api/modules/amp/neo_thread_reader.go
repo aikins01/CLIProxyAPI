@@ -12,64 +12,15 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 )
 
-const neoReadThreadPromptTemplate = `You are helping me extract relevant information from the mentioned thread based on a goal.
-
-## Task
-
-I am talking to another user. They mentioned a thread (a conversation) in their message last message. I turned the thread into Markdown and provided it to you, along with a goal of what I want you to extract.
-
-Your job is to:
-1. Analyze the mentioned thread's content
-2. Identify information that is relevant to the goal
-3. Extract and preserve those relevant parts with full fidelity
-4. Omit clearly irrelevant content to keep the context concise
-
-## Guidelines
-
-**Preserve Fidelity**: When content IS relevant, include it completely with all important details, code snippets, explanations, and context.
-**Be Selective**: When content is clearly NOT relevant to the user's query, omit it entirely.
-**Maintain Structure**: Keep the extracted content well-organized and coherent. If multiple parts are relevant, preserve their logical flow.
-**Technical Precision**: Preserve exact technical details like file paths, function names, error messages, and code snippets that are relevant.
-
-## Examples
-
-### Example 1: Extract implementation details
-
-**Goal**: "Extract the implementation details of the authentication mechanism in the mentioned thread"
-
-**Good Extraction**:
-- Includes: Authentication logic, security considerations, code examples, relevant files
-- Omits: Unrelated features, general discussion, tangential topics
-
-### Example 2: Referencing a bug fix
-
-**Goal**: "Extract how the bug was fixed in the mentioned thread"
-
-**Good Extraction**:
-- Includes: The bug description, root cause, the fix/solution, relevant code changes
-- Omits: Initial troubleshooting steps, unrelated changes, meeting notes
-
-### Example 3: Learning from past work
-
-**Goal**: "Describe what pattern was used to implemented the widget Foo in the mentioned thread"
-
-**Good Extraction**:
-- Includes: The design pattern, implementation approach, example code, key decisions
-- Omits: Project-specific details that don't apply, alternative approaches that were rejected
-
-## Goal
-
-{GOAL}
-
-## Your Response
-
-Format your response as JSON with:
-- ` + "`relevantContent`" + `: The extracted relevant information (as markdown text)`
-
 func (a *neoActor) shouldRunLocalActorTool(name string) bool {
 	toolName := strings.TrimSpace(name)
+	if toolName == "read_thread" {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		return a.executorBootstrapComplete
+	}
 	switch {
-	case toolName == "read_thread" || toolName == "submit_review":
+	case toolName == "submit_review":
 	case isNeoGitHubTool(toolName):
 	case isNeoThreadTool(toolName):
 	default:
@@ -141,55 +92,14 @@ func (a *neoActor) executeLocalReadThread(pending neoPendingTool, generation int
 	if a.subagentGenerationStale(generation) {
 		return "", nil
 	}
-	markdown, err := a.readThreadMarkdown(threadID, pending.ClientAPIKey)
+	corpus, err := a.readThreadCorpus(threadID, pending.ClientAPIKey)
 	if err != nil {
 		return "", fmt.Errorf("Reading thread failed: %w", err)
 	}
 	if a.subagentGenerationStale(generation) {
 		return "", nil
 	}
-
-	a.mu.Lock()
-	settings := cloneMap(a.settings)
-	environment := cloneMap(a.environment)
-	maxTokens := a.maxTokens
-	actorID := a.id
-	currentThreadID := a.threadID
-	a.mu.Unlock()
-
-	route := neoModelRoute{Provider: "google", Model: "gemini-3-flash-preview"}
-	result, err := a.runtime.subagentInfer(neoInferenceRequest{
-		ActorID:                  actorID,
-		ThreadID:                 currentThreadID,
-		MessageID:                newNeoMessageID(),
-		AgentMode:                pending.AgentMode,
-		ParentToolCallID:         pending.ParentToolCallID,
-		MaxTokens:                maxTokens,
-		Settings:                 settings,
-		History:                  neoReadThreadHistory(markdown, goal),
-		Environment:              environment,
-		ModelRouteOverride:       &route,
-		DisableSystemPrompt:      true,
-		DisableProviderReasoning: true,
-		ProviderFeature:          "amp.read-thread",
-		ResponseMimeType:         "application/json",
-		ResponseJSONSchema:       neoReadThreadResponseJSONSchema(),
-	}, func(neoInferenceDelta) {})
-	if err != nil {
-		return "", fmt.Errorf("Reading thread failed: %w", err)
-	}
-	if a.subagentGenerationStale(generation) {
-		return "", nil
-	}
-	text, err := neoReadThreadRelevantContent(result.Text)
-	if err != nil {
-		return "", fmt.Errorf("Reading thread failed: %w", err)
-	}
-	return text, nil
-}
-
-func (a *neoActor) readThreadMarkdown(threadID, clientAPIKey string) (string, error) {
-	return a.fetchUpstreamThreadMarkdown(threadID, clientAPIKey)
+	return a.executeLocalReadThreadAgent(pending, generation, corpus, goal)
 }
 
 func (a *neoActor) fetchUpstreamThreadMarkdown(threadID, clientAPIKey string) (string, error) {
@@ -256,19 +166,6 @@ func (a *neoActor) upstreamThreadFetchAPIKey(cfg *config.Config, clientAPIKey st
 		return "", nil
 	}
 	return strings.TrimSpace(cfg.AmpCode.UpstreamAPIKey), nil
-}
-
-func neoReadThreadHistory(markdown, goal string) []neoHistoryMessage {
-	return []neoHistoryMessage{
-		{Role: "user", Text: strings.Join([]string{
-			"Here is the mentioned thread content:",
-			"",
-			"<mentionedThread>",
-			markdown,
-			"</mentionedThread>",
-		}, "\n")},
-		{Role: "user", Text: strings.ReplaceAll(neoReadThreadPromptTemplate, "{GOAL}", goal)},
-	}
 }
 
 func neoReadThreadRelevantContent(text string) (string, error) {

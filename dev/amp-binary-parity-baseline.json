@@ -1109,6 +1109,7 @@
           "find_thread",
           "librarian",
           "oracle",
+          "advisor",
           "finder",
           "view_media",
           "painter",
@@ -1173,7 +1174,8 @@
           "send_message_to_agg",
           "shell_command",
           "shell_command_status",
-          "apply_patch"
+          "apply_patch",
+          "advisor"
         ],
         "visible": true,
         "visible_in_v2": false,

@@ -5422,6 +5422,84 @@ func TestNeoUserActorReceivesThreadStatusUpdatedNotification(t *testing.T) {
 	}
 }
 
+func TestNeoUserActorReceivesThreadStatusUpdatedOnExecutorConnectDisconnect(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019e0e6e-f3f1-7078-b5dd-748f66f8c261"
+	threadActor := rt.store.ensureThreadActor(threadID)
+	threadActor.mu.Lock()
+	threadActor.title = "Executor local thread"
+	threadActor.messages = []neoMessage{{
+		ThreadID:  threadID,
+		MessageID: "M-executor-local",
+		Role:      "user",
+		CreatedAt: "2026-05-31T12:00:00Z",
+		Content:   []any{map[string]any{"type": "text", "text": "watch executor"}},
+	}}
+	threadActor.mu.Unlock()
+
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	t.Cleanup(server.Close)
+
+	dialer := websocket.Dialer{Subprotocols: []string{"rivet", "rivet_conn_params.%7B%22transport%22%3A%22json-rpc%22%7D", "rivet_encoding.4", "rivet_skip_ready_wait"}}
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/gateway/userActor/?rvt-method=getOrCreate&rvt-key=user-local"
+	conn, resp, err := dialer.Dial(wsURL, nil)
+	if err != nil {
+		status := 0
+		if resp != nil {
+			status = resp.StatusCode
+		}
+		t.Fatalf("gateway userActor websocket dial failed status=%d err=%v", status, err)
+	}
+	defer conn.Close()
+
+	readThreadStatusUpdated := func() map[string]any {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			_ = conn.SetReadDeadline(time.Now().Add(time.Until(deadline)))
+			_, payload, err := conn.ReadMessage()
+			if err != nil {
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					break
+				}
+				t.Fatalf("read userActor executor notification: %v", err)
+			}
+			var frame map[string]any
+			if err := json.Unmarshal(payload, &frame); err != nil {
+				t.Fatalf("userActor executor notification JSON error: %v", err)
+			}
+			if frame["method"] != "threadStatusUpdated" {
+				continue
+			}
+			params := mapValue(frame["params"])
+			if params["threadId"] != threadID {
+				continue
+			}
+			return params
+		}
+		t.Fatal("did not receive threadStatusUpdated notification for executor state")
+		return nil
+	}
+
+	threadActor.executorConnected(map[string]any{"executorId": "executor-test"})
+	params := readThreadStatusUpdated()
+	if params["title"] != "Executor local thread" || params["state"] != "idle" {
+		t.Fatalf("executor connected threadStatusUpdated params = %#v", params)
+	}
+	if params["hasExecutor"] != true || params["executorConnected"] != true {
+		t.Fatalf("executor connected status = has:%#v connected:%#v params=%#v", params["hasExecutor"], params["executorConnected"], params)
+	}
+	if params["lastUserMessageAt"] != "2026-05-31T12:00:00Z" {
+		t.Fatalf("executor connected lastUserMessageAt = %#v", params["lastUserMessageAt"])
+	}
+
+	threadActor.executorDisconnected(map[string]any{"message": "done"})
+	params = readThreadStatusUpdated()
+	if params["hasExecutor"] != false || params["executorConnected"] != false {
+		t.Fatalf("executor disconnected status = has:%#v connected:%#v params=%#v", params["hasExecutor"], params["executorConnected"], params)
+	}
+}
+
 func TestNeoUserActorReceivesThreadStatusUpdatedOnThreadActorCreation(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
@@ -13020,6 +13098,7 @@ func TestNeoActorFiltersAmpBuiltInToolsByMode(t *testing.T) {
 		"oracle":                   {Name: "oracle"},
 		"librarian":                {Name: "librarian"},
 		"Task":                     {Name: "Task"},
+		"advisor":                  {Name: "advisor"},
 		"task_list":                {Name: "task_list"},
 		"todo_write":               {Name: "todo_write"},
 		"todo_read":                {Name: "todo_read"},
@@ -13066,13 +13145,13 @@ func TestNeoActorFiltersAmpBuiltInToolsByMode(t *testing.T) {
 
 	deepNames := requestNames("deep")
 	assertMode("deep", deepNames,
-		[]string{"Task", "read_thread", "shell_command", "apply_patch", "view_media", "tb__gemini-oracle"},
+		[]string{"Task", "advisor", "read_thread", "shell_command", "apply_patch", "view_media", "tb__gemini-oracle"},
 		[]string{"Read", "Grep", "glob", "Glob", "Bash", "create_file", "edit_file", "get_diagnostics", "chart", "look_at", "handoff", "task_list", "todo_write", "file_tree", "code_review", "deferred_custom", "docs_read"})
 
 	smartNames := requestNames("smart")
 	assertMode("smart", smartNames,
 		[]string{"Bash", "create_file", "edit_file", "Task", "view_media", "send_message_to_agg", "tb__gemini-oracle"},
-		[]string{"Grep", "glob", "Glob", "delete_file", "get_diagnostics", "shell_command", "apply_patch", "chart", "look_at", "handoff", "task_list", "todo_write", "file_tree", "code_review", "deferred_custom", "search_documents", "get_document", "docs_read"})
+		[]string{"Grep", "glob", "Glob", "delete_file", "get_diagnostics", "advisor", "shell_command", "apply_patch", "chart", "look_at", "handoff", "task_list", "todo_write", "file_tree", "code_review", "deferred_custom", "search_documents", "get_document", "docs_read"})
 
 	smartPromptNames := map[string]bool{}
 	for _, name := range actor.toolNamesLocked("smart") {
@@ -13085,17 +13164,17 @@ func TestNeoActorFiltersAmpBuiltInToolsByMode(t *testing.T) {
 	rushNames := requestNames("rush")
 	assertMode("rush", rushNames,
 		[]string{"Task", "shell_command", "apply_patch", "view_media", "read_mcp_resource", "tb__gemini-oracle"},
-		[]string{"Read", "Grep", "glob", "Glob", "Bash", "create_file", "edit_file", "get_diagnostics", "chart", "look_at", "handoff", "task_list", "todo_write", "file_tree", "code_review", "deferred_custom", "docs_read"})
+		[]string{"Read", "Grep", "glob", "Glob", "Bash", "create_file", "edit_file", "get_diagnostics", "advisor", "chart", "look_at", "handoff", "task_list", "todo_write", "file_tree", "code_review", "deferred_custom", "docs_read"})
 
 	largeNames := requestNames("large")
 	assertMode("large", largeNames,
 		[]string{"Bash", "create_file", "edit_file", "Task", "view_media", "send_message_to_agg", "tb__gemini-oracle"},
-		[]string{"Grep", "glob", "Glob", "get_diagnostics", "shell_command", "apply_patch", "chart", "look_at", "handoff", "task_list", "todo_write", "file_tree", "code_review", "deferred_custom", "docs_read"})
+		[]string{"Grep", "glob", "Glob", "get_diagnostics", "advisor", "shell_command", "apply_patch", "chart", "look_at", "handoff", "task_list", "todo_write", "file_tree", "code_review", "deferred_custom", "docs_read"})
 
 	unknownModeNames := requestNames("frontier")
 	assertMode("unknown mode", unknownModeNames,
 		[]string{"Bash", "create_file", "edit_file", "Task", "view_media", "send_message_to_agg", "tb__gemini-oracle"},
-		[]string{"shell_command", "apply_patch", "chart", "handoff", "code_review", "deferred_custom"})
+		[]string{"advisor", "shell_command", "apply_patch", "chart", "handoff", "code_review", "deferred_custom"})
 
 	aggNames := requestNames("agg-man")
 	assertMode("agg-man", aggNames,
@@ -13104,7 +13183,7 @@ func TestNeoActorFiltersAmpBuiltInToolsByMode(t *testing.T) {
 
 	nostromoNames := requestNames("nostromo")
 	assertMode("nostromo", nostromoNames,
-		[]string{"Bash", "create_file", "edit_file", "Task", "shell_command", "apply_patch", "view_media", "send_message_to_agg", "tb__gemini-oracle"},
+		[]string{"Bash", "create_file", "edit_file", "Task", "advisor", "shell_command", "apply_patch", "view_media", "send_message_to_agg", "tb__gemini-oracle"},
 		[]string{"Grep", "glob", "Glob", "get_diagnostics", "chart", "look_at", "handoff", "task_list", "todo_write", "file_tree", "code_review", "deferred_custom", "docs_read"})
 }
 
@@ -13112,7 +13191,7 @@ func TestNeoActorToolsForModeFollowBinaryModeOrder(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
 	binaryNostromoOrder := []string{
-		"finder", "Bash", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "send_message_to_agg", "shell_command", "apply_patch",
+		"finder", "Bash", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "send_message_to_agg", "shell_command", "apply_patch", "advisor",
 	}
 	rawTools := []any{map[string]any{"name": "external_tool", "source": map[string]any{"plugin": "test"}}}
 	for i := len(binaryNostromoOrder) - 1; i >= 0; i-- {
@@ -13154,7 +13233,7 @@ func TestNeoActorExposesSyntheticLocalToolsWhenExecutorOmitsThem(t *testing.T) {
 		names = append(names, tool.Name)
 	}
 
-	for _, name := range []string{"finder", "oracle", "librarian", "Task", "read_thread"} {
+	for _, name := range []string{"finder", "oracle", "advisor", "librarian", "Task", "read_thread"} {
 		spec, ok := byName[name]
 		if !ok {
 			t.Fatalf("synthetic local tool %s was not exposed to the model: %v", name, names)
@@ -17171,7 +17250,7 @@ func TestNeoActorClientThreadCommandsUseBinarySchema(t *testing.T) {
 	}
 }
 
-func TestNeoActorRunsClassicReadThreadWhenExecutorOmitsIt(t *testing.T) {
+func TestNeoActorRunsReadThreadAgentEvenWhenExecutorRegistersIt(t *testing.T) {
 	currentThreadID := "T-019e65c0-0310-77a8-b233-4b84d9c0612f"
 	targetThreadID := "T-019e65c0-0310-77a8-b233-4b84d9c06130"
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -17179,17 +17258,16 @@ func TestNeoActorRunsClassicReadThreadWhenExecutorOmitsIt(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	var captured neoInferenceRequest
-	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{UpstreamURL: upstream.URL, UpstreamAPIKey: "secret"}})
-	rt.inferStream = func(_ *neoRuntime, request neoInferenceRequest, _ neoStreamCallback) (neoInferenceResult, error) {
-		captured = request
-		return neoInferenceResult{Text: `{"relevantContent":"extracted local target"}`}, nil
-	}
+	var captured []neoInferenceRequest
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{UpstreamURL: upstream.URL}})
+	rt.setSecretSource(NewStaticSecretSource("secret"))
+	rt.inferStream = neoReadThreadScriptedInfer(t, "extracted local target", "local target", &captured, nil)
 	actor := newNeoActor(rt, "actor-test", "thread-actor", currentThreadID, currentThreadID, neoActorRecord("actor-test", "thread-actor", currentThreadID), nil)
 	actor.executorBootstrapComplete = true
+	actor.tools["read_thread"] = neoReadThreadToolSpec()
 
 	if !actor.shouldRunLocalActorTool("read_thread") {
-		t.Fatal("read_thread should run locally when executor omitted it")
+		t.Fatal("read_thread should run locally even when executor registers it")
 	}
 	if actor.shouldRunLocalActorTool("find_thread") {
 		t.Fatal("find_thread should not run locally")
@@ -17209,41 +17287,32 @@ func TestNeoActorRunsClassicReadThreadWhenExecutorOmitsIt(t *testing.T) {
 	if text != "extracted local target" {
 		t.Fatalf("read_thread text = %q", text)
 	}
-	if captured.ModelRouteOverride == nil || captured.ModelRouteOverride.Provider != "google" || captured.ModelRouteOverride.Model != "gemini-3-flash-preview" {
-		t.Fatalf("route override = %#v, want classic gemini flash route", captured.ModelRouteOverride)
+	if len(captured) != 3 {
+		t.Fatalf("captured requests = %d, want search/read/final turns", len(captured))
 	}
-	if !captured.DisableSystemPrompt || !captured.DisableProviderReasoning {
-		t.Fatalf("classic read_thread request flags = system:%v reasoning:%v", captured.DisableSystemPrompt, captured.DisableProviderReasoning)
-	}
-	if captured.ProviderFeature != "amp.read-thread" {
-		t.Fatalf("provider feature = %q, want amp.read-thread", captured.ProviderFeature)
-	}
-	if captured.ResponseMimeType != "application/json" {
-		t.Fatalf("response mime type = %q", captured.ResponseMimeType)
-	}
-	properties := mapValue(captured.ResponseJSONSchema["properties"])
-	if _, ok := properties["relevantContent"]; !ok {
-		t.Fatalf("response schema = %#v, want relevantContent property", captured.ResponseJSONSchema)
-	}
-	if len(captured.History) != 2 {
-		t.Fatalf("history = %#v, want mentioned thread and extraction prompt", captured.History)
-	}
-	if !strings.Contains(captured.History[0].Text, "<mentionedThread>") || !strings.Contains(captured.History[0].Text, "local thread content") {
-		t.Fatalf("mentioned thread history = %q", captured.History[0].Text)
-	}
-	if !strings.Contains(captured.History[1].Text, "You are helping me extract relevant information from the mentioned thread based on a goal.") || !strings.Contains(captured.History[1].Text, "Extract target decision") {
-		t.Fatalf("extraction prompt history = %q", captured.History[1].Text)
+	neoReadThreadAssertAgentRequest(t, captured[0])
+	if strings.Contains(captured[0].History[0].Text, "local thread content") {
+		t.Fatalf("initial read_thread agent prompt included whole thread content: %q", captured[0].History[0].Text)
 	}
 
 	actor.mu.Lock()
+	var childMessages []neoMessage
+	for _, message := range actor.messages {
+		if message.ParentToolUseID == "TU-read" {
+			childMessages = append(childMessages, message)
+		}
+	}
 	relationships := actor.relationshipListLocked()
 	actor.mu.Unlock()
+	if len(childMessages) != 4 {
+		t.Fatalf("internal read_thread messages = %#v, want two tool uses and two tool results parented under TU-read", childMessages)
+	}
 	if len(relationships) != 0 {
 		t.Fatalf("relationships = %#v, want no explicit relationship from local read_thread execution", relationships)
 	}
 }
 
-func TestNeoActorReadThreadFallsBackToClassicUpstreamMarkdown(t *testing.T) {
+func TestNeoActorReadThreadFallsBackToUpstreamMarkdownCorpus(t *testing.T) {
 	dir := t.TempDir()
 	oldStoreDir := neoAmpDataDir
 	neoAmpDataDir = func() string { return dir }
@@ -17264,12 +17333,17 @@ func TestNeoActorReadThreadFallsBackToClassicUpstreamMarkdown(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	var captured neoInferenceRequest
-	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{UpstreamURL: upstream.URL, UpstreamAPIKey: "secret"}})
-	rt.inferStream = func(_ *neoRuntime, request neoInferenceRequest, _ neoStreamCallback) (neoInferenceResult, error) {
-		captured = request
-		return neoInferenceResult{Text: `{"relevantContent":"remote extracted"}`}, nil
-	}
+	var captured []neoInferenceRequest
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{UpstreamURL: upstream.URL}})
+	rt.setSecretSource(NewStaticSecretSource("secret"))
+	rt.inferStream = neoReadThreadScriptedInfer(t, "remote extracted", "remote markdown", &captured, func(turn int, request neoInferenceRequest) {
+		if turn == 0 && strings.Contains(request.History[0].Text, "remote markdown content") {
+			t.Fatalf("initial read_thread prompt included whole upstream markdown: %q", request.History[0].Text)
+		}
+		if turn == 2 && !strings.Contains(neoHistoryTestText(request.History), "remote markdown content") {
+			t.Fatalf("history = %#v, want upstream markdown available through internal tool results", request.History)
+		}
+	})
 	actor := newNeoActor(rt, "actor-test", "thread-actor", currentThreadID, currentThreadID, neoActorRecord("actor-test", "thread-actor", currentThreadID), nil)
 	actor.executorBootstrapComplete = true
 
@@ -17288,8 +17362,8 @@ func TestNeoActorReadThreadFallsBackToClassicUpstreamMarkdown(t *testing.T) {
 	if !sawUpstream {
 		t.Fatal("upstream markdown fallback was not called")
 	}
-	if len(captured.History) != 2 || !strings.Contains(captured.History[0].Text, "remote markdown content") {
-		t.Fatalf("history = %#v, want upstream markdown in mentioned thread", captured.History)
+	if len(captured) != 3 {
+		t.Fatalf("captured requests = %d, want search/read/final turns", len(captured))
 	}
 }
 
@@ -17319,12 +17393,12 @@ func TestNeoActorReadThreadUsesMappedUpstreamSecret(t *testing.T) {
 
 	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{UpstreamURL: upstream.URL}})
 	rt.setSecretSource(source)
-	rt.inferStream = func(_ *neoRuntime, request neoInferenceRequest, _ neoStreamCallback) (neoInferenceResult, error) {
-		if !strings.Contains(request.History[0].Text, "mapped remote markdown content") {
-			t.Fatalf("history = %#v, want mapped upstream markdown", request.History)
+	var captured []neoInferenceRequest
+	rt.inferStream = neoReadThreadScriptedInfer(t, "mapped remote extracted", "mapped remote", &captured, func(turn int, request neoInferenceRequest) {
+		if turn%3 == 2 && !strings.Contains(neoHistoryTestText(request.History), "mapped remote markdown content") {
+			t.Fatalf("history = %#v, want mapped upstream markdown from internal tool results", request.History)
 		}
-		return neoInferenceResult{Text: `{"relevantContent":"mapped remote extracted"}`}, nil
-	}
+	})
 	actor := newNeoActor(rt, "actor-test", "thread-actor", currentThreadID, currentThreadID, neoActorRecord("actor-test", "thread-actor", currentThreadID), nil)
 	actor.executorBootstrapComplete = true
 
