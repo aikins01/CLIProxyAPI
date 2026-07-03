@@ -255,6 +255,9 @@ func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *ha
 		if m.tryServeNeoLocalAttachment(c) {
 			return
 		}
+		if m.tryServeNeoWebLocalRemote(c) {
+			return
+		}
 
 		// Swallow ErrAbortHandler panics from ReverseProxy copyResponse to avoid noisy stack traces
 		defer func() {
@@ -331,6 +334,7 @@ func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *ha
 	engine.GET("/docs/*path", append(rootMiddleware, proxyHandler)...)
 	engine.GET("/settings", append(rootMiddleware, proxyHandler)...)
 	engine.GET("/settings/*path", append(rootMiddleware, proxyHandler)...)
+	engine.Any("/_app/remote/*path", append(rootMiddleware, proxyHandler)...)
 
 	engine.GET("/threads.rss", append(rootMiddleware, proxyHandler)...)
 	engine.GET("/news.rss", append(rootMiddleware, proxyHandler)...)
@@ -455,8 +459,12 @@ func (m *AmpModule) tryServeNeoWebLocalInternalRPC(c *gin.Context) bool {
 	if !c.GetBool(ampWebLocalInferenceCORSContextKey) {
 		return false
 	}
-	method, params, ok := neoWebLocalInternalRPCRequest(c.Request)
-	if !ok || m == nil || m.neoRuntime == nil {
+	method, params, matched, err := neoWebLocalInternalRPCRequestWithError(c.Request)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_json_body", "message": "invalid JSON body for local internal RPC", "detail": err.Error()})
+		return true
+	}
+	if !matched || m == nil || m.neoRuntime == nil {
 		return false
 	}
 	response, status, ok := m.neoRuntime.neoWebLocalInternalRPCResponse(method, params)
@@ -471,8 +479,11 @@ func (m *AmpModule) canServeNeoWebLocalInternalRPC(c *gin.Context) bool {
 	if c == nil || !c.GetBool(ampWebLocalInferenceCORSContextKey) {
 		return false
 	}
-	method, params, ok := neoWebLocalInternalRPCRequest(c.Request)
-	if !ok || m == nil || m.neoRuntime == nil || m.neoRuntime.store == nil {
+	method, params, matched, err := neoWebLocalInternalRPCRequestWithError(c.Request)
+	if err != nil {
+		return matched
+	}
+	if !matched || m == nil || m.neoRuntime == nil || m.neoRuntime.store == nil {
 		return false
 	}
 	cfg := m.neoThreadConfigSnapshot()
@@ -494,25 +505,29 @@ func (m *AmpModule) canServeNeoWebLocalInternalRPC(c *gin.Context) bool {
 	}
 }
 
-func neoWebLocalInternalRPCRequest(r *http.Request) (string, map[string]any, bool) {
+func neoWebLocalInternalRPCRequestWithError(r *http.Request) (string, map[string]any, bool, error) {
 	if r == nil || r.URL == nil || r.Method != http.MethodPost {
-		return "", nil, false
+		return "", nil, false, nil
 	}
 	if strings.TrimSpace(r.Header.Get(ampWebLocalInferenceHeader)) == "" {
-		return "", nil, false
+		return "", nil, false, nil
 	}
 	if "/"+strings.Trim(r.URL.Path, "/") != "/api/internal" {
-		return "", nil, false
+		return "", nil, false, nil
 	}
-	body := readAndRestoreNeoJSONBody(r)
+	body, err := readAndRestoreNeoJSONBody(r)
+	if err != nil {
+		log.WithError(err).Debug("amp web-local internal RPC body decode failed")
+		return "", nil, true, err
+	}
 	method := strings.TrimSpace(stringValue(body["method"]))
 	if method == "" {
 		method = neoInternalQueryMethod(r.URL.RawQuery)
 	}
 	if !neoWebLocalInternalRPCSupported(method) {
-		return "", nil, false
+		return "", nil, false, nil
 	}
-	return method, mapValue(body["params"]), true
+	return method, mapValue(body["params"]), true, nil
 }
 
 func neoWebLocalInternalRPCSupported(method string) bool {
@@ -528,8 +543,12 @@ func neoWebLocalInternalRPCSupported(method string) bool {
 }
 
 func (m *AmpModule) tryServeNeoLocalInternalRPC(c *gin.Context) bool {
-	method, params, ok := neoLocalInternalRPCRequest(c.Request)
-	if !ok {
+	method, params, matched, err := neoLocalInternalRPCRequestWithError(c.Request)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_json_body", "message": "invalid JSON body for local internal RPC", "detail": err.Error()})
+		return true
+	}
+	if !matched {
 		return false
 	}
 	threadID := neoInternalRPCThreadID(params)
@@ -548,22 +567,26 @@ func (m *AmpModule) tryServeNeoLocalInternalRPC(c *gin.Context) bool {
 	return true
 }
 
-func neoLocalInternalRPCRequest(r *http.Request) (string, map[string]any, bool) {
+func neoLocalInternalRPCRequestWithError(r *http.Request) (string, map[string]any, bool, error) {
 	if r == nil || r.URL == nil || r.Method != http.MethodPost {
-		return "", nil, false
+		return "", nil, false, nil
 	}
 	if "/"+strings.Trim(r.URL.Path, "/") != "/api/internal" {
-		return "", nil, false
+		return "", nil, false, nil
 	}
-	body := readAndRestoreNeoJSONBody(r)
+	body, err := readAndRestoreNeoJSONBody(r)
+	if err != nil {
+		log.WithError(err).Debug("amp local internal RPC body decode failed")
+		return "", nil, true, err
+	}
 	method := strings.TrimSpace(stringValue(body["method"]))
 	if method == "" {
 		method = neoInternalQueryMethod(r.URL.RawQuery)
 	}
 	if !neoLocalInternalRPCSupported(method) {
-		return "", nil, false
+		return "", nil, false, nil
 	}
-	return method, mapValue(body["params"]), true
+	return method, mapValue(body["params"]), true, nil
 }
 
 func neoLocalInternalRPCSupported(method string) bool {
