@@ -22,8 +22,8 @@ func TestNeoSubagentRegistryMatchesBinary(t *testing.T) {
 		tools    []string
 	}{
 		{"finder", "anthropic", "claude-haiku-4-5-20251001", "", []string{"Grep", "glob", "Read"}},
-		{"oracle", "openai", "gpt-5.5", "high", []string{"Read", "Grep", "glob", "web_search", "read_web_page", "read_thread", "find_thread"}},
-		{"advisor", "openai", "gpt-5.5", "high", []string{"Read", "Grep", "glob", "web_search", "read_web_page", "read_thread", "find_thread"}},
+		{"oracle", "anthropic", "claude-fable-5", "high", []string{"Read", "Grep", "glob", "web_search", "read_web_page", "read_thread", "find_thread"}},
+		{"advisor", "anthropic", "claude-fable-5", "high", []string{"Read", "Grep", "glob", "web_search", "read_web_page", "read_thread", "find_thread"}},
 		{"librarian", "openai", "gpt-5.5", "none", []string{"read_github", "search_github", "commit_search", "diff", "list_directory_github", "list_repositories", "glob_github"}},
 		// Task inherits the parent model (empty route) and includes finder (a nested subagent).
 		{"Task", "", "", "", []string{"Read", "Bash", "edit_file", "create_file", "read_web_page", "web_search", "finder", "skill", "view_media"}},
@@ -116,11 +116,21 @@ func TestNeoTaskSubagentInheritsConfigModeModel(t *testing.T) {
 
 func TestNeoOracleSubagentIgnoresConfigModeModel(t *testing.T) {
 	cfg := &config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
-		ModeModels: map[string]string{"smart": "anthropic/claude-fable-5"},
+		ModeModels: map[string]string{"smart": "openai/gpt-5.5"},
 	}}}
 	got := captureNeoSubagentRouteForTest(t, "oracle", "oracle-mode", cfg, "smart", nil)
-	if got.Provider != "openai" || got.Model != "gpt-5.5" {
-		t.Fatalf("oracle route = %#v, want fixed route openai/gpt-5.5", got)
+	if got.Provider != "anthropic" || got.Model != "claude-fable-5" {
+		t.Fatalf("oracle route = %#v, want fixed route anthropic/claude-fable-5", got)
+	}
+}
+
+func TestNeoAdvisorSubagentIgnoresConfigModeModel(t *testing.T) {
+	cfg := &config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
+		ModeModels: map[string]string{"smart": "openai/gpt-5.5"},
+	}}}
+	got := captureNeoSubagentRouteForTest(t, "advisor", "advisor-mode", cfg, "smart", nil)
+	if got.Provider != "anthropic" || got.Model != "claude-fable-5" {
+		t.Fatalf("advisor route = %#v, want fixed route anthropic/claude-fable-5", got)
 	}
 }
 
@@ -152,8 +162,8 @@ func TestNeoAdvisorSubagentMatchesOracleRouting(t *testing.T) {
 		t.Fatalf("advisor requests = %#v, want exactly one", seen)
 	}
 	route := seen[0].ModelRouteOverride
-	if route == nil || route.Provider != "openai" || route.Model != "gpt-5.5" {
-		t.Fatalf("advisor route = %#v, want openai/gpt-5.5", route)
+	if route == nil || route.Provider != "anthropic" || route.Model != "claude-fable-5" {
+		t.Fatalf("advisor route = %#v, want anthropic/claude-fable-5", route)
 	}
 	if seen[0].ReasoningEffort != "high" || stringValue(seen[0].Settings["reasoning.effort"]) != "high" {
 		t.Fatalf("advisor effort request=%q settings=%#v, want high", seen[0].ReasoningEffort, seen[0].Settings)

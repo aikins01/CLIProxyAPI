@@ -1,4 +1,4 @@
-Consult the oracle - an AI advisor powered by OpenAI's GPT-5.5 reasoning model that can plan, review, and provide expert guidance.
+Consult the oracle - an AI advisor powered by Claude Fable 5 with high reasoning that can plan, review, and provide expert guidance.
 
 The oracle has access to the following tools:
 - Read

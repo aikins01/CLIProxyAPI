@@ -421,6 +421,22 @@ func (a *neoActor) executeLocalReadThreadAgent(pending neoPendingTool, generatio
 		}
 	}
 
+	if a.subagentGenerationStale(generation) {
+		return "", nil
+	}
+	if sawSearch && sawRead && !sawLatestRead && len(corpus.Messages) > 1 {
+		latest, readEnd, err := neoReadThreadRead(corpus, map[string]any{"latest": true, "count": 1})
+		if err != nil {
+			return "", fmt.Errorf("read_thread auto latest read failed: %w", err)
+		}
+		if readEnd >= len(corpus.Messages)-1 {
+			sawLatestRead = true
+			conversation = append(conversation, neoHistoryMessage{
+				Role: "user",
+				Text: "The runtime performed the required latest read before finalization because the turn budget was exhausted. Use this latest-read result to check for revisions, superseding decisions, reverts, or contradictions before returning final JSON.\n\n" + runToText(map[string]any{"status": "done", "result": latest}),
+			})
+		}
+	}
 	if correction := neoReadThreadGateCorrection(sawSearch, sawRead, sawLatestRead, corpus); correction != "" {
 		return "", fmt.Errorf("read_thread subagent did not complete required search/read checks after %d turns: %s", neoReadThreadMaxTurns, correction)
 	}
@@ -438,7 +454,13 @@ func (a *neoActor) forceLocalReadThreadFinal(pending neoPendingTool, generation 
 	if a.subagentGenerationStale(generation) {
 		return "", nil
 	}
-	forced := append(append([]neoHistoryMessage(nil), conversation...), neoHistoryMessage{Role: "user", Text: neoReadThreadFinalPrompt})
+	forced := append([]neoHistoryMessage(nil), conversation...)
+	if len(forced) > 0 && forced[len(forced)-1].Role == "user" {
+		forced[len(forced)-1].Text = strings.TrimSpace(forced[len(forced)-1].Text) + "\n\n" + neoReadThreadFinalPrompt
+	} else {
+		forced = append(forced, neoHistoryMessage{Role: "user", Text: neoReadThreadFinalPrompt})
+	}
+	forced = neoReadThreadFinalHistory(forced)
 	routeCopy := route
 	result, err := a.runtime.subagentInfer(neoInferenceRequest{
 		ActorID:              actorID,
@@ -464,6 +486,56 @@ func (a *neoActor) forceLocalReadThreadFinal(pending neoPendingTool, generation 
 		return "", nil
 	}
 	return neoReadThreadRelevantContent(result.Text)
+}
+
+func neoReadThreadFinalHistory(history []neoHistoryMessage) []neoHistoryMessage {
+	sanitized := sanitizeNeoHistoryToolPairs(history)
+	plain := make([]neoHistoryMessage, 0, len(sanitized))
+	for _, message := range sanitized {
+		switch message.Role {
+		case "assistant":
+			message.ToolCalls = nil
+			message.Content = nil
+			message.OpenAIItems = nil
+			message.ThinkingBlocks = nil
+			if strings.TrimSpace(message.Text) == "" {
+				continue
+			}
+			plain = append(plain, message)
+		case "tool":
+			text := strings.TrimSpace(message.Text)
+			if text == "" {
+				text = runToText(map[string]any{"status": "done", "result": message.Content})
+			}
+			if text != "" {
+				plain = append(plain, neoHistoryMessage{Role: "user", Text: "Prior read_thread internal tool result:\n" + text})
+			}
+		default:
+			plain = append(plain, message)
+		}
+	}
+	return neoReadThreadMergeAdjacentUsers(plain)
+}
+
+func neoReadThreadMergeAdjacentUsers(history []neoHistoryMessage) []neoHistoryMessage {
+	merged := make([]neoHistoryMessage, 0, len(history))
+	for _, message := range history {
+		message.Content = append([]any(nil), message.Content...)
+		last := len(merged) - 1
+		if message.Role == "user" && last >= 0 && merged[last].Role == "user" && message.ToolCallID == "" && len(message.ToolCalls) == 0 && len(message.Content) == 0 && len(message.OpenAIItems) == 0 && merged[last].ToolCallID == "" && len(merged[last].ToolCalls) == 0 && len(merged[last].Content) == 0 && len(merged[last].OpenAIItems) == 0 {
+			left := strings.TrimSpace(merged[last].Text)
+			right := strings.TrimSpace(message.Text)
+			switch {
+			case left == "":
+				merged[last].Text = right
+			case right != "":
+				merged[last].Text = left + "\n\n" + right
+			}
+			continue
+		}
+		merged = append(merged, message)
+	}
+	return merged
 }
 
 func neoReadThreadAgentInput(corpus neoReadThreadCorpus, goal string) string {

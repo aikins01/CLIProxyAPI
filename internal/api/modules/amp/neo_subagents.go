@@ -69,7 +69,7 @@ type neoSubagentDef struct {
 
 // neoSubagentDefs maps the model-facing tool name to its definition. Keys match
 // the names the binary advertises and the model calls. Models/includeTools come
-// from Amp subagent routing (finder→haiku, oracle→gpt-5.5, librarian→gpt-5.5).
+// from Amp subagent routing (finder→haiku, oracle→Claude Fable 5, librarian→gpt-5.5).
 var neoSubagentDefs = map[string]neoSubagentDef{
 	"finder": {
 		Key:          "finder",
@@ -82,7 +82,7 @@ var neoSubagentDefs = map[string]neoSubagentDef{
 	"oracle": {
 		Key:             "oracle",
 		DisplayName:     "Oracle",
-		Route:           neoModelRoute{Provider: "openai", Model: "gpt-5.5"},
+		Route:           neoModelRoute{Provider: "anthropic", Model: "claude-fable-5"},
 		IncludeTools:    []string{"Read", "Grep", "glob", "web_search", "read_web_page", "read_thread", "find_thread"},
 		SystemPrompt:    neoOracleSubagentPrompt,
 		ReasoningEffort: "high",
@@ -91,7 +91,7 @@ var neoSubagentDefs = map[string]neoSubagentDef{
 	"advisor": {
 		Key:             "advisor",
 		DisplayName:     "Advisor",
-		Route:           neoModelRoute{Provider: "openai", Model: "gpt-5.5"},
+		Route:           neoModelRoute{Provider: "anthropic", Model: "claude-fable-5"},
 		IncludeTools:    []string{"Read", "Grep", "glob", "web_search", "read_web_page", "read_thread", "find_thread"},
 		SystemPrompt:    neoOracleSubagentPrompt,
 		ReasoningEffort: "high",
