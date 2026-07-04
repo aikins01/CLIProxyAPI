@@ -522,13 +522,17 @@ var knownThreadReaderMarkerValues = map[string]struct{}{
 }
 
 var expectedThreadReaderMarkerValues = map[string]struct{}{
-	"getThread":       {},
-	"getThreadTail":   {},
-	"listThreads":     {},
-	"loadThreadTail":  {},
-	"loadThreads":     {},
-	"read_messages":   {},
-	"search_messages": {},
+	"getThread":             {},
+	"getThreadLabels":       {},
+	"getThreadLinkInfo":     {},
+	"getThreadMeta":         {},
+	"getThreadTail":         {},
+	"listThreads":           {},
+	"loadThreadTail":        {},
+	"loadThreads":           {},
+	"read_messages":         {},
+	"search_messages":       {},
+	"threadDisplayCostInfo": {},
 }
 
 var streamJSONMarkers = map[string]string{
@@ -636,7 +640,7 @@ var knownPromptTagCountValues = map[string]int{
 	"source/artifacts":     2,
 	"source/code-review":   3,
 	"source/compaction":    19,
-	"source/guidance":      28,
+	"source/guidance":      26,
 	"source/painter":       5,
 	"source/settings":      21,
 	"source/skills":        38,
@@ -646,7 +650,7 @@ var knownPromptTagCountValues = map[string]int{
 
 var knownPromptKindCountValues = map[string]int{
 	"prompt": 56,
-	"source": 187,
+	"source": 186,
 }
 
 type agentModeMarker struct {
@@ -676,9 +680,9 @@ var agentModeScopes = map[string]string{
 
 var knownAgentModeProfileValues = map[string]struct{}{
 	"agg-man|primary=GPT_5_5|reasoning=none|levels=|include=present|tools=find_thread,read_thread,web_search,read_web_page,docs_list,docs_read,docs_write,create_project,list_agent_modes,create_thread,archive_thread,archive_threads,unarchive_thread,send_message_to_thread,publish_thread_artifacts,slack_write,slack_read,github_repo_ci_status,read_github,search_github,commit_search,list_directory_github,list_repositories,glob_github,diff|deferred=false|visible=false|visibleInV2=false|serverOnly=true": {},
-	"deep|primary=GPT_5_5|reasoning=medium|levels=low,medium,xhigh|include=present|tools=shell_command,shell_command_status,apply_patch,web_search,read_web_page,Task,skill,read_thread,find_thread,librarian,oracle,advisor,finder,view_media,painter,archive_current_thread,send_message_to_agg|deferred=true|visible=true|visibleInV2=false|serverOnly=false":                                                                                                                                                      {},
+	"deep|primary=GPT_5_5|reasoning=medium|levels=low,medium,xhigh|include=present|tools=shell_command,shell_command_status,apply_patch,web_search,read_web_page,Task,skill,read_thread,find_thread,librarian,oracle,finder,view_media,painter,archive_current_thread,send_message_to_agg|deferred=true|visible=true|visibleInV2=false|serverOnly=false":                                                                                                                                                              {},
 	"large|primary=CLAUDE_OPUS_4_8|reasoning=|levels=|include=present|tools=finder,Bash,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,skill,oracle,librarian,Task,view_media,painter,read_mcp_resource,archive_current_thread,send_message_to_agg|deferred=true|visible=false|visibleInV2=false|serverOnly=false":                                                                                                                                                                            {},
-	"nostromo|primary=AMP_NOSTROMO|reasoning=low|levels=|include=present|tools=finder,Bash,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,skill,oracle,librarian,Task,view_media,painter,read_mcp_resource,archive_current_thread,send_message_to_agg,shell_command,shell_command_status,apply_patch,advisor|deferred=false|visible=true|visibleInV2=false|serverOnly=false":                                                                                                                  {},
+	"nostromo|primary=AMP_NOSTROMO|reasoning=low|levels=|include=present|tools=finder,Bash,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,skill,oracle,librarian,Task,view_media,painter,read_mcp_resource,archive_current_thread,send_message_to_agg,shell_command,shell_command_status,apply_patch|deferred=false|visible=true|visibleInV2=false|serverOnly=false":                                                                                                                          {},
 	"review|primary=GPT_5_5|reasoning=medium|levels=|include=present|tools=shell_command,run_check,submit_review|deferred=false|visible=false|visibleInV2=false|serverOnly=false":                                                                                                                                                                                                                                                                                                                                     {},
 	"rush|primary=GPT_5_5|reasoning=none|levels=|include=present|tools=finder,shell_command,shell_command_status,apply_patch,web_search,read_web_page,read_mcp_resource,read_thread,find_thread,skill,oracle,librarian,Task,view_media,painter,archive_current_thread,send_message_to_agg|deferred=false|visible=true|visibleInV2=false|serverOnly=false":                                                                                                                                                             {},
 	"smart|primary=CLAUDE_OPUS_4_8|reasoning=high|levels=high,max,xhigh|include=present|tools=finder,Bash,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,skill,oracle,librarian,Task,view_media,painter,read_mcp_resource,archive_current_thread,send_message_to_agg|deferred=true|visible=true|visibleInV2=false|serverOnly=false":                                                                                                                                                           {},
@@ -916,11 +920,12 @@ var knownModelLimitValues = map[string]modelLimitExpectation{
 	"gpt-5.5-pro":                       {Enum: "GPT_5_5_PRO", Provider: "openai", DisplayName: "GPT-5.5-Pro", ContextWindow: 1050000, MaxOutputTokens: 128000},
 	"grok-build-0.1":                    {Enum: "GROK_BUILD_0_1", Provider: "xai", DisplayName: "Grok Build 0.1", ContextWindow: 256000, MaxOutputTokens: 32000},
 	"grok-code-fast-1":                  {Enum: "GROK_CODE_FAST_1", Provider: "xai", DisplayName: "Grok Code Fast 1", ContextWindow: 256000, MaxOutputTokens: 32000},
-	"accounts/fireworks/models/glm-5p2": {Enum: "FIREWORKS_GLM_5_2", Provider: "fireworks", DisplayName: "GLM 5.2", ContextWindow: 1040000, MaxOutputTokens: 131072},
+	"accounts/amp/deployments/wkk976k4": {Enum: "FIREWORKS_GLM_5_2_DEDICATED", Provider: "fireworks", DisplayName: "GLM-5.2 Dedicated", ContextWindow: 200000, MaxOutputTokens: 32000},
+	"accounts/fireworks/models/glm-5p2": {Enum: "FIREWORKS_GLM_5_2", Provider: "fireworks", DisplayName: "GLM-5.2", ContextWindow: 200000, MaxOutputTokens: 32000},
 	"moonshotai/Kimi-K2.5":              {Enum: "BASETEN_KIMI_K2P5", Provider: "baseten", DisplayName: "Kimi K2.5", ContextWindow: 262144, MaxOutputTokens: 32000},
 	"o3":                                {Enum: "O3", Provider: "openai", DisplayName: "o3", ContextWindow: 200000, MaxOutputTokens: 1},
 	"o3-mini":                           {Enum: "O3_MINI", Provider: "openai", DisplayName: "o3-mini", ContextWindow: 200000, MaxOutputTokens: 1},
-	"zai-org/GLM-5.2":                   {Enum: "BASETEN_GLM_5_2", Provider: "baseten", DisplayName: "GLM 5.2", ContextWindow: 200000, MaxOutputTokens: 32000},
+	"zai-org/GLM-5.2":                   {Enum: "BASETEN_GLM_5_2", Provider: "baseten", DisplayName: "GLM-5.2", ContextWindow: 200000, MaxOutputTokens: 32000},
 }
 
 var routeScopes = []routeScopeRule{
@@ -7963,7 +7968,7 @@ func knownModelLimitNameShape(provider, name string) bool {
 	case "cerebras":
 		return strings.HasPrefix(name, "zai-") || strings.HasPrefix(name, "moonshotai-")
 	case "fireworks":
-		return strings.HasPrefix(name, "accounts/fireworks/models/")
+		return strings.HasPrefix(name, "accounts/fireworks/models/") || strings.HasPrefix(name, "accounts/amp/deployments/")
 	case "google":
 		return strings.HasPrefix(name, "gemini-")
 	case "moonshotai":

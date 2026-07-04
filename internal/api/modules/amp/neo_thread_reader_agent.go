@@ -485,7 +485,14 @@ func (a *neoActor) forceLocalReadThreadFinal(pending neoPendingTool, generation 
 	if a.subagentGenerationStale(generation) {
 		return "", nil
 	}
-	return neoReadThreadRelevantContent(result.Text)
+	text, parseErr := neoReadThreadRelevantContent(result.Text)
+	if parseErr == nil {
+		return text, nil
+	}
+	if fallback := neoReadThreadMarkdownFallbackContent(result.Text); fallback != "" {
+		return fallback, nil
+	}
+	return "", fmt.Errorf("read_thread forced final did not return valid JSON or markdown fallback: %w", parseErr)
 }
 
 func neoReadThreadFinalHistory(history []neoHistoryMessage) []neoHistoryMessage {

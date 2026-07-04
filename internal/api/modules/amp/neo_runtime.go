@@ -59,7 +59,7 @@ const (
 	defaultNeoTitleModel             = "claude-haiku-4-5-20251001"
 	defaultNeoCompactionModel        = "gpt-5.4"
 	defaultNeoUnknownModeModel       = "claude-sonnet-4-5-20250929"
-	defaultNeoCompactionReasoning    = "xhigh"
+	defaultNeoCompactionReasoning    = "medium"
 	neoCloudGzipBytes                = 10 * 1024 * 1024
 	neoRecentThreadsCloudSeedDefault = 50
 	neoRecentThreadsCloudSeedMin     = 20
@@ -75,7 +75,7 @@ const (
 	neoCompactionPreflightPercent    = 90
 	neoCompactionFallbackMaxInput    = 32 * 1024
 	neoCompactionInputSafetyTokens   = 4096
-	neoCompactionMaxOutputTokens     = 2048
+	neoCompactionMaxOutputTokens     = 8192
 	neoCompactionTranscriptMaxBytes  = 240 * 1024
 	neoCompactionApproxCharsPerToken = 4
 	neoThreadMarkdownToolTextLimit   = 2000
@@ -127,9 +127,9 @@ var (
 		"large":    toolList("finder", "Bash", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "archive_current_thread", "send_message_to_agg"),
 		"rush":     toolList("finder", "shell_command", "shell_command_status", "apply_patch", "web_search", "read_web_page", "read_mcp_resource", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "painter", "archive_current_thread", "send_message_to_agg"),
 		"agg-man":  toolList("find_thread", "read_thread", "web_search", "read_web_page", "docs_list", "docs_read", "docs_write", "create_project", "list_agent_modes", "create_thread", "archive_thread", "archive_threads", "unarchive_thread", "send_message_to_thread", "publish_thread_artifacts", "slack_write", "slack_read", "github_repo_ci_status", "read_github", "search_github", "commit_search", "list_directory_github", "list_repositories", "glob_github", "diff"),
-		"deep":     toolList("shell_command", "shell_command_status", "apply_patch", "web_search", "read_web_page", "Task", "skill", "read_thread", "find_thread", "librarian", "oracle", "advisor", "finder", "view_media", "painter", "archive_current_thread", "send_message_to_agg"),
+		"deep":     toolList("shell_command", "shell_command_status", "apply_patch", "web_search", "read_web_page", "Task", "skill", "read_thread", "find_thread", "librarian", "oracle", "finder", "view_media", "painter", "archive_current_thread", "send_message_to_agg"),
 		"review":   toolList("shell_command", "run_check", "submit_review"),
-		"nostromo": toolList("finder", "Bash", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "archive_current_thread", "send_message_to_agg", "shell_command", "shell_command_status", "apply_patch", "advisor"),
+		"nostromo": toolList("finder", "Bash", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "archive_current_thread", "send_message_to_agg", "shell_command", "shell_command_status", "apply_patch"),
 	}
 	neoModeToolAllowlist = orderedToolSets(neoModeToolOrder)
 	// gaac893 emptied every mode's deferredTools (the code_review deferred tool
@@ -139,7 +139,7 @@ var (
 	neoKnownModeTools            = toolSet(
 		"finder", "Bash", "create_file", "edit_file",
 		"web_search", "read_web_page", "read_mcp_resource", "read_thread", "find_thread", "skill", "oracle",
-		"librarian", "Task", "advisor", "view_media", "painter",
+		"librarian", "Task", "view_media", "painter",
 		"shell_command", "shell_command_status", "apply_patch", "archive_current_thread", "send_message_to_agg", "run_check", "submit_review", "docs_list", "docs_read", "docs_write",
 		"create_project", "list_agent_modes", "create_thread", "archive_thread", "archive_threads", "unarchive_thread", "send_message_to_thread", "publish_thread_artifacts",
 		"slack_write", "slack_read", "github_repo_ci_status", "read_github", "search_github", "commit_search",
@@ -2150,6 +2150,7 @@ type neoActor struct {
 	threadStatus              string
 	compacting                bool
 	compactionRecords         []map[string]any
+	compactionRetryAfterLen   int
 	relationships             []map[string]any
 	retryScheduled            bool
 	pendingInference          *neoInferenceInflight
@@ -7759,9 +7760,13 @@ type neoCompactionPlan struct {
 	compactionMessages            []neoMessage
 	summaryPrompt                 string
 	markCurrentInferenceAsChecked bool
+	sourceLen                     int
 }
 
 func (a *neoActor) prepareCompactionPlanLocked(cfg *config.Config, settings map[string]any, agentMode string, generation int, sourceMessages, compactionMessagesWindow []neoMessage, compactionOffset, sourceLen int, markCurrentInferenceAsChecked, allowSummaryOnlyAtEnd bool) (neoCompactionPlan, bool) {
+	if a.compactionRetryAfterLen > 0 && sourceLen < a.compactionRetryAfterLen {
+		return neoCompactionPlan{}, false
+	}
 	cutRelativeIndex := neoCompactionCutIndex(compactionMessagesWindow)
 	appendSummaryOnly := false
 	if cutRelativeIndex <= 0 && (allowSummaryOnlyAtEnd || neoCompactionCanAppendSummaryOnly(compactionMessagesWindow)) {
@@ -7788,14 +7793,15 @@ func (a *neoActor) prepareCompactionPlanLocked(cfg *config.Config, settings map[
 		compactionMessages:            neoCompactionInputMessages(sourceMessages, compactionOffset),
 		summaryPrompt:                 neoCompactionSummaryPrompt(settings),
 		markCurrentInferenceAsChecked: markCurrentInferenceAsChecked,
+		sourceLen:                     sourceLen,
 	}, true
 }
 
 func (a *neoActor) runCompactionPlan(plan neoCompactionPlan) bool {
-	a.broadcast(map[string]any{"type": "compaction_started"})
 	compactionRoute := applyNeoModelMapping(a.runtime, selectNeoCompactionRoute(plan.cfg, plan.agentMode, plan.settings))
 	inferenceRoute := applyNeoModelMapping(a.runtime, selectNeoModelRouteWithConfig(a.runtime, plan.agentMode, plan.settings))
 	_, _, manualTooLarge := neoCompactionRequestExceedsInputBudget(plan.agentMode, compactionRoute, plan.compactionMessages, plan.summaryPrompt)
+	a.broadcast(map[string]any{"type": "compaction_started"})
 	if manualTooLarge && neoCompactionRouteUsesNativeOpenAI(compactionRoute, inferenceRoute) {
 		return a.runNativeOpenAICompactionPlan(plan, compactionRoute)
 	}
@@ -7813,25 +7819,20 @@ func (a *neoActor) runManualCompactionPlan(plan neoCompactionPlan, compactionRou
 	if err != nil {
 		log.Warnf("amp neo local runtime compaction failed thread=%s: %v", plan.threadID, err)
 		a.mu.Lock()
-		a.compacting = false
-		if plan.markCurrentInferenceAsChecked && plan.generation == a.generation && a.currentInference != nil {
-			a.currentInference.preflightCompactionChecked = true
-		}
+		a.finishFailedCompactionPlanLocked(plan)
 		a.mu.Unlock()
 		a.syncCloudAsync()
-		a.broadcast(map[string]any{"type": "compaction_complete"})
+		a.broadcast(neoProtocolCompactionCompletePayload(nil))
 		return false
 	}
 	summary = neoNormalizeCompactionSummary(summary)
 	if summary == "" {
+		log.Warnf("amp neo local runtime compaction returned empty summary thread=%s provider=%s model=%s", plan.threadID, compactionRoute.Provider, compactionRoute.Model)
 		a.mu.Lock()
-		a.compacting = false
-		if plan.markCurrentInferenceAsChecked && plan.generation == a.generation && a.currentInference != nil {
-			a.currentInference.preflightCompactionChecked = true
-		}
+		a.finishFailedCompactionPlanLocked(plan)
 		a.mu.Unlock()
 		a.syncCloudAsync()
-		a.broadcast(map[string]any{"type": "compaction_complete"})
+		a.broadcast(neoProtocolCompactionCompletePayload(nil))
 		return false
 	}
 
@@ -7840,13 +7841,14 @@ func (a *neoActor) runManualCompactionPlan(plan neoCompactionPlan, compactionRou
 	if plan.generation != a.generation || plan.cutIndex > len(a.messages) || (plan.cutMessageID != "" && (plan.cutIndex >= len(a.messages) || a.messages[plan.cutIndex].MessageID != plan.cutMessageID)) {
 		a.compacting = false
 		a.mu.Unlock()
-		a.broadcast(map[string]any{"type": "compaction_complete"})
+		a.broadcast(neoProtocolCompactionCompletePayload(nil))
 		return false
 	}
 	summaryMessage.Seq = a.nextSeqLocked()
 	if plan.markCurrentInferenceAsChecked && a.currentInference != nil {
 		a.currentInference.preflightCompactionChecked = true
 	}
+	a.compactionRetryAfterLen = 0
 	updated := make([]neoMessage, 0, len(a.messages)+1)
 	updated = append(updated, a.messages[:plan.cutIndex]...)
 	updated = append(updated, summaryMessage)
@@ -7878,24 +7880,19 @@ func (a *neoActor) runNativeOpenAICompactionPlan(plan neoCompactionPlan, compact
 	if err != nil {
 		log.Warnf("amp neo local runtime native compaction failed thread=%s: %v", plan.threadID, err)
 		a.mu.Lock()
-		a.compacting = false
-		if plan.markCurrentInferenceAsChecked && plan.generation == a.generation && a.currentInference != nil {
-			a.currentInference.preflightCompactionChecked = true
-		}
+		a.finishFailedCompactionPlanLocked(plan)
 		a.mu.Unlock()
 		a.syncCloudAsync()
-		a.broadcast(map[string]any{"type": "compaction_complete"})
+		a.broadcast(neoProtocolCompactionCompletePayload(nil))
 		return false
 	}
 	if len(items) == 0 {
+		log.Warnf("amp neo local runtime native compaction returned no items thread=%s provider=%s model=%s", plan.threadID, compactionRoute.Provider, compactionRoute.Model)
 		a.mu.Lock()
-		a.compacting = false
-		if plan.markCurrentInferenceAsChecked && plan.generation == a.generation && a.currentInference != nil {
-			a.currentInference.preflightCompactionChecked = true
-		}
+		a.finishFailedCompactionPlanLocked(plan)
 		a.mu.Unlock()
 		a.syncCloudAsync()
-		a.broadcast(map[string]any{"type": "compaction_complete"})
+		a.broadcast(neoProtocolCompactionCompletePayload(nil))
 		return false
 	}
 
@@ -7904,13 +7901,14 @@ func (a *neoActor) runNativeOpenAICompactionPlan(plan neoCompactionPlan, compact
 	if plan.generation != a.generation || plan.cutIndex > len(a.messages) || (plan.cutMessageID != "" && (plan.cutIndex >= len(a.messages) || a.messages[plan.cutIndex].MessageID != plan.cutMessageID)) {
 		a.compacting = false
 		a.mu.Unlock()
-		a.broadcast(map[string]any{"type": "compaction_complete"})
+		a.broadcast(neoProtocolCompactionCompletePayload(nil))
 		return false
 	}
 	compactionMessage.Seq = a.nextSeqLocked()
 	if plan.markCurrentInferenceAsChecked && a.currentInference != nil {
 		a.currentInference.preflightCompactionChecked = true
 	}
+	a.compactionRetryAfterLen = 0
 	updated := make([]neoMessage, 0, len(a.messages)+1)
 	updated = append(updated, a.messages[:plan.cutIndex]...)
 	updated = append(updated, compactionMessage)
@@ -7932,6 +7930,22 @@ func (a *neoActor) runNativeOpenAICompactionPlan(plan neoCompactionPlan, compact
 	a.dispatchNotification("thread", "compaction_complete", map[string]any{"cutMessageId": recordCutMessageID})
 	a.syncCloudAsync()
 	return true
+}
+
+func (a *neoActor) finishFailedCompactionPlanLocked(plan neoCompactionPlan) {
+	a.compacting = false
+	if plan.markCurrentInferenceAsChecked && plan.generation == a.generation && a.currentInference != nil {
+		a.currentInference.preflightCompactionChecked = true
+	}
+	if plan.sourceLen > 0 {
+		retryAfterLen := plan.sourceLen + neoCompactionTailMessages
+		if retryAfterLen <= plan.sourceLen {
+			retryAfterLen = plan.sourceLen + 1
+		}
+		if retryAfterLen > a.compactionRetryAfterLen {
+			a.compactionRetryAfterLen = retryAfterLen
+		}
+	}
 }
 
 func neoCompactionRouteUsesNativeOpenAI(compactionRoute, inferenceRoute neoModelRoute) bool {
@@ -19513,7 +19527,7 @@ func providerForNeoModel(model string) string {
 		return "openrouter"
 	case model == "zai-glm-4.7" || model == "moonshotai-kimi-k2.6":
 		return "cerebras"
-	case strings.HasPrefix(model, "accounts/fireworks/models/"):
+	case strings.HasPrefix(model, "accounts/fireworks/models/") || strings.HasPrefix(model, "accounts/amp/deployments/"):
 		return "fireworks"
 	case model == "moonshotai/Kimi-K2.5" || model == "zai-org/GLM-5.2":
 		return "baseten"
@@ -20643,7 +20657,7 @@ func inferNeoCompactionLocal(rt *neoRuntime, threadID string, route neoModelRout
 		providerMessages = append(providerMessages, map[string]any{"role": "user", "content": []any{map[string]any{"type": "text", "text": prompt}}})
 		body := map[string]any{
 			"model":      route.Model,
-			"max_tokens": 2048,
+			"max_tokens": neoCompactionMaxOutputTokens,
 			"messages":   providerMessages,
 		}
 		headers := http.Header{}
@@ -20665,7 +20679,7 @@ func inferNeoCompactionLocal(rt *neoRuntime, threadID string, route neoModelRout
 		contents = append(contents, map[string]any{"role": "user", "parts": []any{map[string]any{"text": prompt}}})
 		body := map[string]any{
 			"contents":         contents,
-			"generationConfig": map[string]any{"maxOutputTokens": 2048},
+			"generationConfig": map[string]any{"maxOutputTokens": neoCompactionMaxOutputTokens},
 		}
 		subpath := "/v1beta/models/" + url.PathEscape(route.Model) + ":generateContent"
 		jsonBody, err := callNeoLocalProvider(rt, "google", subpath, body, threadID)
@@ -20689,7 +20703,7 @@ func inferNeoCompactionLocal(rt *neoRuntime, threadID string, route neoModelRout
 			"model":                 route.Model,
 			"stream":                false,
 			"messages":              providerMessages,
-			"max_completion_tokens": 2048,
+			"max_completion_tokens": neoCompactionMaxOutputTokens,
 		}
 		body["reasoning_effort"] = openAIReasoningEffort(firstNonEmptyString(route.ThinkingSuffix, defaultNeoCompactionReasoning))
 		jsonBody, err := callNeoLocalProvider(rt, route.Provider, "/v1/chat/completions", body, threadID)
@@ -20883,7 +20897,7 @@ func inferNeoTitleLocal(rt *neoRuntime, request neoInferenceRequest, route neoMo
 		return "", errors.New("empty title generation prompt")
 	}
 	message := request.History[0].Text
-	system := `You are an assistant that generates short, descriptive titles (maximum 5 words, "Sentence case" with the first word capitalized not "Title Case") based on user's message to an agentic coding tool. Your titles should be concise (max 5 words) and capture the essence of the query or topic. DO NOT ASSUME OR GUESS the user's intent beyond what is in their message. Omit generic words like "question", "request", etc. Be professional and precise. Use common software engineering terms and acronyms if they are helpful. Use the set_title tool to provide your answer.`
+	system := neoTitleSystemPrompt(false)
 
 	switch route.Provider {
 	case "anthropic":
@@ -20892,7 +20906,7 @@ func inferNeoTitleLocal(rt *neoRuntime, request neoInferenceRequest, route neoMo
 			"max_tokens":  60,
 			"temperature": 0.7,
 			"stream":      false,
-			"system":      []any{map[string]any{"type": "text", "text": system}},
+			"system":      []any{map[string]any{"type": "text", "text": neoTitleSystemPrompt(true)}},
 			"messages":    []any{map[string]any{"role": "user", "content": "<message>" + message + "</message>"}},
 			"tools": []any{map[string]any{
 				"name": "set_title",
@@ -20960,6 +20974,14 @@ func inferNeoTitleLocal(rt *neoRuntime, request neoInferenceRequest, route neoMo
 	default:
 		return "", fmt.Errorf("unsupported local Neo title provider %q", route.Provider)
 	}
+}
+
+func neoTitleSystemPrompt(useTool bool) string {
+	prompt := `You are an assistant that generates short, descriptive titles (maximum 5 words, "Sentence case" with the first word capitalized not "Title Case") based on user's message to an agentic coding tool. Your titles should be concise (max 5 words) and capture the essence of the query or topic. DO NOT ASSUME OR GUESS the user's intent beyond what is in their message. Omit generic words like "question", "request", etc. Be professional and precise. Use common software engineering terms and acronyms if they are helpful.`
+	if useTool {
+		return prompt + " Use the set_title tool to provide your answer."
+	}
+	return prompt + " Return only the title text, with no JSON, markdown, quotes, or explanation."
 }
 
 func neoTitleHistory(history []neoHistoryMessage) []neoHistoryMessage {
@@ -25294,113 +25316,115 @@ func normalizeNeoUsage(usage map[string]any) map[string]any {
 // binary's bundled w9 table; entries may be added without invalidating
 // existing behavior because lookups fall back to 0.
 var neoModelContextWindow = map[string]int{
+	"accounts/amp/deployments/wkk976k4":                        200000,
 	"accounts/fireworks/models/glm-4p6":                        162752,
 	"accounts/fireworks/models/glm-5":                          202800,
-	"accounts/fireworks/models/glm-5p2":                        1040000,
+	"accounts/fireworks/models/glm-5p2":                        200000,
 	"accounts/fireworks/models/kimi-k2-instruct-0905":          230144,
 	"accounts/fireworks/models/minimax-m2p5":                   200000,
 	"accounts/fireworks/models/qwen3-235b-a22b-instruct-2507":  230144,
 	"accounts/fireworks/models/qwen3-coder-480b-a35b-instruct": 230144,
-	"amp-nostromo-v1":                  400000,
-	"claude-fable-5":                   1000000,
-	"claude-haiku-4-5-20251001":        200000,
-	"claude-opus-4-1-20250805":         200000,
-	"claude-opus-4-20250514":           200000,
-	"claude-opus-4-5-20251101":         200000,
-	"claude-opus-4-6":                  332000,
-	"claude-opus-4-7":                  332000,
-	"claude-opus-4-8":                  332000,
-	"claude-sonnet-4-20250514":         1000000,
-	"claude-sonnet-4-5-20250929":       1000000,
-	"claude-sonnet-4-6":                1000000,
-	"gemini-3-flash-preview":           1048576,
-	"gemini-3-pro-preview":             1048576,
-	"gemini-3.1-pro-preview":           1048576,
-	"gemini-3.5-flash":                 1048576,
-	"gpt-5":                            400000,
-	"gpt-5-codex":                      400000,
-	"gpt-5-mini":                       400000,
-	"gpt-5-nano":                       400000,
-	"gpt-5.1":                          400000,
-	"gpt-5.1-codex":                    400000,
-	"gpt-5.2":                          400000,
-	"gpt-5.2-codex":                    400000,
-	"gpt-5.3-codex":                    400000,
-	"gpt-5.4":                          400000,
-	"gpt-5.4-pro":                      1050000,
-	"gpt-5.5":                          400000,
-	"gpt-5.5-pro":                      1050000,
-	"grok-build-0.1":                   256000,
-	"grok-code-fast-1":                 256000,
-	"kimi-k2-instruct-0905":            1000000,
-	"moonshotai-kimi-k2.6":             262144,
-	"moonshotai/Kimi-K2.5":             262144,
-	"o3":                               200000,
-	"o3-mini":                          200000,
-	"openai/gpt-oss-120b":              128000,
-	"moonshotai/kimi-k2-0905":          262144,
-	"moonshotai/kimi-k2-instruct-0905": 1000000,
-	"qwen/qwen3-235b-a22b-2507":        262144,
-	"qwen/qwen3-coder":                 262144,
-	"sonoma-sky-alpha":                 256000,
-	"z-ai/glm-4.6":                     131000,
-	"zai-org/GLM-5.2":                  200000,
-	"zai-glm-4.7":                      131000,
+	"amp-nostromo-v1":                                          400000,
+	"claude-fable-5":                                           1000000,
+	"claude-haiku-4-5-20251001":                                200000,
+	"claude-opus-4-1-20250805":                                 200000,
+	"claude-opus-4-20250514":                                   200000,
+	"claude-opus-4-5-20251101":                                 200000,
+	"claude-opus-4-6":                                          332000,
+	"claude-opus-4-7":                                          332000,
+	"claude-opus-4-8":                                          332000,
+	"claude-sonnet-4-20250514":                                 1000000,
+	"claude-sonnet-4-5-20250929":                               1000000,
+	"claude-sonnet-4-6":                                        1000000,
+	"gemini-3-flash-preview":                                   1048576,
+	"gemini-3-pro-preview":                                     1048576,
+	"gemini-3.1-pro-preview":                                   1048576,
+	"gemini-3.5-flash":                                         1048576,
+	"gpt-5":                                                    400000,
+	"gpt-5-codex":                                              400000,
+	"gpt-5-mini":                                               400000,
+	"gpt-5-nano":                                               400000,
+	"gpt-5.1":                                                  400000,
+	"gpt-5.1-codex":                                            400000,
+	"gpt-5.2":                                                  400000,
+	"gpt-5.2-codex":                                            400000,
+	"gpt-5.3-codex":                                            400000,
+	"gpt-5.4":                                                  400000,
+	"gpt-5.4-pro":                                              1050000,
+	"gpt-5.5":                                                  400000,
+	"gpt-5.5-pro":                                              1050000,
+	"grok-build-0.1":                                           256000,
+	"grok-code-fast-1":                                         256000,
+	"kimi-k2-instruct-0905":                                    1000000,
+	"moonshotai-kimi-k2.6":                                     262144,
+	"moonshotai/Kimi-K2.5":                                     262144,
+	"o3":                                                       200000,
+	"o3-mini":                                                  200000,
+	"openai/gpt-oss-120b":                                      128000,
+	"moonshotai/kimi-k2-0905":                                  262144,
+	"moonshotai/kimi-k2-instruct-0905":                         1000000,
+	"qwen/qwen3-235b-a22b-2507":                                262144,
+	"qwen/qwen3-coder":                                         262144,
+	"sonoma-sky-alpha":                                         256000,
+	"z-ai/glm-4.6":                                             131000,
+	"zai-org/GLM-5.2":                                          200000,
+	"zai-glm-4.7":                                              131000,
 }
 
 var neoModelMaxOutputTokens = map[string]int{
+	"accounts/amp/deployments/wkk976k4":                        32000,
 	"accounts/fireworks/models/glm-4p6":                        40000,
 	"accounts/fireworks/models/glm-5":                          40000,
-	"accounts/fireworks/models/glm-5p2":                        131072,
+	"accounts/fireworks/models/glm-5p2":                        32000,
 	"accounts/fireworks/models/kimi-k2-instruct-0905":          32000,
 	"accounts/fireworks/models/minimax-m2p5":                   32000,
 	"accounts/fireworks/models/qwen3-235b-a22b-instruct-2507":  32000,
 	"accounts/fireworks/models/qwen3-coder-480b-a35b-instruct": 32000,
-	"amp-nostromo-v1":                  128000,
-	"claude-fable-5":                   128000,
-	"claude-haiku-4-5-20251001":        64000,
-	"claude-opus-4-1-20250805":         32000,
-	"claude-opus-4-20250514":           32000,
-	"claude-opus-4-5-20251101":         32000,
-	"claude-opus-4-6":                  32000,
-	"claude-opus-4-7":                  32000,
-	"claude-opus-4-8":                  32000,
-	"claude-sonnet-4-20250514":         32000,
-	"claude-sonnet-4-5-20250929":       32000,
-	"claude-sonnet-4-6":                64000,
-	"gemini-3-flash-preview":           65535,
-	"gemini-3-pro-preview":             65535,
-	"gemini-3.1-pro-preview":           65535,
-	"gemini-3.5-flash":                 65535,
-	"gpt-5":                            128000,
-	"gpt-5-codex":                      128000,
-	"gpt-5-mini":                       128000,
-	"gpt-5-nano":                       128000,
-	"gpt-5.1":                          128000,
-	"gpt-5.1-codex":                    128000,
-	"gpt-5.2":                          128000,
-	"gpt-5.2-codex":                    128000,
-	"gpt-5.3-codex":                    128000,
-	"gpt-5.4":                          128000,
-	"gpt-5.4-pro":                      128000,
-	"gpt-5.5":                          128000,
-	"gpt-5.5-pro":                      128000,
-	"grok-build-0.1":                   32000,
-	"grok-code-fast-1":                 32000,
-	"kimi-k2-instruct-0905":            32000,
-	"moonshotai-kimi-k2.6":             32000,
-	"moonshotai/Kimi-K2.5":             32000,
-	"o3":                               1,
-	"o3-mini":                          1,
-	"openai/gpt-oss-120b":              32000,
-	"moonshotai/kimi-k2-0905":          32000,
-	"moonshotai/kimi-k2-instruct-0905": 32000,
-	"qwen/qwen3-235b-a22b-2507":        32000,
-	"qwen/qwen3-coder":                 32000,
-	"sonoma-sky-alpha":                 32000,
-	"z-ai/glm-4.6":                     40000,
-	"zai-org/GLM-5.2":                  32000,
-	"zai-glm-4.7":                      40000,
+	"amp-nostromo-v1":                                          128000,
+	"claude-fable-5":                                           128000,
+	"claude-haiku-4-5-20251001":                                64000,
+	"claude-opus-4-1-20250805":                                 32000,
+	"claude-opus-4-20250514":                                   32000,
+	"claude-opus-4-5-20251101":                                 32000,
+	"claude-opus-4-6":                                          32000,
+	"claude-opus-4-7":                                          32000,
+	"claude-opus-4-8":                                          32000,
+	"claude-sonnet-4-20250514":                                 32000,
+	"claude-sonnet-4-5-20250929":                               32000,
+	"claude-sonnet-4-6":                                        64000,
+	"gemini-3-flash-preview":                                   65535,
+	"gemini-3-pro-preview":                                     65535,
+	"gemini-3.1-pro-preview":                                   65535,
+	"gemini-3.5-flash":                                         65535,
+	"gpt-5":                                                    128000,
+	"gpt-5-codex":                                              128000,
+	"gpt-5-mini":                                               128000,
+	"gpt-5-nano":                                               128000,
+	"gpt-5.1":                                                  128000,
+	"gpt-5.1-codex":                                            128000,
+	"gpt-5.2":                                                  128000,
+	"gpt-5.2-codex":                                            128000,
+	"gpt-5.3-codex":                                            128000,
+	"gpt-5.4":                                                  128000,
+	"gpt-5.4-pro":                                              128000,
+	"gpt-5.5":                                                  128000,
+	"gpt-5.5-pro":                                              128000,
+	"grok-build-0.1":                                           32000,
+	"grok-code-fast-1":                                         32000,
+	"kimi-k2-instruct-0905":                                    32000,
+	"moonshotai-kimi-k2.6":                                     32000,
+	"moonshotai/Kimi-K2.5":                                     32000,
+	"o3":                                                       1,
+	"o3-mini":                                                  1,
+	"openai/gpt-oss-120b":                                      32000,
+	"moonshotai/kimi-k2-0905":                                  32000,
+	"moonshotai/kimi-k2-instruct-0905":                         32000,
+	"qwen/qwen3-235b-a22b-2507":                                32000,
+	"qwen/qwen3-coder":                                         32000,
+	"sonoma-sky-alpha":                                         32000,
+	"z-ai/glm-4.6":                                             40000,
+	"zai-org/GLM-5.2":                                          32000,
+	"zai-glm-4.7":                                              40000,
 }
 
 const defaultNeoOpenAIMaxOutputTokens = 128000

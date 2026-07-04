@@ -382,6 +382,86 @@ func TestNeoReadThreadAutoReadsLatestWhenBudgetExhausted(t *testing.T) {
 	}
 }
 
+func TestNeoReadThreadForcedFinalFallsBackToMarkdown(t *testing.T) {
+	dir := t.TempDir()
+	oldStoreDir := neoAmpDataDir
+	neoAmpDataDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpDataDir = oldStoreDir })
+
+	currentThreadID := "T-019e65c0-0310-77a8-b233-4b84d9c06137"
+	targetThreadID := "T-019e65c0-0310-77a8-b233-4b84d9c06138"
+	neoReadThreadWriteLocalThread(t, dir, targetThreadID, []any{
+		map[string]any{"role": "user", "messageId": "M-early", "content": []any{map[string]any{"type": "text", "text": "Initial plan: approach A."}}},
+		map[string]any{"role": "user", "messageId": "M-latest", "content": []any{map[string]any{"type": "text", "text": "Latest decision: approach D survived."}}},
+	})
+
+	var captured []neoInferenceRequest
+	rt := newNeoRuntime(&config.Config{})
+	rt.inferStream = func(_ *neoRuntime, request neoInferenceRequest, _ neoStreamCallback) (neoInferenceResult, error) {
+		captured = append(captured, request)
+		if len(request.Tools) == 0 {
+			if request.ResponseMimeType != "application/json" || request.ResponseJSONSchema == nil {
+				t.Fatalf("forced final response format = %q/%#v, want json schema", request.ResponseMimeType, request.ResponseJSONSchema)
+			}
+			return neoInferenceResult{Text: "```markdown\n* [message 1] approach D survived.\n```"}, nil
+		}
+		switch len(captured) {
+		case 1:
+			return neoInferenceResult{ToolCalls: []neoToolCall{{ID: newNeoToolCallID(), Name: "search_thread_messages", Input: map[string]any{"query": "approach"}}}}, nil
+		case 2:
+			return neoInferenceResult{ToolCalls: []neoToolCall{{ID: newNeoToolCallID(), Name: "read_thread_messages", Input: map[string]any{"latest": true, "count": 2}}}}, nil
+		default:
+			return neoInferenceResult{Text: "* premature markdown answer"}, nil
+		}
+	}
+	actor := newNeoActor(rt, "actor-test", "thread-actor", currentThreadID, currentThreadID, neoActorRecord("actor-test", "thread-actor", currentThreadID), nil)
+	actor.executorBootstrapComplete = true
+
+	text, err := actor.executeLocalReadThread(neoPendingTool{ID: "TU-read", Name: "read_thread", Input: map[string]any{"threadID": targetThreadID, "question": "Which approach survived?"}, AgentMode: "deep"}, actor.generation)
+	if err != nil {
+		t.Fatalf("executeLocalReadThread error: %v", err)
+	}
+	if text != "* [message 1] approach D survived." {
+		t.Fatalf("read_thread text = %q, want markdown fallback", text)
+	}
+	if len(captured) != 4 {
+		t.Fatalf("captured requests = %d, want 4", len(captured))
+	}
+}
+
+func TestNeoReadThreadMarkdownFallbackContentBoundaries(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"plain markdown", "[message 1] latest decision", "[message 1] latest decision"},
+		{"numeric bracket markdown", "[1] latest decision", "[1] latest decision"},
+		{"dash bracket markdown", "[-] latest decision", "[-] latest decision"},
+		{"boolean bracket markdown", "[true finding] latest decision", "[true finding] latest decision"},
+		{"double bracket markdown", "[[decision]] latest decision", "[[decision]] latest decision"},
+		{"quoted bracket markdown", "[\"decision\"] latest decision", "[\"decision\"] latest decision"},
+		{"plain scalar", "true", "true"},
+		{"fenced markdown", "```markdown\n[message 1] latest decision\n```", "[message 1] latest decision"},
+		{"leading prose fenced markdown", "Here is the relevant content:\n```markdown\n[message 1] latest decision\n```", "[message 1] latest decision"},
+		{"fenced text", "```text\n[message 1] latest decision\n```", "[message 1] latest decision"},
+		{"json object", "{}", ""},
+		{"json array", "[]", ""},
+		{"empty relevant content", `{"relevantContent":""}`, ""},
+		{"truncated json", `{"relevantContent":"partial`, ""},
+		{"truncated json array", `[{"relevantContent":"partial"`, ""},
+		{"fenced json", "```json\n{\"relevantContent\":\"partial\"\n```", ""},
+		{"unterminated fence", "```markdown\n[message 1] latest decision", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := neoReadThreadMarkdownFallbackContent(tt.input); got != tt.want {
+				t.Fatalf("neoReadThreadMarkdownFallbackContent() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestNeoReadThreadSingleMessageDoesNotNeedAutoLatest(t *testing.T) {
 	dir := t.TempDir()
 	oldStoreDir := neoAmpDataDir

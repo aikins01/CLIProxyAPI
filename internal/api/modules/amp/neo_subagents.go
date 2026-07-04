@@ -88,15 +88,6 @@ var neoSubagentDefs = map[string]neoSubagentDef{
 		ReasoningEffort: "high",
 		MaxTurns:        24,
 	},
-	"advisor": {
-		Key:             "advisor",
-		DisplayName:     "Advisor",
-		Route:           neoModelRoute{Provider: "anthropic", Model: "claude-fable-5"},
-		IncludeTools:    []string{"Read", "Grep", "glob", "web_search", "read_web_page", "read_thread", "find_thread"},
-		SystemPrompt:    neoOracleSubagentPrompt,
-		ReasoningEffort: "high",
-		MaxTurns:        24,
-	},
 	"librarian": {
 		Key:             "librarian",
 		DisplayName:     "Librarian",
@@ -163,7 +154,7 @@ func neoSubagentExposureSpec(toolName string) (neoToolSpec, bool) {
 			},
 			Meta: meta,
 		}, true
-	case "oracle", "advisor":
+	case "oracle":
 		return neoToolSpec{
 			Name:        name,
 			Description: neoOracleExposureDescription,
@@ -606,7 +597,7 @@ func (a *neoActor) subagentGenerationStale(generation int) bool {
 // message of the subagent conversation, matching how the binary seeds each one.
 func neoSubagentInputText(toolName string, input map[string]any) string {
 	switch toolName {
-	case "oracle", "advisor":
+	case "oracle":
 		var b strings.Builder
 		if task := stringValue(input["task"]); task != "" {
 			b.WriteString(task)

@@ -203,6 +203,71 @@ func neoReadThreadResponseJSONSchema() map[string]any {
 	}
 }
 
+func neoReadThreadMarkdownFallbackContent(text string) string {
+	raw := strings.TrimSpace(text)
+	if raw == "" {
+		return ""
+	}
+	if fenced := neoReadThreadMarkdownFenceContent(raw); fenced != "" {
+		return fenced
+	}
+	if strings.HasPrefix(raw, "```") || neoReadThreadFallbackLooksLikeJSON(raw) {
+		return ""
+	}
+	return raw
+}
+
+func neoReadThreadMarkdownFenceContent(text string) string {
+	start := strings.Index(text, "```")
+	if start < 0 {
+		return ""
+	}
+	afterFence := text[start+3:]
+	newline := strings.IndexByte(afterFence, '\n')
+	if newline < 0 {
+		return ""
+	}
+	lang := strings.ToLower(strings.TrimSpace(afterFence[:newline]))
+	if fields := strings.Fields(lang); len(fields) > 0 {
+		lang = fields[0]
+	}
+	if lang != "" && lang != "markdown" && lang != "md" && lang != "text" && lang != "txt" {
+		return ""
+	}
+	body := afterFence[newline+1:]
+	end := strings.Index(body, "```")
+	if end < 0 {
+		return ""
+	}
+	inner := strings.TrimSpace(body[:end])
+	if inner == "" || neoReadThreadFallbackLooksLikeJSON(inner) {
+		return ""
+	}
+	return inner
+}
+
+func neoReadThreadFallbackLooksLikeJSON(text string) bool {
+	raw := strings.TrimSpace(text)
+	if strings.HasPrefix(raw, "{") {
+		return true
+	}
+	if !strings.HasPrefix(raw, "[") {
+		return false
+	}
+	afterBracket := strings.TrimSpace(raw[1:])
+	if afterBracket == "" {
+		return true
+	}
+	if json.Valid([]byte(raw)) {
+		return true
+	}
+	first := afterBracket[0]
+	if first == '{' || first == ']' {
+		return true
+	}
+	return false
+}
+
 func neoReadThreadJSONEnvelope(text string) (string, bool) {
 	if start := strings.Index(text, "```"); start >= 0 {
 		afterFence := text[start+3:]

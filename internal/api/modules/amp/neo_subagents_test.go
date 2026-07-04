@@ -23,7 +23,6 @@ func TestNeoSubagentRegistryMatchesBinary(t *testing.T) {
 	}{
 		{"finder", "anthropic", "claude-haiku-4-5-20251001", "", []string{"Grep", "glob", "Read"}},
 		{"oracle", "anthropic", "claude-fable-5", "high", []string{"Read", "Grep", "glob", "web_search", "read_web_page", "read_thread", "find_thread"}},
-		{"advisor", "anthropic", "claude-fable-5", "high", []string{"Read", "Grep", "glob", "web_search", "read_web_page", "read_thread", "find_thread"}},
 		{"librarian", "openai", "gpt-5.5", "none", []string{"read_github", "search_github", "commit_search", "diff", "list_directory_github", "list_repositories", "glob_github"}},
 		// Task inherits the parent model (empty route) and includes finder (a nested subagent).
 		{"Task", "", "", "", []string{"Read", "Bash", "edit_file", "create_file", "read_web_page", "web_search", "finder", "skill", "view_media"}},
@@ -65,7 +64,7 @@ func captureNeoSubagentRouteForTest(t *testing.T, toolName, name string, cfg *co
 	}
 
 	input := map[string]any{"prompt": "delegate"}
-	if toolName == "oracle" || toolName == "advisor" {
+	if toolName == "oracle" {
 		input = map[string]any{"task": "advise"}
 	}
 	if _, err := actor.executeSubagentRun(toolName, input, "TU-"+name, "M-1", actor.generation, 0, ""); err != nil {
@@ -124,59 +123,6 @@ func TestNeoOracleSubagentIgnoresConfigModeModel(t *testing.T) {
 	}
 }
 
-func TestNeoAdvisorSubagentIgnoresConfigModeModel(t *testing.T) {
-	cfg := &config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
-		ModeModels: map[string]string{"smart": "openai/gpt-5.5"},
-	}}}
-	got := captureNeoSubagentRouteForTest(t, "advisor", "advisor-mode", cfg, "smart", nil)
-	if got.Provider != "anthropic" || got.Model != "claude-fable-5" {
-		t.Fatalf("advisor route = %#v, want fixed route anthropic/claude-fable-5", got)
-	}
-}
-
-func TestNeoAdvisorSubagentMatchesOracleRouting(t *testing.T) {
-	rt := newNeoRuntime(&config.Config{})
-	actor := newNeoActor(rt, "actor-advisor", "thread-actor", "T-advisor", "T-advisor", neoActorRecord("actor-advisor", "thread-actor", "T-advisor"), nil)
-	actor.currentAgentMode = "smart"
-	actor.settings = map[string]any{"reasoning.effort": "medium"}
-	actor.registerTools([]any{
-		map[string]any{"name": "Read"},
-		map[string]any{"name": "Grep"},
-		map[string]any{"name": "glob"},
-		map[string]any{"name": "web_search"},
-		map[string]any{"name": "read_web_page"},
-		map[string]any{"name": "read_thread"},
-		map[string]any{"name": "find_thread"},
-	})
-
-	var seen []neoInferenceRequest
-	rt.inferStream = func(_ *neoRuntime, req neoInferenceRequest, _ neoStreamCallback) (neoInferenceResult, error) {
-		seen = append(seen, req)
-		return neoInferenceResult{Text: "done"}, nil
-	}
-
-	if _, err := actor.executeSubagentRun("advisor", map[string]any{"task": "review routing", "context": "same as oracle"}, "TU-advisor", "M-1", actor.generation, 0, ""); err != nil {
-		t.Fatalf("advisor subagent failed: %v", err)
-	}
-	if len(seen) != 1 {
-		t.Fatalf("advisor requests = %#v, want exactly one", seen)
-	}
-	route := seen[0].ModelRouteOverride
-	if route == nil || route.Provider != "anthropic" || route.Model != "claude-fable-5" {
-		t.Fatalf("advisor route = %#v, want anthropic/claude-fable-5", route)
-	}
-	if seen[0].ReasoningEffort != "high" || stringValue(seen[0].Settings["reasoning.effort"]) != "high" {
-		t.Fatalf("advisor effort request=%q settings=%#v, want high", seen[0].ReasoningEffort, seen[0].Settings)
-	}
-	toolNames := make([]string, 0, len(seen[0].Tools))
-	for _, tool := range seen[0].Tools {
-		toolNames = append(toolNames, tool.Name)
-	}
-	if strings.Join(toolNames, ",") != "Read,Grep,glob,web_search,read_web_page,read_thread,find_thread" {
-		t.Fatalf("advisor tools = %#v", toolNames)
-	}
-}
-
 func TestNeoLibrarianSubagentUsesGPT55None(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	actor := newNeoActor(rt, "actor-librarian", "thread-actor", "T-librarian", "T-librarian", neoActorRecord("actor-librarian", "thread-actor", "T-librarian"), nil)
@@ -205,7 +151,7 @@ func TestNeoLibrarianSubagentUsesGPT55None(t *testing.T) {
 }
 
 func TestIsNeoLocalSubagentTool(t *testing.T) {
-	for _, name := range []string{"finder", "oracle", "advisor", "librarian", "Task"} {
+	for _, name := range []string{"finder", "oracle", "librarian", "Task"} {
 		if !isNeoLocalSubagentTool(name) {
 			t.Fatalf("%s should be a local subagent tool", name)
 		}
@@ -230,14 +176,6 @@ func TestNeoSubagentInputText(t *testing.T) {
 		if !strings.Contains(oracle, want) {
 			t.Fatalf("oracle input missing %q:\n%s", want, oracle)
 		}
-	}
-	advisor := neoSubagentInputText("advisor", map[string]any{
-		"task":    "review the auth design",
-		"context": "files attached",
-		"files":   []any{"a.go", "b.go"},
-	})
-	if advisor != oracle {
-		t.Fatalf("advisor input = %q, want oracle-equivalent %q", advisor, oracle)
 	}
 	if got := neoSubagentInputText("librarian", map[string]any{"query": "how does routing work"}); got != "how does routing work" {
 		t.Fatalf("librarian input = %q", got)

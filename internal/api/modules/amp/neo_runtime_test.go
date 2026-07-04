@@ -330,11 +330,11 @@ func TestNeoRuntimeAutoCompactsLargeLocalHistory(t *testing.T) {
 		if payload["stream"] != false {
 			t.Fatalf("compaction stream = %#v, want false", payload["stream"])
 		}
-		if numberFrom(payload["max_completion_tokens"]) != 2048 {
-			t.Fatalf("compaction max_completion_tokens = %#v, want 2048", payload["max_completion_tokens"])
+		if numberFrom(payload["max_completion_tokens"]) != neoCompactionMaxOutputTokens {
+			t.Fatalf("compaction max_completion_tokens = %#v, want %d", payload["max_completion_tokens"], neoCompactionMaxOutputTokens)
 		}
-		if payload["reasoning_effort"] != "xhigh" {
-			t.Fatalf("compaction reasoning_effort = %#v, want xhigh", payload["reasoning_effort"])
+		if payload["reasoning_effort"] != defaultNeoCompactionReasoning {
+			t.Fatalf("compaction reasoning_effort = %#v, want %s", payload["reasoning_effort"], defaultNeoCompactionReasoning)
 		}
 		if _, ok := payload["tools"]; ok {
 			t.Fatalf("compaction payload should omit tools: %#v", payload["tools"])
@@ -487,6 +487,114 @@ func TestNeoRuntimeAutoCompactsLargeLocalHistory(t *testing.T) {
 	defer actor.mu.Unlock()
 	if calls != 1 {
 		t.Fatalf("compaction calls after unchanged compacted window = %d, want 1", calls)
+	}
+}
+
+func TestNeoRuntimeEmptyCompactionSummarySuppressesImmediateRetry(t *testing.T) {
+	dir := t.TempDir()
+	oldStoreDir := neoAmpDataDir
+	neoAmpDataDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpDataDir = oldStoreDir })
+
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.URL.Path != "/api/provider/openai/v1/chat/completions" {
+			t.Fatalf("unexpected compaction path %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":""}}]}`))
+	}))
+	t.Cleanup(upstream.Close)
+	parsed, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+	_, portString, err := net.SplitHostPort(parsed.Host)
+	if err != nil {
+		t.Fatalf("parse upstream host: %v", err)
+	}
+	port, err := strconv.Atoi(portString)
+	if err != nil {
+		t.Fatalf("parse upstream port: %v", err)
+	}
+
+	enabled := true
+	rt := newNeoRuntime(&config.Config{
+		Host: "127.0.0.1",
+		Port: port,
+		AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
+			Enabled:         &enabled,
+			CompactionModel: "openai/gpt-5.4",
+		}},
+	})
+	threadID := "T-empty-compact"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+	actor.settings["internal.compactionThresholdPercent"] = 0
+	longText := strings.Repeat("empty compaction context ", 300)
+	actor.mu.Lock()
+	for i := 0; i < 30; i++ {
+		role := "user"
+		if i%2 == 1 {
+			role = "assistant"
+		}
+		actor.storeMessageLocked(neoMessage{ThreadID: threadID, MessageID: fmt.Sprintf("M-%022d", i), Role: role, Content: []any{map[string]any{"type": "text", "text": fmt.Sprintf("message %02d %s", i, longText)}}})
+	}
+	actor.agentState = "working"
+	actor.currentInference = &neoInferenceInflight{messageID: "M-current", agentMode: "smart", reasoningEffort: "medium"}
+	actor.rebuildHistoryLocked()
+	generation := actor.generation
+	actor.mu.Unlock()
+
+	if actor.maybeCompactBeforeInference("smart", "medium", "", generation, "M-current") {
+		t.Fatal("empty compaction summary reported success")
+	}
+	if calls != 1 {
+		t.Fatalf("compaction calls = %d, want first attempt", calls)
+	}
+	actor.mu.Lock()
+	if actor.compacting {
+		t.Fatal("actor remained compacting after empty summary")
+	}
+	if len(actor.compactionRecords) != 0 {
+		t.Fatalf("compactionRecords = %#v, want none", actor.compactionRecords)
+	}
+	if actor.currentInference == nil || !actor.currentInference.preflightCompactionChecked {
+		t.Fatalf("currentInference = %#v, want checked after empty summary", actor.currentInference)
+	}
+	retryAfter := actor.compactionRetryAfterLen
+	actor.currentInference = &neoInferenceInflight{messageID: "M-current-2", agentMode: "smart", reasoningEffort: "medium"}
+	actor.mu.Unlock()
+
+	if actor.maybeCompactBeforeInference("smart", "medium", "", generation, "M-current-2") {
+		t.Fatal("retry guard reported compaction success")
+	}
+	if calls != 1 {
+		t.Fatalf("compaction calls = %d, want immediate retry suppressed", calls)
+	}
+	actor.mu.Lock()
+	if retryAfter <= len(actor.messages) {
+		t.Fatalf("retryAfterLen = %d, messages = %d, want retry delayed", retryAfter, len(actor.messages))
+	}
+	if actor.currentInference == nil || !actor.currentInference.preflightCompactionChecked {
+		t.Fatalf("currentInference after suppressed retry = %#v, want checked", actor.currentInference)
+	}
+	for i := len(actor.messages); i < retryAfter; i++ {
+		role := "user"
+		if i%2 == 1 {
+			role = "assistant"
+		}
+		actor.storeMessageLocked(neoMessage{ThreadID: threadID, MessageID: fmt.Sprintf("M-%022d", i), Role: role, Content: []any{map[string]any{"type": "text", "text": fmt.Sprintf("new message %02d %s", i, longText)}}})
+	}
+	actor.currentInference = &neoInferenceInflight{messageID: "M-current-3", agentMode: "smart", reasoningEffort: "medium"}
+	generation = actor.generation
+	actor.mu.Unlock()
+
+	if actor.maybeCompactBeforeInference("smart", "medium", "", generation, "M-current-3") {
+		t.Fatal("empty compaction summary after retry boundary reported success")
+	}
+	if calls != 2 {
+		t.Fatalf("compaction calls = %d, want retry after source length reaches %d", calls, retryAfter)
 	}
 }
 
@@ -9746,14 +9854,18 @@ func TestNeoThreadReaderCoverageHasExplicitOwnership(t *testing.T) {
 		t.Fatal("Amp binary parity baseline has no thread_reader_coverage")
 	}
 	coverage := map[string]string{
-		"getThread":       "internal-rpc",
-		"getThreadTail":   "internal-rpc",
-		"listThreads":     "internal-rpc",
-		"loadThreadTail":  "internal-rpc",
-		"loadThreads":     "internal-rpc",
-		"message_stats":   "message-reader-route",
-		"read_messages":   "message-reader-route",
-		"search_messages": "message-reader-route",
+		"getThread":             "internal-rpc",
+		"getThreadLabels":       "internal-rpc",
+		"getThreadLinkInfo":     "internal-rpc",
+		"getThreadMeta":         "internal-rpc",
+		"getThreadTail":         "internal-rpc",
+		"listThreads":           "internal-rpc",
+		"loadThreadTail":        "internal-rpc",
+		"loadThreads":           "internal-rpc",
+		"message_stats":         "message-reader-route",
+		"read_messages":         "message-reader-route",
+		"search_messages":       "message-reader-route",
+		"threadDisplayCostInfo": "internal-rpc",
 	}
 	for _, marker := range baseline.Signals.ThreadReaderCoverage {
 		t.Run(marker.Name, func(t *testing.T) {
@@ -10722,6 +10834,7 @@ func TestProviderForNeoModelMatchesBinaryProviderTable(t *testing.T) {
 		{model: "gemini-3.5-flash", want: "google"},
 		{model: "zai-glm-4.7", want: "cerebras"},
 		{model: "moonshotai-kimi-k2.6", want: "cerebras"},
+		{model: "accounts/amp/deployments/wkk976k4", want: "fireworks"},
 		{model: "accounts/fireworks/models/glm-5", want: "fireworks"},
 		{model: "accounts/fireworks/models/glm-5p2", want: "fireworks"},
 		{model: "moonshotai/Kimi-K2.5", want: "baseten"},
@@ -10749,6 +10862,7 @@ func TestParseNeoModelRoutePreservesBinarySlashModelNames(t *testing.T) {
 		model    string
 	}{
 		{raw: "openai/gpt-oss-120b", provider: "openai", model: "openai/gpt-oss-120b"},
+		{raw: "accounts/amp/deployments/wkk976k4", provider: "fireworks", model: "accounts/amp/deployments/wkk976k4"},
 		{raw: "accounts/fireworks/models/glm-5", provider: "fireworks", model: "accounts/fireworks/models/glm-5"},
 		{raw: "accounts/fireworks/models/glm-5p2", provider: "fireworks", model: "accounts/fireworks/models/glm-5p2"},
 		{raw: "moonshotai/Kimi-K2.5", provider: "baseten", model: "moonshotai/Kimi-K2.5"},
@@ -11748,8 +11862,8 @@ func TestInferNeoCompactionLocalAmpNostromoInfersAmpProvider(t *testing.T) {
 			t.Fatalf("unexpected compaction path %s", r.URL.Path)
 		}
 		payload := readNeoJSON(r.Body)
-		if payload["model"] != "amp-nostromo-v1" || payload["stream"] != false || stringValue(payload["reasoning_effort"]) != "xhigh" {
-			t.Fatalf("payload = %#v, want inferred amp compaction reasoning", payload)
+		if payload["model"] != "amp-nostromo-v1" || payload["stream"] != false || stringValue(payload["reasoning_effort"]) != defaultNeoCompactionReasoning {
+			t.Fatalf("payload = %#v, want inferred amp compaction reasoning %s", payload, defaultNeoCompactionReasoning)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"<summary>amp compacted</summary>"}}]}`))
@@ -13098,7 +13212,6 @@ func TestNeoActorFiltersAmpBuiltInToolsByMode(t *testing.T) {
 		"oracle":                   {Name: "oracle"},
 		"librarian":                {Name: "librarian"},
 		"Task":                     {Name: "Task"},
-		"advisor":                  {Name: "advisor"},
 		"task_list":                {Name: "task_list"},
 		"todo_write":               {Name: "todo_write"},
 		"todo_read":                {Name: "todo_read"},
@@ -13145,8 +13258,8 @@ func TestNeoActorFiltersAmpBuiltInToolsByMode(t *testing.T) {
 
 	deepNames := requestNames("deep")
 	assertMode("deep", deepNames,
-		[]string{"Task", "advisor", "read_thread", "shell_command", "apply_patch", "view_media", "tb__gemini-oracle"},
-		[]string{"Read", "Grep", "glob", "Glob", "Bash", "create_file", "edit_file", "get_diagnostics", "chart", "look_at", "handoff", "task_list", "todo_write", "file_tree", "code_review", "deferred_custom", "docs_read"})
+		[]string{"Task", "read_thread", "shell_command", "apply_patch", "view_media", "tb__gemini-oracle"},
+		[]string{"Read", "Grep", "glob", "Glob", "Bash", "create_file", "edit_file", "get_diagnostics", "advisor", "chart", "look_at", "handoff", "task_list", "todo_write", "file_tree", "code_review", "deferred_custom", "docs_read"})
 
 	smartNames := requestNames("smart")
 	assertMode("smart", smartNames,
@@ -13183,15 +13296,15 @@ func TestNeoActorFiltersAmpBuiltInToolsByMode(t *testing.T) {
 
 	nostromoNames := requestNames("nostromo")
 	assertMode("nostromo", nostromoNames,
-		[]string{"Bash", "create_file", "edit_file", "Task", "advisor", "shell_command", "apply_patch", "view_media", "send_message_to_agg", "tb__gemini-oracle"},
-		[]string{"Grep", "glob", "Glob", "get_diagnostics", "chart", "look_at", "handoff", "task_list", "todo_write", "file_tree", "code_review", "deferred_custom", "docs_read"})
+		[]string{"Bash", "create_file", "edit_file", "Task", "shell_command", "apply_patch", "view_media", "send_message_to_agg", "tb__gemini-oracle"},
+		[]string{"Grep", "glob", "Glob", "get_diagnostics", "advisor", "chart", "look_at", "handoff", "task_list", "todo_write", "file_tree", "code_review", "deferred_custom", "docs_read"})
 }
 
 func TestNeoActorToolsForModeFollowBinaryModeOrder(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
 	binaryNostromoOrder := []string{
-		"finder", "Bash", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "send_message_to_agg", "shell_command", "apply_patch", "advisor",
+		"finder", "Bash", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "send_message_to_agg", "shell_command", "apply_patch",
 	}
 	rawTools := []any{map[string]any{"name": "external_tool", "source": map[string]any{"plugin": "test"}}}
 	for i := len(binaryNostromoOrder) - 1; i >= 0; i-- {
@@ -13233,7 +13346,7 @@ func TestNeoActorExposesSyntheticLocalToolsWhenExecutorOmitsThem(t *testing.T) {
 		names = append(names, tool.Name)
 	}
 
-	for _, name := range []string{"finder", "oracle", "advisor", "librarian", "Task", "read_thread"} {
+	for _, name := range []string{"finder", "oracle", "librarian", "Task", "read_thread"} {
 		spec, ok := byName[name]
 		if !ok {
 			t.Fatalf("synthetic local tool %s was not exposed to the model: %v", name, names)
