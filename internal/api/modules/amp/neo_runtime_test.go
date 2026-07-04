@@ -5600,11 +5600,72 @@ func TestNeoUserActorReceivesThreadStatusUpdatedOnExecutorConnectDisconnect(t *t
 	if params["lastUserMessageAt"] != "2026-05-31T12:00:00Z" {
 		t.Fatalf("executor connected lastUserMessageAt = %#v", params["lastUserMessageAt"])
 	}
+	snapshot, ok := threadActor.threadSnapshot()
+	if !ok {
+		t.Fatal("missing connected thread snapshot")
+	}
+	thread := neoCloudThread(snapshot)
+	if thread["hasExecutor"] != true || thread["executorConnected"] != true || mapValue(thread["meta"])["executorType"] != "local-client" {
+		t.Fatalf("connected cloud thread executor state = has:%#v connected:%#v meta:%#v", thread["hasExecutor"], thread["executorConnected"], thread["meta"])
+	}
 
 	threadActor.executorDisconnected(map[string]any{"message": "done"})
 	params = readThreadStatusUpdated()
 	if params["hasExecutor"] != false || params["executorConnected"] != false {
 		t.Fatalf("executor disconnected status = has:%#v connected:%#v params=%#v", params["hasExecutor"], params["executorConnected"], params)
+	}
+	snapshot, ok = threadActor.threadSnapshot()
+	if !ok {
+		t.Fatal("missing disconnected thread snapshot")
+	}
+	thread = neoCloudThread(snapshot)
+	if thread["hasExecutor"] != false || thread["executorConnected"] != false {
+		t.Fatalf("disconnected cloud thread executor state = has:%#v connected:%#v", thread["hasExecutor"], thread["executorConnected"])
+	}
+}
+
+func TestNeoCloudThreadSnapshotExecutorTypePrecedence(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := rt.store.ensureThreadActor("T-019e0e6e-f3f1-7078-b5dd-748f66f8c264")
+	actor.mu.Lock()
+	actor.executorID = "executor-test"
+	actor.bootstrapExecutorType = "daemon"
+	actor.meta = map[string]any{"executorType": "local-client"}
+	actor.messages = []neoMessage{{MessageID: "M-user", Role: "user", Content: []any{map[string]any{"type": "text", "text": "hi"}}, Seq: 1}}
+	actor.mu.Unlock()
+
+	snapshot, ok := actor.threadSnapshot()
+	if !ok {
+		t.Fatal("missing thread snapshot")
+	}
+	thread := neoCloudThread(snapshot)
+	if mapValue(thread["meta"])["executorType"] != "daemon" {
+		t.Fatalf("executorType with bootstrap override = %#v", thread["meta"])
+	}
+
+	actor.mu.Lock()
+	actor.bootstrapExecutorType = ""
+	actor.meta = map[string]any{"executorType": "custom-client"}
+	actor.mu.Unlock()
+	snapshot, ok = actor.threadSnapshot()
+	if !ok {
+		t.Fatal("missing thread snapshot with meta executor type")
+	}
+	thread = neoCloudThread(snapshot)
+	if mapValue(thread["meta"])["executorType"] != "custom-client" {
+		t.Fatalf("executorType with meta override = %#v", thread["meta"])
+	}
+
+	actor.mu.Lock()
+	actor.meta = nil
+	actor.mu.Unlock()
+	snapshot, ok = actor.threadSnapshot()
+	if !ok {
+		t.Fatal("missing thread snapshot with fallback executor type")
+	}
+	thread = neoCloudThread(snapshot)
+	if mapValue(thread["meta"])["executorType"] != "local-client" {
+		t.Fatalf("executorType fallback = %#v", thread["meta"])
 	}
 }
 
@@ -23478,10 +23539,12 @@ func TestNeoSkillsPathMatchesOnlyKnownEndpoints(t *testing.T) {
 
 func TestNeoCloudThreadIncludesProtocolMessageIDAndCompleteState(t *testing.T) {
 	thread := neoCloudThread(neoCloudThreadSnapshot{
-		threadID:  "T-test",
-		seq:       3,
-		createdMs: 1778170000000,
-		settings:  map[string]any{"agentMode": "deep"},
+		threadID:          "T-test",
+		seq:               3,
+		createdMs:         1778170000000,
+		settings:          map[string]any{"agentMode": "deep", "reasoning.effort": "xhigh", "bitbucketToken": "local-secret", "proxy": "http://127.0.0.1:1"},
+		executorConnected: true,
+		executorType:      "local-client",
 		messages: []neoMessage{
 			{MessageID: "M-user", Role: "user", Content: []any{map[string]any{"type": "text", "text": "hi"}}, AgentMode: "deep", ReadAt: "2026-05-07T21:00:00Z", Seq: 1},
 			{MessageID: "M-assistant", Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "ok"}}, State: map[string]any{"type": "complete", "stopReason": "end_turn"}, Seq: 2},
@@ -23506,9 +23569,22 @@ func TestNeoCloudThreadIncludesProtocolMessageIDAndCompleteState(t *testing.T) {
 	if thread["agentMode"] != "deep" {
 		t.Fatalf("agentMode = %#v", thread["agentMode"])
 	}
+	if thread["reasoningEffort"] != "xhigh" {
+		t.Fatalf("reasoningEffort = %#v", thread["reasoningEffort"])
+	}
+	settings := mapValue(thread["settings"])
+	if settings["agentMode"] != "deep" || settings["reasoning.effort"] != "xhigh" || settings["bitbucketToken"] != nil || settings["proxy"] != nil {
+		t.Fatalf("thread settings = %#v", settings)
+	}
+	if thread["hasExecutor"] != true || thread["executorConnected"] != true {
+		t.Fatalf("executor state = has:%#v connected:%#v", thread["hasExecutor"], thread["executorConnected"])
+	}
 	meta := mapValue(thread["meta"])
 	if meta["ampcodeConnectorLocalNeo"] != true {
 		t.Fatalf("missing connector local Neo marker in meta: %#v", meta)
+	}
+	if meta["executorType"] != "local-client" {
+		t.Fatalf("executorType = %#v", meta["executorType"])
 	}
 	if thread["title"] != "hi" {
 		t.Fatalf("title = %#v", thread["title"])
@@ -23530,6 +23606,151 @@ func TestNeoCloudThreadDefaultsAgentModeForBinarySwitch(t *testing.T) {
 
 	if thread["agentMode"] != "smart" {
 		t.Fatalf("agentMode = %#v, want smart fallback for Amp binary thread switch", thread["agentMode"])
+	}
+}
+
+func TestNeoCloudThreadUsesExplicitUserReasoningEffort(t *testing.T) {
+	thread := neoCloudThread(neoCloudThreadSnapshot{
+		threadID:  "T-test",
+		seq:       1,
+		createdMs: 1778170000000,
+		settings:  map[string]any{"agentMode": "deep"},
+		messages: []neoMessage{
+			{MessageID: "M-user", Role: "user", Content: []any{map[string]any{"type": "text", "text": "hi"}}, AgentMode: "deep", ReasoningEffort: "xhigh", Seq: 1},
+		},
+	})
+
+	if thread["reasoningEffort"] != "xhigh" {
+		t.Fatalf("reasoningEffort = %#v", thread["reasoningEffort"])
+	}
+	settings := mapValue(thread["settings"])
+	if settings["agentMode"] != "deep" || settings["reasoning.effort"] != "xhigh" {
+		t.Fatalf("settings = %#v", settings)
+	}
+}
+
+func TestNeoCloudThreadDoesNotSynthesizeDefaultReasoningEffort(t *testing.T) {
+	thread := neoCloudThread(neoCloudThreadSnapshot{
+		threadID:  "T-test",
+		seq:       1,
+		createdMs: 1778170000000,
+		settings:  map[string]any{"agentMode": "deep"},
+		messages: []neoMessage{
+			{MessageID: "M-user", Role: "user", Content: []any{map[string]any{"type": "text", "text": "hi"}}, AgentMode: "deep", Seq: 1},
+		},
+	})
+
+	if _, exists := thread["reasoningEffort"]; exists {
+		t.Fatalf("reasoningEffort = %#v, want absent", thread["reasoningEffort"])
+	}
+	settings := mapValue(thread["settings"])
+	if _, exists := settings["reasoning.effort"]; exists {
+		t.Fatalf("settings = %#v, want no reasoning.effort", settings)
+	}
+}
+
+func TestNeoCloudThreadReasoningEffortSettingsMatrix(t *testing.T) {
+	tests := []struct {
+		name       string
+		settings   map[string]any
+		messages   []neoMessage
+		wantEffort string
+	}{
+		{
+			name:       "canonicalizes alias",
+			settings:   map[string]any{"agentMode": "deep", "reasoningEffort": "xhigh"},
+			wantEffort: "xhigh",
+		},
+		{
+			name:     "strips invalid alias",
+			settings: map[string]any{"agentMode": "deep", "reasoningEffort": "max"},
+		},
+		{
+			name:     "strips invalid canonical effort",
+			settings: map[string]any{"agentMode": "deep", "reasoning.effort": "max"},
+		},
+		{
+			name:       "falls back from invalid canonical to valid alias",
+			settings:   map[string]any{"agentMode": "deep", "reasoning.effort": "max", "reasoningEffort": "xhigh"},
+			wantEffort: "xhigh",
+		},
+		{
+			name:       "uses mode-unspecified user-message effort",
+			settings:   map[string]any{"agentMode": "deep"},
+			messages:   []neoMessage{{MessageID: "M-user", Role: "user", Content: []any{map[string]any{"type": "text", "text": "hi"}}, ReasoningEffort: "xhigh", Seq: 1}},
+			wantEffort: "xhigh",
+		},
+		{
+			name:     "ignores mismatched user-message mode",
+			settings: map[string]any{"agentMode": "deep"},
+			messages: []neoMessage{{MessageID: "M-user", Role: "user", Content: []any{map[string]any{"type": "text", "text": "hi"}}, AgentMode: "smart", ReasoningEffort: "max", Seq: 1}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			messages := tt.messages
+			if messages == nil {
+				messages = []neoMessage{{MessageID: "M-user", Role: "user", Content: []any{map[string]any{"type": "text", "text": "hi"}}, AgentMode: "deep", Seq: 1}}
+			}
+			thread := neoCloudThread(neoCloudThreadSnapshot{
+				threadID:  "T-test",
+				seq:       1,
+				createdMs: 1778170000000,
+				settings:  tt.settings,
+				messages:  messages,
+			})
+
+			settings := mapValue(thread["settings"])
+			if settings["reasoningEffort"] != nil {
+				t.Fatalf("settings leaked reasoningEffort alias: %#v", settings)
+			}
+			if tt.wantEffort == "" {
+				if _, exists := thread["reasoningEffort"]; exists {
+					t.Fatalf("reasoningEffort = %#v, want absent", thread["reasoningEffort"])
+				}
+				if _, exists := settings["reasoning.effort"]; exists {
+					t.Fatalf("settings = %#v, want no reasoning.effort", settings)
+				}
+				return
+			}
+			if thread["reasoningEffort"] != tt.wantEffort || settings["reasoning.effort"] != tt.wantEffort {
+				t.Fatalf("effort = thread:%#v settings:%#v, want %q", thread["reasoningEffort"], settings["reasoning.effort"], tt.wantEffort)
+			}
+		})
+	}
+}
+
+func TestWriteNeoLocalThreadSnapshotCanonicalizesModeEffortAndExecutorState(t *testing.T) {
+	dir := t.TempDir()
+	threadID := "T-019e0e6e-f3f1-7078-b5dd-748f66f8c265"
+	err := writeNeoLocalThreadSnapshotToDir(neoCloudThreadSnapshot{
+		threadID:          threadID,
+		seq:               1,
+		createdMs:         1778170000000,
+		settings:          map[string]any{"agentMode": "deep", "reasoningEffort": "xhigh", "bitbucketToken": "local-secret"},
+		executorConnected: true,
+		executorType:      "local-client",
+		messages: []neoMessage{
+			{MessageID: "M-user", Role: "user", Content: []any{map[string]any{"type": "text", "text": "hi"}}, AgentMode: "deep", Seq: 1},
+		},
+	}, dir)
+	if err != nil {
+		t.Fatalf("writeNeoLocalThreadSnapshotToDir error: %v", err)
+	}
+
+	thread, ok := loadNeoThreadFromDir(threadID, dir)
+	if !ok {
+		t.Fatal("stored thread not found")
+	}
+	settings := mapValue(thread["settings"])
+	if settings["agentMode"] != "deep" || settings["reasoning.effort"] != "xhigh" || settings["reasoningEffort"] != nil || settings["bitbucketToken"] != nil {
+		t.Fatalf("stored settings = %#v", settings)
+	}
+	if thread["reasoningEffort"] != "xhigh" || thread["hasExecutor"] != true || thread["executorConnected"] != true {
+		t.Fatalf("stored thread effort/executor = effort:%#v has:%#v connected:%#v", thread["reasoningEffort"], thread["hasExecutor"], thread["executorConnected"])
+	}
+	if meta := mapValue(thread["meta"]); meta["executorType"] != "local-client" {
+		t.Fatalf("stored meta = %#v", meta)
 	}
 }
 

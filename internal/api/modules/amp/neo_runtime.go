@@ -3393,6 +3393,7 @@ func (a *neoActor) executorConnected(msg map[string]any) {
 	a.broadcast(payload)
 	a.broadcastExecutorConnectedStatus(executorID)
 	a.broadcastObservers()
+	a.syncCloudAsync()
 	a.drainReadyWork()
 }
 
@@ -3429,6 +3430,7 @@ func (a *neoActor) executorDisconnected(msg map[string]any) {
 		"details": map[string]any{"reasonCode": "executor_disconnected"},
 	}))
 	a.broadcastObservers()
+	a.syncCloudAsync()
 	a.processQueue()
 }
 
@@ -9105,6 +9107,8 @@ type neoCloudThreadSnapshot struct {
 	relationships     []any
 	currentInference  *neoInferenceInflight
 	pendingInference  *neoInferenceInflight
+	executorConnected bool
+	executorType      string
 }
 
 func (a *neoActor) syncCloudAsync() {
@@ -9261,6 +9265,11 @@ func (a *neoActor) threadSnapshotWithOptions(options neoThreadSnapshotOptions) (
 	if a.pendingInference != nil {
 		pending = cloneNeoInferenceInflight(a.pendingInference)
 	}
+	executorConnected := a.executorID != ""
+	executorType := firstNonEmptyString(a.bootstrapExecutorType, stringValue(a.meta["executorType"]))
+	if executorType == "" && executorConnected {
+		executorType = "local-client"
+	}
 	return neoCloudThreadSnapshot{
 		threadID:          a.threadID,
 		seq:               a.lastSeqLocked(),
@@ -9285,6 +9294,8 @@ func (a *neoActor) threadSnapshotWithOptions(options neoThreadSnapshotOptions) (
 		relationships:     cloneNeoJSONArray(a.relationshipListLocked()),
 		currentInference:  inflight,
 		pendingInference:  pending,
+		executorConnected: executorConnected,
+		executorType:      executorType,
 	}, true
 }
 
@@ -10289,17 +10300,32 @@ func writeNeoLocalThreadSnapshotToDir(snapshot neoCloudThreadSnapshot, dir strin
 }
 
 func neoLocalThreadSnapshotSettings(snapshot neoCloudThreadSnapshot) map[string]any {
-	settings := sanitizeNeoThreadSettings(snapshot.settings)
 	mode := neoCloudAgentMode(snapshot, snapshot.messages)
-	if mode != "" {
-		settings["agentMode"] = mode
-	}
-	if effort := strings.ToLower(strings.TrimSpace(stringValue(settings["reasoning.effort"]))); neoReasoningEffortAllowedForMode(mode, effort) {
-		settings["reasoning.effort"] = effort
-	} else {
-		delete(settings, "reasoning.effort")
-	}
+	effort := neoExplicitThreadReasoningEffort(snapshot.settings, snapshot.messages, mode)
+	settings, _, _ := neoThreadModeSettingsPayload(snapshot.settings, mode, effort)
 	return settings
+}
+
+func neoThreadModeSettingsPayload(settings map[string]any, agentMode, reasoningEffort string) (map[string]any, string, string) {
+	out := sanitizeNeoThreadSettings(settings)
+	delete(out, "reasoningEffort")
+	agentMode = strings.TrimSpace(agentMode)
+	if agentMode == "" {
+		agentMode = strings.TrimSpace(stringValue(out["agentMode"]))
+	}
+	if agentMode != "" {
+		out["agentMode"] = agentMode
+	}
+	reasoningEffort = strings.ToLower(strings.TrimSpace(reasoningEffort))
+	if !neoReasoningEffortAllowedForMode(agentMode, reasoningEffort) {
+		reasoningEffort = strings.ToLower(strings.TrimSpace(stringValue(out["reasoning.effort"])))
+	}
+	if !neoReasoningEffortAllowedForMode(agentMode, reasoningEffort) {
+		delete(out, "reasoning.effort")
+		return out, agentMode, ""
+	}
+	out["reasoning.effort"] = reasoningEffort
+	return out, agentMode, reasoningEffort
 }
 
 func writeNeoLocalThreadFileInDir(dir, threadID string, thread map[string]any) (string, error) {
@@ -12723,6 +12749,12 @@ func neoCloudThread(snapshot neoCloudThreadSnapshot) map[string]any {
 	threadStatus := neoThreadStatusValue(snapshot.threadStatus)
 	relationships := neoMergeThreadRelationshipsWithExplicit(neoThreadRelationships(messages), snapshot.relationships)
 	meta := neoThreadActorImportedMeta(snapshot.meta)
+	if snapshot.executorType != "" {
+		meta["executorType"] = snapshot.executorType
+	}
+	agentMode := neoCloudAgentMode(snapshot, messages)
+	reasoningEffort := neoExplicitThreadReasoningEffort(snapshot.settings, messages, agentMode)
+	settings, agentMode, reasoningEffort := neoThreadModeSettingsPayload(snapshot.settings, agentMode, reasoningEffort)
 	thread := map[string]any{
 		"id":                snapshot.threadID,
 		"v":                 version,
@@ -12732,7 +12764,8 @@ func neoCloudThread(snapshot neoCloudThreadSnapshot) map[string]any {
 		"ownerUserId":       neoLocalOwnerUserID,
 		"threadStatus":      threadStatus,
 		"messages":          cloudMessages,
-		"agentMode":         neoCloudAgentMode(snapshot, messages),
+		"agentMode":         agentMode,
+		"settings":          settings,
 		"env":               neoCloudEnvironment(snapshot.environment),
 		"relationships":     relationships,
 		"artifacts":         nonNilArray(snapshot.artifacts),
@@ -12741,6 +12774,11 @@ func neoCloudThread(snapshot neoCloudThreadSnapshot) map[string]any {
 		"nextMessageId":     len(cloudMessages),
 		"activatedSkills":   []any{},
 		"meta":              meta,
+		"hasExecutor":       snapshot.executorConnected,
+		"executorConnected": snapshot.executorConnected,
+	}
+	if reasoningEffort != "" {
+		thread["reasoningEffort"] = reasoningEffort
 	}
 	thread["archived"] = snapshot.archived
 	if snapshot.maxTokens != nil {
@@ -13116,6 +13154,28 @@ func neoCloudAgentMode(snapshot neoCloudThreadSnapshot, messages []neoMessage) s
 		}
 	}
 	return "smart"
+}
+
+func neoExplicitThreadReasoningEffort(settings map[string]any, messages []neoMessage, agentMode string) string {
+	for _, raw := range []any{settings["reasoning.effort"], settings["reasoningEffort"]} {
+		effort := strings.ToLower(strings.TrimSpace(stringValue(raw)))
+		if neoReasoningEffortAllowedForMode(agentMode, effort) {
+			return effort
+		}
+	}
+	for i := len(messages) - 1; i >= 0; i-- {
+		message := messages[i]
+		if message.Role != "user" || strings.TrimSpace(message.ReasoningEffort) == "" {
+			continue
+		}
+		if message.AgentMode != "" && !strings.EqualFold(message.AgentMode, agentMode) {
+			continue
+		}
+		if neoReasoningEffortAllowedForMode(agentMode, message.ReasoningEffort) {
+			return strings.ToLower(strings.TrimSpace(message.ReasoningEffort))
+		}
+	}
+	return ""
 }
 
 func neoCloudTitle(messages []neoMessage) string {
