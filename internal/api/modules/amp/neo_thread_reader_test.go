@@ -39,11 +39,14 @@ func neoReadThreadTestFinalJSON(text string) string {
 func neoReadThreadAssertAgentRequest(t *testing.T, request neoInferenceRequest) {
 	t.Helper()
 	route := request.ModelRouteOverride
-	if route == nil || route.Provider != "google" || route.Model != neoReadThreadAgentModel {
-		t.Fatalf("read_thread route = %#v, want google/%s", route, neoReadThreadAgentModel)
+	if route == nil || route.Provider != neoReadThreadAgentProvider || route.Model != neoReadThreadAgentModel {
+		t.Fatalf("read_thread route = %#v, want %s/%s", route, neoReadThreadAgentProvider, neoReadThreadAgentModel)
 	}
-	if request.ReasoningEffort != neoReadThreadAgentEffort || stringValue(request.Settings["reasoning.effort"]) != neoReadThreadAgentEffort || stringValue(request.Settings["gemini.thinkingLevel"]) != neoReadThreadAgentEffort {
-		t.Fatalf("read_thread effort request=%q settings=%#v, want high", request.ReasoningEffort, request.Settings)
+	if request.ReasoningEffort != neoReadThreadAgentEffort || stringValue(request.Settings["reasoning.effort"]) != neoReadThreadAgentEffort {
+		t.Fatalf("read_thread effort request=%q settings=%#v, want %s", request.ReasoningEffort, request.Settings, neoReadThreadAgentEffort)
+	}
+	if _, ok := request.Settings["gemini.thinkingLevel"]; ok {
+		t.Fatalf("read_thread settings = %#v, want no Gemini thinking level for %s/%s", request.Settings, neoReadThreadAgentProvider, neoReadThreadAgentModel)
 	}
 	if request.DisableSystemPrompt || request.DisableProviderReasoning {
 		t.Fatalf("read_thread disabled flags system=%v providerReasoning=%v, want false", request.DisableSystemPrompt, request.DisableProviderReasoning)

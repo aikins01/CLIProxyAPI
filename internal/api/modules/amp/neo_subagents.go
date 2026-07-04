@@ -105,16 +105,14 @@ var neoSubagentDefs = map[string]neoSubagentDef{
 		SystemPrompt: neoTaskSubagentPrompt,
 		MaxTurns:     30,
 	},
-	// run_check backs the review agent mode. The retired client-side check
-	// runner executed per-check agents on Haiku; that route is kept here now
-	// that the runner is server-owned.
 	"run_check": {
-		Key:          "run_check",
-		DisplayName:  "Check",
-		Route:        neoModelRoute{Provider: "anthropic", Model: "claude-haiku-4-5-20251001"},
-		IncludeTools: []string{"Read", "Grep", "glob", "Bash"},
-		SystemPrompt: neoRunCheckSubagentPrompt,
-		MaxTurns:     12,
+		Key:             "run_check",
+		DisplayName:     "Check",
+		Route:           neoModelRoute{Provider: "google", Model: "gemini-3.5-flash"},
+		IncludeTools:    []string{"Read", "Grep", "glob", "Bash"},
+		SystemPrompt:    neoRunCheckSubagentPrompt,
+		ReasoningEffort: "high",
+		MaxTurns:        12,
 	},
 }
 

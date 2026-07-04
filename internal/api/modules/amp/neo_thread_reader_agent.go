@@ -15,8 +15,9 @@ import (
 )
 
 const (
-	neoReadThreadAgentModel        = "gemini-3.5-flash"
-	neoReadThreadAgentEffort       = "high"
+	neoReadThreadAgentProvider     = "openai"
+	neoReadThreadAgentModel        = "gpt-5.5"
+	neoReadThreadAgentEffort       = "medium"
 	neoReadThreadMaxTurns          = 16
 	neoReadThreadSearchLimit       = 12
 	neoReadThreadSearchLimitMax    = 40
@@ -334,7 +335,6 @@ func (a *neoActor) executeLocalReadThreadAgent(pending neoPendingTool, generatio
 	a.mu.Lock()
 	settings := cloneMap(a.settings)
 	settings["reasoning.effort"] = neoReadThreadAgentEffort
-	settings["gemini.thinkingLevel"] = neoReadThreadAgentEffort
 	environment := cloneMap(a.environment)
 	maxTokens := a.maxTokens
 	actorID := a.id
@@ -342,7 +342,7 @@ func (a *neoActor) executeLocalReadThreadAgent(pending neoPendingTool, generatio
 	agentMode := firstNonEmptyString(pending.AgentMode, a.currentAgentMode)
 	a.mu.Unlock()
 
-	route := neoModelRoute{Provider: "google", Model: neoReadThreadAgentModel}
+	route := neoModelRoute{Provider: neoReadThreadAgentProvider, Model: neoReadThreadAgentModel}
 	conversation := []neoHistoryMessage{{Role: "user", Text: neoReadThreadAgentInput(corpus, goal)}}
 	tools := neoReadThreadInternalToolSpecs()
 	sawSearch := false

@@ -24,6 +24,7 @@ func TestNeoSubagentRegistryMatchesBinary(t *testing.T) {
 		{"finder", "anthropic", "claude-haiku-4-5-20251001", "", []string{"Grep", "glob", "Read"}},
 		{"oracle", "anthropic", "claude-fable-5", "high", []string{"Read", "Grep", "glob", "web_search", "read_web_page", "read_thread", "find_thread"}},
 		{"librarian", "openai", "gpt-5.5", "none", []string{"read_github", "search_github", "commit_search", "diff", "list_directory_github", "list_repositories", "glob_github"}},
+		{"run_check", "google", "gemini-3.5-flash", "high", []string{"Read", "Grep", "glob", "Bash"}},
 		// Task inherits the parent model (empty route) and includes finder (a nested subagent).
 		{"Task", "", "", "", []string{"Read", "Bash", "edit_file", "create_file", "read_web_page", "web_search", "finder", "skill", "view_media"}},
 	}
@@ -150,8 +151,64 @@ func TestNeoLibrarianSubagentUsesGPT55None(t *testing.T) {
 	}
 }
 
+func TestNeoRunCheckSubagentUsesGeminiFlashHigh(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-run-check", "thread-actor", "T-run-check", "T-run-check", neoActorRecord("actor-run-check", "thread-actor", "T-run-check"), nil)
+	actor.currentAgentMode = "review"
+	actor.settings = map[string]any{"reasoning.effort": "medium"}
+	actor.tools = map[string]neoToolSpec{
+		"Read": {Name: "Read", InputSchema: map[string]any{"type": "object"}},
+		"Grep": {Name: "Grep", InputSchema: map[string]any{"type": "object"}},
+		"glob": {Name: "glob", InputSchema: map[string]any{"type": "object"}},
+		"Bash": {Name: "Bash", InputSchema: map[string]any{"type": "object"}},
+	}
+
+	var seen []neoInferenceRequest
+	rt.inferStream = func(_ *neoRuntime, req neoInferenceRequest, _ neoStreamCallback) (neoInferenceResult, error) {
+		seen = append(seen, req)
+		return neoInferenceResult{Text: `{"comments":[]}`}, nil
+	}
+
+	_, err := actor.executeSubagentRun("run_check", map[string]any{
+		"checkName":       "repo-convention-fit",
+		"checkURI":        "file:///checks/repo-convention-fit.md",
+		"checkContent":    "Prefer repository conventions.",
+		"diffDescription": "uncommitted changes",
+		"files":           []any{"internal/api/modules/amp/neo_subagents.go"},
+	}, "TU-run-check", "M-1", actor.generation, 0, "")
+	if err != nil {
+		t.Fatalf("run_check subagent failed: %v", err)
+	}
+	if len(seen) != 1 {
+		t.Fatalf("run_check requests = %#v, want exactly one", seen)
+	}
+	route := seen[0].ModelRouteOverride
+	if route == nil || route.Provider != "google" || route.Model != "gemini-3.5-flash" {
+		t.Fatalf("run_check route = %#v, want google/gemini-3.5-flash", route)
+	}
+	if seen[0].ReasoningEffort != "high" || stringValue(seen[0].Settings["reasoning.effort"]) != "high" {
+		t.Fatalf("run_check effort request=%q settings=%#v, want high", seen[0].ReasoningEffort, seen[0].Settings)
+	}
+	if !neoSubagentHasTools(seen[0].Tools, "Read", "Grep", "glob", "Bash") {
+		t.Fatalf("run_check tools = %#v, want review check tools", seen[0].Tools)
+	}
+}
+
+func neoSubagentHasTools(tools []neoToolSpec, names ...string) bool {
+	seen := map[string]bool{}
+	for _, tool := range tools {
+		seen[tool.Name] = true
+	}
+	for _, name := range names {
+		if !seen[name] {
+			return false
+		}
+	}
+	return true
+}
+
 func TestIsNeoLocalSubagentTool(t *testing.T) {
-	for _, name := range []string{"finder", "oracle", "librarian", "Task"} {
+	for _, name := range []string{"finder", "oracle", "librarian", "Task", "run_check"} {
 		if !isNeoLocalSubagentTool(name) {
 			t.Fatalf("%s should be a local subagent tool", name)
 		}
