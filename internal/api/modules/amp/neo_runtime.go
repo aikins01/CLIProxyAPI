@@ -7801,12 +7801,7 @@ func (a *neoActor) prepareCompactionPlanLocked(cfg *config.Config, settings map[
 
 func (a *neoActor) runCompactionPlan(plan neoCompactionPlan) bool {
 	compactionRoute := applyNeoModelMapping(a.runtime, selectNeoCompactionRoute(plan.cfg, plan.agentMode, plan.settings))
-	inferenceRoute := applyNeoModelMapping(a.runtime, selectNeoModelRouteWithConfig(a.runtime, plan.agentMode, plan.settings))
-	_, _, manualTooLarge := neoCompactionRequestExceedsInputBudget(plan.agentMode, compactionRoute, plan.compactionMessages, plan.summaryPrompt)
 	a.broadcast(map[string]any{"type": "compaction_started"})
-	if manualTooLarge && neoCompactionRouteUsesNativeOpenAI(compactionRoute, inferenceRoute) {
-		return a.runNativeOpenAICompactionPlan(plan, compactionRoute)
-	}
 	return a.runManualCompactionPlan(plan, compactionRoute)
 }
 
@@ -7877,63 +7872,6 @@ func (a *neoActor) runManualCompactionPlan(plan neoCompactionPlan, compactionRou
 	return true
 }
 
-func (a *neoActor) runNativeOpenAICompactionPlan(plan neoCompactionPlan, compactionRoute neoModelRoute) bool {
-	items, err := inferNeoOpenAICompactionNative(a.runtime, plan.threadID, compactionRoute, plan.compactionMessages)
-	if err != nil {
-		log.Warnf("amp neo local runtime native compaction failed thread=%s: %v", plan.threadID, err)
-		a.mu.Lock()
-		a.finishFailedCompactionPlanLocked(plan)
-		a.mu.Unlock()
-		a.syncCloudAsync()
-		a.broadcast(neoProtocolCompactionCompletePayload(nil))
-		return false
-	}
-	if len(items) == 0 {
-		log.Warnf("amp neo local runtime native compaction returned no items thread=%s provider=%s model=%s", plan.threadID, compactionRoute.Provider, compactionRoute.Model)
-		a.mu.Lock()
-		a.finishFailedCompactionPlanLocked(plan)
-		a.mu.Unlock()
-		a.syncCloudAsync()
-		a.broadcast(neoProtocolCompactionCompletePayload(nil))
-		return false
-	}
-
-	compactionMessage := neoOpenAICompactionMessage(plan.threadID, items)
-	a.mu.Lock()
-	if plan.generation != a.generation || plan.cutIndex > len(a.messages) || (plan.cutMessageID != "" && (plan.cutIndex >= len(a.messages) || a.messages[plan.cutIndex].MessageID != plan.cutMessageID)) {
-		a.compacting = false
-		a.mu.Unlock()
-		a.broadcast(neoProtocolCompactionCompletePayload(nil))
-		return false
-	}
-	compactionMessage.Seq = a.nextSeqLocked()
-	if plan.markCurrentInferenceAsChecked && a.currentInference != nil {
-		a.currentInference.preflightCompactionChecked = true
-	}
-	a.compactionRetryAfterLen = 0
-	updated := make([]neoMessage, 0, len(a.messages)+1)
-	updated = append(updated, a.messages[:plan.cutIndex]...)
-	updated = append(updated, compactionMessage)
-	updated = append(updated, a.messages[plan.cutIndex:]...)
-	a.messages = updated
-	recordCutMessageID := compactionMessage.MessageID
-	record := map[string]any{"cutMessageId": recordCutMessageID, "createdAt": time.Now().UTC().Format(time.RFC3339Nano)}
-	a.compacting = false
-	a.upsertCompactionRecordLocked(record)
-	a.rebuildHistoryLocked()
-	records := a.compactionRecordListLocked()
-	addedEvent := neoMessageAddedPayload(compactionMessage)
-	a.rememberReplayEventLocked(addedEvent)
-	a.mu.Unlock()
-
-	a.broadcast(addedEvent)
-	a.broadcast(neoProtocolCompactionCompletePayload(recordCutMessageID))
-	a.broadcast(map[string]any{"type": "compaction_records", "records": neoProtocolCompactionRecordList(records)})
-	a.dispatchNotification("thread", "compaction_complete", map[string]any{"cutMessageId": recordCutMessageID})
-	a.syncCloudAsync()
-	return true
-}
-
 func (a *neoActor) finishFailedCompactionPlanLocked(plan neoCompactionPlan) {
 	a.compacting = false
 	if plan.markCurrentInferenceAsChecked && plan.generation == a.generation && a.currentInference != nil {
@@ -7947,31 +7885,6 @@ func (a *neoActor) finishFailedCompactionPlanLocked(plan neoCompactionPlan) {
 		if retryAfterLen > a.compactionRetryAfterLen {
 			a.compactionRetryAfterLen = retryAfterLen
 		}
-	}
-}
-
-func neoCompactionRouteUsesNativeOpenAI(compactionRoute, inferenceRoute neoModelRoute) bool {
-	provider := strings.ToLower(strings.TrimSpace(compactionRoute.Provider))
-	if provider == "" {
-		provider = providerForNeoModel(compactionRoute.Model)
-	}
-	inferenceProvider := strings.ToLower(strings.TrimSpace(inferenceRoute.Provider))
-	if inferenceProvider == "" {
-		inferenceProvider = providerForNeoModel(inferenceRoute.Model)
-	}
-	return provider == "openai" && inferenceProvider == "openai"
-}
-
-func neoOpenAICompactionMessage(threadID string, items []any) neoMessage {
-	return neoMessage{
-		ThreadID:  threadID,
-		MessageID: newNeoMessageID(),
-		Role:      "info",
-		Content: []any{map[string]any{
-			"type":  "openai_compaction",
-			"items": cloneNeoJSONArray(items),
-		}},
-		CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
 	}
 }
 
@@ -19334,6 +19247,9 @@ func inferNeoLocal(rt *neoRuntime, request neoInferenceRequest) (neoInferenceRes
 		route = *request.ModelRouteOverride
 	}
 	route = applyNeoModelMapping(rt, route)
+	if err := neoInferenceInputBudgetError(request, route); err != nil {
+		return neoInferenceResult{}, err
+	}
 	switch route.Provider {
 	case "anthropic":
 		return inferNeoAnthropic(rt, request, route)
@@ -19358,6 +19274,9 @@ func inferNeoLocalStream(rt *neoRuntime, request neoInferenceRequest, onDelta ne
 		route = *request.ModelRouteOverride
 	}
 	route = applyNeoModelMapping(rt, route)
+	if err := neoInferenceInputBudgetError(request, route); err != nil {
+		return neoInferenceResult{}, err
+	}
 	switch route.Provider {
 	case "anthropic":
 		return inferNeoAnthropicStream(rt, request, route, onDelta)
@@ -19371,6 +19290,29 @@ func inferNeoLocalStream(rt *neoRuntime, request neoInferenceRequest, onDelta ne
 		}
 		return neoInferenceResult{}, fmt.Errorf("unsupported local Neo provider %q", route.Provider)
 	}
+}
+
+func neoInferenceInputBudgetError(request neoInferenceRequest, route neoModelRoute) error {
+	maxInputTokens := neoEffectiveMaxInputTokens(request.AgentMode, route.Model)
+	if maxInputTokens <= 0 {
+		maxInputTokens = neoEffectiveContextWindow(request.AgentMode, route.Model)
+	}
+	if maxInputTokens <= 0 {
+		return nil
+	}
+	estimatedTokens := neoEstimateInferenceInputTokens(request, route)
+	if estimatedTokens <= maxInputTokens {
+		return nil
+	}
+	provider := strings.ToLower(strings.TrimSpace(route.Provider))
+	if provider == "" {
+		provider = providerForNeoModel(route.Model)
+	}
+	routeName := route.Model
+	if !strings.HasPrefix(strings.ToLower(routeName), provider+"/") {
+		routeName = provider + "/" + routeName
+	}
+	return fmt.Errorf("local Neo inference request too large for %s: estimated_input_tokens=%d max_input_tokens=%d; start a new thread or reduce the thread context", routeName, estimatedTokens, maxInputTokens)
 }
 
 // applyNeoModelMapping consults the shared ModelMapper and rewrites the route
@@ -20777,52 +20719,6 @@ func inferNeoCompactionLocal(rt *neoRuntime, threadID string, route neoModelRout
 		return strings.TrimSpace(stringValue(mapValue(mapValue(choices[0])["message"])["content"])), nil
 	default:
 		return "", fmt.Errorf("unsupported local Neo compaction provider %q", route.Provider)
-	}
-}
-
-func inferNeoOpenAICompactionNative(rt *neoRuntime, threadID string, route neoModelRoute, messages []neoMessage) ([]any, error) {
-	if route.Model == "" {
-		route.Model = defaultNeoCompactionModel
-	}
-	body := map[string]any{
-		"model": route.Model,
-		"input": openAIResponsesNeoInput(neoCompactionHistory(messages), ""),
-		"store": false,
-	}
-	jsonBody, err := callNeoLocalProvider(rt, "openai", "/v1/responses/compact", body, threadID)
-	if err != nil {
-		return nil, err
-	}
-	items := neoOpenAICompactionItems(jsonBody)
-	if len(items) == 0 {
-		return nil, fmt.Errorf("native OpenAI compaction returned no compaction items")
-	}
-	return items, nil
-}
-
-func neoOpenAICompactionItems(value any) []any {
-	items := make([]any, 0)
-	neoCollectOpenAICompactionItems(value, &items)
-	return items
-}
-
-func neoCollectOpenAICompactionItems(value any, items *[]any) {
-	switch typed := value.(type) {
-	case []any:
-		for _, item := range typed {
-			neoCollectOpenAICompactionItems(item, items)
-		}
-	case map[string]any:
-		switch stringValue(typed["type"]) {
-		case "compaction", "compaction_summary":
-			*items = append(*items, cloneMap(typed))
-			return
-		}
-		for _, key := range []string{"compaction", "output", "input", "items", "response"} {
-			if child, exists := typed[key]; exists {
-				neoCollectOpenAICompactionItems(child, items)
-			}
-		}
 	}
 }
 
