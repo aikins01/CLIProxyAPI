@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -186,6 +187,195 @@ func TestModifyResponse_GzipScenarios(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestModifyResponse_NormalizesThreadListRelationships(t *testing.T) {
+	proxy, err := createReverseProxy("http://example.com", NewStaticSecretSource("k"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body := []byte(`{"ok":true,"result":{"threads":[{"id":"T-1","title":"missing"},{"id":"T-2","title":"kept","relationships":[{"threadID":"T-1"}]}]}}`)
+	resp := mkResp(http.StatusOK, http.Header{"Content-Type": []string{"application/json"}}, body)
+	resp.Request = httptest.NewRequest(http.MethodPost, "http://proxy.local/api/internal?listThreads", nil)
+
+	if err := proxy.ModifyResponse(resp); err != nil {
+		t.Fatalf("ModifyResponse error: %v", err)
+	}
+	got, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("ReadAll error: %v", err)
+	}
+	var decoded any
+	if err := json.Unmarshal(got, &decoded); err != nil {
+		t.Fatalf("response JSON error: %v; body=%s", err, got)
+	}
+	assertThreadRelationshipsForTest(t, decoded)
+}
+
+func TestModifyResponse_NormalizesThreadListRelationshipsPreservesLargeNumbers(t *testing.T) {
+	proxy, err := createReverseProxy("http://example.com", NewStaticSecretSource("k"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body := []byte(`{"ok":true,"result":{"threads":[{"id":"T-1","title":"missing","precise":9007199254740993}]}}`)
+	resp := mkResp(http.StatusOK, http.Header{"Content-Type": []string{"application/json"}}, body)
+	resp.Request = httptest.NewRequest(http.MethodPost, "http://proxy.local/api/internal?listThreads", nil)
+
+	if err := proxy.ModifyResponse(resp); err != nil {
+		t.Fatalf("ModifyResponse error: %v", err)
+	}
+	got, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("ReadAll error: %v", err)
+	}
+	if !bytes.Contains(got, []byte(`"precise":9007199254740993`)) {
+		t.Fatalf("large numeric field changed: %s", got)
+	}
+	var decoded any
+	if err := json.Unmarshal(got, &decoded); err != nil {
+		t.Fatalf("response JSON error: %v; body=%s", err, got)
+	}
+	assertThreadRelationshipsForTest(t, decoded)
+}
+
+func TestModifyResponse_NormalizesBodyBasedThreadListRelationships(t *testing.T) {
+	proxy, err := createReverseProxy("http://example.com", NewStaticSecretSource("k"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body := []byte(`{"ok":true,"result":{"threads":[{"id":"T-1","title":"missing"}]}}`)
+	req := httptest.NewRequest(http.MethodPost, "http://proxy.local/api/internal", strings.NewReader(`{"method":"listThreads","params":{"limit":20}}`))
+	proxy.Director(req)
+	resp := mkResp(http.StatusOK, http.Header{"Content-Type": []string{"application/json"}}, body)
+	resp.Request = req
+
+	if err := proxy.ModifyResponse(resp); err != nil {
+		t.Fatalf("ModifyResponse error: %v", err)
+	}
+	got, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("ReadAll error: %v", err)
+	}
+	var decoded any
+	if err := json.Unmarshal(got, &decoded); err != nil {
+		t.Fatalf("response JSON error: %v; body=%s", err, got)
+	}
+	assertThreadRelationshipsForTest(t, decoded)
+}
+
+func TestAmpProxyInternalRPCMethodUsesQueryBeforeBody(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "http://proxy.local/api/internal?uploadThread", nil)
+	body := &readCountingBody{}
+	req.Body = body
+
+	if got := ampProxyInternalRPCMethod(req); got != "uploadThread" {
+		t.Fatalf("method = %q, want uploadThread", got)
+	}
+	if body.reads != 0 {
+		t.Fatalf("body reads = %d, want 0", body.reads)
+	}
+}
+
+func TestModifyResponse_DoesNotNormalizeThreadSearchRelationships(t *testing.T) {
+	proxy, err := createReverseProxy("http://example.com", NewStaticSecretSource("k"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body := []byte(`{"threads":[{"id":"T-1","title":"missing"}]}`)
+	resp := mkResp(http.StatusOK, http.Header{"Content-Type": []string{"application/json"}}, body)
+	resp.Request = httptest.NewRequest(http.MethodGet, "http://proxy.local/api/threads/find?q=needle", nil)
+
+	if err := proxy.ModifyResponse(resp); err != nil {
+		t.Fatalf("ModifyResponse error: %v", err)
+	}
+	got, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("ReadAll error: %v", err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Fatalf("thread search body changed:\nwant: %s\ngot:  %s", body, got)
+	}
+}
+
+func TestModifyResponse_NormalizesGzippedThreadListRelationships(t *testing.T) {
+	proxy, err := createReverseProxy("http://example.com", NewStaticSecretSource("k"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body := []byte(`{"ok":true,"result":{"threads":[{"id":"T-1","title":"missing"}]}}`)
+	resp := mkResp(http.StatusOK, http.Header{"Content-Type": []string{"application/json"}}, gzipBytes(body))
+	resp.Request = httptest.NewRequest(http.MethodPost, "http://proxy.local/api/internal?listThreads", nil)
+
+	if err := proxy.ModifyResponse(resp); err != nil {
+		t.Fatalf("ModifyResponse error: %v", err)
+	}
+	got, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("ReadAll error: %v", err)
+	}
+	var decoded any
+	if err := json.Unmarshal(got, &decoded); err != nil {
+		t.Fatalf("response JSON error: %v; body=%s", err, got)
+	}
+	assertThreadRelationshipsForTest(t, decoded)
+}
+
+func assertThreadRelationshipsForTest(t *testing.T, value any) {
+	t.Helper()
+	threads := threadListItemsForTest(value)
+	if len(threads) == 0 {
+		t.Fatalf("no thread list items in %#v", value)
+	}
+	for _, thread := range threads {
+		if _, ok := thread["relationships"].([]any); !ok {
+			t.Fatalf("thread relationships = %#v, want array in %#v", thread["relationships"], thread)
+		}
+	}
+}
+
+func threadListItemsForTest(value any) []map[string]any {
+	switch typed := value.(type) {
+	case []any:
+		return mapThreadItemsForTest(typed)
+	case map[string]any:
+		for _, key := range []string{"threads", "items", "data"} {
+			if items := mapThreadItemsForTest(arrayValue(typed[key])); len(items) > 0 {
+				return items
+			}
+		}
+		if result := typed["result"]; result != nil {
+			return threadListItemsForTest(result)
+		}
+	}
+	return nil
+}
+
+func mapThreadItemsForTest(items []any) []map[string]any {
+	out := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		if thread, ok := item.(map[string]any); ok {
+			out = append(out, thread)
+		}
+	}
+	return out
+}
+
+type readCountingBody struct {
+	reads int
+}
+
+func (b *readCountingBody) Read(_ []byte) (int, error) {
+	b.reads++
+	return 0, fmt.Errorf("unexpected body read")
+}
+
+func (b *readCountingBody) Close() error {
+	return nil
 }
 
 func TestModifyResponse_UpdatesContentLengthHeader(t *testing.T) {

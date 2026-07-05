@@ -190,7 +190,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	return fmt.Sprintf(`// ==UserScript==
 // @name CLIProxyAPI Amp Local Inference
 // @namespace https://github.com/router-for-me/CLIProxyAPI
-// @version 0.1.27
+// @version 0.1.28
 %s
 // @updateURL %s
 // @downloadURL %s
@@ -237,7 +237,8 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		lastInheritedWorkingDirectory: "",
 		lastInheritedWorkingDirectoryThreadID: "",
 		lastObservedThreadID: "",
-		};
+		localSidebarSeedCount: 0,
+	};
 	let observedThreadID = "";
 
 	function localBaseURL() {
@@ -899,7 +900,159 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	let cachedLocalSidebarProjects = [];
 	let cachedLocalSidebarRecentThreads = [];
 
+	function localGoFilePathEscape(part) {
+		return encodeURIComponent(part)
+			.replace(/[!'()*]/g, (value) => "%%" + value.charCodeAt(0).toString(16).toUpperCase())
+			.replace(/%%24/g, "$")
+			.replace(/%%26/g, "&")
+			.replace(/%%2B/gi, "+")
+			.replace(/%%2C/gi, ",")
+			.replace(/%%3B/gi, ";")
+			.replace(/%%3D/gi, "=")
+			.replace(/%%3A/gi, ":")
+			.replace(/%%40/g, "@");
+	}
+
+	function localFileURLForDirectory(workingDirectory) {
+		return "file://" + normalizeWorkingDirectory(workingDirectory).split("/").map(localGoFilePathEscape).join("/");
+	}
+
+	function localUTF8Bytes(value) {
+		const text = String(value);
+		const bytes = [];
+		for (let i = 0; i < text.length; i += 1) {
+			let code = text.charCodeAt(i);
+			if (code >= 0xd800 && code <= 0xdbff && i + 1 < text.length) {
+				const next = text.charCodeAt(i + 1);
+				if (next >= 0xdc00 && next <= 0xdfff) {
+					code = 0x10000 + ((code - 0xd800) << 10) + (next - 0xdc00);
+					i += 1;
+				}
+			}
+			if (code < 0x80) {
+				bytes.push(code);
+			} else if (code < 0x800) {
+				bytes.push(0xc0 | (code >> 6), 0x80 | (code & 0x3f));
+			} else if (code < 0x10000) {
+				bytes.push(0xe0 | (code >> 12), 0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f));
+			} else {
+				bytes.push(0xf0 | (code >> 18), 0x80 | ((code >> 12) & 0x3f), 0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f));
+			}
+		}
+		return bytes;
+	}
+
+	function localRotateLeft(value, bits) {
+		return (value << bits) | (value >>> (32 - bits));
+	}
+
+	function localSHA1Bytes(bytes) {
+		const words = [];
+		const bitLength = bytes.length * 8;
+		for (let i = 0; i < bytes.length; i += 1) {
+			words[i >> 2] = (words[i >> 2] || 0) | (bytes[i] << (24 - ((i %% 4) * 8)));
+		}
+		words[bytes.length >> 2] = (words[bytes.length >> 2] || 0) | (0x80 << (24 - ((bytes.length %% 4) * 8)));
+		const lengthOffset = (((bytes.length + 8) >> 6) << 4) + 14;
+		words[lengthOffset] = Math.floor(bitLength / 0x100000000);
+		words[lengthOffset + 1] = bitLength >>> 0;
+		let h0 = 0x67452301;
+		let h1 = 0xefcdab89;
+		let h2 = 0x98badcfe;
+		let h3 = 0x10325476;
+		let h4 = 0xc3d2e1f0;
+		for (let i = 0; i < words.length; i += 16) {
+			const w = [];
+			for (let j = 0; j < 16; j += 1) {
+				w[j] = words[i + j] || 0;
+			}
+			for (let j = 16; j < 80; j += 1) {
+				w[j] = localRotateLeft(w[j - 3] ^ w[j - 8] ^ w[j - 14] ^ w[j - 16], 1);
+			}
+			let a = h0;
+			let b = h1;
+			let c = h2;
+			let d = h3;
+			let e = h4;
+			for (let j = 0; j < 80; j += 1) {
+				let f;
+				let k;
+				if (j < 20) {
+					f = (b & c) | ((~b) & d);
+					k = 0x5a827999;
+				} else if (j < 40) {
+					f = b ^ c ^ d;
+					k = 0x6ed9eba1;
+				} else if (j < 60) {
+					f = (b & c) | (b & d) | (c & d);
+					k = 0x8f1bbcdc;
+				} else {
+					f = b ^ c ^ d;
+					k = 0xca62c1d6;
+				}
+				const temp = (localRotateLeft(a, 5) + f + e + k + w[j]) | 0;
+				e = d;
+				d = c;
+				c = localRotateLeft(b, 30);
+				b = a;
+				a = temp;
+			}
+			h0 = (h0 + a) | 0;
+			h1 = (h1 + b) | 0;
+			h2 = (h2 + c) | 0;
+			h3 = (h3 + d) | 0;
+			h4 = (h4 + e) | 0;
+		}
+		const digest = [];
+		for (const word of [h0, h1, h2, h3, h4]) {
+			digest.push((word >>> 24) & 0xff, (word >>> 16) & 0xff, (word >>> 8) & 0xff, word & 0xff);
+		}
+		return digest;
+	}
+
+	function localHexByte(value) {
+		return value.toString(16).padStart(2, "0");
+	}
+
+	function localProjectIDForWorkingDirectory(name, repositoryURL, workingDirectory) {
+		const keyParts = [name, repositoryURL, workingDirectory].map((value) => typeof value === "string" ? value : "");
+		let key = keyParts.join("\x00");
+		if (keyParts.every((value) => value.trim() === "")) {
+			key = "local";
+		}
+		const namespaceURL = [0x6b, 0xa7, 0xb8, 0x11, 0x9d, 0xad, 0x11, 0xd1, 0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8];
+		const hash = localSHA1Bytes(namespaceURL.concat(localUTF8Bytes(key))).slice(0, 16);
+		hash[6] = (hash[6] & 0x0f) | 0x50;
+		hash[8] = (hash[8] & 0x3f) | 0x80;
+		const hex = hash.map(localHexByte);
+		return hex.slice(0, 4).join("") + "-" + hex.slice(4, 6).join("") + "-" + hex.slice(6, 8).join("") + "-" + hex.slice(8, 10).join("") + "-" + hex.slice(10, 16).join("");
+	}
+
+	function seedLocalSidebarProjects() {
+		const workingDirectory = normalizeWorkingDirectory(localWorkingDirectory());
+		if (!workingDirectory) {
+			return;
+		}
+		const name = pathBaseName(workingDirectory) || "local";
+		const repositoryURL = localFileURLForDirectory(workingDirectory);
+		const projectID = localProjectIDForWorkingDirectory(name, repositoryURL, workingDirectory);
+		if (cachedLocalSidebarProjects.some((project) => isPlainObject(project) && normalizeWorkingDirectory(project.workingDirectory) === workingDirectory)) {
+			return;
+		}
+		cachedLocalSidebarProjects = [{
+			id: projectID,
+			projectID,
+			name,
+			namespace: "local",
+			repositoryURL,
+			workingDirectory,
+		}, ...cachedLocalSidebarProjects];
+		diagnostics.localSidebarSeedCount += 1;
+		diagnostics.localSidebarProjectCount = cachedLocalSidebarProjects.length;
+	}
+
 	function refreshLocalSidebarProjects() {
+		seedLocalSidebarProjects();
 		const base = localBaseURLString();
 		if (!base || !storedLocalAPIKey()) {
 			return;
@@ -1175,15 +1328,31 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		return patched;
 	}
 
-	function patchDecodedLocalInference(value) {
-		const localBase = localBaseURLString();
-		const patched = patchDevalueThreadActorConfigs(value, localBase) ||
-			patchPlainThreadActorConfigs(value, new WeakSet(), localBase);
-		if (patched) {
-			diagnostics.decodedConfigPatchCount += 1;
-			diagnostics.lastPatchedThreadActorBaseURL = localBase;
+	function parsedTextLocalInferencePatchOptions(text) {
+		const source = typeof text === "string" ? text : "";
+		if (!source) {
+			return { configs: false, sidebar: false };
 		}
-		mergeDevalueSidebarProjects(value);
+		return {
+			configs: source.includes("threadActorConfig") || source.includes("wsToken") || source.includes("hasExecutor") || source.includes("executorConnected") || source.includes("thread_settings") || source.includes("baseURL") || source.includes("ampURL") || source.includes("threadId") || source.includes("threadID") || source.includes("thread_id") || source.includes("\"id\"") || source.includes("workingDirectory") || source.includes("workspaceRoot") || source.includes("workspace"),
+			sidebar: (cachedLocalSidebarProjects.length > 0 || cachedLocalSidebarRecentThreads.length > 0) && source.includes("projects") && source.includes("recentThreads"),
+		};
+	}
+
+	function patchDecodedLocalInference(value, options) {
+		const patchOptions = options || { configs: true, sidebar: true };
+		if (patchOptions.configs) {
+			const localBase = localBaseURLString();
+			const patched = patchDevalueThreadActorConfigs(value, localBase) ||
+				patchPlainThreadActorConfigs(value, new WeakSet(), localBase);
+			if (patched) {
+				diagnostics.decodedConfigPatchCount += 1;
+				diagnostics.lastPatchedThreadActorBaseURL = localBase;
+			}
+		}
+		if (patchOptions.sidebar) {
+			mergeDevalueSidebarProjects(value);
+		}
 	}
 
 	function threadActorAPIPath(path) {
@@ -1421,9 +1590,9 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	}
 
 	function pathBaseName(path) {
-		path = normalizeWorkingDirectory(path).replace(/\/+$/, "");
-		const index = path.lastIndexOf("/");
-		return index >= 0 ? path.slice(index + 1) : path;
+		path = normalizeWorkingDirectory(path).replace(/[\\/]+$/, "");
+		const parts = path.split(/[\\/]+/);
+		return parts[parts.length - 1] || "";
 	}
 
 	function visibleProjectName() {
@@ -1442,14 +1611,41 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		if (!name) {
 			return "";
 		}
-		const matches = [];
+		const matches = new Set();
 		for (const workingDirectory of Object.values(threadWorkingDirectories())) {
 			const normalized = normalizeWorkingDirectory(workingDirectory);
 			if (normalized && pathBaseName(normalized) === name) {
-				matches.push(normalized);
+				matches.add(normalized);
 			}
 		}
-		return matches.length === 1 ? matches[0] : "";
+		for (const project of cachedLocalSidebarProjects) {
+			if (!isPlainObject(project)) {
+				continue;
+			}
+			const normalized = normalizeWorkingDirectory(project.workingDirectory);
+			const projectName = firstString(project.name);
+			if (normalized && (projectName === name || pathBaseName(normalized) === name)) {
+				matches.add(normalized);
+			}
+		}
+		return matches.size === 1 ? [...matches][0] : "";
+	}
+
+	function cachedProjectWorkingDirectory(projectID) {
+		projectID = firstString(projectID);
+		if (!projectID) {
+			return "";
+		}
+		for (const project of cachedLocalSidebarProjects) {
+			if (!isPlainObject(project) || ![project.id, project.projectID, project.projectId, project.project_id].some((value) => firstString(value) === projectID)) {
+				continue;
+			}
+			const workingDirectory = normalizeWorkingDirectory(project.workingDirectory);
+			if (workingDirectory) {
+				return workingDirectory;
+			}
+		}
+		return "";
 	}
 
 	function remoteCreateProjectThreadWorkingDirectory(body) {
@@ -1458,11 +1654,16 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		if (fromMention) {
 			return fromMention;
 		}
+		const projectID = isPlainObject(decoded) ? firstString(decoded.projectID, decoded.projectId, decoded.project_id) : "";
+		const fromCachedProject = cachedProjectWorkingDirectory(projectID);
+		if (fromCachedProject) {
+			return fromCachedProject;
+		}
 		const fromVisibleProject = visibleProjectWorkingDirectory();
 		if (fromVisibleProject) {
 			return fromVisibleProject;
 		}
-		if (isPlainObject(decoded) && firstString(decoded.projectID, decoded.projectId, decoded.project_id)) {
+		if (projectID) {
 			return "";
 		}
 		return localWorkingDirectory();
@@ -2250,7 +2451,10 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	globalThis.JSON.parse = function(text, reviver) {
 		const parsed = originalJSONParse(text, reviver);
 		try {
-			patchDecodedLocalInference(parsed);
+			const patchOptions = parsedTextLocalInferencePatchOptions(text);
+			if (patchOptions.configs || patchOptions.sidebar) {
+				patchDecodedLocalInference(parsed, patchOptions);
+			}
 		} catch {
 		}
 		return parsed;
