@@ -7074,6 +7074,10 @@ func TestNeoRuntimeTerminalBridgeRetypesBothDirections(t *testing.T) {
 	defer executor.Close()
 	waitForNeoMessageType(t, client, "agent_state", 2*time.Second)
 	waitForNeoMessageType(t, executor, "agent_state", 2*time.Second)
+	if err := executor.WriteJSON(map[string]any{"type": "executor_connected", "executorId": "active-executor"}); err != nil {
+		t.Fatalf("write executor_connected: %v", err)
+	}
+	waitForNeoMessageType(t, client, "executor_connected", 2*time.Second)
 
 	for i, suffix := range []string{"open", "input", "resize", "close", "output", "exit"} {
 		clientType := "client_terminal_" + suffix
@@ -7095,6 +7099,55 @@ func TestNeoRuntimeTerminalBridgeRetypesBothDirections(t *testing.T) {
 		if fromExecutor["terminalId"] != executorMarker || fromExecutor["marker"] != executorMarker || numberFrom(fromExecutor["ordinal"]) != i {
 			t.Fatalf("%s bridge = %#v", executorType, fromExecutor)
 		}
+	}
+}
+
+func TestNeoRuntimeTerminalBridgeUsesActiveExecutor(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	t.Cleanup(server.Close)
+
+	threadID := "T-019e0e6e-f3f1-7081-b5dd-748f66f8c25e"
+	client := dialNeoActorWebSocket(t, server.URL, threadID)
+	defer client.Close()
+	probeClient := dialNeoActorWebSocket(t, server.URL, threadID)
+	defer probeClient.Close()
+	activeExecutor := dialNeoActorWebSocket(t, server.URL, threadID)
+	defer activeExecutor.Close()
+	extraSocket := dialNeoActorWebSocket(t, server.URL, threadID)
+	defer extraSocket.Close()
+	waitForNeoMessageType(t, client, "agent_state", 2*time.Second)
+	waitForNeoMessageType(t, probeClient, "agent_state", 2*time.Second)
+	waitForNeoMessageType(t, activeExecutor, "agent_state", 2*time.Second)
+	waitForNeoMessageType(t, extraSocket, "agent_state", 2*time.Second)
+
+	if err := activeExecutor.WriteJSON(map[string]any{"type": "executor_connected", "executorId": "active-executor"}); err != nil {
+		t.Fatalf("write active executor_connected: %v", err)
+	}
+	waitForNeoMessageType(t, client, "executor_connected", 2*time.Second)
+	waitForNeoMessageType(t, probeClient, "executor_connected", 2*time.Second)
+	waitForNeoMessageType(t, extraSocket, "executor_connected", 2*time.Second)
+
+	if err := client.WriteJSON(map[string]any{"type": "client_terminal_open", "terminalId": "term-1", "cols": 80, "rows": 24}); err != nil {
+		t.Fatalf("write client_terminal_open: %v", err)
+	}
+	open := waitForNeoMessageType(t, activeExecutor, "executor_terminal_open", 2*time.Second)
+	if open["terminalId"] != "term-1" {
+		t.Fatalf("executor_terminal_open = %#v", open)
+	}
+	assertNoNeoMessageType(t, extraSocket, "executor_terminal_open", 100*time.Millisecond)
+
+	if err := extraSocket.WriteJSON(map[string]any{"type": "executor_terminal_exit", "terminalId": "term-1", "error": "Remote terminal control is disabled"}); err != nil {
+		t.Fatalf("write stale executor_terminal_exit: %v", err)
+	}
+	assertNoNeoMessageType(t, probeClient, "client_terminal_exit", 100*time.Millisecond)
+
+	if err := activeExecutor.WriteJSON(map[string]any{"type": "executor_terminal_output", "terminalId": "term-1", "dataBase64": "b2s="}); err != nil {
+		t.Fatalf("write active executor_terminal_output: %v", err)
+	}
+	output := waitForNeoMessageType(t, client, "client_terminal_output", 2*time.Second)
+	if output["terminalId"] != "term-1" || output["dataBase64"] != "b2s=" {
+		t.Fatalf("client_terminal_output = %#v", output)
 	}
 }
 
@@ -7628,6 +7681,20 @@ func waitForNeoMessageType(t *testing.T, conn *websocket.Conn, msgType string, t
 	}
 	t.Fatalf("timed out waiting for websocket message type %q", msgType)
 	return nil
+}
+
+func assertNoNeoMessageType(t *testing.T, conn *websocket.Conn, msgType string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		msg, ok := readNeoMessage(t, conn, time.Until(deadline))
+		if !ok {
+			return
+		}
+		if msg["type"] == msgType {
+			t.Fatalf("unexpected websocket message type %q: %#v", msgType, msg)
+		}
+	}
 }
 
 func waitForNeoRivetBareInit(t *testing.T, conn *websocket.Conn, timeout time.Duration) map[string]any {

@@ -2625,7 +2625,7 @@ func (a *neoActor) handleForSocket(socket *neoSocket, msg map[string]any) any {
 	case "client_terminal_open", "client_terminal_input", "client_terminal_resize", "client_terminal_close", "client_terminal_output", "client_terminal_exit",
 		"executor_terminal_open", "executor_terminal_input", "executor_terminal_resize", "executor_terminal_close", "executor_terminal_output", "executor_terminal_exit":
 		if bridgedType, ok := neoTerminalBridgeType(msgType); ok {
-			a.broadcast(neoRetypedMessage(msg, bridgedType))
+			a.routeTerminalBridge(socket, msg, bridgedType)
 		}
 	case "client_upload_assets":
 		a.broadcast(neoRetypedMessage(msg, "executor_upload_assets"))
@@ -17820,6 +17820,34 @@ func (a *neoActor) broadcast(payload any) {
 	a.maybeBroadcastThreadStatusUpdated(payload)
 	for _, socket := range a.socketList() {
 		socket.send(payload)
+	}
+}
+
+func (a *neoActor) routeTerminalBridge(source *neoSocket, msg map[string]any, bridgedType string) {
+	payload := neoRetypedMessage(msg, bridgedType)
+	msgType := stringValue(msg["type"])
+	if strings.HasPrefix(msgType, "client_terminal_") {
+		a.mu.Lock()
+		executorSocket := a.executorSocket
+		a.mu.Unlock()
+		if executorSocket != nil {
+			executorSocket.send(payload)
+		}
+		return
+	}
+	if strings.HasPrefix(msgType, "executor_terminal_") {
+		a.mu.Lock()
+		executorSocket := a.executorSocket
+		a.mu.Unlock()
+		if source != nil && executorSocket != nil && source != executorSocket {
+			return
+		}
+		for _, socket := range a.socketList() {
+			if socket == source || socket.isExecutor() {
+				continue
+			}
+			socket.send(payload)
+		}
 	}
 }
 
