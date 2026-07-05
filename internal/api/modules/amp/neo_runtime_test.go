@@ -3442,6 +3442,127 @@ func TestNeoApplyWebLocalInferenceBootstrapQueryAppliesThreadDefaults(t *testing
 	}
 }
 
+func TestNeoApplyWebLocalInferenceBootstrapQueryDefaultsWorkingDirectory(t *testing.T) {
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+		NeoLocalRuntime: config.AmpNeoLocalRuntime{
+			Enabled:           &enabled,
+			ForceThreadActors: true,
+		},
+		WebLocalInference: config.AmpWebLocalInference{
+			Enabled:        true,
+			AllowedOrigins: []string{"https://ampcode.com"},
+		},
+	}})
+	threadID := "T-12121212-1212-4121-8121-121212121213"
+	actor, _ := rt.store.upsert(map[string]any{
+		"name": "threadActor",
+		"key":  threadID,
+		"input": map[string]any{
+			"threadId": threadID,
+		},
+	}, true)
+	expectedWorkingDirectory := neoDefaultWebLocalWorkingDirectory()
+	if expectedWorkingDirectory == "" {
+		t.Skip("no user home directory available")
+	}
+	rawURL := "/gateway/threadActor/websocket/?rvt-method=get&rvt-key=" + threadID + "&cliproxy-bootstrap-executor=true"
+	req := httptest.NewRequest(http.MethodGet, rawURL, nil)
+	req.Header.Set("Origin", "https://ampcode.com")
+	req.Header.Set(neoInternalClientAPIKeyHeader, "local-key")
+
+	neoApplyWebLocalInferenceBootstrapQuery(req, actor)
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if got := stringValue(actor.environment["workingDirectory"]); got != expectedWorkingDirectory {
+		t.Fatalf("workingDirectory = %q, want %q", got, expectedWorkingDirectory)
+	}
+	if got := stringValue(actor.environment["workspaceRoot"]); got != expectedWorkingDirectory {
+		t.Fatalf("workspaceRoot = %q, want %q", got, expectedWorkingDirectory)
+	}
+}
+
+func TestNeoApplyWebLocalInferenceBootstrapQueryDefaultsInvalidWorkingDirectory(t *testing.T) {
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+		NeoLocalRuntime: config.AmpNeoLocalRuntime{
+			Enabled:           &enabled,
+			ForceThreadActors: true,
+		},
+		WebLocalInference: config.AmpWebLocalInference{
+			Enabled:        true,
+			AllowedOrigins: []string{"https://ampcode.com"},
+		},
+	}})
+	threadID := "T-12121212-1212-4121-8121-121212121215"
+	actor, _ := rt.store.upsert(map[string]any{
+		"name": "threadActor",
+		"key":  threadID,
+		"input": map[string]any{
+			"threadId": threadID,
+		},
+	}, true)
+	expectedWorkingDirectory := neoDefaultWebLocalWorkingDirectory()
+	if expectedWorkingDirectory == "" {
+		t.Skip("no user home directory available")
+	}
+	rawURL := "/gateway/threadActor/websocket/?rvt-method=get&rvt-key=" + threadID +
+		"&cliproxy-bootstrap-executor=true&cliproxy-working-directory=" + url.QueryEscape(filepath.Join(t.TempDir(), "deleted"))
+	req := httptest.NewRequest(http.MethodGet, rawURL, nil)
+	req.Header.Set("Origin", "https://ampcode.com")
+	req.Header.Set(neoInternalClientAPIKeyHeader, "local-key")
+
+	neoApplyWebLocalInferenceBootstrapQuery(req, actor)
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if got := stringValue(actor.environment["workingDirectory"]); got != expectedWorkingDirectory {
+		t.Fatalf("workingDirectory = %q, want %q", got, expectedWorkingDirectory)
+	}
+}
+
+func TestNeoApplyWebLocalInferenceBootstrapQueryPreservesExistingWorkingDirectory(t *testing.T) {
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+		NeoLocalRuntime: config.AmpNeoLocalRuntime{
+			Enabled:           &enabled,
+			ForceThreadActors: true,
+		},
+		WebLocalInference: config.AmpWebLocalInference{
+			Enabled:        true,
+			AllowedOrigins: []string{"https://ampcode.com"},
+		},
+	}})
+	threadID := "T-12121212-1212-4121-8121-121212121214"
+	existingWorkingDirectory := neoExistingDirectory(t.TempDir())
+	actor, _ := rt.store.upsert(map[string]any{
+		"name": "threadActor",
+		"key":  threadID,
+		"input": map[string]any{
+			"threadId": threadID,
+		},
+	}, true)
+	actor.mu.Lock()
+	actor.environment = map[string]any{"workingDirectory": existingWorkingDirectory, "workspaceRoot": existingWorkingDirectory}
+	actor.mu.Unlock()
+	rawURL := "/gateway/threadActor/websocket/?rvt-method=get&rvt-key=" + threadID + "&cliproxy-bootstrap-executor=true"
+	req := httptest.NewRequest(http.MethodGet, rawURL, nil)
+	req.Header.Set("Origin", "https://ampcode.com")
+	req.Header.Set(neoInternalClientAPIKeyHeader, "local-key")
+
+	neoApplyWebLocalInferenceBootstrapQuery(req, actor)
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if got := stringValue(actor.environment["workingDirectory"]); got != existingWorkingDirectory {
+		t.Fatalf("workingDirectory = %q, want existing %q", got, existingWorkingDirectory)
+	}
+	if got := stringValue(actor.environment["workspaceRoot"]); got != existingWorkingDirectory {
+		t.Fatalf("workspaceRoot = %q, want existing %q", got, existingWorkingDirectory)
+	}
+}
+
 func TestNeoRuntimeWebLocalInferenceOriginBootstrapsExecutor(t *testing.T) {
 	dir := t.TempDir()
 	missingCommand := filepath.Join(dir, "missing-amp")

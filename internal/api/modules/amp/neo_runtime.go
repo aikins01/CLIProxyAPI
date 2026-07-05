@@ -1501,6 +1501,9 @@ func neoApplyWebLocalInferenceBootstrapQuery(r *http.Request, actor *neoActor) {
 	actor.mu.Lock()
 	defer actor.mu.Unlock()
 	modeDefaultAllowed := !actor.hasUserTurnLocked() && stringValue(actor.settings["agentMode"]) == ""
+	if workingDirectory == "" && neoExistingDirectory(neoWorkingDirectoryFromEnvironment(actor.environment)) == "" {
+		workingDirectory = neoDefaultWebLocalWorkingDirectory()
+	}
 	if workingDirectory != "" {
 		if actor.environment == nil {
 			actor.environment = map[string]any{}
@@ -1535,6 +1538,13 @@ func neoApplyWebLocalInferenceBootstrapQuery(r *http.Request, actor *neoActor) {
 	if strings.TrimSpace(actor.bootstrapExecutorType) == "" {
 		actor.bootstrapExecutorType = "local-client"
 	}
+}
+
+func neoDefaultWebLocalWorkingDirectory() string {
+	if home, err := os.UserHomeDir(); err == nil {
+		return neoExistingDirectory(home)
+	}
+	return ""
 }
 
 func neoWebLocalInferenceSocketRequested(r *http.Request, actor *neoActor) bool {

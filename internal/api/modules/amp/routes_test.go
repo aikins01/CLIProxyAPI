@@ -406,12 +406,14 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 	body := rec.Body.String()
 	for _, want := range []string{
 		"// ==UserScript==",
-		"@version 0.1.37",
+		"@version 0.1.39",
 		"@match https://ampcode.com/*",
 		"@updateURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
 		"@downloadURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
 		"@sandbox raw",
 		`"http://127.0.0.1:8317"`,
+		`let defaultWorkingDirectory = "";`,
+		"ensureDefaultWorkingDirectory",
 		ampWebLocalInferenceHeader,
 		"globalThis.JSON.parse",
 		"decodedConfigPatchCount",
@@ -422,6 +424,8 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"lastPatchedThreadActorBaseURL",
 		"lastPatchedThreadID",
 		"threadActorConfig",
+		"plainThreadActorConfigHasBridgeFields",
+		"devalueThreadActorConfigHasBridgeFields",
 		"local-client",
 		"cliproxyapi.ampLocalInference.apiKey",
 		"storedLocalAPIKey",
@@ -438,15 +442,25 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"selectedLocalProjectWorkingDirectory",
 		"rememberSelectedLocalProject",
 		"clearSelectedLocalProject",
+		"globalThis.localStorage.removeItem(workingDirectoryStorageKey)",
 		"normalizeLocalProject",
 		"fetchLocalProjects",
+		"function fetchLocalProjects(promptForKey = false)",
+		`const headers = localFetchHeaders("", false)`,
+		"localProjectLookupAPIKey",
+		"promptedProjectsAPIKey",
+		"responseDefaultWorkingDirectory",
+		"fetchLocalProjects(false)",
+		"fetchLocalProjects(true)",
 		"installLocalProjectPickerIntegration",
+		"installLocalProjectNoProjectSelectionHandler",
 		"localProjectPickerLooksLikeProjectPicker",
 		"closeLocalProjectPickerViaNoProject",
 		"localProjectFetchCount",
 		"localProjectPickerIntegrationCount",
 		"lastObservedThreadID",
 		"observedThreadID",
+		"threadID === pathThreadID()",
 		"normalizeExplicitReasoningEffort",
 		"lastInheritedWorkingDirectory",
 		"remoteShellCreateCount",
@@ -490,8 +504,14 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"internalAPIPath",
 		"workingDirectory",
 		`prompt("CLIProxyAPI API key")`,
+		"function localAPIKey(rememberCancel = true)",
 		`"Bearer " + apiKey`,
 		"gatewayActorPath",
+		"gatewayUserActorPath",
+		`"user-actor"`,
+		`.split("@")[0]`,
+		"shouldBridgeUserActorWebSocket",
+		"return !!threadID && rememberedLocalThreadID(threadID);",
 		"threadActorAPIPath",
 		"threadActorCreatePath",
 		"threadActorInstancePath",
@@ -521,6 +541,8 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"cliproxy-client",
 		"amp-web-local-inference",
 		"cliproxy-bootstrap-executor",
+		`const apiKey = local.searchParams.get("cliproxy-api-key") || (userActorSocket ? storedLocalAPIKey() : localAPIKey());`,
+		"if (userActorSocket && !apiKey)",
 		"/api/thread-actors",
 		"/api/internal",
 		"WebSocket",
@@ -1680,6 +1702,10 @@ func TestWebLocalInferenceLocalProjectsRoute(t *testing.T) {
 	projects := arrayValue(response["projects"])
 	if response["ok"] != true || len(projects) != 1 {
 		t.Fatalf("local projects response = %#v", response)
+	}
+	homeDirectory := neoDefaultWebLocalWorkingDirectory()
+	if stringValue(response["defaultWorkingDirectory"]) != homeDirectory {
+		t.Fatalf("defaultWorkingDirectory = %#v, want %q", response["defaultWorkingDirectory"], homeDirectory)
 	}
 	project := mapValue(projects[0])
 	if stringValue(project["id"]) != projectID || stringValue(project["workingDirectory"]) != workDir || stringValue(project["name"]) != "local-app" {
