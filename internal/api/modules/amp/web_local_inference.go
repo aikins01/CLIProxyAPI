@@ -209,7 +209,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	return fmt.Sprintf(`// ==UserScript==
 // @name CLIProxyAPI Amp Local Inference
 // @namespace https://github.com/router-for-me/CLIProxyAPI
-// @version 0.1.39
+// @version 0.1.41
 %s
 // @updateURL %s
 // @downloadURL %s
@@ -275,6 +275,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		lastObservedThreadID: "",
 	};
 	let observedThreadID = "";
+	let pendingLocalBootstrapThreadID = "";
 	let localProjectsCache = { at: 0, projects: [], promise: null };
 
 	function localBaseURL() {
@@ -2881,6 +2882,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	}
 
 	function localWebSocketURL(rawURL) {
+		pendingLocalBootstrapThreadID = "";
 		const source = new URL(String(rawURL), globalThis.location.href);
 		const base = localBaseURL();
 		if (!shouldRewriteWebSocket(source, base)) {
@@ -2889,6 +2891,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		const alreadyLocal = sameLocalWebSocketBase(source, base);
 		const local = alreadyLocal ? new URL(source.href) : new URL(source.pathname + source.search + source.hash, base);
 		const userActorSocket = shouldBridgeUserActorWebSocket(source);
+		const bootstrapExecutor = shouldBootstrapExecutor(source);
 		const apiKey = local.searchParams.get("cliproxy-api-key") || (userActorSocket ? storedLocalAPIKey() : localAPIKey());
 		if (userActorSocket && !apiKey) {
 			return rawURL;
@@ -2903,7 +2906,10 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		diagnostics.lastWebSocketPath = local.pathname;
 		diagnostics.lastWebSocketThreadKey = threadID || local.searchParams.get("rvt-key") || "";
 		diagnostics.lastWebSocketBootstrapped = false;
-		if (shouldBootstrapExecutor(source)) {
+		if (bootstrapExecutor && !userActorSocket && threadID && threadID === pathThreadID()) {
+			pendingLocalBootstrapThreadID = threadID;
+		}
+		if (bootstrapExecutor) {
 			const workingDirectory = localWorkingDirectory();
 			if (workingDirectory && !local.searchParams.has("cliproxy-working-directory")) {
 				local.searchParams.set("cliproxy-working-directory", workingDirectory);
@@ -2988,8 +2994,11 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	globalThis.WebSocket = new Proxy(NativeWebSocket, {
 		construct(target, args, newTarget) {
 			diagnostics.lastWebSocketProtocols = JSON.stringify(args.length > 1 ? args[1] : "");
+			let rememberLocalThreadIDOnOpen = "";
 			if (args.length > 0) {
 				args[0] = localWebSocketURL(args[0]);
+				rememberLocalThreadIDOnOpen = pendingLocalBootstrapThreadID;
+				pendingLocalBootstrapThreadID = "";
 			}
 			const socket = Reflect.construct(target, args, newTarget);
 			try {
@@ -3000,6 +3009,9 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 					diagnostics.activeWebSocketCount += 1;
 					diagnostics.lastWebSocketState = "open";
 					diagnostics.lastWebSocketReadyState = Number(socket.readyState);
+					if (rememberLocalThreadIDOnOpen) {
+						rememberLocalThreadID(rememberLocalThreadIDOnOpen);
+					}
 				});
 				socket.addEventListener("close", (event) => {
 					diagnostics.webSocketCloseCount += 1;
