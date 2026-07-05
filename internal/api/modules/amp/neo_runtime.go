@@ -2507,13 +2507,13 @@ func (a *neoActor) handleForSocket(socket *neoSocket, msg map[string]any) any {
 	case "client_edit_message":
 		a.editMessage(socket, msg)
 	case "executor_tool_result":
-		a.receiveToolResult(msg)
+		a.receiveToolResult(msg, socket)
 	case "executor_tool_result_ack":
 		a.broadcast(normalizeNeoToolResultAck(msg))
 	case "executor_tool_lease_revoked":
 		a.revokeToolLease(msg)
 	case "tool_progress":
-		a.handleToolProgress(msg)
+		a.handleToolProgress(msg, socket)
 	case "executor_tool_approval_request":
 		a.handleToolApprovalRequest(msg)
 	case "tool_approval_queue":
@@ -2966,7 +2966,11 @@ func (a *neoActor) toolProgressPayload(msg map[string]any) map[string]any {
 	return withNeoParentToolCallID(out, pending.ParentToolCallID)
 }
 
-func (a *neoActor) handleToolProgress(msg map[string]any) {
+func (a *neoActor) handleToolProgress(msg map[string]any, sockets ...*neoSocket) {
+	var socket *neoSocket
+	if len(sockets) > 0 {
+		socket = sockets[0]
+	}
 	payload := a.toolProgressPayload(msg)
 	toolCallID := stringValue(payload["toolCallId"])
 	if toolCallID == "" {
@@ -2988,6 +2992,10 @@ func (a *neoActor) handleToolProgress(msg map[string]any) {
 		payload["parentToolCallId"] = parentToolCallID
 	}
 	existingRun, userInput := a.toolResultRunLocked(toolCallID)
+	if !pendingExists && !subagentProgress && socket != nil && socket.isExecutor() {
+		a.mu.Unlock()
+		return
+	}
 	if neoToolRunTerminal(existingRun) {
 		a.mu.Unlock()
 		a.broadcast(payload)
@@ -7761,6 +7769,14 @@ func (a *neoActor) editMessage(socket *neoSocket, msg map[string]any) {
 	if editID == "" {
 		return
 	}
+	replacementMessageID := ""
+	if rawReplacementMessageID, exists := firstPresentValue(msg, "replacementMessageId", "replacementMessageID", "replacement_message_id"); exists && rawReplacementMessageID != nil {
+		replacementMessageID = protocolMessageIDValue(rawReplacementMessageID)
+		if replacementMessageID == "" {
+			a.rejectEdit(editID, "Invalid replacement message ID")
+			return
+		}
+	}
 	content, ok := normalizeNeoClientUserContent(msg["content"])
 	if !ok {
 		return
@@ -7792,6 +7808,15 @@ func (a *neoActor) editMessage(socket *neoSocket, msg map[string]any) {
 		a.rejectEdit(editID, "Only user messages can be edited")
 		return
 	}
+	if replacementMessageID != "" {
+		for i := 0; i < index; i++ {
+			if a.messages[i].MessageID == replacementMessageID {
+				a.mu.Unlock()
+				a.rejectEdit(editID, "Replacement message ID already exists")
+				return
+			}
+		}
+	}
 
 	a.generation++
 	updated := a.messages[index]
@@ -7804,6 +7829,52 @@ func (a *neoActor) editMessage(socket *neoSocket, msg map[string]any) {
 	}
 	if updated.CreatedAt == "" {
 		updated.CreatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	}
+
+	if replacementMessageID != "" {
+		updated.MessageID = replacementMessageID
+		truncateSeq := a.nextSeqLocked()
+		updated.Seq = a.nextSeqLocked()
+		trimmed := make([]neoMessage, 0, index+1)
+		trimmed = append(trimmed, a.messages[:index]...)
+		trimmed = append(trimmed, updated)
+		a.messages = trimmed
+		a.filterRelationshipsForTruncationLocked(index)
+		a.rebuildHistoryLocked()
+		a.pendingTools = map[string]neoPendingTool{}
+		a.approvalQueue = nil
+		a.agentState = "idle"
+		truncateEvent := map[string]any{"type": "thread_truncated", "seq": truncateSeq, "truncateFromMessage": messageID}
+		a.rememberReplayEventLocked(truncateEvent)
+		addedEvent := neoMessageAddedPayload(updated)
+		a.rememberReplayEventLocked(addedEvent)
+		ready := a.executorReady
+		mode := updated.AgentMode
+		if mode == "" {
+			mode = a.agentModeLocked()
+		}
+		effort := updated.ReasoningEffort
+		if !neoReasoningEffortAllowedForMode(mode, effort) {
+			effort = a.reasoningEffortForModeLocked(mode)
+		}
+		a.currentAgentMode = mode
+		a.currentReasoningEffort = effort
+		if !ready {
+			a.pendingInference = &neoInferenceInflight{agentMode: mode, reasoningEffort: effort, clientAPIKey: socket.clientKey()}
+		} else {
+			a.markInferenceAcceptedLocked()
+		}
+		a.mu.Unlock()
+
+		a.broadcast(truncateEvent)
+		a.broadcast(addedEvent)
+		a.syncCloudAsync()
+		if ready {
+			go a.runInferenceWithOptions(mode, effort, neoInferenceRunOptions{clientAPIKey: socket.clientKey()})
+			return
+		}
+		a.maybeSpawnWebLocalExecutorForPendingWork()
+		return
 	}
 
 	var truncateFromMessage string
@@ -8994,7 +9065,11 @@ func neoOpenAIThinkingBlockOffset(agentMode, provider string) int {
 	return 0
 }
 
-func (a *neoActor) receiveToolResult(msg map[string]any) {
+func (a *neoActor) receiveToolResult(msg map[string]any, sockets ...*neoSocket) {
+	var socket *neoSocket
+	if len(sockets) > 0 {
+		socket = sockets[0]
+	}
 	toolCallID := firstNonEmptyString(msg["toolCallId"], msg["toolUseId"], msg["toolUseID"], msg["tool_use_id"], msg["id"])
 	run := neoExecutorToolRunFromMessage(msg)
 	// Leaf-tool results for an in-flight subagent loop are routed to the waiting
@@ -9007,7 +9082,14 @@ func (a *neoActor) receiveToolResult(msg map[string]any) {
 	pending, ok := a.pendingTools[toolCallID]
 	if !ok {
 		a.mu.Unlock()
-		a.broadcast(map[string]any{"type": "executor_error", "message": "Unknown tool lease " + toolCallID, "toolCallId": toolCallID, "code": "LEASE_NOT_FOUND"})
+		if socket != nil && socket.isExecutor() {
+			if socket.conn != nil {
+				socket.send(normalizeNeoToolResultAck(msg))
+			}
+			return
+		}
+		payload := map[string]any{"type": "executor_error", "message": "Unknown tool lease " + toolCallID, "toolCallId": toolCallID, "code": "LEASE_NOT_FOUND"}
+		a.broadcast(payload)
 		return
 	}
 	if !neoToolRunTerminalForPending(pending, run) {

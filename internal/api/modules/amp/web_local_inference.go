@@ -209,7 +209,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	return fmt.Sprintf(`// ==UserScript==
 // @name CLIProxyAPI Amp Local Inference
 // @namespace https://github.com/router-for-me/CLIProxyAPI
-// @version 0.1.33
+// @version 0.1.37
 %s
 // @updateURL %s
 // @downloadURL %s
@@ -237,10 +237,15 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		fetchRewriteCount: 0,
 		webSocketRewriteCount: 0,
 		webSocketBootstrapCount: 0,
+		webSocketOpenCount: 0,
+		webSocketCloseCount: 0,
+		webSocketErrorCount: 0,
+		activeWebSocketCount: 0,
 		menuIntegrationCount: 0,
 		commandPaletteIntegrationCount: 0,
 		localProjectFetchCount: 0,
 		localProjectPickerIntegrationCount: 0,
+		localProjectActivatorIntegrationCount: 0,
 		localThreadPickerOpenCount: 0,
 		removedLocalThreadControlCount: 0,
 		remoteShellCreateCount: 0,
@@ -259,6 +264,11 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		lastWebSocketPath: "",
 		lastWebSocketThreadKey: "",
 		lastWebSocketBootstrapped: false,
+		lastWebSocketProtocols: "",
+		lastWebSocketState: "",
+		lastWebSocketReadyState: -1,
+		lastWebSocketCloseCode: 0,
+		lastWebSocketCloseReason: "",
 		lastInheritedWorkingDirectory: "",
 		lastInheritedWorkingDirectoryThreadID: "",
 		lastObservedThreadID: "",
@@ -1478,7 +1488,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			return response.json().catch(() => ({}));
 		}).then((decoded) => {
 			const projects = Array.isArray(decoded.projects) ? decoded.projects.map(normalizeLocalProject).filter(Boolean) : [];
-			localProjectsCache = { at: Date.now(), projects, promise: null };
+			localProjectsCache = { at: projects.length ? Date.now() : 0, projects, promise: null };
 			return projects;
 		}).catch(() => {
 			localProjectsCache.promise = null;
@@ -1829,6 +1839,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 
 	function installLocalProjectPickerIntegration() {
 		if (globalThis.__cliproxyAmpLocalInferenceProjectPickerObserver) {
+			integrateLocalProjectActivators(globalThis.document);
 			integrateLocalProjectPickers(globalThis.document);
 			return;
 		}
@@ -1836,6 +1847,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			for (const mutation of mutations) {
 				for (const node of mutation.addedNodes) {
 					if (node instanceof Element) {
+						integrateLocalProjectActivators(node);
 						integrateLocalProjectPickers(node);
 					}
 				}
@@ -1843,7 +1855,148 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		});
 		observer.observe(globalThis.document.documentElement, { childList: true, subtree: true });
 		globalThis.__cliproxyAmpLocalInferenceProjectPickerObserver = observer;
+		integrateLocalProjectActivators(globalThis.document);
 		integrateLocalProjectPickers(globalThis.document);
+	}
+
+	function integrateLocalProjectActivators(root) {
+		const workingDirectory = activeThreadWorkingDirectory() || visibleProjectWorkingDirectory() || selectedLocalProjectWorkingDirectory() || localWorkingDirectory();
+		if (!workingDirectory) {
+			return;
+		}
+		for (const activator of localProjectActivatorCandidates(root)) {
+			if (!localProjectActivatorNeedsPatch(activator, workingDirectory) || activator.dataset.cliproxyLocalProjectActivatorLoading === "1") {
+				continue;
+			}
+			activator.dataset.cliproxyLocalProjectActivatorLoading = "1";
+			fetchLocalProjects().then((projects) => {
+				delete activator.dataset.cliproxyLocalProjectActivatorLoading;
+				if (!globalThis.document.contains(activator) || !localProjectActivatorNeedsPatch(activator, workingDirectory)) {
+					return;
+				}
+				const project = localProjectByWorkingDirectory(projects, workingDirectory);
+				const label = firstString(project?.name, pathBaseName(workingDirectory));
+				if (!label) {
+					return;
+				}
+				patchLocalProjectActivator(activator, label, workingDirectory);
+			});
+		}
+	}
+
+	function localProjectActivatorCandidates(root) {
+		const out = [];
+		const add = (element) => {
+			if (element instanceof Element && !out.includes(element)) {
+				out.push(element);
+			}
+		};
+		const selector = "button,[role='button']";
+		if (root instanceof Element) {
+			if (root.matches(selector)) {
+				add(root);
+			}
+			root.querySelectorAll?.(selector).forEach(add);
+		} else {
+			root.querySelectorAll?.(selector).forEach(add);
+		}
+		return out;
+	}
+
+	function localProjectActivatorLooksUnset(activator) {
+		if (!elementVisible(activator)) {
+			return false;
+		}
+		const text = (activator.innerText || activator.textContent || "").replace(/\s+/g, " ").trim();
+		return /\bProject:\s*No Project\b/.test(text);
+	}
+
+	function localProjectActivatorNeedsPatch(activator, workingDirectory) {
+		if (!elementVisible(activator)) {
+			return false;
+		}
+		if (localProjectActivatorLooksUnset(activator)) {
+			return true;
+		}
+		if (activator.dataset?.cliproxyLocalProjectActivator !== "1") {
+			return false;
+		}
+		return normalizeWorkingDirectory(activator.dataset.cliproxyLocalProjectWorkingDirectory) !== normalizeWorkingDirectory(workingDirectory);
+	}
+
+	function patchLocalProjectActivator(activator, label, workingDirectory) {
+		const walker = globalThis.document.createTreeWalker(activator, NodeFilter.SHOW_TEXT);
+		let changed = false;
+		const replacementTargets = ["No Project", activator.dataset.cliproxyLocalProjectLabel].filter((target) => target && target !== label);
+		for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+			if (!node.nodeValue) {
+				continue;
+			}
+			let nextValue = node.nodeValue;
+			for (const target of replacementTargets) {
+				if (nextValue.includes(target)) {
+					nextValue = nextValue.split(target).join(label);
+				}
+			}
+			if (nextValue !== node.nodeValue) {
+				node.nodeValue = nextValue;
+				changed = true;
+			}
+		}
+		if (!changed) {
+			let text = activator.textContent || "";
+			for (const target of replacementTargets) {
+				if (text.includes(target)) {
+					text = text.split(target).join(label);
+					changed = true;
+				}
+			}
+			if (changed) {
+				activator.textContent = text;
+			}
+		}
+		const ariaLabel = activator.getAttribute("aria-label");
+		if (ariaLabel) {
+			let nextAriaLabel = ariaLabel;
+			for (const target of replacementTargets) {
+				if (nextAriaLabel.includes(target)) {
+					nextAriaLabel = nextAriaLabel.split(target).join(label);
+				}
+			}
+			if (nextAriaLabel !== ariaLabel) {
+				activator.setAttribute("aria-label", nextAriaLabel);
+			}
+		}
+		activator.dataset.cliproxyLocalProjectActivator = "1";
+		activator.dataset.cliproxyLocalProjectLabel = label;
+		activator.dataset.cliproxyLocalProjectWorkingDirectory = workingDirectory;
+		diagnostics.localProjectActivatorIntegrationCount += 1;
+	}
+
+	function refreshLocalProjectActivators(project) {
+		const workingDirectory = normalizeWorkingDirectory(project?.workingDirectory);
+		if (!workingDirectory) {
+			return;
+		}
+		const label = firstString(project?.name, pathBaseName(workingDirectory));
+		if (!label) {
+			return;
+		}
+		for (const activator of localProjectActivatorCandidates(globalThis.document)) {
+			if (localProjectActivatorLooksUnset(activator) || activator.dataset?.cliproxyLocalProjectActivator === "1") {
+				patchLocalProjectActivator(activator, label, workingDirectory);
+			}
+		}
+	}
+
+	function localProjectByWorkingDirectory(projects, workingDirectory) {
+		const target = normalizeWorkingDirectory(workingDirectory);
+		for (const project of projects || []) {
+			if (normalizeWorkingDirectory(project?.workingDirectory) === target) {
+				return project;
+			}
+		}
+		return null;
 	}
 
 	function integrateLocalProjectPickers(root) {
@@ -1852,16 +2005,31 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 				continue;
 			}
 			const list = commandPaletteList(picker);
+			if (list) {
+				installLocalProjectPickerKeyboardNavigation(picker, list);
+				autoSelectCurrentProjectInPicker(picker, list);
+			}
 			if (!list || list.querySelector("[data-cliproxy-local-project-item]") || list.dataset.cliproxyLocalProjectLoading === "1") {
 				continue;
 			}
 			list.dataset.cliproxyLocalProjectLoading = "1";
 			fetchLocalProjects().then((projects) => {
 				delete list.dataset.cliproxyLocalProjectLoading;
+				const displayProjects = localProjectPickerDisplayProjects(projects);
 				if (!projects.length || !globalThis.document.contains(picker) || !localProjectPickerLooksLikeProjectPicker(picker)) {
+					const attempts = Number(list.dataset.cliproxyLocalProjectAttempts || "0");
+					if (attempts < 3 && globalThis.document.contains(picker)) {
+						list.dataset.cliproxyLocalProjectAttempts = String(attempts + 1);
+						setTimeout(() => integrateLocalProjectPickers(picker), 750 * (attempts + 1));
+					}
 					return;
 				}
-				injectLocalProjectPickerItems(picker, list, projects);
+				if (!displayProjects.length) {
+					return;
+				}
+				delete list.dataset.cliproxyLocalProjectAttempts;
+				injectLocalProjectPickerItems(picker, list, displayProjects);
+				autoSelectCurrentProjectInPicker(picker, list);
 			});
 		}
 	}
@@ -1886,37 +2054,31 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		if (list.querySelector("[data-cliproxy-local-project-item]")) {
 			return;
 		}
-		for (const project of projects.slice(0, 50)) {
-			list.appendChild(buildLocalProjectPickerItem(picker, project));
+		const before = localProjectPickerActionsRow(list);
+		for (const project of projects) {
+			list.insertBefore(buildLocalProjectPickerItem(picker, project), before);
 			diagnostics.localProjectPickerIntegrationCount += 1;
 		}
 	}
 
 	function buildLocalProjectPickerItem(picker, project) {
 		const template = localProjectPickerTemplateItem(picker);
-		const item = template ? template.cloneNode(true) : globalThis.document.createElement("div");
-		const label = "Local: " + firstString(project.name, pathBaseName(project.workingDirectory), "local");
+		const item = globalThis.document.createElement("button");
+		const isCurrent = normalizeWorkingDirectory(project.workingDirectory) === activeThreadWorkingDirectory();
+		const label = firstString(project.name, pathBaseName(project.workingDirectory), "local");
+		item.type = "button";
 		item.dataset.cliproxyLocalProjectItem = "1";
-		item.removeAttribute("id");
-		item.removeAttribute("aria-selected");
-		item.removeAttribute("data-selected");
-		item.removeAttribute("aria-disabled");
-		item.removeAttribute("data-disabled");
-		item.removeAttribute("hidden");
-		item.removeAttribute("disabled");
+		item.dataset.cliproxyLocalProjectWorkingDirectory = normalizeWorkingDirectory(project.workingDirectory);
 		item.setAttribute("data-value", label);
 		item.setAttribute("aria-label", label);
-		item.setAttribute("role", item.getAttribute("role") || "option");
-		item.setAttribute("tabindex", "-1");
-		if (!template) {
-			item.style.cssText = "display:flex;flex-direction:column;gap:2px;width:100%%;padding:10px 12px;border:0;background:transparent;color:inherit;font:inherit;text-align:left;cursor:default";
-		}
-		fillLocalProjectPickerItem(item, label, project.workingDirectory);
+		item.setAttribute("role", "option");
+		item.setAttribute("aria-selected", "false");
+		item.setAttribute("aria-disabled", "false");
+		item.dataset.selected = "false";
+		item.className = template?.className || "group flex w-full gap-3 rounded-xl px-3.5 py-2.5 text-left hover:bg-black/5 data-[selected=true]:bg-black/6 dark:hover:bg-white/8 dark:data-[selected=true]:bg-white/10 items-center";
+		fillLocalProjectPickerItem(item, label, project.workingDirectory, isCurrent);
 		const activate = (event) => {
-			event.preventDefault();
-			event.stopPropagation();
-			rememberSelectedLocalProject(project);
-			setTimeout(() => closeLocalProjectPickerViaNoProject(picker), 0);
+			activateLocalProjectPickerItem(picker, item, event);
 		};
 		item.addEventListener("pointerdown", activate, true);
 		item.addEventListener("click", activate, true);
@@ -1928,19 +2090,139 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		return item;
 	}
 
-	function fillLocalProjectPickerItem(item, labelText, workingDirectory) {
-		item.textContent = "";
+	function fillLocalProjectPickerItem(item, labelText, workingDirectory, isCurrent) {
+		item.replaceChildren();
+		const left = globalThis.document.createElement("div");
+		left.className = "min-w-0 flex-1";
+		const title = globalThis.document.createElement("div");
+		title.className = "flex min-w-0 gap-1.5 text-lg pointer-coarse:text-[15px] pointer-coarse:leading-snug font-medium items-baseline";
 		const label = globalThis.document.createElement("span");
 		label.textContent = labelText;
+		label.className = "min-w-0 truncate";
+		title.append(label);
+		left.append(title);
+
+		const right = globalThis.document.createElement("div");
+		right.className = "flex shrink-0 items-center gap-2 text-muted-foreground";
+		const meta = globalThis.document.createElement("span");
+		meta.className = "flex max-w-[min(45vw,32rem)] min-w-0 items-center gap-1.5 text-sm font-medium";
+		const badge = globalThis.document.createElement("span");
+		badge.textContent = isCurrent ? "Current" : "Git";
+		badge.className = "shrink-0 rounded-md bg-foreground/8 px-1.5 py-0.5 text-[0.65rem] leading-none font-medium text-muted-foreground";
 		const detail = globalThis.document.createElement("span");
-		detail.textContent = workingDirectory;
-		detail.style.cssText = "opacity:.62;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:42rem";
-		item.append(label, detail);
+		detail.textContent = localProjectPickerPathDisplay(workingDirectory);
+		detail.title = workingDirectory;
+		detail.className = "truncate";
+		const check = globalThis.document.createElement("span");
+		check.className = "flex size-4 shrink-0 items-center justify-center";
+		check.dataset.slot = "project-check";
+		meta.append(badge, detail);
+		right.append(meta, check);
+		item.append(left, right);
 	}
 
 	function localProjectPickerTemplateItem(picker) {
-		return localProjectPickerNoProjectItem(picker) ||
-			picker.querySelector('[cmdk-item],[data-cmdk-item],[data-slot="command-item"],[role="option"],button,[role="button"]');
+		for (const element of picker.querySelectorAll('[cmdk-item],[data-cmdk-item],[data-slot="command-item"],[role="option"],button,[role="button"]')) {
+			const text = projectPickerItemPrimaryText(element);
+			if (element.dataset?.cliproxyLocalProjectItem || /^No Project\b/.test(text) || /^(Actions|Create Project)\b/.test(text)) {
+				continue;
+			}
+			return element;
+		}
+		return null;
+	}
+
+	function localProjectPickerPathDisplay(workingDirectory) {
+		const normalized = normalizeWorkingDirectory(workingDirectory);
+		if (normalized.startsWith("/Users/")) {
+			const parts = normalized.split("/");
+			if (parts.length > 3) {
+				return "~/" + parts.slice(3).join("/");
+			}
+		}
+		return normalized;
+	}
+
+	function localProjectPickerDisplayProjects(projects) {
+		const activeDirectory = activeThreadWorkingDirectory();
+		const selectedDirectory = selectedLocalProjectWorkingDirectory();
+		const fallbackDirectory = normalizeWorkingDirectory(globalThis.localStorage.getItem(workingDirectoryStorageKey) || "");
+		const visibleName = visibleProjectName();
+		const rank = (project) => {
+			const dir = normalizeWorkingDirectory(project.workingDirectory);
+			if (activeDirectory && dir === activeDirectory) {
+				return 0;
+			}
+			if (selectedDirectory && dir === selectedDirectory) {
+				return 1;
+			}
+			if (visibleName && firstString(project.name, pathBaseName(project.workingDirectory)) === visibleName) {
+				return 2;
+			}
+			if (fallbackDirectory && dir === fallbackDirectory) {
+				return 3;
+			}
+			return 4;
+		};
+		const seen = new Set();
+		const projectDirs = projects.map((project) => normalizeWorkingDirectory(project.workingDirectory)).filter((dir) => localProjectPickerDirectoryDisplayable(dir, false));
+		return projects.filter((project) => {
+			const dir = normalizeWorkingDirectory(project.workingDirectory);
+			const projectRank = rank(project);
+			const name = firstString(project.name, pathBaseName(project.workingDirectory));
+			if (!localProjectPickerDirectoryDisplayable(dir, projectRank < 4) || seen.has(dir)) {
+				return false;
+			}
+			if (projectRank >= 4 && localProjectPickerHasAncestorDirectory(dir, projectDirs)) {
+				return false;
+			}
+			seen.add(dir);
+			return true;
+		}).sort((left, right) => {
+			const leftRank = rank(left);
+			const rightRank = rank(right);
+			if (leftRank !== rightRank) {
+				return leftRank - rightRank;
+			}
+			return firstString(left.name, pathBaseName(left.workingDirectory)).localeCompare(firstString(right.name, pathBaseName(right.workingDirectory)));
+		}).slice(0, 50);
+	}
+
+	function localProjectPickerDirectoryDisplayable(dir, keepHidden) {
+		dir = normalizeWorkingDirectory(dir);
+		if (!dir || dir === "/" || /^[A-Za-z]:[\\/]?$/.test(dir)) {
+			return false;
+		}
+		if (/^\/Users\/[^/]+$/.test(dir) || /^\/Users\/[^/]+\/Developer$/.test(dir)) {
+			return false;
+		}
+		if (!keepHidden && pathBaseName(dir).startsWith(".")) {
+			return false;
+		}
+		return true;
+	}
+
+	function localProjectPickerHasAncestorDirectory(dir, dirs) {
+		for (const other of dirs) {
+			if (other && other !== dir && dir.startsWith(other.replace(/[\\/]+$/, "") + "/")) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	function normalizeProjectPickerName(value) {
+		return String(value || "").replace(/\s+/g, " ").trim().toLowerCase();
+	}
+
+	function localProjectPickerActionsRow(list) {
+		for (const element of Array.from(list.children || [])) {
+			const text = (element.innerText || element.textContent || "").replace(/\s+/g, " ").trim();
+			if (/^(Actions|Create Project)\b/.test(text)) {
+				return element;
+			}
+		}
+		return null;
 	}
 
 	function localProjectPickerNoProjectItem(picker) {
@@ -1951,6 +2233,178 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			}
 		}
 		return null;
+	}
+
+	function installLocalProjectPickerKeyboardNavigation(picker, list) {
+		if (list.dataset.cliproxyLocalProjectKeyboardNavigation === "1") {
+			return;
+		}
+		list.dataset.cliproxyLocalProjectKeyboardNavigation = "1";
+		const target = localProjectPickerKeyboardTarget(picker, list);
+		if (!target || target.dataset.cliproxyLocalProjectKeyboardNavigation === "1") {
+			return;
+		}
+		target.dataset.cliproxyLocalProjectKeyboardNavigation = "1";
+		target.addEventListener("keydown", (event) => {
+			const activeList = localProjectPickerKeyboardList(target, list);
+			if (activeList) {
+				handleLocalProjectPickerKeydown(event, target, activeList);
+			}
+		}, true);
+	}
+
+	function localProjectPickerKeyboardTarget(picker, list) {
+		if (!(list instanceof Element)) {
+			return null;
+		}
+		return list.closest('[role="dialog"],[data-slot="dialog-content"],[cmdk-root],[data-cmdk-root]') ||
+			(picker instanceof Element ? picker : null) ||
+			list;
+	}
+
+	function localProjectPickerKeyboardList(target, fallback) {
+		const localItemSelector = "[data-cliproxy-local-project-item]";
+		if (fallback instanceof Element && globalThis.document.contains(fallback) && elementVisible(fallback) && fallback.querySelector(localItemSelector)) {
+			return fallback;
+		}
+		const lists = [];
+		const listSelector = '[cmdk-list],[data-cmdk-list],[data-slot="command-list"],[role="listbox"]';
+		if (target instanceof Element && target.matches(listSelector)) {
+			lists.push(target);
+		}
+		target.querySelectorAll?.(listSelector).forEach((element) => lists.push(element));
+		return lists.find((element) => elementVisible(element) && element.querySelector(localItemSelector)) || null;
+	}
+
+	function handleLocalProjectPickerKeydown(event, picker, list) {
+		if (!list.querySelector("[data-cliproxy-local-project-item]")) {
+			return;
+		}
+		if (event.key !== "ArrowDown" && event.key !== "ArrowUp" && event.key !== "Enter" && event.key !== " ") {
+			return;
+		}
+		if (event.key === " " && projectPickerEditableTarget(event.target)) {
+			return;
+		}
+		const items = projectPickerNavigableItems(list);
+		if (!items.length) {
+			return;
+		}
+		const selected = items.find(projectPickerItemSelected) || items[0];
+		if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+			event.preventDefault();
+			event.stopPropagation();
+			const direction = event.key === "ArrowDown" ? 1 : -1;
+			const index = Math.max(0, items.indexOf(selected));
+			setProjectPickerSelectedItem(list, items[(index + direction + items.length) %% items.length]);
+			return;
+		}
+		event.preventDefault();
+		event.stopPropagation();
+		if (selected.dataset?.cliproxyLocalProjectItem) {
+			activateLocalProjectPickerItem(picker, selected, event);
+			return;
+		}
+		selected.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, cancelable: true, view: globalThis }));
+		selected.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: globalThis }));
+	}
+
+	function projectPickerNavigableItems(list) {
+		return Array.from(list.querySelectorAll('[role="option"],button,[role="button"]')).filter((element) =>
+			elementVisible(element) &&
+			element.getAttribute("aria-disabled") !== "true" &&
+			element.dataset?.disabled !== "true" &&
+			!element.disabled);
+	}
+
+	function setProjectPickerSelectedItem(list, selected) {
+		for (const item of projectPickerNavigableItems(list)) {
+			const active = item === selected;
+			item.setAttribute("aria-selected", active ? "true" : "false");
+			item.dataset.selected = active ? "true" : "false";
+		}
+		selected?.scrollIntoView?.({ block: "nearest" });
+	}
+
+	function activateLocalProjectPickerItem(picker, item, event) {
+		event?.preventDefault?.();
+		event?.stopPropagation?.();
+		const workingDirectory = normalizeWorkingDirectory(item.dataset?.cliproxyLocalProjectWorkingDirectory);
+		if (!workingDirectory) {
+			return;
+		}
+		const selectedProject = {
+			name: projectPickerItemPrimaryText(item),
+			workingDirectory,
+		};
+		rememberSelectedLocalProject(selectedProject);
+		refreshLocalProjectActivators(selectedProject);
+		setTimeout(() => {
+			closeLocalProjectPickerViaNoProject(picker);
+			setTimeout(() => refreshLocalProjectActivators(selectedProject), 50);
+		}, 0);
+	}
+
+	function autoSelectCurrentProjectInPicker(picker, list) {
+		if (!list || list.dataset.cliproxyCurrentProjectAutoSelected === "1") {
+			return;
+		}
+		const noProject = localProjectPickerNoProjectItem(picker);
+		if (!noProject || !projectPickerItemSelected(noProject)) {
+			return;
+		}
+		const item = currentProjectPickerItem(picker);
+		if (!item || item === noProject) {
+			return;
+		}
+		list.dataset.cliproxyCurrentProjectAutoSelected = "1";
+		setTimeout(() => {
+			if (!globalThis.document.contains(item) || !localProjectPickerLooksLikeProjectPicker(picker)) {
+				return;
+			}
+			setProjectPickerSelectedItem(list, item);
+		}, 0);
+	}
+
+	function projectPickerItemSelected(item) {
+		return item?.getAttribute("aria-selected") === "true" || item?.dataset?.selected === "true";
+	}
+
+	function currentProjectPickerItem(picker) {
+		const workingDirectory = localWorkingDirectory();
+		const targetNames = new Set();
+		if (workingDirectory) {
+			targetNames.add(normalizeProjectPickerName(pathBaseName(workingDirectory)));
+		}
+		const visibleName = visibleProjectName();
+		if (visibleName) {
+			targetNames.add(normalizeProjectPickerName(visibleName));
+		}
+		const matches = [];
+		for (const element of picker.querySelectorAll('[cmdk-item],[data-cmdk-item],[data-slot="command-item"],[role="option"],button,[role="button"]')) {
+			if (!elementVisible(element) || /^No Project\b/.test(projectPickerItemPrimaryText(element))) {
+				continue;
+			}
+			if (element.dataset?.cliproxyLocalProjectItem) {
+				if (normalizeWorkingDirectory(element.dataset.cliproxyLocalProjectWorkingDirectory) === workingDirectory) {
+					return element;
+				}
+				continue;
+			}
+			if (targetNames.has(normalizeProjectPickerName(projectPickerItemPrimaryText(element)))) {
+				matches.push(element);
+			}
+		}
+		return matches.length === 1 ? matches[0] : null;
+	}
+
+	function projectPickerItemPrimaryText(element) {
+		return (element.innerText || element.textContent || "").split(/\n+/).map((line) => line.trim()).filter(Boolean)[0] || "";
+	}
+
+	function projectPickerEditableTarget(target) {
+		return target instanceof Element &&
+			(target.matches("input,textarea,[contenteditable=true]") || !!target.closest("input,textarea,[contenteditable=true]"));
 	}
 
 	function closeLocalProjectPickerViaNoProject(picker) {
@@ -2409,10 +2863,42 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 
 	globalThis.WebSocket = new Proxy(NativeWebSocket, {
 		construct(target, args, newTarget) {
+			diagnostics.lastWebSocketProtocols = JSON.stringify(args.length > 1 ? args[1] : "");
 			if (args.length > 0) {
 				args[0] = localWebSocketURL(args[0]);
 			}
-			return Reflect.construct(target, args, newTarget);
+			const socket = Reflect.construct(target, args, newTarget);
+			try {
+				diagnostics.lastWebSocketState = "constructed";
+				diagnostics.lastWebSocketReadyState = Number(socket.readyState);
+				socket.addEventListener("open", () => {
+					diagnostics.webSocketOpenCount += 1;
+					diagnostics.activeWebSocketCount += 1;
+					diagnostics.lastWebSocketState = "open";
+					diagnostics.lastWebSocketReadyState = Number(socket.readyState);
+				});
+				socket.addEventListener("close", (event) => {
+					diagnostics.webSocketCloseCount += 1;
+					diagnostics.activeWebSocketCount = Math.max(0, diagnostics.activeWebSocketCount - 1);
+					diagnostics.lastWebSocketState = "closed";
+					diagnostics.lastWebSocketReadyState = Number(socket.readyState);
+					diagnostics.lastWebSocketCloseCode = Number(event?.code || 0);
+					diagnostics.lastWebSocketCloseReason = String(event?.reason || "");
+				});
+				socket.addEventListener("error", () => {
+					diagnostics.webSocketErrorCount += 1;
+					diagnostics.lastWebSocketState = "error";
+					diagnostics.lastWebSocketReadyState = Number(socket.readyState);
+				});
+				globalThis.setTimeout(() => {
+					diagnostics.lastWebSocketReadyState = Number(socket.readyState);
+					if (diagnostics.lastWebSocketState === "constructed") {
+						diagnostics.lastWebSocketState = ["connecting", "open", "closing", "closed"][socket.readyState] || "unknown";
+					}
+				}, 3000);
+			} catch {
+			}
+			return socket;
 		},
 	});
 

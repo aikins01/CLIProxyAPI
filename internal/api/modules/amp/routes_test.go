@@ -406,7 +406,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 	body := rec.Body.String()
 	for _, want := range []string{
 		"// ==UserScript==",
-		"@version 0.1.33",
+		"@version 0.1.37",
 		"@match https://ampcode.com/*",
 		"@updateURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
 		"@downloadURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
@@ -529,6 +529,11 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 			t.Fatalf("userscript missing %q:\n%s", want, body)
 		}
 	}
+	selectedLocalProjectIndex := strings.Index(body, "const fromSelectedLocalProject = selectedLocalProjectWorkingDirectory();")
+	visibleProjectIndex := strings.Index(body, "const fromVisibleProject = visibleProjectWorkingDirectory();")
+	if selectedLocalProjectIndex < 0 || visibleProjectIndex < 0 || selectedLocalProjectIndex > visibleProjectIndex {
+		t.Fatalf("userscript must prefer selected local project before visible project for create-thread working directory")
+	}
 	for _, unwanted := range []string{
 		"installLocalThreadKeyboardShortcut();",
 		"installThreadMenuIntegration();",
@@ -574,8 +579,8 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		}
 	}
 	projectIDIndex := strings.Index(body, `const projectID = isPlainObject(decoded) ? firstString(decoded.projectID, decoded.projectId, decoded.project_id) : "";`)
-	visibleProjectIndex := strings.Index(body, `const fromVisibleProject = visibleProjectWorkingDirectory();`)
-	if projectIDIndex < 0 || visibleProjectIndex < 0 || projectIDIndex > visibleProjectIndex || !strings.Contains(body[projectIDIndex:visibleProjectIndex], `if (projectID)`) {
+	visibleProjectFallbackIndex := strings.Index(body, `const fromVisibleProject = visibleProjectWorkingDirectory();`)
+	if projectIDIndex < 0 || visibleProjectFallbackIndex < 0 || projectIDIndex > visibleProjectFallbackIndex || !strings.Contains(body[projectIDIndex:visibleProjectFallbackIndex], `if (projectID)`) {
 		t.Fatalf("userscript should reject projectID bodies before visible project fallback:\n%s", body)
 	}
 }

@@ -14741,6 +14741,110 @@ func TestNeoActorHandlesClientEditMessage(t *testing.T) {
 	}
 }
 
+func TestNeoActorHandlesClientEditMessageReplacementID(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	actor.messages = []neoMessage{
+		{ThreadID: "T-test", MessageID: "M-0000000000000000000001", Role: "user", Content: []any{map[string]any{"type": "text", "text": "old"}}, AgentMode: "smart", Seq: 1},
+		{ThreadID: "T-test", MessageID: "M-0000000000000000000002", Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "answer"}}, Seq: 2},
+	}
+	actor.history = []neoHistoryMessage{
+		{Role: "user", Text: "old"},
+		{Role: "assistant", Text: "answer"},
+	}
+	actor.seq = 3
+
+	actor.handle(map[string]any{
+		"type":                 "client_edit_message",
+		"messageId":            "M-0000000000000000000001",
+		"replacementMessageId": "M-0000000000000000000003",
+		"editId":               "E-0000000000000000000001",
+		"content":              []any{map[string]any{"type": "text", "text": "edited"}},
+		"agentMode":            "deep",
+		"reasoningEffort":      "xhigh",
+	})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.messages) != 1 {
+		t.Fatalf("messages len = %d, want replacement message only", len(actor.messages))
+	}
+	if actor.messages[0].MessageID != "M-0000000000000000000003" {
+		t.Fatalf("replacement message id = %q", actor.messages[0].MessageID)
+	}
+	if got := textFromBlocks(actor.messages[0].Content); got != "edited" {
+		t.Fatalf("replacement content = %q", got)
+	}
+	if len(actor.history) != 1 || actor.history[0].Text != "edited" {
+		t.Fatalf("history = %#v", actor.history)
+	}
+	if actor.pendingInference == nil || actor.pendingInference.agentMode != "deep" || actor.pendingInference.reasoningEffort != "xhigh" {
+		t.Fatalf("pending inference after offline edit = %#v, want deep/xhigh", actor.pendingInference)
+	}
+	if len(actor.replayEvents) < 2 {
+		t.Fatalf("replay events = %#v, want truncate and add", actor.replayEvents)
+	}
+	truncated := actor.replayEvents[len(actor.replayEvents)-2].Payload
+	added := actor.replayEvents[len(actor.replayEvents)-1].Payload
+	if truncated["type"] != "thread_truncated" || stringValue(truncated["truncateFromMessage"]) != "M-0000000000000000000001" {
+		t.Fatalf("truncate event = %#v, want original message truncation", truncated)
+	}
+	if added["type"] != "message_added" {
+		t.Fatalf("added event = %#v, want message_added", added)
+	}
+	addedMessage := mapValue(added["message"])
+	if stringValue(addedMessage["messageId"]) != "M-0000000000000000000003" {
+		t.Fatalf("added message = %#v, want replacement id", addedMessage)
+	}
+	if numberFrom(truncated["seq"]) >= numberFrom(added["seq"]) {
+		t.Fatalf("event order seqs = truncate %#v add %#v, want truncate before add", truncated, added)
+	}
+}
+
+func TestNeoActorRejectsClientEditMessageReusedReplacementID(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	actor.messages = []neoMessage{
+		{ThreadID: "T-test", MessageID: "M-0000000000000000000001", Role: "user", Content: []any{map[string]any{"type": "text", "text": "first"}}, AgentMode: "smart", Seq: 1},
+		{ThreadID: "T-test", MessageID: "M-0000000000000000000002", Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "answer"}}, Seq: 2},
+		{ThreadID: "T-test", MessageID: "M-0000000000000000000003", Role: "user", Content: []any{map[string]any{"type": "text", "text": "old"}}, AgentMode: "smart", Seq: 3},
+	}
+	actor.history = []neoHistoryMessage{
+		{Role: "user", Text: "first"},
+		{Role: "assistant", Text: "answer"},
+		{Role: "user", Text: "old"},
+	}
+	actor.seq = 4
+
+	actor.handle(map[string]any{
+		"type":                 "client_edit_message",
+		"messageId":            "M-0000000000000000000003",
+		"replacementMessageId": "M-0000000000000000000001",
+		"editId":               "E-0000000000000000000001",
+		"content":              []any{map[string]any{"type": "text", "text": "edited"}},
+		"agentMode":            "deep",
+		"reasoningEffort":      "xhigh",
+	})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.messages) != 3 {
+		t.Fatalf("messages len = %d, want original messages unchanged", len(actor.messages))
+	}
+	if got := actor.messages[0].MessageID; got != "M-0000000000000000000001" {
+		t.Fatalf("first message id = %q", got)
+	}
+	if got := actor.messages[2].MessageID; got != "M-0000000000000000000003" {
+		t.Fatalf("edited message id = %q", got)
+	}
+	if got := textFromBlocks(actor.messages[2].Content); got != "old" {
+		t.Fatalf("edited message content = %q, want original content", got)
+	}
+	if actor.pendingInference != nil {
+		t.Fatalf("pending inference = %#v, want nil after rejected edit", actor.pendingInference)
+	}
+}
+
 func TestNeoActorUpdateSettingsPreservesModeWhenPatchOmitsAgentMode(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
@@ -19361,6 +19465,24 @@ func TestNeoActorToolResultAfterTerminalProgressSnapshotKeepsResultText(t *testi
 	}
 	if toolEntries[0].Text != "User selected option 2: Sushi" {
 		t.Fatalf("history text = %q, want the executor result text, not the bare snapshot run", toolEntries[0].Text)
+	}
+}
+
+func TestNeoActorDropsUnknownExecutorToolReplay(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "threadActor", "T-test", "T-test", neoActorRecord("actor-test", "threadActor", "T-test"), nil)
+	socket := &neoSocket{executor: true}
+
+	actor.handleToolProgress(map[string]any{"type": "tool_progress", "toolCallId": "TU-stale", "progress": map[string]any{"type": "snapshot", "value": map[string]any{"status": "done"}}}, socket)
+	actor.receiveToolResult(map[string]any{"type": "executor_tool_result", "toolCallId": "TU-stale", "run": map[string]any{"status": "done", "result": "stale"}}, socket)
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.messages) != 0 {
+		t.Fatalf("messages = %#v, want unknown executor replay dropped", actor.messages)
+	}
+	if len(actor.replayEvents) != 0 {
+		t.Fatalf("replay events = %#v, want unknown executor replay dropped", actor.replayEvents)
 	}
 }
 
