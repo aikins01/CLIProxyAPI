@@ -3741,6 +3741,134 @@ func TestNeoRuntimeWebLocalInferenceReplaysCurrentExecutorState(t *testing.T) {
 	}
 }
 
+func TestNeoRuntimeWebLocalInferenceJSONRPCReplaysCurrentExecutorStateAsObserver(t *testing.T) {
+	pidDir := filepath.Join(t.TempDir(), "pids")
+	if err := os.MkdirAll(pidDir, 0o700); err != nil {
+		t.Fatalf("mkdir pid dir: %v", err)
+	}
+	t.Cleanup(replaceNeoHeadlessPIDDir(func() string { return pidDir }))
+
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+		NeoLocalRuntime: config.AmpNeoLocalRuntime{
+			Enabled:           &enabled,
+			ForceThreadActors: true,
+		},
+		WebLocalInference: config.AmpWebLocalInference{
+			Enabled:        true,
+			AllowedOrigins: []string{"https://ampcode.com"},
+		},
+	}})
+	threadID := "T-77777777-7777-4777-8777-777777777778"
+	if err := os.WriteFile(filepath.Join(pidDir, threadID+".pid"), []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
+		t.Fatalf("write pid file: %v", err)
+	}
+	actor, _ := rt.store.upsert(map[string]any{
+		"name": "threadActor",
+		"key":  threadID,
+		"input": map[string]any{
+			"threadId": threadID,
+		},
+	}, true)
+	actor.mu.Lock()
+	actor.executorID = "executor-existing"
+	actor.executorReady = true
+	actor.executorBootstrapComplete = true
+	actor.mu.Unlock()
+
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	t.Cleanup(server.Close)
+
+	dialer := websocket.Dialer{Subprotocols: []string{"rivet", "rivet_encoding.bare", "rivet_conn_params.%7B%22transport%22%3A%22json-rpc%22%7D", "rivet_skip_ready_wait"}}
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/gateway/threadActor/websocket/?rvt-method=get&rvt-key=" + threadID + "&rvt-skip-ready-wait=true&cliproxy-bootstrap-executor=true"
+	headers := http.Header{
+		"Origin":                      []string{"https://ampcode.com"},
+		neoInternalClientAPIKeyHeader: []string{"local-key"},
+	}
+	conn, resp, err := dialer.Dial(wsURL, headers)
+	if err != nil {
+		status := 0
+		if resp != nil {
+			status = resp.StatusCode
+		}
+		t.Fatalf("gateway websocket dial failed status=%d err=%v", status, err)
+	}
+	defer conn.Close()
+
+	var sawObservers bool
+	var sawStatus bool
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && (!sawObservers || !sawStatus) {
+		_ = conn.SetReadDeadline(time.Now().Add(time.Until(deadline)))
+		_, payload, errRead := conn.ReadMessage()
+		if errRead != nil {
+			if netErr, ok := errRead.(net.Error); ok && netErr.Timeout() {
+				break
+			}
+			t.Fatalf("read initial jsonrpc frame: %v", errRead)
+		}
+		var frame map[string]any
+		if err := json.Unmarshal(payload, &frame); err != nil {
+			t.Fatalf("initial jsonrpc frame JSON error: %v", err)
+		}
+		if frame["method"] == "executor_connected" {
+			t.Fatalf("web local JSON-RPC observer received executor_connected: %#v", frame)
+		}
+		if frame["method"] == "observers" {
+			params := mapValue(frame["params"])
+			if params["hasExecutor"] != true {
+				t.Fatalf("observers params = %#v, want hasExecutor", params)
+			}
+			sawObservers = true
+		}
+		if frame["method"] == "executor_status" {
+			params := mapValue(frame["params"])
+			if params["status"] != "running" || params["executorId"] != "executor-existing" {
+				t.Fatalf("executor_status params = %#v, want running existing executor", params)
+			}
+			sawStatus = true
+		}
+	}
+	if !sawObservers || !sawStatus {
+		t.Fatalf("initial JSON-RPC replay sawObservers=%v sawStatus=%v", sawObservers, sawStatus)
+	}
+
+	if err := conn.WriteJSON(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      "resume-1",
+		"method":  "client_resume",
+		"params":  map[string]any{"version": 0},
+	}); err != nil {
+		t.Fatalf("write jsonrpc client_resume: %v", err)
+	}
+
+	sawResponse := false
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && !sawResponse {
+		_ = conn.SetReadDeadline(time.Now().Add(time.Until(deadline)))
+		_, payload, errRead := conn.ReadMessage()
+		if errRead != nil {
+			if netErr, ok := errRead.(net.Error); ok && netErr.Timeout() {
+				break
+			}
+			t.Fatalf("read resumed jsonrpc frame: %v", errRead)
+		}
+		var frame map[string]any
+		if err := json.Unmarshal(payload, &frame); err != nil {
+			t.Fatalf("resumed jsonrpc frame JSON error: %v", err)
+		}
+		if frame["method"] == "executor_connected" {
+			t.Fatalf("web local JSON-RPC observer received resume executor_connected: %#v", frame)
+		}
+		if frame["id"] == "resume-1" {
+			sawResponse = true
+		}
+	}
+	if !sawResponse {
+		t.Fatal("timed out waiting for JSON-RPC client_resume response")
+	}
+}
+
 func TestNeoRuntimeWebLocalInferenceBootstrapReplacesLegacyExecutor(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("test uses POSIX shell script")
@@ -6491,7 +6619,11 @@ func TestNeoRuntimeUserActorConnectUsesRivetActionProtocol(t *testing.T) {
 	threadActor.handle(map[string]any{"type": "agent_state", "state": "working"})
 	eventFrame := waitForNeoRivetBareEventName(t, conn, "threadStatusUpdated", 2*time.Second)
 	eventVal := mapValue(eventFrame["val"])
-	summary := mapValue(eventVal["args"])
+	args := arrayValue(eventVal["args"])
+	if len(args) != 1 {
+		t.Fatalf("event args = %#v, want one summary argument", eventVal["args"])
+	}
+	summary := mapValue(args[0])
 	if summary["threadId"] != threadID || summary["state"] != "working" {
 		t.Fatalf("event summary = %#v", summary)
 	}
@@ -7179,7 +7311,7 @@ func TestNeoRuntimeGitBridgeAndWorkspaceMessageTypes(t *testing.T) {
 	}
 }
 
-func TestNeoWebLocalObserverPayloadPreservesExecutorState(t *testing.T) {
+func TestNeoWebLocalObserverPayloadFiltersExecutorConnected(t *testing.T) {
 	original := neoObserversPayload(1, false)
 	patchedPayload, ok := neoWebLocalObserverPayload(original)
 	if !ok {
@@ -7203,9 +7335,8 @@ func TestNeoWebLocalObserverPayloadPreservesExecutorState(t *testing.T) {
 		t.Fatalf("non-observer payload changed: %#v", unchanged)
 	}
 
-	executorConnected := map[string]any{"type": "executor_connected", "executorId": "executor"}
-	if payload, ok := neoWebLocalObserverPayload(executorConnected); !ok || mapValue(payload)["executorId"] != "executor" {
-		t.Fatalf("executor_connected payload = %#v, ok=%v; want preserved", payload, ok)
+	if payload, ok := neoWebLocalObserverPayload(map[string]any{"type": "executor_connected", "executorId": "executor"}); ok || payload != nil {
+		t.Fatalf("executor_connected payload = %#v, ok=%v; want suppressed", payload, ok)
 	}
 }
 
@@ -9036,20 +9167,7 @@ sleep 5
 		"environment":      map[string]any{"workingDirectory": ignoredWorkDir},
 	})
 
-	var content string
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		raw, err := os.ReadFile(logPath)
-		if err == nil && len(raw) > 0 {
-			content = string(raw)
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if content == "" {
-		t.Fatal("spawn script did not run")
-	}
-	for _, want := range []string{
+	wantLog := []string{
 		"args: [--mode] [deep] [--effort] [xhigh] [--headless] [T-test-thread]",
 		"AMP_URL=http://127.0.0.1:8317",
 		"AMP_API_KEY=local-key",
@@ -9059,7 +9177,30 @@ sleep 5
 		"AMP_THREAD_ID=T-test-thread",
 		"RIVET_ENDPOINT=http://127.0.0.1:6420",
 		"RIVET_PUBLIC_ENDPOINT=http://127.0.0.1:6420",
-	} {
+	}
+	var content string
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		raw, err := os.ReadFile(logPath)
+		if err == nil && len(raw) > 0 {
+			content = string(raw)
+			complete := true
+			for _, want := range wantLog {
+				if !strings.Contains(content, want) {
+					complete = false
+					break
+				}
+			}
+			if complete {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if content == "" {
+		t.Fatal("spawn script did not run")
+	}
+	for _, want := range wantLog {
 		if !strings.Contains(content, want) {
 			t.Fatalf("spawn log missing %q:\n%s", want, content)
 		}

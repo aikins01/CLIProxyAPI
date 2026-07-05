@@ -19266,6 +19266,9 @@ func (s *neoSocket) isWebLocalObserver() bool {
 }
 
 func neoWebLocalObserverPayload(payload any) (any, bool) {
+	if stringValue(mapValue(payload)["type"]) == "executor_connected" {
+		return nil, false
+	}
 	return payload, true
 }
 
@@ -19406,7 +19409,7 @@ func neoRivetEventFrame(payload any, webLocalObserver bool) (map[string]any, boo
 				"tag": "Event",
 				"val": map[string]any{
 					"name": name,
-					"args": args,
+					"args": []any{args},
 				},
 			},
 		}, true
