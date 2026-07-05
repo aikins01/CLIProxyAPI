@@ -88,6 +88,8 @@ const (
 	neoRivetBareFrameKey             = "__neo_rivet_bare_frame"
 	neoRivetBareVersion              = 4
 	neoMaxQueuedMessages             = 5
+	neoWebLocalProjectIndexFileName  = ".cliproxyapi-projects.json"
+	neoWebLocalProjectIndexVersion   = 1
 )
 
 var neoHeadlessLoginShellPath = neoDiscoverHeadlessLoginShellPath
@@ -119,6 +121,7 @@ var (
 	neoAmpDataDir                 = defaultNeoAmpDataDir
 	neoHeadlessPIDDir             = defaultNeoHeadlessPIDDir
 	neoAmpTaskStoreMu             sync.Mutex
+	neoWebLocalProjectIndexMu     sync.Mutex
 	neoInboundMessageHookMu       sync.RWMutex
 	neoInboundMessageHook         func(actor *neoActor, msg map[string]any)
 	errNeoLocalEmptyStream        = errors.New("local provider stream closed before first payload")
@@ -148,22 +151,27 @@ var (
 )
 
 type neoRuntime struct {
-	mu            sync.RWMutex
-	cfg           *config.Config
-	host          string
-	port          int
-	server        *http.Server
-	store         *neoActorStore
-	started       bool
-	cleanup       context.CancelFunc
-	modelMapper   ModelMapper
-	secretSource  SecretSource
-	connMu        sync.Mutex
-	connections   map[net.Conn]struct{}
-	threadDir     string
-	githubClient  *http.Client
-	githubAPIBase string
-	githubRawBase string
+	mu             sync.RWMutex
+	cfg            *config.Config
+	host           string
+	port           int
+	server         *http.Server
+	store          *neoActorStore
+	started        bool
+	cleanup        context.CancelFunc
+	modelMapper    ModelMapper
+	secretSource   SecretSource
+	connMu         sync.Mutex
+	connections    map[net.Conn]struct{}
+	threadDir      string
+	githubClient   *http.Client
+	githubAPIBase  string
+	githubRawBase  string
+	sidebarMu      sync.Mutex
+	sidebarCache   []any
+	sidebarCached  time.Time
+	sidebarLoaded  bool
+	sidebarRefresh bool
 	// inferStream overrides the provider inference call used by the local agent
 	// and subagent loops. Defaults to inferNeoLocalStream; tests set it to replay
 	// a scripted session deterministically without a live provider.
@@ -2767,6 +2775,7 @@ func (a *neoActor) handleProtocolToolApprovalQueue(msg map[string]any) {
 	a.broadcast(payload)
 	if stateChanged {
 		a.broadcast(map[string]any{"type": "agent_state", "state": state, "agentMode": agentMode, "reasoningEffort": omitEmpty(reasoningEffort)})
+		a.syncCloudAsync()
 	}
 }
 
@@ -3295,6 +3304,7 @@ func (a *neoActor) handleToolApprovalRequest(msg map[string]any) {
 	a.broadcast(toolApprovalQueuePayload(approvals))
 	if stateChanged {
 		a.broadcast(map[string]any{"type": "agent_state", "state": "awaiting_approval", "agentMode": agentMode, "reasoningEffort": omitEmpty(reasoningEffort)})
+		a.syncCloudAsync()
 	}
 }
 
@@ -3325,6 +3335,7 @@ func (a *neoActor) handleToolApprovalResponse(msg map[string]any) {
 	}
 	if stateChanged {
 		a.broadcast(map[string]any{"type": "agent_state", "state": state, "agentMode": agentMode, "reasoningEffort": omitEmpty(reasoningEffort)})
+		a.syncCloudAsync()
 	}
 }
 
@@ -4109,6 +4120,7 @@ func (a *neoActor) handleProtocolAgentState(msg map[string]any) {
 	if previous != state && state == "idle" {
 		a.dispatchNotification("agent", "agent_idle", map[string]any{"messageId": omitEmpty(messageID), "agentMode": agentMode})
 	}
+	a.syncCloudAsync()
 }
 
 func (a *neoActor) handleProtocolInferenceTools(msg map[string]any) {
@@ -4156,6 +4168,7 @@ func (a *neoActor) handleProtocolInferenceTools(msg map[string]any) {
 		"tools":     tools,
 	}
 	a.broadcast(withNeoParentToolCallID(payload, parentToolCallID))
+	a.syncCloudAsync()
 }
 
 func (a *neoActor) handleProtocolDelta(msg map[string]any) {
@@ -4487,9 +4500,7 @@ func (a *neoActor) handleProtocolCancelled(msg map[string]any) {
 	}
 	a.broadcast(event)
 	a.broadcast(map[string]any{"type": "agent_state", "state": "idle", "messageId": omitEmpty(messageID), "agentMode": agentMode, "reasoningEffort": omitEmpty(reasoningEffort)})
-	if len(cleanupEvents) > 0 || len(updateEvents) > 0 {
-		a.syncCloudAsync()
-	}
+	a.syncCloudAsync()
 	a.processQueue()
 }
 
@@ -7484,6 +7495,7 @@ func (a *neoActor) runInferenceForParentWithOptions(agentMode, reasoningEffort, 
 
 	a.broadcast(map[string]any{"type": "agent_state", "state": "working", "messageId": assistantID, "agentMode": agentMode, "reasoningEffort": omitEmpty(reasoningEffort)})
 	a.broadcast(withNeoParentToolCallID(map[string]any{"type": "inference_tools", "messageId": assistantID, "agentMode": agentMode, "tools": tools}, parentToolCallID))
+	a.syncCloudAsync()
 	a.handleProtocolDelta(withNeoParentToolCallID(neoAssistantDeltaPayload(assistantID, []any{}, 0, "start", nil), parentToolCallID))
 
 	if !options.skipPreflightCompaction {
@@ -8561,6 +8573,7 @@ func (a *neoActor) receiveToolResult(msg map[string]any) {
 	}
 	if remaining == 0 && !ready && !approvalStateChanged {
 		a.broadcast(map[string]any{"type": "agent_state", "state": "idle", "messageId": omitEmpty(pending.MessageID), "agentMode": pending.AgentMode, "reasoningEffort": omitEmpty(pending.ReasoningEffort)})
+		a.syncCloudAsync()
 	}
 	if remaining == 0 && ready {
 		go a.runInferenceForParentWithOptions(pending.AgentMode, pending.ReasoningEffort, pending.ParentToolCallID, neoInferenceRunOptions{clientAPIKey: pending.ClientAPIKey})
@@ -8622,6 +8635,7 @@ func (a *neoActor) resumeAfterPendingToolCompletion(pending neoPendingTool, rema
 		return
 	}
 	a.broadcast(map[string]any{"type": "agent_state", "state": "idle", "messageId": omitEmpty(pending.MessageID), "agentMode": pending.AgentMode, "reasoningEffort": omitEmpty(pending.ReasoningEffort)})
+	a.syncCloudAsync()
 }
 
 func normalizeNeoExecutorToolRun(ctx context.Context, rt *neoRuntime, pending neoPendingTool, run map[string]any, currentThreadID string) map[string]any {
@@ -8989,6 +9003,7 @@ func (a *neoActor) revokeToolLease(msg map[string]any) {
 			"agentMode":       pending.AgentMode,
 			"reasoningEffort": omitEmpty(pending.ReasoningEffort),
 		})
+		a.syncCloudAsync()
 		a.processQueue()
 	}
 }
@@ -9003,6 +9018,7 @@ type neoCloudThreadSnapshot struct {
 	title             string
 	archived          bool
 	threadStatus      string
+	agentState        string
 	settings          map[string]any
 	messages          []neoMessage
 	environment       map[string]any
@@ -9190,6 +9206,7 @@ func (a *neoActor) threadSnapshotWithOptions(options neoThreadSnapshotOptions) (
 		title:             a.title,
 		archived:          a.archived,
 		threadStatus:      a.threadStatus,
+		agentState:        neoAgentStateOrIdle(a.agentState),
 		settings:          cloneNeoJSONMap(a.settings),
 		messages:          messages,
 		environment:       cloneNeoJSONMap(a.environment),
@@ -10208,6 +10225,9 @@ func writeNeoLocalThreadSnapshotToDir(snapshot neoCloudThreadSnapshot, dir strin
 	if err != nil {
 		return err
 	}
+	if err := updateNeoWebLocalProjectIndexFromThread(dir, thread); err != nil {
+		log.Debugf("amp neo local runtime project index update failed thread=%s: %v", snapshot.threadID, err)
+	}
 	log.Debugf("amp neo local runtime thread store sync complete thread=%s path=%s", snapshot.threadID, path)
 	return nil
 }
@@ -10260,6 +10280,73 @@ func writeNeoLocalThreadFileInDir(dir, threadID string, thread map[string]any) (
 	}
 	path := filepath.Join(dir, threadID+".json")
 	return path, writeNeoAtomicFile(path, append(raw, '\n'), 0o600)
+}
+
+func updateNeoWebLocalProjectIndexFromThread(threadDir string, thread map[string]any) error {
+	project := neoWebLocalProjectFromThread(thread)
+	if len(project) == 0 {
+		return nil
+	}
+	neoWebLocalProjectIndexMu.Lock()
+	defer neoWebLocalProjectIndexMu.Unlock()
+	projects := neoWebLocalMergeSidebarProjects(readNeoWebLocalProjectIndexUnlocked(threadDir), []any{project})
+	return writeNeoWebLocalProjectIndexUnlocked(threadDir, projects)
+}
+
+func readNeoWebLocalProjectIndex(threadDir string) []any {
+	neoWebLocalProjectIndexMu.Lock()
+	defer neoWebLocalProjectIndexMu.Unlock()
+	return readNeoWebLocalProjectIndexUnlocked(threadDir)
+}
+
+func readNeoWebLocalProjectIndexUnlocked(threadDir string) []any {
+	path := neoWebLocalProjectIndexPath(threadDir)
+	if path == "" {
+		return nil
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		log.Debugf("amp neo local runtime project index read failed path=%s: %v", path, err)
+		return nil
+	}
+	return neoWebLocalMergeSidebarProjects(arrayValue(decoded["projects"]))
+}
+
+func writeNeoWebLocalProjectIndex(threadDir string, projects []any) error {
+	neoWebLocalProjectIndexMu.Lock()
+	defer neoWebLocalProjectIndexMu.Unlock()
+	return writeNeoWebLocalProjectIndexUnlocked(threadDir, projects)
+}
+
+func writeNeoWebLocalProjectIndexUnlocked(threadDir string, projects []any) error {
+	path := neoWebLocalProjectIndexPath(threadDir)
+	if path == "" {
+		return errors.New("amp project index directory unavailable")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	raw, err := json.MarshalIndent(map[string]any{
+		"version":   neoWebLocalProjectIndexVersion,
+		"updatedAt": time.Now().UTC().Format(time.RFC3339Nano),
+		"projects":  neoWebLocalMergeSidebarProjects(projects),
+	}, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writeNeoAtomicFile(path, append(raw, '\n'), 0o600)
+}
+
+func neoWebLocalProjectIndexPath(threadDir string) string {
+	threadDir = strings.TrimSpace(threadDir)
+	if threadDir == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(threadDir), neoWebLocalProjectIndexFileName)
 }
 
 func writeNeoAtomicFile(path string, data []byte, perm os.FileMode) error {
@@ -11892,6 +11979,9 @@ func (rt *neoRuntime) neoWebLocalProjectWorkingDirectory(projectID string) strin
 			}
 		}
 	}
+	if dir := neoWebLocalProjectIDWorkingDirectory(rt.neoWebLocalSidebarProjectsCache(), projectID); dir != "" {
+		return dir
+	}
 	if !rt.localThreadSnapshotsEnabled() {
 		return ""
 	}
@@ -12006,6 +12096,8 @@ func neoWebLocalSidebarThread(thread map[string]any) map[string]any {
 	if version <= 0 {
 		version = 1
 	}
+	agentState := neoThreadAgentState(thread)
+	executorConnected := neoThreadExecutorConnected(thread)
 	return map[string]any{
 		"id":                threadID,
 		"threadId":          threadID,
@@ -12021,28 +12113,43 @@ func neoWebLocalSidebarThread(thread map[string]any) map[string]any {
 		"messageCount":      len(messages) + len(queued),
 		"env":               environment,
 		"labels":            []any{},
-		"hasExecutor":       true,
-		"executorConnected": true,
+		"state":             agentState,
+		"agentState":        agentState,
+		"hasExecutor":       executorConnected,
+		"executorConnected": executorConnected,
 		"hasUnreadMessages": false,
 		"summaryStats":      map[string]any{},
 		"creator":           map[string]any{"id": neoLocalOwnerUserID, "name": "Local Amp"},
 	}
 }
 
+func neoThreadExecutorConnected(thread map[string]any) bool {
+	if value, ok := thread["executorConnected"]; ok {
+		return boolValue(value)
+	}
+	if value, ok := thread["hasExecutor"]; ok {
+		return boolValue(value)
+	}
+	return false
+}
+
+func neoThreadAgentState(thread map[string]any) string {
+	if state, ok := neoAgentStateFromValues(thread["agentState"], thread["state"]); ok {
+		return state
+	}
+	if len(mapValue(thread["currentInference"])) > 0 || len(mapValue(thread["pendingInference"])) > 0 {
+		return "working"
+	}
+	return "idle"
+}
+
 func (rt *neoRuntime) neoWebLocalSidebarProjects(extraWorkingDirectories ...string) []any {
 	if rt == nil {
 		return []any{}
 	}
-	byID := map[string]map[string]any{}
-	add := func(project map[string]any) {
-		id := strings.TrimSpace(stringValue(project["id"]))
-		if id == "" {
-			return
-		}
-		if _, exists := byID[id]; !exists {
-			byID[id] = project
-		}
-	}
+	cacheProjects := rt.neoWebLocalSidebarProjectsCache()
+	rt.scheduleNeoWebLocalSidebarProjectsRefresh()
+	actorProjects := []any{}
 	if rt.store != nil {
 		for _, actor := range rt.store.threadActors(0) {
 			thread, ok := actor.neoWebLocalThreadDocument()
@@ -12051,29 +12158,175 @@ func (rt *neoRuntime) neoWebLocalSidebarProjects(extraWorkingDirectories ...stri
 				thread = map[string]any{"meta": cloneMap(actor.meta), "env": neoCloudEnvironment(actor.environment)}
 				actor.mu.Unlock()
 			}
-			add(neoWebLocalProjectFromThread(thread))
+			actorProjects = append(actorProjects, neoWebLocalProjectFromThread(thread))
 		}
 	}
-	if rt.localThreadSnapshotsEnabled() {
-		entries, err := os.ReadDir(rt.threadDir)
-		if err == nil {
-			for _, entry := range entries {
-				if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
-					continue
-				}
-				threadID := strings.TrimSuffix(entry.Name(), ".json")
-				thread, ok := loadNeoThreadFromDir(threadID, rt.threadDir)
-				if ok {
-					add(neoWebLocalProjectFromThread(thread))
-				}
-			}
-		}
-	}
+	extraProjects := []any{}
 	for _, dir := range extraWorkingDirectories {
 		if dir == "" {
 			continue
 		}
-		add(neoWebLocalProjectFromThread(map[string]any{"workingDirectory": dir, "workspaceRoot": dir}))
+		extraProjects = append(extraProjects, neoWebLocalProjectFromThread(map[string]any{"workingDirectory": dir, "workspaceRoot": dir}))
+	}
+	return neoWebLocalMergeSidebarProjects(actorProjects, cacheProjects, extraProjects)
+}
+
+func (rt *neoRuntime) neoWebLocalSidebarProjectsCache() []any {
+	if rt == nil {
+		return nil
+	}
+	rt.ensureNeoWebLocalSidebarProjectsCache()
+	rt.sidebarMu.Lock()
+	defer rt.sidebarMu.Unlock()
+	return cloneArray(rt.sidebarCache)
+}
+
+func (rt *neoRuntime) ensureNeoWebLocalSidebarProjectsCache() {
+	if rt == nil || !rt.localThreadSnapshotsEnabled() {
+		return
+	}
+	rt.sidebarMu.Lock()
+	if rt.sidebarLoaded {
+		rt.sidebarMu.Unlock()
+		return
+	}
+	rt.sidebarMu.Unlock()
+
+	projects := readNeoWebLocalProjectIndex(rt.threadDir)
+	if len(projects) == 0 {
+		projects = scanNeoWebLocalHistoryProjects(rt.threadDir)
+		if len(projects) > 0 {
+			if err := writeNeoWebLocalProjectIndex(rt.threadDir, projects); err != nil {
+				log.Debugf("amp neo local runtime project index seed failed: %v", err)
+			}
+		}
+	}
+
+	rt.sidebarMu.Lock()
+	if !rt.sidebarLoaded {
+		rt.sidebarCache = projects
+		rt.sidebarCached = time.Now()
+		rt.sidebarLoaded = true
+	}
+	rt.sidebarMu.Unlock()
+}
+
+func (rt *neoRuntime) scheduleNeoWebLocalSidebarProjectsRefresh() {
+	if rt == nil || !rt.localThreadSnapshotsEnabled() {
+		return
+	}
+	rt.sidebarMu.Lock()
+	if rt.sidebarRefresh || (!rt.sidebarCached.IsZero() && time.Since(rt.sidebarCached) < time.Minute) {
+		rt.sidebarMu.Unlock()
+		return
+	}
+	rt.sidebarRefresh = true
+	rt.sidebarMu.Unlock()
+	go rt.refreshNeoWebLocalSidebarProjects()
+}
+
+func (rt *neoRuntime) refreshNeoWebLocalSidebarProjects() {
+	projects := rt.scanNeoWebLocalSidebarProjects()
+	if projects == nil {
+		rt.sidebarMu.Lock()
+		rt.sidebarRefresh = false
+		rt.sidebarMu.Unlock()
+		return
+	}
+	if err := writeNeoWebLocalProjectIndex(rt.threadDir, projects); err != nil {
+		log.Debugf("amp neo local runtime project index refresh failed: %v", err)
+	}
+	rt.sidebarMu.Lock()
+	rt.sidebarCache = projects
+	rt.sidebarCached = time.Now()
+	rt.sidebarLoaded = true
+	rt.sidebarRefresh = false
+	rt.sidebarMu.Unlock()
+}
+
+func (rt *neoRuntime) scanNeoWebLocalSidebarProjects() []any {
+	if rt == nil || !rt.localThreadSnapshotsEnabled() {
+		return nil
+	}
+	projects := []any{}
+	historyProjects := scanNeoWebLocalHistoryProjects(rt.threadDir)
+	entries, err := os.ReadDir(rt.threadDir)
+	if err != nil && len(historyProjects) == 0 {
+		return nil
+	}
+	if err == nil {
+		for _, entry := range entries {
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+				continue
+			}
+			threadID := strings.TrimSuffix(entry.Name(), ".json")
+			thread, ok := loadNeoThreadFromDir(threadID, rt.threadDir)
+			if !ok {
+				continue
+			}
+			projects = append(projects, neoWebLocalProjectFromThread(thread))
+		}
+	}
+	return neoWebLocalMergeSidebarProjects(projects, historyProjects)
+}
+
+func scanNeoWebLocalHistoryProjects(threadDir string) []any {
+	path := neoWebLocalHistoryPath(threadDir)
+	if path == "" {
+		return nil
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer func() {
+		if errClose := file.Close(); errClose != nil {
+			log.Debugf("amp neo local runtime history close failed: %v", errClose)
+		}
+	}()
+	projects := []any{}
+	seen := map[string]struct{}{}
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 0, 64*1024), 64*1024*1024)
+	for scanner.Scan() {
+		dir := neoExistingDirectory(gjson.GetBytes(scanner.Bytes(), "cwd").String())
+		if dir == "" {
+			continue
+		}
+		if _, exists := seen[dir]; exists {
+			continue
+		}
+		seen[dir] = struct{}{}
+		projects = append(projects, neoWebLocalProjectFromThread(map[string]any{"workingDirectory": dir, "workspaceRoot": dir}))
+	}
+	if err := scanner.Err(); err != nil {
+		log.Debugf("amp neo local runtime history project scan failed: %v", err)
+	}
+	return neoWebLocalMergeSidebarProjects(projects)
+}
+
+func neoWebLocalHistoryPath(threadDir string) string {
+	threadDir = strings.TrimSpace(threadDir)
+	if threadDir == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(threadDir), "history.jsonl")
+}
+
+func neoWebLocalMergeSidebarProjects(groups ...[]any) []any {
+	byID := map[string]map[string]any{}
+	for _, group := range groups {
+		for _, rawProject := range group {
+			project := neoWebLocalNormalizeSidebarProject(mapValue(rawProject))
+			id := strings.TrimSpace(stringValue(project["id"]))
+			if id == "" {
+				continue
+			}
+			existing, exists := byID[id]
+			if !exists || (stringValue(existing["workingDirectory"]) == "" && stringValue(project["workingDirectory"]) != "") {
+				byID[id] = project
+			}
+		}
 	}
 	projects := make([]any, 0, len(byID))
 	for _, project := range byID {
@@ -12088,6 +12341,79 @@ func (rt *neoRuntime) neoWebLocalSidebarProjects(extraWorkingDirectories ...stri
 		return stringValue(left["id"]) < stringValue(right["id"])
 	})
 	return projects
+}
+
+func neoWebLocalNormalizeSidebarProject(project map[string]any) map[string]any {
+	if len(project) == 0 {
+		return nil
+	}
+	rawDir := strings.TrimSpace(stringValue(project["workingDirectory"]))
+	dir := ""
+	if rawDir != "" {
+		dir = neoExistingDirectory(rawDir)
+		if dir == "" {
+			return nil
+		}
+	}
+	repositoryURL := strings.TrimSpace(firstNonEmptyString(project["repositoryURL"], project["repoURL"]))
+	if repositoryURL == "" && dir != "" {
+		repositoryURL = neoFileURLForDirectory(dir)
+	}
+	name := strings.TrimSpace(firstNonEmptyString(project["name"], project["projectName"], neoProjectNameFromRepositoryURL(repositoryURL)))
+	if name == "" && dir != "" {
+		name = filepath.Base(dir)
+	}
+	if name == "." || name == string(filepath.Separator) {
+		name = "local"
+	}
+	if name == "" && repositoryURL == "" {
+		return nil
+	}
+	projectID := strings.TrimSpace(firstNonEmptyString(project["id"], project["projectID"], project["projectId"], project["project_id"]))
+	if !neoUUIDExactPattern.MatchString(projectID) {
+		projectID = neoDeterministicLocalProjectID(name, repositoryURL, dir)
+	}
+	namespace := strings.TrimSpace(firstNonEmptyString(project["namespace"], project["projectNamespace"]))
+	out := map[string]any{
+		"id":            projectID,
+		"projectID":     projectID,
+		"name":          fallbackString(name, "local"),
+		"namespace":     fallbackString(namespace, "local"),
+		"repositoryURL": repositoryURL,
+	}
+	if dir != "" {
+		out["workingDirectory"] = dir
+	}
+	return out
+}
+
+func neoWebLocalProjectIDWorkingDirectory(projects []any, projectID string) string {
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" {
+		return ""
+	}
+	for _, rawProject := range projects {
+		project := mapValue(rawProject)
+		matched := false
+		for _, candidate := range []string{
+			stringValue(project["id"]),
+			stringValue(project["projectID"]),
+			stringValue(project["projectId"]),
+			stringValue(project["project_id"]),
+		} {
+			if strings.TrimSpace(candidate) == projectID {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+		if dir := neoExistingDirectory(project["workingDirectory"]); dir != "" {
+			return dir
+		}
+	}
+	return ""
 }
 
 func neoWebLocalProjectFromThread(thread map[string]any) map[string]any {
@@ -12668,6 +12994,7 @@ func neoCloudThread(snapshot neoCloudThreadSnapshot) map[string]any {
 	agentMode := neoCloudAgentMode(snapshot, messages)
 	reasoningEffort := neoExplicitThreadReasoningEffort(snapshot.settings, messages, agentMode)
 	settings, agentMode, reasoningEffort := neoThreadModeSettingsPayload(snapshot.settings, agentMode, reasoningEffort)
+	agentState := neoAgentStateOrIdle(snapshot.agentState)
 	thread := map[string]any{
 		"id":                snapshot.threadID,
 		"v":                 version,
@@ -12676,6 +13003,8 @@ func neoCloudThread(snapshot neoCloudThreadSnapshot) map[string]any {
 		"creatorUserID":     neoLocalOwnerUserID,
 		"ownerUserId":       neoLocalOwnerUserID,
 		"threadStatus":      threadStatus,
+		"state":             agentState,
+		"agentState":        agentState,
 		"messages":          cloudMessages,
 		"agentMode":         agentMode,
 		"settings":          settings,
@@ -13945,6 +14274,7 @@ func (a *neoActor) setAgentState(state, messageID, agentMode, reasoningEffort st
 	if previous != state && state == "idle" {
 		a.dispatchNotification("agent", "agent_idle", map[string]any{"messageId": omitEmpty(messageID), "agentMode": agentMode})
 	}
+	a.syncCloudAsync()
 }
 
 // clearCurrentInference removes the in-flight inference tracker if it still
@@ -14973,11 +15303,13 @@ func (a *neoActor) recentThreadStatus() (map[string]any, int) {
 		updatedMs = int(a.lastUsed.UnixMilli())
 	}
 	title := firstNonEmptyString(a.title, neoCloudTitle(a.messages), "Untitled")
+	agentState := neoAgentStateOrIdle(a.agentState)
 	status := map[string]any{
 		"threadId":          threadID,
 		"title":             title,
 		"lastUserMessageAt": updatedAt,
-		"state":             normalizeNeoAgentState(a.agentState),
+		"state":             agentState,
+		"agentState":        agentState,
 	}
 	if a.archived {
 		status["archived"] = true
@@ -16511,8 +16843,9 @@ func (rt *neoRuntime) neoWebLocalInternalRPCResponse(method string, params map[s
 			if len(status) == 0 {
 				continue
 			}
-			status["hasExecutor"] = true
-			status["executorConnected"] = true
+			agentState := neoAgentStateOrIdle(status["agentState"], status["state"])
+			status["state"] = agentState
+			status["agentState"] = agentState
 			statuses[i] = status
 		}
 		return map[string]any{"ok": true, "result": map[string]any{"threads": statuses}}, http.StatusOK, true
@@ -16576,10 +16909,10 @@ func (a *neoActor) neoWebLocalThreadDocument() (map[string]any, bool) {
 	}
 	thread := neoCloudThread(snapshot)
 	meta := neoThreadActorImportedMeta(mapValue(thread["meta"]))
-	meta["executorType"] = "local-client"
+	if boolValue(thread["executorConnected"]) && stringValue(meta["executorType"]) == "" {
+		meta["executorType"] = "local-client"
+	}
 	thread["meta"] = meta
-	thread["hasExecutor"] = true
-	thread["executorConnected"] = true
 	return thread, true
 }
 
@@ -25456,6 +25789,22 @@ func normalizeNeoAgentState(state string) string {
 	default:
 		return "working"
 	}
+}
+
+func neoAgentStateFromValues(values ...any) (string, bool) {
+	for _, value := range values {
+		if state := strings.TrimSpace(stringValue(value)); state != "" {
+			return normalizeNeoAgentState(state), true
+		}
+	}
+	return "", false
+}
+
+func neoAgentStateOrIdle(values ...any) string {
+	if state, ok := neoAgentStateFromValues(values...); ok {
+		return state
+	}
+	return "idle"
 }
 
 func normalizeNeoProtocolReasoningEffort(effort string) string {

@@ -5367,8 +5367,8 @@ func TestNeoUserActorGetRecentThreadsActionMatchesBinaryShape(t *testing.T) {
 	if item["lastUserMessageAt"] != "2026-05-31T10:00:00Z" {
 		t.Fatalf("lastUserMessageAt = %#v", item["lastUserMessageAt"])
 	}
-	if item["state"] != "working" {
-		t.Fatalf("state = %#v", item["state"])
+	if item["state"] != "working" || item["agentState"] != "working" {
+		t.Fatalf("state = %#v agentState = %#v", item["state"], item["agentState"])
 	}
 	if item["hasExecutor"] != true || item["executorConnected"] != true {
 		t.Fatalf("executor status = has:%#v connected:%#v", item["hasExecutor"], item["executorConnected"])
@@ -5384,6 +5384,9 @@ func TestNeoUserActorGetRecentThreadsActionMatchesBinaryShape(t *testing.T) {
 	observerOnlyStatus, _ := recent.recentThreadStatus()
 	if observerOnlyStatus["hasExecutor"] != false || observerOnlyStatus["executorConnected"] != false {
 		t.Fatalf("observer-only executor status = has:%#v connected:%#v", observerOnlyStatus["hasExecutor"], observerOnlyStatus["executorConnected"])
+	}
+	if observerOnlyStatus["agentState"] != "working" {
+		t.Fatalf("observer-only agentState = %#v", observerOnlyStatus["agentState"])
 	}
 }
 
@@ -5628,7 +5631,7 @@ func TestNeoUserActorReceivesThreadStatusUpdatedNotification(t *testing.T) {
 
 	threadActor.handle(map[string]any{"type": "agent_state", "state": "working"})
 	params := readThreadStatusUpdated()
-	if params["threadId"] != threadID || params["title"] != "Live local thread" || params["state"] != "working" {
+	if params["threadId"] != threadID || params["title"] != "Live local thread" || params["state"] != "working" || params["agentState"] != "working" {
 		t.Fatalf("threadStatusUpdated params = %#v", params)
 	}
 	if params["lastUserMessageAt"] != "2026-05-31T11:00:00Z" {
@@ -5715,7 +5718,7 @@ func TestNeoUserActorReceivesThreadStatusUpdatedOnExecutorConnectDisconnect(t *t
 
 	threadActor.executorConnected(map[string]any{"executorId": "executor-test"})
 	params := readThreadStatusUpdated()
-	if params["title"] != "Executor local thread" || params["state"] != "idle" {
+	if params["title"] != "Executor local thread" || params["state"] != "idle" || params["agentState"] != "idle" {
 		t.Fatalf("executor connected threadStatusUpdated params = %#v", params)
 	}
 	if params["hasExecutor"] != true || params["executorConnected"] != true {
@@ -23784,6 +23787,9 @@ func TestNeoCloudThreadIncludesProtocolMessageIDAndCompleteState(t *testing.T) {
 	if thread["hasExecutor"] != true || thread["executorConnected"] != true {
 		t.Fatalf("executor state = has:%#v connected:%#v", thread["hasExecutor"], thread["executorConnected"])
 	}
+	if thread["state"] != "idle" || thread["agentState"] != "idle" {
+		t.Fatalf("thread state = state:%#v agentState:%#v", thread["state"], thread["agentState"])
+	}
 	meta := mapValue(thread["meta"])
 	if meta["ampcodeConnectorLocalNeo"] != true {
 		t.Fatalf("missing connector local Neo marker in meta: %#v", meta)
@@ -23796,6 +23802,70 @@ func TestNeoCloudThreadIncludesProtocolMessageIDAndCompleteState(t *testing.T) {
 	}
 	if meta["usesThreadActors"] != true {
 		t.Fatalf("missing thread actor marker in meta: %#v", meta)
+	}
+}
+
+func TestNeoWebLocalThreadDocumentDoesNotInventExecutorConnection(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019e0e6e-f3f1-7078-b5dd-748f66f8c266"
+	actor := rt.store.ensureThreadActor(threadID)
+	actor.mu.Lock()
+	actor.title = "Disconnected local thread"
+	actor.agentState = "idle"
+	actor.bootstrapExecutorType = "local-client"
+	actor.messages = []neoMessage{{
+		ThreadID:  threadID,
+		MessageID: "M-user",
+		Role:      "user",
+		Content:   []any{map[string]any{"type": "text", "text": "hi"}},
+		Seq:       1,
+	}}
+	actor.mu.Unlock()
+
+	thread, ok := actor.neoWebLocalThreadDocument()
+	if !ok {
+		t.Fatal("missing web local thread document")
+	}
+	if thread["hasExecutor"] != false || thread["executorConnected"] != false {
+		t.Fatalf("executor state = has:%#v connected:%#v", thread["hasExecutor"], thread["executorConnected"])
+	}
+	if thread["state"] != "idle" || thread["agentState"] != "idle" {
+		t.Fatalf("thread state = state:%#v agentState:%#v", thread["state"], thread["agentState"])
+	}
+	sidebarThread := neoWebLocalSidebarThread(thread)
+	if sidebarThread["hasExecutor"] != false || sidebarThread["executorConnected"] != false {
+		t.Fatalf("sidebar executor state = has:%#v connected:%#v", sidebarThread["hasExecutor"], sidebarThread["executorConnected"])
+	}
+	if sidebarThread["state"] != "idle" || sidebarThread["agentState"] != "idle" {
+		t.Fatalf("sidebar state = state:%#v agentState:%#v", sidebarThread["state"], sidebarThread["agentState"])
+	}
+}
+
+func TestNeoWebLocalSidebarThreadInfersProgressOnlyWithoutExplicitState(t *testing.T) {
+	idle := neoWebLocalSidebarThread(map[string]any{
+		"id":                "T-idle",
+		"created":           1778170000000,
+		"title":             "Idle",
+		"executorConnected": false,
+		"currentInference":  map[string]any{"messageId": "M-stale"},
+		"agentState":        "idle",
+	})
+	if idle["agentState"] != "idle" || idle["state"] != "idle" {
+		t.Fatalf("explicit idle state = state:%#v agentState:%#v", idle["state"], idle["agentState"])
+	}
+
+	working := neoWebLocalSidebarThread(map[string]any{
+		"id":                "T-working",
+		"created":           1778170000000,
+		"title":             "Working",
+		"executorConnected": true,
+		"currentInference":  map[string]any{"messageId": "M-working"},
+	})
+	if working["agentState"] != "working" || working["state"] != "working" {
+		t.Fatalf("inferred working state = state:%#v agentState:%#v", working["state"], working["agentState"])
+	}
+	if working["hasExecutor"] != true || working["executorConnected"] != true {
+		t.Fatalf("working executor state = has:%#v connected:%#v", working["hasExecutor"], working["executorConnected"])
 	}
 }
 

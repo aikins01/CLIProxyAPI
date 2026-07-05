@@ -405,7 +405,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 	body := rec.Body.String()
 	for _, want := range []string{
 		"// ==UserScript==",
-		"@version 0.1.28",
+		"@version 0.1.29",
 		"@match https://ampcode.com/*",
 		"@updateURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
 		"@downloadURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
@@ -468,6 +468,10 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"devalueThreadWorkingDirectory",
 		"TextDecoder",
 		"seedLocalSidebarProjects",
+		"seedLocalSidebarProjectForWorkingDirectory",
+		"scheduleLocalSidebarProjectsRefresh",
+		"scheduleLocalSidebarProjectsRefresh(workingDirectory)",
+		`localSidebarRefreshWorkingDirectory = "";`,
 		"localGoFilePathEscape",
 		`.replace(/%2B/gi, "+")`,
 		`.split(/[\\/]+/)`,
@@ -542,8 +546,8 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 			t.Fatalf("userscript still activates obsolete local thread control %q:\n%s", unwanted, body)
 		}
 	}
-	if got := strings.Count(body, "refreshLocalSidebarProjects();"); got != 2 {
-		t.Fatalf("refreshLocalSidebarProjects call count = %d, want 2", got)
+	if got := strings.Count(body, "refreshLocalSidebarProjects();"); got != 3 {
+		t.Fatalf("refreshLocalSidebarProjects call count = %d, want 3", got)
 	}
 	if !strings.Contains(body, `headers: localFetchHeaders("", false)`) {
 		t.Fatalf("background sidebar refresh should not prompt for API key:\n%s", body)
@@ -1495,8 +1499,11 @@ func TestWebLocalInferenceInternalRPCServesLocalThreadWithoutProxy(t *testing.T)
 		t.Fatalf("getThread response JSON error: %v", err)
 	}
 	thread := mapValue(mapValue(getResponse["result"])["thread"])
-	if stringValue(thread["id"]) != threadID || thread["executorConnected"] != true {
+	if stringValue(thread["id"]) != threadID || thread["executorConnected"] != false || thread["hasExecutor"] != false {
 		t.Fatalf("unexpected local thread response: %#v", getResponse)
+	}
+	if thread["agentState"] != "idle" || thread["state"] != "idle" {
+		t.Fatalf("unexpected local thread state: %#v", thread)
 	}
 	if stringValue(mapValue(thread["meta"])["ampcodeConnectorMode"]) != "local-neo" {
 		t.Fatalf("thread meta missing local marker: %#v", thread["meta"])
@@ -1520,8 +1527,11 @@ func TestWebLocalInferenceInternalRPCServesLocalThreadWithoutProxy(t *testing.T)
 		t.Fatalf("listThreads response JSON error: %v", err)
 	}
 	statuses := arrayValue(mapValue(listResponse["result"])["threads"])
-	if len(statuses) != 1 || stringValue(mapValue(statuses[0])["threadId"]) != threadID || mapValue(statuses[0])["executorConnected"] != true {
+	if len(statuses) != 1 || stringValue(mapValue(statuses[0])["threadId"]) != threadID || mapValue(statuses[0])["executorConnected"] != false || mapValue(statuses[0])["hasExecutor"] != false {
 		t.Fatalf("unexpected local thread statuses: %#v", listResponse)
+	}
+	if mapValue(statuses[0])["agentState"] != "idle" || mapValue(statuses[0])["state"] != "idle" {
+		t.Fatalf("unexpected local thread status state: %#v", listResponse)
 	}
 
 	plainReq := httptest.NewRequest(http.MethodPost, "/api/internal?getThread", bytes.NewBufferString(`{"method":"getThread","params":{"thread":"`+threadID+`"}}`))
@@ -1720,7 +1730,7 @@ func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.
 	}
 	for _, rawThread := range arrayValue(queryValue["recentThreads"]) {
 		thread := mapValue(rawThread)
-		if stringValue(thread["id"]) == threadID && thread["hasExecutor"] == true {
+		if stringValue(thread["id"]) == threadID && thread["hasExecutor"] == false && thread["agentState"] == "idle" {
 			sawThread = true
 		}
 	}
@@ -1835,6 +1845,44 @@ func TestWebLocalInferenceRemoteSidebarIncludesWorkingDirectoryHint(t *testing.T
 	}
 	if threads := arrayValue(queryValue["recentThreads"]); len(threads) != 0 {
 		t.Fatalf("recentThreads = %#v, want none for fresh hinted project", threads)
+	}
+}
+
+func TestWebLocalInferenceRemoteSidebarIncludesHistoryProjects(t *testing.T) {
+	dataDir := t.TempDir()
+	oldStoreDir := neoAmpDataDir
+	neoAmpDataDir = func() string { return dataDir }
+	t.Cleanup(func() { neoAmpDataDir = oldStoreDir })
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+		NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled},
+	}})
+
+	workDir := t.TempDir()
+	historyLine, err := json.Marshal(map[string]any{"text": "new local thread", "cwd": workDir})
+	if err != nil {
+		t.Fatalf("marshal history: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "history.jsonl"), append(historyLine, '\n'), 0o600); err != nil {
+		t.Fatalf("write history: %v", err)
+	}
+
+	value := rt.neoWebLocalThreadListSidebar(url.Values{})
+	projects := arrayValue(value["projects"])
+	if len(projects) != 1 {
+		t.Fatalf("projects = %#v, want exactly history project", projects)
+	}
+	expectedWorkDir := neoExistingDirectory(workDir)
+	expectedID := neoDeterministicLocalProjectID(filepath.Base(expectedWorkDir), neoFileURLForDirectory(expectedWorkDir), expectedWorkDir)
+	project := mapValue(projects[0])
+	if stringValue(project["id"]) != expectedID || stringValue(project["workingDirectory"]) != expectedWorkDir || stringValue(project["name"]) != filepath.Base(expectedWorkDir) {
+		t.Fatalf("project = %#v, want id=%q workingDirectory=%q", project, expectedID, expectedWorkDir)
+	}
+	if got := rt.neoWebLocalProjectWorkingDirectory(expectedID); got != expectedWorkDir {
+		t.Fatalf("project workingDirectory = %q, want %q", got, expectedWorkDir)
+	}
+	if _, err := os.Stat(neoWebLocalProjectIndexPath(rt.threadDir)); err != nil {
+		t.Fatalf("project index was not written: %v", err)
 	}
 }
 

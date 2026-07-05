@@ -190,7 +190,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	return fmt.Sprintf(`// ==UserScript==
 // @name CLIProxyAPI Amp Local Inference
 // @namespace https://github.com/router-for-me/CLIProxyAPI
-// @version 0.1.28
+// @version 0.1.29
 %s
 // @updateURL %s
 // @downloadURL %s
@@ -521,6 +521,8 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		globalThis.localStorage.setItem(threadWorkingDirectoriesStorageKey, JSON.stringify(directories));
 		diagnostics.lastInheritedWorkingDirectory = workingDirectory;
 		diagnostics.lastInheritedWorkingDirectoryThreadID = threadID;
+		seedLocalSidebarProjectForWorkingDirectory(workingDirectory);
+		scheduleLocalSidebarProjectsRefresh(workingDirectory);
 	}
 
 	function rememberLocalThreadID(threadID) {
@@ -899,6 +901,8 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 
 	let cachedLocalSidebarProjects = [];
 	let cachedLocalSidebarRecentThreads = [];
+	let localSidebarRefreshWorkingDirectory = "";
+	let localSidebarRefreshTimer = 0;
 
 	function localGoFilePathEscape(part) {
 		return encodeURIComponent(part)
@@ -1028,8 +1032,8 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		return hex.slice(0, 4).join("") + "-" + hex.slice(4, 6).join("") + "-" + hex.slice(6, 8).join("") + "-" + hex.slice(8, 10).join("") + "-" + hex.slice(10, 16).join("");
 	}
 
-	function seedLocalSidebarProjects() {
-		const workingDirectory = normalizeWorkingDirectory(localWorkingDirectory());
+	function seedLocalSidebarProjectForWorkingDirectory(workingDirectory) {
+		workingDirectory = normalizeWorkingDirectory(workingDirectory);
 		if (!workingDirectory) {
 			return;
 		}
@@ -1049,6 +1053,26 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		}, ...cachedLocalSidebarProjects];
 		diagnostics.localSidebarSeedCount += 1;
 		diagnostics.localSidebarProjectCount = cachedLocalSidebarProjects.length;
+	}
+
+	function seedLocalSidebarProjects() {
+		seedLocalSidebarProjectForWorkingDirectory(localWorkingDirectory());
+	}
+
+	function scheduleLocalSidebarProjectsRefresh(workingDirectory) {
+		workingDirectory = normalizeWorkingDirectory(workingDirectory);
+		if (!workingDirectory || workingDirectory === localSidebarRefreshWorkingDirectory) {
+			return;
+		}
+		localSidebarRefreshWorkingDirectory = workingDirectory;
+		if (localSidebarRefreshTimer) {
+			return;
+		}
+		localSidebarRefreshTimer = setTimeout(() => {
+			localSidebarRefreshTimer = 0;
+			localSidebarRefreshWorkingDirectory = "";
+			refreshLocalSidebarProjects();
+		}, 0);
 	}
 
 	function refreshLocalSidebarProjects() {
