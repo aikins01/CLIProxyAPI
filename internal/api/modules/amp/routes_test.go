@@ -405,7 +405,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 	body := rec.Body.String()
 	for _, want := range []string{
 		"// ==UserScript==",
-		"@version 0.1.30",
+		"@version 0.1.31",
 		"@match https://ampcode.com/*",
 		"@updateURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
 		"@downloadURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
@@ -502,6 +502,9 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		`values.push(["Date", iso])`,
 		"appendDevalueSidebarValue",
 		"devalueSidebarThreadIDs",
+		"devalueSidebarThreadRef",
+		"patchDevalueSidebarThread",
+		"existingThreadIDs.has(threadID)",
 		"localSidebarRecentThreadCount",
 		"remoteCreateProjectThreadWorkingDirectory",
 		"rememberRemoteCreateProjectThread",

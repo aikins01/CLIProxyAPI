@@ -12084,12 +12084,13 @@ func neoWebLocalSidebarThread(thread map[string]any) map[string]any {
 	if createdMs <= 0 {
 		createdMs = time.Now().UnixMilli()
 	}
-	updatedAt := firstNonEmptyString(thread["updatedAt"], thread["lastUserMessageAt"])
+	messages := arrayValue(thread["messages"])
+	lastUserMessageAt := neoThreadMapLastUserMessageAt(thread, messages)
+	updatedAt := firstNonEmptyString(thread["updatedAt"], lastUserMessageAt)
 	if updatedAt == "" {
 		updatedAt = time.UnixMilli(createdMs).UTC().Format(time.RFC3339Nano)
 	}
 	meta := neoThreadActorImportedMeta(mapValue(thread["meta"]))
-	messages := arrayValue(thread["messages"])
 	queued := arrayValue(thread["queuedMessages"])
 	environment := mapValue(thread["env"])
 	version := numberFrom(thread["v"])
@@ -12098,7 +12099,19 @@ func neoWebLocalSidebarThread(thread map[string]any) map[string]any {
 	}
 	agentState := neoThreadAgentState(thread)
 	executorConnected := neoThreadExecutorConnected(thread)
-	return map[string]any{
+	agentMode := neoThreadMapAgentMode(thread)
+	reasoningEffort := neoThreadMapReasoningEffort(thread, agentMode)
+	currentInference := cloneMap(mapValue(thread["currentInference"]))
+	pendingInference := cloneMap(mapValue(thread["pendingInference"]))
+	if len(currentInference) > 0 {
+		agentMode = firstNonEmptyString(currentInference["agentMode"], agentMode)
+		reasoningEffort = firstNonEmptyString(currentInference["reasoningEffort"], reasoningEffort)
+	} else if len(pendingInference) > 0 {
+		agentMode = firstNonEmptyString(pendingInference["agentMode"], agentMode)
+		reasoningEffort = firstNonEmptyString(pendingInference["reasoningEffort"], reasoningEffort)
+	}
+	settings, agentMode, reasoningEffort := neoThreadModeSettingsPayload(mapValue(thread["settings"]), agentMode, reasoningEffort)
+	out := map[string]any{
 		"id":                threadID,
 		"threadId":          threadID,
 		"v":                 version,
@@ -12121,6 +12134,39 @@ func neoWebLocalSidebarThread(thread map[string]any) map[string]any {
 		"summaryStats":      map[string]any{},
 		"creator":           map[string]any{"id": neoLocalOwnerUserID, "name": "Local Amp"},
 	}
+	if lastUserMessageAt != "" {
+		out["lastUserMessageAt"] = lastUserMessageAt
+	}
+	if agentMode != "" {
+		out["agentMode"] = agentMode
+		out["settings"] = settings
+	}
+	if reasoningEffort != "" {
+		out["reasoningEffort"] = reasoningEffort
+	}
+	if len(currentInference) > 0 {
+		out["currentInference"] = currentInference
+	}
+	if len(pendingInference) > 0 {
+		out["pendingInference"] = pendingInference
+	}
+	return out
+}
+
+func neoThreadMapLastUserMessageAt(thread map[string]any, messages []any) string {
+	if value := firstNonEmptyString(thread["lastUserMessageAt"], thread["lastUserMessage_at"]); value != "" {
+		return value
+	}
+	for i := len(messages) - 1; i >= 0; i-- {
+		message := mapValue(messages[i])
+		if stringValue(message["role"]) != "user" {
+			continue
+		}
+		if value := firstNonEmptyString(message["createdAt"], message["created_at"]); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func neoThreadExecutorConnected(thread map[string]any) bool {
@@ -15304,6 +15350,17 @@ func (a *neoActor) recentThreadStatus() (map[string]any, int) {
 	}
 	title := firstNonEmptyString(a.title, neoCloudTitle(a.messages), "Untitled")
 	agentState := neoAgentStateOrIdle(a.agentState)
+	agentMode := a.agentModeLocked()
+	reasoningEffort := a.reasoningEffortForModeLocked(agentMode)
+	currentInference := neoInferenceInflightThreadMap(a.currentInference)
+	pendingInference := neoInferenceInflightThreadMap(a.pendingInference)
+	if len(currentInference) > 0 {
+		agentMode = firstNonEmptyString(currentInference["agentMode"], agentMode)
+		reasoningEffort = firstNonEmptyString(currentInference["reasoningEffort"], reasoningEffort)
+	} else if len(pendingInference) > 0 {
+		agentMode = firstNonEmptyString(pendingInference["agentMode"], agentMode)
+		reasoningEffort = firstNonEmptyString(pendingInference["reasoningEffort"], reasoningEffort)
+	}
 	status := map[string]any{
 		"threadId":          threadID,
 		"title":             title,
@@ -15326,6 +15383,21 @@ func (a *neoActor) recentThreadStatus() (map[string]any, int) {
 	executorConnected := a.executorID != ""
 	status["hasExecutor"] = executorConnected
 	status["executorConnected"] = executorConnected
+	if agentMode != "" {
+		status["agentMode"] = agentMode
+	}
+	if reasoningEffort != "" {
+		status["reasoningEffort"] = reasoningEffort
+	}
+	if len(currentInference) > 0 {
+		status["currentInference"] = currentInference
+		if messageID := stringValue(currentInference["messageId"]); messageID != "" {
+			status["messageId"] = messageID
+		}
+	}
+	if len(pendingInference) > 0 {
+		status["pendingInference"] = pendingInference
+	}
 	return status, updatedMs
 }
 

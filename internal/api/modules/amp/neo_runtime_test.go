@@ -5324,6 +5324,7 @@ func TestNeoUserActorGetRecentThreadsActionMatchesBinaryShape(t *testing.T) {
 	recent.title = "Recent local work"
 	recent.agentState = "working"
 	recent.executorID = "executor-test"
+	recent.currentInference = &neoInferenceInflight{messageID: "M-recent-assistant", agentMode: "deep", reasoningEffort: "xhigh", tools: []string{"shell_command"}}
 	recent.environment = map[string]any{"initial": map[string]any{"trees": []any{map[string]any{"uri": "file:///Users/test/project", "displayName": "project"}}}}
 	recent.sockets = map[*neoSocket]struct{}{&neoSocket{}: {}}
 	recent.messages = []neoMessage{{
@@ -5369,6 +5370,12 @@ func TestNeoUserActorGetRecentThreadsActionMatchesBinaryShape(t *testing.T) {
 	}
 	if item["state"] != "working" || item["agentState"] != "working" {
 		t.Fatalf("state = %#v agentState = %#v", item["state"], item["agentState"])
+	}
+	if item["messageId"] != "M-recent-assistant" || item["agentMode"] != "deep" || item["reasoningEffort"] != "xhigh" {
+		t.Fatalf("active inference status = %#v", item)
+	}
+	if tools := arrayValue(mapValue(item["currentInference"])["tools"]); len(tools) != 1 || tools[0] != "shell_command" {
+		t.Fatalf("currentInference = %#v", item["currentInference"])
 	}
 	if item["hasExecutor"] != true || item["executorConnected"] != true {
 		t.Fatalf("executor status = has:%#v connected:%#v", item["hasExecutor"], item["executorConnected"])
@@ -23859,13 +23866,30 @@ func TestNeoWebLocalSidebarThreadInfersProgressOnlyWithoutExplicitState(t *testi
 		"created":           1778170000000,
 		"title":             "Working",
 		"executorConnected": true,
-		"currentInference":  map[string]any{"messageId": "M-working"},
+		"currentInference":  map[string]any{"messageId": "M-working", "agentMode": "deep", "reasoningEffort": "xhigh", "tools": []any{"shell_command"}},
+		"messages": []any{map[string]any{
+			"messageId":       "M-user",
+			"role":            "user",
+			"createdAt":       "2026-05-31T10:00:00Z",
+			"agentMode":       "deep",
+			"reasoningEffort": "xhigh",
+			"content":         []any{map[string]any{"type": "text", "text": "continue"}},
+		}},
 	})
 	if working["agentState"] != "working" || working["state"] != "working" {
 		t.Fatalf("inferred working state = state:%#v agentState:%#v", working["state"], working["agentState"])
 	}
 	if working["hasExecutor"] != true || working["executorConnected"] != true {
 		t.Fatalf("working executor state = has:%#v connected:%#v", working["hasExecutor"], working["executorConnected"])
+	}
+	if working["lastUserMessageAt"] != "2026-05-31T10:00:00Z" || working["updatedAt"] != "2026-05-31T10:00:00Z" {
+		t.Fatalf("working timestamps = last:%#v updated:%#v", working["lastUserMessageAt"], working["updatedAt"])
+	}
+	if working["agentMode"] != "deep" || working["reasoningEffort"] != "xhigh" {
+		t.Fatalf("working mode/effort = mode:%#v effort:%#v", working["agentMode"], working["reasoningEffort"])
+	}
+	if mapValue(working["currentInference"])["messageId"] != "M-working" {
+		t.Fatalf("working currentInference = %#v", working["currentInference"])
 	}
 }
 

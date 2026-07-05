@@ -190,7 +190,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	return fmt.Sprintf(`// ==UserScript==
 // @name CLIProxyAPI Amp Local Inference
 // @namespace https://github.com/router-for-me/CLIProxyAPI
-// @version 0.1.30
+// @version 0.1.31
 %s
 // @updateURL %s
 // @downloadURL %s
@@ -1215,6 +1215,38 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		return ids;
 	}
 
+	function devalueSidebarThreadRef(values, list, threadID) {
+		for (const ref of list) {
+			const thread = Number.isInteger(ref) ? values[ref] : null;
+			if (!isPlainObject(thread)) {
+				continue;
+			}
+			for (const field of ["id", "threadId", "threadID"]) {
+				const value = Number.isInteger(thread[field]) ? values[thread[field]] : null;
+				if (value === threadID) {
+					return ref;
+				}
+			}
+		}
+		return -1;
+	}
+
+	function patchDevalueSidebarThread(values, ref, source) {
+		const target = Number.isInteger(ref) ? values[ref] : null;
+		if (!isPlainObject(target) || !isPlainObject(source)) {
+			return false;
+		}
+		let patched = false;
+		for (const [key, value] of Object.entries(source)) {
+			if (typeof value === "undefined") {
+				continue;
+			}
+			target[key] = appendDevalueSidebarValue(values, value, key);
+			patched = true;
+		}
+		return patched;
+	}
+
 	function mergeDevalueSidebarProjects(values) {
 		if (!Array.isArray(values) || (cachedLocalSidebarProjects.length === 0 && cachedLocalSidebarRecentThreads.length === 0)) {
 			return false;
@@ -1245,7 +1277,13 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 				const existingThreadIDs = devalueSidebarThreadIDs(values, recentThreads);
 				for (const thread of cachedLocalSidebarRecentThreads) {
 					const threadID = firstString(thread.id, thread.threadId, thread.threadID);
-					if (!validThreadID(threadID) || existingThreadIDs.has(threadID)) {
+					if (!validThreadID(threadID)) {
+						continue;
+					}
+					if (existingThreadIDs.has(threadID)) {
+						if (patchDevalueSidebarThread(values, devalueSidebarThreadRef(values, recentThreads, threadID), thread)) {
+							merged = true;
+						}
 						continue;
 					}
 					recentThreads.unshift(appendDevalueSidebarValue(values, thread));
