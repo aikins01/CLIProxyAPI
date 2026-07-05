@@ -406,7 +406,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 	body := rec.Body.String()
 	for _, want := range []string{
 		"// ==UserScript==",
-		"@version 0.1.41",
+		"@version 0.1.42",
 		"@match https://ampcode.com/*",
 		"@updateURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
 		"@downloadURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
@@ -421,16 +421,26 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"commandPaletteIntegrationCount",
 		"localThreadPickerOpenCount",
 		"removedLocalThreadControlCount",
+		`const userscriptVersion = "0.1.42"`,
+		"userscriptVersion",
 		"lastPatchedThreadActorBaseURL",
 		"lastPatchedThreadID",
 		`let pendingLocalBootstrapThreadID = "";`,
 		"threadActorConfig",
 		"plainThreadActorConfigHasBridgeFields",
 		"devalueThreadActorConfigHasBridgeFields",
+		"localPlainThreadActorConfig",
+		"localDevalueThreadActorConfig",
+		"plainContainerThreadID",
+		"devalueContainerThreadID",
+		"ensurePlainLocalThreadActorConfig",
+		"ensureDevalueLocalThreadActorConfig",
+		`wsToken: "local-neo"`,
+		`threadActorTransport: "json-rpc"`,
 		"local-client",
 		"cliproxyapi.ampLocalInference.apiKey",
 		"storedLocalAPIKey",
-		`return globalThis.sessionStorage.getItem(apiKeyStorageKey) || ""`,
+		"globalThis.localStorage.getItem(apiKeyStorageKey)",
 		`const promptedAPIKey = (globalThis.prompt("CLIProxyAPI API key") || "").trim()`,
 		"globalThis.sessionStorage.setItem(apiKeyStorageKey, promptedAPIKey)",
 		"cliproxyapi.ampLocalInference.workingDirectory",
@@ -536,6 +546,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"firstThreadIDFromText",
 		"rvt-input",
 		"sameLocalHTTPBase",
+		"samePageWebSocketBase",
 		"sameLocalWebSocketBase",
 		"diagnostics",
 		"lastWebSocketBootstrapped",
@@ -583,6 +594,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"devalueSidebarThreadRef",
 		"patchDevalueSidebarThread",
 		"localProjectIDForWorkingDirectory",
+		"globalThis.localStorage.setItem(apiKeyStorageKey, promptedAPIKey)",
 		"cachedProjectWorkingDirectory",
 		"patchPlainThreadRuntime",
 		"patchDevalueThreadRuntime",
@@ -625,6 +637,164 @@ func TestWebLocalInferenceUserscriptSyntax(t *testing.T) {
 	cmd := exec.Command("node", "--check", path)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("userscript syntax check failed: %v\n%s", err, output)
+	}
+}
+
+func TestWebLocalInferenceUserscriptPatchesLocalThreadActorConfig(t *testing.T) {
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node not installed")
+	}
+	dir := t.TempDir()
+	scriptPath := filepath.Join(dir, "local-inference.user.js")
+	if err := os.WriteFile(scriptPath, []byte(ampWebLocalInferenceUserscript("http://127.0.0.1:8317", nil)), 0o600); err != nil {
+		t.Fatalf("write userscript: %v", err)
+	}
+	threadID := "T-019f324b-2802-7868-b1b1-5f0fa3e87ea5"
+	secondThreadID := "T-019f324b-2802-7868-b1b1-5f0fa3e87ea6"
+	runner := `
+const assert = (condition, message) => {
+	if (!condition) throw new Error(message);
+};
+const scriptPath = ` + strconv.Quote(scriptPath) + `;
+const threadID = ` + strconv.Quote(threadID) + `;
+const secondThreadID = ` + strconv.Quote(secondThreadID) + `;
+class TestStorage {
+	constructor() { this.values = new Map(); }
+	getItem(key) {
+		key = String(key);
+		return this.values.has(key) ? this.values.get(key) : null;
+	}
+	setItem(key, value) { this.values.set(String(key), String(value)); }
+	removeItem(key) { this.values.delete(String(key)); }
+}
+class FakeElement {
+	constructor() {
+		this.dataset = {};
+		this.style = {};
+		this.children = [];
+		this.classList = { add() {}, remove() {}, contains() { return false; } };
+	}
+	appendChild(child) { this.children.push(child); return child; }
+	addEventListener() {}
+	removeEventListener() {}
+	setAttribute() {}
+	querySelector() { return null; }
+	querySelectorAll() { return []; }
+	closest() { return null; }
+	matches() { return false; }
+}
+class NativeWebSocket {
+	static CONNECTING = 0;
+	static OPEN = 1;
+	static CLOSING = 2;
+	static CLOSED = 3;
+	static instances = [];
+	constructor(url, protocols) {
+		this.url = String(url);
+		this.protocols = protocols;
+		this.readyState = NativeWebSocket.CONNECTING;
+		this.listeners = {};
+		NativeWebSocket.instances.push(this);
+	}
+	addEventListener(name, callback) { this.listeners[name] = callback; }
+	close() { this.readyState = NativeWebSocket.CLOSED; }
+}
+globalThis.location = new URL("https://ampcode.com/threads/" + threadID);
+globalThis.document = {
+	readyState: "loading",
+	body: new FakeElement(),
+	documentElement: new FakeElement(),
+	addEventListener() {},
+	querySelector() { return null; },
+	querySelectorAll() { return []; },
+	createElement() { return new FakeElement(); },
+	createTreeWalker() { return { nextNode() { return null; } }; },
+};
+globalThis.Element = FakeElement;
+globalThis.HTMLElement = FakeElement;
+globalThis.NodeFilter = { SHOW_TEXT: 4, SHOW_ELEMENT: 1 };
+globalThis.MutationObserver = class { observe() {} disconnect() {} };
+globalThis.localStorage = new TestStorage();
+globalThis.sessionStorage = new TestStorage();
+globalThis.fetch = async () => { throw new Error("unexpected fetch"); };
+globalThis.WebSocket = NativeWebSocket;
+globalThis.prompt = () => "";
+globalThis.history = { state: null, replaceState() {} };
+if (typeof globalThis.atob !== "function") {
+	globalThis.atob = (value) => Buffer.from(value, "base64").toString("binary");
+}
+if (typeof globalThis.btoa !== "function") {
+	globalThis.btoa = (value) => Buffer.from(value, "binary").toString("base64");
+}
+require(scriptPath);
+const bridge = globalThis.__cliproxyAmpLocalInference;
+assert(bridge && bridge.userscriptVersion === "0.1.42", "bridge userscript version was not exposed");
+globalThis.localStorage.setItem(bridge.localThreadIDsStorageKey, JSON.stringify([threadID, secondThreadID]));
+globalThis.localStorage.setItem(bridge.apiKeyStorageKey, "local-key");
+const assertPlainConfig = (config, label) => {
+	assert(config && typeof config === "object", label + " config missing");
+	assert(config.threadId === threadID, label + " threadId mismatch");
+	assert(config.wsToken === "local-neo", label + " wsToken mismatch");
+	assert(config.ampURL === "http://127.0.0.1:8317", label + " ampURL mismatch");
+	assert(config.baseURL === "http://127.0.0.1:8317", label + " baseURL mismatch");
+	assert(config.capability === "write", label + " capability mismatch");
+	assert(config.poolName === "default", label + " poolName mismatch");
+	assert(config.requiresSudoForWrite === false, label + " requiresSudoForWrite mismatch");
+	assert(config.requiresSudoForTerminal === false, label + " requiresSudoForTerminal mismatch");
+	assert(config.threadActorTransport === "json-rpc", label + " threadActorTransport mismatch");
+};
+const plain = JSON.parse(JSON.stringify({ current: { thread: { id: threadID, title: "Local" }, threadActorConfig: null } }));
+assertPlainConfig(plain.current.threadActorConfig, "plain");
+const values = JSON.parse(JSON.stringify([{ current: 1 }, { thread: 2 }, { id: 3, title: 4 }, threadID, "Local" ]));
+const configIndex = values[1].threadActorConfig;
+assert(Number.isInteger(configIndex), "devalue threadActorConfig was not a reference");
+const devalueConfig = values[configIndex];
+const deref = (value) => Number.isInteger(value) ? values[value] : value;
+assert(deref(devalueConfig.threadId) === threadID, "devalue threadId mismatch");
+assert(deref(devalueConfig.wsToken) === "local-neo", "devalue wsToken mismatch");
+assert(deref(devalueConfig.ampURL) === "http://127.0.0.1:8317", "devalue ampURL mismatch");
+assert(deref(devalueConfig.baseURL) === "http://127.0.0.1:8317", "devalue baseURL mismatch");
+assert(deref(devalueConfig.capability) === "write", "devalue capability mismatch");
+assert(deref(devalueConfig.poolName) === "default", "devalue poolName mismatch");
+assert(deref(devalueConfig.requiresSudoForWrite) === false, "devalue requiresSudoForWrite mismatch");
+assert(deref(devalueConfig.requiresSudoForTerminal) === false, "devalue requiresSudoForTerminal mismatch");
+assert(deref(devalueConfig.threadActorTransport) === "json-rpc", "devalue threadActorTransport mismatch");
+const nullConfigValues = JSON.parse(JSON.stringify([{ current: 1 }, { thread: 2, threadActorConfig: 5 }, { id: 3, title: 4 }, threadID, "Local", null ]));
+const nullConfigIndex = nullConfigValues[1].threadActorConfig;
+assert(Number.isInteger(nullConfigIndex), "null-ref devalue threadActorConfig was not patched");
+assert(nullConfigIndex !== 5, "null-ref devalue threadActorConfig still points at null");
+const nullConfig = nullConfigValues[nullConfigIndex];
+const nullDeref = (value) => Number.isInteger(value) ? nullConfigValues[value] : value;
+assert(nullDeref(nullConfig.threadId) === threadID, "null-ref devalue threadId mismatch");
+assert(nullDeref(nullConfig.wsToken) === "local-neo", "null-ref devalue wsToken mismatch");
+globalThis.location = new URL("https://ampcode.com/threads/" + secondThreadID);
+const secondValues = JSON.parse(JSON.stringify([{ current: 1 }, { thread: 2 }, { id: 3, title: 4 }, secondThreadID, "Second" ]));
+const secondConfigIndex = secondValues[1].threadActorConfig;
+assert(Number.isInteger(secondConfigIndex), "second devalue threadActorConfig was not patched after local navigation");
+const secondConfig = secondValues[secondConfigIndex];
+const secondDeref = (value) => Number.isInteger(value) ? secondValues[value] : value;
+assert(secondDeref(secondConfig.threadId) === secondThreadID, "second devalue threadId mismatch");
+const socket = new WebSocket("wss://ampcode.com/gateway/threadActor/?rvt-method=get&rvt-key=" + encodeURIComponent(secondThreadID));
+const rewritten = new URL(socket.url);
+assert(rewritten.protocol === "ws:", "websocket protocol was not rewritten");
+assert(rewritten.host === "127.0.0.1:8317", "websocket host was not rewritten");
+assert(rewritten.searchParams.get("cliproxy-api-key") === "local-key", "localStorage API key was not applied");
+assert(rewritten.searchParams.get("cliproxy-bootstrap-executor") === "true", "bootstrap executor flag missing");
+const relativeSocket = new WebSocket("/gateway/threadActor/?rvt-method=get&rvt-key=" + encodeURIComponent(secondThreadID));
+const relativeRewritten = new URL(relativeSocket.url);
+assert(relativeRewritten.protocol === "ws:", "relative websocket protocol was not rewritten");
+assert(relativeRewritten.host === "127.0.0.1:8317", "relative websocket host was not rewritten");
+assert(relativeRewritten.searchParams.get("cliproxy-api-key") === "local-key", "relative localStorage API key was not applied");
+assert(bridge.diagnostics.decodedConfigPatchCount >= 2, "decoded config patches were not recorded");
+assert(bridge.diagnostics.webSocketBootstrapCount === 2, "websocket bootstrap was not recorded");
+`
+	runnerPath := filepath.Join(dir, "run-userscript-test.js")
+	if err := os.WriteFile(runnerPath, []byte(runner), 0o600); err != nil {
+		t.Fatalf("write runner: %v", err)
+	}
+	cmd := exec.Command("node", runnerPath)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("userscript behavior check failed: %v\n%s", err, output)
 	}
 }
 

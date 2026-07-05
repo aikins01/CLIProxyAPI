@@ -209,7 +209,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	return fmt.Sprintf(`// ==UserScript==
 // @name CLIProxyAPI Amp Local Inference
 // @namespace https://github.com/router-for-me/CLIProxyAPI
-// @version 0.1.41
+// @version 0.1.42
 %s
 // @updateURL %s
 // @downloadURL %s
@@ -221,6 +221,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	"use strict";
 
 	const bridgeHeader = %s;
+	const userscriptVersion = "0.1.42";
 	const apiKeyStorageKey = "cliproxyapi.ampLocalInference.apiKey";
 	const workingDirectoryStorageKey = "cliproxyapi.ampLocalInference.workingDirectory";
 	const selectedLocalProjectStorageKey = "cliproxyapi.ampLocalInference.selectedLocalProject";
@@ -287,7 +288,9 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	}
 
 	function storedLocalAPIKey() {
-		return globalThis.sessionStorage.getItem(apiKeyStorageKey) || "";
+		return globalThis.sessionStorage.getItem(apiKeyStorageKey) ||
+			globalThis.localStorage.getItem(apiKeyStorageKey) ||
+			"";
 	}
 
 	function localAPIKey(rememberCancel = true) {
@@ -793,12 +796,51 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		return values.length - 1;
 	}
 
+	function localPlainThreadActorConfig(threadID, localBase) {
+		return {
+			threadId: threadID,
+			wsToken: "local-neo",
+			ampURL: localBase,
+			baseURL: localBase,
+			capability: "write",
+			poolName: "default",
+			requiresSudoForWrite: false,
+			requiresSudoForTerminal: false,
+			threadActorTransport: "json-rpc",
+		};
+	}
+
+	function localDevalueThreadActorConfig(values, threadID, baseIndex) {
+		return {
+			threadId: ensureDevalueStringIndex(values, threadID),
+			wsToken: ensureDevalueStringIndex(values, "local-neo"),
+			ampURL: baseIndex,
+			baseURL: baseIndex,
+			capability: ensureDevalueStringIndex(values, "write"),
+			poolName: ensureDevalueStringIndex(values, "default"),
+			requiresSudoForWrite: ensureDevalueValueIndex(values, false),
+			requiresSudoForTerminal: ensureDevalueValueIndex(values, false),
+			threadActorTransport: ensureDevalueStringIndex(values, "json-rpc"),
+		};
+	}
+
 	function devalueThreadID(values, thread) {
 		if (!isPlainObject(thread) || !Number.isInteger(thread.id)) {
 			return "";
 		}
 		const id = values[thread.id];
 		return rememberObservedThreadID(id);
+	}
+
+	function devalueContainerThreadID(values, entry) {
+		const direct = devalueThreadID(values, entry);
+		if (direct) {
+			return direct;
+		}
+		if (!isPlainObject(entry) || !Number.isInteger(entry.thread)) {
+			return "";
+		}
+		return devalueThreadID(values, values[entry.thread]);
 	}
 
 	function devalueField(values, object, key) {
@@ -940,6 +982,17 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		return patched;
 	}
 
+	function ensureDevalueLocalThreadActorConfig(values, thread, threadID, getBaseIndex) {
+		if (!isPlainObject(thread) || !threadID || !rememberedLocalThreadID(threadID)) {
+			return false;
+		}
+		if (Number.isInteger(thread.threadActorConfig) && devalueThreadActorConfigLike(values[thread.threadActorConfig])) {
+			return false;
+		}
+		thread.threadActorConfig = ensureDevalueValueIndex(values, localDevalueThreadActorConfig(values, threadID, getBaseIndex()));
+		return true;
+	}
+
 	function rememberDevalueThreadRuntime(values, threadIndex) {
 		if (!Number.isInteger(threadIndex) || threadIndex < 0 || threadIndex >= values.length) {
 			return false;
@@ -973,9 +1026,11 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			if (!isPlainObject(entry)) {
 				continue;
 			}
-			if (activeThread && devalueThreadID(values, entry) === activeThread) {
+			const entryThreadID = activeThread ? devalueContainerThreadID(values, entry) : "";
+			if (entryThreadID && entryThreadID === activeThread) {
 				rememberThreadSettings(activeThread, devalueThreadSettings(values, entry));
 				rememberDevalueThreadRuntime(values, i);
+				patched = ensureDevalueLocalThreadActorConfig(values, entry, activeThread, getBaseIndex) || patched;
 			}
 			rememberDevalueThreadSettingsMessage(values, entry);
 			if (Number.isInteger(entry.threadActorConfig)) {
@@ -997,6 +1052,16 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	function plainThreadMatchesActive(thread) {
 		const activeThread = activeThreadID();
 		return isPlainObject(thread) && !!activeThread && thread.id === activeThread;
+	}
+
+	function plainContainerThreadID(entry) {
+		if (plainThreadMatchesActive(entry)) {
+			return entry.id;
+		}
+		if (isPlainObject(entry) && plainThreadMatchesActive(entry.thread)) {
+			return entry.thread.id;
+		}
+		return "";
 	}
 
 	function rememberPlainThreadRuntime(thread) {
@@ -1096,12 +1161,22 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		return patched;
 	}
 
+	function ensurePlainLocalThreadActorConfig(thread, localBase) {
+		const threadID = plainContainerThreadID(thread);
+		if (!threadID || !rememberedLocalThreadID(threadID) || plainThreadActorConfigLike(thread.threadActorConfig)) {
+			return false;
+		}
+		thread.threadActorConfig = localPlainThreadActorConfig(threadID, localBase);
+		return true;
+	}
+
 	function patchPlainThreadActorConfigs(value, seen, localBase) {
 		if (value === null || typeof value !== "object" || seen.has(value)) {
 			return false;
 		}
 		seen.add(value);
 		let patched = false;
+		patched = ensurePlainLocalThreadActorConfig(value, localBase) || patched;
 		if (isPlainObject(value.threadActorConfig)) {
 			patched = patchPlainThreadActorConfig(value.threadActorConfig, localBase) || patched;
 			rememberPlainThreadRuntime(value.thread);
@@ -1214,9 +1289,14 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		return path === "/api/internal";
 	}
 
+	function samePageWebSocketBase(url) {
+		const page = new URL(globalThis.location.href);
+		const protocol = page.protocol === "https:" ? "wss:" : "ws:";
+		return url.origin === page.origin || (url.protocol === protocol && url.host === page.host);
+	}
+
 	function shouldRewriteWebSocket(url, base) {
-		return url.origin === globalThis.location.origin && shouldBridgeWebSocket(url) ||
-			sameLocalWebSocketBase(url, base) && shouldBridgeWebSocket(url);
+		return (samePageWebSocketBase(url) || sameLocalWebSocketBase(url, base)) && shouldBridgeWebSocket(url);
 	}
 
 	function gatewayActorPath(path) {
@@ -1240,10 +1320,10 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 
 	function activeThreadID() {
 		const pathThread = pathThreadID();
-		if (observedThreadID && (!pathThread || observedThreadID === pathThread || rememberedLocalThreadID(observedThreadID))) {
-			return observedThreadID;
+		if (pathThread) {
+			return pathThread;
 		}
-		return pathThread;
+		return observedThreadID;
 	}
 
 	function activeLocalThreadID() {
@@ -3039,6 +3119,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	});
 
 	globalThis.__cliproxyAmpLocalInference = {
+		userscriptVersion,
 		apiKeyStorageKey,
 		workingDirectoryStorageKey,
 		selectedLocalProjectStorageKey,
