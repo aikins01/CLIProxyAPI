@@ -127,6 +127,7 @@ func main() {
 	var tuiMode bool
 	var standalone bool
 	var localModel bool
+	var showVersion bool
 
 	// Define command-line flags for different operation modes.
 	flag.BoolVar(&login, "login", false, "Login Google Account")
@@ -147,6 +148,7 @@ func main() {
 	flag.BoolVar(&tuiMode, "tui", false, "Start with terminal management UI")
 	flag.BoolVar(&standalone, "standalone", false, "In TUI mode, start an embedded local server")
 	flag.BoolVar(&localModel, "local-model", false, "Use embedded model catalog only, skip remote model fetching")
+	flag.BoolVar(&showVersion, "version", false, "Print version and exit")
 
 	flag.CommandLine.Usage = func() {
 		out := flag.CommandLine.Output()
@@ -177,6 +179,9 @@ func main() {
 
 	// Parse the command-line flags.
 	flag.Parse()
+	if showVersion {
+		return
+	}
 
 	// Core application variables.
 	var err error
