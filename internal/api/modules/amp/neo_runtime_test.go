@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -2842,18 +2843,22 @@ func TestNeoRuntimeEditRerunStartsInferenceWithoutPreflightCompaction(t *testing
 
 	streamStarted := make(chan struct{})
 	var closeStreamStarted sync.Once
-	compactionCalls := 0
+	var preStreamCompactionCalls atomic.Int32
+	var streamRequestSeen atomic.Bool
 
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		payload := readNeoJSON(r.Body)
 		if boolValue(payload["stream"]) {
+			streamRequestSeen.Store(true)
 			closeStreamStarted.Do(func() { close(streamStarted) })
 			w.Header().Set("Content-Type", "text/event-stream")
 			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"rerun complete\"}}]}\n\n"))
 			_, _ = w.Write([]byte("data: [DONE]\n\n"))
 			return
 		}
-		compactionCalls++
+		if !streamRequestSeen.Load() {
+			preStreamCompactionCalls.Add(1)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"compact summary"}}]}`))
 	}))
@@ -2962,9 +2967,18 @@ func TestNeoRuntimeEditRerunStartsInferenceWithoutPreflightCompaction(t *testing
 			t.Fatalf("missing %s before inference started; seen=%#v", key, seen)
 		}
 	}
+	waitForNeoActorInferenceComplete(t, actor)
+	waitForNeoActorSyncIdle(t, actor)
+	storedThread, ok := loadNeoThreadFromDir(threadID, rt.threadDir)
+	if !ok {
+		t.Fatal("stored thread not found after rerun")
+	}
+	if currentInference := mapValue(storedThread["currentInference"]); len(currentInference) != 0 {
+		t.Fatalf("stored currentInference = %#v, want cleared after rerun completion", currentInference)
+	}
 
-	if compactionCalls != 1 {
-		t.Fatalf("preflight compaction calls = %d, want 1 from local context-pressure safety threshold", compactionCalls)
+	if got := preStreamCompactionCalls.Load(); got != 1 {
+		t.Fatalf("pre-stream compaction calls = %d, want 1 from local context-pressure safety threshold", got)
 	}
 }
 
@@ -3404,9 +3418,7 @@ func TestNeoRuntimeWebLocalInferenceThreadActorUsesRivetActionProtocol(t *testin
 	if err := os.MkdirAll(pidDir, 0o700); err != nil {
 		t.Fatalf("mkdir pid dir: %v", err)
 	}
-	oldPIDDir := neoHeadlessPIDDir
-	neoHeadlessPIDDir = func() string { return pidDir }
-	t.Cleanup(func() { neoHeadlessPIDDir = oldPIDDir })
+	t.Cleanup(replaceNeoHeadlessPIDDir(func() string { return pidDir }))
 
 	threadID := "T-66666666-6666-4666-8666-666666666666"
 	if err := os.WriteFile(filepath.Join(pidDir, threadID+".pid"), []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
@@ -3457,9 +3469,7 @@ func TestNeoRuntimeWebLocalInferenceReplaysCurrentExecutorState(t *testing.T) {
 	if err := os.MkdirAll(pidDir, 0o700); err != nil {
 		t.Fatalf("mkdir pid dir: %v", err)
 	}
-	oldPIDDir := neoHeadlessPIDDir
-	neoHeadlessPIDDir = func() string { return pidDir }
-	t.Cleanup(func() { neoHeadlessPIDDir = oldPIDDir })
+	t.Cleanup(replaceNeoHeadlessPIDDir(func() string { return pidDir }))
 
 	enabled := true
 	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
@@ -3541,9 +3551,7 @@ func TestNeoRuntimeWebLocalInferenceBootstrapReplacesLegacyExecutor(t *testing.T
 	if err := os.MkdirAll(pidDir, 0o700); err != nil {
 		t.Fatalf("mkdir pid dir: %v", err)
 	}
-	oldPIDDir := neoHeadlessPIDDir
-	neoHeadlessPIDDir = func() string { return pidDir }
-	t.Cleanup(func() { neoHeadlessPIDDir = oldPIDDir })
+	t.Cleanup(replaceNeoHeadlessPIDDir(func() string { return pidDir }))
 
 	command := filepath.Join(dir, "amp")
 	startedLog := filepath.Join(dir, "started.log")
@@ -3685,9 +3693,7 @@ func TestNeoRuntimeWebLocalInferenceSkipsSpawnWhenHeadlessPIDAlive(t *testing.T)
 	if err := os.MkdirAll(pidDir, 0o700); err != nil {
 		t.Fatalf("mkdir pid dir: %v", err)
 	}
-	oldPIDDir := neoHeadlessPIDDir
-	neoHeadlessPIDDir = func() string { return pidDir }
-	t.Cleanup(func() { neoHeadlessPIDDir = oldPIDDir })
+	t.Cleanup(replaceNeoHeadlessPIDDir(func() string { return pidDir }))
 
 	threadID := "T-33333333-3333-4333-8333-333333333333"
 	if err := os.WriteFile(filepath.Join(pidDir, threadID+".pid"), []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
@@ -3744,9 +3750,7 @@ func TestNeoRuntimeWebLocalInferenceObserverCannotClaimExecutor(t *testing.T) {
 	if err := os.MkdirAll(pidDir, 0o700); err != nil {
 		t.Fatalf("mkdir pid dir: %v", err)
 	}
-	oldPIDDir := neoHeadlessPIDDir
-	neoHeadlessPIDDir = func() string { return pidDir }
-	t.Cleanup(func() { neoHeadlessPIDDir = oldPIDDir })
+	t.Cleanup(replaceNeoHeadlessPIDDir(func() string { return pidDir }))
 
 	threadID := "T-55555555-5555-4555-8555-555555555555"
 	if err := os.WriteFile(filepath.Join(pidDir, threadID+".pid"), []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
@@ -5324,6 +5328,8 @@ func TestNeoUserActorGetRecentThreadsActionMatchesBinaryShape(t *testing.T) {
 	recent.title = "Recent local work"
 	recent.agentState = "working"
 	recent.executorID = "executor-test"
+	recent.executorReady = true
+	recent.executorBootstrapComplete = true
 	recent.currentInference = &neoInferenceInflight{messageID: "M-recent-assistant", agentMode: "deep", reasoningEffort: "xhigh", tools: []string{"shell_command"}}
 	recent.environment = map[string]any{"initial": map[string]any{"trees": []any{map[string]any{"uri": "file:///Users/test/project", "displayName": "project"}}}}
 	recent.sockets = map[*neoSocket]struct{}{&neoSocket{}: {}}
@@ -5756,6 +5762,38 @@ func TestNeoUserActorReceivesThreadStatusUpdatedOnExecutorConnectDisconnect(t *t
 	if thread["hasExecutor"] != false || thread["executorConnected"] != false {
 		t.Fatalf("disconnected cloud thread executor state = has:%#v connected:%#v", thread["hasExecutor"], thread["executorConnected"])
 	}
+	if mapValue(thread["meta"])["executorType"] != nil {
+		t.Fatalf("disconnected cloud thread executorType = %#v, want absent", thread["meta"])
+	}
+}
+
+func TestNeoCloudThreadSnapshotDoesNotReportConnectingExecutor(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019f4000-0000-4000-8000-000000000029"
+	actor := rt.store.ensureThreadActor(threadID)
+	actor.mu.Lock()
+	actor.executorID = "executor-connecting"
+	actor.executorReady = false
+	actor.executorBootstrapComplete = false
+	actor.bootstrapExecutorType = "local-client"
+	actor.messages = []neoMessage{{MessageID: "M-user", Role: "user", Content: []any{map[string]any{"type": "text", "text": "hi"}}, Seq: 1}}
+	actor.mu.Unlock()
+
+	snapshot, ok := actor.threadSnapshot()
+	if !ok {
+		t.Fatal("missing thread snapshot")
+	}
+	thread := neoCloudThread(snapshot)
+	if thread["hasExecutor"] != false || thread["executorConnected"] != false {
+		t.Fatalf("connecting executor should not be reported as connected: has=%#v connected=%#v", thread["hasExecutor"], thread["executorConnected"])
+	}
+	if mapValue(thread["meta"])["executorType"] != nil {
+		t.Fatalf("connecting executorType = %#v, want absent", thread["meta"])
+	}
+	status, _ := actor.recentThreadStatus()
+	if status["hasExecutor"] != false || status["executorConnected"] != false {
+		t.Fatalf("connecting executor status should not be reported as connected: has=%#v connected=%#v", status["hasExecutor"], status["executorConnected"])
+	}
 }
 
 func TestNeoCloudThreadSnapshotExecutorTypePrecedence(t *testing.T) {
@@ -5763,6 +5801,8 @@ func TestNeoCloudThreadSnapshotExecutorTypePrecedence(t *testing.T) {
 	actor := rt.store.ensureThreadActor("T-019e0e6e-f3f1-7078-b5dd-748f66f8c264")
 	actor.mu.Lock()
 	actor.executorID = "executor-test"
+	actor.executorReady = true
+	actor.executorBootstrapComplete = true
 	actor.bootstrapExecutorType = "daemon"
 	actor.meta = map[string]any{"executorType": "local-client"}
 	actor.messages = []neoMessage{{MessageID: "M-user", Role: "user", Content: []any{map[string]any{"type": "text", "text": "hi"}}, Seq: 1}}
@@ -5800,6 +5840,30 @@ func TestNeoCloudThreadSnapshotExecutorTypePrecedence(t *testing.T) {
 	thread = neoCloudThread(snapshot)
 	if mapValue(thread["meta"])["executorType"] != "local-client" {
 		t.Fatalf("executorType fallback = %#v", thread["meta"])
+	}
+}
+
+func TestNeoCloudThreadReportsPendingInferenceAsWorking(t *testing.T) {
+	thread := neoCloudThread(neoCloudThreadSnapshot{
+		threadID:         "T-test",
+		seq:              1,
+		createdMs:        1778170000000,
+		agentState:       "idle",
+		pendingInference: &neoInferenceInflight{messageID: "M-pending", agentMode: "deep", reasoningEffort: "xhigh"},
+		messages: []neoMessage{
+			{MessageID: "M-user", Role: "user", Content: []any{map[string]any{"type": "text", "text": "hi"}}, AgentMode: "deep", Seq: 1},
+		},
+	})
+
+	if thread["state"] != "working" || thread["agentState"] != "working" {
+		t.Fatalf("pending inference thread state = state:%#v agentState:%#v", thread["state"], thread["agentState"])
+	}
+	pending := mapValue(thread["pendingInference"])
+	if pending["messageId"] != "M-pending" || pending["agentMode"] != "deep" || pending["reasoningEffort"] != "xhigh" {
+		t.Fatalf("pendingInference = %#v", pending)
+	}
+	if mapValue(thread["meta"])["executorType"] != nil {
+		t.Fatalf("pending disconnected executorType = %#v, want absent", thread["meta"])
 	}
 }
 
@@ -5863,7 +5927,7 @@ func TestNeoUserActorReceivesThreadStatusUpdatedOnThreadActorCreation(t *testing
 	t.Fatal("did not receive threadStatusUpdated notification for created thread")
 }
 
-func TestNeoActorClientCreateThreadNotifiesSidebarForSparseChild(t *testing.T) {
+func TestNeoActorClientCreateThreadNotifiesUserActorForSparseChild(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
 	t.Cleanup(server.Close)
@@ -5913,13 +5977,7 @@ func TestNeoActorClientCreateThreadNotifiesSidebarForSparseChild(t *testing.T) {
 			t.Fatalf("child threadStatusUpdated missing lastUserMessageAt: %#v", params)
 		}
 
-		recents := rt.neoWebLocalSidebarRecentThreads(10)
-		for _, raw := range recents {
-			if stringValue(mapValue(raw)["id"]) == childID {
-				return
-			}
-		}
-		t.Fatalf("sidebar recents missing sparse child thread %s: %#v", childID, recents)
+		return
 	}
 	t.Fatal("did not receive threadStatusUpdated notification for sparse child thread")
 }
@@ -6922,15 +6980,15 @@ func TestNeoRuntimeGitBridgeAndWorkspaceMessageTypes(t *testing.T) {
 	}
 }
 
-func TestNeoWebLocalObserverPayloadForcesHasExecutor(t *testing.T) {
+func TestNeoWebLocalObserverPayloadPreservesExecutorState(t *testing.T) {
 	original := neoObserversPayload(1, false)
 	patchedPayload, ok := neoWebLocalObserverPayload(original)
 	if !ok {
 		t.Fatal("observer payload unexpectedly suppressed")
 	}
 	patched := mapValue(patchedPayload)
-	if patched["hasExecutor"] != true {
-		t.Fatalf("patched hasExecutor = %#v, want true: %#v", patched["hasExecutor"], patched)
+	if patched["hasExecutor"] != false {
+		t.Fatalf("patched hasExecutor = %#v, want false: %#v", patched["hasExecutor"], patched)
 	}
 	if original["hasExecutor"] != false {
 		t.Fatalf("original payload mutated: %#v", original)
@@ -6946,8 +7004,9 @@ func TestNeoWebLocalObserverPayloadForcesHasExecutor(t *testing.T) {
 		t.Fatalf("non-observer payload changed: %#v", unchanged)
 	}
 
-	if payload, ok := neoWebLocalObserverPayload(map[string]any{"type": "executor_connected", "executorId": "executor"}); ok || payload != nil {
-		t.Fatalf("executor_connected payload = %#v, ok=%v; want suppressed", payload, ok)
+	executorConnected := map[string]any{"type": "executor_connected", "executorId": "executor"}
+	if payload, ok := neoWebLocalObserverPayload(executorConnected); !ok || mapValue(payload)["executorId"] != "executor" {
+		t.Fatalf("executor_connected payload = %#v, ok=%v; want preserved", payload, ok)
 	}
 }
 
@@ -6977,9 +7036,9 @@ func TestNeoRuntimeExecutorConnectAlwaysRequiresFreshBootstrap(t *testing.T) {
 	if boolValue(first["resumeBootstrap"]) {
 		t.Fatalf("initial executor_connect resumeBootstrap = true: %#v", first)
 	}
-	connectedObservers := waitForNeoMessageType(t, conn, "observers", 2*time.Second)
-	if connectedObservers["hasExecutor"] != true {
-		t.Fatalf("connected observers hasExecutor = %#v, want true: %#v", connectedObservers["hasExecutor"], connectedObservers)
+	connectingObservers := waitForNeoMessageType(t, conn, "observers", 2*time.Second)
+	if connectingObservers["hasExecutor"] != false {
+		t.Fatalf("connecting observers hasExecutor = %#v, want false until bootstrap completes: %#v", connectingObservers["hasExecutor"], connectingObservers)
 	}
 
 	if err := conn.WriteJSON(map[string]any{
@@ -8811,6 +8870,1314 @@ sleep 5
 	defer actor.mu.Unlock()
 	if len(actor.spawnedExecutors) != 1 {
 		t.Fatalf("spawnedExecutors len = %d, want 1", len(actor.spawnedExecutors))
+	}
+}
+
+func TestNeoActorExecutorSocketCloseClearsConnectedState(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019f4000-0000-4000-8000-000000000001"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+	socket := &neoSocket{}
+	socket.markExecutor("executor-1")
+	actor.mu.Lock()
+	actor.sockets[socket] = struct{}{}
+	actor.executorID = "executor-1"
+	actor.executorReady = true
+	actor.executorBootstrapComplete = true
+	actor.executorSocket = socket
+	actor.spawnedExecutors = map[string]*neoSpawnedExecutor{
+		"spawn-1": &neoSpawnedExecutor{spawnID: "spawn-1", threadID: threadID},
+	}
+	actor.mu.Unlock()
+
+	actor.close(socket)
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.executorID != "" || actor.executorReady || actor.executorBootstrapComplete {
+		t.Fatalf("executor state after close = id:%q ready:%v bootstrap:%v", actor.executorID, actor.executorReady, actor.executorBootstrapComplete)
+	}
+	if len(actor.spawnedExecutors) != 0 {
+		t.Fatalf("spawned executors after close = %#v, want none", actor.spawnedExecutors)
+	}
+	if actor.agentState != "idle" {
+		t.Fatalf("agentState after close = %q, want idle", actor.agentState)
+	}
+}
+
+func TestNeoActorNoIDExecutorSocketCloseClearsConnectedState(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019f4000-0000-4000-8000-000000000006"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+	socket := &neoSocket{}
+
+	actor.executorConnectedForSocket(socket, map[string]any{"registeredToolCount": 1})
+	actor.mu.Lock()
+	if actor.executorID != "local-executor" || socket.executorKey() != "local-executor" || !actor.executorReady || actor.executorSocket != socket {
+		t.Fatalf("executor state after no-id connect = id:%q socketKey:%q ready:%v socket:%p", actor.executorID, socket.executorKey(), actor.executorReady, actor.executorSocket)
+	}
+	actor.spawnedExecutors = map[string]*neoSpawnedExecutor{
+		"spawn-1": {spawnID: "spawn-1", threadID: threadID},
+	}
+	actor.mu.Unlock()
+
+	actor.close(socket)
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.executorID != "" || actor.executorReady || actor.executorBootstrapComplete || actor.executorSocket != nil {
+		t.Fatalf("executor state after no-id close = id:%q ready:%v bootstrap:%v socket:%p", actor.executorID, actor.executorReady, actor.executorBootstrapComplete, actor.executorSocket)
+	}
+	if len(actor.spawnedExecutors) != 0 {
+		t.Fatalf("spawned executors after no-id close = %#v, want none", actor.spawnedExecutors)
+	}
+}
+
+func TestNeoActorClearedExecutorSocketCloseDoesNotDisconnectAgain(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019f4000-0000-4000-8000-00000000000e"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+	socket := &neoSocket{}
+	socket.markExecutor("executor-1")
+	actor.mu.Lock()
+	actor.executorID = "executor-1"
+	actor.executorReady = true
+	actor.executorBootstrapComplete = true
+	actor.executorSocket = socket
+	actor.spawnedExecutors = map[string]*neoSpawnedExecutor{
+		"spawn-1": {spawnID: "spawn-1", threadID: threadID},
+	}
+	actor.mu.Unlock()
+
+	actor.executorDisconnectedForSocket(socket, map[string]any{"executorId": "executor-1"})
+
+	actor.mu.Lock()
+	clearedGeneration := actor.executorIdleGeneration
+	if actor.executorID != "" || actor.executorReady || actor.executorBootstrapComplete || actor.executorSocket != nil {
+		t.Fatalf("executor state after disconnect = id:%q ready:%v bootstrap:%v socket:%p", actor.executorID, actor.executorReady, actor.executorBootstrapComplete, actor.executorSocket)
+	}
+	actor.mu.Unlock()
+
+	actor.close(socket)
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.executorIdleGeneration != clearedGeneration {
+		t.Fatalf("executorIdleGeneration after socket close = %d, want %d", actor.executorIdleGeneration, clearedGeneration)
+	}
+	if actor.executorID != "" || actor.executorReady || actor.executorBootstrapComplete || actor.executorSocket != nil {
+		t.Fatalf("executor state after socket close = id:%q ready:%v bootstrap:%v socket:%p", actor.executorID, actor.executorReady, actor.executorBootstrapComplete, actor.executorSocket)
+	}
+}
+
+func TestNeoActorStaleExecutorDisconnectDoesNotClearReplacement(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019f4000-0000-4000-8000-000000000003"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+	actor.mu.Lock()
+	actor.executorID = "executor-2"
+	actor.executorReady = true
+	actor.executorBootstrapComplete = true
+	actor.spawnedExecutors = map[string]*neoSpawnedExecutor{
+		"spawn-2": &neoSpawnedExecutor{spawnID: "spawn-2", threadID: threadID},
+	}
+	actor.mu.Unlock()
+
+	actor.executorDisconnected(map[string]any{"executorId": "executor-1"})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.executorID != "executor-2" || !actor.executorReady || !actor.executorBootstrapComplete {
+		t.Fatalf("replacement executor was cleared: id=%q ready=%v bootstrap=%v", actor.executorID, actor.executorReady, actor.executorBootstrapComplete)
+	}
+	if len(actor.spawnedExecutors) != 1 {
+		t.Fatalf("spawned executors = %#v, want replacement retained", actor.spawnedExecutors)
+	}
+}
+
+func TestNeoActorStaleExecutorDisconnectDoesNotStopReplacementSpawn(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019f4000-0000-4000-8000-000000000004"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+	actor.mu.Lock()
+	actor.replacingExecutorID = "executor-1"
+	actor.spawnedExecutors = map[string]*neoSpawnedExecutor{
+		"spawn-2": {spawnID: "spawn-2", threadID: threadID},
+	}
+	actor.mu.Unlock()
+
+	actor.executorDisconnected(map[string]any{"executorId": "executor-1"})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.replacingExecutorID != "executor-1" {
+		t.Fatalf("replacingExecutorID = %q, want executor-1", actor.replacingExecutorID)
+	}
+	if len(actor.spawnedExecutors) != 1 {
+		t.Fatalf("spawned executors = %#v, want replacement retained", actor.spawnedExecutors)
+	}
+}
+
+func TestNeoActorStaleExecutorDisconnectClearsOldExecutorWork(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019f4000-0000-4000-8000-000000000009"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+	actor.mu.Lock()
+	actor.replacingExecutorID = "executor-1"
+	actor.agentState = "running_tools"
+	actor.pendingTools["tool-1"] = neoPendingTool{ID: "tool-1"}
+	actor.approvalQueue = []map[string]any{{"toolCallId": "tool-2"}}
+	actor.pendingInference = &neoInferenceInflight{agentMode: "deep", reasoningEffort: "xhigh"}
+	actor.retryScheduled = true
+	actor.spawnedExecutors = map[string]*neoSpawnedExecutor{
+		"spawn-2": {spawnID: "spawn-2", threadID: threadID},
+	}
+	idleGeneration := actor.executorIdleGeneration
+	actor.mu.Unlock()
+
+	actor.executorDisconnected(map[string]any{"executorId": "executor-1"})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.replacingExecutorID != "executor-1" {
+		t.Fatalf("replacingExecutorID = %q, want executor-1", actor.replacingExecutorID)
+	}
+	if len(actor.spawnedExecutors) != 1 {
+		t.Fatalf("spawned executors = %#v, want replacement retained", actor.spawnedExecutors)
+	}
+	if len(actor.pendingTools) != 0 || len(actor.approvalQueue) != 0 || actor.agentState != "idle" {
+		t.Fatalf("old executor work = pending:%d approvals:%d state:%q", len(actor.pendingTools), len(actor.approvalQueue), actor.agentState)
+	}
+	if actor.pendingInference == nil || actor.pendingInference.agentMode != "deep" || !actor.retryScheduled {
+		t.Fatalf("deferred work after stale disconnect = pending:%#v retry:%v", actor.pendingInference, actor.retryScheduled)
+	}
+	if actor.executorIdleGeneration <= idleGeneration {
+		t.Fatalf("executorIdleGeneration = %d, want > %d", actor.executorIdleGeneration, idleGeneration)
+	}
+}
+
+func TestNeoActorStaleExecutorDisconnectClearsOldCurrentInference(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019f4000-0000-4000-8000-00000000000a"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+	actor.mu.Lock()
+	actor.replacingExecutorID = "executor-1"
+	actor.agentState = "working"
+	actor.messages = []neoMessage{
+		{ThreadID: threadID, MessageID: "M-user", Role: "user", Content: []any{map[string]any{"type": "text", "text": "hi"}}, Seq: 1},
+		{
+			ThreadID:  threadID,
+			MessageID: "M-current",
+			Role:      "assistant",
+			Content: []any{
+				map[string]any{"type": "thinking", "blockState": "streaming", "thinking": "partial"},
+				map[string]any{"type": "text", "blockState": "streaming", "text": "answer"},
+			},
+			State: map[string]any{"type": "streaming"},
+			Seq:   2,
+		},
+	}
+	actor.rebuildHistoryLocked()
+	actor.currentInference = &neoInferenceInflight{messageID: "M-current", agentMode: "smart"}
+	actor.spawnedExecutors = map[string]*neoSpawnedExecutor{
+		"spawn-2": {spawnID: "spawn-2", threadID: threadID},
+	}
+	idleGeneration := actor.executorIdleGeneration
+	inferenceGeneration := actor.generation
+	actor.mu.Unlock()
+
+	actor.executorDisconnected(map[string]any{"executorId": "executor-1"})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.replacingExecutorID != "executor-1" {
+		t.Fatalf("replacingExecutorID = %q, want executor-1", actor.replacingExecutorID)
+	}
+	if len(actor.spawnedExecutors) != 1 {
+		t.Fatalf("spawned executors = %#v, want replacement retained", actor.spawnedExecutors)
+	}
+	if actor.currentInference != nil || actor.agentState != "idle" {
+		t.Fatalf("old inference work = current:%#v state:%q", actor.currentInference, actor.agentState)
+	}
+	assistant := actor.messages[1]
+	if state := stringValue(mapValue(assistant.State)["type"]); state != "cancelled" {
+		t.Fatalf("assistant state = %q, want cancelled", state)
+	}
+	for index, raw := range assistant.Content {
+		block := mapValue(raw)
+		if got := stringValue(block["blockState"]); got != "complete" {
+			t.Fatalf("content[%d] blockState = %q, want complete", index, got)
+		}
+	}
+	if actor.executorIdleGeneration <= idleGeneration {
+		t.Fatalf("executorIdleGeneration = %d, want > %d", actor.executorIdleGeneration, idleGeneration)
+	}
+	if actor.generation != inferenceGeneration+1 {
+		t.Fatalf("generation = %d, want %d", actor.generation, inferenceGeneration+1)
+	}
+}
+
+func TestNeoActorOldExecutorSocketCloseDoesNotClearSameIDReplacement(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019f4000-0000-4000-8000-000000000005"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+	oldSocket := &neoSocket{}
+	oldSocket.markExecutor("executor-1")
+	actor.mu.Lock()
+	actor.executorID = ""
+	actor.replacingExecutorID = "executor-1"
+	actor.executorReady = false
+	actor.executorBootstrapComplete = false
+	actor.mu.Unlock()
+
+	newSocket := &neoSocket{}
+	newSocket.markExecutor("executor-1")
+	actor.executorConnectedForSocket(newSocket, map[string]any{"executorId": "executor-1", "registeredToolCount": 1})
+	actor.close(oldSocket)
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.executorID != "executor-1" || actor.executorSocket != newSocket || !actor.executorReady || !actor.executorBootstrapComplete {
+		t.Fatalf("replacement executor was cleared: id=%q socket=%p ready=%v bootstrap=%v", actor.executorID, actor.executorSocket, actor.executorReady, actor.executorBootstrapComplete)
+	}
+}
+
+func TestNeoActorExecutorDisconnectPreservesDeferredWork(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019f4000-0000-4000-8000-00000000000b"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+	actor.mu.Lock()
+	actor.executorID = "executor-1"
+	actor.executorReady = true
+	actor.agentState = "idle"
+	actor.pendingInference = &neoInferenceInflight{agentMode: "deep", reasoningEffort: "xhigh"}
+	actor.retryScheduled = true
+	actor.mu.Unlock()
+
+	actor.executorDisconnected(map[string]any{"executorId": "executor-1"})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.pendingInference == nil || actor.pendingInference.agentMode != "deep" || actor.pendingInference.reasoningEffort != "xhigh" {
+		t.Fatalf("pending inference after disconnect = %#v, want preserved", actor.pendingInference)
+	}
+	if !actor.retryScheduled {
+		t.Fatal("retryScheduled after disconnect = false, want preserved")
+	}
+	if actor.executorID != "" || actor.executorReady {
+		t.Fatalf("executor after disconnect = id:%q ready:%v", actor.executorID, actor.executorReady)
+	}
+}
+
+func TestNeoActorActiveSocketDisconnectAcceptsClientIDAlias(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019f4000-0000-4000-8000-000000000022"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+	socket := &neoSocket{}
+	socket.markExecutor("client-1")
+	actor.mu.Lock()
+	actor.executorID = "executor-1"
+	actor.executorReady = true
+	actor.executorBootstrapComplete = true
+	actor.executorSocket = socket
+	actor.spawnedExecutors = map[string]*neoSpawnedExecutor{
+		"spawn-1": {spawnID: "spawn-1", threadID: threadID},
+	}
+	actor.mu.Unlock()
+
+	actor.executorDisconnectedForSocket(socket, map[string]any{"clientId": "client-1"})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.executorID != "" || actor.executorReady || actor.executorBootstrapComplete || actor.executorSocket != nil {
+		t.Fatalf("active socket clientId disconnect state = id:%q ready:%v bootstrap:%v socket:%p", actor.executorID, actor.executorReady, actor.executorBootstrapComplete, actor.executorSocket)
+	}
+	if len(actor.spawnedExecutors) != 0 {
+		t.Fatalf("spawned executors after active clientId disconnect = %#v, want none", actor.spawnedExecutors)
+	}
+}
+
+func TestNeoActorReplacementConnectClearsOldExecutorWork(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019f4000-0000-4000-8000-00000000000c"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+	oldSocket := &neoSocket{}
+	oldSocket.markExecutor("executor-1")
+	newSocket := &neoSocket{}
+	newSocket.markExecutor("executor-2")
+	actor.mu.Lock()
+	actor.executorID = "executor-1"
+	actor.executorReady = true
+	actor.executorBootstrapComplete = true
+	actor.executorSocket = oldSocket
+	actor.agentState = "working"
+	actor.pendingTools["tool-1"] = neoPendingTool{ID: "tool-1"}
+	actor.currentInference = &neoInferenceInflight{messageID: "M-current", agentMode: "smart"}
+	actor.mu.Unlock()
+
+	actor.executorConnectedForSocket(newSocket, map[string]any{"executorId": "executor-2", "registeredToolCount": 1})
+	actor.close(oldSocket)
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.executorID != "executor-2" || actor.executorSocket != newSocket || !actor.executorReady || !actor.executorBootstrapComplete {
+		t.Fatalf("replacement executor = id:%q socket:%p ready:%v bootstrap:%v", actor.executorID, actor.executorSocket, actor.executorReady, actor.executorBootstrapComplete)
+	}
+	if len(actor.pendingTools) != 0 || actor.currentInference != nil || actor.agentState != "idle" {
+		t.Fatalf("old work after replacement connect = pending:%d current:%#v state:%q", len(actor.pendingTools), actor.currentInference, actor.agentState)
+	}
+}
+
+func TestNeoActorReplacementExecutorConnectClearsOldExecutorWork(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019f4000-0000-4000-8000-00000000000d"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+	newSocket := &neoSocket{}
+	actor.mu.Lock()
+	actor.replacingExecutorID = "executor-1"
+	actor.agentState = "running_tools"
+	actor.pendingTools["tool-1"] = neoPendingTool{ID: "tool-1"}
+	actor.approvalQueue = []map[string]any{{"toolCallId": "tool-2"}}
+	actor.currentInference = &neoInferenceInflight{messageID: "M-current", agentMode: "smart"}
+	actor.pendingInference = &neoInferenceInflight{agentMode: "deep", reasoningEffort: "xhigh"}
+	actor.retryScheduled = true
+	generation := actor.executorIdleGeneration
+	actor.mu.Unlock()
+
+	actor.executorConnectForSocket(newSocket, map[string]any{"clientId": "executor-2"})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.executorID != "executor-2" || actor.replacingExecutorID != "" || actor.executorSocket != newSocket || actor.executorReady || actor.executorBootstrapComplete {
+		t.Fatalf("replacement executor_connect state = id:%q replacing:%q socket:%p ready:%v bootstrap:%v", actor.executorID, actor.replacingExecutorID, actor.executorSocket, actor.executorReady, actor.executorBootstrapComplete)
+	}
+	if len(actor.pendingTools) != 0 || len(actor.approvalQueue) != 0 || actor.currentInference != nil || actor.agentState != "idle" {
+		t.Fatalf("old work after replacement executor_connect = pending:%d approvals:%d current:%#v state:%q", len(actor.pendingTools), len(actor.approvalQueue), actor.currentInference, actor.agentState)
+	}
+	if actor.pendingInference == nil || actor.pendingInference.agentMode != "deep" || actor.pendingInference.reasoningEffort != "xhigh" || !actor.retryScheduled {
+		t.Fatalf("deferred work after replacement executor_connect = pending:%#v retry:%v", actor.pendingInference, actor.retryScheduled)
+	}
+	if actor.executorIdleGeneration <= generation {
+		t.Fatalf("executorIdleGeneration = %d, want > %d", actor.executorIdleGeneration, generation)
+	}
+}
+
+func TestNeoActorReplacementExecutorConnectedClearsOldExecutorWork(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019f4000-0000-4000-8000-00000000002c"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+	newSocket := &neoSocket{}
+	actor.mu.Lock()
+	actor.replacingExecutorID = "executor-1"
+	actor.agentState = "running_tools"
+	actor.pendingTools["tool-1"] = neoPendingTool{ID: "tool-1"}
+	actor.approvalQueue = []map[string]any{{"toolCallId": "tool-2"}}
+	actor.currentInference = &neoInferenceInflight{messageID: "M-current", agentMode: "smart"}
+	idleGeneration := actor.executorIdleGeneration
+	inferenceGeneration := actor.generation
+	actor.mu.Unlock()
+
+	actor.executorConnectedForSocket(newSocket, map[string]any{"executorId": "executor-2", "registeredToolCount": 1})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.executorID != "executor-2" || actor.replacingExecutorID != "" || actor.executorSocket != newSocket || !actor.executorReady || !actor.executorBootstrapComplete {
+		t.Fatalf("replacement executor_connected state = id:%q replacing:%q socket:%p ready:%v bootstrap:%v", actor.executorID, actor.replacingExecutorID, actor.executorSocket, actor.executorReady, actor.executorBootstrapComplete)
+	}
+	if len(actor.pendingTools) != 0 || len(actor.approvalQueue) != 0 || actor.currentInference != nil || actor.agentState != "idle" {
+		t.Fatalf("old work after replacement executor_connected = pending:%d approvals:%d current:%#v state:%q", len(actor.pendingTools), len(actor.approvalQueue), actor.currentInference, actor.agentState)
+	}
+	if actor.executorIdleGeneration <= idleGeneration {
+		t.Fatalf("executorIdleGeneration = %d, want > %d", actor.executorIdleGeneration, idleGeneration)
+	}
+	if actor.generation != inferenceGeneration+1 {
+		t.Fatalf("generation = %d, want %d", actor.generation, inferenceGeneration+1)
+	}
+	if newSocket.executorKey() != "executor-2" {
+		t.Fatalf("socket executor key = %q, want executor-2", newSocket.executorKey())
+	}
+}
+
+func TestNeoActorExecutorConnectAcceptsExecutorIDAlias(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019f4000-0000-4000-8000-00000000002b"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+	socket := &neoSocket{}
+
+	actor.executorConnectForSocket(socket, map[string]any{"executorId": "executor-1"})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.executorID != "executor-1" || actor.executorSocket != socket || actor.executorReady || actor.executorBootstrapComplete {
+		t.Fatalf("executor_connect alias state = id:%q socket:%p ready:%v bootstrap:%v", actor.executorID, actor.executorSocket, actor.executorReady, actor.executorBootstrapComplete)
+	}
+	if socket.executorKey() != "executor-1" {
+		t.Fatalf("socket executor key = %q, want executor-1", socket.executorKey())
+	}
+}
+
+func TestNeoActorExecutorConnectRejectedClearsConnectedState(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019f4000-0000-4000-8000-000000000020"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+	socket := &neoSocket{}
+	socket.markExecutor("executor-1")
+	actor.mu.Lock()
+	actor.executorID = "executor-1"
+	actor.executorReady = true
+	actor.executorBootstrapComplete = true
+	actor.executorSocket = socket
+	actor.agentState = "working"
+	actor.pendingTools["tool-1"] = neoPendingTool{ID: "tool-1"}
+	actor.approvalQueue = []map[string]any{{"toolCallId": "tool-2"}}
+	actor.currentInference = &neoInferenceInflight{messageID: "M-current", agentMode: "smart"}
+	actor.pendingInference = &neoInferenceInflight{agentMode: "deep", reasoningEffort: "xhigh"}
+	actor.retryScheduled = true
+	actor.spawnedExecutors = map[string]*neoSpawnedExecutor{
+		"spawn-1": {spawnID: "spawn-1", threadID: threadID},
+	}
+	generation := actor.executorIdleGeneration
+	actor.mu.Unlock()
+
+	actor.executorConnectRejectedForSocket(socket, map[string]any{"clientId": "executor-1"})
+
+	actor.mu.Lock()
+	if actor.executorID != "" || actor.replacingExecutorID != "" || actor.executorSocket != nil || actor.executorReady || actor.executorBootstrapComplete || actor.executorResumeBootstrap {
+		t.Fatalf("rejected executor state = id:%q replacing:%q socket:%p ready:%v bootstrap:%v resume:%v", actor.executorID, actor.replacingExecutorID, actor.executorSocket, actor.executorReady, actor.executorBootstrapComplete, actor.executorResumeBootstrap)
+	}
+	if len(actor.pendingTools) != 0 || len(actor.approvalQueue) != 0 || actor.currentInference != nil || actor.agentState != "idle" {
+		t.Fatalf("work after rejected connect = pending:%d approvals:%d current:%#v state:%q", len(actor.pendingTools), len(actor.approvalQueue), actor.currentInference, actor.agentState)
+	}
+	if actor.pendingInference == nil || actor.pendingInference.agentMode != "deep" || actor.pendingInference.reasoningEffort != "xhigh" || !actor.retryScheduled {
+		t.Fatalf("deferred work after rejected connect = pending:%#v retry:%v", actor.pendingInference, actor.retryScheduled)
+	}
+	if actor.executorIdleGeneration <= generation {
+		t.Fatalf("executorIdleGeneration = %d, want > %d", actor.executorIdleGeneration, generation)
+	}
+	actor.mu.Unlock()
+
+	status, _ := actor.recentThreadStatus()
+	if status["hasExecutor"] != false || status["executorConnected"] != false || status["currentInference"] != nil {
+		t.Fatalf("recent status after rejected connect = %#v", status)
+	}
+	snapshot, ok := actor.threadSnapshot()
+	if !ok {
+		t.Fatal("missing thread snapshot after rejected connect")
+	}
+	thread := neoCloudThread(snapshot)
+	if thread["hasExecutor"] != false || thread["executorConnected"] != false || thread["currentInference"] != nil || mapValue(thread["meta"])["executorType"] != nil {
+		t.Fatalf("cloud thread after rejected connect = %#v", thread)
+	}
+}
+
+func TestNeoActorActiveNoIDConnectRejectedClearsSpawn(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019f4000-0000-4000-8000-00000000002d"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+	socket := &neoSocket{}
+	socket.markExecutor()
+	actor.mu.Lock()
+	actor.executorSocket = socket
+	actor.spawnedExecutors = map[string]*neoSpawnedExecutor{
+		"spawn-1": {spawnID: "spawn-1", threadID: threadID},
+	}
+	actor.mu.Unlock()
+
+	actor.executorConnectRejectedForSocket(socket, map[string]any{})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.executorID != "" || actor.executorSocket != nil || actor.executorReady || actor.executorBootstrapComplete {
+		t.Fatalf("no-id rejected connect state = id:%q socket:%p ready:%v bootstrap:%v", actor.executorID, actor.executorSocket, actor.executorReady, actor.executorBootstrapComplete)
+	}
+	if len(actor.spawnedExecutors) != 0 {
+		t.Fatalf("spawned executors after no-id rejected connect = %#v, want none", actor.spawnedExecutors)
+	}
+}
+
+func TestNeoActorStaleExecutorConnectRejectedDoesNotClearReplacement(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019f4000-0000-4000-8000-000000000021"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+	oldSocket := &neoSocket{}
+	oldSocket.markExecutor("executor-1")
+	newSocket := &neoSocket{}
+	newSocket.markExecutor("executor-2")
+	actor.mu.Lock()
+	actor.executorID = "executor-2"
+	actor.executorReady = true
+	actor.executorBootstrapComplete = true
+	actor.executorSocket = newSocket
+	actor.spawnedExecutors = map[string]*neoSpawnedExecutor{
+		"spawn-2": {spawnID: "spawn-2", threadID: threadID},
+	}
+	actor.mu.Unlock()
+
+	actor.executorConnectRejectedForSocket(oldSocket, map[string]any{"clientId": "executor-1"})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.executorID != "executor-2" || actor.executorSocket != newSocket || !actor.executorReady || !actor.executorBootstrapComplete {
+		t.Fatalf("replacement cleared by stale rejected connect: id=%q socket=%p ready=%v bootstrap=%v", actor.executorID, actor.executorSocket, actor.executorReady, actor.executorBootstrapComplete)
+	}
+	if len(actor.spawnedExecutors) != 1 {
+		t.Fatalf("spawned executors = %#v, want replacement retained", actor.spawnedExecutors)
+	}
+}
+
+func TestNeoActorStaleConnectRejectedDoesNotClearStartingReplacement(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019f4000-0000-4000-8000-000000000024"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+	actor.mu.Lock()
+	actor.replacingExecutorID = "executor-1"
+	actor.agentState = "running_tools"
+	actor.pendingTools["tool-1"] = neoPendingTool{ID: "tool-1"}
+	actor.currentInference = &neoInferenceInflight{messageID: "M-current", agentMode: "smart"}
+	actor.pendingInference = &neoInferenceInflight{agentMode: "deep", reasoningEffort: "xhigh"}
+	actor.retryScheduled = true
+	actor.spawnedExecutors = map[string]*neoSpawnedExecutor{
+		"spawn-2": {spawnID: "spawn-2", threadID: threadID},
+	}
+	generation := actor.executorIdleGeneration
+	actor.mu.Unlock()
+
+	actor.executorConnectRejectedForSocket(nil, map[string]any{"clientId": "executor-1"})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.replacingExecutorID != "executor-1" || actor.executorID != "" || actor.executorReady || actor.executorBootstrapComplete {
+		t.Fatalf("starting replacement state = id:%q replacing:%q ready:%v bootstrap:%v", actor.executorID, actor.replacingExecutorID, actor.executorReady, actor.executorBootstrapComplete)
+	}
+	if len(actor.spawnedExecutors) != 1 {
+		t.Fatalf("spawned executors = %#v, want starting replacement retained", actor.spawnedExecutors)
+	}
+	if len(actor.pendingTools) != 0 || actor.currentInference != nil || actor.agentState != "idle" {
+		t.Fatalf("old work after stale rejected connect = pending:%d current:%#v state:%q", len(actor.pendingTools), actor.currentInference, actor.agentState)
+	}
+	if actor.pendingInference == nil || actor.pendingInference.agentMode != "deep" || actor.pendingInference.reasoningEffort != "xhigh" || !actor.retryScheduled {
+		t.Fatalf("deferred work after stale rejected connect = pending:%#v retry:%v", actor.pendingInference, actor.retryScheduled)
+	}
+	if actor.executorIdleGeneration <= generation {
+		t.Fatalf("executorIdleGeneration = %d, want > %d", actor.executorIdleGeneration, generation)
+	}
+}
+
+func TestNeoActorExecutorReadyTransitionsInvalidateIdleTimers(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019f4000-0000-4000-8000-000000000023"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+	actor.mu.Lock()
+	actor.executorIdleGeneration = 7
+	actor.mu.Unlock()
+
+	actor.executorConnectedForSocket(nil, map[string]any{"executorId": "executor-1"})
+
+	actor.mu.Lock()
+	connectedGeneration := actor.executorIdleGeneration
+	actor.mu.Unlock()
+	if connectedGeneration <= 7 {
+		t.Fatalf("executor_connected idle generation = %d, want > 7", connectedGeneration)
+	}
+
+	actor.mu.Lock()
+	actor.executorIdleGeneration = 11
+	actor.executorID = "executor-1"
+	actor.executorReady = false
+	actor.executorBootstrapComplete = false
+	actor.mu.Unlock()
+
+	actor.executorToolsBootstrapComplete(map[string]any{"ok": true})
+
+	actor.mu.Lock()
+	bootstrapGeneration := actor.executorIdleGeneration
+	actor.mu.Unlock()
+	if bootstrapGeneration <= 11 {
+		t.Fatalf("bootstrap_complete idle generation = %d, want > 11", bootstrapGeneration)
+	}
+}
+
+func TestNeoExecutorIdleTimeoutDisabledByDefault(t *testing.T) {
+	if timeout := neoExecutorIdleTimeout(&config.Config{}); timeout != 0 {
+		t.Fatalf("default idle timeout = %s, want disabled", timeout)
+	}
+	if timeout := neoExecutorIdleTimeout(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{ExecutorIdleTimeoutSeconds: 45}}}); timeout != 45*time.Second {
+		t.Fatalf("configured idle timeout = %s, want 45s", timeout)
+	}
+}
+
+func TestNeoActorIdleTimerHonorsDisabledHotReload(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{ExecutorIdleTimeoutSeconds: 1}}})
+	threadID := "T-019f4000-0000-4000-8000-00000000001f"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+
+	actor.mu.Lock()
+	actor.executorID = "executor-1"
+	actor.executorReady = true
+	actor.agentState = "idle"
+	actor.spawnedExecutors = map[string]*neoSpawnedExecutor{
+		"spawn-1": {spawnID: "spawn-1", threadID: threadID},
+	}
+	generation := actor.executorIdleGeneration
+	actor.mu.Unlock()
+
+	if err := rt.updateConfig(&config.Config{}); err != nil {
+		t.Fatalf("update config: %v", err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		actor.watchExecutorIdleTimeout(generation, 10*time.Millisecond)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("idle timer did not exit after idle timeout was disabled")
+	}
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.executorID != "executor-1" || !actor.executorReady || len(actor.spawnedExecutors) != 1 {
+		t.Fatalf("disabled idle timer stopped executor: id=%q ready=%v spawned=%d", actor.executorID, actor.executorReady, len(actor.spawnedExecutors))
+	}
+}
+
+func TestNeoActorClearCurrentInferenceSchedulesIdleStop(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{ExecutorIdleTimeoutSeconds: 60}}})
+	threadID := "T-019f4000-0000-4000-8000-000000000007"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+
+	actor.mu.Lock()
+	actor.executorID = "executor-1"
+	actor.executorReady = true
+	actor.agentState = "idle"
+	actor.currentInference = &neoInferenceInflight{messageID: "M-current"}
+	actor.spawnedExecutors = map[string]*neoSpawnedExecutor{
+		"spawn-1": {spawnID: "spawn-1", threadID: threadID},
+	}
+	beforeBlockedSchedule := actor.executorIdleGeneration
+	actor.mu.Unlock()
+
+	actor.scheduleExecutorIdleStopIfNeeded()
+
+	actor.mu.Lock()
+	blockedSchedule := actor.executorIdleGeneration
+	actor.mu.Unlock()
+	if blockedSchedule != beforeBlockedSchedule+1 {
+		t.Fatalf("blocked idle generation = %d, want %d", blockedSchedule, beforeBlockedSchedule+1)
+	}
+
+	actor.clearCurrentInference("M-current")
+
+	actor.mu.Lock()
+	afterClear := actor.executorIdleGeneration
+	if actor.currentInference != nil {
+		t.Fatalf("currentInference after clear = %#v, want nil", actor.currentInference)
+	}
+	if afterClear != blockedSchedule+2 {
+		t.Fatalf("idle generation after clear = %d, want %d", afterClear, blockedSchedule+2)
+	}
+	actor.mu.Unlock()
+
+	actor.stopIdleSpawnedExecutors(afterClear, time.Second)
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.executorID != "" || actor.executorReady || len(actor.spawnedExecutors) != 0 {
+		t.Fatalf("idle executor state = id:%q ready:%v spawned:%d", actor.executorID, actor.executorReady, len(actor.spawnedExecutors))
+	}
+}
+
+func TestNeoActorWebLocalBootstrapSpawnsWhileOldExecutorStopping(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses POSIX shell script")
+	}
+	dir := t.TempDir()
+	pidDir := filepath.Join(dir, "pids")
+	if err := os.MkdirAll(pidDir, 0o700); err != nil {
+		t.Fatalf("mkdir pid dir: %v", err)
+	}
+	t.Cleanup(replaceNeoHeadlessPIDDir(func() string { return pidDir }))
+
+	command := filepath.Join(dir, "amp-sleep")
+	if err := os.WriteFile(command, []byte("#!/bin/sh\nsleep 1\n"), 0o700); err != nil {
+		t.Fatalf("write executor command: %v", err)
+	}
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{ExecutorCommand: command}}})
+	threadID := "T-019f4000-0000-4000-8000-000000000025"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+
+	oldCmd := exec.Command(command, "--old")
+	oldCmd.Stdout = io.Discard
+	oldCmd.Stderr = io.Discard
+	if err := oldCmd.Start(); err != nil {
+		t.Fatalf("start old executor command: %v", err)
+	}
+	oldSpawned := &neoSpawnedExecutor{spawnID: "spawn-old", threadID: threadID, cmd: oldCmd, startedAt: time.Now(), stopping: true}
+	t.Cleanup(func() {
+		actor.stopSpawnedExecutors()
+		oldSpawned.stop()
+		_ = oldCmd.Wait()
+	})
+	if err := os.WriteFile(filepath.Join(pidDir, threadID+".pid"), []byte(strconv.Itoa(oldSpawned.pid())), 0o600); err != nil {
+		t.Fatalf("write pid file: %v", err)
+	}
+	actor.mu.Lock()
+	actor.spawnedExecutors = map[string]*neoSpawnedExecutor{
+		"spawn-old": oldSpawned,
+	}
+	actor.mu.Unlock()
+
+	if !actor.webLocalInferenceBootstrapNeeded() {
+		t.Fatal("bootstrap not needed while only executor is stopping")
+	}
+	status := actor.spawnExecutor(map[string]any{
+		"type":                    "client_spawn_executor",
+		"requestId":               "spawn-new",
+		"replaceExistingExecutor": true,
+	})
+	if stringValue(status["status"]) != "running" || stringValue(mapValue(status["details"])["reasonCode"]) != "waiting_for_executor_connect" {
+		t.Fatalf("spawn status = %#v, want waiting_for_executor_connect", status)
+	}
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.spawnedExecutors) != 2 {
+		t.Fatalf("spawned executors = %#v, want old stopping plus new bootstrap", actor.spawnedExecutors)
+	}
+	if !actor.spawnedExecutors["spawn-old"].stopping {
+		t.Fatalf("old executor stopping = false: %#v", actor.spawnedExecutors["spawn-old"])
+	}
+	newSpawned := actor.spawnedExecutors["spawn-new"]
+	if newSpawned == nil || newSpawned.stopping || newSpawned.pid() == 0 {
+		t.Fatalf("new spawned executor = %#v, want live non-stopping executor", newSpawned)
+	}
+}
+
+func TestNeoActorQueuedWorkRespawnsIdleStoppedWebLocalExecutor(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses POSIX shell script")
+	}
+	dir := t.TempDir()
+	pidDir := filepath.Join(dir, "pids")
+	if err := os.MkdirAll(pidDir, 0o700); err != nil {
+		t.Fatalf("mkdir pid dir: %v", err)
+	}
+	t.Cleanup(replaceNeoHeadlessPIDDir(func() string { return pidDir }))
+
+	command := filepath.Join(dir, "amp-sleep")
+	if err := os.WriteFile(command, []byte("#!/bin/sh\nsleep 5\n"), 0o700); err != nil {
+		t.Fatalf("write executor command: %v", err)
+	}
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
+		ExecutorCommand:            command,
+		ExecutorIdleTimeoutSeconds: 60,
+	}}})
+	threadID := "T-019f4000-0000-4000-8000-00000000000f"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+	t.Cleanup(actor.stopSpawnedExecutors)
+
+	cmd := exec.Command(command, "--old")
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start executor command: %v", err)
+	}
+	spawned := &neoSpawnedExecutor{spawnID: "spawn-1", threadID: threadID, cmd: cmd, startedAt: time.Now()}
+	t.Cleanup(func() {
+		spawned.stop()
+		_ = cmd.Wait()
+	})
+	if err := os.WriteFile(filepath.Join(pidDir, threadID+".pid"), []byte(strconv.Itoa(spawned.pid())), 0o600); err != nil {
+		t.Fatalf("write pid file: %v", err)
+	}
+
+	actor.mu.Lock()
+	actor.bootstrapExecutorType = "local-client"
+	actor.executorID = "executor-1"
+	actor.executorReady = true
+	actor.executorBootstrapComplete = true
+	actor.agentState = "idle"
+	actor.environment = map[string]any{"workingDirectory": dir}
+	actor.spawnedExecutors = map[string]*neoSpawnedExecutor{
+		"spawn-1": spawned,
+	}
+	generation := actor.executorIdleGeneration
+	actor.mu.Unlock()
+
+	actor.stopIdleSpawnedExecutors(generation, time.Second)
+
+	actor.receiveUserMessage(nil, map[string]any{
+		"type":      "client_append_user_msg",
+		"messageId": "M-0000000000000000000001",
+		"content":   []any{map[string]any{"type": "text", "text": "continue"}},
+	})
+
+	actor.mu.Lock()
+	stoppingSpawned := actor.spawnedExecutors["spawn-1"]
+	queuedBeforeWait := len(actor.queue)
+	readyBeforeWait := actor.executorReady
+	actor.mu.Unlock()
+	if stoppingSpawned != spawned || !spawned.stopping || queuedBeforeWait != 1 || readyBeforeWait {
+		t.Fatalf("stopping executor window = spawned:%p stopping:%v queued:%d ready:%v", stoppingSpawned, spawned.stopping, queuedBeforeWait, readyBeforeWait)
+	}
+
+	waitDone := make(chan struct{})
+	go func() {
+		actor.waitSpawnedExecutor("spawn-1", spawned, nil)
+		close(waitDone)
+	}()
+	select {
+	case <-waitDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("idle-stopped executor did not exit")
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		actor.mu.Lock()
+		spawned := len(actor.spawnedExecutors)
+		queued := len(actor.queue)
+		ready := actor.executorReady
+		actor.mu.Unlock()
+		if spawned == 1 && queued == 1 && !ready {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	t.Fatalf("post-idle queued work state = spawned:%d queued:%d ready:%v executorID:%q", len(actor.spawnedExecutors), len(actor.queue), actor.executorReady, actor.executorID)
+}
+
+func TestNeoActorQueuedWorkRespawnsDisconnectedWebLocalExecutorAfterWait(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses POSIX shell script")
+	}
+	dir := t.TempDir()
+	pidDir := filepath.Join(dir, "pids")
+	if err := os.MkdirAll(pidDir, 0o700); err != nil {
+		t.Fatalf("mkdir pid dir: %v", err)
+	}
+	t.Cleanup(replaceNeoHeadlessPIDDir(func() string { return pidDir }))
+
+	command := filepath.Join(dir, "amp-sleep")
+	if err := os.WriteFile(command, []byte("#!/bin/sh\nsleep 5\n"), 0o700); err != nil {
+		t.Fatalf("write executor command: %v", err)
+	}
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
+		ExecutorCommand:            command,
+		ExecutorIdleTimeoutSeconds: 60,
+	}}})
+	threadID := "T-019f4000-0000-4000-8000-000000000010"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+	t.Cleanup(actor.stopSpawnedExecutors)
+
+	cmd := exec.Command(command, "--old")
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start executor command: %v", err)
+	}
+	spawned := &neoSpawnedExecutor{spawnID: "spawn-1", threadID: threadID, cmd: cmd, startedAt: time.Now()}
+	t.Cleanup(func() {
+		spawned.stop()
+		_ = cmd.Wait()
+	})
+	if err := os.WriteFile(filepath.Join(pidDir, threadID+".pid"), []byte(strconv.Itoa(spawned.pid())), 0o600); err != nil {
+		t.Fatalf("write pid file: %v", err)
+	}
+
+	actor.mu.Lock()
+	actor.bootstrapExecutorType = "local-client"
+	actor.executorID = "executor-1"
+	actor.executorReady = true
+	actor.executorBootstrapComplete = true
+	actor.agentState = "idle"
+	actor.environment = map[string]any{"workingDirectory": dir}
+	actor.queue = []neoQueuedMessage{{
+		MessageID: "M-0000000000000000000010",
+		Content:   []any{map[string]any{"type": "text", "text": "continue after disconnect"}},
+	}}
+	actor.spawnedExecutors = map[string]*neoSpawnedExecutor{
+		"spawn-1": spawned,
+	}
+	actor.mu.Unlock()
+
+	actor.executorDisconnected(map[string]any{"executorId": "executor-1", "message": "Executor disconnected"})
+
+	actor.mu.Lock()
+	stoppingSpawned := actor.spawnedExecutors["spawn-1"]
+	queuedBeforeWait := len(actor.queue)
+	readyBeforeWait := actor.executorReady
+	actor.mu.Unlock()
+	if stoppingSpawned != spawned || !spawned.stopping || queuedBeforeWait != 1 || readyBeforeWait {
+		t.Fatalf("disconnect stopping window = spawned:%p stopping:%v queued:%d ready:%v", stoppingSpawned, spawned.stopping, queuedBeforeWait, readyBeforeWait)
+	}
+
+	waitDone := make(chan struct{})
+	go func() {
+		actor.waitSpawnedExecutor("spawn-1", spawned, nil)
+		close(waitDone)
+	}()
+	select {
+	case <-waitDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("disconnected executor did not exit")
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		actor.mu.Lock()
+		spawned := len(actor.spawnedExecutors)
+		queued := len(actor.queue)
+		ready := actor.executorReady
+		actor.mu.Unlock()
+		if spawned == 1 && queued == 1 && !ready {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	t.Fatalf("post-disconnect queued work state = spawned:%d queued:%d ready:%v executorID:%q", len(actor.spawnedExecutors), len(actor.queue), actor.executorReady, actor.executorID)
+}
+
+func TestNeoActorPendingInferenceRespawnsDisconnectedWebLocalExecutorAfterWait(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses POSIX shell script")
+	}
+	dir := t.TempDir()
+	pidDir := filepath.Join(dir, "pids")
+	if err := os.MkdirAll(pidDir, 0o700); err != nil {
+		t.Fatalf("mkdir pid dir: %v", err)
+	}
+	t.Cleanup(replaceNeoHeadlessPIDDir(func() string { return pidDir }))
+
+	command := filepath.Join(dir, "amp-sleep")
+	if err := os.WriteFile(command, []byte("#!/bin/sh\nsleep 5\n"), 0o700); err != nil {
+		t.Fatalf("write executor command: %v", err)
+	}
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
+		ExecutorCommand: command,
+	}}})
+	threadID := "T-019f4000-0000-4000-8000-00000000002e"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+	t.Cleanup(actor.stopSpawnedExecutors)
+	socket := &neoSocket{}
+	socket.markExecutor("executor-1")
+	actor.mu.Lock()
+	actor.bootstrapExecutorType = "local-client"
+	actor.executorID = "executor-1"
+	actor.executorReady = true
+	actor.executorBootstrapComplete = true
+	actor.executorSocket = socket
+	actor.agentState = "idle"
+	actor.environment = map[string]any{"workingDirectory": dir}
+	actor.pendingInference = &neoInferenceInflight{agentMode: "deep", reasoningEffort: "xhigh"}
+	actor.mu.Unlock()
+
+	actor.executorDisconnectedForSocket(socket, map[string]any{"executorId": "executor-1", "message": "Executor disconnected"})
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		actor.mu.Lock()
+		spawned := len(actor.spawnedExecutors)
+		pending := actor.pendingInference
+		ready := actor.executorReady
+		actor.mu.Unlock()
+		if spawned == 1 && pending != nil && pending.agentMode == "deep" && !ready {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	t.Fatalf("post-disconnect pending inference state = spawned:%d pending:%#v ready:%v executorID:%q", len(actor.spawnedExecutors), actor.pendingInference, actor.executorReady, actor.executorID)
+}
+
+func TestNeoActorPreConnectExitDoesNotRespawnQueuedWork(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses POSIX shell script")
+	}
+	dir := t.TempDir()
+	startedLog := filepath.Join(dir, "started.log")
+	command := filepath.Join(dir, "amp-exit")
+	if err := os.WriteFile(command, []byte("#!/bin/sh\nprintf 'start\\n' >> \"$TEST_STARTED_LOG\"\nexit 0\n"), 0o700); err != nil {
+		t.Fatalf("write executor command: %v", err)
+	}
+	t.Setenv("TEST_STARTED_LOG", startedLog)
+
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
+		ExecutorCommand: command,
+	}}})
+	threadID := "T-019f4000-0000-4000-8000-000000000011"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+	t.Cleanup(actor.stopSpawnedExecutors)
+
+	actor.mu.Lock()
+	actor.bootstrapExecutorType = "local-client"
+	actor.agentState = "idle"
+	actor.environment = map[string]any{"workingDirectory": dir}
+	actor.queue = []neoQueuedMessage{{
+		MessageID: "M-0000000000000000000011",
+		Content:   []any{map[string]any{"type": "text", "text": "do not loop"}},
+	}}
+	actor.mu.Unlock()
+
+	actor.spawnExecutor(map[string]any{"type": "client_spawn_executor", "requestId": "spawn-fails"})
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		actor.mu.Lock()
+		spawned := len(actor.spawnedExecutors)
+		actor.mu.Unlock()
+		if spawned == 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	time.Sleep(200 * time.Millisecond)
+	raw, err := os.ReadFile(startedLog)
+	if err != nil {
+		t.Fatalf("read started log: %v", err)
+	}
+	if got := strings.Count(string(raw), "start\n"); got != 1 {
+		t.Fatalf("executor start count = %d, want one failed attempt; log=%q", got, raw)
+	}
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.spawnedExecutors) != 0 || len(actor.queue) != 1 || actor.executorReady {
+		t.Fatalf("pre-connect failure state = spawned:%d queued:%d ready:%v", len(actor.spawnedExecutors), len(actor.queue), actor.executorReady)
+	}
+}
+
+func TestNeoActorConnectRejectedDoesNotRespawnQueuedWork(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses POSIX shell script")
+	}
+	dir := t.TempDir()
+	startedLog := filepath.Join(dir, "started.log")
+	command := filepath.Join(dir, "amp-sleep")
+	if err := os.WriteFile(command, []byte("#!/bin/sh\nprintf 'start\\n' >> \"$TEST_STARTED_LOG\"\nsleep 5\n"), 0o700); err != nil {
+		t.Fatalf("write executor command: %v", err)
+	}
+	t.Setenv("TEST_STARTED_LOG", startedLog)
+
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
+		ExecutorCommand: command,
+	}}})
+	threadID := "T-019f4000-0000-4000-8000-000000000012"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+	t.Cleanup(actor.stopSpawnedExecutors)
+
+	cmd := exec.Command(command, "--old")
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start executor command: %v", err)
+	}
+	started := false
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+		raw, _ := os.ReadFile(startedLog)
+		if strings.Count(string(raw), "start\n") == 1 {
+			started = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !started {
+		t.Fatalf("executor did not write start marker")
+	}
+	spawned := &neoSpawnedExecutor{spawnID: "spawn-1", threadID: threadID, command: command, cmd: cmd, startedAt: time.Now()}
+	t.Cleanup(func() {
+		spawned.stop()
+		_ = cmd.Wait()
+	})
+
+	socket := &neoSocket{}
+	socket.markExecutor("executor-1")
+	actor.mu.Lock()
+	actor.bootstrapExecutorType = "local-client"
+	actor.agentState = "idle"
+	actor.environment = map[string]any{"workingDirectory": dir}
+	actor.spawnedExecutors = map[string]*neoSpawnedExecutor{"spawn-1": spawned}
+	actor.queue = []neoQueuedMessage{{
+		MessageID: "M-0000000000000000000012",
+		Content:   []any{map[string]any{"type": "text", "text": "do not retry rejected connect"}},
+	}}
+	actor.mu.Unlock()
+
+	actor.executorConnectForSocket(socket, map[string]any{"clientId": "executor-1"})
+	actor.executorConnectRejectedForSocket(socket, map[string]any{"clientId": "executor-1"})
+	actor.waitSpawnedExecutor("spawn-1", spawned, nil)
+
+	time.Sleep(200 * time.Millisecond)
+	raw, err := os.ReadFile(startedLog)
+	if err != nil {
+		t.Fatalf("read started log: %v", err)
+	}
+	if got := strings.Count(string(raw), "start\n"); got != 1 {
+		t.Fatalf("executor start count = %d, want one rejected attempt; log=%q", got, raw)
+	}
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.spawnedExecutors) != 0 || len(actor.queue) != 1 || actor.executorReady {
+		t.Fatalf("connect rejection state = spawned:%d queued:%d ready:%v", len(actor.spawnedExecutors), len(actor.queue), actor.executorReady)
+	}
+}
+
+func TestNeoActorAcceptedUserMessageInvalidatesPendingIdleStop(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{ExecutorIdleTimeoutSeconds: 60}}})
+	threadID := "T-019f4000-0000-4000-8000-000000000008"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+
+	actor.mu.Lock()
+	actor.executorID = "executor-1"
+	actor.executorReady = true
+	actor.agentState = "idle"
+	actor.spawnedExecutors = map[string]*neoSpawnedExecutor{
+		"spawn-1": {spawnID: "spawn-1", threadID: threadID},
+	}
+	actor.mu.Unlock()
+
+	actor.scheduleExecutorIdleStopIfNeeded()
+
+	actor.mu.Lock()
+	pendingIdleGeneration := actor.executorIdleGeneration
+	actor.mu.Unlock()
+
+	message, _, _, _ := actor.appendStartedUserMessage(neoQueuedMessage{
+		MessageID: "M-0000000000000000000001",
+		Content:   []any{map[string]any{"type": "text", "text": "start now"}},
+	})
+	if message.MessageID != "M-0000000000000000000001" {
+		t.Fatalf("message = %#v", message)
+	}
+
+	actor.mu.Lock()
+	acceptedGeneration := actor.executorIdleGeneration
+	if acceptedGeneration <= pendingIdleGeneration {
+		t.Fatalf("idle generation after accepting work = %d, want > %d", acceptedGeneration, pendingIdleGeneration)
+	}
+	if actor.agentState != "working" || actor.currentInference != nil || len(actor.queue) != 0 {
+		t.Fatalf("race window state = state:%q current:%#v queue:%d", actor.agentState, actor.currentInference, len(actor.queue))
+	}
+	actor.mu.Unlock()
+
+	actor.stopIdleSpawnedExecutors(pendingIdleGeneration, time.Second)
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.executorID != "executor-1" || !actor.executorReady || len(actor.spawnedExecutors) != 1 {
+		t.Fatalf("accepted work lost executor: id=%q ready=%v spawned=%d", actor.executorID, actor.executorReady, len(actor.spawnedExecutors))
+	}
+}
+
+func TestNeoActorBinaryUserMessageInvalidatesPendingIdleStop(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{ExecutorIdleTimeoutSeconds: 60}}})
+	threadID := "T-019f4000-0000-4000-8000-00000000002a"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+
+	actor.mu.Lock()
+	actor.executorID = "executor-1"
+	actor.executorReady = true
+	actor.agentState = "idle"
+	actor.spawnedExecutors = map[string]*neoSpawnedExecutor{
+		"spawn-1": {spawnID: "spawn-1", threadID: threadID},
+	}
+	actor.mu.Unlock()
+
+	actor.scheduleExecutorIdleStopIfNeeded()
+
+	actor.mu.Lock()
+	pendingIdleGeneration := actor.executorIdleGeneration
+	actor.mu.Unlock()
+
+	actor.appendBinaryUserMessage(neoQueuedMessage{
+		MessageID: "M-00000000000000000002aa",
+		Content:   []any{map[string]any{"type": "text", "text": "binary turn"}},
+	}, map[string]any{"type": "user:message"})
+
+	actor.mu.Lock()
+	acceptedGeneration := actor.executorIdleGeneration
+	if acceptedGeneration <= pendingIdleGeneration {
+		t.Fatalf("idle generation after binary user message = %d, want > %d", acceptedGeneration, pendingIdleGeneration)
+	}
+	actor.mu.Unlock()
+
+	actor.stopIdleSpawnedExecutors(pendingIdleGeneration, time.Second)
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.executorID != "executor-1" || !actor.executorReady || len(actor.spawnedExecutors) != 1 {
+		t.Fatalf("binary user message lost executor: id=%q ready=%v spawned=%d", actor.executorID, actor.executorReady, len(actor.spawnedExecutors))
+	}
+}
+
+func TestNeoActorIdleStopOnlyStopsEligibleSpawnedExecutor(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019f4000-0000-4000-8000-000000000002"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+
+	actor.mu.Lock()
+	actor.executorID = "executor-1"
+	actor.executorReady = true
+	actor.agentState = "running_tools"
+	actor.spawnedExecutors = map[string]*neoSpawnedExecutor{
+		"spawn-1": &neoSpawnedExecutor{spawnID: "spawn-1", threadID: threadID},
+	}
+	generation := actor.executorIdleGeneration
+	actor.mu.Unlock()
+	actor.stopIdleSpawnedExecutors(generation, time.Second)
+
+	actor.mu.Lock()
+	if actor.executorID != "executor-1" || !actor.executorReady || len(actor.spawnedExecutors) != 1 {
+		t.Fatalf("busy executor was stopped: id=%q ready=%v spawned=%d", actor.executorID, actor.executorReady, len(actor.spawnedExecutors))
+	}
+	actor.agentState = "idle"
+	actor.retryScheduled = true
+	generation = actor.executorIdleGeneration
+	actor.mu.Unlock()
+	actor.stopIdleSpawnedExecutors(generation, time.Second)
+
+	actor.mu.Lock()
+	if actor.executorID != "executor-1" || !actor.executorReady || len(actor.spawnedExecutors) != 1 {
+		t.Fatalf("retrying executor was stopped: id=%q ready=%v spawned=%d", actor.executorID, actor.executorReady, len(actor.spawnedExecutors))
+	}
+	actor.retryScheduled = false
+	actor.queue = []neoQueuedMessage{{ID: "queued-1", MessageID: "M-queued"}}
+	generation = actor.executorIdleGeneration
+	actor.mu.Unlock()
+	actor.stopIdleSpawnedExecutors(generation, time.Second)
+
+	actor.mu.Lock()
+	if actor.executorID != "executor-1" || !actor.executorReady || len(actor.spawnedExecutors) != 1 {
+		t.Fatalf("queued executor was stopped: id=%q ready=%v spawned=%d", actor.executorID, actor.executorReady, len(actor.spawnedExecutors))
+	}
+	actor.mu.Unlock()
+	actor.removeQueuedMessage("M-queued")
+	actor.mu.Lock()
+	if len(actor.queue) != 0 {
+		t.Fatalf("queue = %#v, want empty", actor.queue)
+	}
+	generation = actor.executorIdleGeneration
+	actor.mu.Unlock()
+
+	actor.stopIdleSpawnedExecutors(generation, time.Second)
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.executorID != "" || actor.executorReady || len(actor.spawnedExecutors) != 0 {
+		t.Fatalf("idle executor state = id:%q ready:%v spawned:%d", actor.executorID, actor.executorReady, len(actor.spawnedExecutors))
+	}
+	if actor.agentState != "idle" {
+		t.Fatalf("agentState = %q, want idle", actor.agentState)
 	}
 }
 
@@ -23839,57 +25206,8 @@ func TestNeoWebLocalThreadDocumentDoesNotInventExecutorConnection(t *testing.T) 
 	if thread["state"] != "idle" || thread["agentState"] != "idle" {
 		t.Fatalf("thread state = state:%#v agentState:%#v", thread["state"], thread["agentState"])
 	}
-	sidebarThread := neoWebLocalSidebarThread(thread)
-	if sidebarThread["hasExecutor"] != false || sidebarThread["executorConnected"] != false {
-		t.Fatalf("sidebar executor state = has:%#v connected:%#v", sidebarThread["hasExecutor"], sidebarThread["executorConnected"])
-	}
-	if sidebarThread["state"] != "idle" || sidebarThread["agentState"] != "idle" {
-		t.Fatalf("sidebar state = state:%#v agentState:%#v", sidebarThread["state"], sidebarThread["agentState"])
-	}
-}
-
-func TestNeoWebLocalSidebarThreadInfersProgressOnlyWithoutExplicitState(t *testing.T) {
-	idle := neoWebLocalSidebarThread(map[string]any{
-		"id":                "T-idle",
-		"created":           1778170000000,
-		"title":             "Idle",
-		"executorConnected": false,
-		"currentInference":  map[string]any{"messageId": "M-stale"},
-		"agentState":        "idle",
-	})
-	if idle["agentState"] != "idle" || idle["state"] != "idle" {
-		t.Fatalf("explicit idle state = state:%#v agentState:%#v", idle["state"], idle["agentState"])
-	}
-
-	working := neoWebLocalSidebarThread(map[string]any{
-		"id":                "T-working",
-		"created":           1778170000000,
-		"title":             "Working",
-		"executorConnected": true,
-		"currentInference":  map[string]any{"messageId": "M-working", "agentMode": "deep", "reasoningEffort": "xhigh", "tools": []any{"shell_command"}},
-		"messages": []any{map[string]any{
-			"messageId":       "M-user",
-			"role":            "user",
-			"createdAt":       "2026-05-31T10:00:00Z",
-			"agentMode":       "deep",
-			"reasoningEffort": "xhigh",
-			"content":         []any{map[string]any{"type": "text", "text": "continue"}},
-		}},
-	})
-	if working["agentState"] != "working" || working["state"] != "working" {
-		t.Fatalf("inferred working state = state:%#v agentState:%#v", working["state"], working["agentState"])
-	}
-	if working["hasExecutor"] != true || working["executorConnected"] != true {
-		t.Fatalf("working executor state = has:%#v connected:%#v", working["hasExecutor"], working["executorConnected"])
-	}
-	if working["lastUserMessageAt"] != "2026-05-31T10:00:00Z" || working["updatedAt"] != "2026-05-31T10:00:00Z" {
-		t.Fatalf("working timestamps = last:%#v updated:%#v", working["lastUserMessageAt"], working["updatedAt"])
-	}
-	if working["agentMode"] != "deep" || working["reasoningEffort"] != "xhigh" {
-		t.Fatalf("working mode/effort = mode:%#v effort:%#v", working["agentMode"], working["reasoningEffort"])
-	}
-	if mapValue(working["currentInference"])["messageId"] != "M-working" {
-		t.Fatalf("working currentInference = %#v", working["currentInference"])
+	if mapValue(thread["meta"])["executorType"] != nil {
+		t.Fatalf("disconnected web local executorType = %#v, want absent", thread["meta"])
 	}
 }
 

@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -405,7 +406,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 	body := rec.Body.String()
 	for _, want := range []string{
 		"// ==UserScript==",
-		"@version 0.1.31",
+		"@version 0.1.32",
 		"@match https://ampcode.com/*",
 		"@updateURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
 		"@downloadURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
@@ -417,12 +418,10 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"menuIntegrationCount",
 		"commandPaletteIntegrationCount",
 		"localThreadPickerOpenCount",
-		"localSidebarSeedCount",
 		"removedLocalThreadControlCount",
 		"lastPatchedThreadActorBaseURL",
 		"lastPatchedThreadID",
 		"threadActorConfig",
-		"executorConnected",
 		"local-client",
 		"cliproxyapi.ampLocalInference.apiKey",
 		"storedLocalAPIKey",
@@ -466,18 +465,10 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"Generate Diagnostic Report",
 		"plainThreadWorkingDirectory",
 		"devalueThreadWorkingDirectory",
+		"rememberPlainThreadRuntime",
+		"rememberDevalueThreadRuntime",
 		"TextDecoder",
-		"seedLocalSidebarProjects",
-		"seedLocalSidebarProjectForWorkingDirectory",
-		"scheduleLocalSidebarProjectsRefresh",
-		"scheduleLocalSidebarProjectsRefresh(workingDirectory)",
-		`localSidebarRefreshWorkingDirectory = "";`,
-		"localGoFilePathEscape",
-		`.replace(/%2B/gi, "+")`,
 		`.split(/[\\/]+/)`,
-		"normalizeWorkingDirectory(project.workingDirectory) === workingDirectory",
-		"localProjectIDForWorkingDirectory",
-		"cachedProjectWorkingDirectory",
 		"parsedTextLocalInferencePatchOptions",
 		`source.includes("\"id\"")`,
 		`source.includes("workingDirectory")`,
@@ -494,20 +485,10 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"svelteKitRemoteEndpoint",
 		"svelteKitRemotePath",
 		"createProjectThreadRemotePath",
-		"refreshLocalSidebarProjects",
-		"mergeDevalueSidebarProjects",
-		"cachedLocalSidebarRecentThreads",
-		"sidebarDateFields",
-		"appendDevalueSidebarDateValue",
-		`values.push(["Date", iso])`,
-		"appendDevalueSidebarValue",
-		"devalueSidebarThreadIDs",
-		"devalueSidebarThreadRef",
-		"patchDevalueSidebarThread",
-		"existingThreadIDs.has(threadID)",
-		"localSidebarRecentThreadCount",
 		"remoteCreateProjectThreadWorkingDirectory",
 		"rememberRemoteCreateProjectThread",
+		`if (!response || !response.ok || typeof response.clone !== "function")`,
+		`if (workingDirectory)`,
 		"/_app/remote/",
 		"createProjectThread",
 		"prewarmProjectThread",
@@ -541,6 +522,33 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"installCommandPaletteIntegration();",
 		"handleNewThreadIntent();",
 		"mergeSidebarResponse",
+		"seedLocalSidebarProjects",
+		"seedLocalSidebarProjectForWorkingDirectory",
+		"scheduleLocalSidebarProjectsRefresh",
+		"refreshLocalSidebarProjects",
+		"mergeDevalueSidebarProjects",
+		"cachedLocalSidebarRecentThreads",
+		"cachedLocalSidebarProjects",
+		"sidebarDateFields",
+		"appendDevalueSidebarDateValue",
+		"appendDevalueSidebarValue",
+		"devalueSidebarThreadIDs",
+		"devalueSidebarThreadRef",
+		"patchDevalueSidebarThread",
+		"localProjectIDForWorkingDirectory",
+		"cachedProjectWorkingDirectory",
+		"patchPlainThreadRuntime",
+		"patchDevalueThreadRuntime",
+		"thread.hasExecutor",
+		"thread.executorConnected",
+		`meta.executorType = "local-client"`,
+		`source.includes("hasExecutor")`,
+		`source.includes("executorConnected")`,
+		"ensureDevalueValueIndex(values, true)",
+		`if (!workingDirectory || !response || !response.ok || typeof response.clone !== "function")`,
+		"/_app/remote/cliproxy/listThreadListSidebar",
+		`case "listThreadListSidebar":`,
+		`case "listUserExecutorDaemons":`,
 		`svelteKitRemoteEndpoint(sourceURL.pathname) === "listThreadListSidebar"`,
 		"path.endsWith(\"/listThreadListSidebar\")",
 		"path.endsWith(\"/listUserExecutorDaemons\")",
@@ -552,11 +560,24 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 			t.Fatalf("userscript still activates obsolete local thread control %q:\n%s", unwanted, body)
 		}
 	}
-	if got := strings.Count(body, "refreshLocalSidebarProjects();"); got != 3 {
-		t.Fatalf("refreshLocalSidebarProjects call count = %d, want 3", got)
+	projectIDIndex := strings.Index(body, `const projectID = isPlainObject(decoded) ? firstString(decoded.projectID, decoded.projectId, decoded.project_id) : "";`)
+	visibleProjectIndex := strings.Index(body, `const fromVisibleProject = visibleProjectWorkingDirectory();`)
+	if projectIDIndex < 0 || visibleProjectIndex < 0 || projectIDIndex > visibleProjectIndex || !strings.Contains(body[projectIDIndex:visibleProjectIndex], `if (projectID)`) {
+		t.Fatalf("userscript should reject projectID bodies before visible project fallback:\n%s", body)
 	}
-	if !strings.Contains(body, `headers: localFetchHeaders("", false)`) {
-		t.Fatalf("background sidebar refresh should not prompt for API key:\n%s", body)
+}
+
+func TestWebLocalInferenceUserscriptSyntax(t *testing.T) {
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node not installed")
+	}
+	path := filepath.Join(t.TempDir(), "local-inference.user.js")
+	if err := os.WriteFile(path, []byte(ampWebLocalInferenceUserscript("http://127.0.0.1:8317", nil)), 0o600); err != nil {
+		t.Fatalf("write userscript: %v", err)
+	}
+	cmd := exec.Command("node", "--check", path)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("userscript syntax check failed: %v\n%s", err, output)
 	}
 }
 
@@ -1569,6 +1590,19 @@ func TestNeoDecodeSvelteKitCreateProjectThreadPayloadCaptured(t *testing.T) {
 	}
 }
 
+func TestNeoWebLocalRemoteEndpointOnlyAllowsCommandRoutes(t *testing.T) {
+	for _, path := range []string{"/_app/remote/3abror/createProjectThread", "/_app/remote/3abror/prewarmProjectThread"} {
+		if _, _, ok := neoWebLocalRemoteEndpoint(path); !ok {
+			t.Fatalf("remote endpoint %s was not accepted", path)
+		}
+	}
+	for _, path := range []string{"/_app/remote/cliproxy/listThreadListSidebar", "/_app/remote/3abror/listThreadListSidebar", "/_app/remote/3abror/listUserExecutorDaemons"} {
+		if _, _, ok := neoWebLocalRemoteEndpoint(path); ok {
+			t.Fatalf("remote endpoint %s should not be served locally", path)
+		}
+	}
+}
+
 func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	dataDir := t.TempDir()
@@ -1635,6 +1669,9 @@ func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.
 	if createResult["ok"] != true || stringValue(createResult["threadID"]) != threadID {
 		t.Fatalf("create result = %#v", createResult)
 	}
+	if stringValue(createResult["workingDirectory"]) != expectedWorkDir || stringValue(createResult["workspaceRoot"]) != expectedWorkDir {
+		t.Fatalf("create working directory response = %#v, want %q", createResult, expectedWorkDir)
+	}
 
 	actor := rt.store.lookupThreadActor(threadID)
 	if actor == nil {
@@ -1678,6 +1715,14 @@ func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.
 	if projectOnlyRec.Code != http.StatusOK {
 		t.Fatalf("project-only create status = %d, body=%s", projectOnlyRec.Code, projectOnlyRec.Body.String())
 	}
+	projectOnlyEnvelope := decodeSvelteKitRemoteEnvelopeForTest(t, projectOnlyRec.Body.Bytes())
+	projectOnlyResult := mapValue(projectOnlyEnvelope["_"])
+	if projectOnlyResult["ok"] != true || stringValue(projectOnlyResult["threadID"]) != projectOnlyThreadID {
+		t.Fatalf("project-only create result = %#v", projectOnlyResult)
+	}
+	if stringValue(projectOnlyResult["workingDirectory"]) != expectedWorkDir || stringValue(projectOnlyResult["workspaceRoot"]) != expectedWorkDir {
+		t.Fatalf("project-only working directory response = %#v, want %q", projectOnlyResult, expectedWorkDir)
+	}
 	projectOnlyActor := rt.store.lookupThreadActor(projectOnlyThreadID)
 	if projectOnlyActor == nil {
 		t.Fatal("project-only thread actor not found")
@@ -1711,37 +1756,6 @@ func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.
 	}
 	if actor := rt.store.lookupThreadActor(missingDirectoryThreadID); actor != nil {
 		t.Fatal("missing-directory thread actor was created")
-	}
-
-	listReq := httptest.NewRequest(http.MethodGet, "/_app/remote/3abror/listThreadListSidebar?"+ampWebLocalInferenceAPIKeyQuery+"=local-key", nil)
-	listReq.Header.Set("Origin", "https://ampcode.com")
-	listReq.Header.Set(ampWebLocalInferenceHeader, "1")
-	listRec := httptest.NewRecorder()
-	r.ServeHTTP(listRec, listReq)
-	if listRec.Code != http.StatusOK {
-		t.Fatalf("sidebar status = %d, body=%s", listRec.Code, listRec.Body.String())
-	}
-	sidebarEnvelope := decodeSvelteKitRemoteEnvelopeForTest(t, listRec.Body.Bytes())
-	queryCache := mapValue(sidebarEnvelope["q"])
-	queryValue := mapValue(mapValue(queryCache["3abror/listThreadListSidebar/"])["v"])
-	if len(arrayValue(queryValue["projects"])) == 0 || len(arrayValue(queryValue["recentThreads"])) == 0 {
-		t.Fatalf("sidebar query value = %#v", queryValue)
-	}
-	var sawProject, sawThread bool
-	for _, rawProject := range arrayValue(queryValue["projects"]) {
-		project := mapValue(rawProject)
-		if stringValue(project["id"]) == projectID && stringValue(project["workingDirectory"]) == expectedWorkDir {
-			sawProject = true
-		}
-	}
-	for _, rawThread := range arrayValue(queryValue["recentThreads"]) {
-		thread := mapValue(rawThread)
-		if stringValue(thread["id"]) == threadID && thread["hasExecutor"] == false && thread["agentState"] == "idle" {
-			sawThread = true
-		}
-	}
-	if !sawProject || !sawThread {
-		t.Fatalf("sidebar missing project/thread sawProject=%v sawThread=%v value=%#v", sawProject, sawThread, queryValue)
 	}
 }
 
@@ -1796,65 +1810,7 @@ func TestWebLocalInferenceRemotePrewarmRejectsMalformedPayload(t *testing.T) {
 	}
 }
 
-func TestWebLocalInferenceRemoteSidebarIncludesWorkingDirectoryHint(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	dataDir := t.TempDir()
-	oldStoreDir := neoAmpDataDir
-	neoAmpDataDir = func() string { return dataDir }
-	t.Cleanup(func() { neoAmpDataDir = oldStoreDir })
-	r := gin.New()
-	enabled := true
-	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
-		NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled},
-	}})
-	m := &AmpModule{
-		restrictToLocalhost: false,
-		neoRuntime:          rt,
-		lastConfig: &config.AmpCode{
-			WebLocalInference: config.AmpWebLocalInference{Enabled: true},
-		},
-	}
-	auth := func(c *gin.Context) {
-		token := strings.TrimSpace(c.GetHeader("Authorization"))
-		token = strings.TrimSpace(strings.TrimPrefix(token, "Bearer "))
-		if token != "local-key" {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing auth"})
-			return
-		}
-		c.Set("userApiKey", token)
-		c.Next()
-	}
-	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, auth)
-
-	workDir := t.TempDir()
-	expectedWorkDir := neoExistingDirectory(workDir)
-	req := httptest.NewRequest(http.MethodGet, "/_app/remote/3abror/listThreadListSidebar?"+ampWebLocalInferenceAPIKeyQuery+"=local-key&cliproxy-working-directory="+url.QueryEscape(workDir), nil)
-	req.Header.Set("Origin", "https://ampcode.com")
-	req.Header.Set(ampWebLocalInferenceHeader, "1")
-	rec := httptest.NewRecorder()
-	r.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("sidebar status = %d, body=%s", rec.Code, rec.Body.String())
-	}
-
-	sidebarEnvelope := decodeSvelteKitRemoteEnvelopeForTest(t, rec.Body.Bytes())
-	queryCache := mapValue(sidebarEnvelope["q"])
-	queryValue := mapValue(mapValue(queryCache["3abror/listThreadListSidebar/"])["v"])
-	projects := arrayValue(queryValue["projects"])
-	if len(projects) != 1 {
-		t.Fatalf("projects = %#v, want exactly hinted project", projects)
-	}
-	project := mapValue(projects[0])
-	expectedID := neoDeterministicLocalProjectID(filepath.Base(expectedWorkDir), neoFileURLForDirectory(expectedWorkDir), expectedWorkDir)
-	if stringValue(project["id"]) != expectedID || stringValue(project["workingDirectory"]) != expectedWorkDir || stringValue(project["name"]) != filepath.Base(expectedWorkDir) {
-		t.Fatalf("project = %#v, want id=%q workingDirectory=%q", project, expectedID, expectedWorkDir)
-	}
-	if threads := arrayValue(queryValue["recentThreads"]); len(threads) != 0 {
-		t.Fatalf("recentThreads = %#v, want none for fresh hinted project", threads)
-	}
-}
-
-func TestWebLocalInferenceRemoteSidebarIncludesHistoryProjects(t *testing.T) {
+func TestWebLocalInferenceProjectIndexIncludesHistoryProjects(t *testing.T) {
 	dataDir := t.TempDir()
 	oldStoreDir := neoAmpDataDir
 	neoAmpDataDir = func() string { return dataDir }
@@ -1863,6 +1819,20 @@ func TestWebLocalInferenceRemoteSidebarIncludesHistoryProjects(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
 		NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled},
 	}})
+
+	existingDir := neoExistingDirectory(t.TempDir())
+	existingID := neoDeterministicLocalProjectID("existing", neoFileURLForDirectory(existingDir), existingDir)
+	if err := writeNeoWebLocalProjectIndex(rt.threadDir, []any{map[string]any{
+		"id":               existingID,
+		"name":             "existing",
+		"repositoryURL":    neoFileURLForDirectory(existingDir),
+		"workingDirectory": existingDir,
+	}}); err != nil {
+		t.Fatalf("write project index: %v", err)
+	}
+	if projects := rt.neoWebLocalProjectCache(); len(projects) != 1 {
+		t.Fatalf("initial projects = %#v, want existing project only", projects)
+	}
 
 	workDir := t.TempDir()
 	historyLine, err := json.Marshal(map[string]any{"text": "new local thread", "cwd": workDir})
@@ -1873,19 +1843,26 @@ func TestWebLocalInferenceRemoteSidebarIncludesHistoryProjects(t *testing.T) {
 		t.Fatalf("write history: %v", err)
 	}
 
-	value := rt.neoWebLocalThreadListSidebar(url.Values{})
-	projects := arrayValue(value["projects"])
-	if len(projects) != 1 {
-		t.Fatalf("projects = %#v, want exactly history project", projects)
-	}
 	expectedWorkDir := neoExistingDirectory(workDir)
 	expectedID := neoDeterministicLocalProjectID(filepath.Base(expectedWorkDir), neoFileURLForDirectory(expectedWorkDir), expectedWorkDir)
-	project := mapValue(projects[0])
+	if got := rt.neoWebLocalProjectWorkingDirectory(expectedID); got != expectedWorkDir {
+		t.Fatalf("project workingDirectory = %q, want %q", got, expectedWorkDir)
+	}
+	projects := rt.neoWebLocalProjectCache()
+	if len(projects) != 2 {
+		t.Fatalf("projects = %#v, want existing and history projects", projects)
+	}
+	projectsByID := map[string]map[string]any{}
+	for _, rawProject := range projects {
+		project := mapValue(rawProject)
+		projectsByID[stringValue(project["id"])] = project
+	}
+	project := projectsByID[expectedID]
 	if stringValue(project["id"]) != expectedID || stringValue(project["workingDirectory"]) != expectedWorkDir || stringValue(project["name"]) != filepath.Base(expectedWorkDir) {
 		t.Fatalf("project = %#v, want id=%q workingDirectory=%q", project, expectedID, expectedWorkDir)
 	}
-	if got := rt.neoWebLocalProjectWorkingDirectory(expectedID); got != expectedWorkDir {
-		t.Fatalf("project workingDirectory = %q, want %q", got, expectedWorkDir)
+	if got := rt.neoWebLocalProjectWorkingDirectory(existingID); got != existingDir {
+		t.Fatalf("existing project workingDirectory = %q, want %q", got, existingDir)
 	}
 	if _, err := os.Stat(neoWebLocalProjectIndexPath(rt.threadDir)); err != nil {
 		t.Fatalf("project index was not written: %v", err)

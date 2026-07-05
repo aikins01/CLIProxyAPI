@@ -332,6 +332,8 @@ nonstream-keepalive-interval: 0
 #     # optional: override the Amp binary used when the runtime spawns a local headless executor
 #     executor-command: ""
 #     executor-connect-timeout-seconds: 90
+#     # optional: stop proxy-spawned headless executors after idle seconds; 0 disables
+#     executor-idle-timeout-seconds: 600
 #     # serve /api/thread-actors locally even when an Amp cloud upstream is configured
 #     force-thread-actors: true
 #     # optional: generate thread titles through the local provider routes
