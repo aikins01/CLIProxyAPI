@@ -12231,13 +12231,12 @@ func (rt *neoRuntime) localThreadActorManagementResponse(ctx context.Context, bo
 		actor.bootstrapThreadActorFlow = true
 		actor.mu.Unlock()
 		notifyCreatedThreadActor()
-		return map[string]any{
-			"ok":               true,
-			"threadId":         threadID,
-			"usesDtw":          true,
-			"usesThreadActors": true,
-			"executorType":     executorType,
-		}, http.StatusOK
+		response := cloneMap(baseResponse)
+		response["ok"] = true
+		response["usesDtw"] = true
+		response["usesThreadActors"] = true
+		response["executorType"] = executorType
+		return response, http.StatusOK
 	}
 
 	if providedThreadID && boolValue(body["usesThreadActors"]) && bootstrapExecutorType == "" {
@@ -13253,6 +13252,8 @@ func neoCloudThread(snapshot neoCloudThreadSnapshot) map[string]any {
 	meta := neoThreadActorImportedMeta(snapshot.meta)
 	if !snapshot.executorConnected {
 		delete(meta, "executorType")
+		delete(meta, "usesDtw")
+		delete(meta, "usesThreadActors")
 	} else if snapshot.executorType != "" {
 		meta["executorType"] = snapshot.executorType
 	}

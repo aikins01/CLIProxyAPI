@@ -25179,6 +25179,34 @@ func TestNeoCloudThreadIncludesProtocolMessageIDAndCompleteState(t *testing.T) {
 	}
 }
 
+func TestNeoCloudThreadDoesNotAdvertiseDisconnectedThreadActor(t *testing.T) {
+	thread := neoCloudThread(neoCloudThreadSnapshot{
+		threadID:  "T-test",
+		seq:       1,
+		createdMs: 1778170000000,
+		meta: map[string]any{
+			"usesDtw":                  true,
+			"usesThreadActors":         true,
+			"executorType":             "local-client",
+			"ampcodeConnectorLocalNeo": true,
+		},
+		messages: []neoMessage{
+			{MessageID: "M-user", Role: "user", Content: []any{map[string]any{"type": "text", "text": "hi"}}, Seq: 1},
+		},
+	})
+
+	meta := mapValue(thread["meta"])
+	if meta["ampcodeConnectorLocalNeo"] != true || meta["cliProxyAPILocalNeo"] != true || meta["ampcodeLocalRuntime"] != true {
+		t.Fatalf("missing local Neo markers in meta: %#v", meta)
+	}
+	if meta["usesDtw"] != nil || meta["usesThreadActors"] != nil || meta["executorType"] != nil {
+		t.Fatalf("disconnected thread actor metadata leaked: %#v", meta)
+	}
+	if thread["hasExecutor"] != false || thread["executorConnected"] != false {
+		t.Fatalf("executor state = has:%#v connected:%#v", thread["hasExecutor"], thread["executorConnected"])
+	}
+}
+
 func TestNeoWebLocalThreadDocumentDoesNotInventExecutorConnection(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	threadID := "T-019e0e6e-f3f1-7078-b5dd-748f66f8c266"

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"unicode"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 )
@@ -215,6 +216,47 @@ func neoReadThreadMarkdownFallbackContent(text string) string {
 		return ""
 	}
 	return raw
+}
+
+func neoReadThreadGroundedMarkdownFallbackContent(text string) string {
+	fallback := neoReadThreadMarkdownFallbackContent(text)
+	if fallback == "" || !neoReadThreadFallbackHasMessageCitation(fallback) {
+		return ""
+	}
+	return fallback
+}
+
+func neoReadThreadFallbackHasMessageCitation(text string) bool {
+	lower := strings.ToLower(text)
+	for {
+		index := strings.Index(lower, "[message")
+		if index < 0 {
+			return false
+		}
+		rest := lower[index+len("[message"):]
+		if rest == "" || !unicode.IsSpace(rune(rest[0])) {
+			lower = lower[index+1:]
+			continue
+		}
+		rest = strings.TrimLeftFunc(rest, unicode.IsSpace)
+		digitCount := 0
+		for _, r := range rest {
+			if !unicode.IsDigit(r) {
+				break
+			}
+			digitCount++
+		}
+		if digitCount == 0 {
+			lower = lower[index+1:]
+			continue
+		}
+		rest = rest[digitCount:]
+		rest = strings.TrimLeftFunc(rest, unicode.IsSpace)
+		if strings.HasPrefix(rest, "]") {
+			return true
+		}
+		lower = lower[index+1:]
+	}
 }
 
 func neoReadThreadMarkdownFenceContent(text string) string {

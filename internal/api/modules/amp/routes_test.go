@@ -877,7 +877,7 @@ func TestWebLocalInferenceCanBootstrapRemoteShellThreadLocallyWithProxy(t *testi
 	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
 		t.Fatalf("response JSON error: %v", err)
 	}
-	if stringValue(response["threadId"]) != threadID || response["executorType"] != "local-client" {
+	if stringValue(response["threadId"]) != threadID || response["executorType"] != "local-client" || stringValue(response["wsToken"]) == "" || stringValue(response["ownerUserId"]) != neoLocalOwnerUserID {
 		t.Fatalf("unexpected bootstrap response: %#v", response)
 	}
 	actor := m.neoRuntime.store.lookupThreadActor(threadID)
@@ -3906,7 +3906,7 @@ func TestRegisterManagementRoutesMimicsCloudThreadActorHandshake(t *testing.T) {
 	if err := json.Unmarshal(patchRec.Body.Bytes(), &patchResponse); err != nil {
 		t.Fatalf("patch response JSON error: %v", err)
 	}
-	if patchResponse["ok"] != true || patchResponse["usesThreadActors"] != true || patchResponse["executorType"] != "local-client" {
+	if patchResponse["ok"] != true || patchResponse["usesThreadActors"] != true || patchResponse["executorType"] != "local-client" || patchResponse["threadId"] != threadID || stringValue(patchResponse["wsToken"]) == "" {
 		t.Fatalf("patch handshake response = %#v", patchResponse)
 	}
 

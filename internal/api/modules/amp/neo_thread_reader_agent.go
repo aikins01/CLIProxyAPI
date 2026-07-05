@@ -15,18 +15,21 @@ import (
 )
 
 const (
-	neoReadThreadAgentProvider     = "openai"
-	neoReadThreadAgentModel        = "gpt-5.5"
-	neoReadThreadAgentEffort       = "medium"
-	neoReadThreadMaxTurns          = 16
-	neoReadThreadSearchLimit       = 12
-	neoReadThreadSearchLimitMax    = 40
-	neoReadThreadReadCount         = 12
-	neoReadThreadReadCountMax      = 40
-	neoReadThreadSearchExcerpt     = 1400
-	neoReadThreadReadMessageChars  = 14000
-	neoReadThreadReadTotalChars    = 90000
-	neoReadThreadOverviewTailCount = 5
+	neoReadThreadAgentProvider      = "google"
+	neoReadThreadAgentModel         = "gemini-3.5-flash"
+	neoReadThreadAgentEffort        = "high"
+	neoReadThreadMaxTurns           = 16
+	neoReadThreadSearchLimit        = 12
+	neoReadThreadSearchLimitMax     = 40
+	neoReadThreadReadCount          = 12
+	neoReadThreadReadCountMax       = 40
+	neoReadThreadSearchExcerpt      = 1400
+	neoReadThreadReadMessageChars   = 14000
+	neoReadThreadReadTotalChars     = 90000
+	neoReadThreadOverviewTailCount  = 5
+	neoReadThreadHistoryTextChars   = 24000
+	neoReadThreadHistoryTotalChars  = 100000
+	neoReadThreadHistoryNoticeChars = 512
 )
 
 const neoReadThreadAgentSystemPrompt = `You are Amp's read_thread subagent. Your job is to search and read a target thread, then extract the information relevant to the caller's goal.
@@ -36,8 +39,10 @@ Use the thread tools instead of relying on a whole-thread dump. Search broadly, 
 Rules:
 - Do not stop at the first relevant hit. Check newer messages that revise, supersede, revert, or contradict it.
 - Tool calls record attempted actions, not outcomes. Trust an action only after reading the corresponding tool result and its status.
+- Use compactions and summaries for orientation, but inspect original messages when exact requirements, wording, code, commands, chronology, edits, or verification matter.
 - Prefer the latest unreverted decision when the thread contains multiple revisions.
 - Preserve exact technical details: file paths, commands, model names, errors, decisions, and code snippets.
+- When reporting verification or build status, include the complete command string that ran and the latest pass/fail result.
 - Omit unrelated material, but include enough surrounding context for the caller to use the extracted information safely.
 - Cite message indexes such as [message 12] when making claims from the target thread.
 - Your final answer must be JSON only: {"relevantContent":"markdown text"}.`
@@ -329,12 +334,26 @@ func neoReadThreadChunkMarkdownMessage(message neoReadThreadMessage) []neoReadTh
 }
 
 func (a *neoActor) executeLocalReadThreadAgent(pending neoPendingTool, generation int, corpus neoReadThreadCorpus, goal string) (string, error) {
+	return a.executeLocalReadThreadAgentWithRoute(pending, generation, corpus, goal, neoModelRoute{Provider: neoReadThreadAgentProvider, Model: neoReadThreadAgentModel}, neoReadThreadAgentEffort)
+}
+
+func (a *neoActor) executeLocalReadThreadAgentWithRoute(pending neoPendingTool, generation int, corpus neoReadThreadCorpus, goal string, route neoModelRoute, effort string) (string, error) {
 	if len(corpus.Messages) == 0 {
 		return "", errors.New("thread has no readable messages")
 	}
+	if route.Model == "" {
+		route = neoModelRoute{Provider: neoReadThreadAgentProvider, Model: neoReadThreadAgentModel}
+	}
+	if route.Provider == "" {
+		route.Provider = providerForNeoModel(route.Model)
+	}
+	if effort == "" {
+		effort = neoReadThreadAgentEffort
+	}
 	a.mu.Lock()
 	settings := cloneMap(a.settings)
-	settings["reasoning.effort"] = neoReadThreadAgentEffort
+	settings["reasoning.effort"] = effort
+	delete(settings, "gemini.thinkingLevel")
 	environment := cloneMap(a.environment)
 	maxTokens := a.maxTokens
 	actorID := a.id
@@ -342,7 +361,6 @@ func (a *neoActor) executeLocalReadThreadAgent(pending neoPendingTool, generatio
 	agentMode := firstNonEmptyString(pending.AgentMode, a.currentAgentMode)
 	a.mu.Unlock()
 
-	route := neoModelRoute{Provider: neoReadThreadAgentProvider, Model: neoReadThreadAgentModel}
 	conversation := []neoHistoryMessage{{Role: "user", Text: neoReadThreadAgentInput(corpus, goal)}}
 	tools := neoReadThreadInternalToolSpecs()
 	sawSearch := false
@@ -360,11 +378,11 @@ func (a *neoActor) executeLocalReadThreadAgent(pending neoPendingTool, generatio
 			ThreadID:             currentThreadID,
 			MessageID:            newNeoMessageID(),
 			AgentMode:            agentMode,
-			ReasoningEffort:      neoReadThreadAgentEffort,
+			ReasoningEffort:      effort,
 			ParentToolCallID:     pending.ID,
 			MaxTokens:            maxTokens,
 			Settings:             settings,
-			History:              append([]neoHistoryMessage(nil), conversation...),
+			History:              neoReadThreadRequestHistory(conversation),
 			Tools:                tools,
 			Environment:          environment,
 			ModelRouteOverride:   &routeCopy,
@@ -385,7 +403,7 @@ func (a *neoActor) executeLocalReadThreadAgent(pending neoPendingTool, generatio
 				return text, nil
 			}
 			lastErr = parseErr
-			forcedText, forcedErr := a.forceLocalReadThreadFinal(pending, generation, route, actorID, currentThreadID, agentMode, maxTokens, settings, environment, conversation)
+			forcedText, forcedErr := a.forceLocalReadThreadFinal(pending, generation, route, effort, actorID, currentThreadID, agentMode, maxTokens, settings, environment, conversation)
 			if forcedErr == nil {
 				return forcedText, nil
 			}
@@ -440,7 +458,7 @@ func (a *neoActor) executeLocalReadThreadAgent(pending neoPendingTool, generatio
 	if correction := neoReadThreadGateCorrection(sawSearch, sawRead, sawLatestRead, corpus); correction != "" {
 		return "", fmt.Errorf("read_thread subagent did not complete required search/read checks after %d turns: %s", neoReadThreadMaxTurns, correction)
 	}
-	forcedText, forcedErr := a.forceLocalReadThreadFinal(pending, generation, route, actorID, currentThreadID, agentMode, maxTokens, settings, environment, conversation)
+	forcedText, forcedErr := a.forceLocalReadThreadFinal(pending, generation, route, effort, actorID, currentThreadID, agentMode, maxTokens, settings, environment, conversation)
 	if forcedErr != nil {
 		if lastErr != nil {
 			return "", lastErr
@@ -450,7 +468,7 @@ func (a *neoActor) executeLocalReadThreadAgent(pending neoPendingTool, generatio
 	return forcedText, nil
 }
 
-func (a *neoActor) forceLocalReadThreadFinal(pending neoPendingTool, generation int, route neoModelRoute, actorID, currentThreadID, agentMode string, maxTokens any, settings, environment map[string]any, conversation []neoHistoryMessage) (string, error) {
+func (a *neoActor) forceLocalReadThreadFinal(pending neoPendingTool, generation int, route neoModelRoute, effort, actorID, currentThreadID, agentMode string, maxTokens any, settings, environment map[string]any, conversation []neoHistoryMessage) (string, error) {
 	if a.subagentGenerationStale(generation) {
 		return "", nil
 	}
@@ -460,14 +478,14 @@ func (a *neoActor) forceLocalReadThreadFinal(pending neoPendingTool, generation 
 	} else {
 		forced = append(forced, neoHistoryMessage{Role: "user", Text: neoReadThreadFinalPrompt})
 	}
-	forced = neoReadThreadFinalHistory(forced)
+	forced = neoReadThreadFinalHistory(neoReadThreadRequestHistory(forced))
 	routeCopy := route
 	result, err := a.runtime.subagentInfer(neoInferenceRequest{
 		ActorID:              actorID,
 		ThreadID:             currentThreadID,
 		MessageID:            newNeoMessageID(),
 		AgentMode:            agentMode,
-		ReasoningEffort:      neoReadThreadAgentEffort,
+		ReasoningEffort:      effort,
 		ParentToolCallID:     pending.ID,
 		MaxTokens:            maxTokens,
 		Settings:             settings,
@@ -489,10 +507,244 @@ func (a *neoActor) forceLocalReadThreadFinal(pending neoPendingTool, generation 
 	if parseErr == nil {
 		return text, nil
 	}
-	if fallback := neoReadThreadMarkdownFallbackContent(result.Text); fallback != "" {
+	if fallback := neoReadThreadGroundedMarkdownFallbackContent(result.Text); fallback != "" {
 		return fallback, nil
 	}
 	return "", fmt.Errorf("read_thread forced final did not return valid JSON or markdown fallback: %w", parseErr)
+}
+
+func neoReadThreadRequestHistory(history []neoHistoryMessage) []neoHistoryMessage {
+	if len(history) == 0 {
+		return nil
+	}
+	compacted := make([]neoHistoryMessage, 0, len(history))
+	for _, message := range history {
+		compacted = append(compacted, neoReadThreadCompactHistoryMessage(message))
+	}
+	return neoReadThreadTrimHistory(compacted, neoReadThreadHistoryTotalChars)
+}
+
+func neoReadThreadCompactHistoryMessage(message neoHistoryMessage) neoHistoryMessage {
+	message.Text = strings.TrimSpace(message.Text)
+	message.Content = neoReadThreadCompactHistoryContent(message.Content)
+	message.OpenAIItems = nil
+	if message.Role != "assistant" {
+		message.ThinkingBlocks = nil
+	}
+	return message
+}
+
+func neoReadThreadCompactHistoryContent(content []any) []any {
+	if len(content) == 0 {
+		return nil
+	}
+	out := make([]any, 0, len(content))
+	for _, raw := range content {
+		block := mapValue(raw)
+		if len(block) == 0 {
+			out = append(out, raw)
+			continue
+		}
+		copied := cloneMap(block)
+		if text := stringValue(copied["text"]); text != "" {
+			copied["text"] = strings.TrimSpace(text)
+		}
+		out = append(out, copied)
+	}
+	return out
+}
+
+func neoReadThreadTrimHistory(history []neoHistoryMessage, limit int) []neoHistoryMessage {
+	if limit <= 0 || neoReadThreadHistoryApproxChars(history) <= limit || len(history) <= 1 {
+		return history
+	}
+	head := history[0]
+	groups := neoReadThreadHistoryGroups(history[1:])
+	kept := make([][]neoHistoryMessage, 0, len(groups))
+	total := neoReadThreadHistoryApproxChars([]neoHistoryMessage{head})
+	omitted := 0
+	for i := len(groups) - 1; i >= 0; i-- {
+		group := groups[i]
+		groupSize := neoReadThreadHistoryApproxChars(group)
+		if total+groupSize <= limit {
+			kept = append(kept, group)
+			total += groupSize
+			continue
+		}
+		groupLimit := limit - total
+		if groupLimit > neoReadThreadHistoryNoticeChars {
+			groupLimit -= neoReadThreadHistoryNoticeChars
+		}
+		trimmed, dropped := neoReadThreadTrimHistoryGroup(group, groupLimit)
+		omitted += dropped
+		if len(trimmed) > 0 {
+			groupSize = neoReadThreadHistoryApproxChars(trimmed)
+			if total+groupSize <= limit {
+				kept = append(kept, trimmed)
+				total += groupSize
+				if dropped == 0 {
+					continue
+				}
+				for j := i - 1; j >= 0; j-- {
+					omitted += len(groups[j])
+				}
+				break
+			}
+			omitted += len(trimmed)
+		}
+		for j := i - 1; j >= 0; j-- {
+			omitted += len(groups[j])
+		}
+		break
+	}
+	if omitted > 0 {
+		notice := fmt.Sprintf("[read_thread omitted %d older internal observation messages from this subagent context to stay within the model window. Search or read exact message ranges again if those details are needed.]", omitted)
+		head.Text = strings.TrimSpace(head.Text) + "\n\n" + notice
+	}
+	out := make([]neoHistoryMessage, 0, 1+len(history)-omitted)
+	out = append(out, head)
+	for i := len(kept) - 1; i >= 0; i-- {
+		out = append(out, kept[i]...)
+	}
+	return out
+}
+
+func neoReadThreadTrimHistoryGroup(group []neoHistoryMessage, limit int) ([]neoHistoryMessage, int) {
+	if limit <= 0 || len(group) == 0 {
+		return nil, len(group)
+	}
+	trimmed := make([]neoHistoryMessage, len(group))
+	copy(trimmed, group)
+	dropped := 0
+	for neoReadThreadHistoryApproxChars(trimmed) > limit {
+		index := neoReadThreadFirstToolMessageIndex(trimmed)
+		if index < 0 {
+			break
+		}
+		toolCallID := trimmed[index].ToolCallID
+		if neoReadThreadToolMessageCount(trimmed) == 1 {
+			otherSize := neoReadThreadHistoryApproxChars(trimmed[:index]) + neoReadThreadHistoryApproxChars(trimmed[index+1:])
+			trimmed[index] = neoReadThreadClipHistoryMessageToApproxChars(trimmed[index], limit-otherSize)
+			if neoReadThreadHistoryApproxChars(trimmed) <= limit {
+				break
+			}
+		}
+		trimmed = append(trimmed[:index], trimmed[index+1:]...)
+		dropped++
+		if toolCallID != "" {
+			for i := range trimmed {
+				trimmed[i].ToolCalls = neoReadThreadFilterToolCalls(trimmed[i].ToolCalls, toolCallID)
+			}
+		}
+		var emptyDropped int
+		trimmed, emptyDropped = neoReadThreadDropEmptyAssistantToolCallMessages(trimmed)
+		dropped += emptyDropped
+	}
+	for neoReadThreadHistoryApproxChars(trimmed) > limit && len(trimmed) > 1 {
+		trimmed = trimmed[1:]
+		dropped++
+	}
+	if neoReadThreadHistoryApproxChars(trimmed) > limit && len(trimmed) == 1 {
+		trimmed[0] = neoReadThreadClipHistoryMessageToApproxChars(trimmed[0], limit)
+	}
+	if neoReadThreadHistoryApproxChars(trimmed) > limit {
+		return nil, dropped + len(trimmed)
+	}
+	return trimmed, dropped
+}
+
+func neoReadThreadFirstToolMessageIndex(history []neoHistoryMessage) int {
+	for i, message := range history {
+		if message.Role == "tool" {
+			return i
+		}
+	}
+	return -1
+}
+
+func neoReadThreadToolMessageCount(history []neoHistoryMessage) int {
+	count := 0
+	for _, message := range history {
+		if message.Role == "tool" {
+			count++
+		}
+	}
+	return count
+}
+
+func neoReadThreadFilterToolCalls(calls []neoToolCall, dropID string) []neoToolCall {
+	if len(calls) == 0 || dropID == "" {
+		return calls
+	}
+	out := make([]neoToolCall, 0, len(calls))
+	for _, call := range calls {
+		if call.ID != dropID {
+			out = append(out, call)
+		}
+	}
+	return out
+}
+
+func neoReadThreadDropEmptyAssistantToolCallMessages(history []neoHistoryMessage) ([]neoHistoryMessage, int) {
+	out := history[:0]
+	dropped := 0
+	for _, message := range history {
+		if message.Role == "assistant" && strings.TrimSpace(message.Text) == "" && len(message.Content) == 0 && len(message.ToolCalls) == 0 {
+			dropped++
+			continue
+		}
+		out = append(out, message)
+	}
+	return out, dropped
+}
+
+func neoReadThreadClipHistoryMessageToApproxChars(message neoHistoryMessage, limit int) neoHistoryMessage {
+	message.Content = nil
+	message.OpenAIItems = nil
+	message.ToolCalls = nil
+	message.ThinkingBlocks = nil
+	overhead := len(message.Role) + len(message.ToolCallID) + len(message.ToolName) + len(message.ParentToolUseID) + 64
+	textLimit := limit - overhead
+	if textLimit < 0 {
+		textLimit = 0
+	}
+	message.Text = neoClipRunes(strings.TrimSpace(message.Text), textLimit)
+	return message
+}
+
+func neoReadThreadHistoryGroups(history []neoHistoryMessage) [][]neoHistoryMessage {
+	groups := make([][]neoHistoryMessage, 0, len(history))
+	for i := 0; i < len(history); {
+		start := i
+		i++
+		for i < len(history) && history[i].Role == "tool" {
+			i++
+		}
+		group := make([]neoHistoryMessage, i-start)
+		copy(group, history[start:i])
+		groups = append(groups, group)
+	}
+	return groups
+}
+
+func neoReadThreadHistoryApproxChars(history []neoHistoryMessage) int {
+	total := 0
+	for _, message := range history {
+		total += len(message.Role) + len(message.Text) + len(message.ToolCallID) + len(message.ToolName) + len(message.ParentToolUseID)
+		if len(message.ToolCalls) > 0 {
+			raw, _ := json.Marshal(message.ToolCalls)
+			total += len(raw)
+		}
+		if len(message.Content) > 0 {
+			raw, _ := json.Marshal(message.Content)
+			total += len(raw)
+		}
+		if len(message.ThinkingBlocks) > 0 {
+			raw, _ := json.Marshal(message.ThinkingBlocks)
+			total += len(raw)
+		}
+	}
+	return total
 }
 
 func neoReadThreadFinalHistory(history []neoHistoryMessage) []neoHistoryMessage {

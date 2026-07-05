@@ -75,6 +75,40 @@ func neoReadThreadHasTools(tools []neoToolSpec, names ...string) bool {
 	return true
 }
 
+func TestNeoReadThreadAgentClearsInheritedGeminiThinkingLevel(t *testing.T) {
+	corpus := neoReadThreadCorpus{ThreadID: "T-inherited-gemini", Source: "test", Title: "inherited gemini", Messages: []neoReadThreadMessage{
+		{Index: 0, Role: "user", MessageID: "M-0", Text: "The final answer must cite [message 0]."},
+	}}
+	var captured []neoInferenceRequest
+	rt := newNeoRuntime(&config.Config{})
+	rt.inferStream = neoReadThreadScriptedInfer(t, "[message 0] inherited Gemini level was ignored.", "Gemini level", &captured, nil)
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-current", "T-current", neoActorRecord("actor-test", "thread-actor", "T-current"), nil)
+	actor.mu.Lock()
+	actor.settings["gemini.thinkingLevel"] = "minimal"
+	actor.settings["reasoning.effort"] = "low"
+	actor.mu.Unlock()
+
+	text, err := actor.executeLocalReadThreadAgent(neoPendingTool{ID: "TU-read", Name: "read_thread", Input: map[string]any{"threadID": corpus.ThreadID, "question": "Check inherited Gemini thinking."}, AgentMode: "deep"}, actor.generation, corpus, "Check inherited Gemini thinking.")
+	if err != nil {
+		t.Fatalf("executeLocalReadThreadAgent error: %v", err)
+	}
+	if !strings.Contains(text, "inherited Gemini level was ignored") {
+		t.Fatalf("read_thread text = %q, want final content", text)
+	}
+	if len(captured) == 0 {
+		t.Fatal("captured no read_thread requests")
+	}
+	for _, request := range captured {
+		neoReadThreadAssertAgentRequest(t, request)
+		if request.ModelRouteOverride == nil {
+			t.Fatalf("missing route override: %#v", request)
+		}
+		if got := neoProviderReasoningEffort(request, *request.ModelRouteOverride); got != neoReadThreadAgentEffort {
+			t.Fatalf("provider reasoning effort = %q, want %q for settings %#v", got, neoReadThreadAgentEffort, request.Settings)
+		}
+	}
+}
+
 func neoReadThreadWriteLocalThread(t *testing.T, dir, threadID string, messages []any) {
 	t.Helper()
 	threadDir := filepath.Join(dir, "threads")
@@ -250,6 +284,299 @@ func TestNeoReadThreadFinalHistoryFlattensToolContent(t *testing.T) {
 	}
 	if !strings.Contains(history[0].Text, "Prior read_thread internal tool result") || !strings.Contains(history[0].Text, "content-only tool result") || !strings.Contains(history[0].Text, neoReadThreadFinalPrompt) {
 		t.Fatalf("flattened final history text = %q", history[0].Text)
+	}
+}
+
+func TestNeoReadThreadRequestHistoryBoundsLargeToolResults(t *testing.T) {
+	huge := strings.Repeat("large read_thread observation ", neoReadThreadHistoryTextChars*2)
+	history := []neoHistoryMessage{{Role: "user", Text: "Read the target thread for the goal."}}
+	for i := 0; i < 8; i++ {
+		id := fmt.Sprintf("TU-large-%d", i)
+		history = append(history,
+			neoHistoryMessage{Role: "assistant", ToolCalls: []neoToolCall{{ID: id, Name: "read_thread_messages"}}},
+			neoHistoryMessage{Role: "tool", ToolCallID: id, ToolName: "read_thread_messages", Text: fmt.Sprintf("result %d\n%s", i, huge), ThinkingBlocks: []neoThinkingBlock{{Thinking: huge}}},
+		)
+	}
+
+	bounded := neoReadThreadRequestHistory(history)
+	if got := neoReadThreadHistoryApproxChars(bounded); got > neoReadThreadHistoryTotalChars+2048 {
+		t.Fatalf("bounded history chars = %d, want <= %d", got, neoReadThreadHistoryTotalChars+2048)
+	}
+	if !strings.Contains(bounded[0].Text, "omitted") {
+		t.Fatalf("bounded history head missing omission notice: %#v", bounded[0])
+	}
+	openToolCalls := map[string]bool{}
+	for _, message := range bounded {
+		if len(message.OpenAIItems) > 0 || (message.Role != "assistant" && len(message.ThinkingBlocks) > 0) {
+			t.Fatalf("bounded history kept resend-only provider blocks: %#v", message)
+		}
+		for _, call := range message.ToolCalls {
+			openToolCalls[call.ID] = true
+		}
+		if message.Role == "tool" {
+			if !openToolCalls[message.ToolCallID] {
+				t.Fatalf("tool result %q has no retained assistant tool call in %#v", message.ToolCallID, bounded)
+			}
+			delete(openToolCalls, message.ToolCallID)
+			if !strings.Contains(message.Text, "[truncated") {
+				t.Fatalf("tool result was not clipped: len=%d", len(message.Text))
+			}
+		}
+	}
+	if len(openToolCalls) != 0 {
+		t.Fatalf("bounded history kept dangling assistant tool calls: %#v in %#v", openToolCalls, bounded)
+	}
+}
+
+func TestNeoReadThreadRequestHistoryPreservesSingleObservationWithinTotalBudget(t *testing.T) {
+	marker := "final-marker-survives-after-eager-clip-boundary"
+	large := strings.Repeat("x", neoReadThreadHistoryTextChars+512) + marker
+	history := []neoHistoryMessage{
+		{Role: "user", Text: "Read the target thread for the goal."},
+		{Role: "assistant", ToolCalls: []neoToolCall{{ID: "TU-large-fit", Name: "read_thread_messages"}}},
+		{Role: "tool", ToolCallID: "TU-large-fit", ToolName: "read_thread_messages", Text: large},
+	}
+	if neoReadThreadHistoryApproxChars(history) > neoReadThreadHistoryTotalChars {
+		t.Fatalf("test setup history exceeds total budget: %d > %d", neoReadThreadHistoryApproxChars(history), neoReadThreadHistoryTotalChars)
+	}
+
+	bounded := neoReadThreadRequestHistory(history)
+	text := neoHistoryTestText(bounded)
+	if !strings.Contains(text, marker) {
+		t.Fatalf("bounded history lost marker near end of large observation")
+	}
+	if strings.Contains(text, "[truncated") {
+		t.Fatalf("bounded history truncated observation that fits total budget")
+	}
+}
+
+func TestNeoReadThreadRequestHistoryTrimsOversizedLatestGroup(t *testing.T) {
+	huge := strings.Repeat("large read_thread observation ", neoReadThreadHistoryTextChars*2)
+	calls := make([]neoToolCall, 0, 8)
+	originalCallIDs := make([]string, 0, 8)
+	history := []neoHistoryMessage{{Role: "user", Text: "Read the target thread for the goal."}}
+	for i := 0; i < 8; i++ {
+		id := fmt.Sprintf("TU-batched-%d", i)
+		calls = append(calls, neoToolCall{ID: id, Name: "read_thread_messages"})
+		originalCallIDs = append(originalCallIDs, id)
+	}
+	history = append(history, neoHistoryMessage{Role: "assistant", ToolCalls: calls})
+	for i := range calls {
+		history = append(history, neoHistoryMessage{Role: "tool", ToolCallID: calls[i].ID, ToolName: "read_thread_messages", Text: fmt.Sprintf("result %d\n%s", i, huge)})
+	}
+
+	bounded := neoReadThreadRequestHistory(history)
+	if got := neoReadThreadHistoryApproxChars(bounded); got > neoReadThreadHistoryTotalChars {
+		t.Fatalf("bounded history chars = %d, want <= %d", got, neoReadThreadHistoryTotalChars)
+	}
+	afterCallIDs := make([]string, 0, len(history[1].ToolCalls))
+	for _, call := range history[1].ToolCalls {
+		afterCallIDs = append(afterCallIDs, call.ID)
+	}
+	if !slices.Equal(afterCallIDs, originalCallIDs) {
+		t.Fatalf("original tool calls mutated: got %#v, want %#v", afterCallIDs, originalCallIDs)
+	}
+	retainedCalls := map[string]bool{}
+	retainedResults := map[string]bool{}
+	for _, message := range bounded {
+		for _, call := range message.ToolCalls {
+			retainedCalls[call.ID] = true
+		}
+		if message.Role == "tool" {
+			retainedResults[message.ToolCallID] = true
+			if !strings.Contains(message.Text, "[truncated") {
+				t.Fatalf("tool result was not clipped: len=%d", len(message.Text))
+			}
+		}
+	}
+	if len(retainedResults) == 0 || len(retainedResults) >= len(calls) {
+		t.Fatalf("retained tool results = %#v, want a trimmed non-empty subset", retainedResults)
+	}
+	for id := range retainedCalls {
+		if !retainedResults[id] {
+			t.Fatalf("retained tool call %q has no matching result; calls=%#v results=%#v history=%#v", id, retainedCalls, retainedResults, bounded)
+		}
+	}
+	for id := range retainedResults {
+		if !retainedCalls[id] {
+			t.Fatalf("retained tool result %q has no matching call; calls=%#v results=%#v history=%#v", id, retainedCalls, retainedResults, bounded)
+		}
+	}
+}
+
+func TestNeoReadThreadRequestHistoryTrimsLatestReadBeforeOlderHistory(t *testing.T) {
+	huge := strings.Repeat("large read_thread observation ", neoReadThreadHistoryTextChars*2)
+	readCalls := make([]neoToolCall, 0, 8)
+	readResults := make([]neoHistoryMessage, 0, 8)
+	for i := 0; i < 8; i++ {
+		id := fmt.Sprintf("TU-read-%d", i)
+		readCalls = append(readCalls, neoToolCall{ID: id, Name: "read_thread_messages"})
+		text := fmt.Sprintf("older read detail %d\n%s", i, huge)
+		if i == 7 {
+			text = "latest exact detail survived\n" + huge
+		}
+		readResults = append(readResults, neoHistoryMessage{Role: "tool", ToolCallID: id, ToolName: "read_thread_messages", Text: text})
+	}
+	history := []neoHistoryMessage{
+		{Role: "user", Text: "Read the target thread for the goal."},
+		{Role: "assistant", ToolCalls: []neoToolCall{{ID: "TU-search", Name: "search_thread_messages"}}},
+		{Role: "tool", ToolCallID: "TU-search", ToolName: "search_thread_messages", Text: "older search hit"},
+		{Role: "assistant", ToolCalls: readCalls},
+	}
+	history = append(history, readResults...)
+	history = append(history,
+		neoHistoryMessage{Role: "user", Text: neoReadThreadFinalPrompt},
+	)
+
+	bounded := neoReadThreadRequestHistory(history)
+	historyText := neoHistoryTestText(bounded)
+	if !strings.Contains(historyText, "latest exact detail survived") {
+		t.Fatalf("bounded history dropped latest read result: %#v", bounded)
+	}
+	if strings.Contains(historyText, "older search hit") {
+		t.Fatalf("bounded history kept older search after trimming latest read: %#v", bounded)
+	}
+	if bounded[len(bounded)-1].Role != "user" || !strings.Contains(bounded[len(bounded)-1].Text, neoReadThreadFinalPrompt) {
+		t.Fatalf("bounded history lost final prompt: %#v", bounded)
+	}
+}
+
+func TestNeoReadThreadRequestHistoryPreservesAssistantReasoningMetadata(t *testing.T) {
+	history := []neoHistoryMessage{
+		{Role: "user", Text: "Read the target thread for the goal."},
+		{
+			Role:      "assistant",
+			ToolCalls: []neoToolCall{{ID: "TU-read", Name: "read_thread_messages"}},
+			ThinkingBlocks: []neoThinkingBlock{{Provider: "anthropic", Thinking: "exact signed thinking", Signature: "sig-1"}, {
+				Provider:  "openai",
+				ID:        "rs-1",
+				Thinking:  "reasoning summary",
+				Signature: strings.Repeat("encrypted", 32),
+			}},
+		},
+		{Role: "tool", ToolCallID: "TU-read", ToolName: "read_thread_messages", Text: "latest read result", ThinkingBlocks: []neoThinkingBlock{{Thinking: "drop tool thinking"}}},
+	}
+
+	bounded := neoReadThreadRequestHistory(history)
+	var assistant *neoHistoryMessage
+	for i := range bounded {
+		if bounded[i].Role == "assistant" {
+			assistant = &bounded[i]
+			break
+		}
+	}
+	if assistant == nil || len(assistant.ThinkingBlocks) != 2 {
+		t.Fatalf("assistant thinking blocks = %#v, want preserved metadata in %#v", assistant, bounded)
+	}
+	for _, message := range bounded {
+		if message.Role != "assistant" && len(message.ThinkingBlocks) > 0 {
+			t.Fatalf("non-assistant thinking blocks were retained: %#v", bounded)
+		}
+	}
+}
+
+func TestNeoReadThreadRequestHistoryCountsAssistantReasoningMetadata(t *testing.T) {
+	huge := strings.Repeat("signed reasoning payload ", neoReadThreadHistoryTextChars*2)
+	history := []neoHistoryMessage{
+		{Role: "user", Text: "Read the target thread for the goal."},
+		{
+			Role: "assistant",
+			Text: "assistant answer survives",
+			ThinkingBlocks: []neoThinkingBlock{{
+				Provider:  "openai",
+				ID:        "rs-large",
+				Thinking:  huge,
+				Signature: huge,
+			}},
+		},
+	}
+	if got := neoReadThreadHistoryApproxChars(history); got <= neoReadThreadHistoryTotalChars {
+		t.Fatalf("test setup history chars = %d, want > %d", got, neoReadThreadHistoryTotalChars)
+	}
+
+	bounded := neoReadThreadRequestHistory(history)
+	if got := neoReadThreadHistoryApproxChars(bounded); got > neoReadThreadHistoryTotalChars {
+		t.Fatalf("bounded history chars = %d, want <= %d", got, neoReadThreadHistoryTotalChars)
+	}
+	if !strings.Contains(neoHistoryTestText(bounded), "assistant answer survives") {
+		t.Fatalf("bounded history dropped assistant answer: %#v", bounded)
+	}
+	for _, message := range bounded {
+		if len(message.ThinkingBlocks) > 0 {
+			t.Fatalf("oversized assistant thinking blocks were retained: %#v", bounded)
+		}
+	}
+}
+
+func TestNeoReadThreadTrimHistoryDropsOversizedLatestGroupOnce(t *testing.T) {
+	calls := []neoToolCall{
+		{ID: "TU-drop-0", Name: "read_thread_messages"},
+		{ID: "TU-drop-1", Name: "read_thread_messages"},
+		{ID: "TU-drop-2", Name: "read_thread_messages"},
+		{ID: "TU-drop-3", Name: "read_thread_messages"},
+	}
+	history := []neoHistoryMessage{
+		{Role: "user", Text: strings.Repeat("oversized head ", 200)},
+		{Role: "assistant", ToolCalls: calls},
+	}
+	for _, call := range calls {
+		history = append(history, neoHistoryMessage{Role: "tool", ToolCallID: call.ID, ToolName: call.Name, Text: "tool result"})
+	}
+
+	bounded := neoReadThreadTrimHistory(history, 1)
+	if len(bounded) != 1 {
+		t.Fatalf("bounded history len = %d, want only head message: %#v", len(bounded), bounded)
+	}
+	if !strings.Contains(bounded[0].Text, "omitted 5") {
+		t.Fatalf("bounded head text missing exact omission count: %q", bounded[0].Text)
+	}
+}
+
+func TestNeoReadThreadAgentSendsBoundedHistoryAfterRepeatedLargeReads(t *testing.T) {
+	messages := make([]neoReadThreadMessage, 0, 6)
+	for i := 0; i < 6; i++ {
+		messages = append(messages, neoReadThreadMessage{
+			Index:     i,
+			Role:      "assistant",
+			MessageID: fmt.Sprintf("M-large-%d", i),
+			Text:      fmt.Sprintf("target-marker-%d\n%s", i, strings.Repeat("large transcript payload ", 900)),
+		})
+	}
+	corpus := neoReadThreadCorpus{ThreadID: "T-large-history", Source: "test", Title: "large history", Messages: messages}
+
+	var captured []neoInferenceRequest
+	rt := newNeoRuntime(&config.Config{})
+	rt.inferStream = func(_ *neoRuntime, request neoInferenceRequest, _ neoStreamCallback) (neoInferenceResult, error) {
+		turn := len(captured)
+		captured = append(captured, request)
+		switch turn {
+		case 0:
+			return neoInferenceResult{ToolCalls: []neoToolCall{{ID: "TU-search-large", Name: "search_thread_messages", Input: map[string]any{"query": "target-marker"}}}}, nil
+		case 1:
+			return neoInferenceResult{ToolCalls: []neoToolCall{{ID: "TU-read-large-1", Name: "read_thread_messages", Input: map[string]any{"startIndex": 0, "count": 6}}}}, nil
+		case 2:
+			return neoInferenceResult{ToolCalls: []neoToolCall{{ID: "TU-read-large-2", Name: "read_thread_messages", Input: map[string]any{"startIndex": 0, "count": 6}}}}, nil
+		default:
+			if got := neoReadThreadHistoryApproxChars(request.History); got > neoReadThreadHistoryTotalChars+2048 {
+				t.Fatalf("request history chars = %d, want <= %d", got, neoReadThreadHistoryTotalChars+2048)
+			}
+			if !strings.Contains(neoHistoryTestText(request.History), "[truncated") {
+				t.Fatalf("request history missing truncation marker after large repeated reads")
+			}
+			return neoInferenceResult{Text: neoReadThreadTestFinalJSON("[message 5] target-marker-5 is the latest marker.")}, nil
+		}
+	}
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-current-large", "T-current-large", neoActorRecord("actor-test", "thread-actor", "T-current-large"), nil)
+
+	text, err := actor.executeLocalReadThreadAgent(neoPendingTool{ID: "TU-read", Name: "read_thread", Input: map[string]any{"threadID": corpus.ThreadID, "question": "Find the latest marker."}, AgentMode: "deep"}, actor.generation, corpus, "Find the latest marker.")
+	if err != nil {
+		t.Fatalf("executeLocalReadThreadAgent error: %v", err)
+	}
+	if !strings.Contains(text, "target-marker-5") {
+		t.Fatalf("read_thread text = %q, want latest marker", text)
+	}
+	if len(captured) != 4 {
+		t.Fatalf("captured requests = %d, want 4", len(captured))
 	}
 }
 
@@ -460,6 +787,33 @@ func TestNeoReadThreadMarkdownFallbackContentBoundaries(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := neoReadThreadMarkdownFallbackContent(tt.input); got != tt.want {
 				t.Fatalf("neoReadThreadMarkdownFallbackContent() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNeoReadThreadGroundedMarkdownFallbackRequiresMessageCitation(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"cited markdown", "* [message 1] approach D survived.", "* [message 1] approach D survived."},
+		{"tab cited markdown", "* [message\t2] approach D survived.", "* [message\t2] approach D survived."},
+		{"spaced cited markdown", "* [message 3 ] approach D survived.", "* [message 3 ] approach D survived."},
+		{"fenced cited markdown", "```markdown\n[message 2] verified command passed\n```", "[message 2] verified command passed"},
+		{"plural message label", "* [messages] approach D survived.", ""},
+		{"message prefix only", "* [message] approach D survived.", ""},
+		{"message word", "* [messagepack] approach D survived.", ""},
+		{"message without closing bracket", "* [message 1 approach D survived.", ""},
+		{"message nonnumeric", "* [message one] approach D survived.", ""},
+		{"ungrounded progress note", "## Verifying Deployment Steps\n\nI'm now focused on final validation procedures.", ""},
+		{"json still rejected", `{"relevantContent":"partial"`, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := neoReadThreadGroundedMarkdownFallbackContent(tt.input); got != tt.want {
+				t.Fatalf("neoReadThreadGroundedMarkdownFallbackContent() = %q, want %q", got, tt.want)
 			}
 		})
 	}
