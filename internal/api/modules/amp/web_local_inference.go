@@ -190,7 +190,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	return fmt.Sprintf(`// ==UserScript==
 // @name CLIProxyAPI Amp Local Inference
 // @namespace https://github.com/router-for-me/CLIProxyAPI
-// @version 0.1.29
+// @version 0.1.30
 %s
 // @updateURL %s
 // @downloadURL %s
@@ -1108,7 +1108,43 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		});
 	}
 
-	function appendDevalueSidebarValue(values, value) {
+	const sidebarDateFields = new Set(["updatedAt", "firstSyncAt", "lastUserMessageAt", "createdAt", "userLastInteractedAt"]);
+
+	function sidebarDateISOString(value) {
+		let date = null;
+		if (value instanceof Date) {
+			date = value;
+		} else if (typeof value === "string" && value.trim() !== "") {
+			date = new Date(value);
+		} else if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+			date = new Date(value);
+		}
+		if (!date || !Number.isFinite(date.getTime())) {
+			return "";
+		}
+		return date.toISOString();
+	}
+
+	function appendDevalueSidebarDateValue(values, value) {
+		const iso = sidebarDateISOString(value);
+		if (!iso) {
+			return -1;
+		}
+		values.push(["Date", iso]);
+		return values.length - 1;
+	}
+
+	function appendDevalueSidebarValue(values, value, key = "") {
+		if (sidebarDateFields.has(key)) {
+			const dateIndex = appendDevalueSidebarDateValue(values, value);
+			if (dateIndex >= 0) {
+				return dateIndex;
+			}
+		}
+		if (value instanceof Date) {
+			const dateIndex = appendDevalueSidebarDateValue(values, value);
+			return dateIndex >= 0 ? dateIndex : appendDevalueSidebarValue(values, null);
+		}
 		if (value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
 			values.push(value);
 			return values.length - 1;
@@ -1127,7 +1163,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			if (typeof child === "undefined") {
 				continue;
 			}
-			object[key] = appendDevalueSidebarValue(values, child);
+			object[key] = appendDevalueSidebarValue(values, child, key);
 		}
 		values.push(object);
 		return values.length - 1;
