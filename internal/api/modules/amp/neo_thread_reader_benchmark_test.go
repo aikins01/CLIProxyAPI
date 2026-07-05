@@ -369,6 +369,16 @@ func neoReadThreadSyntheticBenchmarkCases() []neoReadThreadSyntheticCase {
 			MustInclude:   []string{"internal/api/modules/amp/neo_thread_sync.go", "internal/api/modules/amp/neo_runtime.go", "go test ./internal/api/modules/amp -run TestNeoSidebar", "PostgreSQL", "web sidebar"},
 		},
 		{
+			Name:           "latest continuation hidden by tool tail",
+			ThreadID:       "T-019e65c0-0310-77a8-b233-4b84d9c06216",
+			Title:          "Late signal paper fixes",
+			Goal:           "Continue from the latest task in this thread. Extract what should be done next and ignore older superseded storage-validation context.",
+			Messages:       neoReadThreadHiddenContinuationTailMessages(),
+			SearchQueries:  []string{"lets do the fixes", "late_actionable"},
+			MustInclude:    []string{"frontend/src/routes/post-launch/strategy-lab/+page.svelte", "data_collection/workers/strategy_paper_trader.py", "late_actionable", "paper-only"},
+			MustNotInclude: []string{"position mark storage/query path", "signal-status ranking"},
+		},
+		{
 			Name:          "review findings after partial fixes",
 			ThreadID:      "T-019e65c0-0310-77a8-b233-4b84d9c06207",
 			Title:         "Review follow-up",
@@ -513,6 +523,28 @@ func neoReadThreadContinuationHandoffMessages() []any {
 		neoReadThreadTextMessage("assistant", "M-handoff-6", "Focused verification passed: go test ./internal/api/modules/amp -run TestNeoSidebar. Full go test ./... is blocked by unrelated PostgreSQL integration setup in internal/store/pg_test.go."),
 		neoReadThreadTextMessage("user", "M-handoff-7", "Next steps: keep the web sidebar untouched, preserve the proxy-side emitted data, note the unrelated PostgreSQL blocker, and do not restart brew in this handoff."),
 	}
+}
+
+func neoReadThreadHiddenContinuationTailMessages() []any {
+	messages := make([]any, 0, 254)
+	for i := 0; i < 230; i++ {
+		text := fmt.Sprintf("Background implementation note %03d.", i)
+		if i == 84 {
+			text = "Earlier superseded context: add regression coverage for the position mark storage/query path and signal-status ranking behavior."
+		}
+		messages = append(messages, neoReadThreadTextMessage("assistant", fmt.Sprintf("M-hidden-%03d", i), text))
+	}
+	messages = append(messages,
+		neoReadThreadTextMessage("user", "M-hidden-230", "why are expired or late signals showing up after the market already moved?"),
+		neoReadThreadTextMessage("assistant", "M-hidden-231", "The issue is discovery-bound lateness. Dashboard labels in frontend/src/routes/post-launch/strategy-lab/+page.svelte collapse arrived-late and expired states, and the paper trader lacks a late_actionable variant."),
+		neoReadThreadTextMessage("user", "M-hidden-232", "so what are going to be the fixes to resolve this"),
+		neoReadThreadTextMessage("assistant", "M-hidden-233", "Fix the dashboard label first in frontend/src/routes/post-launch/strategy-lab/+page.svelte, then add a paper-only late observation variant in data_collection/workers/strategy_paper_trader.py with a 45m window that allows late_actionable."),
+		neoReadThreadTextMessage("user", "M-hidden-234", "lets do the fixes"),
+	)
+	for i := 235; i < 254; i++ {
+		messages = append(messages, neoReadThreadToolResultMessage(fmt.Sprintf("M-hidden-tool-%03d", i), fmt.Sprintf("TU-hidden-%03d", i), "done", fmt.Sprintf("tool result after latest user task %03d", i)))
+	}
+	return messages
 }
 
 func neoReadThreadReviewFindingsMessages() []any {

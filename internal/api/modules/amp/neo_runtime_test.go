@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -1048,7 +1049,7 @@ func TestNeoRuntimePreflightCompactsLargeToolResultBeforeInputBudgetOverflow(t *
 	}
 }
 
-func TestNeoRuntimeOpenAIPreflightCompactionTooLargeDoesNotUseNativeEndpoint(t *testing.T) {
+func TestNeoRuntimeOpenAIPreflightCompactionTooLargeUsesBoundedTranscript(t *testing.T) {
 	dir := t.TempDir()
 	oldStoreDir := neoAmpDataDir
 	neoAmpDataDir = func() string { return dir }
@@ -1057,7 +1058,19 @@ func TestNeoRuntimeOpenAIPreflightCompactionTooLargeDoesNotUseNativeEndpoint(t *
 	calls := 0
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
-		http.Error(w, "unexpected provider call", http.StatusInternalServerError)
+		if r.URL.Path != "/api/provider/openai/v1/chat/completions" {
+			t.Fatalf("unexpected compaction path %s", r.URL.Path)
+		}
+		payload := readNeoJSON(r.Body)
+		if payload["model"] != "gpt-5.5" {
+			t.Fatalf("compaction model = %#v, want gpt-5.5", payload["model"])
+		}
+		rendered := fmt.Sprint(payload["messages"])
+		if !strings.Contains(rendered, "The structured conversation is too large to send in full") || !strings.Contains(rendered, "[...middle of older transcript omitted during compaction...]") {
+			t.Fatalf("compaction payload did not use bounded transcript: %.512s", rendered)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"bounded transcript summary"}}]}`))
 	}))
 	t.Cleanup(upstream.Close)
 	parsed, err := url.Parse(upstream.URL)
@@ -1091,7 +1104,11 @@ func TestNeoRuntimeOpenAIPreflightCompactionTooLargeDoesNotUseNativeEndpoint(t *
 		if i%2 == 1 {
 			role = "assistant"
 		}
-		actor.storeMessageLocked(neoMessage{ThreadID: threadID, MessageID: fmt.Sprintf("M-%022d", i), Role: role, Content: []any{map[string]any{"type": "text", "text": fmt.Sprintf("oversized openai compaction context %02d %s", i, longText)}}})
+		text := fmt.Sprintf("oversized openai compaction context %02d", i)
+		if i < 16 {
+			text += " " + longText
+		}
+		actor.storeMessageLocked(neoMessage{ThreadID: threadID, MessageID: fmt.Sprintf("M-%022d", i), Role: role, Content: []any{map[string]any{"type": "text", "text": text}}})
 	}
 	actor.currentInference = &neoInferenceInflight{messageID: "M-current", agentMode: "deep", reasoningEffort: "xhigh"}
 	actor.rebuildHistoryLocked()
@@ -1104,22 +1121,22 @@ func TestNeoRuntimeOpenAIPreflightCompactionTooLargeDoesNotUseNativeEndpoint(t *
 	generation := actor.generation
 	actor.mu.Unlock()
 
-	if actor.maybeCompactBeforeInference("deep", "xhigh", "", generation, "M-current") {
-		t.Fatal("oversized OpenAI compaction unexpectedly succeeded")
+	if !actor.maybeCompactBeforeInference("deep", "xhigh", "", generation, "M-current") {
+		t.Fatal("oversized OpenAI compaction did not fall back to bounded transcript")
 	}
-	if calls != 0 {
-		t.Fatalf("provider calls = %d, want 0", calls)
+	if calls != 1 {
+		t.Fatalf("provider calls = %d, want 1", calls)
 	}
 	actor.mu.Lock()
 	defer actor.mu.Unlock()
 	if actor.compacting {
-		t.Fatal("actor remained in compacting state after oversized compaction failure")
+		t.Fatal("actor remained in compacting state after oversized compaction")
 	}
 	if actor.currentInference != nil && !actor.currentInference.preflightCompactionChecked {
-		t.Fatalf("currentInference = %#v, want preflight compaction checked after oversized compaction failure", actor.currentInference)
+		t.Fatalf("currentInference = %#v, want preflight compaction checked after oversized compaction", actor.currentInference)
 	}
-	if len(actor.compactionRecords) != 0 {
-		t.Fatalf("compactionRecords = %#v, want none after oversized compaction failure", actor.compactionRecords)
+	if len(actor.compactionRecords) != 1 {
+		t.Fatalf("compactionRecords = %#v, want one record", actor.compactionRecords)
 	}
 	for _, message := range actor.messages {
 		for _, raw := range message.Content {
@@ -1130,16 +1147,34 @@ func TestNeoRuntimeOpenAIPreflightCompactionTooLargeDoesNotUseNativeEndpoint(t *
 	}
 }
 
-func TestNeoRuntimeOversizedPreflightDoesNotSendInferenceProviderRequest(t *testing.T) {
+func TestNeoRuntimeOversizedPreflightCompactsBeforeInferenceProviderRequest(t *testing.T) {
 	dir := t.TempDir()
 	oldStoreDir := neoAmpDataDir
 	neoAmpDataDir = func() string { return dir }
 	t.Cleanup(func() { neoAmpDataDir = oldStoreDir })
 
-	providerCalls := 0
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		providerCalls++
-		http.Error(w, "unexpected provider call", http.StatusInternalServerError)
+	compactionCalls := 0
+	inferenceCalls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/provider/openai/v1/chat/completions":
+			compactionCalls++
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"bounded transcript summary"}}]}`))
+		case "/api/provider/openai/v1/responses":
+			inferenceCalls++
+			payload := readNeoJSON(r.Body)
+			rendered := fmt.Sprint(payload["input"])
+			if strings.Contains(rendered, "oversized openai compaction context 00") {
+				t.Fatalf("inference payload kept compacted prefix: %.512s", rendered)
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte(`data: {"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"ok"}` + "\n\n"))
+			_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1},"output":[]}}` + "\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		default:
+			t.Fatalf("unexpected provider path %s", r.URL.Path)
+		}
 	}))
 	t.Cleanup(upstream.Close)
 	parsed, err := url.Parse(upstream.URL)
@@ -1165,7 +1200,7 @@ func TestNeoRuntimeOversizedPreflightDoesNotSendInferenceProviderRequest(t *test
 			ModeModels:      map[string]string{"deep": "openai/gpt-5.5"},
 		}},
 	})
-	threadID := "T-oversized-preflight-no-provider"
+	threadID := "T-oversized-preflight-compacts"
 	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
 	longText := strings.Repeat("oversized openai compaction context ", 9000)
 	actor.mu.Lock()
@@ -1174,29 +1209,36 @@ func TestNeoRuntimeOversizedPreflightDoesNotSendInferenceProviderRequest(t *test
 		if i%2 == 1 {
 			role = "assistant"
 		}
-		actor.storeMessageLocked(neoMessage{ThreadID: threadID, MessageID: fmt.Sprintf("M-%022d", i), Role: role, Content: []any{map[string]any{"type": "text", "text": fmt.Sprintf("oversized openai compaction context %02d %s", i, longText)}}})
+		text := fmt.Sprintf("oversized openai compaction context %02d", i)
+		if i < 16 {
+			text += " " + longText
+		}
+		actor.storeMessageLocked(neoMessage{ThreadID: threadID, MessageID: fmt.Sprintf("M-%022d", i), Role: role, Content: []any{map[string]any{"type": "text", "text": text}}})
 	}
 	actor.rebuildHistoryLocked()
 	actor.mu.Unlock()
 
 	actor.runInferenceForParentWithOptions("deep", "xhigh", "", neoInferenceRunOptions{})
 
-	if providerCalls != 0 {
-		t.Fatalf("provider calls = %d, want 0", providerCalls)
+	if compactionCalls != 1 {
+		t.Fatalf("compaction calls = %d, want 1", compactionCalls)
+	}
+	if inferenceCalls != 1 {
+		t.Fatalf("inference calls = %d, want 1", inferenceCalls)
 	}
 	actor.mu.Lock()
 	defer actor.mu.Unlock()
 	if actor.currentInference != nil {
-		t.Fatalf("currentInference = %#v, want cleared after local oversized inference failure", actor.currentInference)
+		t.Fatalf("currentInference = %#v, want cleared after compacted inference", actor.currentInference)
 	}
 	if actor.agentState != "idle" {
 		t.Fatalf("agentState = %q, want idle", actor.agentState)
 	}
-	if !strings.Contains(stringValue(actor.activeError["message"]), "local Neo inference request too large") {
-		t.Fatalf("activeError = %#v, want local inference budget error", actor.activeError)
+	if actor.activeError != nil {
+		t.Fatalf("activeError = %#v, want none", actor.activeError)
 	}
-	if len(actor.compactionRecords) != 0 {
-		t.Fatalf("compactionRecords = %#v, want none after failed oversized preflight", actor.compactionRecords)
+	if len(actor.compactionRecords) != 1 {
+		t.Fatalf("compactionRecords = %#v, want one record", actor.compactionRecords)
 	}
 }
 
@@ -1900,11 +1942,23 @@ func TestNeoRuntimePostResponseCompactionCanReplaceShortHistory(t *testing.T) {
 	}
 }
 
-func TestNeoRuntimeAnthropicCompactionTooLargeDoesNotCallProvider(t *testing.T) {
+func TestNeoRuntimeAnthropicCompactionTooLargeUsesBoundedTranscript(t *testing.T) {
 	providerCalls := 0
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		providerCalls++
-		http.Error(w, "unexpected provider call", http.StatusInternalServerError)
+		if r.URL.Path != "/api/provider/anthropic/v1/messages" {
+			t.Fatalf("unexpected compaction path %s", r.URL.Path)
+		}
+		if got := r.Header.Get("x-stainless-helper"); got != "compaction" {
+			t.Fatalf("x-stainless-helper = %q, want compaction", got)
+		}
+		payload := readNeoJSON(r.Body)
+		rendered := fmt.Sprint(payload["messages"])
+		if !strings.Contains(rendered, "The structured conversation is too large to send in full") || !strings.Contains(rendered, "[...middle of older transcript omitted during compaction...]") {
+			t.Fatalf("compaction payload did not use bounded transcript: %.512s", rendered)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"content":[{"type":"text","text":"anthropic bounded summary"}]}`))
 	}))
 	t.Cleanup(upstream.Close)
 	parsed, err := url.Parse(upstream.URL)
@@ -1946,19 +2000,19 @@ func TestNeoRuntimeAnthropicCompactionTooLargeDoesNotCallProvider(t *testing.T) 
 	generation := actor.generation
 	actor.mu.Unlock()
 
-	if runNeoCompactionPlanForTest(t, actor, "deep", "xhigh", "", generation) {
-		t.Fatal("oversized compaction unexpectedly succeeded")
+	if !runNeoCompactionPlanForTest(t, actor, "deep", "xhigh", "", generation) {
+		t.Fatal("oversized compaction did not fall back to bounded transcript")
 	}
-	if providerCalls != 0 {
-		t.Fatalf("provider calls = %d, want 0", providerCalls)
+	if providerCalls != 1 {
+		t.Fatalf("provider calls = %d, want 1", providerCalls)
 	}
 	actor.mu.Lock()
 	defer actor.mu.Unlock()
 	if actor.compacting {
-		t.Fatal("compacting should be false after failed oversized compaction")
+		t.Fatal("compacting should be false after oversized compaction")
 	}
-	if len(actor.compactionRecords) != 0 {
-		t.Fatalf("compaction records = %#v, want none after failed oversized compaction", actor.compactionRecords)
+	if len(actor.compactionRecords) != 1 {
+		t.Fatalf("compaction records = %#v, want one record", actor.compactionRecords)
 	}
 	for _, message := range actor.messages {
 		for _, raw := range message.Content {
@@ -2596,6 +2650,30 @@ func TestNeoCompactionThresholdPercentSettingMatchesBinary(t *testing.T) {
 	}
 	if route := selectNeoCompactionRoute(nil, "smart", map[string]any{"compactionControl": map[string]any{"model": "openai/gpt-5.5"}}); route.Provider != "openai" || route.Model != "gpt-5.5" {
 		t.Fatalf("compactionControl.model route = %#v, want openai/gpt-5.5", route)
+	}
+}
+
+func TestNeoCompactionRequestBudgetUsesModelMaxInput(t *testing.T) {
+	route := neoModelRoute{Provider: "openai", Model: "gpt-5.5"}
+	if got := neoCompactionMaxInputTokens("deep", route); got != 272000 {
+		t.Fatalf("compaction max input = %d, want 272000", got)
+	}
+
+	messages := []neoMessage{{
+		ThreadID:  "T-compaction-budget",
+		MessageID: "M-0000000000000000000001",
+		Role:      "user",
+		Content:   []any{map[string]any{"type": "text", "text": strings.Repeat("input ", 185000)}},
+	}}
+	estimated, maxInput, tooLarge := neoCompactionRequestExceedsInputBudget("deep", route, messages, "")
+	if maxInput != 272000 {
+		t.Fatalf("compaction request max input = %d, want 272000", maxInput)
+	}
+	if estimated >= 390000 {
+		t.Fatalf("test estimate = %d, want below old 400k-context compaction budget", estimated)
+	}
+	if !tooLarge {
+		t.Fatalf("tooLarge = false for estimated=%d maxInput=%d", estimated, maxInput)
 	}
 }
 
@@ -15001,6 +15079,15 @@ func TestNeoActorExposesSyntheticLocalToolsWhenExecutorOmitsThem(t *testing.T) {
 	readThreadProperties := mapValue(byName["read_thread"].InputSchema["properties"])
 	if _, ok := readThreadProperties["threadID"]; !ok {
 		t.Fatalf("read_thread schema missing threadID property: %#v", byName["read_thread"].InputSchema)
+	}
+	if _, ok := readThreadProperties["goal"]; !ok {
+		t.Fatalf("read_thread schema missing goal property: %#v", byName["read_thread"].InputSchema)
+	}
+	if _, ok := readThreadProperties["question"]; ok {
+		t.Fatalf("read_thread schema exposed non-binary question property: %#v", byName["read_thread"].InputSchema)
+	}
+	if required := arrayValue(byName["read_thread"].InputSchema["required"]); !slices.Equal(neoStringSlice(required), []string{"goal"}) {
+		t.Fatalf("read_thread required = %#v, want goal only", required)
 	}
 	for _, name := range []string{"shell_command", "apply_patch", "skill", "view_media", "painter"} {
 		if _, ok := byName[name]; !ok {

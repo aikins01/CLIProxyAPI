@@ -307,7 +307,7 @@ func TestWebLocalInferenceCORSAllowsOnlyConfiguredActorOriginsAndPaths(t *testin
 		t.Fatalf("enabled web-local-inference internal preflight status = %d, want %d", internalRec.Code, http.StatusNoContent)
 	}
 
-	for _, path := range []string{"/metadata", "/actors/metadata", "/gateway/thread-actor/", "/_app/remote/3abror/createProjectThread"} {
+	for _, path := range []string{"/metadata", "/actors/metadata", "/gateway/thread-actor/", "/_app/remote/3abror/createProjectThread", "/ampcode/local-projects.json"} {
 		t.Run("root preflight "+path, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodOptions, path, nil)
 			req.Header.Set("Origin", "https://ampcode.com")
@@ -406,7 +406,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 	body := rec.Body.String()
 	for _, want := range []string{
 		"// ==UserScript==",
-		"@version 0.1.32",
+		"@version 0.1.33",
 		"@match https://ampcode.com/*",
 		"@updateURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
 		"@downloadURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
@@ -429,9 +429,22 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		`const promptedAPIKey = (globalThis.prompt("CLIProxyAPI API key") || "").trim()`,
 		"globalThis.sessionStorage.setItem(apiKeyStorageKey, promptedAPIKey)",
 		"cliproxyapi.ampLocalInference.workingDirectory",
+		"cliproxyapi.ampLocalInference.selectedLocalProject",
 		"cliproxyapi.ampLocalInference.localThreadIDs",
 		"cliproxyapi.ampLocalInference.threadWorkingDirectories",
 		"cliproxyapi.ampLocalInference.threadSettings",
+		"/ampcode/local-projects.json",
+		"localProjectsEndpointPath",
+		"selectedLocalProjectWorkingDirectory",
+		"rememberSelectedLocalProject",
+		"clearSelectedLocalProject",
+		"normalizeLocalProject",
+		"fetchLocalProjects",
+		"installLocalProjectPickerIntegration",
+		"localProjectPickerLooksLikeProjectPicker",
+		"closeLocalProjectPickerViaNoProject",
+		"localProjectFetchCount",
+		"localProjectPickerIntegrationCount",
 		"lastObservedThreadID",
 		"observedThreadID",
 		"normalizeExplicitReasoningEffort",
@@ -1600,6 +1613,126 @@ func TestNeoWebLocalRemoteEndpointOnlyAllowsCommandRoutes(t *testing.T) {
 		if _, _, ok := neoWebLocalRemoteEndpoint(path); ok {
 			t.Fatalf("remote endpoint %s should not be served locally", path)
 		}
+	}
+}
+
+func TestWebLocalInferenceLocalProjectsRoute(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	dataDir := t.TempDir()
+	oldStoreDir := neoAmpDataDir
+	neoAmpDataDir = func() string { return dataDir }
+	t.Cleanup(func() { neoAmpDataDir = oldStoreDir })
+	r := gin.New()
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+		NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled},
+	}})
+	m := &AmpModule{
+		restrictToLocalhost: false,
+		neoRuntime:          rt,
+		lastConfig: &config.AmpCode{
+			WebLocalInference: config.AmpWebLocalInference{Enabled: true},
+		},
+	}
+	auth := func(c *gin.Context) {
+		token := strings.TrimSpace(c.GetHeader("Authorization"))
+		token = strings.TrimSpace(strings.TrimPrefix(token, "Bearer "))
+		if token != "local-key" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing auth"})
+			return
+		}
+		c.Set("userApiKey", token)
+		c.Next()
+	}
+	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, auth)
+
+	workDir := neoExistingDirectory(t.TempDir())
+	projectID := neoDeterministicLocalProjectID("local-app", neoFileURLForDirectory(workDir), workDir)
+	if err := writeNeoWebLocalProjectIndex(rt.threadDir, []any{map[string]any{
+		"id":               projectID,
+		"name":             "local-app",
+		"repositoryURL":    neoFileURLForDirectory(workDir),
+		"workingDirectory": workDir,
+	}}); err != nil {
+		t.Fatalf("write project index: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/ampcode/local-projects.json?"+ampWebLocalInferenceAPIKeyQuery+"=local-key", nil)
+	req.Header.Set("Origin", "https://ampcode.com")
+	req.Header.Set(ampWebLocalInferenceHeader, "1")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("local projects status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if allowOrigin := rec.Header().Get("Access-Control-Allow-Origin"); allowOrigin != "https://ampcode.com" {
+		t.Fatalf("Access-Control-Allow-Origin = %q, want https://ampcode.com", allowOrigin)
+	}
+	var response map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("local projects JSON error: %v", err)
+	}
+	projects := arrayValue(response["projects"])
+	if response["ok"] != true || len(projects) != 1 {
+		t.Fatalf("local projects response = %#v", response)
+	}
+	project := mapValue(projects[0])
+	if stringValue(project["id"]) != projectID || stringValue(project["workingDirectory"]) != workDir || stringValue(project["name"]) != "local-app" {
+		t.Fatalf("project = %#v, want id=%q workingDirectory=%q", project, projectID, workDir)
+	}
+
+	historyDir := neoExistingDirectory(t.TempDir())
+	historyLine, err := json.Marshal(map[string]any{"text": "history project", "cwd": historyDir})
+	if err != nil {
+		t.Fatalf("marshal history: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "history.jsonl"), append(historyLine, '\n'), 0o600); err != nil {
+		t.Fatalf("write history: %v", err)
+	}
+	refreshedReq := httptest.NewRequest(http.MethodGet, "/ampcode/local-projects.json?"+ampWebLocalInferenceAPIKeyQuery+"=local-key", nil)
+	refreshedReq.Header.Set("Origin", "https://ampcode.com")
+	refreshedReq.Header.Set(ampWebLocalInferenceHeader, "1")
+	refreshedRec := httptest.NewRecorder()
+	r.ServeHTTP(refreshedRec, refreshedReq)
+	if refreshedRec.Code != http.StatusOK {
+		t.Fatalf("refreshed local projects status = %d, body=%s", refreshedRec.Code, refreshedRec.Body.String())
+	}
+	var refreshedResponse map[string]any
+	if err := json.Unmarshal(refreshedRec.Body.Bytes(), &refreshedResponse); err != nil {
+		t.Fatalf("refreshed local projects JSON error: %v", err)
+	}
+	refreshedProjects := arrayValue(refreshedResponse["projects"])
+	if len(refreshedProjects) != 2 {
+		t.Fatalf("refreshed projects = %#v, want index and history projects", refreshedResponse)
+	}
+	historyID := neoDeterministicLocalProjectID(filepath.Base(historyDir), neoFileURLForDirectory(historyDir), historyDir)
+	foundHistoryProject := false
+	for _, rawProject := range refreshedProjects {
+		project := mapValue(rawProject)
+		if stringValue(project["id"]) == historyID && stringValue(project["workingDirectory"]) == historyDir {
+			foundHistoryProject = true
+			break
+		}
+	}
+	if !foundHistoryProject {
+		t.Fatalf("refreshed projects missing history project id=%q dir=%q: %#v", historyID, historyDir, refreshedProjects)
+	}
+
+	unmarkedReq := httptest.NewRequest(http.MethodGet, "/ampcode/local-projects.json?"+ampWebLocalInferenceAPIKeyQuery+"=local-key", nil)
+	unmarkedReq.Header.Set("Origin", "https://ampcode.com")
+	unmarkedRec := httptest.NewRecorder()
+	r.ServeHTTP(unmarkedRec, unmarkedReq)
+	if unmarkedRec.Code != http.StatusNotFound {
+		t.Fatalf("unmarked local projects status = %d, want %d; body=%s", unmarkedRec.Code, http.StatusNotFound, unmarkedRec.Body.String())
+	}
+
+	unauthorizedReq := httptest.NewRequest(http.MethodGet, "/ampcode/local-projects.json", nil)
+	unauthorizedReq.Header.Set("Origin", "https://ampcode.com")
+	unauthorizedReq.Header.Set(ampWebLocalInferenceHeader, "1")
+	unauthorizedRec := httptest.NewRecorder()
+	r.ServeHTTP(unauthorizedRec, unauthorizedReq)
+	if unauthorizedRec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized local projects status = %d, want %d; body=%s", unauthorizedRec.Code, http.StatusUnauthorized, unauthorizedRec.Body.String())
 	}
 }
 

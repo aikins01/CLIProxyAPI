@@ -129,6 +129,8 @@ func ampWebLocalInferencePath(path string) bool {
 	switch {
 	case path == "/api/internal":
 		return true
+	case path == "/ampcode/local-projects.json":
+		return true
 	case path == "/api/thread-actors" || strings.HasPrefix(path, "/api/thread-actors/"):
 		return true
 	case ampWebLocalInferenceRemotePath(path):
@@ -183,6 +185,23 @@ func (m *AmpModule) serveWebLocalInferenceUserscript(c *gin.Context) {
 	c.String(http.StatusOK, ampWebLocalInferenceUserscript(defaultBaseURL, settings.AllowedOrigins))
 }
 
+func (m *AmpModule) serveWebLocalProjects(c *gin.Context) {
+	if c.Request.Method != http.MethodGet {
+		c.JSON(http.StatusMethodNotAllowed, gin.H{"error": "method not allowed"})
+		return
+	}
+	if m == nil || m.neoRuntime == nil || !c.GetBool(ampWebLocalInferenceCORSContextKey) || strings.TrimSpace(c.GetHeader(ampWebLocalInferenceHeader)) == "" {
+		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+		return
+	}
+	cfg := m.neoThreadConfigSnapshot()
+	if cfg == nil || !neoRuntimeEnabled(cfg) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true, "projects": m.neoRuntime.reloadNeoWebLocalProjectCache()})
+}
+
 func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []string) string {
 	baseURL := ampWebLocalInferenceSafeBaseURL(defaultBaseURL)
 	userscriptURL := strings.NewReplacer("\r", "", "\n", "").Replace(baseURL + "/ampcode/local-inference.user.js")
@@ -190,7 +209,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	return fmt.Sprintf(`// ==UserScript==
 // @name CLIProxyAPI Amp Local Inference
 // @namespace https://github.com/router-for-me/CLIProxyAPI
-// @version 0.1.32
+// @version 0.1.33
 %s
 // @updateURL %s
 // @downloadURL %s
@@ -204,9 +223,11 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	const bridgeHeader = %s;
 	const apiKeyStorageKey = "cliproxyapi.ampLocalInference.apiKey";
 	const workingDirectoryStorageKey = "cliproxyapi.ampLocalInference.workingDirectory";
+	const selectedLocalProjectStorageKey = "cliproxyapi.ampLocalInference.selectedLocalProject";
 	const localThreadIDsStorageKey = "cliproxyapi.ampLocalInference.localThreadIDs";
 	const threadWorkingDirectoriesStorageKey = "cliproxyapi.ampLocalInference.threadWorkingDirectories";
 	const threadSettingsStorageKey = "cliproxyapi.ampLocalInference.threadSettings";
+	const localProjectsEndpointPath = "/ampcode/local-projects.json";
 	const defaultBaseURL = %s;
 	const originalJSONParse = globalThis.JSON.parse.bind(globalThis.JSON);
 	const originalFetch = globalThis.fetch.bind(globalThis);
@@ -218,6 +239,8 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		webSocketBootstrapCount: 0,
 		menuIntegrationCount: 0,
 		commandPaletteIntegrationCount: 0,
+		localProjectFetchCount: 0,
+		localProjectPickerIntegrationCount: 0,
 		localThreadPickerOpenCount: 0,
 		removedLocalThreadControlCount: 0,
 		remoteShellCreateCount: 0,
@@ -230,6 +253,8 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		lastVisibleThreadModeAgentMode: "",
 		lastVisibleThreadModeReasoningEffort: "",
 		lastLocalThreadChoice: "",
+		lastLocalProjectChoice: "",
+		lastLocalProjectWorkingDirectory: "",
 		lastWebSocketHost: "",
 		lastWebSocketPath: "",
 		lastWebSocketThreadKey: "",
@@ -239,6 +264,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		lastObservedThreadID: "",
 	};
 	let observedThreadID = "";
+	let localProjectsCache = { at: 0, projects: [], promise: null };
 
 	function localBaseURL() {
 		return new URL(defaultBaseURL);
@@ -274,7 +300,45 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		if (activeDirectory) {
 			return activeDirectory;
 		}
+		const selectedDirectory = selectedLocalProjectWorkingDirectory();
+		if (selectedDirectory) {
+			return selectedDirectory;
+		}
 		return (globalThis.localStorage.getItem(workingDirectoryStorageKey) || "").trim();
+	}
+
+	function selectedLocalProjectWorkingDirectory() {
+		try {
+			const parsed = originalJSONParse(globalThis.sessionStorage.getItem(selectedLocalProjectStorageKey) || "{}");
+			const selectedAt = Number(parsed.selectedAt || 0);
+			if (!selectedAt || Date.now() - selectedAt > 10 * 60 * 1000) {
+				return "";
+			}
+			return normalizeWorkingDirectory(parsed.workingDirectory);
+		} catch {
+			return "";
+		}
+	}
+
+	function rememberSelectedLocalProject(project) {
+		const workingDirectory = normalizeWorkingDirectory(project?.workingDirectory);
+		if (!workingDirectory) {
+			return;
+		}
+		const selected = {
+			id: firstString(project.id, project.projectID, project.projectId, project.project_id),
+			name: firstString(project.name, project.projectName, pathBaseName(workingDirectory), "local"),
+			workingDirectory,
+			selectedAt: Date.now(),
+		};
+		globalThis.sessionStorage.setItem(selectedLocalProjectStorageKey, JSON.stringify(selected));
+		globalThis.localStorage.setItem(workingDirectoryStorageKey, workingDirectory);
+		diagnostics.lastLocalProjectChoice = selected.name;
+		diagnostics.lastLocalProjectWorkingDirectory = workingDirectory;
+	}
+
+	function clearSelectedLocalProject() {
+		globalThis.sessionStorage.removeItem(selectedLocalProjectStorageKey);
 	}
 
 	function activeThreadWorkingDirectory() {
@@ -1273,6 +1337,10 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		if (projectID) {
 			return "";
 		}
+		const fromSelectedLocalProject = selectedLocalProjectWorkingDirectory();
+		if (fromSelectedLocalProject) {
+			return fromSelectedLocalProject;
+		}
 		const fromVisibleProject = visibleProjectWorkingDirectory();
 		if (fromVisibleProject) {
 			return fromVisibleProject;
@@ -1299,6 +1367,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 					return;
 				}
 				const resolvedWorkingDirectory = responseWorkingDirectory(value) || workingDirectory;
+				clearSelectedLocalProject();
 				rememberLocalThreadID(threadID);
 				if (resolvedWorkingDirectory) {
 					rememberThreadWorkingDirectory(threadID, resolvedWorkingDirectory);
@@ -1366,6 +1435,56 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			headers.set("Authorization", "Bearer " + apiKey);
 		}
 		return headers;
+	}
+
+	function normalizeLocalProject(project) {
+		if (!isPlainObject(project)) {
+			return null;
+		}
+		const workingDirectory = normalizeWorkingDirectory(firstString(project.workingDirectory, project.workspaceRoot, project.cwd));
+		if (!workingDirectory) {
+			return null;
+		}
+		return {
+			id: firstString(project.id, project.projectID, project.projectId, project.project_id),
+			name: firstString(project.name, project.projectName, pathBaseName(workingDirectory), "local"),
+			namespace: firstString(project.namespace, project.projectNamespace, "local"),
+			repositoryURL: firstString(project.repositoryURL, project.repoURL),
+			workingDirectory,
+		};
+	}
+
+	function fetchLocalProjects() {
+		if (!storedLocalAPIKey()) {
+			return Promise.resolve([]);
+		}
+		const now = Date.now();
+		if (localProjectsCache.promise) {
+			return localProjectsCache.promise;
+		}
+		if (now - localProjectsCache.at < 10000) {
+			return Promise.resolve(localProjectsCache.projects);
+		}
+		diagnostics.localProjectFetchCount += 1;
+		localProjectsCache.promise = originalFetch(localBaseURLString() + localProjectsEndpointPath, {
+			method: "GET",
+			headers: localFetchHeaders("", false),
+			mode: "cors",
+			credentials: "omit",
+		}).then((response) => {
+			if (!response.ok) {
+				return [];
+			}
+			return response.json().catch(() => ({}));
+		}).then((decoded) => {
+			const projects = Array.isArray(decoded.projects) ? decoded.projects.map(normalizeLocalProject).filter(Boolean) : [];
+			localProjectsCache = { at: Date.now(), projects, promise: null };
+			return projects;
+		}).catch(() => {
+			localProjectsCache.promise = null;
+			return [];
+		});
+		return localProjectsCache.promise;
 	}
 
 	function promptLocalThread() {
@@ -1683,6 +1802,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 
 	function installLocalThreadControls() {
 		removeInjectedLocalThreadControls();
+		installLocalProjectPickerIntegration();
 	}
 
 	function removeStaleLocalThreadButton() {
@@ -1693,11 +1813,11 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		removeStaleLocalThreadButton();
 		removeLocalThreadPicker();
 		let removed = 0;
-		globalThis.document.querySelectorAll("[data-cliproxy-local-thread-command-item],[data-cliproxy-local-thread-menu-item]").forEach((element) => {
+		globalThis.document.querySelectorAll("[data-cliproxy-local-thread-command-item],[data-cliproxy-local-thread-menu-item],[data-cliproxy-local-project-item]").forEach((element) => {
 			element.remove();
 			removed += 1;
 		});
-		for (const key of ["__cliproxyAmpLocalInferenceMenuObserver", "__cliproxyAmpLocalInferenceCommandPaletteObserver"]) {
+		for (const key of ["__cliproxyAmpLocalInferenceMenuObserver", "__cliproxyAmpLocalInferenceCommandPaletteObserver", "__cliproxyAmpLocalInferenceProjectPickerObserver"]) {
 			const observer = globalThis[key];
 			if (observer && typeof observer.disconnect === "function") {
 				observer.disconnect();
@@ -1705,6 +1825,142 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			globalThis[key] = null;
 		}
 		diagnostics.removedLocalThreadControlCount += removed;
+	}
+
+	function installLocalProjectPickerIntegration() {
+		if (globalThis.__cliproxyAmpLocalInferenceProjectPickerObserver) {
+			integrateLocalProjectPickers(globalThis.document);
+			return;
+		}
+		const observer = new MutationObserver((mutations) => {
+			for (const mutation of mutations) {
+				for (const node of mutation.addedNodes) {
+					if (node instanceof Element) {
+						integrateLocalProjectPickers(node);
+					}
+				}
+			}
+		});
+		observer.observe(globalThis.document.documentElement, { childList: true, subtree: true });
+		globalThis.__cliproxyAmpLocalInferenceProjectPickerObserver = observer;
+		integrateLocalProjectPickers(globalThis.document);
+	}
+
+	function integrateLocalProjectPickers(root) {
+		for (const picker of localProjectPickerCandidates(root)) {
+			if (!localProjectPickerLooksLikeProjectPicker(picker)) {
+				continue;
+			}
+			const list = commandPaletteList(picker);
+			if (!list || list.querySelector("[data-cliproxy-local-project-item]") || list.dataset.cliproxyLocalProjectLoading === "1") {
+				continue;
+			}
+			list.dataset.cliproxyLocalProjectLoading = "1";
+			fetchLocalProjects().then((projects) => {
+				delete list.dataset.cliproxyLocalProjectLoading;
+				if (!projects.length || !globalThis.document.contains(picker) || !localProjectPickerLooksLikeProjectPicker(picker)) {
+					return;
+				}
+				injectLocalProjectPickerItems(picker, list, projects);
+			});
+		}
+	}
+
+	function localProjectPickerCandidates(root) {
+		const candidates = commandPaletteCandidates(root);
+		if (root instanceof Element && !candidates.includes(root)) {
+			candidates.push(root);
+		}
+		return candidates;
+	}
+
+	function localProjectPickerLooksLikeProjectPicker(picker) {
+		if (!elementVisible(picker)) {
+			return false;
+		}
+		const text = (picker.innerText || picker.textContent || "").replace(/\s+/g, " ").trim();
+		return text.includes("No Project") && /\bProjects?\b/.test(text);
+	}
+
+	function injectLocalProjectPickerItems(picker, list, projects) {
+		if (list.querySelector("[data-cliproxy-local-project-item]")) {
+			return;
+		}
+		for (const project of projects.slice(0, 50)) {
+			list.appendChild(buildLocalProjectPickerItem(picker, project));
+			diagnostics.localProjectPickerIntegrationCount += 1;
+		}
+	}
+
+	function buildLocalProjectPickerItem(picker, project) {
+		const template = localProjectPickerTemplateItem(picker);
+		const item = template ? template.cloneNode(true) : globalThis.document.createElement("div");
+		const label = "Local: " + firstString(project.name, pathBaseName(project.workingDirectory), "local");
+		item.dataset.cliproxyLocalProjectItem = "1";
+		item.removeAttribute("id");
+		item.removeAttribute("aria-selected");
+		item.removeAttribute("data-selected");
+		item.removeAttribute("aria-disabled");
+		item.removeAttribute("data-disabled");
+		item.removeAttribute("hidden");
+		item.removeAttribute("disabled");
+		item.setAttribute("data-value", label);
+		item.setAttribute("aria-label", label);
+		item.setAttribute("role", item.getAttribute("role") || "option");
+		item.setAttribute("tabindex", "-1");
+		if (!template) {
+			item.style.cssText = "display:flex;flex-direction:column;gap:2px;width:100%%;padding:10px 12px;border:0;background:transparent;color:inherit;font:inherit;text-align:left;cursor:default";
+		}
+		fillLocalProjectPickerItem(item, label, project.workingDirectory);
+		const activate = (event) => {
+			event.preventDefault();
+			event.stopPropagation();
+			rememberSelectedLocalProject(project);
+			setTimeout(() => closeLocalProjectPickerViaNoProject(picker), 0);
+		};
+		item.addEventListener("pointerdown", activate, true);
+		item.addEventListener("click", activate, true);
+		item.addEventListener("keydown", (event) => {
+			if (event.key === "Enter") {
+				activate(event);
+			}
+		}, true);
+		return item;
+	}
+
+	function fillLocalProjectPickerItem(item, labelText, workingDirectory) {
+		item.textContent = "";
+		const label = globalThis.document.createElement("span");
+		label.textContent = labelText;
+		const detail = globalThis.document.createElement("span");
+		detail.textContent = workingDirectory;
+		detail.style.cssText = "opacity:.62;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:42rem";
+		item.append(label, detail);
+	}
+
+	function localProjectPickerTemplateItem(picker) {
+		return localProjectPickerNoProjectItem(picker) ||
+			picker.querySelector('[cmdk-item],[data-cmdk-item],[data-slot="command-item"],[role="option"],button,[role="button"]');
+	}
+
+	function localProjectPickerNoProjectItem(picker) {
+		for (const element of picker.querySelectorAll('[cmdk-item],[data-cmdk-item],[data-slot="command-item"],[role="option"],button,[role="button"]')) {
+			const text = (element.innerText || element.textContent || "").replace(/\s+/g, " ").trim();
+			if (/^No Project\b/.test(text) && !element.dataset.cliproxyLocalProjectItem) {
+				return element;
+			}
+		}
+		return null;
+	}
+
+	function closeLocalProjectPickerViaNoProject(picker) {
+		const noProject = localProjectPickerNoProjectItem(picker);
+		if (noProject) {
+			noProject.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, cancelable: true, view: globalThis }));
+			noProject.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: globalThis }));
+			return;
+		}
+		globalThis.document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
 	}
 
 	function installLocalThreadKeyboardShortcut() {
@@ -2163,6 +2419,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	globalThis.__cliproxyAmpLocalInference = {
 		apiKeyStorageKey,
 		workingDirectoryStorageKey,
+		selectedLocalProjectStorageKey,
 		localThreadIDsStorageKey,
 		threadWorkingDirectoriesStorageKey,
 		defaultBaseURL,

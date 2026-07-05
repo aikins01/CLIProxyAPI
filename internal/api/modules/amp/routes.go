@@ -328,6 +328,12 @@ func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *ha
 	}
 	// Add clientAPIKeyMiddleware after auth for per-client upstream routing
 	rootMiddleware = append(rootMiddleware, clientAPIKeyMiddleware())
+	localProjectMiddleware := []gin.HandlerFunc{m.webLocalInferenceCORSMiddleware(), m.webLocalInferenceQueryAuthMiddleware(), noCORSMiddleware(), m.localhostOnlyMiddleware()}
+	if auth != nil {
+		localProjectMiddleware = append(localProjectMiddleware, auth)
+	}
+	localProjectMiddleware = append(localProjectMiddleware, clientAPIKeyMiddleware())
+	engine.Any("/ampcode/local-projects.json", append(localProjectMiddleware, m.serveWebLocalProjects)...)
 	engine.Any("/threads", append(rootMiddleware, proxyHandler)...)
 	engine.Any("/threads/*path", append(rootMiddleware, proxyHandler)...)
 	engine.GET("/docs", append(rootMiddleware, proxyHandler)...)

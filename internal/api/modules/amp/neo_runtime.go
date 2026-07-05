@@ -8151,7 +8151,16 @@ func (a *neoActor) maybeCompactBeforeInference(agentMode, reasoningEffort, paren
 		maxInputTokens = neoCompactionFallbackMaxInput
 	}
 	thresholdTokens := neoCompactionPreflightThresholdTokensForSettings(maxInputTokens, settings)
-	if !neoCompactionShouldRunForTokensWithThreshold(compactionMessagesWindow, estimatedInputTokens, thresholdTokens) {
+	shouldCompact := neoCompactionShouldRunForTokensWithThreshold(compactionMessagesWindow, estimatedInputTokens, thresholdTokens)
+	if !shouldCompact {
+		compactionRoute := applyNeoModelMapping(a.runtime, selectNeoCompactionRoute(cfg, agentMode, settings))
+		compactionInputMessages := neoCompactionInputMessages(a.messages, compactionOffset)
+		compactionMaxInputTokens := neoCompactionMaxInputTokens(agentMode, compactionRoute)
+		compactionThresholdTokens := neoCompactionPreflightThresholdTokensForSettings(compactionMaxInputTokens, settings)
+		compactionEstimatedInputTokens := neoEstimateCompactionRequestInputTokens(compactionRoute, compactionInputMessages, neoCompactionSummaryPrompt(settings))
+		shouldCompact = neoCompactionShouldRunForTokensWithThreshold(compactionMessagesWindow, compactionEstimatedInputTokens, compactionThresholdTokens)
+	}
+	if !shouldCompact {
 		if messageID != "" && a.currentInference != nil && a.currentInference.messageID == messageID {
 			a.currentInference.preflightCompactionChecked = true
 			markCheckedOnly = true
@@ -8301,7 +8310,12 @@ func (a *neoActor) runManualCompactionPlan(plan neoCompactionPlan, compactionRou
 	summary := ""
 	var err error
 	if estimatedTokens, maxInputTokens, tooLarge := neoCompactionRequestExceedsInputBudget(plan.agentMode, compactionRoute, plan.compactionMessages, plan.summaryPrompt); tooLarge {
-		err = fmt.Errorf("local Neo compaction request too large for %s/%s: estimated_input_tokens=%d compaction_input_budget_tokens=%d safety_tokens=%d", compactionRoute.Provider, compactionRoute.Model, estimatedTokens, maxInputTokens, neoCompactionInputSafetyTokens)
+		transcriptMessages := neoCompactionBoundedTranscriptMessages(plan.threadID, plan.compactionMessages)
+		if transcriptTokens, transcriptMaxInputTokens, transcriptTooLarge := neoCompactionRequestExceedsInputBudget(plan.agentMode, compactionRoute, transcriptMessages, plan.summaryPrompt); transcriptTooLarge {
+			err = fmt.Errorf("local Neo compaction request too large for %s/%s: estimated_input_tokens=%d compaction_input_budget_tokens=%d safety_tokens=%d transcript_estimated_input_tokens=%d transcript_compaction_input_budget_tokens=%d", compactionRoute.Provider, compactionRoute.Model, estimatedTokens, maxInputTokens, neoCompactionInputSafetyTokens, transcriptTokens, transcriptMaxInputTokens)
+		} else {
+			summary, err = inferNeoCompactionLocal(a.runtime, plan.threadID, compactionRoute, transcriptMessages, plan.summaryPrompt)
+		}
 	} else {
 		summary, err = inferNeoCompactionLocal(a.runtime, plan.threadID, compactionRoute, plan.compactionMessages, plan.summaryPrompt)
 	}
@@ -8381,13 +8395,7 @@ func (a *neoActor) finishFailedCompactionPlanLocked(plan neoCompactionPlan) {
 }
 
 func neoCompactionRequestExceedsInputBudget(agentMode string, route neoModelRoute, messages []neoMessage, summaryPrompt string) (int, int, bool) {
-	maxInputTokens := neoEffectiveContextWindow(agentMode, route.Model)
-	if maxInputTokens > neoCompactionMaxOutputTokens {
-		maxInputTokens -= neoCompactionMaxOutputTokens
-	}
-	if maxInputTokens <= 0 {
-		maxInputTokens = neoEffectiveMaxInputTokens(agentMode, route.Model)
-	}
+	maxInputTokens := neoCompactionMaxInputTokens(agentMode, route)
 	if maxInputTokens <= 0 {
 		return 0, 0, false
 	}
@@ -8397,6 +8405,31 @@ func neoCompactionRequestExceedsInputBudget(agentMode string, route neoModelRout
 		budgetTokens = maxInputTokens
 	}
 	return estimatedTokens, maxInputTokens, estimatedTokens > budgetTokens
+}
+
+func neoCompactionMaxInputTokens(agentMode string, route neoModelRoute) int {
+	maxInputTokens := neoEffectiveMaxInputTokens(agentMode, route.Model)
+	if maxInputTokens > 0 {
+		return maxInputTokens
+	}
+	maxInputTokens = neoEffectiveContextWindow(agentMode, route.Model)
+	if maxInputTokens > neoCompactionMaxOutputTokens {
+		maxInputTokens -= neoCompactionMaxOutputTokens
+	}
+	return maxInputTokens
+}
+
+func neoCompactionBoundedTranscriptMessages(threadID string, messages []neoMessage) []neoMessage {
+	transcript := strings.TrimSpace(neoCompactionTranscript(messages))
+	if transcript == "" {
+		transcript = "[no transcript content]"
+	}
+	text := "The structured conversation is too large to send in full. Summarize this bounded transcript instead.\n\n<transcript>\n" + transcript + "\n</transcript>"
+	return []neoMessage{{
+		ThreadID: threadID,
+		Role:     "user",
+		Content:  []any{map[string]any{"type": "text", "text": text}},
+	}}
 }
 
 func neoEstimateCompactionRequestInputTokens(route neoModelRoute, messages []neoMessage, summaryPrompt string) int {

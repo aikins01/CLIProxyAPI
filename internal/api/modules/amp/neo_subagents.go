@@ -341,7 +341,10 @@ func (a *neoActor) executeSubagentRun(name string, input map[string]any, parentT
 				}
 				a.storeSubagentToolResultMessage(call.ID, run, parentToolCallID, "")
 			} else if call.Name == "read_thread" && a.shouldRunLocalActorTool(call.Name) {
-				text, err := a.executeLocalReadThread(neoPendingTool{ID: call.ID, Name: call.Name, Input: call.Input, AgentMode: agentMode, ParentToolCallID: parentToolCallID, MessageID: childMessageID, ClientAPIKey: clientAPIKey}, generation)
+				readPending := neoPendingTool{ID: call.ID, Name: call.Name, Input: call.Input, AgentMode: agentMode, ParentToolCallID: parentToolCallID, MessageID: childMessageID, ClientAPIKey: clientAPIKey}
+				text, err := a.executeLocalReadThreadWithProgress(readPending, generation, func(statusMessage string) {
+					a.storeSubagentToolResultMessage(call.ID, neoReadThreadProgressRun(statusMessage), parentToolCallID, "tool_progress")
+				})
 				if a.subagentGenerationStale(generation) {
 					return "", nil
 				}

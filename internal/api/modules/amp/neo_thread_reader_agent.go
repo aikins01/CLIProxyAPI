@@ -23,10 +23,11 @@ const (
 	neoReadThreadSearchLimitMax     = 40
 	neoReadThreadReadCount          = 12
 	neoReadThreadReadCountMax       = 40
+	neoReadThreadLatestReadCount    = 24
 	neoReadThreadSearchExcerpt      = 1400
 	neoReadThreadReadMessageChars   = 14000
 	neoReadThreadReadTotalChars     = 90000
-	neoReadThreadOverviewTailCount  = 5
+	neoReadThreadOverviewTailCount  = neoReadThreadLatestReadCount
 	neoReadThreadHistoryTextChars   = 24000
 	neoReadThreadHistoryTotalChars  = 100000
 	neoReadThreadHistoryNoticeChars = 512
@@ -41,6 +42,7 @@ Rules:
 - Tool calls record attempted actions, not outcomes. Trust an action only after reading the corresponding tool result and its status.
 - Use compactions and summaries for orientation, but inspect original messages when exact requirements, wording, code, commands, chronology, edits, or verification matter.
 - Prefer the latest unreverted decision when the thread contains multiple revisions.
+- For continuation or handoff goals, identify the latest explicit user objective first, then read the assistant and tool outcomes that followed it.
 - Preserve exact technical details: file paths, commands, model names, errors, decisions, and code snippets.
 - When reporting verification or build status, include the complete command string that ran and the latest pass/fail result.
 - Omit unrelated material, but include enough surrounding context for the caller to use the extracted information safely.
@@ -110,7 +112,10 @@ func (a *neoActor) liveReadThreadCorpus(threadID string) (neoReadThreadCorpus, b
 	if a == nil || a.runtime == nil || a.runtime.store == nil || !neoThreadIDExactPattern.MatchString(threadID) {
 		return neoReadThreadCorpus{}, false
 	}
-	target := a.runtime.store.lookupThreadActor(threadID)
+	target := a
+	if a.threadID != threadID && a.key != threadID {
+		target = a.runtime.store.lookupThreadActor(threadID)
+	}
 	if target == nil || !target.hasLocalThreadState() {
 		return neoReadThreadCorpus{}, false
 	}
@@ -443,7 +448,7 @@ func (a *neoActor) executeLocalReadThreadAgentWithRoute(pending neoPendingTool, 
 		return "", nil
 	}
 	if sawSearch && sawRead && !sawLatestRead && len(corpus.Messages) > 1 {
-		latest, readEnd, err := neoReadThreadRead(corpus, map[string]any{"latest": true, "count": 1})
+		latest, readEnd, err := neoReadThreadRead(corpus, map[string]any{"latest": true, "count": neoReadThreadLatestReadCount})
 		if err != nil {
 			return "", fmt.Errorf("read_thread auto latest read failed: %w", err)
 		}
@@ -809,7 +814,7 @@ func neoReadThreadAgentInput(corpus neoReadThreadCorpus, goal string) string {
 	out.WriteString("Latest message index: " + strconv.Itoa(len(corpus.Messages)-1) + "\n\n")
 	out.WriteString("Goal:\n")
 	out.WriteString(goal)
-	out.WriteString("\n\nStart with thread_overview or search_thread_messages. After finding relevant hits, read exact messages and later/latest messages before final JSON.")
+	out.WriteString("\n\nStart with thread_overview or search_thread_messages. For continuation goals, anchor on the latest user instruction in the tail before older matching topics. After finding relevant hits, read exact messages and later/latest messages before final JSON.")
 	return out.String()
 }
 
@@ -821,7 +826,7 @@ func neoReadThreadGateCorrection(sawSearch, sawRead, sawLatestRead bool, corpus 
 		return "Before your final answer, call read_thread_messages for the relevant search hits and their surrounding context."
 	}
 	if !sawLatestRead && len(corpus.Messages) > 1 {
-		return "Before your final answer, call read_thread_messages on later/latest messages through index " + strconv.Itoa(len(corpus.Messages)-1) + " to check for revisions, superseding decisions, reverts, or contradictions."
+		return "Before your final answer, call read_thread_messages with latest=true and count=" + strconv.Itoa(neoReadThreadLatestReadCount) + " through index " + strconv.Itoa(len(corpus.Messages)-1) + " to check for revisions, superseding decisions, reverts, contradictions, and continuation instructions."
 	}
 	return ""
 }

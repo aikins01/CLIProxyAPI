@@ -142,6 +142,85 @@ func TestNeoReadThreadLocalGateRequiresExecutorBootstrap(t *testing.T) {
 	}
 }
 
+func TestNeoReadThreadDefaultsToCurrentThread(t *testing.T) {
+	threadID := "T-019e65c0-0310-77a8-b233-4b84d9c06140"
+	var captured []neoInferenceRequest
+	rt := newNeoRuntime(&config.Config{})
+	rt.inferStream = neoReadThreadScriptedInfer(t, "[message 0] current thread context", "current thread", &captured, nil)
+	actor := newNeoActor(rt, "actor-test", "thread-actor", threadID, threadID, neoActorRecord("actor-test", "thread-actor", threadID), nil)
+	actor.messages = []neoMessage{
+		{ThreadID: threadID, MessageID: "M-current", Role: "user", Content: []any{map[string]any{"type": "text", "text": "current thread context"}}, Seq: 1},
+	}
+
+	text, err := actor.executeLocalReadThread(neoPendingTool{ID: "TU-read", Name: "read_thread", Input: map[string]any{"goal": "Extract current thread context."}, AgentMode: "deep"}, actor.generation)
+	if err != nil {
+		t.Fatalf("executeLocalReadThread error: %v", err)
+	}
+	if !strings.Contains(text, "current thread context") {
+		t.Fatalf("read_thread text = %q, want current thread content", text)
+	}
+	if len(captured) == 0 || !strings.Contains(captured[0].History[0].Text, "Thread ID: "+threadID) {
+		t.Fatalf("read_thread initial request did not target current thread: %#v", captured)
+	}
+}
+
+func TestNeoReadThreadRunLocalActorToolEmitsBinaryProgress(t *testing.T) {
+	threadID := "T-019e65c0-0310-77a8-b233-4b84d9c06141"
+	var captured []neoInferenceRequest
+	rt := newNeoRuntime(&config.Config{})
+	rt.inferStream = neoReadThreadScriptedInfer(t, "[message 0] local progress result", "local progress", &captured, nil)
+	actor := newNeoActor(rt, "actor-test", "thread-actor", threadID, threadID, neoActorRecord("actor-test", "thread-actor", threadID), nil)
+	actor.executorBootstrapComplete = true
+	actor.messages = []neoMessage{
+		{ThreadID: threadID, MessageID: "M-assistant", Role: "assistant", Content: []any{map[string]any{"type": "tool_use", "id": "TU-read", "name": "read_thread", "input": map[string]any{"goal": "Extract local progress."}}}, Seq: 1},
+		{ThreadID: threadID, MessageID: "M-current", Role: "user", Content: []any{map[string]any{"type": "text", "text": "local progress result"}}, Seq: 2},
+	}
+	pending := neoPendingTool{ID: "TU-read", Name: "read_thread", Input: map[string]any{"goal": "Extract local progress."}, AgentMode: "deep", MessageID: "M-assistant"}
+	actor.pendingTools[pending.ID] = pending
+
+	actor.runLocalActorTool(pending, actor.generation)
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	var sawExtracting bool
+	for _, replay := range actor.replayEvents {
+		payload := mapValue(replay.Payload)
+		if payload["type"] != "message_added" && payload["type"] != "message_updated" {
+			continue
+		}
+		message := mapValue(payload["message"])
+		for _, raw := range arrayValue(message["content"]) {
+			run := mapValue(mapValue(raw)["run"])
+			progress := mapValue(run["progress"])
+			switch stringValue(progress["statusMessage"]) {
+			case "Extracting content from thread...":
+				sawExtracting = true
+			}
+		}
+	}
+	if !sawExtracting {
+		t.Fatalf("read_thread progress events missing extracting status replay=%#v", actor.replayEvents)
+	}
+	result := actor.messages[actor.messageIndexLocked(toolResultMessageID("TU-read"))]
+	run := mapValue(mapValue(result.Content[0])["run"])
+	if result.CompletionStatus != "" || stringValue(run["status"]) != "done" || !strings.Contains(stringValue(run["result"]), "local progress result") {
+		t.Fatalf("final read_thread result = %#v run=%#v", result, run)
+	}
+	if len(captured) > 1 && strings.Contains(neoHistoryTestText(captured[1].History), "Loading thread...") {
+		t.Fatalf("read_thread agent read its own progress message: %#v", captured[1].History)
+	}
+	foundFinalHistory := false
+	for _, message := range actor.history {
+		if message.ToolCallID == "TU-read" && strings.Contains(message.Text, "local progress result") {
+			foundFinalHistory = true
+			break
+		}
+	}
+	if !foundFinalHistory {
+		t.Fatalf("history = %#v, want final read_thread result", actor.history)
+	}
+}
+
 func TestNeoReadThreadRangeMatrix(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -185,6 +264,33 @@ func TestNeoReadThreadRangeMatrix(t *testing.T) {
 				t.Fatalf("range = %d-%d, want %d-%d", start, end, tt.wantStart, tt.wantEnd)
 			}
 		})
+	}
+}
+
+func TestNeoReadThreadOverviewIncludesContinuationObjectiveTail(t *testing.T) {
+	messages := make([]neoReadThreadMessage, 254)
+	for i := range messages {
+		messages[i] = neoReadThreadMessage{Index: i, Role: "assistant", MessageID: fmt.Sprintf("M-%03d", i), Text: fmt.Sprintf("background tool output %03d", i)}
+	}
+	messages[71] = neoReadThreadMessage{Index: 71, Role: "assistant", MessageID: "M-old-storage", Text: "Earlier context: add storage validation coverage for position marks and signal-status ranking."}
+	messages[235] = neoReadThreadMessage{Index: 235, Role: "user", MessageID: "M-late-question", Text: "so what are going to be the fixes to resolve the expired and late signals"}
+	messages[236] = neoReadThreadMessage{Index: 236, Role: "assistant", MessageID: "M-late-plan", Text: "Fix dashboard labels in frontend/src/routes/post-launch/strategy-lab/+page.svelte and add the paper-only late observation variant in data_collection/workers/strategy_paper_trader.py."}
+	messages[237] = neoReadThreadMessage{Index: 237, Role: "user", MessageID: "M-latest-objective", Text: "lets do the fixes"}
+	for i := 238; i < len(messages); i++ {
+		messages[i] = neoReadThreadMessage{Index: i, Role: "tool", MessageID: fmt.Sprintf("M-tool-%03d", i), Text: fmt.Sprintf("tool output after the user instruction %03d", i)}
+	}
+
+	overview := neoReadThreadOverview(neoReadThreadCorpus{ThreadID: "T-continuation", Source: "test", Title: "late signal fixes", Messages: messages})
+	raw, err := json.Marshal(overview["latestMessages"])
+	if err != nil {
+		t.Fatalf("marshal latestMessages: %v", err)
+	}
+	text := string(raw)
+	if !strings.Contains(text, "lets do the fixes") || !strings.Contains(text, "strategy_paper_trader.py") {
+		t.Fatalf("latestMessages missed continuation objective tail: %s", text)
+	}
+	if strings.Contains(text, "position marks") || strings.Contains(text, "signal-status ranking") {
+		t.Fatalf("latestMessages included stale older context: %s", text)
 	}
 }
 

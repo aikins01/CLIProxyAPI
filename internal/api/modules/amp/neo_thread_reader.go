@@ -50,7 +50,9 @@ func (a *neoActor) runLocalActorTool(pending neoPendingTool, generation int) {
 	}
 	switch toolName {
 	case "read_thread":
-		text, err := a.executeLocalReadThread(pending, generation)
+		text, err := a.executeLocalReadThreadWithProgress(pending, generation, func(statusMessage string) {
+			a.receiveToolResult(map[string]any{"type": "executor_tool_result", "toolCallId": pending.ID, "run": neoReadThreadProgressRun(statusMessage)})
+		})
 		if a.subagentGenerationStale(generation) {
 			return
 		}
@@ -77,21 +79,33 @@ func (a *neoActor) runLocalActorTool(pending neoPendingTool, generation int) {
 }
 
 func (a *neoActor) executeLocalReadThread(pending neoPendingTool, generation int) (string, error) {
+	return a.executeLocalReadThreadWithProgress(pending, generation, nil)
+}
+
+func (a *neoActor) executeLocalReadThreadWithProgress(pending neoPendingTool, generation int, progress func(string)) (string, error) {
 	input := pending.Input
 	rawThreadID := firstNonEmptyString(input["threadID"], input["threadId"], input["thread_id"], input["thread"], input["url"])
 	threadID := neoToolInputThreadID(input)
+	if threadID == "" && (strings.TrimSpace(rawThreadID) == "" || neoReadThreadCurrentThreadSentinel(rawThreadID)) {
+		threadID = firstNonEmptyString(a.threadID, a.key)
+	}
 	if threadID == "" {
 		return "", fmt.Errorf("Reading thread failed: Invalid thread ID or thread URL: %s", rawThreadID)
 	}
-	goal := strings.TrimSpace(firstNonEmptyString(input["question"], input["goal"]))
+	goal := strings.TrimSpace(firstNonEmptyString(input["goal"], input["question"]))
 	if goal == "" {
-		return "", fmt.Errorf("Reading thread failed: missing required question")
+		return "", fmt.Errorf("Reading thread failed: missing required goal")
 	}
 	if a.runtime == nil {
 		return "", fmt.Errorf("Reading thread failed: missing local runtime")
 	}
 	if a.subagentGenerationStale(generation) {
 		return "", nil
+	}
+	currentThreadID := firstNonEmptyString(a.threadID, a.key)
+	isCurrentThread := threadID == currentThreadID
+	if progress != nil && !isCurrentThread {
+		progress("Loading thread...")
 	}
 	corpus, err := a.readThreadCorpus(threadID, pending.ClientAPIKey)
 	if err != nil {
@@ -100,7 +114,27 @@ func (a *neoActor) executeLocalReadThread(pending neoPendingTool, generation int
 	if a.subagentGenerationStale(generation) {
 		return "", nil
 	}
+	if progress != nil {
+		if isCurrentThread {
+			progress("Loading thread...")
+		}
+		progress("Extracting content from thread...")
+	}
 	return a.executeLocalReadThreadAgent(pending, generation, corpus, goal)
+}
+
+func neoReadThreadProgressRun(statusMessage string) map[string]any {
+	return map[string]any{"status": "in-progress", "progress": map[string]any{"statusMessage": statusMessage}}
+}
+
+func neoReadThreadCurrentThreadSentinel(raw string) bool {
+	value := strings.Trim(strings.ToLower(strings.TrimSpace(raw)), "@")
+	switch value {
+	case "current", "current_thread", "this_thread", "active", "active_thread", "this thread", "active thread":
+		return true
+	default:
+		return false
+	}
 }
 
 func (a *neoActor) fetchUpstreamThreadMarkdown(threadID, clientAPIKey string) (string, error) {
