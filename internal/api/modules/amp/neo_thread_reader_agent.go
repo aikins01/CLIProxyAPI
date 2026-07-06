@@ -24,6 +24,8 @@ const (
 	neoReadThreadReadCount          = 12
 	neoReadThreadReadCountMax       = 40
 	neoReadThreadLatestReadCount    = 24
+	neoReadThreadOverviewExcerpt    = 260
+	neoReadThreadOverviewResultText = 160
 	neoReadThreadSearchExcerpt      = 1400
 	neoReadThreadReadMessageChars   = 14000
 	neoReadThreadReadTotalChars     = 90000
@@ -367,7 +369,7 @@ func (a *neoActor) executeLocalReadThreadAgentWithRoute(pending neoPendingTool, 
 	a.mu.Unlock()
 
 	conversation := []neoHistoryMessage{{Role: "user", Text: neoReadThreadAgentInput(corpus, goal)}}
-	tools := neoReadThreadInternalToolSpecs()
+	sawOverview := false
 	sawSearch := false
 	sawRead := false
 	sawLatestRead := len(corpus.Messages) <= 1
@@ -388,7 +390,7 @@ func (a *neoActor) executeLocalReadThreadAgentWithRoute(pending neoPendingTool, 
 			MaxTokens:            maxTokens,
 			Settings:             settings,
 			History:              neoReadThreadRequestHistory(conversation),
-			Tools:                tools,
+			Tools:                neoReadThreadInternalToolSpecsForState(sawOverview, sawSearch),
 			Environment:          environment,
 			ModelRouteOverride:   &routeCopy,
 			SystemPromptOverride: neoReadThreadAgentSystemPrompt,
@@ -421,7 +423,10 @@ func (a *neoActor) executeLocalReadThreadAgentWithRoute(pending neoPendingTool, 
 				continue
 			}
 			childMessageID := a.storeSubagentToolUseMessage(call, pending.ID)
-			run, observation := neoReadThreadExecuteInternalTool(corpus, call)
+			run, observation := neoReadThreadExecuteInternalToolForState(corpus, call, sawOverview, sawSearch)
+			if strings.TrimSpace(call.Name) == "thread_overview" && stringValue(run["status"]) == "done" {
+				sawOverview = true
+			}
 			if observation.Searched {
 				sawSearch = true
 			}
@@ -814,7 +819,7 @@ func neoReadThreadAgentInput(corpus neoReadThreadCorpus, goal string) string {
 	out.WriteString("Latest message index: " + strconv.Itoa(len(corpus.Messages)-1) + "\n\n")
 	out.WriteString("Goal:\n")
 	out.WriteString(goal)
-	out.WriteString("\n\nStart with thread_overview or search_thread_messages. For continuation goals, anchor on the latest user instruction in the tail before older matching topics. After finding relevant hits, read exact messages and later/latest messages before final JSON.")
+	out.WriteString("\n\nStart with search_thread_messages. If you need orientation first, call thread_overview once, then search. For continuation goals, anchor on the latest user instruction in the tail before older matching topics. After finding relevant hits, read exact messages and later/latest messages before final JSON.")
 	return out.String()
 }
 
@@ -874,9 +879,36 @@ func neoReadThreadInternalToolSpecs() []neoToolSpec {
 	}
 }
 
+func neoReadThreadInternalToolSpecsForState(sawOverview, sawSearch bool) []neoToolSpec {
+	tools := neoReadThreadInternalToolSpecs()
+	if !sawOverview && !sawSearch {
+		return tools
+	}
+	out := make([]neoToolSpec, 0, len(tools))
+	for _, tool := range tools {
+		switch tool.Name {
+		case "thread_overview":
+			continue
+		case "read_thread_messages":
+			if !sawSearch {
+				continue
+			}
+		}
+		out = append(out, tool)
+	}
+	return out
+}
+
 func neoReadThreadExecuteInternalTool(corpus neoReadThreadCorpus, call neoToolCall) (map[string]any, neoReadThreadToolObservation) {
+	return neoReadThreadExecuteInternalToolForState(corpus, call, false, true)
+}
+
+func neoReadThreadExecuteInternalToolForState(corpus neoReadThreadCorpus, call neoToolCall, sawOverview, sawSearch bool) (map[string]any, neoReadThreadToolObservation) {
 	switch strings.TrimSpace(call.Name) {
 	case "thread_overview":
+		if sawOverview {
+			return map[string]any{"status": "error", "error": map[string]any{"message": "thread_overview was already called; use search_thread_messages next."}}, neoReadThreadToolObservation{}
+		}
 		return map[string]any{"status": "done", "result": neoReadThreadOverview(corpus)}, neoReadThreadToolObservation{}
 	case "search_thread_messages":
 		result, err := neoReadThreadSearch(corpus, call.Input)
@@ -885,6 +917,9 @@ func neoReadThreadExecuteInternalTool(corpus neoReadThreadCorpus, call neoToolCa
 		}
 		return map[string]any{"status": "done", "result": result}, neoReadThreadToolObservation{Searched: true}
 	case "read_thread_messages":
+		if !sawSearch {
+			return map[string]any{"status": "error", "error": map[string]any{"message": "search_thread_messages is required before read_thread_messages."}}, neoReadThreadToolObservation{}
+		}
 		result, end, err := neoReadThreadRead(corpus, call.Input)
 		if err != nil {
 			return map[string]any{"status": "error", "error": map[string]any{"message": err.Error()}}, neoReadThreadToolObservation{}
@@ -904,10 +939,10 @@ func neoReadThreadOverview(corpus neoReadThreadCorpus) map[string]any {
 	last := make([]any, 0)
 	for i, message := range corpus.Messages {
 		if i < neoReadThreadOverviewTailCount {
-			first = append(first, message.summaryMap(700))
+			first = append(first, message.summaryMap(neoReadThreadOverviewExcerpt))
 		}
 		if len(corpus.Messages)-i <= neoReadThreadOverviewTailCount {
-			last = append(last, message.summaryMap(700))
+			last = append(last, message.summaryMap(neoReadThreadOverviewExcerpt))
 		}
 	}
 	return map[string]any{
@@ -1106,7 +1141,7 @@ func (m neoReadThreadMessage) summaryMap(limit int) map[string]any {
 		out["toolUses"] = m.ToolUses
 	}
 	if len(m.ToolResults) > 0 {
-		out["toolResults"] = m.ToolResults
+		out["toolResults"] = neoReadThreadClipToolResults(m.ToolResults, neoReadThreadOverviewResultText)
 	}
 	return out
 }
@@ -1122,6 +1157,18 @@ func (m neoReadThreadMessage) detailMap(limit int) map[string]any {
 	}
 	if len(m.ToolResults) > 0 {
 		out["toolResults"] = m.ToolResults
+	}
+	return out
+}
+
+func neoReadThreadClipToolResults(results []neoReadThreadToolResult, limit int) []neoReadThreadToolResult {
+	if len(results) == 0 {
+		return nil
+	}
+	out := make([]neoReadThreadToolResult, 0, len(results))
+	for _, result := range results {
+		result.Text = neoClipRunes(result.Text, limit)
+		out = append(out, result)
 	}
 	return out
 }

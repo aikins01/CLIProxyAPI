@@ -24,6 +24,7 @@ type neoReadThreadSyntheticCase struct {
 	MustInclude      []string
 	MustIncludeOneOf []string
 	MustNotInclude   []string
+	MaxOverviewBytes int
 }
 
 type neoReadThreadBenchmarkCandidate struct {
@@ -71,6 +72,15 @@ func TestNeoReadThreadSyntheticBenchmarkFixtures(t *testing.T) {
 			}
 			if end != len(corpus.Messages)-1 || len(arrayValue(latest["messages"])) == 0 {
 				t.Fatalf("latest read = %#v end=%d", latest, end)
+			}
+			if tc.MaxOverviewBytes > 0 {
+				raw, err := json.Marshal(neoReadThreadOverview(corpus))
+				if err != nil {
+					t.Fatalf("overview JSON error: %v", err)
+				}
+				if len(raw) > tc.MaxOverviewBytes {
+					t.Fatalf("overview bytes = %d, want <= %d", len(raw), tc.MaxOverviewBytes)
+				}
 			}
 		})
 	}
@@ -379,6 +389,16 @@ func neoReadThreadSyntheticBenchmarkCases() []neoReadThreadSyntheticCase {
 			MustNotInclude: []string{"position mark storage/query path", "signal-status ranking"},
 		},
 		{
+			Name:             "read thread overview loop noise",
+			ThreadID:         "T-019e65c0-0310-77a8-b233-4b84d9c06217",
+			Title:            "Read thread turn limit and compaction pressure",
+			Goal:             "Why did compaction happen early in T-019f34dd, and what read_thread implementation issue must be fixed?",
+			Messages:         neoReadThreadOverviewLoopNoiseMessages(),
+			SearchQueries:    []string{"thread_overview", "compaction happened early"},
+			MustInclude:      []string{"T-019f34dd", "thread_overview", "123 KB", "search_thread_messages", "turn limit"},
+			MaxOverviewBytes: 20000,
+		},
+		{
 			Name:          "review findings after partial fixes",
 			ThreadID:      "T-019e65c0-0310-77a8-b233-4b84d9c06207",
 			Title:         "Review follow-up",
@@ -544,6 +564,29 @@ func neoReadThreadHiddenContinuationTailMessages() []any {
 	for i := 235; i < 254; i++ {
 		messages = append(messages, neoReadThreadToolResultMessage(fmt.Sprintf("M-hidden-tool-%03d", i), fmt.Sprintf("TU-hidden-%03d", i), "done", fmt.Sprintf("tool result after latest user task %03d", i)))
 	}
+	return messages
+}
+
+func neoReadThreadOverviewLoopNoiseMessages() []any {
+	messages := []any{
+		neoReadThreadTextMessage("user", "M-overview-loop-0", "Why is compaction happening so early in T-019f34dd-0994-72af-b671-cf176400a31f?"),
+		neoReadThreadTextMessage("assistant", "M-overview-loop-1", "I am checking whether read_thread is creating large internal observations."),
+	}
+	for i := 0; i < 12; i++ {
+		messages = append(messages,
+			neoReadThreadTextMessage("assistant", fmt.Sprintf("M-overview-loop-use-%02d", i), fmt.Sprintf("[tool_use attempted_action name=thread_overview id=TU-overview-%02d]", i)),
+			neoReadThreadToolResultMessage(
+				fmt.Sprintf("M-overview-loop-result-%02d", i),
+				fmt.Sprintf("TU-overview-%02d", i),
+				"done",
+				fmt.Sprintf("thread_overview result %02d for T-019f34dd: repeated overview payload was about 123 KB and did not satisfy the required search_thread_messages gate. %s", i, strings.Repeat("overview-noise ", 120)),
+			),
+		)
+	}
+	messages = append(messages,
+		neoReadThreadTextMessage("assistant", "M-overview-loop-final", "Final diagnosis: compaction happened early because repeated read_thread thread_overview observations inflated the active thread. The implementation issue is that read_thread kept looping on overview and hit the 16 turn limit before search_thread_messages/read_thread_messages completed."),
+		neoReadThreadTextMessage("user", "M-overview-loop-latest", "Latest next step: make overview one-shot, require search_thread_messages before reads/final, and keep the benchmark case for this turn limit edge case."),
+	)
 	return messages
 }
 

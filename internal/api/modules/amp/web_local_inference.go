@@ -209,7 +209,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	return fmt.Sprintf(`// ==UserScript==
 // @name CLIProxyAPI Amp Local Inference
 // @namespace https://github.com/router-for-me/CLIProxyAPI
-// @version 0.1.43
+// @version 0.1.44
 %s
 // @updateURL %s
 // @downloadURL %s
@@ -221,7 +221,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	"use strict";
 
 	const bridgeHeader = %s;
-	const userscriptVersion = "0.1.43";
+	const userscriptVersion = "0.1.44";
 	const apiKeyStorageKey = "cliproxyapi.ampLocalInference.apiKey";
 	const workingDirectoryStorageKey = "cliproxyapi.ampLocalInference.workingDirectory";
 	const selectedLocalProjectStorageKey = "cliproxyapi.ampLocalInference.selectedLocalProject";
@@ -340,6 +340,14 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			return selectedDirectory;
 		}
 		return storedLocalWorkingDirectory() || defaultLocalWorkingDirectory();
+	}
+
+	function currentLocalProjectWorkingDirectory() {
+		return activeThreadWorkingDirectory() ||
+			visibleProjectWorkingDirectory() ||
+			selectedLocalProjectWorkingDirectory() ||
+			storedLocalWorkingDirectory() ||
+			defaultLocalWorkingDirectory();
 	}
 
 	function storedLocalWorkingDirectory() {
@@ -2044,7 +2052,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	}
 
 	function integrateLocalProjectActivators(root) {
-		const workingDirectory = activeThreadWorkingDirectory() || visibleProjectWorkingDirectory() || selectedLocalProjectWorkingDirectory() || localWorkingDirectory();
+		const workingDirectory = currentLocalProjectWorkingDirectory();
 		if (!workingDirectory) {
 			return;
 		}
@@ -2249,7 +2257,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	function buildLocalProjectPickerItem(picker, project) {
 		const template = localProjectPickerTemplateItem(picker);
 		const item = globalThis.document.createElement("button");
-		const isCurrent = normalizeWorkingDirectory(project.workingDirectory) === activeThreadWorkingDirectory();
+		const isCurrent = normalizeWorkingDirectory(project.workingDirectory) === currentLocalProjectWorkingDirectory();
 		const label = firstString(project.name, pathBaseName(project.workingDirectory), "local");
 		item.type = "button";
 		item.dataset.cliproxyLocalProjectItem = "1";
@@ -2280,7 +2288,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		const left = globalThis.document.createElement("div");
 		left.className = "min-w-0 flex-1";
 		const title = globalThis.document.createElement("div");
-		title.className = "flex min-w-0 gap-1.5 text-lg pointer-coarse:text-[15px] pointer-coarse:leading-snug font-medium items-baseline";
+		title.className = "flex min-w-0 gap-1.5 text-sm leading-tight pointer-coarse:text-[15px] pointer-coarse:leading-snug font-medium items-baseline";
 		const label = globalThis.document.createElement("span");
 		label.textContent = labelText;
 		label.className = "min-w-0 truncate";
@@ -2329,7 +2337,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	}
 
 	function localProjectPickerDisplayProjects(projects) {
-		const activeDirectory = activeThreadWorkingDirectory();
+		const activeDirectory = currentLocalProjectWorkingDirectory();
 		const selectedDirectory = selectedLocalProjectWorkingDirectory();
 		const fallbackDirectory = normalizeWorkingDirectory(globalThis.localStorage.getItem(workingDirectoryStorageKey) || "");
 		const visibleName = visibleProjectName();
@@ -2564,6 +2572,15 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 				return;
 			}
 			setProjectPickerSelectedItem(list, item);
+			const workingDirectory = normalizeWorkingDirectory(item.dataset?.cliproxyLocalProjectWorkingDirectory);
+			if (workingDirectory) {
+				const selectedProject = {
+					name: projectPickerItemPrimaryText(item),
+					workingDirectory,
+				};
+				rememberSelectedLocalProject(selectedProject);
+				refreshLocalProjectActivators(selectedProject);
+			}
 		}, 0);
 	}
 
@@ -2572,7 +2589,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	}
 
 	function currentProjectPickerItem(picker) {
-		const workingDirectory = localWorkingDirectory();
+		const workingDirectory = currentLocalProjectWorkingDirectory();
 		const targetNames = new Set();
 		if (workingDirectory) {
 			targetNames.add(normalizeProjectPickerName(pathBaseName(workingDirectory)));

@@ -11948,7 +11948,7 @@ func (m *AmpModule) tryServeNeoWebLocalRemote(c *gin.Context) bool {
 			writeNeoSvelteKitRemoteCommand(c.Writer, http.StatusOK, neoWebLocalRemoteCommandError(err.Error()))
 			return true
 		}
-		result := m.neoRuntime.neoWebLocalCreateProjectThread(c.Request.Context(), c.Request.URL.Query(), request)
+		result := m.neoRuntime.neoWebLocalCreateProjectThread(c.Request.Context(), c.Request.URL.Query(), request, neoWebLocalRequestBaseURL(c.Request))
 		writeNeoSvelteKitRemoteCommand(c.Writer, http.StatusOK, result)
 		return true
 	case "prewarmProjectThread":
@@ -12394,7 +12394,28 @@ func (rt *neoRuntime) localThreadActorManagementResponse(ctx context.Context, bo
 	return baseResponse, http.StatusOK
 }
 
-func (rt *neoRuntime) neoWebLocalCreateProjectThread(ctx context.Context, query url.Values, request map[string]any) map[string]any {
+func neoWebLocalRequestBaseURL(r *http.Request) string {
+	if r == nil {
+		return "http://127.0.0.1:8317"
+	}
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	if forwardedProto := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")); forwardedProto == "http" || forwardedProto == "https" {
+		scheme = forwardedProto
+	}
+	host := strings.TrimSpace(r.Host)
+	if host == "" && r.URL != nil {
+		host = strings.TrimSpace(r.URL.Host)
+	}
+	if host == "" {
+		return "http://127.0.0.1:8317"
+	}
+	return scheme + "://" + host
+}
+
+func (rt *neoRuntime) neoWebLocalCreateProjectThread(ctx context.Context, query url.Values, request map[string]any, localBaseURL string) map[string]any {
 	threadID := firstNonEmptyString(request["threadID"], request["threadId"], request["id"])
 	if threadID == "" {
 		threadID = "T-" + randomUUIDLike()
@@ -12479,6 +12500,14 @@ func (rt *neoRuntime) neoWebLocalCreateProjectThread(ctx context.Context, query 
 			result[key] = value
 		}
 	}
+	if response["usesThreadActors"] == true {
+		threadActorConfig := neoWebLocalPlainThreadActorConfig(createdThreadID, stringValue(response["wsToken"]), localBaseURL)
+		result["threadActorConfig"] = threadActorConfig
+		result["threadData"] = map[string]any{
+			"thread":            map[string]any{"id": createdThreadID},
+			"threadActorConfig": threadActorConfig,
+		}
+	}
 	if workingDirectory != "" {
 		result["workingDirectory"] = workingDirectory
 		result["workspaceRoot"] = workingDirectory
@@ -12489,6 +12518,27 @@ func (rt *neoRuntime) neoWebLocalCreateProjectThread(ctx context.Context, query 
 		}
 	}
 	return result
+}
+
+func neoWebLocalPlainThreadActorConfig(threadID, wsToken, localBaseURL string) map[string]any {
+	if wsToken == "" {
+		wsToken = "local-neo"
+	}
+	localBaseURL = strings.TrimRight(strings.TrimSpace(localBaseURL), "/")
+	if localBaseURL == "" {
+		localBaseURL = "http://127.0.0.1:8317"
+	}
+	return map[string]any{
+		"threadId":                threadID,
+		"wsToken":                 wsToken,
+		"ampURL":                  localBaseURL,
+		"baseURL":                 localBaseURL,
+		"capability":              "write",
+		"poolName":                "default",
+		"requiresSudoForWrite":    false,
+		"requiresSudoForTerminal": false,
+		"threadActorTransport":    "json-rpc",
+	}
 }
 
 func neoWebLocalProjectThreadContentText(content any) string {

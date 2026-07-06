@@ -407,7 +407,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 	body := rec.Body.String()
 	for _, want := range []string{
 		"// ==UserScript==",
-		"@version 0.1.43",
+		"@version 0.1.44",
 		"@match https://ampcode.com/*",
 		"@updateURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
 		"@downloadURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
@@ -422,7 +422,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"commandPaletteIntegrationCount",
 		"localThreadPickerOpenCount",
 		"removedLocalThreadControlCount",
-		`const userscriptVersion = "0.1.43"`,
+		`const userscriptVersion = "0.1.44"`,
 		"userscriptVersion",
 		"lastPatchedThreadActorBaseURL",
 		"lastPatchedThreadID",
@@ -452,6 +452,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"/ampcode/local-projects.json",
 		"localProjectsEndpointPath",
 		"selectedLocalProjectWorkingDirectory",
+		"currentLocalProjectWorkingDirectory",
 		"rememberSelectedLocalProject",
 		"clearSelectedLocalProject",
 		"globalThis.localStorage.removeItem(workingDirectoryStorageKey)",
@@ -769,7 +770,7 @@ if (typeof globalThis.btoa !== "function") {
 }
 require(scriptPath);
 const bridge = globalThis.__cliproxyAmpLocalInference;
-assert(bridge && bridge.userscriptVersion === "0.1.43", "bridge userscript version was not exposed");
+assert(bridge && bridge.userscriptVersion === "0.1.44", "bridge userscript version was not exposed");
 globalThis.localStorage.setItem(bridge.localThreadIDsStorageKey, JSON.stringify([threadID, secondThreadID]));
 globalThis.localStorage.setItem(bridge.apiKeyStorageKey, "local-key");
 globalThis.localStorage.setItem(bridge.workingDirectoryStorageKey, createdThreadWorkDir);
@@ -2123,6 +2124,15 @@ func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.
 	if createResult["usesThreadActors"] != true || createResult["usesDtw"] != true || stringValue(createResult["executorType"]) != "local-client" || stringValue(createResult["wsToken"]) == "" {
 		t.Fatalf("create local actor response = %#v", createResult)
 	}
+	createActorConfig := mapValue(createResult["threadActorConfig"])
+	if stringValue(createActorConfig["threadId"]) != threadID || stringValue(createActorConfig["wsToken"]) == "" || stringValue(createActorConfig["baseURL"]) == "" || stringValue(createActorConfig["ampURL"]) == "" {
+		t.Fatalf("create actor config = %#v", createActorConfig)
+	}
+	createThreadData := mapValue(createResult["threadData"])
+	createThreadDataConfig := mapValue(createThreadData["threadActorConfig"])
+	if stringValue(createThreadDataConfig["threadId"]) != threadID || stringValue(createThreadDataConfig["wsToken"]) == "" {
+		t.Fatalf("create threadData actor config = %#v", createThreadData)
+	}
 	if stringValue(createResult["workingDirectory"]) != expectedWorkDir || stringValue(createResult["workspaceRoot"]) != expectedWorkDir {
 		t.Fatalf("create working directory response = %#v, want %q", createResult, expectedWorkDir)
 	}
@@ -2225,6 +2235,12 @@ func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.
 	}
 	if explicitFalseResult["usesThreadActors"] != false || explicitFalseResult["usesDtw"] != false || stringValue(explicitFalseResult["executorType"]) != "" {
 		t.Fatalf("explicit-false local actor response = %#v", explicitFalseResult)
+	}
+	if _, ok := explicitFalseResult["threadActorConfig"]; ok {
+		t.Fatalf("explicit-false returned threadActorConfig: %#v", explicitFalseResult)
+	}
+	if threadData := mapValue(explicitFalseResult["threadData"]); threadData["threadActorConfig"] != nil {
+		t.Fatalf("explicit-false returned threadData actor config: %#v", threadData)
 	}
 	if stringValue(explicitFalseResult["workingDirectory"]) != expectedWorkDir || stringValue(explicitFalseResult["workspaceRoot"]) != expectedWorkDir {
 		t.Fatalf("explicit-false working directory response = %#v, want %q", explicitFalseResult, expectedWorkDir)

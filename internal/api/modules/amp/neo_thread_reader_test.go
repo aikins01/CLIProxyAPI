@@ -57,8 +57,8 @@ func neoReadThreadAssertAgentRequest(t *testing.T, request neoInferenceRequest) 
 	if !strings.Contains(request.SystemPromptOverride, "read_thread subagent") {
 		t.Fatalf("system prompt override = %q", request.SystemPromptOverride)
 	}
-	if !neoReadThreadHasTools(request.Tools, "thread_overview", "search_thread_messages", "read_thread_messages") {
-		t.Fatalf("tools = %#v, want read_thread internal tools", request.Tools)
+	if !neoReadThreadHasTools(request.Tools, "search_thread_messages") {
+		t.Fatalf("tools = %#v, want read_thread search tool", request.Tools)
 	}
 }
 
@@ -683,6 +683,70 @@ func TestNeoReadThreadAgentSendsBoundedHistoryAfterRepeatedLargeReads(t *testing
 	}
 	if len(captured) != 4 {
 		t.Fatalf("captured requests = %d, want 4", len(captured))
+	}
+}
+
+func TestNeoReadThreadOverviewIsOneShotThenRequiresSearch(t *testing.T) {
+	corpus := neoReadThreadCorpus{ThreadID: "T-overview-once", Source: "test", Title: "overview loop", Messages: []neoReadThreadMessage{
+		{Index: 0, Role: "user", MessageID: "M-0", Text: "Initial task mentions sidebar progress."},
+		{Index: 1, Role: "assistant", MessageID: "M-1", Text: "Latest outcome says actor connection is fixed."},
+	}}
+
+	var captured []neoInferenceRequest
+	rt := newNeoRuntime(&config.Config{})
+	rt.inferStream = func(_ *neoRuntime, request neoInferenceRequest, _ neoStreamCallback) (neoInferenceResult, error) {
+		turn := len(captured)
+		captured = append(captured, request)
+		switch turn {
+		case 0:
+			if !neoReadThreadHasTools(request.Tools, "thread_overview", "search_thread_messages", "read_thread_messages") {
+				t.Fatalf("turn 0 tools = %#v", request.Tools)
+			}
+			return neoInferenceResult{ToolCalls: []neoToolCall{{ID: "TU-overview", Name: "thread_overview"}}}, nil
+		case 1:
+			if !neoReadThreadHasTools(request.Tools, "search_thread_messages") || neoReadThreadHasTools(request.Tools, "thread_overview") || neoReadThreadHasTools(request.Tools, "read_thread_messages") {
+				t.Fatalf("turn 1 tools = %#v, want search only after overview", request.Tools)
+			}
+			return neoInferenceResult{ToolCalls: []neoToolCall{{ID: "TU-search", Name: "search_thread_messages", Input: map[string]any{"query": "actor connection sidebar progress"}}}}, nil
+		case 2:
+			if !neoReadThreadHasTools(request.Tools, "search_thread_messages", "read_thread_messages") || neoReadThreadHasTools(request.Tools, "thread_overview") {
+				t.Fatalf("turn 2 tools = %#v, want search/read without overview", request.Tools)
+			}
+			return neoInferenceResult{ToolCalls: []neoToolCall{{ID: "TU-read", Name: "read_thread_messages", Input: map[string]any{"latest": true, "count": 2}}}}, nil
+		default:
+			return neoInferenceResult{Text: neoReadThreadTestFinalJSON("[message 1] actor connection is fixed.")}, nil
+		}
+	}
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-current-overview", "T-current-overview", neoActorRecord("actor-test", "thread-actor", "T-current-overview"), nil)
+
+	text, err := actor.executeLocalReadThreadAgent(neoPendingTool{ID: "TU-read", Name: "read_thread", Input: map[string]any{"threadID": corpus.ThreadID, "question": "What happened with actor connection?"}, AgentMode: "deep"}, actor.generation, corpus, "What happened with actor connection?")
+	if err != nil {
+		t.Fatalf("executeLocalReadThreadAgent error: %v", err)
+	}
+	if !strings.Contains(text, "actor connection") {
+		t.Fatalf("read_thread text = %q, want actor connection", text)
+	}
+	if len(captured) != 4 {
+		t.Fatalf("captured requests = %d, want 4", len(captured))
+	}
+}
+
+func TestNeoReadThreadOverviewClipsToolResultDetails(t *testing.T) {
+	corpus := neoReadThreadCorpus{ThreadID: "T-overview-clip", Source: "test", Title: "overview clip", Messages: []neoReadThreadMessage{
+		{Index: 0, Role: "user", MessageID: "M-tool-result", Text: "tool result summary " + strings.Repeat("x", 2000), ToolResults: []neoReadThreadToolResult{{
+			ToolUseID: "TU-large",
+			Status:    "done",
+			Text:      "large tool output " + strings.Repeat("y", 6000),
+		}}},
+	}}
+
+	overview := neoReadThreadOverview(corpus)
+	raw, _ := json.Marshal(overview)
+	if len(raw) > 3000 {
+		t.Fatalf("overview bytes = %d, want clipped result: %s", len(raw), raw)
+	}
+	if !strings.Contains(string(raw), "[truncated") {
+		t.Fatalf("overview missing truncation marker: %s", raw)
 	}
 }
 
