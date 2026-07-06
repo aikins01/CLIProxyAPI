@@ -1110,10 +1110,13 @@ globalThis.sessionStorage.setItem("cliproxyapi.ampLocalInference.selectedLocalPr
 	workingDirectory: "/Users/aikins01/Developer/on-chain",
 	selectedAt: Date.now(),
 }));
+const tempTelemetryDirectory = "/private/tmp/telemetry-pr81-review-6soxv4lc/telemetry.dev";
 let localProjectsPayload = {
 	defaultWorkingDirectory: "/Users/aikins01",
 	projects: [
 		{ name: "on-chain", workingDirectory: "/Users/aikins01/Developer/on-chain" },
+		{ name: "telemetry.dev", workingDirectory: tempTelemetryDirectory },
+		{ name: "telemetry.dev", workingDirectory: "/private/var/folders/63/_bz0gwdn0px0d4r7s9zhct8m0000gn/T/telemetry-pr78-review-XXXXXX.RGqjFliah5/telemetry.dev" },
 		{ name: "telemetry.dev", workingDirectory: "/Users/aikins01/Developer/telemetry.dev" },
 	],
 };
@@ -1130,12 +1133,13 @@ globalThis.prompt = () => "";
 globalThis.WebSocket = class {};
 const visibleActivator = new FakeElement("button");
 visibleActivator.textContent = "Project: telemetry.dev";
-body.appendChild(visibleActivator);
 const picker = new FakeElement("div");
 picker.setAttribute("role", "dialog");
 const input = new FakeElement("input");
 const title = new FakeElement("div");
 title.textContent = "Projects";
+const popupProjectButton = new FakeElement("button");
+popupProjectButton.textContent = "Project: on-chain ⌘ K";
 const list = new FakeElement("div");
 list.setAttribute("role", "listbox");
 const noProject = new FakeElement("button");
@@ -1145,8 +1149,9 @@ const actions = new FakeElement("div");
 actions.textContent = "Actions";
 list.appendChild(noProject);
 list.appendChild(actions);
-	picker.append(input, title, list);
+	picker.append(input, title, popupProjectButton, list);
 	body.appendChild(picker);
+	body.appendChild(visibleActivator);
 	require(scriptPath);
 	globalThis.sessionStorage.setItem("cliproxyapi.ampLocalInference.selectedLocalProject", JSON.stringify({
 		name: "on-chain",
@@ -1164,11 +1169,25 @@ list.appendChild(actions);
 	assert(createURL.searchParams.get("cliproxy-working-directory") === "/Users/aikins01/Developer/telemetry.dev", "create-thread did not use visible project from local cache: " + lastFetchURL);
 	await new Promise((resolve) => setTimeout(resolve, 25));
 	const localItems = list.querySelectorAll("[data-cliproxy-local-project-item]");
-assert(localItems.length === 2, "expected two local project items, got " + localItems.length);
+assert(localItems.length === 4, "expected four local project items, got " + localItems.length);
 const selected = localItems.find((item) => item.getAttribute("aria-selected") === "true" || item.dataset.selected === "true");
 assert(selected, "no injected local project item was selected");
 assert(selected.dataset.cliproxyLocalProjectWorkingDirectory === "/Users/aikins01/Developer/telemetry.dev", "visible project was not selected: " + selected.innerText);
 assert(selected.innerText.includes("Current"), "visible project item was not marked Current");
+assert(popupProjectButton.textContent.includes("Project: telemetry.dev"), "popup project button stayed stale: " + popupProjectButton.textContent);
+globalThis.sessionStorage.setItem("cliproxyapi.ampLocalInference.selectedLocalProject", JSON.stringify({
+	name: "telemetry.dev",
+	workingDirectory: tempTelemetryDirectory,
+	selectedAt: Date.now(),
+}));
+lastFetchURL = "";
+await globalThis.fetch("https://ampcode.com/_app/remote/3abror/createProjectThread", {
+	method: "POST",
+	headers: { "Content-Type": "application/json" },
+	body: JSON.stringify({ payload: "" }),
+});
+const explicitDuplicateURL = new URL(lastFetchURL);
+assert(explicitDuplicateURL.searchParams.get("cliproxy-working-directory") === tempTelemetryDirectory, "explicit duplicate project was overridden: " + lastFetchURL);
 	picker.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
 	await new Promise((resolve) => setTimeout(resolve, 25));
 	assert(globalThis.localStorage.getItem("cliproxyapi.ampLocalInference.workingDirectory") === "/Users/aikins01/Developer/telemetry.dev", "Enter did not activate the selected visible project");

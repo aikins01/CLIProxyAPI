@@ -1492,40 +1492,42 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 
 	function visibleProjectName() {
 		for (const element of globalThis.document.querySelectorAll("button,[role='button'],[aria-haspopup]")) {
-			const text = (element.innerText || element.textContent || "").replace(/\s+/g, " ").trim();
-			const match = text.match(/(?:^|\b)Project:\s*([^\n]+?)(?:\s{2,}|\s*[⌃⌥⇧⌘]|$)/);
-			if (match && match[1]) {
-				return match[1].trim();
+			if (element.closest('[cmdk-root],[data-cmdk-root],[data-slot="dialog-content"],[role="dialog"]')) {
+				continue;
+			}
+			const label = localProjectActivatorProjectLabel(element);
+			if (label) {
+				return label;
 			}
 		}
 		return "";
 	}
 
-		function visibleProjectWorkingDirectory() {
-			const name = visibleProjectName();
-			if (!name) {
-				return "";
-			}
-			const project = localProjectByVisibleName(localProjectsCache.projects, name);
-			const projectDirectory = normalizeWorkingDirectory(project?.workingDirectory);
-			if (projectDirectory) {
-				return projectDirectory;
-			}
-			if (selectedLocalProjectWorkingDirectory() || storedLocalWorkingDirectory()) {
-				return "";
-			}
-			const matches = new Set();
-			for (const workingDirectory of Object.values(threadWorkingDirectories())) {
-				const normalized = normalizeWorkingDirectory(workingDirectory);
-				if (normalized && pathBaseName(normalized) === name) {
-					matches.add(normalized);
-				}
-			}
-			if (matches.size === 1) {
-				return [...matches][0];
-			}
+	function visibleProjectWorkingDirectory() {
+		const name = visibleProjectName();
+		if (!name) {
 			return "";
 		}
+		const project = localProjectByVisibleName(localProjectsCache.projects, name);
+		const projectDirectory = normalizeWorkingDirectory(project?.workingDirectory);
+		if (projectDirectory) {
+			return projectDirectory;
+		}
+		if (selectedLocalProjectWorkingDirectory() || storedLocalWorkingDirectory()) {
+			return "";
+		}
+		const matches = new Set();
+		for (const workingDirectory of Object.values(threadWorkingDirectories())) {
+			const normalized = normalizeWorkingDirectory(workingDirectory);
+			if (normalized && pathBaseName(normalized) === name) {
+				matches.add(normalized);
+			}
+		}
+		if (matches.size === 1) {
+			return [...matches][0];
+		}
+		return "";
+	}
 
 	function remoteCreateProjectThreadWorkingDirectory(body) {
 		const decoded = decodeRemoteCommandBody(body);
@@ -2079,11 +2081,12 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		const workingDirectory = currentLocalProjectWorkingDirectory();
 		const visibleName = visibleProjectName();
 		const visibleNeedsLookup = !!visibleName && !visibleProjectWorkingDirectory();
+		const targetLabel = firstString(visibleName, pathBaseName(workingDirectory));
 		if (!workingDirectory && !visibleName) {
 			return;
 		}
 		for (const activator of localProjectActivatorCandidates(root)) {
-			if ((!visibleNeedsLookup && workingDirectory && !localProjectActivatorNeedsPatch(activator, workingDirectory)) || activator.dataset.cliproxyLocalProjectActivatorLoading === "1") {
+			if ((!visibleNeedsLookup && workingDirectory && !localProjectActivatorNeedsPatch(activator, workingDirectory, targetLabel)) || activator.dataset.cliproxyLocalProjectActivatorLoading === "1") {
 				continue;
 			}
 			activator.dataset.cliproxyLocalProjectActivatorLoading = "1";
@@ -2091,13 +2094,13 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 				delete activator.dataset.cliproxyLocalProjectActivatorLoading;
 				let project = localProjectByVisibleName(projects, visibleName);
 				const resolvedWorkingDirectory = normalizeWorkingDirectory(project?.workingDirectory) || workingDirectory;
-				if (!resolvedWorkingDirectory || !globalThis.document.contains(activator) || !localProjectActivatorNeedsPatch(activator, resolvedWorkingDirectory)) {
-					return;
-				}
 				if (!project) {
 					project = localProjectByWorkingDirectory(projects, resolvedWorkingDirectory);
 				}
 				const label = firstString(project?.name, pathBaseName(resolvedWorkingDirectory));
+				if (!resolvedWorkingDirectory || !globalThis.document.contains(activator) || !localProjectActivatorNeedsPatch(activator, resolvedWorkingDirectory, label)) {
+					return;
+				}
 				if (!label) {
 					return;
 				}
@@ -2129,15 +2132,27 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		if (!elementVisible(activator)) {
 			return false;
 		}
-		const text = (activator.innerText || activator.textContent || "").replace(/\s+/g, " ").trim();
-		return /\bProject:\s*No Project\b/.test(text);
+		return localProjectActivatorProjectLabel(activator) === "No Project";
 	}
 
-	function localProjectActivatorNeedsPatch(activator, workingDirectory) {
+	function localProjectActivatorProjectLabel(activator) {
+		if (!(activator instanceof Element)) {
+			return "";
+		}
+		const text = (activator.innerText || activator.textContent || "").replace(/\s+/g, " ").trim();
+		const match = text.match(/(?:^|\b)Project:\s*([^\n]+?)(?:\s{2,}|\s*[⌃⌥⇧⌘]|$)/);
+		return match && match[1] ? match[1].trim() : "";
+	}
+
+	function localProjectActivatorNeedsPatch(activator, workingDirectory, label = "") {
 		if (!elementVisible(activator)) {
 			return false;
 		}
 		if (localProjectActivatorLooksUnset(activator)) {
+			return true;
+		}
+		const currentLabel = localProjectActivatorProjectLabel(activator);
+		if (label && currentLabel && normalizeProjectPickerName(currentLabel) !== normalizeProjectPickerName(label)) {
 			return true;
 		}
 		if (activator.dataset?.cliproxyLocalProjectActivator !== "1") {
@@ -2149,7 +2164,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	function patchLocalProjectActivator(activator, label, workingDirectory) {
 		const walker = globalThis.document.createTreeWalker(activator, NodeFilter.SHOW_TEXT);
 		let changed = false;
-		const replacementTargets = ["No Project", activator.dataset.cliproxyLocalProjectLabel].filter((target) => target && target !== label);
+		const replacementTargets = ["No Project", activator.dataset.cliproxyLocalProjectLabel, localProjectActivatorProjectLabel(activator)].filter((target) => target && target !== label);
 		for (let node = walker.nextNode(); node; node = walker.nextNode()) {
 			if (!node.nodeValue) {
 				continue;
@@ -2232,7 +2247,38 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 				matches.push(project);
 			}
 		}
-		return matches.length === 1 ? matches[0] : null;
+		if (matches.length <= 1) {
+			return matches[0] || null;
+		}
+		for (const workingDirectory of [activeThreadWorkingDirectory(), selectedLocalProjectWorkingDirectory(), storedLocalWorkingDirectory()]) {
+			const project = localProjectByWorkingDirectory(matches, workingDirectory);
+			if (project) {
+				return project;
+			}
+		}
+		matches.sort((left, right) => localProjectDirectoryRank(left?.workingDirectory) - localProjectDirectoryRank(right?.workingDirectory));
+		return matches[0] || null;
+	}
+
+	function localProjectDirectoryRank(workingDirectory) {
+		const dir = normalizeWorkingDirectory(workingDirectory);
+		if (!dir) {
+			return 99;
+		}
+		const activeDirectory = activeThreadWorkingDirectory();
+		if (activeDirectory && dir === activeDirectory) {
+			return 0;
+		}
+		if (/^\/Users\/[^/]+\/Developer\//.test(dir)) {
+			return 1;
+		}
+		if (/^\/Users\//.test(dir)) {
+			return 2;
+		}
+		if (/^(\/private)?\/tmp\//.test(dir) || /^\/private\/var\/folders\//.test(dir) || /^\/var\/folders\//.test(dir)) {
+			return 4;
+		}
+		return 3;
 	}
 
 	function integrateLocalProjectPickers(root) {
