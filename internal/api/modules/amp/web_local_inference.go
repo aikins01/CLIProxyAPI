@@ -209,7 +209,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	return fmt.Sprintf(`// ==UserScript==
 // @name CLIProxyAPI Amp Local Inference
 // @namespace https://github.com/router-for-me/CLIProxyAPI
-// @version 0.1.42
+// @version 0.1.43
 %s
 // @updateURL %s
 // @downloadURL %s
@@ -221,7 +221,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	"use strict";
 
 	const bridgeHeader = %s;
-	const userscriptVersion = "0.1.42";
+	const userscriptVersion = "0.1.43";
 	const apiKeyStorageKey = "cliproxyapi.ampLocalInference.apiKey";
 	const workingDirectoryStorageKey = "cliproxyapi.ampLocalInference.workingDirectory";
 	const selectedLocalProjectStorageKey = "cliproxyapi.ampLocalInference.selectedLocalProject";
@@ -990,6 +990,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			return false;
 		}
 		thread.threadActorConfig = ensureDevalueValueIndex(values, localDevalueThreadActorConfig(values, threadID, getBaseIndex()));
+		diagnostics.lastPatchedThreadID = threadID;
 		return true;
 	}
 
@@ -1167,6 +1168,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			return false;
 		}
 		thread.threadActorConfig = localPlainThreadActorConfig(threadID, localBase);
+		diagnostics.lastPatchedThreadID = threadID;
 		return true;
 	}
 
@@ -1523,18 +1525,21 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 
 	function rememberRemoteCreateProjectThread(sourceURL, body, response) {
 		if (!createProjectThreadRemotePath(sourceURL.pathname)) {
-			return;
+			return Promise.resolve(response);
 		}
 		const workingDirectory = remoteCreateProjectThreadWorkingDirectory(body);
 		if (!response || !response.ok || typeof response.clone !== "function") {
-			return;
+			return Promise.resolve(response);
 		}
 		const decodedRequest = decodeRemoteCommandBody(body);
-		response.clone().text().then((text) => {
+		return response.clone().text().then((text) => {
 			try {
 				const envelope = originalJSONParse(text || "{}");
 				const result = decodeDevalueString(envelope.data || "");
 				const value = isPlainObject(result) ? result._ : null;
+				if (isPlainObject(value) && value.ok === false) {
+					return;
+				}
 				const threadID = responseThreadID(value);
 				if (!threadID) {
 					return;
@@ -1551,7 +1556,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 				});
 			} catch {
 			}
-		});
+		}).then(() => response, () => response);
 	}
 
 	function bridgeRequestBody(sourceURL, method, body) {
@@ -3056,8 +3061,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 				return request.clone().text().then((text) => {
 					const body = bridgeRequestBody(sourceURL, method, text);
 					return originalFetch(targetURLForBody(body), makeOptions(body)).then((response) => {
-						rememberRemoteCreateProjectThread(sourceURL, body, response);
-						return response;
+						return rememberRemoteCreateProjectThread(sourceURL, body, response);
 					});
 				});
 			} catch {
@@ -3066,8 +3070,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		const body = bridgeRequestBody(sourceURL, method, init?.body ?? requestOptions.body);
 		const options = makeOptions(body);
 		return originalFetch(targetURLForBody(body), options).then((response) => {
-			rememberRemoteCreateProjectThread(sourceURL, body, response);
-			return response;
+			return rememberRemoteCreateProjectThread(sourceURL, body, response);
 		});
 	};
 

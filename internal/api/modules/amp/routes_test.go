@@ -407,7 +407,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 	body := rec.Body.String()
 	for _, want := range []string{
 		"// ==UserScript==",
-		"@version 0.1.42",
+		"@version 0.1.43",
 		"@match https://ampcode.com/*",
 		"@updateURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
 		"@downloadURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
@@ -422,7 +422,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"commandPaletteIntegrationCount",
 		"localThreadPickerOpenCount",
 		"removedLocalThreadControlCount",
-		`const userscriptVersion = "0.1.42"`,
+		`const userscriptVersion = "0.1.43"`,
 		"userscriptVersion",
 		"lastPatchedThreadActorBaseURL",
 		"lastPatchedThreadID",
@@ -653,12 +653,16 @@ func TestWebLocalInferenceUserscriptPatchesLocalThreadActorConfig(t *testing.T) 
 	threadID := "T-019f324b-2802-7868-b1b1-5f0fa3e87ea5"
 	secondThreadID := "T-019f324b-2802-7868-b1b1-5f0fa3e87ea6"
 	runner := `
+(async () => {
 const assert = (condition, message) => {
 	if (!condition) throw new Error(message);
 };
 const scriptPath = ` + strconv.Quote(scriptPath) + `;
 const threadID = ` + strconv.Quote(threadID) + `;
 const secondThreadID = ` + strconv.Quote(secondThreadID) + `;
+const createdThreadID = "T-019f20b2-5e05-7501-8ddd-994e151ee951";
+const failedThreadID = "T-019f20b2-5e05-7501-8ddd-994e151ee955";
+const createdThreadWorkDir = "/Users/aikins01/Developer/CLIProxyAPI";
 class TestStorage {
 	constructor() { this.values = new Map(); }
 	getItem(key) {
@@ -717,7 +721,43 @@ globalThis.NodeFilter = { SHOW_TEXT: 4, SHOW_ELEMENT: 1 };
 globalThis.MutationObserver = class { observe() {} disconnect() {} };
 globalThis.localStorage = new TestStorage();
 globalThis.sessionStorage = new TestStorage();
-globalThis.fetch = async () => { throw new Error("unexpected fetch"); };
+const encodeDevalue = (value) => Buffer.from(JSON.stringify(value)).toString("base64url");
+const requestPayloadText = (body) => {
+	try {
+		return Buffer.from(JSON.parse(body).payload || "", "base64url").toString("utf8");
+	} catch {
+		return "";
+	}
+};
+let createFetchURL = "";
+globalThis.fetch = async (url, init) => {
+	createFetchURL = String(url);
+	const body = String(init?.body || "");
+	if (requestPayloadText(body).includes(failedThreadID)) {
+		const data = JSON.stringify([
+			{ _: 1 },
+			{ ok: 2, error: 3 },
+			false,
+			{ message: 4 },
+			"missing working directory",
+		]);
+		return new Response(JSON.stringify({ type: "result", data }), {
+			status: 200,
+			headers: { "Content-Type": "application/json" },
+		});
+	}
+	const data = JSON.stringify([
+		{ _: 1 },
+		{ ok: 2, threadID: 3, threadId: 3, workingDirectory: 4, workspaceRoot: 4 },
+		true,
+		createdThreadID,
+		createdThreadWorkDir,
+	]);
+	return new Response(JSON.stringify({ type: "result", data }), {
+		status: 200,
+		headers: { "Content-Type": "application/json" },
+	});
+};
 globalThis.WebSocket = NativeWebSocket;
 globalThis.prompt = () => "";
 globalThis.history = { state: null, replaceState() {} };
@@ -729,12 +769,14 @@ if (typeof globalThis.btoa !== "function") {
 }
 require(scriptPath);
 const bridge = globalThis.__cliproxyAmpLocalInference;
-assert(bridge && bridge.userscriptVersion === "0.1.42", "bridge userscript version was not exposed");
+assert(bridge && bridge.userscriptVersion === "0.1.43", "bridge userscript version was not exposed");
 globalThis.localStorage.setItem(bridge.localThreadIDsStorageKey, JSON.stringify([threadID, secondThreadID]));
 globalThis.localStorage.setItem(bridge.apiKeyStorageKey, "local-key");
+globalThis.localStorage.setItem(bridge.workingDirectoryStorageKey, createdThreadWorkDir);
 const assertPlainConfig = (config, label) => {
 	assert(config && typeof config === "object", label + " config missing");
-	assert(config.threadId === threadID, label + " threadId mismatch");
+	const expectedThreadID = label === "created plain" ? createdThreadID : threadID;
+	assert(config.threadId === expectedThreadID, label + " threadId mismatch");
 	assert(config.wsToken === "local-neo", label + " wsToken mismatch");
 	assert(config.ampURL === "http://127.0.0.1:8317", label + " ampURL mismatch");
 	assert(config.baseURL === "http://127.0.0.1:8317", label + " baseURL mismatch");
@@ -746,6 +788,7 @@ const assertPlainConfig = (config, label) => {
 };
 const plain = JSON.parse(JSON.stringify({ current: { thread: { id: threadID, title: "Local" }, threadActorConfig: null } }));
 assertPlainConfig(plain.current.threadActorConfig, "plain");
+assert(bridge.diagnostics.lastPatchedThreadID === threadID, "plain patch did not record thread ID");
 const values = JSON.parse(JSON.stringify([{ current: 1 }, { thread: 2 }, { id: 3, title: 4 }, threadID, "Local" ]));
 const configIndex = values[1].threadActorConfig;
 assert(Number.isInteger(configIndex), "devalue threadActorConfig was not a reference");
@@ -760,6 +803,7 @@ assert(deref(devalueConfig.poolName) === "default", "devalue poolName mismatch")
 assert(deref(devalueConfig.requiresSudoForWrite) === false, "devalue requiresSudoForWrite mismatch");
 assert(deref(devalueConfig.requiresSudoForTerminal) === false, "devalue requiresSudoForTerminal mismatch");
 assert(deref(devalueConfig.threadActorTransport) === "json-rpc", "devalue threadActorTransport mismatch");
+assert(bridge.diagnostics.lastPatchedThreadID === threadID, "devalue patch did not record thread ID");
 const nullConfigValues = JSON.parse(JSON.stringify([{ current: 1 }, { thread: 2, threadActorConfig: 5 }, { id: 3, title: 4 }, threadID, "Local", null ]));
 const nullConfigIndex = nullConfigValues[1].threadActorConfig;
 assert(Number.isInteger(nullConfigIndex), "null-ref devalue threadActorConfig was not patched");
@@ -775,6 +819,51 @@ assert(Number.isInteger(secondConfigIndex), "second devalue threadActorConfig wa
 const secondConfig = secondValues[secondConfigIndex];
 const secondDeref = (value) => Number.isInteger(value) ? secondValues[value] : value;
 assert(secondDeref(secondConfig.threadId) === secondThreadID, "second devalue threadId mismatch");
+const failedRequestBody = JSON.stringify({
+	payload: encodeDevalue([
+		{ content: 1, agentMode: 5, threadID: 6, reasoningEffort: 7 },
+		[2],
+		{ type: 3, text: 4 },
+		"text",
+		"Missing local project",
+		"deep",
+		failedThreadID,
+		"xhigh",
+	]),
+	refreshes: [],
+});
+await fetch("https://ampcode.com/_app/remote/3abror/createProjectThread", {
+	method: "POST",
+	headers: { "Content-Type": "application/json" },
+	body: failedRequestBody,
+});
+assert(!JSON.parse(globalThis.localStorage.getItem(bridge.localThreadIDsStorageKey)).includes(failedThreadID), "failed create thread was remembered");
+const createRequestBody = JSON.stringify({
+	payload: encodeDevalue([
+		{ content: 1, agentMode: 5, threadID: 6, reasoningEffort: 7 },
+		[2],
+		{ type: 3, text: 4 },
+		"text",
+		"Use local project",
+		"deep",
+		createdThreadID,
+		"xhigh",
+	]),
+	refreshes: [],
+});
+await fetch("https://ampcode.com/_app/remote/3abror/createProjectThread", {
+	method: "POST",
+	headers: { "Content-Type": "application/json" },
+	body: createRequestBody,
+});
+const bridgedCreateURL = new URL(createFetchURL);
+assert(bridgedCreateURL.origin === "http://127.0.0.1:8317", "create fetch was not bridged to local base");
+assert(bridgedCreateURL.searchParams.get("cliproxy-working-directory") === createdThreadWorkDir, "create fetch missing working directory");
+assert(JSON.parse(globalThis.localStorage.getItem(bridge.localThreadIDsStorageKey)).includes(createdThreadID), "created thread was not remembered before route-data parse");
+globalThis.location = new URL("https://ampcode.com/threads/" + createdThreadID);
+const createdPlain = JSON.parse(JSON.stringify({ threadData: { thread: { id: createdThreadID, title: "Created" }, threadActorConfig: null } }));
+assertPlainConfig(createdPlain.threadData.threadActorConfig, "created plain");
+assert(bridge.diagnostics.lastPatchedThreadID === createdThreadID, "created route-data patch did not record thread ID");
 const socket = new WebSocket("wss://ampcode.com/gateway/threadActor/?rvt-method=get&rvt-key=" + encodeURIComponent(secondThreadID));
 const rewritten = new URL(socket.url);
 assert(rewritten.protocol === "ws:", "websocket protocol was not rewritten");
@@ -788,6 +877,10 @@ assert(relativeRewritten.host === "127.0.0.1:8317", "relative websocket host was
 assert(relativeRewritten.searchParams.get("cliproxy-api-key") === "local-key", "relative localStorage API key was not applied");
 assert(bridge.diagnostics.decodedConfigPatchCount >= 2, "decoded config patches were not recorded");
 assert(bridge.diagnostics.webSocketBootstrapCount === 2, "websocket bootstrap was not recorded");
+})().catch((error) => {
+	console.error(error && error.stack ? error.stack : error);
+	process.exit(1);
+});
 `
 	runnerPath := filepath.Join(dir, "run-userscript-test.js")
 	if err := os.WriteFile(runnerPath, []byte(runner), 0o600); err != nil {
