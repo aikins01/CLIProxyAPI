@@ -407,7 +407,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 	body := rec.Body.String()
 	for _, want := range []string{
 		"// ==UserScript==",
-		"@version 0.1.44",
+		"@version 0.1.45",
 		"@match https://ampcode.com/*",
 		"@updateURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
 		"@downloadURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
@@ -422,7 +422,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"commandPaletteIntegrationCount",
 		"localThreadPickerOpenCount",
 		"removedLocalThreadControlCount",
-		`const userscriptVersion = "0.1.44"`,
+		`const userscriptVersion = "0.1.45"`,
 		"userscriptVersion",
 		"lastPatchedThreadActorBaseURL",
 		"lastPatchedThreadID",
@@ -468,6 +468,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"installLocalProjectPickerIntegration",
 		"installLocalProjectNoProjectSelectionHandler",
 		"localProjectPickerLooksLikeProjectPicker",
+		"if (!item || projectPickerItemSelected(item))",
 		"closeLocalProjectPickerViaNoProject",
 		"localProjectFetchCount",
 		"localProjectPickerIntegrationCount",
@@ -607,6 +608,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		`source.includes("executorConnected")`,
 		"ensureDevalueValueIndex(values, true)",
 		`if (!workingDirectory || !response || !response.ok || typeof response.clone !== "function")`,
+		"!projectPickerItemSelected(noProject)",
 		"/_app/remote/cliproxy/listThreadListSidebar",
 		`case "listThreadListSidebar":`,
 		`case "listUserExecutorDaemons":`,
@@ -770,7 +772,7 @@ if (typeof globalThis.btoa !== "function") {
 }
 require(scriptPath);
 const bridge = globalThis.__cliproxyAmpLocalInference;
-assert(bridge && bridge.userscriptVersion === "0.1.44", "bridge userscript version was not exposed");
+assert(bridge && bridge.userscriptVersion === "0.1.45", "bridge userscript version was not exposed");
 globalThis.localStorage.setItem(bridge.localThreadIDsStorageKey, JSON.stringify([threadID, secondThreadID]));
 globalThis.localStorage.setItem(bridge.apiKeyStorageKey, "local-key");
 globalThis.localStorage.setItem(bridge.workingDirectoryStorageKey, createdThreadWorkDir);

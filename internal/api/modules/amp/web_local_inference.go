@@ -209,7 +209,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	return fmt.Sprintf(`// ==UserScript==
 // @name CLIProxyAPI Amp Local Inference
 // @namespace https://github.com/router-for-me/CLIProxyAPI
-// @version 0.1.44
+// @version 0.1.45
 %s
 // @updateURL %s
 // @downloadURL %s
@@ -221,7 +221,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	"use strict";
 
 	const bridgeHeader = %s;
-	const userscriptVersion = "0.1.44";
+	const userscriptVersion = "0.1.45";
 	const apiKeyStorageKey = "cliproxyapi.ampLocalInference.apiKey";
 	const workingDirectoryStorageKey = "cliproxyapi.ampLocalInference.workingDirectory";
 	const selectedLocalProjectStorageKey = "cliproxyapi.ampLocalInference.selectedLocalProject";
@@ -2558,12 +2558,8 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		if (!list || list.dataset.cliproxyCurrentProjectAutoSelected === "1") {
 			return;
 		}
-		const noProject = localProjectPickerNoProjectItem(picker);
-		if (!noProject || !projectPickerItemSelected(noProject)) {
-			return;
-		}
 		const item = currentProjectPickerItem(picker);
-		if (!item || item === noProject) {
+		if (!item || projectPickerItemSelected(item)) {
 			return;
 		}
 		list.dataset.cliproxyCurrentProjectAutoSelected = "1";
