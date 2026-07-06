@@ -215,7 +215,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	return fmt.Sprintf(`// ==UserScript==
 // @name CLIProxyAPI Amp Local Inference
 // @namespace https://github.com/router-for-me/CLIProxyAPI
-// @version 0.1.47
+// @version 0.1.48
 %s
 // @updateURL %s
 // @downloadURL %s
@@ -227,7 +227,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	"use strict";
 
 	const bridgeHeader = %s;
-	const userscriptVersion = "0.1.47";
+	const userscriptVersion = "0.1.48";
 	const apiKeyStorageKey = "cliproxyapi.ampLocalInference.apiKey";
 	const workingDirectoryStorageKey = "cliproxyapi.ampLocalInference.workingDirectory";
 	const selectedLocalProjectStorageKey = "cliproxyapi.ampLocalInference.selectedLocalProject";
@@ -374,15 +374,19 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	}
 
 	function selectedLocalProjectWorkingDirectory() {
+		return normalizeWorkingDirectory(selectedLocalProject()?.workingDirectory);
+	}
+
+	function selectedLocalProject() {
 		try {
 			const parsed = originalJSONParse(globalThis.sessionStorage.getItem(selectedLocalProjectStorageKey) || "{}");
 			const selectedAt = Number(parsed.selectedAt || 0);
 			if (!selectedAt || Date.now() - selectedAt > 10 * 60 * 1000) {
-				return "";
+				return null;
 			}
-			return normalizeWorkingDirectory(parsed.workingDirectory);
+			return parsed;
 		} catch {
-			return "";
+			return null;
 		}
 	}
 
@@ -1609,6 +1613,24 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	}
 
 	function visibleProjectName() {
+		return visibleProjectNameFromDocument();
+	}
+
+	function visibleCreateProjectName(localOnly = false) {
+		const dialogSelector = '[cmdk-root],[data-cmdk-root],[data-slot="dialog-content"],[role="dialog"]';
+		for (const element of globalThis.document.querySelectorAll("button,[role='button'],[aria-haspopup],a")) {
+			if (!element.closest(dialogSelector) || (localOnly && element.dataset?.cliproxyLocalProjectActivator !== "1")) {
+				continue;
+			}
+			const label = localProjectActivatorProjectLabel(element) || projectHeaderProjectLabel(element);
+			if (label) {
+				return label;
+			}
+		}
+		return "";
+	}
+
+	function visibleProjectNameFromDocument() {
 		for (const element of globalThis.document.querySelectorAll("button,[role='button'],[aria-haspopup],a")) {
 			if (element.closest('[cmdk-root],[data-cmdk-root],[data-slot="dialog-content"],[role="dialog"],article,[data-message-id],[data-message]')) {
 				continue;
@@ -1619,6 +1641,31 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			}
 		}
 		return "";
+	}
+
+	function visibleCreateThreadProjectName() {
+		const createName = visibleCreateProjectName(false);
+		const pageName = visibleProjectName();
+		if (!createName) {
+			return pageName;
+		}
+		const createDirectory = visibleLocalProjectWorkingDirectory(createName);
+		if (createDirectory || !pageName || normalizeProjectPickerName(createName) === normalizeProjectPickerName(pageName)) {
+			return createName;
+		}
+		return pageName;
+	}
+
+	function visibleCreateThreadLookupProjectName() {
+		return visibleCreateProjectName(false) || visibleProjectName();
+	}
+
+	function unresolvedCreateThreadDialogProject() {
+		const createName = visibleCreateProjectName(false);
+		const pageName = visibleProjectName();
+		return !!createName && !!pageName &&
+			normalizeProjectPickerName(createName) !== normalizeProjectPickerName(pageName) &&
+			!visibleLocalProjectWorkingDirectory(createName);
 	}
 
 	function compactElementText(element) {
@@ -1661,8 +1708,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			element.matches?.("main,[role='main'],article,section,[data-message-id],[data-message]");
 	}
 
-	function visibleProjectWorkingDirectory() {
-		const name = visibleProjectName();
+	function visibleProjectWorkingDirectory(name = visibleProjectName()) {
 		if (!name) {
 			return "";
 		}
@@ -1706,13 +1752,19 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			if (fromProjectID) {
 				return fromProjectID;
 			}
-			const fromVisibleLocalProject = visibleLocalProjectWorkingDirectory();
+			if (unresolvedCreateThreadDialogProject()) {
+				return "";
+			}
+			const fromVisibleLocalProject = visibleLocalProjectWorkingDirectory(visibleCreateThreadProjectName());
 			if (fromVisibleLocalProject) {
 				return fromVisibleLocalProject;
 			}
 			return "";
 		}
-		const fromVisibleProject = visibleProjectWorkingDirectory();
+		if (unresolvedCreateThreadDialogProject()) {
+			return "";
+		}
+		const fromVisibleProject = visibleProjectWorkingDirectory(visibleCreateThreadProjectName());
 		if (fromVisibleProject) {
 			return fromVisibleProject;
 		}
@@ -1724,7 +1776,8 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	}
 
 	function ensureVisibleProjectLookupForRemoteCreate(sourceURL) {
-		if (!createProjectThreadRemotePath(sourceURL.pathname) || visibleProjectWorkingDirectory() || !visibleProjectName()) {
+		const projectName = visibleCreateThreadLookupProjectName();
+		if (!createProjectThreadRemotePath(sourceURL.pathname) || visibleProjectWorkingDirectory(projectName) || !projectName) {
 			return Promise.resolve();
 		}
 		return fetchLocalProjects(false).then(() => undefined, () => undefined);

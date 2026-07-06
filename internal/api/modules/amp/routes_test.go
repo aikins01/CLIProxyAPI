@@ -413,7 +413,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 	}
 	for _, want := range []string{
 		"// ==UserScript==",
-		"@version 0.1.47",
+		"@version 0.1.48",
 		"@match https://ampcode.com/*",
 		"@updateURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
 		"@downloadURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
@@ -428,7 +428,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"commandPaletteIntegrationCount",
 		"localThreadPickerOpenCount",
 		"removedLocalThreadControlCount",
-		`const userscriptVersion = "0.1.47"`,
+		`const userscriptVersion = "0.1.48"`,
 		"userscriptVersion",
 		"lastPatchedThreadActorBaseURL",
 		"lastPatchedThreadID",
@@ -578,7 +578,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 			t.Fatalf("userscript missing %q:\n%s", want, body)
 		}
 	}
-	visibleProjectIndex := strings.Index(body, "const fromVisibleProject = visibleProjectWorkingDirectory();")
+	visibleProjectIndex := strings.Index(body, "const fromVisibleProject = visibleProjectWorkingDirectory(visibleCreateThreadProjectName());")
 	selectedLocalProjectIndex := strings.Index(body, "const fromSelectedLocalProject = selectedLocalProjectWorkingDirectory();")
 	if selectedLocalProjectIndex < 0 || visibleProjectIndex < 0 || visibleProjectIndex > selectedLocalProjectIndex {
 		t.Fatalf("userscript must prefer visible project before stale selected local project for create-thread working directory")
@@ -629,8 +629,8 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 	}
 	projectIDIndex := strings.Index(body, `const projectID = isPlainObject(decoded) ? firstString(decoded.projectID, decoded.projectId, decoded.project_id) : "";`)
 	projectIDLookupIndex := strings.Index(body, `const fromProjectID = normalizeWorkingDirectory(localProjectByID(localProjectsCache.projects, projectID)?.workingDirectory);`)
-	projectIDVisibleLookupIndex := strings.Index(body, `const fromVisibleLocalProject = visibleLocalProjectWorkingDirectory();`)
-	visibleProjectFallbackIndex := strings.Index(body, `const fromVisibleProject = visibleProjectWorkingDirectory();`)
+	projectIDVisibleLookupIndex := strings.Index(body, `const fromVisibleLocalProject = visibleLocalProjectWorkingDirectory(visibleCreateThreadProjectName());`)
+	visibleProjectFallbackIndex := strings.Index(body, `const fromVisibleProject = visibleProjectWorkingDirectory(visibleCreateThreadProjectName());`)
 	if projectIDIndex < 0 || projectIDLookupIndex < 0 || projectIDVisibleLookupIndex < 0 || visibleProjectFallbackIndex < 0 || projectIDIndex > projectIDLookupIndex || projectIDLookupIndex > projectIDVisibleLookupIndex || projectIDVisibleLookupIndex > visibleProjectFallbackIndex || !strings.Contains(body[projectIDLookupIndex:visibleProjectFallbackIndex], `return fromProjectID;`) || !strings.Contains(body[projectIDVisibleLookupIndex:visibleProjectFallbackIndex], `return "";`) {
 		t.Fatalf("userscript should resolve projectID bodies before visible project fallback:\n%s", body)
 	}
@@ -793,7 +793,7 @@ if (typeof globalThis.btoa !== "function") {
 }
 require(scriptPath);
 const bridge = globalThis.__cliproxyAmpLocalInference;
-assert(bridge && bridge.userscriptVersion === "0.1.47", "bridge userscript version was not exposed");
+assert(bridge && bridge.userscriptVersion === "0.1.48", "bridge userscript version was not exposed");
 globalThis.localStorage.setItem(bridge.localThreadIDsStorageKey, JSON.stringify([threadID, secondThreadID]));
 globalThis.localStorage.setItem(bridge.apiKeyStorageKey, "local-key");
 globalThis.localStorage.setItem(bridge.workingDirectoryStorageKey, createdThreadWorkDir);
@@ -1261,6 +1261,7 @@ list.appendChild(actions);
 		workingDirectory: "/Users/aikins01/Developer/on-chain",
 		selectedAt: Date.now(),
 	}));
+	popupProjectButton.textContent = "Project: telemetry.dev";
 	lastFetchURL = "";
 	await globalThis.fetch("https://ampcode.com/_app/remote/3abror/createProjectThread", {
 		method: "POST",
@@ -1272,6 +1273,7 @@ list.appendChild(actions);
 	assert(createURL.searchParams.get("cliproxy-working-directory") === "/Users/aikins01/Developer/telemetry.dev", "create-thread did not use visible project from local cache: " + lastFetchURL);
 	headerProjectLink.textContent = "missing";
 	headerProjectLink.setAttribute("href", "https://github.com/example/missing/tree/main");
+	popupProjectButton.textContent = "Project: cloud-only";
 	lastFetchURL = "";
 	await globalThis.fetch("https://ampcode.com/_app/remote/3abror/createProjectThread", {
 		method: "POST",
@@ -1282,6 +1284,7 @@ list.appendChild(actions);
 	assert(!unresolvedProjectURL.searchParams.has("cliproxy-working-directory"), "unresolved projectID fell through to stale selected project: " + lastFetchURL);
 	headerProjectLink.textContent = "telemetry.dev";
 	headerProjectLink.setAttribute("href", "https://github.com/telemetry-dev/telemetry.dev/tree/6bcbce6911b604cfc8dd8255bc9215a930222dfb");
+	popupProjectButton.textContent = "Project: telemetry.dev";
 	await new Promise((resolve) => setTimeout(resolve, 25));
 	const localItems = list.querySelectorAll("[data-cliproxy-local-project-item]");
 assert(localItems.length === 4, "expected four local project items, got " + localItems.length);
@@ -1290,6 +1293,63 @@ assert(selected, "no injected local project item was selected");
 assert(selected.dataset.cliproxyLocalProjectWorkingDirectory === "/Users/aikins01/Developer/telemetry.dev", "visible project was not selected: " + selected.innerText);
 assert(selected.innerText.includes("Current"), "visible project item was not marked Current");
 assert(popupProjectButton.textContent.includes("Project: telemetry.dev"), "popup project button stayed stale: " + popupProjectButton.textContent);
+popupProjectButton.textContent = "Project: on-chain";
+delete popupProjectButton.dataset.cliproxyLocalProjectActivator;
+delete popupProjectButton.dataset.cliproxyLocalProjectLabel;
+delete popupProjectButton.dataset.cliproxyLocalProjectWorkingDirectory;
+globalThis.sessionStorage.setItem("cliproxyapi.ampLocalInference.selectedLocalProject", JSON.stringify({
+	name: "stale",
+	workingDirectory: "/Users/aikins01/Developer/stale",
+	selectedAt: Date.now(),
+}));
+lastFetchURL = "";
+await globalThis.fetch("https://ampcode.com/_app/remote/3abror/createProjectThread", {
+	method: "POST",
+	headers: { "Content-Type": "application/json" },
+	body: JSON.stringify({ payload: "" }),
+});
+const nativeDialogSelectedURL = new URL(lastFetchURL);
+assert(nativeDialogSelectedURL.searchParams.get("cliproxy-working-directory") === "/Users/aikins01/Developer/on-chain", "native dialog-selected project did not win: " + lastFetchURL);
+lastFetchURL = "";
+await globalThis.fetch("https://ampcode.com/_app/remote/3abror/createProjectThread", {
+	method: "POST",
+	headers: { "Content-Type": "application/json" },
+	body: JSON.stringify({ payload: encodeDevalue([{ projectID: 1 }, "75616c3b-f4de-48b7-8b83-c1af6978a034"]) }),
+});
+const nativeDialogProjectIDURL = new URL(lastFetchURL);
+assert(nativeDialogProjectIDURL.searchParams.get("cliproxy-working-directory") === "/Users/aikins01/Developer/on-chain", "projectID create did not use known dialog-selected project: " + lastFetchURL);
+popupProjectButton.textContent = "Project: cloud-only";
+delete popupProjectButton.dataset.cliproxyLocalProjectActivator;
+delete popupProjectButton.dataset.cliproxyLocalProjectLabel;
+delete popupProjectButton.dataset.cliproxyLocalProjectWorkingDirectory;
+lastFetchURL = "";
+await globalThis.fetch("https://ampcode.com/_app/remote/3abror/createProjectThread", {
+	method: "POST",
+	headers: { "Content-Type": "application/json" },
+	body: JSON.stringify({ payload: "" }),
+});
+const unresolvedDialogURL = new URL(lastFetchURL);
+assert(!unresolvedDialogURL.searchParams.has("cliproxy-working-directory"), "unresolved dialog project inherited page project: " + lastFetchURL);
+popupProjectButton.textContent = "Project: on-chain";
+popupProjectButton.dataset.cliproxyLocalProjectActivator = "1";
+popupProjectButton.dataset.cliproxyLocalProjectLabel = "on-chain";
+popupProjectButton.dataset.cliproxyLocalProjectWorkingDirectory = "/Users/aikins01/Developer/on-chain";
+globalThis.sessionStorage.setItem("cliproxyapi.ampLocalInference.selectedLocalProject", JSON.stringify({
+	name: "on-chain",
+	workingDirectory: "/Users/aikins01/Developer/on-chain",
+	selectedAt: Date.now(),
+}));
+lastFetchURL = "";
+await globalThis.fetch("https://ampcode.com/_app/remote/3abror/createProjectThread", {
+	method: "POST",
+	headers: { "Content-Type": "application/json" },
+	body: JSON.stringify({ payload: "" }),
+});
+const dialogSelectedURL = new URL(lastFetchURL);
+assert(dialogSelectedURL.searchParams.get("cliproxy-working-directory") === "/Users/aikins01/Developer/on-chain", "dialog-selected project did not win: " + lastFetchURL);
+popupProjectButton.textContent = "Project: telemetry.dev";
+popupProjectButton.dataset.cliproxyLocalProjectLabel = "telemetry.dev";
+popupProjectButton.dataset.cliproxyLocalProjectWorkingDirectory = "/Users/aikins01/Developer/telemetry.dev";
 globalThis.sessionStorage.setItem("cliproxyapi.ampLocalInference.selectedLocalProject", JSON.stringify({
 	name: "telemetry.dev",
 	workingDirectory: tempTelemetryDirectory,
@@ -1308,6 +1368,9 @@ assert(explicitDuplicateURL.searchParams.get("cliproxy-working-directory") === t
 	assert(globalThis.localStorage.getItem("cliproxyapi.ampLocalInference.workingDirectory") === "/Users/aikins01/Developer/telemetry.dev", "Enter did not activate the selected visible project");
 	headerProjectLink.textContent = "api";
 	headerProjectLink.setAttribute("href", "https://github.com/example/foo/tree/main");
+	popupProjectButton.textContent = "Project: api";
+	popupProjectButton.dataset.cliproxyLocalProjectLabel = "api";
+	popupProjectButton.dataset.cliproxyLocalProjectWorkingDirectory = "/Users/aikins01/Developer/bar/api";
 	globalThis.sessionStorage.setItem("cliproxyapi.ampLocalInference.selectedLocalProject", JSON.stringify({
 		name: "api",
 		workingDirectory: "/Users/aikins01/Developer/bar/api",
@@ -2820,11 +2883,17 @@ func TestWebLocalInferenceProjectIndexIncludesHistoryProjects(t *testing.T) {
 
 	existingDir := neoExistingDirectory(t.TempDir())
 	existingID := neoDeterministicLocalProjectID("existing", neoFileURLForDirectory(existingDir), existingDir)
+	rootProjectID := "75616c3b-f4de-48b7-8b83-c1af6978a034"
 	if err := writeNeoWebLocalProjectIndex(rt.threadDir, []any{map[string]any{
 		"id":               existingID,
 		"name":             "existing",
 		"repositoryURL":    neoFileURLForDirectory(existingDir),
 		"workingDirectory": existingDir,
+	}, map[string]any{
+		"id":               rootProjectID,
+		"name":             "local",
+		"repositoryURL":    "file:///",
+		"workingDirectory": string(filepath.Separator),
 	}}); err != nil {
 		t.Fatalf("write project index: %v", err)
 	}
@@ -2840,11 +2909,29 @@ func TestWebLocalInferenceProjectIndexIncludesHistoryProjects(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dataDir, "history.jsonl"), append(historyLine, '\n'), 0o600); err != nil {
 		t.Fatalf("write history: %v", err)
 	}
+	rootHistoryLine, err := json.Marshal(map[string]any{"text": "root local thread", "cwd": string(filepath.Separator)})
+	if err != nil {
+		t.Fatalf("marshal root history: %v", err)
+	}
+	historyFile, err := os.OpenFile(filepath.Join(dataDir, "history.jsonl"), os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("open history: %v", err)
+	}
+	if _, err := historyFile.Write(append(rootHistoryLine, '\n')); err != nil {
+		_ = historyFile.Close()
+		t.Fatalf("append root history: %v", err)
+	}
+	if err := historyFile.Close(); err != nil {
+		t.Fatalf("close history: %v", err)
+	}
 
 	expectedWorkDir := neoExistingDirectory(workDir)
 	expectedID := neoDeterministicLocalProjectID(filepath.Base(expectedWorkDir), neoFileURLForDirectory(expectedWorkDir), expectedWorkDir)
 	if got := rt.neoWebLocalProjectWorkingDirectory(expectedID); got != expectedWorkDir {
 		t.Fatalf("project workingDirectory = %q, want %q", got, expectedWorkDir)
+	}
+	if got := rt.neoWebLocalProjectWorkingDirectory(rootProjectID); got != "" {
+		t.Fatalf("root project workingDirectory = %q, want empty", got)
 	}
 	projects := rt.neoWebLocalProjectCache()
 	if len(projects) != 2 {
@@ -2864,6 +2951,19 @@ func TestWebLocalInferenceProjectIndexIncludesHistoryProjects(t *testing.T) {
 	}
 	if _, err := os.Stat(neoWebLocalProjectIndexPath(rt.threadDir)); err != nil {
 		t.Fatalf("project index was not written: %v", err)
+	}
+}
+
+func TestNeoWebLocalFilesystemRoot(t *testing.T) {
+	root := filepath.VolumeName(os.TempDir()) + string(filepath.Separator)
+	if !neoWebLocalFilesystemRoot(root) {
+		t.Fatalf("neoWebLocalFilesystemRoot(%q) = false, want true", root)
+	}
+	if neoWebLocalFilesystemRoot(t.TempDir()) {
+		t.Fatal("temporary directory was treated as filesystem root")
+	}
+	if got := neoWebLocalProjectDirectory(root); got != "" {
+		t.Fatalf("root project directory = %q, want empty", got)
 	}
 }
 

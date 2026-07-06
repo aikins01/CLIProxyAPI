@@ -12637,7 +12637,7 @@ func (rt *neoRuntime) neoWebLocalProjectWorkingDirectory(projectID string) strin
 			environment := cloneMap(actor.environment)
 			actor.mu.Unlock()
 			if neoThreadProjectID(meta) == projectID {
-				if dir := neoExistingDirectory(neoWorkingDirectoryFromEnvironment(environment)); dir != "" {
+				if dir := neoWebLocalProjectDirectory(neoWorkingDirectoryFromEnvironment(environment)); dir != "" {
 					return dir
 				}
 			}
@@ -12665,7 +12665,7 @@ func (rt *neoRuntime) neoWebLocalProjectWorkingDirectory(projectID string) strin
 		if !ok || neoThreadProjectID(mapValue(thread["meta"])) != projectID {
 			continue
 		}
-		if dir := neoExistingDirectory(neoWorkingDirectoryFromThread(thread)); dir != "" {
+		if dir := neoWebLocalProjectDirectory(neoWorkingDirectoryFromThread(thread)); dir != "" {
 			return dir
 		}
 	}
@@ -12741,7 +12741,7 @@ func scanNeoWebLocalHistoryProjects(threadDir string) []any {
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 0, 64*1024), 64*1024*1024)
 	for scanner.Scan() {
-		dir := neoExistingDirectory(gjson.GetBytes(scanner.Bytes(), "cwd").String())
+		dir := neoWebLocalProjectDirectory(gjson.GetBytes(scanner.Bytes(), "cwd").String())
 		if dir == "" {
 			continue
 		}
@@ -12802,7 +12802,7 @@ func neoWebLocalNormalizeProject(project map[string]any) map[string]any {
 	rawDir := strings.TrimSpace(stringValue(project["workingDirectory"]))
 	dir := ""
 	if rawDir != "" {
-		dir = neoExistingDirectory(rawDir)
+		dir = neoWebLocalProjectDirectory(rawDir)
 		if dir == "" {
 			return nil
 		}
@@ -12861,11 +12861,24 @@ func neoWebLocalProjectIDWorkingDirectory(projects []any, projectID string) stri
 		if !matched {
 			continue
 		}
-		if dir := neoExistingDirectory(project["workingDirectory"]); dir != "" {
+		if dir := neoWebLocalProjectDirectory(project["workingDirectory"]); dir != "" {
 			return dir
 		}
 	}
 	return ""
+}
+
+func neoWebLocalProjectDirectory(value any) string {
+	dir := neoExistingDirectory(value)
+	if dir == "" || neoWebLocalFilesystemRoot(dir) {
+		return ""
+	}
+	return dir
+}
+
+func neoWebLocalFilesystemRoot(dir string) bool {
+	clean := filepath.Clean(dir)
+	return filepath.IsAbs(clean) && filepath.Dir(clean) == clean
 }
 
 func neoWebLocalProjectFromThread(thread map[string]any) map[string]any {
@@ -12873,7 +12886,7 @@ func neoWebLocalProjectFromThread(thread map[string]any) map[string]any {
 		return nil
 	}
 	meta := mapValue(thread["meta"])
-	dir := neoWorkingDirectoryFromThread(thread)
+	dir := neoWebLocalProjectDirectory(neoWorkingDirectoryFromThread(thread))
 	repositoryURL := strings.TrimSpace(firstNonEmptyString(thread["repositoryURL"], meta["repositoryURL"], meta["repoURL"]))
 	if repositoryURL == "" && dir != "" {
 		repositoryURL = neoFileURLForDirectory(dir)
