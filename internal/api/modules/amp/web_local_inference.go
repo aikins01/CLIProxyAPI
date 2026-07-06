@@ -215,7 +215,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	return fmt.Sprintf(`// ==UserScript==
 // @name CLIProxyAPI Amp Local Inference
 // @namespace https://github.com/router-for-me/CLIProxyAPI
-// @version 0.1.46
+// @version 0.1.47
 %s
 // @updateURL %s
 // @downloadURL %s
@@ -227,7 +227,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	"use strict";
 
 	const bridgeHeader = %s;
-	const userscriptVersion = "0.1.46";
+	const userscriptVersion = "0.1.47";
 	const apiKeyStorageKey = "cliproxyapi.ampLocalInference.apiKey";
 	const workingDirectoryStorageKey = "cliproxyapi.ampLocalInference.workingDirectory";
 	const selectedLocalProjectStorageKey = "cliproxyapi.ampLocalInference.selectedLocalProject";
@@ -1666,8 +1666,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		if (!name) {
 			return "";
 		}
-		const project = localProjectByVisibleName(localProjectsCache.projects, name);
-		const projectDirectory = normalizeWorkingDirectory(project?.workingDirectory);
+		const projectDirectory = visibleLocalProjectWorkingDirectory(name);
 		if (projectDirectory) {
 			return projectDirectory;
 		}
@@ -1687,6 +1686,14 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		return "";
 	}
 
+	function visibleLocalProjectWorkingDirectory(name = visibleProjectName()) {
+		if (!name) {
+			return "";
+		}
+		const project = localProjectByVisibleName(localProjectsCache.projects, name);
+		return normalizeWorkingDirectory(project?.workingDirectory);
+	}
+
 	function remoteCreateProjectThreadWorkingDirectory(body) {
 		const decoded = decodeRemoteCommandBody(body);
 		const fromMention = threadMentionWorkingDirectory(remoteContentText(isPlainObject(decoded) ? decoded.content : null));
@@ -1695,6 +1702,14 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		}
 		const projectID = isPlainObject(decoded) ? firstString(decoded.projectID, decoded.projectId, decoded.project_id) : "";
 		if (projectID) {
+			const fromProjectID = normalizeWorkingDirectory(localProjectByID(localProjectsCache.projects, projectID)?.workingDirectory);
+			if (fromProjectID) {
+				return fromProjectID;
+			}
+			const fromVisibleLocalProject = visibleLocalProjectWorkingDirectory();
+			if (fromVisibleLocalProject) {
+				return fromVisibleLocalProject;
+			}
 			return "";
 		}
 		const fromVisibleProject = visibleProjectWorkingDirectory();
@@ -2388,6 +2403,19 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		const target = normalizeWorkingDirectory(workingDirectory);
 		for (const project of projects || []) {
 			if (normalizeWorkingDirectory(project?.workingDirectory) === target) {
+				return project;
+			}
+		}
+		return null;
+	}
+
+	function localProjectByID(projects, projectID) {
+		const target = firstString(projectID);
+		if (!target) {
+			return null;
+		}
+		for (const project of projects || []) {
+			if (firstString(project?.id, project?.projectID, project?.projectId, project?.project_id) === target) {
 				return project;
 			}
 		}

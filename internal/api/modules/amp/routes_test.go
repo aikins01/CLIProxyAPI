@@ -413,7 +413,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 	}
 	for _, want := range []string{
 		"// ==UserScript==",
-		"@version 0.1.46",
+		"@version 0.1.47",
 		"@match https://ampcode.com/*",
 		"@updateURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
 		"@downloadURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
@@ -428,7 +428,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"commandPaletteIntegrationCount",
 		"localThreadPickerOpenCount",
 		"removedLocalThreadControlCount",
-		`const userscriptVersion = "0.1.46"`,
+		`const userscriptVersion = "0.1.47"`,
 		"userscriptVersion",
 		"lastPatchedThreadActorBaseURL",
 		"lastPatchedThreadID",
@@ -628,9 +628,11 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		}
 	}
 	projectIDIndex := strings.Index(body, `const projectID = isPlainObject(decoded) ? firstString(decoded.projectID, decoded.projectId, decoded.project_id) : "";`)
+	projectIDLookupIndex := strings.Index(body, `const fromProjectID = normalizeWorkingDirectory(localProjectByID(localProjectsCache.projects, projectID)?.workingDirectory);`)
+	projectIDVisibleLookupIndex := strings.Index(body, `const fromVisibleLocalProject = visibleLocalProjectWorkingDirectory();`)
 	visibleProjectFallbackIndex := strings.Index(body, `const fromVisibleProject = visibleProjectWorkingDirectory();`)
-	if projectIDIndex < 0 || visibleProjectFallbackIndex < 0 || projectIDIndex > visibleProjectFallbackIndex || !strings.Contains(body[projectIDIndex:visibleProjectFallbackIndex], `if (projectID)`) {
-		t.Fatalf("userscript should reject projectID bodies before visible project fallback:\n%s", body)
+	if projectIDIndex < 0 || projectIDLookupIndex < 0 || projectIDVisibleLookupIndex < 0 || visibleProjectFallbackIndex < 0 || projectIDIndex > projectIDLookupIndex || projectIDLookupIndex > projectIDVisibleLookupIndex || projectIDVisibleLookupIndex > visibleProjectFallbackIndex || !strings.Contains(body[projectIDLookupIndex:visibleProjectFallbackIndex], `return fromProjectID;`) || !strings.Contains(body[projectIDVisibleLookupIndex:visibleProjectFallbackIndex], `return "";`) {
+		t.Fatalf("userscript should resolve projectID bodies before visible project fallback:\n%s", body)
 	}
 
 	headReq := httptest.NewRequest(http.MethodHead, "/ampcode/local-inference.user.js", nil)
@@ -791,7 +793,7 @@ if (typeof globalThis.btoa !== "function") {
 }
 require(scriptPath);
 const bridge = globalThis.__cliproxyAmpLocalInference;
-assert(bridge && bridge.userscriptVersion === "0.1.46", "bridge userscript version was not exposed");
+assert(bridge && bridge.userscriptVersion === "0.1.47", "bridge userscript version was not exposed");
 globalThis.localStorage.setItem(bridge.localThreadIDsStorageKey, JSON.stringify([threadID, secondThreadID]));
 globalThis.localStorage.setItem(bridge.apiKeyStorageKey, "local-key");
 globalThis.localStorage.setItem(bridge.workingDirectoryStorageKey, createdThreadWorkDir);
@@ -1212,6 +1214,7 @@ let localProjectsPayload = {
 };
 globalThis.prompt = () => "";
 globalThis.WebSocket = class {};
+const encodeDevalue = (value) => Buffer.from(JSON.stringify(value)).toString("base64url");
 const headerProjectLink = new FakeElement("a");
 headerProjectLink.setAttribute("href", "https://github.com/telemetry-dev/telemetry.dev/tree/6bcbce6911b604cfc8dd8255bc9215a930222dfb");
 headerProjectLink.textContent = "telemetry.dev";
@@ -1262,11 +1265,23 @@ list.appendChild(actions);
 	await globalThis.fetch("https://ampcode.com/_app/remote/3abror/createProjectThread", {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({ payload: "" }),
+		body: JSON.stringify({ payload: encodeDevalue([{ projectID: 1 }, "75616c3b-f4de-48b7-8b83-c1af6978a034"]) }),
 	});
 	const createURL = new URL(lastFetchURL);
 	assert(createURL.origin === "http://127.0.0.1:8317", "create-thread request was not rewritten locally: " + lastFetchURL);
 	assert(createURL.searchParams.get("cliproxy-working-directory") === "/Users/aikins01/Developer/telemetry.dev", "create-thread did not use visible project from local cache: " + lastFetchURL);
+	headerProjectLink.textContent = "missing";
+	headerProjectLink.setAttribute("href", "https://github.com/example/missing/tree/main");
+	lastFetchURL = "";
+	await globalThis.fetch("https://ampcode.com/_app/remote/3abror/createProjectThread", {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ payload: encodeDevalue([{ projectID: 1 }, "75616c3b-f4de-48b7-8b83-c1af6978a034"]) }),
+	});
+	const unresolvedProjectURL = new URL(lastFetchURL);
+	assert(!unresolvedProjectURL.searchParams.has("cliproxy-working-directory"), "unresolved projectID fell through to stale selected project: " + lastFetchURL);
+	headerProjectLink.textContent = "telemetry.dev";
+	headerProjectLink.setAttribute("href", "https://github.com/telemetry-dev/telemetry.dev/tree/6bcbce6911b604cfc8dd8255bc9215a930222dfb");
 	await new Promise((resolve) => setTimeout(resolve, 25));
 	const localItems = list.querySelectorAll("[data-cliproxy-local-project-item]");
 assert(localItems.length === 4, "expected four local project items, got " + localItems.length);
