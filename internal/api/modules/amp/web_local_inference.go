@@ -35,7 +35,7 @@ func (m *AmpModule) webLocalInferenceCORSMiddleware() gin.HandlerFunc {
 		c.Header("Vary", appendVaryHeader(c.Writer.Header().Get("Vary"), "Origin"))
 		c.Header("Access-Control-Allow-Origin", origin)
 		c.Header("Access-Control-Allow-Credentials", "true")
-		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		c.Header("Access-Control-Allow-Methods", "GET, HEAD, POST, PUT, DELETE, OPTIONS")
 		c.Header("Access-Control-Allow-Private-Network", "true")
 		c.Header("Access-Control-Allow-Headers", "Authorization, Content-Type, "+ampWebLocalInferenceHeader)
 		c.Header("Access-Control-Max-Age", "600")
@@ -182,7 +182,13 @@ func (m *AmpModule) serveWebLocalInferenceUserscript(c *gin.Context) {
 	if defaultBaseURL == "" {
 		defaultBaseURL = ampWebLocalInferenceDefaultBaseURL
 	}
-	c.String(http.StatusOK, ampWebLocalInferenceUserscript(defaultBaseURL, settings.AllowedOrigins))
+	script := ampWebLocalInferenceUserscript(defaultBaseURL, settings.AllowedOrigins)
+	c.Header("Content-Length", strconv.Itoa(len(script)))
+	if c.Request.Method == http.MethodHead {
+		c.Status(http.StatusOK)
+		return
+	}
+	c.Data(http.StatusOK, "application/javascript; charset=utf-8", []byte(script))
 }
 
 func (m *AmpModule) serveWebLocalProjects(c *gin.Context) {
@@ -1495,20 +1501,31 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		return "";
 	}
 
-	function visibleProjectWorkingDirectory() {
-		const name = visibleProjectName();
-		if (!name) {
+		function visibleProjectWorkingDirectory() {
+			const name = visibleProjectName();
+			if (!name) {
+				return "";
+			}
+			const project = localProjectByVisibleName(localProjectsCache.projects, name);
+			const projectDirectory = normalizeWorkingDirectory(project?.workingDirectory);
+			if (projectDirectory) {
+				return projectDirectory;
+			}
+			if (selectedLocalProjectWorkingDirectory() || storedLocalWorkingDirectory()) {
+				return "";
+			}
+			const matches = new Set();
+			for (const workingDirectory of Object.values(threadWorkingDirectories())) {
+				const normalized = normalizeWorkingDirectory(workingDirectory);
+				if (normalized && pathBaseName(normalized) === name) {
+					matches.add(normalized);
+				}
+			}
+			if (matches.size === 1) {
+				return [...matches][0];
+			}
 			return "";
 		}
-		const matches = new Set();
-		for (const workingDirectory of Object.values(threadWorkingDirectories())) {
-			const normalized = normalizeWorkingDirectory(workingDirectory);
-			if (normalized && pathBaseName(normalized) === name) {
-				matches.add(normalized);
-			}
-		}
-		return matches.size === 1 ? [...matches][0] : "";
-	}
 
 	function remoteCreateProjectThreadWorkingDirectory(body) {
 		const decoded = decodeRemoteCommandBody(body);
@@ -1520,15 +1537,22 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		if (projectID) {
 			return "";
 		}
-		const fromSelectedLocalProject = selectedLocalProjectWorkingDirectory();
-		if (fromSelectedLocalProject) {
-			return fromSelectedLocalProject;
-		}
 		const fromVisibleProject = visibleProjectWorkingDirectory();
 		if (fromVisibleProject) {
 			return fromVisibleProject;
 		}
+		const fromSelectedLocalProject = selectedLocalProjectWorkingDirectory();
+		if (fromSelectedLocalProject) {
+			return fromSelectedLocalProject;
+		}
 		return localWorkingDirectory();
+	}
+
+	function ensureVisibleProjectLookupForRemoteCreate(sourceURL) {
+		if (!createProjectThreadRemotePath(sourceURL.pathname) || visibleProjectWorkingDirectory() || !visibleProjectName()) {
+			return Promise.resolve();
+		}
+		return fetchLocalProjects(false).then(() => undefined, () => undefined);
 	}
 
 	function rememberRemoteCreateProjectThread(sourceURL, body, response) {
@@ -2053,25 +2077,31 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 
 	function integrateLocalProjectActivators(root) {
 		const workingDirectory = currentLocalProjectWorkingDirectory();
-		if (!workingDirectory) {
+		const visibleName = visibleProjectName();
+		const visibleNeedsLookup = !!visibleName && !visibleProjectWorkingDirectory();
+		if (!workingDirectory && !visibleName) {
 			return;
 		}
 		for (const activator of localProjectActivatorCandidates(root)) {
-			if (!localProjectActivatorNeedsPatch(activator, workingDirectory) || activator.dataset.cliproxyLocalProjectActivatorLoading === "1") {
+			if ((!visibleNeedsLookup && workingDirectory && !localProjectActivatorNeedsPatch(activator, workingDirectory)) || activator.dataset.cliproxyLocalProjectActivatorLoading === "1") {
 				continue;
 			}
 			activator.dataset.cliproxyLocalProjectActivatorLoading = "1";
 			fetchLocalProjects(false).then((projects) => {
 				delete activator.dataset.cliproxyLocalProjectActivatorLoading;
-				if (!globalThis.document.contains(activator) || !localProjectActivatorNeedsPatch(activator, workingDirectory)) {
+				let project = localProjectByVisibleName(projects, visibleName);
+				const resolvedWorkingDirectory = normalizeWorkingDirectory(project?.workingDirectory) || workingDirectory;
+				if (!resolvedWorkingDirectory || !globalThis.document.contains(activator) || !localProjectActivatorNeedsPatch(activator, resolvedWorkingDirectory)) {
 					return;
 				}
-				const project = localProjectByWorkingDirectory(projects, workingDirectory);
-				const label = firstString(project?.name, pathBaseName(workingDirectory));
+				if (!project) {
+					project = localProjectByWorkingDirectory(projects, resolvedWorkingDirectory);
+				}
+				const label = firstString(project?.name, pathBaseName(resolvedWorkingDirectory));
 				if (!label) {
 					return;
 				}
-				patchLocalProjectActivator(activator, label, workingDirectory);
+				patchLocalProjectActivator(activator, label, resolvedWorkingDirectory);
 			});
 		}
 	}
@@ -2191,6 +2221,20 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		return null;
 	}
 
+	function localProjectByVisibleName(projects, visibleName = visibleProjectName()) {
+		const target = normalizeProjectPickerName(visibleName);
+		if (!target) {
+			return null;
+		}
+		const matches = [];
+		for (const project of projects || []) {
+			if (normalizeProjectPickerName(firstString(project?.name, pathBaseName(project?.workingDirectory))) === target) {
+				matches.push(project);
+			}
+		}
+		return matches.length === 1 ? matches[0] : null;
+	}
+
 	function integrateLocalProjectPickers(root) {
 		for (const picker of localProjectPickerCandidates(root)) {
 			if (!localProjectPickerLooksLikeProjectPicker(picker)) {
@@ -2248,16 +2292,17 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			return;
 		}
 		const before = localProjectPickerActionsRow(list);
+		const currentDirectory = localProjectPickerCurrentDirectory(projects);
 		for (const project of projects) {
-			list.insertBefore(buildLocalProjectPickerItem(picker, project), before);
+			list.insertBefore(buildLocalProjectPickerItem(picker, project, currentDirectory), before);
 			diagnostics.localProjectPickerIntegrationCount += 1;
 		}
 	}
 
-	function buildLocalProjectPickerItem(picker, project) {
+	function buildLocalProjectPickerItem(picker, project, currentDirectory = currentLocalProjectWorkingDirectory()) {
 		const template = localProjectPickerTemplateItem(picker);
 		const item = globalThis.document.createElement("button");
-		const isCurrent = normalizeWorkingDirectory(project.workingDirectory) === currentLocalProjectWorkingDirectory();
+		const isCurrent = normalizeWorkingDirectory(project.workingDirectory) === normalizeWorkingDirectory(currentDirectory);
 		const label = firstString(project.name, pathBaseName(project.workingDirectory), "local");
 		item.type = "button";
 		item.dataset.cliproxyLocalProjectItem = "1";
@@ -2337,19 +2382,20 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	}
 
 	function localProjectPickerDisplayProjects(projects) {
-		const activeDirectory = currentLocalProjectWorkingDirectory();
+		const visibleName = visibleProjectName();
+		const activeDirectory = activeThreadWorkingDirectory();
+		const visibleDirectory = normalizeWorkingDirectory(localProjectByVisibleName(projects, visibleName)?.workingDirectory);
 		const selectedDirectory = selectedLocalProjectWorkingDirectory();
 		const fallbackDirectory = normalizeWorkingDirectory(globalThis.localStorage.getItem(workingDirectoryStorageKey) || "");
-		const visibleName = visibleProjectName();
 		const rank = (project) => {
 			const dir = normalizeWorkingDirectory(project.workingDirectory);
 			if (activeDirectory && dir === activeDirectory) {
 				return 0;
 			}
-			if (selectedDirectory && dir === selectedDirectory) {
+			if (visibleDirectory && dir === visibleDirectory) {
 				return 1;
 			}
-			if (visibleName && firstString(project.name, pathBaseName(project.workingDirectory)) === visibleName) {
+			if (selectedDirectory && dir === selectedDirectory) {
 				return 2;
 			}
 			if (fallbackDirectory && dir === fallbackDirectory) {
@@ -2402,6 +2448,20 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			}
 		}
 		return false;
+	}
+
+	function localProjectPickerCurrentDirectory(projects) {
+		const activeDirectory = activeThreadWorkingDirectory();
+		if (activeDirectory) {
+			return activeDirectory;
+		}
+		const visibleDirectory = normalizeWorkingDirectory(localProjectByVisibleName(projects)?.workingDirectory);
+		if (visibleDirectory) {
+			return visibleDirectory;
+		}
+		return selectedLocalProjectWorkingDirectory() ||
+			normalizeWorkingDirectory(globalThis.localStorage.getItem(workingDirectoryStorageKey) || "") ||
+			defaultLocalWorkingDirectory();
 	}
 
 	function normalizeProjectPickerName(value) {
@@ -2585,29 +2645,42 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	}
 
 	function currentProjectPickerItem(picker) {
-		const workingDirectory = currentLocalProjectWorkingDirectory();
+		const workingDirectory = localProjectPickerCurrentDirectory(localProjectsCache.projects);
 		const targetNames = new Set();
 		if (workingDirectory) {
 			targetNames.add(normalizeProjectPickerName(pathBaseName(workingDirectory)));
 		}
 		const visibleName = visibleProjectName();
+		const visibleTargetName = normalizeProjectPickerName(visibleName);
 		if (visibleName) {
-			targetNames.add(normalizeProjectPickerName(visibleName));
+			targetNames.add(visibleTargetName);
 		}
 		const matches = [];
+		const localNameMatches = [];
+		let localDirectoryMatch = null;
 		for (const element of picker.querySelectorAll('[cmdk-item],[data-cmdk-item],[data-slot="command-item"],[role="option"],button,[role="button"]')) {
 			if (!elementVisible(element) || /^No Project\b/.test(projectPickerItemPrimaryText(element))) {
 				continue;
 			}
+			const itemName = normalizeProjectPickerName(projectPickerItemPrimaryText(element));
 			if (element.dataset?.cliproxyLocalProjectItem) {
-				if (normalizeWorkingDirectory(element.dataset.cliproxyLocalProjectWorkingDirectory) === workingDirectory) {
-					return element;
+				if (visibleTargetName && itemName === visibleTargetName) {
+					localNameMatches.push(element);
+				}
+				if (normalizeWorkingDirectory(element.dataset.cliproxyLocalProjectWorkingDirectory) === workingDirectory && !localDirectoryMatch) {
+					localDirectoryMatch = element;
 				}
 				continue;
 			}
-			if (targetNames.has(normalizeProjectPickerName(projectPickerItemPrimaryText(element)))) {
+			if (targetNames.has(itemName)) {
 				matches.push(element);
 			}
+		}
+		if (localDirectoryMatch) {
+			return localDirectoryMatch;
+		}
+		if (localNameMatches.length === 1) {
+			return localNameMatches[0];
 		}
 		return matches.length === 1 ? matches[0] : null;
 	}
@@ -3069,23 +3142,27 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			}
 			return options;
 		};
-		if (bodyNeedsTextBridge(sourceURL, method, request, init)) {
-			try {
-				return request.clone().text().then((text) => {
-					const body = bridgeRequestBody(sourceURL, method, text);
-					return originalFetch(targetURLForBody(body), makeOptions(body)).then((response) => {
-						return rememberRemoteCreateProjectThread(sourceURL, body, response);
+			if (bodyNeedsTextBridge(sourceURL, method, request, init)) {
+				try {
+					return request.clone().text().then((text) => {
+						const body = bridgeRequestBody(sourceURL, method, text);
+						return ensureVisibleProjectLookupForRemoteCreate(sourceURL).then(() => {
+							return originalFetch(targetURLForBody(body), makeOptions(body)).then((response) => {
+								return rememberRemoteCreateProjectThread(sourceURL, body, response);
+							});
+						});
 					});
-				});
-			} catch {
+				} catch {
+				}
 			}
-		}
-		const body = bridgeRequestBody(sourceURL, method, init?.body ?? requestOptions.body);
-		const options = makeOptions(body);
-		return originalFetch(targetURLForBody(body), options).then((response) => {
-			return rememberRemoteCreateProjectThread(sourceURL, body, response);
-		});
-	};
+			const body = bridgeRequestBody(sourceURL, method, init?.body ?? requestOptions.body);
+			const options = makeOptions(body);
+			return ensureVisibleProjectLookupForRemoteCreate(sourceURL).then(() => {
+				return originalFetch(targetURLForBody(body), options).then((response) => {
+					return rememberRemoteCreateProjectThread(sourceURL, body, response);
+				});
+			});
+		};
 
 	globalThis.WebSocket = new Proxy(NativeWebSocket, {
 		construct(target, args, newTarget) {

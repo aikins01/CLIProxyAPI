@@ -228,6 +228,7 @@ func requestAddrIP(addr string) net.IP {
 // The auth middleware validates Authorization header against configured API keys.
 func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *handlers.BaseAPIHandler, auth gin.HandlerFunc) {
 	engine.GET("/ampcode/local-inference.user.js", m.serveWebLocalInferenceUserscript)
+	engine.HEAD("/ampcode/local-inference.user.js", m.serveWebLocalInferenceUserscript)
 
 	ampAPI := engine.Group("/api")
 

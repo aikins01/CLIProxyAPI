@@ -15682,7 +15682,12 @@ func TestNeoReviewModeRouteAndPrompt(t *testing.T) {
 		"git diff --merge-base origin/HEAD HEAD",
 		"more than 100 changed files or is more than 10,000 lines",
 		// bridge to the gaac893 run_check/submit_review protocol
-		"look for .agents/checks/*.md",
+		"discover applicable code-review checks",
+		"repo-local .agents/checks/*.md",
+		"$HOME/.config/amp/checks/*.md",
+		"$HOME/.config/agents/checks/*.md",
+		"User-wide checks are additive",
+		"repo-local checks override only same-named parent repo-local checks",
 		"set checkName to frontmatter.name",
 		"run_check exactly once per check",
 		"submit_review tool; call it exactly once",

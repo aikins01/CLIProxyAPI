@@ -405,6 +405,12 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		t.Fatalf("userscript status = %d, want %d", rec.Code, http.StatusOK)
 	}
 	body := rec.Body.String()
+	if strings.Contains(body, "%!") {
+		t.Fatalf("userscript response contains fmt corruption marker:\n%s", body)
+	}
+	if got, want := rec.Header().Get("Content-Length"), strconv.Itoa(len(rec.Body.Bytes())); got != want {
+		t.Fatalf("userscript Content-Length = %q, want %q", got, want)
+	}
 	for _, want := range []string{
 		"// ==UserScript==",
 		"@version 0.1.45",
@@ -572,10 +578,10 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 			t.Fatalf("userscript missing %q:\n%s", want, body)
 		}
 	}
-	selectedLocalProjectIndex := strings.Index(body, "const fromSelectedLocalProject = selectedLocalProjectWorkingDirectory();")
 	visibleProjectIndex := strings.Index(body, "const fromVisibleProject = visibleProjectWorkingDirectory();")
-	if selectedLocalProjectIndex < 0 || visibleProjectIndex < 0 || selectedLocalProjectIndex > visibleProjectIndex {
-		t.Fatalf("userscript must prefer selected local project before visible project for create-thread working directory")
+	selectedLocalProjectIndex := strings.Index(body, "const fromSelectedLocalProject = selectedLocalProjectWorkingDirectory();")
+	if selectedLocalProjectIndex < 0 || visibleProjectIndex < 0 || visibleProjectIndex > selectedLocalProjectIndex {
+		t.Fatalf("userscript must prefer visible project before stale selected local project for create-thread working directory")
 	}
 	for _, unwanted := range []string{
 		"installLocalThreadKeyboardShortcut();",
@@ -627,6 +633,21 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 	visibleProjectFallbackIndex := strings.Index(body, `const fromVisibleProject = visibleProjectWorkingDirectory();`)
 	if projectIDIndex < 0 || visibleProjectFallbackIndex < 0 || projectIDIndex > visibleProjectFallbackIndex || !strings.Contains(body[projectIDIndex:visibleProjectFallbackIndex], `if (projectID)`) {
 		t.Fatalf("userscript should reject projectID bodies before visible project fallback:\n%s", body)
+	}
+
+	headReq := httptest.NewRequest(http.MethodHead, "/ampcode/local-inference.user.js", nil)
+	headReq.Host = "127.0.0.1:8317"
+	headRec := httptest.NewRecorder()
+	r.ServeHTTP(headRec, headReq)
+
+	if headRec.Code != http.StatusOK {
+		t.Fatalf("userscript HEAD status = %d, want %d", headRec.Code, http.StatusOK)
+	}
+	if got := headRec.Body.String(); got != "" {
+		t.Fatalf("userscript HEAD body = %q, want empty", got)
+	}
+	if got := headRec.Header().Get("Content-Length"); got == "" {
+		t.Fatalf("userscript HEAD missing Content-Length")
 	}
 }
 
@@ -895,6 +916,314 @@ assert(bridge.diagnostics.webSocketBootstrapCount === 2, "websocket bootstrap wa
 	}
 }
 
+func TestWebLocalInferenceUserscriptProjectPickerPrefersVisibleProject(t *testing.T) {
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node not installed")
+	}
+	dir := t.TempDir()
+	scriptPath := filepath.Join(dir, "local-inference.user.js")
+	if err := os.WriteFile(scriptPath, []byte(ampWebLocalInferenceUserscript("http://127.0.0.1:8317", nil)), 0o600); err != nil {
+		t.Fatalf("write userscript: %v", err)
+	}
+	runner := `
+(async () => {
+const assert = (condition, message) => {
+	if (!condition) throw new Error(message);
+};
+const scriptPath = ` + strconv.Quote(scriptPath) + `;
+class TestStorage {
+	constructor() { this.values = new Map(); }
+	getItem(key) { key = String(key); return this.values.has(key) ? this.values.get(key) : null; }
+	setItem(key, value) { this.values.set(String(key), String(value)); }
+	removeItem(key) { this.values.delete(String(key)); }
+}
+const datasetKey = (name) => String(name || "").replace(/^data-/, "").replace(/-([a-z])/g, (_, char) => char.toUpperCase());
+class FakeEvent {
+	constructor(type, init = {}) {
+		this.type = type;
+		this.key = init.key || "";
+		this.bubbles = !!init.bubbles;
+		this.cancelable = !!init.cancelable;
+		this.defaultPrevented = false;
+		this.propagationStopped = false;
+		this.target = null;
+	}
+	preventDefault() { this.defaultPrevented = true; }
+	stopPropagation() { this.propagationStopped = true; }
+}
+class FakeElement {
+	constructor(tagName = "div") {
+		this.tagName = String(tagName).toUpperCase();
+		this.dataset = {};
+		this.attributes = new Map();
+		this.style = {};
+		this.children = [];
+		this.parentElement = null;
+		this.eventListeners = {};
+		this.className = "";
+		this.disabled = false;
+		this._text = "";
+	}
+	get firstElementChild() { return this.children[0] || null; }
+	get textContent() { return this._text + this.children.map((child) => child.textContent).join(""); }
+	set textContent(value) { this._text = String(value || ""); this.children = []; }
+	get innerText() {
+		const childText = this.children.map((child) => child.innerText).filter(Boolean);
+		if (!childText.length) return this._text;
+		const separator = ["BUTTON", "DIV"].includes(this.tagName) ? "\n" : "";
+		return [this._text, childText.join(separator)].filter(Boolean).join(separator);
+	}
+	set innerText(value) { this.textContent = value; }
+	append(...nodes) { for (const node of nodes) this.appendChild(node); }
+	appendChild(child) {
+		if (!(child instanceof FakeElement)) return child;
+		child.remove();
+		child.parentElement = this;
+		this.children.push(child);
+		return child;
+	}
+	insertBefore(child, before) {
+		if (!(child instanceof FakeElement)) return child;
+		child.remove();
+		child.parentElement = this;
+		const index = before ? this.children.indexOf(before) : -1;
+		if (index >= 0) this.children.splice(index, 0, child);
+		else this.children.push(child);
+		return child;
+	}
+	replaceChildren(...nodes) {
+		for (const child of this.children) child.parentElement = null;
+		this.children = [];
+		this._text = "";
+		this.append(...nodes);
+	}
+	remove() {
+		if (!this.parentElement) return;
+		const index = this.parentElement.children.indexOf(this);
+		if (index >= 0) this.parentElement.children.splice(index, 1);
+		this.parentElement = null;
+	}
+	setAttribute(name, value) {
+		name = String(name);
+		value = String(value);
+		this.attributes.set(name, value);
+		if (name.startsWith("data-")) this.dataset[datasetKey(name)] = value;
+		if (name === "role") this.role = value;
+	}
+	getAttribute(name) {
+		name = String(name);
+		if (name.startsWith("data-") && this.dataset[datasetKey(name)] !== undefined) return this.dataset[datasetKey(name)];
+		return this.attributes.has(name) ? this.attributes.get(name) : null;
+	}
+	removeAttribute(name) {
+		name = String(name);
+		this.attributes.delete(name);
+		if (name.startsWith("data-")) delete this.dataset[datasetKey(name)];
+	}
+	matches(selector) {
+		return String(selector).split(",").some((raw) => {
+			const part = raw.trim();
+			if (!part) return false;
+			if (part === "*") return true;
+			if (/^[a-z]+$/i.test(part)) return this.tagName.toLowerCase() === part.toLowerCase();
+			const match = part.match(/^\[([^=\]]+)(?:=['"]?([^'"\]]+)['"]?)?\]$/);
+			if (!match) return false;
+			const name = match[1];
+			const expected = match[2];
+			const value = this.getAttribute(name);
+			return expected === undefined ? value !== null || this.dataset[datasetKey(name)] !== undefined : value === expected;
+		});
+	}
+	querySelectorAll(selector) {
+		const out = [];
+		const visit = (element) => {
+			for (const child of element.children) {
+				if (child.matches(selector)) out.push(child);
+				visit(child);
+			}
+		};
+		visit(this);
+		return out;
+	}
+	querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
+	closest(selector) {
+		for (let node = this; node; node = node.parentElement) {
+			if (node.matches(selector)) return node;
+		}
+		return null;
+	}
+	contains(target) {
+		for (let node = target; node; node = node.parentElement) {
+			if (node === this) return true;
+		}
+		return false;
+	}
+	addEventListener(type, callback) {
+		(this.eventListeners[type] ||= []).push(callback);
+	}
+	removeEventListener() {}
+	dispatchEvent(event) {
+		event.target ||= this;
+		for (const callback of this.eventListeners[event.type] || []) {
+			callback.call(this, event);
+			if (event.propagationStopped) return !event.defaultPrevented;
+		}
+		if (event.bubbles && this.parentElement) {
+			return this.parentElement.dispatchEvent(event);
+		}
+		return !event.defaultPrevented;
+	}
+	getBoundingClientRect() { return { width: 320, height: 32, left: 0, top: 0, right: 320, bottom: 32 }; }
+	scrollIntoView() {}
+}
+const documentElement = new FakeElement("html");
+const body = new FakeElement("body");
+documentElement.appendChild(body);
+globalThis.Element = FakeElement;
+globalThis.HTMLElement = FakeElement;
+globalThis.NodeFilter = { SHOW_TEXT: 4, SHOW_ELEMENT: 1 };
+globalThis.KeyboardEvent = class extends FakeEvent { constructor(type, init) { super(type, init); } };
+globalThis.MouseEvent = class extends FakeEvent { constructor(type, init) { super(type, init); } };
+globalThis.MutationObserver = class { observe() {} disconnect() {} };
+globalThis.document = {
+	readyState: "complete",
+	body,
+	documentElement,
+	createElement(tag) { return new FakeElement(tag); },
+	querySelector(selector) { return documentElement.querySelector(selector); },
+	querySelectorAll(selector) { return documentElement.querySelectorAll(selector); },
+	getElementById(id) { return documentElement.querySelectorAll("*").find((element) => element.getAttribute("id") === String(id)) || null; },
+	contains(target) { return documentElement.contains(target); },
+	addEventListener() {},
+	removeEventListener() {},
+	dispatchEvent(event) { return documentElement.dispatchEvent(event); },
+	createTreeWalker() { return { currentNode: null, nextNode() { return null; } }; },
+};
+globalThis.location = new URL("https://ampcode.com/threads/T-019f324b-2802-7868-b1b1-5f0fa3e87ea5");
+globalThis.history = { state: null, replaceState() {} };
+globalThis.localStorage = new TestStorage();
+globalThis.sessionStorage = new TestStorage();
+globalThis.localStorage.setItem("cliproxyapi.ampLocalInference.apiKey", "local-key");
+globalThis.localStorage.setItem("cliproxyapi.ampLocalInference.workingDirectory", "/Users/aikins01/Developer/on-chain");
+globalThis.sessionStorage.setItem("cliproxyapi.ampLocalInference.selectedLocalProject", JSON.stringify({
+	name: "on-chain",
+	workingDirectory: "/Users/aikins01/Developer/on-chain",
+	selectedAt: Date.now(),
+}));
+let localProjectsPayload = {
+	defaultWorkingDirectory: "/Users/aikins01",
+	projects: [
+		{ name: "on-chain", workingDirectory: "/Users/aikins01/Developer/on-chain" },
+		{ name: "telemetry.dev", workingDirectory: "/Users/aikins01/Developer/telemetry.dev" },
+	],
+};
+	let lastFetchURL = "";
+	globalThis.fetch = async (url) => {
+		lastFetchURL = String(url);
+		if (lastFetchURL.includes("/_app/remote/3abror/createProjectThread")) {
+			return new Response(JSON.stringify({ data: "" }), { status: 200, headers: { "Content-Type": "application/json" } });
+		}
+		assert(lastFetchURL.includes("/ampcode/local-projects.json"), "unexpected fetch " + url);
+		return new Response(JSON.stringify(localProjectsPayload), { status: 200, headers: { "Content-Type": "application/json" } });
+};
+globalThis.prompt = () => "";
+globalThis.WebSocket = class {};
+const visibleActivator = new FakeElement("button");
+visibleActivator.textContent = "Project: telemetry.dev";
+body.appendChild(visibleActivator);
+const picker = new FakeElement("div");
+picker.setAttribute("role", "dialog");
+const input = new FakeElement("input");
+const title = new FakeElement("div");
+title.textContent = "Projects";
+const list = new FakeElement("div");
+list.setAttribute("role", "listbox");
+const noProject = new FakeElement("button");
+noProject.setAttribute("role", "option");
+noProject.textContent = "No Project";
+const actions = new FakeElement("div");
+actions.textContent = "Actions";
+list.appendChild(noProject);
+list.appendChild(actions);
+	picker.append(input, title, list);
+	body.appendChild(picker);
+	require(scriptPath);
+	globalThis.sessionStorage.setItem("cliproxyapi.ampLocalInference.selectedLocalProject", JSON.stringify({
+		name: "on-chain",
+		workingDirectory: "/Users/aikins01/Developer/on-chain",
+		selectedAt: Date.now(),
+	}));
+	lastFetchURL = "";
+	await globalThis.fetch("https://ampcode.com/_app/remote/3abror/createProjectThread", {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ payload: "" }),
+	});
+	const createURL = new URL(lastFetchURL);
+	assert(createURL.origin === "http://127.0.0.1:8317", "create-thread request was not rewritten locally: " + lastFetchURL);
+	assert(createURL.searchParams.get("cliproxy-working-directory") === "/Users/aikins01/Developer/telemetry.dev", "create-thread did not use visible project from local cache: " + lastFetchURL);
+	await new Promise((resolve) => setTimeout(resolve, 25));
+	const localItems = list.querySelectorAll("[data-cliproxy-local-project-item]");
+assert(localItems.length === 2, "expected two local project items, got " + localItems.length);
+const selected = localItems.find((item) => item.getAttribute("aria-selected") === "true" || item.dataset.selected === "true");
+assert(selected, "no injected local project item was selected");
+assert(selected.dataset.cliproxyLocalProjectWorkingDirectory === "/Users/aikins01/Developer/telemetry.dev", "visible project was not selected: " + selected.innerText);
+assert(selected.innerText.includes("Current"), "visible project item was not marked Current");
+	picker.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+	await new Promise((resolve) => setTimeout(resolve, 25));
+	assert(globalThis.localStorage.getItem("cliproxyapi.ampLocalInference.workingDirectory") === "/Users/aikins01/Developer/telemetry.dev", "Enter did not activate the selected visible project");
+	visibleActivator.textContent = "Project: api";
+	globalThis.sessionStorage.setItem("cliproxyapi.ampLocalInference.selectedLocalProject", JSON.stringify({
+		name: "api",
+		workingDirectory: "/Users/aikins01/Developer/bar/api",
+		selectedAt: Date.now(),
+	}));
+	globalThis.localStorage.setItem("cliproxyapi.ampLocalInference.workingDirectory", "/Users/aikins01/Developer/bar/api");
+	globalThis.localStorage.setItem("cliproxyapi.ampLocalInference.threadWorkingDirectories", JSON.stringify({
+		"T-019f324b-2802-7868-b1b1-5f0fa3e87ea6": "/Users/aikins01/Developer/foo/api",
+	}));
+	lastFetchURL = "";
+	await globalThis.fetch("https://ampcode.com/_app/remote/3abror/createProjectThread", {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ payload: "" }),
+	});
+	const collisionURL = new URL(lastFetchURL);
+	assert(collisionURL.searchParams.get("cliproxy-working-directory") === "/Users/aikins01/Developer/bar/api", "remembered basename match overrode selected project: " + lastFetchURL);
+	visibleActivator.textContent = "Project: missing";
+	localProjectsPayload = {
+		defaultWorkingDirectory: "/Users/aikins01",
+		projects: [
+			{ name: "api", workingDirectory: "/Users/aikins01/Developer/foo/api" },
+			{ name: "bar service", workingDirectory: "/Users/aikins01/Developer/bar/api" },
+		],
+	};
+	for (const item of list.querySelectorAll("[data-cliproxy-local-project-item]")) item.remove();
+	delete list.dataset.cliproxyCurrentProjectAutoSelected;
+	delete list.dataset.cliproxyLocalProjectLoading;
+	delete list.dataset.cliproxyLocalProjectAttempts;
+	delete require.cache[require.resolve(scriptPath)];
+	require(scriptPath);
+	await new Promise((resolve) => setTimeout(resolve, 25));
+	const collisionItems = list.querySelectorAll("[data-cliproxy-local-project-item]");
+	const selectedCollision = collisionItems.find((item) => item.getAttribute("aria-selected") === "true" || item.dataset.selected === "true");
+	assert(selectedCollision, "no collision local project item was selected");
+	assert(selectedCollision.dataset.cliproxyLocalProjectWorkingDirectory === "/Users/aikins01/Developer/bar/api", "basename collision selected wrong local project: " + selectedCollision.innerText);
+	})().catch((error) => {
+	console.error(error && error.stack ? error.stack : error);
+	process.exit(1);
+});
+`
+	runnerPath := filepath.Join(dir, "run-project-picker-test.js")
+	if err := os.WriteFile(runnerPath, []byte(runner), 0o600); err != nil {
+		t.Fatalf("write runner: %v", err)
+	}
+	cmd := exec.Command("node", runnerPath)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("userscript project picker check failed: %v\n%s", err, output)
+	}
+}
+
 func TestWebLocalInferenceUserscriptRouteRequiresOptIn(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
@@ -907,6 +1236,14 @@ func TestWebLocalInferenceUserscriptRouteRequiresOptIn(t *testing.T) {
 
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("userscript status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+
+	headReq := httptest.NewRequest(http.MethodHead, "/ampcode/local-inference.user.js", nil)
+	headRec := httptest.NewRecorder()
+	r.ServeHTTP(headRec, headReq)
+
+	if headRec.Code != http.StatusNotFound {
+		t.Fatalf("userscript HEAD status = %d, want %d", headRec.Code, http.StatusNotFound)
 	}
 }
 
