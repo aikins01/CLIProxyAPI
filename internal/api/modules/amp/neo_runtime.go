@@ -12416,7 +12416,9 @@ func (rt *neoRuntime) neoWebLocalCreateProjectThread(ctx context.Context, query 
 	}
 	prompt := strings.TrimSpace(neoWebLocalProjectThreadContentText(request["content"]))
 	workingDirectory := rt.neoWebLocalResolveWorkingDirectory(query, request, prompt, projectID)
-	if boolValue(request["spawnExecutor"]) && workingDirectory == "" {
+	spawnExecutorValue, spawnExecutorProvided := request["spawnExecutor"]
+	spawnLocalExecutor := boolValue(spawnExecutorValue) || (!spawnExecutorProvided && workingDirectory != "")
+	if spawnLocalExecutor && workingDirectory == "" {
 		return neoWebLocalRemoteCommandError("working directory is required for local executor bootstrap")
 	}
 
@@ -12438,6 +12440,9 @@ func (rt *neoRuntime) neoWebLocalCreateProjectThread(ctx context.Context, query 
 		"reasoningEffort":          omitEmpty(reasoningEffort),
 		"projectID":                omitEmpty(projectID),
 	}
+	if spawnLocalExecutor {
+		threadMeta["executorType"] = "local-client"
+	}
 	body := map[string]any{
 		"threadId":         threadID,
 		"threadID":         threadID,
@@ -12448,7 +12453,7 @@ func (rt *neoRuntime) neoWebLocalCreateProjectThread(ctx context.Context, query 
 		"threadMeta":       threadMeta,
 		"projectID":        omitEmpty(projectID),
 	}
-	if boolValue(request["spawnExecutor"]) {
+	if spawnLocalExecutor {
 		body["executorType"] = "local-client"
 	}
 	if workingDirectory != "" {
@@ -12468,10 +12473,20 @@ func (rt *neoRuntime) neoWebLocalCreateProjectThread(ctx context.Context, query 
 		return neoWebLocalRemoteCommandError(message)
 	}
 	createdThreadID := firstNonEmptyString(response["threadID"], response["threadId"], threadID)
-	result := map[string]any{"ok": true, "threadID": createdThreadID}
+	result := map[string]any{"ok": true, "threadID": createdThreadID, "threadId": createdThreadID}
+	for _, key := range []string{"ownerUserId", "threadVersion", "agentMode", "wsToken", "usesDtw", "usesThreadActors", "executorType"} {
+		if value, ok := response[key]; ok && value != nil {
+			result[key] = value
+		}
+	}
 	if workingDirectory != "" {
 		result["workingDirectory"] = workingDirectory
 		result["workspaceRoot"] = workingDirectory
+	}
+	if spawnLocalExecutor {
+		if actor := rt.store.lookupThreadActor(createdThreadID); actor != nil {
+			actor.maybeSpawnWebLocalExecutorForPendingWork()
+		}
 	}
 	return result
 }

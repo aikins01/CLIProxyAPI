@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -1945,16 +1946,32 @@ func TestWebLocalInferenceLocalProjectsRoute(t *testing.T) {
 }
 
 func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses POSIX shell script")
+	}
 	gin.SetMode(gin.TestMode)
 	dataDir := t.TempDir()
 	oldStoreDir := neoAmpDataDir
 	neoAmpDataDir = func() string { return dataDir }
 	t.Cleanup(func() { neoAmpDataDir = oldStoreDir })
+	pidDir := filepath.Join(t.TempDir(), "pids")
+	if err := os.MkdirAll(pidDir, 0o700); err != nil {
+		t.Fatalf("mkdir pid dir: %v", err)
+	}
+	t.Cleanup(replaceNeoHeadlessPIDDir(func() string { return pidDir }))
+	executorDir := t.TempDir()
+	command := filepath.Join(executorDir, "amp")
+	startedLog := filepath.Join(executorDir, "started.log")
+	if err := os.WriteFile(command, []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$TEST_STARTED_LOG\"\nsleep 30\n"), 0o755); err != nil {
+		t.Fatalf("write fake amp: %v", err)
+	}
+	t.Setenv("TEST_STARTED_LOG", startedLog)
 	r := gin.New()
 	enabled := true
 	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
-		NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled},
+		NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled, ExecutorCommand: command},
 	}})
+	t.Cleanup(func() { rt.store.disposeAll(true, "test done", false) })
 	m := &AmpModule{
 		restrictToLocalhost: false,
 		neoRuntime:          rt,
@@ -2010,6 +2027,9 @@ func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.
 	if createResult["ok"] != true || stringValue(createResult["threadID"]) != threadID {
 		t.Fatalf("create result = %#v", createResult)
 	}
+	if createResult["usesThreadActors"] != true || createResult["usesDtw"] != true || stringValue(createResult["executorType"]) != "local-client" || stringValue(createResult["wsToken"]) == "" {
+		t.Fatalf("create local actor response = %#v", createResult)
+	}
 	if stringValue(createResult["workingDirectory"]) != expectedWorkDir || stringValue(createResult["workspaceRoot"]) != expectedWorkDir {
 		t.Fatalf("create working directory response = %#v, want %q", createResult, expectedWorkDir)
 	}
@@ -2024,6 +2044,8 @@ func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.
 	agentMode := actor.currentAgentMode
 	reasoningEffort := actor.currentReasoningEffort
 	meta := cloneMap(actor.meta)
+	bootstrapExecutorType := actor.bootstrapExecutorType
+	spawnedCount := len(actor.spawnedExecutors)
 	actor.mu.Unlock()
 	if got := stringValue(environment["workingDirectory"]); got != expectedWorkDir {
 		t.Fatalf("workingDirectory = %q, want %q", got, expectedWorkDir)
@@ -2037,12 +2059,14 @@ func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.
 	if stringValue(meta["projectID"]) != projectID || stringValue(meta["ampcodeConnectorMode"]) != "local-neo" {
 		t.Fatalf("meta = %#v", meta)
 	}
+	if bootstrapExecutorType != "local-client" || spawnedCount != 1 {
+		t.Fatalf("executor bootstrap = type:%q spawned:%d", bootstrapExecutorType, spawnedCount)
+	}
 
 	projectOnlyThreadID := "T-019f20b2-5e05-7501-8ddd-994e151ee952"
 	projectOnlyBody := neoSvelteKitRemoteCommandBodyForTest(t, map[string]any{
 		"content":         []any{map[string]any{"type": "text", "text": "Use selected project only"}},
 		"agentMode":       "smart",
-		"spawnExecutor":   true,
 		"threadID":        projectOnlyThreadID,
 		"projectID":       projectID,
 		"reasoningEffort": "high",
@@ -2061,6 +2085,9 @@ func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.
 	if projectOnlyResult["ok"] != true || stringValue(projectOnlyResult["threadID"]) != projectOnlyThreadID {
 		t.Fatalf("project-only create result = %#v", projectOnlyResult)
 	}
+	if projectOnlyResult["usesThreadActors"] != true || stringValue(projectOnlyResult["executorType"]) != "local-client" {
+		t.Fatalf("project-only local actor response = %#v", projectOnlyResult)
+	}
 	if stringValue(projectOnlyResult["workingDirectory"]) != expectedWorkDir || stringValue(projectOnlyResult["workspaceRoot"]) != expectedWorkDir {
 		t.Fatalf("project-only working directory response = %#v, want %q", projectOnlyResult, expectedWorkDir)
 	}
@@ -2070,9 +2097,55 @@ func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.
 	}
 	projectOnlyActor.mu.Lock()
 	projectOnlyEnvironment := cloneMap(projectOnlyActor.environment)
+	projectOnlyBootstrapExecutorType := projectOnlyActor.bootstrapExecutorType
+	projectOnlySpawnedCount := len(projectOnlyActor.spawnedExecutors)
 	projectOnlyActor.mu.Unlock()
 	if got := stringValue(projectOnlyEnvironment["workingDirectory"]); got != expectedWorkDir {
 		t.Fatalf("project-only workingDirectory = %q, want %q", got, expectedWorkDir)
+	}
+	if projectOnlyBootstrapExecutorType != "local-client" || projectOnlySpawnedCount != 1 {
+		t.Fatalf("project-only executor bootstrap = type:%q spawned:%d", projectOnlyBootstrapExecutorType, projectOnlySpawnedCount)
+	}
+
+	explicitFalseThreadID := "T-019f20b2-5e05-7501-8ddd-994e151ee954"
+	explicitFalseBody := neoSvelteKitRemoteCommandBodyForTest(t, map[string]any{
+		"content":         []any{map[string]any{"type": "text", "text": "Create without spawning"}},
+		"agentMode":       "smart",
+		"spawnExecutor":   false,
+		"threadID":        explicitFalseThreadID,
+		"projectID":       projectID,
+		"reasoningEffort": "high",
+	})
+	explicitFalseReq := httptest.NewRequest(http.MethodPost, "/_app/remote/3abror/createProjectThread?"+ampWebLocalInferenceAPIKeyQuery+"=local-key", strings.NewReader(explicitFalseBody))
+	explicitFalseReq.Header.Set("Content-Type", "application/json")
+	explicitFalseReq.Header.Set("Origin", "https://ampcode.com")
+	explicitFalseReq.Header.Set(ampWebLocalInferenceHeader, "1")
+	explicitFalseRec := httptest.NewRecorder()
+	r.ServeHTTP(explicitFalseRec, explicitFalseReq)
+	if explicitFalseRec.Code != http.StatusOK {
+		t.Fatalf("explicit-false create status = %d, body=%s", explicitFalseRec.Code, explicitFalseRec.Body.String())
+	}
+	explicitFalseEnvelope := decodeSvelteKitRemoteEnvelopeForTest(t, explicitFalseRec.Body.Bytes())
+	explicitFalseResult := mapValue(explicitFalseEnvelope["_"])
+	if explicitFalseResult["ok"] != true || stringValue(explicitFalseResult["threadID"]) != explicitFalseThreadID {
+		t.Fatalf("explicit-false create result = %#v", explicitFalseResult)
+	}
+	if explicitFalseResult["usesThreadActors"] != false || explicitFalseResult["usesDtw"] != false || stringValue(explicitFalseResult["executorType"]) != "" {
+		t.Fatalf("explicit-false local actor response = %#v", explicitFalseResult)
+	}
+	if stringValue(explicitFalseResult["workingDirectory"]) != expectedWorkDir || stringValue(explicitFalseResult["workspaceRoot"]) != expectedWorkDir {
+		t.Fatalf("explicit-false working directory response = %#v, want %q", explicitFalseResult, expectedWorkDir)
+	}
+	explicitFalseActor := rt.store.lookupThreadActor(explicitFalseThreadID)
+	if explicitFalseActor == nil {
+		t.Fatal("explicit-false thread actor not found")
+	}
+	explicitFalseActor.mu.Lock()
+	explicitFalseBootstrapExecutorType := explicitFalseActor.bootstrapExecutorType
+	explicitFalseSpawnedCount := len(explicitFalseActor.spawnedExecutors)
+	explicitFalseActor.mu.Unlock()
+	if explicitFalseBootstrapExecutorType != "" || explicitFalseSpawnedCount != 0 {
+		t.Fatalf("explicit-false executor bootstrap = type:%q spawned:%d", explicitFalseBootstrapExecutorType, explicitFalseSpawnedCount)
 	}
 
 	missingDirectoryThreadID := "T-019f20b2-5e05-7501-8ddd-994e151ee953"
