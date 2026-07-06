@@ -215,7 +215,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	return fmt.Sprintf(`// ==UserScript==
 // @name CLIProxyAPI Amp Local Inference
 // @namespace https://github.com/router-for-me/CLIProxyAPI
-// @version 0.1.48
+// @version 0.1.49
 %s
 // @updateURL %s
 // @downloadURL %s
@@ -227,7 +227,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	"use strict";
 
 	const bridgeHeader = %s;
-	const userscriptVersion = "0.1.48";
+	const userscriptVersion = "0.1.49";
 	const apiKeyStorageKey = "cliproxyapi.ampLocalInference.apiKey";
 	const workingDirectoryStorageKey = "cliproxyapi.ampLocalInference.workingDirectory";
 	const selectedLocalProjectStorageKey = "cliproxyapi.ampLocalInference.selectedLocalProject";
@@ -1148,6 +1148,22 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		return patched;
 	}
 
+	function patchNestedDevalueThreadActorConfigs(value, seen, localBase) {
+		if (value === null || typeof value !== "object" || seen.has(value)) {
+			return false;
+		}
+		seen.add(value);
+		let patched = false;
+		if (Array.isArray(value)) {
+			patched = patchDevalueThreadActorConfigs(value, localBase) || patched;
+		}
+		const children = Array.isArray(value) ? value : Object.values(value);
+		for (const child of children) {
+			patched = patchNestedDevalueThreadActorConfigs(child, seen, localBase) || patched;
+		}
+		return patched;
+	}
+
 	function plainThreadMatchesActive(thread) {
 		const activeThread = activeThreadID();
 		return isPlainObject(thread) && !!activeThread && thread.id === activeThread;
@@ -1342,7 +1358,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		const patchOptions = options || { configs: true };
 		if (patchOptions.configs) {
 			const localBase = localBaseURLString();
-			const devaluePatched = patchDevalueThreadActorConfigs(value, localBase);
+			const devaluePatched = patchNestedDevalueThreadActorConfigs(value, new WeakSet(), localBase);
 			const plainPatched = patchPlainThreadActorConfigs(value, new WeakSet(), localBase);
 			const patched = devaluePatched || plainPatched;
 			if (patched) {

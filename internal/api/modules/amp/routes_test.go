@@ -413,7 +413,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 	}
 	for _, want := range []string{
 		"// ==UserScript==",
-		"@version 0.1.48",
+		"@version 0.1.49",
 		"@match https://ampcode.com/*",
 		"@updateURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
 		"@downloadURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
@@ -428,7 +428,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"commandPaletteIntegrationCount",
 		"localThreadPickerOpenCount",
 		"removedLocalThreadControlCount",
-		`const userscriptVersion = "0.1.48"`,
+		`const userscriptVersion = "0.1.49"`,
 		"userscriptVersion",
 		"lastPatchedThreadActorBaseURL",
 		"lastPatchedThreadID",
@@ -793,7 +793,7 @@ if (typeof globalThis.btoa !== "function") {
 }
 require(scriptPath);
 const bridge = globalThis.__cliproxyAmpLocalInference;
-assert(bridge && bridge.userscriptVersion === "0.1.48", "bridge userscript version was not exposed");
+assert(bridge && bridge.userscriptVersion === "0.1.49", "bridge userscript version was not exposed");
 globalThis.localStorage.setItem(bridge.localThreadIDsStorageKey, JSON.stringify([threadID, secondThreadID]));
 globalThis.localStorage.setItem(bridge.apiKeyStorageKey, "local-key");
 globalThis.localStorage.setItem(bridge.workingDirectoryStorageKey, createdThreadWorkDir);
@@ -971,6 +971,33 @@ assert(bridge.diagnostics.localThreadStatusPatchCount >= 2, "local thread status
 const createdPlain = JSON.parse(JSON.stringify({ threadData: { thread: { id: createdThreadID, title: "Created" }, threadActorConfig: null } }));
 assertPlainConfig(createdPlain.threadData.threadActorConfig, "created plain");
 assert(bridge.diagnostics.lastPatchedThreadID === createdThreadID, "created route-data patch did not record thread ID");
+const nestedRouteData = JSON.parse(JSON.stringify({
+	type: "data",
+	nodes: [
+		null,
+		{
+			type: "data",
+			data: [
+				{ threadData: 1 },
+				{ thread: 2, threadActorConfig: 5 },
+				{ id: 3, title: 4 },
+				createdThreadID,
+				"Created",
+				null,
+			],
+		},
+	],
+}));
+const nestedValues = nestedRouteData.nodes[1].data;
+const nestedConfigIndex = nestedValues[1].threadActorConfig;
+assert(Number.isInteger(nestedConfigIndex), "nested route-data threadActorConfig was not patched");
+assert(nestedConfigIndex !== 5, "nested route-data threadActorConfig still points at null");
+const nestedConfig = nestedValues[nestedConfigIndex];
+const nestedDeref = (value) => Number.isInteger(value) ? nestedValues[value] : value;
+assert(nestedDeref(nestedConfig.threadId) === createdThreadID, "nested route-data threadId mismatch");
+assert(nestedDeref(nestedConfig.wsToken) === "local-neo", "nested route-data wsToken mismatch");
+assert(nestedDeref(nestedConfig.ampURL) === "http://127.0.0.1:8317", "nested route-data ampURL mismatch");
+assert(bridge.diagnostics.lastPatchedThreadID === createdThreadID, "nested route-data patch did not record thread ID");
 const socket = new WebSocket("wss://ampcode.com/gateway/threadActor/?rvt-method=get&rvt-key=" + encodeURIComponent(secondThreadID));
 const rewritten = new URL(socket.url);
 assert(rewritten.protocol === "ws:", "websocket protocol was not rewritten");
