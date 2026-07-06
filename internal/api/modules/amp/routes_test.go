@@ -2709,6 +2709,16 @@ func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.
 	if stringValue(createThreadDataConfig["threadId"]) != threadID || stringValue(createThreadDataConfig["wsToken"]) == "" {
 		t.Fatalf("create threadData actor config = %#v", createThreadData)
 	}
+	createThreadDataThread := mapValue(createThreadData["thread"])
+	if stringValue(createThreadDataThread["id"]) != threadID || stringValue(createThreadDataThread["creatorUserID"]) == "" {
+		t.Fatalf("create threadData thread identity = %#v", createThreadDataThread)
+	}
+	if _, ok := createThreadDataThread["messages"].([]any); !ok {
+		t.Fatalf("create threadData thread messages = %#v", createThreadDataThread["messages"])
+	}
+	if createThreadDataThread["hasExecutor"] == false || createThreadDataThread["executorConnected"] == false {
+		t.Fatalf("create threadData leaked disconnected executor state: %#v", createThreadDataThread)
+	}
 	if stringValue(createResult["workingDirectory"]) != expectedWorkDir || stringValue(createResult["workspaceRoot"]) != expectedWorkDir {
 		t.Fatalf("create working directory response = %#v, want %q", createResult, expectedWorkDir)
 	}

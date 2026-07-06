@@ -12502,9 +12502,27 @@ func (rt *neoRuntime) neoWebLocalCreateProjectThread(ctx context.Context, query 
 	}
 	if response["usesThreadActors"] == true {
 		threadActorConfig := neoWebLocalPlainThreadActorConfig(createdThreadID, stringValue(response["wsToken"]), localBaseURL)
+		threadDataThread := map[string]any{
+			"id":            createdThreadID,
+			"v":             0,
+			"creatorUserID": neoLocalOwnerUserID,
+			"ownerUserId":   neoLocalOwnerUserID,
+			"messages":      []any{},
+		}
+		if actor := rt.store.lookupThreadActor(createdThreadID); actor != nil {
+			if snapshot, ok := actor.threadSnapshot(); ok {
+				threadDataThread = neoCloudThread(snapshot)
+			}
+		}
+		if threadDataThread["hasExecutor"] == false {
+			delete(threadDataThread, "hasExecutor")
+		}
+		if threadDataThread["executorConnected"] == false {
+			delete(threadDataThread, "executorConnected")
+		}
 		result["threadActorConfig"] = threadActorConfig
 		result["threadData"] = map[string]any{
-			"thread":            map[string]any{"id": createdThreadID},
+			"thread":            threadDataThread,
 			"threadActorConfig": threadActorConfig,
 		}
 	}
