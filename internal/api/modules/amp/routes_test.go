@@ -413,7 +413,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 	}
 	for _, want := range []string{
 		"// ==UserScript==",
-		"@version 0.1.45",
+		"@version 0.1.46",
 		"@match https://ampcode.com/*",
 		"@updateURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
 		"@downloadURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
@@ -428,7 +428,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"commandPaletteIntegrationCount",
 		"localThreadPickerOpenCount",
 		"removedLocalThreadControlCount",
-		`const userscriptVersion = "0.1.45"`,
+		`const userscriptVersion = "0.1.46"`,
 		"userscriptVersion",
 		"lastPatchedThreadActorBaseURL",
 		"lastPatchedThreadID",
@@ -607,8 +607,6 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"cachedProjectWorkingDirectory",
 		"patchPlainThreadRuntime",
 		"patchDevalueThreadRuntime",
-		"thread.hasExecutor",
-		"thread.executorConnected",
 		`meta.executorType = "local-client"`,
 		`source.includes("hasExecutor")`,
 		`source.includes("executorConnected")`,
@@ -793,7 +791,7 @@ if (typeof globalThis.btoa !== "function") {
 }
 require(scriptPath);
 const bridge = globalThis.__cliproxyAmpLocalInference;
-assert(bridge && bridge.userscriptVersion === "0.1.45", "bridge userscript version was not exposed");
+assert(bridge && bridge.userscriptVersion === "0.1.46", "bridge userscript version was not exposed");
 globalThis.localStorage.setItem(bridge.localThreadIDsStorageKey, JSON.stringify([threadID, secondThreadID]));
 globalThis.localStorage.setItem(bridge.apiKeyStorageKey, "local-key");
 globalThis.localStorage.setItem(bridge.workingDirectoryStorageKey, createdThreadWorkDir);
@@ -885,6 +883,89 @@ assert(bridgedCreateURL.origin === "http://127.0.0.1:8317", "create fetch was no
 assert(bridgedCreateURL.searchParams.get("cliproxy-working-directory") === createdThreadWorkDir, "create fetch missing working directory");
 assert(JSON.parse(globalThis.localStorage.getItem(bridge.localThreadIDsStorageKey)).includes(createdThreadID), "created thread was not remembered before route-data parse");
 globalThis.location = new URL("https://ampcode.com/threads/" + createdThreadID);
+const staleSidebarThreadID = "T-019f3586-fb79-7309-a219-4a279ef2900c";
+const sideEffectThreadID = "T-019f3586-fb79-7309-a219-4a279ef2900d";
+const stalePlainSidebar = JSON.parse(JSON.stringify({
+	recentThreads: [
+		{ id: createdThreadID, title: "Created", hasExecutor: false, executorConnected: false, meta: { executorType: "local-client", usesThreadActors: true } },
+		{ id: staleSidebarThreadID, title: "Remote", hasExecutor: false, executorConnected: false, meta: { executorType: "local-client", usesThreadActors: true } },
+	],
+}));
+assert(!Object.hasOwn(stalePlainSidebar.recentThreads[0], "hasExecutor"), "plain local stale hasExecutor was not cleared");
+assert(!Object.hasOwn(stalePlainSidebar.recentThreads[0], "executorConnected"), "plain local stale executorConnected was not cleared");
+assert(stalePlainSidebar.recentThreads[1].hasExecutor === false, "plain nonlocal hasExecutor was changed");
+assert(stalePlainSidebar.recentThreads[1].executorConnected === false, "plain nonlocal executorConnected was changed");
+const stalePlainAlias = JSON.parse(JSON.stringify({ id: "not-a-thread-id", threadId: createdThreadID, hasExecutor: false, executorConnected: false }));
+assert(!Object.hasOwn(stalePlainAlias, "hasExecutor"), "plain alias stale hasExecutor was not cleared");
+assert(!Object.hasOwn(stalePlainAlias, "executorConnected"), "plain alias stale executorConnected was not cleared");
+const activePlainArray = JSON.parse(JSON.stringify([{ id: createdThreadID, title: "Created", hasExecutor: false, executorConnected: false, threadActorConfig: null }]));
+assertPlainConfig(activePlainArray[0].threadActorConfig, "created plain");
+assert(!Object.hasOwn(activePlainArray[0], "hasExecutor"), "active plain array stale hasExecutor was not cleared");
+assert(!Object.hasOwn(activePlainArray[0], "executorConnected"), "active plain array stale executorConnected was not cleared");
+const stalePlainContainer = JSON.parse(JSON.stringify({ thread: { id: createdThreadID, title: "Created" }, hasExecutor: false, executorConnected: false, threadActorConfig: null }));
+assertPlainConfig(stalePlainContainer.threadActorConfig, "created plain");
+assert(!Object.hasOwn(stalePlainContainer, "hasExecutor"), "plain container stale hasExecutor was not cleared");
+assert(!Object.hasOwn(stalePlainContainer, "executorConnected"), "plain container stale executorConnected was not cleared");
+const staleDevalueSidebar = JSON.parse(JSON.stringify([
+	{ recentThreads: 1 },
+	[2, 7],
+	{ id: 3, title: 4, hasExecutor: 5, executorConnected: 5, meta: 6 },
+	createdThreadID,
+	"Created",
+	false,
+	{ executorType: 8, usesThreadActors: 9 },
+	{ id: 10, title: 11, hasExecutor: 5, executorConnected: 5, meta: 6 },
+	"local-client",
+	true,
+	staleSidebarThreadID,
+	"Remote",
+]));
+assert(!Object.hasOwn(staleDevalueSidebar[2], "hasExecutor"), "devalue local stale hasExecutor was not cleared");
+assert(!Object.hasOwn(staleDevalueSidebar[2], "executorConnected"), "devalue local stale executorConnected was not cleared");
+assert(staleDevalueSidebar[7].hasExecutor === 5, "devalue nonlocal hasExecutor was changed");
+assert(staleDevalueSidebar[7].executorConnected === 5, "devalue nonlocal executorConnected was changed");
+const staleDevalueAlias = JSON.parse(JSON.stringify([
+	{ id: 1, threadID: 2, hasExecutor: 3, executorConnected: 3 },
+	"not-a-thread-id",
+	createdThreadID,
+	false,
+]));
+assert(!Object.hasOwn(staleDevalueAlias[0], "hasExecutor"), "devalue alias stale hasExecutor was not cleared");
+assert(!Object.hasOwn(staleDevalueAlias[0], "executorConnected"), "devalue alias stale executorConnected was not cleared");
+const devalueThreadSettingsMessage = JSON.parse(JSON.stringify([
+	{ type: 1, threadID: 2, settings: 3 },
+	"thread_settings",
+	createdThreadID,
+	{ agentMode: 4 },
+	"deep",
+]));
+assert(!Object.hasOwn(devalueThreadSettingsMessage[0], "threadActorConfig"), "devalue thread_settings message was given a threadActorConfig");
+const staleDevalueContainer = JSON.parse(JSON.stringify([
+	{ thread: 1, hasExecutor: 3, executorConnected: 3 },
+	{ id: 2, title: 4 },
+	createdThreadID,
+	false,
+	"Created",
+]));
+assert(!Object.hasOwn(staleDevalueContainer[0], "hasExecutor"), "devalue container stale hasExecutor was not cleared");
+assert(!Object.hasOwn(staleDevalueContainer[0], "executorConnected"), "devalue container stale executorConnected was not cleared");
+const localThreadIDs = JSON.parse(globalThis.localStorage.getItem(bridge.localThreadIDsStorageKey));
+localThreadIDs.unshift(sideEffectThreadID);
+globalThis.localStorage.setItem(bridge.localThreadIDsStorageKey, JSON.stringify(localThreadIDs));
+const observedBeforeContainerClear = bridge.diagnostics.lastObservedThreadID;
+globalThis.location = new URL("https://ampcode.com/");
+const sideEffectDevalueContainer = JSON.parse(JSON.stringify([
+	{ thread: 1, hasExecutor: 3, executorConnected: 3 },
+	{ id: 2, title: 4 },
+	sideEffectThreadID,
+	false,
+	"Container",
+]));
+assert(!Object.hasOwn(sideEffectDevalueContainer[0], "hasExecutor"), "side-effect devalue container stale hasExecutor was not cleared");
+assert(!Object.hasOwn(sideEffectDevalueContainer[0], "executorConnected"), "side-effect devalue container stale executorConnected was not cleared");
+assert(bridge.diagnostics.lastObservedThreadID === observedBeforeContainerClear, "stale devalue container changed the observed thread");
+globalThis.location = new URL("https://ampcode.com/threads/" + createdThreadID);
+assert(bridge.diagnostics.localThreadStatusPatchCount >= 2, "local thread status patches were not recorded");
 const createdPlain = JSON.parse(JSON.stringify({ threadData: { thread: { id: createdThreadID, title: "Created" }, threadActorConfig: null } }));
 assertPlainConfig(createdPlain.threadData.threadActorConfig, "created plain");
 assert(bridge.diagnostics.lastPatchedThreadID === createdThreadID, "created route-data patch did not record thread ID");
@@ -1131,8 +1212,24 @@ let localProjectsPayload = {
 };
 globalThis.prompt = () => "";
 globalThis.WebSocket = class {};
-const visibleActivator = new FakeElement("button");
-visibleActivator.textContent = "Project: telemetry.dev";
+const headerProjectLink = new FakeElement("a");
+headerProjectLink.setAttribute("href", "https://github.com/telemetry-dev/telemetry.dev/tree/6bcbce6911b604cfc8dd8255bc9215a930222dfb");
+headerProjectLink.textContent = "telemetry.dev";
+const message = new FakeElement("article");
+const messageProjectLink = new FakeElement("a");
+messageProjectLink.setAttribute("href", "https://github.com/example/wrong/tree/main");
+messageProjectLink.textContent = "wrong";
+message.appendChild(messageProjectLink);
+const broadProjectLink = new FakeElement("a");
+broadProjectLink.setAttribute("href", "https://github.com/example/body-wrong/tree/main");
+broadProjectLink.textContent = "body-wrong";
+const broadMoreActions = new FakeElement("button");
+broadMoreActions.textContent = "More Actions";
+const headerContainer = new FakeElement("div");
+const moreActions = new FakeElement("button");
+moreActions.setAttribute("aria-label", "More Actions");
+moreActions.textContent = "More Actions";
+headerContainer.append(moreActions, headerProjectLink);
 const picker = new FakeElement("div");
 picker.setAttribute("role", "dialog");
 const input = new FakeElement("input");
@@ -1151,7 +1248,10 @@ list.appendChild(noProject);
 list.appendChild(actions);
 	picker.append(input, title, popupProjectButton, list);
 	body.appendChild(picker);
-	body.appendChild(visibleActivator);
+	body.appendChild(message);
+	body.appendChild(broadProjectLink);
+	body.appendChild(broadMoreActions);
+	body.appendChild(headerContainer);
 	require(scriptPath);
 	globalThis.sessionStorage.setItem("cliproxyapi.ampLocalInference.selectedLocalProject", JSON.stringify({
 		name: "on-chain",
@@ -1191,7 +1291,8 @@ assert(explicitDuplicateURL.searchParams.get("cliproxy-working-directory") === t
 	picker.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
 	await new Promise((resolve) => setTimeout(resolve, 25));
 	assert(globalThis.localStorage.getItem("cliproxyapi.ampLocalInference.workingDirectory") === "/Users/aikins01/Developer/telemetry.dev", "Enter did not activate the selected visible project");
-	visibleActivator.textContent = "Project: api";
+	headerProjectLink.textContent = "api";
+	headerProjectLink.setAttribute("href", "https://github.com/example/foo/tree/main");
 	globalThis.sessionStorage.setItem("cliproxyapi.ampLocalInference.selectedLocalProject", JSON.stringify({
 		name: "api",
 		workingDirectory: "/Users/aikins01/Developer/bar/api",
@@ -1209,7 +1310,8 @@ assert(explicitDuplicateURL.searchParams.get("cliproxy-working-directory") === t
 	});
 	const collisionURL = new URL(lastFetchURL);
 	assert(collisionURL.searchParams.get("cliproxy-working-directory") === "/Users/aikins01/Developer/bar/api", "remembered basename match overrode selected project: " + lastFetchURL);
-	visibleActivator.textContent = "Project: missing";
+	headerProjectLink.textContent = "missing";
+	headerProjectLink.setAttribute("href", "https://github.com/example/missing/tree/main");
 	localProjectsPayload = {
 		defaultWorkingDirectory: "/Users/aikins01",
 		projects: [

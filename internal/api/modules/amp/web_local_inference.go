@@ -215,7 +215,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	return fmt.Sprintf(`// ==UserScript==
 // @name CLIProxyAPI Amp Local Inference
 // @namespace https://github.com/router-for-me/CLIProxyAPI
-// @version 0.1.45
+// @version 0.1.46
 %s
 // @updateURL %s
 // @downloadURL %s
@@ -227,7 +227,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	"use strict";
 
 	const bridgeHeader = %s;
-	const userscriptVersion = "0.1.45";
+	const userscriptVersion = "0.1.46";
 	const apiKeyStorageKey = "cliproxyapi.ampLocalInference.apiKey";
 	const workingDirectoryStorageKey = "cliproxyapi.ampLocalInference.workingDirectory";
 	const selectedLocalProjectStorageKey = "cliproxyapi.ampLocalInference.selectedLocalProject";
@@ -254,6 +254,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		localProjectFetchCount: 0,
 		localProjectPickerIntegrationCount: 0,
 		localProjectActivatorIntegrationCount: 0,
+		localThreadStatusPatchCount: 0,
 		localThreadPickerOpenCount: 0,
 		removedLocalThreadControlCount: 0,
 		remoteShellCreateCount: 0,
@@ -676,9 +677,24 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		return typeof value === "string" && /^T-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(value.trim());
 	}
 
+	function normalizeThreadIDValue(value) {
+		value = typeof value === "string" ? value.trim() : "";
+		return validThreadID(value) ? value : "";
+	}
+
+	function firstNormalizedThreadID(...values) {
+		for (const value of values) {
+			const threadID = normalizeThreadIDValue(value);
+			if (threadID) {
+				return threadID;
+			}
+		}
+		return "";
+	}
+
 	function rememberObservedThreadID(threadID) {
-		threadID = typeof threadID === "string" ? threadID.trim() : "";
-		if (!validThreadID(threadID)) {
+		threadID = normalizeThreadIDValue(threadID);
+		if (!threadID) {
 			return "";
 		}
 		observedThreadID = threadID;
@@ -839,11 +855,11 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	}
 
 	function devalueThreadID(values, thread) {
-		if (!isPlainObject(thread) || !Number.isInteger(thread.id)) {
-			return "";
-		}
-		const id = values[thread.id];
-		return rememberObservedThreadID(id);
+		return rememberObservedThreadID(devalueStringField(values, thread, "id"));
+	}
+
+	function devalueThreadIDValue(values, thread) {
+		return normalizeThreadIDValue(devalueStringField(values, thread, "id"));
 	}
 
 	function devalueContainerThreadID(values, entry) {
@@ -857,6 +873,17 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		return devalueThreadID(values, values[entry.thread]);
 	}
 
+	function devalueContainerThreadIDValue(values, entry) {
+		const direct = devalueThreadIDValue(values, entry);
+		if (direct) {
+			return direct;
+		}
+		if (!isPlainObject(entry) || !Number.isInteger(entry.thread)) {
+			return "";
+		}
+		return devalueThreadIDValue(values, values[entry.thread]);
+	}
+
 	function devalueField(values, object, key) {
 		if (!isPlainObject(object) || !Number.isInteger(object[key])) {
 			return undefined;
@@ -867,6 +894,36 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	function devalueStringField(values, object, key) {
 		const value = devalueField(values, object, key);
 		return typeof value === "string" ? value : "";
+	}
+
+	function devalueAnyThreadID(values, thread) {
+		if (!isPlainObject(thread)) {
+			return "";
+		}
+		return firstNormalizedThreadID(
+			devalueStringField(values, thread, "id"),
+			devalueStringField(values, thread, "threadId"),
+			devalueStringField(values, thread, "threadID"),
+			devalueStringField(values, thread, "thread_id"),
+		);
+	}
+
+	function devalueContainerAnyThreadID(values, entry) {
+		const direct = devalueAnyThreadID(values, entry);
+		if (direct) {
+			return direct;
+		}
+		if (!isPlainObject(entry) || !Number.isInteger(entry.thread)) {
+			return "";
+		}
+		return devalueAnyThreadID(values, values[entry.thread]);
+	}
+
+	function devalueFalseField(values, object, key) {
+		if (!isPlainObject(object) || !Number.isInteger(object[key])) {
+			return false;
+		}
+		return values[object[key]] === false;
 	}
 
 	function devalueObjectField(values, object, key) {
@@ -1022,6 +1079,27 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		return false;
 	}
 
+	function clearDevalueStaleLocalThreadExecutorState(values, thread) {
+		const threadID = devalueContainerAnyThreadID(values, thread);
+		if (!threadID || !rememberedLocalThreadID(threadID)) {
+			return false;
+		}
+		let patched = false;
+		if (devalueFalseField(values, thread, "hasExecutor")) {
+			delete thread.hasExecutor;
+			patched = true;
+		}
+		if (devalueFalseField(values, thread, "executorConnected")) {
+			delete thread.executorConnected;
+			patched = true;
+		}
+		if (patched) {
+			diagnostics.localThreadStatusPatchCount += 1;
+			diagnostics.lastPatchedThreadID = threadID;
+		}
+		return patched;
+	}
+
 	function patchDevalueThreadActorConfigs(values, localBase) {
 		if (!Array.isArray(values)) {
 			return false;
@@ -1041,8 +1119,10 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			if (!isPlainObject(entry)) {
 				continue;
 			}
-			const entryThreadID = activeThread ? devalueContainerThreadID(values, entry) : "";
+			patched = clearDevalueStaleLocalThreadExecutorState(values, entry) || patched;
+			const entryThreadID = activeThread ? devalueContainerThreadIDValue(values, entry) : "";
 			if (entryThreadID && entryThreadID === activeThread) {
+				rememberObservedThreadID(entryThreadID);
 				rememberThreadSettings(activeThread, devalueThreadSettings(values, entry));
 				rememberDevalueThreadRuntime(values, i);
 				patched = ensureDevalueLocalThreadActorConfig(values, entry, activeThread, getBaseIndex) || patched;
@@ -1156,6 +1236,42 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		rememberThreadSettings(threadID, plainThreadSettings(settings));
 	}
 
+	function plainAnyThreadID(value) {
+		if (!isPlainObject(value)) {
+			return "";
+		}
+		return firstNormalizedThreadID(value.id, value.threadId, value.threadID, value.thread_id);
+	}
+
+	function plainContainerAnyThreadID(entry) {
+		const direct = plainAnyThreadID(entry);
+		if (direct) {
+			return direct;
+		}
+		return isPlainObject(entry) ? plainAnyThreadID(entry.thread) : "";
+	}
+
+	function clearPlainStaleLocalThreadExecutorState(thread) {
+		const threadID = plainContainerAnyThreadID(thread);
+		if (!threadID || !rememberedLocalThreadID(threadID)) {
+			return false;
+		}
+		let patched = false;
+		if (thread.hasExecutor === false) {
+			delete thread.hasExecutor;
+			patched = true;
+		}
+		if (thread.executorConnected === false) {
+			delete thread.executorConnected;
+			patched = true;
+		}
+		if (patched) {
+			diagnostics.localThreadStatusPatchCount += 1;
+			diagnostics.lastPatchedThreadID = threadID;
+		}
+		return patched;
+	}
+
 	function patchPlainThreadActorConfig(config, localBase) {
 		if (!plainThreadActorConfigLike(config)) {
 			return false;
@@ -1192,6 +1308,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		}
 		seen.add(value);
 		let patched = false;
+		patched = clearPlainStaleLocalThreadExecutorState(value) || patched;
 		patched = ensurePlainLocalThreadActorConfig(value, localBase) || patched;
 		if (isPlainObject(value.threadActorConfig)) {
 			patched = patchPlainThreadActorConfig(value.threadActorConfig, localBase) || patched;
@@ -1221,8 +1338,9 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		const patchOptions = options || { configs: true };
 		if (patchOptions.configs) {
 			const localBase = localBaseURLString();
-			const patched = patchDevalueThreadActorConfigs(value, localBase) ||
-				patchPlainThreadActorConfigs(value, new WeakSet(), localBase);
+			const devaluePatched = patchDevalueThreadActorConfigs(value, localBase);
+			const plainPatched = patchPlainThreadActorConfigs(value, new WeakSet(), localBase);
+			const patched = devaluePatched || plainPatched;
 			if (patched) {
 				diagnostics.decodedConfigPatchCount += 1;
 				diagnostics.lastPatchedThreadActorBaseURL = localBase;
@@ -1491,16 +1609,56 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	}
 
 	function visibleProjectName() {
-		for (const element of globalThis.document.querySelectorAll("button,[role='button'],[aria-haspopup]")) {
-			if (element.closest('[cmdk-root],[data-cmdk-root],[data-slot="dialog-content"],[role="dialog"]')) {
+		for (const element of globalThis.document.querySelectorAll("button,[role='button'],[aria-haspopup],a")) {
+			if (element.closest('[cmdk-root],[data-cmdk-root],[data-slot="dialog-content"],[role="dialog"],article,[data-message-id],[data-message]')) {
 				continue;
 			}
-			const label = localProjectActivatorProjectLabel(element);
+			const label = localProjectActivatorProjectLabel(element) || projectHeaderProjectLabel(element);
 			if (label) {
 				return label;
 			}
 		}
 		return "";
+	}
+
+	function compactElementText(element) {
+		if (!(element instanceof Element)) {
+			return "";
+		}
+		return firstString(element.innerText, element.textContent, element.getAttribute?.("aria-label"), element.getAttribute?.("title")).replace(/\s+/g, " ").trim();
+	}
+
+	function projectHeaderProjectLabel(element) {
+		if (!(element instanceof Element)) {
+			return "";
+		}
+		const href = firstString(element.getAttribute?.("href"));
+		if (!/^https?:\/\/github\.com\/[^/]+\/[^/]+\/tree\/.+/.test(href)) {
+			return "";
+		}
+		const label = compactElementText(element);
+		return label && projectHeaderContainer(element, label) ? label : "";
+	}
+
+	function projectHeaderContainer(element, label) {
+		for (let current = element.parentElement, depth = 0; current && depth < 7; current = current.parentElement, depth += 1) {
+			if (projectHeaderSearchBoundary(current)) {
+				return null;
+			}
+			const text = compactElementText(current);
+			const controls = Array.from(current.querySelectorAll?.("button,[role='button'],[aria-haspopup]") || []);
+			const hasActions = text.includes("More Actions") || controls.some((candidate) => compactElementText(candidate) === "More Actions");
+			if (text.includes(label) && hasActions) {
+				return current;
+			}
+		}
+		return null;
+	}
+
+	function projectHeaderSearchBoundary(element) {
+		return element === globalThis.document.body ||
+			element === globalThis.document.documentElement ||
+			element.matches?.("main,[role='main'],article,section,[data-message-id],[data-message]");
 	}
 
 	function visibleProjectWorkingDirectory() {
@@ -3188,27 +3346,27 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			}
 			return options;
 		};
-			if (bodyNeedsTextBridge(sourceURL, method, request, init)) {
-				try {
-					return request.clone().text().then((text) => {
-						const body = bridgeRequestBody(sourceURL, method, text);
-						return ensureVisibleProjectLookupForRemoteCreate(sourceURL).then(() => {
-							return originalFetch(targetURLForBody(body), makeOptions(body)).then((response) => {
-								return rememberRemoteCreateProjectThread(sourceURL, body, response);
-							});
+		if (bodyNeedsTextBridge(sourceURL, method, request, init)) {
+			try {
+				return request.clone().text().then((text) => {
+					const body = bridgeRequestBody(sourceURL, method, text);
+					return ensureVisibleProjectLookupForRemoteCreate(sourceURL).then(() => {
+						return originalFetch(targetURLForBody(body), makeOptions(body)).then((response) => {
+							return rememberRemoteCreateProjectThread(sourceURL, body, response);
 						});
 					});
-				} catch {
-				}
-			}
-			const body = bridgeRequestBody(sourceURL, method, init?.body ?? requestOptions.body);
-			const options = makeOptions(body);
-			return ensureVisibleProjectLookupForRemoteCreate(sourceURL).then(() => {
-				return originalFetch(targetURLForBody(body), options).then((response) => {
-					return rememberRemoteCreateProjectThread(sourceURL, body, response);
 				});
+			} catch {
+			}
+		}
+		const body = bridgeRequestBody(sourceURL, method, init?.body ?? requestOptions.body);
+		const options = makeOptions(body);
+		return ensureVisibleProjectLookupForRemoteCreate(sourceURL).then(() => {
+			return originalFetch(targetURLForBody(body), options).then((response) => {
+				return rememberRemoteCreateProjectThread(sourceURL, body, response);
 			});
-		};
+		});
+	};
 
 	globalThis.WebSocket = new Proxy(NativeWebSocket, {
 		construct(target, args, newTarget) {
