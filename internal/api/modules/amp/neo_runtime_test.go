@@ -3722,22 +3722,16 @@ func TestNeoRuntimeWebLocalInferenceReplaysCurrentExecutorState(t *testing.T) {
 	if observers["hasExecutor"] != true {
 		t.Fatalf("observers = %#v, want hasExecutor", observers)
 	}
+	connected := waitForNeoRivetBareEventType(t, conn, "executor_connected", 2*time.Second)
+	if connected["executorId"] != "executor-existing" {
+		t.Fatalf("executor_connected = %#v, want executor-existing", connected)
+	}
 	status := waitForNeoRivetBareEventType(t, conn, "executor_status", 2*time.Second)
 	if status["status"] != "running" || status["executorId"] != "executor-existing" {
 		t.Fatalf("executor_status = %#v, want running existing executor", status)
 	}
 	if mapValue(status["details"])["reasonCode"] != "executor_connected" {
 		t.Fatalf("executor_status details = %#v, want executor_connected", status["details"])
-	}
-	deadline := time.Now().Add(200 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		name, _, ok := readNeoRivetBareEvent(t, conn, time.Until(deadline))
-		if !ok {
-			return
-		}
-		if name == "executor_connected" {
-			t.Fatal("web local observer received executor_connected")
-		}
 	}
 }
 
@@ -3797,8 +3791,9 @@ func TestNeoRuntimeWebLocalInferenceJSONRPCReplaysCurrentExecutorStateAsObserver
 
 	var sawObservers bool
 	var sawStatus bool
+	var sawConnected bool
 	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) && (!sawObservers || !sawStatus) {
+	for time.Now().Before(deadline) && (!sawObservers || !sawStatus || !sawConnected) {
 		_ = conn.SetReadDeadline(time.Now().Add(time.Until(deadline)))
 		_, payload, errRead := conn.ReadMessage()
 		if errRead != nil {
@@ -3812,7 +3807,11 @@ func TestNeoRuntimeWebLocalInferenceJSONRPCReplaysCurrentExecutorStateAsObserver
 			t.Fatalf("initial jsonrpc frame JSON error: %v", err)
 		}
 		if frame["method"] == "executor_connected" {
-			t.Fatalf("web local JSON-RPC observer received executor_connected: %#v", frame)
+			params := mapValue(frame["params"])
+			if params["executorId"] != "executor-existing" {
+				t.Fatalf("executor_connected params = %#v, want executor-existing", params)
+			}
+			sawConnected = true
 		}
 		if frame["method"] == "observers" {
 			params := mapValue(frame["params"])
@@ -3829,8 +3828,8 @@ func TestNeoRuntimeWebLocalInferenceJSONRPCReplaysCurrentExecutorStateAsObserver
 			sawStatus = true
 		}
 	}
-	if !sawObservers || !sawStatus {
-		t.Fatalf("initial JSON-RPC replay sawObservers=%v sawStatus=%v", sawObservers, sawStatus)
+	if !sawObservers || !sawStatus || !sawConnected {
+		t.Fatalf("initial JSON-RPC replay sawObservers=%v sawStatus=%v sawConnected=%v", sawObservers, sawStatus, sawConnected)
 	}
 
 	if err := conn.WriteJSON(map[string]any{
@@ -3843,8 +3842,9 @@ func TestNeoRuntimeWebLocalInferenceJSONRPCReplaysCurrentExecutorStateAsObserver
 	}
 
 	sawResponse := false
+	sawConnected = false
 	deadline = time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) && !sawResponse {
+	for time.Now().Before(deadline) && (!sawResponse || !sawConnected) {
 		_ = conn.SetReadDeadline(time.Now().Add(time.Until(deadline)))
 		_, payload, errRead := conn.ReadMessage()
 		if errRead != nil {
@@ -3858,14 +3858,18 @@ func TestNeoRuntimeWebLocalInferenceJSONRPCReplaysCurrentExecutorStateAsObserver
 			t.Fatalf("resumed jsonrpc frame JSON error: %v", err)
 		}
 		if frame["method"] == "executor_connected" {
-			t.Fatalf("web local JSON-RPC observer received resume executor_connected: %#v", frame)
+			params := mapValue(frame["params"])
+			if params["executorId"] != "executor-existing" {
+				t.Fatalf("resumed executor_connected params = %#v, want executor-existing", params)
+			}
+			sawConnected = true
 		}
 		if frame["id"] == "resume-1" {
 			sawResponse = true
 		}
 	}
-	if !sawResponse {
-		t.Fatal("timed out waiting for JSON-RPC client_resume response")
+	if !sawResponse || !sawConnected {
+		t.Fatalf("resumed JSON-RPC sawResponse=%v sawConnected=%v", sawResponse, sawConnected)
 	}
 }
 
@@ -7364,7 +7368,7 @@ func TestNeoRuntimeGitBridgeAndWorkspaceMessageTypes(t *testing.T) {
 	}
 }
 
-func TestNeoWebLocalObserverPayloadFiltersExecutorConnected(t *testing.T) {
+func TestNeoWebLocalObserverPayloadAllowsExecutorConnected(t *testing.T) {
 	original := neoObserversPayload(1, false)
 	patchedPayload, ok := neoWebLocalObserverPayload(original)
 	if !ok {
@@ -7388,8 +7392,8 @@ func TestNeoWebLocalObserverPayloadFiltersExecutorConnected(t *testing.T) {
 		t.Fatalf("non-observer payload changed: %#v", unchanged)
 	}
 
-	if payload, ok := neoWebLocalObserverPayload(map[string]any{"type": "executor_connected", "executorId": "executor"}); ok || payload != nil {
-		t.Fatalf("executor_connected payload = %#v, ok=%v; want suppressed", payload, ok)
+	if payload, ok := neoWebLocalObserverPayload(map[string]any{"type": "executor_connected", "executorId": "executor"}); !ok || stringValue(mapValue(payload)["type"]) != "executor_connected" {
+		t.Fatalf("executor_connected payload = %#v, ok=%v; want forwarded", payload, ok)
 	}
 }
 

@@ -19359,9 +19359,6 @@ func (s *neoSocket) isWebLocalObserver() bool {
 }
 
 func neoWebLocalObserverPayload(payload any) (any, bool) {
-	if stringValue(mapValue(payload)["type"]) == "executor_connected" {
-		return nil, false
-	}
 	return payload, true
 }
 
