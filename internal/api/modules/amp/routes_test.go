@@ -413,7 +413,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 	}
 	for _, want := range []string{
 		"// ==UserScript==",
-		"@version 0.1.49",
+		"@version 0.1.50",
 		"@match https://ampcode.com/*",
 		"@updateURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
 		"@downloadURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
@@ -428,7 +428,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"commandPaletteIntegrationCount",
 		"localThreadPickerOpenCount",
 		"removedLocalThreadControlCount",
-		`const userscriptVersion = "0.1.49"`,
+		`const userscriptVersion = "0.1.50"`,
 		"userscriptVersion",
 		"lastPatchedThreadActorBaseURL",
 		"lastPatchedThreadID",
@@ -793,7 +793,7 @@ if (typeof globalThis.btoa !== "function") {
 }
 require(scriptPath);
 const bridge = globalThis.__cliproxyAmpLocalInference;
-assert(bridge && bridge.userscriptVersion === "0.1.49", "bridge userscript version was not exposed");
+assert(bridge && bridge.userscriptVersion === "0.1.50", "bridge userscript version was not exposed");
 globalThis.localStorage.setItem(bridge.localThreadIDsStorageKey, JSON.stringify([threadID, secondThreadID]));
 globalThis.localStorage.setItem(bridge.apiKeyStorageKey, "local-key");
 globalThis.localStorage.setItem(bridge.workingDirectoryStorageKey, createdThreadWorkDir);
@@ -971,6 +971,17 @@ assert(bridge.diagnostics.localThreadStatusPatchCount >= 2, "local thread status
 const createdPlain = JSON.parse(JSON.stringify({ threadData: { thread: { id: createdThreadID, title: "Created" }, threadActorConfig: null } }));
 assertPlainConfig(createdPlain.threadData.threadActorConfig, "created plain");
 assert(bridge.diagnostics.lastPatchedThreadID === createdThreadID, "created route-data patch did not record thread ID");
+const threadDataResponse = new Response(JSON.stringify({
+	type: "result",
+	thread: { id: createdThreadID, title: "Created", hasExecutor: false, executorConnected: false },
+	project: null,
+}));
+Object.defineProperty(threadDataResponse, "url", { value: "https://ampcode.com/threads/" + createdThreadID + "/__data" });
+const decodedThreadDataResponse = await threadDataResponse.json();
+assertPlainConfig(decodedThreadDataResponse.threadActorConfig, "created plain");
+assert(!Object.hasOwn(decodedThreadDataResponse.thread, "hasExecutor"), "thread data response stale hasExecutor was not cleared");
+assert(!Object.hasOwn(decodedThreadDataResponse.thread, "executorConnected"), "thread data response stale executorConnected was not cleared");
+assert(bridge.diagnostics.lastPatchedThreadID === createdThreadID, "thread data response patch did not record thread ID");
 const nestedRouteData = JSON.parse(JSON.stringify({
 	type: "data",
 	nodes: [

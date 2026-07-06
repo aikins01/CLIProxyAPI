@@ -215,7 +215,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	return fmt.Sprintf(`// ==UserScript==
 // @name CLIProxyAPI Amp Local Inference
 // @namespace https://github.com/router-for-me/CLIProxyAPI
-// @version 0.1.49
+// @version 0.1.50
 %s
 // @updateURL %s
 // @downloadURL %s
@@ -227,7 +227,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	"use strict";
 
 	const bridgeHeader = %s;
-	const userscriptVersion = "0.1.49";
+	const userscriptVersion = "0.1.50";
 	const apiKeyStorageKey = "cliproxyapi.ampLocalInference.apiKey";
 	const workingDirectoryStorageKey = "cliproxyapi.ampLocalInference.workingDirectory";
 	const selectedLocalProjectStorageKey = "cliproxyapi.ampLocalInference.selectedLocalProject";
@@ -239,6 +239,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	let defaultWorkingDirectory = "";
 	const originalJSONParse = globalThis.JSON.parse.bind(globalThis.JSON);
 	const originalFetch = globalThis.fetch.bind(globalThis);
+	const originalResponseJSON = globalThis.Response?.prototype?.json;
 	const NativeWebSocket = globalThis.WebSocket;
 	const diagnostics = {
 		decodedConfigPatchCount: 0,
@@ -1414,6 +1415,23 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 
 	function createProjectThreadRemotePath(path) {
 		return svelteKitRemoteEndpoint(path) === "createProjectThread";
+	}
+
+	function threadPageDataPath(path) {
+		const match = String(path || "").match(/^\/threads\/([^/?#]+)\/__data\/?$/);
+		return !!match && validThreadID(decodeURIComponent(match[1]));
+	}
+
+	function shouldPatchResponseJSON(response) {
+		if (!response || !response.url) {
+			return false;
+		}
+		try {
+			const url = new URL(response.url, globalThis.location.href);
+			return url.origin === globalThis.location.origin && threadPageDataPath(url.pathname);
+		} catch {
+			return false;
+		}
 	}
 
 	function shouldBridgeHTTP(url) {
@@ -3412,6 +3430,21 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		}
 		return parsed;
 	};
+
+	if (typeof originalResponseJSON === "function") {
+		globalThis.Response.prototype.json = function(...args) {
+			const response = this;
+			return originalResponseJSON.apply(response, args).then((parsed) => {
+				try {
+					if (shouldPatchResponseJSON(response)) {
+						patchDecodedLocalInference(parsed, { configs: true });
+					}
+				} catch {
+				}
+				return parsed;
+			});
+		};
+	}
 
 	globalThis.fetch = function(input, init) {
 		const request = input instanceof Request ? input : null;
