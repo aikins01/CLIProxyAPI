@@ -413,7 +413,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 	}
 	for _, want := range []string{
 		"// ==UserScript==",
-		"@version 0.1.50",
+		"@version 0.1.53",
 		"@match https://ampcode.com/*",
 		"@updateURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
 		"@downloadURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
@@ -428,7 +428,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"commandPaletteIntegrationCount",
 		"localThreadPickerOpenCount",
 		"removedLocalThreadControlCount",
-		`const userscriptVersion = "0.1.50"`,
+		`const userscriptVersion = "0.1.53"`,
 		"userscriptVersion",
 		"lastPatchedThreadActorBaseURL",
 		"lastPatchedThreadID",
@@ -754,8 +754,30 @@ const requestPayloadText = (body) => {
 	}
 };
 let createFetchURL = "";
+let metadataFetchURL = "";
+let metadataFetchAuthorization = "";
+let metadataFetchBridgeHeader = "";
 globalThis.fetch = async (url, init) => {
-	createFetchURL = String(url);
+	const fetchURL = String(url);
+	const parsedURL = new URL(fetchURL, globalThis.location.href);
+	if (parsedURL.pathname === "/metadata" || parsedURL.pathname === "/actors/metadata") {
+		metadataFetchURL = fetchURL;
+		const headers = new Headers(init?.headers || {});
+		metadataFetchAuthorization = headers.get("Authorization") || "";
+		metadataFetchBridgeHeader = headers.get("X-CLIProxyAPI-Web-Local-Inference") || "";
+		return new Response(JSON.stringify({
+			clientEndpoint: "http://127.0.0.1:8317",
+			clientNamespace: parsedURL.searchParams.get("namespace") || "default",
+			clientToken: "local-neo",
+			runtime: "engine",
+		}), {
+			status: 200,
+			headers: { "Content-Type": "application/json" },
+		});
+	}
+	if (parsedURL.pathname.endsWith("/createProjectThread")) {
+		createFetchURL = fetchURL;
+	}
 	const body = String(init?.body || "");
 	if (requestPayloadText(body).includes(failedThreadID)) {
 		const data = JSON.stringify([
@@ -793,10 +815,22 @@ if (typeof globalThis.btoa !== "function") {
 }
 require(scriptPath);
 const bridge = globalThis.__cliproxyAmpLocalInference;
-assert(bridge && bridge.userscriptVersion === "0.1.50", "bridge userscript version was not exposed");
+assert(bridge && bridge.userscriptVersion === "0.1.53", "bridge userscript version was not exposed");
 globalThis.localStorage.setItem(bridge.localThreadIDsStorageKey, JSON.stringify([threadID, secondThreadID]));
 globalThis.localStorage.setItem(bridge.apiKeyStorageKey, "local-key");
 globalThis.localStorage.setItem(bridge.workingDirectoryStorageKey, createdThreadWorkDir);
+const metadataResponse = await fetch("http://127.0.0.1:8317/metadata?namespace=default");
+assert(metadataResponse.ok, "metadata fetch failed");
+assert(metadataFetchURL === "http://127.0.0.1:8317/metadata?namespace=default", "local metadata URL changed");
+assert(metadataFetchAuthorization === "Bearer local-key", "local metadata fetch missing API key");
+assert(metadataFetchBridgeHeader === "1", "local metadata fetch missing bridge header");
+const actorsMetadataResponse = await fetch("https://ampcode.com/actors/metadata?namespace=default");
+assert(actorsMetadataResponse.ok, "actors metadata fetch failed");
+const bridgedActorsMetadataURL = new URL(metadataFetchURL);
+assert(bridgedActorsMetadataURL.origin === "http://127.0.0.1:8317", "same-origin actors metadata was not bridged to local base");
+assert(bridgedActorsMetadataURL.pathname === "/actors/metadata", "actors metadata path changed");
+assert(metadataFetchAuthorization === "Bearer local-key", "actors metadata fetch missing API key");
+assert(metadataFetchBridgeHeader === "1", "actors metadata fetch missing bridge header");
 const assertPlainConfig = (config, label) => {
 	assert(config && typeof config === "object", label + " config missing");
 	const expectedThreadID = label === "created plain" ? createdThreadID : threadID;
@@ -982,6 +1016,47 @@ assertPlainConfig(decodedThreadDataResponse.threadActorConfig, "created plain");
 assert(!Object.hasOwn(decodedThreadDataResponse.thread, "hasExecutor"), "thread data response stale hasExecutor was not cleared");
 assert(!Object.hasOwn(decodedThreadDataResponse.thread, "executorConnected"), "thread data response stale executorConnected was not cleared");
 assert(bridge.diagnostics.lastPatchedThreadID === createdThreadID, "thread data response patch did not record thread ID");
+const localThreadDataResponse = new Response(JSON.stringify({
+	type: "result",
+	thread: { id: createdThreadID, title: "Created local", hasExecutor: false, executorConnected: false },
+	project: null,
+}));
+Object.defineProperty(localThreadDataResponse, "url", { value: "http://127.0.0.1:8317/threads/" + createdThreadID + "/__data" });
+const decodedLocalThreadDataResponse = await localThreadDataResponse.json();
+assertPlainConfig(decodedLocalThreadDataResponse.threadActorConfig, "created plain");
+assert(!Object.hasOwn(decodedLocalThreadDataResponse.thread, "hasExecutor"), "local thread data response stale hasExecutor was not cleared");
+assert(!Object.hasOwn(decodedLocalThreadDataResponse.thread, "executorConnected"), "local thread data response stale executorConnected was not cleared");
+const jsonThreadDataResponse = new Response(JSON.stringify({
+	type: "data",
+	nodes: [
+		null,
+		{
+			type: "data",
+			data: [
+				{ threadData: 1 },
+				{ thread: 2, threadActorConfig: 5 },
+				{ id: 3, title: 4, hasExecutor: 6, executorConnected: 6 },
+				createdThreadID,
+				"Created JSON",
+				null,
+				false,
+			],
+		},
+	],
+}));
+Object.defineProperty(jsonThreadDataResponse, "url", { value: "https://ampcode.com/threads/" + createdThreadID + "/__data.json" });
+const decodedJSONThreadDataResponse = await jsonThreadDataResponse.json();
+const jsonValues = decodedJSONThreadDataResponse.nodes[1].data;
+const jsonConfigIndex = jsonValues[1].threadActorConfig;
+assert(Number.isInteger(jsonConfigIndex), "json route-data threadActorConfig was not patched");
+assert(jsonConfigIndex !== 5, "json route-data threadActorConfig still points at null");
+const jsonConfig = jsonValues[jsonConfigIndex];
+const jsonDeref = (value) => Number.isInteger(value) ? jsonValues[value] : value;
+assert(jsonDeref(jsonConfig.threadId) === createdThreadID, "json route-data threadId mismatch");
+assert(jsonDeref(jsonConfig.wsToken) === "local-neo", "json route-data wsToken mismatch");
+assert(!Object.hasOwn(jsonValues[2], "hasExecutor"), "json route-data stale hasExecutor was not cleared");
+assert(!Object.hasOwn(jsonValues[2], "executorConnected"), "json route-data stale executorConnected was not cleared");
+assert(bridge.diagnostics.responseJSONPatchCount >= 3, "response json patches were not recorded");
 const nestedRouteData = JSON.parse(JSON.stringify({
 	type: "data",
 	nodes: [
@@ -1588,6 +1663,29 @@ func TestWebLocalInferenceGatewayWebSocketUsesQueryAPIKey(t *testing.T) {
 	}
 	if sawQueryAPIKey {
 		t.Fatal("web local inference query API key leaked to runtime")
+	}
+
+	sawInternalClientKey = ""
+	sawQueryAPIKey = false
+	rivetReq, err := http.NewRequest(http.MethodGet, server.URL+"/gateway/threadActor/?rvt-method=get&rvt-key=T-web&rvt-token=local-neo&"+ampWebLocalInferenceAPIKeyQuery+"=local-key", nil)
+	if err != nil {
+		t.Fatalf("rivet request build: %v", err)
+	}
+	rivetReq.Header.Set("Origin", "https://ampcode.com")
+	rivetResp, err := http.DefaultClient.Do(rivetReq)
+	if err != nil {
+		t.Fatalf("rivet request: %v", err)
+	}
+	defer rivetResp.Body.Close()
+	if rivetResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(rivetResp.Body)
+		t.Fatalf("rivet status = %d, body=%s", rivetResp.StatusCode, body)
+	}
+	if sawInternalClientKey != "local-key" {
+		t.Fatalf("rivet %s = %q, want local-key", neoInternalClientAPIKeyHeader, sawInternalClientKey)
+	}
+	if sawQueryAPIKey {
+		t.Fatal("rivet web local inference query API key leaked to runtime")
 	}
 }
 
@@ -2455,6 +2553,25 @@ func TestWebLocalInferenceInternalRPCServesLocalThreadWithoutProxy(t *testing.T)
 	r.ServeHTTP(plainRec, plainReq)
 	if plainRec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("unmarked getThread status = %d, want %d; body=%s", plainRec.Code, http.StatusServiceUnavailable, plainRec.Body.String())
+	}
+
+	cliReq := httptest.NewRequest(http.MethodPost, "/api/internal?getThread", bytes.NewBufferString(`{"method":"getThread","params":{"thread":"`+threadID+`"}}`))
+	cliReq.Header.Set("Content-Type", "application/json")
+	cliReq.Header.Set("X-Amp-Client-Application", "CLI")
+	cliReq.Header.Set("X-Amp-Client-Type", "cli")
+	cliReq.RemoteAddr = "[::1]:54321"
+	cliRec := httptest.NewRecorder()
+	r.ServeHTTP(cliRec, cliReq)
+	if cliRec.Code != http.StatusOK {
+		t.Fatalf("cli getThread status = %d, body=%s", cliRec.Code, cliRec.Body.String())
+	}
+	var cliResponse map[string]any
+	if err := json.Unmarshal(cliRec.Body.Bytes(), &cliResponse); err != nil {
+		t.Fatalf("cli getThread response JSON error: %v", err)
+	}
+	cliThread := mapValue(mapValue(cliResponse["result"])["thread"])
+	if stringValue(cliThread["id"]) != threadID || stringValue(mapValue(cliThread["meta"])["ampcodeConnectorMode"]) != "local-neo" {
+		t.Fatalf("unexpected cli local thread response: %#v", cliResponse)
 	}
 }
 
@@ -3951,6 +4068,112 @@ func TestRegisterManagementRoutesBypassesManagementAuthForActorEngineWebsocketTo
 	}
 	if hdr.Get("X-Api-Key") != "" {
 		t.Fatalf("X-Api-Key = %q, want stripped for actor websocket token", hdr.Get("X-Api-Key"))
+	}
+}
+
+func TestRegisterManagementRoutesRequiresManagementAuthForWebLocalActorEngineWebsocketToken(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	gotPath := make(chan string, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath <- r.URL.RequestURI()
+		writeNeoJSON(w, http.StatusOK, map[string]any{"source": "upstream"})
+	}))
+	defer upstream.Close()
+
+	r := gin.New()
+	m := &AmpModule{
+		restrictToLocalhost: false,
+		lastConfig: &config.AmpCode{
+			WebLocalInference: config.AmpWebLocalInference{
+				Enabled:        true,
+				AllowedOrigins: []string{"https://ampcode.com"},
+			},
+		},
+	}
+	proxy, err := createReverseProxy(upstream.URL, NewStaticSecretSource("secret"))
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	m.setProxy(proxy)
+	authCalled := false
+	auth := func(c *gin.Context) {
+		authCalled = true
+		token := strings.TrimSpace(c.GetHeader("Authorization"))
+		token = strings.TrimSpace(strings.TrimPrefix(token, "Bearer "))
+		if token != "local-key" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing auth"})
+			return
+		}
+		c.Set("userApiKey", token)
+		c.Next()
+	}
+	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, auth)
+
+	server := httptest.NewServer(r)
+	defer server.Close()
+
+	req, err := http.NewRequest(http.MethodGet, server.URL+"/gateway/threadActor/websocket/?rvt-namespace=default&rvt-method=get&rvt-key=T-web&rvt-token=local-neo&rvt-skip-ready-wait=true", nil)
+	if err != nil {
+		t.Fatalf("create request: %v", err)
+	}
+	req.Header.Set("Origin", "https://ampcode.com")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, body=%s", resp.StatusCode, body)
+	}
+	if !authCalled {
+		t.Fatal("actor websocket token request should call management auth for web-local CORS")
+	}
+	select {
+	case path := <-gotPath:
+		t.Fatalf("unauthorized request reached upstream path %q", path)
+	default:
+	}
+
+	authCalled = false
+	authorizedReq, err := http.NewRequest(http.MethodGet, server.URL+"/gateway/threadActor/websocket/?rvt-namespace=default&rvt-method=get&rvt-key=T-web&rvt-token=local-neo&rvt-skip-ready-wait=true&"+ampWebLocalInferenceAPIKeyQuery+"=local-key", nil)
+	if err != nil {
+		t.Fatalf("create authorized request: %v", err)
+	}
+	authorizedReq.Header.Set("Origin", "https://ampcode.com")
+	authorizedResp, err := http.DefaultClient.Do(authorizedReq)
+	if err != nil {
+		t.Fatalf("authorized request: %v", err)
+	}
+	defer authorizedResp.Body.Close()
+	if authorizedResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(authorizedResp.Body)
+		t.Fatalf("authorized status = %d, body=%s", authorizedResp.StatusCode, body)
+	}
+	if !authCalled {
+		t.Fatal("authorized actor websocket token request should call management auth")
+	}
+	if path := <-gotPath; !strings.HasPrefix(path, "/gateway/threadActor/websocket/") {
+		t.Fatalf("upstream path = %q, want actor websocket path", path)
+	} else if strings.Contains(path, ampWebLocalInferenceAPIKeyQuery) {
+		t.Fatalf("upstream path leaked query API key: %q", path)
+	}
+
+	metadataReq, err := http.NewRequest(http.MethodGet, server.URL+"/metadata?namespace=default", nil)
+	if err != nil {
+		t.Fatalf("metadata request build: %v", err)
+	}
+	metadataReq.Header.Set("Origin", "https://ampcode.com")
+	metadataResp, err := http.DefaultClient.Do(metadataReq)
+	if err != nil {
+		t.Fatalf("metadata request: %v", err)
+	}
+	defer metadataResp.Body.Close()
+	if metadataResp.StatusCode != http.StatusUnauthorized {
+		body, _ := io.ReadAll(metadataResp.Body)
+		t.Fatalf("metadata status = %d, body=%s", metadataResp.StatusCode, body)
 	}
 }
 

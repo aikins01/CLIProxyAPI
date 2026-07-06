@@ -215,7 +215,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	return fmt.Sprintf(`// ==UserScript==
 // @name CLIProxyAPI Amp Local Inference
 // @namespace https://github.com/router-for-me/CLIProxyAPI
-// @version 0.1.50
+// @version 0.1.53
 %s
 // @updateURL %s
 // @downloadURL %s
@@ -227,7 +227,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	"use strict";
 
 	const bridgeHeader = %s;
-	const userscriptVersion = "0.1.50";
+	const userscriptVersion = "0.1.53";
 	const apiKeyStorageKey = "cliproxyapi.ampLocalInference.apiKey";
 	const workingDirectoryStorageKey = "cliproxyapi.ampLocalInference.workingDirectory";
 	const selectedLocalProjectStorageKey = "cliproxyapi.ampLocalInference.selectedLocalProject";
@@ -243,6 +243,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	const NativeWebSocket = globalThis.WebSocket;
 	const diagnostics = {
 		decodedConfigPatchCount: 0,
+		responseJSONPatchCount: 0,
 		fetchRewriteCount: 0,
 		webSocketRewriteCount: 0,
 		webSocketBootstrapCount: 0,
@@ -1417,8 +1418,12 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		return svelteKitRemoteEndpoint(path) === "createProjectThread";
 	}
 
+	function rivetMetadataPath(path) {
+		return path === "/metadata" || path === "/actors/metadata";
+	}
+
 	function threadPageDataPath(path) {
-		const match = String(path || "").match(/^\/threads\/([^/?#]+)\/__data\/?$/);
+		const match = String(path || "").match(/^\/threads\/([^/?#]+)\/__data(?:\.json)?\/?$/);
 		return !!match && validThreadID(decodeURIComponent(match[1]));
 	}
 
@@ -1428,14 +1433,15 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		}
 		try {
 			const url = new URL(response.url, globalThis.location.href);
-			return url.origin === globalThis.location.origin && threadPageDataPath(url.pathname);
+			return threadPageDataPath(url.pathname) &&
+				(url.origin === globalThis.location.origin || sameLocalHTTPBase(url, localBaseURL()));
 		} catch {
 			return false;
 		}
 	}
 
 	function shouldBridgeHTTP(url) {
-		if (!threadActorAPIPath(url.pathname) && !internalAPIPath(url.pathname) && !svelteKitRemotePath(url.pathname)) {
+		if (!threadActorAPIPath(url.pathname) && !internalAPIPath(url.pathname) && !svelteKitRemotePath(url.pathname) && !rivetMetadataPath(url.pathname)) {
 			return false;
 		}
 		if (internalAPIPath(url.pathname) && !activeLocalThreadID()) {
@@ -1454,7 +1460,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	}
 
 	function shouldRewriteHTTP(url) {
-		return url.origin === globalThis.location.origin && (threadActorAPIPath(url.pathname) || internalAPIPath(url.pathname) || svelteKitRemotePath(url.pathname));
+		return url.origin === globalThis.location.origin && (threadActorAPIPath(url.pathname) || internalAPIPath(url.pathname) || svelteKitRemotePath(url.pathname) || rivetMetadataPath(url.pathname));
 	}
 
 	function internalAPIPath(path) {
@@ -3438,6 +3444,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 				try {
 					if (shouldPatchResponseJSON(response)) {
 						patchDecodedLocalInference(parsed, { configs: true });
+						diagnostics.responseJSONPatchCount += 1;
 					}
 				} catch {
 				}

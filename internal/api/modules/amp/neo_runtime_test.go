@@ -3731,6 +3731,125 @@ func TestNeoRuntimeWebLocalInferenceReplaysCurrentExecutorState(t *testing.T) {
 	}
 }
 
+func TestNeoRuntimeWebLocalInferenceReplaysLastExecutorFailure(t *testing.T) {
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+		NeoLocalRuntime: config.AmpNeoLocalRuntime{
+			Enabled:           &enabled,
+			ForceThreadActors: true,
+		},
+		WebLocalInference: config.AmpWebLocalInference{
+			Enabled:        true,
+			AllowedOrigins: []string{"https://ampcode.com"},
+		},
+	}})
+	threadID := "T-77777777-7777-4777-8777-777777777779"
+	actor, _ := rt.store.upsert(map[string]any{
+		"name": "threadActor",
+		"key":  threadID,
+		"input": map[string]any{
+			"threadId": threadID,
+		},
+	}, true)
+	actor.broadcastExecutorStatus("spawn-failed", "failed", "Local Amp headless executor did not connect before the timeout.", map[string]any{
+		"reasonCode":     "connect_timeout",
+		"threadId":       threadID,
+		"timeoutSeconds": 10,
+	})
+
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	t.Cleanup(server.Close)
+
+	dialer := websocket.Dialer{Subprotocols: []string{"rivet", "rivet_encoding.4", "rivet_skip_ready_wait"}}
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/gateway/threadActor/websocket/?rvt-method=get&rvt-key=" + threadID + "&rvt-skip-ready-wait=true"
+	headers := http.Header{
+		"Origin":                      []string{"https://ampcode.com"},
+		neoInternalClientAPIKeyHeader: []string{"local-key"},
+	}
+	conn, resp, err := dialer.Dial(wsURL, headers)
+	if err != nil {
+		status := 0
+		if resp != nil {
+			status = resp.StatusCode
+		}
+		t.Fatalf("gateway websocket dial failed status=%d err=%v", status, err)
+	}
+	defer conn.Close()
+
+	waitForNeoRivetBareInit(t, conn, 2*time.Second)
+	observers := waitForNeoRivetBareEventType(t, conn, "observers", 2*time.Second)
+	if observers["hasExecutor"] == true {
+		t.Fatalf("observers = %#v, want disconnected executor", observers)
+	}
+	status := waitForNeoRivetBareEventType(t, conn, "executor_status", 2*time.Second)
+	if status["status"] != "failed" || status["spawnId"] != "spawn-failed" {
+		t.Fatalf("executor_status = %#v, want replayed failed spawn", status)
+	}
+	if mapValue(status["details"])["reasonCode"] != "connect_timeout" {
+		t.Fatalf("executor_status details = %#v, want connect_timeout", status["details"])
+	}
+}
+
+func TestNeoRuntimeWebLocalInferenceReplaysExecutorOriginatedStatus(t *testing.T) {
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+		NeoLocalRuntime: config.AmpNeoLocalRuntime{
+			Enabled:           &enabled,
+			ForceThreadActors: true,
+		},
+		WebLocalInference: config.AmpWebLocalInference{
+			Enabled:        true,
+			AllowedOrigins: []string{"https://ampcode.com"},
+		},
+	}})
+	threadID := "T-77777777-7777-4777-8777-777777777780"
+	actor, _ := rt.store.upsert(map[string]any{
+		"name": "threadActor",
+		"key":  threadID,
+		"input": map[string]any{
+			"threadId": threadID,
+		},
+	}, true)
+	actor.handle(map[string]any{
+		"type":    "executor_status",
+		"spawnId": "spawn-executor",
+		"status":  "failed",
+		"message": "executor setup failed",
+		"details": map[string]any{
+			"reasonCode": "spawn_failed",
+			"threadId":   threadID,
+		},
+	})
+
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	t.Cleanup(server.Close)
+
+	dialer := websocket.Dialer{Subprotocols: []string{"rivet", "rivet_encoding.4", "rivet_skip_ready_wait"}}
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/gateway/threadActor/websocket/?rvt-method=get&rvt-key=" + threadID + "&rvt-skip-ready-wait=true"
+	headers := http.Header{
+		"Origin":                      []string{"https://ampcode.com"},
+		neoInternalClientAPIKeyHeader: []string{"local-key"},
+	}
+	conn, resp, err := dialer.Dial(wsURL, headers)
+	if err != nil {
+		status := 0
+		if resp != nil {
+			status = resp.StatusCode
+		}
+		t.Fatalf("gateway websocket dial failed status=%d err=%v", status, err)
+	}
+	defer conn.Close()
+
+	waitForNeoRivetBareInit(t, conn, 2*time.Second)
+	status := waitForNeoRivetBareEventType(t, conn, "executor_status", 2*time.Second)
+	if status["status"] != "failed" || status["spawnId"] != "spawn-executor" {
+		t.Fatalf("executor_status = %#v, want replayed executor-originated status", status)
+	}
+	if mapValue(status["details"])["reasonCode"] != "spawn_failed" {
+		t.Fatalf("executor_status details = %#v, want spawn_failed", status["details"])
+	}
+}
+
 func TestNeoRuntimeWebLocalInferenceJSONRPCReplaysCurrentExecutorStateAsObserver(t *testing.T) {
 	pidDir := filepath.Join(t.TempDir(), "pids")
 	if err := os.MkdirAll(pidDir, 0o700); err != nil {
@@ -3859,10 +3978,7 @@ func TestNeoRuntimeWebLocalInferenceJSONRPCReplaysCurrentExecutorStateAsObserver
 	}
 }
 
-func TestNeoRuntimeWebLocalInferenceBootstrapReplacesLegacyExecutor(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("test uses POSIX shell script")
-	}
+func TestNeoRuntimeWebLocalInferenceBootstrapDoesNotReplaceConnectedExecutor(t *testing.T) {
 	dir := t.TempDir()
 	pidDir := filepath.Join(dir, "pids")
 	if err := os.MkdirAll(pidDir, 0o700); err != nil {
@@ -3870,19 +3986,12 @@ func TestNeoRuntimeWebLocalInferenceBootstrapReplacesLegacyExecutor(t *testing.T
 	}
 	t.Cleanup(replaceNeoHeadlessPIDDir(func() string { return pidDir }))
 
-	command := filepath.Join(dir, "amp")
-	startedLog := filepath.Join(dir, "started.log")
-	if err := os.WriteFile(command, []byte("#!/bin/sh\nprintf 'started %s\\n' \"$*\" > \"$TEST_STARTED_LOG\"\nsleep 5\n"), 0o755); err != nil {
-		t.Fatalf("write fake amp: %v", err)
-	}
-	t.Setenv("TEST_STARTED_LOG", startedLog)
-
 	enabled := true
 	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
 		NeoLocalRuntime: config.AmpNeoLocalRuntime{
 			Enabled:           &enabled,
 			ForceThreadActors: true,
-			ExecutorCommand:   command,
+			ExecutorCommand:   filepath.Join(dir, "missing-amp"),
 		},
 		WebLocalInference: config.AmpWebLocalInference{
 			Enabled:        true,
@@ -3925,30 +4034,19 @@ func TestNeoRuntimeWebLocalInferenceBootstrapReplacesLegacyExecutor(t *testing.T
 
 	waitForNeoRivetBareInit(t, conn, 2*time.Second)
 	status := waitForNeoRivetBareEventTypeWhere(t, conn, "executor_status", 2*time.Second, func(msg map[string]any) bool {
-		reasonCode := stringValue(mapValue(msg["details"])["reasonCode"])
-		return reasonCode == "waiting_for_executor_connect" || reasonCode == "executor_connected"
+		return stringValue(mapValue(msg["details"])["reasonCode"]) == "executor_connected"
 	})
-	if mapValue(status["details"])["reasonCode"] == "executor_connected" {
-		t.Fatalf("bootstrap reused legacy executor instead of spawning managed headless: %#v", status)
+	if status["status"] != "running" || status["executorId"] != "legacy-executor" {
+		t.Fatalf("executor status = %#v, want existing connected executor", status)
 	}
 
 	actor.mu.Lock()
 	executorID := actor.executorID
 	executorReady := actor.executorReady
+	spawnedExecutors := len(actor.spawnedExecutors)
 	actor.mu.Unlock()
-	if executorID != "" || executorReady {
-		t.Fatalf("legacy executor still marked ready id=%q ready=%v", executorID, executorReady)
-	}
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		data, err := os.ReadFile(startedLog)
-		if err == nil && strings.Contains(string(data), "--headless "+threadID) {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("fake amp start log = %q err=%v", data, err)
-		}
-		time.Sleep(10 * time.Millisecond)
+	if executorID != "legacy-executor" || !executorReady || spawnedExecutors != 0 {
+		t.Fatalf("connected executor changed id=%q ready=%v spawned=%d", executorID, executorReady, spawnedExecutors)
 	}
 }
 
@@ -4989,7 +5087,7 @@ func TestNeoRuntimeShutdownPreservesSpawnedExecutors(t *testing.T) {
 }
 
 func TestNeoConfigureSpawnedExecutorProcessDetachesFromServiceGroup(t *testing.T) {
-	cmd := exec.Command("amp", "--headless", "T-detach")
+	cmd := exec.Command("amp", "--headless=T-detach")
 	neoConfigureSpawnedExecutorProcess(cmd)
 	if !neoSpawnedExecutorDetachedForTest(cmd) {
 		t.Fatal("spawned executor was not configured to survive service process group shutdown")
@@ -9192,7 +9290,7 @@ func TestNeoActorSpawnExecutorStartsHeadlessAmp(t *testing.T) {
 {
   printf 'args:'
   for arg in "$@"; do printf ' [%s]' "$arg"; done
-  printf '\nAMP_URL=%s\nAMP_API_KEY=%s\nAMP_EXECUTOR=%s\nAMP_REMOTE_CONTROL_TERMINAL=%s\nAMP_PWD=%s\nAMP_THREAD_ID=%s\nRIVET_ENDPOINT=%s\nRIVET_PUBLIC_ENDPOINT=%s\n' "$AMP_URL" "$AMP_API_KEY" "$AMP_EXECUTOR" "$AMP_REMOTE_CONTROL_TERMINAL" "$AMP_PWD" "$AMP_THREAD_ID" "$RIVET_ENDPOINT" "$RIVET_PUBLIC_ENDPOINT"
+  printf '\nAMP_URL=%s\nAMP_API_KEY=%s\nAMP_EXECUTOR=%s\nAMP_REMOTE_CONTROL_TERMINAL=%s\nAMP_PWD=%s\nAMP_THREAD_ID=%s\nAMP_LOG_FILE=%s\nRIVET_ENDPOINT=%s\nRIVET_PUBLIC_ENDPOINT=%s\nRIVET_TOKEN=%s\nRIVET_NAMESPACE=%s\nRIVET_POOL=%s\n' "$AMP_URL" "$AMP_API_KEY" "$AMP_EXECUTOR" "$AMP_REMOTE_CONTROL_TERMINAL" "$AMP_PWD" "$AMP_THREAD_ID" "$AMP_LOG_FILE" "$RIVET_ENDPOINT" "$RIVET_PUBLIC_ENDPOINT" "$RIVET_TOKEN" "$RIVET_NAMESPACE" "$RIVET_POOL"
 } > "$TEST_SPAWN_LOG"
 sleep 5
 `), 0o755); err != nil {
@@ -9225,15 +9323,19 @@ sleep 5
 	})
 
 	wantLog := []string{
-		"args: [--mode] [deep] [--effort] [xhigh] [--headless] [T-test-thread]",
+		"args: [--mode] [deep] [--effort] [xhigh] [--headless=T-test-thread] [--log-file]",
 		"AMP_URL=http://127.0.0.1:8317",
 		"AMP_API_KEY=local-key",
 		"AMP_EXECUTOR=1",
 		"AMP_REMOTE_CONTROL_TERMINAL=1",
 		"AMP_PWD=" + realWorkDir,
 		"AMP_THREAD_ID=T-test-thread",
+		"AMP_LOG_FILE=",
 		"RIVET_ENDPOINT=http://127.0.0.1:6420",
 		"RIVET_PUBLIC_ENDPOINT=http://127.0.0.1:6420",
+		"RIVET_TOKEN=local-neo",
+		"RIVET_NAMESPACE=default",
+		"RIVET_POOL=default",
 	}
 	var content string
 	deadline := time.Now().Add(2 * time.Second)
@@ -10049,6 +10151,124 @@ func TestNeoActorWebLocalBootstrapSpawnsWhileOldExecutorStopping(t *testing.T) {
 	newSpawned := actor.spawnedExecutors["spawn-new"]
 	if newSpawned == nil || newSpawned.stopping || newSpawned.pid() == 0 {
 		t.Fatalf("new spawned executor = %#v, want live non-stopping executor", newSpawned)
+	}
+}
+
+func TestNeoActorWebLocalBootstrapOmitsUnusableHeadlessLogFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses POSIX shell script")
+	}
+	dir := t.TempDir()
+	pidDir := filepath.Join(dir, "pids")
+	if err := os.MkdirAll(pidDir, 0o700); err != nil {
+		t.Fatalf("mkdir pid dir: %v", err)
+	}
+	t.Cleanup(replaceNeoHeadlessPIDDir(func() string { return pidDir }))
+
+	argsLog := filepath.Join(dir, "args.log")
+	command := filepath.Join(dir, "amp-args")
+	script := "#!/bin/sh\n: > \"$TEST_ARGS_LOG\"\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\" >> \"$TEST_ARGS_LOG\"; done\nif [ -n \"$AMP_LOG_FILE\" ]; then printf 'AMP_LOG_FILE=%s\\n' \"$AMP_LOG_FILE\" >> \"$TEST_ARGS_LOG\"; fi\nsleep 5\n"
+	if err := os.WriteFile(command, []byte(script), 0o700); err != nil {
+		t.Fatalf("write executor command: %v", err)
+	}
+	homeFile := filepath.Join(dir, "home-file")
+	if err := os.WriteFile(homeFile, []byte("not a directory"), 0o600); err != nil {
+		t.Fatalf("write home file: %v", err)
+	}
+	t.Setenv("HOME", homeFile)
+	t.Setenv("TEST_ARGS_LOG", argsLog)
+
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
+		ExecutorCommand: command,
+	}}})
+	threadID := "T-019f4000-0000-4000-8000-000000000030"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+	t.Cleanup(actor.stopSpawnedExecutors)
+
+	actor.mu.Lock()
+	actor.bootstrapExecutorType = "local-client"
+	actor.agentState = "idle"
+	actor.environment = map[string]any{"workingDirectory": dir}
+	actor.mu.Unlock()
+
+	status := actor.spawnExecutor(map[string]any{
+		"type":      "client_spawn_executor",
+		"requestId": "spawn-no-log",
+	})
+	if status["status"] != "running" {
+		t.Fatalf("spawn status = %#v, want running", status)
+	}
+
+	var argsData []byte
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(argsLog)
+		if err == nil && len(data) > 0 {
+			argsData = data
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if len(argsData) == 0 {
+		t.Fatalf("spawned executor did not write args log")
+	}
+	argsText := string(argsData)
+	if strings.Contains(argsText, "--log-file") || strings.Contains(argsText, "AMP_LOG_FILE=") {
+		t.Fatalf("spawn args/env leaked unusable log path:\n%s", argsText)
+	}
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if spawned := actor.spawnedExecutors["spawn-no-log"]; spawned == nil || spawned.logPath != "" {
+		t.Fatalf("spawned executor log path = %#v, want empty", spawned)
+	}
+}
+
+func TestNeoActorWebLocalBootstrapSkipsConnectedOrConnectingExecutor(t *testing.T) {
+	pidDir := filepath.Join(t.TempDir(), "pids")
+	if err := os.MkdirAll(pidDir, 0o700); err != nil {
+		t.Fatalf("mkdir pid dir: %v", err)
+	}
+	t.Cleanup(replaceNeoHeadlessPIDDir(func() string { return pidDir }))
+
+	rt := newNeoRuntime(&config.Config{})
+	cases := []struct {
+		name   string
+		mutate func(*neoActor)
+	}{
+		{
+			name: "connecting executor id",
+			mutate: func(actor *neoActor) {
+				actor.executorID = "executor-connecting"
+			},
+		},
+		{
+			name: "ready executor",
+			mutate: func(actor *neoActor) {
+				actor.executorID = "executor-ready"
+				actor.executorReady = true
+			},
+		},
+		{
+			name: "bootstrapped executor",
+			mutate: func(actor *neoActor) {
+				actor.executorID = "executor-bootstrapped"
+				actor.executorReady = true
+				actor.executorBootstrapComplete = true
+			},
+		},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			threadID := fmt.Sprintf("T-019f4000-0000-4000-8000-0000000001%02d", i)
+			actor := newNeoActor(rt, "actor-test-"+strconv.Itoa(i), "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+			actor.mu.Lock()
+			tc.mutate(actor)
+			actor.mu.Unlock()
+
+			if actor.webLocalInferenceBootstrapNeeded() {
+				t.Fatal("web local bootstrap should not spawn while executor is connected or connecting")
+			}
+		})
 	}
 }
 
@@ -10880,7 +11100,7 @@ func TestNeoAmpBinaryHeadlessBootstrapSmoke(t *testing.T) {
 		t.Fatalf("update runtime config: %v", err)
 	}
 
-	cmd := exec.Command(command, "--mode", "rush", "--headless", threadID)
+	cmd := exec.Command(command, "--mode", "rush", "--headless="+threadID, "--log-file", logPath)
 	cmd.Dir = workDir
 	var cmdOutput bytes.Buffer
 	cmd.Stdout = &cmdOutput
@@ -10901,8 +11121,11 @@ func TestNeoAmpBinaryHeadlessBootstrapSmoke(t *testing.T) {
 		"HOME":                  testHome,
 		"RIVET_ENDPOINT":        server.URL,
 		"RIVET_GATEWAY_URL":     server.URL,
+		"RIVET_NAMESPACE":       "default",
+		"RIVET_POOL":            "default",
 		"RIVET_PUBLIC_ENDPOINT": server.URL,
 		"RIVET_THREAD_ID":       threadID,
+		"RIVET_TOKEN":           neoLocalRuntimeClientToken,
 		"RIVETKIT_ENGINE_URL":   server.URL,
 	})
 	cmd.Env = ampEnv
@@ -11010,7 +11233,7 @@ func TestNeoAmpBinaryHeadlessBootstrapSmoke(t *testing.T) {
 			time.Sleep(25 * time.Millisecond)
 		}
 
-		cmd = exec.Command(command, "--mode", "rush", "--headless", threadID)
+		cmd = exec.Command(command, "--mode", "rush", "--headless="+threadID, "--log-file", logPath)
 		cmd.Dir = workDir
 		cmd.Stdout = &cmdOutput
 		cmd.Stderr = &cmdOutput
@@ -11116,7 +11339,19 @@ func TestNeoAmpBinarySpawnPathBootstrapSmoke(t *testing.T) {
 			return
 		}
 		if r.URL.Path == "/api/internal" && r.URL.RawQuery == "getUserInfo" {
-			writeNeoJSON(w, http.StatusOK, map[string]any{"ok": true, "result": map[string]any{"id": "U-local-test", "email": "local@example.com", "workspaceID": "W-local-test"}})
+			writeNeoJSON(w, http.StatusOK, map[string]any{
+				"ok": true,
+				"result": map[string]any{
+					"id":          "U-local-test",
+					"email":       "local@example.com",
+					"features":    []any{},
+					"name":        "Local Test",
+					"team":        map[string]any{"id": "W-local-test", "name": "Local Workspace"},
+					"username":    "local-test",
+					"workspaceID": "W-local-test",
+					"workspaceId": "W-local-test",
+				},
+			})
 			return
 		}
 		http.NotFound(w, r)
@@ -11231,7 +11466,7 @@ func TestNeoAmpBinarySpawnPathBootstrapSmoke(t *testing.T) {
 	t.Fatalf("spawned amp binary did not bootstrap: ready=%v bootstrap=%v executorID=%q activeError=%#v\n%s%s%s", actor.executorReady, actor.executorBootstrapComplete, actor.executorID, actor.activeError, requestLogForTest(&requestsMu, requests), readSpawnLogsForTest(testHome), recorder.report())
 }
 
-func TestNeoAmpBinarySpawnedExecutorReconnectsAfterRuntimeRestart(t *testing.T) {
+func TestNeoAmpBinaryRespawnsPendingWorkAfterRuntimeRestart(t *testing.T) {
 	command := strings.TrimSpace(os.Getenv("AMP_BINARY_E2E"))
 	if command == "" {
 		t.Skip("set AMP_BINARY_E2E to an amp binary path, or 1 to use ~/.amp/bin/amp")
@@ -11283,12 +11518,48 @@ func TestNeoAmpBinarySpawnedExecutorReconnectsAfterRuntimeRestart(t *testing.T) 
 			writeNeoJSON(w, status, response)
 			return
 		}
+		if r.URL.Path == "/api/provider/openai/v1/responses" {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":1,"output_tokens":1},"output":[]}}` + "\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+			return
+		}
+		if r.URL.Path == "/api/provider/openai/v1/chat/completions" {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte(`data: {"choices":[{"delta":{"content":"resumed"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}` + "\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+			return
+		}
+		if r.URL.Path == "/api/provider/anthropic/v1/messages" {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("event: message_start\n" +
+				`data: {"type":"message_start","message":{"usage":{"input_tokens":1}}}` + "\n\n" +
+				"event: content_block_start\n" +
+				`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}` + "\n\n" +
+				"event: content_block_delta\n" +
+				`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"resumed"}}` + "\n\n" +
+				"event: message_stop\n" +
+				`data: {"type":"message_stop"}` + "\n\n"))
+			return
+		}
 		if r.URL.Path == "/api/internal" && r.URL.RawQuery == "loadPlugins" {
 			writeNeoJSON(w, http.StatusOK, map[string]any{"ok": true, "result": []any{}})
 			return
 		}
 		if r.URL.Path == "/api/internal" && r.URL.RawQuery == "getUserInfo" {
-			writeNeoJSON(w, http.StatusOK, map[string]any{"ok": true, "result": map[string]any{"id": "U-local-test", "email": "local@example.com", "workspaceID": "W-local-test"}})
+			writeNeoJSON(w, http.StatusOK, map[string]any{
+				"ok": true,
+				"result": map[string]any{
+					"id":          "U-local-test",
+					"email":       "local@example.com",
+					"features":    []any{},
+					"name":        "Local Test",
+					"team":        map[string]any{"id": "W-local-test", "name": "Local Workspace"},
+					"username":    "local-test",
+					"workspaceID": "W-local-test",
+					"workspaceId": "W-local-test",
+				},
+			})
 			return
 		}
 		http.NotFound(w, r)
@@ -11359,6 +11630,19 @@ func TestNeoAmpBinarySpawnedExecutorReconnectsAfterRuntimeRestart(t *testing.T) 
 	if !ready || !bootstrapComplete || spawned == nil || spawned.cmd == nil || spawned.cmd.Process == nil {
 		t.Fatalf("spawned amp binary did not bootstrap before restart: ready=%v bootstrap=%v spawned=%v\n%s%s", ready, bootstrapComplete, spawned != nil, requestLogForTest(&requestsMu, requests), readSpawnLogsForTest(testHome))
 	}
+	actor.mu.Lock()
+	firstExecutorID := actor.executorID
+	actor.messages = []neoMessage{
+		{ThreadID: threadID, MessageID: "M-restart-user", Role: "user", AgentMode: "rush", Content: []any{map[string]any{"type": "text", "text": "continue after restart"}}, Seq: 1},
+		{ThreadID: threadID, MessageID: "M-restart-assistant", Role: "assistant", State: map[string]any{"type": "cancelled"}, Content: []any{map[string]any{"type": "text", "text": "partial"}}, Seq: 2},
+	}
+	actor.pendingInference = &neoInferenceInflight{messageID: "M-restart-assistant", agentMode: "rush", preflightCompactionChecked: true}
+	actor.bootstrapExecutorType = "local-client"
+	actor.rebuildHistoryLocked()
+	actor.mu.Unlock()
+	if firstExecutorID == "" {
+		t.Fatal("first executor ID is empty before restart")
+	}
 	t.Cleanup(func() {
 		spawned.stop()
 		if spawned.cmd != nil {
@@ -11373,8 +11657,15 @@ func TestNeoAmpBinarySpawnedExecutorReconnectsAfterRuntimeRestart(t *testing.T) 
 	}
 	cancel()
 	_ = client.Close()
-	if err := spawned.cmd.Process.Signal(syscall.Signal(0)); err != nil {
-		t.Fatalf("spawned executor died during runtime shutdown: %v\n%s", err, readSpawnLogsForTest(testHome))
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := spawned.cmd.Process.Signal(syscall.Signal(0)); err != nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if err := spawned.cmd.Process.Signal(syscall.Signal(0)); err == nil {
+		t.Fatalf("spawned executor survived runtime shutdown unexpectedly\n%s", readSpawnLogsForTest(testHome))
 	}
 
 	rt = newRuntime()
@@ -11384,30 +11675,27 @@ func TestNeoAmpBinarySpawnedExecutorReconnectsAfterRuntimeRestart(t *testing.T) 
 		_ = rt.stop(ctx)
 	}()
 
+	reconnected := rt.store.ensureThreadActor(threadID)
 	deadline = time.Now().Add(12 * time.Second)
 	for time.Now().Before(deadline) {
-		actors := rt.store.findActors(url.Values{"name": []string{"threadActor"}, "key": []string{threadID}})
-		for _, record := range actors {
-			id := firstNonEmptyString(record["actor_id"], record["id"])
-			reconnected := rt.store.get(id)
-			if reconnected == nil {
-				continue
-			}
-			reconnected.mu.Lock()
-			ready := reconnected.executorReady
-			bootstrapComplete := reconnected.executorBootstrapComplete
-			executorID := reconnected.executorID
-			reconnected.mu.Unlock()
-			if ready && bootstrapComplete && executorID != "" {
-				return
-			}
+		reconnected.mu.Lock()
+		ready := reconnected.executorReady
+		bootstrapComplete := reconnected.executorBootstrapComplete
+		executorID := reconnected.executorID
+		pending := reconnected.pendingInference
+		spawnedCount := len(reconnected.spawnedExecutors)
+		reconnected.mu.Unlock()
+		if ready && bootstrapComplete && executorID != "" && executorID != firstExecutorID {
+			return
 		}
-		if err := spawned.cmd.Process.Signal(syscall.Signal(0)); err != nil {
-			t.Fatalf("spawned executor exited before reconnecting: %v\n%s%s", err, requestLogForTest(&requestsMu, requests), readSpawnLogsForTest(testHome))
+		if pending == nil && spawnedCount == 0 {
+			t.Fatalf("restored pending work was lost before respawn\n%s%s", requestLogForTest(&requestsMu, requests), readSpawnLogsForTest(testHome))
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	t.Fatalf("spawned executor did not reconnect after runtime restart\n%s%s", requestLogForTest(&requestsMu, requests), readSpawnLogsForTest(testHome))
+	reconnected.mu.Lock()
+	defer reconnected.mu.Unlock()
+	t.Fatalf("spawned executor did not respawn after runtime restart: ready=%v bootstrap=%v executorID=%q firstExecutorID=%q pending=%#v spawned=%d\n%s%s", reconnected.executorReady, reconnected.executorBootstrapComplete, reconnected.executorID, firstExecutorID, reconnected.pendingInference, len(reconnected.spawnedExecutors), requestLogForTest(&requestsMu, requests), readSpawnLogsForTest(testHome))
 }
 
 func freeTCPPortForTest(t *testing.T) int {
@@ -12588,17 +12876,17 @@ func TestNeoHeadlessExecutorArgsByMode(t *testing.T) {
 		effort string
 		want   []string
 	}{
-		{name: "smart", mode: "smart", effort: "high", want: []string{"--mode", "smart", "--effort", "high", "--headless", "T-test"}},
-		{name: "deep", mode: "deep", effort: "xhigh", want: []string{"--mode", "deep", "--effort", "xhigh", "--headless", "T-test"}},
-		{name: "rush", mode: "rush", effort: "", want: []string{"--mode", "rush", "--headless", "T-test"}},
-		{name: "rush none", mode: "rush", effort: "none", want: []string{"--mode", "rush", "--headless", "T-test"}},
-		{name: "large", mode: "large", effort: "", want: []string{"--mode", "large", "--headless", "T-test"}},
-		{name: "default", mode: "", effort: "", want: []string{"--mode", "smart", "--headless", "T-test"}},
+		{name: "smart", mode: "smart", effort: "high", want: []string{"--mode", "smart", "--effort", "high", "--headless=T-test"}},
+		{name: "deep", mode: "deep", effort: "xhigh", want: []string{"--mode", "deep", "--effort", "xhigh", "--headless=T-test"}},
+		{name: "rush", mode: "rush", effort: "", want: []string{"--mode", "rush", "--headless=T-test"}},
+		{name: "rush none", mode: "rush", effort: "none", want: []string{"--mode", "rush", "--headless=T-test"}},
+		{name: "large", mode: "large", effort: "", want: []string{"--mode", "large", "--headless=T-test"}},
+		{name: "default", mode: "", effort: "", want: []string{"--mode", "smart", "--headless=T-test"}},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := neoHeadlessExecutorArgs("T-test", tt.mode, tt.effort)
+			got := neoHeadlessExecutorArgs("T-test", tt.mode, tt.effort, "")
 			if strings.Join(got, "\x00") != strings.Join(tt.want, "\x00") {
 				t.Fatalf("args = %#v, want %#v", got, tt.want)
 			}
@@ -24091,6 +24379,64 @@ func TestNeoActorImportRunsPendingInferenceWhenExecutorAlreadyReady(t *testing.T
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("resumed inference did not finish")
+}
+
+func TestNeoActorImportSpawnsWebLocalExecutorForRestoredPendingInference(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake Amp executor script uses /bin/sh")
+	}
+
+	dir := t.TempDir()
+	pidDir := filepath.Join(dir, "pids")
+	if err := os.MkdirAll(pidDir, 0o700); err != nil {
+		t.Fatalf("mkdir pid dir: %v", err)
+	}
+	t.Cleanup(replaceNeoHeadlessPIDDir(func() string { return pidDir }))
+
+	command := filepath.Join(dir, "amp-sleep")
+	if err := os.WriteFile(command, []byte("#!/bin/sh\nsleep 5\n"), 0o700); err != nil {
+		t.Fatalf("write executor command: %v", err)
+	}
+	rt := newNeoRuntime(&config.Config{
+		SDKConfig: config.SDKConfig{APIKeys: []string{"local-key"}},
+		AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
+			ExecutorCommand: command,
+		}},
+	})
+	threadID := "T-019e6541-06ae-75d7-b10e-d893170fa62d"
+	actor := newNeoActor(rt, "actor-restored-pending", "thread-actor", threadID, threadID, neoActorRecord("actor-restored-pending", "thread-actor", threadID), nil)
+	t.Cleanup(actor.stopSpawnedExecutors)
+
+	thread := map[string]any{
+		"id":        threadID,
+		"agentMode": "deep",
+		"meta":      map[string]any{"ampcodeConnectorLocalNeo": true},
+		"env":       map[string]any{"workingDirectory": dir},
+		"messages": []any{
+			map[string]any{"messageId": "M-user", "role": "user", "agentMode": "deep", "reasoningEffort": "xhigh", "content": []any{map[string]any{"type": "text", "text": "continue after restart"}}},
+			map[string]any{"messageId": "M-cancelled", "role": "assistant", "state": map[string]any{"type": "cancelled"}, "content": []any{map[string]any{"type": "text", "text": "partial"}}},
+		},
+		"pendingInference": map[string]any{"messageId": "M-cancelled", "agentMode": "deep", "reasoningEffort": "xhigh", "preflightCompactionChecked": true},
+	}
+	if err := actor.importThreadLocalOnly(thread); err != nil {
+		t.Fatalf("import thread: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		actor.mu.Lock()
+		bootstrapExecutorType := actor.bootstrapExecutorType
+		pending := actor.pendingInference
+		spawned := len(actor.spawnedExecutors)
+		actor.mu.Unlock()
+		if bootstrapExecutorType == "local-client" && pending != nil && spawned == 1 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	t.Fatalf("restored pending inference did not spawn executor: bootstrap=%q pending=%#v spawned=%d", actor.bootstrapExecutorType, actor.pendingInference, len(actor.spawnedExecutors))
 }
 
 func TestNeoActorThreadSnapshotDropsStaleCurrentInference(t *testing.T) {

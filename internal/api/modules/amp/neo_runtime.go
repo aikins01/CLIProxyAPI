@@ -130,7 +130,7 @@ var (
 		"smart":    toolList("finder", "Bash", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "archive_current_thread", "send_message_to_agg"),
 		"large":    toolList("finder", "Bash", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "archive_current_thread", "send_message_to_agg"),
 		"rush":     toolList("finder", "shell_command", "shell_command_status", "apply_patch", "web_search", "read_web_page", "read_mcp_resource", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "painter", "archive_current_thread", "send_message_to_agg"),
-		"agg-man":  toolList("find_thread", "read_thread", "web_search", "read_web_page", "docs_list", "docs_read", "docs_write", "create_project", "list_agent_modes", "create_thread", "archive_thread", "archive_threads", "unarchive_thread", "send_message_to_thread", "publish_thread_artifacts", "slack_write", "slack_read", "github_repo_ci_status", "read_github", "search_github", "commit_search", "list_directory_github", "list_repositories", "glob_github", "diff"),
+		"agg-man":  toolList("find_thread", "read_thread", "web_search", "read_web_page", "docs_list", "docs_read", "docs_write", "create_project", "list_agent_modes", "create_thread", "archive_thread", "archive_threads", "unarchive_thread", "send_message_to_thread", "publish_thread_artifacts", "manage_automation", "slack_write", "slack_read", "github_repo_ci_status", "read_github", "search_github", "commit_search", "list_directory_github", "list_repositories", "glob_github", "diff"),
 		"deep":     toolList("shell_command", "shell_command_status", "apply_patch", "web_search", "read_web_page", "Task", "skill", "read_thread", "find_thread", "librarian", "oracle", "finder", "view_media", "painter", "archive_current_thread", "send_message_to_agg"),
 		"review":   toolList("shell_command", "run_check", "submit_review"),
 		"nostromo": toolList("finder", "Bash", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "archive_current_thread", "send_message_to_agg", "shell_command", "shell_command_status", "apply_patch"),
@@ -145,7 +145,7 @@ var (
 		"web_search", "read_web_page", "read_mcp_resource", "read_thread", "find_thread", "skill", "oracle",
 		"librarian", "Task", "view_media", "painter",
 		"shell_command", "shell_command_status", "apply_patch", "archive_current_thread", "send_message_to_agg", "run_check", "submit_review", "docs_list", "docs_read", "docs_write",
-		"create_project", "list_agent_modes", "create_thread", "archive_thread", "archive_threads", "unarchive_thread", "send_message_to_thread", "publish_thread_artifacts",
+		"create_project", "list_agent_modes", "create_thread", "archive_thread", "archive_threads", "unarchive_thread", "send_message_to_thread", "publish_thread_artifacts", "manage_automation",
 		"slack_write", "slack_read", "github_repo_ci_status", "read_github", "search_github", "commit_search",
 		"list_directory_github", "list_repositories", "glob_github", "diff",
 	)
@@ -997,7 +997,7 @@ func (rt *neoRuntime) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		actor.spawnExecutor(map[string]any{
 			"type":                    "client_spawn_executor",
 			"requestId":               "web-local-inference-" + randomBase62(12),
-			"replaceExistingExecutor": true,
+			"replaceExistingExecutor": false,
 		})
 	}
 	if webLocalInferenceSocket {
@@ -2184,6 +2184,7 @@ type neoActor struct {
 	executorReady             bool
 	executorBootstrapComplete bool
 	executorResumeBootstrap   bool
+	lastExecutorStatus        map[string]any
 	currentAgentMode          string
 	currentReasoningEffort    string
 	executorIdleGeneration    int
@@ -2467,7 +2468,7 @@ func (a *neoActor) handleForSocket(socket *neoSocket, msg map[string]any) any {
 	case "executor_connect_rejected":
 		a.executorConnectRejectedForSocket(socket, msg)
 	case "executor_status":
-		a.broadcast(normalizeNeoExecutorStatus(msg))
+		a.broadcastExecutorStatusPayload(msg)
 	case "executor_error":
 		a.broadcast(normalizeNeoExecutorError(msg))
 	case "client_append_user_msg":
@@ -3576,13 +3577,13 @@ func (a *neoActor) executorDisconnectedForSocket(socket *neoSocket, msg map[stri
 		executor.stop()
 	}
 	a.broadcastExecutorWorkCleanup(cleanup)
-	a.broadcast(normalizeNeoExecutorStatus(map[string]any{
+	a.broadcastExecutorStatusPayload(map[string]any{
 		"type":    "executor_status",
 		"spawnId": firstNonEmptyString(msg["spawnId"], msg["requestId"]),
 		"status":  "failed",
 		"message": fallbackString(msg["message"], "Executor disconnected"),
 		"details": details,
-	}))
+	})
 	a.broadcastObservers()
 	a.syncCloudAsync()
 	a.processQueue()
@@ -3717,13 +3718,13 @@ func (a *neoActor) executorConnectRejectedForSocket(socket *neoSocket, msg map[s
 		executor.stop()
 	}
 	a.broadcastStaleExecutorWorkCleanup(cleanup)
-	a.broadcast(normalizeNeoExecutorStatus(map[string]any{
+	a.broadcastExecutorStatusPayload(map[string]any{
 		"type":    "executor_status",
 		"spawnId": firstNonEmptyString(msg["spawnId"], msg["requestId"]),
 		"status":  "failed",
 		"message": fallbackString(msg["message"], "Executor connect rejected"),
 		"details": details,
-	}))
+	})
 	a.broadcastObservers()
 	a.syncCloudAsync()
 }
@@ -3818,6 +3819,10 @@ func (a *neoActor) webLocalInferenceBootstrapNeeded() bool {
 	}
 	a.mu.Lock()
 	threadID := firstNonEmptyString(a.threadID, a.key)
+	if a.executorID != "" || a.executorReady || a.executorBootstrapComplete {
+		a.mu.Unlock()
+		return false
+	}
 	stopping := false
 	for _, spawned := range a.spawnedExecutors {
 		if spawned != nil && spawned.stopping {
@@ -3845,7 +3850,7 @@ func (a *neoActor) maybeSpawnWebLocalExecutorForPendingWork() {
 	a.spawnExecutor(map[string]any{
 		"type":                    "client_spawn_executor",
 		"requestId":               "web-local-inference-work-" + randomBase62(12),
-		"replaceExistingExecutor": true,
+		"replaceExistingExecutor": false,
 	})
 }
 
@@ -3921,8 +3926,22 @@ func (a *neoActor) spawnExecutor(msg map[string]any) map[string]any {
 	}
 
 	workDir := neoHeadlessWorkingDirectory(neoHeadlessExecutorSpawnOptions(msg), environment)
-	logPath := neoHeadlessExecutorLogPath(threadID, spawnID)
-	args := neoHeadlessExecutorArgs(threadID, agentMode, reasoningEffort)
+	requestedLogPath := neoHeadlessExecutorLogPath(threadID, spawnID)
+	logPath := ""
+	var logFile *os.File
+	if requestedLogPath != "" {
+		if err := os.MkdirAll(filepath.Dir(requestedLogPath), 0o700); err != nil {
+			log.Warnf("amp neo local runtime failed to create headless log directory %s: %v", filepath.Dir(requestedLogPath), err)
+		} else {
+			logFile, err = os.OpenFile(requestedLogPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+			if err != nil {
+				log.Warnf("amp neo local runtime failed to open headless log file %s: %v", requestedLogPath, err)
+			} else {
+				logPath = requestedLogPath
+			}
+		}
+	}
+	args := neoHeadlessExecutorArgs(threadID, agentMode, reasoningEffort, logPath)
 	cmd := exec.Command(command, args...)
 	neoConfigureSpawnedExecutorProcess(cmd)
 	if workDir != "" {
@@ -3930,15 +3949,6 @@ func (a *neoActor) spawnExecutor(msg map[string]any) map[string]any {
 	}
 	cmd.Env = neoHeadlessExecutorEnv(os.Environ(), cfg, threadID, workDir, logPath, command)
 
-	var logFile *os.File
-	if logPath != "" {
-		if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err == nil {
-			logFile, err = os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
-			if err != nil {
-				log.Warnf("amp neo local runtime failed to open headless log file %s: %v", logPath, err)
-			}
-		}
-	}
 	if logFile != nil {
 		cmd.Stdout = logFile
 		cmd.Stderr = logFile
@@ -4031,12 +4041,16 @@ func (a *neoActor) prepareExecutorConnectionReplacement(reason string) func() {
 	}
 }
 
-func neoHeadlessExecutorArgs(threadID, agentMode, reasoningEffort string) []string {
+func neoHeadlessExecutorArgs(threadID, agentMode, reasoningEffort, logPath string) []string {
 	args := []string{"--mode", fallbackString(agentMode, "smart")}
 	if neoModeSupportsReasoningEffort(agentMode) && strings.TrimSpace(reasoningEffort) != "" && !strings.EqualFold(reasoningEffort, "none") {
 		args = append(args, "--effort", reasoningEffort)
 	}
-	return append(args, "--headless", threadID)
+	args = append(args, "--headless="+threadID)
+	if strings.TrimSpace(logPath) != "" {
+		args = append(args, "--log-file", logPath)
+	}
+	return args
 }
 
 func (a *neoActor) waitSpawnedExecutor(spawnID string, spawned *neoSpawnedExecutor, logFile *os.File) {
@@ -4200,7 +4214,7 @@ func (a *neoActor) stopIdleSpawnedExecutors(generation int, timeout time.Duratio
 	if a.runtime != nil && a.runtime.store != nil {
 		a.runtime.store.broadcastThreadStatusUpdated(a)
 	}
-	a.broadcast(normalizeNeoExecutorStatus(map[string]any{
+	a.broadcastExecutorStatusPayload(map[string]any{
 		"type":    "executor_status",
 		"spawnId": firstSpawnedExecutorID(executors),
 		"status":  "failed",
@@ -4209,7 +4223,7 @@ func (a *neoActor) stopIdleSpawnedExecutors(generation int, timeout time.Duratio
 			"reasonCode":     "executor_disconnected",
 			"timeoutSeconds": int(timeout.Seconds()),
 		},
-	}))
+	})
 	a.broadcastObservers()
 	a.syncCloudAsync()
 	a.processQueue()
@@ -4240,21 +4254,27 @@ func firstSpawnedExecutorID(executors []*neoSpawnedExecutor) string {
 }
 
 func (a *neoActor) broadcastExecutorStatus(spawnID, status, message string, details map[string]any) map[string]any {
-	payload := normalizeNeoExecutorStatus(map[string]any{
+	return a.broadcastExecutorStatusPayload(map[string]any{
 		"type":    "executor_status",
 		"spawnId": spawnID,
 		"status":  status,
 		"message": message,
 		"details": details,
 	})
+}
+
+func (a *neoActor) broadcastExecutorStatusPayload(payload map[string]any) map[string]any {
+	payload = normalizeNeoExecutorStatus(payload)
+	a.mu.Lock()
+	a.lastExecutorStatus = cloneNeoJSONMap(payload)
+	a.mu.Unlock()
 	a.broadcast(payload)
 	return payload
 }
 
 func (a *neoActor) broadcastExecutorConnectedStatus(executorID string) map[string]any {
 	payload := neoExecutorConnectedStatusPayload(executorID)
-	a.broadcast(payload)
-	return payload
+	return a.broadcastExecutorStatusPayload(payload)
 }
 
 func neoExecutorConnectedStatusPayload(executorID string) map[string]any {
@@ -14634,6 +14654,7 @@ func (a *neoActor) sendSnapshot(socket *neoSocket, sinceSeq int) {
 		agentState = "awaiting_approval"
 	}
 	spawnedExecutorStatuses := a.spawnedExecutorStatusListLocked()
+	lastExecutorStatus := cloneNeoJSONMap(a.lastExecutorStatus)
 	relationships := a.threadProtocolRelationshipsLocked(allMessages)
 	var inflightInference *neoInferenceInflight
 	a.currentInferenceMessageIndexLocked(a.shouldPreserveMissingCurrentInferenceLocked())
@@ -14676,6 +14697,9 @@ func (a *neoActor) sendSnapshot(socket *neoSocket, sinceSeq int) {
 	send(neoObserversPayload(observerCount, hasExecutor))
 	for _, status := range spawnedExecutorStatuses {
 		send(status)
+	}
+	if len(spawnedExecutorStatuses) == 0 && len(lastExecutorStatus) > 0 {
+		send(lastExecutorStatus)
 	}
 	if hasExecutor {
 		send(map[string]any{"type": "executor_connected", "executorId": executorID, "registeredToolCount": registeredTools, "guidanceInventory": guidanceInventory, "resumeBootstrap": false})
@@ -14756,8 +14780,12 @@ func (a *neoActor) sendCurrentExecutorState(socket *neoSocket) {
 	executorID := a.executorID
 	executorConnected := a.executorConnectedLocked()
 	observerCount := len(a.sockets)
+	lastExecutorStatus := cloneNeoJSONMap(a.lastExecutorStatus)
 	a.mu.Unlock()
 	if !executorConnected {
+		if len(lastExecutorStatus) > 0 {
+			socket.send(lastExecutorStatus)
+		}
 		return
 	}
 	socket.send(neoObserversPayload(observerCount, true))
@@ -15269,6 +15297,9 @@ func (a *neoActor) importThreadWithSyncOptions(thread map[string]any, syncCloud,
 	a.artifacts = artifacts
 	a.kv = actorKV
 	a.meta = meta
+	if executorType := neoImportedBootstrapExecutorType(thread, meta, pendingInference, queuedMessages); executorType != "" {
+		a.bootstrapExecutorType = executorType
+	}
 	a.debug = debug
 	a.draft = draft
 	a.autoSubmitDraft = autoSubmitDraft
@@ -15320,6 +15351,7 @@ func (a *neoActor) importThreadWithSyncOptions(thread map[string]any, syncCloud,
 
 	a.sendSnapshot(nil, 0)
 	a.drainReadyWork()
+	a.maybeSpawnWebLocalExecutorForPendingWork()
 	if syncCloud {
 		a.syncCloudAsync()
 	}
@@ -15340,6 +15372,16 @@ func neoShouldPreservePendingInferenceOnImport(existing *neoInferenceInflight, i
 		return stringValue(mapValue(message.State)["type"]) == "cancelled"
 	}
 	return true
+}
+
+func neoImportedBootstrapExecutorType(thread, meta map[string]any, pendingInference *neoInferenceInflight, queuedMessages []neoQueuedMessage) string {
+	if executorType := firstNonEmptyString(meta["executorType"], thread["executorType"]); executorType != "" {
+		return executorType
+	}
+	if neoCloudThreadHasLocalNeoMarker(thread) && (pendingInference != nil || len(queuedMessages) > 0) {
+		return "local-client"
+	}
+	return ""
 }
 
 func neoImportedThreadAgentMode(messages []neoMessage) string {
@@ -17501,6 +17543,25 @@ func (a *neoActor) archiveThread(archive bool, _ map[string]any) {
 
 func (a *neoActor) neoLocalInternalRPCResponse(method string, params map[string]any) (map[string]any, int, bool) {
 	switch strings.ToLower(strings.TrimSpace(method)) {
+	case "getthread", "readthread":
+		thread, ok := a.neoWebLocalThreadDocument()
+		if !ok {
+			return nil, 0, false
+		}
+		return map[string]any{"ok": true, "result": map[string]any{"thread": thread}}, http.StatusOK, true
+	case "getthreadtail", "loadthreadtail":
+		thread, ok := a.neoWebLocalThreadDocument()
+		if !ok {
+			return nil, 0, false
+		}
+		messages := a.neoWebLocalThreadMessages(numberFrom(params["limit"]))
+		return map[string]any{"ok": true, "result": map[string]any{"thread": thread, "messages": messages}, "messages": messages}, http.StatusOK, true
+	case "getthreadmeta":
+		thread, ok := a.neoWebLocalThreadDocument()
+		if !ok {
+			return nil, 0, false
+		}
+		return map[string]any{"ok": true, "result": mapValue(thread["meta"])}, http.StatusOK, true
 	case "getthreadlabels":
 		return map[string]any{"ok": true, "result": neoThreadLabelObjects(a.threadLabels())}, http.StatusOK, true
 	case "setthreadlabels":
@@ -22484,6 +22545,7 @@ func neoAmpExecutorCommand(cfg *config.Config) (string, error) {
 }
 
 func neoHeadlessExecutorEnv(base []string, cfg *config.Config, threadID, workDir, logPath, executorCommand string) []string {
+	runtimeBaseURL := neoRuntimeBaseURL(cfg)
 	updates := map[string]string{
 		"AMP_EXECUTOR":                "1",
 		"AMP_URL":                     neoProxyBaseURL(cfg),
@@ -22492,14 +22554,16 @@ func neoHeadlessExecutorEnv(base []string, cfg *config.Config, threadID, workDir
 		"AMP_SKIP_UPDATE_CHECK":       "1",
 		"AMP_HEADLESS_OAUTH":          "1",
 		"AMP_REMOTE_CONTROL_TERMINAL": "1",
-		// Rivetkit / runtime location used by the bundled JS client.
-		"AMP_GATEWAY_URL":       neoRuntimeBaseURL(cfg),
-		"AMP_RUNTIME_URL":       neoRuntimeBaseURL(cfg),
-		"RIVET_ENDPOINT":        neoRuntimeBaseURL(cfg),
-		"RIVET_GATEWAY_URL":     neoRuntimeBaseURL(cfg),
-		"RIVET_PUBLIC_ENDPOINT": neoRuntimeBaseURL(cfg),
-		"RIVETKIT_ENGINE_URL":   neoRuntimeBaseURL(cfg),
-		"RIVET_THREAD_ID":       threadID,
+		"AMP_GATEWAY_URL":             runtimeBaseURL,
+		"AMP_RUNTIME_URL":             runtimeBaseURL,
+		"RIVET_ENDPOINT":              runtimeBaseURL,
+		"RIVET_GATEWAY_URL":           runtimeBaseURL,
+		"RIVET_PUBLIC_ENDPOINT":       runtimeBaseURL,
+		"RIVETKIT_ENGINE_URL":         runtimeBaseURL,
+		"RIVET_THREAD_ID":             threadID,
+		"RIVET_TOKEN":                 neoLocalRuntimeClientToken,
+		"RIVET_NAMESPACE":             "default",
+		"RIVET_POOL":                  "default",
 	}
 	if path := neoHeadlessExecutorPath(base, executorCommand); path != "" {
 		updates["PATH"] = path
@@ -26244,6 +26308,9 @@ var neoModelContextWindow = map[string]int{
 	"gpt-5.4-pro":                                              1050000,
 	"gpt-5.5":                                                  400000,
 	"gpt-5.5-pro":                                              1050000,
+	"gpt-5.6-luna":                                             400000,
+	"gpt-5.6-sol":                                              400000,
+	"gpt-5.6-terra":                                            400000,
 	"grok-build-0.1":                                           256000,
 	"grok-code-fast-1":                                         256000,
 	"kimi-k2-instruct-0905":                                    1000000,
@@ -26300,6 +26367,9 @@ var neoModelMaxOutputTokens = map[string]int{
 	"gpt-5.4-pro":                                              128000,
 	"gpt-5.5":                                                  128000,
 	"gpt-5.5-pro":                                              128000,
+	"gpt-5.6-luna":                                             128000,
+	"gpt-5.6-sol":                                              128000,
+	"gpt-5.6-terra":                                            128000,
 	"grok-build-0.1":                                           32000,
 	"grok-code-fast-1":                                         32000,
 	"kimi-k2-instruct-0905":                                    32000,

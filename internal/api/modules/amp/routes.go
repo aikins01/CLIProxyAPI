@@ -147,7 +147,11 @@ func (m *AmpModule) managementAvailabilityMiddleware() gin.HandlerFunc {
 func wrapManagementAuth(auth gin.HandlerFunc, prefixes ...string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		path := c.Request.URL.Path
-		if !c.GetBool(ampWebLocalInferenceCORSContextKey) && actorEngineRequest(c.Request) {
+		if actorEngineRequest(c.Request) {
+			if c.GetBool(ampWebLocalInferenceCORSContextKey) {
+				auth(c)
+				return
+			}
 			c.Next()
 			return
 		}
@@ -558,6 +562,9 @@ func (m *AmpModule) tryServeNeoLocalInternalRPC(c *gin.Context) bool {
 	if !matched {
 		return false
 	}
+	if neoLocalInternalRPCRequiresLocalConnection(method) && (!requestRemoteAddrIsLocalConnection(c.Request) || !requestHasAmpClientHeaders(c.Request)) {
+		return false
+	}
 	threadID := neoInternalRPCThreadID(params)
 	if !neoThreadIDExactPattern.MatchString(threadID) {
 		return false
@@ -598,7 +605,17 @@ func neoLocalInternalRPCRequestWithError(r *http.Request) (string, map[string]an
 
 func neoLocalInternalRPCSupported(method string) bool {
 	switch strings.ToLower(strings.TrimSpace(method)) {
-	case "getthreadlabels", "setthreadlabels", "addthreadlabels", "archivethread":
+	case "getthread", "readthread", "getthreadtail", "loadthreadtail", "getthreadmeta",
+		"getthreadlabels", "setthreadlabels", "addthreadlabels", "archivethread":
+		return true
+	default:
+		return false
+	}
+}
+
+func neoLocalInternalRPCRequiresLocalConnection(method string) bool {
+	switch strings.ToLower(strings.TrimSpace(method)) {
+	case "getthread", "readthread", "getthreadtail", "loadthreadtail", "getthreadmeta":
 		return true
 	default:
 		return false

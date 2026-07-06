@@ -558,7 +558,7 @@ var knownPromptTagSetCountValues = map[string]int{
 	"prompt/skills":                     5,
 	"prompt/skills,system-prompt,tools": 1,
 	"prompt/skills,tools":               1,
-	"prompt/tools":                      34,
+	"prompt/tools":                      33,
 	"source/artifacts,compaction,guidance,skills,tools": 1,
 	"source/artifacts,code-review,painter,skills,tools": 1,
 	"source/code-review,guidance,settings":              1,
@@ -575,12 +575,12 @@ var knownPromptTagSetCountValues = map[string]int{
 	"source/guidance,tools":                             12,
 	"source/painter":                                    1,
 	"source/painter,tools":                              2,
-	"source/settings":                                   3,
-	"source/settings,skills,tools":                      4,
+	"source/settings":                                   4,
+	"source/settings,skills,tools":                      3,
 	"source/settings,system-prompt,tools":               1,
 	"source/settings,tools":                             9,
 	"source/skills":                                     12,
-	"source/skills,tools":                               11,
+	"source/skills,tools":                               12,
 	"source/tools":                                      98,
 }
 
@@ -4366,7 +4366,7 @@ func TestBaselineWriteProblemsRejectsUnexpectedRawReleaseSignals(t *testing.T) {
 			StreamJSONMarkers:   []string{"future_stream_field"},
 			ModeSettingMarkers:  []string{"futureModeDefault"},
 			ProviderProtocol:    []string{"future-provider-header"},
-			ReviewContract:      []string{"run-check-uri-input-shape"},
+			ReviewContract:      []string{"future-review-contract"},
 			Settings:            []string{"future.setting"},
 			Models:              []string{"future-model"},
 			ActorRuntime:        []string{"futureActor"},
@@ -4381,7 +4381,7 @@ func TestBaselineWriteProblemsRejectsUnexpectedRawReleaseSignals(t *testing.T) {
 	assertContainsString(t, text, "thread_delta_events:future:event")
 	assertContainsString(t, text, "thread_reader_markers:futureReader")
 	assertContainsString(t, text, "tool_catalog_markers:future_tool")
-	assertContainsString(t, text, "review_contract_markers:run-check-uri-input-shape")
+	assertContainsString(t, text, "review_contract_markers:future-review-contract")
 	assertContainsString(t, text, "settings:future.setting")
 	assertContainsString(t, text, "actor_runtime_markers:futureActor")
 	if !strictAuditFailed(snapshot, auditDiff{}) {

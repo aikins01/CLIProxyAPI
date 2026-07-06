@@ -191,7 +191,6 @@ var knownRawThreadDeltaEventValues = map[string]struct{}{
 	"retry_cancelled":                           {},
 	"retry_scheduled":                           {},
 	"retry_started":                             {},
-	"thread_relationships":                      {},
 	"thread_settings":                           {},
 	"thread_status":                             {},
 	"thread_title":                              {},
@@ -485,9 +484,7 @@ var knownReviewContractMarkerValues = map[string]struct{}{
 	"run-check-uri-input-shape":               {},
 }
 
-var retiredReviewContractMarkerValues = map[string]struct{}{
-	"run-check-uri-input-shape": {},
-}
+var retiredReviewContractMarkerValues = map[string]struct{}{}
 
 var threadReaderMarkers = map[string]string{
 	"getThread":             "internal-rpc",
@@ -636,7 +633,7 @@ var knownPromptTagCountValues = map[string]int{
 	"prompt/painter":       2,
 	"prompt/skills":        8,
 	"prompt/system-prompt": 1,
-	"prompt/tools":         37,
+	"prompt/tools":         36,
 	"source/artifacts":     2,
 	"source/code-review":   3,
 	"source/compaction":    19,
@@ -649,8 +646,8 @@ var knownPromptTagCountValues = map[string]int{
 }
 
 var knownPromptKindCountValues = map[string]int{
-	"prompt": 56,
-	"source": 186,
+	"prompt": 55,
+	"source": 187,
 }
 
 type agentModeMarker struct {
@@ -679,13 +676,13 @@ var agentModeScopes = map[string]string{
 }
 
 var knownAgentModeProfileValues = map[string]struct{}{
-	"agg-man|primary=GPT_5_5|reasoning=none|levels=|include=present|tools=find_thread,read_thread,web_search,read_web_page,docs_list,docs_read,docs_write,create_project,list_agent_modes,create_thread,archive_thread,archive_threads,unarchive_thread,send_message_to_thread,publish_thread_artifacts,slack_write,slack_read,github_repo_ci_status,read_github,search_github,commit_search,list_directory_github,list_repositories,glob_github,diff|deferred=false|visible=false|visibleInV2=false|serverOnly=true": {},
-	"deep|primary=GPT_5_5|reasoning=medium|levels=low,medium,xhigh|include=present|tools=shell_command,shell_command_status,apply_patch,web_search,read_web_page,Task,skill,read_thread,find_thread,librarian,oracle,finder,view_media,painter,archive_current_thread,send_message_to_agg|deferred=true|visible=true|visibleInV2=false|serverOnly=false":                                                                                                                                                              {},
-	"large|primary=CLAUDE_OPUS_4_8|reasoning=|levels=|include=present|tools=finder,Bash,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,skill,oracle,librarian,Task,view_media,painter,read_mcp_resource,archive_current_thread,send_message_to_agg|deferred=true|visible=false|visibleInV2=false|serverOnly=false":                                                                                                                                                                            {},
-	"nostromo|primary=AMP_NOSTROMO|reasoning=low|levels=|include=present|tools=finder,Bash,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,skill,oracle,librarian,Task,view_media,painter,read_mcp_resource,archive_current_thread,send_message_to_agg,shell_command,shell_command_status,apply_patch|deferred=false|visible=true|visibleInV2=false|serverOnly=false":                                                                                                                          {},
-	"review|primary=GPT_5_5|reasoning=medium|levels=|include=present|tools=shell_command,run_check,submit_review|deferred=false|visible=false|visibleInV2=false|serverOnly=false":                                                                                                                                                                                                                                                                                                                                     {},
-	"rush|primary=GPT_5_5|reasoning=none|levels=|include=present|tools=finder,shell_command,shell_command_status,apply_patch,web_search,read_web_page,read_mcp_resource,read_thread,find_thread,skill,oracle,librarian,Task,view_media,painter,archive_current_thread,send_message_to_agg|deferred=false|visible=true|visibleInV2=false|serverOnly=false":                                                                                                                                                             {},
-	"smart|primary=CLAUDE_OPUS_4_8|reasoning=high|levels=high,max,xhigh|include=present|tools=finder,Bash,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,skill,oracle,librarian,Task,view_media,painter,read_mcp_resource,archive_current_thread,send_message_to_agg|deferred=true|visible=true|visibleInV2=false|serverOnly=false":                                                                                                                                                           {},
+	"agg-man|primary=GPT_5_5|reasoning=none|levels=|include=present|tools=find_thread,read_thread,web_search,read_web_page,docs_list,docs_read,docs_write,create_project,list_agent_modes,create_thread,archive_thread,archive_threads,unarchive_thread,send_message_to_thread,publish_thread_artifacts,manage_automation,slack_write,slack_read,github_repo_ci_status,read_github,search_github,commit_search,list_directory_github,list_repositories,glob_github,diff|deferred=false|visible=false|visibleInV2=false|serverOnly=true": {},
+	"deep|primary=GPT_5_5|reasoning=medium|levels=low,medium,xhigh|include=present|tools=shell_command,shell_command_status,apply_patch,web_search,read_web_page,Task,skill,read_thread,find_thread,librarian,oracle,finder,view_media,painter,archive_current_thread,send_message_to_agg|deferred=true|visible=true|visibleInV2=false|serverOnly=false":                                                                                                                                                                                {},
+	"large|primary=CLAUDE_OPUS_4_8|reasoning=|levels=|include=present|tools=finder,Bash,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,skill,oracle,librarian,Task,view_media,painter,read_mcp_resource,archive_current_thread,send_message_to_agg|deferred=true|visible=false|visibleInV2=false|serverOnly=false":                                                                                                                                                                                              {},
+	"nostromo|primary=AMP_NOSTROMO|reasoning=low|levels=|include=present|tools=finder,Bash,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,skill,oracle,librarian,Task,view_media,painter,read_mcp_resource,archive_current_thread,send_message_to_agg,shell_command,shell_command_status,apply_patch|deferred=false|visible=true|visibleInV2=false|serverOnly=false":                                                                                                                                            {},
+	"review|primary=GPT_5_5|reasoning=medium|levels=|include=present|tools=shell_command,run_check,submit_review|deferred=false|visible=false|visibleInV2=false|serverOnly=false":                                                                                                                                                                                                                                                                                                                                                       {},
+	"rush|primary=GPT_5_5|reasoning=none|levels=|include=present|tools=finder,shell_command,shell_command_status,apply_patch,web_search,read_web_page,read_mcp_resource,read_thread,find_thread,skill,oracle,librarian,Task,view_media,painter,archive_current_thread,send_message_to_agg|deferred=false|visible=true|visibleInV2=false|serverOnly=false":                                                                                                                                                                               {},
+	"smart|primary=CLAUDE_OPUS_4_8|reasoning=high|levels=high,max,xhigh|include=present|tools=finder,Bash,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,skill,oracle,librarian,Task,view_media,painter,read_mcp_resource,archive_current_thread,send_message_to_agg|deferred=true|visible=true|visibleInV2=false|serverOnly=false":                                                                                                                                                                             {},
 }
 
 var knownAgentModeRouteValues = map[string]struct{}{
@@ -861,6 +858,10 @@ var knownRawModelValues = map[string]struct{}{
 	"gpt-5.4-pro":                 {},
 	"gpt-5.5":                     {},
 	"gpt-5.5-pro":                 {},
+	"gpt-5.6-luna":                {},
+	"gpt-5.6-sol":                 {},
+	"gpt-5.6-terra":               {},
+	"gpt-56":                      {},
 	"o3-mini":                     {},
 }
 
@@ -918,6 +919,9 @@ var knownModelLimitValues = map[string]modelLimitExpectation{
 	"gpt-5.4-pro":                       {Enum: "GPT_5_4_PRO", Provider: "openai", DisplayName: "GPT-5.4-Pro", ContextWindow: 1050000, MaxOutputTokens: 128000},
 	"gpt-5.5":                           {Enum: "GPT_5_5", Provider: "openai", DisplayName: "GPT-5.5", ContextWindow: 400000, MaxOutputTokens: 128000},
 	"gpt-5.5-pro":                       {Enum: "GPT_5_5_PRO", Provider: "openai", DisplayName: "GPT-5.5-Pro", ContextWindow: 1050000, MaxOutputTokens: 128000},
+	"gpt-5.6-luna":                      {Enum: "GPT_5_6_LUNA", Provider: "openai", DisplayName: "GPT-5.6 Luna", ContextWindow: 400000, MaxOutputTokens: 128000},
+	"gpt-5.6-sol":                       {Enum: "GPT_5_6_SOL", Provider: "openai", DisplayName: "GPT-5.6 Sol", ContextWindow: 400000, MaxOutputTokens: 128000},
+	"gpt-5.6-terra":                     {Enum: "GPT_5_6_TERRA", Provider: "openai", DisplayName: "GPT-5.6 Terra", ContextWindow: 400000, MaxOutputTokens: 128000},
 	"grok-build-0.1":                    {Enum: "GROK_BUILD_0_1", Provider: "xai", DisplayName: "Grok Build 0.1", ContextWindow: 256000, MaxOutputTokens: 32000},
 	"grok-code-fast-1":                  {Enum: "GROK_CODE_FAST_1", Provider: "xai", DisplayName: "Grok Code Fast 1", ContextWindow: 256000, MaxOutputTokens: 32000},
 	"accounts/amp/deployments/wkk976k4": {Enum: "FIREWORKS_GLM_5_2_DEDICATED", Provider: "fireworks", DisplayName: "GLM-5.2 Dedicated", ContextWindow: 200000, MaxOutputTokens: 32000},

@@ -425,6 +425,21 @@ func actorEngineRequest(req *http.Request) bool {
 	return false
 }
 
+func actorEngineRivetCredentialRequest(req *http.Request) bool {
+	if req == nil || req.URL == nil {
+		return false
+	}
+	if strings.TrimSpace(req.URL.Query().Get("rvt-token")) != "" {
+		return true
+	}
+	for _, protocol := range req.Header.Values("Sec-WebSocket-Protocol") {
+		if strings.Contains(strings.ToLower(protocol), "rivet_token.") {
+			return true
+		}
+	}
+	return false
+}
+
 func actorEnginePath(path string) bool {
 	normalized := "/" + strings.Trim(path, "/")
 	// /gateway is the rivetkit engine transport the client uses once it adopts the
