@@ -4758,10 +4758,12 @@ func TestNeoRuntimeShutdownPersistsLocalThreadActorSnapshot(t *testing.T) {
 	useTempNeoThreadStore(t)
 	enabled := true
 	port := freeTCPPortForTest(t)
+	missingExecutorCommand := filepath.Join(t.TempDir(), "missing-amp")
 	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
-		Enabled: &enabled,
-		Host:    "127.0.0.1",
-		Port:    port,
+		Enabled:         &enabled,
+		Host:            "127.0.0.1",
+		Port:            port,
+		ExecutorCommand: missingExecutorCommand,
 	}}})
 	if err := rt.start(); err != nil {
 		t.Fatalf("start runtime: %v", err)
@@ -4797,7 +4799,10 @@ func TestNeoRuntimeShutdownPersistsLocalThreadActorSnapshot(t *testing.T) {
 		t.Fatalf("persisted thread missing durable state: %s", body)
 	}
 
-	restarted := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled}}})
+	restarted := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
+		Enabled:         &enabled,
+		ExecutorCommand: missingExecutorCommand,
+	}}})
 	restored := restarted.store.ensureThreadActor(threadID)
 	deadline := time.Now().Add(time.Second)
 	for {
