@@ -413,7 +413,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 	}
 	for _, want := range []string{
 		"// ==UserScript==",
-		"@version 0.1.53",
+		"@version 0.1.54",
 		"@match https://ampcode.com/*",
 		"@updateURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
 		"@downloadURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
@@ -428,7 +428,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"commandPaletteIntegrationCount",
 		"localThreadPickerOpenCount",
 		"removedLocalThreadControlCount",
-		`const userscriptVersion = "0.1.53"`,
+		`const userscriptVersion = "0.1.54"`,
 		"userscriptVersion",
 		"lastPatchedThreadActorBaseURL",
 		"lastPatchedThreadID",
@@ -815,7 +815,7 @@ if (typeof globalThis.btoa !== "function") {
 }
 require(scriptPath);
 const bridge = globalThis.__cliproxyAmpLocalInference;
-assert(bridge && bridge.userscriptVersion === "0.1.53", "bridge userscript version was not exposed");
+assert(bridge && bridge.userscriptVersion === "0.1.54", "bridge userscript version was not exposed");
 globalThis.localStorage.setItem(bridge.localThreadIDsStorageKey, JSON.stringify([threadID, secondThreadID]));
 globalThis.localStorage.setItem(bridge.apiKeyStorageKey, "local-key");
 globalThis.localStorage.setItem(bridge.workingDirectoryStorageKey, createdThreadWorkDir);
@@ -1095,8 +1095,13 @@ const relativeRewritten = new URL(relativeSocket.url);
 assert(relativeRewritten.protocol === "ws:", "relative websocket protocol was not rewritten");
 assert(relativeRewritten.host === "127.0.0.1:8317", "relative websocket host was not rewritten");
 assert(relativeRewritten.searchParams.get("cliproxy-api-key") === "local-key", "relative localStorage API key was not applied");
+const localHTTPConfigSocket = new WebSocket("http://127.0.0.1:8317/gateway/threadActor/websocket/?rvt-method=get&rvt-key=" + encodeURIComponent(secondThreadID));
+const localHTTPRewritten = new URL(localHTTPConfigSocket.url);
+assert(localHTTPRewritten.protocol === "ws:", "local http websocket protocol was not rewritten");
+assert(localHTTPRewritten.host === "127.0.0.1:8317", "local http websocket host changed");
+assert(localHTTPRewritten.searchParams.get("cliproxy-api-key") === "local-key", "local http websocket localStorage API key was not applied");
 assert(bridge.diagnostics.decodedConfigPatchCount >= 2, "decoded config patches were not recorded");
-assert(bridge.diagnostics.webSocketBootstrapCount === 2, "websocket bootstrap was not recorded");
+assert(bridge.diagnostics.webSocketBootstrapCount === 3, "websocket bootstrap was not recorded");
 })().catch((error) => {
 	console.error(error && error.stack ? error.stack : error);
 	process.exit(1);

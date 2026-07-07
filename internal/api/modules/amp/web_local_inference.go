@@ -215,7 +215,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	return fmt.Sprintf(`// ==UserScript==
 // @name CLIProxyAPI Amp Local Inference
 // @namespace https://github.com/router-for-me/CLIProxyAPI
-// @version 0.1.53
+// @version 0.1.54
 %s
 // @updateURL %s
 // @downloadURL %s
@@ -227,7 +227,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	"use strict";
 
 	const bridgeHeader = %s;
-	const userscriptVersion = "0.1.53";
+	const userscriptVersion = "0.1.54";
 	const apiKeyStorageKey = "cliproxyapi.ampLocalInference.apiKey";
 	const workingDirectoryStorageKey = "cliproxyapi.ampLocalInference.workingDirectory";
 	const selectedLocalProjectStorageKey = "cliproxyapi.ampLocalInference.selectedLocalProject";
@@ -3374,7 +3374,8 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 
 	function sameLocalWebSocketBase(url, base) {
 		const protocol = base.protocol === "https:" ? "wss:" : "ws:";
-		return url.protocol === protocol && url.host === base.host;
+		return (url.protocol === protocol && url.host === base.host) ||
+			((url.protocol === "http:" || url.protocol === "https:") && sameLocalHTTPBase(url, base));
 	}
 
 	function localWebSocketURL(rawURL) {
