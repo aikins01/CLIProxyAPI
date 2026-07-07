@@ -368,14 +368,14 @@ nonstream-keepalive-interval: 0
 #   # model's provider returns a transient quota/unavailable error (HTTP 429/503): the
 #   # model is then routed to the target for a short cooldown before the original is
 #   # retried. Useful for Amp's Gemini subagents (code review = gemini-3.1-pro,
-#   # search/read_thread/media = gemini-3-flash) hitting a Vertex/AI-Studio quota cap.
+#   # search/media = gemini-3-flash) hitting a Vertex/AI-Studio quota cap.
 #   model-fallbacks:
 #     - from: "claude-haiku-4-5-20251001"        # Haiku subagents/checks when Anthropic is unavailable
 #       to: "gemini-3.1-flash-lite"
 #     - from: '^gemini-3(\.1)?-pro(-preview)?$'    # code review
 #       to: claude-opus-4-8(xhigh)
 #       regex: true
-#     - from: '^gemini-3(\.5)?-flash(-preview)?$'  # search / read_thread / media analysis
+#     - from: '^gemini-3(\.5)?-flash(-preview)?$'  # search / media analysis
 #       to: claude-sonnet-4-6
 #       regex: true
 

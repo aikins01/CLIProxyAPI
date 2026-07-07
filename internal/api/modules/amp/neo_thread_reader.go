@@ -234,7 +234,8 @@ func neoReadThreadResponseJSONSchema() map[string]any {
 				"description": "Extracted relevant information from the thread based on the goal. Preserve fidelity and details for relevant parts. Omit irrelevant content.",
 			},
 		},
-		"required": []any{"relevantContent"},
+		"required":             []any{"relevantContent"},
+		"additionalProperties": false,
 	}
 }
 

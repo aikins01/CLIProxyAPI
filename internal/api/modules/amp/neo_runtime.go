@@ -8237,7 +8237,8 @@ func (a *neoActor) maybeCompactBeforeInference(agentMode, reasoningEffort, paren
 	}
 
 	settings := cloneMap(a.settings)
-	compactionMessagesWindow, compactionOffset := neoCompactionWindow(a.messages, a.compactionRecords)
+	sourceMessages, sourceIndexes := neoCompactionSourceMessages(a.messages, parentToolCallID)
+	compactionMessagesWindow, compactionOffset := neoCompactionWindow(sourceMessages, a.compactionRecords)
 	inferenceRoute := applyNeoModelMapping(a.runtime, selectNeoModelRouteWithConfig(a.runtime, agentMode, settings))
 	request := a.inferenceRequestLocked(agentMode, reasoningEffort, parentToolCallID)
 	estimatedInputTokens := neoEstimateInferenceInputTokens(request, inferenceRoute)
@@ -8255,7 +8256,7 @@ func (a *neoActor) maybeCompactBeforeInference(agentMode, reasoningEffort, paren
 	shouldCompact := neoCompactionShouldRunForTokensWithThreshold(compactionMessagesWindow, estimatedInputTokens, thresholdTokens)
 	if !shouldCompact {
 		compactionRoute := applyNeoModelMapping(a.runtime, selectNeoCompactionRoute(cfg, agentMode, settings))
-		compactionInputMessages := neoCompactionInputMessages(a.messages, compactionOffset)
+		compactionInputMessages := neoCompactionInputMessages(sourceMessages, compactionOffset)
 		compactionMaxInputTokens := neoCompactionMaxInputTokens(agentMode, compactionRoute)
 		compactionThresholdTokens := neoCompactionPreflightThresholdTokensForSettings(compactionMaxInputTokens, settings)
 		compactionEstimatedInputTokens := neoEstimateCompactionRequestInputTokens(compactionRoute, compactionInputMessages, neoCompactionSummaryPrompt(settings))
@@ -8272,7 +8273,7 @@ func (a *neoActor) maybeCompactBeforeInference(agentMode, reasoningEffort, paren
 		}
 		return false
 	}
-	plan, ok := a.prepareCompactionPlanLocked(cfg, settings, agentMode, generation, a.messages, compactionMessagesWindow, compactionOffset, len(a.messages), true, false)
+	plan, ok := a.prepareCompactionPlanLocked(cfg, settings, agentMode, generation, sourceMessages, sourceIndexes, compactionMessagesWindow, compactionOffset, len(a.messages), true, false)
 	if !ok {
 		if messageID != "" && a.currentInference != nil && a.currentInference.messageID == messageID {
 			a.currentInference.preflightCompactionChecked = true
@@ -8337,13 +8338,13 @@ func (a *neoActor) maybeCompactAfterInference(agentMode, reasoningEffort, parent
 		return false
 	}
 	thresholdTokens := neoCompactionObservedThresholdTokensForSettings(agentMode, binaryInferenceRoute, maxInput, settings)
-	sourceMessages := a.messages[:finalIndex]
+	sourceMessages, sourceIndexes := neoCompactionSourceMessages(a.messages[:finalIndex], parentToolCallID)
 	compactionMessagesWindow, compactionOffset := neoCompactionWindow(sourceMessages, a.compactionRecords)
 	if float64(observedTokens) < thresholdTokens {
 		a.mu.Unlock()
 		return false
 	}
-	plan, ok := a.prepareCompactionPlanLocked(cfg, settings, agentMode, a.generation, sourceMessages, compactionMessagesWindow, compactionOffset, finalIndex, true, true)
+	plan, ok := a.prepareCompactionPlanLocked(cfg, settings, agentMode, a.generation, sourceMessages, sourceIndexes, compactionMessagesWindow, compactionOffset, finalIndex, true, true)
 	if !ok {
 		a.mu.Unlock()
 		return false
@@ -8367,7 +8368,7 @@ type neoCompactionPlan struct {
 	sourceLen                     int
 }
 
-func (a *neoActor) prepareCompactionPlanLocked(cfg *config.Config, settings map[string]any, agentMode string, generation int, sourceMessages, compactionMessagesWindow []neoMessage, compactionOffset, sourceLen int, markCurrentInferenceAsChecked, allowSummaryOnlyAtEnd bool) (neoCompactionPlan, bool) {
+func (a *neoActor) prepareCompactionPlanLocked(cfg *config.Config, settings map[string]any, agentMode string, generation int, sourceMessages []neoMessage, sourceIndexes []int, compactionMessagesWindow []neoMessage, compactionOffset, sourceLen int, markCurrentInferenceAsChecked, allowSummaryOnlyAtEnd bool) (neoCompactionPlan, bool) {
 	if a.compactionRetryAfterLen > 0 && sourceLen < a.compactionRetryAfterLen {
 		return neoCompactionPlan{}, false
 	}
@@ -8377,13 +8378,14 @@ func (a *neoActor) prepareCompactionPlanLocked(cfg *config.Config, settings map[
 		cutRelativeIndex = len(compactionMessagesWindow)
 		appendSummaryOnly = true
 	}
-	cutIndex := compactionOffset + cutRelativeIndex
+	cutScopedIndex := compactionOffset + cutRelativeIndex
+	cutIndex := neoCompactionActualMessageIndex(sourceIndexes, cutScopedIndex, sourceLen)
 	if cutIndex <= 0 || cutIndex > sourceLen || (!appendSummaryOnly && cutIndex >= sourceLen) {
 		return neoCompactionPlan{}, false
 	}
 	cutMessageID := ""
-	if cutIndex < sourceLen {
-		cutMessageID = sourceMessages[cutIndex].MessageID
+	if cutScopedIndex < len(sourceMessages) {
+		cutMessageID = sourceMessages[cutScopedIndex].MessageID
 	}
 	a.compacting = true
 	return neoCompactionPlan{
@@ -14291,6 +14293,28 @@ func scopedNeoHistory(history []neoHistoryMessage, parentToolCallID string) []ne
 		}
 	}
 	return out
+}
+
+func neoCompactionSourceMessages(messages []neoMessage, parentToolCallID string) ([]neoMessage, []int) {
+	out := make([]neoMessage, 0, len(messages))
+	indexes := make([]int, 0, len(messages))
+	for index, message := range messages {
+		if message.ParentToolUseID == "" || (parentToolCallID != "" && message.ParentToolUseID == parentToolCallID) {
+			out = append(out, message)
+			indexes = append(indexes, index)
+		}
+	}
+	return out, indexes
+}
+
+func neoCompactionActualMessageIndex(indexes []int, scopedIndex, sourceLen int) int {
+	if scopedIndex < 0 {
+		return scopedIndex
+	}
+	if scopedIndex < len(indexes) {
+		return indexes[scopedIndex]
+	}
+	return sourceLen
 }
 
 func (a *neoActor) toolsForModeLocked(agentMode string, history []neoHistoryMessage) []neoToolSpec {
@@ -20546,6 +20570,9 @@ func inferNeoOpenAIChatProvider(rt *neoRuntime, request neoInferenceRequest, rou
 		body["tools"] = openAINeoTools(request.Tools)
 		body["tool_choice"] = "auto"
 	}
+	if responseFormat := neoOpenAIChatResponseFormat(request); len(responseFormat) > 0 {
+		body["response_format"] = responseFormat
+	}
 	if (provider == "openai" || provider == "amp") && !request.DisableProviderReasoning {
 		neoApplyOpenAIReasoning(body, route, neoProviderReasoningEffort(request, route))
 	} else {
@@ -21334,6 +21361,9 @@ func inferNeoOpenAIChatStreamProvider(rt *neoRuntime, request neoInferenceReques
 	if len(request.Tools) > 0 {
 		body["tools"] = openAINeoTools(request.Tools)
 		body["tool_choice"] = "auto"
+	}
+	if responseFormat := neoOpenAIChatResponseFormat(request); len(responseFormat) > 0 {
+		body["response_format"] = responseFormat
 	}
 	if (provider == "openai" || provider == "amp") && !request.DisableProviderReasoning {
 		neoApplyOpenAIReasoning(body, route, neoProviderReasoningEffort(request, route))
@@ -24729,10 +24759,39 @@ func openAIResponsesNeoBody(request neoInferenceRequest, route neoModelRoute, st
 	if serviceTier := neoOpenAIResponsesServiceTier(request); serviceTier != "" {
 		body["service_tier"] = serviceTier
 	}
+	if textFormat := neoOpenAIResponsesTextFormat(request); len(textFormat) > 0 {
+		body["text"] = map[string]any{"format": textFormat}
+	}
 	if !request.DisableProviderReasoning {
 		neoApplyOpenAIResponsesReasoning(body, route, neoProviderReasoningEffort(request, route))
 	}
 	return body
+}
+
+func neoOpenAIResponsesTextFormat(request neoInferenceRequest) map[string]any {
+	if len(request.ResponseJSONSchema) == 0 {
+		return nil
+	}
+	return map[string]any{
+		"type":   "json_schema",
+		"name":   "neo_response",
+		"schema": cloneMap(request.ResponseJSONSchema),
+		"strict": true,
+	}
+}
+
+func neoOpenAIChatResponseFormat(request neoInferenceRequest) map[string]any {
+	if len(request.ResponseJSONSchema) == 0 {
+		return nil
+	}
+	return map[string]any{
+		"type": "json_schema",
+		"json_schema": map[string]any{
+			"name":   "neo_response",
+			"schema": cloneMap(request.ResponseJSONSchema),
+			"strict": true,
+		},
+	}
 }
 
 func neoOpenAIResponsesServiceTier(request neoInferenceRequest) string {

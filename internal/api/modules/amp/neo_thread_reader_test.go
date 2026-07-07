@@ -164,6 +164,95 @@ func TestNeoReadThreadDefaultsToCurrentThread(t *testing.T) {
 	}
 }
 
+func TestNeoReadThreadPromptsAvoidCopyableFinalPlaceholder(t *testing.T) {
+	combined := neoReadThreadAgentSystemPrompt + "\n" + neoReadThreadFinalPrompt
+	if strings.Contains(combined, `"markdown text"`) {
+		t.Fatalf("read_thread prompts contain copyable final placeholder: %s", combined)
+	}
+	if !strings.Contains(combined, "do not return placeholder") {
+		t.Fatalf("read_thread prompts do not explicitly reject placeholder output: %s", combined)
+	}
+	if !strings.Contains(combined, "not nested JSON") {
+		t.Fatalf("read_thread prompts do not reject nested JSON final content: %s", combined)
+	}
+	if !strings.Contains(combined, "Copy relevant identifiers verbatim") {
+		t.Fatalf("read_thread prompts do not require verbatim identifiers: %s", combined)
+	}
+	if !strings.Contains(combined, "Do not mention superseded or irrelevant topics") {
+		t.Fatalf("read_thread prompts do not suppress superseded-topic resurfacing: %s", combined)
+	}
+}
+
+func TestNeoReadThreadCorpusUsesVisibleRootMessages(t *testing.T) {
+	threadID := "T-visible-reader"
+	thread := map[string]any{
+		"id":    threadID,
+		"title": "visible reader",
+		"messages": []any{
+			map[string]any{"role": "user", "messageId": "M-root-0", "content": []any{map[string]any{"type": "text", "text": "start shipping PR #1003"}}},
+			map[string]any{"role": "assistant", "messageId": "M-root-1", "content": []any{map[string]any{"type": "tool_use", "id": "TU-read", "name": "read_thread", "input": map[string]any{"goal": "continue"}}}},
+			map[string]any{"role": "user", "messageId": "M-child-0", "parentToolUseId": "TU-read", "content": []any{map[string]any{"type": "text", "text": "hidden stale subagent observation: wait for cooldown"}}},
+			map[string]any{"role": "user", "messageId": "M-root-2", "content": []any{map[string]any{"type": "tool_result", "toolUseID": "TU-read", "run": map[string]any{"status": "done", "result": "handoff extracted"}}}},
+			map[string]any{"role": "user", "messageId": "M-child-1", "parentToolUseID": "TU-read", "content": []any{map[string]any{"type": "text", "text": "hidden tail noise: commit and push still pending"}}},
+			map[string]any{"role": "assistant", "messageId": "M-root-3", "content": []any{map[string]any{"type": "text", "text": "PR #1003 was merged and local main is synced."}}},
+		},
+		"queuedMessages": []any{
+			map[string]any{"role": "user", "parentToolCallId": "TU-read", "content": []any{map[string]any{"type": "text", "text": "hidden queued child"}}},
+			map[string]any{"role": "user", "content": []any{map[string]any{"type": "text", "text": "visible queued follow-up"}}},
+		},
+	}
+
+	corpus := neoReadThreadCorpusFromThreadMap(threadID, thread, "test")
+	if len(corpus.Messages) != 5 {
+		t.Fatalf("visible message count = %d, want 5: %#v", len(corpus.Messages), corpus.Messages)
+	}
+	rendered := fmt.Sprint(corpus.Messages)
+	if strings.Contains(rendered, "hidden stale") || strings.Contains(rendered, "hidden tail noise") || strings.Contains(rendered, "hidden queued child") {
+		t.Fatalf("corpus included nested subagent messages: %#v", corpus.Messages)
+	}
+	if corpus.Messages[3].Index != 5 || !strings.Contains(corpus.Messages[3].Text, "merged") || corpus.Messages[4].Index != 7 {
+		t.Fatalf("visible indexes/tail = %#v", corpus.Messages)
+	}
+
+	overview := neoReadThreadOverview(corpus)
+	if numberFrom(overview["latestMessageIndex"]) != 7 {
+		t.Fatalf("overview latestMessageIndex = %#v, want original visible index 7", overview["latestMessageIndex"])
+	}
+	raw, _ := json.Marshal(overview["latestMessages"])
+	if !strings.Contains(string(raw), "PR #1003 was merged") || strings.Contains(string(raw), "commit and push still pending") {
+		t.Fatalf("overview latest messages = %s", raw)
+	}
+
+	read, end, err := neoReadThreadRead(corpus, map[string]any{"startIndex": 5, "count": 2})
+	if err != nil {
+		t.Fatalf("read original range: %v", err)
+	}
+	if end != 7 {
+		t.Fatalf("read end = %d, want latest original index 7", end)
+	}
+	readRange := mapValue(read["range"])
+	if numberFrom(readRange["startIndex"]) != 5 || numberFrom(readRange["endIndex"]) != 7 {
+		t.Fatalf("read range = %#v, want original indexes 5-7", readRange)
+	}
+	latestRead, latestEnd, err := neoReadThreadRead(corpus, map[string]any{"latest": true, "startIndex": 0, "count": 2})
+	if err != nil {
+		t.Fatalf("read mixed latest/start range: %v", err)
+	}
+	if latestEnd != 7 {
+		t.Fatalf("latest mixed end = %d, want latest original index 7", latestEnd)
+	}
+	latestRange := mapValue(latestRead["range"])
+	if numberFrom(latestRange["startIndex"]) != 5 || numberFrom(latestRange["endIndex"]) != 7 {
+		t.Fatalf("latest mixed range = %#v, want original indexes 5-7", latestRange)
+	}
+	if _, _, err := neoReadThreadRead(corpus, map[string]any{"startIndex": 99}); err == nil || !strings.Contains(err.Error(), "outside thread message range") {
+		t.Fatalf("read past sparse tail err = %v, want out-of-range", err)
+	}
+	if _, _, err := neoReadThreadRead(corpus, map[string]any{"afterIndex": 99}); err == nil || !strings.Contains(err.Error(), "outside thread message range") {
+		t.Fatalf("read after sparse tail err = %v, want out-of-range", err)
+	}
+}
+
 func TestNeoReadThreadRunLocalActorToolEmitsBinaryProgress(t *testing.T) {
 	threadID := "T-019e65c0-0310-77a8-b233-4b84d9c06141"
 	var captured []neoInferenceRequest
@@ -390,6 +479,53 @@ func TestNeoReadThreadFinalHistoryFlattensToolContent(t *testing.T) {
 	}
 	if !strings.Contains(history[0].Text, "Prior read_thread internal tool result") || !strings.Contains(history[0].Text, "content-only tool result") || !strings.Contains(history[0].Text, neoReadThreadFinalPrompt) {
 		t.Fatalf("flattened final history text = %q", history[0].Text)
+	}
+}
+
+func TestNeoReadThreadForcedFinalAnchorsLatestVisibleTail(t *testing.T) {
+	corpus := neoReadThreadCorpus{ThreadID: "T-final-tail", Source: "test", Title: "final tail", Messages: []neoReadThreadMessage{
+		{Index: 0, Role: "user", MessageID: "M-old", Text: "Old summary says wait for review cooldown."},
+		{Index: 1, Role: "assistant", MessageID: "M-merged", Text: "Latest state: PR #1003 was merged and local main is synced."},
+	}}
+	var captured []neoInferenceRequest
+	rt := newNeoRuntime(&config.Config{})
+	rt.inferStream = func(_ *neoRuntime, request neoInferenceRequest, _ neoStreamCallback) (neoInferenceResult, error) {
+		captured = append(captured, request)
+		return neoInferenceResult{Text: neoReadThreadTestFinalJSON("[message 1] PR #1003 was merged and local main is synced.")}, nil
+	}
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-current", "T-current", neoActorRecord("actor-test", "thread-actor", "T-current"), nil)
+	text, err := actor.forceLocalReadThreadFinal(
+		neoPendingTool{ID: "TU-read", Name: "read_thread"},
+		actor.generation,
+		neoModelRoute{Provider: neoReadThreadAgentProvider, Model: neoReadThreadAgentModel},
+		neoReadThreadAgentEffort,
+		actor.id,
+		actor.threadID,
+		"deep",
+		nil,
+		map[string]any{"reasoning.effort": neoReadThreadAgentEffort},
+		nil,
+		[]neoHistoryMessage{
+			{Role: "user", Text: "Read thread for continuation."},
+			{Role: "tool", ToolCallID: "TU-old", ToolName: "read_thread_messages", Text: "Old tool result: wait for review cooldown."},
+		},
+		corpus,
+	)
+	if err != nil {
+		t.Fatalf("forceLocalReadThreadFinal error: %v", err)
+	}
+	if !strings.Contains(text, "merged") {
+		t.Fatalf("forced final text = %q, want merged state", text)
+	}
+	if len(captured) != 1 {
+		t.Fatalf("captured requests = %d, want 1", len(captured))
+	}
+	historyText := neoHistoryTestText(captured[0].History)
+	if !strings.Contains(historyText, "Authoritative latest visible target-thread messages") || !strings.Contains(historyText, "PR #1003 was merged") {
+		t.Fatalf("forced final history missing latest visible tail: %s", historyText)
+	}
+	if !strings.Contains(historyText, neoReadThreadFinalPrompt) {
+		t.Fatalf("forced final history missing final prompt: %s", historyText)
 	}
 }
 

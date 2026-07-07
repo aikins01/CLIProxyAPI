@@ -93,9 +93,36 @@ func TestNeoReadThreadDefaultBenchmarkCandidates(t *testing.T) {
 	for _, candidate := range candidates {
 		got = append(got, candidate.Route.Provider+"/"+candidate.Route.Model+"@"+candidate.Effort)
 	}
-	want := []string{"google/gemini-3.5-flash@high", "openai/gpt-5.5@medium"}
+	want := []string{"openai/gpt-5.5@medium"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("default benchmark candidates = %#v, want %#v", got, want)
+	}
+}
+
+func TestNeoReadThreadBenchmarkRubricNormalizesMarkdown(t *testing.T) {
+	tc := neoReadThreadSyntheticCase{
+		MustInclude: []string{"do not push", "do not restart brew", "leave the patch uncommitted"},
+	}
+	passed, missing, forbidden := neoReadThreadBenchmarkRubric("Do **not** push. Do **not** restart brew. Leave the patch **uncommitted**.", tc)
+	if !passed || len(missing) != 0 || len(forbidden) != 0 {
+		t.Fatalf("rubric = passed:%v missing:%#v forbidden:%#v", passed, missing, forbidden)
+	}
+}
+
+func TestNeoReadThreadBenchmarkRubricAllowsPriorUnavailableContext(t *testing.T) {
+	tc := neoReadThreadSyntheticCase{
+		MustInclude:    []string{"code_review", "target", "HEAD", "checks", "applying-review-checks"},
+		MustNotInclude: []string{"not available after loading", "unavailable after loading"},
+	}
+	text := "Before loading the skill, code_review was not available. After loading, code_review is available with target HEAD and checks applying-review-checks."
+	passed, missing, forbidden := neoReadThreadBenchmarkRubric(text, tc)
+	if !passed || len(missing) != 0 || len(forbidden) != 0 {
+		t.Fatalf("rubric = passed:%v missing:%#v forbidden:%#v", passed, missing, forbidden)
+	}
+
+	passed, _, forbidden = neoReadThreadBenchmarkRubric("code_review target HEAD checks applying-review-checks is not available after loading", tc)
+	if passed || len(forbidden) == 0 {
+		t.Fatalf("rubric allowed forbidden unavailable-after-loading claim")
 	}
 }
 
@@ -180,7 +207,6 @@ func neoReadThreadBenchmarkCandidates(t *testing.T) []neoReadThreadBenchmarkCand
 	raw := strings.TrimSpace(os.Getenv("AMP_READ_THREAD_MODEL_BENCHMARK_CANDIDATES"))
 	if raw == "" {
 		return []neoReadThreadBenchmarkCandidate{
-			{Name: "gemini-3.5-flash-high", Route: neoModelRoute{Provider: "google", Model: "gemini-3.5-flash"}, Effort: "high"},
 			{Name: "gpt-5.5-medium", Route: neoModelRoute{Provider: "openai", Model: "gpt-5.5"}, Effort: "medium"},
 		}
 	}
@@ -261,17 +287,17 @@ func neoReadThreadBenchmarkRepetitions(t *testing.T) int {
 }
 
 func neoReadThreadBenchmarkRubric(text string, tc neoReadThreadSyntheticCase) (bool, []string, []string) {
-	lower := strings.ToLower(text)
+	normalized := neoReadThreadBenchmarkRubricText(text)
 	missing := make([]string, 0)
 	for _, want := range tc.MustInclude {
-		if !strings.Contains(lower, strings.ToLower(want)) {
+		if !strings.Contains(normalized, neoReadThreadBenchmarkRubricText(want)) {
 			missing = append(missing, want)
 		}
 	}
 	if len(tc.MustIncludeOneOf) > 0 {
 		matched := false
 		for _, want := range tc.MustIncludeOneOf {
-			if strings.Contains(lower, strings.ToLower(want)) {
+			if strings.Contains(normalized, neoReadThreadBenchmarkRubricText(want)) {
 				matched = true
 				break
 			}
@@ -282,11 +308,17 @@ func neoReadThreadBenchmarkRubric(text string, tc neoReadThreadSyntheticCase) (b
 	}
 	forbidden := make([]string, 0)
 	for _, bad := range tc.MustNotInclude {
-		if strings.Contains(lower, strings.ToLower(bad)) {
+		if strings.Contains(normalized, neoReadThreadBenchmarkRubricText(bad)) {
 			forbidden = append(forbidden, bad)
 		}
 	}
 	return len(missing) == 0 && len(forbidden) == 0, missing, forbidden
+}
+
+func neoReadThreadBenchmarkRubricText(text string) string {
+	text = strings.ToLower(text)
+	text = strings.NewReplacer("*", "", "`", "").Replace(text)
+	return strings.Join(strings.Fields(text), " ")
 }
 
 func neoReadThreadBenchmarkUsageInt(usage map[string]any, keys ...string) int {
@@ -379,14 +411,15 @@ func neoReadThreadSyntheticBenchmarkCases() []neoReadThreadSyntheticCase {
 			MustInclude:   []string{"internal/api/modules/amp/neo_thread_sync.go", "internal/api/modules/amp/neo_runtime.go", "go test ./internal/api/modules/amp -run TestNeoSidebar", "PostgreSQL", "web sidebar"},
 		},
 		{
-			Name:           "latest continuation hidden by tool tail",
-			ThreadID:       "T-019e65c0-0310-77a8-b233-4b84d9c06216",
-			Title:          "Late signal paper fixes",
-			Goal:           "Continue from the latest task in this thread. Extract what should be done next and ignore older superseded storage-validation context.",
-			Messages:       neoReadThreadHiddenContinuationTailMessages(),
-			SearchQueries:  []string{"lets do the fixes", "late_actionable"},
-			MustInclude:    []string{"frontend/src/routes/post-launch/strategy-lab/+page.svelte", "data_collection/workers/strategy_paper_trader.py", "late_actionable", "paper-only"},
-			MustNotInclude: []string{"position mark storage/query path", "signal-status ranking"},
+			Name:             "latest continuation hidden by tool tail",
+			ThreadID:         "T-019e65c0-0310-77a8-b233-4b84d9c06216",
+			Title:            "Late signal paper fixes",
+			Goal:             "Continue from the latest task in this thread. Extract what should be done next and ignore older superseded storage-validation context.",
+			Messages:         neoReadThreadHiddenContinuationTailMessages(),
+			SearchQueries:    []string{"lets do the fixes", "late_actionable"},
+			MustInclude:      []string{"frontend/src/routes/post-launch/strategy-lab/+page.svelte", "data_collection/workers/strategy_paper_trader.py", "late_actionable"},
+			MustIncludeOneOf: []string{"paper-only", "paper-trader-only", "paper trader"},
+			MustNotInclude:   []string{"position mark storage/query path", "signal-status ranking"},
 		},
 		{
 			Name:             "read thread overview loop noise",
@@ -462,7 +495,7 @@ func neoReadThreadSyntheticBenchmarkCases() []neoReadThreadSyntheticCase {
 			Messages:       neoReadThreadSameThreadCodeReviewMessages(),
 			SearchQueries:  []string{"code_review", "applying-review-checks"},
 			MustInclude:    []string{"code_review", "target", "HEAD", "checks", "applying-review-checks"},
-			MustNotInclude: []string{"not available", "unavailable after loading"},
+			MustNotInclude: []string{"not available after loading", "unavailable after loading"},
 		},
 		{
 			Name:           "repository switch recommendation",

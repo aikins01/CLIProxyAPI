@@ -492,6 +492,82 @@ func TestNeoRuntimeAutoCompactsLargeLocalHistory(t *testing.T) {
 	}
 }
 
+func TestNeoRuntimePreflightIgnoresNestedSubagentMessagePressure(t *testing.T) {
+	dir := t.TempDir()
+	oldStoreDir := neoAmpDataDir
+	neoAmpDataDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpDataDir = oldStoreDir })
+
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"unexpected summary"}}]}`))
+	}))
+	t.Cleanup(upstream.Close)
+	parsed, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+	_, portString, err := net.SplitHostPort(parsed.Host)
+	if err != nil {
+		t.Fatalf("parse upstream host: %v", err)
+	}
+	port, err := strconv.Atoi(portString)
+	if err != nil {
+		t.Fatalf("parse upstream port: %v", err)
+	}
+
+	enabled := true
+	rt := newNeoRuntime(&config.Config{
+		Host: "127.0.0.1",
+		Port: port,
+		AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
+			Enabled:         &enabled,
+			CompactionModel: "openai/gpt-5.4",
+		}},
+	})
+	threadID := "T-nested-pressure"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+	actor.settings["internal.compactionThresholdPercent"] = 0
+	longNested := strings.Repeat("hidden read_thread observation ", 4000)
+	actor.mu.Lock()
+	for i := 0; i < 4; i++ {
+		role := "user"
+		if i%2 == 1 {
+			role = "assistant"
+		}
+		actor.storeMessageLocked(neoMessage{ThreadID: threadID, MessageID: fmt.Sprintf("M-root-%019d", i), Role: role, Content: []any{map[string]any{"type": "text", "text": fmt.Sprintf("visible root message %02d", i)}}})
+	}
+	for i := 0; i < 40; i++ {
+		actor.storeMessageLocked(neoMessage{ThreadID: threadID, MessageID: fmt.Sprintf("M-child-%018d", i), Role: "user", ParentToolUseID: "TU-read", Content: []any{map[string]any{"type": "text", "text": fmt.Sprintf("child message %02d %s", i, longNested)}}})
+	}
+	rootMessages, _ := neoCompactionSourceMessages(actor.messages, "")
+	if len(rootMessages) != 4 {
+		actor.mu.Unlock()
+		t.Fatalf("root messages = %d, want 4", len(rootMessages))
+	}
+	if !neoCompactionShouldRun(actor.messages, 1, 0) {
+		actor.mu.Unlock()
+		t.Fatal("unscoped messages should demonstrate pre-change compaction pressure")
+	}
+	if neoCompactionShouldRun(rootMessages, 1, 0) {
+		actor.mu.Unlock()
+		t.Fatal("root-scoped messages should stay below minimum safe compaction count")
+	}
+	actor.currentInference = &neoInferenceInflight{messageID: "M-current", agentMode: "smart", reasoningEffort: "medium"}
+	actor.rebuildHistoryLocked()
+	generation := actor.generation
+	actor.mu.Unlock()
+
+	if actor.maybeCompactBeforeInference("smart", "medium", "", generation, "M-current") {
+		t.Fatal("nested child pressure triggered root compaction")
+	}
+	if calls != 0 {
+		t.Fatalf("compaction calls = %d, want 0", calls)
+	}
+}
+
 func TestNeoRuntimeEmptyCompactionSummarySuppressesImmediateRetry(t *testing.T) {
 	dir := t.TempDir()
 	oldStoreDir := neoAmpDataDir
@@ -2526,6 +2602,73 @@ func TestNeoCompactionWindowUsesLatestBinaryCutRecord(t *testing.T) {
 	window, offset = neoCompactionWindow(withSummary, []map[string]any{{"cutMessageId": "M-0000000000000000000024", "createdAt": "2026-05-30T00:00:00Z"}})
 	if offset != 25 || len(window) != 6 || window[0].MessageID != "M-0000000000000000000024" {
 		t.Fatalf("latest record should win over older summary: offset=%d len=%d first=%q", offset, len(window), window[0].MessageID)
+	}
+}
+
+func TestNeoCompactionSourceMessagesScopesNestedSubagentMessages(t *testing.T) {
+	messages := []neoMessage{
+		{ThreadID: "T-scope", MessageID: "M-root-0", Role: "user", Content: []any{map[string]any{"type": "text", "text": "root start"}}},
+		{ThreadID: "T-scope", MessageID: "M-child-read", Role: "user", ParentToolUseID: "TU-read", Content: []any{map[string]any{"type": "text", "text": "read_thread internal observation"}}},
+		{ThreadID: "T-scope", MessageID: "M-root-1", Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "root answer"}}},
+		{ThreadID: "T-scope", MessageID: "M-child-oracle", Role: "assistant", ParentToolUseID: "TU-oracle", Content: []any{map[string]any{"type": "text", "text": "oracle internal observation"}}},
+		{ThreadID: "T-scope", MessageID: "M-root-2", Role: "user", Content: []any{map[string]any{"type": "text", "text": "root latest"}}},
+	}
+
+	root, rootIndexes := neoCompactionSourceMessages(messages, "")
+	if got := fmt.Sprint(rootIndexes); got != "[0 2 4]" {
+		t.Fatalf("root indexes = %s, want [0 2 4]", got)
+	}
+	if len(root) != 3 || strings.Contains(fmt.Sprint(root), "internal observation") {
+		t.Fatalf("root compaction source = %#v, want visible root messages only", root)
+	}
+	if got := neoCompactionActualMessageIndex(rootIndexes, 2, len(messages)); got != 4 {
+		t.Fatalf("actual index for root scoped index 2 = %d, want 4", got)
+	}
+
+	readScope, readIndexes := neoCompactionSourceMessages(messages, "TU-read")
+	if got := fmt.Sprint(readIndexes); got != "[0 1 2 4]" {
+		t.Fatalf("read scope indexes = %s, want [0 1 2 4]", got)
+	}
+	if len(readScope) != 4 || strings.Contains(fmt.Sprint(readScope), "oracle internal") {
+		t.Fatalf("read scoped compaction source = %#v, want root plus matching child messages", readScope)
+	}
+}
+
+func TestNeoCompactionPlanUsesScopedCutMessageID(t *testing.T) {
+	threadID := "T-sparse-cut"
+	messages := make([]neoMessage, 0, 17)
+	rootCount := 0
+	for index := 0; index < 17; index++ {
+		if index == 1 || index == 3 || index == 5 || index == 7 || index == 9 || index == 11 {
+			messages = append(messages, neoMessage{ThreadID: threadID, MessageID: fmt.Sprintf("M-child-%02d", index), Role: "assistant", ParentToolUseID: "TU-read", Content: []any{map[string]any{"type": "text", "text": "hidden child"}}})
+			continue
+		}
+		role := "assistant"
+		if rootCount == 3 || rootCount%2 == 0 {
+			role = "user"
+		}
+		messages = append(messages, neoMessage{ThreadID: threadID, MessageID: fmt.Sprintf("M-root-%02d", rootCount), Role: role, Content: []any{map[string]any{"type": "text", "text": "visible root"}}})
+		rootCount++
+	}
+	sourceMessages, sourceIndexes := neoCompactionSourceMessages(messages, "")
+	if len(sourceMessages) <= neoCompactionTailMessages+1 {
+		t.Fatalf("source messages = %d, want enough for normal cut", len(sourceMessages))
+	}
+	cutRelativeIndex := neoCompactionCutIndex(sourceMessages)
+	if cutRelativeIndex <= 0 {
+		t.Fatalf("cut relative index = %d, want normal cut", cutRelativeIndex)
+	}
+
+	actor := newNeoActor(newNeoRuntime(&config.Config{}), "actor-test", "thread-actor", threadID, threadID, neoActorRecord("actor-test", "thread-actor", threadID), nil)
+	plan, ok := actor.prepareCompactionPlanLocked(&config.Config{}, nil, "deep", actor.generation, sourceMessages, sourceIndexes, sourceMessages, 0, len(messages), false, false)
+	if !ok {
+		t.Fatal("prepare compaction plan failed")
+	}
+	if plan.cutIndex != sourceIndexes[cutRelativeIndex] {
+		t.Fatalf("cut index = %d, want actual index %d", plan.cutIndex, sourceIndexes[cutRelativeIndex])
+	}
+	if plan.cutMessageID != sourceMessages[cutRelativeIndex].MessageID {
+		t.Fatalf("cut message id = %q, want scoped cut id %q", plan.cutMessageID, sourceMessages[cutRelativeIndex].MessageID)
 	}
 }
 
@@ -13549,6 +13692,70 @@ func TestInferNeoOpenAIChatStreamProviderOpenAIEmptyStreamKeepsResponsesFallback
 	}
 }
 
+func TestInferNeoOpenAIChatProviderAppliesResponseJSONSchema(t *testing.T) {
+	schema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"relevantContent": map[string]any{"type": "string"},
+		},
+		"required":             []any{"relevantContent"},
+		"additionalProperties": false,
+	}
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream_%t", stream), func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/api/provider/openai/v1/chat/completions" {
+					t.Fatalf("unexpected path %s", r.URL.Path)
+				}
+				payload := readNeoJSON(r.Body)
+				format := mapValue(payload["response_format"])
+				if format["type"] != "json_schema" {
+					t.Fatalf("response_format = %#v, want json_schema", format)
+				}
+				jsonSchema := mapValue(format["json_schema"])
+				if jsonSchema["name"] != "neo_response" || jsonSchema["strict"] != true {
+					t.Fatalf("json_schema = %#v, want strict neo_response", jsonSchema)
+				}
+				gotSchema := mapValue(jsonSchema["schema"])
+				if gotSchema["additionalProperties"] != false || len(mapValue(gotSchema["properties"])) == 0 {
+					t.Fatalf("json_schema.schema = %#v, want cloned schema", gotSchema)
+				}
+				if stream {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"{\\\"relevantContent\\\":\\\"ok\\\"}\"}}]}\n\ndata: [DONE]\n\n"))
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"relevantContent\":\"ok\"}"}}]}`))
+			}))
+			defer upstream.Close()
+
+			request := neoInferenceRequest{
+				ThreadID:           "T-openai-chat-schema",
+				History:            []neoHistoryMessage{{Role: "user", Text: "hi"}},
+				ResponseMimeType:   "application/json",
+				ResponseJSONSchema: schema,
+				ProviderFeature:    "amp.read-thread",
+			}
+			var (
+				result neoInferenceResult
+				err    error
+			)
+			if stream {
+				result, err = inferNeoOpenAIChatStreamProvider(testNeoRuntimeForServer(t, upstream), request, neoModelRoute{Provider: "openai", Model: "gpt-test"}, nil, "openai")
+			} else {
+				result, err = inferNeoOpenAIChatProvider(testNeoRuntimeForServer(t, upstream), request, neoModelRoute{Provider: "openai", Model: "gpt-test"}, "openai")
+			}
+			if err != nil {
+				t.Fatalf("inferNeoOpenAIChatProvider stream=%v error: %v", stream, err)
+			}
+			if !strings.Contains(result.Text, "relevantContent") {
+				t.Fatalf("text = %q, want JSON response text", result.Text)
+			}
+		})
+	}
+}
+
 func TestInferNeoLocalFireworksAppliesBinaryProviderSettings(t *testing.T) {
 	for _, stream := range []bool{false, true} {
 		t.Run(fmt.Sprintf("stream_%v", stream), func(t *testing.T) {
@@ -17020,6 +17227,68 @@ func TestInferNeoOpenAIResponsesSendsReasoningEffortWithTools(t *testing.T) {
 	}
 }
 
+func TestInferNeoOpenAIResponsesAppliesResponseJSONSchema(t *testing.T) {
+	schema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"relevantContent": map[string]any{"type": "string"},
+		},
+		"required":             []any{"relevantContent"},
+		"additionalProperties": false,
+	}
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream_%t", stream), func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/api/provider/openai/v1/responses" {
+					t.Fatalf("unexpected path %s", r.URL.Path)
+				}
+				payload := readNeoJSON(r.Body)
+				format := mapValue(mapValue(payload["text"])["format"])
+				if format["type"] != "json_schema" || format["name"] != "neo_response" || format["strict"] != true {
+					t.Fatalf("text.format = %#v, want strict neo_response json_schema", format)
+				}
+				gotSchema := mapValue(format["schema"])
+				if gotSchema["additionalProperties"] != false || len(mapValue(gotSchema["properties"])) == 0 {
+					t.Fatalf("text.format.schema = %#v, want cloned schema", gotSchema)
+				}
+				if stream {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"{\\\"relevantContent\\\":\\\"ok\\\"}\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1},\"output\":[]}}\n\ndata: [DONE]\n\n"))
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"{\"relevantContent\":\"ok\"}"}]}]}`))
+			}))
+			defer upstream.Close()
+
+			request := neoInferenceRequest{
+				ThreadID:           "T-openai-schema",
+				Settings:           map[string]any{"internal.model": "openai/gpt-5.5"},
+				History:            []neoHistoryMessage{{Role: "user", Text: "hi"}},
+				ResponseMimeType:   "application/json",
+				ResponseJSONSchema: schema,
+				ProviderFeature:    "amp.read-thread",
+				ReasoningEffort:    "medium",
+			}
+			var (
+				result neoInferenceResult
+				err    error
+			)
+			if stream {
+				result, err = inferNeoLocalStream(testNeoRuntimeForServer(t, upstream), request, nil)
+			} else {
+				result, err = inferNeoLocal(testNeoRuntimeForServer(t, upstream), request)
+			}
+			if err != nil {
+				t.Fatalf("inferNeoLocal stream=%v error: %v", stream, err)
+			}
+			if !strings.Contains(result.Text, "relevantContent") {
+				t.Fatalf("text = %q, want JSON response text", result.Text)
+			}
+		})
+	}
+}
+
 func TestOpenAIResponsesServiceTierOnlyUsesFastSpeed(t *testing.T) {
 	fastBody := openAIResponsesNeoBody(neoInferenceRequest{
 		ThreadID:        "T-test",
@@ -17072,6 +17341,32 @@ func TestOpenAIResponsesNeoBodyMatchesBinaryBaseEnvelopeWithoutTools(t *testing.
 	reasoning := mapValue(body["reasoning"])
 	if reasoning["effort"] != "medium" || reasoning["summary"] != "auto" {
 		t.Fatalf("reasoning = %#v, want medium summary auto", reasoning)
+	}
+}
+
+func TestOpenAIResponsesNeoBodyAppliesResponseJSONSchema(t *testing.T) {
+	schema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"relevantContent": map[string]any{"type": "string"},
+		},
+		"required":             []any{"relevantContent"},
+		"additionalProperties": false,
+	}
+	body := openAIResponsesNeoBody(neoInferenceRequest{
+		ThreadID:           "T-test",
+		History:            []neoHistoryMessage{{Role: "user", Text: "hi"}},
+		ResponseMimeType:   "application/json",
+		ResponseJSONSchema: schema,
+	}, neoModelRoute{Provider: "openai", Model: "gpt-5.5"}, false)
+
+	format := mapValue(mapValue(body["text"])["format"])
+	if format["type"] != "json_schema" || format["name"] != "neo_response" || format["strict"] != true {
+		t.Fatalf("text.format = %#v, want strict neo_response json_schema", format)
+	}
+	gotSchema := mapValue(format["schema"])
+	if gotSchema["additionalProperties"] != false || len(mapValue(gotSchema["properties"])) == 0 {
+		t.Fatalf("schema = %#v, want cloned response schema", gotSchema)
 	}
 }
 

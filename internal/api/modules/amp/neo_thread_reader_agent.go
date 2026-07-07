@@ -15,9 +15,9 @@ import (
 )
 
 const (
-	neoReadThreadAgentProvider      = "google"
-	neoReadThreadAgentModel         = "gemini-3.5-flash"
-	neoReadThreadAgentEffort        = "high"
+	neoReadThreadAgentProvider      = "openai"
+	neoReadThreadAgentModel         = "gpt-5.5"
+	neoReadThreadAgentEffort        = "medium"
 	neoReadThreadMaxTurns           = 16
 	neoReadThreadSearchLimit        = 12
 	neoReadThreadSearchLimitMax     = 40
@@ -47,11 +47,13 @@ Rules:
 - For continuation or handoff goals, identify the latest explicit user objective first, then read the assistant and tool outcomes that followed it.
 - Preserve exact technical details: file paths, commands, model names, errors, decisions, and code snippets.
 - When reporting verification or build status, include the complete command string that ran and the latest pass/fail result.
+- Copy relevant file paths, symbols, type names, env vars, commands, model names, and error strings verbatim. Do not replace exact identifiers with categories.
+- Do not mention superseded or irrelevant topics just to say they are not relevant. Omit them unless the caller specifically asks for that contrast.
 - Omit unrelated material, but include enough surrounding context for the caller to use the extracted information safely.
 - Cite message indexes such as [message 12] when making claims from the target thread.
-- Your final answer must be JSON only: {"relevantContent":"markdown text"}.`
+- Your final answer must be JSON only with exactly one key named relevantContent. Put the actual extracted thread details in that value as markdown prose or bullets, not nested JSON; do not return placeholder or template text.`
 
-const neoReadThreadFinalPrompt = `Return the final answer now as JSON only with one key: relevantContent. Include the relevant thread content as markdown text. Do not call tools.`
+const neoReadThreadFinalPrompt = `Return the final answer now as JSON only with one key named relevantContent. Include the actual relevant thread content as markdown prose or bullets, not nested JSON. Copy relevant identifiers verbatim. Do not call tools and do not return placeholder or template text.`
 
 type neoReadThreadCorpus struct {
 	ThreadID string
@@ -162,17 +164,25 @@ func (a *neoActor) localReadThreadFileCorpus(threadID string) (neoReadThreadCorp
 
 func neoReadThreadCorpusFromThreadMap(threadID string, thread map[string]any, source string) neoReadThreadCorpus {
 	corpus := neoReadThreadCorpus{ThreadID: threadID, Source: source, Title: strings.TrimSpace(stringValue(thread["title"]))}
-	for _, raw := range arrayValue(thread["messages"]) {
-		if message, ok := neoReadThreadMessageFromMap(mapValue(raw), len(corpus.Messages)); ok {
+	rawMessages := arrayValue(thread["messages"])
+	for sourceIndex, raw := range rawMessages {
+		messageMap := mapValue(raw)
+		if neoReadThreadMessageIsNested(messageMap) {
+			continue
+		}
+		if message, ok := neoReadThreadMessageFromMap(messageMap, sourceIndex); ok {
 			corpus.Messages = append(corpus.Messages, message)
 		}
 	}
-	for _, raw := range arrayValue(thread["queuedMessages"]) {
+	for queuedIndex, raw := range arrayValue(thread["queuedMessages"]) {
 		messageMap := mapValue(raw)
 		if len(messageMap) == 0 {
 			messageMap = map[string]any{"role": "user", "content": raw}
 		}
-		if message, ok := neoReadThreadMessageFromMap(messageMap, len(corpus.Messages)); ok {
+		if neoReadThreadMessageIsNested(messageMap) {
+			continue
+		}
+		if message, ok := neoReadThreadMessageFromMap(messageMap, len(rawMessages)+queuedIndex); ok {
 			if message.Completion == "" {
 				message.Completion = "queued"
 			}
@@ -180,6 +190,10 @@ func neoReadThreadCorpusFromThreadMap(threadID string, thread map[string]any, so
 		}
 	}
 	return corpus
+}
+
+func neoReadThreadMessageIsNested(message map[string]any) bool {
+	return firstNonEmptyString(message["parentToolUseId"], message["parentToolUseID"], message["parent_tool_use_id"], message["parentToolCallId"]) != ""
 }
 
 func neoReadThreadMessageFromMap(message map[string]any, index int) (neoReadThreadMessage, bool) {
@@ -410,7 +424,7 @@ func (a *neoActor) executeLocalReadThreadAgentWithRoute(pending neoPendingTool, 
 				return text, nil
 			}
 			lastErr = parseErr
-			forcedText, forcedErr := a.forceLocalReadThreadFinal(pending, generation, route, effort, actorID, currentThreadID, agentMode, maxTokens, settings, environment, conversation)
+			forcedText, forcedErr := a.forceLocalReadThreadFinal(pending, generation, route, effort, actorID, currentThreadID, agentMode, maxTokens, settings, environment, conversation, corpus)
 			if forcedErr == nil {
 				return forcedText, nil
 			}
@@ -432,7 +446,7 @@ func (a *neoActor) executeLocalReadThreadAgentWithRoute(pending neoPendingTool, 
 			}
 			if observation.Read {
 				sawRead = true
-				if observation.ReadEnd >= len(corpus.Messages)-1 {
+				if observation.ReadEnd >= neoReadThreadLatestMessageIndex(corpus) {
 					sawLatestRead = true
 				}
 			}
@@ -457,7 +471,7 @@ func (a *neoActor) executeLocalReadThreadAgentWithRoute(pending neoPendingTool, 
 		if err != nil {
 			return "", fmt.Errorf("read_thread auto latest read failed: %w", err)
 		}
-		if readEnd >= len(corpus.Messages)-1 {
+		if readEnd >= neoReadThreadLatestMessageIndex(corpus) {
 			sawLatestRead = true
 			conversation = append(conversation, neoHistoryMessage{
 				Role: "user",
@@ -468,7 +482,7 @@ func (a *neoActor) executeLocalReadThreadAgentWithRoute(pending neoPendingTool, 
 	if correction := neoReadThreadGateCorrection(sawSearch, sawRead, sawLatestRead, corpus); correction != "" {
 		return "", fmt.Errorf("read_thread subagent did not complete required search/read checks after %d turns: %s", neoReadThreadMaxTurns, correction)
 	}
-	forcedText, forcedErr := a.forceLocalReadThreadFinal(pending, generation, route, effort, actorID, currentThreadID, agentMode, maxTokens, settings, environment, conversation)
+	forcedText, forcedErr := a.forceLocalReadThreadFinal(pending, generation, route, effort, actorID, currentThreadID, agentMode, maxTokens, settings, environment, conversation, corpus)
 	if forcedErr != nil {
 		if lastErr != nil {
 			return "", lastErr
@@ -478,11 +492,14 @@ func (a *neoActor) executeLocalReadThreadAgentWithRoute(pending neoPendingTool, 
 	return forcedText, nil
 }
 
-func (a *neoActor) forceLocalReadThreadFinal(pending neoPendingTool, generation int, route neoModelRoute, effort, actorID, currentThreadID, agentMode string, maxTokens any, settings, environment map[string]any, conversation []neoHistoryMessage) (string, error) {
+func (a *neoActor) forceLocalReadThreadFinal(pending neoPendingTool, generation int, route neoModelRoute, effort, actorID, currentThreadID, agentMode string, maxTokens any, settings, environment map[string]any, conversation []neoHistoryMessage, corpus neoReadThreadCorpus) (string, error) {
 	if a.subagentGenerationStale(generation) {
 		return "", nil
 	}
 	forced := append([]neoHistoryMessage(nil), conversation...)
+	if latestContext := neoReadThreadLatestFinalContext(corpus); latestContext != "" {
+		forced = append(forced, neoHistoryMessage{Role: "user", Text: latestContext})
+	}
 	if len(forced) > 0 && forced[len(forced)-1].Role == "user" {
 		forced[len(forced)-1].Text = strings.TrimSpace(forced[len(forced)-1].Text) + "\n\n" + neoReadThreadFinalPrompt
 	} else {
@@ -521,6 +538,21 @@ func (a *neoActor) forceLocalReadThreadFinal(pending neoPendingTool, generation 
 		return fallback, nil
 	}
 	return "", fmt.Errorf("read_thread forced final did not return valid JSON or markdown fallback: %w", parseErr)
+}
+
+func neoReadThreadLatestFinalContext(corpus neoReadThreadCorpus) string {
+	if len(corpus.Messages) == 0 {
+		return ""
+	}
+	count := neoReadThreadLatestReadCount
+	if count > len(corpus.Messages) {
+		count = len(corpus.Messages)
+	}
+	latest, _, err := neoReadThreadRead(corpus, map[string]any{"latest": true, "count": count})
+	if err != nil {
+		return ""
+	}
+	return "Authoritative latest visible target-thread messages before finalization. Prefer this tail over older summaries or earlier search hits when they conflict.\n\n" + runToText(map[string]any{"status": "done", "result": latest})
 }
 
 func neoReadThreadRequestHistory(history []neoHistoryMessage) []neoHistoryMessage {
@@ -816,7 +848,7 @@ func neoReadThreadAgentInput(corpus neoReadThreadCorpus, goal string) string {
 		out.WriteString("Title: " + corpus.Title + "\n")
 	}
 	out.WriteString("Message count: " + strconv.Itoa(len(corpus.Messages)) + "\n")
-	out.WriteString("Latest message index: " + strconv.Itoa(len(corpus.Messages)-1) + "\n\n")
+	out.WriteString("Latest message index: " + strconv.Itoa(neoReadThreadLatestMessageIndex(corpus)) + "\n\n")
 	out.WriteString("Goal:\n")
 	out.WriteString(goal)
 	out.WriteString("\n\nStart with search_thread_messages. If you need orientation first, call thread_overview once, then search. For continuation goals, anchor on the latest user instruction in the tail before older matching topics. After finding relevant hits, read exact messages and later/latest messages before final JSON.")
@@ -831,7 +863,7 @@ func neoReadThreadGateCorrection(sawSearch, sawRead, sawLatestRead bool, corpus 
 		return "Before your final answer, call read_thread_messages for the relevant search hits and their surrounding context."
 	}
 	if !sawLatestRead && len(corpus.Messages) > 1 {
-		return "Before your final answer, call read_thread_messages with latest=true and count=" + strconv.Itoa(neoReadThreadLatestReadCount) + " through index " + strconv.Itoa(len(corpus.Messages)-1) + " to check for revisions, superseding decisions, reverts, contradictions, and continuation instructions."
+		return "Before your final answer, call read_thread_messages with latest=true and count=" + strconv.Itoa(neoReadThreadLatestReadCount) + " through index " + strconv.Itoa(neoReadThreadLatestMessageIndex(corpus)) + " to check for revisions, superseding decisions, reverts, contradictions, and continuation instructions."
 	}
 	return ""
 }
@@ -950,7 +982,7 @@ func neoReadThreadOverview(corpus neoReadThreadCorpus) map[string]any {
 		"source":             corpus.Source,
 		"title":              corpus.Title,
 		"messageCount":       len(corpus.Messages),
-		"latestMessageIndex": len(corpus.Messages) - 1,
+		"latestMessageIndex": neoReadThreadLatestMessageIndex(corpus),
 		"roleCounts":         roleCounts,
 		"firstMessages":      first,
 		"latestMessages":     last,
@@ -1021,6 +1053,7 @@ func neoReadThreadSearch(corpus neoReadThreadCorpus, input map[string]any) (map[
 	items := make([]any, 0, len(hits))
 	for _, hit := range hits {
 		message := hit.message
+		position := neoReadThreadMessagePosition(corpus, message.Index)
 		items = append(items, map[string]any{
 			"index":             message.Index,
 			"role":              message.Role,
@@ -1029,11 +1062,11 @@ func neoReadThreadSearch(corpus neoReadThreadCorpus, input map[string]any) (map[
 			"parentToolUseID":   message.ParentToolUseID,
 			"score":             hit.score,
 			"excerpt":           neoReadThreadExcerpt(message.Text, query, terms, neoReadThreadSearchExcerpt),
-			"hasLaterMessages":  message.Index < len(corpus.Messages)-1,
-			"laterMessageCount": len(corpus.Messages) - message.Index - 1,
+			"hasLaterMessages":  position >= 0 && position < len(corpus.Messages)-1,
+			"laterMessageCount": neoReadThreadLaterVisibleMessageCount(corpus, position),
 			"recommendedRead": map[string]any{
 				"startIndex": message.Index,
-				"count":      neoReadThreadRecommendedReadCount(message.Index, len(corpus.Messages)),
+				"count":      neoReadThreadRecommendedReadCount(position, len(corpus.Messages)),
 			},
 		})
 	}
@@ -1042,7 +1075,7 @@ func neoReadThreadSearch(corpus neoReadThreadCorpus, input map[string]any) (map[
 		"source":             corpus.Source,
 		"query":              query,
 		"messageCount":       len(corpus.Messages),
-		"latestMessageIndex": len(corpus.Messages) - 1,
+		"latestMessageIndex": neoReadThreadLatestMessageIndex(corpus),
 		"hits":               items,
 	}, nil
 }
@@ -1051,13 +1084,14 @@ func neoReadThreadRead(corpus neoReadThreadCorpus, input map[string]any) (map[st
 	if len(corpus.Messages) == 0 {
 		return nil, -1, errors.New("thread has no readable messages")
 	}
-	start, end, err := neoReadThreadRange(input, len(corpus.Messages))
+	start, end, err := neoReadThreadRangeForCorpus(input, corpus)
 	if err != nil {
 		return nil, -1, err
 	}
 	messages := make([]any, 0, end-start+1)
 	total := 0
-	actualEnd := start - 1
+	actualEnd := -1
+	actualEndPosition := start - 1
 	truncated := false
 	for i := start; i <= end; i++ {
 		message := corpus.Messages[i]
@@ -1068,27 +1102,138 @@ func neoReadThreadRead(corpus neoReadThreadCorpus, input map[string]any) (map[st
 			break
 		}
 		total += len(raw)
-		actualEnd = i
+		actualEnd = message.Index
+		actualEndPosition = i
 		messages = append(messages, entry)
 	}
 	result := map[string]any{
 		"threadID":           corpus.ThreadID,
 		"source":             corpus.Source,
 		"messageCount":       len(corpus.Messages),
-		"latestMessageIndex": len(corpus.Messages) - 1,
+		"latestMessageIndex": neoReadThreadLatestMessageIndex(corpus),
 		"range": map[string]any{
-			"startIndex": start,
+			"startIndex": corpus.Messages[start].Index,
 			"endIndex":   actualEnd,
 		},
 		"messages": messages,
 	}
-	if truncated || actualEnd < end {
+	if truncated || actualEndPosition < end {
 		result["truncated"] = true
-		if actualEnd+1 < len(corpus.Messages) {
-			result["nextStartIndex"] = actualEnd + 1
+		if actualEndPosition+1 < len(corpus.Messages) {
+			if nextPosition := neoReadThreadFirstVisiblePositionAfter(corpus, actualEnd); nextPosition >= 0 {
+				result["nextStartIndex"] = corpus.Messages[nextPosition].Index
+			}
 		}
 	}
 	return result, actualEnd, nil
+}
+
+func neoReadThreadRangeForCorpus(input map[string]any, corpus neoReadThreadCorpus) (int, int, error) {
+	count, hasCount := neoReadThreadInputInt(input, "count", "limit")
+	if !hasCount || count <= 0 {
+		count = neoReadThreadReadCount
+	}
+	if count > neoReadThreadReadCountMax {
+		count = neoReadThreadReadCountMax
+	}
+
+	start := 0
+	hasStart := false
+	explicitIndexLookup := false
+	if rawStart, ok := neoReadThreadInputInt(input, "startIndex", "messageIndex", "index"); ok {
+		start = neoReadThreadFirstVisiblePositionAtOrAfter(corpus, rawStart)
+		hasStart = true
+		explicitIndexLookup = true
+	}
+	if latest := boolValue(input["latest"]); latest {
+		start = len(corpus.Messages) - count
+		hasStart = true
+		explicitIndexLookup = false
+	}
+	if position := strings.ToLower(strings.TrimSpace(stringValue(input["position"]))); position == "latest" || position == "tail" {
+		start = len(corpus.Messages) - count
+		hasStart = true
+		explicitIndexLookup = false
+	}
+	if after, ok := neoReadThreadInputInt(input, "afterIndex"); ok {
+		start = neoReadThreadFirstVisiblePositionAfter(corpus, after)
+		hasStart = true
+		explicitIndexLookup = true
+	}
+	if !hasStart {
+		start = 0
+	}
+	if start < 0 {
+		if explicitIndexLookup {
+			return 0, 0, fmt.Errorf("startIndex is outside thread message range 0-%d", neoReadThreadLatestMessageIndex(corpus))
+		}
+		start = 0
+	}
+	if start >= len(corpus.Messages) || start < 0 {
+		return 0, 0, fmt.Errorf("startIndex is outside thread message range 0-%d", neoReadThreadLatestMessageIndex(corpus))
+	}
+
+	end := start + count - 1
+	if rawEnd, hasEnd := neoReadThreadInputInt(input, "endIndex"); hasEnd {
+		end = neoReadThreadLastVisiblePositionAtOrBefore(corpus, rawEnd)
+	}
+	if end >= len(corpus.Messages) {
+		end = len(corpus.Messages) - 1
+	}
+	if end < start {
+		return 0, 0, fmt.Errorf("endIndex is before startIndex")
+	}
+	return start, end, nil
+}
+
+func neoReadThreadLatestMessageIndex(corpus neoReadThreadCorpus) int {
+	if len(corpus.Messages) == 0 {
+		return -1
+	}
+	return corpus.Messages[len(corpus.Messages)-1].Index
+}
+
+func neoReadThreadMessagePosition(corpus neoReadThreadCorpus, index int) int {
+	for position, message := range corpus.Messages {
+		if message.Index == index {
+			return position
+		}
+	}
+	return -1
+}
+
+func neoReadThreadLaterVisibleMessageCount(corpus neoReadThreadCorpus, position int) int {
+	if position < 0 || position >= len(corpus.Messages) {
+		return 0
+	}
+	return len(corpus.Messages) - position - 1
+}
+
+func neoReadThreadFirstVisiblePositionAtOrAfter(corpus neoReadThreadCorpus, index int) int {
+	for position, message := range corpus.Messages {
+		if message.Index >= index {
+			return position
+		}
+	}
+	return -1
+}
+
+func neoReadThreadFirstVisiblePositionAfter(corpus neoReadThreadCorpus, index int) int {
+	for position, message := range corpus.Messages {
+		if message.Index > index {
+			return position
+		}
+	}
+	return -1
+}
+
+func neoReadThreadLastVisiblePositionAtOrBefore(corpus neoReadThreadCorpus, index int) int {
+	for position := len(corpus.Messages) - 1; position >= 0; position-- {
+		if corpus.Messages[position].Index <= index {
+			return position
+		}
+	}
+	return -1
 }
 
 func neoReadThreadRange(input map[string]any, messageCount int) (int, int, error) {
