@@ -26086,38 +26086,6 @@ func TestNeoCloudThreadDoesNotAdvertiseDisconnectedThreadActor(t *testing.T) {
 	}
 }
 
-func TestNeoWebLocalThreadDocumentDoesNotInventExecutorConnection(t *testing.T) {
-	rt := newNeoRuntime(&config.Config{})
-	threadID := "T-019e0e6e-f3f1-7078-b5dd-748f66f8c266"
-	actor := rt.store.ensureThreadActor(threadID)
-	actor.mu.Lock()
-	actor.title = "Disconnected local thread"
-	actor.agentState = "idle"
-	actor.bootstrapExecutorType = "local-client"
-	actor.messages = []neoMessage{{
-		ThreadID:  threadID,
-		MessageID: "M-user",
-		Role:      "user",
-		Content:   []any{map[string]any{"type": "text", "text": "hi"}},
-		Seq:       1,
-	}}
-	actor.mu.Unlock()
-
-	thread, ok := actor.neoWebLocalThreadDocument()
-	if !ok {
-		t.Fatal("missing web local thread document")
-	}
-	if thread["hasExecutor"] != false || thread["executorConnected"] != false {
-		t.Fatalf("executor state = has:%#v connected:%#v", thread["hasExecutor"], thread["executorConnected"])
-	}
-	if thread["state"] != "idle" || thread["agentState"] != "idle" {
-		t.Fatalf("thread state = state:%#v agentState:%#v", thread["state"], thread["agentState"])
-	}
-	if mapValue(thread["meta"])["executorType"] != nil {
-		t.Fatalf("disconnected web local executorType = %#v, want absent", thread["meta"])
-	}
-}
-
 func TestNeoCloudThreadDefaultsAgentModeForBinarySwitch(t *testing.T) {
 	thread := neoCloudThread(neoCloudThreadSnapshot{
 		threadID:  "T-test",

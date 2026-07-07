@@ -545,12 +545,7 @@ func neoWebLocalInternalRPCSupported(method string) bool {
 	if neoLocalInternalRPCSupported(method) {
 		return true
 	}
-	switch strings.ToLower(strings.TrimSpace(method)) {
-	case "listthreads", "loadthreads", "getthread", "readthread", "getthreadtail", "loadthreadtail", "getthreadmeta":
-		return true
-	default:
-		return false
-	}
+	return false
 }
 
 func (m *AmpModule) tryServeNeoLocalInternalRPC(c *gin.Context) bool {
@@ -560,9 +555,6 @@ func (m *AmpModule) tryServeNeoLocalInternalRPC(c *gin.Context) bool {
 		return true
 	}
 	if !matched {
-		return false
-	}
-	if neoLocalInternalRPCRequiresLocalConnection(method) && (!requestRemoteAddrIsLocalConnection(c.Request) || !requestHasAmpClientHeaders(c.Request)) {
 		return false
 	}
 	threadID := neoInternalRPCThreadID(params)
@@ -605,17 +597,7 @@ func neoLocalInternalRPCRequestWithError(r *http.Request) (string, map[string]an
 
 func neoLocalInternalRPCSupported(method string) bool {
 	switch strings.ToLower(strings.TrimSpace(method)) {
-	case "getthread", "readthread", "getthreadtail", "loadthreadtail", "getthreadmeta",
-		"getthreadlabels", "setthreadlabels", "addthreadlabels", "archivethread":
-		return true
-	default:
-		return false
-	}
-}
-
-func neoLocalInternalRPCRequiresLocalConnection(method string) bool {
-	switch strings.ToLower(strings.TrimSpace(method)) {
-	case "getthread", "readthread", "getthreadtail", "loadthreadtail", "getthreadmeta":
+	case "getthreadlabels", "setthreadlabels", "addthreadlabels", "archivethread":
 		return true
 	default:
 		return false

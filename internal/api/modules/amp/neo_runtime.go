@@ -17424,59 +17424,12 @@ func (rt *neoRuntime) neoWebLocalInternalRPCResponse(method string, params map[s
 	if rt == nil || rt.store == nil {
 		return nil, 0, false
 	}
-	switch strings.ToLower(strings.TrimSpace(method)) {
-	case "listthreads":
-		limit := numberFrom(params["limit"])
-		sinceMs := numberFrom(params["sinceMs"], params["since"])
-		statuses := rt.store.recentThreadStatuses(limit, sinceMs)
-		for i, raw := range statuses {
-			status := cloneMap(mapValue(raw))
-			if len(status) == 0 {
-				continue
-			}
-			agentState := neoAgentStateOrIdle(status["agentState"], status["state"])
-			status["state"] = agentState
-			status["agentState"] = agentState
-			statuses[i] = status
-		}
-		return map[string]any{"ok": true, "result": map[string]any{"threads": statuses}}, http.StatusOK, true
-	case "loadthreads":
-		threads := make([]any, 0)
-		for _, threadID := range neoInternalRPCThreadIDs(params) {
-			actor := rt.neoWebLocalInternalRPCActor(threadID)
-			if actor == nil {
-				continue
-			}
-			if thread, ok := actor.neoWebLocalThreadDocument(); ok {
-				threads = append(threads, thread)
-			}
-		}
-		return map[string]any{"ok": true, "result": map[string]any{"threads": threads}}, http.StatusOK, true
-	}
-
 	threadID := neoInternalRPCThreadID(params)
 	actor := rt.neoWebLocalInternalRPCActor(threadID)
 	if actor == nil {
 		return nil, 0, false
 	}
-	if response, status, ok := actor.neoLocalInternalRPCResponse(method, params); ok {
-		return response, status, true
-	}
-	thread, ok := actor.neoWebLocalThreadDocument()
-	if !ok {
-		return nil, 0, false
-	}
-	switch strings.ToLower(strings.TrimSpace(method)) {
-	case "getthread", "readthread":
-		return map[string]any{"ok": true, "result": map[string]any{"thread": thread}}, http.StatusOK, true
-	case "getthreadtail", "loadthreadtail":
-		messages := actor.neoWebLocalThreadMessages(numberFrom(params["limit"]))
-		return map[string]any{"ok": true, "result": map[string]any{"thread": thread, "messages": messages}, "messages": messages}, http.StatusOK, true
-	case "getthreadmeta":
-		return map[string]any{"ok": true, "result": mapValue(thread["meta"])}, http.StatusOK, true
-	default:
-		return nil, 0, false
-	}
+	return actor.neoLocalInternalRPCResponse(method, params)
 }
 
 func (rt *neoRuntime) neoWebLocalInternalRPCActor(threadID string) *neoActor {
@@ -17488,44 +17441,6 @@ func (rt *neoRuntime) neoWebLocalInternalRPCActor(threadID string) *neoActor {
 		return nil
 	}
 	return actor
-}
-
-func (a *neoActor) neoWebLocalThreadDocument() (map[string]any, bool) {
-	if a == nil {
-		return nil, false
-	}
-	snapshot, ok := a.threadSnapshot()
-	if !ok {
-		return nil, false
-	}
-	thread := neoCloudThread(snapshot)
-	meta := neoThreadActorImportedMeta(mapValue(thread["meta"]))
-	if boolValue(thread["executorConnected"]) && stringValue(meta["executorType"]) == "" {
-		meta["executorType"] = "local-client"
-	}
-	thread["meta"] = meta
-	return thread, true
-}
-
-func (a *neoActor) neoWebLocalThreadMessages(limit int) []any {
-	if a == nil {
-		return []any{}
-	}
-	a.mu.Lock()
-	messages := append([]neoMessage(nil), a.messages...)
-	a.mu.Unlock()
-	if limit <= 0 || limit > len(messages) {
-		limit = len(messages)
-	}
-	start := len(messages) - limit
-	if start < 0 {
-		start = 0
-	}
-	out := make([]any, 0, len(messages)-start)
-	for _, message := range messages[start:] {
-		out = append(out, neoCloudMessage(message))
-	}
-	return out
 }
 
 // archiving tracks the official top-level archived flag separately from
@@ -17543,25 +17458,6 @@ func (a *neoActor) archiveThread(archive bool, _ map[string]any) {
 
 func (a *neoActor) neoLocalInternalRPCResponse(method string, params map[string]any) (map[string]any, int, bool) {
 	switch strings.ToLower(strings.TrimSpace(method)) {
-	case "getthread", "readthread":
-		thread, ok := a.neoWebLocalThreadDocument()
-		if !ok {
-			return nil, 0, false
-		}
-		return map[string]any{"ok": true, "result": map[string]any{"thread": thread}}, http.StatusOK, true
-	case "getthreadtail", "loadthreadtail":
-		thread, ok := a.neoWebLocalThreadDocument()
-		if !ok {
-			return nil, 0, false
-		}
-		messages := a.neoWebLocalThreadMessages(numberFrom(params["limit"]))
-		return map[string]any{"ok": true, "result": map[string]any{"thread": thread, "messages": messages}, "messages": messages}, http.StatusOK, true
-	case "getthreadmeta":
-		thread, ok := a.neoWebLocalThreadDocument()
-		if !ok {
-			return nil, 0, false
-		}
-		return map[string]any{"ok": true, "result": mapValue(thread["meta"])}, http.StatusOK, true
 	case "getthreadlabels":
 		return map[string]any{"ok": true, "result": neoThreadLabelObjects(a.threadLabels())}, http.StatusOK, true
 	case "setthreadlabels":

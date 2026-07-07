@@ -2009,7 +2009,11 @@ func TestWebLocalInferenceInternalRPCRequiresAPIKey(t *testing.T) {
 	}
 	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, auth)
 
-	unauthReq := httptest.NewRequest(http.MethodPost, "/api/internal?listThreads", bytes.NewBufferString(`{"method":"listThreads","params":{"limit":20}}`))
+	threadID := "T-019e0e6e-f3f1-7078-b5dd-748f66f8c267"
+	m.neoRuntime.store.ensureThreadActor(threadID)
+	body := `{"method":"getThreadLabels","params":{"thread":"` + threadID + `"}}`
+
+	unauthReq := httptest.NewRequest(http.MethodPost, "/api/internal?getThreadLabels", bytes.NewBufferString(body))
 	unauthReq.Header.Set("Content-Type", "application/json")
 	unauthReq.Header.Set("Origin", "https://ampcode.com")
 	unauthReq.Header.Set(ampWebLocalInferenceHeader, "1")
@@ -2019,7 +2023,7 @@ func TestWebLocalInferenceInternalRPCRequiresAPIKey(t *testing.T) {
 		t.Fatalf("unauthenticated internal RPC status = %d, want %d; body=%s", unauthRec.Code, http.StatusUnauthorized, unauthRec.Body.String())
 	}
 
-	authReq := httptest.NewRequest(http.MethodPost, "/api/internal?listThreads&"+ampWebLocalInferenceAPIKeyQuery+"=local-key", bytes.NewBufferString(`{"method":"listThreads","params":{"limit":20}}`))
+	authReq := httptest.NewRequest(http.MethodPost, "/api/internal?getThreadLabels&"+ampWebLocalInferenceAPIKeyQuery+"=local-key", bytes.NewBufferString(body))
 	authReq.Header.Set("Content-Type", "application/json")
 	authReq.Header.Set("Origin", "https://ampcode.com")
 	authReq.Header.Set(ampWebLocalInferenceHeader, "1")
@@ -2469,7 +2473,7 @@ func TestRegisterManagementRoutesRemoteWebRoutesDoNotSynthesizeLocalThreadData(t
 	}
 }
 
-func TestWebLocalInferenceInternalRPCServesLocalThreadWithoutProxy(t *testing.T) {
+func TestWebLocalInferenceInternalRPCDoesNotServeThreadDocumentsWithoutProxy(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	enabled := true
@@ -2498,80 +2502,63 @@ func TestWebLocalInferenceInternalRPCServesLocalThreadWithoutProxy(t *testing.T)
 	threadID := stringValue(createResponse["threadId"])
 	requireNeoBinaryV7ThreadID(t, threadID)
 
-	getReq := httptest.NewRequest(http.MethodPost, "/api/internal?getThread", bytes.NewBufferString(`{"method":"getThread","params":{"thread":"`+threadID+`"}}`))
-	getReq.Header.Set("Content-Type", "application/json")
-	getReq.Header.Set("Origin", "https://ampcode.com")
-	getReq.Header.Set(ampWebLocalInferenceHeader, "1")
-	getRec := httptest.NewRecorder()
-	r.ServeHTTP(getRec, getReq)
-	if getRec.Code != http.StatusOK {
-		t.Fatalf("getThread status = %d, body=%s", getRec.Code, getRec.Body.String())
+	tests := []struct {
+		name    string
+		method  string
+		body    string
+		headers map[string]string
+		remote  string
+	}{
+		{
+			name:   "web getThread",
+			method: "getThread",
+			body:   `{"method":"getThread","params":{"thread":"` + threadID + `"}}`,
+			headers: map[string]string{
+				"Origin":                   "https://ampcode.com",
+				ampWebLocalInferenceHeader: "1",
+			},
+		},
+		{
+			name:   "web listThreads",
+			method: "listThreads",
+			body:   `{"method":"listThreads","params":{"limit":20}}`,
+			headers: map[string]string{
+				"Origin":                   "https://ampcode.com",
+				ampWebLocalInferenceHeader: "1",
+			},
+		},
+		{
+			name:   "plain getThread",
+			method: "getThread",
+			body:   `{"method":"getThread","params":{"thread":"` + threadID + `"}}`,
+		},
+		{
+			name:   "cli getThread",
+			method: "getThread",
+			body:   `{"method":"getThread","params":{"thread":"` + threadID + `"}}`,
+			headers: map[string]string{
+				"X-Amp-Client-Application": "CLI",
+				"X-Amp-Client-Type":        "cli",
+			},
+			remote: "[::1]:54321",
+		},
 	}
-	var getResponse map[string]any
-	if err := json.Unmarshal(getRec.Body.Bytes(), &getResponse); err != nil {
-		t.Fatalf("getThread response JSON error: %v", err)
-	}
-	thread := mapValue(mapValue(getResponse["result"])["thread"])
-	if stringValue(thread["id"]) != threadID || thread["executorConnected"] != false || thread["hasExecutor"] != false {
-		t.Fatalf("unexpected local thread response: %#v", getResponse)
-	}
-	if thread["agentState"] != "idle" || thread["state"] != "idle" {
-		t.Fatalf("unexpected local thread state: %#v", thread)
-	}
-	if stringValue(mapValue(thread["meta"])["ampcodeConnectorMode"]) != "local-neo" {
-		t.Fatalf("thread meta missing local marker: %#v", thread["meta"])
-	}
-	queued := arrayValue(thread["queuedMessages"])
-	if len(queued) != 1 || textFromBlocks(arrayValue(mapValue(mapValue(queued[0])["queuedMessage"])["content"])) != "hello local web" {
-		t.Fatalf("queuedMessages = %#v", queued)
-	}
-
-	listReq := httptest.NewRequest(http.MethodPost, "/api/internal?listThreads", bytes.NewBufferString(`{"method":"listThreads","params":{"limit":20}}`))
-	listReq.Header.Set("Content-Type", "application/json")
-	listReq.Header.Set("Origin", "https://ampcode.com")
-	listReq.Header.Set(ampWebLocalInferenceHeader, "1")
-	listRec := httptest.NewRecorder()
-	r.ServeHTTP(listRec, listReq)
-	if listRec.Code != http.StatusOK {
-		t.Fatalf("listThreads status = %d, body=%s", listRec.Code, listRec.Body.String())
-	}
-	var listResponse map[string]any
-	if err := json.Unmarshal(listRec.Body.Bytes(), &listResponse); err != nil {
-		t.Fatalf("listThreads response JSON error: %v", err)
-	}
-	statuses := arrayValue(mapValue(listResponse["result"])["threads"])
-	if len(statuses) != 1 || stringValue(mapValue(statuses[0])["threadId"]) != threadID || mapValue(statuses[0])["executorConnected"] != false || mapValue(statuses[0])["hasExecutor"] != false {
-		t.Fatalf("unexpected local thread statuses: %#v", listResponse)
-	}
-	if mapValue(statuses[0])["agentState"] != "idle" || mapValue(statuses[0])["state"] != "idle" {
-		t.Fatalf("unexpected local thread status state: %#v", listResponse)
-	}
-
-	plainReq := httptest.NewRequest(http.MethodPost, "/api/internal?getThread", bytes.NewBufferString(`{"method":"getThread","params":{"thread":"`+threadID+`"}}`))
-	plainReq.Header.Set("Content-Type", "application/json")
-	plainRec := httptest.NewRecorder()
-	r.ServeHTTP(plainRec, plainReq)
-	if plainRec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("unmarked getThread status = %d, want %d; body=%s", plainRec.Code, http.StatusServiceUnavailable, plainRec.Body.String())
-	}
-
-	cliReq := httptest.NewRequest(http.MethodPost, "/api/internal?getThread", bytes.NewBufferString(`{"method":"getThread","params":{"thread":"`+threadID+`"}}`))
-	cliReq.Header.Set("Content-Type", "application/json")
-	cliReq.Header.Set("X-Amp-Client-Application", "CLI")
-	cliReq.Header.Set("X-Amp-Client-Type", "cli")
-	cliReq.RemoteAddr = "[::1]:54321"
-	cliRec := httptest.NewRecorder()
-	r.ServeHTTP(cliRec, cliReq)
-	if cliRec.Code != http.StatusOK {
-		t.Fatalf("cli getThread status = %d, body=%s", cliRec.Code, cliRec.Body.String())
-	}
-	var cliResponse map[string]any
-	if err := json.Unmarshal(cliRec.Body.Bytes(), &cliResponse); err != nil {
-		t.Fatalf("cli getThread response JSON error: %v", err)
-	}
-	cliThread := mapValue(mapValue(cliResponse["result"])["thread"])
-	if stringValue(cliThread["id"]) != threadID || stringValue(mapValue(cliThread["meta"])["ampcodeConnectorMode"]) != "local-neo" {
-		t.Fatalf("unexpected cli local thread response: %#v", cliResponse)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/api/internal?"+tc.method, bytes.NewBufferString(tc.body))
+			req.Header.Set("Content-Type", "application/json")
+			for key, value := range tc.headers {
+				req.Header.Set(key, value)
+			}
+			if tc.remote != "" {
+				req.RemoteAddr = tc.remote
+			}
+			rec := httptest.NewRecorder()
+			r.ServeHTTP(rec, req)
+			if rec.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusServiceUnavailable, rec.Body.String())
+			}
+		})
 	}
 }
 
