@@ -858,6 +858,66 @@ func TestScanThreadDirFindsDanglingCompleteToolUseBeforeAssistantMessage(t *test
 	}
 }
 
+func TestScanThreadDirAllowsNestedReadThreadChildMessagesBeforeParentResult(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "T-test.json"), map[string]any{
+		"id": "T-test",
+		"messages": []any{
+			map[string]any{
+				"messageId": "M-read",
+				"role":      "assistant",
+				"state":     map[string]any{"type": "complete", "stopReason": "end_turn"},
+				"content": []any{map[string]any{
+					"type":     "tool_use",
+					"id":       "TU-read",
+					"name":     "read_thread",
+					"complete": true,
+					"input":    map[string]any{"threadID": "T-source"},
+				}},
+			},
+			map[string]any{
+				"messageId":       "M-child-tool",
+				"parentToolUseId": "TU-read",
+				"role":            "assistant",
+				"state":           map[string]any{"type": "complete", "stopReason": "end_turn"},
+				"content": []any{map[string]any{
+					"type":     "tool_use",
+					"id":       "TU-overview",
+					"name":     "thread_overview",
+					"complete": true,
+				}},
+			},
+			map[string]any{
+				"messageId":       "M-child-result",
+				"parentToolUseId": "TU-read",
+				"role":            "user",
+				"content": []any{map[string]any{
+					"type":      "tool_result",
+					"toolUseID": "TU-overview",
+					"run":       map[string]any{"status": "done", "result": map[string]any{"messageCount": 3}},
+				}},
+			},
+			map[string]any{
+				"messageId": "M-read-result",
+				"role":      "user",
+				"content": []any{map[string]any{
+					"type":      "tool_result",
+					"toolUseID": "TU-read",
+					"run":       map[string]any{"status": "done", "result": "thread summary"},
+				}},
+			},
+		},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("findings = %#v, want none for nested read_thread child messages", findings)
+	}
+}
+
 func TestScanThreadDirIgnoresReviewModeDanglingToolUse(t *testing.T) {
 	dir := t.TempDir()
 	writeJSONFile(t, filepath.Join(dir, "T-test.json"), map[string]any{

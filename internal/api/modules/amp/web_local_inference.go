@@ -215,7 +215,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	return fmt.Sprintf(`// ==UserScript==
 // @name CLIProxyAPI Amp Local Inference
 // @namespace https://github.com/router-for-me/CLIProxyAPI
-// @version 0.1.54
+// @version 0.1.55
 %s
 // @updateURL %s
 // @downloadURL %s
@@ -227,7 +227,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	"use strict";
 
 	const bridgeHeader = %s;
-	const userscriptVersion = "0.1.54";
+	const userscriptVersion = "0.1.55";
 	const apiKeyStorageKey = "cliproxyapi.ampLocalInference.apiKey";
 	const workingDirectoryStorageKey = "cliproxyapi.ampLocalInference.workingDirectory";
 	const selectedLocalProjectStorageKey = "cliproxyapi.ampLocalInference.selectedLocalProject";
@@ -460,15 +460,17 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	}
 
 	function defaultReasoningEffort(agentMode) {
-		switch (normalizeAgentMode(agentMode)) {
+		const mode = normalizeAgentMode(agentMode);
+		switch (mode) {
 		case "smart":
 			return "high";
 		case "rush":
 		case "agg-man":
 			return "none";
 		case "deep":
+		case "large":
 		case "review":
-			return "medium";
+			return mode === "large" ? "low" : "medium";
 		case "nostromo":
 			return "low";
 		default:
@@ -486,7 +488,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		const effort = typeof value === "string" ? value.trim().toLowerCase() : "";
 		const allowed = {
 			smart: ["high", "xhigh", "max"],
-			large: [],
+			large: ["low"],
 			rush: ["none"],
 			deep: ["low", "medium", "xhigh"],
 			review: ["low", "medium", "high"],
@@ -504,7 +506,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		const effort = typeof value === "string" ? value.trim().toLowerCase() : "";
 		const allowed = {
 			smart: ["high", "xhigh", "max"],
-			large: [],
+			large: ["low"],
 			rush: ["none"],
 			deep: ["low", "medium", "xhigh"],
 			review: ["low", "medium", "high"],
@@ -576,7 +578,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			{ id: "deep-low", label: "Deep 1", detail: "Low", options: { agentMode: "deep", reasoningEffort: "low" } },
 			{ id: "deep-medium", label: "Deep 2", detail: "Medium", options: { agentMode: "deep", reasoningEffort: "medium" } },
 			{ id: "deep-xhigh", label: "Deep 3", detail: "XHigh", options: { agentMode: "deep", reasoningEffort: "xhigh" } },
-			{ id: "large", label: "Large", detail: "Claude", options: { agentMode: "large" } },
+			{ id: "large", label: "Large", detail: "Low", options: { agentMode: "large", reasoningEffort: "low" } },
 			{ id: "rush", label: "Rush", detail: "Fast", options: { agentMode: "rush", reasoningEffort: "none" } },
 			{ id: "nostromo", label: "Nostromo", detail: "Amp", options: { agentMode: "nostromo", reasoningEffort: "low" } },
 		];
@@ -596,7 +598,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			"review:medium": "Review",
 			"agg-man:none": "Agg-man",
 			"nostromo:low": "Nostromo",
-			"large:": "Large",
+			"large:low": "Large",
 		};
 		return labels[mode + ":" + effort] || (mode ? mode[0].toUpperCase() + mode.slice(1) : "Smart 1");
 	}

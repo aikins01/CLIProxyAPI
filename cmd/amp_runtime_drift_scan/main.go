@@ -659,16 +659,18 @@ func scanThreadDanglingToolUseDrift(file, threadID string, messages []any, since
 				}
 			}
 			if threadUserMessageHasNonToolResultContent(message) {
-				findings = appendDanglingToolUseFindings(findings, file, threadID, pending, message, "later user message", since)
-				pending = map[string]pendingThreadToolUse{}
+				parentToolID := threadMessageParentToolUseID(message)
+				findings = appendDanglingToolUseFindings(findings, file, threadID, pending, message, "later user message", since, parentToolID)
+				pending = pendingAfterDanglingBoundary(pending, parentToolID)
 			}
 			continue
 		}
 		if role != "assistant" {
 			continue
 		}
-		findings = appendDanglingToolUseFindings(findings, file, threadID, pending, message, "later assistant message", since)
-		pending = map[string]pendingThreadToolUse{}
+		parentToolID := threadMessageParentToolUseID(message)
+		findings = appendDanglingToolUseFindings(findings, file, threadID, pending, message, "later assistant message", since, parentToolID)
+		pending = pendingAfterDanglingBoundary(pending, parentToolID)
 		for _, rawBlock := range arrayValue(message["content"]) {
 			block := mapValue(rawBlock)
 			if !completedToolUseBlock(message, block) {
@@ -688,11 +690,14 @@ func scanThreadDanglingToolUseDrift(file, threadID string, messages []any, since
 	return findings
 }
 
-func appendDanglingToolUseFindings(findings []driftFinding, file, threadID string, pending map[string]pendingThreadToolUse, triggerMessage map[string]any, trigger string, since time.Time) []driftFinding {
+func appendDanglingToolUseFindings(findings []driftFinding, file, threadID string, pending map[string]pendingThreadToolUse, triggerMessage map[string]any, trigger string, since time.Time, activeParentToolID string) []driftFinding {
 	if len(pending) == 0 || threadMessageBeforeSince(triggerMessage, since) {
 		return findings
 	}
 	for _, item := range pending {
+		if activeParentToolID != "" && item.toolID == activeParentToolID {
+			continue
+		}
 		findings = append(findings, driftFinding{
 			Source:    "thread",
 			File:      file,
@@ -704,6 +709,21 @@ func appendDanglingToolUseFindings(findings []driftFinding, file, threadID strin
 		})
 	}
 	return findings
+}
+
+func pendingAfterDanglingBoundary(pending map[string]pendingThreadToolUse, activeParentToolID string) map[string]pendingThreadToolUse {
+	if activeParentToolID == "" {
+		return map[string]pendingThreadToolUse{}
+	}
+	item, ok := pending[activeParentToolID]
+	if !ok {
+		return map[string]pendingThreadToolUse{}
+	}
+	return map[string]pendingThreadToolUse{activeParentToolID: item}
+}
+
+func threadMessageParentToolUseID(message map[string]any) string {
+	return firstNonEmptyString(message["parentToolUseId"], message["parentToolUseID"], message["parent_tool_use_id"], message["parentToolCallId"])
 }
 
 func threadUserMessageHasNonToolResultContent(message map[string]any) bool {

@@ -2960,6 +2960,9 @@ func TestNeoCompactionTriggerMatchesAuditBaselineAgentModeRoutes(t *testing.T) {
 	}
 	for _, route := range baseline.Signals.AgentModeRoutes {
 		t.Run(route.Name, func(t *testing.T) {
+			if strings.TrimSpace(route.Provider) == "" && strings.TrimSpace(route.Model) == "" {
+				t.Skip("Amp binary no longer exposes client-side provider/model route for this mode")
+			}
 			selected := selectNeoModelRoute(route.Name, nil)
 			if selected.Provider != route.Provider || selected.Model != route.Model {
 				t.Fatalf("route = %+v, want %s/%s from Amp binary baseline", selected, route.Provider, route.Model)
@@ -6051,6 +6054,46 @@ func TestNeoUserActorGetRecentThreadsSeedsMarkedCloudThread(t *testing.T) {
 	}
 }
 
+func TestNeoUserActorGetRecentThreadsPrefersLiveActorOverCachedSummary(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019e0e6e-f3f1-7078-b5dd-748f66f8c266"
+	updatedAt := "2026-06-20T12:00:00Z"
+	rt.store.upsertRecentThreadStatus(map[string]any{
+		"threadId":          threadID,
+		"title":             "Cached idle",
+		"lastUserMessageAt": updatedAt,
+		"state":             "idle",
+		"agentState":        "idle",
+		"hasExecutor":       false,
+		"executorConnected": false,
+	}, int(neoTimeStringMillis(updatedAt)))
+	actor := rt.store.ensureThreadActor(threadID)
+	actor.mu.Lock()
+	actor.title = "Live running"
+	actor.agentState = "running_tools"
+	actor.executorID = "executor-live"
+	actor.executorSocket = &neoSocket{}
+	actor.executorReady = true
+	actor.executorBootstrapComplete = true
+	actor.messages = []neoMessage{{
+		ThreadID:  threadID,
+		MessageID: "M-live",
+		Role:      "user",
+		CreatedAt: updatedAt,
+		Content:   []any{map[string]any{"type": "text", "text": "live status"}},
+	}}
+	actor.mu.Unlock()
+
+	statuses := rt.store.recentThreadStatuses(10, 0)
+	if len(statuses) != 1 {
+		t.Fatalf("recent statuses = %#v, want one deduped status", statuses)
+	}
+	status := mapValue(statuses[0])
+	if status["title"] != "Live running" || status["hasExecutor"] != true || status["executorConnected"] != true || status["agentState"] != "running_tools" {
+		t.Fatalf("recent status = %#v, want live actor status", status)
+	}
+}
+
 func TestNeoUserActorGetRecentThreadsDoesNotSeedUnmarkedCloudThread(t *testing.T) {
 	enabled := true
 	threadID := "T-019e0e6e-f3f1-7078-b5dd-748f66f8c263"
@@ -7387,6 +7430,122 @@ func TestNeoRuntimeTerminalBridgeUsesActiveExecutor(t *testing.T) {
 	}
 }
 
+func TestNeoRuntimeConcurrentExecutorConnectWithActiveWorkSendsRejected(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	t.Cleanup(server.Close)
+	threadID := "T-019f4000-0000-4000-8000-000000000032"
+
+	activeExecutor := dialNeoActorWebSocket(t, server.URL, threadID)
+	defer activeExecutor.Close()
+	if err := activeExecutor.WriteJSON(map[string]any{"type": "executor_connected", "executorId": "local-active"}); err != nil {
+		t.Fatalf("write active executor_connected: %v", err)
+	}
+	waitForNeoMessageType(t, activeExecutor, "executor_connected", 2*time.Second)
+
+	actor := rt.store.lookupThreadActor(threadID)
+	if actor == nil {
+		t.Fatal("missing thread actor")
+	}
+	actor.mu.Lock()
+	actor.agentState = "running_tools"
+	actor.pendingTools["tool-1"] = neoPendingTool{ID: "tool-1"}
+	actor.mu.Unlock()
+
+	newExecutor := dialNeoActorWebSocket(t, server.URL, threadID)
+	defer newExecutor.Close()
+	if err := newExecutor.WriteJSON(map[string]any{"type": "executor_connect", "clientId": "neo-cli"}); err != nil {
+		t.Fatalf("write concurrent executor_connect: %v", err)
+	}
+	rejected := waitForNeoMessageType(t, newExecutor, "executor_connect_rejected", 2*time.Second)
+	if rejected["clientId"] != "neo-cli" || rejected["reason"] != "executor_already_connected" {
+		t.Fatalf("rejected payload = %#v", rejected)
+	}
+	existingInfo := mapValue(rejected["existingExecutorInfo"])
+	if existingInfo["executorId"] != "local-active" || existingInfo["executorType"] != "local-client" {
+		t.Fatalf("existing executor info = %#v", existingInfo)
+	}
+	assertNoNeoMessageType(t, activeExecutor, "executor_tool_lease_revoked", 150*time.Millisecond)
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.executorID != "local-active" || len(actor.pendingTools) != 1 || actor.agentState != "running_tools" {
+		t.Fatalf("active executor state after rejected connect = id:%q pending:%d current:%#v state:%q", actor.executorID, len(actor.pendingTools), actor.currentInference, actor.agentState)
+	}
+}
+
+func TestNeoRuntimeHeadlessExecutorConnectDefersUntilIdle(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	t.Cleanup(server.Close)
+	threadID := "T-019f4000-0000-4000-8000-000000000033"
+
+	activeExecutor := dialNeoActorWebSocket(t, server.URL, threadID)
+	defer activeExecutor.Close()
+	if err := activeExecutor.WriteJSON(map[string]any{"type": "executor_connected", "executorId": "cli-headless-active"}); err != nil {
+		t.Fatalf("write active executor_connected: %v", err)
+	}
+	waitForNeoMessageType(t, activeExecutor, "executor_connected", 2*time.Second)
+
+	actor := rt.store.lookupThreadActor(threadID)
+	if actor == nil {
+		t.Fatal("missing thread actor")
+	}
+	actor.mu.Lock()
+	actor.agentState = "running_tools"
+	actor.pendingTools["tool-1"] = neoPendingTool{ID: "tool-1"}
+	actor.spawnedExecutors = map[string]*neoSpawnedExecutor{
+		"spawn-1": {spawnID: "spawn-1", threadID: threadID},
+	}
+	actor.mu.Unlock()
+
+	newExecutor := dialNeoActorWebSocket(t, server.URL, threadID)
+	defer newExecutor.Close()
+	if err := newExecutor.WriteJSON(map[string]any{"type": "executor_connect", "clientId": "neo-cli"}); err != nil {
+		t.Fatalf("write deferred executor_connect: %v", err)
+	}
+	status := waitForNeoMessageTypeWhere(t, newExecutor, "executor_status", 2*time.Second, func(msg map[string]any) bool {
+		return mapValue(msg["details"])["reasonCode"] == "executor_handoff_deferred"
+	})
+	if details := mapValue(status["details"]); details["reasonCode"] != "executor_handoff_deferred" {
+		t.Fatalf("deferred status = %#v", status)
+	}
+	actor.mu.Lock()
+	if actor.pendingExecutorHandoff == nil {
+		actor.mu.Unlock()
+		t.Fatal("executor_connect was not held as a pending handoff")
+	}
+	actor.mu.Unlock()
+
+	actor.mu.Lock()
+	actor.pendingTools = map[string]neoPendingTool{}
+	actor.mu.Unlock()
+	actor.setAgentState("idle", "", "smart", defaultNeoReasoningEffort("smart"))
+
+	actor.mu.Lock()
+	acceptedID := actor.executorID
+	pendingHandoff := actor.pendingExecutorHandoff
+	_, newSocketRegistered := actor.sockets[actor.executorSocket]
+	acceptedSocketIsExecutor := false
+	if actor.executorSocket != nil {
+		acceptedSocketIsExecutor = actor.executorSocket.isExecutor()
+	}
+	actor.mu.Unlock()
+	if acceptedID != "neo-cli" || pendingHandoff != nil {
+		t.Fatalf("deferred handoff did not accept before frame wait: id=%q pending=%#v registered=%v isExecutor=%v", acceptedID, pendingHandoff, newSocketRegistered, acceptedSocketIsExecutor)
+	}
+
+	connected := waitForNeoMessageType(t, newExecutor, "executor_connected", 2*time.Second)
+	if connected["executorId"] != "neo-cli" {
+		t.Fatalf("executor_connected = %#v", connected)
+	}
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.executorID != "neo-cli" || actor.executorSocket == nil || actor.executorReady || actor.executorBootstrapComplete || len(actor.spawnedExecutors) != 0 || actor.pendingExecutorHandoff != nil {
+		t.Fatalf("deferred handoff state = id:%q socket:%p ready:%v bootstrap:%v spawned:%d pending:%#v", actor.executorID, actor.executorSocket, actor.executorReady, actor.executorBootstrapComplete, len(actor.spawnedExecutors), actor.pendingExecutorHandoff)
+	}
+}
+
 func TestNeoTerminalBridgeTypeNearMisses(t *testing.T) {
 	for _, msgType := range []string{
 		"client_terminal",
@@ -7904,6 +8063,10 @@ func seedNeoLocalExtensionStateForTest(t *testing.T, rt *neoRuntime, threadID st
 }
 
 func waitForNeoMessageType(t *testing.T, conn *websocket.Conn, msgType string, timeout time.Duration) map[string]any {
+	return waitForNeoMessageTypeWhere(t, conn, msgType, timeout, nil)
+}
+
+func waitForNeoMessageTypeWhere(t *testing.T, conn *websocket.Conn, msgType string, timeout time.Duration, match func(map[string]any) bool) map[string]any {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -7911,7 +8074,7 @@ func waitForNeoMessageType(t *testing.T, conn *websocket.Conn, msgType string, t
 		if !ok {
 			break
 		}
-		if msg["type"] == msgType {
+		if msg["type"] == msgType && (match == nil || match(msg)) {
 			return msg
 		}
 	}
@@ -9844,7 +10007,7 @@ func TestNeoActorActiveSocketDisconnectAcceptsClientIDAlias(t *testing.T) {
 	}
 }
 
-func TestNeoActorReplacementConnectClearsOldExecutorWork(t *testing.T) {
+func TestNeoActorConcurrentExecutorConnectedWithActiveWorkDoesNotReplace(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	threadID := "T-019f4000-0000-4000-8000-00000000000c"
 	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
@@ -9852,6 +10015,7 @@ func TestNeoActorReplacementConnectClearsOldExecutorWork(t *testing.T) {
 	oldSocket.markExecutor("executor-1")
 	newSocket := &neoSocket{}
 	newSocket.markExecutor("executor-2")
+	generation := actor.generation
 	actor.mu.Lock()
 	actor.executorID = "executor-1"
 	actor.executorReady = true
@@ -9863,15 +10027,182 @@ func TestNeoActorReplacementConnectClearsOldExecutorWork(t *testing.T) {
 	actor.mu.Unlock()
 
 	actor.executorConnectedForSocket(newSocket, map[string]any{"executorId": "executor-2", "registeredToolCount": 1})
-	actor.close(oldSocket)
+	actor.close(newSocket)
 
 	actor.mu.Lock()
 	defer actor.mu.Unlock()
-	if actor.executorID != "executor-2" || actor.executorSocket != newSocket || !actor.executorReady || !actor.executorBootstrapComplete {
-		t.Fatalf("replacement executor = id:%q socket:%p ready:%v bootstrap:%v", actor.executorID, actor.executorSocket, actor.executorReady, actor.executorBootstrapComplete)
+	if actor.executorID != "executor-1" || actor.executorSocket != oldSocket || !actor.executorReady || !actor.executorBootstrapComplete {
+		t.Fatalf("active executor was replaced: id:%q socket:%p ready:%v bootstrap:%v", actor.executorID, actor.executorSocket, actor.executorReady, actor.executorBootstrapComplete)
 	}
-	if len(actor.pendingTools) != 0 || actor.currentInference != nil || actor.agentState != "idle" {
-		t.Fatalf("old work after replacement connect = pending:%d current:%#v state:%q", len(actor.pendingTools), actor.currentInference, actor.agentState)
+	if len(actor.pendingTools) != 1 || actor.currentInference == nil || actor.agentState != "working" {
+		t.Fatalf("active work after rejected concurrent executor = pending:%d current:%#v state:%q", len(actor.pendingTools), actor.currentInference, actor.agentState)
+	}
+	if actor.generation != generation {
+		t.Fatalf("generation = %d, want %d", actor.generation, generation)
+	}
+	if newSocket.isExecutor() {
+		t.Fatal("rejected executor socket kept executor role")
+	}
+}
+
+func TestNeoActorConcurrentExecutorConnectWithActiveWorkDoesNotReplace(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019f4000-0000-4000-8000-000000000030"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+	oldSocket := &neoSocket{}
+	oldSocket.markExecutor("executor-1")
+	newSocket := &neoSocket{}
+	newSocket.markExecutor("executor-2")
+	actor.mu.Lock()
+	actor.executorID = "executor-1"
+	actor.executorReady = true
+	actor.executorBootstrapComplete = true
+	actor.executorSocket = oldSocket
+	actor.agentState = "running_tools"
+	actor.pendingTools["tool-1"] = neoPendingTool{ID: "tool-1"}
+	actor.approvalQueue = []map[string]any{{"toolCallId": "tool-2"}}
+	actor.currentInference = &neoInferenceInflight{messageID: "M-current", agentMode: "smart"}
+	generation := actor.generation
+	idleGeneration := actor.executorIdleGeneration
+	actor.mu.Unlock()
+
+	actor.executorConnectForSocket(newSocket, map[string]any{"clientId": "executor-2"})
+	actor.close(newSocket)
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.executorID != "executor-1" || actor.executorSocket != oldSocket || !actor.executorReady || !actor.executorBootstrapComplete {
+		t.Fatalf("active executor was replaced: id:%q socket:%p ready:%v bootstrap:%v", actor.executorID, actor.executorSocket, actor.executorReady, actor.executorBootstrapComplete)
+	}
+	if len(actor.pendingTools) != 1 || len(actor.approvalQueue) != 1 || actor.currentInference == nil || actor.agentState != "running_tools" {
+		t.Fatalf("active work after rejected concurrent executor_connect = pending:%d approvals:%d current:%#v state:%q", len(actor.pendingTools), len(actor.approvalQueue), actor.currentInference, actor.agentState)
+	}
+	if actor.generation != generation || actor.executorIdleGeneration != idleGeneration {
+		t.Fatalf("generations changed after rejected concurrent executor_connect: generation=%d want %d idle=%d want %d", actor.generation, generation, actor.executorIdleGeneration, idleGeneration)
+	}
+	if newSocket.isExecutor() {
+		t.Fatal("rejected executor_connect socket kept executor role")
+	}
+}
+
+func TestNeoActorIdleExecutorHandoffClearsSpawnedHeadless(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019f4000-0000-4000-8000-000000000031"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+	oldSocket := &neoSocket{}
+	oldSocket.markExecutor("cli-headless-old")
+	newSocket := &neoSocket{}
+	actor.mu.Lock()
+	actor.executorID = "cli-headless-old"
+	actor.executorReady = true
+	actor.executorBootstrapComplete = true
+	actor.executorSocket = oldSocket
+	actor.agentState = "idle"
+	actor.spawnedExecutors = map[string]*neoSpawnedExecutor{
+		"spawn-1": {spawnID: "spawn-1", threadID: threadID},
+	}
+	actor.mu.Unlock()
+
+	actor.executorConnectedForSocket(newSocket, map[string]any{"executorId": "neo-cli", "registeredToolCount": 1})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.executorID != "neo-cli" || actor.executorSocket != newSocket || !actor.executorReady || !actor.executorBootstrapComplete {
+		t.Fatalf("handoff executor = id:%q socket:%p ready:%v bootstrap:%v", actor.executorID, actor.executorSocket, actor.executorReady, actor.executorBootstrapComplete)
+	}
+	if len(actor.spawnedExecutors) != 0 {
+		t.Fatalf("spawned executors after idle CLI handoff = %#v, want none", actor.spawnedExecutors)
+	}
+}
+
+func TestNeoActorHeadlessExecutorHandoffCompletesWhenIdle(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019f4000-0000-4000-8000-000000000034"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+	oldSocket := &neoSocket{}
+	oldSocket.markExecutor("cli-headless-active")
+	newSocket := &neoSocket{}
+	newSocket.markExecutor("neo-cli")
+	actor.mu.Lock()
+	actor.sockets[oldSocket] = struct{}{}
+	actor.sockets[newSocket] = struct{}{}
+	actor.executorID = "cli-headless-active"
+	actor.executorReady = true
+	actor.executorBootstrapComplete = true
+	actor.executorSocket = oldSocket
+	actor.agentState = "running_tools"
+	actor.pendingTools["tool-1"] = neoPendingTool{ID: "tool-1"}
+	actor.spawnedExecutors = map[string]*neoSpawnedExecutor{
+		"spawn-1": {spawnID: "spawn-1", threadID: threadID},
+	}
+	actor.mu.Unlock()
+
+	actor.executorConnectForSocket(newSocket, map[string]any{"clientId": "neo-cli"})
+
+	actor.mu.Lock()
+	if actor.executorID != "cli-headless-active" || actor.executorSocket != oldSocket || actor.pendingExecutorHandoff == nil || newSocket.isExecutor() {
+		actor.mu.Unlock()
+		t.Fatalf("handoff was not deferred: id=%q socket=%p pending=%#v newExecutor=%v", actor.executorID, actor.executorSocket, actor.pendingExecutorHandoff, newSocket.isExecutor())
+	}
+	actor.pendingTools = map[string]neoPendingTool{}
+	actor.agentState = "idle"
+	actor.mu.Unlock()
+
+	if !actor.maybeCompletePendingExecutorHandoff() {
+		t.Fatal("pending handoff did not complete")
+	}
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.executorID != "neo-cli" || actor.executorSocket != newSocket || actor.executorReady || actor.executorBootstrapComplete || actor.pendingExecutorHandoff != nil {
+		t.Fatalf("completed handoff state = id:%q socket:%p ready:%v bootstrap:%v pending:%#v", actor.executorID, actor.executorSocket, actor.executorReady, actor.executorBootstrapComplete, actor.pendingExecutorHandoff)
+	}
+	if len(actor.spawnedExecutors) != 0 {
+		t.Fatalf("spawned executors after deferred handoff = %#v, want none", actor.spawnedExecutors)
+	}
+}
+
+func TestNeoActorHeadlessExecutorHandoffCompletesOnProtocolIdle(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019f4000-0000-4000-8000-000000000035"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+	oldSocket := &neoSocket{}
+	oldSocket.markExecutor("cli-headless-active")
+	newSocket := &neoSocket{}
+	newSocket.markExecutor("neo-cli")
+	actor.mu.Lock()
+	actor.sockets[oldSocket] = struct{}{}
+	actor.sockets[newSocket] = struct{}{}
+	actor.executorID = "cli-headless-active"
+	actor.executorReady = true
+	actor.executorBootstrapComplete = true
+	actor.executorSocket = oldSocket
+	actor.agentState = "running_tools"
+	actor.pendingTools["tool-1"] = neoPendingTool{ID: "tool-1"}
+	actor.spawnedExecutors = map[string]*neoSpawnedExecutor{
+		"spawn-1": {spawnID: "spawn-1", threadID: threadID},
+	}
+	actor.mu.Unlock()
+
+	actor.executorConnectForSocket(newSocket, map[string]any{"clientId": "neo-cli"})
+
+	actor.mu.Lock()
+	if actor.pendingExecutorHandoff == nil {
+		actor.mu.Unlock()
+		t.Fatal("handoff was not deferred")
+	}
+	actor.pendingTools = map[string]neoPendingTool{}
+	actor.mu.Unlock()
+
+	actor.handleProtocolAgentState(map[string]any{"type": "agent_state", "state": "idle"})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.executorID != "neo-cli" || actor.executorSocket != newSocket || actor.executorReady || actor.executorBootstrapComplete || actor.pendingExecutorHandoff != nil {
+		t.Fatalf("protocol idle handoff state = id:%q socket:%p ready:%v bootstrap:%v pending:%#v", actor.executorID, actor.executorSocket, actor.executorReady, actor.executorBootstrapComplete, actor.pendingExecutorHandoff)
+	}
+	if len(actor.spawnedExecutors) != 0 {
+		t.Fatalf("spawned executors after protocol idle handoff = %#v, want none", actor.spawnedExecutors)
 	}
 }
 
@@ -13189,6 +13520,12 @@ func TestSelectNeoModelRouteMatchesAuditBaselineAgentModeRoutes(t *testing.T) {
 	}
 	for _, route := range baseline.Signals.AgentModeRoutes {
 		t.Run(route.Name, func(t *testing.T) {
+			if strings.TrimSpace(route.Provider) == "" && strings.TrimSpace(route.Model) == "" {
+				if got := defaultNeoReasoningEffort(route.Name); got != route.ReasoningEffort {
+					t.Fatalf("default reasoning effort = %q, want %q from Amp binary baseline", got, route.ReasoningEffort)
+				}
+				return
+			}
 			got := selectNeoModelRoute(route.Name, nil)
 			if got.Provider != route.Provider || got.Model != route.Model {
 				t.Fatalf("route = %+v, want %s/%s from Amp binary baseline", got, route.Provider, route.Model)
@@ -16077,7 +16414,7 @@ func TestNeoActorPreservesBinaryTopLevelToolMetadata(t *testing.T) {
 		names[tool.Name] = true
 	}
 	if names["code_review"] {
-		t.Fatalf("deferred tool was included despite empty binary deferredTools: %#v", names)
+		t.Fatalf("non-binary deferred tool was included: %#v", names)
 	}
 	if !names["plugin_custom"] || !names["skill"] {
 		t.Fatalf("binary top-level metadata did not affect tool inclusion: %#v", names)
@@ -16109,11 +16446,21 @@ func TestNeoDeferredToolsAreSuppressedLikeBinary(t *testing.T) {
 	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
 	actor.tools = map[string]neoToolSpec{
 		"code_review": {Name: "code_review", Meta: map[string]any{"deferred": true}},
+		"gmail_read":  {Name: "gmail_read", Meta: map[string]any{"deferred": true}},
+		"gmail_write": {Name: "gmail_write", Meta: map[string]any{"deferred": true}},
 	}
-	for _, mode := range []string{"smart", "large", "deep", "rush"} {
-		if got := actor.inferenceRequestLocked(mode, "", ""); len(got.Tools) != 0 {
-			t.Fatalf("%s deferred tools = %#v, want omitted (binary deferredTools are empty)", mode, got.Tools)
+	for _, mode := range []string{"smart", "large", "deep"} {
+		got := actor.inferenceRequestLocked(mode, "", "")
+		names := make([]string, 0, len(got.Tools))
+		for _, tool := range got.Tools {
+			names = append(names, tool.Name)
 		}
+		if !reflect.DeepEqual(names, []string{"gmail_read", "gmail_write"}) {
+			t.Fatalf("%s deferred tools = %#v, want Gmail deferred tools only", mode, names)
+		}
+	}
+	if got := actor.inferenceRequestLocked("rush", "", ""); len(got.Tools) != 0 {
+		t.Fatalf("rush deferred tools = %#v, want omitted", got.Tools)
 	}
 }
 
@@ -18394,7 +18741,7 @@ func TestInferNeoAnthropicUsesBinaryDefaultMaxTokens(t *testing.T) {
 	}
 }
 
-func TestInferNeoAnthropicLargeModeUsesBinaryAdaptiveHighFallback(t *testing.T) {
+func TestInferNeoAnthropicLargeModeUsesBinaryAdaptiveLowFallback(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/provider/anthropic/v1/messages" {
 			t.Fatalf("unexpected path %s", r.URL.Path)
@@ -18404,8 +18751,8 @@ func TestInferNeoAnthropicLargeModeUsesBinaryAdaptiveHighFallback(t *testing.T) 
 		if stringValue(thinkingBody["type"]) != "adaptive" || stringValue(thinkingBody["display"]) != "summarized" {
 			t.Fatalf("thinking = %#v, want adaptive summarized; payload=%#v", thinkingBody, payload)
 		}
-		if effort := stringValue(mapValue(payload["output_config"])["effort"]); effort != "high" {
-			t.Fatalf("output_config.effort = %q, want high; payload=%#v", effort, payload)
+		if effort := stringValue(mapValue(payload["output_config"])["effort"]); effort != "low" {
+			t.Fatalf("output_config.effort = %q, want low; payload=%#v", effort, payload)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"content":[{"type":"text","text":"ok"}]}`))
@@ -19689,8 +20036,8 @@ func TestNeoGoogleThinkingFallbackFollowsBinaryOrder(t *testing.T) {
 	if got := neoGoogleThinkingFallback(neoInferenceRequest{AgentMode: "smart"}); got != "high" {
 		t.Fatalf("smart fallback = %q, want high", got)
 	}
-	if got := neoGoogleThinkingFallback(neoInferenceRequest{AgentMode: "large"}); got != "medium" {
-		t.Fatalf("large fallback = %q, want provider default medium", got)
+	if got := neoGoogleThinkingFallback(neoInferenceRequest{AgentMode: "large"}); got != "low" {
+		t.Fatalf("large fallback = %q, want binary default low", got)
 	}
 	if got := neoGoogleThinkingFallback(neoInferenceRequest{}); got != "medium" {
 		t.Fatalf("empty fallback = %q, want provider default medium", got)

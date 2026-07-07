@@ -135,15 +135,17 @@ var (
 		"review":   toolList("shell_command", "run_check", "submit_review"),
 		"nostromo": toolList("finder", "Bash", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "archive_current_thread", "send_message_to_agg", "shell_command", "shell_command_status", "apply_patch"),
 	}
-	neoModeToolAllowlist = orderedToolSets(neoModeToolOrder)
-	// gaac893 emptied every mode's deferredTools (the code_review deferred tool
-	// and its code-review builtin skill left the binary; reviews now run in the
-	// dedicated "review" agent mode), so nothing is deferred anymore.
-	neoModeDeferredToolAllowlist = map[string]map[string]bool{}
-	neoKnownModeTools            = toolSet(
+	neoModeToolAllowlist         = orderedToolSets(neoModeToolOrder)
+	neoModeDeferredToolAllowlist = map[string]map[string]bool{
+		"smart": toolSet("gmail_read", "gmail_write"),
+		"large": toolSet("gmail_read", "gmail_write"),
+		"deep":  toolSet("gmail_read", "gmail_write"),
+	}
+	neoKnownModeTools = toolSet(
 		"finder", "Bash", "create_file", "edit_file",
 		"web_search", "read_web_page", "read_mcp_resource", "read_thread", "find_thread", "skill", "oracle",
 		"librarian", "Task", "view_media", "painter",
+		"gmail_read", "gmail_write",
 		"shell_command", "shell_command_status", "apply_patch", "archive_current_thread", "send_message_to_agg", "run_check", "submit_review", "docs_list", "docs_read", "docs_write",
 		"create_project", "list_agent_modes", "create_thread", "archive_thread", "archive_threads", "unarchive_thread", "send_message_to_thread", "publish_thread_artifacts", "manage_automation",
 		"slack_write", "slack_read", "github_repo_ci_status", "read_github", "search_github", "commit_search",
@@ -1380,13 +1382,20 @@ type neoActorStore struct {
 	runtime   *neoRuntime
 	actors    map[string]*neoActor
 	byNameKey map[string]string
+	recent    map[string]neoRecentThreadStatus
 }
 
 func newNeoActorStore() *neoActorStore {
 	return &neoActorStore{
 		actors:    make(map[string]*neoActor),
 		byNameKey: make(map[string]string),
+		recent:    make(map[string]neoRecentThreadStatus),
 	}
+}
+
+type neoRecentThreadStatus struct {
+	status    map[string]any
+	updatedMs int
 }
 
 func (s *neoActorStore) get(id string) *neoActor {
@@ -1683,6 +1692,17 @@ func (s *neoActorStore) recentThreadStatuses(limit, sinceMs int) []any {
 		}
 		statuses = append(statuses, status)
 	}
+	s.mu.RLock()
+	for _, entry := range s.recent {
+		if len(entry.status) == 0 {
+			continue
+		}
+		if sinceMs > 0 && entry.updatedMs > 0 && entry.updatedMs < sinceMs {
+			continue
+		}
+		statuses = append(statuses, cloneMap(entry.status))
+	}
+	s.mu.RUnlock()
 	statuses = neoDedupeRecentThreadStatuses(statuses)
 	sort.Slice(statuses, func(i, j int) bool {
 		left := neoTimeStringMillis(stringValue(mapValue(statuses[i])["lastUserMessageAt"]))
@@ -1696,6 +1716,27 @@ func (s *neoActorStore) recentThreadStatuses(limit, sinceMs int) []any {
 		statuses = statuses[:limit]
 	}
 	return statuses
+}
+
+func (s *neoActorStore) upsertRecentThreadStatus(status map[string]any, updatedMs int) {
+	if s == nil || len(status) == 0 {
+		return
+	}
+	threadID := strings.TrimSpace(stringValue(status["threadId"]))
+	if !neoThreadIDExactPattern.MatchString(threadID) {
+		return
+	}
+	s.mu.Lock()
+	if s.recent == nil {
+		s.recent = map[string]neoRecentThreadStatus{}
+	}
+	existing := s.recent[threadID]
+	if existing.updatedMs > updatedMs {
+		s.mu.Unlock()
+		return
+	}
+	s.recent[threadID] = neoRecentThreadStatus{status: cloneMap(status), updatedMs: updatedMs}
+	s.mu.Unlock()
 }
 
 func neoDedupeRecentThreadStatuses(statuses []any) []any {
@@ -2179,6 +2220,7 @@ type neoActor struct {
 	executorID                string
 	replacingExecutorID       string
 	executorSocket            *neoSocket
+	pendingExecutorHandoff    *neoPendingExecutorHandoff
 	bootstrapExecutorType     string
 	bootstrapThreadActorFlow  bool
 	executorReady             bool
@@ -2228,6 +2270,12 @@ type neoSpawnedExecutor struct {
 	startedAt     time.Time
 	stopping      bool
 	respawnOnStop bool
+}
+
+type neoPendingExecutorHandoff struct {
+	socket     *neoSocket
+	msg        map[string]any
+	connecting bool
 }
 
 func (e *neoSpawnedExecutor) pid() int {
@@ -2314,6 +2362,9 @@ func (a *neoActor) close(socket *neoSocket) {
 	}
 	a.mu.Lock()
 	delete(a.sockets, socket)
+	if a.pendingExecutorHandoff != nil && a.pendingExecutorHandoff.socket == socket {
+		a.pendingExecutorHandoff = nil
+	}
 	activeExecutorSocket := socket != nil && a.executorSocket == socket
 	if executorSocket && executorID == "" && activeExecutorSocket {
 		executorID = a.executorID
@@ -2823,7 +2874,9 @@ func (a *neoActor) handleProtocolToolApprovalQueue(msg map[string]any) {
 	if stateChanged {
 		a.broadcast(map[string]any{"type": "agent_state", "state": state, "agentMode": agentMode, "reasoningEffort": omitEmpty(reasoningEffort)})
 		a.syncCloudAsync()
-		a.scheduleExecutorIdleStopIfNeeded()
+		if state != "idle" || !a.maybeCompletePendingExecutorHandoff() {
+			a.scheduleExecutorIdleStopIfNeeded()
+		}
 	}
 }
 
@@ -3415,7 +3468,9 @@ func (a *neoActor) handleToolApprovalResponse(msg map[string]any) {
 	if stateChanged {
 		a.broadcast(map[string]any{"type": "agent_state", "state": state, "agentMode": agentMode, "reasoningEffort": omitEmpty(reasoningEffort)})
 		a.syncCloudAsync()
-		a.scheduleExecutorIdleStopIfNeeded()
+		if state != "idle" || !a.maybeCompletePendingExecutorHandoff() {
+			a.scheduleExecutorIdleStopIfNeeded()
+		}
 	}
 }
 
@@ -3425,6 +3480,25 @@ func (a *neoActor) executorConnect(msg map[string]any) {
 
 func (a *neoActor) executorConnectForSocket(socket *neoSocket, msg map[string]any) {
 	a.mu.Lock()
+	incomingExecutorID := firstNonEmptyString(msg["clientId"], msg["executorId"])
+	if a.shouldDeferConcurrentExecutorHandoffLocked(socket, msg) {
+		a.pendingExecutorHandoff = &neoPendingExecutorHandoff{
+			socket:     socket,
+			msg:        cloneMap(msg),
+			connecting: true,
+		}
+		existingExecutorID := a.executorID
+		a.mu.Unlock()
+		a.deferConcurrentExecutorHandoff(socket, incomingExecutorID, existingExecutorID)
+		return
+	}
+	if a.shouldRejectConcurrentExecutorLocked(socket) {
+		existingExecutorID := a.executorID
+		a.mu.Unlock()
+		a.rejectConcurrentExecutor(socket, incomingExecutorID, existingExecutorID)
+		return
+	}
+	stopExecutors := a.spawnedExecutorsForAcceptedHandoffLocked(socket, msg)
 	cleanup := neoExecutorWorkCleanup{}
 	if a.replacingExecutorID != "" ||
 		(socket != nil && a.executorSocket != nil && a.executorSocket != socket) ||
@@ -3435,7 +3509,7 @@ func (a *neoActor) executorConnectForSocket(socket *neoSocket, msg map[string]an
 		a.currentInference != nil {
 		cleanup = a.clearStaleExecutorWorkForDisconnectLocked()
 	}
-	clientID := firstNonEmptyString(msg["clientId"], msg["executorId"], a.executorID)
+	clientID := firstNonEmptyString(incomingExecutorID, a.executorID)
 	a.executorID = clientID
 	a.replacingExecutorID = ""
 	if socket != nil {
@@ -3450,7 +3524,12 @@ func (a *neoActor) executorConnectForSocket(socket *neoSocket, msg map[string]an
 	a.guidanceSnapshot = map[string]any{}
 	a.skillSnapshot = map[string]any{}
 	a.capabilities = mapValue(msg["capabilities"])
+	a.pendingExecutorHandoff = nil
 	a.mu.Unlock()
+	for _, executor := range stopExecutors {
+		executor.stop()
+	}
+	a.closeSupersededExecutorSockets(socket, "Executor handoff")
 	a.broadcastStaleExecutorWorkCleanup(cleanup)
 	a.sendExecutorConnected(nil, false)
 	a.broadcastObservers()
@@ -3483,11 +3562,30 @@ func (a *neoActor) executorConnected(msg map[string]any) {
 
 func (a *neoActor) executorConnectedForSocket(socket *neoSocket, msg map[string]any) {
 	a.mu.Lock()
+	incomingExecutorID := firstNonEmptyString(msg["executorId"], msg["clientId"])
+	if a.shouldDeferConcurrentExecutorHandoffLocked(socket, msg) {
+		a.pendingExecutorHandoff = &neoPendingExecutorHandoff{
+			socket:     socket,
+			msg:        cloneMap(msg),
+			connecting: false,
+		}
+		existingExecutorID := a.executorID
+		a.mu.Unlock()
+		a.deferConcurrentExecutorHandoff(socket, incomingExecutorID, existingExecutorID)
+		return
+	}
+	if a.shouldRejectConcurrentExecutorLocked(socket) {
+		existingExecutorID := a.executorID
+		a.mu.Unlock()
+		a.rejectConcurrentExecutor(socket, incomingExecutorID, existingExecutorID)
+		return
+	}
+	stopExecutors := a.spawnedExecutorsForAcceptedHandoffLocked(socket, msg)
 	cleanup := neoExecutorWorkCleanup{}
 	if a.replacingExecutorID != "" || (socket != nil && a.executorSocket != nil && a.executorSocket != socket) {
 		cleanup = a.clearStaleExecutorWorkForDisconnectLocked()
 	}
-	executorID := firstNonEmptyString(msg["executorId"], msg["clientId"], a.executorID)
+	executorID := firstNonEmptyString(incomingExecutorID, a.executorID)
 	if executorID == "" {
 		executorID = "local-executor"
 	}
@@ -3502,10 +3600,15 @@ func (a *neoActor) executorConnectedForSocket(socket *neoSocket, msg map[string]
 	a.executorBootstrapComplete = true
 	a.executorResumeBootstrap = false
 	a.executorIdleGeneration++
+	a.pendingExecutorHandoff = nil
 	registeredToolCount := numberFrom(msg["registeredToolCount"], len(a.tools))
 	guidanceInventory := neoGuidanceInventory(a.guidanceSnapshot)
 	a.mu.Unlock()
 
+	for _, executor := range stopExecutors {
+		executor.stop()
+	}
+	a.closeSupersededExecutorSockets(socket, "Executor handoff")
 	a.broadcastStaleExecutorWorkCleanup(cleanup)
 	payload := cloneMap(msg)
 	payload["type"] = "executor_connected"
@@ -3520,6 +3623,155 @@ func (a *neoActor) executorConnectedForSocket(socket *neoSocket, msg map[string]
 	a.syncCloudAsync()
 	a.drainReadyWork()
 	a.scheduleExecutorIdleStopIfNeeded()
+}
+
+func (a *neoActor) shouldRejectConcurrentExecutorLocked(socket *neoSocket) bool {
+	return socket != nil &&
+		a.replacingExecutorID == "" &&
+		a.executorSocket != nil &&
+		a.executorSocket != socket &&
+		a.executorWorkActiveLocked()
+}
+
+func (a *neoActor) shouldDeferConcurrentExecutorHandoffLocked(socket *neoSocket, msg map[string]any) bool {
+	return socket != nil &&
+		a.replacingExecutorID == "" &&
+		a.executorSocket != nil &&
+		a.executorSocket != socket &&
+		a.executorWorkActiveLocked() &&
+		a.currentExecutorIsSpawnedHeadlessLocked() &&
+		!neoIncomingExecutorIsSpawnedHeadless(msg)
+}
+
+func (a *neoActor) currentExecutorIsSpawnedHeadlessLocked() bool {
+	if strings.HasPrefix(a.executorID, "cli-headless-") {
+		return true
+	}
+	if len(a.spawnedExecutors) == 0 {
+		return false
+	}
+	return strings.EqualFold(a.bootstrapExecutorType, "sandbox") || strings.EqualFold(stringValue(a.meta["executorType"]), "sandbox")
+}
+
+func (a *neoActor) executorWorkActiveLocked() bool {
+	if len(a.pendingTools) > 0 || len(a.approvalQueue) > 0 || a.currentInference != nil {
+		return true
+	}
+	switch normalizeNeoAgentState(a.agentState) {
+	case "working", "streaming", "running_tools", "awaiting_approval":
+		return true
+	default:
+		return false
+	}
+}
+
+func (a *neoActor) spawnedExecutorsForAcceptedHandoffLocked(socket *neoSocket, msg map[string]any) []*neoSpawnedExecutor {
+	if socket == nil || a.executorSocket == nil || a.executorSocket == socket || neoIncomingExecutorIsSpawnedHeadless(msg) {
+		return nil
+	}
+	return a.markSpawnedExecutorsStoppingLocked(false)
+}
+
+func neoIncomingExecutorIsSpawnedHeadless(msg map[string]any) bool {
+	executorID := firstNonEmptyString(msg["clientId"], msg["executorId"])
+	if strings.HasPrefix(executorID, "cli-headless-") {
+		return true
+	}
+	return strings.EqualFold(stringValue(msg["executorType"]), "sandbox")
+}
+
+func (a *neoActor) rejectConcurrentExecutor(socket *neoSocket, incomingExecutorID, existingExecutorID string) {
+	if socket != nil {
+		socket.clearExecutor()
+		if socket.conn != nil {
+			existingExecutorInfo := neoExistingExecutorInfo(existingExecutorID)
+			payload := map[string]any{
+				"type":                 "executor_connect_rejected",
+				"message":              "Executor already connected.",
+				"reason":               "executor_already_connected",
+				"existingExecutorInfo": existingExecutorInfo,
+				"details": map[string]any{
+					"reasonCode":           "executor_connect_rejected",
+					"existingExecutorId":   omitEmpty(existingExecutorID),
+					"existingExecutorInfo": existingExecutorInfo,
+				},
+			}
+			if incomingExecutorID != "" {
+				payload["executorId"] = incomingExecutorID
+				payload["clientId"] = incomingExecutorID
+			}
+			socket.send(payload)
+		}
+	}
+	a.broadcastObservers()
+}
+
+func (a *neoActor) deferConcurrentExecutorHandoff(socket *neoSocket, incomingExecutorID, existingExecutorID string) {
+	if socket != nil {
+		socket.clearExecutor()
+		if socket.conn != nil {
+			socket.send(map[string]any{
+				"type":    "executor_status",
+				"status":  "running",
+				"message": "Waiting for active headless executor to finish before handoff.",
+				"details": map[string]any{
+					"reasonCode":         "executor_handoff_deferred",
+					"incomingExecutorId": omitEmpty(incomingExecutorID),
+					"existingExecutorId": omitEmpty(existingExecutorID),
+				},
+			})
+		}
+	}
+	a.broadcastObservers()
+}
+
+func (a *neoActor) maybeCompletePendingExecutorHandoff() bool {
+	if a == nil {
+		return false
+	}
+	a.mu.Lock()
+	pending := a.pendingExecutorHandoff
+	if pending == nil {
+		a.mu.Unlock()
+		return false
+	}
+	if _, exists := a.sockets[pending.socket]; !exists || a.executorWorkActiveLocked() || normalizeNeoAgentState(a.agentState) != "idle" {
+		a.mu.Unlock()
+		return false
+	}
+	a.pendingExecutorHandoff = nil
+	msg := cloneMap(pending.msg)
+	socket := pending.socket
+	connecting := pending.connecting
+	a.mu.Unlock()
+	if connecting {
+		a.executorConnectForSocket(socket, msg)
+	} else {
+		a.executorConnectedForSocket(socket, msg)
+	}
+	return true
+}
+
+func neoExistingExecutorInfo(executorID string) map[string]any {
+	info := map[string]any{"executorId": omitEmpty(executorID)}
+	if strings.HasPrefix(executorID, "cli-headless-") {
+		info["executorType"] = "sandbox"
+	} else if executorID != "" {
+		info["executorType"] = "local-client"
+	}
+	return info
+}
+
+func (a *neoActor) closeSupersededExecutorSockets(active *neoSocket, reason string) {
+	if active == nil {
+		return
+	}
+	for _, socket := range a.socketList() {
+		if socket == active || !socket.isExecutor() {
+			continue
+		}
+		socket.close(websocket.CloseGoingAway, reason)
+	}
 }
 
 func (a *neoActor) executorDisconnected(msg map[string]any) {
@@ -4163,6 +4415,7 @@ func (a *neoActor) executorIdleStopEligibleLocked() bool {
 	return a.executorID != "" &&
 		a.executorReady &&
 		normalizeNeoAgentState(a.agentState) == "idle" &&
+		a.pendingExecutorHandoff == nil &&
 		len(a.spawnedExecutors) > 0 &&
 		len(a.pendingTools) == 0 &&
 		len(a.approvalQueue) == 0 &&
@@ -4588,7 +4841,9 @@ func (a *neoActor) handleProtocolAgentState(msg map[string]any) {
 		a.dispatchNotification("agent", "agent_idle", map[string]any{"messageId": omitEmpty(messageID), "agentMode": agentMode})
 	}
 	a.syncCloudAsync()
-	a.scheduleExecutorIdleStopIfNeeded()
+	if state != "idle" || !a.maybeCompletePendingExecutorHandoff() {
+		a.scheduleExecutorIdleStopIfNeeded()
+	}
 }
 
 func (a *neoActor) handleProtocolInferenceTools(msg map[string]any) {
@@ -10913,7 +11168,7 @@ func writeNeoLocalThreadFileInDir(dir, threadID string, thread map[string]any) (
 	if err := os.Chmod(dir, 0o700); err != nil {
 		return "", err
 	}
-	raw, err := json.MarshalIndent(thread, "", "  ")
+	raw, err := json.Marshal(thread)
 	if err != nil {
 		return "", err
 	}
@@ -13090,7 +13345,16 @@ func (rt *neoRuntime) seedRecentThreadsFromCloud(ctx context.Context, limit, sin
 		if actor := rt.store.lookupThreadActor(threadID); actor != nil && actor.hasLocalThreadState() {
 			continue
 		}
-		rt.tryImportNeoCloudLocalThreadActor(ctx, threadID)
+		thread, err := rt.fetchNeoCloudThread(ctx, threadID)
+		if err != nil {
+			log.Debugf("amp neo local runtime cloud recent thread probe failed thread=%s: %v", threadID, err)
+			continue
+		}
+		if !neoCloudThreadHasLocalNeoMarker(thread) {
+			continue
+		}
+		status, updatedMs := neoRecentThreadStatusFromThreadMap(thread)
+		rt.store.upsertRecentThreadStatus(status, updatedMs)
 	}
 }
 
@@ -14828,7 +15092,9 @@ func (a *neoActor) setAgentState(state, messageID, agentMode, reasoningEffort st
 		a.dispatchNotification("agent", "agent_idle", map[string]any{"messageId": omitEmpty(messageID), "agentMode": agentMode})
 	}
 	a.syncCloudAsync()
-	a.scheduleExecutorIdleStopIfNeeded()
+	if state != "idle" || !a.maybeCompletePendingExecutorHandoff() {
+		a.scheduleExecutorIdleStopIfNeeded()
+	}
 }
 
 func (a *neoActor) clearCurrentInference(messageID string) {
@@ -14837,7 +15103,9 @@ func (a *neoActor) clearCurrentInference(messageID string) {
 	a.mu.Unlock()
 	if cleared {
 		a.syncCloudAsync()
-		a.scheduleExecutorIdleStopIfNeeded()
+		if !a.maybeCompletePendingExecutorHandoff() {
+			a.scheduleExecutorIdleStopIfNeeded()
+		}
 	}
 }
 
@@ -15942,6 +16210,98 @@ func (a *neoActor) recentThreadStatus() (map[string]any, int) {
 		status["pendingInference"] = pendingInference
 	}
 	return status, updatedMs
+}
+
+func neoRecentThreadStatusFromThreadMap(thread map[string]any) (map[string]any, int) {
+	threadID := firstNonEmptyString(thread["id"], thread["threadId"], thread["threadID"], findThreadID(thread))
+	if !neoThreadIDExactPattern.MatchString(threadID) {
+		return nil, 0
+	}
+	messages := arrayValue(thread["messages"])
+	updatedMs := firstNonZero(neoRecentThreadUserUpdatedMillis(thread, messages), neoThreadUpdatedMillis(thread))
+	lastUserMessageAt := neoMillisRFC3339(updatedMs)
+	title := firstNonEmptyString(thread["title"], neoTitleFromRawMessages(messages), "Untitled")
+	agentMode := firstNonEmptyString(thread["agentMode"], nestedValue(thread["settings"], "agentMode"), neoThreadMessagesAgentMode(messages))
+	reasoningEffort := strings.ToLower(strings.TrimSpace(firstNonEmptyString(thread["reasoningEffort"], thread["reasoning_effort"], nestedValue(thread["settings"], "reasoning.effort"))))
+	if !neoReasoningEffortAllowedForMode(agentMode, reasoningEffort) {
+		reasoningEffort = ""
+	}
+	state := "idle"
+	status := map[string]any{
+		"threadId":          threadID,
+		"title":             title,
+		"lastUserMessageAt": lastUserMessageAt,
+		"state":             state,
+		"agentState":        state,
+		"hasExecutor":       false,
+		"executorConnected": false,
+	}
+	if boolValue(thread["archived"]) {
+		status["archived"] = true
+	}
+	if threadStatus := normalizedNeoThreadStatus(stringValue(thread["threadStatus"])); threadStatus != "" {
+		status["threadStatus"] = threadStatus
+	}
+	if workspace := neoRecentThreadWorkspace(mapValue(thread["env"])); len(workspace) > 0 {
+		status["workspace"] = workspace
+	}
+	if agentMode != "" {
+		status["agentMode"] = agentMode
+	}
+	if reasoningEffort != "" {
+		status["reasoningEffort"] = reasoningEffort
+	}
+	if parentThreadID := neoRecentParentThreadIDFromRawRelationships(thread["relationships"]); parentThreadID != "" {
+		status["parentThreadID"] = parentThreadID
+	}
+	return status, updatedMs
+}
+
+func neoRecentThreadUserUpdatedMillis(thread map[string]any, messages []any) int {
+	updated := neoThreadUserLastInteractedAtFromMessages(thread, messages)
+	for _, raw := range messages {
+		message := mapValue(raw)
+		if stringValue(message["role"]) != "user" {
+			continue
+		}
+		if created := firstNonZero(numberFrom(message["created"]), neoTimeStringMillis(stringValue(message["createdAt"]))); created > updated {
+			updated = created
+		}
+	}
+	return updated
+}
+
+func neoTitleFromRawMessages(messages []any) string {
+	for _, raw := range messages {
+		message := mapValue(raw)
+		if stringValue(message["role"]) != "user" {
+			continue
+		}
+		for _, rawBlock := range arrayValue(message["content"]) {
+			block := mapValue(rawBlock)
+			if stringValue(block["type"]) != "text" {
+				continue
+			}
+			if title := neoTitleFromContent([]any{block}); title != "" {
+				return title
+			}
+		}
+	}
+	return ""
+}
+
+func neoRecentParentThreadIDFromRawRelationships(raw any) string {
+	for _, item := range arrayValue(raw) {
+		relationship := mapValue(item)
+		if stringValue(relationship["role"]) != "parent" {
+			continue
+		}
+		threadID := firstNonEmptyString(relationship["threadID"], relationship["threadId"], relationship["thread_id"])
+		if neoThreadIDExactPattern.MatchString(threadID) {
+			return threadID
+		}
+	}
+	return ""
 }
 
 func (a *neoActor) recentParentThreadIDLocked() string {
@@ -17896,6 +18256,9 @@ func neoObserversPayload(count int, hasExecutor bool) map[string]any {
 func (a *neoActor) broadcast(payload any) {
 	a.maybeBroadcastThreadStatusUpdated(payload)
 	for _, socket := range a.socketList() {
+		if socket == nil || socket.conn == nil {
+			continue
+		}
 		socket.send(payload)
 	}
 }
@@ -18797,6 +19160,8 @@ func defaultNeoReasoningEffort(agentMode string) string {
 		return "none"
 	case "deep":
 		return "medium"
+	case "large":
+		return "low"
 	case "review":
 		return "medium"
 	case "agg-man":
@@ -18817,7 +19182,7 @@ func normalizeNeoReasoningEffortForMode(agentMode, effort string) string {
 
 func neoModeSupportsReasoningEffort(agentMode string) bool {
 	switch strings.ToLower(strings.TrimSpace(agentMode)) {
-	case "smart", "rush", "deep", "review", "agg-man", "nostromo":
+	case "smart", "large", "rush", "deep", "review", "agg-man", "nostromo":
 		return true
 	default:
 		return false
@@ -18832,6 +19197,8 @@ func neoReasoningEffortAllowedForMode(agentMode, effort string) bool {
 	switch strings.ToLower(strings.TrimSpace(agentMode)) {
 	case "smart":
 		return effort == "high" || effort == "xhigh" || effort == "max"
+	case "large":
+		return effort == "low"
 	case "rush", "agg-man":
 		return effort == "none"
 	case "deep":
@@ -19268,6 +19635,16 @@ func (s *neoSocket) markExecutor(executorID ...string) {
 	if len(executorID) > 0 && strings.TrimSpace(executorID[0]) != "" {
 		s.executorID = strings.TrimSpace(executorID[0])
 	}
+	s.mu.Unlock()
+}
+
+func (s *neoSocket) clearExecutor() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.executor = false
+	s.executorID = ""
 	s.mu.Unlock()
 }
 
@@ -26235,7 +26612,7 @@ var neoModelContextWindow = map[string]int{
 	"accounts/fireworks/models/qwen3-235b-a22b-instruct-2507":  230144,
 	"accounts/fireworks/models/qwen3-coder-480b-a35b-instruct": 230144,
 	"amp-nostromo-v1":                                          400000,
-	"claude-fable-5":                                           1000000,
+	"claude-fable-5":                                           332000,
 	"claude-haiku-4-5-20251001":                                200000,
 	"claude-opus-4-1-20250805":                                 200000,
 	"claude-opus-4-20250514":                                   200000,
@@ -26510,6 +26887,7 @@ func deleteNeoNonThreadSettings(settings map[string]any) {
 		"terminal.animation",
 		"terminal.copyOnSelect",
 		"terminal.detailsExpandedByDefault",
+		"thread.autoArchiveOnQuit",
 		"updates.mode",
 		"url",
 	} {

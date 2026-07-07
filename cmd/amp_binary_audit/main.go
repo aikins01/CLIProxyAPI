@@ -484,7 +484,9 @@ var knownReviewContractMarkerValues = map[string]struct{}{
 	"run-check-uri-input-shape":               {},
 }
 
-var retiredReviewContractMarkerValues = map[string]struct{}{}
+var retiredReviewContractMarkerValues = map[string]struct{}{
+	"run-check-uri-input-shape": {},
+}
 
 var threadReaderMarkers = map[string]string{
 	"getThread":             "internal-rpc",
@@ -521,7 +523,6 @@ var knownThreadReaderMarkerValues = map[string]struct{}{
 var expectedThreadReaderMarkerValues = map[string]struct{}{
 	"getThread":             {},
 	"getThreadLabels":       {},
-	"getThreadLinkInfo":     {},
 	"getThreadMeta":         {},
 	"getThreadTail":         {},
 	"listThreads":           {},
@@ -633,21 +634,21 @@ var knownPromptTagCountValues = map[string]int{
 	"prompt/painter":       2,
 	"prompt/skills":        8,
 	"prompt/system-prompt": 1,
-	"prompt/tools":         36,
+	"prompt/tools":         38,
 	"source/artifacts":     2,
 	"source/code-review":   3,
 	"source/compaction":    19,
 	"source/guidance":      26,
 	"source/painter":       5,
 	"source/settings":      21,
-	"source/skills":        38,
+	"source/skills":        40,
 	"source/system-prompt": 1,
 	"source/tools":         155,
 }
 
 var knownPromptKindCountValues = map[string]int{
-	"prompt": 55,
-	"source": 187,
+	"prompt": 56,
+	"source": 189,
 }
 
 type agentModeMarker struct {
@@ -676,23 +677,23 @@ var agentModeScopes = map[string]string{
 }
 
 var knownAgentModeProfileValues = map[string]struct{}{
-	"agg-man|primary=GPT_5_5|reasoning=none|levels=|include=present|tools=find_thread,read_thread,web_search,read_web_page,docs_list,docs_read,docs_write,create_project,list_agent_modes,create_thread,archive_thread,archive_threads,unarchive_thread,send_message_to_thread,publish_thread_artifacts,manage_automation,slack_write,slack_read,github_repo_ci_status,read_github,search_github,commit_search,list_directory_github,list_repositories,glob_github,diff|deferred=false|visible=false|visibleInV2=false|serverOnly=true": {},
-	"deep|primary=GPT_5_5|reasoning=medium|levels=low,medium,xhigh|include=present|tools=shell_command,shell_command_status,apply_patch,web_search,read_web_page,Task,skill,read_thread,find_thread,librarian,oracle,finder,view_media,painter,archive_current_thread,send_message_to_agg|deferred=true|visible=true|visibleInV2=false|serverOnly=false":                                                                                                                                                                                {},
-	"large|primary=CLAUDE_OPUS_4_8|reasoning=|levels=|include=present|tools=finder,Bash,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,skill,oracle,librarian,Task,view_media,painter,read_mcp_resource,archive_current_thread,send_message_to_agg|deferred=true|visible=false|visibleInV2=false|serverOnly=false":                                                                                                                                                                                              {},
-	"nostromo|primary=AMP_NOSTROMO|reasoning=low|levels=|include=present|tools=finder,Bash,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,skill,oracle,librarian,Task,view_media,painter,read_mcp_resource,archive_current_thread,send_message_to_agg,shell_command,shell_command_status,apply_patch|deferred=false|visible=true|visibleInV2=false|serverOnly=false":                                                                                                                                            {},
-	"review|primary=GPT_5_5|reasoning=medium|levels=|include=present|tools=shell_command,run_check,submit_review|deferred=false|visible=false|visibleInV2=false|serverOnly=false":                                                                                                                                                                                                                                                                                                                                                       {},
-	"rush|primary=GPT_5_5|reasoning=none|levels=|include=present|tools=finder,shell_command,shell_command_status,apply_patch,web_search,read_web_page,read_mcp_resource,read_thread,find_thread,skill,oracle,librarian,Task,view_media,painter,archive_current_thread,send_message_to_agg|deferred=false|visible=true|visibleInV2=false|serverOnly=false":                                                                                                                                                                               {},
-	"smart|primary=CLAUDE_OPUS_4_8|reasoning=high|levels=high,max,xhigh|include=present|tools=finder,Bash,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,skill,oracle,librarian,Task,view_media,painter,read_mcp_resource,archive_current_thread,send_message_to_agg|deferred=true|visible=true|visibleInV2=false|serverOnly=false":                                                                                                                                                                             {},
+	"agg-man|primary=|reasoning=none|levels=|include=present|tools=find_thread,read_thread,web_search,read_web_page,docs_list,docs_read,docs_write,create_project,list_agent_modes,create_thread,archive_thread,archive_threads,unarchive_thread,send_message_to_thread,publish_thread_artifacts,manage_automation,slack_write,slack_read,github_repo_ci_status,read_github,search_github,commit_search,list_directory_github,list_repositories,glob_github,diff|deferred=false|visible=false|visibleInV2=false|serverOnly=true": {},
+	"deep|primary=|reasoning=medium|levels=low,medium,xhigh|include=present|tools=shell_command,shell_command_status,apply_patch,web_search,read_web_page,Task,skill,read_thread,find_thread,librarian,oracle,finder,view_media,painter,archive_current_thread,send_message_to_agg|deferred=true|visible=true|visibleInV2=false|serverOnly=false":                                                                                                                                                                                {},
+	"large|primary=|reasoning=low|levels=|include=present|tools=finder,Bash,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,skill,oracle,librarian,Task,view_media,painter,read_mcp_resource,archive_current_thread,send_message_to_agg|deferred=true|visible=false|visibleInV2=false|serverOnly=false":                                                                                                                                                                                                   {},
+	"nostromo|primary=|reasoning=low|levels=|include=present|tools=finder,Bash,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,skill,oracle,librarian,Task,view_media,painter,read_mcp_resource,archive_current_thread,send_message_to_agg,shell_command,shell_command_status,apply_patch|deferred=false|visible=true|visibleInV2=false|serverOnly=false":                                                                                                                                                 {},
+	"review|primary=|reasoning=medium|levels=|include=present|tools=shell_command,run_check,submit_review|deferred=false|visible=false|visibleInV2=false|serverOnly=false":                                                                                                                                                                                                                                                                                                                                                       {},
+	"rush|primary=|reasoning=none|levels=|include=present|tools=finder,shell_command,shell_command_status,apply_patch,web_search,read_web_page,read_mcp_resource,read_thread,find_thread,skill,oracle,librarian,Task,view_media,painter,archive_current_thread,send_message_to_agg|deferred=false|visible=true|visibleInV2=false|serverOnly=false":                                                                                                                                                                               {},
+	"smart|primary=|reasoning=high|levels=high,max,xhigh|include=present|tools=finder,Bash,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,skill,oracle,librarian,Task,view_media,painter,read_mcp_resource,archive_current_thread,send_message_to_agg|deferred=true|visible=true|visibleInV2=false|serverOnly=false":                                                                                                                                                                                     {},
 }
 
 var knownAgentModeRouteValues = map[string]struct{}{
-	"agg-man|provider=openai|model=gpt-5.5|primary=GPT_5_5|reasoning=none|context=400000|max_out=128000":                 {},
-	"deep|provider=openai|model=gpt-5.5|primary=GPT_5_5|reasoning=medium|context=400000|max_out=128000":                  {},
-	"large|provider=anthropic|model=claude-opus-4-8|primary=CLAUDE_OPUS_4_8|reasoning=|context=332000|max_out=32000":     {},
-	"nostromo|provider=amp|model=amp-nostromo-v1|primary=AMP_NOSTROMO|reasoning=low|context=400000|max_out=128000":       {},
-	"review|provider=openai|model=gpt-5.5|primary=GPT_5_5|reasoning=medium|context=400000|max_out=128000":                {},
-	"rush|provider=openai|model=gpt-5.5|primary=GPT_5_5|reasoning=none|context=400000|max_out=128000":                    {},
-	"smart|provider=anthropic|model=claude-opus-4-8|primary=CLAUDE_OPUS_4_8|reasoning=high|context=332000|max_out=32000": {},
+	"agg-man|provider=|model=|primary=|reasoning=none|context=0|max_out=0":  {},
+	"deep|provider=|model=|primary=|reasoning=medium|context=0|max_out=0":   {},
+	"large|provider=|model=|primary=|reasoning=low|context=0|max_out=0":     {},
+	"nostromo|provider=|model=|primary=|reasoning=low|context=0|max_out=0":  {},
+	"review|provider=|model=|primary=|reasoning=medium|context=0|max_out=0": {},
+	"rush|provider=|model=|primary=|reasoning=none|context=0|max_out=0":     {},
+	"smart|provider=|model=|primary=|reasoning=high|context=0|max_out=0":    {},
 }
 
 var ignoredToolCancelReasonTokens = map[string]struct{}{
@@ -750,6 +751,7 @@ var settingScopes = map[string]string{
 	"terminal.animation":                            "remote-web",
 	"terminal.copyOnSelect":                         "remote-web",
 	"terminal.detailsExpandedByDefault":             "remote-web",
+	"thread.autoArchiveOnQuit":                      "amp-owned",
 	"toolbox.path":                                  "local-runtime",
 	"tools.disable":                                 "local-runtime",
 	"tools.enable":                                  "local-runtime",
@@ -800,6 +802,7 @@ var knownSettingDefaultValues = map[string]string{
 	"terminal.animation":                            "true",
 	"terminal.copyOnSelect":                         "true",
 	"terminal.detailsExpandedByDefault":             "false",
+	"thread.autoArchiveOnQuit":                      "false",
 	"toolbox.path":                                  "undefined",
 	"tools.disable":                                 `["browser_navigate","builtin:edit_file"]`,
 	"tools.enable":                                  "undefined",
@@ -891,7 +894,7 @@ var retiredModelNames = map[string]struct{}{
 
 var knownModelLimitValues = map[string]modelLimitExpectation{
 	"amp-nostromo-v1":                   {Enum: "AMP_NOSTROMO", Provider: "amp", DisplayName: "nostromo", ContextWindow: 400000, MaxOutputTokens: 128000},
-	"claude-fable-5":                    {Enum: "CLAUDE_FABLE_5", Provider: "anthropic", DisplayName: "Claude Fable 5", ContextWindow: 1000000, MaxOutputTokens: 128000},
+	"claude-fable-5":                    {Enum: "CLAUDE_FABLE_5", Provider: "anthropic", DisplayName: "Claude Fable 5", ContextWindow: 332000, MaxOutputTokens: 128000},
 	"claude-haiku-4-5-20251001":         {Enum: "CLAUDE_HAIKU_4_5", Provider: "anthropic", DisplayName: "Claude Haiku 4.5", ContextWindow: 200000, MaxOutputTokens: 64000},
 	"claude-opus-4-1-20250805":          {Enum: "CLAUDE_OPUS_4_1", Provider: "anthropic", DisplayName: "Claude Opus 4.1", ContextWindow: 200000, MaxOutputTokens: 32000},
 	"claude-opus-4-20250514":            {Enum: "CLAUDE_OPUS_4", Provider: "anthropic", DisplayName: "Claude Opus 4", ContextWindow: 200000, MaxOutputTokens: 32000},
@@ -7595,7 +7598,15 @@ func unknownAgentModeInternalsFromCoverage(diff auditDiff) []string {
 				if effort := pipeFieldValue(value, "reasoning"); strings.TrimSpace(effort) != "" && !knownAgentModeReasoningEffort(effort) {
 					seen["reasoning="+effort] = struct{}{}
 				}
+				opaqueServerRoute := strings.TrimSpace(provider) == "" &&
+					strings.TrimSpace(model) == "" &&
+					strings.TrimSpace(primary) == "" &&
+					pipeFieldValue(value, "context") == "0" &&
+					pipeFieldValue(value, "max_out") == "0"
 				for _, field := range []string{"context", "max_out"} {
+					if opaqueServerRoute {
+						continue
+					}
 					parsed, ok := parsePositiveIntField(pipeFieldValue(value, field))
 					if !ok || field == "context" && !knownModelLimitContext(parsed) || field == "max_out" && !knownModelLimitMaxOutput(parsed) {
 						seen[field+"="+pipeFieldValue(value, field)] = struct{}{}
@@ -7745,6 +7756,9 @@ func unknownModelsFromCoverage(diff auditDiff) []string {
 		case "agent-mode-routes":
 			for _, value := range changedDiffValues(category) {
 				model := agentModeRouteModelFromDiffValue(value)
+				if strings.TrimSpace(model) == "" {
+					continue
+				}
 				provider, family := modelProviderAndFamily(model)
 				if provider == "unknown" || family == "unknown" {
 					seen[model] = struct{}{}
