@@ -1409,7 +1409,7 @@ assert(localItems.length === 4, "expected four local project items, got " + loca
 const selected = localItems.find((item) => item.getAttribute("aria-selected") === "true" || item.dataset.selected === "true");
 assert(selected, "no injected local project item was selected");
 assert(selected.dataset.cliproxyLocalProjectWorkingDirectory === "/Users/aikins01/Developer/telemetry.dev", "visible project was not selected: " + selected.innerText);
-assert(selected.innerText.includes("Current"), "visible project item was not marked Current");
+	assert(selected.dataset.cliproxyLocalProjectCurrent === "1", "visible project item was not marked current");
 assert(popupProjectButton.textContent.includes("Project: telemetry.dev"), "popup project button stayed stale: " + popupProjectButton.textContent);
 popupProjectButton.textContent = "Project: on-chain";
 delete popupProjectButton.dataset.cliproxyLocalProjectActivator;
@@ -1524,7 +1524,8 @@ assert(explicitDuplicateURL.searchParams.get("cliproxy-working-directory") === t
 	await new Promise((resolve) => setTimeout(resolve, 25));
 	const collisionItems = list.querySelectorAll("[data-cliproxy-local-project-item]");
 	const selectedCollision = collisionItems.find((item) => item.getAttribute("aria-selected") === "true" || item.dataset.selected === "true");
-	assert(selectedCollision, "no collision local project item was selected");
+	const collisionSummary = collisionItems.map((item) => item.dataset.cliproxyLocalProjectWorkingDirectory + ":" + item.dataset.selected + ":" + item.getAttribute("aria-selected") + ":" + item.dataset.cliproxyLocalProjectCurrent).join("|");
+	assert(selectedCollision, "no collision local project item was selected: " + collisionSummary);
 	assert(selectedCollision.dataset.cliproxyLocalProjectWorkingDirectory === "/Users/aikins01/Developer/bar/api", "basename collision selected wrong local project: " + selectedCollision.innerText);
 	})().catch((error) => {
 	console.error(error && error.stack ? error.stack : error);
@@ -2587,8 +2588,8 @@ func TestNeoDecodeSvelteKitCreateProjectThreadPayloadCaptured(t *testing.T) {
 	}
 }
 
-func TestNeoWebLocalRemoteEndpointOnlyAllowsCommandRoutes(t *testing.T) {
-	for _, path := range []string{"/_app/remote/3abror/createProjectThread", "/_app/remote/3abror/prewarmProjectThread"} {
+func TestNeoWebLocalRemoteEndpointOnlyAllowsLocalWebRoutes(t *testing.T) {
+	for _, path := range []string{"/_app/remote/3abror/createProjectThread", "/_app/remote/3abror/listUserExecutorRunners", "/_app/remote/3abror/prewarmProjectThread"} {
 		if _, _, ok := neoWebLocalRemoteEndpoint(path); !ok {
 			t.Fatalf("remote endpoint %s was not accepted", path)
 		}
@@ -2905,6 +2906,86 @@ func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.
 		t.Fatalf("project-only executor bootstrap = type:%q spawned:%d", projectOnlyBootstrapExecutorType, projectOnlySpawnedCount)
 	}
 
+	runnerThreadID := "T-019f20b2-5e05-7501-8ddd-994e151ee955"
+	runnerBody := neoSvelteKitRemoteCommandBodyForTest(t, map[string]any{
+		"content":         []any{map[string]any{"type": "text", "text": "Use selected runner"}},
+		"agentMode":       "smart",
+		"threadID":        runnerThreadID,
+		"projectID":       projectID,
+		"reasoningEffort": "high",
+		"runnerId":        "cliproxy-local-test",
+	})
+	runnerReq := httptest.NewRequest(http.MethodPost, "/_app/remote/3abror/createProjectThread?"+ampWebLocalInferenceAPIKeyQuery+"=local-key", strings.NewReader(runnerBody))
+	runnerReq.Header.Set("Content-Type", "application/json")
+	runnerReq.Header.Set("Origin", "https://ampcode.com")
+	runnerReq.Header.Set(ampWebLocalInferenceHeader, "1")
+	runnerRec := httptest.NewRecorder()
+	r.ServeHTTP(runnerRec, runnerReq)
+	if runnerRec.Code != http.StatusOK {
+		t.Fatalf("runner create status = %d, body=%s", runnerRec.Code, runnerRec.Body.String())
+	}
+	runnerEnvelope := decodeSvelteKitRemoteEnvelopeForTest(t, runnerRec.Body.Bytes())
+	runnerResult := mapValue(runnerEnvelope["_"])
+	if runnerResult["ok"] != true || stringValue(runnerResult["threadID"]) != runnerThreadID {
+		t.Fatalf("runner create result = %#v", runnerResult)
+	}
+	runnerActor := rt.store.lookupThreadActor(runnerThreadID)
+	if runnerActor == nil {
+		t.Fatal("runner thread actor not found")
+	}
+	runnerActor.mu.Lock()
+	runnerMeta := cloneMap(runnerActor.meta)
+	runnerBootstrapExecutorType := runnerActor.bootstrapExecutorType
+	runnerSpawnedCount := len(runnerActor.spawnedExecutors)
+	runnerActor.mu.Unlock()
+	if stringValue(runnerMeta["runnerId"]) != "cliproxy-local-test" {
+		t.Fatalf("runner meta = %#v", runnerMeta)
+	}
+	if runnerBootstrapExecutorType != "local-client" || runnerSpawnedCount != 1 {
+		t.Fatalf("runner executor bootstrap = type:%q spawned:%d", runnerBootstrapExecutorType, runnerSpawnedCount)
+	}
+
+	runnerOptOutThreadID := "T-019f20b2-5e05-7501-8ddd-994e151ee956"
+	runnerOptOutBody := neoSvelteKitRemoteCommandBodyForTest(t, map[string]any{
+		"content":       []any{map[string]any{"type": "text", "text": "Use selected runner without spawning"}},
+		"agentMode":     "smart",
+		"spawnExecutor": false,
+		"threadID":      runnerOptOutThreadID,
+		"runnerId":      "cliproxy-local-optout",
+	})
+	runnerOptOutReq := httptest.NewRequest(http.MethodPost, "/_app/remote/3abror/createProjectThread?"+ampWebLocalInferenceAPIKeyQuery+"=local-key", strings.NewReader(runnerOptOutBody))
+	runnerOptOutReq.Header.Set("Content-Type", "application/json")
+	runnerOptOutReq.Header.Set("Origin", "https://ampcode.com")
+	runnerOptOutReq.Header.Set(ampWebLocalInferenceHeader, "1")
+	runnerOptOutRec := httptest.NewRecorder()
+	r.ServeHTTP(runnerOptOutRec, runnerOptOutReq)
+	if runnerOptOutRec.Code != http.StatusOK {
+		t.Fatalf("runner opt-out create status = %d, body=%s", runnerOptOutRec.Code, runnerOptOutRec.Body.String())
+	}
+	runnerOptOutEnvelope := decodeSvelteKitRemoteEnvelopeForTest(t, runnerOptOutRec.Body.Bytes())
+	runnerOptOutResult := mapValue(runnerOptOutEnvelope["_"])
+	if runnerOptOutResult["ok"] != true || stringValue(runnerOptOutResult["threadID"]) != runnerOptOutThreadID {
+		t.Fatalf("runner opt-out create result = %#v", runnerOptOutResult)
+	}
+	if runnerOptOutResult["usesThreadActors"] != false || runnerOptOutResult["usesDtw"] != false || stringValue(runnerOptOutResult["executorType"]) != "" {
+		t.Fatalf("runner opt-out local actor response = %#v", runnerOptOutResult)
+	}
+	runnerOptOutActor := rt.store.lookupThreadActor(runnerOptOutThreadID)
+	if runnerOptOutActor == nil {
+		t.Fatal("runner opt-out thread actor not found")
+	}
+	runnerOptOutActor.mu.Lock()
+	runnerOptOutMeta := cloneMap(runnerOptOutActor.meta)
+	runnerOptOutBootstrapExecutorType := runnerOptOutActor.bootstrapExecutorType
+	runnerOptOutSpawnedCount := len(runnerOptOutActor.spawnedExecutors)
+	runnerOptOutActor.mu.Unlock()
+	if stringValue(runnerOptOutMeta["runnerId"]) != "cliproxy-local-optout" {
+		t.Fatalf("runner opt-out meta = %#v", runnerOptOutMeta)
+	}
+	if runnerOptOutBootstrapExecutorType != "" || runnerOptOutSpawnedCount != 0 {
+		t.Fatalf("runner opt-out executor bootstrap = type:%q spawned:%d", runnerOptOutBootstrapExecutorType, runnerOptOutSpawnedCount)
+	}
+
 	explicitFalseThreadID := "T-019f20b2-5e05-7501-8ddd-994e151ee954"
 	explicitFalseBody := neoSvelteKitRemoteCommandBodyForTest(t, map[string]any{
 		"content":         []any{map[string]any{"type": "text", "text": "Create without spawning"}},
@@ -2974,6 +3055,56 @@ func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.
 	}
 	if actor := rt.store.lookupThreadActor(missingDirectoryThreadID); actor != nil {
 		t.Fatal("missing-directory thread actor was created")
+	}
+}
+
+func TestWebLocalInferenceListUserExecutorRunnersCreatesQueryResult(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+		NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled},
+	}})
+	m := &AmpModule{
+		restrictToLocalhost: false,
+		neoRuntime:          rt,
+		lastConfig: &config.AmpCode{
+			WebLocalInference: config.AmpWebLocalInference{Enabled: true},
+		},
+	}
+	auth := func(c *gin.Context) {
+		token := strings.TrimSpace(c.GetHeader("Authorization"))
+		token = strings.TrimSpace(strings.TrimPrefix(token, "Bearer "))
+		if token != "local-key" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing auth"})
+			return
+		}
+		c.Set("userApiKey", token)
+		c.Next()
+	}
+	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, auth)
+
+	req := httptest.NewRequest(http.MethodGet, "/_app/remote/3abror/listUserExecutorRunners?"+ampWebLocalInferenceAPIKeyQuery+"=local-key", nil)
+	req.Header.Set("Origin", "https://ampcode.com")
+	req.Header.Set(ampWebLocalInferenceHeader, "1")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("runner query status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	envelope := decodeSvelteKitRemoteEnvelopeForTest(t, rec.Body.Bytes())
+	queryResults := mapValue(envelope["q"])
+	node := mapValue(queryResults["3abror/listUserExecutorRunners/"])
+	runners := arrayValue(node["v"])
+	if len(runners) != 1 {
+		t.Fatalf("runner query = %#v", envelope)
+	}
+	runner := mapValue(runners[0])
+	if stringValue(runner["runnerId"]) == "" || stringValue(runner["hostname"]) == "" {
+		t.Fatalf("runner identity = %#v", runner)
+	}
+	if got, want := stringValue(runner["workingDirectory"]), neoDefaultWebLocalWorkingDirectory(); got != want {
+		t.Fatalf("runner workingDirectory = %q, want %q", got, want)
 	}
 }
 

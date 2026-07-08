@@ -636,9 +636,10 @@ func threadMessagesByID(messages []any) map[string]map[string]any {
 }
 
 type pendingThreadToolUse struct {
-	messageID string
-	toolID    string
-	toolName  string
+	messageID    string
+	parentToolID string
+	toolID       string
+	toolName     string
 }
 
 func scanThreadDanglingToolUseDrift(file, threadID string, messages []any, since time.Time) []driftFinding {
@@ -681,9 +682,10 @@ func scanThreadDanglingToolUseDrift(file, threadID string, messages []any, since
 				continue
 			}
 			pending[toolID] = pendingThreadToolUse{
-				messageID: firstNonEmptyString(message["messageId"], message["messageID"], message["id"]),
-				toolID:    toolID,
-				toolName:  stringValue(block["name"]),
+				messageID:    firstNonEmptyString(message["messageId"], message["messageID"], message["id"]),
+				parentToolID: parentToolID,
+				toolID:       toolID,
+				toolName:     stringValue(block["name"]),
 			}
 		}
 	}
@@ -696,6 +698,9 @@ func appendDanglingToolUseFindings(findings []driftFinding, file, threadID strin
 	}
 	for _, item := range pending {
 		if activeParentToolID != "" && item.toolID == activeParentToolID {
+			continue
+		}
+		if activeParentToolID != "" && item.parentToolID != activeParentToolID {
 			continue
 		}
 		findings = append(findings, driftFinding{
@@ -715,11 +720,17 @@ func pendingAfterDanglingBoundary(pending map[string]pendingThreadToolUse, activ
 	if activeParentToolID == "" {
 		return map[string]pendingThreadToolUse{}
 	}
-	item, ok := pending[activeParentToolID]
-	if !ok {
-		return map[string]pendingThreadToolUse{}
+	out := map[string]pendingThreadToolUse{}
+	for toolID, item := range pending {
+		if activeParentToolID != "" && item.toolID == activeParentToolID {
+			out[toolID] = item
+			continue
+		}
+		if item.parentToolID != activeParentToolID {
+			out[toolID] = item
+		}
 	}
-	return map[string]pendingThreadToolUse{activeParentToolID: item}
+	return out
 }
 
 func threadMessageParentToolUseID(message map[string]any) string {

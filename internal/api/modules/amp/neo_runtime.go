@@ -127,13 +127,13 @@ var (
 	neoInboundMessageHook         func(actor *neoActor, msg map[string]any)
 	errNeoLocalEmptyStream        = errors.New("local provider stream closed before first payload")
 	neoModeToolOrder              = map[string][]string{
-		"smart":    toolList("finder", "Bash", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "archive_current_thread", "send_message_to_agg"),
-		"large":    toolList("finder", "Bash", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "archive_current_thread", "send_message_to_agg"),
+		"smart":    toolList("finder", "shell_command", "shell_command_status", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "archive_current_thread", "send_message_to_agg"),
+		"large":    toolList("finder", "shell_command", "shell_command_status", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "archive_current_thread", "send_message_to_agg"),
 		"rush":     toolList("finder", "shell_command", "shell_command_status", "apply_patch", "web_search", "read_web_page", "read_mcp_resource", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "painter", "archive_current_thread", "send_message_to_agg"),
 		"agg-man":  toolList("find_thread", "read_thread", "web_search", "read_web_page", "docs_list", "docs_read", "docs_write", "create_project", "list_agent_modes", "create_thread", "archive_thread", "archive_threads", "unarchive_thread", "send_message_to_thread", "publish_thread_artifacts", "manage_automation", "slack_write", "slack_read", "github_repo_ci_status", "read_github", "search_github", "commit_search", "list_directory_github", "list_repositories", "glob_github", "diff"),
 		"deep":     toolList("shell_command", "shell_command_status", "apply_patch", "web_search", "read_web_page", "Task", "skill", "read_thread", "find_thread", "librarian", "oracle", "finder", "view_media", "painter", "archive_current_thread", "send_message_to_agg"),
 		"review":   toolList("shell_command", "run_check", "submit_review"),
-		"nostromo": toolList("finder", "Bash", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "archive_current_thread", "send_message_to_agg", "shell_command", "shell_command_status", "apply_patch"),
+		"nostromo": toolList("finder", "shell_command", "shell_command_status", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "archive_current_thread", "send_message_to_agg", "apply_patch"),
 	}
 	neoModeToolAllowlist         = orderedToolSets(neoModeToolOrder)
 	neoModeDeferredToolAllowlist = map[string]map[string]bool{
@@ -142,7 +142,7 @@ var (
 		"deep":  toolSet("gmail_read", "gmail_write"),
 	}
 	neoKnownModeTools = toolSet(
-		"finder", "Bash", "create_file", "edit_file",
+		"finder", "create_file", "edit_file",
 		"web_search", "read_web_page", "read_mcp_resource", "read_thread", "find_thread", "skill", "oracle",
 		"librarian", "Task", "view_media", "painter",
 		"gmail_read", "gmail_write",
@@ -12210,7 +12210,7 @@ func (m *AmpModule) tryServeNeoWebLocalRemote(c *gin.Context) bool {
 	if !m.canServeNeoWebLocalRemote(c) {
 		return false
 	}
-	endpoint, _, ok := neoWebLocalRemoteEndpoint(c.Request.URL.Path)
+	endpoint, remoteID, ok := neoWebLocalRemoteEndpoint(c.Request.URL.Path)
 	if !ok {
 		return false
 	}
@@ -12227,6 +12227,13 @@ func (m *AmpModule) tryServeNeoWebLocalRemote(c *gin.Context) bool {
 		}
 		result := m.neoRuntime.neoWebLocalCreateProjectThread(c.Request.Context(), c.Request.URL.Query(), request, neoWebLocalRequestBaseURL(c.Request))
 		writeNeoSvelteKitRemoteCommand(c.Writer, http.StatusOK, result)
+		return true
+	case "listUserExecutorRunners":
+		if c.Request.Method != http.MethodGet {
+			writeNeoSvelteKitRemoteQuery(c.Writer, http.StatusOK, remoteID, c.Request.URL.Query().Get("payload"), nil, http.StatusMethodNotAllowed, "method not allowed")
+			return true
+		}
+		writeNeoSvelteKitRemoteQuery(c.Writer, http.StatusOK, remoteID, c.Request.URL.Query().Get("payload"), m.neoRuntime.neoWebLocalUserExecutorRunners(), 0, "")
 		return true
 	case "prewarmProjectThread":
 		if c.Request.Method != http.MethodPost {
@@ -12264,7 +12271,7 @@ func neoWebLocalRemoteEndpoint(path string) (string, string, bool) {
 		return "", "", false
 	}
 	switch endpoint {
-	case "createProjectThread", "prewarmProjectThread":
+	case "createProjectThread", "listUserExecutorRunners", "prewarmProjectThread":
 		return endpoint, remoteID, true
 	default:
 		return "", "", false
@@ -12387,6 +12394,18 @@ func neoSvelteKitDevalueRef(raw any) (int, bool) {
 
 func writeNeoSvelteKitRemoteCommand(w http.ResponseWriter, status int, result map[string]any) {
 	writeNeoSvelteKitRemoteResult(w, status, map[string]any{"_": result})
+}
+
+func writeNeoSvelteKitRemoteQuery(w http.ResponseWriter, status int, remoteID, payload string, value any, errorStatus int, errorMessage string) {
+	key := strings.TrimSpace(remoteID) + "/" + strings.TrimSpace(payload)
+	node := map[string]any{"v": value}
+	if errorStatus > 0 {
+		if errorMessage == "" {
+			errorMessage = http.StatusText(errorStatus)
+		}
+		node = map[string]any{"e": []any{errorStatus, errorMessage}}
+	}
+	writeNeoSvelteKitRemoteResult(w, status, map[string]any{"q": map[string]any{key: node}})
 }
 
 func writeNeoSvelteKitRemoteResult(w http.ResponseWriter, status int, value any) {
@@ -12715,7 +12734,11 @@ func (rt *neoRuntime) neoWebLocalCreateProjectThread(ctx context.Context, query 
 	prompt := strings.TrimSpace(neoWebLocalProjectThreadContentText(request["content"]))
 	workingDirectory := rt.neoWebLocalResolveWorkingDirectory(query, request, prompt, projectID)
 	spawnExecutorValue, spawnExecutorProvided := request["spawnExecutor"]
-	spawnLocalExecutor := boolValue(spawnExecutorValue) || (!spawnExecutorProvided && workingDirectory != "")
+	runnerID := strings.TrimSpace(firstNonEmptyString(request["runnerId"], request["runnerID"], request["runner_id"]))
+	spawnLocalExecutor := boolValue(spawnExecutorValue)
+	if !spawnExecutorProvided {
+		spawnLocalExecutor = runnerID != "" || workingDirectory != ""
+	}
 	if spawnLocalExecutor && workingDirectory == "" {
 		return neoWebLocalRemoteCommandError("working directory is required for local executor bootstrap")
 	}
@@ -12737,6 +12760,7 @@ func (rt *neoRuntime) neoWebLocalCreateProjectThread(ctx context.Context, query 
 		"agentMode":                omitEmpty(agentMode),
 		"reasoningEffort":          omitEmpty(reasoningEffort),
 		"projectID":                omitEmpty(projectID),
+		"runnerId":                 omitEmpty(runnerID),
 	}
 	if spawnLocalExecutor {
 		threadMeta["executorType"] = "local-client"
@@ -12813,6 +12837,27 @@ func (rt *neoRuntime) neoWebLocalCreateProjectThread(ctx context.Context, query 
 		}
 	}
 	return result
+}
+
+func (rt *neoRuntime) neoWebLocalUserExecutorRunners() []any {
+	workingDirectory := neoDefaultWebLocalWorkingDirectory()
+	runnerID := "cliproxy-local"
+	if workingDirectory != "" {
+		runnerID = "cliproxy-local-" + neoDeterministicLocalProjectID(workingDirectory)[:8]
+	}
+	hostname, _ := os.Hostname()
+	hostname = strings.TrimSpace(hostname)
+	if hostname == "" {
+		hostname = "Local Machine"
+	}
+	runner := map[string]any{
+		"runnerId":         runnerID,
+		"hostname":         hostname,
+		"workingDirectory": workingDirectory,
+		"runningThreads":   []any{},
+		"source":           "cliproxyapi",
+	}
+	return []any{runner}
 }
 
 func neoWebLocalPlainThreadActorConfig(threadID, wsToken, localBaseURL string) map[string]any {
@@ -20800,7 +20845,7 @@ func providerForNeoModel(model string) string {
 		return "openrouter"
 	case model == "zai-glm-4.7" || model == "moonshotai-kimi-k2.6":
 		return "cerebras"
-	case strings.HasPrefix(model, "accounts/fireworks/models/") || strings.HasPrefix(model, "accounts/amp/deployments/"):
+	case strings.HasPrefix(model, "accounts/fireworks/models/") || strings.HasPrefix(model, "accounts/fireworks/routers/") || strings.HasPrefix(model, "accounts/amp/deployments/"):
 		return "fireworks"
 	case model == "moonshotai/Kimi-K2.5" || model == "zai-org/GLM-5.2":
 		return "baseten"
@@ -20808,7 +20853,7 @@ func providerForNeoModel(model string) string {
 		return "moonshotai"
 	case strings.HasPrefix(model, "grok-"):
 		return "xai"
-	case model == "amp-nostromo-v1":
+	case model == "amp-nostromo-v1" || strings.HasPrefix(model, "glm-"):
 		return "amp"
 	case strings.HasPrefix(model, "gpt-") || strings.HasPrefix(model, "openai/") || strings.HasPrefix(model, "o3-") || strings.Contains(model, "codex"):
 		return "openai"
@@ -26607,6 +26652,7 @@ var neoModelContextWindow = map[string]int{
 	"accounts/fireworks/models/glm-4p6":                        162752,
 	"accounts/fireworks/models/glm-5":                          202800,
 	"accounts/fireworks/models/glm-5p2":                        200000,
+	"accounts/fireworks/routers/glm-5p2-fast":                  200000,
 	"accounts/fireworks/models/kimi-k2-instruct-0905":          230144,
 	"accounts/fireworks/models/minimax-m2p5":                   200000,
 	"accounts/fireworks/models/qwen3-235b-a22b-instruct-2507":  230144,
@@ -26643,6 +26689,7 @@ var neoModelContextWindow = map[string]int{
 	"gpt-5.6-luna":                                             400000,
 	"gpt-5.6-sol":                                              400000,
 	"gpt-5.6-terra":                                            400000,
+	"glm-5.2":                                                  200000,
 	"grok-build-0.1":                                           256000,
 	"grok-code-fast-1":                                         256000,
 	"kimi-k2-instruct-0905":                                    1000000,
@@ -26666,6 +26713,7 @@ var neoModelMaxOutputTokens = map[string]int{
 	"accounts/fireworks/models/glm-4p6":                        40000,
 	"accounts/fireworks/models/glm-5":                          40000,
 	"accounts/fireworks/models/glm-5p2":                        32000,
+	"accounts/fireworks/routers/glm-5p2-fast":                  32000,
 	"accounts/fireworks/models/kimi-k2-instruct-0905":          32000,
 	"accounts/fireworks/models/minimax-m2p5":                   32000,
 	"accounts/fireworks/models/qwen3-235b-a22b-instruct-2507":  32000,
@@ -26702,6 +26750,7 @@ var neoModelMaxOutputTokens = map[string]int{
 	"gpt-5.6-luna":                                             128000,
 	"gpt-5.6-sol":                                              128000,
 	"gpt-5.6-terra":                                            128000,
+	"glm-5.2":                                                  32000,
 	"grok-build-0.1":                                           32000,
 	"grok-code-fast-1":                                         32000,
 	"kimi-k2-instruct-0905":                                    32000,
@@ -26882,6 +26931,7 @@ func deleteNeoNonThreadSettings(settings map[string]any) {
 		"notifications.enabled",
 		"notifications.system.enabled",
 		"proxy",
+		"remoteThreadCreation.enabled",
 		"showCosts",
 		"submitOnEnter",
 		"terminal.animation",

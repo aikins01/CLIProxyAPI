@@ -1812,6 +1812,11 @@ func TestNeoRuntimePostResponseCompactionExcludesTriggeringAssistantMessage(t *t
 }
 
 func TestNeoRuntimePostResponseCompactionDoesNotRepeatAfterRestart(t *testing.T) {
+	dir := t.TempDir()
+	oldStoreDir := neoAmpDataDir
+	neoAmpDataDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpDataDir = oldStoreDir })
+
 	calls := 0
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
@@ -1926,6 +1931,11 @@ func TestNeoRuntimeImportRestoresCurrentInferenceAsPendingAfterRestart(t *testin
 }
 
 func TestNeoRuntimePostResponseCompactionCanReplaceShortHistory(t *testing.T) {
+	dir := t.TempDir()
+	oldStoreDir := neoAmpDataDir
+	neoAmpDataDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpDataDir = oldStoreDir })
+
 	calls := 0
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
@@ -13569,6 +13579,7 @@ func TestProviderForNeoModelMatchesBinaryProviderTable(t *testing.T) {
 		{model: "accounts/amp/deployments/wkk976k4", want: "fireworks"},
 		{model: "accounts/fireworks/models/glm-5", want: "fireworks"},
 		{model: "accounts/fireworks/models/glm-5p2", want: "fireworks"},
+		{model: "accounts/fireworks/routers/glm-5p2-fast", want: "fireworks"},
 		{model: "moonshotai/Kimi-K2.5", want: "baseten"},
 		{model: "zai-org/GLM-5.2", want: "baseten"},
 		{model: "kimi-k2-instruct-0905", want: "moonshotai"},
@@ -13576,6 +13587,7 @@ func TestProviderForNeoModelMatchesBinaryProviderTable(t *testing.T) {
 		{model: "z-ai/glm-4.6", want: "openrouter"},
 		{model: "moonshotai/kimi-k2-0905", want: "openrouter"},
 		{model: "qwen/qwen3-coder", want: "openrouter"},
+		{model: "glm-5.2", want: "amp"},
 		{model: "claude-opus-4-7", want: "anthropic"},
 		{model: "claude-opus-4-8", want: "anthropic"},
 	} {
@@ -13597,8 +13609,10 @@ func TestParseNeoModelRoutePreservesBinarySlashModelNames(t *testing.T) {
 		{raw: "accounts/amp/deployments/wkk976k4", provider: "fireworks", model: "accounts/amp/deployments/wkk976k4"},
 		{raw: "accounts/fireworks/models/glm-5", provider: "fireworks", model: "accounts/fireworks/models/glm-5"},
 		{raw: "accounts/fireworks/models/glm-5p2", provider: "fireworks", model: "accounts/fireworks/models/glm-5p2"},
+		{raw: "accounts/fireworks/routers/glm-5p2-fast", provider: "fireworks", model: "accounts/fireworks/routers/glm-5p2-fast"},
 		{raw: "moonshotai/Kimi-K2.5", provider: "baseten", model: "moonshotai/Kimi-K2.5"},
 		{raw: "zai-org/GLM-5.2", provider: "baseten", model: "zai-org/GLM-5.2"},
+		{raw: "glm-5.2", provider: "amp", model: "glm-5.2"},
 		{raw: "z-ai/glm-4.6", provider: "openrouter", model: "z-ai/glm-4.6"},
 		{raw: "qwen/qwen3-coder", provider: "openrouter", model: "qwen/qwen3-coder"},
 		{raw: "openai:gpt-5.5", provider: "openai", model: "gpt-5.5"},
@@ -16201,7 +16215,9 @@ func TestNeoActorFiltersAmpBuiltInToolsByMode(t *testing.T) {
 		"handoff":                  {Name: "handoff"},
 		"painter":                  {Name: "painter"},
 		"shell_command":            {Name: "shell_command"},
+		"shell_command_status":     {Name: "shell_command_status"},
 		"apply_patch":              {Name: "apply_patch"},
+		"archive_current_thread":   {Name: "archive_current_thread"},
 		"send_message_to_agg":      {Name: "send_message_to_agg"},
 		"send_message_to_aggman":   {Name: "send_message_to_aggman"},
 		"search_documents":         {Name: "search_documents"},
@@ -16244,8 +16260,8 @@ func TestNeoActorFiltersAmpBuiltInToolsByMode(t *testing.T) {
 
 	smartNames := requestNames("smart")
 	assertMode("smart", smartNames,
-		[]string{"Bash", "create_file", "edit_file", "Task", "view_media", "send_message_to_agg", "tb__gemini-oracle"},
-		[]string{"Grep", "glob", "Glob", "delete_file", "get_diagnostics", "advisor", "shell_command", "apply_patch", "chart", "look_at", "handoff", "task_list", "todo_write", "file_tree", "code_review", "deferred_custom", "search_documents", "get_document", "docs_read"})
+		[]string{"shell_command", "shell_command_status", "create_file", "edit_file", "Task", "view_media", "send_message_to_agg", "tb__gemini-oracle"},
+		[]string{"Grep", "glob", "Glob", "Bash", "delete_file", "get_diagnostics", "advisor", "apply_patch", "chart", "look_at", "handoff", "task_list", "todo_write", "file_tree", "code_review", "deferred_custom", "search_documents", "get_document", "docs_read"})
 
 	smartPromptNames := map[string]bool{}
 	for _, name := range actor.toolNamesLocked("smart") {
@@ -16262,13 +16278,13 @@ func TestNeoActorFiltersAmpBuiltInToolsByMode(t *testing.T) {
 
 	largeNames := requestNames("large")
 	assertMode("large", largeNames,
-		[]string{"Bash", "create_file", "edit_file", "Task", "view_media", "send_message_to_agg", "tb__gemini-oracle"},
-		[]string{"Grep", "glob", "Glob", "get_diagnostics", "advisor", "shell_command", "apply_patch", "chart", "look_at", "handoff", "task_list", "todo_write", "file_tree", "code_review", "deferred_custom", "docs_read"})
+		[]string{"shell_command", "shell_command_status", "create_file", "edit_file", "Task", "view_media", "send_message_to_agg", "tb__gemini-oracle"},
+		[]string{"Grep", "glob", "Glob", "Bash", "get_diagnostics", "advisor", "apply_patch", "chart", "look_at", "handoff", "task_list", "todo_write", "file_tree", "code_review", "deferred_custom", "docs_read"})
 
 	unknownModeNames := requestNames("frontier")
 	assertMode("unknown mode", unknownModeNames,
-		[]string{"Bash", "create_file", "edit_file", "Task", "view_media", "send_message_to_agg", "tb__gemini-oracle"},
-		[]string{"advisor", "shell_command", "apply_patch", "chart", "handoff", "code_review", "deferred_custom"})
+		[]string{"shell_command", "shell_command_status", "create_file", "edit_file", "Task", "view_media", "send_message_to_agg", "tb__gemini-oracle"},
+		[]string{"Bash", "advisor", "apply_patch", "chart", "handoff", "code_review", "deferred_custom"})
 
 	aggNames := requestNames("agg-man")
 	assertMode("agg-man", aggNames,
@@ -16277,7 +16293,7 @@ func TestNeoActorFiltersAmpBuiltInToolsByMode(t *testing.T) {
 
 	nostromoNames := requestNames("nostromo")
 	assertMode("nostromo", nostromoNames,
-		[]string{"Bash", "create_file", "edit_file", "Task", "shell_command", "apply_patch", "view_media", "send_message_to_agg", "tb__gemini-oracle"},
+		[]string{"shell_command", "shell_command_status", "create_file", "edit_file", "Task", "apply_patch", "view_media", "send_message_to_agg", "tb__gemini-oracle"},
 		[]string{"Grep", "glob", "Glob", "get_diagnostics", "advisor", "chart", "look_at", "handoff", "task_list", "todo_write", "file_tree", "code_review", "deferred_custom", "docs_read"})
 }
 
@@ -16285,7 +16301,7 @@ func TestNeoActorToolsForModeFollowBinaryModeOrder(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
 	binaryNostromoOrder := []string{
-		"finder", "Bash", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "send_message_to_agg", "shell_command", "apply_patch",
+		"finder", "shell_command", "shell_command_status", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "archive_current_thread", "send_message_to_agg", "apply_patch",
 	}
 	rawTools := []any{map[string]any{"name": "external_tool", "source": map[string]any{"plugin": "test"}}}
 	for i := len(binaryNostromoOrder) - 1; i >= 0; i-- {

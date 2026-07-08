@@ -1400,6 +1400,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		}
 		switch (parts[1]) {
 		case "createProjectThread":
+		case "listUserExecutorRunners":
 		case "prewarmProjectThread":
 			return parts[1];
 		default:
@@ -1409,11 +1410,12 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 
 	function svelteKitRemotePath(path) {
 		const endpoint = svelteKitRemoteEndpoint(path);
-		return endpoint === "createProjectThread" || endpoint === "prewarmProjectThread";
+		return endpoint === "createProjectThread" || endpoint === "listUserExecutorRunners" || endpoint === "prewarmProjectThread";
 	}
 
 	function svelteKitRemoteCommandPath(path) {
-		return svelteKitRemotePath(path);
+		const endpoint = svelteKitRemoteEndpoint(path);
+		return endpoint === "createProjectThread" || endpoint === "prewarmProjectThread";
 	}
 
 	function createProjectThreadRemotePath(path) {
@@ -2313,6 +2315,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			element.remove();
 			removed += 1;
 		});
+		localProjectsCache = { at: 0, projects: [], promise: null };
 		for (const key of ["__cliproxyAmpLocalInferenceMenuObserver", "__cliproxyAmpLocalInferenceCommandPaletteObserver", "__cliproxyAmpLocalInferenceProjectPickerObserver"]) {
 			const observer = globalThis[key];
 			if (observer && typeof observer.disconnect === "function") {
@@ -2593,7 +2596,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 				}
 				delete list.dataset.cliproxyLocalProjectAttempts;
 				injectLocalProjectPickerItems(picker, list, displayProjects);
-				autoSelectCurrentProjectInPicker(picker, list);
+				autoSelectCurrentProjectInPicker(picker, list, true);
 			});
 		}
 	}
@@ -2628,19 +2631,27 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 
 	function buildLocalProjectPickerItem(picker, project, currentDirectory = currentLocalProjectWorkingDirectory()) {
 		const template = localProjectPickerTemplateItem(picker);
-		const item = globalThis.document.createElement("button");
+		const item = template && typeof template.cloneNode === "function" ? template.cloneNode(false) : globalThis.document.createElement("button");
 		const isCurrent = normalizeWorkingDirectory(project.workingDirectory) === normalizeWorkingDirectory(currentDirectory);
 		const label = firstString(project.name, pathBaseName(project.workingDirectory), "local");
-		item.type = "button";
+		if ("type" in item) {
+			item.type = "button";
+		}
+		item.removeAttribute("id");
 		item.dataset.cliproxyLocalProjectItem = "1";
+		item.dataset.cliproxyLocalProjectLabel = label;
 		item.dataset.cliproxyLocalProjectWorkingDirectory = normalizeWorkingDirectory(project.workingDirectory);
+		item.dataset.cliproxyLocalProjectCurrent = isCurrent ? "1" : "0";
 		item.setAttribute("data-value", label);
 		item.setAttribute("aria-label", label);
 		item.setAttribute("role", "option");
 		item.setAttribute("aria-selected", "false");
 		item.setAttribute("aria-disabled", "false");
+		item.setAttribute("data-disabled", "false");
+		item.removeAttribute("disabled");
 		item.dataset.selected = "false";
 		item.className = template?.className || "group flex w-full gap-3 rounded-xl px-3.5 py-2.5 text-left hover:bg-black/5 data-[selected=true]:bg-black/6 dark:hover:bg-white/8 dark:data-[selected=true]:bg-white/10 items-center";
+		applyLocalProjectPickerItemFrame(item);
 		fillLocalProjectPickerItem(item, label, project.workingDirectory, isCurrent);
 		const activate = (event) => {
 			activateLocalProjectPickerItem(picker, item, event);
@@ -2655,32 +2666,54 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		return item;
 	}
 
+	function applyLocalProjectPickerItemFrame(item) {
+		item.style.display = "flex";
+		item.style.alignItems = "center";
+		item.style.justifyContent = "space-between";
+		item.style.gap = "12px";
+		item.style.width = "100%%";
+		item.style.minHeight = "34px";
+		item.style.border = "0";
+		item.style.font = "inherit";
+		item.style.textAlign = "left";
+	}
+
 	function fillLocalProjectPickerItem(item, labelText, workingDirectory, isCurrent) {
 		item.replaceChildren();
 		const left = globalThis.document.createElement("div");
 		left.className = "min-w-0 flex-1";
+		left.style.cssText = "min-width:0;flex:1 1 auto;display:flex;align-items:center";
 		const title = globalThis.document.createElement("div");
 		title.className = "flex min-w-0 gap-1.5 text-sm leading-tight pointer-coarse:text-[15px] pointer-coarse:leading-snug font-medium items-baseline";
+		title.style.cssText = "min-width:0;font-size:14px;line-height:1.2;font-weight:600";
 		const label = globalThis.document.createElement("span");
 		label.textContent = labelText;
 		label.className = "min-w-0 truncate";
+		label.style.cssText = "display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap";
 		title.append(label);
 		left.append(title);
 
 		const right = globalThis.document.createElement("div");
 		right.className = "flex shrink-0 items-center gap-2 text-muted-foreground";
+		right.style.cssText = "display:flex;align-items:center;gap:8px;min-width:0;flex:0 1 auto;opacity:.72";
 		const meta = globalThis.document.createElement("span");
 		meta.className = "flex max-w-[min(45vw,32rem)] min-w-0 items-center gap-1.5 text-sm font-medium";
+		meta.style.cssText = "display:flex;align-items:center;gap:6px;min-width:0;max-width:min(45vw,32rem);font-size:12px;line-height:1.15;font-weight:500";
 		const badge = globalThis.document.createElement("span");
-		badge.textContent = isCurrent ? "Current" : "Git";
+		badge.textContent = "Git";
 		badge.className = "shrink-0 rounded-md bg-foreground/8 px-1.5 py-0.5 text-[0.65rem] leading-none font-medium text-muted-foreground";
+		badge.style.cssText = "flex:0 0 auto;border-radius:6px;padding:2px 5px;background:color-mix(in srgb,currentColor 10%%,transparent);font-size:11px;line-height:1;font-weight:600";
 		const detail = globalThis.document.createElement("span");
 		detail.textContent = localProjectPickerPathDisplay(workingDirectory);
 		detail.title = workingDirectory;
 		detail.className = "truncate";
+		detail.style.cssText = "display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap";
 		const check = globalThis.document.createElement("span");
 		check.className = "flex size-4 shrink-0 items-center justify-center";
 		check.dataset.slot = "project-check";
+		check.textContent = isCurrent ? "\u2713" : "";
+		check.setAttribute("aria-hidden", "true");
+		check.style.cssText = "display:flex;align-items:center;justify-content:center;width:16px;height:16px;flex:0 0 auto;font-size:12px;line-height:1";
 		meta.append(badge, detail);
 		right.append(meta, check);
 		item.append(left, right);
@@ -2941,8 +2974,8 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		}, 0);
 	}
 
-	function autoSelectCurrentProjectInPicker(picker, list) {
-		if (!list || list.dataset.cliproxyCurrentProjectAutoSelected === "1") {
+	function autoSelectCurrentProjectInPicker(picker, list, force = false) {
+		if (!list || (!force && list.dataset.cliproxyCurrentProjectAutoSelected === "1")) {
 			return;
 		}
 		const item = currentProjectPickerItem(picker);
@@ -3013,6 +3046,9 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	}
 
 	function projectPickerItemPrimaryText(element) {
+		if (element?.dataset?.cliproxyLocalProjectLabel) {
+			return element.dataset.cliproxyLocalProjectLabel;
+		}
 		return (element.innerText || element.textContent || "").split(/\n+/).map((line) => line.trim()).filter(Boolean)[0] || "";
 	}
 
