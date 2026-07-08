@@ -3811,7 +3811,7 @@ func (a *neoActor) executorDisconnectedForSocket(socket *neoSocket, msg map[stri
 	a.executorBootstrapComplete = false
 	a.executorResumeBootstrap = false
 	spawnedExecutors := a.markSpawnedExecutorsStoppingLocked(true)
-	cleanup := a.clearExecutorWorkForDisconnectLocked()
+	cleanup := a.clearExecutorWorkForDisconnectLocked(true)
 	a.agentState = "idle"
 	a.mu.Unlock()
 	if a.runtime != nil && a.runtime.store != nil {
@@ -3851,11 +3851,15 @@ type neoExecutorWorkCleanup struct {
 	reasoningEffort string
 }
 
-func (a *neoActor) clearExecutorWorkForDisconnectLocked() neoExecutorWorkCleanup {
+func (a *neoActor) clearExecutorWorkForDisconnectLocked(preserveResume bool) neoExecutorWorkCleanup {
 	pending := a.pendingToolIDsLocked()
 	hadPending := len(a.pendingTools) > 0
 	hadApprovals := len(a.approvalQueue) > 0
 	hadCurrentInference := a.currentInference != nil
+	var resume *neoInferenceInflight
+	if preserveResume {
+		resume = a.pendingInferenceForExecutorDisconnectLocked()
+	}
 	finalizeEvents := a.cleanupPriorAssistantForBinaryDeltaLocked("system:disposed", nil)
 	updateEvents := a.cancelToolResultMessagesLocked(pending, "system:disposed")
 	stateChanged := a.agentState != "" && normalizeNeoAgentState(a.agentState) != "idle"
@@ -3869,6 +3873,9 @@ func (a *neoActor) clearExecutorWorkForDisconnectLocked() neoExecutorWorkCleanup
 		a.generation++
 		a.currentInference = nil
 	}
+	if resume != nil {
+		a.pendingInference = resume
+	}
 	updateEvents = append(finalizeEvents, updateEvents...)
 	changed := hadPending || hadApprovals || hadCurrentInference || len(updateEvents) > 0 || stateChanged
 	return neoExecutorWorkCleanup{
@@ -3881,8 +3888,55 @@ func (a *neoActor) clearExecutorWorkForDisconnectLocked() neoExecutorWorkCleanup
 	}
 }
 
+func (a *neoActor) pendingInferenceForExecutorDisconnectLocked() *neoInferenceInflight {
+	if a == nil {
+		return nil
+	}
+	if a.currentInference != nil {
+		resume := cloneNeoInferenceInflight(a.currentInference)
+		if resume.agentMode == "" {
+			resume.agentMode = a.currentAgentMode
+		}
+		if resume.agentMode == "" {
+			resume.agentMode = a.agentModeLocked()
+		}
+		if !neoReasoningEffortAllowedForMode(resume.agentMode, resume.reasoningEffort) {
+			resume.reasoningEffort = a.reasoningEffortForModeLocked(resume.agentMode)
+		}
+		return resume
+	}
+	if len(a.pendingTools) == 0 {
+		return nil
+	}
+	ids := a.pendingToolIDsLocked()
+	if len(ids) == 0 {
+		return nil
+	}
+	pending, ok := a.pendingTools[ids[0]]
+	if !ok {
+		return nil
+	}
+	mode := pending.AgentMode
+	if mode == "" {
+		mode = a.currentAgentMode
+	}
+	if mode == "" {
+		mode = a.agentModeLocked()
+	}
+	effort := pending.ReasoningEffort
+	if !neoReasoningEffortAllowedForMode(mode, effort) {
+		effort = a.reasoningEffortForModeLocked(mode)
+	}
+	return &neoInferenceInflight{
+		agentMode:        mode,
+		reasoningEffort:  effort,
+		parentToolCallID: pending.ParentToolCallID,
+		clientAPIKey:     pending.ClientAPIKey,
+	}
+}
+
 func (a *neoActor) clearStaleExecutorWorkForDisconnectLocked() neoExecutorWorkCleanup {
-	cleanup := a.clearExecutorWorkForDisconnectLocked()
+	cleanup := a.clearExecutorWorkForDisconnectLocked(false)
 	if cleanup.changed {
 		a.touchLocked()
 		a.executorIdleGeneration++
@@ -3952,7 +4006,7 @@ func (a *neoActor) executorConnectRejectedForSocket(socket *neoSocket, msg map[s
 	a.executorBootstrapComplete = false
 	a.executorResumeBootstrap = false
 	spawnedExecutors := a.markSpawnedExecutorsStoppingLocked(false)
-	cleanup := a.clearExecutorWorkForDisconnectLocked()
+	cleanup := a.clearExecutorWorkForDisconnectLocked(false)
 	a.agentState = "idle"
 	a.mu.Unlock()
 	if a.runtime != nil && a.runtime.store != nil {

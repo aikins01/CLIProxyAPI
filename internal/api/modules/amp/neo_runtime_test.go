@@ -26443,6 +26443,69 @@ func TestNeoActorHandlesExecutorDisconnected(t *testing.T) {
 	}
 }
 
+func TestNeoActorExecutorDisconnectPreservesPendingInferenceForRestart(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019f418e-1345-76d6-b0f5-9d49ae8a8d3d"
+	actor := newNeoActor(rt, "actor-disconnect-resume", "thread-actor", threadID, threadID, neoActorRecord("actor-disconnect-resume", "thread-actor", threadID), nil)
+	actor.mu.Lock()
+	actor.executorID = "executor-test"
+	actor.executorReady = true
+	actor.executorBootstrapComplete = true
+	actor.currentAgentMode = "deep"
+	actor.currentReasoningEffort = "xhigh"
+	actor.storeMessageLocked(neoMessage{ThreadID: threadID, MessageID: "M-user", Role: "user", AgentMode: "deep", ReasoningEffort: "xhigh", Content: []any{map[string]any{"type": "text", "text": "run final review"}}})
+	actor.storeMessageLocked(neoMessage{ThreadID: threadID, MessageID: "M-assistant", Role: "assistant", State: map[string]any{"type": "complete", "stopReason": "tool_use"}, Content: []any{map[string]any{"type": "tool_use", "id": "TU-review", "name": "shell_command", "input": map[string]any{"command": "amp review", "timeout_ms": 600000}}}})
+	actor.storeMessageLocked(neoMessage{ThreadID: threadID, MessageID: "M-result", Role: "user", Content: []any{map[string]any{"type": "tool_result", "toolUseID": "TU-review", "run": map[string]any{"status": "running"}}}, CompletionStatus: "tool_progress"})
+	actor.pendingTools["TU-review"] = neoPendingTool{ID: "TU-review", Name: "shell_command", AgentMode: "deep", ReasoningEffort: "xhigh", MessageID: "M-assistant", ClientAPIKey: "local-key"}
+	actor.agentState = "running_tools"
+	actor.rebuildHistoryLocked()
+	actor.mu.Unlock()
+
+	actor.handle(map[string]any{"type": "executor_disconnected", "executorId": "executor-test", "message": "lost"})
+
+	actor.mu.Lock()
+	if actor.executorReady || actor.executorID != "" {
+		actor.mu.Unlock()
+		t.Fatalf("executor state = ready:%v id:%q", actor.executorReady, actor.executorID)
+	}
+	if len(actor.pendingTools) != 0 {
+		actor.mu.Unlock()
+		t.Fatalf("pending tools = %#v", actor.pendingTools)
+	}
+	pending := cloneNeoInferenceInflight(actor.pendingInference)
+	result := actor.messages[2]
+	actor.mu.Unlock()
+
+	if pending == nil || pending.agentMode != "deep" || pending.reasoningEffort != "xhigh" || pending.clientAPIKey != "local-key" {
+		t.Fatalf("pendingInference = %#v, want restart continuation metadata", pending)
+	}
+	run := mapValue(mapValue(result.Content[0])["run"])
+	if run["status"] != "cancelled" || run["reason"] != "system:disposed" {
+		t.Fatalf("tool result run = %#v, want system disposed cancellation", run)
+	}
+
+	snapshot, ok := actor.threadSnapshot()
+	if !ok {
+		t.Fatal("threadSnapshot failed")
+	}
+	thread := neoCloudThread(snapshot)
+	persistedPending := mapValue(thread["pendingInference"])
+	if persistedPending["agentMode"] != "deep" || persistedPending["reasoningEffort"] != "xhigh" {
+		t.Fatalf("persisted pendingInference = %#v, want deep/xhigh", persistedPending)
+	}
+
+	restored := newNeoActor(rt, "actor-restored", "thread-actor", threadID, threadID, neoActorRecord("actor-restored", "thread-actor", threadID), nil)
+	if err := restored.importThreadLocalOnly(thread); err != nil {
+		t.Fatalf("import persisted thread: %v", err)
+	}
+	restored.mu.Lock()
+	restoredPending := cloneNeoInferenceInflight(restored.pendingInference)
+	restored.mu.Unlock()
+	if restoredPending == nil || restoredPending.agentMode != "deep" || restoredPending.reasoningEffort != "xhigh" {
+		t.Fatalf("restored pendingInference = %#v, want restart continuation", restoredPending)
+	}
+}
+
 func TestNeoRuntimeDoesNotServeThreadReadSearchHTTP(t *testing.T) {
 	dir := t.TempDir()
 	oldStoreDir := neoAmpDataDir
