@@ -59,6 +59,8 @@ var (
 	anthropicBetaHeaderPattern           = regexp.MustCompile(`\{"([^"]+)":a\.join\(","\)\}`)
 	anthropicOverridePattern             = regexp.MustCompile(`\{"([^"]+)":c\}`)
 	ampFeaturePattern                    = regexp.MustCompile(`\[Vw\]:"([^"]+)"`)
+	runCheckURIFieldPattern              = regexp.MustCompile(`"checkURI"in\s*([A-Za-z_$][A-Za-z0-9_$]*)&&typeof\s+([A-Za-z_$][A-Za-z0-9_$]*)\.checkURI==="string"`)
+	runCheckNameFieldPattern             = regexp.MustCompile(`"checkName"in\s*([A-Za-z_$][A-Za-z0-9_$]*)&&typeof\s+([A-Za-z_$][A-Za-z0-9_$]*)\.checkName==="string"`)
 	settingKeyPattern                    = regexp.MustCompile(`"?([A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z0-9]+)*)"?\s*:\s*\{value:`)
 	settingDefaultPattern                = regexp.MustCompile(`"?([A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z0-9]+)*)"?\s*:\s*\{value:((?:void 0|!0|!1|true|false|null|-?[0-9]+(?:\.[0-9]+)?|"[^"]{0,160}"|\[(?:"[^"]{0,160}"(?:,"[^"]{0,160}")*)?\]))`)
 	threadIDPattern                      = regexp.MustCompile(`T-[0-9a-fA-Fx]{8,}-[0-9a-fA-Fx-]{8,}`)
@@ -637,17 +639,17 @@ var knownPromptTagCountValues = map[string]int{
 	"source/artifacts":     2,
 	"source/code-review":   3,
 	"source/compaction":    18,
-	"source/guidance":      26,
+	"source/guidance":      27,
 	"source/painter":       5,
 	"source/settings":      20,
 	"source/skills":        41,
 	"source/system-prompt": 1,
-	"source/tools":         154,
+	"source/tools":         158,
 }
 
 var knownPromptKindCountValues = map[string]int{
 	"prompt": 59,
-	"source": 189,
+	"source": 192,
 }
 
 type agentModeMarker struct {
@@ -677,12 +679,12 @@ var agentModeScopes = map[string]string{
 
 var knownAgentModeProfileValues = map[string]struct{}{
 	"agg-man|primary=|reasoning=none|levels=|include=present|tools=find_thread,read_thread,web_search,read_web_page,docs_list,docs_read,docs_write,create_project,list_agent_modes,create_thread,archive_thread,archive_threads,unarchive_thread,send_message_to_thread,publish_thread_artifacts,manage_automation,slack_write,slack_read,github_repo_ci_status,read_github,search_github,commit_search,list_directory_github,list_repositories,glob_github,diff|deferred=false|visible=false|visibleInV2=false|serverOnly=true": {},
-	"deep|primary=|reasoning=medium|levels=low,medium,xhigh|include=present|tools=shell_command,shell_command_status,apply_patch,web_search,read_web_page,Task,skill,read_thread,find_thread,librarian,oracle,finder,view_media,painter,archive_current_thread,send_message_to_agg|deferred=true|visible=true|visibleInV2=false|serverOnly=false":                                                                                                                                                                                {},
-	"large|primary=|reasoning=low|levels=|include=present|tools=finder,shell_command,shell_command_status,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,skill,oracle,librarian,Task,view_media,painter,read_mcp_resource,archive_current_thread,send_message_to_agg|deferred=true|visible=false|visibleInV2=false|serverOnly=false":                                                                                                                                                                     {},
-	"nostromo|primary=|reasoning=low|levels=|include=present|tools=finder,shell_command,shell_command_status,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,skill,oracle,librarian,Task,view_media,painter,read_mcp_resource,archive_current_thread,send_message_to_agg,apply_patch|deferred=false|visible=true|visibleInV2=false|serverOnly=false":                                                                                                                                                      {},
+	"deep|primary=|reasoning=medium|levels=low,medium,xhigh|include=present|tools=shell_command,shell_command_status,apply_patch,web_search,read_web_page,Task,skill,load_plugin,read_thread,find_thread,librarian,oracle,finder,view_media,painter,archive_current_thread,manage_automation,send_message_to_agg|deferred=true|visible=true|visibleInV2=false|serverOnly=false":                                                                                                                                                  {},
+	"large|primary=|reasoning=low|levels=|include=present|tools=finder,shell_command,shell_command_status,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,skill,load_plugin,oracle,librarian,Task,view_media,painter,read_mcp_resource,archive_current_thread,manage_automation,send_message_to_agg|deferred=true|visible=false|visibleInV2=false|serverOnly=false":                                                                                                                                       {},
+	"nostromo|primary=|reasoning=low|levels=|include=present|tools=finder,shell_command,shell_command_status,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,skill,load_plugin,oracle,librarian,Task,view_media,painter,read_mcp_resource,archive_current_thread,manage_automation,send_message_to_agg,apply_patch|deferred=false|visible=true|visibleInV2=false|serverOnly=false":                                                                                                                        {},
 	"review|primary=|reasoning=medium|levels=|include=present|tools=shell_command,run_check,submit_review|deferred=false|visible=false|visibleInV2=false|serverOnly=false":                                                                                                                                                                                                                                                                                                                                                       {},
-	"rush|primary=|reasoning=none|levels=|include=present|tools=finder,shell_command,shell_command_status,apply_patch,web_search,read_web_page,read_mcp_resource,read_thread,find_thread,skill,oracle,librarian,Task,view_media,painter,archive_current_thread,send_message_to_agg|deferred=false|visible=true|visibleInV2=false|serverOnly=false":                                                                                                                                                                               {},
-	"smart|primary=|reasoning=high|levels=high,max,xhigh|include=present|tools=finder,shell_command,shell_command_status,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,skill,oracle,librarian,Task,view_media,painter,read_mcp_resource,archive_current_thread,send_message_to_agg|deferred=true|visible=true|visibleInV2=false|serverOnly=false":                                                                                                                                                       {},
+	"rush|primary=|reasoning=none|levels=|include=present|tools=finder,shell_command,shell_command_status,apply_patch,web_search,read_web_page,read_mcp_resource,read_thread,find_thread,skill,load_plugin,oracle,librarian,Task,view_media,painter,archive_current_thread,manage_automation,send_message_to_agg|deferred=false|visible=true|visibleInV2=false|serverOnly=false":                                                                                                                                                 {},
+	"smart|primary=|reasoning=high|levels=high,max,xhigh|include=present|tools=finder,shell_command,shell_command_status,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,skill,load_plugin,oracle,librarian,Task,view_media,painter,read_mcp_resource,archive_current_thread,manage_automation,send_message_to_agg|deferred=true|visible=true|visibleInV2=false|serverOnly=false":                                                                                                                         {},
 }
 
 var knownAgentModeRouteValues = map[string]struct{}{
@@ -696,6 +698,7 @@ var knownAgentModeRouteValues = map[string]struct{}{
 }
 
 var ignoredToolCancelReasonTokens = map[string]struct{}{
+	"system:null": {},
 	"system:this": {},
 	"user:this":   {},
 }
@@ -927,6 +930,7 @@ var knownModelLimitValues = map[string]modelLimitExpectation{
 	"gpt-5.6-sol":                       {Enum: "GPT_5_6_SOL", Provider: "openai", DisplayName: "GPT-5.6 Sol", ContextWindow: 400000, MaxOutputTokens: 128000},
 	"gpt-5.6-terra":                     {Enum: "GPT_5_6_TERRA", Provider: "openai", DisplayName: "GPT-5.6 Terra", ContextWindow: 400000, MaxOutputTokens: 128000},
 	"glm-5.2":                           {Enum: "AMP_GLM_5_2", Provider: "amp", DisplayName: "GLM-5.2", ContextWindow: 200000, MaxOutputTokens: 32000},
+	"grok-4.5":                          {Enum: "GROK_4_5", Provider: "xai", DisplayName: "Grok 4.5", ContextWindow: 500000, MaxOutputTokens: 32000},
 	"grok-build-0.1":                    {Enum: "GROK_BUILD_0_1", Provider: "xai", DisplayName: "Grok Build 0.1", ContextWindow: 256000, MaxOutputTokens: 32000},
 	"grok-code-fast-1":                  {Enum: "GROK_CODE_FAST_1", Provider: "xai", DisplayName: "Grok Code Fast 1", ContextWindow: 256000, MaxOutputTokens: 32000},
 	"accounts/amp/deployments/wkk976k4": {Enum: "FIREWORKS_GLM_5_2_DEDICATED", Provider: "fireworks", DisplayName: "GLM-5.2 Dedicated", ContextWindow: 200000, MaxOutputTokens: 32000},
@@ -3003,7 +3007,7 @@ func addReviewContractMarkers(found map[string]struct{}, s string) {
 	if strings.Contains(s, "CLI appends structured check findings mechanically") {
 		found["review-cli-appends-check-findings"] = struct{}{}
 	}
-	if strings.Contains(s, `"checkURI"`) && strings.Contains(s, `typeof o.checkURI==="string"`) && strings.Contains(s, `"checkName"`) && strings.Contains(s, `typeof o.checkName==="string"`) {
+	if containsRunCheckURIInputShape(s) {
 		found["run-check-uri-input-shape"] = struct{}{}
 	}
 	if strings.Contains(s, `"instructions":`) && strings.Contains(s, "Outcome-first brief") && strings.Contains(s, "check agent") {
@@ -3015,6 +3019,59 @@ func addReviewContractMarkers(found map[string]struct{}, s string) {
 	if strings.Contains(s, "yellow") && strings.Contains(s, "issues found") && strings.Contains(s, "result.check.name") {
 		found["human-review-check-footer-counts-issues"] = struct{}{}
 	}
+}
+
+func containsRunCheckURIInputShape(s string) bool {
+	uriMatches := runCheckFieldMatches(s, runCheckURIFieldPattern)
+	if len(uriMatches) == 0 {
+		return false
+	}
+	nameMatches := runCheckFieldMatches(s, runCheckNameFieldPattern)
+	for _, uriMatch := range uriMatches {
+		for _, nameMatch := range nameMatches {
+			if uriMatch.Object == nameMatch.Object && runCheckFieldMatchesShareExpression(s, uriMatch, nameMatch) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+type runCheckFieldMatch struct {
+	Object string
+	Start  int
+	End    int
+}
+
+func runCheckFieldMatches(s string, pattern *regexp.Regexp) []runCheckFieldMatch {
+	matches := pattern.FindAllStringSubmatchIndex(s, -1)
+	out := make([]runCheckFieldMatch, 0, len(matches))
+	for _, match := range matches {
+		if len(match) < 6 || match[2] < 0 || match[4] < 0 {
+			continue
+		}
+		object := s[match[2]:match[3]]
+		if object != s[match[4]:match[5]] {
+			continue
+		}
+		out = append(out, runCheckFieldMatch{
+			Object: object,
+			Start:  match[0],
+			End:    match[1],
+		})
+	}
+	return out
+}
+
+func runCheckFieldMatchesShareExpression(s string, a, b runCheckFieldMatch) bool {
+	if a.Start > b.Start {
+		a, b = b, a
+	}
+	if b.End-a.Start > 512 {
+		return false
+	}
+	between := s[a.End:b.Start]
+	return !strings.ContainsAny(between, "{}") && !strings.Contains(between, "function") && !strings.Contains(between, "=>")
 }
 
 type agentModeMarkerPosition struct {
@@ -8014,7 +8071,7 @@ func parsePositiveIntField(value string) (int, bool) {
 
 func knownModelLimitContext(context int) bool {
 	switch context {
-	case 128000, 131000, 162752, 200000, 202800, 230144, 256000, 262144, 332000, 400000, 1000000, 1040000, 1048576, 1050000:
+	case 128000, 131000, 162752, 200000, 202800, 230144, 256000, 262144, 332000, 400000, 500000, 1000000, 1040000, 1048576, 1050000:
 		return true
 	default:
 		return false

@@ -16204,6 +16204,7 @@ func TestNeoActorFiltersAmpBuiltInToolsByMode(t *testing.T) {
 		"read_thread":              {Name: "read_thread"},
 		"find_thread":              {Name: "find_thread"},
 		"skill":                    {Name: "skill"},
+		"load_plugin":              {Name: "load_plugin"},
 		"oracle":                   {Name: "oracle"},
 		"librarian":                {Name: "librarian"},
 		"Task":                     {Name: "Task"},
@@ -16218,6 +16219,7 @@ func TestNeoActorFiltersAmpBuiltInToolsByMode(t *testing.T) {
 		"shell_command_status":     {Name: "shell_command_status"},
 		"apply_patch":              {Name: "apply_patch"},
 		"archive_current_thread":   {Name: "archive_current_thread"},
+		"manage_automation":        {Name: "manage_automation"},
 		"send_message_to_agg":      {Name: "send_message_to_agg"},
 		"send_message_to_aggman":   {Name: "send_message_to_aggman"},
 		"search_documents":         {Name: "search_documents"},
@@ -16255,12 +16257,12 @@ func TestNeoActorFiltersAmpBuiltInToolsByMode(t *testing.T) {
 
 	deepNames := requestNames("deep")
 	assertMode("deep", deepNames,
-		[]string{"Task", "read_thread", "shell_command", "apply_patch", "view_media", "tb__gemini-oracle"},
+		[]string{"Task", "read_thread", "shell_command", "apply_patch", "load_plugin", "manage_automation", "view_media", "tb__gemini-oracle"},
 		[]string{"Read", "Grep", "glob", "Glob", "Bash", "create_file", "edit_file", "get_diagnostics", "advisor", "chart", "look_at", "handoff", "task_list", "todo_write", "file_tree", "code_review", "deferred_custom", "docs_read"})
 
 	smartNames := requestNames("smart")
 	assertMode("smart", smartNames,
-		[]string{"shell_command", "shell_command_status", "create_file", "edit_file", "Task", "view_media", "send_message_to_agg", "tb__gemini-oracle"},
+		[]string{"shell_command", "shell_command_status", "create_file", "edit_file", "load_plugin", "manage_automation", "Task", "view_media", "send_message_to_agg", "tb__gemini-oracle"},
 		[]string{"Grep", "glob", "Glob", "Bash", "delete_file", "get_diagnostics", "advisor", "apply_patch", "chart", "look_at", "handoff", "task_list", "todo_write", "file_tree", "code_review", "deferred_custom", "search_documents", "get_document", "docs_read"})
 
 	smartPromptNames := map[string]bool{}
@@ -16273,27 +16275,27 @@ func TestNeoActorFiltersAmpBuiltInToolsByMode(t *testing.T) {
 
 	rushNames := requestNames("rush")
 	assertMode("rush", rushNames,
-		[]string{"Task", "shell_command", "apply_patch", "view_media", "read_mcp_resource", "tb__gemini-oracle"},
+		[]string{"Task", "shell_command", "apply_patch", "load_plugin", "manage_automation", "view_media", "read_mcp_resource", "tb__gemini-oracle"},
 		[]string{"Read", "Grep", "glob", "Glob", "Bash", "create_file", "edit_file", "get_diagnostics", "advisor", "chart", "look_at", "handoff", "task_list", "todo_write", "file_tree", "code_review", "deferred_custom", "docs_read"})
 
 	largeNames := requestNames("large")
 	assertMode("large", largeNames,
-		[]string{"shell_command", "shell_command_status", "create_file", "edit_file", "Task", "view_media", "send_message_to_agg", "tb__gemini-oracle"},
+		[]string{"shell_command", "shell_command_status", "create_file", "edit_file", "load_plugin", "manage_automation", "Task", "view_media", "send_message_to_agg", "tb__gemini-oracle"},
 		[]string{"Grep", "glob", "Glob", "Bash", "get_diagnostics", "advisor", "apply_patch", "chart", "look_at", "handoff", "task_list", "todo_write", "file_tree", "code_review", "deferred_custom", "docs_read"})
 
 	unknownModeNames := requestNames("frontier")
 	assertMode("unknown mode", unknownModeNames,
-		[]string{"shell_command", "shell_command_status", "create_file", "edit_file", "Task", "view_media", "send_message_to_agg", "tb__gemini-oracle"},
+		[]string{"shell_command", "shell_command_status", "create_file", "edit_file", "load_plugin", "manage_automation", "Task", "view_media", "send_message_to_agg", "tb__gemini-oracle"},
 		[]string{"Bash", "advisor", "apply_patch", "chart", "handoff", "code_review", "deferred_custom"})
 
 	aggNames := requestNames("agg-man")
 	assertMode("agg-man", aggNames,
-		[]string{"read_thread", "web_search", "docs_read", "diff", "archive_threads", "publish_thread_artifacts", "tb__gemini-oracle"},
-		[]string{"Read", "Grep", "glob", "Glob", "Task", "shell_command", "chart", "view_media", "todo_write", "file_tree", "delete_file", "search_documents", "get_document", "code_review", "deferred_custom"})
+		[]string{"read_thread", "web_search", "docs_read", "diff", "archive_threads", "publish_thread_artifacts", "manage_automation", "tb__gemini-oracle"},
+		[]string{"Read", "Grep", "glob", "Glob", "Task", "shell_command", "load_plugin", "chart", "view_media", "todo_write", "file_tree", "delete_file", "search_documents", "get_document", "code_review", "deferred_custom"})
 
 	nostromoNames := requestNames("nostromo")
 	assertMode("nostromo", nostromoNames,
-		[]string{"shell_command", "shell_command_status", "create_file", "edit_file", "Task", "apply_patch", "view_media", "send_message_to_agg", "tb__gemini-oracle"},
+		[]string{"shell_command", "shell_command_status", "create_file", "edit_file", "load_plugin", "manage_automation", "Task", "apply_patch", "view_media", "send_message_to_agg", "tb__gemini-oracle"},
 		[]string{"Grep", "glob", "Glob", "get_diagnostics", "advisor", "chart", "look_at", "handoff", "task_list", "todo_write", "file_tree", "code_review", "deferred_custom", "docs_read"})
 }
 
@@ -16301,7 +16303,7 @@ func TestNeoActorToolsForModeFollowBinaryModeOrder(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
 	binaryNostromoOrder := []string{
-		"finder", "shell_command", "shell_command_status", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "archive_current_thread", "send_message_to_agg", "apply_patch",
+		"finder", "shell_command", "shell_command_status", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "load_plugin", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "archive_current_thread", "manage_automation", "send_message_to_agg", "apply_patch",
 	}
 	rawTools := []any{map[string]any{"name": "external_tool", "source": map[string]any{"plugin": "test"}}}
 	for i := len(binaryNostromoOrder) - 1; i >= 0; i-- {

@@ -127,13 +127,13 @@ var (
 	neoInboundMessageHook         func(actor *neoActor, msg map[string]any)
 	errNeoLocalEmptyStream        = errors.New("local provider stream closed before first payload")
 	neoModeToolOrder              = map[string][]string{
-		"smart":    toolList("finder", "shell_command", "shell_command_status", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "archive_current_thread", "send_message_to_agg"),
-		"large":    toolList("finder", "shell_command", "shell_command_status", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "archive_current_thread", "send_message_to_agg"),
-		"rush":     toolList("finder", "shell_command", "shell_command_status", "apply_patch", "web_search", "read_web_page", "read_mcp_resource", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "painter", "archive_current_thread", "send_message_to_agg"),
+		"smart":    toolList("finder", "shell_command", "shell_command_status", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "load_plugin", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "archive_current_thread", "manage_automation", "send_message_to_agg"),
+		"large":    toolList("finder", "shell_command", "shell_command_status", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "load_plugin", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "archive_current_thread", "manage_automation", "send_message_to_agg"),
+		"rush":     toolList("finder", "shell_command", "shell_command_status", "apply_patch", "web_search", "read_web_page", "read_mcp_resource", "read_thread", "find_thread", "skill", "load_plugin", "oracle", "librarian", "Task", "view_media", "painter", "archive_current_thread", "manage_automation", "send_message_to_agg"),
 		"agg-man":  toolList("find_thread", "read_thread", "web_search", "read_web_page", "docs_list", "docs_read", "docs_write", "create_project", "list_agent_modes", "create_thread", "archive_thread", "archive_threads", "unarchive_thread", "send_message_to_thread", "publish_thread_artifacts", "manage_automation", "slack_write", "slack_read", "github_repo_ci_status", "read_github", "search_github", "commit_search", "list_directory_github", "list_repositories", "glob_github", "diff"),
-		"deep":     toolList("shell_command", "shell_command_status", "apply_patch", "web_search", "read_web_page", "Task", "skill", "read_thread", "find_thread", "librarian", "oracle", "finder", "view_media", "painter", "archive_current_thread", "send_message_to_agg"),
+		"deep":     toolList("shell_command", "shell_command_status", "apply_patch", "web_search", "read_web_page", "Task", "skill", "load_plugin", "read_thread", "find_thread", "librarian", "oracle", "finder", "view_media", "painter", "archive_current_thread", "manage_automation", "send_message_to_agg"),
 		"review":   toolList("shell_command", "run_check", "submit_review"),
-		"nostromo": toolList("finder", "shell_command", "shell_command_status", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "archive_current_thread", "send_message_to_agg", "apply_patch"),
+		"nostromo": toolList("finder", "shell_command", "shell_command_status", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "load_plugin", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "archive_current_thread", "manage_automation", "send_message_to_agg", "apply_patch"),
 	}
 	neoModeToolAllowlist         = orderedToolSets(neoModeToolOrder)
 	neoModeDeferredToolAllowlist = map[string]map[string]bool{
@@ -143,7 +143,7 @@ var (
 	}
 	neoKnownModeTools = toolSet(
 		"finder", "create_file", "edit_file",
-		"web_search", "read_web_page", "read_mcp_resource", "read_thread", "find_thread", "skill", "oracle",
+		"web_search", "read_web_page", "read_mcp_resource", "read_thread", "find_thread", "skill", "load_plugin", "oracle",
 		"librarian", "Task", "view_media", "painter",
 		"gmail_read", "gmail_write",
 		"shell_command", "shell_command_status", "apply_patch", "archive_current_thread", "send_message_to_agg", "run_check", "submit_review", "docs_list", "docs_read", "docs_write",
@@ -26744,6 +26744,7 @@ var neoModelContextWindow = map[string]int{
 	"gpt-5.6-sol":                                              400000,
 	"gpt-5.6-terra":                                            400000,
 	"glm-5.2":                                                  200000,
+	"grok-4.5":                                                 500000,
 	"grok-build-0.1":                                           256000,
 	"grok-code-fast-1":                                         256000,
 	"kimi-k2-instruct-0905":                                    1000000,
@@ -26805,6 +26806,7 @@ var neoModelMaxOutputTokens = map[string]int{
 	"gpt-5.6-sol":                                              128000,
 	"gpt-5.6-terra":                                            128000,
 	"glm-5.2":                                                  32000,
+	"grok-4.5":                                                 32000,
 	"grok-build-0.1":                                           32000,
 	"grok-code-fast-1":                                         32000,
 	"kimi-k2-instruct-0905":                                    32000,
