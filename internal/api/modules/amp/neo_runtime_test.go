@@ -2991,6 +2991,7 @@ func TestNeoCompactionPromptMatchesBinaryContinuationStyle(t *testing.T) {
 	for _, want := range []string{
 		"continuation summary",
 		"1. Task Overview",
+		"Do not treat this compaction prompt itself as the active request",
 		"2. Current State",
 		"3. Important Discoveries",
 		"4. Next Steps",
@@ -13500,6 +13501,26 @@ func TestSelectNeoModelRouteDefaultsAggManToGPT55(t *testing.T) {
 	}
 }
 
+func TestSelectNeoModelRouteDefaultsVisibleModesToAmpBinaryRoutes(t *testing.T) {
+	for _, tc := range []struct {
+		mode     string
+		provider string
+		model    string
+	}{
+		{mode: "low", provider: "amp", model: "glm-5.2"},
+		{mode: "medium", provider: "openai", model: "gpt-5.5"},
+		{mode: "high", provider: "openai", model: "gpt-5.5"},
+		{mode: "ultra", provider: "anthropic", model: "claude-fable-5"},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			got := selectNeoModelRoute(tc.mode, nil)
+			if got.Provider != tc.provider || got.Model != tc.model {
+				t.Fatalf("route = %+v, want %s/%s", got, tc.provider, tc.model)
+			}
+		})
+	}
+}
+
 func TestSelectNeoModelRouteDefaultsSmartToOpus48(t *testing.T) {
 	for _, mode := range []string{"", "smart", "SMART"} {
 		got := selectNeoModelRoute(mode, nil)
@@ -14957,11 +14978,18 @@ func TestNeoSystemPromptUsesExpandedModeFamilies(t *testing.T) {
 	mermaidGuidance := "Only write Mermaid syntax for diagrams if the user explicitly asks for Mermaid diagrams."
 	closedDiagram := "╰────────╯\n```"
 
-	gpt55ServerStatus := map[string]any{"features": []any{map[string]any{"name": neoPromptFeatureGPT55Deep, "enabled": true}}}
-	deep := neoSystemPrompt(neoInferenceRequest{AgentMode: "deep", Capabilities: map[string]any{"serverStatus": gpt55ServerStatus}}, neoModelRoute{Provider: "openai", Model: "gpt-5.5"})
+	deep := neoSystemPrompt(neoInferenceRequest{AgentMode: "deep"}, neoModelRoute{Provider: "openai", Model: "gpt-5.5"})
 	for _, want := range []string{"## Discovery Discipline", "## Verification", "## Working with the user", communicationGuidance, headingGuidance, mermaidGuidance, closedDiagram} {
 		if !strings.Contains(deep, want) {
 			t.Fatalf("deep prompt missing %q:\n%s", want, deep)
+		}
+	}
+	for _, mode := range []string{"medium", "high"} {
+		prompt := neoSystemPrompt(neoInferenceRequest{AgentMode: mode}, neoModelRoute{Provider: "openai", Model: "gpt-5.5"})
+		for _, want := range []string{"## Discovery Discipline", "## Verification", "## Working with the user", communicationGuidance, headingGuidance, mermaidGuidance, closedDiagram} {
+			if !strings.Contains(prompt, want) {
+				t.Fatalf("%s prompt missing %q:\n%s", mode, want, prompt)
+			}
 		}
 	}
 
@@ -14985,27 +15013,36 @@ func TestNeoSystemPromptUsesExpandedModeFamilies(t *testing.T) {
 
 func TestNeoPromptFamilyMatchesBinarySelector(t *testing.T) {
 	for _, tc := range []struct {
-		name         string
-		agentMode    string
-		route        neoModelRoute
-		serverStatus any
-		want         string
+		name      string
+		agentMode string
+		route     neoModelRoute
+		want      string
 	}{
 		{name: "agg man mode", agentMode: "agg-man", route: neoModelRoute{Provider: "openai", Model: "gpt-5.5"}, want: "aggman"},
 		{name: "rush mode", agentMode: "rush", route: neoModelRoute{Provider: "openai", Model: "gpt-5.5"}, want: neoPromptFamilyRush},
-		{name: "deep gpt55 feature enabled", agentMode: "deep", route: neoModelRoute{Provider: "openai", Model: "gpt-5.5"}, serverStatus: map[string]any{"features": []any{map[string]any{"name": neoPromptFeatureGPT55Deep, "enabled": true}}}, want: neoPromptFamilyDeep},
-		{name: "deep feature missing", agentMode: "deep", route: neoModelRoute{Provider: "openai", Model: "gpt-5.5"}, want: neoPromptFamilyDeepGPT54},
-		{name: "deep feature disabled", agentMode: "deep", route: neoModelRoute{Provider: "openai", Model: "gpt-5.5"}, serverStatus: map[string]any{"features": []any{map[string]any{"name": neoPromptFeatureGPT55Deep, "enabled": false}}}, want: neoPromptFamilyDeepGPT54},
-		{name: "deep feature enabled ignores model name", agentMode: "deep", route: neoModelRoute{Provider: "openai", Model: "gpt-5.4"}, serverStatus: map[string]any{"features": []any{map[string]any{"name": neoPromptFeatureGPT55Deep, "enabled": true}}}, want: neoPromptFamilyDeep},
+		{name: "low mode", agentMode: "low", route: neoModelRoute{Provider: "amp", Model: "glm-5.2"}, want: neoPromptFamilyGLM52},
+		{name: "low mode gpt fallback", agentMode: "low", route: neoModelRoute{Provider: "openai", Model: "gpt-5.5"}, want: neoPromptFamilyRush},
+		{name: "ultra mode", agentMode: "ultra", route: neoModelRoute{Provider: "anthropic", Model: "claude-fable-5"}, want: neoPromptFamilyFable},
+		{name: "fable model", agentMode: "smart", route: neoModelRoute{Provider: "anthropic", Model: "claude-fable-5"}, want: neoPromptFamilyFable},
+		{name: "deep gpt55", agentMode: "deep", route: neoModelRoute{Provider: "openai", Model: "gpt-5.5"}, want: neoPromptFamilyDeep},
+		{name: "deep fable override", agentMode: "deep", route: neoModelRoute{Provider: "anthropic", Model: "claude-fable-5"}, want: neoPromptFamilyDeep},
+		{name: "medium gpt55", agentMode: "medium", route: neoModelRoute{Provider: "openai", Model: "gpt-5.5"}, want: neoPromptFamilyDeep},
+		{name: "medium fable override", agentMode: "medium", route: neoModelRoute{Provider: "anthropic", Model: "claude-fable-5"}, want: neoPromptFamilyDeep},
+		{name: "high gpt55", agentMode: "high", route: neoModelRoute{Provider: "openai", Model: "gpt-5.5"}, want: neoPromptFamilyDeep},
+		{name: "high fable override", agentMode: "high", route: neoModelRoute{Provider: "anthropic", Model: "claude-fable-5"}, want: neoPromptFamilyDeep},
+		{name: "review fable override", agentMode: "review", route: neoModelRoute{Provider: "anthropic", Model: "claude-fable-5"}, want: neoPromptFamilyReview},
+		{name: "deep gpt54 fallback", agentMode: "deep", route: neoModelRoute{Provider: "openai", Model: "gpt-5.4"}, want: neoPromptFamilyDeepGPT54},
 		{name: "codex model", agentMode: "smart", route: neoModelRoute{Provider: "openai", Model: "gpt-5-codex"}, want: neoPromptFamilyGPT5Codex},
 		{name: "kimi model", agentMode: "smart", route: neoModelRoute{Provider: "anthropic", Model: "kimi-k2-0905"}, want: neoPromptFamilyKimi},
 		{name: "generic openai", agentMode: "smart", route: neoModelRoute{Provider: "openai", Model: "o3"}, want: neoPromptFamilyGPT},
 		{name: "xai provider", agentMode: "smart", route: neoModelRoute{Provider: "xai", Model: "grok-code-fast-1"}, want: neoPromptFamilyXAI},
 		{name: "google provider", agentMode: "smart", route: neoModelRoute{Provider: "google", Model: "gemini-3-pro"}, want: neoPromptFamilyGemini},
-		{name: "default provider", agentMode: "smart", route: neoModelRoute{Provider: "anthropic", Model: "claude-opus-4-7"}, want: neoPromptFamilyDefault},
+		{name: "smart provider", agentMode: "smart", route: neoModelRoute{Provider: "anthropic", Model: "claude-opus-4-8"}, want: neoPromptFamilySmart},
+		{name: "empty mode provider", agentMode: "", route: neoModelRoute{Provider: "anthropic", Model: "claude-opus-4-8"}, want: neoPromptFamilySmart},
+		{name: "large provider", agentMode: "large", route: neoModelRoute{Provider: "anthropic", Model: "claude-opus-4-8"}, want: neoPromptFamilyDefault},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := neoPromptFamily(tc.agentMode, tc.route, tc.serverStatus); got != tc.want {
+			if got := neoPromptFamily(tc.agentMode, tc.route); got != tc.want {
 				t.Fatalf("prompt family = %q, want %q", got, tc.want)
 			}
 		})
@@ -15030,9 +15067,21 @@ func TestNeoSystemPromptUsesBinaryPromptFamilies(t *testing.T) {
 		},
 		{
 			name:    "deep",
-			request: neoInferenceRequest{AgentMode: "deep", Capabilities: map[string]any{"serverStatus": map[string]any{"features": []any{map[string]any{"name": neoPromptFeatureGPT55Deep, "enabled": true}}}}},
+			request: neoInferenceRequest{AgentMode: "deep"},
 			route:   neoModelRoute{Provider: "openai", Model: "gpt-5.5"},
 			want:    []string{"You are Amp, an autonomous coding agent.", "Use finder for complex, multi-step codebase discovery", neoGitCommitMultilinePromptLine, headingGuidance, closedDiagram},
+		},
+		{
+			name:    "low glm",
+			request: neoInferenceRequest{AgentMode: "low"},
+			route:   neoModelRoute{Provider: "amp", Model: "glm-5.2"},
+			want:    []string{"You are a senior software engineer working directly in the user's codebase", "<operating_principles>", "<frontend_taste>"},
+		},
+		{
+			name:    "ultra fable",
+			request: neoInferenceRequest{AgentMode: "ultra"},
+			route:   neoModelRoute{Provider: "anthropic", Model: "claude-fable-5"},
+			want:    []string{"You are pair programming with a user to solve their coding task", "# How to act", "# Engineering principles", "# Verification", "# Communication"},
 		},
 		{
 			name:    "deep gpt54",
@@ -15065,9 +15114,15 @@ func TestNeoSystemPromptUsesBinaryPromptFamilies(t *testing.T) {
 			want:    []string{"oracle tool to get expert guidance", "get_diagnostics tool and  any lint", headingGuidance, closedDiagram},
 		},
 		{
-			name:    "default",
+			name:    "smart",
 			request: neoInferenceRequest{AgentMode: "smart"},
 			route:   neoModelRoute{Provider: "anthropic", Model: "claude-opus-4-7"},
+			want:    []string{"Your main goal is to follow the user's instructions and verify that the result works", "<autonomy_and_persistence>", "<using_subagents>", "fewer than 4 lines of text", headingGuidance, closedDiagram},
+		},
+		{
+			name:    "large default",
+			request: neoInferenceRequest{AgentMode: "large"},
+			route:   neoModelRoute{Provider: "anthropic", Model: "claude-opus-4-8"},
 			want:    []string{"<autonomy_and_persistence>", "<using_subagents>", "fewer than 4 lines of text", headingGuidance, closedDiagram},
 		},
 	} {
@@ -16079,6 +16134,18 @@ func TestNeoActorReasoningEffortDefaultsByMode(t *testing.T) {
 	if got := actor.reasoningEffortForModeLocked("nostromo"); got != "low" {
 		t.Fatalf("nostromo effort = %q, want low", got)
 	}
+	if got := actor.reasoningEffortForModeLocked("low"); got != "medium" {
+		t.Fatalf("low effort = %q, want medium", got)
+	}
+	if got := actor.reasoningEffortForModeLocked("medium"); got != "medium" {
+		t.Fatalf("medium effort = %q, want medium", got)
+	}
+	if got := actor.reasoningEffortForModeLocked("high"); got != "xhigh" {
+		t.Fatalf("high effort = %q, want xhigh", got)
+	}
+	if got := actor.reasoningEffortForModeLocked("ultra"); got != "high" {
+		t.Fatalf("ultra effort = %q, want high", got)
+	}
 }
 
 func TestNeoReasoningDefaultsAndLevelsMatchAuditBaseline(t *testing.T) {
@@ -16111,11 +16178,15 @@ func TestNeoAgentModeCoverageHasExplicitOwnership(t *testing.T) {
 	coverage := map[string]string{
 		"agg-man":  "server-only",
 		"deep":     "local-runtime",
+		"high":     "local-runtime",
 		"large":    "local-runtime",
+		"low":      "local-runtime",
+		"medium":   "local-runtime",
 		"nostromo": "local-runtime",
 		"review":   "local-runtime",
 		"rush":     "local-runtime",
 		"smart":    "local-runtime",
+		"ultra":    "local-runtime",
 	}
 	for _, mode := range baseline.Signals.AgentModeCoverage {
 		t.Run(mode.Name, func(t *testing.T) {
@@ -16220,6 +16291,8 @@ func TestNeoActorFiltersAmpBuiltInToolsByMode(t *testing.T) {
 		"apply_patch":              {Name: "apply_patch"},
 		"archive_current_thread":   {Name: "archive_current_thread"},
 		"manage_automation":        {Name: "manage_automation"},
+		"slack_write":              {Name: "slack_write"},
+		"slack_read":               {Name: "slack_read"},
 		"send_message_to_agg":      {Name: "send_message_to_agg"},
 		"send_message_to_aggman":   {Name: "send_message_to_aggman"},
 		"search_documents":         {Name: "search_documents"},
@@ -16257,12 +16330,12 @@ func TestNeoActorFiltersAmpBuiltInToolsByMode(t *testing.T) {
 
 	deepNames := requestNames("deep")
 	assertMode("deep", deepNames,
-		[]string{"Task", "read_thread", "shell_command", "apply_patch", "load_plugin", "manage_automation", "view_media", "tb__gemini-oracle"},
+		[]string{"Task", "read_thread", "shell_command", "apply_patch", "load_plugin", "manage_automation", "slack_write", "slack_read", "view_media", "tb__gemini-oracle"},
 		[]string{"Read", "Grep", "glob", "Glob", "Bash", "create_file", "edit_file", "get_diagnostics", "advisor", "chart", "look_at", "handoff", "task_list", "todo_write", "file_tree", "code_review", "deferred_custom", "docs_read"})
 
 	smartNames := requestNames("smart")
 	assertMode("smart", smartNames,
-		[]string{"shell_command", "shell_command_status", "create_file", "edit_file", "load_plugin", "manage_automation", "Task", "view_media", "send_message_to_agg", "tb__gemini-oracle"},
+		[]string{"shell_command", "shell_command_status", "create_file", "edit_file", "load_plugin", "manage_automation", "slack_write", "slack_read", "Task", "view_media", "send_message_to_agg", "tb__gemini-oracle"},
 		[]string{"Grep", "glob", "Glob", "Bash", "delete_file", "get_diagnostics", "advisor", "apply_patch", "chart", "look_at", "handoff", "task_list", "todo_write", "file_tree", "code_review", "deferred_custom", "search_documents", "get_document", "docs_read"})
 
 	smartPromptNames := map[string]bool{}
@@ -16275,17 +16348,17 @@ func TestNeoActorFiltersAmpBuiltInToolsByMode(t *testing.T) {
 
 	rushNames := requestNames("rush")
 	assertMode("rush", rushNames,
-		[]string{"Task", "shell_command", "apply_patch", "load_plugin", "manage_automation", "view_media", "read_mcp_resource", "tb__gemini-oracle"},
-		[]string{"Read", "Grep", "glob", "Glob", "Bash", "create_file", "edit_file", "get_diagnostics", "advisor", "chart", "look_at", "handoff", "task_list", "todo_write", "file_tree", "code_review", "deferred_custom", "docs_read"})
+		[]string{"Task", "shell_command", "apply_patch", "load_plugin", "manage_automation", "slack_write", "slack_read", "view_media", "tb__gemini-oracle"},
+		[]string{"Read", "Grep", "glob", "Glob", "Bash", "create_file", "edit_file", "read_mcp_resource", "get_diagnostics", "advisor", "chart", "look_at", "handoff", "task_list", "todo_write", "file_tree", "code_review", "deferred_custom", "docs_read"})
 
 	largeNames := requestNames("large")
 	assertMode("large", largeNames,
-		[]string{"shell_command", "shell_command_status", "create_file", "edit_file", "load_plugin", "manage_automation", "Task", "view_media", "send_message_to_agg", "tb__gemini-oracle"},
+		[]string{"shell_command", "shell_command_status", "create_file", "edit_file", "load_plugin", "manage_automation", "slack_write", "slack_read", "Task", "view_media", "send_message_to_agg", "tb__gemini-oracle"},
 		[]string{"Grep", "glob", "Glob", "Bash", "get_diagnostics", "advisor", "apply_patch", "chart", "look_at", "handoff", "task_list", "todo_write", "file_tree", "code_review", "deferred_custom", "docs_read"})
 
 	unknownModeNames := requestNames("frontier")
 	assertMode("unknown mode", unknownModeNames,
-		[]string{"shell_command", "shell_command_status", "create_file", "edit_file", "load_plugin", "manage_automation", "Task", "view_media", "send_message_to_agg", "tb__gemini-oracle"},
+		[]string{"shell_command", "shell_command_status", "create_file", "edit_file", "load_plugin", "manage_automation", "slack_write", "slack_read", "Task", "view_media", "send_message_to_agg", "tb__gemini-oracle"},
 		[]string{"Bash", "advisor", "apply_patch", "chart", "handoff", "code_review", "deferred_custom"})
 
 	aggNames := requestNames("agg-man")
@@ -16295,15 +16368,35 @@ func TestNeoActorFiltersAmpBuiltInToolsByMode(t *testing.T) {
 
 	nostromoNames := requestNames("nostromo")
 	assertMode("nostromo", nostromoNames,
-		[]string{"shell_command", "shell_command_status", "create_file", "edit_file", "load_plugin", "manage_automation", "Task", "apply_patch", "view_media", "send_message_to_agg", "tb__gemini-oracle"},
+		[]string{"shell_command", "shell_command_status", "create_file", "edit_file", "load_plugin", "manage_automation", "slack_write", "slack_read", "Task", "apply_patch", "view_media", "send_message_to_agg", "tb__gemini-oracle"},
 		[]string{"Grep", "glob", "Glob", "get_diagnostics", "advisor", "chart", "look_at", "handoff", "task_list", "todo_write", "file_tree", "code_review", "deferred_custom", "docs_read"})
+
+	lowNames := requestNames("low")
+	assertMode("low", lowNames,
+		[]string{"Task", "shell_command", "apply_patch", "load_plugin", "manage_automation", "slack_write", "slack_read", "view_media", "tb__gemini-oracle"},
+		[]string{"create_file", "edit_file", "read_mcp_resource", "code_review", "deferred_custom"})
+
+	mediumNames := requestNames("medium")
+	assertMode("medium", mediumNames,
+		[]string{"Task", "read_thread", "shell_command", "apply_patch", "load_plugin", "manage_automation", "slack_write", "slack_read", "view_media", "tb__gemini-oracle"},
+		[]string{"create_file", "edit_file", "read_mcp_resource", "code_review", "deferred_custom"})
+
+	highNames := requestNames("high")
+	assertMode("high", highNames,
+		[]string{"Task", "read_thread", "shell_command", "apply_patch", "load_plugin", "manage_automation", "slack_write", "slack_read", "view_media", "tb__gemini-oracle"},
+		[]string{"create_file", "edit_file", "read_mcp_resource", "code_review", "deferred_custom"})
+
+	ultraNames := requestNames("ultra")
+	assertMode("ultra", ultraNames,
+		[]string{"shell_command", "shell_command_status", "create_file", "edit_file", "load_plugin", "manage_automation", "slack_write", "slack_read", "Task", "view_media", "send_message_to_agg", "tb__gemini-oracle"},
+		[]string{"apply_patch", "code_review", "deferred_custom"})
 }
 
 func TestNeoActorToolsForModeFollowBinaryModeOrder(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
 	binaryNostromoOrder := []string{
-		"finder", "shell_command", "shell_command_status", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "load_plugin", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "archive_current_thread", "manage_automation", "send_message_to_agg", "apply_patch",
+		"finder", "shell_command", "shell_command_status", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "load_plugin", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "archive_current_thread", "manage_automation", "slack_write", "slack_read", "send_message_to_agg", "apply_patch",
 	}
 	rawTools := []any{map[string]any{"name": "external_tool", "source": map[string]any{"plugin": "test"}}}
 	for i := len(binaryNostromoOrder) - 1; i >= 0; i-- {
@@ -18759,7 +18852,7 @@ func TestInferNeoAnthropicUsesBinaryDefaultMaxTokens(t *testing.T) {
 	}
 }
 
-func TestInferNeoAnthropicLargeModeUsesBinaryAdaptiveLowFallback(t *testing.T) {
+func TestInferNeoAnthropicLargeModeUsesProviderAdaptiveHighFallback(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/provider/anthropic/v1/messages" {
 			t.Fatalf("unexpected path %s", r.URL.Path)
@@ -18769,8 +18862,8 @@ func TestInferNeoAnthropicLargeModeUsesBinaryAdaptiveLowFallback(t *testing.T) {
 		if stringValue(thinkingBody["type"]) != "adaptive" || stringValue(thinkingBody["display"]) != "summarized" {
 			t.Fatalf("thinking = %#v, want adaptive summarized; payload=%#v", thinkingBody, payload)
 		}
-		if effort := stringValue(mapValue(payload["output_config"])["effort"]); effort != "low" {
-			t.Fatalf("output_config.effort = %q, want low; payload=%#v", effort, payload)
+		if effort := stringValue(mapValue(payload["output_config"])["effort"]); effort != "high" {
+			t.Fatalf("output_config.effort = %q, want high; payload=%#v", effort, payload)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"content":[{"type":"text","text":"ok"}]}`))
@@ -19155,6 +19248,19 @@ func TestNeoApplyAnthropicThinkingUsesAdaptiveEffortForAmpOpusModels(t *testing.
 				t.Fatalf("output_config.effort = %q, want %q; body=%#v", effort, tt.want, body)
 			}
 		})
+	}
+}
+
+func TestNeoAnthropicMaxTokensUsesModelLimit(t *testing.T) {
+	route := neoModelRoute{Provider: "anthropic", Model: "claude-fable-5"}
+	if got := neoAnthropicMaxTokens(neoInferenceRequest{Settings: map[string]any{}}, route); got != 128000 {
+		t.Fatalf("fable max tokens = %d, want 128000", got)
+	}
+	if got := neoAnthropicMaxTokens(neoInferenceRequest{MaxTokens: 4096, Settings: map[string]any{}}, route); got != 4096 {
+		t.Fatalf("explicit fable max tokens = %d, want 4096", got)
+	}
+	if got := neoAnthropicMaxTokens(neoInferenceRequest{Settings: map[string]any{}}, neoModelRoute{Provider: "anthropic", Model: "claude-test"}); got != neoDefaultAnthropicMaxTokens {
+		t.Fatalf("unknown anthropic max tokens = %d, want %d", got, neoDefaultAnthropicMaxTokens)
 	}
 }
 
@@ -20054,8 +20160,8 @@ func TestNeoGoogleThinkingFallbackFollowsBinaryOrder(t *testing.T) {
 	if got := neoGoogleThinkingFallback(neoInferenceRequest{AgentMode: "smart"}); got != "high" {
 		t.Fatalf("smart fallback = %q, want high", got)
 	}
-	if got := neoGoogleThinkingFallback(neoInferenceRequest{AgentMode: "large"}); got != "low" {
-		t.Fatalf("large fallback = %q, want binary default low", got)
+	if got := neoGoogleThinkingFallback(neoInferenceRequest{AgentMode: "large"}); got != "medium" {
+		t.Fatalf("large fallback = %q, want provider default medium", got)
 	}
 	if got := neoGoogleThinkingFallback(neoInferenceRequest{}); got != "medium" {
 		t.Fatalf("empty fallback = %q, want provider default medium", got)

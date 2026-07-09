@@ -413,7 +413,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 	}
 	for _, want := range []string{
 		"// ==UserScript==",
-		"@version 0.1.55",
+		"@version 0.1.56",
 		"@match https://ampcode.com/*",
 		"@updateURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
 		"@downloadURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
@@ -428,7 +428,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"commandPaletteIntegrationCount",
 		"localThreadPickerOpenCount",
 		"removedLocalThreadControlCount",
-		`const userscriptVersion = "0.1.55"`,
+		`const userscriptVersion = "0.1.56"`,
 		"userscriptVersion",
 		"lastPatchedThreadActorBaseURL",
 		"lastPatchedThreadID",
@@ -696,22 +696,32 @@ class TestStorage {
 	setItem(key, value) { this.values.set(String(key), String(value)); }
 	removeItem(key) { this.values.delete(String(key)); }
 }
-class FakeElement {
-	constructor() {
-		this.dataset = {};
-		this.style = {};
-		this.children = [];
-		this.classList = { add() {}, remove() {}, contains() { return false; } };
+	class FakeElement {
+		constructor(tagName = "div", text = "") {
+			this.dataset = {};
+			this.style = {};
+			this.children = [];
+			this.attributes = new Map();
+			this.tagName = String(tagName).toUpperCase();
+			this.textContent = String(text);
+			this.parentElement = null;
+			this.classList = { add() {}, remove() {}, contains() { return false; } };
+		}
+		appendChild(child) { this.children.push(child); child.parentElement = this; return child; }
+		append(...children) { for (const child of children) this.appendChild(child); }
+		addEventListener() {}
+		removeEventListener() {}
+		setAttribute(name, value) { this.attributes.set(String(name), String(value)); }
+		getAttribute(name) { return this.attributes.has(String(name)) ? this.attributes.get(String(name)) : null; }
+		hasAttribute(name) { return this.attributes.has(String(name)); }
+		removeAttribute(name) { this.attributes.delete(String(name)); }
+		getBoundingClientRect() { return { width: 120, height: 24 }; }
+		replaceChildren(...children) { this.children = []; this.textContent = ""; this.append(...children); }
+		querySelector() { return null; }
+		querySelectorAll() { return []; }
+		closest() { return null; }
+		matches() { return false; }
 	}
-	appendChild(child) { this.children.push(child); return child; }
-	addEventListener() {}
-	removeEventListener() {}
-	setAttribute() {}
-	querySelector() { return null; }
-	querySelectorAll() { return []; }
-	closest() { return null; }
-	matches() { return false; }
-}
 class NativeWebSocket {
 	static CONNECTING = 0;
 	static OPEN = 1;
@@ -729,16 +739,17 @@ class NativeWebSocket {
 	close() { this.readyState = NativeWebSocket.CLOSED; }
 }
 globalThis.location = new URL("https://ampcode.com/threads/" + threadID);
-globalThis.document = {
-	readyState: "loading",
-	body: new FakeElement(),
-	documentElement: new FakeElement(),
-	addEventListener() {},
-	querySelector() { return null; },
-	querySelectorAll() { return []; },
-	createElement() { return new FakeElement(); },
-	createTreeWalker() { return { nextNode() { return null; } }; },
-};
+	let documentQueryElements = [];
+	globalThis.document = {
+		readyState: "loading",
+		body: new FakeElement(),
+		documentElement: new FakeElement(),
+		addEventListener() {},
+		querySelector() { return null; },
+		querySelectorAll() { return documentQueryElements; },
+		createElement(tagName) { return new FakeElement(tagName); },
+		createTreeWalker() { return { nextNode() { return null; } }; },
+	};
 globalThis.Element = FakeElement;
 globalThis.HTMLElement = FakeElement;
 globalThis.NodeFilter = { SHOW_TEXT: 4, SHOW_ELEMENT: 1 };
@@ -815,11 +826,28 @@ if (typeof globalThis.btoa !== "function") {
 }
 require(scriptPath);
 const bridge = globalThis.__cliproxyAmpLocalInference;
-assert(bridge && bridge.userscriptVersion === "0.1.55", "bridge userscript version was not exposed");
-globalThis.localStorage.setItem(bridge.localThreadIDsStorageKey, JSON.stringify([threadID, secondThreadID]));
-globalThis.localStorage.setItem(bridge.apiKeyStorageKey, "local-key");
-globalThis.localStorage.setItem(bridge.workingDirectoryStorageKey, createdThreadWorkDir);
-const metadataResponse = await fetch("http://127.0.0.1:8317/metadata?namespace=default");
+	assert(bridge && bridge.userscriptVersion === "0.1.56", "bridge userscript version was not exposed");
+	globalThis.localStorage.setItem(bridge.localThreadIDsStorageKey, JSON.stringify([threadID, secondThreadID]));
+	globalThis.localStorage.setItem(bridge.apiKeyStorageKey, "local-key");
+	globalThis.localStorage.setItem(bridge.workingDirectoryStorageKey, createdThreadWorkDir);
+	const strayHigh = new FakeElement("span", "High");
+	const modeLow = new FakeElement("button", "Low");
+	modeLow.setAttribute("aria-haspopup", "menu");
+	documentQueryElements = [strayHigh, modeLow];
+		new WebSocket("wss://ampcode.com/gateway?key=" + encodeURIComponent(threadID));
+		const inheritedModeURL = new URL(NativeWebSocket.instances.at(-1).url);
+		assert(inheritedModeURL.origin === "ws://127.0.0.1:8317", "gateway websocket was not bridged locally");
+		assert(inheritedModeURL.searchParams.get("cliproxy-agent-mode") === "low", "unrelated High text overrode real mode control");
+		assert(inheritedModeURL.searchParams.get("cliproxy-reasoning-effort") === "medium", "low mode reasoning effort was not inherited");
+		const genericAriaModeHigh = new FakeElement("button", "High");
+		genericAriaModeHigh.setAttribute("aria-label", "Agent mode");
+		documentQueryElements = [genericAriaModeHigh];
+		new WebSocket("wss://ampcode.com/gateway?key=" + encodeURIComponent(threadID));
+		const genericAriaModeURL = new URL(NativeWebSocket.instances.at(-1).url);
+		assert(genericAriaModeURL.searchParams.get("cliproxy-agent-mode") === "high", "generic aria label masked visible mode text");
+		assert(genericAriaModeURL.searchParams.get("cliproxy-reasoning-effort") === "xhigh", "high mode reasoning effort was not inherited");
+		documentQueryElements = [];
+	const metadataResponse = await fetch("http://127.0.0.1:8317/metadata?namespace=default");
 assert(metadataResponse.ok, "metadata fetch failed");
 assert(metadataFetchURL === "http://127.0.0.1:8317/metadata?namespace=default", "local metadata URL changed");
 assert(metadataFetchAuthorization === "Bearer local-key", "local metadata fetch missing API key");
@@ -1101,7 +1129,7 @@ assert(localHTTPRewritten.protocol === "ws:", "local http websocket protocol was
 assert(localHTTPRewritten.host === "127.0.0.1:8317", "local http websocket host changed");
 assert(localHTTPRewritten.searchParams.get("cliproxy-api-key") === "local-key", "local http websocket localStorage API key was not applied");
 assert(bridge.diagnostics.decodedConfigPatchCount >= 2, "decoded config patches were not recorded");
-assert(bridge.diagnostics.webSocketBootstrapCount === 3, "websocket bootstrap was not recorded");
+assert(bridge.diagnostics.webSocketBootstrapCount === 5, "websocket bootstrap was not recorded");
 })().catch((error) => {
 	console.error(error && error.stack ? error.stack : error);
 	process.exit(1);

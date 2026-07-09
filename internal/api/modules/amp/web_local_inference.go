@@ -215,7 +215,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	return fmt.Sprintf(`// ==UserScript==
 // @name CLIProxyAPI Amp Local Inference
 // @namespace https://github.com/router-for-me/CLIProxyAPI
-// @version 0.1.55
+// @version 0.1.56
 %s
 // @updateURL %s
 // @downloadURL %s
@@ -227,7 +227,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	"use strict";
 
 	const bridgeHeader = %s;
-	const userscriptVersion = "0.1.55";
+	const userscriptVersion = "0.1.56";
 	const apiKeyStorageKey = "cliproxyapi.ampLocalInference.apiKey";
 	const workingDirectoryStorageKey = "cliproxyapi.ampLocalInference.workingDirectory";
 	const selectedLocalProjectStorageKey = "cliproxyapi.ampLocalInference.selectedLocalProject";
@@ -462,15 +462,22 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	function defaultReasoningEffort(agentMode) {
 		const mode = normalizeAgentMode(agentMode);
 		switch (mode) {
+		case "low":
+			return "medium";
+		case "medium":
+			return "medium";
+		case "high":
+			return "xhigh";
+		case "ultra":
+			return "high";
 		case "smart":
 			return "high";
 		case "rush":
 		case "agg-man":
 			return "none";
 		case "deep":
-		case "large":
 		case "review":
-			return mode === "large" ? "low" : "medium";
+			return "medium";
 		case "nostromo":
 			return "low";
 		default:
@@ -480,15 +487,18 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 
 	function normalizeAgentMode(value) {
 		const mode = typeof value === "string" ? value.trim().toLowerCase() : "";
-		return ["smart", "large", "rush", "deep", "review", "agg-man", "nostromo"].includes(mode) ? mode : "";
+		return ["low", "medium", "high", "ultra", "smart", "large", "rush", "deep", "review", "agg-man", "nostromo"].includes(mode) ? mode : "";
 	}
 
 	function normalizeReasoningEffort(agentMode, value) {
 		const mode = normalizeAgentMode(agentMode);
 		const effort = typeof value === "string" ? value.trim().toLowerCase() : "";
 		const allowed = {
+			low: ["medium"],
+			medium: ["medium"],
+			high: ["xhigh"],
+			ultra: ["high"],
 			smart: ["high", "xhigh", "max"],
-			large: ["low"],
 			rush: ["none"],
 			deep: ["low", "medium", "xhigh"],
 			review: ["low", "medium", "high"],
@@ -505,8 +515,11 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		const mode = normalizeAgentMode(agentMode);
 		const effort = typeof value === "string" ? value.trim().toLowerCase() : "";
 		const allowed = {
+			low: ["medium"],
+			medium: ["medium"],
+			high: ["xhigh"],
+			ultra: ["high"],
 			smart: ["high", "xhigh", "max"],
-			large: ["low"],
 			rush: ["none"],
 			deep: ["low", "medium", "xhigh"],
 			review: ["low", "medium", "high"],
@@ -561,7 +574,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		}
 		const settings = activeThreadSettings();
 		const visible = visibleThreadModeOptions();
-		const agentMode = settings.agentMode || visible.agentMode || "smart";
+		const agentMode = settings.agentMode || visible.agentMode || "medium";
 		return {
 			agentMode,
 			reasoningEffort: normalizeReasoningEffort(agentMode, settings.reasoningEffort || visible.reasoningEffort),
@@ -572,14 +585,10 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		const inherited = localThreadModeOptions();
 		return [
 			{ id: "inherit", label: "Use current", detail: localThreadModeLabel(inherited), options: {} },
-			{ id: "smart-high", label: "Smart 1", detail: "High", options: { agentMode: "smart", reasoningEffort: "high" } },
-			{ id: "smart-xhigh", label: "Smart 2", detail: "XHigh", options: { agentMode: "smart", reasoningEffort: "xhigh" } },
-			{ id: "smart-max", label: "Smart 3", detail: "Max", options: { agentMode: "smart", reasoningEffort: "max" } },
-			{ id: "deep-low", label: "Deep 1", detail: "Low", options: { agentMode: "deep", reasoningEffort: "low" } },
-			{ id: "deep-medium", label: "Deep 2", detail: "Medium", options: { agentMode: "deep", reasoningEffort: "medium" } },
-			{ id: "deep-xhigh", label: "Deep 3", detail: "XHigh", options: { agentMode: "deep", reasoningEffort: "xhigh" } },
-			{ id: "large", label: "Large", detail: "Low", options: { agentMode: "large", reasoningEffort: "low" } },
-			{ id: "rush", label: "Rush", detail: "Fast", options: { agentMode: "rush", reasoningEffort: "none" } },
+			{ id: "low", label: "Low", detail: "Medium", options: { agentMode: "low", reasoningEffort: "medium" } },
+			{ id: "medium", label: "Medium", detail: "Medium", options: { agentMode: "medium", reasoningEffort: "medium" } },
+			{ id: "high", label: "High", detail: "XHigh", options: { agentMode: "high", reasoningEffort: "xhigh" } },
+			{ id: "ultra", label: "Ultra", detail: "High", options: { agentMode: "ultra", reasoningEffort: "high" } },
 			{ id: "nostromo", label: "Nostromo", detail: "Amp", options: { agentMode: "nostromo", reasoningEffort: "low" } },
 		];
 	}
@@ -588,6 +597,10 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		const mode = normalizeAgentMode(options?.agentMode);
 		const effort = normalizeReasoningEffort(mode, options?.reasoningEffort);
 		const labels = {
+			"low:medium": "Low",
+			"medium:medium": "Medium",
+			"high:xhigh": "High",
+			"ultra:high": "Ultra",
 			"smart:high": "Smart 1",
 			"smart:xhigh": "Smart 2",
 			"smart:max": "Smart 3",
@@ -598,21 +611,20 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			"review:medium": "Review",
 			"agg-man:none": "Agg-man",
 			"nostromo:low": "Nostromo",
-			"large:low": "Large",
 		};
-		return labels[mode + ":" + effort] || (mode ? mode[0].toUpperCase() + mode.slice(1) : "Smart 1");
+		return labels[mode + ":" + effort] || (mode ? mode[0].toUpperCase() + mode.slice(1) : "Medium");
 	}
 
 	function visibleThreadModeOptions() {
 		if (!globalThis.document?.querySelectorAll) {
 			return {};
 		}
-		const selector = "button,[role='button'],[aria-label],span,div,p";
+		const selector = "button,[role='button'],[aria-haspopup],[aria-label]";
 		for (const element of globalThis.document.querySelectorAll(selector)) {
-			if (!elementVisible(element)) {
+			if (!modeBadgeElement(element)) {
 				continue;
 			}
-			const text = (element.textContent || "").trim();
+			const text = modeBadgeElementText(element);
 			const options = modeOptionsFromBadgeText(text);
 			if (options.agentMode) {
 				diagnostics.lastVisibleThreadModeBadge = text;
@@ -624,6 +636,44 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		return {};
 	}
 
+	function modeBadgeElement(element) {
+		if (!(element instanceof Element) || !elementVisible(element)) {
+			return false;
+		}
+		if (element.closest?.("#cliproxy-amp-local-thread-picker,[data-cliproxy-local-thread-command-item],[data-cliproxy-local-thread-menu-item],[data-cliproxy-local-project-item]")) {
+			return false;
+		}
+		const text = modeBadgeElementText(element);
+		if (!modeOptionsFromBadgeText(text).agentMode) {
+			return false;
+		}
+		const tag = String(element.tagName || "").toLowerCase();
+		const role = String(element.getAttribute?.("role") || "").toLowerCase();
+		const aria = String(element.getAttribute?.("aria-label") || "").toLowerCase();
+		const hasPopup = element.hasAttribute?.("aria-haspopup") || element.hasAttribute?.("aria-expanded");
+		if (!genericDialModeBadgeText(text)) {
+			return tag === "button" || role === "button" || hasPopup || /\b(agent|mode|model|reasoning|dial)\b/.test(aria);
+		}
+		return hasPopup || /\b(agent|mode|model|reasoning|dial)\b/.test(aria);
+	}
+
+	function modeBadgeElementText(element) {
+		const visible = String(element.textContent || "").trim();
+		if (modeOptionsFromBadgeText(visible).agentMode) {
+			return visible;
+		}
+		const aria = String(element.getAttribute?.("aria-label") || "").trim();
+		if (modeOptionsFromBadgeText(aria).agentMode) {
+			return aria;
+		}
+		return aria || visible;
+	}
+
+	function genericDialModeBadgeText(text) {
+		const normalized = String(text || "").trim().toLowerCase().replace(/\s+/g, "");
+		return /^(low|medium|high|ultra)$/.test(normalized);
+	}
+
 	function modeOptionsFromBadgeText(text) {
 		let normalized = typeof text === "string" ? text.trim().toLowerCase() : "";
 		normalized = normalized
@@ -631,7 +681,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			.replace(/\u00b2/g, "2")
 			.replace(/\u00b3/g, "3")
 			.replace(/\s+/g, "");
-		const match = normalized.match(/^(smart|large|rush|deep|review|agg-man|nostromo)([123])?$/);
+		const match = normalized.match(/^(low|medium|high|ultra|smart|large|rush|deep|review|agg-man|nostromo)([123])?$/);
 		if (!match) {
 			return {};
 		}
@@ -647,6 +697,10 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 
 	function badgeLevelReasoningEffort(agentMode, level) {
 		const efforts = {
+			low: { 1: "medium" },
+			medium: { 1: "medium" },
+			high: { 1: "xhigh" },
+			ultra: { 1: "high" },
 			smart: { 1: "high", 2: "xhigh", 3: "max" },
 			rush: { 1: "none" },
 			deep: { 1: "low", 2: "medium", 3: "xhigh" },

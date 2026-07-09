@@ -31,6 +31,10 @@ var neoModeSystemPromptKey = map[string]string{
 	"deep":     "deep",
 	"review":   "review",
 	"nostromo": "nostromo",
+	"low":      "low",
+	"medium":   "deep",
+	"high":     "deep",
+	"ultra":    "ultra",
 }
 
 // TestNeoKnownModeToolsMatchesModeUnion is a pure runtime invariant (no binary
@@ -194,7 +198,7 @@ func neoToolParityResolveArray(text, ident string, depth int) ([]string, bool) {
 	if open := neoToolParityIndexUnbound(text, ident+"=["); open >= 0 {
 		bracket := open + len(ident) + 1
 		if body, ok := neoToolParityScanBracket(text, bracket); ok {
-			return neoToolParityQuoted(body), true
+			return neoToolParityArrayLiteralTools(text, body, depth)
 		}
 	}
 	setNeedle := ident + "=Array.from(new Set(["
@@ -220,7 +224,39 @@ func neoToolParityResolveArray(text, ident string, depth int) ([]string, bool) {
 			}
 		}
 	}
+	assignNeedle := ident + "="
+	if at := neoToolParityIndexUnbound(text, assignNeedle); at >= 0 {
+		rest := text[at+len(assignNeedle):]
+		alias := neoToolParityReadIdent(rest)
+		if alias != "" && alias != ident {
+			return neoToolParityResolveArray(text, alias, depth+1)
+		}
+	}
 	return nil, false
+}
+
+func neoToolParityArrayLiteralTools(text, body string, depth int) ([]string, bool) {
+	var out []string
+	for _, part := range strings.Split(body, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if strings.HasPrefix(part, "...") {
+			id := neoToolParityReadIdent(part[3:])
+			if id == "" {
+				return nil, false
+			}
+			sub, ok := neoToolParityResolveArray(text, id, depth+1)
+			if !ok {
+				return nil, false
+			}
+			out = append(out, sub...)
+			continue
+		}
+		out = append(out, neoToolParityQuoted(part)...)
+	}
+	return out, true
 }
 
 // neoToolParityIndexUnbound returns the index of needle in text where the character

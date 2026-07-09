@@ -65,16 +65,17 @@ var (
 	settingDefaultPattern                = regexp.MustCompile(`"?([A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z0-9]+)*)"?\s*:\s*\{value:((?:void 0|!0|!1|true|false|null|-?[0-9]+(?:\.[0-9]+)?|"[^"]{0,160}"|\[(?:"[^"]{0,160}"(?:,"[^"]{0,160}")*)?\]))`)
 	threadIDPattern                      = regexp.MustCompile(`T-[0-9a-fA-Fx]{8,}-[0-9a-fA-Fx-]{8,}`)
 
-	primaryModelRefPattern       = regexp.MustCompile(`primaryModel:[A-Za-z0-9_$]+\("([A-Z0-9_]+)"\)`)
-	includeToolsRefPattern       = regexp.MustCompile(`includeTools:([A-Za-z0-9_$]+)`)
-	stringArrayAssignmentPattern = regexp.MustCompile(`(?:^|[^A-Za-z0-9_$])([A-Za-z_$][A-Za-z0-9_$]*)=\[((?:"[^"]+"(?:,"[^"]+")*)?)\]`)
-	stringArrayUnionPattern      = regexp.MustCompile(`(?:^|[^A-Za-z0-9_$])([A-Za-z_$][A-Za-z0-9_$]*)=Array\.from\(new Set\(\[\.\.\.([A-Za-z_$][A-Za-z0-9_$]*),\.\.\.([A-Za-z_$][A-Za-z0-9_$]*)\]\)\)`)
-	reasoningEffortPattern       = regexp.MustCompile(`reasoningEffort:"([^"]+)"`)
-	reasoningLevelsBlockPattern  = regexp.MustCompile(`reasoningEffortControl:\{levels:\[([^\]]*)\]`)
-	quotedStringPattern          = regexp.MustCompile(`"([^"]+)"`)
-	httpMethodPropertyPattern    = regexp.MustCompile(`method\s*:\s*["']?\s*(GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD)\b`)
-	httpQuotedMethodArgPattern   = regexp.MustCompile("[\"'](GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD)[\"']\\s*,\\s*[\"'`]?$")
-	httpMethodCallPrefixPattern  = regexp.MustCompile("(?i)\\.(get|post|put|patch|delete|options|head)\\s*\\(\\s*[\"'`]?$")
+	primaryModelRefPattern      = regexp.MustCompile(`(?:primaryModel|model):[A-Za-z0-9_$]+\("([A-Z0-9_]+)"\)`)
+	includeToolsRefPattern      = regexp.MustCompile(`includeTools:([A-Za-z0-9_$]+)`)
+	stringArrayOpenPattern      = regexp.MustCompile(`(?:^|[^A-Za-z0-9_$])([A-Za-z_$][A-Za-z0-9_$]*)=\[`)
+	stringArrayUnionOpenPattern = regexp.MustCompile(`(?:^|[^A-Za-z0-9_$])([A-Za-z_$][A-Za-z0-9_$]*)=Array\.from\(new Set\(\[`)
+	stringArrayAliasPattern     = regexp.MustCompile(`(?:^|[^A-Za-z0-9_$])([A-Za-z_$][A-Za-z0-9_$]*)=([A-Za-z_$][A-Za-z0-9_$]*)\b`)
+	reasoningEffortPattern      = regexp.MustCompile(`reasoningEffort:"([^"]+)"`)
+	reasoningLevelsBlockPattern = regexp.MustCompile(`reasoningEffortControl:\{levels:\[([^\]]*)\]`)
+	quotedStringPattern         = regexp.MustCompile(`"([^"]+)"`)
+	httpMethodPropertyPattern   = regexp.MustCompile(`method\s*:\s*["']?\s*(GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD)\b`)
+	httpQuotedMethodArgPattern  = regexp.MustCompile("[\"'](GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD)[\"']\\s*,\\s*[\"'`]?$")
+	httpMethodCallPrefixPattern = regexp.MustCompile("(?i)\\.(get|post|put|patch|delete|options|head)\\s*\\(\\s*[\"'`]?$")
 )
 
 var knownDeltaNames = []string{
@@ -664,37 +665,53 @@ var agentModeMarkers = []agentModeMarker{
 	{Name: "review", Token: `REVIEW:{key:"review"`},
 	{Name: "agg-man", Token: `AGG:{key:"agg-man"`},
 	{Name: "large", Token: `LARGE:{key:"large"`},
+	{Name: "low", Token: `LOW:{key:"low"`},
+	{Name: "medium", Token: `MED:{key:"medium"`},
+	{Name: "high", Token: `HIGH:{key:"high"`},
+	{Name: "ultra", Token: `ULTRA:{key:"ultra"`},
 	{Name: "nostromo", Token: `NOSTROMO:{key:`},
 }
 
 var agentModeScopes = map[string]string{
 	"agg-man":  "server-only",
 	"deep":     "local-runtime",
+	"high":     "local-runtime",
 	"large":    "local-runtime",
+	"low":      "local-runtime",
+	"medium":   "local-runtime",
 	"nostromo": "local-runtime",
 	"review":   "local-runtime",
 	"rush":     "local-runtime",
 	"smart":    "local-runtime",
+	"ultra":    "local-runtime",
 }
 
 var knownAgentModeProfileValues = map[string]struct{}{
-	"agg-man|primary=|reasoning=none|levels=|include=present|tools=find_thread,read_thread,web_search,read_web_page,docs_list,docs_read,docs_write,create_project,list_agent_modes,create_thread,archive_thread,archive_threads,unarchive_thread,send_message_to_thread,publish_thread_artifacts,manage_automation,slack_write,slack_read,github_repo_ci_status,read_github,search_github,commit_search,list_directory_github,list_repositories,glob_github,diff|deferred=false|visible=false|visibleInV2=false|serverOnly=true": {},
-	"deep|primary=|reasoning=medium|levels=low,medium,xhigh|include=present|tools=shell_command,shell_command_status,apply_patch,web_search,read_web_page,Task,skill,load_plugin,read_thread,find_thread,librarian,oracle,finder,view_media,painter,archive_current_thread,manage_automation,send_message_to_agg|deferred=true|visible=true|visibleInV2=false|serverOnly=false":                                                                                                                                                  {},
-	"large|primary=|reasoning=low|levels=|include=present|tools=finder,shell_command,shell_command_status,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,skill,load_plugin,oracle,librarian,Task,view_media,painter,read_mcp_resource,archive_current_thread,manage_automation,send_message_to_agg|deferred=true|visible=false|visibleInV2=false|serverOnly=false":                                                                                                                                       {},
-	"nostromo|primary=|reasoning=low|levels=|include=present|tools=finder,shell_command,shell_command_status,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,skill,load_plugin,oracle,librarian,Task,view_media,painter,read_mcp_resource,archive_current_thread,manage_automation,send_message_to_agg,apply_patch|deferred=false|visible=true|visibleInV2=false|serverOnly=false":                                                                                                                        {},
-	"review|primary=|reasoning=medium|levels=|include=present|tools=shell_command,run_check,submit_review|deferred=false|visible=false|visibleInV2=false|serverOnly=false":                                                                                                                                                                                                                                                                                                                                                       {},
-	"rush|primary=|reasoning=none|levels=|include=present|tools=finder,shell_command,shell_command_status,apply_patch,web_search,read_web_page,read_mcp_resource,read_thread,find_thread,skill,load_plugin,oracle,librarian,Task,view_media,painter,archive_current_thread,manage_automation,send_message_to_agg|deferred=false|visible=true|visibleInV2=false|serverOnly=false":                                                                                                                                                 {},
-	"smart|primary=|reasoning=high|levels=high,max,xhigh|include=present|tools=finder,shell_command,shell_command_status,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,skill,load_plugin,oracle,librarian,Task,view_media,painter,read_mcp_resource,archive_current_thread,manage_automation,send_message_to_agg|deferred=true|visible=true|visibleInV2=false|serverOnly=false":                                                                                                                         {},
+	"agg-man|primary=GPT_5_5|reasoning=none|levels=|include=present|tools=find_thread,read_thread,web_search,read_web_page,docs_list,docs_read,docs_write,create_project,list_agent_modes,create_thread,archive_thread,archive_threads,unarchive_thread,send_message_to_thread,publish_thread_artifacts,manage_automation,slack_write,slack_read,github_repo_ci_status,read_github,search_github,commit_search,list_directory_github,list_repositories,glob_github,diff|deferred=false|visible=false|visibleInV2=false|serverOnly=true": {},
+	"deep|primary=GPT_5_5|reasoning=medium|levels=low,medium,xhigh|include=present|tools=shell_command,shell_command_status,apply_patch,web_search,read_web_page,Task,skill,load_plugin,read_thread,find_thread,librarian,oracle,finder,view_media,painter,archive_current_thread,manage_automation,slack_write,slack_read,send_message_to_agg|deferred=true|visible=false|visibleInV2=false|serverOnly=false":                                                                                                                          {},
+	"high|primary=GPT_5_5|reasoning=xhigh|levels=|include=present|tools=shell_command,shell_command_status,apply_patch,web_search,read_web_page,Task,skill,load_plugin,read_thread,find_thread,librarian,oracle,finder,view_media,painter,archive_current_thread,manage_automation,slack_write,slack_read,send_message_to_agg|deferred=true|visible=true|visibleInV2=true|serverOnly=false":                                                                                                                                             {},
+	"large|primary=CLAUDE_OPUS_4_8|reasoning=|levels=|include=present|tools=finder,shell_command,shell_command_status,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,skill,load_plugin,oracle,librarian,Task,view_media,painter,read_mcp_resource,archive_current_thread,manage_automation,slack_write,slack_read,send_message_to_agg|deferred=true|visible=false|visibleInV2=false|serverOnly=false":                                                                                                           {},
+	"low|primary=AMP_GLM_5_2|reasoning=medium|levels=|include=present|tools=finder,shell_command,shell_command_status,apply_patch,web_search,read_web_page,read_thread,find_thread,skill,load_plugin,oracle,librarian,Task,view_media,painter,archive_current_thread,manage_automation,slack_write,slack_read,send_message_to_agg|deferred=false|visible=true|visibleInV2=true|serverOnly=false":                                                                                                                                        {},
+	"medium|primary=GPT_5_5|reasoning=medium|levels=|include=present|tools=shell_command,shell_command_status,apply_patch,web_search,read_web_page,Task,skill,load_plugin,read_thread,find_thread,librarian,oracle,finder,view_media,painter,archive_current_thread,manage_automation,slack_write,slack_read,send_message_to_agg|deferred=true|visible=true|visibleInV2=true|serverOnly=false":                                                                                                                                          {},
+	"nostromo|primary=AMP_NOSTROMO|reasoning=low|levels=|include=present|tools=finder,shell_command,shell_command_status,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,skill,load_plugin,oracle,librarian,Task,view_media,painter,read_mcp_resource,archive_current_thread,manage_automation,slack_write,slack_read,send_message_to_agg,apply_patch|deferred=false|visible=true|visibleInV2=true|serverOnly=false":                                                                                             {},
+	"review|primary=GPT_5_5|reasoning=medium|levels=|include=present|tools=shell_command,run_check,submit_review|deferred=false|visible=false|visibleInV2=false|serverOnly=false":                                                                                                                                                                                                                                                                                                                                                       {},
+	"rush|primary=GPT_5_5|reasoning=none|levels=|include=present|tools=finder,shell_command,shell_command_status,apply_patch,web_search,read_web_page,read_thread,find_thread,skill,load_plugin,oracle,librarian,Task,view_media,painter,archive_current_thread,manage_automation,slack_write,slack_read,send_message_to_agg|deferred=false|visible=false|visibleInV2=false|serverOnly=false":                                                                                                                                           {},
+	"smart|primary=CLAUDE_OPUS_4_8|reasoning=high|levels=high,max,xhigh|include=present|tools=finder,shell_command,shell_command_status,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,skill,load_plugin,oracle,librarian,Task,view_media,painter,read_mcp_resource,archive_current_thread,manage_automation,slack_write,slack_read,send_message_to_agg|deferred=true|visible=false|visibleInV2=false|serverOnly=false":                                                                                         {},
+	"ultra|primary=CLAUDE_FABLE_5|reasoning=high|levels=|include=present|tools=finder,shell_command,shell_command_status,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,skill,load_plugin,oracle,librarian,Task,view_media,painter,read_mcp_resource,archive_current_thread,manage_automation,slack_write,slack_read,send_message_to_agg|deferred=true|visible=true|visibleInV2=true|serverOnly=false":                                                                                                          {},
 }
 
 var knownAgentModeRouteValues = map[string]struct{}{
-	"agg-man|provider=|model=|primary=|reasoning=none|context=0|max_out=0":  {},
-	"deep|provider=|model=|primary=|reasoning=medium|context=0|max_out=0":   {},
-	"large|provider=|model=|primary=|reasoning=low|context=0|max_out=0":     {},
-	"nostromo|provider=|model=|primary=|reasoning=low|context=0|max_out=0":  {},
-	"review|provider=|model=|primary=|reasoning=medium|context=0|max_out=0": {},
-	"rush|provider=|model=|primary=|reasoning=none|context=0|max_out=0":     {},
-	"smart|provider=|model=|primary=|reasoning=high|context=0|max_out=0":    {},
+	"agg-man|provider=openai|model=gpt-5.5|primary=GPT_5_5|reasoning=none|context=400000|max_out=128000":                 {},
+	"deep|provider=openai|model=gpt-5.5|primary=GPT_5_5|reasoning=medium|context=400000|max_out=128000":                  {},
+	"high|provider=openai|model=gpt-5.5|primary=GPT_5_5|reasoning=xhigh|context=400000|max_out=128000":                   {},
+	"large|provider=anthropic|model=claude-opus-4-8|primary=CLAUDE_OPUS_4_8|reasoning=|context=332000|max_out=32000":     {},
+	"low|provider=amp|model=glm-5.2|primary=AMP_GLM_5_2|reasoning=medium|context=200000|max_out=32000":                   {},
+	"medium|provider=openai|model=gpt-5.5|primary=GPT_5_5|reasoning=medium|context=400000|max_out=128000":                {},
+	"nostromo|provider=amp|model=amp-nostromo-v1|primary=AMP_NOSTROMO|reasoning=low|context=400000|max_out=128000":       {},
+	"review|provider=openai|model=gpt-5.5|primary=GPT_5_5|reasoning=medium|context=400000|max_out=128000":                {},
+	"rush|provider=openai|model=gpt-5.5|primary=GPT_5_5|reasoning=none|context=400000|max_out=128000":                    {},
+	"smart|provider=anthropic|model=claude-opus-4-8|primary=CLAUDE_OPUS_4_8|reasoning=high|context=332000|max_out=32000": {},
+	"ultra|provider=anthropic|model=claude-fable-5|primary=CLAUDE_FABLE_5|reasoning=high|context=332000|max_out=128000":  {},
 }
 
 var ignoredToolCancelReasonTokens = map[string]struct{}{
@@ -3102,13 +3119,13 @@ func extractAgentModeProfiles(s string) []AgentModeProfile {
 		profiles = append(profiles, AgentModeProfile{
 			Name:            position.Name,
 			PrimaryModel:    firstSubmatch(primaryModelRefPattern, segment),
-			ReasoningEffort: firstSubmatch(reasoningEffortPattern, segment),
+			ReasoningEffort: lastSubmatch(reasoningEffortPattern, segment),
 			ReasoningLevels: quotedValues(firstSubmatch(reasoningLevelsBlockPattern, segment)),
 			IncludeTools:    normalizedAgentModeIncludeTools(includeTools),
 			ToolNames:       append([]string(nil), toolArrays[includeTools]...),
 			DeferredTools:   strings.Contains(segment, "deferredTools:"),
 			Visible:         strings.Contains(segment, "visible:!0"),
-			VisibleInV2:     strings.Contains(segment, "visibleInV2:!0"),
+			VisibleInV2:     strings.Contains(segment, "visibleInV2:!0") || strings.Contains(segment, "visibleInApp:!0"),
 			ServerOnly:      strings.Contains(segment, "serverOnly:!0"),
 		})
 	}
@@ -3116,24 +3133,121 @@ func extractAgentModeProfiles(s string) []AgentModeProfile {
 }
 
 func stringArrayAssignments(s string) map[string][]string {
-	arrays := map[string][]string{}
-	for _, match := range stringArrayAssignmentPattern.FindAllStringSubmatch(s, -1) {
-		if len(match) < 3 {
-			continue
-		}
-		arrays[match[1]] = quotedValuesInOrder(match[2])
-	}
-	for _, match := range stringArrayUnionPattern.FindAllStringSubmatch(s, -1) {
+	bodies := map[string]string{}
+	for _, match := range stringArrayOpenPattern.FindAllStringSubmatchIndex(s, -1) {
 		if len(match) < 4 {
 			continue
 		}
-		arrays[match[1]] = uniqueStringsInOrder(append(append([]string{}, arrays[match[2]]...), arrays[match[3]]...))
+		open := match[1] - 1
+		if body, ok := scanJSBracketBody(s, open); ok {
+			bodies[s[match[2]:match[3]]] = body
+		}
 	}
-	return arrays
+	unions := map[string]string{}
+	for _, match := range stringArrayUnionOpenPattern.FindAllStringSubmatchIndex(s, -1) {
+		if len(match) < 4 {
+			continue
+		}
+		open := match[1] - 1
+		if body, ok := scanJSBracketBody(s, open); ok {
+			unions[s[match[2]:match[3]]] = body
+		}
+	}
+	aliases := map[string]string{}
+	for _, match := range stringArrayAliasPattern.FindAllStringSubmatch(s, -1) {
+		if len(match) < 3 {
+			continue
+		}
+		if match[1] != match[2] {
+			aliases[match[1]] = match[2]
+		}
+	}
+	resolved := map[string][]string{}
+	resolving := map[string]bool{}
+	var resolve func(string) []string
+	resolve = func(name string) []string {
+		if values, ok := resolved[name]; ok {
+			return values
+		}
+		if resolving[name] {
+			return nil
+		}
+		resolving[name] = true
+		defer delete(resolving, name)
+		var values []string
+		if body, ok := bodies[name]; ok {
+			values = resolveArrayLiteralTools(body, resolve)
+		} else if body, ok := unions[name]; ok {
+			values = uniqueStringsInOrder(resolveArrayLiteralTools(body, resolve))
+		} else if alias := aliases[name]; alias != "" {
+			values = resolve(alias)
+		}
+		resolved[name] = values
+		return values
+	}
+	for name := range bodies {
+		resolve(name)
+	}
+	for name := range unions {
+		resolve(name)
+	}
+	for name := range aliases {
+		resolve(name)
+	}
+	return resolved
+}
+
+func scanJSBracketBody(s string, open int) (string, bool) {
+	if open < 0 || open >= len(s) || s[open] != '[' {
+		return "", false
+	}
+	depth := 0
+	for i := open; i < len(s); i++ {
+		switch s[i] {
+		case '[':
+			depth++
+		case ']':
+			depth--
+			if depth == 0 {
+				return s[open+1 : i], true
+			}
+		}
+	}
+	return "", false
+}
+
+func resolveArrayLiteralTools(body string, resolve func(string) []string) []string {
+	var out []string
+	for _, part := range strings.Split(body, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if strings.HasPrefix(part, "...") {
+			if ident := readJSIdent(part[3:]); ident != "" {
+				out = append(out, resolve(ident)...)
+			}
+			continue
+		}
+		out = append(out, quotedValuesInOrder(part)...)
+	}
+	return out
+}
+
+func readJSIdent(s string) string {
+	end := 0
+	for end < len(s) && isJSIdentByte(s[end]) {
+		end++
+	}
+	return s[:end]
+}
+
+func isJSIdentByte(b byte) bool {
+	return b >= 'A' && b <= 'Z' || b >= 'a' && b <= 'z' || b >= '0' && b <= '9' || b == '_' || b == '$'
 }
 
 func agentModeTableEnd(s string) int {
-	ends := []string{"}},Fc=", "}},uU="}
+	ends := []string{"}},Fc=", "}},uU=", "}};var "}
 	best := -1
 	for _, marker := range ends {
 		if index := strings.Index(s, marker); index >= 0 && (best == -1 || index < best) {
@@ -3169,6 +3283,14 @@ func firstSubmatch(pattern *regexp.Regexp, s string) string {
 		return ""
 	}
 	return match[1]
+}
+
+func lastSubmatch(pattern *regexp.Regexp, s string) string {
+	matches := pattern.FindAllStringSubmatch(s, -1)
+	if len(matches) == 0 || len(matches[len(matches)-1]) < 2 {
+		return ""
+	}
+	return matches[len(matches)-1][1]
 }
 
 func quotedValues(s string) []string {
@@ -7693,7 +7815,7 @@ func unknownAgentModeInternalsFromCoverage(diff auditDiff) []string {
 
 func knownAgentModePrimary(primary string) bool {
 	switch strings.TrimSpace(primary) {
-	case "AMP_NOSTROMO", "CLAUDE_OPUS_4_6", "CLAUDE_OPUS_4_7", "CLAUDE_OPUS_4_8", "GPT_5_5":
+	case "AMP_GLM_5_2", "AMP_NOSTROMO", "CLAUDE_FABLE_5", "CLAUDE_OPUS_4_6", "CLAUDE_OPUS_4_7", "CLAUDE_OPUS_4_8", "GPT_5_5":
 		return true
 	default:
 		return false
@@ -7735,12 +7857,16 @@ func knownAgentModeProfileFlags(name, visible, visibleInV2, serverOnly string) b
 	}
 	expected := map[string]flags{
 		"agg-man":  {visible: "false", visibleInV2: "false", serverOnly: "true"},
-		"deep":     {visible: "true", visibleInV2: "false", serverOnly: "false"},
+		"deep":     {visible: "false", visibleInV2: "false", serverOnly: "false"},
+		"high":     {visible: "true", visibleInV2: "true", serverOnly: "false"},
 		"large":    {visible: "false", visibleInV2: "false", serverOnly: "false"},
-		"nostromo": {visible: "true", visibleInV2: "false", serverOnly: "false"},
+		"low":      {visible: "true", visibleInV2: "true", serverOnly: "false"},
+		"medium":   {visible: "true", visibleInV2: "true", serverOnly: "false"},
+		"nostromo": {visible: "true", visibleInV2: "true", serverOnly: "false"},
 		"review":   {visible: "false", visibleInV2: "false", serverOnly: "false"},
-		"rush":     {visible: "true", visibleInV2: "false", serverOnly: "false"},
-		"smart":    {visible: "true", visibleInV2: "false", serverOnly: "false"},
+		"rush":     {visible: "false", visibleInV2: "false", serverOnly: "false"},
+		"smart":    {visible: "false", visibleInV2: "false", serverOnly: "false"},
+		"ultra":    {visible: "true", visibleInV2: "true", serverOnly: "false"},
 	}
 	want, ok := expected[strings.TrimSpace(name)]
 	if !ok {
