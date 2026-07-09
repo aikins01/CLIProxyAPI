@@ -24,7 +24,7 @@ func TestNeoSubagentRegistryMatchesLocalContract(t *testing.T) {
 		{"finder", "anthropic", "claude-haiku-4-5-20251001", "", []string{"Grep", "glob", "Read"}},
 		{"oracle", "anthropic", "claude-fable-5", "high", []string{"Read", "Grep", "glob", "web_search", "read_web_page", "read_thread", "find_thread"}},
 		{"librarian", "openai", "gpt-5.6-sol", "none", []string{"read_github", "search_github", "commit_search", "diff", "list_directory_github", "list_repositories", "glob_github"}},
-		{"run_check", "google", "gemini-3.5-flash", "high", []string{"Read", "Grep", "glob", "Bash"}},
+		{"run_check", "openai", "gpt-5.6-terra", "low", []string{"Read", "Grep", "glob", "Bash"}},
 		// Task inherits the parent model (empty route) and includes finder (a nested subagent).
 		{"Task", "", "", "", []string{"Read", "Bash", "edit_file", "create_file", "read_web_page", "web_search", "finder", "skill", "view_media"}},
 	}
@@ -151,7 +151,7 @@ func TestNeoLibrarianSubagentUsesGPT56SolNone(t *testing.T) {
 	}
 }
 
-func TestNeoRunCheckSubagentUsesGeminiFlashHigh(t *testing.T) {
+func TestNeoRunCheckSubagentUsesGPT56TerraLow(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	actor := newNeoActor(rt, "actor-run-check", "thread-actor", "T-run-check", "T-run-check", neoActorRecord("actor-run-check", "thread-actor", "T-run-check"), nil)
 	actor.currentAgentMode = "review"
@@ -183,11 +183,11 @@ func TestNeoRunCheckSubagentUsesGeminiFlashHigh(t *testing.T) {
 		t.Fatalf("run_check requests = %#v, want exactly one", seen)
 	}
 	route := seen[0].ModelRouteOverride
-	if route == nil || route.Provider != "google" || route.Model != "gemini-3.5-flash" {
-		t.Fatalf("run_check route = %#v, want google/gemini-3.5-flash", route)
+	if route == nil || route.Provider != "openai" || route.Model != "gpt-5.6-terra" {
+		t.Fatalf("run_check route = %#v, want openai/gpt-5.6-terra", route)
 	}
-	if seen[0].ReasoningEffort != "high" || stringValue(seen[0].Settings["reasoning.effort"]) != "high" {
-		t.Fatalf("run_check effort request=%q settings=%#v, want high", seen[0].ReasoningEffort, seen[0].Settings)
+	if seen[0].ReasoningEffort != "low" || stringValue(seen[0].Settings["reasoning.effort"]) != "low" {
+		t.Fatalf("run_check effort request=%q settings=%#v, want low", seen[0].ReasoningEffort, seen[0].Settings)
 	}
 	if !neoSubagentHasTools(seen[0].Tools, "Read", "Grep", "glob", "Bash") {
 		t.Fatalf("run_check tools = %#v, want review check tools", seen[0].Tools)

@@ -292,6 +292,11 @@ func TestWebLocalInferenceCORSAllowsOnlyConfiguredActorOriginsAndPaths(t *testin
 	if allowHeaders := rec.Header().Get("Access-Control-Allow-Headers"); !strings.Contains(strings.ToLower(allowHeaders), strings.ToLower(ampWebLocalInferenceHeader)) {
 		t.Fatalf("Access-Control-Allow-Headers = %q, want %s", allowHeaders, ampWebLocalInferenceHeader)
 	}
+	for _, header := range []string{"X-Rivet-Conn-Params", "X-Rivet-Encoding"} {
+		if allowHeaders := rec.Header().Get("Access-Control-Allow-Headers"); !strings.Contains(strings.ToLower(allowHeaders), strings.ToLower(header)) {
+			t.Fatalf("Access-Control-Allow-Headers = %q, want %s", allowHeaders, header)
+		}
+	}
 	if allowCredentials := rec.Header().Get("Access-Control-Allow-Credentials"); allowCredentials != "true" {
 		t.Fatalf("Access-Control-Allow-Credentials = %q, want true", allowCredentials)
 	}
@@ -413,7 +418,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 	}
 	for _, want := range []string{
 		"// ==UserScript==",
-		"@version 0.1.56",
+		"@version 0.1.57",
 		"@match https://ampcode.com/*",
 		"@updateURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
 		"@downloadURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
@@ -428,7 +433,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"commandPaletteIntegrationCount",
 		"localThreadPickerOpenCount",
 		"removedLocalThreadControlCount",
-		`const userscriptVersion = "0.1.56"`,
+		`const userscriptVersion = "0.1.57"`,
 		"userscriptVersion",
 		"lastPatchedThreadActorBaseURL",
 		"lastPatchedThreadID",
@@ -472,6 +477,8 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"fetchLocalProjects(false)",
 		"fetchLocalProjects(true)",
 		"installLocalProjectPickerIntegration",
+		"installLocalProjectPickerSearch",
+		"filterLocalProjectPickerItems",
 		"installLocalProjectNoProjectSelectionHandler",
 		"localProjectPickerLooksLikeProjectPicker",
 		"if (!item || projectPickerItemSelected(item))",
@@ -528,10 +535,13 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		`"Bearer " + apiKey`,
 		"gatewayActorPath",
 		"gatewayUserActorPath",
+		"gatewayUserActorActionPath",
+		`new Set(["registerRunner", "runnerHeartbeat", "unregisterRunner", "listRunners"])`,
+		"localRunnerActionNames.has(parts[3])",
 		`"user-actor"`,
 		`.split("@")[0]`,
 		"shouldBridgeUserActorWebSocket",
-		"return !!threadID && rememberedLocalThreadID(threadID);",
+		"return !!storedLocalAPIKey();",
 		"threadActorAPIPath",
 		"threadActorCreatePath",
 		"threadActorInstancePath",
@@ -768,6 +778,8 @@ let createFetchURL = "";
 let metadataFetchURL = "";
 let metadataFetchAuthorization = "";
 let metadataFetchBridgeHeader = "";
+let metadataFetchRivetEncoding = "";
+let metadataFetchUnsupportedHeader = "";
 globalThis.fetch = async (url, init) => {
 	const fetchURL = String(url);
 	const parsedURL = new URL(fetchURL, globalThis.location.href);
@@ -776,6 +788,8 @@ globalThis.fetch = async (url, init) => {
 		const headers = new Headers(init?.headers || {});
 		metadataFetchAuthorization = headers.get("Authorization") || "";
 		metadataFetchBridgeHeader = headers.get("X-CLIProxyAPI-Web-Local-Inference") || "";
+		metadataFetchRivetEncoding = headers.get("X-Rivet-Encoding") || "";
+		metadataFetchUnsupportedHeader = headers.get("X-Unlisted-Framework-Header") || "";
 		return new Response(JSON.stringify({
 			clientEndpoint: "http://127.0.0.1:8317",
 			clientNamespace: parsedURL.searchParams.get("namespace") || "default",
@@ -826,7 +840,7 @@ if (typeof globalThis.btoa !== "function") {
 }
 require(scriptPath);
 const bridge = globalThis.__cliproxyAmpLocalInference;
-	assert(bridge && bridge.userscriptVersion === "0.1.56", "bridge userscript version was not exposed");
+	assert(bridge && bridge.userscriptVersion === "0.1.57", "bridge userscript version was not exposed");
 	globalThis.localStorage.setItem(bridge.localThreadIDsStorageKey, JSON.stringify([threadID, secondThreadID]));
 	globalThis.localStorage.setItem(bridge.apiKeyStorageKey, "local-key");
 	globalThis.localStorage.setItem(bridge.workingDirectoryStorageKey, createdThreadWorkDir);
@@ -852,13 +866,15 @@ assert(metadataResponse.ok, "metadata fetch failed");
 assert(metadataFetchURL === "http://127.0.0.1:8317/metadata?namespace=default", "local metadata URL changed");
 assert(metadataFetchAuthorization === "Bearer local-key", "local metadata fetch missing API key");
 assert(metadataFetchBridgeHeader === "1", "local metadata fetch missing bridge header");
-const actorsMetadataResponse = await fetch("https://ampcode.com/actors/metadata?namespace=default");
+const actorsMetadataResponse = await fetch("https://ampcode.com/actors/metadata?namespace=default", { headers: { "X-Rivet-Encoding": "bare", "X-Unlisted-Framework-Header": "blocked" } });
 assert(actorsMetadataResponse.ok, "actors metadata fetch failed");
 const bridgedActorsMetadataURL = new URL(metadataFetchURL);
 assert(bridgedActorsMetadataURL.origin === "http://127.0.0.1:8317", "same-origin actors metadata was not bridged to local base");
 assert(bridgedActorsMetadataURL.pathname === "/actors/metadata", "actors metadata path changed");
 assert(metadataFetchAuthorization === "Bearer local-key", "actors metadata fetch missing API key");
 assert(metadataFetchBridgeHeader === "1", "actors metadata fetch missing bridge header");
+assert(metadataFetchRivetEncoding === "bare", "supported Rivet header was not forwarded");
+assert(metadataFetchUnsupportedHeader === "", "unsupported source header was forwarded to local CORS request");
 const assertPlainConfig = (config, label) => {
 	assert(config && typeof config === "object", label + " config missing");
 	const expectedThreadID = label === "created plain" ? createdThreadID : threadID;
@@ -1191,6 +1207,8 @@ class FakeElement {
 		this.eventListeners = {};
 		this.className = "";
 		this.disabled = false;
+		this.hidden = false;
+		this.value = "";
 		this._text = "";
 	}
 	get firstElementChild() { return this.children[0] || null; }
@@ -1302,7 +1320,10 @@ class FakeElement {
 		}
 		return !event.defaultPrevented;
 	}
-	getBoundingClientRect() { return { width: 320, height: 32, left: 0, top: 0, right: 320, bottom: 32 }; }
+	getBoundingClientRect() {
+		if (this.hidden || this.style.display === "none") return { width: 0, height: 0, left: 0, top: 0, right: 0, bottom: 0 };
+		return { width: 320, height: 32, left: 0, top: 0, right: 320, bottom: 32 };
+	}
 	scrollIntoView() {}
 }
 const documentElement = new FakeElement("html");
@@ -1439,6 +1460,17 @@ assert(selected, "no injected local project item was selected");
 assert(selected.dataset.cliproxyLocalProjectWorkingDirectory === "/Users/aikins01/Developer/telemetry.dev", "visible project was not selected: " + selected.innerText);
 	assert(selected.dataset.cliproxyLocalProjectCurrent === "1", "visible project item was not marked current");
 assert(popupProjectButton.textContent.includes("Project: telemetry.dev"), "popup project button stayed stale: " + popupProjectButton.textContent);
+input.value = "Developer/telemetry.dev";
+input.dispatchEvent(new FakeEvent("input", { bubbles: true }));
+await new Promise((resolve) => setTimeout(resolve, 25));
+const filteredItems = localItems.filter((item) => !item.hidden && item.style.display !== "none");
+assert(filteredItems.length === 1, "local project search did not filter to one item: " + filteredItems.map((item) => item.innerText).join(" | "));
+assert(filteredItems[0].dataset.cliproxyLocalProjectWorkingDirectory === "/Users/aikins01/Developer/telemetry.dev", "local project search kept wrong duplicate");
+assert(filteredItems[0].dataset.selected === "true", "local project search did not select its visible match");
+input.value = "";
+input.dispatchEvent(new FakeEvent("input", { bubbles: true }));
+await new Promise((resolve) => setTimeout(resolve, 25));
+assert(localItems.every((item) => !item.hidden && item.style.display !== "none"), "clearing local project search did not restore all items");
 popupProjectButton.textContent = "Project: on-chain";
 delete popupProjectButton.dataset.cliproxyLocalProjectActivator;
 delete popupProjectButton.dataset.cliproxyLocalProjectLabel;
@@ -2934,6 +2966,21 @@ func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.
 		t.Fatalf("project-only executor bootstrap = type:%q spawned:%d", projectOnlyBootstrapExecutorType, projectOnlySpawnedCount)
 	}
 
+	userActor, _ := rt.store.upsert(map[string]any{"name": "userActor", "key": "user-local"}, true)
+	runnerSocket := &neoSocket{runnerID: "runner-local-test"}
+	runnerRegistration := mapValue(userActor.handleForSocket(runnerSocket, map[string]any{
+		"type": "registerRunner",
+		"args": []any{map[string]any{
+			"sessionId":        "session-local-test",
+			"hostname":         "Local Machine",
+			"workingDirectory": expectedWorkDir,
+			"runningThreads":   []any{},
+		}},
+	}))
+	if runnerRegistration["ok"] != true {
+		t.Fatalf("runner registration = %#v", runnerRegistration)
+	}
+
 	runnerThreadID := "T-019f20b2-5e05-7501-8ddd-994e151ee955"
 	runnerBody := neoSvelteKitRemoteCommandBodyForTest(t, map[string]any{
 		"content":         []any{map[string]any{"type": "text", "text": "Use selected runner"}},
@@ -2941,7 +2988,7 @@ func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.
 		"threadID":        runnerThreadID,
 		"projectID":       projectID,
 		"reasoningEffort": "high",
-		"runnerId":        "cliproxy-local-test",
+		"runnerId":        "runner-local-test",
 	})
 	runnerReq := httptest.NewRequest(http.MethodPost, "/_app/remote/3abror/createProjectThread?"+ampWebLocalInferenceAPIKeyQuery+"=local-key", strings.NewReader(runnerBody))
 	runnerReq.Header.Set("Content-Type", "application/json")
@@ -2957,6 +3004,12 @@ func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.
 	if runnerResult["ok"] != true || stringValue(runnerResult["threadID"]) != runnerThreadID {
 		t.Fatalf("runner create result = %#v", runnerResult)
 	}
+	if runnerResult["usesThreadActors"] != true || runnerResult["usesDtw"] != true || stringValue(runnerResult["executorType"]) != "local-client" {
+		t.Fatalf("runner local actor response = %#v", runnerResult)
+	}
+	if stringValue(mapValue(runnerResult["threadActorConfig"])["threadId"]) != runnerThreadID {
+		t.Fatalf("runner actor config = %#v", runnerResult["threadActorConfig"])
+	}
 	runnerActor := rt.store.lookupThreadActor(runnerThreadID)
 	if runnerActor == nil {
 		t.Fatal("runner thread actor not found")
@@ -2966,11 +3019,19 @@ func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.
 	runnerBootstrapExecutorType := runnerActor.bootstrapExecutorType
 	runnerSpawnedCount := len(runnerActor.spawnedExecutors)
 	runnerActor.mu.Unlock()
-	if stringValue(runnerMeta["runnerId"]) != "cliproxy-local-test" {
+	if stringValue(runnerMeta["runnerId"]) != "runner-local-test" {
 		t.Fatalf("runner meta = %#v", runnerMeta)
 	}
-	if runnerBootstrapExecutorType != "local-client" || runnerSpawnedCount != 1 {
+	if runnerBootstrapExecutorType != "local-client" || runnerSpawnedCount != 0 {
 		t.Fatalf("runner executor bootstrap = type:%q spawned:%d", runnerBootstrapExecutorType, runnerSpawnedCount)
+	}
+	runnerHeartbeat := mapValue(userActor.handleForSocket(runnerSocket, map[string]any{
+		"type": "runnerHeartbeat",
+		"args": []any{map[string]any{"sessionId": "session-local-test", "runningThreads": []any{}}},
+	}))
+	runnerIntents := arrayValue(runnerHeartbeat["intents"])
+	if runnerHeartbeat["ok"] != true || len(runnerIntents) != 1 || stringValue(mapValue(runnerIntents[0])["threadId"]) != runnerThreadID || stringValue(mapValue(runnerIntents[0])["desired"]) != "running" {
+		t.Fatalf("runner heartbeat = %#v", runnerHeartbeat)
 	}
 
 	runnerOptOutThreadID := "T-019f20b2-5e05-7501-8ddd-994e151ee956"
@@ -2992,26 +3053,11 @@ func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.
 	}
 	runnerOptOutEnvelope := decodeSvelteKitRemoteEnvelopeForTest(t, runnerOptOutRec.Body.Bytes())
 	runnerOptOutResult := mapValue(runnerOptOutEnvelope["_"])
-	if runnerOptOutResult["ok"] != true || stringValue(runnerOptOutResult["threadID"]) != runnerOptOutThreadID {
+	if runnerOptOutResult["ok"] != false || stringValue(mapValue(runnerOptOutResult["error"])["message"]) != "selected local runner is no longer available" {
 		t.Fatalf("runner opt-out create result = %#v", runnerOptOutResult)
 	}
-	if runnerOptOutResult["usesThreadActors"] != false || runnerOptOutResult["usesDtw"] != false || stringValue(runnerOptOutResult["executorType"]) != "" {
-		t.Fatalf("runner opt-out local actor response = %#v", runnerOptOutResult)
-	}
-	runnerOptOutActor := rt.store.lookupThreadActor(runnerOptOutThreadID)
-	if runnerOptOutActor == nil {
-		t.Fatal("runner opt-out thread actor not found")
-	}
-	runnerOptOutActor.mu.Lock()
-	runnerOptOutMeta := cloneMap(runnerOptOutActor.meta)
-	runnerOptOutBootstrapExecutorType := runnerOptOutActor.bootstrapExecutorType
-	runnerOptOutSpawnedCount := len(runnerOptOutActor.spawnedExecutors)
-	runnerOptOutActor.mu.Unlock()
-	if stringValue(runnerOptOutMeta["runnerId"]) != "cliproxy-local-optout" {
-		t.Fatalf("runner opt-out meta = %#v", runnerOptOutMeta)
-	}
-	if runnerOptOutBootstrapExecutorType != "" || runnerOptOutSpawnedCount != 0 {
-		t.Fatalf("runner opt-out executor bootstrap = type:%q spawned:%d", runnerOptOutBootstrapExecutorType, runnerOptOutSpawnedCount)
+	if actor := rt.store.lookupThreadActor(runnerOptOutThreadID); actor != nil {
+		t.Fatalf("unavailable runner created actor %#v", actor)
 	}
 
 	explicitFalseThreadID := "T-019f20b2-5e05-7501-8ddd-994e151ee954"
@@ -3093,6 +3139,16 @@ func TestWebLocalInferenceListUserExecutorRunnersCreatesQueryResult(t *testing.T
 	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
 		NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled},
 	}})
+	userActor, _ := rt.store.upsert(map[string]any{"name": "userActor", "key": "user-local"}, true)
+	userActor.handleForSocket(&neoSocket{runnerID: "runner-local"}, map[string]any{
+		"type": "registerRunner",
+		"args": []any{map[string]any{
+			"sessionId":        "session-local",
+			"hostname":         "Local Machine",
+			"workingDirectory": neoDefaultWebLocalWorkingDirectory(),
+			"runningThreads":   []any{},
+		}},
+	})
 	m := &AmpModule{
 		restrictToLocalhost: false,
 		neoRuntime:          rt,

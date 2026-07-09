@@ -90,6 +90,7 @@ const (
 	neoMaxQueuedMessages             = 5
 	neoWebLocalProjectIndexFileName  = ".cliproxyapi-projects.json"
 	neoWebLocalProjectIndexVersion   = 1
+	neoResumeExecutorIDMetaKey       = "cliProxyAPIResumeExecutorID"
 )
 
 var neoHeadlessLoginShellPath = neoDiscoverHeadlessLoginShellPath
@@ -399,6 +400,9 @@ func (rt *neoRuntime) stopWithOptions(ctx context.Context, options neoRuntimeSto
 	rt.server = nil
 	flushLocalSnapshots := options.flushLocalSnapshots && rt.localThreadSnapshotsEnabledLocked()
 	stopExecutorsOnDispose := options.stopExecutors
+	if flushLocalSnapshots && !options.stopExecutors {
+		rt.store.preserveExecutorWorkOnClose()
+	}
 	if flushLocalSnapshots && options.stopExecutors {
 		rt.store.stopAllSpawnedExecutors()
 		stopExecutorsOnDispose = false
@@ -564,6 +568,8 @@ func (rt *neoRuntime) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		rt.handleStateRequest(w, r)
 	case isNeoMessagesRequestPath(r.URL.Path) && r.Method == http.MethodGet:
 		rt.handleMessagesRequest(w, r)
+	case neoGatewayActionRequest(r):
+		rt.handleGatewayActionRequest(w, r)
 	case rt.serveActorKVKeyHTTP(w, r):
 		return
 	case isNeoSkillsPath(r.URL.Path) && (r.Method == http.MethodGet || r.Method == http.MethodPost):
@@ -576,6 +582,88 @@ func (rt *neoRuntime) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		log.Debugf("amp neo local runtime HTTP not_found method=%s path=%s rawQuery=%s", r.Method, r.URL.Path, r.URL.RawQuery)
 		writeNeoJSON(w, http.StatusNotFound, map[string]any{"error": "not_found"})
 	}
+}
+
+func neoGatewayActionName(path string) string {
+	path = neoStripActorsRivetPrefix("/" + strings.Trim(path, "/"))
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) != 4 || parts[0] != "gateway" || parts[2] != "action" {
+		return ""
+	}
+	return strings.TrimSpace(parts[3])
+}
+
+func neoGatewayActionRequest(r *http.Request) bool {
+	return r != nil && r.Method == http.MethodPost && r.URL != nil && neoGatewayActionName(r.URL.Path) != ""
+}
+
+func decodeNeoGatewayActionArgs(r *http.Request) ([]any, uint16, error) {
+	if r == nil || r.Body == nil {
+		return nil, 0, errors.New("missing action body")
+	}
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		return nil, 0, err
+	}
+	if strings.Contains(strings.ToLower(r.Header.Get("Content-Type")), "json") || strings.EqualFold(r.Header.Get("x-rivet-encoding"), "json") {
+		var payload map[string]any
+		if err := json.Unmarshal(raw, &payload); err != nil {
+			return nil, 0, err
+		}
+		return arrayValue(payload["args"]), 0, nil
+	}
+	if len(raw) < 3 {
+		return nil, 0, io.ErrUnexpectedEOF
+	}
+	version := binary.LittleEndian.Uint16(raw[:2])
+	offset := 2
+	encoded, err := neoRivetBareReadBytes(raw, &offset)
+	if err != nil {
+		return nil, 0, err
+	}
+	decoded, err := neoRivetDecodeData(encoded)
+	if err != nil {
+		return nil, 0, err
+	}
+	return arrayValue(decoded), version, nil
+}
+
+func writeNeoGatewayActionResult(w http.ResponseWriter, result any, version uint16) {
+	if version == 0 {
+		writeNeoJSON(w, http.StatusOK, map[string]any{"output": result})
+		return
+	}
+	encoded, err := neoRivetEncodeData(result)
+	if err != nil {
+		writeNeoJSON(w, http.StatusInternalServerError, map[string]any{"error": "action_encode_failed"})
+		return
+	}
+	var body bytes.Buffer
+	neoRivetBareWriteBytes(&body, encoded)
+	payload := make([]byte, 2+body.Len())
+	binary.LittleEndian.PutUint16(payload[:2], version)
+	copy(payload[2:], body.Bytes())
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(payload)
+}
+
+func (rt *neoRuntime) handleGatewayActionRequest(w http.ResponseWriter, r *http.Request) {
+	actor := rt.store.actorForGatewayRequest(r)
+	if actor == nil {
+		writeNeoJSON(w, http.StatusNotFound, map[string]any{"error": "actor_not_found"})
+		return
+	}
+	args, version, err := decodeNeoGatewayActionArgs(r)
+	if err != nil {
+		writeNeoJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_action_body"})
+		return
+	}
+	result := actor.handleForSocket(&neoSocket{runnerID: stringValue(neoRivetConnectionParams(r, nil)["runnerId"])}, map[string]any{
+		"type": neoGatewayActionName(r.URL.Path),
+		"args": args,
+	})
+	writeNeoGatewayActionResult(w, result, version)
 }
 
 func (rt *neoRuntime) serveActorKVKeyHTTP(w http.ResponseWriter, r *http.Request) bool {
@@ -840,6 +928,32 @@ func neoJSONRPCTransportRequested(r *http.Request, protocols []string) bool {
 	return false
 }
 
+func neoRivetConnectionParams(r *http.Request, protocols []string) map[string]any {
+	values := make([]string, 0, len(protocols)+1)
+	if r != nil {
+		values = append(values, r.Header.Get("x-rivet-conn-params"))
+	}
+	for _, protocol := range protocols {
+		if strings.HasPrefix(protocol, "rivet_conn_params.") {
+			values = append(values, strings.TrimPrefix(protocol, "rivet_conn_params."))
+		}
+	}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if decoded, err := url.QueryUnescape(value); err == nil {
+			value = decoded
+		}
+		var params map[string]any
+		if json.Unmarshal([]byte(value), &params) == nil && len(params) > 0 {
+			return params
+		}
+	}
+	return nil
+}
+
 func neoValueContainsJSONRPCTransport(value any) bool {
 	switch typed := value.(type) {
 	case map[string]any:
@@ -993,6 +1107,7 @@ func (rt *neoRuntime) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		localExtensions:  neoLocalRuntimeExtensionsRequested(r),
 		webLocalObserver: webLocalInferenceSocket,
 		clientAPIKey:     strings.TrimSpace(r.Header.Get(neoInternalClientAPIKeyHeader)),
+		runnerID:         stringValue(neoRivetConnectionParams(r, protocols)["runnerId"]),
 	}
 	if underlying := conn.UnderlyingConn(); underlying != nil {
 		defer rt.unregisterConnection(underlying)
@@ -1424,7 +1539,7 @@ func (s *neoActorStore) actorForGatewayRequest(r *http.Request) *neoActor {
 		return nil
 	}
 	q := r.URL.Query()
-	target := neoGatewayTargetFromPath(r.URL.Path)
+	target := neoGatewayTargetFromPath(neoStripActorsRivetPrefix("/" + strings.Trim(r.URL.Path, "/")))
 	canonicalTarget := neoCanonicalActorName(target)
 	key := strings.TrimSpace(q.Get("rvt-key"))
 	requestedThreadID := neoThreadIDFromBridgeRequest(r)
@@ -1784,6 +1899,53 @@ func (s *neoActorStore) userActors() []*neoActor {
 	return actors
 }
 
+func (s *neoActorStore) userExecutorRunners() []any {
+	if s == nil {
+		return []any{}
+	}
+	byID := map[string]any{}
+	for _, actor := range s.userActors() {
+		for _, rawRunner := range actor.userExecutorRunners() {
+			runner := mapValue(rawRunner)
+			if runnerID := stringValue(runner["runnerId"]); runnerID != "" {
+				byID[runnerID] = runner
+			}
+		}
+	}
+	runnerIDs := make([]string, 0, len(byID))
+	for runnerID := range byID {
+		runnerIDs = append(runnerIDs, runnerID)
+	}
+	sort.Strings(runnerIDs)
+	runners := make([]any, 0, len(runnerIDs))
+	for _, runnerID := range runnerIDs {
+		runners = append(runners, byID[runnerID])
+	}
+	return runners
+}
+
+func (s *neoActorStore) userExecutorRunnerWorkingDirectory(runnerID string) string {
+	for _, rawRunner := range s.userExecutorRunners() {
+		runner := mapValue(rawRunner)
+		if stringValue(runner["runnerId"]) == runnerID {
+			return neoExistingDirectory(stringValue(runner["workingDirectory"]))
+		}
+	}
+	return ""
+}
+
+func (s *neoActorStore) requestUserExecutorRunnerThread(runnerID, threadID string) bool {
+	if s == nil || runnerID == "" {
+		return false
+	}
+	for _, actor := range s.userActors() {
+		if actor.requestUserExecutorRunnerThread(runnerID, threadID) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *neoActorStore) broadcastThreadStatusUpdated(actor *neoActor) {
 	if s == nil || actor == nil || !neoGatewayThreadActorTarget(actor.name) {
 		return
@@ -2128,6 +2290,23 @@ func (s *neoActorStore) closeAllSockets(closeReason string, transportClose bool)
 	}
 }
 
+func (s *neoActorStore) preserveExecutorWorkOnClose() {
+	if s == nil {
+		return
+	}
+	s.mu.RLock()
+	actors := make([]*neoActor, 0, len(s.actors))
+	for _, actor := range s.actors {
+		actors = append(actors, actor)
+	}
+	s.mu.RUnlock()
+	for _, actor := range actors {
+		actor.mu.Lock()
+		actor.preserveExecutorWorkOnClose = true
+		actor.mu.Unlock()
+	}
+}
+
 func (s *neoActorStore) syncLocalThreadSnapshots() {
 	if s == nil {
 		return
@@ -2168,77 +2347,92 @@ func (s *neoActorStore) pruneIdle(now time.Time, ttl time.Duration) int {
 }
 
 type neoActor struct {
-	mu                        sync.Mutex
-	runtime                   *neoRuntime
-	id                        string
-	name                      string
-	key                       string
-	threadID                  string
-	record                    map[string]any
-	settings                  map[string]any
-	environment               map[string]any
-	capabilities              map[string]any
-	guidanceSnapshot          map[string]any
-	tools                     map[string]neoToolSpec
-	toolOrder                 []string
-	skillSnapshot             map[string]any
-	messages                  []neoMessage
-	history                   []neoHistoryMessage
-	queue                     []neoQueuedMessage
-	queuedIDSeq               int
-	pendingTools              map[string]neoPendingTool
-	subagentWaiters           map[string]chan map[string]any
-	subagentTools             map[string]neoPendingTool
-	approvalQueue             []map[string]any
-	sockets                   map[*neoSocket]struct{}
-	spawnedExecutors          map[string]*neoSpawnedExecutor
-	artifacts                 map[string]any
-	kv                        map[string]any
-	meta                      map[string]any
-	debug                     map[string]any
-	draft                     []any
-	autoSubmitDraft           bool
-	pendingNavigation         string
-	maxTokens                 any
-	mainThreadID              string
-	notificationSubs          map[string]map[string]any
-	lastUsed                  time.Time
-	syncRunning               bool
-	syncPending               bool
-	syncWG                    sync.WaitGroup
-	localSnapshotClosing      bool
-	localSnapshotEpoch        uint64
-	title                     string
-	titleSource               string
-	titleGenerationStarted    bool
-	archived                  bool
-	threadStatus              string
-	compacting                bool
-	compactionRecords         []map[string]any
-	compactionRetryAfterLen   int
-	relationships             []map[string]any
-	retryScheduled            bool
-	pendingInference          *neoInferenceInflight
-	replayEvents              []neoReplayEvent
-	activeError               map[string]any
-	activeErrorSeq            int
-	seq                       int
-	agentState                string
-	executorID                string
-	replacingExecutorID       string
-	executorSocket            *neoSocket
-	pendingExecutorHandoff    *neoPendingExecutorHandoff
-	bootstrapExecutorType     string
-	bootstrapThreadActorFlow  bool
-	executorReady             bool
-	executorBootstrapComplete bool
-	executorResumeBootstrap   bool
-	lastExecutorStatus        map[string]any
-	currentAgentMode          string
-	currentReasoningEffort    string
-	executorIdleGeneration    int
-	generation                int
-	currentInference          *neoInferenceInflight
+	mu                          sync.Mutex
+	runtime                     *neoRuntime
+	id                          string
+	name                        string
+	key                         string
+	threadID                    string
+	record                      map[string]any
+	settings                    map[string]any
+	environment                 map[string]any
+	capabilities                map[string]any
+	guidanceSnapshot            map[string]any
+	tools                       map[string]neoToolSpec
+	toolOrder                   []string
+	skillSnapshot               map[string]any
+	messages                    []neoMessage
+	history                     []neoHistoryMessage
+	queue                       []neoQueuedMessage
+	queuedIDSeq                 int
+	pendingTools                map[string]neoPendingTool
+	subagentWaiters             map[string]chan map[string]any
+	subagentTools               map[string]neoPendingTool
+	approvalQueue               []map[string]any
+	sockets                     map[*neoSocket]struct{}
+	spawnedExecutors            map[string]*neoSpawnedExecutor
+	artifacts                   map[string]any
+	kv                          map[string]any
+	meta                        map[string]any
+	debug                       map[string]any
+	draft                       []any
+	autoSubmitDraft             bool
+	pendingNavigation           string
+	maxTokens                   any
+	mainThreadID                string
+	notificationSubs            map[string]map[string]any
+	userRunners                 map[string]neoUserExecutorRunner
+	lastUsed                    time.Time
+	syncRunning                 bool
+	syncPending                 bool
+	syncWG                      sync.WaitGroup
+	localSnapshotClosing        bool
+	localSnapshotEpoch          uint64
+	title                       string
+	titleSource                 string
+	titleGenerationStarted      bool
+	archived                    bool
+	threadStatus                string
+	compacting                  bool
+	compactionRecords           []map[string]any
+	compactionRetryAfterLen     int
+	relationships               []map[string]any
+	retryScheduled              bool
+	pendingInference            *neoInferenceInflight
+	replayEvents                []neoReplayEvent
+	activeError                 map[string]any
+	activeErrorSeq              int
+	seq                         int
+	agentState                  string
+	executorID                  string
+	replacingExecutorID         string
+	executorSocket              *neoSocket
+	pendingExecutorHandoff      *neoPendingExecutorHandoff
+	bootstrapExecutorType       string
+	bootstrapThreadActorFlow    bool
+	executorReady               bool
+	executorBootstrapComplete   bool
+	executorResumeBootstrap     bool
+	lastExecutorStatus          map[string]any
+	currentAgentMode            string
+	currentReasoningEffort      string
+	executorIdleGeneration      int
+	generation                  int
+	currentInference            *neoInferenceInflight
+	preserveExecutorWorkOnClose bool
+	resumeExecutorID            string
+}
+
+type neoUserExecutorRunner struct {
+	runnerID         string
+	sessionID        string
+	hostname         string
+	workingDirectory string
+	repositoryURL    string
+	pid              int
+	runningThreads   []string
+	intents          map[string]string
+	updatedAt        time.Time
 }
 
 // neoInferenceInflight tracks the assistant message currently being
@@ -2373,12 +2567,16 @@ func (a *neoActor) close(socket *neoSocket) {
 		a.pendingExecutorHandoff = nil
 	}
 	activeExecutorSocket := socket != nil && a.executorSocket == socket
+	preserveExecutorWork := a.preserveExecutorWorkOnClose
 	if executorSocket && executorID == "" && activeExecutorSocket {
 		executorID = a.executorID
 	}
 	disconnectExecutor := executorSocket && activeExecutorSocket
 	a.mu.Unlock()
 	if disconnectExecutor {
+		if preserveExecutorWork {
+			return
+		}
 		a.executorDisconnectedForSocket(socket, map[string]any{"executorId": executorID, "message": "Executor disconnected"})
 		return
 	}
@@ -2782,10 +2980,199 @@ func (a *neoActor) handleForSocket(socket *neoSocket, msg map[string]any) any {
 		a.handleSendMessageToAggman(msg)
 	case "getRecentThreads":
 		return a.handleGetRecentThreads(socket, msg)
+	case "registerRunner":
+		return a.registerUserExecutorRunner(socket, msg)
+	case "runnerHeartbeat":
+		return a.heartbeatUserExecutorRunner(socket, msg)
+	case "unregisterRunner":
+		return a.unregisterUserExecutorRunner(socket, msg)
+	case "listRunners":
+		return a.userExecutorRunners()
 	default:
 		log.Debugf("amp neo local runtime ignored message %s", msgType)
 	}
 	return nil
+}
+
+func neoUserExecutorRunnerActionArg(msg map[string]any) map[string]any {
+	args := arrayValue(msg["args"])
+	if len(args) == 0 {
+		return nil
+	}
+	return mapValue(args[0])
+}
+
+func neoUserExecutorRunnerThreadIDs(value any) []string {
+	items := arrayValue(value)
+	out := make([]string, 0, len(items))
+	seen := map[string]bool{}
+	for _, item := range items {
+		threadID := strings.TrimSpace(stringValue(item))
+		if !neoThreadIDExactPattern.MatchString(threadID) || seen[threadID] {
+			continue
+		}
+		seen[threadID] = true
+		out = append(out, threadID)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func neoUserExecutorRunnerIntentValues(runner neoUserExecutorRunner) []any {
+	threadIDs := make([]string, 0, len(runner.intents))
+	for threadID := range runner.intents {
+		threadIDs = append(threadIDs, threadID)
+	}
+	sort.Strings(threadIDs)
+	intents := make([]any, 0, len(threadIDs))
+	for _, threadID := range threadIDs {
+		intents = append(intents, map[string]any{"threadId": threadID, "desired": runner.intents[threadID]})
+	}
+	return intents
+}
+
+func (a *neoActor) registerUserExecutorRunner(socket *neoSocket, msg map[string]any) map[string]any {
+	if a == nil || !neoGatewayUserActorTarget(a.name) {
+		return map[string]any{"ok": false, "intents": []any{}}
+	}
+	arg := neoUserExecutorRunnerActionArg(msg)
+	sessionID := strings.TrimSpace(stringValue(arg["sessionId"]))
+	runnerID := strings.TrimSpace(firstNonEmptyString(socket.runnerKey(), arg["runnerId"], sessionID))
+	if sessionID == "" || runnerID == "" {
+		return map[string]any{"ok": false, "intents": []any{}}
+	}
+	a.mu.Lock()
+	if a.userRunners == nil {
+		a.userRunners = map[string]neoUserExecutorRunner{}
+	}
+	runner := a.userRunners[runnerID]
+	if runner.intents == nil {
+		runner.intents = map[string]string{}
+	}
+	runner.runnerID = runnerID
+	runner.sessionID = sessionID
+	runner.hostname = strings.TrimSpace(stringValue(arg["hostname"]))
+	runner.workingDirectory = neoExistingDirectory(stringValue(arg["workingDirectory"]))
+	runner.repositoryURL = strings.TrimSpace(stringValue(arg["repositoryURL"]))
+	runner.pid = intValue(arg["pid"])
+	runner.runningThreads = neoUserExecutorRunnerThreadIDs(arg["runningThreads"])
+	runner.updatedAt = time.Now()
+	a.userRunners[runnerID] = runner
+	intents := neoUserExecutorRunnerIntentValues(runner)
+	a.mu.Unlock()
+	return map[string]any{"ok": true, "intents": intents}
+}
+
+func (a *neoActor) heartbeatUserExecutorRunner(socket *neoSocket, msg map[string]any) map[string]any {
+	if a == nil || !neoGatewayUserActorTarget(a.name) {
+		return map[string]any{"ok": false, "intents": []any{}}
+	}
+	arg := neoUserExecutorRunnerActionArg(msg)
+	sessionID := strings.TrimSpace(stringValue(arg["sessionId"]))
+	runnerID := strings.TrimSpace(socket.runnerKey())
+	a.mu.Lock()
+	if runnerID == "" {
+		for candidateID, runner := range a.userRunners {
+			if runner.sessionID == sessionID {
+				runnerID = candidateID
+				break
+			}
+		}
+	}
+	runner, ok := a.userRunners[runnerID]
+	if ok && runner.sessionID == sessionID {
+		runner.runningThreads = neoUserExecutorRunnerThreadIDs(arg["runningThreads"])
+		runner.updatedAt = time.Now()
+		a.userRunners[runnerID] = runner
+	}
+	intents := neoUserExecutorRunnerIntentValues(runner)
+	a.mu.Unlock()
+	if !ok || runner.sessionID != sessionID {
+		return map[string]any{"ok": false, "intents": []any{}}
+	}
+	return map[string]any{"ok": true, "intents": intents}
+}
+
+func (a *neoActor) unregisterUserExecutorRunner(socket *neoSocket, msg map[string]any) map[string]any {
+	if a == nil || !neoGatewayUserActorTarget(a.name) {
+		return map[string]any{"ok": false}
+	}
+	arg := neoUserExecutorRunnerActionArg(msg)
+	sessionID := strings.TrimSpace(stringValue(arg["sessionId"]))
+	runnerID := strings.TrimSpace(socket.runnerKey())
+	a.mu.Lock()
+	if runnerID != "" {
+		if runner, ok := a.userRunners[runnerID]; ok && runner.sessionID == sessionID {
+			delete(a.userRunners, runnerID)
+		}
+	} else {
+		for candidateID, runner := range a.userRunners {
+			if runner.sessionID == sessionID {
+				delete(a.userRunners, candidateID)
+			}
+		}
+	}
+	a.mu.Unlock()
+	return map[string]any{"ok": true}
+}
+
+func (a *neoActor) userExecutorRunners() []any {
+	if a == nil || !neoGatewayUserActorTarget(a.name) {
+		return []any{}
+	}
+	cutoff := time.Now().Add(-2 * time.Minute)
+	a.mu.Lock()
+	runnerIDs := make([]string, 0, len(a.userRunners))
+	for runnerID, runner := range a.userRunners {
+		if runner.updatedAt.Before(cutoff) {
+			delete(a.userRunners, runnerID)
+			continue
+		}
+		runnerIDs = append(runnerIDs, runnerID)
+	}
+	sort.Strings(runnerIDs)
+	runners := make([]any, 0, len(runnerIDs))
+	for _, runnerID := range runnerIDs {
+		runner := a.userRunners[runnerID]
+		runningThreads := make([]any, len(runner.runningThreads))
+		for index, threadID := range runner.runningThreads {
+			runningThreads[index] = threadID
+		}
+		runners = append(runners, map[string]any{
+			"runnerId":         runner.runnerID,
+			"hostname":         runner.hostname,
+			"workingDirectory": runner.workingDirectory,
+			"repositoryURL":    omitEmpty(runner.repositoryURL),
+			"pid":              runner.pid,
+			"runningThreads":   runningThreads,
+		})
+	}
+	a.mu.Unlock()
+	return runners
+}
+
+func (a *neoActor) requestUserExecutorRunnerThread(runnerID, threadID string) bool {
+	if a == nil || !neoGatewayUserActorTarget(a.name) || !neoThreadIDExactPattern.MatchString(threadID) {
+		return false
+	}
+	a.mu.Lock()
+	runner, ok := a.userRunners[runnerID]
+	if ok && runner.updatedAt.Before(time.Now().Add(-2*time.Minute)) {
+		delete(a.userRunners, runnerID)
+		ok = false
+	}
+	if ok {
+		if runner.intents == nil {
+			runner.intents = map[string]string{}
+		}
+		runner.intents[threadID] = "running"
+		a.userRunners[runnerID] = runner
+	}
+	a.mu.Unlock()
+	if ok {
+		a.broadcast(map[string]any{"type": "runnerIntentsUpdated", "runnerId": runnerID})
+	}
+	return ok
 }
 
 func (a *neoActor) updateSettings(settings map[string]any) {
@@ -3488,6 +3875,7 @@ func (a *neoActor) executorConnect(msg map[string]any) {
 func (a *neoActor) executorConnectForSocket(socket *neoSocket, msg map[string]any) {
 	a.mu.Lock()
 	incomingExecutorID := firstNonEmptyString(msg["clientId"], msg["executorId"])
+	resumePendingWork := incomingExecutorID != "" && incomingExecutorID == a.resumeExecutorID && (len(a.pendingTools) > 0 || len(a.approvalQueue) > 0)
 	if a.shouldDeferConcurrentExecutorHandoffLocked(socket, msg) {
 		a.pendingExecutorHandoff = &neoPendingExecutorHandoff{
 			socket:     socket,
@@ -3511,20 +3899,20 @@ func (a *neoActor) executorConnectForSocket(socket *neoSocket, msg map[string]an
 		(socket != nil && a.executorSocket != nil && a.executorSocket != socket) ||
 		a.executorReady ||
 		a.executorBootstrapComplete ||
-		len(a.pendingTools) > 0 ||
-		len(a.approvalQueue) > 0 ||
+		(!resumePendingWork && (len(a.pendingTools) > 0 || len(a.approvalQueue) > 0)) ||
 		a.currentInference != nil {
 		cleanup = a.clearStaleExecutorWorkForDisconnectLocked()
 	}
 	clientID := firstNonEmptyString(incomingExecutorID, a.executorID)
 	a.executorID = clientID
+	a.resumeExecutorID = clientID
 	a.replacingExecutorID = ""
 	if socket != nil {
 		socket.markExecutor(clientID)
 		a.executorSocket = socket
 	}
 	a.executorReady = false
-	a.executorResumeBootstrap = false
+	a.executorResumeBootstrap = resumePendingWork
 	a.executorBootstrapComplete = false
 	a.tools = map[string]neoToolSpec{}
 	a.toolOrder = nil
@@ -3598,6 +3986,7 @@ func (a *neoActor) executorConnectedForSocket(socket *neoSocket, msg map[string]
 	}
 	a.touchLocked()
 	a.executorID = executorID
+	a.resumeExecutorID = executorID
 	a.replacingExecutorID = ""
 	if socket != nil {
 		socket.markExecutor(executorID)
@@ -3788,6 +4177,10 @@ func (a *neoActor) executorDisconnected(msg map[string]any) {
 func (a *neoActor) executorDisconnectedForSocket(socket *neoSocket, msg map[string]any) {
 	msgExecutorID := firstNonEmptyString(msg["executorId"], msg["clientId"])
 	a.mu.Lock()
+	if socket != nil && a.preserveExecutorWorkOnClose {
+		a.mu.Unlock()
+		return
+	}
 	activeExecutorSocket := socket != nil && a.executorSocket == socket
 	if socket != nil && socket.isExecutor() && a.executorSocket != nil && !activeExecutorSocket {
 		a.mu.Unlock()
@@ -10148,10 +10541,17 @@ func (a *neoActor) threadSnapshotWithOptions(options neoThreadSnapshotOptions) (
 	}
 	executorConnected := a.executorConnectedLocked()
 	executorType := ""
+	meta := cloneNeoJSONMap(a.meta)
+	if meta == nil {
+		meta = map[string]any{}
+	}
 	if executorConnected {
 		executorType = firstNonEmptyString(a.bootstrapExecutorType, stringValue(a.meta["executorType"]))
 		if executorType == "" && a.executorID != "" {
 			executorType = "local-client"
+		}
+		if a.executorID != "" {
+			meta[neoResumeExecutorIDMetaKey] = a.executorID
 		}
 	}
 	return neoCloudThreadSnapshot{
@@ -10167,7 +10567,7 @@ func (a *neoActor) threadSnapshotWithOptions(options neoThreadSnapshotOptions) (
 		environment:       cloneNeoJSONMap(a.environment),
 		artifacts:         cloneNeoJSONArray(a.artifactListLocked()),
 		actorKV:           cloneNeoJSONMap(a.kv),
-		meta:              cloneNeoJSONMap(a.meta),
+		meta:              meta,
 		debug:             cloneNeoJSONMap(a.debug),
 		draft:             cloneNeoJSONArray(a.draft),
 		autoSubmitDraft:   a.autoSubmitDraft,
@@ -12796,9 +13196,17 @@ func (rt *neoRuntime) neoWebLocalCreateProjectThread(ctx context.Context, query 
 	workingDirectory := rt.neoWebLocalResolveWorkingDirectory(query, request, prompt, projectID)
 	spawnExecutorValue, spawnExecutorProvided := request["spawnExecutor"]
 	runnerID := strings.TrimSpace(firstNonEmptyString(request["runnerId"], request["runnerID"], request["runner_id"]))
+	runnerWorkingDirectory := rt.store.userExecutorRunnerWorkingDirectory(runnerID)
+	nativeRunnerRequested := runnerID != "" && runnerWorkingDirectory != ""
+	if workingDirectory == "" && nativeRunnerRequested {
+		workingDirectory = runnerWorkingDirectory
+	}
 	spawnLocalExecutor := boolValue(spawnExecutorValue)
+	if runnerID != "" && !nativeRunnerRequested && (workingDirectory == "" || (spawnExecutorProvided && !spawnLocalExecutor)) {
+		return neoWebLocalRemoteCommandError("selected local runner is no longer available")
+	}
 	if !spawnExecutorProvided {
-		spawnLocalExecutor = runnerID != "" || workingDirectory != ""
+		spawnLocalExecutor = workingDirectory != "" && !nativeRunnerRequested
 	}
 	if spawnLocalExecutor && workingDirectory == "" {
 		return neoWebLocalRemoteCommandError("working directory is required for local executor bootstrap")
@@ -12823,7 +13231,8 @@ func (rt *neoRuntime) neoWebLocalCreateProjectThread(ctx context.Context, query 
 		"projectID":                omitEmpty(projectID),
 		"runnerId":                 omitEmpty(runnerID),
 	}
-	if spawnLocalExecutor {
+	localClientExecutor := spawnLocalExecutor || nativeRunnerRequested
+	if localClientExecutor {
 		threadMeta["executorType"] = "local-client"
 	}
 	body := map[string]any{
@@ -12836,7 +13245,7 @@ func (rt *neoRuntime) neoWebLocalCreateProjectThread(ctx context.Context, query 
 		"threadMeta":       threadMeta,
 		"projectID":        omitEmpty(projectID),
 	}
-	if spawnLocalExecutor {
+	if localClientExecutor {
 		body["executorType"] = "local-client"
 	}
 	if workingDirectory != "" {
@@ -12896,29 +13305,19 @@ func (rt *neoRuntime) neoWebLocalCreateProjectThread(ctx context.Context, query 
 		if actor := rt.store.lookupThreadActor(createdThreadID); actor != nil {
 			actor.maybeSpawnWebLocalExecutorForPendingWork()
 		}
+	} else if nativeRunnerRequested && !rt.store.requestUserExecutorRunnerThread(runnerID, createdThreadID) {
+		if actor := rt.store.lookupThreadActor(createdThreadID); actor != nil {
+			actor.maybeSpawnWebLocalExecutorForPendingWork()
+		}
 	}
 	return result
 }
 
 func (rt *neoRuntime) neoWebLocalUserExecutorRunners() []any {
-	workingDirectory := neoDefaultWebLocalWorkingDirectory()
-	runnerID := "cliproxy-local"
-	if workingDirectory != "" {
-		runnerID = "cliproxy-local-" + neoDeterministicLocalProjectID(workingDirectory)[:8]
+	if rt == nil || rt.store == nil {
+		return []any{}
 	}
-	hostname, _ := os.Hostname()
-	hostname = strings.TrimSpace(hostname)
-	if hostname == "" {
-		hostname = "Local Machine"
-	}
-	runner := map[string]any{
-		"runnerId":         runnerID,
-		"hostname":         hostname,
-		"workingDirectory": workingDirectory,
-		"runningThreads":   []any{},
-		"source":           "cliproxyapi",
-	}
-	return []any{runner}
+	return rt.store.userExecutorRunners()
 }
 
 func neoWebLocalPlainThreadActorConfig(threadID, wsToken, localBaseURL string) map[string]any {
@@ -15695,6 +16094,7 @@ func (a *neoActor) importThreadWithSyncOptions(thread map[string]any, syncCloud,
 	a.artifacts = artifacts
 	a.kv = actorKV
 	a.meta = meta
+	a.resumeExecutorID = strings.TrimSpace(stringValue(meta[neoResumeExecutorIDMetaKey]))
 	if executorType := neoImportedBootstrapExecutorType(thread, meta, pendingInference, queuedMessages); executorType != "" {
 		a.bootstrapExecutorType = executorType
 	}
@@ -19724,6 +20124,7 @@ type neoSocket struct {
 	executor         bool
 	executorID       string
 	clientAPIKey     string
+	runnerID         string
 }
 
 func (s *neoSocket) clientKey() string {
@@ -19733,6 +20134,15 @@ func (s *neoSocket) clientKey() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.clientAPIKey
+}
+
+func (s *neoSocket) runnerKey() string {
+	if s == nil {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return strings.TrimSpace(s.runnerID)
 }
 
 func (s *neoSocket) markSnapshotSent() {
@@ -28894,14 +29304,43 @@ func intValue(v any) int {
 	switch value := v.(type) {
 	case int:
 		return value
+	case int8:
+		return int(value)
+	case int16:
+		return int(value)
+	case int32:
+		return int(value)
+	case int64:
+		converted := int(value)
+		if int64(converted) == value {
+			return converted
+		}
+	case uint:
+		converted := int(value)
+		if converted >= 0 && uint(converted) == value {
+			return converted
+		}
+	case uint8:
+		return int(value)
+	case uint16:
+		return int(value)
+	case uint32:
+		converted := int(value)
+		if converted >= 0 && uint32(converted) == value {
+			return converted
+		}
+	case uint64:
+		converted := int(value)
+		if converted >= 0 && uint64(converted) == value {
+			return converted
+		}
 	case float64:
 		return int(value)
 	case json.Number:
 		i, _ := value.Int64()
 		return int(i)
-	default:
-		return 0
 	}
+	return 0
 }
 
 func numberFrom(values ...any) int {

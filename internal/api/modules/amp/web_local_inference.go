@@ -37,7 +37,7 @@ func (m *AmpModule) webLocalInferenceCORSMiddleware() gin.HandlerFunc {
 		c.Header("Access-Control-Allow-Credentials", "true")
 		c.Header("Access-Control-Allow-Methods", "GET, HEAD, POST, PUT, DELETE, OPTIONS")
 		c.Header("Access-Control-Allow-Private-Network", "true")
-		c.Header("Access-Control-Allow-Headers", "Authorization, Content-Type, "+ampWebLocalInferenceHeader)
+		c.Header("Access-Control-Allow-Headers", "Authorization, Content-Type, "+ampWebLocalInferenceHeader+", X-Rivet-Actor, X-Rivet-Conn-Params, X-Rivet-Encoding, X-Rivet-Skip-Ready-Wait, X-Rivet-Target, X-Rivet-Token")
 		c.Header("Access-Control-Max-Age", "600")
 
 		if c.Request.Method == http.MethodOptions {
@@ -215,7 +215,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	return fmt.Sprintf(`// ==UserScript==
 // @name CLIProxyAPI Amp Local Inference
 // @namespace https://github.com/router-for-me/CLIProxyAPI
-// @version 0.1.56
+// @version 0.1.57
 %s
 // @updateURL %s
 // @downloadURL %s
@@ -227,7 +227,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	"use strict";
 
 	const bridgeHeader = %s;
-	const userscriptVersion = "0.1.56";
+	const userscriptVersion = "0.1.57";
 	const apiKeyStorageKey = "cliproxyapi.ampLocalInference.apiKey";
 	const workingDirectoryStorageKey = "cliproxyapi.ampLocalInference.workingDirectory";
 	const selectedLocalProjectStorageKey = "cliproxyapi.ampLocalInference.selectedLocalProject";
@@ -235,6 +235,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	const threadWorkingDirectoriesStorageKey = "cliproxyapi.ampLocalInference.threadWorkingDirectories";
 	const threadSettingsStorageKey = "cliproxyapi.ampLocalInference.threadSettings";
 	const localProjectsEndpointPath = "/ampcode/local-projects.json";
+	const localRunnerActionNames = new Set(["registerRunner", "runnerHeartbeat", "unregisterRunner", "listRunners"]);
 	const defaultBaseURL = %s;
 	let defaultWorkingDirectory = "";
 	const originalJSONParse = globalThis.JSON.parse.bind(globalThis.JSON);
@@ -1499,7 +1500,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	}
 
 	function shouldBridgeHTTP(url) {
-		if (!threadActorAPIPath(url.pathname) && !internalAPIPath(url.pathname) && !svelteKitRemotePath(url.pathname) && !rivetMetadataPath(url.pathname)) {
+		if (!threadActorAPIPath(url.pathname) && !internalAPIPath(url.pathname) && !svelteKitRemotePath(url.pathname) && !rivetMetadataPath(url.pathname) && !gatewayUserActorActionPath(url.pathname)) {
 			return false;
 		}
 		if (internalAPIPath(url.pathname) && !activeLocalThreadID()) {
@@ -1518,7 +1519,8 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	}
 
 	function shouldRewriteHTTP(url) {
-		return url.origin === globalThis.location.origin && (threadActorAPIPath(url.pathname) || internalAPIPath(url.pathname) || svelteKitRemotePath(url.pathname) || rivetMetadataPath(url.pathname));
+		return (url.origin === globalThis.location.origin || sameLocalHTTPBase(url, localBaseURL())) &&
+			(threadActorAPIPath(url.pathname) || internalAPIPath(url.pathname) || svelteKitRemotePath(url.pathname) || rivetMetadataPath(url.pathname) || gatewayUserActorActionPath(url.pathname));
 	}
 
 	function internalAPIPath(path) {
@@ -1547,6 +1549,16 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		}
 		const target = normalized.slice("/gateway/".length).split("/")[0].split("@")[0];
 		return target === "userActor" || target === "user-actor";
+	}
+
+	function gatewayUserActorActionPath(path) {
+		const normalized = path.startsWith("/actors/gateway/") ? path.slice("/actors".length) : path;
+		const parts = normalized.split("/").filter(Boolean);
+		if (parts.length !== 4 || parts[0] !== "gateway" || parts[2] !== "action") {
+			return false;
+		}
+		const target = parts[1].split("@")[0];
+		return target === "userActor" || target === "user-actor" || localRunnerActionNames.has(parts[3]);
 	}
 
 	function pathThreadID() {
@@ -1591,8 +1603,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		if (!gatewayUserActorPath(url.pathname)) {
 			return false;
 		}
-		const threadID = pathThreadID();
-		return !!threadID && rememberedLocalThreadID(threadID);
+		return !!storedLocalAPIKey();
 	}
 
 	function localHTTPURL(url, body) {
@@ -2627,6 +2638,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			const list = commandPaletteList(picker);
 			if (list) {
 				installLocalProjectPickerKeyboardNavigation(picker, list);
+				installLocalProjectPickerSearch(picker, list);
 				installLocalProjectNoProjectSelectionHandler(picker);
 				autoSelectCurrentProjectInPicker(picker, list);
 			}
@@ -2650,6 +2662,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 				}
 				delete list.dataset.cliproxyLocalProjectAttempts;
 				injectLocalProjectPickerItems(picker, list, displayProjects);
+				filterLocalProjectPickerItems(picker, list);
 				autoSelectCurrentProjectInPicker(picker, list, true);
 			});
 		}
@@ -2681,6 +2694,50 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			list.insertBefore(buildLocalProjectPickerItem(picker, project, currentDirectory), before);
 			diagnostics.localProjectPickerIntegrationCount += 1;
 		}
+	}
+
+	function installLocalProjectPickerSearch(picker, list) {
+		const target = localProjectPickerSearchTarget(picker);
+		if (!target || target.dataset.cliproxyLocalProjectSearch === "1") {
+			return;
+		}
+		target.dataset.cliproxyLocalProjectSearch = "1";
+		const apply = () => {
+			filterLocalProjectPickerItems(picker, list);
+			setTimeout(() => filterLocalProjectPickerItems(picker, list), 0);
+		};
+		target.addEventListener("input", apply, true);
+		target.addEventListener("change", apply, true);
+	}
+
+	function localProjectPickerSearchTarget(picker) {
+		return picker.querySelector('input,[role="combobox"],textarea,[contenteditable="true"]');
+	}
+
+	function localProjectPickerSearchQuery(picker) {
+		const target = localProjectPickerSearchTarget(picker);
+		return normalizeProjectPickerName(target?.value || target?.textContent || "");
+	}
+
+	function filterLocalProjectPickerItems(picker, list) {
+		const query = localProjectPickerSearchQuery(picker);
+		const visible = [];
+		for (const item of list.querySelectorAll("[data-cliproxy-local-project-item]")) {
+			const label = normalizeProjectPickerName(item.dataset.cliproxyLocalProjectLabel);
+			const workingDirectory = normalizeProjectPickerName(item.dataset.cliproxyLocalProjectWorkingDirectory);
+			const matches = !query || label.includes(query) || workingDirectory.includes(query);
+			item.hidden = !matches;
+			item.style.display = matches ? "flex" : "none";
+			item.setAttribute("aria-hidden", matches ? "false" : "true");
+			if (matches) {
+				visible.push(item);
+			}
+		}
+		if (!query || !visible.length) {
+			return;
+		}
+		const selected = visible.find((item) => normalizeProjectPickerName(item.dataset.cliproxyLocalProjectLabel) === query) || visible[0];
+		setProjectPickerSelectedItem(list, selected);
 	}
 
 	function buildLocalProjectPickerItem(picker, project, currentDirectory = currentLocalProjectWorkingDirectory()) {
@@ -2994,6 +3051,8 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 
 	function projectPickerNavigableItems(list) {
 		return Array.from(list.querySelectorAll('[role="option"],button,[role="button"]')).filter((element) =>
+			element.hidden !== true &&
+			element.style?.display !== "none" &&
 			elementVisible(element) &&
 			element.getAttribute("aria-disabled") !== "true" &&
 			element.dataset?.disabled !== "true" &&
@@ -3518,6 +3577,20 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		return local.href;
 	}
 
+	function webSocketProtocolDiagnostics(protocols) {
+		const values = Array.isArray(protocols) ? protocols : [protocols];
+		return JSON.stringify(values.map((value) => {
+			const protocol = String(value || "");
+			if (protocol.startsWith("rivet_token.")) {
+				return "rivet_token.<redacted>";
+			}
+			if (protocol.startsWith("rivet_conn_params.")) {
+				return "rivet_conn_params.<redacted>";
+			}
+			return protocol;
+		}));
+	}
+
 	globalThis.JSON.parse = function(text, reviver) {
 		const parsed = originalJSONParse(text, reviver);
 		try {
@@ -3556,6 +3629,20 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		diagnostics.fetchRewriteCount += 1;
 		const sourceHeaders = new Headers(init?.headers || request?.headers || undefined);
 		const headers = localFetchHeaders(sourceHeaders.get("Content-Type"));
+		const forwardedHeaderNames = new Set([
+			"accept",
+			"x-rivet-actor",
+			"x-rivet-conn-params",
+			"x-rivet-encoding",
+			"x-rivet-skip-ready-wait",
+			"x-rivet-target",
+			"x-rivet-token",
+		]);
+		for (const [name, value] of sourceHeaders.entries()) {
+			if (forwardedHeaderNames.has(name.toLowerCase()) && !headers.has(name)) {
+				headers.set(name, value);
+			}
+		}
 
 		const requestOptions = request ? {
 			method: request.method,
@@ -3600,7 +3687,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 
 	globalThis.WebSocket = new Proxy(NativeWebSocket, {
 		construct(target, args, newTarget) {
-			diagnostics.lastWebSocketProtocols = JSON.stringify(args.length > 1 ? args[1] : "");
+			diagnostics.lastWebSocketProtocols = webSocketProtocolDiagnostics(args.length > 1 ? args[1] : "");
 			let rememberLocalThreadIDOnOpen = "";
 			if (args.length > 0) {
 				args[0] = localWebSocketURL(args[0]);

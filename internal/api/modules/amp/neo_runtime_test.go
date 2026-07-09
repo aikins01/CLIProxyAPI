@@ -4840,6 +4840,114 @@ func TestNeoRuntimeShutdownPersistsLocalThreadActorSnapshot(t *testing.T) {
 	}
 }
 
+func TestNeoRuntimeShutdownPreservesPendingExecutorToolForReconnect(t *testing.T) {
+	useTempNeoThreadStore(t)
+	enabled := true
+	port := freeTCPPortForTest(t)
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
+		Enabled: &enabled,
+		Host:    "127.0.0.1",
+		Port:    port,
+	}}})
+	if err := rt.start(); err != nil {
+		t.Fatalf("start runtime: %v", err)
+	}
+
+	threadID := "T-019f4899-7bfa-78aa-9d42-ca39216d818c"
+	toolCallID := "TU-0000000000000000000001"
+	conn := dialNeoActorWebSocket(t, fmt.Sprintf("http://127.0.0.1:%d", port), threadID)
+	defer conn.Close()
+	if err := conn.WriteJSON(map[string]any{"type": "executor_connected", "executorId": "executor-review", "registeredToolCount": 1}); err != nil {
+		t.Fatalf("connect executor: %v", err)
+	}
+	waitForNeoMessageType(t, conn, "executor_connected", 2*time.Second)
+
+	actor := rt.store.lookupThreadActor(threadID)
+	if actor == nil {
+		t.Fatal("thread actor was not created")
+	}
+	actor.mu.Lock()
+	actor.currentAgentMode = "high"
+	actor.currentReasoningEffort = "xhigh"
+	actor.storeMessageLocked(neoMessage{ThreadID: threadID, MessageID: "M-user", Role: "user", AgentMode: "high", ReasoningEffort: "xhigh", Content: []any{map[string]any{"type": "text", "text": "run final review"}}})
+	actor.storeMessageLocked(neoMessage{ThreadID: threadID, MessageID: "M-0000000000000000000002", Role: "assistant", AgentMode: "high", ReasoningEffort: "xhigh", State: map[string]any{"type": "complete", "stopReason": "tool_use"}, Content: []any{map[string]any{"type": "tool_use", "id": toolCallID, "name": "shell_command", "input": map[string]any{"command": "amp review"}}}})
+	actor.storeMessageLocked(neoMessage{ThreadID: threadID, MessageID: toolResultMessageID(toolCallID), Role: "user", Content: []any{map[string]any{"type": "tool_result", "toolUseID": toolCallID, "run": map[string]any{"status": "in-progress", "progress": "reviewing"}}}, CompletionStatus: "tool_progress"})
+	actor.pendingTools[toolCallID] = neoPendingTool{ID: toolCallID, Name: "shell_command", AgentMode: "high", ReasoningEffort: "xhigh", MessageID: "M-0000000000000000000002"}
+	actor.agentState = "running_tools"
+	actor.rebuildHistoryLocked()
+	actor.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := rt.shutdown(ctx); err != nil {
+		t.Fatalf("shutdown runtime: %v", err)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(neoAmpThreadStoreDir(), threadID+".json"))
+	if err != nil {
+		t.Fatalf("read persisted thread: %v", err)
+	}
+	var thread map[string]any
+	if err := json.Unmarshal(raw, &thread); err != nil {
+		t.Fatalf("decode persisted thread: %v", err)
+	}
+	if got := stringValue(mapValue(thread["meta"])[neoResumeExecutorIDMetaKey]); got != "executor-review" {
+		t.Fatalf("resume executor id = %q, want executor-review", got)
+	}
+
+	restarted := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled}}})
+	restored := restarted.store.ensureThreadActor(threadID)
+	restored.mu.Lock()
+	pendingBeforeReconnect := restored.pendingTools[toolCallID]
+	resultBeforeReconnect := mapValue(mapValue(restored.messages[2].Content[0])["run"])
+	restored.mu.Unlock()
+	if pendingBeforeReconnect.ID != toolCallID {
+		t.Fatalf("restored pending tool = %#v", pendingBeforeReconnect)
+	}
+	if got := stringValue(resultBeforeReconnect["status"]); got != "in-progress" {
+		t.Fatalf("persisted review status = %q, want in-progress", got)
+	}
+	replacement := newNeoActor(restarted, "actor-replacement", "thread-actor", threadID, threadID, neoActorRecord("actor-replacement", "thread-actor", threadID), nil)
+	if err := replacement.importThreadLocalOnly(thread); err != nil {
+		t.Fatalf("import replacement thread: %v", err)
+	}
+	replacement.executorConnectForSocket(&neoSocket{}, map[string]any{"clientId": "executor-other"})
+	replacement.mu.Lock()
+	_, replacementPending := replacement.pendingTools[toolCallID]
+	replacementResumeBootstrap := replacement.executorResumeBootstrap
+	replacementRun := mapValue(mapValue(replacement.messages[2].Content[0])["run"])
+	replacement.mu.Unlock()
+	if replacementPending || replacementResumeBootstrap || stringValue(replacementRun["status"]) != "cancelled" {
+		t.Fatalf("replacement executor inherited pending review: pending=%v resumeBootstrap=%v run=%#v", replacementPending, replacementResumeBootstrap, replacementRun)
+	}
+
+	socket := &neoSocket{}
+	restored.executorConnectForSocket(socket, map[string]any{"clientId": "executor-review"})
+	restored.mu.Lock()
+	_, pendingAfterReconnect := restored.pendingTools[toolCallID]
+	resumeBootstrap := restored.executorResumeBootstrap
+	restored.mu.Unlock()
+	if !pendingAfterReconnect || !resumeBootstrap {
+		t.Fatalf("matching executor did not reclaim pending review: pending=%v resumeBootstrap=%v", pendingAfterReconnect, resumeBootstrap)
+	}
+
+	restored.receiveToolResult(map[string]any{"type": "executor_tool_result", "toolCallId": toolCallID, "run": map[string]any{"status": "done", "result": "review passed"}}, socket)
+	restored.mu.Lock()
+	_, stillPending := restored.pendingTools[toolCallID]
+	pendingInference := cloneNeoInferenceInflight(restored.pendingInference)
+	resultAfterReconnect := mapValue(mapValue(restored.messages[2].Content[0])["run"])
+	restored.mu.Unlock()
+	if stillPending {
+		t.Fatal("completed review remained pending after reconnect")
+	}
+	if pendingInference == nil || pendingInference.agentMode != "high" || pendingInference.reasoningEffort != "xhigh" {
+		t.Fatalf("continuation after review = %#v", pendingInference)
+	}
+	if got := stringValue(resultAfterReconnect["status"]); got != "done" {
+		t.Fatalf("restored review result status = %q, want done", got)
+	}
+}
+
 func TestNeoRuntimeShutdownPersistsLocalReasoningEffortSetting(t *testing.T) {
 	useTempNeoThreadStore(t)
 	enabled := true
@@ -6597,6 +6705,134 @@ func TestNeoActorClientCreateThreadNotifiesUserActorForSparseChild(t *testing.T)
 		return
 	}
 	t.Fatal("did not receive threadStatusUpdated notification for sparse child thread")
+}
+
+func TestNeoUserActorRunnerLifecycle(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	userActor, _ := rt.store.upsert(map[string]any{"name": "userActor", "key": "user-local"}, true)
+	workingDirectory := neoExistingDirectory(t.TempDir())
+	socket := &neoSocket{runnerID: "runner-local"}
+	registered := mapValue(userActor.handleForSocket(socket, map[string]any{
+		"type": "registerRunner",
+		"args": []any{map[string]any{
+			"sessionId":        "session-local",
+			"hostname":         "Local Machine",
+			"workingDirectory": workingDirectory,
+			"repositoryURL":    "file://" + workingDirectory,
+			"pid":              1234,
+			"runningThreads":   []any{},
+		}},
+	}))
+	if registered["ok"] != true || len(arrayValue(registered["intents"])) != 0 {
+		t.Fatalf("registerRunner result = %#v", registered)
+	}
+	runners := arrayValue(userActor.handleForSocket(nil, map[string]any{"type": "listRunners"}))
+	if len(runners) != 1 {
+		t.Fatalf("listRunners result = %#v", runners)
+	}
+	runner := mapValue(runners[0])
+	if runner["runnerId"] != "runner-local" || runner["workingDirectory"] != workingDirectory || runner["hostname"] != "Local Machine" {
+		t.Fatalf("runner = %#v", runner)
+	}
+	threadID := "T-019f4000-0000-4000-8000-000000000031"
+	if !rt.store.requestUserExecutorRunnerThread("runner-local", threadID) {
+		t.Fatal("requestUserExecutorRunnerThread did not find registered runner")
+	}
+	heartbeat := mapValue(userActor.handleForSocket(socket, map[string]any{
+		"type": "runnerHeartbeat",
+		"args": []any{map[string]any{"sessionId": "session-local", "runningThreads": []any{}}},
+	}))
+	intents := arrayValue(heartbeat["intents"])
+	if heartbeat["ok"] != true || len(intents) != 1 || mapValue(intents[0])["threadId"] != threadID || mapValue(intents[0])["desired"] != "running" {
+		t.Fatalf("runnerHeartbeat result = %#v", heartbeat)
+	}
+	unregistered := mapValue(userActor.handleForSocket(socket, map[string]any{
+		"type": "unregisterRunner",
+		"args": []any{map[string]any{"sessionId": "session-local"}},
+	}))
+	if unregistered["ok"] != true || len(userActor.userExecutorRunners()) != 0 {
+		t.Fatalf("unregisterRunner result = %#v runners=%#v", unregistered, userActor.userExecutorRunners())
+	}
+}
+
+func TestNeoRuntimeUserActorListRunnersHTTPActionBare(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	userActor, _ := rt.store.upsert(map[string]any{"name": "userActor", "key": "user-local"}, true)
+	workingDirectory := neoExistingDirectory(t.TempDir())
+	registerArgs, err := neoRivetEncodeData([]any{map[string]any{
+		"sessionId":        "session-local",
+		"hostname":         "Local Machine",
+		"workingDirectory": workingDirectory,
+		"pid":              uint64(1234),
+		"runningThreads":   []any{},
+	}})
+	if err != nil {
+		t.Fatalf("encode register args: %v", err)
+	}
+	var registerBody bytes.Buffer
+	neoRivetBareWriteBytes(&registerBody, registerArgs)
+	registerReq := httptest.NewRequest(http.MethodPost, "/gateway/"+userActor.id+"/action/registerRunner", bytes.NewReader(neoRivetBareVersioned(registerBody.Bytes())))
+	registerReq.Header.Set("Content-Type", "application/octet-stream")
+	registerReq.Header.Set("x-rivet-encoding", "bare")
+	registerReq.Header.Set("x-rivet-conn-params", `{"runnerId":"runner-local"}`)
+	registerRec := httptest.NewRecorder()
+	rt.handleHTTP(registerRec, registerReq)
+	if registerRec.Code != http.StatusOK {
+		t.Fatalf("registerRunner action status = %d body=%q", registerRec.Code, registerRec.Body.String())
+	}
+
+	encodedArgs, err := neoRivetEncodeData([]any{})
+	if err != nil {
+		t.Fatalf("encode action args: %v", err)
+	}
+	var actionBody bytes.Buffer
+	neoRivetBareWriteBytes(&actionBody, encodedArgs)
+	req := httptest.NewRequest(http.MethodPost, "/gateway/userActor/action/listRunners?rvt-method=get&rvt-key=user-local", bytes.NewReader(neoRivetBareVersioned(actionBody.Bytes())))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("x-rivet-encoding", "bare")
+	rec := httptest.NewRecorder()
+	rt.handleHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("listRunners action status = %d body=%q", rec.Code, rec.Body.String())
+	}
+	raw := rec.Body.Bytes()
+	if len(raw) < 3 || binary.LittleEndian.Uint16(raw[:2]) != neoRivetBareVersion {
+		t.Fatalf("listRunners action response = %x", raw)
+	}
+	offset := 2
+	encodedResult, err := neoRivetBareReadBytes(raw, &offset)
+	if err != nil {
+		t.Fatalf("decode action response: %v", err)
+	}
+	decodedResult, err := neoRivetDecodeData(encodedResult)
+	if err != nil {
+		t.Fatalf("decode action response data: %v", err)
+	}
+	runners := arrayValue(decodedResult)
+	if len(runners) != 1 || mapValue(runners[0])["runnerId"] != "runner-local" || intValue(mapValue(runners[0])["pid"]) != 1234 {
+		t.Fatalf("listRunners action result = %#v", decodedResult)
+	}
+}
+
+func TestNeoRuntimeUserActorHTTPActionPrefixedPathCreatesActor(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	encodedArgs, err := neoRivetEncodeData([]any{})
+	if err != nil {
+		t.Fatalf("encode action args: %v", err)
+	}
+	var actionBody bytes.Buffer
+	neoRivetBareWriteBytes(&actionBody, encodedArgs)
+	req := httptest.NewRequest(http.MethodPost, "/actors/gateway/userActor/action/listRunners?rvt-method=get&rvt-key=user-local", bytes.NewReader(neoRivetBareVersioned(actionBody.Bytes())))
+	req.Header.Set("x-rivet-encoding", "bare")
+	rec := httptest.NewRecorder()
+	rt.handleHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("prefixed action status = %d body=%q", rec.Code, rec.Body.String())
+	}
+	actors := rt.store.userActors()
+	if len(actors) != 1 || actors[0].key != "user-local" {
+		t.Fatalf("prefixed action actors = %#v", actors)
+	}
 }
 
 func TestNeoRuntimeUserActorGetConnectCreatesLocalActor(t *testing.T) {

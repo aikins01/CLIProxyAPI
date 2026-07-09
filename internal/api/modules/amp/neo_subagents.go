@@ -105,10 +105,10 @@ var neoSubagentDefs = map[string]neoSubagentDef{
 	"run_check": {
 		Key:             "run_check",
 		DisplayName:     "Check",
-		Route:           neoModelRoute{Provider: "google", Model: "gemini-3.5-flash"},
+		Route:           neoModelRoute{Provider: "openai", Model: "gpt-5.6-terra"},
 		IncludeTools:    []string{"Read", "Grep", "glob", "Bash"},
 		SystemPrompt:    neoRunCheckSubagentPrompt,
-		ReasoningEffort: "high",
+		ReasoningEffort: "low",
 		MaxTurns:        12,
 	},
 }
