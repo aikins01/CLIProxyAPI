@@ -22128,35 +22128,15 @@ func inferNeoCompactionLocal(rt *neoRuntime, threadID string, route neoModelRout
 
 func neoCompactionPrompt() string {
 	return strings.Join([]string{
-		"You have been working on the task described above but have not yet completed it. Write a continuation summary that will allow you (or another instance of yourself) to resume work efficiently in a future context window where the conversation history will be replaced with this summary. Your summary should be structured, concise, and actionable. Include:",
-		"1. Task Overview",
-		"The latest active user request, including whether it supersedes earlier work",
-		"Do not treat this compaction prompt itself as the active request; summarize the prior user task that should continue",
-		"The user's core request and success criteria",
-		"Any clarifications or constraints they specified",
-		"2. Current State",
-		"What has been completed so far",
-		"Files created, modified, or analyzed (with paths if relevant)",
-		"Current repository, branch, worktree, runtime, or environment state needed to continue",
-		"Key outputs or artifacts produced",
-		"3. Important Discoveries",
-		"Technical constraints or requirements uncovered",
-		"Decisions made and their rationale",
-		"Errors encountered and how they were resolved",
-		"What approaches were tried that didn't work (and why)",
-		"4. Next Steps",
-		"Specific actions needed to complete the task",
-		"Exact commands to rerun, tests to run, or files to open first",
-		"Any blockers or open questions to resolve",
-		"Priority order if multiple steps remain",
-		"5. Context to Preserve",
-		"Important prior compaction summary details that still affect this task",
-		"User preferences or style requirements",
-		"Domain-specific details that aren't obvious",
-		"Any promises made to the user",
-		"Do not include secrets; keep only variable names, paths, or redacted placeholders when credentials were discussed.",
-		"Be concise but complete—err on the side of including information that would prevent duplicate work or repeated mistakes. Omit stale completed work unless it explains a surviving decision or constraint. Avoid restating every message. Write in a way that enables immediate resumption of the task.",
-		"Wrap your summary in <summary></summary> tags.",
+		"Write a continuation summary that will replace the conversation above. Summarize the latest active user task, not this request.",
+		"Preserve what is needed to resume correctly:",
+		"- the objective and success criteria, including later corrections or superseded directions",
+		"- current implementation state and relevant repository, branch, worktree, runtime, files, and artifacts",
+		"- exact technical details, commands, errors, tool outcomes, and latest verification results",
+		"- surviving decisions, constraints, approval boundaries, blockers, and ordered next steps",
+		"- still-relevant details from prior compaction summaries",
+		"Treat tool calls as attempts unless their results confirm success. Omit stale, reverted, or rejected work except where needed to prevent repeating it. Never include secrets; retain only names, paths, and redacted placeholders.",
+		"Use headings: Task, Current state, Decisions and constraints, Next steps. Keep all required facts, caveats, and next steps; trim repetition and stale background first. Wrap the result in <summary></summary> tags.",
 	}, "\n")
 }
 
@@ -26117,10 +26097,15 @@ func openAIReasoningEffort(effort string) string {
 	}
 }
 
-func openAIResponsesReasoningEffort(effort string) string {
+func openAIResponsesReasoningEffort(model, effort string) string {
 	switch strings.ToLower(strings.TrimSpace(effort)) {
 	case "none", "minimal", "low", "medium", "high", "xhigh":
 		return strings.ToLower(strings.TrimSpace(effort))
+	case "max":
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(model)), "gpt-5.6") {
+			return "max"
+		}
+		return "medium"
 	default:
 		return "medium"
 	}
@@ -26605,7 +26590,7 @@ func neoApplyOpenAIResponsesReasoning(body map[string]any, route neoModelRoute, 
 	suffix := neoEffectiveThinkingLevel(route, fallback)
 	if neoOpenAIResponsesSupportsReasoning(route.Model) {
 		body["reasoning"] = map[string]any{
-			"effort":  openAIResponsesReasoningEffort(firstNonEmptyString(suffix, fallback)),
+			"effort":  openAIResponsesReasoningEffort(route.Model, firstNonEmptyString(suffix, fallback)),
 			"summary": "auto",
 		}
 		return

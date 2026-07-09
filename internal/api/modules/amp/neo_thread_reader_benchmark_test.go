@@ -93,7 +93,7 @@ func TestNeoReadThreadDefaultBenchmarkCandidates(t *testing.T) {
 	for _, candidate := range candidates {
 		got = append(got, candidate.Route.Provider+"/"+candidate.Route.Model+"@"+candidate.Effort)
 	}
-	want := []string{"openai/gpt-5.5@medium"}
+	want := []string{"openai/gpt-5.6-sol@medium"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("default benchmark candidates = %#v, want %#v", got, want)
 	}
@@ -207,7 +207,7 @@ func neoReadThreadBenchmarkCandidates(t *testing.T) []neoReadThreadBenchmarkCand
 	raw := strings.TrimSpace(os.Getenv("AMP_READ_THREAD_MODEL_BENCHMARK_CANDIDATES"))
 	if raw == "" {
 		return []neoReadThreadBenchmarkCandidate{
-			{Name: "gpt-5.5-medium", Route: neoModelRoute{Provider: "openai", Model: "gpt-5.5"}, Effort: "medium"},
+			{Name: "gpt-5.6-sol-medium", Route: neoModelRoute{Provider: "openai", Model: "gpt-5.6-sol"}, Effort: "medium"},
 		}
 	}
 	candidates := make([]neoReadThreadBenchmarkCandidate, 0)

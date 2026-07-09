@@ -16,7 +16,7 @@ import (
 
 const (
 	neoReadThreadAgentProvider      = "openai"
-	neoReadThreadAgentModel         = "gpt-5.5"
+	neoReadThreadAgentModel         = "gpt-5.6-sol"
 	neoReadThreadAgentEffort        = "medium"
 	neoReadThreadMaxTurns           = 16
 	neoReadThreadSearchLimit        = 12

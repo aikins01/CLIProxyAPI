@@ -67,9 +67,6 @@ type neoSubagentDef struct {
 	MaxTurns        int
 }
 
-// neoSubagentDefs maps the model-facing tool name to its definition. Keys match
-// the names the binary advertises and the model calls. Models/includeTools come
-// from Amp subagent routing (finder→haiku, oracle→Claude Fable 5, librarian→gpt-5.5).
 var neoSubagentDefs = map[string]neoSubagentDef{
 	"finder": {
 		Key:          "finder",
@@ -91,7 +88,7 @@ var neoSubagentDefs = map[string]neoSubagentDef{
 	"librarian": {
 		Key:             "librarian",
 		DisplayName:     "Librarian",
-		Route:           neoModelRoute{Provider: "openai", Model: "gpt-5.5"},
+		Route:           neoModelRoute{Provider: "openai", Model: "gpt-5.6-sol"},
 		IncludeTools:    []string{"read_github", "search_github", "commit_search", "diff", "list_directory_github", "list_repositories", "glob_github"},
 		SystemPrompt:    neoLibrarianSubagentPrompt,
 		ReasoningEffort: "none",

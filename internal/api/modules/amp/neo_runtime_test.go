@@ -2985,18 +2985,18 @@ func TestNeoCompactionTriggerMatchesAuditBaselineAgentModeRoutes(t *testing.T) {
 	}
 }
 
-func TestNeoCompactionPromptMatchesBinaryContinuationStyle(t *testing.T) {
+func TestNeoCompactionPromptPreservesContinuationContract(t *testing.T) {
 	prompt := neoCompactionPrompt()
 
 	for _, want := range []string{
 		"continuation summary",
-		"1. Task Overview",
-		"Do not treat this compaction prompt itself as the active request",
-		"2. Current State",
-		"3. Important Discoveries",
-		"4. Next Steps",
-		"5. Context to Preserve",
-		"Wrap your summary in <summary></summary> tags.",
+		"latest active user task",
+		"current implementation state",
+		"exact technical details, commands, errors, tool outcomes, and latest verification results",
+		"Treat tool calls as attempts unless their results confirm success",
+		"Never include secrets",
+		"Task, Current state, Decisions and constraints, Next steps",
+		"Wrap the result in <summary></summary> tags.",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("compaction prompt missing %q:\n%s", want, prompt)
@@ -14609,6 +14609,15 @@ func TestNeoProviderReasoningRulesMatchAuditBaseline(t *testing.T) {
 				t.Fatalf("uncovered provider reasoning rule: %#v", rule)
 			}
 		})
+	}
+}
+
+func TestOpenAIResponsesReasoningEffortSupportsGPT56Max(t *testing.T) {
+	if got := openAIResponsesReasoningEffort("gpt-5.6-sol", "max"); got != "max" {
+		t.Fatalf("GPT-5.6 max effort = %q, want max", got)
+	}
+	if got := openAIResponsesReasoningEffort("gpt-5.5", "max"); got != "medium" {
+		t.Fatalf("GPT-5.5 max effort = %q, want medium", got)
 	}
 }
 

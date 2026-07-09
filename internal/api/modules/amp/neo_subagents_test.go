@@ -13,7 +13,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 )
 
-func TestNeoSubagentRegistryMatchesBinary(t *testing.T) {
+func TestNeoSubagentRegistryMatchesLocalContract(t *testing.T) {
 	cases := []struct {
 		tool     string
 		provider string
@@ -23,7 +23,7 @@ func TestNeoSubagentRegistryMatchesBinary(t *testing.T) {
 	}{
 		{"finder", "anthropic", "claude-haiku-4-5-20251001", "", []string{"Grep", "glob", "Read"}},
 		{"oracle", "anthropic", "claude-fable-5", "high", []string{"Read", "Grep", "glob", "web_search", "read_web_page", "read_thread", "find_thread"}},
-		{"librarian", "openai", "gpt-5.5", "none", []string{"read_github", "search_github", "commit_search", "diff", "list_directory_github", "list_repositories", "glob_github"}},
+		{"librarian", "openai", "gpt-5.6-sol", "none", []string{"read_github", "search_github", "commit_search", "diff", "list_directory_github", "list_repositories", "glob_github"}},
 		{"run_check", "google", "gemini-3.5-flash", "high", []string{"Read", "Grep", "glob", "Bash"}},
 		// Task inherits the parent model (empty route) and includes finder (a nested subagent).
 		{"Task", "", "", "", []string{"Read", "Bash", "edit_file", "create_file", "read_web_page", "web_search", "finder", "skill", "view_media"}},
@@ -124,7 +124,7 @@ func TestNeoOracleSubagentIgnoresConfigModeModel(t *testing.T) {
 	}
 }
 
-func TestNeoLibrarianSubagentUsesGPT55None(t *testing.T) {
+func TestNeoLibrarianSubagentUsesGPT56SolNone(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	actor := newNeoActor(rt, "actor-librarian", "thread-actor", "T-librarian", "T-librarian", neoActorRecord("actor-librarian", "thread-actor", "T-librarian"), nil)
 	actor.currentAgentMode = "smart"
@@ -143,8 +143,8 @@ func TestNeoLibrarianSubagentUsesGPT55None(t *testing.T) {
 		t.Fatalf("librarian requests = %#v, want exactly one", seen)
 	}
 	route := seen[0].ModelRouteOverride
-	if route == nil || route.Provider != "openai" || route.Model != "gpt-5.5" {
-		t.Fatalf("librarian route = %#v, want openai/gpt-5.5", route)
+	if route == nil || route.Provider != "openai" || route.Model != "gpt-5.6-sol" {
+		t.Fatalf("librarian route = %#v, want openai/gpt-5.6-sol", route)
 	}
 	if seen[0].ReasoningEffort != "none" || stringValue(seen[0].Settings["reasoning.effort"]) != "none" {
 		t.Fatalf("librarian effort request=%q settings=%#v, want none", seen[0].ReasoningEffort, seen[0].Settings)
