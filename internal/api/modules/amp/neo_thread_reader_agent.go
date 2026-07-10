@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	log "github.com/sirupsen/logrus"
 )
@@ -83,6 +84,7 @@ type neoReadThreadMessage struct {
 	ToolUses        []neoReadThreadToolUse
 	ToolResults     []neoReadThreadToolResult
 	Completion      string
+	searchTextLower string
 }
 
 type neoReadThreadToolUse struct {
@@ -1240,12 +1242,13 @@ func neoReadThreadSearch(corpus neoReadThreadCorpus, input map[string]any) (map[
 	}
 	terms := neoReadThreadSearchTerms(query)
 	type hit struct {
-		message neoReadThreadMessage
-		score   int
+		position int
+		score    int
 	}
 	hits := make([]hit, 0)
 	queryLower := strings.ToLower(query)
-	for _, message := range corpus.Messages {
+	for position := range corpus.Messages {
+		message := &corpus.Messages[position]
 		if hasAfter && message.Index <= after {
 			continue
 		}
@@ -1255,7 +1258,7 @@ func neoReadThreadSearch(corpus neoReadThreadCorpus, input map[string]any) (map[
 		if len(roles) > 0 && !roles[strings.ToLower(message.Role)] {
 			continue
 		}
-		haystack := strings.ToLower(message.searchText())
+		haystack := message.normalizedSearchText()
 		score := 0
 		if strings.Contains(haystack, queryLower) {
 			score += 100
@@ -1270,21 +1273,20 @@ func neoReadThreadSearch(corpus neoReadThreadCorpus, input map[string]any) (map[
 		if score == 0 {
 			continue
 		}
-		hits = append(hits, hit{message: message, score: score})
+		hits = append(hits, hit{position: position, score: score})
 	}
 	sort.SliceStable(hits, func(i, j int) bool {
 		if hits[i].score != hits[j].score {
 			return hits[i].score > hits[j].score
 		}
-		return hits[i].message.Index < hits[j].message.Index
+		return corpus.Messages[hits[i].position].Index < corpus.Messages[hits[j].position].Index
 	})
 	if len(hits) > limit {
 		hits = hits[:limit]
 	}
 	items := make([]any, 0, len(hits))
 	for _, hit := range hits {
-		message := hit.message
-		position := neoReadThreadMessagePosition(corpus, message.Index)
+		message := corpus.Messages[hit.position]
 		items = append(items, map[string]any{
 			"index":             message.Index,
 			"role":              message.Role,
@@ -1293,11 +1295,11 @@ func neoReadThreadSearch(corpus neoReadThreadCorpus, input map[string]any) (map[
 			"parentToolUseID":   message.ParentToolUseID,
 			"score":             hit.score,
 			"excerpt":           neoReadThreadExcerpt(message.Text, query, terms, neoReadThreadSearchExcerpt),
-			"hasLaterMessages":  position >= 0 && position < len(corpus.Messages)-1,
-			"laterMessageCount": neoReadThreadLaterVisibleMessageCount(corpus, position),
+			"hasLaterMessages":  hit.position < len(corpus.Messages)-1,
+			"laterMessageCount": neoReadThreadLaterVisibleMessageCount(corpus, hit.position),
 			"recommendedRead": map[string]any{
 				"startIndex": message.Index,
-				"count":      neoReadThreadRecommendedReadCount(position, len(corpus.Messages)),
+				"count":      neoReadThreadRecommendedReadCount(hit.position, len(corpus.Messages)),
 			},
 		})
 	}
@@ -1619,6 +1621,13 @@ func (m neoReadThreadMessage) searchText() string {
 	return strings.Join(parts, "\n")
 }
 
+func (m *neoReadThreadMessage) normalizedSearchText() string {
+	if m.searchTextLower == "" {
+		m.searchTextLower = strings.ToLower(m.searchText())
+	}
+	return m.searchTextLower
+}
+
 func neoReadThreadInputInt(input map[string]any, keys ...string) (int, bool) {
 	for _, key := range keys {
 		value, exists := input[key]
@@ -1690,6 +1699,19 @@ func neoReadThreadExcerpt(text, query string, terms []string, limit int) string 
 }
 
 func neoReadThreadMatchPrefixRunes(text string, needles []string) int {
+	lowerText := strings.ToLower(text)
+	if utf8.RuneCountInString(lowerText) == utf8.RuneCountInString(text) {
+		for _, raw := range needles {
+			needle := strings.ToLower(strings.TrimSpace(raw))
+			if needle == "" {
+				continue
+			}
+			if byteIndex := strings.Index(lowerText, needle); byteIndex >= 0 {
+				return utf8.RuneCountInString(lowerText[:byteIndex])
+			}
+		}
+		return -1
+	}
 	for _, raw := range needles {
 		needle := strings.ToLower(strings.TrimSpace(raw))
 		if needle == "" {

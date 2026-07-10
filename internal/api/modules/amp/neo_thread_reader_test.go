@@ -1019,6 +1019,28 @@ func TestNeoReadThreadExcerptHandlesUnicodeCaseExpansion(t *testing.T) {
 	}
 }
 
+func BenchmarkNeoReadThreadSearchLargeCorpus(b *testing.B) {
+	messages := make([]neoReadThreadMessage, 1386)
+	for i := range messages {
+		text := strings.Repeat("build output without the requested evidence\n", 140)
+		if i%100 == 0 {
+			text += "concurrency corruption fixes and deployment constraints"
+		}
+		messages[i] = neoReadThreadMessage{Index: i, Role: "assistant", MessageID: fmt.Sprintf("M-%d", i), Text: text}
+	}
+	corpus := neoReadThreadCorpus{ThreadID: "T-large-search", Source: "benchmark", Messages: messages}
+	input := map[string]any{"query": "concurrency corruption fixes", "limit": neoReadThreadSearchLimitMax}
+
+	b.ReportAllocs()
+	b.SetBytes(int64(len(messages) * len(messages[0].Text)))
+	b.ResetTimer()
+	for range b.N {
+		if _, err := neoReadThreadSearch(corpus, input); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func TestNeoReadThreadRejectsFinalUntilSearchReadAndLatest(t *testing.T) {
 	dir := t.TempDir()
 	oldStoreDir := neoAmpDataDir
