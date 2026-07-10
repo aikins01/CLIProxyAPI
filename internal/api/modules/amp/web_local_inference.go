@@ -35,9 +35,9 @@ func (m *AmpModule) webLocalInferenceCORSMiddleware() gin.HandlerFunc {
 		c.Header("Vary", appendVaryHeader(c.Writer.Header().Get("Vary"), "Origin"))
 		c.Header("Access-Control-Allow-Origin", origin)
 		c.Header("Access-Control-Allow-Credentials", "true")
-		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		c.Header("Access-Control-Allow-Methods", "GET, HEAD, POST, PUT, DELETE, OPTIONS")
 		c.Header("Access-Control-Allow-Private-Network", "true")
-		c.Header("Access-Control-Allow-Headers", "Authorization, Content-Type, "+ampWebLocalInferenceHeader)
+		c.Header("Access-Control-Allow-Headers", "Authorization, Content-Type, "+ampWebLocalInferenceHeader+", X-Rivet-Actor, X-Rivet-Conn-Params, X-Rivet-Encoding, X-Rivet-Skip-Ready-Wait, X-Rivet-Target, X-Rivet-Token")
 		c.Header("Access-Control-Max-Age", "600")
 
 		if c.Request.Method == http.MethodOptions {
@@ -129,6 +129,8 @@ func ampWebLocalInferencePath(path string) bool {
 	switch {
 	case path == "/api/internal":
 		return true
+	case path == "/ampcode/local-projects.json":
+		return true
 	case path == "/api/thread-actors" || strings.HasPrefix(path, "/api/thread-actors/"):
 		return true
 	case ampWebLocalInferenceRemotePath(path):
@@ -180,7 +182,30 @@ func (m *AmpModule) serveWebLocalInferenceUserscript(c *gin.Context) {
 	if defaultBaseURL == "" {
 		defaultBaseURL = ampWebLocalInferenceDefaultBaseURL
 	}
-	c.String(http.StatusOK, ampWebLocalInferenceUserscript(defaultBaseURL, settings.AllowedOrigins))
+	script := ampWebLocalInferenceUserscript(defaultBaseURL, settings.AllowedOrigins)
+	c.Header("Content-Length", strconv.Itoa(len(script)))
+	if c.Request.Method == http.MethodHead {
+		c.Status(http.StatusOK)
+		return
+	}
+	c.Data(http.StatusOK, "application/javascript; charset=utf-8", []byte(script))
+}
+
+func (m *AmpModule) serveWebLocalProjects(c *gin.Context) {
+	if c.Request.Method != http.MethodGet {
+		c.JSON(http.StatusMethodNotAllowed, gin.H{"error": "method not allowed"})
+		return
+	}
+	if m == nil || m.neoRuntime == nil || !c.GetBool(ampWebLocalInferenceCORSContextKey) || strings.TrimSpace(c.GetHeader(ampWebLocalInferenceHeader)) == "" {
+		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+		return
+	}
+	cfg := m.neoThreadConfigSnapshot()
+	if cfg == nil || !neoRuntimeEnabled(cfg) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true, "projects": m.neoRuntime.reloadNeoWebLocalProjectCache(), "defaultWorkingDirectory": neoDefaultWebLocalWorkingDirectory()})
 }
 
 func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []string) string {
@@ -190,7 +215,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	return fmt.Sprintf(`// ==UserScript==
 // @name CLIProxyAPI Amp Local Inference
 // @namespace https://github.com/router-for-me/CLIProxyAPI
-// @version 0.1.27
+// @version 0.1.57
 %s
 // @updateURL %s
 // @downloadURL %s
@@ -202,22 +227,37 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	"use strict";
 
 	const bridgeHeader = %s;
+	const userscriptVersion = "0.1.57";
 	const apiKeyStorageKey = "cliproxyapi.ampLocalInference.apiKey";
 	const workingDirectoryStorageKey = "cliproxyapi.ampLocalInference.workingDirectory";
+	const selectedLocalProjectStorageKey = "cliproxyapi.ampLocalInference.selectedLocalProject";
 	const localThreadIDsStorageKey = "cliproxyapi.ampLocalInference.localThreadIDs";
 	const threadWorkingDirectoriesStorageKey = "cliproxyapi.ampLocalInference.threadWorkingDirectories";
 	const threadSettingsStorageKey = "cliproxyapi.ampLocalInference.threadSettings";
+	const localProjectsEndpointPath = "/ampcode/local-projects.json";
+	const localRunnerActionNames = new Set(["registerRunner", "runnerHeartbeat", "unregisterRunner", "listRunners"]);
 	const defaultBaseURL = %s;
+	let defaultWorkingDirectory = "";
 	const originalJSONParse = globalThis.JSON.parse.bind(globalThis.JSON);
 	const originalFetch = globalThis.fetch.bind(globalThis);
+	const originalResponseJSON = globalThis.Response?.prototype?.json;
 	const NativeWebSocket = globalThis.WebSocket;
 	const diagnostics = {
 		decodedConfigPatchCount: 0,
+		responseJSONPatchCount: 0,
 		fetchRewriteCount: 0,
 		webSocketRewriteCount: 0,
 		webSocketBootstrapCount: 0,
+		webSocketOpenCount: 0,
+		webSocketCloseCount: 0,
+		webSocketErrorCount: 0,
+		activeWebSocketCount: 0,
 		menuIntegrationCount: 0,
 		commandPaletteIntegrationCount: 0,
+		localProjectFetchCount: 0,
+		localProjectPickerIntegrationCount: 0,
+		localProjectActivatorIntegrationCount: 0,
+		localThreadStatusPatchCount: 0,
 		localThreadPickerOpenCount: 0,
 		removedLocalThreadControlCount: 0,
 		remoteShellCreateCount: 0,
@@ -230,15 +270,24 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		lastVisibleThreadModeAgentMode: "",
 		lastVisibleThreadModeReasoningEffort: "",
 		lastLocalThreadChoice: "",
+		lastLocalProjectChoice: "",
+		lastLocalProjectWorkingDirectory: "",
 		lastWebSocketHost: "",
 		lastWebSocketPath: "",
 		lastWebSocketThreadKey: "",
 		lastWebSocketBootstrapped: false,
+		lastWebSocketProtocols: "",
+		lastWebSocketState: "",
+		lastWebSocketReadyState: -1,
+		lastWebSocketCloseCode: 0,
+		lastWebSocketCloseReason: "",
 		lastInheritedWorkingDirectory: "",
 		lastInheritedWorkingDirectoryThreadID: "",
 		lastObservedThreadID: "",
-		};
+	};
 	let observedThreadID = "";
+	let pendingLocalBootstrapThreadID = "";
+	let localProjectsCache = { at: 0, projects: [], promise: null };
 
 	function localBaseURL() {
 		return new URL(defaultBaseURL);
@@ -249,15 +298,36 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	}
 
 	function storedLocalAPIKey() {
-		return globalThis.sessionStorage.getItem(apiKeyStorageKey) || "";
+		return globalThis.sessionStorage.getItem(apiKeyStorageKey) ||
+			globalThis.localStorage.getItem(apiKeyStorageKey) ||
+			"";
 	}
 
-	function localAPIKey() {
+	function localAPIKey(rememberCancel = true) {
 		const apiKey = storedLocalAPIKey();
 		if (apiKey) {
 			return apiKey;
 		}
 		const promptedKey = "cliproxyapi.ampLocalInference.promptedAPIKey";
+		if (rememberCancel && globalThis.sessionStorage.getItem(promptedKey) === "1") {
+			return "";
+		}
+		if (rememberCancel) {
+			globalThis.sessionStorage.setItem(promptedKey, "1");
+		}
+		const promptedAPIKey = (globalThis.prompt("CLIProxyAPI API key") || "").trim();
+		if (promptedAPIKey) {
+			globalThis.sessionStorage.setItem(apiKeyStorageKey, promptedAPIKey);
+		}
+		return promptedAPIKey;
+	}
+
+	function localProjectLookupAPIKey() {
+		const apiKey = storedLocalAPIKey();
+		if (apiKey) {
+			return apiKey;
+		}
+		const promptedKey = "cliproxyapi.ampLocalInference.promptedProjectsAPIKey";
 		if (globalThis.sessionStorage.getItem(promptedKey) === "1") {
 			return "";
 		}
@@ -265,6 +335,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		const promptedAPIKey = (globalThis.prompt("CLIProxyAPI API key") || "").trim();
 		if (promptedAPIKey) {
 			globalThis.sessionStorage.setItem(apiKeyStorageKey, promptedAPIKey);
+			globalThis.sessionStorage.removeItem(promptedKey);
 		}
 		return promptedAPIKey;
 	}
@@ -274,7 +345,81 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		if (activeDirectory) {
 			return activeDirectory;
 		}
-		return (globalThis.localStorage.getItem(workingDirectoryStorageKey) || "").trim();
+		const selectedDirectory = selectedLocalProjectWorkingDirectory();
+		if (selectedDirectory) {
+			return selectedDirectory;
+		}
+		return storedLocalWorkingDirectory() || defaultLocalWorkingDirectory();
+	}
+
+	function currentLocalProjectWorkingDirectory() {
+		return activeThreadWorkingDirectory() ||
+			visibleProjectWorkingDirectory() ||
+			selectedLocalProjectWorkingDirectory() ||
+			storedLocalWorkingDirectory() ||
+			defaultLocalWorkingDirectory();
+	}
+
+	function storedLocalWorkingDirectory() {
+		return normalizeWorkingDirectory(globalThis.localStorage.getItem(workingDirectoryStorageKey) || "");
+	}
+
+	function defaultLocalWorkingDirectory() {
+		return normalizeWorkingDirectory(defaultWorkingDirectory);
+	}
+
+	function ensureDefaultWorkingDirectory(promptForKey = false) {
+		const workingDirectory = defaultLocalWorkingDirectory();
+		if (workingDirectory) {
+			return Promise.resolve(workingDirectory);
+		}
+		return fetchLocalProjects(promptForKey).then(() => defaultLocalWorkingDirectory());
+	}
+
+	function selectedLocalProjectWorkingDirectory() {
+		return normalizeWorkingDirectory(selectedLocalProject()?.workingDirectory);
+	}
+
+	function selectedLocalProject() {
+		try {
+			const parsed = originalJSONParse(globalThis.sessionStorage.getItem(selectedLocalProjectStorageKey) || "{}");
+			const selectedAt = Number(parsed.selectedAt || 0);
+			if (!selectedAt || Date.now() - selectedAt > 10 * 60 * 1000) {
+				return null;
+			}
+			return parsed;
+		} catch {
+			return null;
+		}
+	}
+
+	function rememberSelectedLocalProject(project) {
+		const workingDirectory = normalizeWorkingDirectory(project?.workingDirectory);
+		if (!workingDirectory) {
+			return;
+		}
+		const selected = {
+			id: firstString(project.id, project.projectID, project.projectId, project.project_id),
+			name: firstString(project.name, project.projectName, pathBaseName(workingDirectory), "local"),
+			workingDirectory,
+			selectedAt: Date.now(),
+		};
+		globalThis.sessionStorage.setItem(selectedLocalProjectStorageKey, JSON.stringify(selected));
+		globalThis.localStorage.setItem(workingDirectoryStorageKey, workingDirectory);
+		diagnostics.lastLocalProjectChoice = selected.name;
+		diagnostics.lastLocalProjectWorkingDirectory = workingDirectory;
+	}
+
+	function clearSelectedLocalProject(useDefaultWorkingDirectory = false) {
+		globalThis.sessionStorage.removeItem(selectedLocalProjectStorageKey);
+		if (useDefaultWorkingDirectory) {
+			const workingDirectory = defaultLocalWorkingDirectory();
+			if (workingDirectory) {
+				globalThis.localStorage.setItem(workingDirectoryStorageKey, workingDirectory);
+			} else {
+				globalThis.localStorage.removeItem(workingDirectoryStorageKey);
+			}
+		}
 	}
 
 	function activeThreadWorkingDirectory() {
@@ -316,7 +461,16 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	}
 
 	function defaultReasoningEffort(agentMode) {
-		switch (normalizeAgentMode(agentMode)) {
+		const mode = normalizeAgentMode(agentMode);
+		switch (mode) {
+		case "low":
+			return "medium";
+		case "medium":
+			return "medium";
+		case "high":
+			return "xhigh";
+		case "ultra":
+			return "high";
 		case "smart":
 			return "high";
 		case "rush":
@@ -334,15 +488,18 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 
 	function normalizeAgentMode(value) {
 		const mode = typeof value === "string" ? value.trim().toLowerCase() : "";
-		return ["smart", "large", "rush", "deep", "review", "agg-man", "nostromo"].includes(mode) ? mode : "";
+		return ["low", "medium", "high", "ultra", "smart", "large", "rush", "deep", "review", "agg-man", "nostromo"].includes(mode) ? mode : "";
 	}
 
 	function normalizeReasoningEffort(agentMode, value) {
 		const mode = normalizeAgentMode(agentMode);
 		const effort = typeof value === "string" ? value.trim().toLowerCase() : "";
 		const allowed = {
+			low: ["medium"],
+			medium: ["medium"],
+			high: ["xhigh"],
+			ultra: ["high"],
 			smart: ["high", "xhigh", "max"],
-			large: [],
 			rush: ["none"],
 			deep: ["low", "medium", "xhigh"],
 			review: ["low", "medium", "high"],
@@ -359,8 +516,11 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		const mode = normalizeAgentMode(agentMode);
 		const effort = typeof value === "string" ? value.trim().toLowerCase() : "";
 		const allowed = {
+			low: ["medium"],
+			medium: ["medium"],
+			high: ["xhigh"],
+			ultra: ["high"],
 			smart: ["high", "xhigh", "max"],
-			large: [],
 			rush: ["none"],
 			deep: ["low", "medium", "xhigh"],
 			review: ["low", "medium", "high"],
@@ -415,7 +575,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		}
 		const settings = activeThreadSettings();
 		const visible = visibleThreadModeOptions();
-		const agentMode = settings.agentMode || visible.agentMode || "smart";
+		const agentMode = settings.agentMode || visible.agentMode || "medium";
 		return {
 			agentMode,
 			reasoningEffort: normalizeReasoningEffort(agentMode, settings.reasoningEffort || visible.reasoningEffort),
@@ -426,14 +586,10 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		const inherited = localThreadModeOptions();
 		return [
 			{ id: "inherit", label: "Use current", detail: localThreadModeLabel(inherited), options: {} },
-			{ id: "smart-high", label: "Smart 1", detail: "High", options: { agentMode: "smart", reasoningEffort: "high" } },
-			{ id: "smart-xhigh", label: "Smart 2", detail: "XHigh", options: { agentMode: "smart", reasoningEffort: "xhigh" } },
-			{ id: "smart-max", label: "Smart 3", detail: "Max", options: { agentMode: "smart", reasoningEffort: "max" } },
-			{ id: "deep-low", label: "Deep 1", detail: "Low", options: { agentMode: "deep", reasoningEffort: "low" } },
-			{ id: "deep-medium", label: "Deep 2", detail: "Medium", options: { agentMode: "deep", reasoningEffort: "medium" } },
-			{ id: "deep-xhigh", label: "Deep 3", detail: "XHigh", options: { agentMode: "deep", reasoningEffort: "xhigh" } },
-			{ id: "large", label: "Large", detail: "Claude", options: { agentMode: "large" } },
-			{ id: "rush", label: "Rush", detail: "Fast", options: { agentMode: "rush", reasoningEffort: "none" } },
+			{ id: "low", label: "Low", detail: "Medium", options: { agentMode: "low", reasoningEffort: "medium" } },
+			{ id: "medium", label: "Medium", detail: "Medium", options: { agentMode: "medium", reasoningEffort: "medium" } },
+			{ id: "high", label: "High", detail: "XHigh", options: { agentMode: "high", reasoningEffort: "xhigh" } },
+			{ id: "ultra", label: "Ultra", detail: "High", options: { agentMode: "ultra", reasoningEffort: "high" } },
 			{ id: "nostromo", label: "Nostromo", detail: "Amp", options: { agentMode: "nostromo", reasoningEffort: "low" } },
 		];
 	}
@@ -442,6 +598,10 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		const mode = normalizeAgentMode(options?.agentMode);
 		const effort = normalizeReasoningEffort(mode, options?.reasoningEffort);
 		const labels = {
+			"low:medium": "Low",
+			"medium:medium": "Medium",
+			"high:xhigh": "High",
+			"ultra:high": "Ultra",
 			"smart:high": "Smart 1",
 			"smart:xhigh": "Smart 2",
 			"smart:max": "Smart 3",
@@ -452,21 +612,20 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			"review:medium": "Review",
 			"agg-man:none": "Agg-man",
 			"nostromo:low": "Nostromo",
-			"large:": "Large",
 		};
-		return labels[mode + ":" + effort] || (mode ? mode[0].toUpperCase() + mode.slice(1) : "Smart 1");
+		return labels[mode + ":" + effort] || (mode ? mode[0].toUpperCase() + mode.slice(1) : "Medium");
 	}
 
 	function visibleThreadModeOptions() {
 		if (!globalThis.document?.querySelectorAll) {
 			return {};
 		}
-		const selector = "button,[role='button'],[aria-label],span,div,p";
+		const selector = "button,[role='button'],[aria-haspopup],[aria-label]";
 		for (const element of globalThis.document.querySelectorAll(selector)) {
-			if (!elementVisible(element)) {
+			if (!modeBadgeElement(element)) {
 				continue;
 			}
-			const text = (element.textContent || "").trim();
+			const text = modeBadgeElementText(element);
 			const options = modeOptionsFromBadgeText(text);
 			if (options.agentMode) {
 				diagnostics.lastVisibleThreadModeBadge = text;
@@ -478,6 +637,44 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		return {};
 	}
 
+	function modeBadgeElement(element) {
+		if (!(element instanceof Element) || !elementVisible(element)) {
+			return false;
+		}
+		if (element.closest?.("#cliproxy-amp-local-thread-picker,[data-cliproxy-local-thread-command-item],[data-cliproxy-local-thread-menu-item],[data-cliproxy-local-project-item]")) {
+			return false;
+		}
+		const text = modeBadgeElementText(element);
+		if (!modeOptionsFromBadgeText(text).agentMode) {
+			return false;
+		}
+		const tag = String(element.tagName || "").toLowerCase();
+		const role = String(element.getAttribute?.("role") || "").toLowerCase();
+		const aria = String(element.getAttribute?.("aria-label") || "").toLowerCase();
+		const hasPopup = element.hasAttribute?.("aria-haspopup") || element.hasAttribute?.("aria-expanded");
+		if (!genericDialModeBadgeText(text)) {
+			return tag === "button" || role === "button" || hasPopup || /\b(agent|mode|model|reasoning|dial)\b/.test(aria);
+		}
+		return hasPopup || /\b(agent|mode|model|reasoning|dial)\b/.test(aria);
+	}
+
+	function modeBadgeElementText(element) {
+		const visible = String(element.textContent || "").trim();
+		if (modeOptionsFromBadgeText(visible).agentMode) {
+			return visible;
+		}
+		const aria = String(element.getAttribute?.("aria-label") || "").trim();
+		if (modeOptionsFromBadgeText(aria).agentMode) {
+			return aria;
+		}
+		return aria || visible;
+	}
+
+	function genericDialModeBadgeText(text) {
+		const normalized = String(text || "").trim().toLowerCase().replace(/\s+/g, "");
+		return /^(low|medium|high|ultra)$/.test(normalized);
+	}
+
 	function modeOptionsFromBadgeText(text) {
 		let normalized = typeof text === "string" ? text.trim().toLowerCase() : "";
 		normalized = normalized
@@ -485,7 +682,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			.replace(/\u00b2/g, "2")
 			.replace(/\u00b3/g, "3")
 			.replace(/\s+/g, "");
-		const match = normalized.match(/^(smart|large|rush|deep|review|agg-man|nostromo)([123])?$/);
+		const match = normalized.match(/^(low|medium|high|ultra|smart|large|rush|deep|review|agg-man|nostromo)([123])?$/);
 		if (!match) {
 			return {};
 		}
@@ -501,6 +698,10 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 
 	function badgeLevelReasoningEffort(agentMode, level) {
 		const efforts = {
+			low: { 1: "medium" },
+			medium: { 1: "medium" },
+			high: { 1: "xhigh" },
+			ultra: { 1: "high" },
 			smart: { 1: "high", 2: "xhigh", 3: "max" },
 			rush: { 1: "none" },
 			deep: { 1: "low", 2: "medium", 3: "xhigh" },
@@ -539,9 +740,24 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		return typeof value === "string" && /^T-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(value.trim());
 	}
 
+	function normalizeThreadIDValue(value) {
+		value = typeof value === "string" ? value.trim() : "";
+		return validThreadID(value) ? value : "";
+	}
+
+	function firstNormalizedThreadID(...values) {
+		for (const value of values) {
+			const threadID = normalizeThreadIDValue(value);
+			if (threadID) {
+				return threadID;
+			}
+		}
+		return "";
+	}
+
 	function rememberObservedThreadID(threadID) {
-		threadID = typeof threadID === "string" ? threadID.trim() : "";
-		if (!validThreadID(threadID)) {
+		threadID = normalizeThreadIDValue(threadID);
+		if (!threadID) {
 			return "";
 		}
 		observedThreadID = threadID;
@@ -673,12 +889,62 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		return values.length - 1;
 	}
 
+	function localPlainThreadActorConfig(threadID, localBase) {
+		return {
+			threadId: threadID,
+			wsToken: "local-neo",
+			ampURL: localBase,
+			baseURL: localBase,
+			capability: "write",
+			poolName: "default",
+			requiresSudoForWrite: false,
+			requiresSudoForTerminal: false,
+			threadActorTransport: "json-rpc",
+		};
+	}
+
+	function localDevalueThreadActorConfig(values, threadID, baseIndex) {
+		return {
+			threadId: ensureDevalueStringIndex(values, threadID),
+			wsToken: ensureDevalueStringIndex(values, "local-neo"),
+			ampURL: baseIndex,
+			baseURL: baseIndex,
+			capability: ensureDevalueStringIndex(values, "write"),
+			poolName: ensureDevalueStringIndex(values, "default"),
+			requiresSudoForWrite: ensureDevalueValueIndex(values, false),
+			requiresSudoForTerminal: ensureDevalueValueIndex(values, false),
+			threadActorTransport: ensureDevalueStringIndex(values, "json-rpc"),
+		};
+	}
+
 	function devalueThreadID(values, thread) {
-		if (!isPlainObject(thread) || !Number.isInteger(thread.id)) {
+		return rememberObservedThreadID(devalueStringField(values, thread, "id"));
+	}
+
+	function devalueThreadIDValue(values, thread) {
+		return normalizeThreadIDValue(devalueStringField(values, thread, "id"));
+	}
+
+	function devalueContainerThreadID(values, entry) {
+		const direct = devalueThreadID(values, entry);
+		if (direct) {
+			return direct;
+		}
+		if (!isPlainObject(entry) || !Number.isInteger(entry.thread)) {
 			return "";
 		}
-		const id = values[thread.id];
-		return rememberObservedThreadID(id);
+		return devalueThreadID(values, values[entry.thread]);
+	}
+
+	function devalueContainerThreadIDValue(values, entry) {
+		const direct = devalueThreadIDValue(values, entry);
+		if (direct) {
+			return direct;
+		}
+		if (!isPlainObject(entry) || !Number.isInteger(entry.thread)) {
+			return "";
+		}
+		return devalueThreadIDValue(values, values[entry.thread]);
 	}
 
 	function devalueField(values, object, key) {
@@ -691,6 +957,36 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	function devalueStringField(values, object, key) {
 		const value = devalueField(values, object, key);
 		return typeof value === "string" ? value : "";
+	}
+
+	function devalueAnyThreadID(values, thread) {
+		if (!isPlainObject(thread)) {
+			return "";
+		}
+		return firstNormalizedThreadID(
+			devalueStringField(values, thread, "id"),
+			devalueStringField(values, thread, "threadId"),
+			devalueStringField(values, thread, "threadID"),
+			devalueStringField(values, thread, "thread_id"),
+		);
+	}
+
+	function devalueContainerAnyThreadID(values, entry) {
+		const direct = devalueAnyThreadID(values, entry);
+		if (direct) {
+			return direct;
+		}
+		if (!isPlainObject(entry) || !Number.isInteger(entry.thread)) {
+			return "";
+		}
+		return devalueAnyThreadID(values, values[entry.thread]);
+	}
+
+	function devalueFalseField(values, object, key) {
+		if (!isPlainObject(object) || !Number.isInteger(object[key])) {
+			return false;
+		}
+		return values[object[key]] === false;
 	}
 
 	function devalueObjectField(values, object, key) {
@@ -717,7 +1013,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 				const tree = devalueObjectFromRaw(values, rawTree);
 				if (!tree) {
 					continue;
-			}
+				}
 				const workingDirectory = firstWorkingDirectory(
 					devalueStringField(values, tree, "workingDirectory"),
 					devalueStringField(values, tree, "workspaceRoot"),
@@ -725,7 +1021,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 				);
 				if (workingDirectory) {
 					return workingDirectory;
-			}
+				}
 			}
 		}
 		return "";
@@ -787,6 +1083,13 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 				typeof config.wsToken === "number");
 	}
 
+	function devalueThreadActorConfigHasBridgeFields(config) {
+		return isPlainObject(config) &&
+			(typeof config.baseURL === "number" ||
+				typeof config.ampURL === "number" ||
+				typeof config.wsToken === "number");
+	}
+
 	function patchDevalueThreadActorConfig(values, index, baseIndex) {
 		if (!Number.isInteger(index) || index < 0 || index >= values.length) {
 			return false;
@@ -796,8 +1099,11 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			return false;
 		}
 		if (Number.isInteger(config.threadId)) {
-			rememberObservedThreadID(values[config.threadId]);
+			const threadID = rememberObservedThreadID(values[config.threadId]);
+			if (threadID && threadID === pathThreadID() && devalueThreadActorConfigHasBridgeFields(config)) {
+				rememberLocalThreadID(threadID);
 			}
+		}
 		let patched = false;
 		if (config.baseURL !== baseIndex) {
 			config.baseURL = baseIndex;
@@ -810,7 +1116,19 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		return patched;
 	}
 
-	function patchDevalueThreadRuntime(values, threadIndex, executorTypeIndex, connectedIndex) {
+	function ensureDevalueLocalThreadActorConfig(values, thread, threadID, getBaseIndex) {
+		if (!isPlainObject(thread) || !threadID || !rememberedLocalThreadID(threadID)) {
+			return false;
+		}
+		if (Number.isInteger(thread.threadActorConfig) && devalueThreadActorConfigLike(values[thread.threadActorConfig])) {
+			return false;
+		}
+		thread.threadActorConfig = ensureDevalueValueIndex(values, localDevalueThreadActorConfig(values, threadID, getBaseIndex()));
+		diagnostics.lastPatchedThreadID = threadID;
+		return true;
+	}
+
+	function rememberDevalueThreadRuntime(values, threadIndex) {
 		if (!Number.isInteger(threadIndex) || threadIndex < 0 || threadIndex >= values.length) {
 			return false;
 		}
@@ -820,24 +1138,27 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			return false;
 		}
 		rememberThreadWorkingDirectory(activeThread, devalueThreadWorkingDirectory(values, thread));
+		rememberThreadSettings(activeThread, devalueThreadSettings(values, thread));
+		return false;
+	}
+
+	function clearDevalueStaleLocalThreadExecutorState(values, thread) {
+		const threadID = devalueContainerAnyThreadID(values, thread);
+		if (!threadID || !rememberedLocalThreadID(threadID)) {
+			return false;
+		}
 		let patched = false;
-		if (thread.hasExecutor !== connectedIndex) {
-			thread.hasExecutor = connectedIndex;
+		if (devalueFalseField(values, thread, "hasExecutor")) {
+			delete thread.hasExecutor;
 			patched = true;
 		}
-		if (thread.executorConnected !== connectedIndex) {
-			thread.executorConnected = connectedIndex;
+		if (devalueFalseField(values, thread, "executorConnected")) {
+			delete thread.executorConnected;
 			patched = true;
-		}
-		if (Number.isInteger(thread.meta)) {
-			const meta = values[thread.meta];
-			if (isPlainObject(meta) && meta.executorType !== executorTypeIndex) {
-				meta.executorType = executorTypeIndex;
-				patched = true;
-			}
 		}
 		if (patched) {
-			diagnostics.lastPatchedThreadID = activeThread;
+			diagnostics.localThreadStatusPatchCount += 1;
+			diagnostics.lastPatchedThreadID = threadID;
 		}
 		return patched;
 	}
@@ -848,25 +1169,11 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		}
 		let patched = false;
 		let baseIndex = -1;
-		let executorTypeIndex = -1;
 		const getBaseIndex = () => {
 			if (baseIndex === -1) {
 				baseIndex = ensureDevalueStringIndex(values, localBase);
 			}
 			return baseIndex;
-		};
-		const getExecutorTypeIndex = () => {
-			if (executorTypeIndex === -1) {
-				executorTypeIndex = ensureDevalueStringIndex(values, "local-client");
-			}
-			return executorTypeIndex;
-		};
-		let connectedIndex = -1;
-		const getConnectedIndex = () => {
-			if (connectedIndex === -1) {
-				connectedIndex = ensureDevalueValueIndex(values, true);
-			}
-			return connectedIndex;
 		};
 		const originalLength = values.length;
 		const activeThread = activeThreadID();
@@ -875,9 +1182,13 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			if (!isPlainObject(entry)) {
 				continue;
 			}
-			if (activeThread && devalueThreadID(values, entry) === activeThread) {
+			patched = clearDevalueStaleLocalThreadExecutorState(values, entry) || patched;
+			const entryThreadID = activeThread ? devalueContainerThreadIDValue(values, entry) : "";
+			if (entryThreadID && entryThreadID === activeThread) {
+				rememberObservedThreadID(entryThreadID);
 				rememberThreadSettings(activeThread, devalueThreadSettings(values, entry));
-				patched = patchDevalueThreadRuntime(values, i, getExecutorTypeIndex(), getConnectedIndex()) || patched;
+				rememberDevalueThreadRuntime(values, i);
+				patched = ensureDevalueLocalThreadActorConfig(values, entry, activeThread, getBaseIndex) || patched;
 			}
 			rememberDevalueThreadSettingsMessage(values, entry);
 			if (Number.isInteger(entry.threadActorConfig)) {
@@ -885,9 +1196,9 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 				if (devalueThreadActorConfigLike(config)) {
 					patched = patchDevalueThreadActorConfig(values, entry.threadActorConfig, getBaseIndex()) || patched;
 					if (Number.isInteger(entry.thread)) {
-						patched = patchDevalueThreadRuntime(values, entry.thread, getExecutorTypeIndex(), getConnectedIndex()) || patched;
-			}
-			}
+						rememberDevalueThreadRuntime(values, entry.thread);
+					}
+				}
 			}
 			if (devalueThreadActorConfigLike(entry)) {
 				patched = patchDevalueThreadActorConfig(values, i, getBaseIndex()) || patched;
@@ -896,155 +1207,20 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		return patched;
 	}
 
-	let cachedLocalSidebarProjects = [];
-	let cachedLocalSidebarRecentThreads = [];
-
-	function refreshLocalSidebarProjects() {
-		const base = localBaseURLString();
-		if (!base || !storedLocalAPIKey()) {
-			return;
-		}
-		const url = new URL(base + "/_app/remote/cliproxy/listThreadListSidebar");
-		url.searchParams.set("payload", "e30");
-		const workingDirectory = localWorkingDirectory();
-		if (workingDirectory) {
-			url.searchParams.set("cliproxy-working-directory", workingDirectory);
-		}
-		originalFetch(url.href, {
-			headers: localFetchHeaders("", false),
-			mode: "cors",
-			credentials: "omit",
-		}).then((response) => response.ok ? response.text() : "").then((text) => {
-			const envelope = text ? originalJSONParse(text) : null;
-			const decoded = isPlainObject(envelope) && typeof envelope.data === "string" ? decodeDevalueString(envelope.data) : null;
-			const result = isPlainObject(decoded) ? decoded._ : null;
-			const projects = isPlainObject(result) && Array.isArray(result.projects) ? result.projects : null;
-			const recentThreads = isPlainObject(result) && Array.isArray(result.recentThreads) ? result.recentThreads : null;
-			if (!projects && !recentThreads) {
-				return;
-			}
-			cachedLocalSidebarProjects = (projects || []).filter((project) => isPlainObject(project) && typeof project.name === "string" && project.name !== "");
-			cachedLocalSidebarRecentThreads = (recentThreads || []).filter((thread) => isPlainObject(thread) && validThreadID(firstString(thread.id, thread.threadId, thread.threadID)));
-			diagnostics.localSidebarProjectCount = cachedLocalSidebarProjects.length;
-			diagnostics.localSidebarRecentThreadCount = cachedLocalSidebarRecentThreads.length;
-		}).catch(() => {
-		});
-	}
-
-	function appendDevalueSidebarValue(values, value) {
-		if (value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
-			values.push(value);
-			return values.length - 1;
-		}
-		if (Array.isArray(value)) {
-			const list = value.map((item) => appendDevalueSidebarValue(values, item));
-			values.push(list);
-			return values.length - 1;
-		}
-		if (!isPlainObject(value)) {
-			values.push(null);
-			return values.length - 1;
-		}
-		const object = {};
-		for (const [key, child] of Object.entries(value)) {
-			if (typeof child === "undefined") {
-				continue;
-			}
-			object[key] = appendDevalueSidebarValue(values, child);
-		}
-		values.push(object);
-		return values.length - 1;
-	}
-
-	function appendDevalueSidebarProject(values, project) {
-		const object = {};
-		for (const [key, value] of Object.entries(project)) {
-			if (typeof value !== "string" || value === "") {
-				continue;
-			}
-			object[key] = ensureDevalueStringIndex(values, value);
-		}
-		values.push(object);
-		return values.length - 1;
-	}
-
-	function devalueSidebarProjectKeys(values, list) {
-		const keys = new Set();
-		for (const ref of list) {
-			const project = Number.isInteger(ref) ? values[ref] : null;
-			if (!isPlainObject(project)) {
-				continue;
-			}
-			for (const field of ["projectID", "id", "name"]) {
-				const value = Number.isInteger(project[field]) ? values[project[field]] : null;
-				if (typeof value === "string" && value !== "") {
-					keys.add(field === "name" ? value.toLowerCase() : value);
-				}
-			}
-		}
-		return keys;
-	}
-
-	function devalueSidebarThreadIDs(values, list) {
-		const ids = new Set();
-		for (const ref of list) {
-			const thread = Number.isInteger(ref) ? values[ref] : null;
-			if (!isPlainObject(thread)) {
-				continue;
-			}
-			for (const field of ["id", "threadId", "threadID"]) {
-				const value = Number.isInteger(thread[field]) ? values[thread[field]] : null;
-				if (validThreadID(value)) {
-					ids.add(value);
-				}
-			}
-		}
-		return ids;
-	}
-
-	function mergeDevalueSidebarProjects(values) {
-		if (!Array.isArray(values) || (cachedLocalSidebarProjects.length === 0 && cachedLocalSidebarRecentThreads.length === 0)) {
+	function patchNestedDevalueThreadActorConfigs(value, seen, localBase) {
+		if (value === null || typeof value !== "object" || seen.has(value)) {
 			return false;
 		}
-		let merged = false;
-		const originalLength = values.length;
-		for (let i = 0; i < originalLength; i += 1) {
-			const entry = values[i];
-			if (!isPlainObject(entry) || !Number.isInteger(entry.projects) || !Number.isInteger(entry.recentThreads)) {
-				continue;
-			}
-			const list = values[entry.projects];
-			if (!Array.isArray(list)) {
-				continue;
-			}
-			const existing = devalueSidebarProjectKeys(values, list);
-			for (const project of cachedLocalSidebarProjects) {
-				const nameKey = project.name.toLowerCase();
-				if (existing.has(nameKey) || (typeof project.projectID === "string" && existing.has(project.projectID))) {
-					continue;
-				}
-				list.push(appendDevalueSidebarProject(values, project));
-				existing.add(nameKey);
-				merged = true;
-			}
-			const recentThreads = values[entry.recentThreads];
-			if (Array.isArray(recentThreads)) {
-				const existingThreadIDs = devalueSidebarThreadIDs(values, recentThreads);
-				for (const thread of cachedLocalSidebarRecentThreads) {
-					const threadID = firstString(thread.id, thread.threadId, thread.threadID);
-					if (!validThreadID(threadID) || existingThreadIDs.has(threadID)) {
-						continue;
-					}
-					recentThreads.unshift(appendDevalueSidebarValue(values, thread));
-					existingThreadIDs.add(threadID);
-					merged = true;
-				}
-			}
+		seen.add(value);
+		let patched = false;
+		if (Array.isArray(value)) {
+			patched = patchDevalueThreadActorConfigs(value, localBase) || patched;
 		}
-		if (merged) {
-			diagnostics.sidebarProjectMergeCount = (diagnostics.sidebarProjectMergeCount || 0) + 1;
+		const children = Array.isArray(value) ? value : Object.values(value);
+		for (const child of children) {
+			patched = patchNestedDevalueThreadActorConfigs(child, seen, localBase) || patched;
 		}
-		return merged;
+		return patched;
 	}
 
 	function plainThreadMatchesActive(thread) {
@@ -1052,35 +1228,36 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		return isPlainObject(thread) && !!activeThread && thread.id === activeThread;
 	}
 
-	function patchPlainThreadRuntime(thread) {
+	function plainContainerThreadID(entry) {
+		if (plainThreadMatchesActive(entry)) {
+			return entry.id;
+		}
+		if (isPlainObject(entry) && plainThreadMatchesActive(entry.thread)) {
+			return entry.thread.id;
+		}
+		return "";
+	}
+
+	function rememberPlainThreadRuntime(thread) {
 		if (!plainThreadMatchesActive(thread)) {
 			return false;
 		}
 		rememberThreadWorkingDirectory(thread.id, plainThreadWorkingDirectory(thread));
 		rememberThreadSettings(thread.id, plainThreadSettings(thread));
-		let patched = false;
-		if (thread.hasExecutor !== true) {
-			thread.hasExecutor = true;
-			patched = true;
-		}
-		if (thread.executorConnected !== true) {
-			thread.executorConnected = true;
-			patched = true;
-		}
-		if (isPlainObject(thread.meta) && thread.meta.executorType !== "local-client") {
-			thread.meta.executorType = "local-client";
-			patched = true;
-		}
-		if (patched) {
-			diagnostics.lastPatchedThreadID = thread.id;
-		}
-		return patched;
+		return false;
 	}
 
 	function plainThreadActorConfigLike(config) {
 		return isPlainObject(config) &&
 			(typeof config.threadId === "string" ||
 				typeof config.baseURL === "string" ||
+				typeof config.ampURL === "string" ||
+				typeof config.wsToken === "string");
+	}
+
+	function plainThreadActorConfigHasBridgeFields(config) {
+		return isPlainObject(config) &&
+			(typeof config.baseURL === "string" ||
 				typeof config.ampURL === "string" ||
 				typeof config.wsToken === "string");
 	}
@@ -1093,11 +1270,11 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			for (const tree of container.trees) {
 				if (!isPlainObject(tree)) {
 					continue;
-			}
+				}
 				const workingDirectory = firstWorkingDirectory(tree.workingDirectory, tree.workspaceRoot, tree.uri);
 				if (workingDirectory) {
 					return workingDirectory;
-			}
+				}
 			}
 		}
 		return "";
@@ -1138,11 +1315,50 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		rememberThreadSettings(threadID, plainThreadSettings(settings));
 	}
 
+	function plainAnyThreadID(value) {
+		if (!isPlainObject(value)) {
+			return "";
+		}
+		return firstNormalizedThreadID(value.id, value.threadId, value.threadID, value.thread_id);
+	}
+
+	function plainContainerAnyThreadID(entry) {
+		const direct = plainAnyThreadID(entry);
+		if (direct) {
+			return direct;
+		}
+		return isPlainObject(entry) ? plainAnyThreadID(entry.thread) : "";
+	}
+
+	function clearPlainStaleLocalThreadExecutorState(thread) {
+		const threadID = plainContainerAnyThreadID(thread);
+		if (!threadID || !rememberedLocalThreadID(threadID)) {
+			return false;
+		}
+		let patched = false;
+		if (thread.hasExecutor === false) {
+			delete thread.hasExecutor;
+			patched = true;
+		}
+		if (thread.executorConnected === false) {
+			delete thread.executorConnected;
+			patched = true;
+		}
+		if (patched) {
+			diagnostics.localThreadStatusPatchCount += 1;
+			diagnostics.lastPatchedThreadID = threadID;
+		}
+		return patched;
+	}
+
 	function patchPlainThreadActorConfig(config, localBase) {
 		if (!plainThreadActorConfigLike(config)) {
 			return false;
 		}
-		rememberObservedThreadID(firstString(config.threadId, config.threadID, config.thread_id));
+		const threadID = rememberObservedThreadID(firstString(config.threadId, config.threadID, config.thread_id));
+		if (threadID && threadID === pathThreadID() && plainThreadActorConfigHasBridgeFields(config)) {
+			rememberLocalThreadID(threadID);
+		}
 		let patched = false;
 		if (config.baseURL !== localBase) {
 			config.baseURL = localBase;
@@ -1155,18 +1371,30 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		return patched;
 	}
 
+	function ensurePlainLocalThreadActorConfig(thread, localBase) {
+		const threadID = plainContainerThreadID(thread);
+		if (!threadID || !rememberedLocalThreadID(threadID) || plainThreadActorConfigLike(thread.threadActorConfig)) {
+			return false;
+		}
+		thread.threadActorConfig = localPlainThreadActorConfig(threadID, localBase);
+		diagnostics.lastPatchedThreadID = threadID;
+		return true;
+	}
+
 	function patchPlainThreadActorConfigs(value, seen, localBase) {
 		if (value === null || typeof value !== "object" || seen.has(value)) {
 			return false;
 		}
 		seen.add(value);
 		let patched = false;
+		patched = clearPlainStaleLocalThreadExecutorState(value) || patched;
+		patched = ensurePlainLocalThreadActorConfig(value, localBase) || patched;
 		if (isPlainObject(value.threadActorConfig)) {
 			patched = patchPlainThreadActorConfig(value.threadActorConfig, localBase) || patched;
-			patched = patchPlainThreadRuntime(value.thread) || patched;
+			rememberPlainThreadRuntime(value.thread);
 		}
 		patched = patchPlainThreadActorConfig(value, localBase) || patched;
-		patched = patchPlainThreadRuntime(value) || patched;
+		rememberPlainThreadRuntime(value);
 		rememberPlainThreadSettingsMessage(value);
 		const children = Array.isArray(value) ? value : Object.values(value);
 		for (const child of children) {
@@ -1175,15 +1403,28 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		return patched;
 	}
 
-	function patchDecodedLocalInference(value) {
-		const localBase = localBaseURLString();
-		const patched = patchDevalueThreadActorConfigs(value, localBase) ||
-			patchPlainThreadActorConfigs(value, new WeakSet(), localBase);
-		if (patched) {
-			diagnostics.decodedConfigPatchCount += 1;
-			diagnostics.lastPatchedThreadActorBaseURL = localBase;
+	function parsedTextLocalInferencePatchOptions(text) {
+		const source = typeof text === "string" ? text : "";
+		if (!source) {
+			return { configs: false };
 		}
-		mergeDevalueSidebarProjects(value);
+		return {
+			configs: source.includes("threadActorConfig") || source.includes("wsToken") || source.includes("thread_settings") || source.includes("baseURL") || source.includes("ampURL") || source.includes("threadId") || source.includes("threadID") || source.includes("thread_id") || source.includes("\"id\"") || source.includes("workingDirectory") || source.includes("workspaceRoot") || source.includes("workspace"),
+		};
+	}
+
+	function patchDecodedLocalInference(value, options) {
+		const patchOptions = options || { configs: true };
+		if (patchOptions.configs) {
+			const localBase = localBaseURLString();
+			const devaluePatched = patchNestedDevalueThreadActorConfigs(value, new WeakSet(), localBase);
+			const plainPatched = patchPlainThreadActorConfigs(value, new WeakSet(), localBase);
+			const patched = devaluePatched || plainPatched;
+			if (patched) {
+				diagnostics.decodedConfigPatchCount += 1;
+				diagnostics.lastPatchedThreadActorBaseURL = localBase;
+			}
+		}
 	}
 
 	function threadActorAPIPath(path) {
@@ -1214,8 +1455,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		}
 		switch (parts[1]) {
 		case "createProjectThread":
-		case "listThreadListSidebar":
-		case "listUserExecutorDaemons":
+		case "listUserExecutorRunners":
 		case "prewarmProjectThread":
 			return parts[1];
 		default:
@@ -1225,19 +1465,42 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 
 	function svelteKitRemotePath(path) {
 		const endpoint = svelteKitRemoteEndpoint(path);
-		return endpoint === "createProjectThread" || endpoint === "prewarmProjectThread";
+		return endpoint === "createProjectThread" || endpoint === "listUserExecutorRunners" || endpoint === "prewarmProjectThread";
 	}
 
 	function svelteKitRemoteCommandPath(path) {
-		return svelteKitRemotePath(path);
+		const endpoint = svelteKitRemoteEndpoint(path);
+		return endpoint === "createProjectThread" || endpoint === "prewarmProjectThread";
 	}
 
 	function createProjectThreadRemotePath(path) {
 		return svelteKitRemoteEndpoint(path) === "createProjectThread";
 	}
 
+	function rivetMetadataPath(path) {
+		return path === "/metadata" || path === "/actors/metadata";
+	}
+
+	function threadPageDataPath(path) {
+		const match = String(path || "").match(/^\/threads\/([^/?#]+)\/__data(?:\.json)?\/?$/);
+		return !!match && validThreadID(decodeURIComponent(match[1]));
+	}
+
+	function shouldPatchResponseJSON(response) {
+		if (!response || !response.url) {
+			return false;
+		}
+		try {
+			const url = new URL(response.url, globalThis.location.href);
+			return threadPageDataPath(url.pathname) &&
+				(url.origin === globalThis.location.origin || sameLocalHTTPBase(url, localBaseURL()));
+		} catch {
+			return false;
+		}
+	}
+
 	function shouldBridgeHTTP(url) {
-		if (!threadActorAPIPath(url.pathname) && !internalAPIPath(url.pathname) && !svelteKitRemotePath(url.pathname)) {
+		if (!threadActorAPIPath(url.pathname) && !internalAPIPath(url.pathname) && !svelteKitRemotePath(url.pathname) && !rivetMetadataPath(url.pathname) && !gatewayUserActorActionPath(url.pathname)) {
 			return false;
 		}
 		if (internalAPIPath(url.pathname) && !activeLocalThreadID()) {
@@ -1248,7 +1511,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	}
 
 	function shouldBridgeWebSocket(url) {
-		return shouldBootstrapExecutor(url);
+		return shouldBootstrapExecutor(url) || shouldBridgeUserActorWebSocket(url);
 	}
 
 	function sameLocalHTTPBase(url, base) {
@@ -1256,21 +1519,46 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	}
 
 	function shouldRewriteHTTP(url) {
-		return url.origin === globalThis.location.origin && (threadActorAPIPath(url.pathname) || internalAPIPath(url.pathname) || svelteKitRemotePath(url.pathname));
+		return (url.origin === globalThis.location.origin || sameLocalHTTPBase(url, localBaseURL())) &&
+			(threadActorAPIPath(url.pathname) || internalAPIPath(url.pathname) || svelteKitRemotePath(url.pathname) || rivetMetadataPath(url.pathname) || gatewayUserActorActionPath(url.pathname));
 	}
 
 	function internalAPIPath(path) {
 		return path === "/api/internal";
 	}
 
+	function samePageWebSocketBase(url) {
+		const page = new URL(globalThis.location.href);
+		const protocol = page.protocol === "https:" ? "wss:" : "ws:";
+		return url.origin === page.origin || (url.protocol === protocol && url.host === page.host);
+	}
+
 	function shouldRewriteWebSocket(url, base) {
-		return url.origin === globalThis.location.origin && shouldBridgeWebSocket(url) ||
-			sameLocalWebSocketBase(url, base) && shouldBridgeWebSocket(url);
+		return (samePageWebSocketBase(url) || sameLocalWebSocketBase(url, base)) && shouldBridgeWebSocket(url);
 	}
 
 	function gatewayActorPath(path) {
 		const normalized = path.startsWith("/actors/gateway/") ? path.slice("/actors".length) : path;
 		return normalized === "/gateway" || normalized.startsWith("/gateway/");
+	}
+
+	function gatewayUserActorPath(path) {
+		const normalized = path.startsWith("/actors/gateway/") ? path.slice("/actors".length) : path;
+		if (!normalized.startsWith("/gateway/")) {
+			return false;
+		}
+		const target = normalized.slice("/gateway/".length).split("/")[0].split("@")[0];
+		return target === "userActor" || target === "user-actor";
+	}
+
+	function gatewayUserActorActionPath(path) {
+		const normalized = path.startsWith("/actors/gateway/") ? path.slice("/actors".length) : path;
+		const parts = normalized.split("/").filter(Boolean);
+		if (parts.length !== 4 || parts[0] !== "gateway" || parts[2] !== "action") {
+			return false;
+		}
+		const target = parts[1].split("@")[0];
+		return target === "userActor" || target === "user-actor" || localRunnerActionNames.has(parts[3]);
 	}
 
 	function pathThreadID() {
@@ -1280,36 +1568,43 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 
 	function activeThreadID() {
 		const pathThread = pathThreadID();
-		if (observedThreadID && (!pathThread || observedThreadID === pathThread || rememberedLocalThreadID(observedThreadID))) {
-			return observedThreadID;
-			}
-		return pathThread;
+		if (pathThread) {
+			return pathThread;
 		}
+		return observedThreadID;
+	}
 
 	function activeLocalThreadID() {
 		const threadID = activeThreadID();
 		return rememberedLocalThreadID(threadID) ? threadID : "";
-		}
+	}
 
 	function threadIDFromGatewayURL(url) {
-			const fromKey = firstThreadIDFromText(url.searchParams.get("rvt-key") || url.searchParams.get("key") || "");
-			if (fromKey) {
-				return fromKey;
-			}
-			const encodedInput = url.searchParams.get("rvt-input") || "";
-			const inputText = decodeBase64Text(encodedInput);
-			const input = parseJSONText(inputText);
-			return firstThreadIDFromValue(input);
+		const fromKey = firstThreadIDFromText(url.searchParams.get("rvt-key") || url.searchParams.get("key") || "");
+		if (fromKey) {
+			return fromKey;
 		}
+		const encodedInput = url.searchParams.get("rvt-input") || "";
+		const inputText = decodeBase64Text(encodedInput);
+		const input = parseJSONText(inputText);
+		return firstThreadIDFromValue(input);
+	}
 
 	function shouldBootstrapExecutor(url) {
-			if (!gatewayActorPath(url.pathname)) {
+		if (!gatewayActorPath(url.pathname)) {
 			return false;
-			}
-			const threadID = rememberObservedThreadID(threadIDFromGatewayURL(url));
-			const activeThread = activeThreadID();
-			return !!threadID && (!activeThread || activeThread === threadID || rememberedLocalThreadID(threadID));
 		}
+		const threadID = rememberObservedThreadID(threadIDFromGatewayURL(url));
+		const activeThread = activeThreadID();
+		return !!threadID && (!activeThread || activeThread === threadID || rememberedLocalThreadID(threadID));
+	}
+
+	function shouldBridgeUserActorWebSocket(url) {
+		if (!gatewayUserActorPath(url.pathname)) {
+			return false;
+		}
+		return !!storedLocalAPIKey();
+	}
 
 	function localHTTPURL(url, body) {
 		const base = localBaseURL();
@@ -1368,7 +1663,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 				decoded = {};
 				for (const [key, item] of Object.entries(value)) {
 					decoded[key] = decodeIndex(item);
-			}
+				}
 			} else {
 				decoded = value;
 			}
@@ -1421,35 +1716,137 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	}
 
 	function pathBaseName(path) {
-		path = normalizeWorkingDirectory(path).replace(/\/+$/, "");
-		const index = path.lastIndexOf("/");
-		return index >= 0 ? path.slice(index + 1) : path;
+		path = normalizeWorkingDirectory(path).replace(/[\\/]+$/, "");
+		const parts = path.split(/[\\/]+/);
+		return parts[parts.length - 1] || "";
 	}
 
 	function visibleProjectName() {
-		for (const element of globalThis.document.querySelectorAll("button,[role='button'],[aria-haspopup]")) {
-			const text = (element.innerText || element.textContent || "").replace(/\s+/g, " ").trim();
-			const match = text.match(/(?:^|\b)Project:\s*([^\n]+?)(?:\s{2,}|\s*[⌃⌥⇧⌘]|$)/);
-			if (match && match[1]) {
-				return match[1].trim();
+		return visibleProjectNameFromDocument();
+	}
+
+	function visibleCreateProjectName(localOnly = false) {
+		const dialogSelector = '[cmdk-root],[data-cmdk-root],[data-slot="dialog-content"],[role="dialog"]';
+		for (const element of globalThis.document.querySelectorAll("button,[role='button'],[aria-haspopup],a")) {
+			if (!element.closest(dialogSelector) || (localOnly && element.dataset?.cliproxyLocalProjectActivator !== "1")) {
+				continue;
+			}
+			const label = localProjectActivatorProjectLabel(element) || projectHeaderProjectLabel(element);
+			if (label) {
+				return label;
 			}
 		}
 		return "";
 	}
 
-	function visibleProjectWorkingDirectory() {
-		const name = visibleProjectName();
+	function visibleProjectNameFromDocument() {
+		for (const element of globalThis.document.querySelectorAll("button,[role='button'],[aria-haspopup],a")) {
+			if (element.closest('[cmdk-root],[data-cmdk-root],[data-slot="dialog-content"],[role="dialog"],article,[data-message-id],[data-message]')) {
+				continue;
+			}
+			const label = localProjectActivatorProjectLabel(element) || projectHeaderProjectLabel(element);
+			if (label) {
+				return label;
+			}
+		}
+		return "";
+	}
+
+	function visibleCreateThreadProjectName() {
+		const createName = visibleCreateProjectName(false);
+		const pageName = visibleProjectName();
+		if (!createName) {
+			return pageName;
+		}
+		const createDirectory = visibleLocalProjectWorkingDirectory(createName);
+		if (createDirectory || !pageName || normalizeProjectPickerName(createName) === normalizeProjectPickerName(pageName)) {
+			return createName;
+		}
+		return pageName;
+	}
+
+	function visibleCreateThreadLookupProjectName() {
+		return visibleCreateProjectName(false) || visibleProjectName();
+	}
+
+	function unresolvedCreateThreadDialogProject() {
+		const createName = visibleCreateProjectName(false);
+		const pageName = visibleProjectName();
+		return !!createName && !!pageName &&
+			normalizeProjectPickerName(createName) !== normalizeProjectPickerName(pageName) &&
+			!visibleLocalProjectWorkingDirectory(createName);
+	}
+
+	function compactElementText(element) {
+		if (!(element instanceof Element)) {
+			return "";
+		}
+		return firstString(element.innerText, element.textContent, element.getAttribute?.("aria-label"), element.getAttribute?.("title")).replace(/\s+/g, " ").trim();
+	}
+
+	function projectHeaderProjectLabel(element) {
+		if (!(element instanceof Element)) {
+			return "";
+		}
+		const href = firstString(element.getAttribute?.("href"));
+		if (!/^https?:\/\/github\.com\/[^/]+\/[^/]+\/tree\/.+/.test(href)) {
+			return "";
+		}
+		const label = compactElementText(element);
+		return label && projectHeaderContainer(element, label) ? label : "";
+	}
+
+	function projectHeaderContainer(element, label) {
+		for (let current = element.parentElement, depth = 0; current && depth < 7; current = current.parentElement, depth += 1) {
+			if (projectHeaderSearchBoundary(current)) {
+				return null;
+			}
+			const text = compactElementText(current);
+			const controls = Array.from(current.querySelectorAll?.("button,[role='button'],[aria-haspopup]") || []);
+			const hasActions = text.includes("More Actions") || controls.some((candidate) => compactElementText(candidate) === "More Actions");
+			if (text.includes(label) && hasActions) {
+				return current;
+			}
+		}
+		return null;
+	}
+
+	function projectHeaderSearchBoundary(element) {
+		return element === globalThis.document.body ||
+			element === globalThis.document.documentElement ||
+			element.matches?.("main,[role='main'],article,section,[data-message-id],[data-message]");
+	}
+
+	function visibleProjectWorkingDirectory(name = visibleProjectName()) {
 		if (!name) {
 			return "";
 		}
-		const matches = [];
+		const projectDirectory = visibleLocalProjectWorkingDirectory(name);
+		if (projectDirectory) {
+			return projectDirectory;
+		}
+		if (selectedLocalProjectWorkingDirectory() || storedLocalWorkingDirectory()) {
+			return "";
+		}
+		const matches = new Set();
 		for (const workingDirectory of Object.values(threadWorkingDirectories())) {
 			const normalized = normalizeWorkingDirectory(workingDirectory);
 			if (normalized && pathBaseName(normalized) === name) {
-				matches.push(normalized);
+				matches.add(normalized);
 			}
 		}
-		return matches.length === 1 ? matches[0] : "";
+		if (matches.size === 1) {
+			return [...matches][0];
+		}
+		return "";
+	}
+
+	function visibleLocalProjectWorkingDirectory(name = visibleProjectName()) {
+		if (!name) {
+			return "";
+		}
+		const project = localProjectByVisibleName(localProjectsCache.projects, name);
+		return normalizeWorkingDirectory(project?.workingDirectory);
 	}
 
 	function remoteCreateProjectThreadWorkingDirectory(body) {
@@ -1458,44 +1855,77 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		if (fromMention) {
 			return fromMention;
 		}
-		const fromVisibleProject = visibleProjectWorkingDirectory();
+		const projectID = isPlainObject(decoded) ? firstString(decoded.projectID, decoded.projectId, decoded.project_id) : "";
+		if (projectID) {
+			const fromProjectID = normalizeWorkingDirectory(localProjectByID(localProjectsCache.projects, projectID)?.workingDirectory);
+			if (fromProjectID) {
+				return fromProjectID;
+			}
+			if (unresolvedCreateThreadDialogProject()) {
+				return "";
+			}
+			const fromVisibleLocalProject = visibleLocalProjectWorkingDirectory(visibleCreateThreadProjectName());
+			if (fromVisibleLocalProject) {
+				return fromVisibleLocalProject;
+			}
+			return "";
+		}
+		if (unresolvedCreateThreadDialogProject()) {
+			return "";
+		}
+		const fromVisibleProject = visibleProjectWorkingDirectory(visibleCreateThreadProjectName());
 		if (fromVisibleProject) {
 			return fromVisibleProject;
 		}
-		if (isPlainObject(decoded) && firstString(decoded.projectID, decoded.projectId, decoded.project_id)) {
-			return "";
+		const fromSelectedLocalProject = selectedLocalProjectWorkingDirectory();
+		if (fromSelectedLocalProject) {
+			return fromSelectedLocalProject;
 		}
 		return localWorkingDirectory();
 	}
 
+	function ensureVisibleProjectLookupForRemoteCreate(sourceURL) {
+		const projectName = visibleCreateThreadLookupProjectName();
+		if (!createProjectThreadRemotePath(sourceURL.pathname) || visibleProjectWorkingDirectory(projectName) || !projectName) {
+			return Promise.resolve();
+		}
+		return fetchLocalProjects(false).then(() => undefined, () => undefined);
+	}
+
 	function rememberRemoteCreateProjectThread(sourceURL, body, response) {
 		if (!createProjectThreadRemotePath(sourceURL.pathname)) {
-			return;
+			return Promise.resolve(response);
 		}
 		const workingDirectory = remoteCreateProjectThreadWorkingDirectory(body);
-		if (!workingDirectory || !response || !response.ok || typeof response.clone !== "function") {
-			return;
+		if (!response || !response.ok || typeof response.clone !== "function") {
+			return Promise.resolve(response);
 		}
 		const decodedRequest = decodeRemoteCommandBody(body);
-		response.clone().text().then((text) => {
+		return response.clone().text().then((text) => {
 			try {
 				const envelope = originalJSONParse(text || "{}");
 				const result = decodeDevalueString(envelope.data || "");
 				const value = isPlainObject(result) ? result._ : null;
+				if (isPlainObject(value) && value.ok === false) {
+					return;
+				}
 				const threadID = responseThreadID(value);
 				if (!threadID) {
 					return;
-			}
+				}
+				const resolvedWorkingDirectory = responseWorkingDirectory(value) || workingDirectory;
+				clearSelectedLocalProject();
 				rememberLocalThreadID(threadID);
-				rememberThreadWorkingDirectory(threadID, workingDirectory);
+				if (resolvedWorkingDirectory) {
+					rememberThreadWorkingDirectory(threadID, resolvedWorkingDirectory);
+				}
 				rememberThreadSettings(threadID, {
 					agentMode: firstString(isPlainObject(decodedRequest) ? decodedRequest.agentMode : ""),
 					reasoningEffort: firstString(isPlainObject(decodedRequest) ? decodedRequest.reasoningEffort : ""),
-			});
-				refreshLocalSidebarProjects();
+				});
 			} catch {
 			}
-		});
+		}).then(() => response, () => response);
 	}
 
 	function bridgeRequestBody(sourceURL, method, body) {
@@ -1515,7 +1945,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			if (sourceURL.pathname === "/api/internal") {
 				if (activeLocalThreadID() && isPlainObject(payload.params) && !payload.params.thread && !payload.params.threadID && !payload.params.threadId) {
 					payload.params.thread = activeLocalThreadID();
-			}
+				}
 				return JSON.stringify(payload);
 			}
 			if (!isThreadActorRequest) {
@@ -1554,12 +1984,76 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		return headers;
 	}
 
-	function promptLocalThread() {
+	function normalizeLocalProject(project) {
+		if (!isPlainObject(project)) {
+			return null;
+		}
+		const workingDirectory = normalizeWorkingDirectory(firstString(project.workingDirectory, project.workspaceRoot, project.cwd));
+		if (!workingDirectory) {
+			return null;
+		}
+		return {
+			id: firstString(project.id, project.projectID, project.projectId, project.project_id),
+			name: firstString(project.name, project.projectName, pathBaseName(workingDirectory), "local"),
+			namespace: firstString(project.namespace, project.projectNamespace, "local"),
+			repositoryURL: firstString(project.repositoryURL, project.repoURL),
+			workingDirectory,
+		};
+	}
+
+	function fetchLocalProjects(promptForKey = false) {
+		const now = Date.now();
+		if (localProjectsCache.promise) {
+			return localProjectsCache.promise;
+		}
+		if (now - localProjectsCache.at < 10000) {
+			return Promise.resolve(localProjectsCache.projects);
+		}
+		const headers = localFetchHeaders("", false);
+		if (!headers.get("Authorization") && promptForKey) {
+			const apiKey = localProjectLookupAPIKey();
+			if (apiKey) {
+				headers.set("Authorization", "Bearer " + apiKey);
+			}
+		}
+		if (!headers.get("Authorization")) {
+			return Promise.resolve([]);
+		}
+		diagnostics.localProjectFetchCount += 1;
+		localProjectsCache.promise = originalFetch(localBaseURLString() + localProjectsEndpointPath, {
+			method: "GET",
+			headers,
+			mode: "cors",
+			credentials: "omit",
+		}).then((response) => {
+			if (!response.ok) {
+				return [];
+			}
+			return response.json().catch(() => ({}));
+		}).then((decoded) => {
+			const responseDefaultWorkingDirectory = normalizeWorkingDirectory(firstString(decoded.defaultWorkingDirectory, decoded.homeDirectory));
+			if (responseDefaultWorkingDirectory) {
+				defaultWorkingDirectory = responseDefaultWorkingDirectory;
+			}
+			const projects = Array.isArray(decoded.projects) ? decoded.projects.map(normalizeLocalProject).filter(Boolean) : [];
+			localProjectsCache = { at: projects.length ? Date.now() : 0, projects, promise: null };
+			return projects;
+		}).catch(() => {
+			localProjectsCache.promise = null;
+			return [];
+		});
+		return localProjectsCache.promise;
+	}
+
+	async function promptLocalThread() {
 		const promptText = globalThis.prompt("Start local Amp thread");
 		if (promptText === null) {
 			return;
 		}
 		let workingDirectory = localWorkingDirectory();
+		if (!workingDirectory) {
+			workingDirectory = await ensureDefaultWorkingDirectory(false);
+		}
 		if (!workingDirectory) {
 			workingDirectory = (globalThis.prompt("Working directory for local inference", "") || "").trim();
 			if (workingDirectory) {
@@ -1609,13 +2103,15 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	}
 
 	async function createLocalThread(promptText, workingDirectory, modeOptions) {
+		const headers = localFetchHeaders("application/json");
+		workingDirectory = normalizeWorkingDirectory(workingDirectory) || await ensureDefaultWorkingDirectory(false);
 		const payload = localThreadPayload(promptText, workingDirectory, modeOptions);
 		const shellThreadID = await createRemoteThreadShell(payload);
 		payload.threadId = shellThreadID;
 		payload.threadID = shellThreadID;
 		const response = await originalFetch(localBaseURLString() + "/api/thread-actors/" + encodeURIComponent(shellThreadID), {
 			method: "POST",
-			headers: localFetchHeaders("application/json"),
+			headers,
 			mode: "cors",
 			credentials: "omit",
 			body: JSON.stringify(payload),
@@ -1679,7 +2175,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 				const candidate = object[key];
 				if (typeof candidate === "string" && candidate.startsWith("T-")) {
 					return candidate;
-			}
+				}
 			}
 			return "";
 		};
@@ -1702,6 +2198,34 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			threadID = directThreadID(result[key]);
 			if (threadID) {
 				return threadID;
+			}
+		}
+		return "";
+	}
+
+	function responseWorkingDirectory(value) {
+		const directWorkingDirectory = (object) => {
+			if (!isPlainObject(object)) {
+				return "";
+			}
+			return normalizeWorkingDirectory(firstString(object.workingDirectory, object.workspaceRoot, object.cwd));
+		};
+		if (!isPlainObject(value)) {
+			return "";
+		}
+		let workingDirectory = directWorkingDirectory(value);
+		if (workingDirectory) {
+			return workingDirectory;
+		}
+		const result = isPlainObject(value.result) ? value.result : {};
+		workingDirectory = directWorkingDirectory(result);
+		if (workingDirectory) {
+			return workingDirectory;
+		}
+		for (const key of ["thread", "threadActor", "actor"]) {
+			workingDirectory = directWorkingDirectory(result[key]);
+			if (workingDirectory) {
+				return workingDirectory;
 			}
 		}
 		return "";
@@ -1841,6 +2365,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 
 	function installLocalThreadControls() {
 		removeInjectedLocalThreadControls();
+		installLocalProjectPickerIntegration();
 	}
 
 	function removeStaleLocalThreadButton() {
@@ -1851,11 +2376,12 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		removeStaleLocalThreadButton();
 		removeLocalThreadPicker();
 		let removed = 0;
-		globalThis.document.querySelectorAll("[data-cliproxy-local-thread-command-item],[data-cliproxy-local-thread-menu-item]").forEach((element) => {
+		globalThis.document.querySelectorAll("[data-cliproxy-local-thread-command-item],[data-cliproxy-local-thread-menu-item],[data-cliproxy-local-project-item]").forEach((element) => {
 			element.remove();
 			removed += 1;
 		});
-		for (const key of ["__cliproxyAmpLocalInferenceMenuObserver", "__cliproxyAmpLocalInferenceCommandPaletteObserver"]) {
+		localProjectsCache = { at: 0, projects: [], promise: null };
+		for (const key of ["__cliproxyAmpLocalInferenceMenuObserver", "__cliproxyAmpLocalInferenceCommandPaletteObserver", "__cliproxyAmpLocalInferenceProjectPickerObserver"]) {
 			const observer = globalThis[key];
 			if (observer && typeof observer.disconnect === "function") {
 				observer.disconnect();
@@ -1863,6 +2389,800 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			globalThis[key] = null;
 		}
 		diagnostics.removedLocalThreadControlCount += removed;
+	}
+
+	function installLocalProjectPickerIntegration() {
+		if (globalThis.__cliproxyAmpLocalInferenceProjectPickerObserver) {
+			integrateLocalProjectActivators(globalThis.document);
+			integrateLocalProjectPickers(globalThis.document);
+			return;
+		}
+		const observer = new MutationObserver((mutations) => {
+			for (const mutation of mutations) {
+				for (const node of mutation.addedNodes) {
+					if (node instanceof Element) {
+						integrateLocalProjectActivators(node);
+						integrateLocalProjectPickers(node);
+					}
+				}
+			}
+		});
+		observer.observe(globalThis.document.documentElement, { childList: true, subtree: true });
+		globalThis.__cliproxyAmpLocalInferenceProjectPickerObserver = observer;
+		integrateLocalProjectActivators(globalThis.document);
+		integrateLocalProjectPickers(globalThis.document);
+	}
+
+	function integrateLocalProjectActivators(root) {
+		const workingDirectory = currentLocalProjectWorkingDirectory();
+		const visibleName = visibleProjectName();
+		const visibleNeedsLookup = !!visibleName && !visibleProjectWorkingDirectory();
+		const targetLabel = firstString(visibleName, pathBaseName(workingDirectory));
+		if (!workingDirectory && !visibleName) {
+			return;
+		}
+		for (const activator of localProjectActivatorCandidates(root)) {
+			if ((!visibleNeedsLookup && workingDirectory && !localProjectActivatorNeedsPatch(activator, workingDirectory, targetLabel)) || activator.dataset.cliproxyLocalProjectActivatorLoading === "1") {
+				continue;
+			}
+			activator.dataset.cliproxyLocalProjectActivatorLoading = "1";
+			fetchLocalProjects(false).then((projects) => {
+				delete activator.dataset.cliproxyLocalProjectActivatorLoading;
+				let project = localProjectByVisibleName(projects, visibleName);
+				const resolvedWorkingDirectory = normalizeWorkingDirectory(project?.workingDirectory) || workingDirectory;
+				if (!project) {
+					project = localProjectByWorkingDirectory(projects, resolvedWorkingDirectory);
+				}
+				const label = firstString(project?.name, pathBaseName(resolvedWorkingDirectory));
+				if (!resolvedWorkingDirectory || !globalThis.document.contains(activator) || !localProjectActivatorNeedsPatch(activator, resolvedWorkingDirectory, label)) {
+					return;
+				}
+				if (!label) {
+					return;
+				}
+				patchLocalProjectActivator(activator, label, resolvedWorkingDirectory);
+			});
+		}
+	}
+
+	function localProjectActivatorCandidates(root) {
+		const out = [];
+		const add = (element) => {
+			if (element instanceof Element && !out.includes(element)) {
+				out.push(element);
+			}
+		};
+		const selector = "button,[role='button']";
+		if (root instanceof Element) {
+			if (root.matches(selector)) {
+				add(root);
+			}
+			root.querySelectorAll?.(selector).forEach(add);
+		} else {
+			root.querySelectorAll?.(selector).forEach(add);
+		}
+		return out;
+	}
+
+	function localProjectActivatorLooksUnset(activator) {
+		if (!elementVisible(activator)) {
+			return false;
+		}
+		return localProjectActivatorProjectLabel(activator) === "No Project";
+	}
+
+	function localProjectActivatorProjectLabel(activator) {
+		if (!(activator instanceof Element)) {
+			return "";
+		}
+		const text = (activator.innerText || activator.textContent || "").replace(/\s+/g, " ").trim();
+		const match = text.match(/(?:^|\b)Project:\s*([^\n]+?)(?:\s{2,}|\s*[⌃⌥⇧⌘]|$)/);
+		return match && match[1] ? match[1].trim() : "";
+	}
+
+	function localProjectActivatorNeedsPatch(activator, workingDirectory, label = "") {
+		if (!elementVisible(activator)) {
+			return false;
+		}
+		if (localProjectActivatorLooksUnset(activator)) {
+			return true;
+		}
+		const currentLabel = localProjectActivatorProjectLabel(activator);
+		if (label && currentLabel && normalizeProjectPickerName(currentLabel) !== normalizeProjectPickerName(label)) {
+			return true;
+		}
+		if (activator.dataset?.cliproxyLocalProjectActivator !== "1") {
+			return false;
+		}
+		return normalizeWorkingDirectory(activator.dataset.cliproxyLocalProjectWorkingDirectory) !== normalizeWorkingDirectory(workingDirectory);
+	}
+
+	function patchLocalProjectActivator(activator, label, workingDirectory) {
+		const walker = globalThis.document.createTreeWalker(activator, NodeFilter.SHOW_TEXT);
+		let changed = false;
+		const replacementTargets = ["No Project", activator.dataset.cliproxyLocalProjectLabel, localProjectActivatorProjectLabel(activator)].filter((target) => target && target !== label);
+		for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+			if (!node.nodeValue) {
+				continue;
+			}
+			let nextValue = node.nodeValue;
+			for (const target of replacementTargets) {
+				if (nextValue.includes(target)) {
+					nextValue = nextValue.split(target).join(label);
+				}
+			}
+			if (nextValue !== node.nodeValue) {
+				node.nodeValue = nextValue;
+				changed = true;
+			}
+		}
+		if (!changed) {
+			let text = activator.textContent || "";
+			for (const target of replacementTargets) {
+				if (text.includes(target)) {
+					text = text.split(target).join(label);
+					changed = true;
+				}
+			}
+			if (changed) {
+				activator.textContent = text;
+			}
+		}
+		const ariaLabel = activator.getAttribute("aria-label");
+		if (ariaLabel) {
+			let nextAriaLabel = ariaLabel;
+			for (const target of replacementTargets) {
+				if (nextAriaLabel.includes(target)) {
+					nextAriaLabel = nextAriaLabel.split(target).join(label);
+				}
+			}
+			if (nextAriaLabel !== ariaLabel) {
+				activator.setAttribute("aria-label", nextAriaLabel);
+			}
+		}
+		activator.dataset.cliproxyLocalProjectActivator = "1";
+		activator.dataset.cliproxyLocalProjectLabel = label;
+		activator.dataset.cliproxyLocalProjectWorkingDirectory = workingDirectory;
+		diagnostics.localProjectActivatorIntegrationCount += 1;
+	}
+
+	function refreshLocalProjectActivators(project) {
+		const workingDirectory = normalizeWorkingDirectory(project?.workingDirectory);
+		if (!workingDirectory) {
+			return;
+		}
+		const label = firstString(project?.name, pathBaseName(workingDirectory));
+		if (!label) {
+			return;
+		}
+		for (const activator of localProjectActivatorCandidates(globalThis.document)) {
+			if (localProjectActivatorLooksUnset(activator) || activator.dataset?.cliproxyLocalProjectActivator === "1") {
+				patchLocalProjectActivator(activator, label, workingDirectory);
+			}
+		}
+	}
+
+	function localProjectByWorkingDirectory(projects, workingDirectory) {
+		const target = normalizeWorkingDirectory(workingDirectory);
+		for (const project of projects || []) {
+			if (normalizeWorkingDirectory(project?.workingDirectory) === target) {
+				return project;
+			}
+		}
+		return null;
+	}
+
+	function localProjectByID(projects, projectID) {
+		const target = firstString(projectID);
+		if (!target) {
+			return null;
+		}
+		for (const project of projects || []) {
+			if (firstString(project?.id, project?.projectID, project?.projectId, project?.project_id) === target) {
+				return project;
+			}
+		}
+		return null;
+	}
+
+	function localProjectByVisibleName(projects, visibleName = visibleProjectName()) {
+		const target = normalizeProjectPickerName(visibleName);
+		if (!target) {
+			return null;
+		}
+		const matches = [];
+		for (const project of projects || []) {
+			if (normalizeProjectPickerName(firstString(project?.name, pathBaseName(project?.workingDirectory))) === target) {
+				matches.push(project);
+			}
+		}
+		if (matches.length <= 1) {
+			return matches[0] || null;
+		}
+		for (const workingDirectory of [activeThreadWorkingDirectory(), selectedLocalProjectWorkingDirectory(), storedLocalWorkingDirectory()]) {
+			const project = localProjectByWorkingDirectory(matches, workingDirectory);
+			if (project) {
+				return project;
+			}
+		}
+		matches.sort((left, right) => localProjectDirectoryRank(left?.workingDirectory) - localProjectDirectoryRank(right?.workingDirectory));
+		return matches[0] || null;
+	}
+
+	function localProjectDirectoryRank(workingDirectory) {
+		const dir = normalizeWorkingDirectory(workingDirectory);
+		if (!dir) {
+			return 99;
+		}
+		const activeDirectory = activeThreadWorkingDirectory();
+		if (activeDirectory && dir === activeDirectory) {
+			return 0;
+		}
+		if (/^\/Users\/[^/]+\/Developer\//.test(dir)) {
+			return 1;
+		}
+		if (/^\/Users\//.test(dir)) {
+			return 2;
+		}
+		if (/^(\/private)?\/tmp\//.test(dir) || /^\/private\/var\/folders\//.test(dir) || /^\/var\/folders\//.test(dir)) {
+			return 4;
+		}
+		return 3;
+	}
+
+	function integrateLocalProjectPickers(root) {
+		for (const picker of localProjectPickerCandidates(root)) {
+			if (!localProjectPickerLooksLikeProjectPicker(picker)) {
+				continue;
+			}
+			const list = commandPaletteList(picker);
+			if (list) {
+				installLocalProjectPickerKeyboardNavigation(picker, list);
+				installLocalProjectPickerSearch(picker, list);
+				installLocalProjectNoProjectSelectionHandler(picker);
+				autoSelectCurrentProjectInPicker(picker, list);
+			}
+			if (!list || list.querySelector("[data-cliproxy-local-project-item]") || list.dataset.cliproxyLocalProjectLoading === "1") {
+				continue;
+			}
+			list.dataset.cliproxyLocalProjectLoading = "1";
+			fetchLocalProjects(true).then((projects) => {
+				delete list.dataset.cliproxyLocalProjectLoading;
+				const displayProjects = localProjectPickerDisplayProjects(projects);
+				if (!projects.length || !globalThis.document.contains(picker) || !localProjectPickerLooksLikeProjectPicker(picker)) {
+					const attempts = Number(list.dataset.cliproxyLocalProjectAttempts || "0");
+					if (attempts < 3 && globalThis.document.contains(picker)) {
+						list.dataset.cliproxyLocalProjectAttempts = String(attempts + 1);
+						setTimeout(() => integrateLocalProjectPickers(picker), 750 * (attempts + 1));
+					}
+					return;
+				}
+				if (!displayProjects.length) {
+					return;
+				}
+				delete list.dataset.cliproxyLocalProjectAttempts;
+				injectLocalProjectPickerItems(picker, list, displayProjects);
+				filterLocalProjectPickerItems(picker, list);
+				autoSelectCurrentProjectInPicker(picker, list, true);
+			});
+		}
+	}
+
+	function localProjectPickerCandidates(root) {
+		const candidates = commandPaletteCandidates(root);
+		if (root instanceof Element && !candidates.includes(root)) {
+			candidates.push(root);
+		}
+		return candidates;
+	}
+
+	function localProjectPickerLooksLikeProjectPicker(picker) {
+		if (!elementVisible(picker)) {
+			return false;
+		}
+		const text = (picker.innerText || picker.textContent || "").replace(/\s+/g, " ").trim();
+		return text.includes("No Project") && /\bProjects?\b/.test(text);
+	}
+
+	function injectLocalProjectPickerItems(picker, list, projects) {
+		if (list.querySelector("[data-cliproxy-local-project-item]")) {
+			return;
+		}
+		const before = localProjectPickerActionsRow(list);
+		const currentDirectory = localProjectPickerCurrentDirectory(projects);
+		for (const project of projects) {
+			list.insertBefore(buildLocalProjectPickerItem(picker, project, currentDirectory), before);
+			diagnostics.localProjectPickerIntegrationCount += 1;
+		}
+	}
+
+	function installLocalProjectPickerSearch(picker, list) {
+		const target = localProjectPickerSearchTarget(picker);
+		if (!target || target.dataset.cliproxyLocalProjectSearch === "1") {
+			return;
+		}
+		target.dataset.cliproxyLocalProjectSearch = "1";
+		const apply = () => {
+			filterLocalProjectPickerItems(picker, list);
+			setTimeout(() => filterLocalProjectPickerItems(picker, list), 0);
+		};
+		target.addEventListener("input", apply, true);
+		target.addEventListener("change", apply, true);
+	}
+
+	function localProjectPickerSearchTarget(picker) {
+		return picker.querySelector('input,[role="combobox"],textarea,[contenteditable="true"]');
+	}
+
+	function localProjectPickerSearchQuery(picker) {
+		const target = localProjectPickerSearchTarget(picker);
+		return normalizeProjectPickerName(target?.value || target?.textContent || "");
+	}
+
+	function filterLocalProjectPickerItems(picker, list) {
+		const query = localProjectPickerSearchQuery(picker);
+		const visible = [];
+		for (const item of list.querySelectorAll("[data-cliproxy-local-project-item]")) {
+			const label = normalizeProjectPickerName(item.dataset.cliproxyLocalProjectLabel);
+			const workingDirectory = normalizeProjectPickerName(item.dataset.cliproxyLocalProjectWorkingDirectory);
+			const matches = !query || label.includes(query) || workingDirectory.includes(query);
+			item.hidden = !matches;
+			item.style.display = matches ? "flex" : "none";
+			item.setAttribute("aria-hidden", matches ? "false" : "true");
+			if (matches) {
+				visible.push(item);
+			}
+		}
+		if (!query || !visible.length) {
+			return;
+		}
+		const selected = visible.find((item) => normalizeProjectPickerName(item.dataset.cliproxyLocalProjectLabel) === query) || visible[0];
+		setProjectPickerSelectedItem(list, selected);
+	}
+
+	function buildLocalProjectPickerItem(picker, project, currentDirectory = currentLocalProjectWorkingDirectory()) {
+		const template = localProjectPickerTemplateItem(picker);
+		const item = template && typeof template.cloneNode === "function" ? template.cloneNode(false) : globalThis.document.createElement("button");
+		const isCurrent = normalizeWorkingDirectory(project.workingDirectory) === normalizeWorkingDirectory(currentDirectory);
+		const label = firstString(project.name, pathBaseName(project.workingDirectory), "local");
+		if ("type" in item) {
+			item.type = "button";
+		}
+		item.removeAttribute("id");
+		item.dataset.cliproxyLocalProjectItem = "1";
+		item.dataset.cliproxyLocalProjectLabel = label;
+		item.dataset.cliproxyLocalProjectWorkingDirectory = normalizeWorkingDirectory(project.workingDirectory);
+		item.dataset.cliproxyLocalProjectCurrent = isCurrent ? "1" : "0";
+		item.setAttribute("data-value", label);
+		item.setAttribute("aria-label", label);
+		item.setAttribute("role", "option");
+		item.setAttribute("aria-selected", "false");
+		item.setAttribute("aria-disabled", "false");
+		item.setAttribute("data-disabled", "false");
+		item.removeAttribute("disabled");
+		item.dataset.selected = "false";
+		item.className = template?.className || "group flex w-full gap-3 rounded-xl px-3.5 py-2.5 text-left hover:bg-black/5 data-[selected=true]:bg-black/6 dark:hover:bg-white/8 dark:data-[selected=true]:bg-white/10 items-center";
+		applyLocalProjectPickerItemFrame(item);
+		fillLocalProjectPickerItem(item, label, project.workingDirectory, isCurrent);
+		const activate = (event) => {
+			activateLocalProjectPickerItem(picker, item, event);
+		};
+		item.addEventListener("pointerdown", activate, true);
+		item.addEventListener("click", activate, true);
+		item.addEventListener("keydown", (event) => {
+			if (event.key === "Enter") {
+				activate(event);
+			}
+		}, true);
+		return item;
+	}
+
+	function applyLocalProjectPickerItemFrame(item) {
+		item.style.display = "flex";
+		item.style.alignItems = "center";
+		item.style.justifyContent = "space-between";
+		item.style.gap = "12px";
+		item.style.width = "100%%";
+		item.style.minHeight = "34px";
+		item.style.border = "0";
+		item.style.font = "inherit";
+		item.style.textAlign = "left";
+	}
+
+	function fillLocalProjectPickerItem(item, labelText, workingDirectory, isCurrent) {
+		item.replaceChildren();
+		const left = globalThis.document.createElement("div");
+		left.className = "min-w-0 flex-1";
+		left.style.cssText = "min-width:0;flex:1 1 auto;display:flex;align-items:center";
+		const title = globalThis.document.createElement("div");
+		title.className = "flex min-w-0 gap-1.5 text-sm leading-tight pointer-coarse:text-[15px] pointer-coarse:leading-snug font-medium items-baseline";
+		title.style.cssText = "min-width:0;font-size:14px;line-height:1.2;font-weight:600";
+		const label = globalThis.document.createElement("span");
+		label.textContent = labelText;
+		label.className = "min-w-0 truncate";
+		label.style.cssText = "display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap";
+		title.append(label);
+		left.append(title);
+
+		const right = globalThis.document.createElement("div");
+		right.className = "flex shrink-0 items-center gap-2 text-muted-foreground";
+		right.style.cssText = "display:flex;align-items:center;gap:8px;min-width:0;flex:0 1 auto;opacity:.72";
+		const meta = globalThis.document.createElement("span");
+		meta.className = "flex max-w-[min(45vw,32rem)] min-w-0 items-center gap-1.5 text-sm font-medium";
+		meta.style.cssText = "display:flex;align-items:center;gap:6px;min-width:0;max-width:min(45vw,32rem);font-size:12px;line-height:1.15;font-weight:500";
+		const badge = globalThis.document.createElement("span");
+		badge.textContent = "Git";
+		badge.className = "shrink-0 rounded-md bg-foreground/8 px-1.5 py-0.5 text-[0.65rem] leading-none font-medium text-muted-foreground";
+		badge.style.cssText = "flex:0 0 auto;border-radius:6px;padding:2px 5px;background:color-mix(in srgb,currentColor 10%%,transparent);font-size:11px;line-height:1;font-weight:600";
+		const detail = globalThis.document.createElement("span");
+		detail.textContent = localProjectPickerPathDisplay(workingDirectory);
+		detail.title = workingDirectory;
+		detail.className = "truncate";
+		detail.style.cssText = "display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap";
+		const check = globalThis.document.createElement("span");
+		check.className = "flex size-4 shrink-0 items-center justify-center";
+		check.dataset.slot = "project-check";
+		check.textContent = isCurrent ? "\u2713" : "";
+		check.setAttribute("aria-hidden", "true");
+		check.style.cssText = "display:flex;align-items:center;justify-content:center;width:16px;height:16px;flex:0 0 auto;font-size:12px;line-height:1";
+		meta.append(badge, detail);
+		right.append(meta, check);
+		item.append(left, right);
+	}
+
+	function localProjectPickerTemplateItem(picker) {
+		for (const element of picker.querySelectorAll('[cmdk-item],[data-cmdk-item],[data-slot="command-item"],[role="option"],button,[role="button"]')) {
+			const text = projectPickerItemPrimaryText(element);
+			if (element.dataset?.cliproxyLocalProjectItem || /^No Project\b/.test(text) || /^(Actions|Create Project)\b/.test(text)) {
+				continue;
+			}
+			return element;
+		}
+		return null;
+	}
+
+	function localProjectPickerPathDisplay(workingDirectory) {
+		const normalized = normalizeWorkingDirectory(workingDirectory);
+		if (normalized.startsWith("/Users/")) {
+			const parts = normalized.split("/");
+			if (parts.length > 3) {
+				return "~/" + parts.slice(3).join("/");
+			}
+		}
+		return normalized;
+	}
+
+	function localProjectPickerDisplayProjects(projects) {
+		const visibleName = visibleProjectName();
+		const activeDirectory = activeThreadWorkingDirectory();
+		const visibleDirectory = normalizeWorkingDirectory(localProjectByVisibleName(projects, visibleName)?.workingDirectory);
+		const selectedDirectory = selectedLocalProjectWorkingDirectory();
+		const fallbackDirectory = normalizeWorkingDirectory(globalThis.localStorage.getItem(workingDirectoryStorageKey) || "");
+		const rank = (project) => {
+			const dir = normalizeWorkingDirectory(project.workingDirectory);
+			if (activeDirectory && dir === activeDirectory) {
+				return 0;
+			}
+			if (visibleDirectory && dir === visibleDirectory) {
+				return 1;
+			}
+			if (selectedDirectory && dir === selectedDirectory) {
+				return 2;
+			}
+			if (fallbackDirectory && dir === fallbackDirectory) {
+				return 3;
+			}
+			return 4;
+		};
+		const seen = new Set();
+		const projectDirs = projects.map((project) => normalizeWorkingDirectory(project.workingDirectory)).filter((dir) => localProjectPickerDirectoryDisplayable(dir, false));
+		return projects.filter((project) => {
+			const dir = normalizeWorkingDirectory(project.workingDirectory);
+			const projectRank = rank(project);
+			const name = firstString(project.name, pathBaseName(project.workingDirectory));
+			if (!localProjectPickerDirectoryDisplayable(dir, projectRank < 4) || seen.has(dir)) {
+				return false;
+			}
+			if (projectRank >= 4 && localProjectPickerHasAncestorDirectory(dir, projectDirs)) {
+				return false;
+			}
+			seen.add(dir);
+			return true;
+		}).sort((left, right) => {
+			const leftRank = rank(left);
+			const rightRank = rank(right);
+			if (leftRank !== rightRank) {
+				return leftRank - rightRank;
+			}
+			return firstString(left.name, pathBaseName(left.workingDirectory)).localeCompare(firstString(right.name, pathBaseName(right.workingDirectory)));
+		}).slice(0, 50);
+	}
+
+	function localProjectPickerDirectoryDisplayable(dir, keepHidden) {
+		dir = normalizeWorkingDirectory(dir);
+		if (!dir || dir === "/" || /^[A-Za-z]:[\\/]?$/.test(dir)) {
+			return false;
+		}
+		if (/^\/Users\/[^/]+$/.test(dir) || /^\/Users\/[^/]+\/Developer$/.test(dir)) {
+			return false;
+		}
+		if (!keepHidden && pathBaseName(dir).startsWith(".")) {
+			return false;
+		}
+		return true;
+	}
+
+	function localProjectPickerHasAncestorDirectory(dir, dirs) {
+		for (const other of dirs) {
+			if (other && other !== dir && dir.startsWith(other.replace(/[\\/]+$/, "") + "/")) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	function localProjectPickerCurrentDirectory(projects) {
+		const activeDirectory = activeThreadWorkingDirectory();
+		if (activeDirectory) {
+			return activeDirectory;
+		}
+		const visibleDirectory = normalizeWorkingDirectory(localProjectByVisibleName(projects)?.workingDirectory);
+		if (visibleDirectory) {
+			return visibleDirectory;
+		}
+		return selectedLocalProjectWorkingDirectory() ||
+			normalizeWorkingDirectory(globalThis.localStorage.getItem(workingDirectoryStorageKey) || "") ||
+			defaultLocalWorkingDirectory();
+	}
+
+	function normalizeProjectPickerName(value) {
+		return String(value || "").replace(/\s+/g, " ").trim().toLowerCase();
+	}
+
+	function installLocalProjectNoProjectSelectionHandler(picker) {
+		const noProject = localProjectPickerNoProjectItem(picker);
+		if (!noProject || noProject.dataset.cliproxyNoProjectHandler === "1") {
+			return;
+		}
+		noProject.dataset.cliproxyNoProjectHandler = "1";
+		const clear = () => {
+			if (noProject.dataset.cliproxySuppressLocalProjectClear === "1") {
+				return;
+			}
+			clearSelectedLocalProject(true);
+		};
+		noProject.addEventListener("pointerdown", clear, true);
+		noProject.addEventListener("click", clear, true);
+	}
+
+	function localProjectPickerActionsRow(list) {
+		for (const element of Array.from(list.children || [])) {
+			const text = (element.innerText || element.textContent || "").replace(/\s+/g, " ").trim();
+			if (/^(Actions|Create Project)\b/.test(text)) {
+				return element;
+			}
+		}
+		return null;
+	}
+
+	function localProjectPickerNoProjectItem(picker) {
+		for (const element of picker.querySelectorAll('[cmdk-item],[data-cmdk-item],[data-slot="command-item"],[role="option"],button,[role="button"]')) {
+			const text = (element.innerText || element.textContent || "").replace(/\s+/g, " ").trim();
+			if (/^No Project\b/.test(text) && !element.dataset.cliproxyLocalProjectItem) {
+				return element;
+			}
+		}
+		return null;
+	}
+
+	function installLocalProjectPickerKeyboardNavigation(picker, list) {
+		if (list.dataset.cliproxyLocalProjectKeyboardNavigation === "1") {
+			return;
+		}
+		list.dataset.cliproxyLocalProjectKeyboardNavigation = "1";
+		const target = localProjectPickerKeyboardTarget(picker, list);
+		if (!target || target.dataset.cliproxyLocalProjectKeyboardNavigation === "1") {
+			return;
+		}
+		target.dataset.cliproxyLocalProjectKeyboardNavigation = "1";
+		target.addEventListener("keydown", (event) => {
+			const activeList = localProjectPickerKeyboardList(target, list);
+			if (activeList) {
+				handleLocalProjectPickerKeydown(event, target, activeList);
+			}
+		}, true);
+	}
+
+	function localProjectPickerKeyboardTarget(picker, list) {
+		if (!(list instanceof Element)) {
+			return null;
+		}
+		return list.closest('[role="dialog"],[data-slot="dialog-content"],[cmdk-root],[data-cmdk-root]') ||
+			(picker instanceof Element ? picker : null) ||
+			list;
+	}
+
+	function localProjectPickerKeyboardList(target, fallback) {
+		const localItemSelector = "[data-cliproxy-local-project-item]";
+		if (fallback instanceof Element && globalThis.document.contains(fallback) && elementVisible(fallback) && fallback.querySelector(localItemSelector)) {
+			return fallback;
+		}
+		const lists = [];
+		const listSelector = '[cmdk-list],[data-cmdk-list],[data-slot="command-list"],[role="listbox"]';
+		if (target instanceof Element && target.matches(listSelector)) {
+			lists.push(target);
+		}
+		target.querySelectorAll?.(listSelector).forEach((element) => lists.push(element));
+		return lists.find((element) => elementVisible(element) && element.querySelector(localItemSelector)) || null;
+	}
+
+	function handleLocalProjectPickerKeydown(event, picker, list) {
+		if (!list.querySelector("[data-cliproxy-local-project-item]")) {
+			return;
+		}
+		if (event.key !== "ArrowDown" && event.key !== "ArrowUp" && event.key !== "Enter" && event.key !== " ") {
+			return;
+		}
+		if (event.key === " " && projectPickerEditableTarget(event.target)) {
+			return;
+		}
+		const items = projectPickerNavigableItems(list);
+		if (!items.length) {
+			return;
+		}
+		const selected = items.find(projectPickerItemSelected) || items[0];
+		if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+			event.preventDefault();
+			event.stopPropagation();
+			const direction = event.key === "ArrowDown" ? 1 : -1;
+			const index = Math.max(0, items.indexOf(selected));
+			setProjectPickerSelectedItem(list, items[(index + direction + items.length) %% items.length]);
+			return;
+		}
+		event.preventDefault();
+		event.stopPropagation();
+		if (selected.dataset?.cliproxyLocalProjectItem) {
+			activateLocalProjectPickerItem(picker, selected, event);
+			return;
+		}
+		selected.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, cancelable: true, view: globalThis }));
+		selected.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: globalThis }));
+	}
+
+	function projectPickerNavigableItems(list) {
+		return Array.from(list.querySelectorAll('[role="option"],button,[role="button"]')).filter((element) =>
+			element.hidden !== true &&
+			element.style?.display !== "none" &&
+			elementVisible(element) &&
+			element.getAttribute("aria-disabled") !== "true" &&
+			element.dataset?.disabled !== "true" &&
+			!element.disabled);
+	}
+
+	function setProjectPickerSelectedItem(list, selected) {
+		for (const item of projectPickerNavigableItems(list)) {
+			const active = item === selected;
+			item.setAttribute("aria-selected", active ? "true" : "false");
+			item.dataset.selected = active ? "true" : "false";
+		}
+		selected?.scrollIntoView?.({ block: "nearest" });
+	}
+
+	function activateLocalProjectPickerItem(picker, item, event) {
+		event?.preventDefault?.();
+		event?.stopPropagation?.();
+		const workingDirectory = normalizeWorkingDirectory(item.dataset?.cliproxyLocalProjectWorkingDirectory);
+		if (!workingDirectory) {
+			return;
+		}
+		const selectedProject = {
+			name: projectPickerItemPrimaryText(item),
+			workingDirectory,
+		};
+		rememberSelectedLocalProject(selectedProject);
+		refreshLocalProjectActivators(selectedProject);
+		setTimeout(() => {
+			closeLocalProjectPickerViaNoProject(picker);
+			setTimeout(() => refreshLocalProjectActivators(selectedProject), 50);
+		}, 0);
+	}
+
+	function autoSelectCurrentProjectInPicker(picker, list, force = false) {
+		if (!list || (!force && list.dataset.cliproxyCurrentProjectAutoSelected === "1")) {
+			return;
+		}
+		const item = currentProjectPickerItem(picker);
+		if (!item || projectPickerItemSelected(item)) {
+			return;
+		}
+		list.dataset.cliproxyCurrentProjectAutoSelected = "1";
+		setTimeout(() => {
+			if (!globalThis.document.contains(item) || !localProjectPickerLooksLikeProjectPicker(picker)) {
+				return;
+			}
+			setProjectPickerSelectedItem(list, item);
+			const workingDirectory = normalizeWorkingDirectory(item.dataset?.cliproxyLocalProjectWorkingDirectory);
+			if (workingDirectory) {
+				const selectedProject = {
+					name: projectPickerItemPrimaryText(item),
+					workingDirectory,
+				};
+				rememberSelectedLocalProject(selectedProject);
+				refreshLocalProjectActivators(selectedProject);
+			}
+		}, 0);
+	}
+
+	function projectPickerItemSelected(item) {
+		return item?.getAttribute("aria-selected") === "true" || item?.dataset?.selected === "true";
+	}
+
+	function currentProjectPickerItem(picker) {
+		const workingDirectory = localProjectPickerCurrentDirectory(localProjectsCache.projects);
+		const targetNames = new Set();
+		if (workingDirectory) {
+			targetNames.add(normalizeProjectPickerName(pathBaseName(workingDirectory)));
+		}
+		const visibleName = visibleProjectName();
+		const visibleTargetName = normalizeProjectPickerName(visibleName);
+		if (visibleName) {
+			targetNames.add(visibleTargetName);
+		}
+		const matches = [];
+		const localNameMatches = [];
+		let localDirectoryMatch = null;
+		for (const element of picker.querySelectorAll('[cmdk-item],[data-cmdk-item],[data-slot="command-item"],[role="option"],button,[role="button"]')) {
+			if (!elementVisible(element) || /^No Project\b/.test(projectPickerItemPrimaryText(element))) {
+				continue;
+			}
+			const itemName = normalizeProjectPickerName(projectPickerItemPrimaryText(element));
+			if (element.dataset?.cliproxyLocalProjectItem) {
+				if (visibleTargetName && itemName === visibleTargetName) {
+					localNameMatches.push(element);
+				}
+				if (normalizeWorkingDirectory(element.dataset.cliproxyLocalProjectWorkingDirectory) === workingDirectory && !localDirectoryMatch) {
+					localDirectoryMatch = element;
+				}
+				continue;
+			}
+			if (targetNames.has(itemName)) {
+				matches.push(element);
+			}
+		}
+		if (localDirectoryMatch) {
+			return localDirectoryMatch;
+		}
+		if (localNameMatches.length === 1) {
+			return localNameMatches[0];
+		}
+		return matches.length === 1 ? matches[0] : null;
+	}
+
+	function projectPickerItemPrimaryText(element) {
+		if (element?.dataset?.cliproxyLocalProjectLabel) {
+			return element.dataset.cliproxyLocalProjectLabel;
+		}
+		return (element.innerText || element.textContent || "").split(/\n+/).map((line) => line.trim()).filter(Boolean)[0] || "";
+	}
+
+	function projectPickerEditableTarget(target) {
+		return target instanceof Element &&
+			(target.matches("input,textarea,[contenteditable=true]") || !!target.closest("input,textarea,[contenteditable=true]"));
+	}
+
+	function closeLocalProjectPickerViaNoProject(picker) {
+		const noProject = localProjectPickerNoProjectItem(picker);
+		if (noProject) {
+			noProject.dataset.cliproxySuppressLocalProjectClear = "1";
+			try {
+				noProject.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, cancelable: true, view: globalThis }));
+				noProject.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: globalThis }));
+			} finally {
+				delete noProject.dataset.cliproxySuppressLocalProjectClear;
+			}
+			return;
+		}
+		globalThis.document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
 	}
 
 	function installLocalThreadKeyboardShortcut() {
@@ -1888,8 +3208,8 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 				for (const node of mutation.addedNodes) {
 					if (node instanceof Element) {
 						integrateThreadMenus(node);
-			}
-			}
+					}
+				}
 			}
 		});
 		observer.observe(globalThis.document.documentElement, { childList: true, subtree: true });
@@ -1907,8 +3227,8 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 				for (const node of mutation.addedNodes) {
 					if (node instanceof Element) {
 						integrateCommandPalettes(node);
-			}
-			}
+					}
+				}
 			}
 		});
 		observer.observe(globalThis.document.documentElement, { childList: true, subtree: true });
@@ -1930,7 +3250,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 				const item = buildCommandPaletteItem(palette, choice);
 				if (!item) {
 					continue;
-			}
+				}
 				list.insertBefore(item, before);
 				diagnostics.commandPaletteIntegrationCount += 1;
 			}
@@ -2157,11 +3477,11 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			if (value) {
 				if (!fallback) {
 					fallback = node;
-			}
+				}
 				if (["Rename", "Pin", "Generate Diagnostic Report"].includes(value)) {
 					node.nodeValue = node.nodeValue.replace(value, text);
 					return;
-			}
+				}
 			}
 			node = walker.nextNode();
 		}
@@ -2205,10 +3525,12 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 
 	function sameLocalWebSocketBase(url, base) {
 		const protocol = base.protocol === "https:" ? "wss:" : "ws:";
-		return url.protocol === protocol && url.host === base.host;
+		return (url.protocol === protocol && url.host === base.host) ||
+			((url.protocol === "http:" || url.protocol === "https:") && sameLocalHTTPBase(url, base));
 	}
 
 	function localWebSocketURL(rawURL) {
+		pendingLocalBootstrapThreadID = "";
 		const source = new URL(String(rawURL), globalThis.location.href);
 		const base = localBaseURL();
 		if (!shouldRewriteWebSocket(source, base)) {
@@ -2216,6 +3538,15 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		}
 		const alreadyLocal = sameLocalWebSocketBase(source, base);
 		const local = alreadyLocal ? new URL(source.href) : new URL(source.pathname + source.search + source.hash, base);
+		const userActorSocket = shouldBridgeUserActorWebSocket(source);
+		const bootstrapExecutor = shouldBootstrapExecutor(source);
+		const apiKey = local.searchParams.get("cliproxy-api-key") || (userActorSocket ? storedLocalAPIKey() : localAPIKey());
+		if (userActorSocket && !apiKey) {
+			return rawURL;
+		}
+		if (apiKey && !local.searchParams.has("cliproxy-api-key")) {
+			local.searchParams.set("cliproxy-api-key", apiKey);
+		}
 		const threadID = rememberObservedThreadID(threadIDFromGatewayURL(source));
 		local.protocol = base.protocol === "https:" ? "wss:" : "ws:";
 		diagnostics.webSocketRewriteCount += 1;
@@ -2223,11 +3554,10 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		diagnostics.lastWebSocketPath = local.pathname;
 		diagnostics.lastWebSocketThreadKey = threadID || local.searchParams.get("rvt-key") || "";
 		diagnostics.lastWebSocketBootstrapped = false;
-		if (shouldBootstrapExecutor(source)) {
-			const apiKey = localAPIKey();
-			if (apiKey && !local.searchParams.has("cliproxy-api-key")) {
-				local.searchParams.set("cliproxy-api-key", apiKey);
-			}
+		if (bootstrapExecutor && !userActorSocket && threadID && threadID === pathThreadID()) {
+			pendingLocalBootstrapThreadID = threadID;
+		}
+		if (bootstrapExecutor) {
 			const workingDirectory = localWorkingDirectory();
 			if (workingDirectory && !local.searchParams.has("cliproxy-working-directory")) {
 				local.searchParams.set("cliproxy-working-directory", workingDirectory);
@@ -2247,14 +3577,47 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		return local.href;
 	}
 
+	function webSocketProtocolDiagnostics(protocols) {
+		const values = Array.isArray(protocols) ? protocols : [protocols];
+		return JSON.stringify(values.map((value) => {
+			const protocol = String(value || "");
+			if (protocol.startsWith("rivet_token.")) {
+				return "rivet_token.<redacted>";
+			}
+			if (protocol.startsWith("rivet_conn_params.")) {
+				return "rivet_conn_params.<redacted>";
+			}
+			return protocol;
+		}));
+	}
+
 	globalThis.JSON.parse = function(text, reviver) {
 		const parsed = originalJSONParse(text, reviver);
 		try {
-			patchDecodedLocalInference(parsed);
+			const patchOptions = parsedTextLocalInferencePatchOptions(text);
+			if (patchOptions.configs) {
+				patchDecodedLocalInference(parsed, patchOptions);
+			}
 		} catch {
 		}
 		return parsed;
 	};
+
+	if (typeof originalResponseJSON === "function") {
+		globalThis.Response.prototype.json = function(...args) {
+			const response = this;
+			return originalResponseJSON.apply(response, args).then((parsed) => {
+				try {
+					if (shouldPatchResponseJSON(response)) {
+						patchDecodedLocalInference(parsed, { configs: true });
+						diagnostics.responseJSONPatchCount += 1;
+					}
+				} catch {
+				}
+				return parsed;
+			});
+		};
+	}
 
 	globalThis.fetch = function(input, init) {
 		const request = input instanceof Request ? input : null;
@@ -2266,6 +3629,20 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		diagnostics.fetchRewriteCount += 1;
 		const sourceHeaders = new Headers(init?.headers || request?.headers || undefined);
 		const headers = localFetchHeaders(sourceHeaders.get("Content-Type"));
+		const forwardedHeaderNames = new Set([
+			"accept",
+			"x-rivet-actor",
+			"x-rivet-conn-params",
+			"x-rivet-encoding",
+			"x-rivet-skip-ready-wait",
+			"x-rivet-target",
+			"x-rivet-token",
+		]);
+		for (const [name, value] of sourceHeaders.entries()) {
+			if (forwardedHeaderNames.has(name.toLowerCase()) && !headers.has(name)) {
+				headers.set(name, value);
+			}
+		}
 
 		const requestOptions = request ? {
 			method: request.method,
@@ -2290,34 +3667,76 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			try {
 				return request.clone().text().then((text) => {
 					const body = bridgeRequestBody(sourceURL, method, text);
-					return originalFetch(targetURLForBody(body), makeOptions(body)).then((response) => {
-						rememberRemoteCreateProjectThread(sourceURL, body, response);
-						return response;
-			});
-			});
+					return ensureVisibleProjectLookupForRemoteCreate(sourceURL).then(() => {
+						return originalFetch(targetURLForBody(body), makeOptions(body)).then((response) => {
+							return rememberRemoteCreateProjectThread(sourceURL, body, response);
+						});
+					});
+				});
 			} catch {
 			}
 		}
 		const body = bridgeRequestBody(sourceURL, method, init?.body ?? requestOptions.body);
 		const options = makeOptions(body);
-		return originalFetch(targetURLForBody(body), options).then((response) => {
-			rememberRemoteCreateProjectThread(sourceURL, body, response);
-			return response;
+		return ensureVisibleProjectLookupForRemoteCreate(sourceURL).then(() => {
+			return originalFetch(targetURLForBody(body), options).then((response) => {
+				return rememberRemoteCreateProjectThread(sourceURL, body, response);
+			});
 		});
 	};
 
 	globalThis.WebSocket = new Proxy(NativeWebSocket, {
 		construct(target, args, newTarget) {
+			diagnostics.lastWebSocketProtocols = webSocketProtocolDiagnostics(args.length > 1 ? args[1] : "");
+			let rememberLocalThreadIDOnOpen = "";
 			if (args.length > 0) {
 				args[0] = localWebSocketURL(args[0]);
+				rememberLocalThreadIDOnOpen = pendingLocalBootstrapThreadID;
+				pendingLocalBootstrapThreadID = "";
 			}
-			return Reflect.construct(target, args, newTarget);
+			const socket = Reflect.construct(target, args, newTarget);
+			try {
+				diagnostics.lastWebSocketState = "constructed";
+				diagnostics.lastWebSocketReadyState = Number(socket.readyState);
+				socket.addEventListener("open", () => {
+					diagnostics.webSocketOpenCount += 1;
+					diagnostics.activeWebSocketCount += 1;
+					diagnostics.lastWebSocketState = "open";
+					diagnostics.lastWebSocketReadyState = Number(socket.readyState);
+					if (rememberLocalThreadIDOnOpen) {
+						rememberLocalThreadID(rememberLocalThreadIDOnOpen);
+					}
+				});
+				socket.addEventListener("close", (event) => {
+					diagnostics.webSocketCloseCount += 1;
+					diagnostics.activeWebSocketCount = Math.max(0, diagnostics.activeWebSocketCount - 1);
+					diagnostics.lastWebSocketState = "closed";
+					diagnostics.lastWebSocketReadyState = Number(socket.readyState);
+					diagnostics.lastWebSocketCloseCode = Number(event?.code || 0);
+					diagnostics.lastWebSocketCloseReason = String(event?.reason || "");
+				});
+				socket.addEventListener("error", () => {
+					diagnostics.webSocketErrorCount += 1;
+					diagnostics.lastWebSocketState = "error";
+					diagnostics.lastWebSocketReadyState = Number(socket.readyState);
+				});
+				globalThis.setTimeout(() => {
+					diagnostics.lastWebSocketReadyState = Number(socket.readyState);
+					if (diagnostics.lastWebSocketState === "constructed") {
+						diagnostics.lastWebSocketState = ["connecting", "open", "closing", "closed"][socket.readyState] || "unknown";
+					}
+				}, 3000);
+			} catch {
+			}
+			return socket;
 		},
 	});
 
 	globalThis.__cliproxyAmpLocalInference = {
+		userscriptVersion,
 		apiKeyStorageKey,
 		workingDirectoryStorageKey,
+		selectedLocalProjectStorageKey,
 		localThreadIDsStorageKey,
 		threadWorkingDirectoriesStorageKey,
 		defaultBaseURL,
@@ -2333,8 +3752,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		installLocalThreadControls();
 	}
 
-	refreshLocalSidebarProjects();
-})();
+	})();
 `, matchLines, userscriptURL, userscriptURL, strconv.Quote(ampWebLocalInferenceHeader), strconv.Quote(baseURL))
 }
 

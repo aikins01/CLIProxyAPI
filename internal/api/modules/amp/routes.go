@@ -147,7 +147,11 @@ func (m *AmpModule) managementAvailabilityMiddleware() gin.HandlerFunc {
 func wrapManagementAuth(auth gin.HandlerFunc, prefixes ...string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		path := c.Request.URL.Path
-		if !c.GetBool(ampWebLocalInferenceCORSContextKey) && actorEngineRequest(c.Request) {
+		if actorEngineRequest(c.Request) {
+			if c.GetBool(ampWebLocalInferenceCORSContextKey) {
+				auth(c)
+				return
+			}
 			c.Next()
 			return
 		}
@@ -228,6 +232,7 @@ func requestAddrIP(addr string) net.IP {
 // The auth middleware validates Authorization header against configured API keys.
 func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *handlers.BaseAPIHandler, auth gin.HandlerFunc) {
 	engine.GET("/ampcode/local-inference.user.js", m.serveWebLocalInferenceUserscript)
+	engine.HEAD("/ampcode/local-inference.user.js", m.serveWebLocalInferenceUserscript)
 
 	ampAPI := engine.Group("/api")
 
@@ -328,6 +333,12 @@ func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *ha
 	}
 	// Add clientAPIKeyMiddleware after auth for per-client upstream routing
 	rootMiddleware = append(rootMiddleware, clientAPIKeyMiddleware())
+	localProjectMiddleware := []gin.HandlerFunc{m.webLocalInferenceCORSMiddleware(), m.webLocalInferenceQueryAuthMiddleware(), noCORSMiddleware(), m.localhostOnlyMiddleware()}
+	if auth != nil {
+		localProjectMiddleware = append(localProjectMiddleware, auth)
+	}
+	localProjectMiddleware = append(localProjectMiddleware, clientAPIKeyMiddleware())
+	engine.Any("/ampcode/local-projects.json", append(localProjectMiddleware, m.serveWebLocalProjects)...)
 	engine.Any("/threads", append(rootMiddleware, proxyHandler)...)
 	engine.Any("/threads/*path", append(rootMiddleware, proxyHandler)...)
 	engine.GET("/docs", append(rootMiddleware, proxyHandler)...)
@@ -534,12 +545,7 @@ func neoWebLocalInternalRPCSupported(method string) bool {
 	if neoLocalInternalRPCSupported(method) {
 		return true
 	}
-	switch strings.ToLower(strings.TrimSpace(method)) {
-	case "listthreads", "loadthreads", "getthread", "readthread", "getthreadtail", "loadthreadtail", "getthreadmeta":
-		return true
-	default:
-		return false
-	}
+	return false
 }
 
 func (m *AmpModule) tryServeNeoLocalInternalRPC(c *gin.Context) bool {

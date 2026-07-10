@@ -182,7 +182,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	body, _ = sjson.DeleteBytes(body, "safety_identifier")
 	body, _ = sjson.DeleteBytes(body, "stream_options")
 	body = normalizeCodexInstructions(body)
-	if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
+	if shouldEnsureImageGenerationTool(e.cfg, opts) {
 		body = ensureImageGenerationTool(body, baseModel, auth)
 	}
 
@@ -333,7 +333,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body, _ = sjson.DeleteBytes(body, "stream")
 	body = normalizeCodexInstructions(body)
-	if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
+	if shouldEnsureImageGenerationTool(e.cfg, opts) {
 		body = ensureImageGenerationTool(body, baseModel, auth)
 	}
 
@@ -431,7 +431,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	body, _ = sjson.DeleteBytes(body, "stream_options")
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body = normalizeCodexInstructions(body)
-	if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
+	if shouldEnsureImageGenerationTool(e.cfg, opts) {
 		body = ensureImageGenerationTool(body, baseModel, auth)
 	}
 
@@ -904,6 +904,13 @@ func isCodexFreePlanAuth(auth *cliproxyauth.Auth) bool {
 		return false
 	}
 	return strings.EqualFold(strings.TrimSpace(auth.Attributes["plan_type"]), "free")
+}
+
+func shouldEnsureImageGenerationTool(cfg *config.Config, opts cliproxyexecutor.Options) bool {
+	if cfg != nil && cfg.DisableImageGeneration != config.DisableImageGenerationOff {
+		return false
+	}
+	return strings.TrimSpace(opts.Headers.Get(localNeoInferenceHeaderName)) != "1"
 }
 
 func ensureImageGenerationTool(body []byte, baseModel string, auth *cliproxyauth.Auth) []byte {

@@ -67,17 +67,15 @@ type neoSubagentDef struct {
 	MaxTurns        int
 }
 
-// neoSubagentDefs maps the model-facing tool name to its definition. Keys match
-// the names the binary advertises and the model calls. Models/includeTools come
-// from Amp subagent routing (finder→haiku, oracle→Claude Fable 5, librarian→gpt-5.5).
 var neoSubagentDefs = map[string]neoSubagentDef{
 	"finder": {
-		Key:          "finder",
-		DisplayName:  "Finder",
-		Route:        neoModelRoute{Provider: "anthropic", Model: "claude-haiku-4-5-20251001"},
-		IncludeTools: []string{"Grep", "glob", "Read"},
-		SystemPrompt: neoFinderSubagentPrompt,
-		MaxTurns:     6,
+		Key:             "finder",
+		DisplayName:     "Finder",
+		Route:           neoModelRoute{Provider: "google", Model: "gemini-3.5-flash"},
+		IncludeTools:    []string{"Grep", "glob", "Read"},
+		SystemPrompt:    neoFinderSubagentPrompt,
+		ReasoningEffort: "low",
+		MaxTurns:        6,
 	},
 	"oracle": {
 		Key:             "oracle",
@@ -91,7 +89,7 @@ var neoSubagentDefs = map[string]neoSubagentDef{
 	"librarian": {
 		Key:             "librarian",
 		DisplayName:     "Librarian",
-		Route:           neoModelRoute{Provider: "openai", Model: "gpt-5.5"},
+		Route:           neoModelRoute{Provider: "openai", Model: "gpt-5.6-sol"},
 		IncludeTools:    []string{"read_github", "search_github", "commit_search", "diff", "list_directory_github", "list_repositories", "glob_github"},
 		SystemPrompt:    neoLibrarianSubagentPrompt,
 		ReasoningEffort: "none",
@@ -105,16 +103,14 @@ var neoSubagentDefs = map[string]neoSubagentDef{
 		SystemPrompt: neoTaskSubagentPrompt,
 		MaxTurns:     30,
 	},
-	// run_check backs the review agent mode. The retired client-side check
-	// runner executed per-check agents on Haiku; that route is kept here now
-	// that the runner is server-owned.
 	"run_check": {
-		Key:          "run_check",
-		DisplayName:  "Check",
-		Route:        neoModelRoute{Provider: "anthropic", Model: "claude-haiku-4-5-20251001"},
-		IncludeTools: []string{"Read", "Grep", "glob", "Bash"},
-		SystemPrompt: neoRunCheckSubagentPrompt,
-		MaxTurns:     12,
+		Key:             "run_check",
+		DisplayName:     "Check",
+		Route:           neoModelRoute{Provider: "openai", Model: "gpt-5.6-terra"},
+		IncludeTools:    []string{"Read", "Grep", "glob", "Bash"},
+		SystemPrompt:    neoRunCheckSubagentPrompt,
+		ReasoningEffort: "low",
+		MaxTurns:        12,
 	},
 }
 
@@ -249,6 +245,9 @@ func (a *neoActor) executeSubagentRun(name string, input map[string]any, parentT
 	settings := cloneMap(a.settings)
 	if def.ReasoningEffort != "" {
 		settings["reasoning.effort"] = def.ReasoningEffort
+		if (route.Provider == "google" || route.Provider == "vertexai") && validNeoGeminiThinkingLevel(def.ReasoningEffort) {
+			settings["gemini.thinkingLevel"] = def.ReasoningEffort
+		}
 	}
 	environment := cloneMap(a.environment)
 	maxTokens := a.maxTokens
@@ -343,7 +342,10 @@ func (a *neoActor) executeSubagentRun(name string, input map[string]any, parentT
 				}
 				a.storeSubagentToolResultMessage(call.ID, run, parentToolCallID, "")
 			} else if call.Name == "read_thread" && a.shouldRunLocalActorTool(call.Name) {
-				text, err := a.executeLocalReadThread(neoPendingTool{ID: call.ID, Name: call.Name, Input: call.Input, AgentMode: agentMode, ParentToolCallID: parentToolCallID, MessageID: childMessageID, ClientAPIKey: clientAPIKey}, generation)
+				readPending := neoPendingTool{ID: call.ID, Name: call.Name, Input: call.Input, AgentMode: agentMode, ParentToolCallID: parentToolCallID, MessageID: childMessageID, ClientAPIKey: clientAPIKey}
+				text, err := a.executeLocalReadThreadWithProgress(readPending, generation, func(statusMessage string) {
+					a.storeSubagentToolResultMessage(call.ID, neoReadThreadProgressRun(statusMessage), parentToolCallID, "tool_progress")
+				})
 				if a.subagentGenerationStale(generation) {
 					return "", nil
 				}
@@ -452,6 +454,46 @@ func (a *neoActor) storeSubagentToolResultMessage(toolCallID string, run map[str
 	a.mu.Unlock()
 
 	a.broadcast(event)
+	a.syncCloudAsync()
+}
+
+type neoSubagentToolExchange struct {
+	Call neoToolCall
+	Run  map[string]any
+}
+
+func (a *neoActor) storeSubagentToolExchanges(exchanges []neoSubagentToolExchange, parentToolCallID string) {
+	if len(exchanges) == 0 {
+		return
+	}
+	events := make([]map[string]any, 0, len(exchanges)*2)
+	a.mu.Lock()
+	for _, exchange := range exchanges {
+		_, useEvent := a.storeMessageEventLocked(neoMessage{
+			ThreadID:        a.threadID,
+			Role:            "assistant",
+			MessageID:       newNeoMessageID(),
+			Content:         []any{neoToolUseBlock(exchange.Call, true)},
+			State:           map[string]any{"type": "complete", "stopReason": "tool_use"},
+			CreatedAt:       time.Now().UTC().Format(time.RFC3339Nano),
+			ParentToolUseID: parentToolCallID,
+		})
+		events = append(events, useEvent)
+		_, resultEvent := a.storeMessageEventLocked(neoMessage{
+			ThreadID:        a.threadID,
+			Role:            "user",
+			MessageID:       toolResultMessageID(exchange.Call.ID),
+			Content:         []any{map[string]any{"type": "tool_result", "toolUseID": exchange.Call.ID, "run": exchange.Run}},
+			CreatedAt:       time.Now().UTC().Format(time.RFC3339Nano),
+			ParentToolUseID: parentToolCallID,
+		})
+		events = append(events, resultEvent)
+	}
+	a.mu.Unlock()
+
+	for _, event := range events {
+		a.broadcast(event)
+	}
 	a.syncCloudAsync()
 }
 

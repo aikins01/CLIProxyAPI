@@ -858,6 +858,188 @@ func TestScanThreadDirFindsDanglingCompleteToolUseBeforeAssistantMessage(t *test
 	}
 }
 
+func TestScanThreadDirAllowsNestedReadThreadChildMessagesBeforeParentResult(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "T-test.json"), map[string]any{
+		"id": "T-test",
+		"messages": []any{
+			map[string]any{
+				"messageId": "M-read",
+				"role":      "assistant",
+				"state":     map[string]any{"type": "complete", "stopReason": "end_turn"},
+				"content": []any{map[string]any{
+					"type":     "tool_use",
+					"id":       "TU-read",
+					"name":     "read_thread",
+					"complete": true,
+					"input":    map[string]any{"threadID": "T-source"},
+				}},
+			},
+			map[string]any{
+				"messageId":       "M-child-tool",
+				"parentToolUseId": "TU-read",
+				"role":            "assistant",
+				"state":           map[string]any{"type": "complete", "stopReason": "end_turn"},
+				"content": []any{map[string]any{
+					"type":     "tool_use",
+					"id":       "TU-overview",
+					"name":     "thread_overview",
+					"complete": true,
+				}},
+			},
+			map[string]any{
+				"messageId":       "M-child-result",
+				"parentToolUseId": "TU-read",
+				"role":            "user",
+				"content": []any{map[string]any{
+					"type":      "tool_result",
+					"toolUseID": "TU-overview",
+					"run":       map[string]any{"status": "done", "result": map[string]any{"messageCount": 3}},
+				}},
+			},
+			map[string]any{
+				"messageId": "M-read-result",
+				"role":      "user",
+				"content": []any{map[string]any{
+					"type":      "tool_result",
+					"toolUseID": "TU-read",
+					"run":       map[string]any{"status": "done", "result": "thread summary"},
+				}},
+			},
+		},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("findings = %#v, want none for nested read_thread child messages", findings)
+	}
+}
+
+func TestScanThreadDirFindsDanglingNestedToolUseAfterParentResult(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "T-test.json"), map[string]any{
+		"id": "T-test",
+		"messages": []any{
+			map[string]any{
+				"messageId": "M-read",
+				"role":      "assistant",
+				"state":     map[string]any{"type": "complete", "stopReason": "tool_use"},
+				"content": []any{map[string]any{
+					"type":     "tool_use",
+					"id":       "TU-read",
+					"name":     "read_thread",
+					"complete": true,
+					"input":    map[string]any{"threadID": "T-source"},
+				}},
+			},
+			map[string]any{
+				"messageId":       "M-child-tool",
+				"parentToolUseId": "TU-read",
+				"role":            "assistant",
+				"state":           map[string]any{"type": "complete", "stopReason": "tool_use"},
+				"content": []any{map[string]any{
+					"type":     "tool_use",
+					"id":       "TU-overview",
+					"name":     "thread_overview",
+					"complete": true,
+				}},
+			},
+			map[string]any{
+				"messageId": "M-read-result",
+				"role":      "user",
+				"content": []any{map[string]any{
+					"type":      "tool_result",
+					"toolUseID": "TU-read",
+					"run":       map[string]any{"status": "done", "result": "thread summary"},
+				}},
+			},
+			map[string]any{
+				"messageId": "M-answer",
+				"role":      "assistant",
+				"state":     map[string]any{"type": "complete", "stopReason": "end_turn"},
+				"content":   []any{map[string]any{"type": "text", "text": "done"}},
+			},
+		},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 1 {
+		t.Fatalf("findings = %#v, want dangling nested tool use", findings)
+	}
+	if findings[0].CallID != "TU-overview" || !strings.Contains(findings[0].Detail, "later assistant message") {
+		t.Fatalf("finding = %#v", findings[0])
+	}
+}
+
+func TestScanThreadDirAllowsInterleavedNestedToolResultsByParent(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "T-test.json"), map[string]any{
+		"id": "T-test",
+		"messages": []any{
+			map[string]any{
+				"messageId":       "M-child-a-tool",
+				"parentToolUseId": "TU-parent-a",
+				"role":            "assistant",
+				"state":           map[string]any{"type": "complete", "stopReason": "tool_use"},
+				"content": []any{map[string]any{
+					"type":     "tool_use",
+					"id":       "TU-search-a",
+					"name":     "search_thread_messages",
+					"complete": true,
+					"input":    map[string]any{"query": "first parent"},
+				}},
+			},
+			map[string]any{
+				"messageId":       "M-child-b-tool",
+				"parentToolUseId": "TU-parent-b",
+				"role":            "assistant",
+				"state":           map[string]any{"type": "complete", "stopReason": "tool_use"},
+				"content": []any{map[string]any{
+					"type":     "tool_use",
+					"id":       "TU-search-b",
+					"name":     "search_thread_messages",
+					"complete": true,
+					"input":    map[string]any{"query": "second parent"},
+				}},
+			},
+			map[string]any{
+				"messageId":       "M-child-a-result",
+				"parentToolUseId": "TU-parent-a",
+				"role":            "user",
+				"content": []any{map[string]any{
+					"type":      "tool_result",
+					"toolUseID": "TU-search-a",
+					"run":       map[string]any{"status": "done", "result": map[string]any{"hits": []any{}}},
+				}},
+			},
+			map[string]any{
+				"messageId":       "M-child-b-result",
+				"parentToolUseId": "TU-parent-b",
+				"role":            "user",
+				"content": []any{map[string]any{
+					"type":      "tool_result",
+					"toolUseID": "TU-search-b",
+					"run":       map[string]any{"status": "done", "result": map[string]any{"hits": []any{}}},
+				}},
+			},
+		},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("findings = %#v, want none for interleaved nested tool results", findings)
+	}
+}
+
 func TestScanThreadDirIgnoresReviewModeDanglingToolUse(t *testing.T) {
 	dir := t.TempDir()
 	writeJSONFile(t, filepath.Join(dir, "T-test.json"), map[string]any{

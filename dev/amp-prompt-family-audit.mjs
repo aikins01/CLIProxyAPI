@@ -26,12 +26,15 @@ const source = fs.readFileSync(sourcePath, "utf8");
 const binary = fs.readFileSync(binaryPath).toString("latin1");
 
 const promptBlobs = {
+  smart: "neoPromptFamilySmartGzip",
   aggman: "neoPromptFamilyAggManGzip",
   rush: "neoPromptFamilyRushGzip",
   gpt: "neoPromptFamilyGPTGzip",
   "gpt-5-codex": "neoPromptFamilyGPT5CodexGzip",
   "deep-gpt5.4": "neoPromptFamilyDeepGPT54Gzip",
   deep: "neoPromptFamilyDeepGzip",
+  "glm-5.2": "neoPromptFamilyGLM52Gzip",
+  fable: "neoPromptFamilyFableGzip",
   xai: "neoPromptFamilyXAIGzip",
   kimi: "neoPromptFamilyKimiGzip",
   default: "neoPromptFamilyDefaultGzip",

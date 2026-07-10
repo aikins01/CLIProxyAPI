@@ -53,7 +53,7 @@ func TestClassifyStringsExtractsParitySignals(t *testing.T) {
 		`Do not include run_check findings in submit_review`,
 		`CLI appends structured check findings mechanically`,
 		`"instructions": "Outcome-first brief for the check agent (see system guidance)."`,
-		`"checkURI"in o&&typeof o.checkURI==="string";"checkName"in o&&typeof o.checkName==="string"`,
+		`let o=input,k=o&&typeof o==="object"&&"checkURI"in o&&typeof o.checkURI==="string"?o.checkURI:void 0,p=o&&typeof o==="object"&&"checkName"in o&&typeof o.checkName==="string"?o.checkName:void 0`,
 		`severity!=="low" The following checks were run`,
 		"rR.yellow(\"issues found\"); i.push(`${e.result.check.name}: ${n}`)",
 		"Please perform compaction guidance for the system prompt and code review workflow. This deliberately long prompt-like segment has enough ordinary words to be fingerprinted without storing the body in the baseline.",
@@ -302,6 +302,16 @@ func TestClassifyStringsRejectsReviewContractNearMisses(t *testing.T) {
 			marker: "run-check-uri-input-shape",
 		},
 		{
+			name:   "run check uri shape requires same validated object",
+			strs:   []string{`"checkURI"in a&&typeof a.checkURI==="string";"checkName"in b&&typeof b.checkName==="string"`},
+			marker: "run-check-uri-input-shape",
+		},
+		{
+			name:   "run check uri shape rejects reused object name in separate scopes",
+			strs:   []string{`function a(){return "checkURI"in o&&typeof o.checkURI==="string"}function b(){return "checkName"in o&&typeof o.checkName==="string"}`},
+			marker: "run-check-uri-input-shape",
+		},
+		{
 			name:   "instructions shape requires json field context",
 			strs:   []string{`instructions Outcome-first brief for the check agent`},
 			marker: "run-check-instructions-input-shape",
@@ -349,7 +359,17 @@ func TestClassifyStringsDetectsReviewContractMarkers(t *testing.T) {
 		},
 		{
 			name:   "run check uri input shape",
+			str:    `let o=input,k=o&&typeof o==="object"&&"checkURI"in o&&typeof o.checkURI==="string"?o.checkURI:void 0,p=o&&typeof o==="object"&&"checkName"in o&&typeof o.checkName==="string"?o.checkName:void 0`,
+			marker: "run-check-uri-input-shape",
+		},
+		{
+			name:   "run check uri input shape with adjacent statements",
 			str:    `"checkURI"in o&&typeof o.checkURI==="string";"checkName"in o&&typeof o.checkName==="string"`,
+			marker: "run-check-uri-input-shape",
+		},
+		{
+			name:   "run check uri input shape with remapped minifier variable",
+			str:    `let _=o.input,k=_&&typeof _==="object"&&"checkURI"in _&&typeof _.checkURI==="string"?_.checkURI:void 0,p=_&&typeof _==="object"&&"checkName"in _&&typeof _.checkName==="string"?_.checkName:void 0`,
 			marker: "run-check-uri-input-shape",
 		},
 		{
@@ -551,14 +571,14 @@ func TestCommittedBaselineMatchesInstalledAmpBinaryWhenPathMatches(t *testing.T)
 
 var knownPromptTagSetCountValues = map[string]int{
 	"prompt/compaction":                 6,
-	"prompt/compaction,tools":           1,
 	"prompt/guidance":                   6,
 	"prompt/painter":                    1,
 	"prompt/painter,skills":             1,
-	"prompt/skills":                     5,
+	"prompt/settings,tools":             1,
+	"prompt/skills":                     4,
 	"prompt/skills,system-prompt,tools": 1,
-	"prompt/skills,tools":               1,
-	"prompt/tools":                      34,
+	"prompt/skills,tools":               3,
+	"prompt/tools":                      36,
 	"source/artifacts,compaction,guidance,skills,tools": 1,
 	"source/artifacts,code-review,painter,skills,tools": 1,
 	"source/code-review,guidance,settings":              1,
@@ -566,22 +586,22 @@ var knownPromptTagSetCountValues = map[string]int{
 	"source/compaction":                                 6,
 	"source/compaction,painter,skills,tools":            1,
 	"source/compaction,skills,tools":                    3,
-	"source/compaction,tools":                           8,
-	"source/guidance":                                   6,
+	"source/compaction,tools":                           7,
+	"source/guidance":                                   7,
 	"source/guidance,settings":                          1,
 	"source/guidance,settings,skills,tools":             1,
-	"source/guidance,skills":                            1,
+	"source/guidance,skills":                            2,
 	"source/guidance,skills,tools":                      2,
-	"source/guidance,tools":                             12,
+	"source/guidance,tools":                             11,
 	"source/painter":                                    1,
 	"source/painter,tools":                              2,
-	"source/settings":                                   3,
-	"source/settings,skills,tools":                      4,
+	"source/settings":                                   4,
+	"source/settings,skills,tools":                      2,
 	"source/settings,system-prompt,tools":               1,
 	"source/settings,tools":                             9,
 	"source/skills":                                     12,
-	"source/skills,tools":                               11,
-	"source/tools":                                      98,
+	"source/skills,tools":                               15,
+	"source/tools":                                      101,
 }
 
 func TestLifecycleChecklistKnownPromptTagCountsRunFocusedChecks(t *testing.T) {
@@ -589,6 +609,7 @@ func TestLifecycleChecklistKnownPromptTagCountsRunFocusedChecks(t *testing.T) {
 		"prompt/compaction":    {"compaction and continuation prompts"},
 		"prompt/guidance":      {"compaction and continuation prompts", "streaming assistant and tool edits"},
 		"prompt/painter":       {"tools, code review, skills, and images"},
+		"prompt/settings":      {"model routing, modes, and reasoning", "remote web control surface"},
 		"prompt/skills":        {"tools, code review, skills, and images"},
 		"prompt/system-prompt": {"compaction and continuation prompts", "streaming assistant and tool edits"},
 		"prompt/tools":         {"tools, code review, skills, and images", "streaming assistant and tool edits", "upstream-owned thread read and search", "remote web control surface"},
@@ -3261,6 +3282,7 @@ func TestLifecycleChecklistCommittedPromptTagCountsMapToFocusedChecks(t *testing
 		"prompt/compaction":    {"compaction and continuation prompts"},
 		"prompt/guidance":      {"streaming assistant and tool edits", "compaction and continuation prompts"},
 		"prompt/painter":       {"tools, code review, skills, and images"},
+		"prompt/settings":      {"model routing, modes, and reasoning", "remote web control surface"},
 		"prompt/skills":        {"tools, code review, skills, and images"},
 		"prompt/system-prompt": {"streaming assistant and tool edits", "compaction and continuation prompts"},
 		"prompt/tools":         {"streaming assistant and tool edits", "tools, code review, skills, and images"},
@@ -4366,7 +4388,7 @@ func TestBaselineWriteProblemsRejectsUnexpectedRawReleaseSignals(t *testing.T) {
 			StreamJSONMarkers:   []string{"future_stream_field"},
 			ModeSettingMarkers:  []string{"futureModeDefault"},
 			ProviderProtocol:    []string{"future-provider-header"},
-			ReviewContract:      []string{"run-check-uri-input-shape"},
+			ReviewContract:      []string{"future-review-contract"},
 			Settings:            []string{"future.setting"},
 			Models:              []string{"future-model"},
 			ActorRuntime:        []string{"futureActor"},
@@ -4381,7 +4403,7 @@ func TestBaselineWriteProblemsRejectsUnexpectedRawReleaseSignals(t *testing.T) {
 	assertContainsString(t, text, "thread_delta_events:future:event")
 	assertContainsString(t, text, "thread_reader_markers:futureReader")
 	assertContainsString(t, text, "tool_catalog_markers:future_tool")
-	assertContainsString(t, text, "review_contract_markers:run-check-uri-input-shape")
+	assertContainsString(t, text, "review_contract_markers:future-review-contract")
 	assertContainsString(t, text, "settings:future.setting")
 	assertContainsString(t, text, "actor_runtime_markers:futureActor")
 	if !strictAuditFailed(snapshot, auditDiff{}) {

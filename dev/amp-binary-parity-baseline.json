@@ -2,18 +2,18 @@
   "schema": 33,
   "source": {
     "path": "/Users/aikins01/.amp/bin/amp",
-    "sha256": "0b8d557b206073550eadc8543e12e6de29bf21dd8fda532049c4499c8e472443",
-    "size_bytes": 70860002,
-    "mod_time": "2026-07-04T00:53:39Z",
+    "sha256": "f97a3f070b192930e84e8fde6295a3ba64521a6f5767ed06e4479b9c45672874",
+    "size_bytes": 70893026,
+    "mod_time": "2026-07-09T20:22:52Z",
     "versions": [
-      "0.0.1783124438-g15510a"
+      "0.0.1783626973-gd97022"
     ],
     "build_stamps": [
       "2024-01-15T10:30:00Z",
-      "2026-07-04T00:25:54.488Z",
+      "2026-07-09T20:01:38.994Z",
       "2050-01-01T00:00:00Z"
     ],
-    "strings_scanned": 298208
+    "strings_scanned": 298171
   },
   "signals": {
     "routes": [
@@ -295,7 +295,6 @@
       "retry_cancelled",
       "retry_scheduled",
       "retry_started",
-      "thread_relationships",
       "thread_settings",
       "thread_status",
       "thread_title",
@@ -671,10 +670,6 @@
         "area": "retry"
       },
       {
-        "name": "thread_relationships",
-        "area": "relationship"
-      },
-      {
         "name": "thread_settings",
         "area": "settings"
       },
@@ -710,7 +705,6 @@
     "thread_reader_markers": [
       "getThread",
       "getThreadLabels",
-      "getThreadLinkInfo",
       "getThreadMeta",
       "getThreadTail",
       "listThreads",
@@ -727,10 +721,6 @@
       },
       {
         "name": "getThreadLabels",
-        "area": "internal-rpc"
-      },
-      {
-        "name": "getThreadLinkInfo",
         "area": "internal-rpc"
       },
       {
@@ -1068,7 +1058,8 @@
       "human-review-filters-low-severity",
       "review-cli-appends-check-findings",
       "review-submit-omits-run-check-findings",
-      "run-check-instructions-input-shape"
+      "run-check-instructions-input-shape",
+      "run-check-uri-input-shape"
     ],
     "agent_mode_profiles": [
       {
@@ -1092,6 +1083,7 @@
           "unarchive_thread",
           "send_message_to_thread",
           "publish_thread_artifacts",
+          "manage_automation",
           "slack_write",
           "slack_read",
           "github_repo_ci_status",
@@ -1125,6 +1117,7 @@
           "read_web_page",
           "Task",
           "skill",
+          "load_plugin",
           "read_thread",
           "find_thread",
           "librarian",
@@ -1133,11 +1126,46 @@
           "view_media",
           "painter",
           "archive_current_thread",
+          "manage_automation",
+          "slack_write",
+          "slack_read",
+          "send_message_to_agg"
+        ],
+        "deferred_tools": true,
+        "visible": false,
+        "visible_in_v2": false,
+        "server_only": false
+      },
+      {
+        "name": "high",
+        "primary_model": "GPT_5_5",
+        "reasoning_effort": "xhigh",
+        "include_tools": "present",
+        "tool_names": [
+          "shell_command",
+          "shell_command_status",
+          "apply_patch",
+          "web_search",
+          "read_web_page",
+          "Task",
+          "skill",
+          "load_plugin",
+          "read_thread",
+          "find_thread",
+          "librarian",
+          "oracle",
+          "finder",
+          "view_media",
+          "painter",
+          "archive_current_thread",
+          "manage_automation",
+          "slack_write",
+          "slack_read",
           "send_message_to_agg"
         ],
         "deferred_tools": true,
         "visible": true,
-        "visible_in_v2": false,
+        "visible_in_v2": true,
         "server_only": false
       },
       {
@@ -1146,7 +1174,8 @@
         "include_tools": "present",
         "tool_names": [
           "finder",
-          "Bash",
+          "shell_command",
+          "shell_command_status",
           "create_file",
           "edit_file",
           "web_search",
@@ -1154,6 +1183,7 @@
           "read_thread",
           "find_thread",
           "skill",
+          "load_plugin",
           "oracle",
           "librarian",
           "Task",
@@ -1161,11 +1191,77 @@
           "painter",
           "read_mcp_resource",
           "archive_current_thread",
+          "manage_automation",
+          "slack_write",
+          "slack_read",
           "send_message_to_agg"
         ],
         "deferred_tools": true,
         "visible": false,
         "visible_in_v2": false,
+        "server_only": false
+      },
+      {
+        "name": "low",
+        "primary_model": "AMP_GLM_5_2",
+        "reasoning_effort": "medium",
+        "include_tools": "present",
+        "tool_names": [
+          "finder",
+          "shell_command",
+          "shell_command_status",
+          "apply_patch",
+          "web_search",
+          "read_web_page",
+          "read_thread",
+          "find_thread",
+          "skill",
+          "load_plugin",
+          "oracle",
+          "librarian",
+          "Task",
+          "view_media",
+          "painter",
+          "archive_current_thread",
+          "manage_automation",
+          "slack_write",
+          "slack_read",
+          "send_message_to_agg"
+        ],
+        "visible": true,
+        "visible_in_v2": true,
+        "server_only": false
+      },
+      {
+        "name": "medium",
+        "primary_model": "GPT_5_5",
+        "reasoning_effort": "medium",
+        "include_tools": "present",
+        "tool_names": [
+          "shell_command",
+          "shell_command_status",
+          "apply_patch",
+          "web_search",
+          "read_web_page",
+          "Task",
+          "skill",
+          "load_plugin",
+          "read_thread",
+          "find_thread",
+          "librarian",
+          "oracle",
+          "finder",
+          "view_media",
+          "painter",
+          "archive_current_thread",
+          "manage_automation",
+          "slack_write",
+          "slack_read",
+          "send_message_to_agg"
+        ],
+        "deferred_tools": true,
+        "visible": true,
+        "visible_in_v2": true,
         "server_only": false
       },
       {
@@ -1175,7 +1271,8 @@
         "include_tools": "present",
         "tool_names": [
           "finder",
-          "Bash",
+          "shell_command",
+          "shell_command_status",
           "create_file",
           "edit_file",
           "web_search",
@@ -1183,6 +1280,7 @@
           "read_thread",
           "find_thread",
           "skill",
+          "load_plugin",
           "oracle",
           "librarian",
           "Task",
@@ -1190,13 +1288,14 @@
           "painter",
           "read_mcp_resource",
           "archive_current_thread",
+          "manage_automation",
+          "slack_write",
+          "slack_read",
           "send_message_to_agg",
-          "shell_command",
-          "shell_command_status",
           "apply_patch"
         ],
         "visible": true,
-        "visible_in_v2": false,
+        "visible_in_v2": true,
         "server_only": false
       },
       {
@@ -1225,19 +1324,22 @@
           "apply_patch",
           "web_search",
           "read_web_page",
-          "read_mcp_resource",
           "read_thread",
           "find_thread",
           "skill",
+          "load_plugin",
           "oracle",
           "librarian",
           "Task",
           "view_media",
           "painter",
           "archive_current_thread",
+          "manage_automation",
+          "slack_write",
+          "slack_read",
           "send_message_to_agg"
         ],
-        "visible": true,
+        "visible": false,
         "visible_in_v2": false,
         "server_only": false
       },
@@ -1253,7 +1355,8 @@
         "include_tools": "present",
         "tool_names": [
           "finder",
-          "Bash",
+          "shell_command",
+          "shell_command_status",
           "create_file",
           "edit_file",
           "web_search",
@@ -1261,6 +1364,7 @@
           "read_thread",
           "find_thread",
           "skill",
+          "load_plugin",
           "oracle",
           "librarian",
           "Task",
@@ -1268,11 +1372,48 @@
           "painter",
           "read_mcp_resource",
           "archive_current_thread",
+          "manage_automation",
+          "slack_write",
+          "slack_read",
+          "send_message_to_agg"
+        ],
+        "deferred_tools": true,
+        "visible": false,
+        "visible_in_v2": false,
+        "server_only": false
+      },
+      {
+        "name": "ultra",
+        "primary_model": "CLAUDE_FABLE_5",
+        "reasoning_effort": "high",
+        "include_tools": "present",
+        "tool_names": [
+          "finder",
+          "shell_command",
+          "shell_command_status",
+          "create_file",
+          "edit_file",
+          "web_search",
+          "read_web_page",
+          "read_thread",
+          "find_thread",
+          "skill",
+          "load_plugin",
+          "oracle",
+          "librarian",
+          "Task",
+          "view_media",
+          "painter",
+          "read_mcp_resource",
+          "archive_current_thread",
+          "manage_automation",
+          "slack_write",
+          "slack_read",
           "send_message_to_agg"
         ],
         "deferred_tools": true,
         "visible": true,
-        "visible_in_v2": false,
+        "visible_in_v2": true,
         "server_only": false
       }
     ],
@@ -1296,12 +1437,39 @@
         "max_output_tokens": 128000
       },
       {
+        "name": "high",
+        "provider": "openai",
+        "model": "gpt-5.5",
+        "primary_model": "GPT_5_5",
+        "reasoning_effort": "xhigh",
+        "context_window": 400000,
+        "max_output_tokens": 128000
+      },
+      {
         "name": "large",
         "provider": "anthropic",
         "model": "claude-opus-4-8",
         "primary_model": "CLAUDE_OPUS_4_8",
         "context_window": 332000,
         "max_output_tokens": 32000
+      },
+      {
+        "name": "low",
+        "provider": "amp",
+        "model": "glm-5.2",
+        "primary_model": "AMP_GLM_5_2",
+        "reasoning_effort": "medium",
+        "context_window": 200000,
+        "max_output_tokens": 32000
+      },
+      {
+        "name": "medium",
+        "provider": "openai",
+        "model": "gpt-5.5",
+        "primary_model": "GPT_5_5",
+        "reasoning_effort": "medium",
+        "context_window": 400000,
+        "max_output_tokens": 128000
       },
       {
         "name": "nostromo",
@@ -1338,6 +1506,15 @@
         "reasoning_effort": "high",
         "context_window": 332000,
         "max_output_tokens": 32000
+      },
+      {
+        "name": "ultra",
+        "provider": "anthropic",
+        "model": "claude-fable-5",
+        "primary_model": "CLAUDE_FABLE_5",
+        "reasoning_effort": "high",
+        "context_window": 332000,
+        "max_output_tokens": 128000
       }
     ],
     "agent_mode_coverage": [
@@ -1350,7 +1527,19 @@
         "scope": "local-runtime"
       },
       {
+        "name": "high",
+        "scope": "local-runtime"
+      },
+      {
         "name": "large",
+        "scope": "local-runtime"
+      },
+      {
+        "name": "low",
+        "scope": "local-runtime"
+      },
+      {
+        "name": "medium",
         "scope": "local-runtime"
       },
       {
@@ -1367,6 +1556,10 @@
       },
       {
         "name": "smart",
+        "scope": "local-runtime"
+      },
+      {
+        "name": "ultra",
         "scope": "local-runtime"
       }
     ],
@@ -1396,6 +1589,7 @@
       "openai.speed",
       "permissions",
       "proxy",
+      "remoteThreadCreation.enabled",
       "showCosts",
       "skills.disableClaudeCodeSkills",
       "skills.path",
@@ -1403,6 +1597,7 @@
       "terminal.animation",
       "terminal.copyOnSelect",
       "terminal.detailsExpandedByDefault",
+      "thread.autoArchiveOnQuit",
       "tools.disable",
       "tools.enable",
       "updates.mode",
@@ -1520,6 +1715,11 @@
         "scope": "amp-owned"
       },
       {
+        "name": "remoteThreadCreation.enabled",
+        "value": "false",
+        "scope": "remote-web"
+      },
+      {
         "name": "showCosts",
         "value": "true",
         "scope": "remote-web"
@@ -1553,6 +1753,11 @@
         "name": "terminal.detailsExpandedByDefault",
         "value": "false",
         "scope": "remote-web"
+      },
+      {
+        "name": "thread.autoArchiveOnQuit",
+        "value": "false",
+        "scope": "amp-owned"
       },
       {
         "name": "tools.disable",
@@ -1677,6 +1882,10 @@
         "scope": "amp-owned"
       },
       {
+        "name": "remoteThreadCreation.enabled",
+        "scope": "remote-web"
+      },
+      {
         "name": "showCosts",
         "scope": "remote-web"
       },
@@ -1703,6 +1912,10 @@
       {
         "name": "terminal.detailsExpandedByDefault",
         "scope": "remote-web"
+      },
+      {
+        "name": "thread.autoArchiveOnQuit",
+        "scope": "amp-owned"
       },
       {
         "name": "tools.disable",
@@ -1751,6 +1964,10 @@
       "gpt-5.4-pro",
       "gpt-5.5",
       "gpt-5.5-pro",
+      "gpt-5.6-luna",
+      "gpt-5.6-sol",
+      "gpt-5.6-terra",
+      "gpt-56",
       "o3-mini"
     ],
     "model_limits": [
@@ -1771,6 +1988,14 @@
         "max_output_tokens": 32000
       },
       {
+        "enum": "FIREWORKS_GLM_5_2_FAST",
+        "name": "accounts/fireworks/routers/glm-5p2-fast",
+        "provider": "fireworks",
+        "display_name": "GLM-5.2 Fast",
+        "context_window": 200000,
+        "max_output_tokens": 32000
+      },
+      {
         "enum": "AMP_NOSTROMO",
         "name": "amp-nostromo-v1",
         "provider": "amp",
@@ -1783,7 +2008,7 @@
         "name": "claude-fable-5",
         "provider": "anthropic",
         "display_name": "Claude Fable 5",
-        "context_window": 1000000,
+        "context_window": 332000,
         "max_output_tokens": 128000
       },
       {
@@ -1899,6 +2124,14 @@
         "max_output_tokens": 65535
       },
       {
+        "enum": "AMP_GLM_5_2",
+        "name": "glm-5.2",
+        "provider": "amp",
+        "display_name": "GLM-5.2",
+        "context_window": 200000,
+        "max_output_tokens": 32000
+      },
+      {
         "enum": "GPT_5",
         "name": "gpt-5",
         "provider": "openai",
@@ -2001,6 +2234,38 @@
         "display_name": "GPT-5.5-Pro",
         "context_window": 1050000,
         "max_output_tokens": 128000
+      },
+      {
+        "enum": "GPT_5_6_LUNA",
+        "name": "gpt-5.6-luna",
+        "provider": "openai",
+        "display_name": "GPT-5.6 Luna",
+        "context_window": 400000,
+        "max_output_tokens": 128000
+      },
+      {
+        "enum": "GPT_5_6_SOL",
+        "name": "gpt-5.6-sol",
+        "provider": "openai",
+        "display_name": "GPT-5.6 Sol",
+        "context_window": 400000,
+        "max_output_tokens": 128000
+      },
+      {
+        "enum": "GPT_5_6_TERRA",
+        "name": "gpt-5.6-terra",
+        "provider": "openai",
+        "display_name": "GPT-5.6 Terra",
+        "context_window": 400000,
+        "max_output_tokens": 128000
+      },
+      {
+        "enum": "GROK_4_5",
+        "name": "grok-4.5",
+        "provider": "xai",
+        "display_name": "Grok 4.5",
+        "context_window": 500000,
+        "max_output_tokens": 32000
       },
       {
         "enum": "GROK_BUILD_0_1",
@@ -2204,6 +2469,26 @@
         "family": "gpt"
       },
       {
+        "name": "gpt-5.6-luna",
+        "provider": "openai",
+        "family": "gpt"
+      },
+      {
+        "name": "gpt-5.6-sol",
+        "provider": "openai",
+        "family": "gpt"
+      },
+      {
+        "name": "gpt-5.6-terra",
+        "provider": "openai",
+        "family": "gpt"
+      },
+      {
+        "name": "gpt-56",
+        "provider": "openai",
+        "family": "gpt"
+      },
+      {
         "name": "o3-mini",
         "provider": "openai",
         "family": "o-series"
@@ -2335,8 +2620,41 @@
     ],
     "prompt_fingerprints": [
       {
-        "sha256": "00635e1266c40917f645b0a5252e5b34bbfdf3313641729d7b16cf9005cdde0d",
-        "length": 2787,
+        "sha256": "0042a94a7abe8a275846d547e47bc5ee0e0ab2c612cfa4f9d70d8ad8f39fc392",
+        "length": 17548,
+        "kind": "source",
+        "tags": [
+          "skills",
+          "tools"
+        ]
+      },
+      {
+        "sha256": "007aa1d9e133e5b597ac65a8151741e87537c3446ef406f64279302e570b54da",
+        "length": 1939,
+        "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "00d7029cf268e774ad42a71b1623332bd0da2f3936e26e8a24273b2207473060",
+        "length": 1099,
+        "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "00fcf17ae5fc4ec0f498c8affd15e24a91cb09f3a44f3514a28e76e155563ea8",
+        "length": 12020,
+        "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "00ff4769c40379acb88103822a1fc60766004bf0ab341b363af2fc4d9d533a50",
+        "length": 6605,
         "kind": "source",
         "tags": [
           "tools"
@@ -2351,40 +2669,71 @@
         ]
       },
       {
-        "sha256": "03292a70b9bde310f56fcf3aacc33eb82096b29915e284f8eb2987c5ea627686",
-        "length": 12842,
+        "sha256": "013abd4a3c8ccf1fa795f5a4e63c6cca713808168a5f75493e216635310c1992",
+        "length": 1418,
         "kind": "source",
         "tags": [
-          "compaction",
-          "painter",
+          "tools"
+        ]
+      },
+      {
+        "sha256": "017f4e9a01d2a70a4f81cd1d37c554aca31383923267525b0dc9be84f308f6af",
+        "length": 2063,
+        "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "02248b119f8bfb46fbb0a2825d08585b7c22d61bac444f5347b58b357e97054f",
+        "length": 1537,
+        "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "0292b712c469158c2d30a237f87aeee41fc8bf068a80aa02e3a325e995eba26e",
+        "length": 5638,
+        "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "0382672f96d2a1f51f59c268db0213241aa44a084f21d892fb67189f6028f733",
+        "length": 2763,
+        "kind": "source",
+        "tags": [
+          "settings",
           "skills",
           "tools"
         ]
       },
       {
-        "sha256": "0385e1f224eaaf6e450e6f30894218ca5d4d5824cf83c25f47b1a09ebbea82f8",
-        "length": 3864,
+        "sha256": "0682542553240a4904d2b9f5a812f1bcf40651121a368daa2bd63b1dc6472c6b",
+        "length": 2660,
         "kind": "source",
         "tags": [
-          "settings",
-          "system-prompt",
           "tools"
         ]
       },
       {
-        "sha256": "06c5cfe9abedff3501b3f71b5ff61026eb5c25ea5900d818413a52014a1df201",
-        "length": 1709,
+        "sha256": "071d9cbf81090c96b32b8aeeed62a220b63a7eba3ad8a193ed7e410bfb2f3714",
+        "length": 2242,
         "kind": "source",
         "tags": [
-          "guidance"
+          "compaction",
+          "tools"
         ]
       },
       {
-        "sha256": "073ec8a724666f49dd98968d20092f6526a84ec6300eff27198994d4dab36bd2",
-        "length": 8302,
+        "sha256": "07f11cac8a4240d7202d98c7e1b9f154648eacf512165329b6ea88dc14372141",
+        "length": 6742,
         "kind": "source",
         "tags": [
           "guidance",
+          "skills",
           "tools"
         ]
       },
@@ -2405,16 +2754,24 @@
         ]
       },
       {
-        "sha256": "08cb647edd6b9444f2ededaf6572771d8e32e3de5cfc1873b9cd1ac1e70a6431",
-        "length": 2356,
+        "sha256": "08a35a636cc8a09be0e096752488ea95ec990a4473ae8694b9b5ed0f612531ce",
+        "length": 491,
+        "kind": "prompt",
+        "tags": [
+          "skills"
+        ]
+      },
+      {
+        "sha256": "092b94c61a2b6ee02294693bbe194bc28e5fcac83458665b08bbcf859a96951b",
+        "length": 1913,
         "kind": "source",
         "tags": [
           "tools"
         ]
       },
       {
-        "sha256": "091c10387a662693acf45ffa3ac2df6c10cb59929f6937e371dc5fba8b33f45b",
-        "length": 11759,
+        "sha256": "0a3693dba75967f36e6be7b27e1460634f6e9a3f30bbe0828d67d1d2d2a75198",
+        "length": 2612,
         "kind": "source",
         "tags": [
           "tools"
@@ -2429,54 +2786,53 @@
         ]
       },
       {
-        "sha256": "0d6c4305717b238af76ca2151af91b71e75d64067eab4ac02e19efbbb6a45f0c",
-        "length": 388,
+        "sha256": "0b796c8ddfbd0ebf9228baa9fb240d1cf80caf83602bf74f0d6f51429de648a4",
+        "length": 402,
         "kind": "prompt",
         "tags": [
           "tools"
         ]
       },
       {
-        "sha256": "0e19b11a3f2b84901b97ab59181dcea60f8bee0f7714b8e06fe691bbfefe2817",
-        "length": 324,
+        "sha256": "0bbf36fc0064d94c2b654589746a7bd4ea35d3fa7b6d00cf3da36488cbf551b8",
+        "length": 939,
+        "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "0d404782af0814accb3bde3f267b2ac94646b171a5ab7e80ba19088057f0d28f",
+        "length": 3535,
+        "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "10ed0dd75bef3efb511864e45d12577c97a3d555ac2fc45e0d0310cc045eaa26",
+        "length": 8873,
         "kind": "prompt",
         "tags": [
           "tools"
         ]
       },
       {
-        "sha256": "0fd147f9c00a362b243f92b9c83a6a3c9d5849a8edba267335c3fa916116f659",
-        "length": 6548,
+        "sha256": "113f68a1459947f11aaee0b1e4fbd56381e99c10ef5f5bd2e7cfe93a1ddd6128",
+        "length": 8617,
         "kind": "source",
         "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "0ff6653b954943bf43ac1171ffa5b6961b1ad5268533b7f1772174e6945e007e",
-        "length": 13501,
-        "kind": "source",
-        "tags": [
-          "guidance",
           "settings",
           "skills",
           "tools"
         ]
       },
       {
-        "sha256": "10391eb4ecf4131b23b0d32863e3d8d6ebc2d76261c5cf39402c7c906a3b7252",
-        "length": 4721,
+        "sha256": "11d43326a5168efeb73afa976ced584e7f186feef6bc330a12527b4b33dd94c0",
+        "length": 1482,
         "kind": "source",
         "tags": [
           "tools"
-        ]
-      },
-      {
-        "sha256": "10afd8f2aeb766b1a5f80377b8fc4c5857fdae27835042bb1fa7e8e6d3c68efb",
-        "length": 3709,
-        "kind": "prompt",
-        "tags": [
-          "guidance"
         ]
       },
       {
@@ -2489,74 +2845,16 @@
         ]
       },
       {
-        "sha256": "13ffe45dd63f8dd6f80cc775d0234a166cae03181ce88c690b556ce510d447a8",
-        "length": 1109,
+        "sha256": "13ff80583c7372c923736f3fc356a3ddaa7a4884730ecd9960d6f8c363973f35",
+        "length": 1986,
         "kind": "source",
         "tags": [
           "tools"
         ]
       },
       {
-        "sha256": "154e7afb41f690f0e9aa5e2175b5314ad4b16ef3b1a6368bc0cb864418167b17",
-        "length": 948,
-        "kind": "source",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "156898bf15fe9ef3923335bcf64d2b1c86c546b7417c47fe3ecbd9b30e066661",
-        "length": 5359,
-        "kind": "source",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "1748591552783b3e2947c5965c7e1c2e40b7eb316a61ea6001edd9779d1c8e6d",
-        "length": 402,
-        "kind": "prompt",
-        "tags": [
-          "skills"
-        ]
-      },
-      {
-        "sha256": "175de533370abc1f0bddf81ff722eedce7dde04ff2fd324e17c49e74468daa53",
-        "length": 18560,
-        "kind": "source",
-        "tags": [
-          "compaction",
-          "tools"
-        ]
-      },
-      {
-        "sha256": "18ef32ab2bb39554ac20484bf9b00aa9fe0fef8d200f7b14c1768f8e71ece4ab",
-        "length": 3136,
-        "kind": "prompt",
-        "tags": [
-          "painter",
-          "skills"
-        ]
-      },
-      {
-        "sha256": "19f84aa79c0b14693af12216188f38e1bb65d2f3b3a85bcd140117d71e8c724e",
-        "length": 1994,
-        "kind": "source",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "1a4a4981f3ad0597b3967b737a88d9b1924592050abc07fcfa9b34a2495de2f8",
-        "length": 13631,
-        "kind": "source",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "1a698132908cf8eb1679eb76a5cbdad320790229f29c3d1f40346042f6338243",
-        "length": 4328,
+        "sha256": "1430b8da30302e34375f6cde7952d2d3ff48d4076e2cf76c8fe376d1179c3b69",
+        "length": 9046,
         "kind": "source",
         "tags": [
           "skills",
@@ -2564,67 +2862,7 @@
         ]
       },
       {
-        "sha256": "1a6cca9565fe829230ebbe1cb28509f3b3a577050678408a1056ee8b44ee0c2b",
-        "length": 4854,
-        "kind": "source",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "1aedcaba50caa0ba40a1ca1eabc9e99dd89ff9300fa16d679e5ece0570f7c6d8",
-        "length": 8821,
-        "kind": "source",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "1bc6180e18b0aedbd1db09ca7e8ba992513d97745c08ce1ccc9a16526e038def",
-        "length": 2207,
-        "kind": "source",
-        "tags": [
-          "skills"
-        ]
-      },
-      {
-        "sha256": "1ca6384655366612a797190caa11a602bfb8408256aefe5d72d6099b06c6e709",
-        "length": 2660,
-        "kind": "source",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "1d2b56002fc32bd7141e0c0d138a626c64f1945a70c81540afae00fb10e2468a",
-        "length": 10626,
-        "kind": "source",
-        "tags": [
-          "settings",
-          "skills",
-          "tools"
-        ]
-      },
-      {
-        "sha256": "1d81b3181756f501fcde95865066f893064c502f4f01a98ed7080def9a4b1fb2",
-        "length": 4893,
-        "kind": "source",
-        "tags": [
-          "skills",
-          "tools"
-        ]
-      },
-      {
-        "sha256": "1d8faa645f403fb619c49a991e01ea2f34d43be803f6af2c5290706a20e565ce",
-        "length": 11003,
-        "kind": "source",
-        "tags": [
-          "settings",
-          "tools"
-        ]
-      },
-      {
-        "sha256": "1e30e078444abc1a3eb43ca5d01fdf1fb8018ddc390a7ae7dc76e5c07e8283bf",
+        "sha256": "14beea2287df1463d2fae670a367ec94cbc6698fc9246db3fecf32a665975768",
         "length": 1440,
         "kind": "source",
         "tags": [
@@ -2632,28 +2870,131 @@
         ]
       },
       {
-        "sha256": "1f8a72fee9eecb68d28cbe428ea4064327fa03304e55dbb012cedcdaf9eaa2fe",
-        "length": 520,
+        "sha256": "1538c2c527b146cac8a755cb41253e1bffdfced125611f274c0d7ad36a1668c4",
+        "length": 2356,
+        "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "1666eeb7f246e4a355d31700f3a4309c323a0991f2093058246b2ffca094dbd0",
+        "length": 409,
         "kind": "prompt",
+        "tags": [
+          "guidance"
+        ]
+      },
+      {
+        "sha256": "1a570986a6251b2679f88c94648313e31db4ce9f34a98bf8b391b482bc9950e2",
+        "length": 654,
+        "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "1a57256777d2462b8c0c002aaaa30451c0632cbf72257cb3eb09ab93860dc7f1",
+        "length": 1032,
+        "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "1a5f6ee56dfd732bef1e38c2a0f25392032c8353db13c593e1d5ab350a0395e9",
+        "length": 7532,
+        "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "1b0270993512aa57cbf5454ae61c3595d20a7cc6ae27d5915ef090b413f417c4",
+        "length": 2642,
+        "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "1b3b67db0b3be4bef80c1ae4d1a20a1a6ce7186f0bdacab37e93b73661341a6f",
+        "length": 6211,
+        "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "1b63f3866080ad6090fde0e7adb4d18ba395476c374705461a18f2e251ddefa0",
+        "length": 411,
+        "kind": "prompt",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "1b65af4589cc21ecfe7f9f4f05d6280525609a0ae16aae78888290fcebeab8a8",
+        "length": 1023,
+        "kind": "source",
+        "tags": [
+          "guidance",
+          "tools"
+        ]
+      },
+      {
+        "sha256": "1c91cee436c9151813e9c72afb4c310a7e65702b3e80a0b98b90cc95fe4f594f",
+        "length": 1963,
+        "kind": "source",
         "tags": [
           "skills"
         ]
       },
       {
-        "sha256": "2103a0dd877ab84c85c784ddf02632805060591114d663881d5203f91c540a61",
-        "length": 2316,
+        "sha256": "1d066c13f8693163e99d04f9b01a6dc3dd29c9f360b6b51e1bc06611feb97f87",
+        "length": 806,
         "kind": "source",
         "tags": [
-          "skills",
           "tools"
         ]
       },
       {
-        "sha256": "211115b936a79596c167964f227f4a38aeb0aece67bc2c37e21c86652c9f75f9",
-        "length": 1559,
+        "sha256": "1d2ebfe64bfd35d8c54b030f400c9a6ea672387805ee5dbd339ed510bc71624e",
+        "length": 272,
+        "kind": "prompt",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "1df60780713eb99588a26129b9af4570e7a084f5e520588b8a7a992a6eec2d7b",
+        "length": 2089,
         "kind": "source",
         "tags": [
-          "guidance",
+          "skills"
+        ]
+      },
+      {
+        "sha256": "1e7606fd2e37b82c44508f6e31cfaca573851269758de2e6b97ea3f9226290ad",
+        "length": 8075,
+        "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "1f1055564ac8212809f791cf66a6e6fc6ea2d96967635a2932cc3aa81fc7db29",
+        "length": 3105,
+        "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "1fbc1b79e79fb764d56b8f8c3a9592e8e30d3c612f78b09eeb28dedfef318466",
+        "length": 2287,
+        "kind": "prompt",
+        "tags": [
           "tools"
         ]
       },
@@ -2666,171 +3007,41 @@
         ]
       },
       {
-        "sha256": "2355bb8f5c035ca0fd9bb3dca17db519783503ceb8dfefce3adfce28a2f18f1d",
-        "length": 18892,
+        "sha256": "2360ba24c4c9b5986de0d2c41b647cfe17998ca357dae8fe42685b1c70953cc9",
+        "length": 2929,
         "kind": "source",
         "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "23f1f3e8d21e21ea7af6fe3161452bfb3c304b57f665c3909144c51d6dd50b32",
-        "length": 12397,
-        "kind": "source",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "24a3bc7bd0fe853d75f767affc3efd41f38cceff858e006dd11147b91217fb96",
-        "length": 8075,
-        "kind": "source",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "26a6d282a8044e17118a2d575fcc76d2279459512c2c498daf1f9181ccd95aa9",
-        "length": 1186,
-        "kind": "source",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "275ef532ff8fd8c9ba3700081e1d6189b297b50e9a12c34a7ba5ae9aade4703a",
-        "length": 330,
-        "kind": "prompt",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "2774b65c4e0f668cdca65ed9905f22cfbbcc853cea5d5f7ceb717e07ce31db78",
-        "length": 1471,
-        "kind": "source",
-        "tags": [
-          "guidance",
           "settings"
         ]
       },
       {
-        "sha256": "285e6353ddd72a4d40221b7aa026bf19427725257edde7456e05ae392acb2ae1",
-        "length": 2126,
+        "sha256": "23861dd92794ce05fdba2f4b8ce0dfb7143632adc6b4304dbfcf231697f54184",
+        "length": 8214,
+        "kind": "source",
+        "tags": [
+          "settings",
+          "tools"
+        ]
+      },
+      {
+        "sha256": "259d9eb970fbddb0be51e2b36c0ab44fb4c8b20cedbd07e8c525f4abc1ecd97c",
+        "length": 1774,
         "kind": "source",
         "tags": [
           "tools"
         ]
       },
       {
-        "sha256": "285e99645a543c5aac67decdf95de6d186ff9b096646d0f1163371bf6021f6c3",
-        "length": 2741,
-        "kind": "source",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "28bc1a64c3408e5df7da935b5c76de3920da23c7abecd6018ad8f4a6aa549f85",
-        "length": 411,
+        "sha256": "25b8e0cc2c59f5f40462204ff9f87589c319a1ea1026c2806ffc0c37a331e903",
+        "length": 161,
         "kind": "prompt",
         "tags": [
           "tools"
         ]
       },
       {
-        "sha256": "292459a9fa249098ffe9ef21c53b3e843d6735fc8ac11ad9381d28aca15c0704",
-        "length": 1271,
-        "kind": "prompt",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "2a9da1b85fac3f7a7bdb2776de66a01580d524ab497624a8767a9ba4e9762018",
-        "length": 973,
-        "kind": "source",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "2b5bb0e42462f21ab548d2d4b4568fa5d9b147c4941ff385a2ccf92d9cadad43",
-        "length": 641,
-        "kind": "source",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "2bec5376ac8337b3a18b4ea5c02bd0ff39efbbeb4ce2ad347b4f2618fa1a5b76",
-        "length": 2141,
-        "kind": "source",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "2cc69d2089bac1679267de62e9343d92e7227b2725b5f696be09493276619ffa",
-        "length": 807,
-        "kind": "source",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "2cd8b9156cb706d2508e6dcbd1f9baa3b70002944fb7c7ac851194a410f1d428",
-        "length": 6106,
-        "kind": "source",
-        "tags": [
-          "compaction",
-          "tools"
-        ]
-      },
-      {
-        "sha256": "3067edab57097b148c8920125cad0b25f2811947f68869b6f21a3df862e82f4e",
-        "length": 7382,
-        "kind": "source",
-        "tags": [
-          "skills"
-        ]
-      },
-      {
-        "sha256": "313d2636033b5a73c648c301405837e7c1a5e6133d5c8816477a6095d27a9533",
-        "length": 5331,
-        "kind": "source",
-        "tags": [
-          "painter",
-          "tools"
-        ]
-      },
-      {
-        "sha256": "31a248215b5456623d3e401295527fd5071c4543fbb2b12568bc529c4b8198ab",
-        "length": 1061,
-        "kind": "prompt",
-        "tags": [
-          "compaction"
-        ]
-      },
-      {
-        "sha256": "327f172512e3c139a96a1f72ac3ac6a77f6c9659f446e25f8ab96b6801f51bf9",
-        "length": 5692,
-        "kind": "source",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "33233ea6e82525e25a9d4b53799be5e65e2ccf88f83f7a11554e15a07a823598",
-        "length": 2957,
-        "kind": "source",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "340e70f61599de1a03616c56eecfd8bc8b16e5d2ce7c32d492bde6968e2c77cb",
-        "length": 1145,
+        "sha256": "26f0aaaacc41409a838ab7a8051e2b24a88ff393e85fa1b0422be5002b40da77",
+        "length": 1103,
         "kind": "source",
         "tags": [
           "compaction",
@@ -2839,41 +3050,25 @@
         ]
       },
       {
-        "sha256": "350ffd2c0dfea577375c0ecb31acaf426e29e7a572f7f89dac11f568e7b413b1",
-        "length": 272,
-        "kind": "prompt",
+        "sha256": "279ecac2c17ebf73bd2c158f0ed2cda41ccd67bd7ff8704e6083f1d1bf590a83",
+        "length": 1229,
+        "kind": "source",
         "tags": [
           "tools"
         ]
       },
       {
-        "sha256": "3565fd5949bea7099ca3c050b4060ea7a29e120c60f17cafa39459a225818995",
-        "length": 1939,
+        "sha256": "27f2ddff7c98b73e503476d25f9f36bc2900e19d0ff19a38d10d6b5987be1365",
+        "length": 11426,
         "kind": "source",
         "tags": [
-          "painter"
-        ]
-      },
-      {
-        "sha256": "377eea926ebad86ded5ad0a99b52f92d1b76b1aedc48ff528cd5e7bddeb21e62",
-        "length": 4996,
-        "kind": "source",
-        "tags": [
-          "guidance",
+          "compaction",
+          "skills",
           "tools"
         ]
       },
       {
-        "sha256": "38f653bf12284c7b6fc55439a638b049bcfd4fc651e371332f3a896aa8b84642",
-        "length": 4642,
-        "kind": "source",
-        "tags": [
-          "settings",
-          "tools"
-        ]
-      },
-      {
-        "sha256": "396f452e92fa8811b8cde2200d385221c468476fffb375d910a4ceb28b9b64b5",
+        "sha256": "2839cf0b2bb6c330f846e5d3d3663959967c1706d6db61dd8d545a761047a18c",
         "length": 8612,
         "kind": "source",
         "tags": [
@@ -2881,50 +3076,32 @@
         ]
       },
       {
-        "sha256": "3bb6b195fcd2acd6b055afe0a9850757655d1d520a1bc9dbb4aa6171201bd1a3",
-        "length": 9046,
-        "kind": "source",
-        "tags": [
-          "skills",
-          "tools"
-        ]
-      },
-      {
-        "sha256": "3ca11dc56a41f32f9403c849622649030fa52a832b5a36f77e78905a24d9d028",
-        "length": 13000,
+        "sha256": "2848849099da535d5eeb940ca62560401da4732faf103bea7aba360ddd3033e8",
+        "length": 1589,
         "kind": "source",
         "tags": [
           "tools"
         ]
       },
       {
-        "sha256": "3d1c4229c1fed4dd72a3d5b69e112cdb2476e8aab60dd651619dae9f8d6dc4a9",
-        "length": 1283,
+        "sha256": "289ced59b40ba964c1bea76d55f65fe93e718a79382f1365e662678170882662",
+        "length": 973,
         "kind": "source",
         "tags": [
           "tools"
         ]
       },
       {
-        "sha256": "3ee39c4a1caeadd747059d6bc455df74da0c87c4b4dedbbfb8d3fcdef1ccf572",
-        "length": 2148,
+        "sha256": "2a99ca77628c7da18bb2fd535c5763d94740b16384496b76819c35ab813d0a83",
+        "length": 1662,
         "kind": "source",
         "tags": [
-          "settings",
           "tools"
         ]
       },
       {
-        "sha256": "3fceb146bfd4b60b54cb696c248338b1cd3138a0509e81d1038e7dac762974f1",
-        "length": 482,
-        "kind": "prompt",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "40065106662eca5f01476b62cbaa690d9d812ea02a8ecc0a10f10fe5207317b9",
-        "length": 1505,
+        "sha256": "2ad0e6dce0908aa7e531503654e124aa794f7f5668d6ae9281184b39705cac96",
+        "length": 8302,
         "kind": "source",
         "tags": [
           "guidance",
@@ -2932,27 +3109,272 @@
         ]
       },
       {
-        "sha256": "4121ead55797ec7f5b5eb5134383f66dc61124dbd618d63feb94b815421e616b",
-        "length": 1537,
+        "sha256": "2cee33389a28f77feb3d14493b4b672a8d9bc24b901577f2490bee446fbdd206",
+        "length": 5043,
+        "kind": "source",
+        "tags": [
+          "compaction",
+          "skills",
+          "tools"
+        ]
+      },
+      {
+        "sha256": "2d4d4d9c8ef8394e1c814b7cb381ae2766e376df8ac827bc9e985274c21fed10",
+        "length": 1276,
+        "kind": "source",
+        "tags": [
+          "guidance"
+        ]
+      },
+      {
+        "sha256": "2d7c7457ab88c34397ce5bb22dd1dc0673bdaeb85efcbaa93adbf1b861be7c72",
+        "length": 925,
         "kind": "source",
         "tags": [
           "tools"
         ]
       },
       {
-        "sha256": "413d79607956ca7ffa9a27e4d83bb27fe6468f6527eaa413723519c54fab165d",
-        "length": 8003,
+        "sha256": "2da4904fc3c23cfd5b7a085c79d8de82d3883287be2b83b9922f1842d411beb9",
+        "length": 1237,
         "kind": "source",
         "tags": [
           "tools"
         ]
       },
       {
-        "sha256": "41e22c6519885636dfbc5358e75a950c2ab6c7582182b01b4f50d6b2fc6db0f2",
-        "length": 455,
+        "sha256": "2de9626b70c9ee3e997490693844df7fb8e7aaf0d9dce8209818e5d76b6260a3",
+        "length": 1061,
+        "kind": "prompt",
+        "tags": [
+          "compaction"
+        ]
+      },
+      {
+        "sha256": "303757683cc7f86fefde6717d162313e304f1030ea673cb18e8eb53c33e7ce8f",
+        "length": 1300,
+        "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "327d0949893e0f64a4f0f88a742ac1a67db1466343fe51d1be5e408ab46ebabb",
+        "length": 4338,
+        "kind": "source",
+        "tags": [
+          "guidance",
+          "tools"
+        ]
+      },
+      {
+        "sha256": "32cfcb4549674f0944da9ad3460992fb84ff4c47045dae05c5b186e158fd2e7c",
+        "length": 1709,
+        "kind": "source",
+        "tags": [
+          "guidance"
+        ]
+      },
+      {
+        "sha256": "3346131efd8686f04d6d71d21344c8d9c91d695747fa0b7653eab371017443f9",
+        "length": 4703,
+        "kind": "source",
+        "tags": [
+          "skills",
+          "tools"
+        ]
+      },
+      {
+        "sha256": "35470a9d527fb361aa60d45a700008ea95c30b056682a071a20aa9c6d65ffdb2",
+        "length": 3405,
+        "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "35a0036b7651ed69d388284016ee61199dee9b8f2b8b63535d2da3347e84c318",
+        "length": 437,
         "kind": "prompt",
         "tags": [
           "tools"
+        ]
+      },
+      {
+        "sha256": "35b015d18810403424b8bad67bac4aff735b7c8efa852a18ae974edc03d2eab9",
+        "length": 1178,
+        "kind": "source",
+        "tags": [
+          "skills",
+          "tools"
+        ]
+      },
+      {
+        "sha256": "364145b5dde3891bcb3fbd70744e5ff9986d183378b677886891744289369731",
+        "length": 1963,
+        "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "380f353065676f2963270b9ab1487a8d1119fe49623c260cb402af32a8f5de6f",
+        "length": 2253,
+        "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "38d4492a6c933810056f6fa04aaa426d95b49c3c4d6ed7b7ed36d794b7e2e288",
+        "length": 2741,
+        "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "39dbbd888b7462cff6e45e46432fd236f5de79742cab32c228b737d7cb83e821",
+        "length": 7099,
+        "kind": "source",
+        "tags": [
+          "guidance",
+          "skills",
+          "tools"
+        ]
+      },
+      {
+        "sha256": "3af2dd54ae513ac85da0f94c689bae083d8dd93eea0bb0c3d44508b9b8e1b6cf",
+        "length": 737,
+        "kind": "prompt",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "3bca277a6cbf6fbafa03a9e21cd03307c2f7f970b3823d4cc10a88067f398647",
+        "length": 5537,
+        "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "3be4bb2cdb542afbe931e601bba8b945a870f622ba402d7b03f3ef2d6b8beee0",
+        "length": 13631,
+        "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "3c09f7427809bbf80516a92d1b8446a95bb1cec73bdbb0ec7fe7e3487320128a",
+        "length": 14751,
+        "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "3d8f43453ecf19b2cf3cf26697f26914442d246ddd9ce2403723bccf4dc41b7e",
+        "length": 1939,
+        "kind": "source",
+        "tags": [
+          "painter"
+        ]
+      },
+      {
+        "sha256": "3e01142355185478e971f3a771990adce78842312ccf1efb887b7fb160c244a2",
+        "length": 335,
+        "kind": "prompt",
+        "tags": [
+          "skills"
+        ]
+      },
+      {
+        "sha256": "3f66f2fcf52df65db8f5080909a20ce614d78eefb0bded7cdafbbfc2f72841ba",
+        "length": 3991,
+        "kind": "source",
+        "tags": [
+          "settings",
+          "system-prompt",
+          "tools"
+        ]
+      },
+      {
+        "sha256": "40668c45ddf8fd0e6e02299294510dbf6b2bbe614da46defce4e78e6c952b382",
+        "length": 283,
+        "kind": "prompt",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "422087b0a6a67ce9b0c9f82f3722af3030fc65f93e863f4afae9c5adc765caa3",
+        "length": 5015,
+        "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "423cdc79ab47145f7e6c3015e4695ec6bfc9ceb49b53d7e1ae428f6b4afc3d74",
+        "length": 1725,
+        "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "429a9a5d1e8121712820a05c406d98b704b5c2b7bb5eaf53d83e098282517e59",
+        "length": 952,
+        "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "42d723a6bfc85bf90697f9617a97617e128f7cd2b2cb5bb12b24c0ea4f863282",
+        "length": 575,
+        "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "43eabade0a33f1f6e1359048683c3ff152045b8bb516b9c5521ffe177155f91f",
+        "length": 917,
+        "kind": "source",
+        "tags": [
+          "skills"
+        ]
+      },
+      {
+        "sha256": "45880a9e8cac8b0258a3bd2bf75ad57e3db8f46b09f77632abf8100d72f6d32b",
+        "length": 8988,
+        "kind": "source",
+        "tags": [
+          "artifacts",
+          "compaction",
+          "guidance",
+          "skills",
+          "tools"
+        ]
+      },
+      {
+        "sha256": "45999f2b050aeba0b349db0b7f3165fcfd2211e56836a17aae1d4ee0b7a52a20",
+        "length": 2207,
+        "kind": "source",
+        "tags": [
+          "skills"
+        ]
+      },
+      {
+        "sha256": "46184f65e2f5ebdcadeb45201a4f7d538719c90139defe2980651be77edb3c61",
+        "length": 2375,
+        "kind": "source",
+        "tags": [
+          "guidance"
         ]
       },
       {
@@ -2964,37 +3386,45 @@
         ]
       },
       {
-        "sha256": "47b8093588d1e73b8ace1eec7495c70e327ebc45a4a58ce3b420e23ce3662570",
-        "length": 8337,
-        "kind": "source",
+        "sha256": "49319c5721f1b614003984d05d07c6c42a8af40d6c8df7356faeca8da054146a",
+        "length": 3709,
+        "kind": "prompt",
         "tags": [
-          "skills"
+          "guidance"
         ]
       },
       {
-        "sha256": "48958718efa2eebf283e2ae8a018a9b8340ff400f30ebacf1778eaa36f73aa55",
-        "length": 18620,
+        "sha256": "4a98fb3aa8c169a9a12f66f626a5bab3750040f4baf73a6c7d12835f90b28a55",
+        "length": 12900,
         "kind": "source",
         "tags": [
-          "artifacts",
-          "code-review",
+          "compaction",
           "painter",
           "skills",
           "tools"
         ]
       },
       {
-        "sha256": "49d6f39291d4d80b75bee1ef0424c4b6e6e935ec8dbec138e0a63f16a2de3dbd",
-        "length": 806,
+        "sha256": "4c8109f54a265bf01e38ca436dfa6d555cdfdaac7f7cbfbdbfd9527af1e01137",
+        "length": 4852,
         "kind": "source",
         "tags": [
+          "compaction"
+        ]
+      },
+      {
+        "sha256": "4c85261b82f5561be27e797b6640ba19899e39beecdef61fbe9b84681efc9173",
+        "length": 1505,
+        "kind": "source",
+        "tags": [
+          "guidance",
           "tools"
         ]
       },
       {
-        "sha256": "4b07300f393641103aacef3858d3c4547678cbf39e37fb0424cc6c9e82ff6841",
-        "length": 1482,
-        "kind": "source",
+        "sha256": "4cefa02d46c506176728a85a98db998737c566fdf17e34cdc04124751a63b6dc",
+        "length": 330,
+        "kind": "prompt",
         "tags": [
           "tools"
         ]
@@ -3008,32 +3438,42 @@
         ]
       },
       {
-        "sha256": "4d84dc4991b1295654f890c82b4a7d8bae08d5c3f1cacbc3d880751c366f9555",
-        "length": 1099,
-        "kind": "source",
+        "sha256": "504238b946da1ee2a01665ded4946368f445faea3966b8f7430f0e212741f161",
+        "length": 1497,
+        "kind": "prompt",
         "tags": [
           "tools"
         ]
       },
       {
-        "sha256": "4f915f43e1a34af4669c0621ac58402643b77c8a83fb5b4426e61d711194c8e3",
-        "length": 2089,
+        "sha256": "50b28530418d5b9d43a39be846d78c12f1d225739c80c6ac6b9fdd6cabd30bf5",
+        "length": 2575,
         "kind": "source",
         "tags": [
-          "skills"
+          "settings",
+          "tools"
         ]
       },
       {
-        "sha256": "4fa49433933ca3000d749c161920ec978bc9a6fc2a7ef7b3a933bfe48abc3611",
-        "length": 2248,
+        "sha256": "51d2a1340cabfba1b92de17938cd76b38ae36256d56740f65688cf3e53658259",
+        "length": 1507,
         "kind": "source",
         "tags": [
-          "guidance"
+          "guidance",
+          "tools"
         ]
       },
       {
-        "sha256": "5212c09d4fe66ef64a24bc6687af1c664518fef84e3834fcc8938e0d4f4f30a0",
-        "length": 1033,
+        "sha256": "53b9724f8bb9c48a2c626f2029f89eb3799b0ef98e6d1f63d10aaf795a944b5b",
+        "length": 362,
+        "kind": "prompt",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "54320a208a810cfa24e147cdb85e49bcd738b14e65fa8b6f19a4c23d80dfd772",
+        "length": 591,
         "kind": "source",
         "tags": [
           "tools"
@@ -3048,36 +3488,44 @@
         ]
       },
       {
-        "sha256": "581fb2b87b49b6debb6a376efdaa4394e5e0544841ba1aee6ea8a9c8d28a1bb2",
-        "length": 4229,
+        "sha256": "56556c4d5ee8bda6c945591a9d0034dd82468641864edb2e40bbfee3067da61d",
+        "length": 1552,
         "kind": "source",
         "tags": [
           "tools"
         ]
       },
       {
-        "sha256": "5881f309b910e07d48777b7aed224cbe1d4de8ba95c35c60599abe80cf054f52",
-        "length": 2158,
+        "sha256": "5852743170cd4c4e43ad16b28dc7e9bd35b7f1f6ee574f78b638d8cff00fcf6c",
+        "length": 5692,
         "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "58f4aeac59d9144f81290000db1f1de18d17fb93ca87dba8e58bb3c9fd1073cf",
+        "length": 579,
+        "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "5aba68a13c8158dda6c89a5b22c8940de2d243cbb6b28cf5f71595e04bb31811",
+        "length": 2628,
+        "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "5b5694fd0e415e9612e3b31e2e8f5f4cf894ef38c8af836400fef843e298e125",
+        "length": 1234,
+        "kind": "prompt",
         "tags": [
           "settings",
           "tools"
-        ]
-      },
-      {
-        "sha256": "58880e0a52c08e762c46507a025a5e2d57589ac4655dde942d91576b495d5c41",
-        "length": 1435,
-        "kind": "source",
-        "tags": [
-          "skills"
-        ]
-      },
-      {
-        "sha256": "5aea76b07427c8db2df7f3f208696cd6554b403ba62f1fb3548140a7eae3c4aa",
-        "length": 742,
-        "kind": "source",
-        "tags": [
-          "skills"
         ]
       },
       {
@@ -3089,16 +3537,8 @@
         ]
       },
       {
-        "sha256": "5d971894fc2d1f8adbb7fd737c9099aa4575cfae37651458220c43661de06a78",
-        "length": 2720,
-        "kind": "source",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "5e8b1a4aab0b2106d42c06f956b611d4af1f229c9a48bf25b345fa9d0ef53048",
-        "length": 3105,
+        "sha256": "5dbf3ff1667dc73419743c926dc14c1b5698ab093e1c665efebf5cbb159825f4",
+        "length": 2126,
         "kind": "source",
         "tags": [
           "tools"
@@ -3113,10 +3553,20 @@
         ]
       },
       {
-        "sha256": "62de1b67a3a699933b6a338a4157770856bb82d041268a38a9b425feb4780910",
-        "length": 3183,
+        "sha256": "5f16f9c5a001d8b9f44da0e53fc5c97afdd252c3966b82a5b3985c334c0e000c",
+        "length": 14793,
         "kind": "source",
         "tags": [
+          "compaction",
+          "tools"
+        ]
+      },
+      {
+        "sha256": "5f7bcf43606bc17f8bcd8685aa38fd128900916e09212119f0d71c214a3d9b2c",
+        "length": 11954,
+        "kind": "source",
+        "tags": [
+          "skills",
           "tools"
         ]
       },
@@ -3129,84 +3579,81 @@
         ]
       },
       {
-        "sha256": "637c06cf8210c989915f152926f1aa77e987cc7549099c58aaa877952dc84971",
-        "length": 18560,
+        "sha256": "6447c4c52ac9041a0a8e4e0e015a2bbc925c10a3e1598abc47fcbe383912e2ee",
+        "length": 1186,
         "kind": "source",
         "tags": [
-          "code-review",
+          "tools"
+        ]
+      },
+      {
+        "sha256": "65f2ea31332cabf6f5b19750e675675e1c6049f776f89b9505abb9479ed82c31",
+        "length": 7382,
+        "kind": "source",
+        "tags": [
+          "skills"
+        ]
+      },
+      {
+        "sha256": "69f2e9bff4414186ba996817f98b1309a71f79c7c8d90aa5f132c601c9ae47a4",
+        "length": 2158,
+        "kind": "source",
+        "tags": [
+          "settings",
+          "tools"
+        ]
+      },
+      {
+        "sha256": "69f6cda47318aa68948a4a20dddebb57507d5ae747ce6248aec985a38729278e",
+        "length": 11481,
+        "kind": "source",
+        "tags": [
           "guidance",
-          "settings",
-          "skills",
           "tools"
         ]
       },
       {
-        "sha256": "675e01943d2cc234a168897f03d1ca182ded7a31d7fe27b6ebe256c30b1061b0",
-        "length": 2071,
+        "sha256": "6a7fb999b2874d6ef33f74549842e2e189ddcdeac26b7cc4c6b5d25fb17387a9",
+        "length": 2632,
         "kind": "source",
         "tags": [
           "tools"
         ]
       },
       {
-        "sha256": "69f730123e960bdc8f8ca88f3628a96e235f6998d4f09717d52d3deeaf580da9",
-        "length": 3383,
-        "kind": "source",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "6a0fddf4826e5009366860f97471e628e64b8622f6836b18fa52f259def19ca6",
-        "length": 12526,
-        "kind": "source",
-        "tags": [
-          "compaction",
-          "skills",
-          "tools"
-        ]
-      },
-      {
-        "sha256": "6b332c21f295ae088b93fdfa92e46d48af9f59dd1f1144046004585a0cc06c65",
-        "length": 8214,
-        "kind": "source",
-        "tags": [
-          "settings",
-          "tools"
-        ]
-      },
-      {
-        "sha256": "6b9bff3047009446966f380d21aae1869735d9f0f01e7f0689d6d6217de8620f",
-        "length": 6317,
-        "kind": "source",
-        "tags": [
-          "settings",
-          "tools"
-        ]
-      },
-      {
-        "sha256": "6c764ef3f92a16a7c138e8c55d30c4ab635dd79210e7c41d4b3e6af94a7bea9f",
-        "length": 505,
-        "kind": "source",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "6ca75c68f1aa4fae144d3f235ed62e61f74a8a915f2984d96cdb6764e6d0283b",
-        "length": 2297,
+        "sha256": "6aa07a84f59f890016351abcb7992cfc3097d4fa6672fc8bbb65d8b2cf66e5d8",
+        "length": 388,
         "kind": "prompt",
         "tags": [
           "tools"
         ]
       },
       {
-        "sha256": "6d79a26077263a41e01cd97daca2db53ce6e0fb872b7aa21dfc29b92ccbf6de1",
-        "length": 2158,
+        "sha256": "6ae4cc155220b65ad6f4908958ac9ff7f46d62c22fbf4b15716f9c0cfad0ba6a",
+        "length": 8933,
         "kind": "source",
         "tags": [
-          "settings",
+          "artifacts",
+          "code-review",
+          "painter",
+          "skills",
           "tools"
+        ]
+      },
+      {
+        "sha256": "6b53d1718ca9d4f08061015b3decbf9cb28d3947035092366f7e023b7fdd693d",
+        "length": 8591,
+        "kind": "source",
+        "tags": [
+          "skills"
+        ]
+      },
+      {
+        "sha256": "6dc1708b150b9e670666fc5d2c14ae1902f7bae6eb4800903b01bce70f15b1c2",
+        "length": 2240,
+        "kind": "source",
+        "tags": [
+          "guidance"
         ]
       },
       {
@@ -3218,18 +3665,35 @@
         ]
       },
       {
-        "sha256": "6e56772b9e4a4ed7eacf83a8d4ba9d897ee2af6444eb4635715b449e525b9bb0",
-        "length": 7548,
+        "sha256": "6f612bd647d3e2f6086efb1c8079da5547521629888239e6f56ef090b7934893",
+        "length": 429,
+        "kind": "prompt",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "70780bd4c58d2e661ee38b198693e9a539c252b07ebe4e0b356eb7863329b531",
+        "length": 1053,
+        "kind": "source",
+        "tags": [
+          "skills"
+        ]
+      },
+      {
+        "sha256": "71bfcfca970563491150300586d49adaad27684cdfac95fc1162d8f079f6a600",
+        "length": 19149,
         "kind": "source",
         "tags": [
           "tools"
         ]
       },
       {
-        "sha256": "6f6848e18f77d2238fd1ebefc16db1a81254d419c84dd62cf3a7baf0315d6047",
-        "length": 2139,
+        "sha256": "725e8fddc20307219a6f882051d5cb81d94837ea677229eb54bf13911e4f3fe4",
+        "length": 5011,
         "kind": "source",
         "tags": [
+          "guidance",
           "tools"
         ]
       },
@@ -3242,73 +3706,73 @@
         ]
       },
       {
-        "sha256": "73fc3b15edd63a4b54e5cbf3beb3af0d66bb9e371d7997f8e9039cf646d70888",
-        "length": 9889,
+        "sha256": "73760492310bb9c71e75f7b06b7e31e546303df34b441a8ad89453f887035c71",
+        "length": 467,
+        "kind": "prompt",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "743b21e29d41f3e9cc4b52c69e423e89cb861de879579359462c186800b475e1",
+        "length": 18892,
         "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "754e186adff3278992da58097e357fcb459e6e65d7902d68e78947aea898f4dc",
+        "length": 5267,
+        "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "76522f161dc4e4700693822ab6461c9fcebd62b8428af176ba4a74566b4c0999",
+        "length": 742,
+        "kind": "source",
+        "tags": [
+          "skills"
+        ]
+      },
+      {
+        "sha256": "7a3425b9a42cb617f2562bd176a9c4d12e66e061e836f13b1e08b823a33dc2e0",
+        "length": 6237,
+        "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "7a61b94cad0572a60b30c886d88cadfc179d606ee3b42d7009bfc3f0722545d0",
+        "length": 900,
+        "kind": "prompt",
         "tags": [
           "skills",
           "tools"
         ]
       },
       {
-        "sha256": "741b1d6877bbce467315caae94846ea8b8a3baad34f0e9bb6e9228c037cac202",
-        "length": 2253,
+        "sha256": "7a7498481c362d32fc6f6b65b61fd7d7a26ee899057ad9a8e4fb0482df4312e7",
+        "length": 1109,
         "kind": "source",
         "tags": [
           "tools"
         ]
       },
       {
-        "sha256": "744f2401672251a9f698e07180914e4137bab12dd22e3e853aa86a8ba77fd17e",
-        "length": 409,
-        "kind": "prompt",
-        "tags": [
-          "guidance"
-        ]
-      },
-      {
-        "sha256": "74e5ef0a305feb45a84149fd60c63044e21f0bb6a6614ea9961bce421fcc2647",
-        "length": 849,
-        "kind": "source",
-        "tags": [
-          "guidance"
-        ]
-      },
-      {
-        "sha256": "7623161f5c7480c4c7925a0656a98305be878e4283951407b28044eba50c4de4",
-        "length": 161,
-        "kind": "prompt",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "76bac1ede1455598843f1d9d7d2b6514b53aafa0698681994a7dacd61a6f9078",
-        "length": 196,
-        "kind": "prompt",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "78438a9ef58e71df8368e6c9048e58503275818f6b8564919fc94df1d98208a8",
-        "length": 1478,
+        "sha256": "7c399d6674472bda3cdadb1b850b2aaaaa42c17ee8caf841c5b41514a038704c",
+        "length": 950,
         "kind": "source",
         "tags": [
           "tools"
         ]
       },
       {
-        "sha256": "7881a48ddb282f7f108d21010371384e97f497b2e040ad6c618fb114e6b45283",
-        "length": 6503,
-        "kind": "source",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "799b3ef4d2c01deb10e53dee1972c417b2e69a104b7a3e6a40fba4c95d7e6438",
-        "length": 11481,
+        "sha256": "7c8b9a91b148f2ffbbd4fc0a04b82b29d135e3538553d334fa41cef747896a81",
+        "length": 15798,
         "kind": "source",
         "tags": [
           "guidance",
@@ -3316,34 +3780,16 @@
         ]
       },
       {
-        "sha256": "7a33ed96fc41d979e3b6f0f76b42568362f81f58eba8ef46ffb3fe0d22cba030",
-        "length": 1986,
+        "sha256": "7ecad0576b733c806a5f3fb66702aa7cf9f6ae224d81c92c5d7acd0c5acfcae4",
+        "length": 3381,
         "kind": "source",
         "tags": [
           "tools"
         ]
       },
       {
-        "sha256": "7b13d764eaee20aaaba8e498ad0f37efdcccadf68f5b50c8d3328be98c1c2d52",
-        "length": 5832,
-        "kind": "source",
-        "tags": [
-          "compaction",
-          "tools"
-        ]
-      },
-      {
-        "sha256": "8057ba445d874f765ff68f6c44dc17ce25e3397a427e2ce9917c618c21994de9",
-        "length": 1955,
-        "kind": "source",
-        "tags": [
-          "guidance",
-          "tools"
-        ]
-      },
-      {
-        "sha256": "80624fb4d8488a1fc87fbba833e30609e025804d8eeaf27bad17135e7adf5266",
-        "length": 4692,
+        "sha256": "7fe2b54d7acf527b475a16505837479c881bdfff01e03f49d68d98faa610b75f",
+        "length": 8464,
         "kind": "source",
         "tags": [
           "skills",
@@ -3351,11 +3797,20 @@
         ]
       },
       {
-        "sha256": "80d811c15d699427440f7f6f697cb302875baf4c53236862751848e77cf18e03",
-        "length": 1220,
+        "sha256": "80c71b802668fa4af4f7062cdabd9af00aa3a8946fc8fef2ed499f5e23b507ab",
+        "length": 1914,
         "kind": "source",
         "tags": [
-          "compaction"
+          "tools"
+        ]
+      },
+      {
+        "sha256": "81246235151400ea9c928c01095b059d730d573f02f69713ec0b80e91bf352d2",
+        "length": 6413,
+        "kind": "source",
+        "tags": [
+          "settings",
+          "tools"
         ]
       },
       {
@@ -3367,44 +3822,19 @@
         ]
       },
       {
-        "sha256": "82c84cddde40c58cb243dd19e506f8ebc8f094d66d40dde8ba07822907c07f8c",
-        "length": 1909,
+        "sha256": "835d6056f93c3e14030caffbbba11828706f5cbccaf27f8328e37d1450a58aac",
+        "length": 10072,
         "kind": "source",
         "tags": [
           "tools"
         ]
       },
       {
-        "sha256": "82ed1dce8af933cb84f8709314306aa00bae3e8a74c6bf0d7f33dfe060fb2893",
-        "length": 4191,
-        "kind": "source",
-        "tags": [
-          "compaction",
-          "tools"
-        ]
-      },
-      {
-        "sha256": "83238e1d242945f59f56e60a0abdfbfc3f15f3833fa0c939788ae9ff65345513",
-        "length": 1914,
-        "kind": "source",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "853e8dd770fa6e2355c4eec9cd97c0b9bc0c7127b39864b992717fb2c5193ede",
-        "length": 296,
+        "sha256": "86fd471e7173bd0e810142e19be6a1756311fa6390ef20e9bf81309d04c58759",
+        "length": 559,
         "kind": "prompt",
         "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "86bc192a2ccb3904fb28e5f7aa428cf0b4c7939b6ce4a263c8ae11eccaa6c9cb",
-        "length": 1934,
-        "kind": "source",
-        "tags": [
-          "tools"
+          "skills"
         ]
       },
       {
@@ -3416,10 +3846,21 @@
         ]
       },
       {
-        "sha256": "89647f7f254e665eeb1722606a36fa6835fef0b7b6faee9563e2d3963f1b7190",
-        "length": 1557,
+        "sha256": "893ba2bcdc95a6c4a506345cb241cb8e7e749a81d48206ba005f8768e0d83255",
+        "length": 2316,
         "kind": "source",
         "tags": [
+          "skills",
+          "tools"
+        ]
+      },
+      {
+        "sha256": "89c8d01fdbbc6dec358f8b372a99f83b568bbb239cb7833700f62ceea174b574",
+        "length": 1800,
+        "kind": "prompt",
+        "tags": [
+          "skills",
+          "system-prompt",
           "tools"
         ]
       },
@@ -3432,26 +3873,6 @@
         ]
       },
       {
-        "sha256": "8a0dc6da37d7f117adcef97f1a7a746ad1ddb2e8f52ca2c7d20415e644b7514c",
-        "length": 9065,
-        "kind": "source",
-        "tags": [
-          "artifacts",
-          "compaction",
-          "guidance",
-          "skills",
-          "tools"
-        ]
-      },
-      {
-        "sha256": "8a69e3b2486e29db819ca4e5a270d4a8670dc205151c12ade2c5f8d584c830c9",
-        "length": 542,
-        "kind": "source",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
         "sha256": "8abd2b1293228eedad9f29debbcffa60fe2a3a1fe2f5ed90a65d6a72c05fe980",
         "length": 214,
         "kind": "prompt",
@@ -3460,77 +3881,50 @@
         ]
       },
       {
-        "sha256": "8b16b122d3e2cf8af72aca2accbbc44cf674a6f83c528a432c7f0b2f645f428d",
-        "length": 1774,
+        "sha256": "901583df98bc705514a38a3cbe3f2decf9d07308ce8dc2dd5f9aba8ccbabc5f3",
+        "length": 1033,
         "kind": "source",
         "tags": [
           "tools"
         ]
       },
       {
-        "sha256": "8b69898bad09ae8ad023cdb5ec8db233f4323fdde5b1095ed037f265cae3f80a",
-        "length": 722,
+        "sha256": "90314e924a1db164aec6268b43a5c0fe93b14320dbaef63d48cba8a90b32d715",
+        "length": 4161,
         "kind": "source",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "8ba4a8c142b6f8c523dba12301d206eb7a77778d2bc4c20781f1a3c10b022af7",
-        "length": 2497,
-        "kind": "source",
-        "tags": [
-          "settings",
-          "tools"
-        ]
-      },
-      {
-        "sha256": "8bf63dcde83074509b811ee0c885f1d5b01a534adf617d2099cc3f2bb97bcbbf",
-        "length": 4172,
-        "kind": "source",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "8cbb0ec7603a3f1a7e28075ce34abccd939a7836d4e7320311b227c9b57066a5",
-        "length": 17066,
-        "kind": "source",
-        "tags": [
-          "skills",
-          "tools"
-        ]
-      },
-      {
-        "sha256": "8e24769be7a23e655b75a68670d114c479ce3bab518cea5bf201b32c1dd54166",
-        "length": 6696,
-        "kind": "source",
-        "tags": [
-          "guidance",
-          "skills",
-          "tools"
-        ]
-      },
-      {
-        "sha256": "90d88027b66ac1cb7598fa52728385748cbebd5fcae902fe7abee384d1f0cd1b",
-        "length": 203,
-        "kind": "prompt",
         "tags": [
           "compaction",
           "tools"
         ]
       },
       {
-        "sha256": "95aafc36cd0ef5c932713d5922c602af9fdb561b84e42fe701d899b6053a4eeb",
-        "length": 6153,
+        "sha256": "91765bd4a555e78117aa24107d6a59d0a996a1711c9a3c3da274533205b38378",
+        "length": 5509,
+        "kind": "source",
+        "tags": [
+          "painter",
+          "tools"
+        ]
+      },
+      {
+        "sha256": "91898c20090df8fb56498cad9f9af218d024a105ccf7d43357a4d5d4e574895a",
+        "length": 8821,
         "kind": "source",
         "tags": [
           "tools"
         ]
       },
       {
-        "sha256": "968047d66734b97dfc9e9a4b410392584e13e7826cb6661dcb6d3c3dd13ed8be",
-        "length": 1237,
+        "sha256": "922ff5a27b6a96d0367fdadcbff8670ca3bb772b7e362c8edb255b07c51d86fb",
+        "length": 3257,
+        "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "946e99b6982b6712e33f297b9d7b7ed518501b1b9283ae2af047d5685149dca7",
+        "length": 1994,
         "kind": "source",
         "tags": [
           "tools"
@@ -3545,187 +3939,64 @@
         ]
       },
       {
-        "sha256": "991c50eb918225324152043d2a6c91d69aead14fc59fe863875dc0bee7d4756f",
-        "length": 8898,
-        "kind": "source",
-        "tags": [
-          "skills",
-          "tools"
-        ]
-      },
-      {
-        "sha256": "99a3ddd180a83ca967e1426e1df483855e8a83a4042ae38e2beb72061a65dfc5",
-        "length": 713,
+        "sha256": "984b9724d4c14622cfa8fd1144993ee67e3107065d7134966735fccbeb3de7d8",
+        "length": 2348,
         "kind": "source",
         "tags": [
           "tools"
         ]
       },
       {
-        "sha256": "99e64dc08404fc7fa87e7d174212c814d60b887a2ebd842d230b04b92c309322",
-        "length": 491,
-        "kind": "prompt",
-        "tags": [
-          "skills"
-        ]
-      },
-      {
-        "sha256": "9a5a925157c4b739fa74e58928c5cf90bb55de6573922ab61fea614df12f71cb",
-        "length": 1340,
+        "sha256": "98e891065096a81f0bc80e345af98b49176ec6fdbf8cac1c4e98dad6c87fd487",
+        "length": 2139,
         "kind": "source",
         "tags": [
           "tools"
         ]
       },
       {
-        "sha256": "9a930661f9736767bc991c72de33433f6dbc459a34c3eb63698dba6b4effc662",
-        "length": 917,
+        "sha256": "9c2ec70a00a9c888d1c67657a29a0a0163d529d760aa0347c519c29cb8aca876",
+        "length": 2141,
         "kind": "source",
         "tags": [
-          "skills"
+          "tools"
         ]
       },
       {
-        "sha256": "9af960bf481ec92713ef2c73faa63fc8f720186637843f4a535ca4b21431c72e",
-        "length": 429,
+        "sha256": "9d3c44632c7668b5c9b346f239054dd8e43e2320b1ae3dd0050d6236d172a0fe",
+        "length": 346,
         "kind": "prompt",
         "tags": [
           "tools"
         ]
       },
       {
-        "sha256": "9b9914a0183457cb9f7c9a4ffffd86a4647cdc55254285ff869195cb5e0c465d",
-        "length": 3596,
+        "sha256": "9e123ac02185d195a820056dafded98782423e36efd896baebeb06c5a386618d",
+        "length": 1478,
         "kind": "source",
         "tags": [
           "tools"
         ]
       },
       {
-        "sha256": "9bfbb52b7b784e4c93aef67e76574cef83472d661968f33e931b9e3e0764bdd8",
-        "length": 11837,
+        "sha256": "9feeedec27aaf66f4bb177fbb89bf6923f212cc33ecd83530a69321d9f884177",
+        "length": 5866,
         "kind": "source",
         "tags": [
+          "compaction",
           "tools"
         ]
       },
       {
-        "sha256": "9c1b6a8313cb7e1763be1c3f4afe6595706aa2b319e3033df1b4f74c99acc7fe",
-        "length": 2632,
+        "sha256": "a2af7768ce139c132c82fae202e53fd5076deb952585258ec3ee2fdac8f3b212",
+        "length": 1220,
         "kind": "source",
         "tags": [
-          "tools"
+          "compaction"
         ]
       },
       {
-        "sha256": "9d94b9dbfa7a1c4589f444ed49abddd827ce771b4c68f0fbb8ac831f422761e4",
-        "length": 19149,
-        "kind": "source",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "9f8c0e9b02363ab61dae34c02a7004a12cfe4bf4dcfd2414349ed2efd02e5ecc",
-        "length": 1911,
-        "kind": "source",
-        "tags": [
-          "skills"
-        ]
-      },
-      {
-        "sha256": "a13efc590e5180dcf83dc52a74a511fa00c703883eaec472aea626861b005de5",
-        "length": 4787,
-        "kind": "source",
-        "tags": [
-          "skills"
-        ]
-      },
-      {
-        "sha256": "a182d6551bff57d2595e04482b93f98204473dbae60cc343ccade458c2f6deaa",
-        "length": 2302,
-        "kind": "source",
-        "tags": [
-          "guidance",
-          "skills"
-        ]
-      },
-      {
-        "sha256": "a36ca7ed4761be758b1dca91a544f8f9647ddb7e01552a0ff6b8ca284cbf7538",
-        "length": 1507,
-        "kind": "source",
-        "tags": [
-          "guidance",
-          "tools"
-        ]
-      },
-      {
-        "sha256": "a4664c5aa98957f635ec038070ec92a2f4607f0c3533495b7d1aa275dcc0a5a2",
-        "length": 7278,
-        "kind": "source",
-        "tags": [
-          "settings"
-        ]
-      },
-      {
-        "sha256": "a4ce8da0c1dbeecea9833298a5e9465e0cf6af270cb4e09a476732ae4d5baf1b",
-        "length": 950,
-        "kind": "source",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "a851f32e0ab0fa5fa417ab9f1611aa1ebd8a888676ab4a70a757cd990c2dcbee",
-        "length": 925,
-        "kind": "source",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "a8efe2f8fa57f202f8a43b68a57ad5fb19380303cfe22cf7f83504db43c91668",
-        "length": 1676,
-        "kind": "source",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "aa739c0b3c69b7facfcd57b6eb8efdb30c20833e2461090d19fff23b2bf002ff",
-        "length": 5509,
-        "kind": "source",
-        "tags": [
-          "painter",
-          "tools"
-        ]
-      },
-      {
-        "sha256": "acbf5dee98af5d20e5b9367f6f42194a1de03b11bc32c27f544dd356d0aed0dc",
-        "length": 6237,
-        "kind": "source",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "ae7d1e755099e232b6e57a5c151348265fca180847a21ef3199ffe8000bbb483",
-        "length": 233,
-        "kind": "prompt",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "ae9dede4ce22893d2dd73b414c2770015444d60477af18c20e3f6b7afbc82631",
-        "length": 3780,
-        "kind": "source",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "b1c4054376f98c387fc899571a46d7173956255fa7c31b068eaeb1a2cf46b231",
+        "sha256": "a4a462c79cd1f54fb2d95b90c2929c3d14eb72326e2edc15882f91b3b0080e57",
         "length": 16300,
         "kind": "source",
         "tags": [
@@ -3733,7 +4004,56 @@
         ]
       },
       {
-        "sha256": "b1d07a81769550e5d7c7b897e765875514a1b3963332158ff3cc451e35e5045e",
+        "sha256": "a5401a81e6245cfe8a4396761e9462b8cace7ff90ec0c64c40c7cece64bceebc",
+        "length": 2886,
+        "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "a5c55b79bd670f4460c4693c78e22d413eff9ed3ce8721ee3e7bb09523147c79",
+        "length": 4172,
+        "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "a67981608560c20b5b8361078851c00c4712746ee851cf69b02b62d50fbe7beb",
+        "length": 246,
+        "kind": "prompt",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "a73fcaef8fec3a80aaa0ddaf7620a8cc4c2c2ae5c4e464fd596ddd0306c8f16b",
+        "length": 4787,
+        "kind": "source",
+        "tags": [
+          "skills"
+        ]
+      },
+      {
+        "sha256": "a8b9d48612eee213e9b43eb38c62136b96e3af67fa9f7f42f68034989ea66eff",
+        "length": 1718,
+        "kind": "source",
+        "tags": [
+          "skills",
+          "tools"
+        ]
+      },
+      {
+        "sha256": "a9086ed7a412076a9b0ca1adb5fa77d7e70dafe94e871bb0efcdcf8df3c815f1",
+        "length": 3949,
+        "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "ab849e432b7f4bbc67905652373f7ac7961607e52bb9a84e1a96a1a9279c5365",
         "length": 442,
         "kind": "prompt",
         "tags": [
@@ -3741,16 +4061,8 @@
         ]
       },
       {
-        "sha256": "b30814b7ad271e082d4c8ca52b488daa7c4a900c92e00eec85e07c5b6bef4a81",
-        "length": 1493,
-        "kind": "prompt",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "b3315826c54560430e4863cfbeaffeaaa9cd68648bb9349f6a690cf6dde28bb9",
-        "length": 1019,
+        "sha256": "acd8860eb26886ad67ba84dc7972c7d4f0bb76ce0176a78b7563932757d78e40",
+        "length": 2465,
         "kind": "source",
         "tags": [
           "guidance",
@@ -3758,11 +4070,29 @@
         ]
       },
       {
-        "sha256": "b37d366a40a248606769967ffda3b49f064bac81c730dfcb6dceaad3eddb79bd",
-        "length": 2886,
+        "sha256": "ad5777824aa77a4c33304a0b368ed309ca303239ee06753565c03114196012db",
+        "length": 6548,
         "kind": "source",
         "tags": [
           "tools"
+        ]
+      },
+      {
+        "sha256": "aef7014516c2e2202d2b77a10d2914a6c211d4afc64371cd7bc4477a7595f2b1",
+        "length": 1861,
+        "kind": "source",
+        "tags": [
+          "settings",
+          "tools"
+        ]
+      },
+      {
+        "sha256": "af6e528e22cf875a31debe5fa3814d11036a43c92334c44ae2c7e734620fd6c5",
+        "length": 1471,
+        "kind": "source",
+        "tags": [
+          "guidance",
+          "settings"
         ]
       },
       {
@@ -3774,125 +4104,40 @@
         ]
       },
       {
-        "sha256": "b3ff5d15f0f687b87819f3bfdee5bdf6e0c33016a98bd31725c326b89f34c5d2",
-        "length": 210,
-        "kind": "prompt",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "b495dfc6a4ccd33bde14b05246c33d8e6e1aecc8b0b47bee86c3b00fac3128a5",
-        "length": 17548,
+        "sha256": "b448108ad900f744708cb776fcfa54fdbc2ab315fbcd9c520900938abbff1ee4",
+        "length": 7439,
         "kind": "source",
         "tags": [
-          "skills",
-          "tools"
-        ]
-      },
-      {
-        "sha256": "b4b6e1f43c3d98c74a26aede099f6682d3b2b4ad3bdb7325c6a0bce89cf71be5",
-        "length": 5040,
-        "kind": "source",
-        "tags": [
-          "compaction",
-          "skills",
-          "tools"
-        ]
-      },
-      {
-        "sha256": "b7524e670ed677016201ddd2b607d18fa05e450bddf75c13261fc77af49b9493",
-        "length": 3301,
-        "kind": "source",
-        "tags": [
-          "settings"
-        ]
-      },
-      {
-        "sha256": "b8580408e069916e4b259c134a0b242078e53970f15a323b26418218f95f15a6",
-        "length": 579,
-        "kind": "source",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "b8b276e18a33e147e2916281c374be384f1ee0a80a65210c91c1cba2b2faa3a9",
-        "length": 402,
-        "kind": "prompt",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "b8c29b487d47659631b34ef681b891da2baecf3e28bb0495c9716a038f2a33b2",
-        "length": 2763,
-        "kind": "source",
-        "tags": [
-          "settings",
-          "skills",
-          "tools"
-        ]
-      },
-      {
-        "sha256": "bcaa3c4d7eb8a951fe27cbf146e4c56b431665341af556f1e543f6ec5432c135",
-        "length": 6211,
-        "kind": "source",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "bff765c9937d2b3023cb69a4148f82b4b393824663e8e0e0305aa9130cd32125",
-        "length": 3257,
-        "kind": "source",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "c02378204ce64f55233dafa3aadf1a5476972bb5e24a7ecbf0cd85fa6547c181",
-        "length": 335,
-        "kind": "prompt",
-        "tags": [
+          "guidance",
           "skills"
         ]
       },
       {
-        "sha256": "c0eb2e1a83a580460e15204f85755e842fbf325a13d8dfb48a9eac2ecbf66147",
-        "length": 1276,
+        "sha256": "b6fe30f76fa3e4c3e35014bdfa4852e3796b9b3653fee170a5de7f045d1ef002",
+        "length": 1385,
         "kind": "source",
         "tags": [
           "guidance"
         ]
       },
       {
-        "sha256": "c2cafe8bb840c0718bb30fc09b8ffb74f05bfe9c29016e2ca02b9a03cbd9438e",
-        "length": 1325,
-        "kind": "source",
-        "tags": [
-          "guidance",
-          "tools"
-        ]
-      },
-      {
-        "sha256": "c802c44308a47bb6f914e32bf60ce719054fb78da79c10c4eacbf8b417be6f5c",
-        "length": 362,
+        "sha256": "b77a9903279f39b947c984e821e9e70a1846f977e228133da2aa20a83a73e512",
+        "length": 230,
         "kind": "prompt",
         "tags": [
           "tools"
         ]
       },
       {
-        "sha256": "c863448686ede355845a6abb1636d1637e4ac794c7b1f20310ba189d3e40fce1",
-        "length": 2060,
+        "sha256": "b90612dd93f0c4472cc6e0e7e816960f543a2b18fadb7d030e373e7500f42b2d",
+        "length": 4690,
         "kind": "source",
         "tags": [
-          "tools"
+          "settings"
         ]
       },
       {
-        "sha256": "c98581e935b6cda4f51c36a31b5cf892a40f3fc5b5e1f5b6d14fed1585df13c7",
+        "sha256": "bc00729d2dc094d4dfde0974f1f37855ffd4a20b3e6ff46b1c7c0c83ea532226",
         "length": 1081,
         "kind": "source",
         "tags": [
@@ -3902,67 +4147,143 @@
         ]
       },
       {
-        "sha256": "cca12fc75726194b9743d32cdd80b9ba34dc836c84b84a6cac8268227227cf5f",
-        "length": 737,
+        "sha256": "bc56d41064c753d409d5a8991e9ee50b99f55fa3f26ced1a38cdf5a6451d1d68",
+        "length": 2071,
+        "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "bca653b8851f2bbce2e9e4eed141a1a8f99a330854bae51deceb10fcd0df977f",
+        "length": 1340,
+        "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "be3d4a87788ba1dd730e685381b2b0842d9ff54e2f6b1ddd0a8c7880ea9097a0",
+        "length": 233,
         "kind": "prompt",
         "tags": [
           "tools"
         ]
       },
       {
-        "sha256": "cca80a819965217b1d188d93aea113edc8c52ee317cf5145b9d6093cf14df367",
-        "length": 10038,
+        "sha256": "befd2b79290091b8618c0fd71ad53aff4bd240f0d890053bd5e2d8d3a2b22576",
+        "length": 1283,
         "kind": "source",
         "tags": [
           "tools"
         ]
       },
       {
-        "sha256": "cd23d18dd81846cab44f1dc503f7d9f825557b02e19d3cf4d3da55a2379ba033",
-        "length": 654,
+        "sha256": "c025181715d83bbd6c1864c8a1595960b8eaa90b72c8078513732ba48ec2fb5f",
+        "length": 8482,
+        "kind": "source",
+        "tags": [
+          "skills",
+          "tools"
+        ]
+      },
+      {
+        "sha256": "c170eb315126993f65a6e8a628b5fc3393151e228a5ce0a8a6e7dd5d0b76ff93",
+        "length": 1846,
         "kind": "source",
         "tags": [
           "tools"
         ]
       },
       {
-        "sha256": "ce0feda7a0ec36652f43b34c7c5a801b76e0e4ec55e1fddb619155a4e4a08024",
-        "length": 1300,
+        "sha256": "c32f68ed792f9eb3532a9fe82546621cc3ec8dff65b30b4303d0ee5550126da3",
+        "length": 2720,
         "kind": "source",
         "tags": [
           "tools"
         ]
       },
       {
-        "sha256": "d02d6259c504b24f333f9441956324a8012efe5606dd2fb1786041e81e05dc03",
-        "length": 591,
+        "sha256": "c6ecdef957d7242e194d12dfc6e5d42fd677599001a01de2be3f83acc465a12d",
+        "length": 1482,
         "kind": "source",
         "tags": [
           "tools"
         ]
       },
       {
-        "sha256": "d0ac6d3417e6833ed7b4cb943c4d4d2de2c73f1a40f683681aba72539f368e98",
-        "length": 4852,
+        "sha256": "cb6b09aea90e4eb92140534ff33779acfd0f4d583de3e8d4aa830c093da445c0",
+        "length": 2302,
         "kind": "source",
         "tags": [
-          "compaction"
-        ]
-      },
-      {
-        "sha256": "d1b997a7adad2e9ced51ddf5b8771b9aeccf0d52e6ec6dc84c6cca5126ed6843",
-        "length": 1531,
-        "kind": "source",
-        "tags": [
+          "guidance",
           "skills"
         ]
       },
       {
-        "sha256": "d27cf592e1d014a3cadc1f38b63ee86f11551d1057f21e5d0cd42bfa8d822d56",
-        "length": 1229,
+        "sha256": "cb8f6d56637e76d514c550308930f453f5b282d7ed83dd2802ed60a4eb9cffa5",
+        "length": 4721,
         "kind": "source",
         "tags": [
           "tools"
+        ]
+      },
+      {
+        "sha256": "cb9be66f89b84fe5798212e904525157e80422f34535adbcc901e4d5165e133f",
+        "length": 11453,
+        "kind": "source",
+        "tags": [
+          "skills",
+          "tools"
+        ]
+      },
+      {
+        "sha256": "cc10b22ec5dea1f1abca51d490c59077000445037e5c5e55bbff8e45147f8e13",
+        "length": 270,
+        "kind": "prompt",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "cc960c6081235c961b7f7017514b5c6ade520e47c1a260d5b2ae9fee27a09c5d",
+        "length": 4545,
+        "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "cedc7204e5268447066fae3cb92b2ef272102927c311be70c872a23c80e7c261",
+        "length": 196,
+        "kind": "prompt",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "cf83c06059cbf4c5c48fb62f11557353bbd6b1991b2e2015618a9de1c7b73c5b",
+        "length": 714,
+        "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "cf9e1460896cc10a3c7afe2a9bfcaebf369a48344fa3495922662f3d57d715d9",
+        "length": 17066,
+        "kind": "source",
+        "tags": [
+          "skills",
+          "tools"
+        ]
+      },
+      {
+        "sha256": "d210dc2c3aa6cf5446a2eeb59a4ed34ce435dba482b21e92b60c02d96b9ce78b",
+        "length": 2405,
+        "kind": "source",
+        "tags": [
+          "guidance"
         ]
       },
       {
@@ -3974,91 +4295,109 @@
         ]
       },
       {
-        "sha256": "d37e80213bd424a5cea833a7e663e868ad6b27adf856c828bb9ad4297c4644f5",
-        "length": 1963,
+        "sha256": "d3ecfeef44ab61922b8226915ceaca48cf2397daa7bb7fbf3a2e520051699e63",
+        "length": 7464,
         "kind": "source",
         "tags": [
-          "tools"
+          "skills"
         ]
       },
       {
-        "sha256": "d621b12642389ea1119de929a44353f748730a317f635c5d6cb6588fac55b7af",
-        "length": 2789,
-        "kind": "source",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "d75e93aefe087d7455ec8ab0dd2227484089eb5a6e720932f9ff186add8907db",
-        "length": 1913,
-        "kind": "source",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "d7600603eeb6766c5278ea99fa4ca478f1062f8c8b7f56664ebea57d35ca3c61",
-        "length": 1800,
+        "sha256": "d3f5306a866359624ba75a6222c9d3162461b5a796e28e613c3a5af9a0a58ca3",
+        "length": 3136,
         "kind": "prompt",
+        "tags": [
+          "painter",
+          "skills"
+        ]
+      },
+      {
+        "sha256": "d4348bede4ca401af05a02871e7d9a84c806df5a6f32ae9d9bfdaf03117c7ad4",
+        "length": 11837,
+        "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "d4a97e00c550ff38a40cf0fd47832f989093fd217ded90c1a2583ffb6d5f45a4",
+        "length": 2158,
+        "kind": "source",
+        "tags": [
+          "settings",
+          "tools"
+        ]
+      },
+      {
+        "sha256": "d752a363ef826046ada88b101a03900a84ef9131d62dda39cf2c7d2a465df425",
+        "length": 5638,
+        "kind": "source",
+        "tags": [
+          "painter",
+          "tools"
+        ]
+      },
+      {
+        "sha256": "d75a116dab255479c15eb92e0cea584fa5c14b39a7ac2eee23475ed179f3473d",
+        "length": 5987,
+        "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "d7c3361cf343108a4dca0446e6b40a93ce16512c9f6cec3d929a356d9ac171da",
+        "length": 455,
+        "kind": "prompt",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "d7d801cc825dc66e7d2e7135c799c20db05bb09dbb70ac0ba470f2c2c8614445",
+        "length": 4821,
+        "kind": "source",
         "tags": [
           "skills",
-          "system-prompt",
           "tools"
         ]
       },
       {
-        "sha256": "d78900ab4dd068537e8596b9d4512523c8822982bb84c1eeb921c498465ed710",
-        "length": 283,
-        "kind": "prompt",
+        "sha256": "d8389e2088962468d93f75103233fa85d4a5ea8246c6608ece3642e3712a7203",
+        "length": 12863,
+        "kind": "source",
         "tags": [
           "tools"
         ]
       },
       {
-        "sha256": "d7c14b5ae248cf03b903d7e674738dad919a7fcb3219d76ca41c1a91ffe5ffed",
-        "length": 559,
+        "sha256": "d8bdf8cc4e96fbbf640339830094c8c6c5fab3ddc330040ece039b827d41f7c3",
+        "length": 402,
         "kind": "prompt",
         "tags": [
           "skills"
         ]
       },
       {
-        "sha256": "d7c382868e6ecfaa72f2ebc72af15d59f8bf1e164b4815440a56888715fb6229",
-        "length": 713,
-        "kind": "source",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "d92fce40152e165fc21d16bd8a77b988fad713aa34e0e7446af71e24d68efa1d",
-        "length": 15081,
-        "kind": "source",
-        "tags": [
-          "settings"
-        ]
-      },
-      {
-        "sha256": "dacce96a9cb976be9d01c6a3d3f12e46efdad0865070f14f0ab4b8f8779dfbd7",
-        "length": 246,
+        "sha256": "db97582ca9fb82e78f58bcff498260fbf23e217a3a2895a10acffe068b432b8d",
+        "length": 1201,
         "kind": "prompt",
         "tags": [
+          "skills",
           "tools"
         ]
       },
       {
-        "sha256": "db28744247a959a729d2fddddc18044ef69fba45c0717d56d769e3ea7bffbd00",
-        "length": 2430,
+        "sha256": "dc0118fb5e93e53a4c7eb92ca18aa5601ee22c7a303a72c854fcb4a635d7591e",
+        "length": 4229,
         "kind": "source",
         "tags": [
-          "guidance",
           "tools"
         ]
       },
       {
-        "sha256": "dd5e0135c70e7c92cdd5767310a764967d0718dee9da69fe2aaed29221ead79e",
-        "length": 2242,
+        "sha256": "de9617fc411f3cdca2340e8061dbcb46e7c3fd517908f4819f19af4ae837e6f7",
+        "length": 6106,
         "kind": "source",
         "tags": [
           "compaction",
@@ -4066,11 +4405,12 @@
         ]
       },
       {
-        "sha256": "ddb003b4affeb030b427730de8bcf05a9db592371197512e2ed8910e20592498",
-        "length": 1053,
+        "sha256": "def553c9a91c2eccd9f57ab1856da4ac11d82c50c8cd193bae4cb0a44de3f019",
+        "length": 11353,
         "kind": "source",
         "tags": [
-          "skills"
+          "compaction",
+          "tools"
         ]
       },
       {
@@ -4082,31 +4422,32 @@
         ]
       },
       {
-        "sha256": "df927ee51167daf00408b34e313c1783322c1836dc91176dfd3a81ff1ffb9de3",
-        "length": 1032,
+        "sha256": "e06585c0009310bca8c023fb40f5187939d2e6e7b31b34077bed6a5d8634d3d8",
+        "length": 3183,
         "kind": "source",
         "tags": [
           "tools"
         ]
       },
       {
-        "sha256": "df9b515533877e3a26e04eaf139ae62bb0d3891693c67f1e57fab791f6bbd2fd",
-        "length": 1385,
+        "sha256": "e07ef9865703ce232be9c1f7a6507bf773b872a9e56fa20e40876b0a4ce75ba7",
+        "length": 919,
         "kind": "source",
         "tags": [
-          "guidance"
+          "skills",
+          "tools"
         ]
       },
       {
-        "sha256": "e1c858f11a2ba07d6a0625c55ab224191e9155a896e823e164fe982f2fb66969",
-        "length": 2348,
-        "kind": "source",
+        "sha256": "e20f734cac8fc8c3d9d8c02c16aa4045617e136ab56baa01ca41a7197034cc12",
+        "length": 1473,
+        "kind": "prompt",
         "tags": [
           "tools"
         ]
       },
       {
-        "sha256": "e22e0afdbdb57ac9106b961e20a87433afbae3da5ee4302f9be0ce62d463f5bb",
+        "sha256": "e30dd35b44afabb9b105380bff0913bdd43457733b5072d1affd53d8e71e386b",
         "length": 371,
         "kind": "prompt",
         "tags": [
@@ -4114,16 +4455,8 @@
         ]
       },
       {
-        "sha256": "e2a6c12f1b77d944e0552d83b27d17fd18e4127c9a503215564f43a0346880ac",
-        "length": 1482,
-        "kind": "source",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "e3efc6eea70a85aa0f533b09dfd4bf389911cb19ee3cea151bf0c13ba45e0072",
-        "length": 1662,
+        "sha256": "e31a3bab84604eb168878e6fca2a9ec6346f95628873659db2cf991acccb43d0",
+        "length": 6503,
         "kind": "source",
         "tags": [
           "tools"
@@ -4138,117 +4471,8 @@
         ]
       },
       {
-        "sha256": "e7018301ff74b0ccca6c010400d0e9ad31d38fa9e7812981c9635f6b0046bcf3",
-        "length": 5320,
-        "kind": "source",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "e81feb8ab711e6523bab467e348277f93731b0308da9a0fe54f84f0fef4ba85e",
-        "length": 2405,
-        "kind": "source",
-        "tags": [
-          "guidance"
-        ]
-      },
-      {
-        "sha256": "e91ad66759d7fcb29ae826cfc2921a4a02f8e4f24e4e18d1204d5a2e9a7af880",
-        "length": 575,
-        "kind": "source",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "ea8a03525eed822e34107949fc7cc8b0e52a68a6d63c3b96234a762a6b322180",
-        "length": 938,
-        "kind": "source",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "ec01fd515d06a68fc8392d68ccb32ce8a9c658121c1377480cc8036cd734d8ca",
-        "length": 9889,
-        "kind": "source",
-        "tags": [
-          "settings",
-          "skills",
-          "tools"
-        ]
-      },
-      {
-        "sha256": "ec1f4aa613fb8558640db655de4af9c1b59055e49fdf4b597c96531db0b37fa3",
-        "length": 7014,
-        "kind": "source",
-        "tags": [
-          "guidance",
-          "tools"
-        ]
-      },
-      {
-        "sha256": "ec23876ab16922ab88b27436a5000fc74ca08d3491f235c9cb2b9ab7cf5fe470",
-        "length": 1552,
-        "kind": "source",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "ecab98d23ff45e11b5b7b6969b0e4cbeb54069fb27c89430ba6bdcd7412f76b4",
-        "length": 4545,
-        "kind": "source",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "edde6ad10f388a0173fd2cc6faf07842301bde15404341b68e6dfb3ef6d8b728",
-        "length": 346,
-        "kind": "prompt",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "eea20fef61d9e89ca3657a0f6a04cb25623e510425c2ef205eac6a473db47561",
-        "length": 14793,
-        "kind": "source",
-        "tags": [
-          "compaction",
-          "tools"
-        ]
-      },
-      {
-        "sha256": "eeb314b699ea4b0460af85c7711c25a15b4ecd55a870c0018ba4e60916a262c5",
-        "length": 467,
-        "kind": "prompt",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "ef47da3ceeaceceaa3181ace17a869bcb74717a0da8029c912da00401cec2e14",
-        "length": 1178,
-        "kind": "source",
-        "tags": [
-          "skills",
-          "tools"
-        ]
-      },
-      {
-        "sha256": "f064e0def1c4e802ba106d42426fc99b3f04563667e3642b35eb92c5f8eddc18",
-        "length": 5987,
-        "kind": "source",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "f1509c4728149659c8f9d200c70c48da0cbe7ffe22529cbb8a9a18892ee1915c",
-        "length": 1861,
+        "sha256": "e62264e9b08445870648ae613fa02a43d3228a911f6b3b536236fab6889e67c1",
+        "length": 11223,
         "kind": "source",
         "tags": [
           "settings",
@@ -4256,94 +4480,177 @@
         ]
       },
       {
-        "sha256": "f1875b165c325a25fba8de1ac52e7b8c0782c00826abbcd77302a36454bc5c13",
-        "length": 656,
+        "sha256": "e8112fbaf039c9f6ad9710b2b457982ffb1b468eb11bb09022baf69b9046a72f",
+        "length": 1676,
+        "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "e85961a050dd68c0fe0a136c9b4a0f73420a6a1da95dc7e401f20f5746cecf6b",
+        "length": 5359,
+        "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "e8a9c4e8d495f2cc69164881734f5b39df8f7c6fcbed126dd9eb0fa313577d35",
+        "length": 1909,
+        "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "e94e574d19fcb8758aa39a776c786384e4cebf4f7a62b004d3d2f0796153d32e",
+        "length": 4972,
+        "kind": "source",
+        "tags": [
+          "skills",
+          "tools"
+        ]
+      },
+      {
+        "sha256": "e9673d2b1885896504d272abce2da0a4bb6c376b54e2f86d636d7c2d3ccd17df",
+        "length": 1271,
+        "kind": "prompt",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "ea5364c1ea39ff4e60b41299768cdbe56f9fe4334d934041da1a1e4f133ea34c",
+        "length": 296,
+        "kind": "prompt",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "ea6164c4ef921d041f0ad4260bfa1f80b1c7655d3b5278c95269ffc8e5b09ecd",
+        "length": 2150,
+        "kind": "source",
+        "tags": [
+          "settings",
+          "tools"
+        ]
+      },
+      {
+        "sha256": "eaa727594c7e109143d99276b3d5a8fb41b48b6f6d6278387a8e96beaeaaf90e",
+        "length": 15328,
+        "kind": "source",
+        "tags": [
+          "settings"
+        ]
+      },
+      {
+        "sha256": "ec0e7d0c758846fa655980d902d04f4e54f5848254c53a28905f7c570f300c64",
+        "length": 14084,
+        "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "f1c51c64aee8b16855e532b30e924cca85cd134691927498263d35d8ca33307b",
+        "length": 807,
+        "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "f1f44965fa7125a70d26a120782d07ddfc3ed579381144d73d68123cfc5d7ffd",
+        "length": 578,
         "kind": "source",
         "tags": [
           "skills"
         ]
       },
       {
-        "sha256": "f2e263d25638d506acc56c7cd9a353d3c39d92b9000c8c126f42344620781fdb",
-        "length": 4338,
+        "sha256": "f2d9924ac99a71617e04774c97f60a8239253c712a40642cde459b801a98916e",
+        "length": 4903,
         "kind": "source",
         "tags": [
+          "settings",
+          "tools"
+        ]
+      },
+      {
+        "sha256": "f33a33e535b5007b548208d5497e6697ac5c25b15ef07798c0fe5685afd81feb",
+        "length": 18560,
+        "kind": "source",
+        "tags": [
+          "code-review",
           "guidance",
-          "tools"
-        ]
-      },
-      {
-        "sha256": "f7b895381f8b5b547a82a202ed1ac063c41d16ba7558d15e8287eb531b1844a9",
-        "length": 270,
-        "kind": "prompt",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "f80186989d968dad65b5c64e31eaf12fb76a3b01ab784028e907709e7fa1a688",
-        "length": 11570,
-        "kind": "source",
-        "tags": [
-          "compaction",
-          "tools"
-        ]
-      },
-      {
-        "sha256": "f8ca713955b134b60c867a54efd8a0de6246fe0b9fa2bd92baa533026913e3ac",
-        "length": 17948,
-        "kind": "source",
-        "tags": [
-          "guidance",
-          "skills",
-          "tools"
-        ]
-      },
-      {
-        "sha256": "fabfb2c01c643b6f8ce020a3b19ddf99e8494eba939c07fa0610ee7340a67853",
-        "length": 10035,
-        "kind": "source",
-        "tags": [
-          "tools"
-        ]
-      },
-      {
-        "sha256": "fb77c79f358ff75535f6399a852a505b3c862a5e2a5945810cf8cb5abbd87d9c",
-        "length": 7463,
-        "kind": "source",
-        "tags": [
           "settings",
           "skills",
           "tools"
         ]
       },
       {
-        "sha256": "fb9667700e0c4a98c6dc11259b80f948e7b4f9c49f1cad44fecf26fb93ea87c7",
-        "length": 5637,
+        "sha256": "f46be7e9602a4691552997bc3f26d637e43fa23ad3fa33c83e49231a007b4eda",
+        "length": 8003,
         "kind": "source",
         "tags": [
           "tools"
         ]
       },
       {
-        "sha256": "fba27b301049699c47d9acc8f1b9e3f9c2befa4d79587195b1c2db97d8f98bf5",
-        "length": 3687,
+        "sha256": "f4fb6b7180a123f90f3a8085c722126c4e6c8faf185c9c6d25bff3d30601b95b",
+        "length": 1325,
+        "kind": "source",
+        "tags": [
+          "guidance",
+          "tools"
+        ]
+      },
+      {
+        "sha256": "f544ddc80d68fd55a420d4d02d1121795411f2dd504263734bfd62ea2fde50d8",
+        "length": 641,
         "kind": "source",
         "tags": [
           "tools"
         ]
       },
       {
-        "sha256": "fc10ec9bdb85d2b7a4eefa0a98f8527a8102857ffcb762a0765afd8ba5d671ab",
-        "length": 3461,
+        "sha256": "f5735c5009f29e70d4092f0309563f22c160ba0566e187f5d8ab26d6a7040061",
+        "length": 11990,
+        "kind": "source",
+        "tags": [
+          "skills",
+          "tools"
+        ]
+      },
+      {
+        "sha256": "f7e1a0768dd5b3071dc1bf9d011d225929e9fc7c814004e2a319a115b0e98cc7",
+        "length": 5411,
         "kind": "source",
         "tags": [
           "tools"
         ]
       },
       {
-        "sha256": "fe927035d65aaa0c37ea8f1afd53d3240a00426c1019699fd6096d614b6a785b",
-        "length": 3467,
+        "sha256": "f8d304b8e8f27d40597d529aa7ba5ac210382381c7b272f4b1e99d3aa2e99a84",
+        "length": 1934,
+        "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "f972b97f15ce1f94b92f9b978cf1bfd6df1af1dd0b7eb9bfe0b9aff6c1506fcd",
+        "length": 3042,
+        "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "fa551800fbe6f60a74fbc5984affd925f31c5f5738f0244d74da6bb51d697c42",
+        "length": 18560,
         "kind": "source",
         "tags": [
           "compaction",
@@ -4351,11 +4658,62 @@
         ]
       },
       {
-        "sha256": "ff14194eb399365dc54a880dac4243c2bd97d5b82226a0091a21022b4e399095",
-        "length": 1718,
+        "sha256": "fa7ddbb76c9381a89e04481a5860b7f117222bfb2b8d0333c06757e303b4ab21",
+        "length": 7278,
         "kind": "source",
         "tags": [
+          "settings"
+        ]
+      },
+      {
+        "sha256": "fc52ad05714c1cb93b694cf093173e87ae2c8532d2e1dc40649ec83f27fcf3fd",
+        "length": 852,
+        "kind": "source",
+        "tags": [
+          "guidance"
+        ]
+      },
+      {
+        "sha256": "fea2127a560e8306e956ff8d55c55d6fa3ca4ea9a0fe897e3dc4aeda98c07e92",
+        "length": 557,
+        "kind": "source",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "fecdcdd99ed2844ac99658e2a6861700c0ae7e59abe3bb34e716c635ea4f8fa0",
+        "length": 660,
+        "kind": "source",
+        "tags": [
+          "skills"
+        ]
+      },
+      {
+        "sha256": "fee05dafd37e2a760f30cba7f2cf294ba31b7dc013bf0f260a90d8cb3e56a7a6",
+        "length": 324,
+        "kind": "prompt",
+        "tags": [
+          "tools"
+        ]
+      },
+      {
+        "sha256": "ff38d3fe0197d448eec92411f63052c8c5f4048952aa6fdcd60d2a7fb74c6685",
+        "length": 14542,
+        "kind": "source",
+        "tags": [
+          "guidance",
+          "settings",
           "skills",
+          "tools"
+        ]
+      },
+      {
+        "sha256": "ff90fb6b49d39fa7ff219488d38c934d507d3104cf8b332c5adf1e224cba4037",
+        "length": 1955,
+        "kind": "source",
+        "tags": [
+          "guidance",
           "tools"
         ]
       }
@@ -4364,7 +4722,7 @@
       {
         "kind": "prompt",
         "tag": "compaction",
-        "count": 7
+        "count": 6
       },
       {
         "kind": "prompt",
@@ -4378,8 +4736,13 @@
       },
       {
         "kind": "prompt",
+        "tag": "settings",
+        "count": 1
+      },
+      {
+        "kind": "prompt",
         "tag": "skills",
-        "count": 8
+        "count": 9
       },
       {
         "kind": "prompt",
@@ -4389,7 +4752,7 @@
       {
         "kind": "prompt",
         "tag": "tools",
-        "count": 37
+        "count": 41
       },
       {
         "kind": "source",
@@ -4404,12 +4767,12 @@
       {
         "kind": "source",
         "tag": "compaction",
-        "count": 19
+        "count": 18
       },
       {
         "kind": "source",
         "tag": "guidance",
-        "count": 26
+        "count": 27
       },
       {
         "kind": "source",
@@ -4419,12 +4782,12 @@
       {
         "kind": "source",
         "tag": "settings",
-        "count": 21
+        "count": 20
       },
       {
         "kind": "source",
         "tag": "skills",
-        "count": 38
+        "count": 41
       },
       {
         "kind": "source",
@@ -4434,9 +4797,9 @@
       {
         "kind": "source",
         "tag": "tools",
-        "count": 155
+        "count": 158
       }
     ]
   },
-  "generated_at": "2026-07-04T01:07:53Z"
+  "generated_at": "2026-07-09T20:27:28Z"
 }

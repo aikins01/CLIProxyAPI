@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -55,6 +56,8 @@ type readCloser struct {
 func (rc *readCloser) Read(p []byte) (int, error) { return rc.r.Read(p) }
 func (rc *readCloser) Close() error               { return rc.c.Close() }
 
+type ampProxyInternalMethodContextKey struct{}
+
 // createReverseProxy creates a reverse proxy handler for Amp upstream
 // with automatic gzip decompression via ModifyResponse
 func createReverseProxy(upstreamURL string, secretSource SecretSource) (*httputil.ReverseProxy, error) {
@@ -80,6 +83,7 @@ func createReverseProxyWithClientVersionProvider(upstreamURL string, secretSourc
 	// Modify outgoing requests to inject API key and fix routing
 	proxy.Director = func(req *http.Request) {
 		originalDirector(req)
+		tagAmpProxyInternalRPCMethod(req)
 		req.Host = parsed.Host
 		actorRequest := actorEngineRequest(req)
 		actorAuthorization := actorEngineAuthorization(req)
@@ -193,17 +197,27 @@ func createReverseProxyWithClientVersionProvider(upstreamURL string, secretSourc
 			// Close original body since we're replacing with in-memory decompressed content
 			_ = originalBody.Close()
 
-			// Replace body with decompressed content
-			resp.Body = io.NopCloser(bytes.NewReader(decompressed))
-			resp.ContentLength = int64(len(decompressed))
+			if normalized := normalizeAmpThreadListResponse(resp, decompressed); normalized != nil {
+				decompressed = normalized
+			}
 
-			// Update headers to reflect decompressed state
-			resp.Header.Del("Content-Encoding")                                          // No longer compressed
-			resp.Header.Del("Content-Length")                                            // Remove stale compressed length
-			resp.Header.Set("Content-Length", strconv.FormatInt(resp.ContentLength, 10)) // Set decompressed length
+			replaceAmpProxyResponseBody(resp, decompressed)
 
 			log.Debugf("amp proxy: decompressed gzip response (%d -> %d bytes)", len(gzippedData), len(decompressed))
 		} else {
+			if ampThreadListResponse(resp) {
+				rest, err := io.ReadAll(originalBody)
+				if err == nil {
+					body := append(header[:n], rest...)
+					if normalized := normalizeAmpThreadListResponse(resp, body); normalized != nil {
+						body = normalized
+					}
+					_ = originalBody.Close()
+					replaceAmpProxyResponseBody(resp, body)
+					return nil
+				}
+			}
+
 			// Not gzip - restore peeked bytes while preserving Close behavior
 			// Handle edge cases: n might be 0, 1, or 2 depending on EOF
 			resp.Body = &readCloser{
@@ -228,6 +242,124 @@ func createReverseProxyWithClientVersionProvider(upstreamURL string, secretSourc
 	}
 
 	return proxy, nil
+}
+
+func replaceAmpProxyResponseBody(resp *http.Response, body []byte) {
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	resp.ContentLength = int64(len(body))
+	resp.Header.Del("Content-Encoding")
+	resp.Header.Del("Content-Length")
+	resp.Header.Set("Content-Length", strconv.FormatInt(resp.ContentLength, 10))
+}
+
+func normalizeAmpThreadListResponse(resp *http.Response, body []byte) []byte {
+	if !ampThreadListResponse(resp) || len(body) == 0 {
+		return nil
+	}
+	var payload any
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	if err := decoder.Decode(&payload); err != nil {
+		return nil
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return nil
+	}
+	if !ensureAmpThreadRelationships(payload) {
+		return nil
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return nil
+	}
+	return encoded
+}
+
+func ampThreadListResponse(resp *http.Response) bool {
+	if resp == nil || resp.Request == nil || resp.Request.URL == nil {
+		return false
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return false
+	}
+	path := "/" + strings.Trim(resp.Request.URL.Path, "/")
+	if path != "/api/internal" {
+		return false
+	}
+	if method, ok := resp.Request.Context().Value(ampProxyInternalMethodContextKey{}).(string); ok && strings.EqualFold(method, "listThreads") {
+		return true
+	}
+	if strings.EqualFold(neoInternalQueryMethod(resp.Request.URL.RawQuery), "listThreads") {
+		return true
+	}
+	return false
+}
+
+func tagAmpProxyInternalRPCMethod(req *http.Request) {
+	method := ampProxyInternalRPCMethod(req)
+	if method == "" {
+		return
+	}
+	*req = *req.WithContext(context.WithValue(req.Context(), ampProxyInternalMethodContextKey{}, method))
+}
+
+func ampProxyInternalRPCMethod(req *http.Request) string {
+	if req == nil || req.URL == nil || req.Method != http.MethodPost {
+		return ""
+	}
+	if "/"+strings.Trim(req.URL.Path, "/") != "/api/internal" {
+		return ""
+	}
+	if method := neoInternalQueryMethod(req.URL.RawQuery); method != "" {
+		return method
+	}
+	body, err := readAndRestoreNeoJSONBody(req)
+	if err == nil {
+		if method := strings.TrimSpace(stringValue(body["method"])); method != "" {
+			return method
+		}
+	}
+	return ""
+}
+
+func ensureAmpThreadRelationships(value any) bool {
+	switch typed := value.(type) {
+	case map[string]any:
+		changed := false
+		for _, key := range []string{"threads", "items", "data"} {
+			if ensureAmpThreadListRelationships(typed[key]) {
+				changed = true
+			}
+		}
+		if result, ok := typed["result"]; ok {
+			if ensureAmpThreadRelationships(result) {
+				changed = true
+			}
+		}
+		return changed
+	default:
+		return ensureAmpThreadListRelationships(value)
+	}
+}
+
+func ensureAmpThreadListRelationships(value any) bool {
+	items, ok := value.([]any)
+	if !ok {
+		return false
+	}
+	changed := false
+	for _, item := range items {
+		thread, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if _, ok := thread["relationships"].([]any); !ok {
+			thread["relationships"] = []any{}
+			changed = true
+		}
+	}
+	return changed
 }
 
 func actorEngineAuthorization(req *http.Request) string {
@@ -281,6 +413,21 @@ func actorEngineRequest(req *http.Request) bool {
 	}
 	if actorEngineAuthorization(req) != "" {
 		return true
+	}
+	if strings.TrimSpace(req.URL.Query().Get("rvt-token")) != "" {
+		return true
+	}
+	for _, protocol := range req.Header.Values("Sec-WebSocket-Protocol") {
+		if strings.Contains(strings.ToLower(protocol), "rivet_token.") {
+			return true
+		}
+	}
+	return false
+}
+
+func actorEngineRivetCredentialRequest(req *http.Request) bool {
+	if req == nil || req.URL == nil {
+		return false
 	}
 	if strings.TrimSpace(req.URL.Query().Get("rvt-token")) != "" {
 		return true

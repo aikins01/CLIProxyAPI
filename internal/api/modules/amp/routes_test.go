@@ -13,7 +13,9 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -290,6 +292,11 @@ func TestWebLocalInferenceCORSAllowsOnlyConfiguredActorOriginsAndPaths(t *testin
 	if allowHeaders := rec.Header().Get("Access-Control-Allow-Headers"); !strings.Contains(strings.ToLower(allowHeaders), strings.ToLower(ampWebLocalInferenceHeader)) {
 		t.Fatalf("Access-Control-Allow-Headers = %q, want %s", allowHeaders, ampWebLocalInferenceHeader)
 	}
+	for _, header := range []string{"X-Rivet-Conn-Params", "X-Rivet-Encoding"} {
+		if allowHeaders := rec.Header().Get("Access-Control-Allow-Headers"); !strings.Contains(strings.ToLower(allowHeaders), strings.ToLower(header)) {
+			t.Fatalf("Access-Control-Allow-Headers = %q, want %s", allowHeaders, header)
+		}
+	}
 	if allowCredentials := rec.Header().Get("Access-Control-Allow-Credentials"); allowCredentials != "true" {
 		t.Fatalf("Access-Control-Allow-Credentials = %q, want true", allowCredentials)
 	}
@@ -306,7 +313,7 @@ func TestWebLocalInferenceCORSAllowsOnlyConfiguredActorOriginsAndPaths(t *testin
 		t.Fatalf("enabled web-local-inference internal preflight status = %d, want %d", internalRec.Code, http.StatusNoContent)
 	}
 
-	for _, path := range []string{"/metadata", "/actors/metadata", "/gateway/thread-actor/", "/_app/remote/3abror/createProjectThread"} {
+	for _, path := range []string{"/metadata", "/actors/metadata", "/gateway/thread-actor/", "/_app/remote/3abror/createProjectThread", "/ampcode/local-projects.json"} {
 		t.Run("root preflight "+path, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodOptions, path, nil)
 			req.Header.Set("Origin", "https://ampcode.com")
@@ -403,14 +410,22 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		t.Fatalf("userscript status = %d, want %d", rec.Code, http.StatusOK)
 	}
 	body := rec.Body.String()
+	if strings.Contains(body, "%!") {
+		t.Fatalf("userscript response contains fmt corruption marker:\n%s", body)
+	}
+	if got, want := rec.Header().Get("Content-Length"), strconv.Itoa(len(rec.Body.Bytes())); got != want {
+		t.Fatalf("userscript Content-Length = %q, want %q", got, want)
+	}
 	for _, want := range []string{
 		"// ==UserScript==",
-		"@version 0.1.27",
+		"@version 0.1.57",
 		"@match https://ampcode.com/*",
 		"@updateURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
 		"@downloadURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
 		"@sandbox raw",
 		`"http://127.0.0.1:8317"`,
+		`let defaultWorkingDirectory = "";`,
+		"ensureDefaultWorkingDirectory",
 		ampWebLocalInferenceHeader,
 		"globalThis.JSON.parse",
 		"decodedConfigPatchCount",
@@ -418,22 +433,61 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"commandPaletteIntegrationCount",
 		"localThreadPickerOpenCount",
 		"removedLocalThreadControlCount",
+		`const userscriptVersion = "0.1.57"`,
+		"userscriptVersion",
 		"lastPatchedThreadActorBaseURL",
 		"lastPatchedThreadID",
+		`let pendingLocalBootstrapThreadID = "";`,
 		"threadActorConfig",
-		"executorConnected",
+		"plainThreadActorConfigHasBridgeFields",
+		"devalueThreadActorConfigHasBridgeFields",
+		"localPlainThreadActorConfig",
+		"localDevalueThreadActorConfig",
+		"plainContainerThreadID",
+		"devalueContainerThreadID",
+		"ensurePlainLocalThreadActorConfig",
+		"ensureDevalueLocalThreadActorConfig",
+		`wsToken: "local-neo"`,
+		`threadActorTransport: "json-rpc"`,
 		"local-client",
 		"cliproxyapi.ampLocalInference.apiKey",
 		"storedLocalAPIKey",
-		`return globalThis.sessionStorage.getItem(apiKeyStorageKey) || ""`,
+		"globalThis.localStorage.getItem(apiKeyStorageKey)",
 		`const promptedAPIKey = (globalThis.prompt("CLIProxyAPI API key") || "").trim()`,
 		"globalThis.sessionStorage.setItem(apiKeyStorageKey, promptedAPIKey)",
 		"cliproxyapi.ampLocalInference.workingDirectory",
+		"cliproxyapi.ampLocalInference.selectedLocalProject",
 		"cliproxyapi.ampLocalInference.localThreadIDs",
 		"cliproxyapi.ampLocalInference.threadWorkingDirectories",
 		"cliproxyapi.ampLocalInference.threadSettings",
+		"/ampcode/local-projects.json",
+		"localProjectsEndpointPath",
+		"selectedLocalProjectWorkingDirectory",
+		"currentLocalProjectWorkingDirectory",
+		"rememberSelectedLocalProject",
+		"clearSelectedLocalProject",
+		"globalThis.localStorage.removeItem(workingDirectoryStorageKey)",
+		"normalizeLocalProject",
+		"fetchLocalProjects",
+		"function fetchLocalProjects(promptForKey = false)",
+		`const headers = localFetchHeaders("", false)`,
+		"localProjectLookupAPIKey",
+		"promptedProjectsAPIKey",
+		"responseDefaultWorkingDirectory",
+		"fetchLocalProjects(false)",
+		"fetchLocalProjects(true)",
+		"installLocalProjectPickerIntegration",
+		"installLocalProjectPickerSearch",
+		"filterLocalProjectPickerItems",
+		"installLocalProjectNoProjectSelectionHandler",
+		"localProjectPickerLooksLikeProjectPicker",
+		"if (!item || projectPickerItemSelected(item))",
+		"closeLocalProjectPickerViaNoProject",
+		"localProjectFetchCount",
+		"localProjectPickerIntegrationCount",
 		"lastObservedThreadID",
 		"observedThreadID",
+		"threadID === pathThreadID()",
 		"normalizeExplicitReasoningEffort",
 		"lastInheritedWorkingDirectory",
 		"remoteShellCreateCount",
@@ -465,27 +519,39 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"Generate Diagnostic Report",
 		"plainThreadWorkingDirectory",
 		"devalueThreadWorkingDirectory",
+		"rememberPlainThreadRuntime",
+		"rememberDevalueThreadRuntime",
 		"TextDecoder",
-		"matches.length === 1",
+		`.split(/[\\/]+/)`,
+		"parsedTextLocalInferencePatchOptions",
+		`source.includes("\"id\"")`,
+		`source.includes("workingDirectory")`,
+		`source.includes("workspaceRoot")`,
+		"matches.size === 1",
 		"internalAPIPath",
 		"workingDirectory",
 		`prompt("CLIProxyAPI API key")`,
+		"function localAPIKey(rememberCancel = true)",
 		`"Bearer " + apiKey`,
 		"gatewayActorPath",
+		"gatewayUserActorPath",
+		"gatewayUserActorActionPath",
+		`new Set(["registerRunner", "runnerHeartbeat", "unregisterRunner", "listRunners"])`,
+		"localRunnerActionNames.has(parts[3])",
+		`"user-actor"`,
+		`.split("@")[0]`,
+		"shouldBridgeUserActorWebSocket",
+		"return !!storedLocalAPIKey();",
 		"threadActorAPIPath",
 		"threadActorCreatePath",
 		"threadActorInstancePath",
 		"svelteKitRemoteEndpoint",
 		"svelteKitRemotePath",
 		"createProjectThreadRemotePath",
-		"refreshLocalSidebarProjects",
-		"mergeDevalueSidebarProjects",
-		"cachedLocalSidebarRecentThreads",
-		"appendDevalueSidebarValue",
-		"devalueSidebarThreadIDs",
-		"localSidebarRecentThreadCount",
 		"remoteCreateProjectThreadWorkingDirectory",
 		"rememberRemoteCreateProjectThread",
+		`if (!response || !response.ok || typeof response.clone !== "function")`,
+		`if (workingDirectory)`,
 		"/_app/remote/",
 		"createProjectThread",
 		"prewarmProjectThread",
@@ -499,12 +565,21 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"firstThreadIDFromText",
 		"rvt-input",
 		"sameLocalHTTPBase",
+		"samePageWebSocketBase",
 		"sameLocalWebSocketBase",
 		"diagnostics",
 		"lastWebSocketBootstrapped",
 		"cliproxy-client",
 		"amp-web-local-inference",
 		"cliproxy-bootstrap-executor",
+		`const apiKey = local.searchParams.get("cliproxy-api-key") || (userActorSocket ? storedLocalAPIKey() : localAPIKey());`,
+		"if (userActorSocket && !apiKey)",
+		"const bootstrapExecutor = shouldBootstrapExecutor(source);",
+		"if (bootstrapExecutor && !userActorSocket && threadID && threadID === pathThreadID())",
+		"pendingLocalBootstrapThreadID = threadID;",
+		"let rememberLocalThreadIDOnOpen = \"\";",
+		"rememberLocalThreadIDOnOpen = pendingLocalBootstrapThreadID;",
+		"if (rememberLocalThreadIDOnOpen)",
 		"/api/thread-actors",
 		"/api/internal",
 		"WebSocket",
@@ -513,12 +588,44 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 			t.Fatalf("userscript missing %q:\n%s", want, body)
 		}
 	}
+	visibleProjectIndex := strings.Index(body, "const fromVisibleProject = visibleProjectWorkingDirectory(visibleCreateThreadProjectName());")
+	selectedLocalProjectIndex := strings.Index(body, "const fromSelectedLocalProject = selectedLocalProjectWorkingDirectory();")
+	if selectedLocalProjectIndex < 0 || visibleProjectIndex < 0 || visibleProjectIndex > selectedLocalProjectIndex {
+		t.Fatalf("userscript must prefer visible project before stale selected local project for create-thread working directory")
+	}
 	for _, unwanted := range []string{
 		"installLocalThreadKeyboardShortcut();",
 		"installThreadMenuIntegration();",
 		"installCommandPaletteIntegration();",
 		"handleNewThreadIntent();",
 		"mergeSidebarResponse",
+		"seedLocalSidebarProjects",
+		"seedLocalSidebarProjectForWorkingDirectory",
+		"scheduleLocalSidebarProjectsRefresh",
+		"refreshLocalSidebarProjects",
+		"mergeDevalueSidebarProjects",
+		"cachedLocalSidebarRecentThreads",
+		"cachedLocalSidebarProjects",
+		"sidebarDateFields",
+		"appendDevalueSidebarDateValue",
+		"appendDevalueSidebarValue",
+		"devalueSidebarThreadIDs",
+		"devalueSidebarThreadRef",
+		"patchDevalueSidebarThread",
+		"localProjectIDForWorkingDirectory",
+		"globalThis.localStorage.setItem(apiKeyStorageKey, promptedAPIKey)",
+		"cachedProjectWorkingDirectory",
+		"patchPlainThreadRuntime",
+		"patchDevalueThreadRuntime",
+		`meta.executorType = "local-client"`,
+		`source.includes("hasExecutor")`,
+		`source.includes("executorConnected")`,
+		"ensureDevalueValueIndex(values, true)",
+		`if (!workingDirectory || !response || !response.ok || typeof response.clone !== "function")`,
+		"!projectPickerItemSelected(noProject)",
+		"/_app/remote/cliproxy/listThreadListSidebar",
+		`case "listThreadListSidebar":`,
+		`case "listUserExecutorDaemons":`,
 		`svelteKitRemoteEndpoint(sourceURL.pathname) === "listThreadListSidebar"`,
 		"path.endsWith(\"/listThreadListSidebar\")",
 		"path.endsWith(\"/listUserExecutorDaemons\")",
@@ -530,11 +637,968 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 			t.Fatalf("userscript still activates obsolete local thread control %q:\n%s", unwanted, body)
 		}
 	}
-	if got := strings.Count(body, "refreshLocalSidebarProjects();"); got != 2 {
-		t.Fatalf("refreshLocalSidebarProjects call count = %d, want 2", got)
+	projectIDIndex := strings.Index(body, `const projectID = isPlainObject(decoded) ? firstString(decoded.projectID, decoded.projectId, decoded.project_id) : "";`)
+	projectIDLookupIndex := strings.Index(body, `const fromProjectID = normalizeWorkingDirectory(localProjectByID(localProjectsCache.projects, projectID)?.workingDirectory);`)
+	projectIDVisibleLookupIndex := strings.Index(body, `const fromVisibleLocalProject = visibleLocalProjectWorkingDirectory(visibleCreateThreadProjectName());`)
+	visibleProjectFallbackIndex := strings.Index(body, `const fromVisibleProject = visibleProjectWorkingDirectory(visibleCreateThreadProjectName());`)
+	if projectIDIndex < 0 || projectIDLookupIndex < 0 || projectIDVisibleLookupIndex < 0 || visibleProjectFallbackIndex < 0 || projectIDIndex > projectIDLookupIndex || projectIDLookupIndex > projectIDVisibleLookupIndex || projectIDVisibleLookupIndex > visibleProjectFallbackIndex || !strings.Contains(body[projectIDLookupIndex:visibleProjectFallbackIndex], `return fromProjectID;`) || !strings.Contains(body[projectIDVisibleLookupIndex:visibleProjectFallbackIndex], `return "";`) {
+		t.Fatalf("userscript should resolve projectID bodies before visible project fallback:\n%s", body)
 	}
-	if !strings.Contains(body, `headers: localFetchHeaders("", false)`) {
-		t.Fatalf("background sidebar refresh should not prompt for API key:\n%s", body)
+
+	headReq := httptest.NewRequest(http.MethodHead, "/ampcode/local-inference.user.js", nil)
+	headReq.Host = "127.0.0.1:8317"
+	headRec := httptest.NewRecorder()
+	r.ServeHTTP(headRec, headReq)
+
+	if headRec.Code != http.StatusOK {
+		t.Fatalf("userscript HEAD status = %d, want %d", headRec.Code, http.StatusOK)
+	}
+	if got := headRec.Body.String(); got != "" {
+		t.Fatalf("userscript HEAD body = %q, want empty", got)
+	}
+	if got := headRec.Header().Get("Content-Length"); got == "" {
+		t.Fatalf("userscript HEAD missing Content-Length")
+	}
+}
+
+func TestWebLocalInferenceUserscriptSyntax(t *testing.T) {
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node not installed")
+	}
+	path := filepath.Join(t.TempDir(), "local-inference.user.js")
+	if err := os.WriteFile(path, []byte(ampWebLocalInferenceUserscript("http://127.0.0.1:8317", nil)), 0o600); err != nil {
+		t.Fatalf("write userscript: %v", err)
+	}
+	cmd := exec.Command("node", "--check", path)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("userscript syntax check failed: %v\n%s", err, output)
+	}
+}
+
+func TestWebLocalInferenceUserscriptPatchesLocalThreadActorConfig(t *testing.T) {
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node not installed")
+	}
+	dir := t.TempDir()
+	scriptPath := filepath.Join(dir, "local-inference.user.js")
+	if err := os.WriteFile(scriptPath, []byte(ampWebLocalInferenceUserscript("http://127.0.0.1:8317", nil)), 0o600); err != nil {
+		t.Fatalf("write userscript: %v", err)
+	}
+	threadID := "T-019f324b-2802-7868-b1b1-5f0fa3e87ea5"
+	secondThreadID := "T-019f324b-2802-7868-b1b1-5f0fa3e87ea6"
+	runner := `
+(async () => {
+const assert = (condition, message) => {
+	if (!condition) throw new Error(message);
+};
+const scriptPath = ` + strconv.Quote(scriptPath) + `;
+const threadID = ` + strconv.Quote(threadID) + `;
+const secondThreadID = ` + strconv.Quote(secondThreadID) + `;
+const createdThreadID = "T-019f20b2-5e05-7501-8ddd-994e151ee951";
+const failedThreadID = "T-019f20b2-5e05-7501-8ddd-994e151ee955";
+const createdThreadWorkDir = "/Users/aikins01/Developer/CLIProxyAPI";
+class TestStorage {
+	constructor() { this.values = new Map(); }
+	getItem(key) {
+		key = String(key);
+		return this.values.has(key) ? this.values.get(key) : null;
+	}
+	setItem(key, value) { this.values.set(String(key), String(value)); }
+	removeItem(key) { this.values.delete(String(key)); }
+}
+	class FakeElement {
+		constructor(tagName = "div", text = "") {
+			this.dataset = {};
+			this.style = {};
+			this.children = [];
+			this.attributes = new Map();
+			this.tagName = String(tagName).toUpperCase();
+			this.textContent = String(text);
+			this.parentElement = null;
+			this.classList = { add() {}, remove() {}, contains() { return false; } };
+		}
+		appendChild(child) { this.children.push(child); child.parentElement = this; return child; }
+		append(...children) { for (const child of children) this.appendChild(child); }
+		addEventListener() {}
+		removeEventListener() {}
+		setAttribute(name, value) { this.attributes.set(String(name), String(value)); }
+		getAttribute(name) { return this.attributes.has(String(name)) ? this.attributes.get(String(name)) : null; }
+		hasAttribute(name) { return this.attributes.has(String(name)); }
+		removeAttribute(name) { this.attributes.delete(String(name)); }
+		getBoundingClientRect() { return { width: 120, height: 24 }; }
+		replaceChildren(...children) { this.children = []; this.textContent = ""; this.append(...children); }
+		querySelector() { return null; }
+		querySelectorAll() { return []; }
+		closest() { return null; }
+		matches() { return false; }
+	}
+class NativeWebSocket {
+	static CONNECTING = 0;
+	static OPEN = 1;
+	static CLOSING = 2;
+	static CLOSED = 3;
+	static instances = [];
+	constructor(url, protocols) {
+		this.url = String(url);
+		this.protocols = protocols;
+		this.readyState = NativeWebSocket.CONNECTING;
+		this.listeners = {};
+		NativeWebSocket.instances.push(this);
+	}
+	addEventListener(name, callback) { this.listeners[name] = callback; }
+	close() { this.readyState = NativeWebSocket.CLOSED; }
+}
+globalThis.location = new URL("https://ampcode.com/threads/" + threadID);
+	let documentQueryElements = [];
+	globalThis.document = {
+		readyState: "loading",
+		body: new FakeElement(),
+		documentElement: new FakeElement(),
+		addEventListener() {},
+		querySelector() { return null; },
+		querySelectorAll() { return documentQueryElements; },
+		createElement(tagName) { return new FakeElement(tagName); },
+		createTreeWalker() { return { nextNode() { return null; } }; },
+	};
+globalThis.Element = FakeElement;
+globalThis.HTMLElement = FakeElement;
+globalThis.NodeFilter = { SHOW_TEXT: 4, SHOW_ELEMENT: 1 };
+globalThis.MutationObserver = class { observe() {} disconnect() {} };
+globalThis.localStorage = new TestStorage();
+globalThis.sessionStorage = new TestStorage();
+const encodeDevalue = (value) => Buffer.from(JSON.stringify(value)).toString("base64url");
+const requestPayloadText = (body) => {
+	try {
+		return Buffer.from(JSON.parse(body).payload || "", "base64url").toString("utf8");
+	} catch {
+		return "";
+	}
+};
+let createFetchURL = "";
+let metadataFetchURL = "";
+let metadataFetchAuthorization = "";
+let metadataFetchBridgeHeader = "";
+let metadataFetchRivetEncoding = "";
+let metadataFetchUnsupportedHeader = "";
+globalThis.fetch = async (url, init) => {
+	const fetchURL = String(url);
+	const parsedURL = new URL(fetchURL, globalThis.location.href);
+	if (parsedURL.pathname === "/metadata" || parsedURL.pathname === "/actors/metadata") {
+		metadataFetchURL = fetchURL;
+		const headers = new Headers(init?.headers || {});
+		metadataFetchAuthorization = headers.get("Authorization") || "";
+		metadataFetchBridgeHeader = headers.get("X-CLIProxyAPI-Web-Local-Inference") || "";
+		metadataFetchRivetEncoding = headers.get("X-Rivet-Encoding") || "";
+		metadataFetchUnsupportedHeader = headers.get("X-Unlisted-Framework-Header") || "";
+		return new Response(JSON.stringify({
+			clientEndpoint: "http://127.0.0.1:8317",
+			clientNamespace: parsedURL.searchParams.get("namespace") || "default",
+			clientToken: "local-neo",
+			runtime: "engine",
+		}), {
+			status: 200,
+			headers: { "Content-Type": "application/json" },
+		});
+	}
+	if (parsedURL.pathname.endsWith("/createProjectThread")) {
+		createFetchURL = fetchURL;
+	}
+	const body = String(init?.body || "");
+	if (requestPayloadText(body).includes(failedThreadID)) {
+		const data = JSON.stringify([
+			{ _: 1 },
+			{ ok: 2, error: 3 },
+			false,
+			{ message: 4 },
+			"missing working directory",
+		]);
+		return new Response(JSON.stringify({ type: "result", data }), {
+			status: 200,
+			headers: { "Content-Type": "application/json" },
+		});
+	}
+	const data = JSON.stringify([
+		{ _: 1 },
+		{ ok: 2, threadID: 3, threadId: 3, workingDirectory: 4, workspaceRoot: 4 },
+		true,
+		createdThreadID,
+		createdThreadWorkDir,
+	]);
+	return new Response(JSON.stringify({ type: "result", data }), {
+		status: 200,
+		headers: { "Content-Type": "application/json" },
+	});
+};
+globalThis.WebSocket = NativeWebSocket;
+globalThis.prompt = () => "";
+globalThis.history = { state: null, replaceState() {} };
+if (typeof globalThis.atob !== "function") {
+	globalThis.atob = (value) => Buffer.from(value, "base64").toString("binary");
+}
+if (typeof globalThis.btoa !== "function") {
+	globalThis.btoa = (value) => Buffer.from(value, "binary").toString("base64");
+}
+require(scriptPath);
+const bridge = globalThis.__cliproxyAmpLocalInference;
+	assert(bridge && bridge.userscriptVersion === "0.1.57", "bridge userscript version was not exposed");
+	globalThis.localStorage.setItem(bridge.localThreadIDsStorageKey, JSON.stringify([threadID, secondThreadID]));
+	globalThis.localStorage.setItem(bridge.apiKeyStorageKey, "local-key");
+	globalThis.localStorage.setItem(bridge.workingDirectoryStorageKey, createdThreadWorkDir);
+	const strayHigh = new FakeElement("span", "High");
+	const modeLow = new FakeElement("button", "Low");
+	modeLow.setAttribute("aria-haspopup", "menu");
+	documentQueryElements = [strayHigh, modeLow];
+		new WebSocket("wss://ampcode.com/gateway?key=" + encodeURIComponent(threadID));
+		const inheritedModeURL = new URL(NativeWebSocket.instances.at(-1).url);
+		assert(inheritedModeURL.origin === "ws://127.0.0.1:8317", "gateway websocket was not bridged locally");
+		assert(inheritedModeURL.searchParams.get("cliproxy-agent-mode") === "low", "unrelated High text overrode real mode control");
+		assert(inheritedModeURL.searchParams.get("cliproxy-reasoning-effort") === "medium", "low mode reasoning effort was not inherited");
+		const genericAriaModeHigh = new FakeElement("button", "High");
+		genericAriaModeHigh.setAttribute("aria-label", "Agent mode");
+		documentQueryElements = [genericAriaModeHigh];
+		new WebSocket("wss://ampcode.com/gateway?key=" + encodeURIComponent(threadID));
+		const genericAriaModeURL = new URL(NativeWebSocket.instances.at(-1).url);
+		assert(genericAriaModeURL.searchParams.get("cliproxy-agent-mode") === "high", "generic aria label masked visible mode text");
+		assert(genericAriaModeURL.searchParams.get("cliproxy-reasoning-effort") === "xhigh", "high mode reasoning effort was not inherited");
+		documentQueryElements = [];
+	const metadataResponse = await fetch("http://127.0.0.1:8317/metadata?namespace=default");
+assert(metadataResponse.ok, "metadata fetch failed");
+assert(metadataFetchURL === "http://127.0.0.1:8317/metadata?namespace=default", "local metadata URL changed");
+assert(metadataFetchAuthorization === "Bearer local-key", "local metadata fetch missing API key");
+assert(metadataFetchBridgeHeader === "1", "local metadata fetch missing bridge header");
+const actorsMetadataResponse = await fetch("https://ampcode.com/actors/metadata?namespace=default", { headers: { "X-Rivet-Encoding": "bare", "X-Unlisted-Framework-Header": "blocked" } });
+assert(actorsMetadataResponse.ok, "actors metadata fetch failed");
+const bridgedActorsMetadataURL = new URL(metadataFetchURL);
+assert(bridgedActorsMetadataURL.origin === "http://127.0.0.1:8317", "same-origin actors metadata was not bridged to local base");
+assert(bridgedActorsMetadataURL.pathname === "/actors/metadata", "actors metadata path changed");
+assert(metadataFetchAuthorization === "Bearer local-key", "actors metadata fetch missing API key");
+assert(metadataFetchBridgeHeader === "1", "actors metadata fetch missing bridge header");
+assert(metadataFetchRivetEncoding === "bare", "supported Rivet header was not forwarded");
+assert(metadataFetchUnsupportedHeader === "", "unsupported source header was forwarded to local CORS request");
+const assertPlainConfig = (config, label) => {
+	assert(config && typeof config === "object", label + " config missing");
+	const expectedThreadID = label === "created plain" ? createdThreadID : threadID;
+	assert(config.threadId === expectedThreadID, label + " threadId mismatch");
+	assert(config.wsToken === "local-neo", label + " wsToken mismatch");
+	assert(config.ampURL === "http://127.0.0.1:8317", label + " ampURL mismatch");
+	assert(config.baseURL === "http://127.0.0.1:8317", label + " baseURL mismatch");
+	assert(config.capability === "write", label + " capability mismatch");
+	assert(config.poolName === "default", label + " poolName mismatch");
+	assert(config.requiresSudoForWrite === false, label + " requiresSudoForWrite mismatch");
+	assert(config.requiresSudoForTerminal === false, label + " requiresSudoForTerminal mismatch");
+	assert(config.threadActorTransport === "json-rpc", label + " threadActorTransport mismatch");
+};
+const plain = JSON.parse(JSON.stringify({ current: { thread: { id: threadID, title: "Local" }, threadActorConfig: null } }));
+assertPlainConfig(plain.current.threadActorConfig, "plain");
+assert(bridge.diagnostics.lastPatchedThreadID === threadID, "plain patch did not record thread ID");
+const values = JSON.parse(JSON.stringify([{ current: 1 }, { thread: 2 }, { id: 3, title: 4 }, threadID, "Local" ]));
+const configIndex = values[1].threadActorConfig;
+assert(Number.isInteger(configIndex), "devalue threadActorConfig was not a reference");
+const devalueConfig = values[configIndex];
+const deref = (value) => Number.isInteger(value) ? values[value] : value;
+assert(deref(devalueConfig.threadId) === threadID, "devalue threadId mismatch");
+assert(deref(devalueConfig.wsToken) === "local-neo", "devalue wsToken mismatch");
+assert(deref(devalueConfig.ampURL) === "http://127.0.0.1:8317", "devalue ampURL mismatch");
+assert(deref(devalueConfig.baseURL) === "http://127.0.0.1:8317", "devalue baseURL mismatch");
+assert(deref(devalueConfig.capability) === "write", "devalue capability mismatch");
+assert(deref(devalueConfig.poolName) === "default", "devalue poolName mismatch");
+assert(deref(devalueConfig.requiresSudoForWrite) === false, "devalue requiresSudoForWrite mismatch");
+assert(deref(devalueConfig.requiresSudoForTerminal) === false, "devalue requiresSudoForTerminal mismatch");
+assert(deref(devalueConfig.threadActorTransport) === "json-rpc", "devalue threadActorTransport mismatch");
+assert(bridge.diagnostics.lastPatchedThreadID === threadID, "devalue patch did not record thread ID");
+const nullConfigValues = JSON.parse(JSON.stringify([{ current: 1 }, { thread: 2, threadActorConfig: 5 }, { id: 3, title: 4 }, threadID, "Local", null ]));
+const nullConfigIndex = nullConfigValues[1].threadActorConfig;
+assert(Number.isInteger(nullConfigIndex), "null-ref devalue threadActorConfig was not patched");
+assert(nullConfigIndex !== 5, "null-ref devalue threadActorConfig still points at null");
+const nullConfig = nullConfigValues[nullConfigIndex];
+const nullDeref = (value) => Number.isInteger(value) ? nullConfigValues[value] : value;
+assert(nullDeref(nullConfig.threadId) === threadID, "null-ref devalue threadId mismatch");
+assert(nullDeref(nullConfig.wsToken) === "local-neo", "null-ref devalue wsToken mismatch");
+globalThis.location = new URL("https://ampcode.com/threads/" + secondThreadID);
+const secondValues = JSON.parse(JSON.stringify([{ current: 1 }, { thread: 2 }, { id: 3, title: 4 }, secondThreadID, "Second" ]));
+const secondConfigIndex = secondValues[1].threadActorConfig;
+assert(Number.isInteger(secondConfigIndex), "second devalue threadActorConfig was not patched after local navigation");
+const secondConfig = secondValues[secondConfigIndex];
+const secondDeref = (value) => Number.isInteger(value) ? secondValues[value] : value;
+assert(secondDeref(secondConfig.threadId) === secondThreadID, "second devalue threadId mismatch");
+const failedRequestBody = JSON.stringify({
+	payload: encodeDevalue([
+		{ content: 1, agentMode: 5, threadID: 6, reasoningEffort: 7 },
+		[2],
+		{ type: 3, text: 4 },
+		"text",
+		"Missing local project",
+		"deep",
+		failedThreadID,
+		"xhigh",
+	]),
+	refreshes: [],
+});
+await fetch("https://ampcode.com/_app/remote/3abror/createProjectThread", {
+	method: "POST",
+	headers: { "Content-Type": "application/json" },
+	body: failedRequestBody,
+});
+assert(!JSON.parse(globalThis.localStorage.getItem(bridge.localThreadIDsStorageKey)).includes(failedThreadID), "failed create thread was remembered");
+const createRequestBody = JSON.stringify({
+	payload: encodeDevalue([
+		{ content: 1, agentMode: 5, threadID: 6, reasoningEffort: 7 },
+		[2],
+		{ type: 3, text: 4 },
+		"text",
+		"Use local project",
+		"deep",
+		createdThreadID,
+		"xhigh",
+	]),
+	refreshes: [],
+});
+await fetch("https://ampcode.com/_app/remote/3abror/createProjectThread", {
+	method: "POST",
+	headers: { "Content-Type": "application/json" },
+	body: createRequestBody,
+});
+const bridgedCreateURL = new URL(createFetchURL);
+assert(bridgedCreateURL.origin === "http://127.0.0.1:8317", "create fetch was not bridged to local base");
+assert(bridgedCreateURL.searchParams.get("cliproxy-working-directory") === createdThreadWorkDir, "create fetch missing working directory");
+assert(JSON.parse(globalThis.localStorage.getItem(bridge.localThreadIDsStorageKey)).includes(createdThreadID), "created thread was not remembered before route-data parse");
+globalThis.location = new URL("https://ampcode.com/threads/" + createdThreadID);
+const staleSidebarThreadID = "T-019f3586-fb79-7309-a219-4a279ef2900c";
+const sideEffectThreadID = "T-019f3586-fb79-7309-a219-4a279ef2900d";
+const stalePlainSidebar = JSON.parse(JSON.stringify({
+	recentThreads: [
+		{ id: createdThreadID, title: "Created", hasExecutor: false, executorConnected: false, meta: { executorType: "local-client", usesThreadActors: true } },
+		{ id: staleSidebarThreadID, title: "Remote", hasExecutor: false, executorConnected: false, meta: { executorType: "local-client", usesThreadActors: true } },
+	],
+}));
+assert(!Object.hasOwn(stalePlainSidebar.recentThreads[0], "hasExecutor"), "plain local stale hasExecutor was not cleared");
+assert(!Object.hasOwn(stalePlainSidebar.recentThreads[0], "executorConnected"), "plain local stale executorConnected was not cleared");
+assert(stalePlainSidebar.recentThreads[1].hasExecutor === false, "plain nonlocal hasExecutor was changed");
+assert(stalePlainSidebar.recentThreads[1].executorConnected === false, "plain nonlocal executorConnected was changed");
+const stalePlainAlias = JSON.parse(JSON.stringify({ id: "not-a-thread-id", threadId: createdThreadID, hasExecutor: false, executorConnected: false }));
+assert(!Object.hasOwn(stalePlainAlias, "hasExecutor"), "plain alias stale hasExecutor was not cleared");
+assert(!Object.hasOwn(stalePlainAlias, "executorConnected"), "plain alias stale executorConnected was not cleared");
+const activePlainArray = JSON.parse(JSON.stringify([{ id: createdThreadID, title: "Created", hasExecutor: false, executorConnected: false, threadActorConfig: null }]));
+assertPlainConfig(activePlainArray[0].threadActorConfig, "created plain");
+assert(!Object.hasOwn(activePlainArray[0], "hasExecutor"), "active plain array stale hasExecutor was not cleared");
+assert(!Object.hasOwn(activePlainArray[0], "executorConnected"), "active plain array stale executorConnected was not cleared");
+const stalePlainContainer = JSON.parse(JSON.stringify({ thread: { id: createdThreadID, title: "Created" }, hasExecutor: false, executorConnected: false, threadActorConfig: null }));
+assertPlainConfig(stalePlainContainer.threadActorConfig, "created plain");
+assert(!Object.hasOwn(stalePlainContainer, "hasExecutor"), "plain container stale hasExecutor was not cleared");
+assert(!Object.hasOwn(stalePlainContainer, "executorConnected"), "plain container stale executorConnected was not cleared");
+const staleDevalueSidebar = JSON.parse(JSON.stringify([
+	{ recentThreads: 1 },
+	[2, 7],
+	{ id: 3, title: 4, hasExecutor: 5, executorConnected: 5, meta: 6 },
+	createdThreadID,
+	"Created",
+	false,
+	{ executorType: 8, usesThreadActors: 9 },
+	{ id: 10, title: 11, hasExecutor: 5, executorConnected: 5, meta: 6 },
+	"local-client",
+	true,
+	staleSidebarThreadID,
+	"Remote",
+]));
+assert(!Object.hasOwn(staleDevalueSidebar[2], "hasExecutor"), "devalue local stale hasExecutor was not cleared");
+assert(!Object.hasOwn(staleDevalueSidebar[2], "executorConnected"), "devalue local stale executorConnected was not cleared");
+assert(staleDevalueSidebar[7].hasExecutor === 5, "devalue nonlocal hasExecutor was changed");
+assert(staleDevalueSidebar[7].executorConnected === 5, "devalue nonlocal executorConnected was changed");
+const staleDevalueAlias = JSON.parse(JSON.stringify([
+	{ id: 1, threadID: 2, hasExecutor: 3, executorConnected: 3 },
+	"not-a-thread-id",
+	createdThreadID,
+	false,
+]));
+assert(!Object.hasOwn(staleDevalueAlias[0], "hasExecutor"), "devalue alias stale hasExecutor was not cleared");
+assert(!Object.hasOwn(staleDevalueAlias[0], "executorConnected"), "devalue alias stale executorConnected was not cleared");
+const devalueThreadSettingsMessage = JSON.parse(JSON.stringify([
+	{ type: 1, threadID: 2, settings: 3 },
+	"thread_settings",
+	createdThreadID,
+	{ agentMode: 4 },
+	"deep",
+]));
+assert(!Object.hasOwn(devalueThreadSettingsMessage[0], "threadActorConfig"), "devalue thread_settings message was given a threadActorConfig");
+const staleDevalueContainer = JSON.parse(JSON.stringify([
+	{ thread: 1, hasExecutor: 3, executorConnected: 3 },
+	{ id: 2, title: 4 },
+	createdThreadID,
+	false,
+	"Created",
+]));
+assert(!Object.hasOwn(staleDevalueContainer[0], "hasExecutor"), "devalue container stale hasExecutor was not cleared");
+assert(!Object.hasOwn(staleDevalueContainer[0], "executorConnected"), "devalue container stale executorConnected was not cleared");
+const localThreadIDs = JSON.parse(globalThis.localStorage.getItem(bridge.localThreadIDsStorageKey));
+localThreadIDs.unshift(sideEffectThreadID);
+globalThis.localStorage.setItem(bridge.localThreadIDsStorageKey, JSON.stringify(localThreadIDs));
+const observedBeforeContainerClear = bridge.diagnostics.lastObservedThreadID;
+globalThis.location = new URL("https://ampcode.com/");
+const sideEffectDevalueContainer = JSON.parse(JSON.stringify([
+	{ thread: 1, hasExecutor: 3, executorConnected: 3 },
+	{ id: 2, title: 4 },
+	sideEffectThreadID,
+	false,
+	"Container",
+]));
+assert(!Object.hasOwn(sideEffectDevalueContainer[0], "hasExecutor"), "side-effect devalue container stale hasExecutor was not cleared");
+assert(!Object.hasOwn(sideEffectDevalueContainer[0], "executorConnected"), "side-effect devalue container stale executorConnected was not cleared");
+assert(bridge.diagnostics.lastObservedThreadID === observedBeforeContainerClear, "stale devalue container changed the observed thread");
+globalThis.location = new URL("https://ampcode.com/threads/" + createdThreadID);
+assert(bridge.diagnostics.localThreadStatusPatchCount >= 2, "local thread status patches were not recorded");
+const createdPlain = JSON.parse(JSON.stringify({ threadData: { thread: { id: createdThreadID, title: "Created" }, threadActorConfig: null } }));
+assertPlainConfig(createdPlain.threadData.threadActorConfig, "created plain");
+assert(bridge.diagnostics.lastPatchedThreadID === createdThreadID, "created route-data patch did not record thread ID");
+const threadDataResponse = new Response(JSON.stringify({
+	type: "result",
+	thread: { id: createdThreadID, title: "Created", hasExecutor: false, executorConnected: false },
+	project: null,
+}));
+Object.defineProperty(threadDataResponse, "url", { value: "https://ampcode.com/threads/" + createdThreadID + "/__data" });
+const decodedThreadDataResponse = await threadDataResponse.json();
+assertPlainConfig(decodedThreadDataResponse.threadActorConfig, "created plain");
+assert(!Object.hasOwn(decodedThreadDataResponse.thread, "hasExecutor"), "thread data response stale hasExecutor was not cleared");
+assert(!Object.hasOwn(decodedThreadDataResponse.thread, "executorConnected"), "thread data response stale executorConnected was not cleared");
+assert(bridge.diagnostics.lastPatchedThreadID === createdThreadID, "thread data response patch did not record thread ID");
+const localThreadDataResponse = new Response(JSON.stringify({
+	type: "result",
+	thread: { id: createdThreadID, title: "Created local", hasExecutor: false, executorConnected: false },
+	project: null,
+}));
+Object.defineProperty(localThreadDataResponse, "url", { value: "http://127.0.0.1:8317/threads/" + createdThreadID + "/__data" });
+const decodedLocalThreadDataResponse = await localThreadDataResponse.json();
+assertPlainConfig(decodedLocalThreadDataResponse.threadActorConfig, "created plain");
+assert(!Object.hasOwn(decodedLocalThreadDataResponse.thread, "hasExecutor"), "local thread data response stale hasExecutor was not cleared");
+assert(!Object.hasOwn(decodedLocalThreadDataResponse.thread, "executorConnected"), "local thread data response stale executorConnected was not cleared");
+const jsonThreadDataResponse = new Response(JSON.stringify({
+	type: "data",
+	nodes: [
+		null,
+		{
+			type: "data",
+			data: [
+				{ threadData: 1 },
+				{ thread: 2, threadActorConfig: 5 },
+				{ id: 3, title: 4, hasExecutor: 6, executorConnected: 6 },
+				createdThreadID,
+				"Created JSON",
+				null,
+				false,
+			],
+		},
+	],
+}));
+Object.defineProperty(jsonThreadDataResponse, "url", { value: "https://ampcode.com/threads/" + createdThreadID + "/__data.json" });
+const decodedJSONThreadDataResponse = await jsonThreadDataResponse.json();
+const jsonValues = decodedJSONThreadDataResponse.nodes[1].data;
+const jsonConfigIndex = jsonValues[1].threadActorConfig;
+assert(Number.isInteger(jsonConfigIndex), "json route-data threadActorConfig was not patched");
+assert(jsonConfigIndex !== 5, "json route-data threadActorConfig still points at null");
+const jsonConfig = jsonValues[jsonConfigIndex];
+const jsonDeref = (value) => Number.isInteger(value) ? jsonValues[value] : value;
+assert(jsonDeref(jsonConfig.threadId) === createdThreadID, "json route-data threadId mismatch");
+assert(jsonDeref(jsonConfig.wsToken) === "local-neo", "json route-data wsToken mismatch");
+assert(!Object.hasOwn(jsonValues[2], "hasExecutor"), "json route-data stale hasExecutor was not cleared");
+assert(!Object.hasOwn(jsonValues[2], "executorConnected"), "json route-data stale executorConnected was not cleared");
+assert(bridge.diagnostics.responseJSONPatchCount >= 3, "response json patches were not recorded");
+const nestedRouteData = JSON.parse(JSON.stringify({
+	type: "data",
+	nodes: [
+		null,
+		{
+			type: "data",
+			data: [
+				{ threadData: 1 },
+				{ thread: 2, threadActorConfig: 5 },
+				{ id: 3, title: 4 },
+				createdThreadID,
+				"Created",
+				null,
+			],
+		},
+	],
+}));
+const nestedValues = nestedRouteData.nodes[1].data;
+const nestedConfigIndex = nestedValues[1].threadActorConfig;
+assert(Number.isInteger(nestedConfigIndex), "nested route-data threadActorConfig was not patched");
+assert(nestedConfigIndex !== 5, "nested route-data threadActorConfig still points at null");
+const nestedConfig = nestedValues[nestedConfigIndex];
+const nestedDeref = (value) => Number.isInteger(value) ? nestedValues[value] : value;
+assert(nestedDeref(nestedConfig.threadId) === createdThreadID, "nested route-data threadId mismatch");
+assert(nestedDeref(nestedConfig.wsToken) === "local-neo", "nested route-data wsToken mismatch");
+assert(nestedDeref(nestedConfig.ampURL) === "http://127.0.0.1:8317", "nested route-data ampURL mismatch");
+assert(bridge.diagnostics.lastPatchedThreadID === createdThreadID, "nested route-data patch did not record thread ID");
+const socket = new WebSocket("wss://ampcode.com/gateway/threadActor/?rvt-method=get&rvt-key=" + encodeURIComponent(secondThreadID));
+const rewritten = new URL(socket.url);
+assert(rewritten.protocol === "ws:", "websocket protocol was not rewritten");
+assert(rewritten.host === "127.0.0.1:8317", "websocket host was not rewritten");
+assert(rewritten.searchParams.get("cliproxy-api-key") === "local-key", "localStorage API key was not applied");
+assert(rewritten.searchParams.get("cliproxy-bootstrap-executor") === "true", "bootstrap executor flag missing");
+const relativeSocket = new WebSocket("/gateway/threadActor/?rvt-method=get&rvt-key=" + encodeURIComponent(secondThreadID));
+const relativeRewritten = new URL(relativeSocket.url);
+assert(relativeRewritten.protocol === "ws:", "relative websocket protocol was not rewritten");
+assert(relativeRewritten.host === "127.0.0.1:8317", "relative websocket host was not rewritten");
+assert(relativeRewritten.searchParams.get("cliproxy-api-key") === "local-key", "relative localStorage API key was not applied");
+const localHTTPConfigSocket = new WebSocket("http://127.0.0.1:8317/gateway/threadActor/websocket/?rvt-method=get&rvt-key=" + encodeURIComponent(secondThreadID));
+const localHTTPRewritten = new URL(localHTTPConfigSocket.url);
+assert(localHTTPRewritten.protocol === "ws:", "local http websocket protocol was not rewritten");
+assert(localHTTPRewritten.host === "127.0.0.1:8317", "local http websocket host changed");
+assert(localHTTPRewritten.searchParams.get("cliproxy-api-key") === "local-key", "local http websocket localStorage API key was not applied");
+assert(bridge.diagnostics.decodedConfigPatchCount >= 2, "decoded config patches were not recorded");
+assert(bridge.diagnostics.webSocketBootstrapCount === 5, "websocket bootstrap was not recorded");
+})().catch((error) => {
+	console.error(error && error.stack ? error.stack : error);
+	process.exit(1);
+});
+`
+	runnerPath := filepath.Join(dir, "run-userscript-test.js")
+	if err := os.WriteFile(runnerPath, []byte(runner), 0o600); err != nil {
+		t.Fatalf("write runner: %v", err)
+	}
+	cmd := exec.Command("node", runnerPath)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("userscript behavior check failed: %v\n%s", err, output)
+	}
+}
+
+func TestWebLocalInferenceUserscriptProjectPickerPrefersVisibleProject(t *testing.T) {
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node not installed")
+	}
+	dir := t.TempDir()
+	scriptPath := filepath.Join(dir, "local-inference.user.js")
+	if err := os.WriteFile(scriptPath, []byte(ampWebLocalInferenceUserscript("http://127.0.0.1:8317", nil)), 0o600); err != nil {
+		t.Fatalf("write userscript: %v", err)
+	}
+	runner := `
+(async () => {
+const assert = (condition, message) => {
+	if (!condition) throw new Error(message);
+};
+const scriptPath = ` + strconv.Quote(scriptPath) + `;
+class TestStorage {
+	constructor() { this.values = new Map(); }
+	getItem(key) { key = String(key); return this.values.has(key) ? this.values.get(key) : null; }
+	setItem(key, value) { this.values.set(String(key), String(value)); }
+	removeItem(key) { this.values.delete(String(key)); }
+}
+const datasetKey = (name) => String(name || "").replace(/^data-/, "").replace(/-([a-z])/g, (_, char) => char.toUpperCase());
+class FakeEvent {
+	constructor(type, init = {}) {
+		this.type = type;
+		this.key = init.key || "";
+		this.bubbles = !!init.bubbles;
+		this.cancelable = !!init.cancelable;
+		this.defaultPrevented = false;
+		this.propagationStopped = false;
+		this.target = null;
+	}
+	preventDefault() { this.defaultPrevented = true; }
+	stopPropagation() { this.propagationStopped = true; }
+}
+class FakeElement {
+	constructor(tagName = "div") {
+		this.tagName = String(tagName).toUpperCase();
+		this.dataset = {};
+		this.attributes = new Map();
+		this.style = {};
+		this.children = [];
+		this.parentElement = null;
+		this.eventListeners = {};
+		this.className = "";
+		this.disabled = false;
+		this.hidden = false;
+		this.value = "";
+		this._text = "";
+	}
+	get firstElementChild() { return this.children[0] || null; }
+	get textContent() { return this._text + this.children.map((child) => child.textContent).join(""); }
+	set textContent(value) { this._text = String(value || ""); this.children = []; }
+	get innerText() {
+		const childText = this.children.map((child) => child.innerText).filter(Boolean);
+		if (!childText.length) return this._text;
+		const separator = ["BUTTON", "DIV"].includes(this.tagName) ? "\n" : "";
+		return [this._text, childText.join(separator)].filter(Boolean).join(separator);
+	}
+	set innerText(value) { this.textContent = value; }
+	append(...nodes) { for (const node of nodes) this.appendChild(node); }
+	appendChild(child) {
+		if (!(child instanceof FakeElement)) return child;
+		child.remove();
+		child.parentElement = this;
+		this.children.push(child);
+		return child;
+	}
+	insertBefore(child, before) {
+		if (!(child instanceof FakeElement)) return child;
+		child.remove();
+		child.parentElement = this;
+		const index = before ? this.children.indexOf(before) : -1;
+		if (index >= 0) this.children.splice(index, 0, child);
+		else this.children.push(child);
+		return child;
+	}
+	replaceChildren(...nodes) {
+		for (const child of this.children) child.parentElement = null;
+		this.children = [];
+		this._text = "";
+		this.append(...nodes);
+	}
+	remove() {
+		if (!this.parentElement) return;
+		const index = this.parentElement.children.indexOf(this);
+		if (index >= 0) this.parentElement.children.splice(index, 1);
+		this.parentElement = null;
+	}
+	setAttribute(name, value) {
+		name = String(name);
+		value = String(value);
+		this.attributes.set(name, value);
+		if (name.startsWith("data-")) this.dataset[datasetKey(name)] = value;
+		if (name === "role") this.role = value;
+	}
+	getAttribute(name) {
+		name = String(name);
+		if (name.startsWith("data-") && this.dataset[datasetKey(name)] !== undefined) return this.dataset[datasetKey(name)];
+		return this.attributes.has(name) ? this.attributes.get(name) : null;
+	}
+	removeAttribute(name) {
+		name = String(name);
+		this.attributes.delete(name);
+		if (name.startsWith("data-")) delete this.dataset[datasetKey(name)];
+	}
+	matches(selector) {
+		return String(selector).split(",").some((raw) => {
+			const part = raw.trim();
+			if (!part) return false;
+			if (part === "*") return true;
+			if (/^[a-z]+$/i.test(part)) return this.tagName.toLowerCase() === part.toLowerCase();
+			const match = part.match(/^\[([^=\]]+)(?:=['"]?([^'"\]]+)['"]?)?\]$/);
+			if (!match) return false;
+			const name = match[1];
+			const expected = match[2];
+			const value = this.getAttribute(name);
+			return expected === undefined ? value !== null || this.dataset[datasetKey(name)] !== undefined : value === expected;
+		});
+	}
+	querySelectorAll(selector) {
+		const out = [];
+		const visit = (element) => {
+			for (const child of element.children) {
+				if (child.matches(selector)) out.push(child);
+				visit(child);
+			}
+		};
+		visit(this);
+		return out;
+	}
+	querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
+	closest(selector) {
+		for (let node = this; node; node = node.parentElement) {
+			if (node.matches(selector)) return node;
+		}
+		return null;
+	}
+	contains(target) {
+		for (let node = target; node; node = node.parentElement) {
+			if (node === this) return true;
+		}
+		return false;
+	}
+	addEventListener(type, callback) {
+		(this.eventListeners[type] ||= []).push(callback);
+	}
+	removeEventListener() {}
+	dispatchEvent(event) {
+		event.target ||= this;
+		for (const callback of this.eventListeners[event.type] || []) {
+			callback.call(this, event);
+			if (event.propagationStopped) return !event.defaultPrevented;
+		}
+		if (event.bubbles && this.parentElement) {
+			return this.parentElement.dispatchEvent(event);
+		}
+		return !event.defaultPrevented;
+	}
+	getBoundingClientRect() {
+		if (this.hidden || this.style.display === "none") return { width: 0, height: 0, left: 0, top: 0, right: 0, bottom: 0 };
+		return { width: 320, height: 32, left: 0, top: 0, right: 320, bottom: 32 };
+	}
+	scrollIntoView() {}
+}
+const documentElement = new FakeElement("html");
+const body = new FakeElement("body");
+documentElement.appendChild(body);
+globalThis.Element = FakeElement;
+globalThis.HTMLElement = FakeElement;
+globalThis.NodeFilter = { SHOW_TEXT: 4, SHOW_ELEMENT: 1 };
+globalThis.KeyboardEvent = class extends FakeEvent { constructor(type, init) { super(type, init); } };
+globalThis.MouseEvent = class extends FakeEvent { constructor(type, init) { super(type, init); } };
+globalThis.MutationObserver = class { observe() {} disconnect() {} };
+globalThis.document = {
+	readyState: "complete",
+	body,
+	documentElement,
+	createElement(tag) { return new FakeElement(tag); },
+	querySelector(selector) { return documentElement.querySelector(selector); },
+	querySelectorAll(selector) { return documentElement.querySelectorAll(selector); },
+	getElementById(id) { return documentElement.querySelectorAll("*").find((element) => element.getAttribute("id") === String(id)) || null; },
+	contains(target) { return documentElement.contains(target); },
+	addEventListener() {},
+	removeEventListener() {},
+	dispatchEvent(event) { return documentElement.dispatchEvent(event); },
+	createTreeWalker() { return { currentNode: null, nextNode() { return null; } }; },
+};
+globalThis.location = new URL("https://ampcode.com/threads/T-019f324b-2802-7868-b1b1-5f0fa3e87ea5");
+globalThis.history = { state: null, replaceState() {} };
+globalThis.localStorage = new TestStorage();
+globalThis.sessionStorage = new TestStorage();
+globalThis.localStorage.setItem("cliproxyapi.ampLocalInference.apiKey", "local-key");
+globalThis.localStorage.setItem("cliproxyapi.ampLocalInference.workingDirectory", "/Users/aikins01/Developer/on-chain");
+globalThis.sessionStorage.setItem("cliproxyapi.ampLocalInference.selectedLocalProject", JSON.stringify({
+	name: "on-chain",
+	workingDirectory: "/Users/aikins01/Developer/on-chain",
+	selectedAt: Date.now(),
+}));
+const tempTelemetryDirectory = "/private/tmp/telemetry-pr81-review-6soxv4lc/telemetry.dev";
+let localProjectsPayload = {
+	defaultWorkingDirectory: "/Users/aikins01",
+	projects: [
+		{ name: "on-chain", workingDirectory: "/Users/aikins01/Developer/on-chain" },
+		{ name: "telemetry.dev", workingDirectory: tempTelemetryDirectory },
+		{ name: "telemetry.dev", workingDirectory: "/private/var/folders/63/_bz0gwdn0px0d4r7s9zhct8m0000gn/T/telemetry-pr78-review-XXXXXX.RGqjFliah5/telemetry.dev" },
+		{ name: "telemetry.dev", workingDirectory: "/Users/aikins01/Developer/telemetry.dev" },
+	],
+};
+	let lastFetchURL = "";
+	globalThis.fetch = async (url) => {
+		lastFetchURL = String(url);
+		if (lastFetchURL.includes("/_app/remote/3abror/createProjectThread")) {
+			return new Response(JSON.stringify({ data: "" }), { status: 200, headers: { "Content-Type": "application/json" } });
+		}
+		assert(lastFetchURL.includes("/ampcode/local-projects.json"), "unexpected fetch " + url);
+		return new Response(JSON.stringify(localProjectsPayload), { status: 200, headers: { "Content-Type": "application/json" } });
+};
+globalThis.prompt = () => "";
+globalThis.WebSocket = class {};
+const encodeDevalue = (value) => Buffer.from(JSON.stringify(value)).toString("base64url");
+const headerProjectLink = new FakeElement("a");
+headerProjectLink.setAttribute("href", "https://github.com/telemetry-dev/telemetry.dev/tree/6bcbce6911b604cfc8dd8255bc9215a930222dfb");
+headerProjectLink.textContent = "telemetry.dev";
+const message = new FakeElement("article");
+const messageProjectLink = new FakeElement("a");
+messageProjectLink.setAttribute("href", "https://github.com/example/wrong/tree/main");
+messageProjectLink.textContent = "wrong";
+message.appendChild(messageProjectLink);
+const broadProjectLink = new FakeElement("a");
+broadProjectLink.setAttribute("href", "https://github.com/example/body-wrong/tree/main");
+broadProjectLink.textContent = "body-wrong";
+const broadMoreActions = new FakeElement("button");
+broadMoreActions.textContent = "More Actions";
+const headerContainer = new FakeElement("div");
+const moreActions = new FakeElement("button");
+moreActions.setAttribute("aria-label", "More Actions");
+moreActions.textContent = "More Actions";
+headerContainer.append(moreActions, headerProjectLink);
+const picker = new FakeElement("div");
+picker.setAttribute("role", "dialog");
+const input = new FakeElement("input");
+const title = new FakeElement("div");
+title.textContent = "Projects";
+const popupProjectButton = new FakeElement("button");
+popupProjectButton.textContent = "Project: on-chain ⌘ K";
+const list = new FakeElement("div");
+list.setAttribute("role", "listbox");
+const noProject = new FakeElement("button");
+noProject.setAttribute("role", "option");
+noProject.textContent = "No Project";
+const actions = new FakeElement("div");
+actions.textContent = "Actions";
+list.appendChild(noProject);
+list.appendChild(actions);
+	picker.append(input, title, popupProjectButton, list);
+	body.appendChild(picker);
+	body.appendChild(message);
+	body.appendChild(broadProjectLink);
+	body.appendChild(broadMoreActions);
+	body.appendChild(headerContainer);
+	require(scriptPath);
+	globalThis.sessionStorage.setItem("cliproxyapi.ampLocalInference.selectedLocalProject", JSON.stringify({
+		name: "on-chain",
+		workingDirectory: "/Users/aikins01/Developer/on-chain",
+		selectedAt: Date.now(),
+	}));
+	popupProjectButton.textContent = "Project: telemetry.dev";
+	lastFetchURL = "";
+	await globalThis.fetch("https://ampcode.com/_app/remote/3abror/createProjectThread", {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ payload: encodeDevalue([{ projectID: 1 }, "75616c3b-f4de-48b7-8b83-c1af6978a034"]) }),
+	});
+	const createURL = new URL(lastFetchURL);
+	assert(createURL.origin === "http://127.0.0.1:8317", "create-thread request was not rewritten locally: " + lastFetchURL);
+	assert(createURL.searchParams.get("cliproxy-working-directory") === "/Users/aikins01/Developer/telemetry.dev", "create-thread did not use visible project from local cache: " + lastFetchURL);
+	headerProjectLink.textContent = "missing";
+	headerProjectLink.setAttribute("href", "https://github.com/example/missing/tree/main");
+	popupProjectButton.textContent = "Project: cloud-only";
+	lastFetchURL = "";
+	await globalThis.fetch("https://ampcode.com/_app/remote/3abror/createProjectThread", {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ payload: encodeDevalue([{ projectID: 1 }, "75616c3b-f4de-48b7-8b83-c1af6978a034"]) }),
+	});
+	const unresolvedProjectURL = new URL(lastFetchURL);
+	assert(!unresolvedProjectURL.searchParams.has("cliproxy-working-directory"), "unresolved projectID fell through to stale selected project: " + lastFetchURL);
+	headerProjectLink.textContent = "telemetry.dev";
+	headerProjectLink.setAttribute("href", "https://github.com/telemetry-dev/telemetry.dev/tree/6bcbce6911b604cfc8dd8255bc9215a930222dfb");
+	popupProjectButton.textContent = "Project: telemetry.dev";
+	await new Promise((resolve) => setTimeout(resolve, 25));
+	const localItems = list.querySelectorAll("[data-cliproxy-local-project-item]");
+assert(localItems.length === 4, "expected four local project items, got " + localItems.length);
+const selected = localItems.find((item) => item.getAttribute("aria-selected") === "true" || item.dataset.selected === "true");
+assert(selected, "no injected local project item was selected");
+assert(selected.dataset.cliproxyLocalProjectWorkingDirectory === "/Users/aikins01/Developer/telemetry.dev", "visible project was not selected: " + selected.innerText);
+	assert(selected.dataset.cliproxyLocalProjectCurrent === "1", "visible project item was not marked current");
+assert(popupProjectButton.textContent.includes("Project: telemetry.dev"), "popup project button stayed stale: " + popupProjectButton.textContent);
+input.value = "Developer/telemetry.dev";
+input.dispatchEvent(new FakeEvent("input", { bubbles: true }));
+await new Promise((resolve) => setTimeout(resolve, 25));
+const filteredItems = localItems.filter((item) => !item.hidden && item.style.display !== "none");
+assert(filteredItems.length === 1, "local project search did not filter to one item: " + filteredItems.map((item) => item.innerText).join(" | "));
+assert(filteredItems[0].dataset.cliproxyLocalProjectWorkingDirectory === "/Users/aikins01/Developer/telemetry.dev", "local project search kept wrong duplicate");
+assert(filteredItems[0].dataset.selected === "true", "local project search did not select its visible match");
+input.value = "";
+input.dispatchEvent(new FakeEvent("input", { bubbles: true }));
+await new Promise((resolve) => setTimeout(resolve, 25));
+assert(localItems.every((item) => !item.hidden && item.style.display !== "none"), "clearing local project search did not restore all items");
+popupProjectButton.textContent = "Project: on-chain";
+delete popupProjectButton.dataset.cliproxyLocalProjectActivator;
+delete popupProjectButton.dataset.cliproxyLocalProjectLabel;
+delete popupProjectButton.dataset.cliproxyLocalProjectWorkingDirectory;
+globalThis.sessionStorage.setItem("cliproxyapi.ampLocalInference.selectedLocalProject", JSON.stringify({
+	name: "stale",
+	workingDirectory: "/Users/aikins01/Developer/stale",
+	selectedAt: Date.now(),
+}));
+lastFetchURL = "";
+await globalThis.fetch("https://ampcode.com/_app/remote/3abror/createProjectThread", {
+	method: "POST",
+	headers: { "Content-Type": "application/json" },
+	body: JSON.stringify({ payload: "" }),
+});
+const nativeDialogSelectedURL = new URL(lastFetchURL);
+assert(nativeDialogSelectedURL.searchParams.get("cliproxy-working-directory") === "/Users/aikins01/Developer/on-chain", "native dialog-selected project did not win: " + lastFetchURL);
+lastFetchURL = "";
+await globalThis.fetch("https://ampcode.com/_app/remote/3abror/createProjectThread", {
+	method: "POST",
+	headers: { "Content-Type": "application/json" },
+	body: JSON.stringify({ payload: encodeDevalue([{ projectID: 1 }, "75616c3b-f4de-48b7-8b83-c1af6978a034"]) }),
+});
+const nativeDialogProjectIDURL = new URL(lastFetchURL);
+assert(nativeDialogProjectIDURL.searchParams.get("cliproxy-working-directory") === "/Users/aikins01/Developer/on-chain", "projectID create did not use known dialog-selected project: " + lastFetchURL);
+popupProjectButton.textContent = "Project: cloud-only";
+delete popupProjectButton.dataset.cliproxyLocalProjectActivator;
+delete popupProjectButton.dataset.cliproxyLocalProjectLabel;
+delete popupProjectButton.dataset.cliproxyLocalProjectWorkingDirectory;
+lastFetchURL = "";
+await globalThis.fetch("https://ampcode.com/_app/remote/3abror/createProjectThread", {
+	method: "POST",
+	headers: { "Content-Type": "application/json" },
+	body: JSON.stringify({ payload: "" }),
+});
+const unresolvedDialogURL = new URL(lastFetchURL);
+assert(!unresolvedDialogURL.searchParams.has("cliproxy-working-directory"), "unresolved dialog project inherited page project: " + lastFetchURL);
+popupProjectButton.textContent = "Project: on-chain";
+popupProjectButton.dataset.cliproxyLocalProjectActivator = "1";
+popupProjectButton.dataset.cliproxyLocalProjectLabel = "on-chain";
+popupProjectButton.dataset.cliproxyLocalProjectWorkingDirectory = "/Users/aikins01/Developer/on-chain";
+globalThis.sessionStorage.setItem("cliproxyapi.ampLocalInference.selectedLocalProject", JSON.stringify({
+	name: "on-chain",
+	workingDirectory: "/Users/aikins01/Developer/on-chain",
+	selectedAt: Date.now(),
+}));
+lastFetchURL = "";
+await globalThis.fetch("https://ampcode.com/_app/remote/3abror/createProjectThread", {
+	method: "POST",
+	headers: { "Content-Type": "application/json" },
+	body: JSON.stringify({ payload: "" }),
+});
+const dialogSelectedURL = new URL(lastFetchURL);
+assert(dialogSelectedURL.searchParams.get("cliproxy-working-directory") === "/Users/aikins01/Developer/on-chain", "dialog-selected project did not win: " + lastFetchURL);
+popupProjectButton.textContent = "Project: telemetry.dev";
+popupProjectButton.dataset.cliproxyLocalProjectLabel = "telemetry.dev";
+popupProjectButton.dataset.cliproxyLocalProjectWorkingDirectory = "/Users/aikins01/Developer/telemetry.dev";
+globalThis.sessionStorage.setItem("cliproxyapi.ampLocalInference.selectedLocalProject", JSON.stringify({
+	name: "telemetry.dev",
+	workingDirectory: tempTelemetryDirectory,
+	selectedAt: Date.now(),
+}));
+lastFetchURL = "";
+await globalThis.fetch("https://ampcode.com/_app/remote/3abror/createProjectThread", {
+	method: "POST",
+	headers: { "Content-Type": "application/json" },
+	body: JSON.stringify({ payload: "" }),
+});
+const explicitDuplicateURL = new URL(lastFetchURL);
+assert(explicitDuplicateURL.searchParams.get("cliproxy-working-directory") === tempTelemetryDirectory, "explicit duplicate project was overridden: " + lastFetchURL);
+	picker.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+	await new Promise((resolve) => setTimeout(resolve, 25));
+	assert(globalThis.localStorage.getItem("cliproxyapi.ampLocalInference.workingDirectory") === "/Users/aikins01/Developer/telemetry.dev", "Enter did not activate the selected visible project");
+	headerProjectLink.textContent = "api";
+	headerProjectLink.setAttribute("href", "https://github.com/example/foo/tree/main");
+	popupProjectButton.textContent = "Project: api";
+	popupProjectButton.dataset.cliproxyLocalProjectLabel = "api";
+	popupProjectButton.dataset.cliproxyLocalProjectWorkingDirectory = "/Users/aikins01/Developer/bar/api";
+	globalThis.sessionStorage.setItem("cliproxyapi.ampLocalInference.selectedLocalProject", JSON.stringify({
+		name: "api",
+		workingDirectory: "/Users/aikins01/Developer/bar/api",
+		selectedAt: Date.now(),
+	}));
+	globalThis.localStorage.setItem("cliproxyapi.ampLocalInference.workingDirectory", "/Users/aikins01/Developer/bar/api");
+	globalThis.localStorage.setItem("cliproxyapi.ampLocalInference.threadWorkingDirectories", JSON.stringify({
+		"T-019f324b-2802-7868-b1b1-5f0fa3e87ea6": "/Users/aikins01/Developer/foo/api",
+	}));
+	lastFetchURL = "";
+	await globalThis.fetch("https://ampcode.com/_app/remote/3abror/createProjectThread", {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ payload: "" }),
+	});
+	const collisionURL = new URL(lastFetchURL);
+	assert(collisionURL.searchParams.get("cliproxy-working-directory") === "/Users/aikins01/Developer/bar/api", "remembered basename match overrode selected project: " + lastFetchURL);
+	headerProjectLink.textContent = "missing";
+	headerProjectLink.setAttribute("href", "https://github.com/example/missing/tree/main");
+	localProjectsPayload = {
+		defaultWorkingDirectory: "/Users/aikins01",
+		projects: [
+			{ name: "api", workingDirectory: "/Users/aikins01/Developer/foo/api" },
+			{ name: "bar service", workingDirectory: "/Users/aikins01/Developer/bar/api" },
+		],
+	};
+	for (const item of list.querySelectorAll("[data-cliproxy-local-project-item]")) item.remove();
+	delete list.dataset.cliproxyCurrentProjectAutoSelected;
+	delete list.dataset.cliproxyLocalProjectLoading;
+	delete list.dataset.cliproxyLocalProjectAttempts;
+	delete require.cache[require.resolve(scriptPath)];
+	require(scriptPath);
+	await new Promise((resolve) => setTimeout(resolve, 25));
+	const collisionItems = list.querySelectorAll("[data-cliproxy-local-project-item]");
+	const selectedCollision = collisionItems.find((item) => item.getAttribute("aria-selected") === "true" || item.dataset.selected === "true");
+	const collisionSummary = collisionItems.map((item) => item.dataset.cliproxyLocalProjectWorkingDirectory + ":" + item.dataset.selected + ":" + item.getAttribute("aria-selected") + ":" + item.dataset.cliproxyLocalProjectCurrent).join("|");
+	assert(selectedCollision, "no collision local project item was selected: " + collisionSummary);
+	assert(selectedCollision.dataset.cliproxyLocalProjectWorkingDirectory === "/Users/aikins01/Developer/bar/api", "basename collision selected wrong local project: " + selectedCollision.innerText);
+	})().catch((error) => {
+	console.error(error && error.stack ? error.stack : error);
+	process.exit(1);
+});
+`
+	runnerPath := filepath.Join(dir, "run-project-picker-test.js")
+	if err := os.WriteFile(runnerPath, []byte(runner), 0o600); err != nil {
+		t.Fatalf("write runner: %v", err)
+	}
+	cmd := exec.Command("node", runnerPath)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("userscript project picker check failed: %v\n%s", err, output)
 	}
 }
 
@@ -550,6 +1614,14 @@ func TestWebLocalInferenceUserscriptRouteRequiresOptIn(t *testing.T) {
 
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("userscript status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+
+	headReq := httptest.NewRequest(http.MethodHead, "/ampcode/local-inference.user.js", nil)
+	headRec := httptest.NewRecorder()
+	r.ServeHTTP(headRec, headReq)
+
+	if headRec.Code != http.StatusNotFound {
+		t.Fatalf("userscript HEAD status = %d, want %d", headRec.Code, http.StatusNotFound)
 	}
 }
 
@@ -657,6 +1729,29 @@ func TestWebLocalInferenceGatewayWebSocketUsesQueryAPIKey(t *testing.T) {
 	}
 	if sawQueryAPIKey {
 		t.Fatal("web local inference query API key leaked to runtime")
+	}
+
+	sawInternalClientKey = ""
+	sawQueryAPIKey = false
+	rivetReq, err := http.NewRequest(http.MethodGet, server.URL+"/gateway/threadActor/?rvt-method=get&rvt-key=T-web&rvt-token=local-neo&"+ampWebLocalInferenceAPIKeyQuery+"=local-key", nil)
+	if err != nil {
+		t.Fatalf("rivet request build: %v", err)
+	}
+	rivetReq.Header.Set("Origin", "https://ampcode.com")
+	rivetResp, err := http.DefaultClient.Do(rivetReq)
+	if err != nil {
+		t.Fatalf("rivet request: %v", err)
+	}
+	defer rivetResp.Body.Close()
+	if rivetResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(rivetResp.Body)
+		t.Fatalf("rivet status = %d, body=%s", rivetResp.StatusCode, body)
+	}
+	if sawInternalClientKey != "local-key" {
+		t.Fatalf("rivet %s = %q, want local-key", neoInternalClientAPIKeyHeader, sawInternalClientKey)
+	}
+	if sawQueryAPIKey {
+		t.Fatal("rivet web local inference query API key leaked to runtime")
 	}
 }
 
@@ -834,7 +1929,7 @@ func TestWebLocalInferenceCanBootstrapRemoteShellThreadLocallyWithProxy(t *testi
 	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
 		t.Fatalf("response JSON error: %v", err)
 	}
-	if stringValue(response["threadId"]) != threadID || response["executorType"] != "local-client" {
+	if stringValue(response["threadId"]) != threadID || response["executorType"] != "local-client" || stringValue(response["wsToken"]) == "" || stringValue(response["ownerUserId"]) != neoLocalOwnerUserID {
 		t.Fatalf("unexpected bootstrap response: %#v", response)
 	}
 	actor := m.neoRuntime.store.lookupThreadActor(threadID)
@@ -980,7 +2075,11 @@ func TestWebLocalInferenceInternalRPCRequiresAPIKey(t *testing.T) {
 	}
 	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, auth)
 
-	unauthReq := httptest.NewRequest(http.MethodPost, "/api/internal?listThreads", bytes.NewBufferString(`{"method":"listThreads","params":{"limit":20}}`))
+	threadID := "T-019e0e6e-f3f1-7078-b5dd-748f66f8c267"
+	m.neoRuntime.store.ensureThreadActor(threadID)
+	body := `{"method":"getThreadLabels","params":{"thread":"` + threadID + `"}}`
+
+	unauthReq := httptest.NewRequest(http.MethodPost, "/api/internal?getThreadLabels", bytes.NewBufferString(body))
 	unauthReq.Header.Set("Content-Type", "application/json")
 	unauthReq.Header.Set("Origin", "https://ampcode.com")
 	unauthReq.Header.Set(ampWebLocalInferenceHeader, "1")
@@ -990,7 +2089,7 @@ func TestWebLocalInferenceInternalRPCRequiresAPIKey(t *testing.T) {
 		t.Fatalf("unauthenticated internal RPC status = %d, want %d; body=%s", unauthRec.Code, http.StatusUnauthorized, unauthRec.Body.String())
 	}
 
-	authReq := httptest.NewRequest(http.MethodPost, "/api/internal?listThreads&"+ampWebLocalInferenceAPIKeyQuery+"=local-key", bytes.NewBufferString(`{"method":"listThreads","params":{"limit":20}}`))
+	authReq := httptest.NewRequest(http.MethodPost, "/api/internal?getThreadLabels&"+ampWebLocalInferenceAPIKeyQuery+"=local-key", bytes.NewBufferString(body))
 	authReq.Header.Set("Content-Type", "application/json")
 	authReq.Header.Set("Origin", "https://ampcode.com")
 	authReq.Header.Set(ampWebLocalInferenceHeader, "1")
@@ -1440,7 +2539,7 @@ func TestRegisterManagementRoutesRemoteWebRoutesDoNotSynthesizeLocalThreadData(t
 	}
 }
 
-func TestWebLocalInferenceInternalRPCServesLocalThreadWithoutProxy(t *testing.T) {
+func TestWebLocalInferenceInternalRPCDoesNotServeThreadDocumentsWithoutProxy(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	enabled := true
@@ -1469,55 +2568,63 @@ func TestWebLocalInferenceInternalRPCServesLocalThreadWithoutProxy(t *testing.T)
 	threadID := stringValue(createResponse["threadId"])
 	requireNeoBinaryV7ThreadID(t, threadID)
 
-	getReq := httptest.NewRequest(http.MethodPost, "/api/internal?getThread", bytes.NewBufferString(`{"method":"getThread","params":{"thread":"`+threadID+`"}}`))
-	getReq.Header.Set("Content-Type", "application/json")
-	getReq.Header.Set("Origin", "https://ampcode.com")
-	getReq.Header.Set(ampWebLocalInferenceHeader, "1")
-	getRec := httptest.NewRecorder()
-	r.ServeHTTP(getRec, getReq)
-	if getRec.Code != http.StatusOK {
-		t.Fatalf("getThread status = %d, body=%s", getRec.Code, getRec.Body.String())
+	tests := []struct {
+		name    string
+		method  string
+		body    string
+		headers map[string]string
+		remote  string
+	}{
+		{
+			name:   "web getThread",
+			method: "getThread",
+			body:   `{"method":"getThread","params":{"thread":"` + threadID + `"}}`,
+			headers: map[string]string{
+				"Origin":                   "https://ampcode.com",
+				ampWebLocalInferenceHeader: "1",
+			},
+		},
+		{
+			name:   "web listThreads",
+			method: "listThreads",
+			body:   `{"method":"listThreads","params":{"limit":20}}`,
+			headers: map[string]string{
+				"Origin":                   "https://ampcode.com",
+				ampWebLocalInferenceHeader: "1",
+			},
+		},
+		{
+			name:   "plain getThread",
+			method: "getThread",
+			body:   `{"method":"getThread","params":{"thread":"` + threadID + `"}}`,
+		},
+		{
+			name:   "cli getThread",
+			method: "getThread",
+			body:   `{"method":"getThread","params":{"thread":"` + threadID + `"}}`,
+			headers: map[string]string{
+				"X-Amp-Client-Application": "CLI",
+				"X-Amp-Client-Type":        "cli",
+			},
+			remote: "[::1]:54321",
+		},
 	}
-	var getResponse map[string]any
-	if err := json.Unmarshal(getRec.Body.Bytes(), &getResponse); err != nil {
-		t.Fatalf("getThread response JSON error: %v", err)
-	}
-	thread := mapValue(mapValue(getResponse["result"])["thread"])
-	if stringValue(thread["id"]) != threadID || thread["executorConnected"] != true {
-		t.Fatalf("unexpected local thread response: %#v", getResponse)
-	}
-	if stringValue(mapValue(thread["meta"])["ampcodeConnectorMode"]) != "local-neo" {
-		t.Fatalf("thread meta missing local marker: %#v", thread["meta"])
-	}
-	queued := arrayValue(thread["queuedMessages"])
-	if len(queued) != 1 || textFromBlocks(arrayValue(mapValue(mapValue(queued[0])["queuedMessage"])["content"])) != "hello local web" {
-		t.Fatalf("queuedMessages = %#v", queued)
-	}
-
-	listReq := httptest.NewRequest(http.MethodPost, "/api/internal?listThreads", bytes.NewBufferString(`{"method":"listThreads","params":{"limit":20}}`))
-	listReq.Header.Set("Content-Type", "application/json")
-	listReq.Header.Set("Origin", "https://ampcode.com")
-	listReq.Header.Set(ampWebLocalInferenceHeader, "1")
-	listRec := httptest.NewRecorder()
-	r.ServeHTTP(listRec, listReq)
-	if listRec.Code != http.StatusOK {
-		t.Fatalf("listThreads status = %d, body=%s", listRec.Code, listRec.Body.String())
-	}
-	var listResponse map[string]any
-	if err := json.Unmarshal(listRec.Body.Bytes(), &listResponse); err != nil {
-		t.Fatalf("listThreads response JSON error: %v", err)
-	}
-	statuses := arrayValue(mapValue(listResponse["result"])["threads"])
-	if len(statuses) != 1 || stringValue(mapValue(statuses[0])["threadId"]) != threadID || mapValue(statuses[0])["executorConnected"] != true {
-		t.Fatalf("unexpected local thread statuses: %#v", listResponse)
-	}
-
-	plainReq := httptest.NewRequest(http.MethodPost, "/api/internal?getThread", bytes.NewBufferString(`{"method":"getThread","params":{"thread":"`+threadID+`"}}`))
-	plainReq.Header.Set("Content-Type", "application/json")
-	plainRec := httptest.NewRecorder()
-	r.ServeHTTP(plainRec, plainReq)
-	if plainRec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("unmarked getThread status = %d, want %d; body=%s", plainRec.Code, http.StatusServiceUnavailable, plainRec.Body.String())
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/api/internal?"+tc.method, bytes.NewBufferString(tc.body))
+			req.Header.Set("Content-Type", "application/json")
+			for key, value := range tc.headers {
+				req.Header.Set(key, value)
+			}
+			if tc.remote != "" {
+				req.RemoteAddr = tc.remote
+			}
+			rec := httptest.NewRecorder()
+			r.ServeHTTP(rec, req)
+			if rec.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusServiceUnavailable, rec.Body.String())
+			}
+		})
 	}
 }
 
@@ -1541,7 +2648,20 @@ func TestNeoDecodeSvelteKitCreateProjectThreadPayloadCaptured(t *testing.T) {
 	}
 }
 
-func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.T) {
+func TestNeoWebLocalRemoteEndpointOnlyAllowsLocalWebRoutes(t *testing.T) {
+	for _, path := range []string{"/_app/remote/3abror/createProjectThread", "/_app/remote/3abror/listUserExecutorRunners", "/_app/remote/3abror/prewarmProjectThread"} {
+		if _, _, ok := neoWebLocalRemoteEndpoint(path); !ok {
+			t.Fatalf("remote endpoint %s was not accepted", path)
+		}
+	}
+	for _, path := range []string{"/_app/remote/cliproxy/listThreadListSidebar", "/_app/remote/3abror/listThreadListSidebar", "/_app/remote/3abror/listUserExecutorDaemons"} {
+		if _, _, ok := neoWebLocalRemoteEndpoint(path); ok {
+			t.Fatalf("remote endpoint %s should not be served locally", path)
+		}
+	}
+}
+
+func TestWebLocalInferenceLocalProjectsRoute(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	dataDir := t.TempDir()
 	oldStoreDir := neoAmpDataDir
@@ -1552,6 +2672,146 @@ func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.
 	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
 		NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled},
 	}})
+	m := &AmpModule{
+		restrictToLocalhost: false,
+		neoRuntime:          rt,
+		lastConfig: &config.AmpCode{
+			WebLocalInference: config.AmpWebLocalInference{Enabled: true},
+		},
+	}
+	auth := func(c *gin.Context) {
+		token := strings.TrimSpace(c.GetHeader("Authorization"))
+		token = strings.TrimSpace(strings.TrimPrefix(token, "Bearer "))
+		if token != "local-key" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing auth"})
+			return
+		}
+		c.Set("userApiKey", token)
+		c.Next()
+	}
+	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, auth)
+
+	workDir := neoExistingDirectory(t.TempDir())
+	projectID := neoDeterministicLocalProjectID("local-app", neoFileURLForDirectory(workDir), workDir)
+	if err := writeNeoWebLocalProjectIndex(rt.threadDir, []any{map[string]any{
+		"id":               projectID,
+		"name":             "local-app",
+		"repositoryURL":    neoFileURLForDirectory(workDir),
+		"workingDirectory": workDir,
+	}}); err != nil {
+		t.Fatalf("write project index: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/ampcode/local-projects.json?"+ampWebLocalInferenceAPIKeyQuery+"=local-key", nil)
+	req.Header.Set("Origin", "https://ampcode.com")
+	req.Header.Set(ampWebLocalInferenceHeader, "1")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("local projects status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if allowOrigin := rec.Header().Get("Access-Control-Allow-Origin"); allowOrigin != "https://ampcode.com" {
+		t.Fatalf("Access-Control-Allow-Origin = %q, want https://ampcode.com", allowOrigin)
+	}
+	var response map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("local projects JSON error: %v", err)
+	}
+	projects := arrayValue(response["projects"])
+	if response["ok"] != true || len(projects) != 1 {
+		t.Fatalf("local projects response = %#v", response)
+	}
+	homeDirectory := neoDefaultWebLocalWorkingDirectory()
+	if stringValue(response["defaultWorkingDirectory"]) != homeDirectory {
+		t.Fatalf("defaultWorkingDirectory = %#v, want %q", response["defaultWorkingDirectory"], homeDirectory)
+	}
+	project := mapValue(projects[0])
+	if stringValue(project["id"]) != projectID || stringValue(project["workingDirectory"]) != workDir || stringValue(project["name"]) != "local-app" {
+		t.Fatalf("project = %#v, want id=%q workingDirectory=%q", project, projectID, workDir)
+	}
+
+	historyDir := neoExistingDirectory(t.TempDir())
+	historyLine, err := json.Marshal(map[string]any{"text": "history project", "cwd": historyDir})
+	if err != nil {
+		t.Fatalf("marshal history: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "history.jsonl"), append(historyLine, '\n'), 0o600); err != nil {
+		t.Fatalf("write history: %v", err)
+	}
+	refreshedReq := httptest.NewRequest(http.MethodGet, "/ampcode/local-projects.json?"+ampWebLocalInferenceAPIKeyQuery+"=local-key", nil)
+	refreshedReq.Header.Set("Origin", "https://ampcode.com")
+	refreshedReq.Header.Set(ampWebLocalInferenceHeader, "1")
+	refreshedRec := httptest.NewRecorder()
+	r.ServeHTTP(refreshedRec, refreshedReq)
+	if refreshedRec.Code != http.StatusOK {
+		t.Fatalf("refreshed local projects status = %d, body=%s", refreshedRec.Code, refreshedRec.Body.String())
+	}
+	var refreshedResponse map[string]any
+	if err := json.Unmarshal(refreshedRec.Body.Bytes(), &refreshedResponse); err != nil {
+		t.Fatalf("refreshed local projects JSON error: %v", err)
+	}
+	refreshedProjects := arrayValue(refreshedResponse["projects"])
+	if len(refreshedProjects) != 2 {
+		t.Fatalf("refreshed projects = %#v, want index and history projects", refreshedResponse)
+	}
+	historyID := neoDeterministicLocalProjectID(filepath.Base(historyDir), neoFileURLForDirectory(historyDir), historyDir)
+	foundHistoryProject := false
+	for _, rawProject := range refreshedProjects {
+		project := mapValue(rawProject)
+		if stringValue(project["id"]) == historyID && stringValue(project["workingDirectory"]) == historyDir {
+			foundHistoryProject = true
+			break
+		}
+	}
+	if !foundHistoryProject {
+		t.Fatalf("refreshed projects missing history project id=%q dir=%q: %#v", historyID, historyDir, refreshedProjects)
+	}
+
+	unmarkedReq := httptest.NewRequest(http.MethodGet, "/ampcode/local-projects.json?"+ampWebLocalInferenceAPIKeyQuery+"=local-key", nil)
+	unmarkedReq.Header.Set("Origin", "https://ampcode.com")
+	unmarkedRec := httptest.NewRecorder()
+	r.ServeHTTP(unmarkedRec, unmarkedReq)
+	if unmarkedRec.Code != http.StatusNotFound {
+		t.Fatalf("unmarked local projects status = %d, want %d; body=%s", unmarkedRec.Code, http.StatusNotFound, unmarkedRec.Body.String())
+	}
+
+	unauthorizedReq := httptest.NewRequest(http.MethodGet, "/ampcode/local-projects.json", nil)
+	unauthorizedReq.Header.Set("Origin", "https://ampcode.com")
+	unauthorizedReq.Header.Set(ampWebLocalInferenceHeader, "1")
+	unauthorizedRec := httptest.NewRecorder()
+	r.ServeHTTP(unauthorizedRec, unauthorizedReq)
+	if unauthorizedRec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized local projects status = %d, want %d; body=%s", unauthorizedRec.Code, http.StatusUnauthorized, unauthorizedRec.Body.String())
+	}
+}
+
+func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses POSIX shell script")
+	}
+	gin.SetMode(gin.TestMode)
+	dataDir := t.TempDir()
+	oldStoreDir := neoAmpDataDir
+	neoAmpDataDir = func() string { return dataDir }
+	t.Cleanup(func() { neoAmpDataDir = oldStoreDir })
+	pidDir := filepath.Join(t.TempDir(), "pids")
+	if err := os.MkdirAll(pidDir, 0o700); err != nil {
+		t.Fatalf("mkdir pid dir: %v", err)
+	}
+	t.Cleanup(replaceNeoHeadlessPIDDir(func() string { return pidDir }))
+	executorDir := t.TempDir()
+	command := filepath.Join(executorDir, "amp")
+	startedLog := filepath.Join(executorDir, "started.log")
+	if err := os.WriteFile(command, []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$TEST_STARTED_LOG\"\nsleep 30\n"), 0o755); err != nil {
+		t.Fatalf("write fake amp: %v", err)
+	}
+	t.Setenv("TEST_STARTED_LOG", startedLog)
+	r := gin.New()
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+		NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled, ExecutorCommand: command},
+	}})
+	t.Cleanup(func() { rt.store.disposeAll(true, "test done", false) })
 	m := &AmpModule{
 		restrictToLocalhost: false,
 		neoRuntime:          rt,
@@ -1607,6 +2867,31 @@ func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.
 	if createResult["ok"] != true || stringValue(createResult["threadID"]) != threadID {
 		t.Fatalf("create result = %#v", createResult)
 	}
+	if createResult["usesThreadActors"] != true || createResult["usesDtw"] != true || stringValue(createResult["executorType"]) != "local-client" || stringValue(createResult["wsToken"]) == "" {
+		t.Fatalf("create local actor response = %#v", createResult)
+	}
+	createActorConfig := mapValue(createResult["threadActorConfig"])
+	if stringValue(createActorConfig["threadId"]) != threadID || stringValue(createActorConfig["wsToken"]) == "" || stringValue(createActorConfig["baseURL"]) == "" || stringValue(createActorConfig["ampURL"]) == "" {
+		t.Fatalf("create actor config = %#v", createActorConfig)
+	}
+	createThreadData := mapValue(createResult["threadData"])
+	createThreadDataConfig := mapValue(createThreadData["threadActorConfig"])
+	if stringValue(createThreadDataConfig["threadId"]) != threadID || stringValue(createThreadDataConfig["wsToken"]) == "" {
+		t.Fatalf("create threadData actor config = %#v", createThreadData)
+	}
+	createThreadDataThread := mapValue(createThreadData["thread"])
+	if stringValue(createThreadDataThread["id"]) != threadID || stringValue(createThreadDataThread["creatorUserID"]) == "" {
+		t.Fatalf("create threadData thread identity = %#v", createThreadDataThread)
+	}
+	if _, ok := createThreadDataThread["messages"].([]any); !ok {
+		t.Fatalf("create threadData thread messages = %#v", createThreadDataThread["messages"])
+	}
+	if createThreadDataThread["hasExecutor"] == false || createThreadDataThread["executorConnected"] == false {
+		t.Fatalf("create threadData leaked disconnected executor state: %#v", createThreadDataThread)
+	}
+	if stringValue(createResult["workingDirectory"]) != expectedWorkDir || stringValue(createResult["workspaceRoot"]) != expectedWorkDir {
+		t.Fatalf("create working directory response = %#v, want %q", createResult, expectedWorkDir)
+	}
 
 	actor := rt.store.lookupThreadActor(threadID)
 	if actor == nil {
@@ -1618,6 +2903,8 @@ func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.
 	agentMode := actor.currentAgentMode
 	reasoningEffort := actor.currentReasoningEffort
 	meta := cloneMap(actor.meta)
+	bootstrapExecutorType := actor.bootstrapExecutorType
+	spawnedCount := len(actor.spawnedExecutors)
 	actor.mu.Unlock()
 	if got := stringValue(environment["workingDirectory"]); got != expectedWorkDir {
 		t.Fatalf("workingDirectory = %q, want %q", got, expectedWorkDir)
@@ -1631,12 +2918,14 @@ func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.
 	if stringValue(meta["projectID"]) != projectID || stringValue(meta["ampcodeConnectorMode"]) != "local-neo" {
 		t.Fatalf("meta = %#v", meta)
 	}
+	if bootstrapExecutorType != "local-client" || spawnedCount != 1 {
+		t.Fatalf("executor bootstrap = type:%q spawned:%d", bootstrapExecutorType, spawnedCount)
+	}
 
 	projectOnlyThreadID := "T-019f20b2-5e05-7501-8ddd-994e151ee952"
 	projectOnlyBody := neoSvelteKitRemoteCommandBodyForTest(t, map[string]any{
 		"content":         []any{map[string]any{"type": "text", "text": "Use selected project only"}},
 		"agentMode":       "smart",
-		"spawnExecutor":   true,
 		"threadID":        projectOnlyThreadID,
 		"projectID":       projectID,
 		"reasoningEffort": "high",
@@ -1650,15 +2939,172 @@ func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.
 	if projectOnlyRec.Code != http.StatusOK {
 		t.Fatalf("project-only create status = %d, body=%s", projectOnlyRec.Code, projectOnlyRec.Body.String())
 	}
+	projectOnlyEnvelope := decodeSvelteKitRemoteEnvelopeForTest(t, projectOnlyRec.Body.Bytes())
+	projectOnlyResult := mapValue(projectOnlyEnvelope["_"])
+	if projectOnlyResult["ok"] != true || stringValue(projectOnlyResult["threadID"]) != projectOnlyThreadID {
+		t.Fatalf("project-only create result = %#v", projectOnlyResult)
+	}
+	if projectOnlyResult["usesThreadActors"] != true || stringValue(projectOnlyResult["executorType"]) != "local-client" {
+		t.Fatalf("project-only local actor response = %#v", projectOnlyResult)
+	}
+	if stringValue(projectOnlyResult["workingDirectory"]) != expectedWorkDir || stringValue(projectOnlyResult["workspaceRoot"]) != expectedWorkDir {
+		t.Fatalf("project-only working directory response = %#v, want %q", projectOnlyResult, expectedWorkDir)
+	}
 	projectOnlyActor := rt.store.lookupThreadActor(projectOnlyThreadID)
 	if projectOnlyActor == nil {
 		t.Fatal("project-only thread actor not found")
 	}
 	projectOnlyActor.mu.Lock()
 	projectOnlyEnvironment := cloneMap(projectOnlyActor.environment)
+	projectOnlyBootstrapExecutorType := projectOnlyActor.bootstrapExecutorType
+	projectOnlySpawnedCount := len(projectOnlyActor.spawnedExecutors)
 	projectOnlyActor.mu.Unlock()
 	if got := stringValue(projectOnlyEnvironment["workingDirectory"]); got != expectedWorkDir {
 		t.Fatalf("project-only workingDirectory = %q, want %q", got, expectedWorkDir)
+	}
+	if projectOnlyBootstrapExecutorType != "local-client" || projectOnlySpawnedCount != 1 {
+		t.Fatalf("project-only executor bootstrap = type:%q spawned:%d", projectOnlyBootstrapExecutorType, projectOnlySpawnedCount)
+	}
+
+	userActor, _ := rt.store.upsert(map[string]any{"name": "userActor", "key": "user-local"}, true)
+	runnerSocket := &neoSocket{runnerID: "runner-local-test"}
+	runnerRegistration := mapValue(userActor.handleForSocket(runnerSocket, map[string]any{
+		"type": "registerRunner",
+		"args": []any{map[string]any{
+			"sessionId":        "session-local-test",
+			"hostname":         "Local Machine",
+			"workingDirectory": expectedWorkDir,
+			"runningThreads":   []any{},
+		}},
+	}))
+	if runnerRegistration["ok"] != true {
+		t.Fatalf("runner registration = %#v", runnerRegistration)
+	}
+
+	runnerThreadID := "T-019f20b2-5e05-7501-8ddd-994e151ee955"
+	runnerBody := neoSvelteKitRemoteCommandBodyForTest(t, map[string]any{
+		"content":         []any{map[string]any{"type": "text", "text": "Use selected runner"}},
+		"agentMode":       "smart",
+		"threadID":        runnerThreadID,
+		"projectID":       projectID,
+		"reasoningEffort": "high",
+		"runnerId":        "runner-local-test",
+	})
+	runnerReq := httptest.NewRequest(http.MethodPost, "/_app/remote/3abror/createProjectThread?"+ampWebLocalInferenceAPIKeyQuery+"=local-key", strings.NewReader(runnerBody))
+	runnerReq.Header.Set("Content-Type", "application/json")
+	runnerReq.Header.Set("Origin", "https://ampcode.com")
+	runnerReq.Header.Set(ampWebLocalInferenceHeader, "1")
+	runnerRec := httptest.NewRecorder()
+	r.ServeHTTP(runnerRec, runnerReq)
+	if runnerRec.Code != http.StatusOK {
+		t.Fatalf("runner create status = %d, body=%s", runnerRec.Code, runnerRec.Body.String())
+	}
+	runnerEnvelope := decodeSvelteKitRemoteEnvelopeForTest(t, runnerRec.Body.Bytes())
+	runnerResult := mapValue(runnerEnvelope["_"])
+	if runnerResult["ok"] != true || stringValue(runnerResult["threadID"]) != runnerThreadID {
+		t.Fatalf("runner create result = %#v", runnerResult)
+	}
+	if runnerResult["usesThreadActors"] != true || runnerResult["usesDtw"] != true || stringValue(runnerResult["executorType"]) != "local-client" {
+		t.Fatalf("runner local actor response = %#v", runnerResult)
+	}
+	if stringValue(mapValue(runnerResult["threadActorConfig"])["threadId"]) != runnerThreadID {
+		t.Fatalf("runner actor config = %#v", runnerResult["threadActorConfig"])
+	}
+	runnerActor := rt.store.lookupThreadActor(runnerThreadID)
+	if runnerActor == nil {
+		t.Fatal("runner thread actor not found")
+	}
+	runnerActor.mu.Lock()
+	runnerMeta := cloneMap(runnerActor.meta)
+	runnerBootstrapExecutorType := runnerActor.bootstrapExecutorType
+	runnerSpawnedCount := len(runnerActor.spawnedExecutors)
+	runnerActor.mu.Unlock()
+	if stringValue(runnerMeta["runnerId"]) != "runner-local-test" {
+		t.Fatalf("runner meta = %#v", runnerMeta)
+	}
+	if runnerBootstrapExecutorType != "local-client" || runnerSpawnedCount != 0 {
+		t.Fatalf("runner executor bootstrap = type:%q spawned:%d", runnerBootstrapExecutorType, runnerSpawnedCount)
+	}
+	runnerHeartbeat := mapValue(userActor.handleForSocket(runnerSocket, map[string]any{
+		"type": "runnerHeartbeat",
+		"args": []any{map[string]any{"sessionId": "session-local-test", "runningThreads": []any{}}},
+	}))
+	runnerIntents := arrayValue(runnerHeartbeat["intents"])
+	if runnerHeartbeat["ok"] != true || len(runnerIntents) != 1 || stringValue(mapValue(runnerIntents[0])["threadId"]) != runnerThreadID || stringValue(mapValue(runnerIntents[0])["desired"]) != "running" {
+		t.Fatalf("runner heartbeat = %#v", runnerHeartbeat)
+	}
+
+	runnerOptOutThreadID := "T-019f20b2-5e05-7501-8ddd-994e151ee956"
+	runnerOptOutBody := neoSvelteKitRemoteCommandBodyForTest(t, map[string]any{
+		"content":       []any{map[string]any{"type": "text", "text": "Use selected runner without spawning"}},
+		"agentMode":     "smart",
+		"spawnExecutor": false,
+		"threadID":      runnerOptOutThreadID,
+		"runnerId":      "cliproxy-local-optout",
+	})
+	runnerOptOutReq := httptest.NewRequest(http.MethodPost, "/_app/remote/3abror/createProjectThread?"+ampWebLocalInferenceAPIKeyQuery+"=local-key", strings.NewReader(runnerOptOutBody))
+	runnerOptOutReq.Header.Set("Content-Type", "application/json")
+	runnerOptOutReq.Header.Set("Origin", "https://ampcode.com")
+	runnerOptOutReq.Header.Set(ampWebLocalInferenceHeader, "1")
+	runnerOptOutRec := httptest.NewRecorder()
+	r.ServeHTTP(runnerOptOutRec, runnerOptOutReq)
+	if runnerOptOutRec.Code != http.StatusOK {
+		t.Fatalf("runner opt-out create status = %d, body=%s", runnerOptOutRec.Code, runnerOptOutRec.Body.String())
+	}
+	runnerOptOutEnvelope := decodeSvelteKitRemoteEnvelopeForTest(t, runnerOptOutRec.Body.Bytes())
+	runnerOptOutResult := mapValue(runnerOptOutEnvelope["_"])
+	if runnerOptOutResult["ok"] != false || stringValue(mapValue(runnerOptOutResult["error"])["message"]) != "selected local runner is no longer available" {
+		t.Fatalf("runner opt-out create result = %#v", runnerOptOutResult)
+	}
+	if actor := rt.store.lookupThreadActor(runnerOptOutThreadID); actor != nil {
+		t.Fatalf("unavailable runner created actor %#v", actor)
+	}
+
+	explicitFalseThreadID := "T-019f20b2-5e05-7501-8ddd-994e151ee954"
+	explicitFalseBody := neoSvelteKitRemoteCommandBodyForTest(t, map[string]any{
+		"content":         []any{map[string]any{"type": "text", "text": "Create without spawning"}},
+		"agentMode":       "smart",
+		"spawnExecutor":   false,
+		"threadID":        explicitFalseThreadID,
+		"projectID":       projectID,
+		"reasoningEffort": "high",
+	})
+	explicitFalseReq := httptest.NewRequest(http.MethodPost, "/_app/remote/3abror/createProjectThread?"+ampWebLocalInferenceAPIKeyQuery+"=local-key", strings.NewReader(explicitFalseBody))
+	explicitFalseReq.Header.Set("Content-Type", "application/json")
+	explicitFalseReq.Header.Set("Origin", "https://ampcode.com")
+	explicitFalseReq.Header.Set(ampWebLocalInferenceHeader, "1")
+	explicitFalseRec := httptest.NewRecorder()
+	r.ServeHTTP(explicitFalseRec, explicitFalseReq)
+	if explicitFalseRec.Code != http.StatusOK {
+		t.Fatalf("explicit-false create status = %d, body=%s", explicitFalseRec.Code, explicitFalseRec.Body.String())
+	}
+	explicitFalseEnvelope := decodeSvelteKitRemoteEnvelopeForTest(t, explicitFalseRec.Body.Bytes())
+	explicitFalseResult := mapValue(explicitFalseEnvelope["_"])
+	if explicitFalseResult["ok"] != true || stringValue(explicitFalseResult["threadID"]) != explicitFalseThreadID {
+		t.Fatalf("explicit-false create result = %#v", explicitFalseResult)
+	}
+	if explicitFalseResult["usesThreadActors"] != false || explicitFalseResult["usesDtw"] != false || stringValue(explicitFalseResult["executorType"]) != "" {
+		t.Fatalf("explicit-false local actor response = %#v", explicitFalseResult)
+	}
+	if _, ok := explicitFalseResult["threadActorConfig"]; ok {
+		t.Fatalf("explicit-false returned threadActorConfig: %#v", explicitFalseResult)
+	}
+	if threadData := mapValue(explicitFalseResult["threadData"]); threadData["threadActorConfig"] != nil {
+		t.Fatalf("explicit-false returned threadData actor config: %#v", threadData)
+	}
+	if stringValue(explicitFalseResult["workingDirectory"]) != expectedWorkDir || stringValue(explicitFalseResult["workspaceRoot"]) != expectedWorkDir {
+		t.Fatalf("explicit-false working directory response = %#v, want %q", explicitFalseResult, expectedWorkDir)
+	}
+	explicitFalseActor := rt.store.lookupThreadActor(explicitFalseThreadID)
+	if explicitFalseActor == nil {
+		t.Fatal("explicit-false thread actor not found")
+	}
+	explicitFalseActor.mu.Lock()
+	explicitFalseBootstrapExecutorType := explicitFalseActor.bootstrapExecutorType
+	explicitFalseSpawnedCount := len(explicitFalseActor.spawnedExecutors)
+	explicitFalseActor.mu.Unlock()
+	if explicitFalseBootstrapExecutorType != "" || explicitFalseSpawnedCount != 0 {
+		t.Fatalf("explicit-false executor bootstrap = type:%q spawned:%d", explicitFalseBootstrapExecutorType, explicitFalseSpawnedCount)
 	}
 
 	missingDirectoryThreadID := "T-019f20b2-5e05-7501-8ddd-994e151ee953"
@@ -1684,36 +3130,65 @@ func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.
 	if actor := rt.store.lookupThreadActor(missingDirectoryThreadID); actor != nil {
 		t.Fatal("missing-directory thread actor was created")
 	}
+}
 
-	listReq := httptest.NewRequest(http.MethodGet, "/_app/remote/3abror/listThreadListSidebar?"+ampWebLocalInferenceAPIKeyQuery+"=local-key", nil)
-	listReq.Header.Set("Origin", "https://ampcode.com")
-	listReq.Header.Set(ampWebLocalInferenceHeader, "1")
-	listRec := httptest.NewRecorder()
-	r.ServeHTTP(listRec, listReq)
-	if listRec.Code != http.StatusOK {
-		t.Fatalf("sidebar status = %d, body=%s", listRec.Code, listRec.Body.String())
+func TestWebLocalInferenceListUserExecutorRunnersCreatesQueryResult(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+		NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled},
+	}})
+	userActor, _ := rt.store.upsert(map[string]any{"name": "userActor", "key": "user-local"}, true)
+	userActor.handleForSocket(&neoSocket{runnerID: "runner-local"}, map[string]any{
+		"type": "registerRunner",
+		"args": []any{map[string]any{
+			"sessionId":        "session-local",
+			"hostname":         "Local Machine",
+			"workingDirectory": neoDefaultWebLocalWorkingDirectory(),
+			"runningThreads":   []any{},
+		}},
+	})
+	m := &AmpModule{
+		restrictToLocalhost: false,
+		neoRuntime:          rt,
+		lastConfig: &config.AmpCode{
+			WebLocalInference: config.AmpWebLocalInference{Enabled: true},
+		},
 	}
-	sidebarEnvelope := decodeSvelteKitRemoteEnvelopeForTest(t, listRec.Body.Bytes())
-	queryCache := mapValue(sidebarEnvelope["q"])
-	queryValue := mapValue(mapValue(queryCache["3abror/listThreadListSidebar/"])["v"])
-	if len(arrayValue(queryValue["projects"])) == 0 || len(arrayValue(queryValue["recentThreads"])) == 0 {
-		t.Fatalf("sidebar query value = %#v", queryValue)
-	}
-	var sawProject, sawThread bool
-	for _, rawProject := range arrayValue(queryValue["projects"]) {
-		project := mapValue(rawProject)
-		if stringValue(project["id"]) == projectID && stringValue(project["workingDirectory"]) == expectedWorkDir {
-			sawProject = true
+	auth := func(c *gin.Context) {
+		token := strings.TrimSpace(c.GetHeader("Authorization"))
+		token = strings.TrimSpace(strings.TrimPrefix(token, "Bearer "))
+		if token != "local-key" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing auth"})
+			return
 		}
+		c.Set("userApiKey", token)
+		c.Next()
 	}
-	for _, rawThread := range arrayValue(queryValue["recentThreads"]) {
-		thread := mapValue(rawThread)
-		if stringValue(thread["id"]) == threadID && thread["hasExecutor"] == true {
-			sawThread = true
-		}
+	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, auth)
+
+	req := httptest.NewRequest(http.MethodGet, "/_app/remote/3abror/listUserExecutorRunners?"+ampWebLocalInferenceAPIKeyQuery+"=local-key", nil)
+	req.Header.Set("Origin", "https://ampcode.com")
+	req.Header.Set(ampWebLocalInferenceHeader, "1")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("runner query status = %d, body=%s", rec.Code, rec.Body.String())
 	}
-	if !sawProject || !sawThread {
-		t.Fatalf("sidebar missing project/thread sawProject=%v sawThread=%v value=%#v", sawProject, sawThread, queryValue)
+	envelope := decodeSvelteKitRemoteEnvelopeForTest(t, rec.Body.Bytes())
+	queryResults := mapValue(envelope["q"])
+	node := mapValue(queryResults["3abror/listUserExecutorRunners/"])
+	runners := arrayValue(node["v"])
+	if len(runners) != 1 {
+		t.Fatalf("runner query = %#v", envelope)
+	}
+	runner := mapValue(runners[0])
+	if stringValue(runner["runnerId"]) == "" || stringValue(runner["hostname"]) == "" {
+		t.Fatalf("runner identity = %#v", runner)
+	}
+	if got, want := stringValue(runner["workingDirectory"]), neoDefaultWebLocalWorkingDirectory(); got != want {
+		t.Fatalf("runner workingDirectory = %q, want %q", got, want)
 	}
 }
 
@@ -1768,61 +3243,99 @@ func TestWebLocalInferenceRemotePrewarmRejectsMalformedPayload(t *testing.T) {
 	}
 }
 
-func TestWebLocalInferenceRemoteSidebarIncludesWorkingDirectoryHint(t *testing.T) {
-	gin.SetMode(gin.TestMode)
+func TestWebLocalInferenceProjectIndexIncludesHistoryProjects(t *testing.T) {
 	dataDir := t.TempDir()
 	oldStoreDir := neoAmpDataDir
 	neoAmpDataDir = func() string { return dataDir }
 	t.Cleanup(func() { neoAmpDataDir = oldStoreDir })
-	r := gin.New()
 	enabled := true
 	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
 		NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled},
 	}})
-	m := &AmpModule{
-		restrictToLocalhost: false,
-		neoRuntime:          rt,
-		lastConfig: &config.AmpCode{
-			WebLocalInference: config.AmpWebLocalInference{Enabled: true},
-		},
+
+	existingDir := neoExistingDirectory(t.TempDir())
+	existingID := neoDeterministicLocalProjectID("existing", neoFileURLForDirectory(existingDir), existingDir)
+	rootProjectID := "75616c3b-f4de-48b7-8b83-c1af6978a034"
+	if err := writeNeoWebLocalProjectIndex(rt.threadDir, []any{map[string]any{
+		"id":               existingID,
+		"name":             "existing",
+		"repositoryURL":    neoFileURLForDirectory(existingDir),
+		"workingDirectory": existingDir,
+	}, map[string]any{
+		"id":               rootProjectID,
+		"name":             "local",
+		"repositoryURL":    "file:///",
+		"workingDirectory": string(filepath.Separator),
+	}}); err != nil {
+		t.Fatalf("write project index: %v", err)
 	}
-	auth := func(c *gin.Context) {
-		token := strings.TrimSpace(c.GetHeader("Authorization"))
-		token = strings.TrimSpace(strings.TrimPrefix(token, "Bearer "))
-		if token != "local-key" {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing auth"})
-			return
-		}
-		c.Set("userApiKey", token)
-		c.Next()
+	if projects := rt.neoWebLocalProjectCache(); len(projects) != 1 {
+		t.Fatalf("initial projects = %#v, want existing project only", projects)
 	}
-	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, auth)
 
 	workDir := t.TempDir()
-	expectedWorkDir := neoExistingDirectory(workDir)
-	req := httptest.NewRequest(http.MethodGet, "/_app/remote/3abror/listThreadListSidebar?"+ampWebLocalInferenceAPIKeyQuery+"=local-key&cliproxy-working-directory="+url.QueryEscape(workDir), nil)
-	req.Header.Set("Origin", "https://ampcode.com")
-	req.Header.Set(ampWebLocalInferenceHeader, "1")
-	rec := httptest.NewRecorder()
-	r.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("sidebar status = %d, body=%s", rec.Code, rec.Body.String())
+	historyLine, err := json.Marshal(map[string]any{"text": "new local thread", "cwd": workDir})
+	if err != nil {
+		t.Fatalf("marshal history: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "history.jsonl"), append(historyLine, '\n'), 0o600); err != nil {
+		t.Fatalf("write history: %v", err)
+	}
+	rootHistoryLine, err := json.Marshal(map[string]any{"text": "root local thread", "cwd": string(filepath.Separator)})
+	if err != nil {
+		t.Fatalf("marshal root history: %v", err)
+	}
+	historyFile, err := os.OpenFile(filepath.Join(dataDir, "history.jsonl"), os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("open history: %v", err)
+	}
+	if _, err := historyFile.Write(append(rootHistoryLine, '\n')); err != nil {
+		_ = historyFile.Close()
+		t.Fatalf("append root history: %v", err)
+	}
+	if err := historyFile.Close(); err != nil {
+		t.Fatalf("close history: %v", err)
 	}
 
-	sidebarEnvelope := decodeSvelteKitRemoteEnvelopeForTest(t, rec.Body.Bytes())
-	queryCache := mapValue(sidebarEnvelope["q"])
-	queryValue := mapValue(mapValue(queryCache["3abror/listThreadListSidebar/"])["v"])
-	projects := arrayValue(queryValue["projects"])
-	if len(projects) != 1 {
-		t.Fatalf("projects = %#v, want exactly hinted project", projects)
-	}
-	project := mapValue(projects[0])
+	expectedWorkDir := neoExistingDirectory(workDir)
 	expectedID := neoDeterministicLocalProjectID(filepath.Base(expectedWorkDir), neoFileURLForDirectory(expectedWorkDir), expectedWorkDir)
+	if got := rt.neoWebLocalProjectWorkingDirectory(expectedID); got != expectedWorkDir {
+		t.Fatalf("project workingDirectory = %q, want %q", got, expectedWorkDir)
+	}
+	if got := rt.neoWebLocalProjectWorkingDirectory(rootProjectID); got != "" {
+		t.Fatalf("root project workingDirectory = %q, want empty", got)
+	}
+	projects := rt.neoWebLocalProjectCache()
+	if len(projects) != 2 {
+		t.Fatalf("projects = %#v, want existing and history projects", projects)
+	}
+	projectsByID := map[string]map[string]any{}
+	for _, rawProject := range projects {
+		project := mapValue(rawProject)
+		projectsByID[stringValue(project["id"])] = project
+	}
+	project := projectsByID[expectedID]
 	if stringValue(project["id"]) != expectedID || stringValue(project["workingDirectory"]) != expectedWorkDir || stringValue(project["name"]) != filepath.Base(expectedWorkDir) {
 		t.Fatalf("project = %#v, want id=%q workingDirectory=%q", project, expectedID, expectedWorkDir)
 	}
-	if threads := arrayValue(queryValue["recentThreads"]); len(threads) != 0 {
-		t.Fatalf("recentThreads = %#v, want none for fresh hinted project", threads)
+	if got := rt.neoWebLocalProjectWorkingDirectory(existingID); got != existingDir {
+		t.Fatalf("existing project workingDirectory = %q, want %q", got, existingDir)
+	}
+	if _, err := os.Stat(neoWebLocalProjectIndexPath(rt.threadDir)); err != nil {
+		t.Fatalf("project index was not written: %v", err)
+	}
+}
+
+func TestNeoWebLocalFilesystemRoot(t *testing.T) {
+	root := filepath.VolumeName(os.TempDir()) + string(filepath.Separator)
+	if !neoWebLocalFilesystemRoot(root) {
+		t.Fatalf("neoWebLocalFilesystemRoot(%q) = false, want true", root)
+	}
+	if neoWebLocalFilesystemRoot(t.TempDir()) {
+		t.Fatal("temporary directory was treated as filesystem root")
+	}
+	if got := neoWebLocalProjectDirectory(root); got != "" {
+		t.Fatalf("root project directory = %q, want empty", got)
 	}
 }
 
@@ -2762,6 +4275,112 @@ func TestRegisterManagementRoutesBypassesManagementAuthForActorEngineWebsocketTo
 	}
 	if hdr.Get("X-Api-Key") != "" {
 		t.Fatalf("X-Api-Key = %q, want stripped for actor websocket token", hdr.Get("X-Api-Key"))
+	}
+}
+
+func TestRegisterManagementRoutesRequiresManagementAuthForWebLocalActorEngineWebsocketToken(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	gotPath := make(chan string, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath <- r.URL.RequestURI()
+		writeNeoJSON(w, http.StatusOK, map[string]any{"source": "upstream"})
+	}))
+	defer upstream.Close()
+
+	r := gin.New()
+	m := &AmpModule{
+		restrictToLocalhost: false,
+		lastConfig: &config.AmpCode{
+			WebLocalInference: config.AmpWebLocalInference{
+				Enabled:        true,
+				AllowedOrigins: []string{"https://ampcode.com"},
+			},
+		},
+	}
+	proxy, err := createReverseProxy(upstream.URL, NewStaticSecretSource("secret"))
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	m.setProxy(proxy)
+	authCalled := false
+	auth := func(c *gin.Context) {
+		authCalled = true
+		token := strings.TrimSpace(c.GetHeader("Authorization"))
+		token = strings.TrimSpace(strings.TrimPrefix(token, "Bearer "))
+		if token != "local-key" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing auth"})
+			return
+		}
+		c.Set("userApiKey", token)
+		c.Next()
+	}
+	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, auth)
+
+	server := httptest.NewServer(r)
+	defer server.Close()
+
+	req, err := http.NewRequest(http.MethodGet, server.URL+"/gateway/threadActor/websocket/?rvt-namespace=default&rvt-method=get&rvt-key=T-web&rvt-token=local-neo&rvt-skip-ready-wait=true", nil)
+	if err != nil {
+		t.Fatalf("create request: %v", err)
+	}
+	req.Header.Set("Origin", "https://ampcode.com")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, body=%s", resp.StatusCode, body)
+	}
+	if !authCalled {
+		t.Fatal("actor websocket token request should call management auth for web-local CORS")
+	}
+	select {
+	case path := <-gotPath:
+		t.Fatalf("unauthorized request reached upstream path %q", path)
+	default:
+	}
+
+	authCalled = false
+	authorizedReq, err := http.NewRequest(http.MethodGet, server.URL+"/gateway/threadActor/websocket/?rvt-namespace=default&rvt-method=get&rvt-key=T-web&rvt-token=local-neo&rvt-skip-ready-wait=true&"+ampWebLocalInferenceAPIKeyQuery+"=local-key", nil)
+	if err != nil {
+		t.Fatalf("create authorized request: %v", err)
+	}
+	authorizedReq.Header.Set("Origin", "https://ampcode.com")
+	authorizedResp, err := http.DefaultClient.Do(authorizedReq)
+	if err != nil {
+		t.Fatalf("authorized request: %v", err)
+	}
+	defer authorizedResp.Body.Close()
+	if authorizedResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(authorizedResp.Body)
+		t.Fatalf("authorized status = %d, body=%s", authorizedResp.StatusCode, body)
+	}
+	if !authCalled {
+		t.Fatal("authorized actor websocket token request should call management auth")
+	}
+	if path := <-gotPath; !strings.HasPrefix(path, "/gateway/threadActor/websocket/") {
+		t.Fatalf("upstream path = %q, want actor websocket path", path)
+	} else if strings.Contains(path, ampWebLocalInferenceAPIKeyQuery) {
+		t.Fatalf("upstream path leaked query API key: %q", path)
+	}
+
+	metadataReq, err := http.NewRequest(http.MethodGet, server.URL+"/metadata?namespace=default", nil)
+	if err != nil {
+		t.Fatalf("metadata request build: %v", err)
+	}
+	metadataReq.Header.Set("Origin", "https://ampcode.com")
+	metadataResp, err := http.DefaultClient.Do(metadataReq)
+	if err != nil {
+		t.Fatalf("metadata request: %v", err)
+	}
+	defer metadataResp.Body.Close()
+	if metadataResp.StatusCode != http.StatusUnauthorized {
+		body, _ := io.ReadAll(metadataResp.Body)
+		t.Fatalf("metadata status = %d, body=%s", metadataResp.StatusCode, body)
 	}
 }
 
@@ -3863,7 +5482,7 @@ func TestRegisterManagementRoutesMimicsCloudThreadActorHandshake(t *testing.T) {
 	if err := json.Unmarshal(patchRec.Body.Bytes(), &patchResponse); err != nil {
 		t.Fatalf("patch response JSON error: %v", err)
 	}
-	if patchResponse["ok"] != true || patchResponse["usesThreadActors"] != true || patchResponse["executorType"] != "local-client" {
+	if patchResponse["ok"] != true || patchResponse["usesThreadActors"] != true || patchResponse["executorType"] != "local-client" || patchResponse["threadId"] != threadID || stringValue(patchResponse["wsToken"]) == "" {
 		t.Fatalf("patch handshake response = %#v", patchResponse)
 	}
 

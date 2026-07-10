@@ -342,6 +342,10 @@ type AmpNeoLocalRuntime struct {
 	// headless executor to connect before reporting a failed spawn.
 	ExecutorConnectTimeoutSeconds int `yaml:"executor-connect-timeout-seconds,omitempty" json:"executor-connect-timeout-seconds,omitempty"`
 
+	// ExecutorIdleTimeoutSeconds stops idle proxy-spawned Amp headless
+	// executors after this many seconds. Zero leaves them running.
+	ExecutorIdleTimeoutSeconds int `yaml:"executor-idle-timeout-seconds,omitempty" json:"executor-idle-timeout-seconds,omitempty"`
+
 	// force-thread-actors serves /api/thread-actors locally even when an
 	// upstream Amp control plane proxy is configured.
 	ForceThreadActors bool `yaml:"force-thread-actors,omitempty" json:"force-thread-actors,omitempty"`

@@ -59,20 +59,23 @@ var (
 	anthropicBetaHeaderPattern           = regexp.MustCompile(`\{"([^"]+)":a\.join\(","\)\}`)
 	anthropicOverridePattern             = regexp.MustCompile(`\{"([^"]+)":c\}`)
 	ampFeaturePattern                    = regexp.MustCompile(`\[Vw\]:"([^"]+)"`)
+	runCheckURIFieldPattern              = regexp.MustCompile(`"checkURI"in\s*([A-Za-z_$][A-Za-z0-9_$]*)&&typeof\s+([A-Za-z_$][A-Za-z0-9_$]*)\.checkURI==="string"`)
+	runCheckNameFieldPattern             = regexp.MustCompile(`"checkName"in\s*([A-Za-z_$][A-Za-z0-9_$]*)&&typeof\s+([A-Za-z_$][A-Za-z0-9_$]*)\.checkName==="string"`)
 	settingKeyPattern                    = regexp.MustCompile(`"?([A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z0-9]+)*)"?\s*:\s*\{value:`)
 	settingDefaultPattern                = regexp.MustCompile(`"?([A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z0-9]+)*)"?\s*:\s*\{value:((?:void 0|!0|!1|true|false|null|-?[0-9]+(?:\.[0-9]+)?|"[^"]{0,160}"|\[(?:"[^"]{0,160}"(?:,"[^"]{0,160}")*)?\]))`)
 	threadIDPattern                      = regexp.MustCompile(`T-[0-9a-fA-Fx]{8,}-[0-9a-fA-Fx-]{8,}`)
 
-	primaryModelRefPattern       = regexp.MustCompile(`primaryModel:[A-Za-z0-9_$]+\("([A-Z0-9_]+)"\)`)
-	includeToolsRefPattern       = regexp.MustCompile(`includeTools:([A-Za-z0-9_$]+)`)
-	stringArrayAssignmentPattern = regexp.MustCompile(`(?:^|[^A-Za-z0-9_$])([A-Za-z_$][A-Za-z0-9_$]*)=\[((?:"[^"]+"(?:,"[^"]+")*)?)\]`)
-	stringArrayUnionPattern      = regexp.MustCompile(`(?:^|[^A-Za-z0-9_$])([A-Za-z_$][A-Za-z0-9_$]*)=Array\.from\(new Set\(\[\.\.\.([A-Za-z_$][A-Za-z0-9_$]*),\.\.\.([A-Za-z_$][A-Za-z0-9_$]*)\]\)\)`)
-	reasoningEffortPattern       = regexp.MustCompile(`reasoningEffort:"([^"]+)"`)
-	reasoningLevelsBlockPattern  = regexp.MustCompile(`reasoningEffortControl:\{levels:\[([^\]]*)\]`)
-	quotedStringPattern          = regexp.MustCompile(`"([^"]+)"`)
-	httpMethodPropertyPattern    = regexp.MustCompile(`method\s*:\s*["']?\s*(GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD)\b`)
-	httpQuotedMethodArgPattern   = regexp.MustCompile("[\"'](GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD)[\"']\\s*,\\s*[\"'`]?$")
-	httpMethodCallPrefixPattern  = regexp.MustCompile("(?i)\\.(get|post|put|patch|delete|options|head)\\s*\\(\\s*[\"'`]?$")
+	primaryModelRefPattern      = regexp.MustCompile(`(?:primaryModel|model):[A-Za-z0-9_$]+\("([A-Z0-9_]+)"\)`)
+	includeToolsRefPattern      = regexp.MustCompile(`includeTools:([A-Za-z0-9_$]+)`)
+	stringArrayOpenPattern      = regexp.MustCompile(`(?:^|[^A-Za-z0-9_$])([A-Za-z_$][A-Za-z0-9_$]*)=\[`)
+	stringArrayUnionOpenPattern = regexp.MustCompile(`(?:^|[^A-Za-z0-9_$])([A-Za-z_$][A-Za-z0-9_$]*)=Array\.from\(new Set\(\[`)
+	stringArrayAliasPattern     = regexp.MustCompile(`(?:^|[^A-Za-z0-9_$])([A-Za-z_$][A-Za-z0-9_$]*)=([A-Za-z_$][A-Za-z0-9_$]*)\b`)
+	reasoningEffortPattern      = regexp.MustCompile(`reasoningEffort:"([^"]+)"`)
+	reasoningLevelsBlockPattern = regexp.MustCompile(`reasoningEffortControl:\{levels:\[([^\]]*)\]`)
+	quotedStringPattern         = regexp.MustCompile(`"([^"]+)"`)
+	httpMethodPropertyPattern   = regexp.MustCompile(`method\s*:\s*["']?\s*(GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD)\b`)
+	httpQuotedMethodArgPattern  = regexp.MustCompile("[\"'](GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD)[\"']\\s*,\\s*[\"'`]?$")
+	httpMethodCallPrefixPattern = regexp.MustCompile("(?i)\\.(get|post|put|patch|delete|options|head)\\s*\\(\\s*[\"'`]?$")
 )
 
 var knownDeltaNames = []string{
@@ -191,7 +194,6 @@ var knownRawThreadDeltaEventValues = map[string]struct{}{
 	"retry_cancelled":                           {},
 	"retry_scheduled":                           {},
 	"retry_started":                             {},
-	"thread_relationships":                      {},
 	"thread_settings":                           {},
 	"thread_status":                             {},
 	"thread_title":                              {},
@@ -485,9 +487,7 @@ var knownReviewContractMarkerValues = map[string]struct{}{
 	"run-check-uri-input-shape":               {},
 }
 
-var retiredReviewContractMarkerValues = map[string]struct{}{
-	"run-check-uri-input-shape": {},
-}
+var retiredReviewContractMarkerValues = map[string]struct{}{}
 
 var threadReaderMarkers = map[string]string{
 	"getThread":             "internal-rpc",
@@ -524,7 +524,6 @@ var knownThreadReaderMarkerValues = map[string]struct{}{
 var expectedThreadReaderMarkerValues = map[string]struct{}{
 	"getThread":             {},
 	"getThreadLabels":       {},
-	"getThreadLinkInfo":     {},
 	"getThreadMeta":         {},
 	"getThreadTail":         {},
 	"listThreads":           {},
@@ -631,26 +630,27 @@ var knownCompactionRuleValues = map[string]struct{}{}
 // prompts our runtime mirrors. They are kept as a coarse drift tripwire; expect to
 // refresh them whenever Amp reshapes the embedded tool catalog.
 var knownPromptTagCountValues = map[string]int{
-	"prompt/compaction":    7,
+	"prompt/compaction":    6,
 	"prompt/guidance":      6,
 	"prompt/painter":       2,
-	"prompt/skills":        8,
+	"prompt/settings":      1,
+	"prompt/skills":        9,
 	"prompt/system-prompt": 1,
-	"prompt/tools":         37,
+	"prompt/tools":         41,
 	"source/artifacts":     2,
 	"source/code-review":   3,
-	"source/compaction":    19,
-	"source/guidance":      26,
+	"source/compaction":    18,
+	"source/guidance":      27,
 	"source/painter":       5,
-	"source/settings":      21,
-	"source/skills":        38,
+	"source/settings":      20,
+	"source/skills":        41,
 	"source/system-prompt": 1,
-	"source/tools":         155,
+	"source/tools":         158,
 }
 
 var knownPromptKindCountValues = map[string]int{
-	"prompt": 56,
-	"source": 186,
+	"prompt": 59,
+	"source": 192,
 }
 
 type agentModeMarker struct {
@@ -665,40 +665,57 @@ var agentModeMarkers = []agentModeMarker{
 	{Name: "review", Token: `REVIEW:{key:"review"`},
 	{Name: "agg-man", Token: `AGG:{key:"agg-man"`},
 	{Name: "large", Token: `LARGE:{key:"large"`},
+	{Name: "low", Token: `LOW:{key:"low"`},
+	{Name: "medium", Token: `MED:{key:"medium"`},
+	{Name: "high", Token: `HIGH:{key:"high"`},
+	{Name: "ultra", Token: `ULTRA:{key:"ultra"`},
 	{Name: "nostromo", Token: `NOSTROMO:{key:`},
 }
 
 var agentModeScopes = map[string]string{
 	"agg-man":  "server-only",
 	"deep":     "local-runtime",
+	"high":     "local-runtime",
 	"large":    "local-runtime",
+	"low":      "local-runtime",
+	"medium":   "local-runtime",
 	"nostromo": "local-runtime",
 	"review":   "local-runtime",
 	"rush":     "local-runtime",
 	"smart":    "local-runtime",
+	"ultra":    "local-runtime",
 }
 
 var knownAgentModeProfileValues = map[string]struct{}{
-	"agg-man|primary=GPT_5_5|reasoning=none|levels=|include=present|tools=find_thread,read_thread,web_search,read_web_page,docs_list,docs_read,docs_write,create_project,list_agent_modes,create_thread,archive_thread,archive_threads,unarchive_thread,send_message_to_thread,publish_thread_artifacts,slack_write,slack_read,github_repo_ci_status,read_github,search_github,commit_search,list_directory_github,list_repositories,glob_github,diff|deferred=false|visible=false|visibleInV2=false|serverOnly=true": {},
-	"deep|primary=GPT_5_5|reasoning=medium|levels=low,medium,xhigh|include=present|tools=shell_command,shell_command_status,apply_patch,web_search,read_web_page,Task,skill,read_thread,find_thread,librarian,oracle,finder,view_media,painter,archive_current_thread,send_message_to_agg|deferred=true|visible=true|visibleInV2=false|serverOnly=false":                                                                                                                                                              {},
-	"large|primary=CLAUDE_OPUS_4_8|reasoning=|levels=|include=present|tools=finder,Bash,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,skill,oracle,librarian,Task,view_media,painter,read_mcp_resource,archive_current_thread,send_message_to_agg|deferred=true|visible=false|visibleInV2=false|serverOnly=false":                                                                                                                                                                            {},
-	"nostromo|primary=AMP_NOSTROMO|reasoning=low|levels=|include=present|tools=finder,Bash,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,skill,oracle,librarian,Task,view_media,painter,read_mcp_resource,archive_current_thread,send_message_to_agg,shell_command,shell_command_status,apply_patch|deferred=false|visible=true|visibleInV2=false|serverOnly=false":                                                                                                                          {},
-	"review|primary=GPT_5_5|reasoning=medium|levels=|include=present|tools=shell_command,run_check,submit_review|deferred=false|visible=false|visibleInV2=false|serverOnly=false":                                                                                                                                                                                                                                                                                                                                     {},
-	"rush|primary=GPT_5_5|reasoning=none|levels=|include=present|tools=finder,shell_command,shell_command_status,apply_patch,web_search,read_web_page,read_mcp_resource,read_thread,find_thread,skill,oracle,librarian,Task,view_media,painter,archive_current_thread,send_message_to_agg|deferred=false|visible=true|visibleInV2=false|serverOnly=false":                                                                                                                                                             {},
-	"smart|primary=CLAUDE_OPUS_4_8|reasoning=high|levels=high,max,xhigh|include=present|tools=finder,Bash,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,skill,oracle,librarian,Task,view_media,painter,read_mcp_resource,archive_current_thread,send_message_to_agg|deferred=true|visible=true|visibleInV2=false|serverOnly=false":                                                                                                                                                           {},
+	"agg-man|primary=GPT_5_5|reasoning=none|levels=|include=present|tools=find_thread,read_thread,web_search,read_web_page,docs_list,docs_read,docs_write,create_project,list_agent_modes,create_thread,archive_thread,archive_threads,unarchive_thread,send_message_to_thread,publish_thread_artifacts,manage_automation,slack_write,slack_read,github_repo_ci_status,read_github,search_github,commit_search,list_directory_github,list_repositories,glob_github,diff|deferred=false|visible=false|visibleInV2=false|serverOnly=true": {},
+	"deep|primary=GPT_5_5|reasoning=medium|levels=low,medium,xhigh|include=present|tools=shell_command,shell_command_status,apply_patch,web_search,read_web_page,Task,skill,load_plugin,read_thread,find_thread,librarian,oracle,finder,view_media,painter,archive_current_thread,manage_automation,slack_write,slack_read,send_message_to_agg|deferred=true|visible=false|visibleInV2=false|serverOnly=false":                                                                                                                          {},
+	"high|primary=GPT_5_5|reasoning=xhigh|levels=|include=present|tools=shell_command,shell_command_status,apply_patch,web_search,read_web_page,Task,skill,load_plugin,read_thread,find_thread,librarian,oracle,finder,view_media,painter,archive_current_thread,manage_automation,slack_write,slack_read,send_message_to_agg|deferred=true|visible=true|visibleInV2=true|serverOnly=false":                                                                                                                                             {},
+	"large|primary=CLAUDE_OPUS_4_8|reasoning=|levels=|include=present|tools=finder,shell_command,shell_command_status,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,skill,load_plugin,oracle,librarian,Task,view_media,painter,read_mcp_resource,archive_current_thread,manage_automation,slack_write,slack_read,send_message_to_agg|deferred=true|visible=false|visibleInV2=false|serverOnly=false":                                                                                                           {},
+	"low|primary=AMP_GLM_5_2|reasoning=medium|levels=|include=present|tools=finder,shell_command,shell_command_status,apply_patch,web_search,read_web_page,read_thread,find_thread,skill,load_plugin,oracle,librarian,Task,view_media,painter,archive_current_thread,manage_automation,slack_write,slack_read,send_message_to_agg|deferred=false|visible=true|visibleInV2=true|serverOnly=false":                                                                                                                                        {},
+	"medium|primary=GPT_5_5|reasoning=medium|levels=|include=present|tools=shell_command,shell_command_status,apply_patch,web_search,read_web_page,Task,skill,load_plugin,read_thread,find_thread,librarian,oracle,finder,view_media,painter,archive_current_thread,manage_automation,slack_write,slack_read,send_message_to_agg|deferred=true|visible=true|visibleInV2=true|serverOnly=false":                                                                                                                                          {},
+	"nostromo|primary=AMP_NOSTROMO|reasoning=low|levels=|include=present|tools=finder,shell_command,shell_command_status,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,skill,load_plugin,oracle,librarian,Task,view_media,painter,read_mcp_resource,archive_current_thread,manage_automation,slack_write,slack_read,send_message_to_agg,apply_patch|deferred=false|visible=true|visibleInV2=true|serverOnly=false":                                                                                             {},
+	"review|primary=GPT_5_5|reasoning=medium|levels=|include=present|tools=shell_command,run_check,submit_review|deferred=false|visible=false|visibleInV2=false|serverOnly=false":                                                                                                                                                                                                                                                                                                                                                       {},
+	"rush|primary=GPT_5_5|reasoning=none|levels=|include=present|tools=finder,shell_command,shell_command_status,apply_patch,web_search,read_web_page,read_thread,find_thread,skill,load_plugin,oracle,librarian,Task,view_media,painter,archive_current_thread,manage_automation,slack_write,slack_read,send_message_to_agg|deferred=false|visible=false|visibleInV2=false|serverOnly=false":                                                                                                                                           {},
+	"smart|primary=CLAUDE_OPUS_4_8|reasoning=high|levels=high,max,xhigh|include=present|tools=finder,shell_command,shell_command_status,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,skill,load_plugin,oracle,librarian,Task,view_media,painter,read_mcp_resource,archive_current_thread,manage_automation,slack_write,slack_read,send_message_to_agg|deferred=true|visible=false|visibleInV2=false|serverOnly=false":                                                                                         {},
+	"ultra|primary=CLAUDE_FABLE_5|reasoning=high|levels=|include=present|tools=finder,shell_command,shell_command_status,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,skill,load_plugin,oracle,librarian,Task,view_media,painter,read_mcp_resource,archive_current_thread,manage_automation,slack_write,slack_read,send_message_to_agg|deferred=true|visible=true|visibleInV2=true|serverOnly=false":                                                                                                          {},
 }
 
 var knownAgentModeRouteValues = map[string]struct{}{
 	"agg-man|provider=openai|model=gpt-5.5|primary=GPT_5_5|reasoning=none|context=400000|max_out=128000":                 {},
 	"deep|provider=openai|model=gpt-5.5|primary=GPT_5_5|reasoning=medium|context=400000|max_out=128000":                  {},
+	"high|provider=openai|model=gpt-5.5|primary=GPT_5_5|reasoning=xhigh|context=400000|max_out=128000":                   {},
 	"large|provider=anthropic|model=claude-opus-4-8|primary=CLAUDE_OPUS_4_8|reasoning=|context=332000|max_out=32000":     {},
+	"low|provider=amp|model=glm-5.2|primary=AMP_GLM_5_2|reasoning=medium|context=200000|max_out=32000":                   {},
+	"medium|provider=openai|model=gpt-5.5|primary=GPT_5_5|reasoning=medium|context=400000|max_out=128000":                {},
 	"nostromo|provider=amp|model=amp-nostromo-v1|primary=AMP_NOSTROMO|reasoning=low|context=400000|max_out=128000":       {},
 	"review|provider=openai|model=gpt-5.5|primary=GPT_5_5|reasoning=medium|context=400000|max_out=128000":                {},
 	"rush|provider=openai|model=gpt-5.5|primary=GPT_5_5|reasoning=none|context=400000|max_out=128000":                    {},
 	"smart|provider=anthropic|model=claude-opus-4-8|primary=CLAUDE_OPUS_4_8|reasoning=high|context=332000|max_out=32000": {},
+	"ultra|provider=anthropic|model=claude-fable-5|primary=CLAUDE_FABLE_5|reasoning=high|context=332000|max_out=128000":  {},
 }
 
 var ignoredToolCancelReasonTokens = map[string]struct{}{
+	"system:null": {},
 	"system:this": {},
 	"user:this":   {},
 }
@@ -746,6 +763,7 @@ var settingScopes = map[string]string{
 	"openai.speed":                                  "local-runtime",
 	"permissions":                                   "local-runtime",
 	"proxy":                                         "amp-owned",
+	"remoteThreadCreation.enabled":                  "remote-web",
 	"showCosts":                                     "remote-web",
 	"skills.disableClaudeCodeSkills":                "local-runtime",
 	"skills.path":                                   "local-runtime",
@@ -753,6 +771,7 @@ var settingScopes = map[string]string{
 	"terminal.animation":                            "remote-web",
 	"terminal.copyOnSelect":                         "remote-web",
 	"terminal.detailsExpandedByDefault":             "remote-web",
+	"thread.autoArchiveOnQuit":                      "amp-owned",
 	"toolbox.path":                                  "local-runtime",
 	"tools.disable":                                 "local-runtime",
 	"tools.enable":                                  "local-runtime",
@@ -796,6 +815,7 @@ var knownSettingDefaultValues = map[string]string{
 	"notifications.system.enabled":                  "true",
 	"openai.speed":                                  "undefined",
 	"proxy":                                         "undefined",
+	"remoteThreadCreation.enabled":                  "false",
 	"showCosts":                                     "true",
 	"skills.disableClaudeCodeSkills":                "false",
 	"skills.path":                                   "undefined",
@@ -803,6 +823,7 @@ var knownSettingDefaultValues = map[string]string{
 	"terminal.animation":                            "true",
 	"terminal.copyOnSelect":                         "true",
 	"terminal.detailsExpandedByDefault":             "false",
+	"thread.autoArchiveOnQuit":                      "false",
 	"toolbox.path":                                  "undefined",
 	"tools.disable":                                 `["browser_navigate","builtin:edit_file"]`,
 	"tools.enable":                                  "undefined",
@@ -861,6 +882,10 @@ var knownRawModelValues = map[string]struct{}{
 	"gpt-5.4-pro":                 {},
 	"gpt-5.5":                     {},
 	"gpt-5.5-pro":                 {},
+	"gpt-5.6-luna":                {},
+	"gpt-5.6-sol":                 {},
+	"gpt-5.6-terra":               {},
+	"gpt-56":                      {},
 	"o3-mini":                     {},
 }
 
@@ -890,7 +915,7 @@ var retiredModelNames = map[string]struct{}{
 
 var knownModelLimitValues = map[string]modelLimitExpectation{
 	"amp-nostromo-v1":                   {Enum: "AMP_NOSTROMO", Provider: "amp", DisplayName: "nostromo", ContextWindow: 400000, MaxOutputTokens: 128000},
-	"claude-fable-5":                    {Enum: "CLAUDE_FABLE_5", Provider: "anthropic", DisplayName: "Claude Fable 5", ContextWindow: 1000000, MaxOutputTokens: 128000},
+	"claude-fable-5":                    {Enum: "CLAUDE_FABLE_5", Provider: "anthropic", DisplayName: "Claude Fable 5", ContextWindow: 332000, MaxOutputTokens: 128000},
 	"claude-haiku-4-5-20251001":         {Enum: "CLAUDE_HAIKU_4_5", Provider: "anthropic", DisplayName: "Claude Haiku 4.5", ContextWindow: 200000, MaxOutputTokens: 64000},
 	"claude-opus-4-1-20250805":          {Enum: "CLAUDE_OPUS_4_1", Provider: "anthropic", DisplayName: "Claude Opus 4.1", ContextWindow: 200000, MaxOutputTokens: 32000},
 	"claude-opus-4-20250514":            {Enum: "CLAUDE_OPUS_4", Provider: "anthropic", DisplayName: "Claude Opus 4", ContextWindow: 200000, MaxOutputTokens: 32000},
@@ -918,14 +943,20 @@ var knownModelLimitValues = map[string]modelLimitExpectation{
 	"gpt-5.4-pro":                       {Enum: "GPT_5_4_PRO", Provider: "openai", DisplayName: "GPT-5.4-Pro", ContextWindow: 1050000, MaxOutputTokens: 128000},
 	"gpt-5.5":                           {Enum: "GPT_5_5", Provider: "openai", DisplayName: "GPT-5.5", ContextWindow: 400000, MaxOutputTokens: 128000},
 	"gpt-5.5-pro":                       {Enum: "GPT_5_5_PRO", Provider: "openai", DisplayName: "GPT-5.5-Pro", ContextWindow: 1050000, MaxOutputTokens: 128000},
+	"gpt-5.6-luna":                      {Enum: "GPT_5_6_LUNA", Provider: "openai", DisplayName: "GPT-5.6 Luna", ContextWindow: 400000, MaxOutputTokens: 128000},
+	"gpt-5.6-sol":                       {Enum: "GPT_5_6_SOL", Provider: "openai", DisplayName: "GPT-5.6 Sol", ContextWindow: 400000, MaxOutputTokens: 128000},
+	"gpt-5.6-terra":                     {Enum: "GPT_5_6_TERRA", Provider: "openai", DisplayName: "GPT-5.6 Terra", ContextWindow: 400000, MaxOutputTokens: 128000},
+	"glm-5.2":                           {Enum: "AMP_GLM_5_2", Provider: "amp", DisplayName: "GLM-5.2", ContextWindow: 200000, MaxOutputTokens: 32000},
+	"grok-4.5":                          {Enum: "GROK_4_5", Provider: "xai", DisplayName: "Grok 4.5", ContextWindow: 500000, MaxOutputTokens: 32000},
 	"grok-build-0.1":                    {Enum: "GROK_BUILD_0_1", Provider: "xai", DisplayName: "Grok Build 0.1", ContextWindow: 256000, MaxOutputTokens: 32000},
 	"grok-code-fast-1":                  {Enum: "GROK_CODE_FAST_1", Provider: "xai", DisplayName: "Grok Code Fast 1", ContextWindow: 256000, MaxOutputTokens: 32000},
 	"accounts/amp/deployments/wkk976k4": {Enum: "FIREWORKS_GLM_5_2_DEDICATED", Provider: "fireworks", DisplayName: "GLM-5.2 Dedicated", ContextWindow: 200000, MaxOutputTokens: 32000},
 	"accounts/fireworks/models/glm-5p2": {Enum: "FIREWORKS_GLM_5_2", Provider: "fireworks", DisplayName: "GLM-5.2", ContextWindow: 200000, MaxOutputTokens: 32000},
-	"moonshotai/Kimi-K2.5":              {Enum: "BASETEN_KIMI_K2P5", Provider: "baseten", DisplayName: "Kimi K2.5", ContextWindow: 262144, MaxOutputTokens: 32000},
-	"o3":                                {Enum: "O3", Provider: "openai", DisplayName: "o3", ContextWindow: 200000, MaxOutputTokens: 1},
-	"o3-mini":                           {Enum: "O3_MINI", Provider: "openai", DisplayName: "o3-mini", ContextWindow: 200000, MaxOutputTokens: 1},
-	"zai-org/GLM-5.2":                   {Enum: "BASETEN_GLM_5_2", Provider: "baseten", DisplayName: "GLM-5.2", ContextWindow: 200000, MaxOutputTokens: 32000},
+	"accounts/fireworks/routers/glm-5p2-fast": {Enum: "FIREWORKS_GLM_5_2_FAST", Provider: "fireworks", DisplayName: "GLM-5.2 Fast", ContextWindow: 200000, MaxOutputTokens: 32000},
+	"moonshotai/Kimi-K2.5":                    {Enum: "BASETEN_KIMI_K2P5", Provider: "baseten", DisplayName: "Kimi K2.5", ContextWindow: 262144, MaxOutputTokens: 32000},
+	"o3":                                      {Enum: "O3", Provider: "openai", DisplayName: "o3", ContextWindow: 200000, MaxOutputTokens: 1},
+	"o3-mini":                                 {Enum: "O3_MINI", Provider: "openai", DisplayName: "o3-mini", ContextWindow: 200000, MaxOutputTokens: 1},
+	"zai-org/GLM-5.2":                         {Enum: "BASETEN_GLM_5_2", Provider: "baseten", DisplayName: "GLM-5.2", ContextWindow: 200000, MaxOutputTokens: 32000},
 }
 
 var routeScopes = []routeScopeRule{
@@ -2789,6 +2820,8 @@ func modelProviderAndFamily(model string) (string, string) {
 		return "google", geminiModelFamily(lower)
 	case lower == "amp-nostromo-v1":
 		return "amp", "amp-nostromo"
+	case strings.HasPrefix(lower, "glm-"):
+		return "amp", "glm"
 	case strings.HasPrefix(lower, "gpt-image-"):
 		return "openai", "gpt-image"
 	case strings.HasPrefix(lower, "gpt-oss-"):
@@ -2991,7 +3024,7 @@ func addReviewContractMarkers(found map[string]struct{}, s string) {
 	if strings.Contains(s, "CLI appends structured check findings mechanically") {
 		found["review-cli-appends-check-findings"] = struct{}{}
 	}
-	if strings.Contains(s, `"checkURI"`) && strings.Contains(s, `typeof o.checkURI==="string"`) && strings.Contains(s, `"checkName"`) && strings.Contains(s, `typeof o.checkName==="string"`) {
+	if containsRunCheckURIInputShape(s) {
 		found["run-check-uri-input-shape"] = struct{}{}
 	}
 	if strings.Contains(s, `"instructions":`) && strings.Contains(s, "Outcome-first brief") && strings.Contains(s, "check agent") {
@@ -3003,6 +3036,59 @@ func addReviewContractMarkers(found map[string]struct{}, s string) {
 	if strings.Contains(s, "yellow") && strings.Contains(s, "issues found") && strings.Contains(s, "result.check.name") {
 		found["human-review-check-footer-counts-issues"] = struct{}{}
 	}
+}
+
+func containsRunCheckURIInputShape(s string) bool {
+	uriMatches := runCheckFieldMatches(s, runCheckURIFieldPattern)
+	if len(uriMatches) == 0 {
+		return false
+	}
+	nameMatches := runCheckFieldMatches(s, runCheckNameFieldPattern)
+	for _, uriMatch := range uriMatches {
+		for _, nameMatch := range nameMatches {
+			if uriMatch.Object == nameMatch.Object && runCheckFieldMatchesShareExpression(s, uriMatch, nameMatch) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+type runCheckFieldMatch struct {
+	Object string
+	Start  int
+	End    int
+}
+
+func runCheckFieldMatches(s string, pattern *regexp.Regexp) []runCheckFieldMatch {
+	matches := pattern.FindAllStringSubmatchIndex(s, -1)
+	out := make([]runCheckFieldMatch, 0, len(matches))
+	for _, match := range matches {
+		if len(match) < 6 || match[2] < 0 || match[4] < 0 {
+			continue
+		}
+		object := s[match[2]:match[3]]
+		if object != s[match[4]:match[5]] {
+			continue
+		}
+		out = append(out, runCheckFieldMatch{
+			Object: object,
+			Start:  match[0],
+			End:    match[1],
+		})
+	}
+	return out
+}
+
+func runCheckFieldMatchesShareExpression(s string, a, b runCheckFieldMatch) bool {
+	if a.Start > b.Start {
+		a, b = b, a
+	}
+	if b.End-a.Start > 512 {
+		return false
+	}
+	between := s[a.End:b.Start]
+	return !strings.ContainsAny(between, "{}") && !strings.Contains(between, "function") && !strings.Contains(between, "=>")
 }
 
 type agentModeMarkerPosition struct {
@@ -3033,13 +3119,13 @@ func extractAgentModeProfiles(s string) []AgentModeProfile {
 		profiles = append(profiles, AgentModeProfile{
 			Name:            position.Name,
 			PrimaryModel:    firstSubmatch(primaryModelRefPattern, segment),
-			ReasoningEffort: firstSubmatch(reasoningEffortPattern, segment),
+			ReasoningEffort: lastSubmatch(reasoningEffortPattern, segment),
 			ReasoningLevels: quotedValues(firstSubmatch(reasoningLevelsBlockPattern, segment)),
 			IncludeTools:    normalizedAgentModeIncludeTools(includeTools),
 			ToolNames:       append([]string(nil), toolArrays[includeTools]...),
 			DeferredTools:   strings.Contains(segment, "deferredTools:"),
 			Visible:         strings.Contains(segment, "visible:!0"),
-			VisibleInV2:     strings.Contains(segment, "visibleInV2:!0"),
+			VisibleInV2:     strings.Contains(segment, "visibleInV2:!0") || strings.Contains(segment, "visibleInApp:!0"),
 			ServerOnly:      strings.Contains(segment, "serverOnly:!0"),
 		})
 	}
@@ -3047,24 +3133,121 @@ func extractAgentModeProfiles(s string) []AgentModeProfile {
 }
 
 func stringArrayAssignments(s string) map[string][]string {
-	arrays := map[string][]string{}
-	for _, match := range stringArrayAssignmentPattern.FindAllStringSubmatch(s, -1) {
-		if len(match) < 3 {
-			continue
-		}
-		arrays[match[1]] = quotedValuesInOrder(match[2])
-	}
-	for _, match := range stringArrayUnionPattern.FindAllStringSubmatch(s, -1) {
+	bodies := map[string]string{}
+	for _, match := range stringArrayOpenPattern.FindAllStringSubmatchIndex(s, -1) {
 		if len(match) < 4 {
 			continue
 		}
-		arrays[match[1]] = uniqueStringsInOrder(append(append([]string{}, arrays[match[2]]...), arrays[match[3]]...))
+		open := match[1] - 1
+		if body, ok := scanJSBracketBody(s, open); ok {
+			bodies[s[match[2]:match[3]]] = body
+		}
 	}
-	return arrays
+	unions := map[string]string{}
+	for _, match := range stringArrayUnionOpenPattern.FindAllStringSubmatchIndex(s, -1) {
+		if len(match) < 4 {
+			continue
+		}
+		open := match[1] - 1
+		if body, ok := scanJSBracketBody(s, open); ok {
+			unions[s[match[2]:match[3]]] = body
+		}
+	}
+	aliases := map[string]string{}
+	for _, match := range stringArrayAliasPattern.FindAllStringSubmatch(s, -1) {
+		if len(match) < 3 {
+			continue
+		}
+		if match[1] != match[2] {
+			aliases[match[1]] = match[2]
+		}
+	}
+	resolved := map[string][]string{}
+	resolving := map[string]bool{}
+	var resolve func(string) []string
+	resolve = func(name string) []string {
+		if values, ok := resolved[name]; ok {
+			return values
+		}
+		if resolving[name] {
+			return nil
+		}
+		resolving[name] = true
+		defer delete(resolving, name)
+		var values []string
+		if body, ok := bodies[name]; ok {
+			values = resolveArrayLiteralTools(body, resolve)
+		} else if body, ok := unions[name]; ok {
+			values = uniqueStringsInOrder(resolveArrayLiteralTools(body, resolve))
+		} else if alias := aliases[name]; alias != "" {
+			values = resolve(alias)
+		}
+		resolved[name] = values
+		return values
+	}
+	for name := range bodies {
+		resolve(name)
+	}
+	for name := range unions {
+		resolve(name)
+	}
+	for name := range aliases {
+		resolve(name)
+	}
+	return resolved
+}
+
+func scanJSBracketBody(s string, open int) (string, bool) {
+	if open < 0 || open >= len(s) || s[open] != '[' {
+		return "", false
+	}
+	depth := 0
+	for i := open; i < len(s); i++ {
+		switch s[i] {
+		case '[':
+			depth++
+		case ']':
+			depth--
+			if depth == 0 {
+				return s[open+1 : i], true
+			}
+		}
+	}
+	return "", false
+}
+
+func resolveArrayLiteralTools(body string, resolve func(string) []string) []string {
+	var out []string
+	for _, part := range strings.Split(body, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if strings.HasPrefix(part, "...") {
+			if ident := readJSIdent(part[3:]); ident != "" {
+				out = append(out, resolve(ident)...)
+			}
+			continue
+		}
+		out = append(out, quotedValuesInOrder(part)...)
+	}
+	return out
+}
+
+func readJSIdent(s string) string {
+	end := 0
+	for end < len(s) && isJSIdentByte(s[end]) {
+		end++
+	}
+	return s[:end]
+}
+
+func isJSIdentByte(b byte) bool {
+	return b >= 'A' && b <= 'Z' || b >= 'a' && b <= 'z' || b >= '0' && b <= '9' || b == '_' || b == '$'
 }
 
 func agentModeTableEnd(s string) int {
-	ends := []string{"}},Fc=", "}},uU="}
+	ends := []string{"}},Fc=", "}},uU=", "}};var "}
 	best := -1
 	for _, marker := range ends {
 		if index := strings.Index(s, marker); index >= 0 && (best == -1 || index < best) {
@@ -3100,6 +3283,14 @@ func firstSubmatch(pattern *regexp.Regexp, s string) string {
 		return ""
 	}
 	return match[1]
+}
+
+func lastSubmatch(pattern *regexp.Regexp, s string) string {
+	matches := pattern.FindAllStringSubmatch(s, -1)
+	if len(matches) == 0 || len(matches[len(matches)-1]) < 2 {
+		return ""
+	}
+	return matches[len(matches)-1][1]
 }
 
 func quotedValues(s string) []string {
@@ -7591,7 +7782,15 @@ func unknownAgentModeInternalsFromCoverage(diff auditDiff) []string {
 				if effort := pipeFieldValue(value, "reasoning"); strings.TrimSpace(effort) != "" && !knownAgentModeReasoningEffort(effort) {
 					seen["reasoning="+effort] = struct{}{}
 				}
+				opaqueServerRoute := strings.TrimSpace(provider) == "" &&
+					strings.TrimSpace(model) == "" &&
+					strings.TrimSpace(primary) == "" &&
+					pipeFieldValue(value, "context") == "0" &&
+					pipeFieldValue(value, "max_out") == "0"
 				for _, field := range []string{"context", "max_out"} {
+					if opaqueServerRoute {
+						continue
+					}
 					parsed, ok := parsePositiveIntField(pipeFieldValue(value, field))
 					if !ok || field == "context" && !knownModelLimitContext(parsed) || field == "max_out" && !knownModelLimitMaxOutput(parsed) {
 						seen[field+"="+pipeFieldValue(value, field)] = struct{}{}
@@ -7616,7 +7815,7 @@ func unknownAgentModeInternalsFromCoverage(diff auditDiff) []string {
 
 func knownAgentModePrimary(primary string) bool {
 	switch strings.TrimSpace(primary) {
-	case "AMP_NOSTROMO", "CLAUDE_OPUS_4_6", "CLAUDE_OPUS_4_7", "CLAUDE_OPUS_4_8", "GPT_5_5":
+	case "AMP_GLM_5_2", "AMP_NOSTROMO", "CLAUDE_FABLE_5", "CLAUDE_OPUS_4_6", "CLAUDE_OPUS_4_7", "CLAUDE_OPUS_4_8", "GPT_5_5":
 		return true
 	default:
 		return false
@@ -7658,12 +7857,16 @@ func knownAgentModeProfileFlags(name, visible, visibleInV2, serverOnly string) b
 	}
 	expected := map[string]flags{
 		"agg-man":  {visible: "false", visibleInV2: "false", serverOnly: "true"},
-		"deep":     {visible: "true", visibleInV2: "false", serverOnly: "false"},
+		"deep":     {visible: "false", visibleInV2: "false", serverOnly: "false"},
+		"high":     {visible: "true", visibleInV2: "true", serverOnly: "false"},
 		"large":    {visible: "false", visibleInV2: "false", serverOnly: "false"},
-		"nostromo": {visible: "true", visibleInV2: "false", serverOnly: "false"},
+		"low":      {visible: "true", visibleInV2: "true", serverOnly: "false"},
+		"medium":   {visible: "true", visibleInV2: "true", serverOnly: "false"},
+		"nostromo": {visible: "true", visibleInV2: "true", serverOnly: "false"},
 		"review":   {visible: "false", visibleInV2: "false", serverOnly: "false"},
-		"rush":     {visible: "true", visibleInV2: "false", serverOnly: "false"},
-		"smart":    {visible: "true", visibleInV2: "false", serverOnly: "false"},
+		"rush":     {visible: "false", visibleInV2: "false", serverOnly: "false"},
+		"smart":    {visible: "false", visibleInV2: "false", serverOnly: "false"},
+		"ultra":    {visible: "true", visibleInV2: "true", serverOnly: "false"},
 	}
 	want, ok := expected[strings.TrimSpace(name)]
 	if !ok {
@@ -7741,6 +7944,9 @@ func unknownModelsFromCoverage(diff auditDiff) []string {
 		case "agent-mode-routes":
 			for _, value := range changedDiffValues(category) {
 				model := agentModeRouteModelFromDiffValue(value)
+				if strings.TrimSpace(model) == "" {
+					continue
+				}
 				provider, family := modelProviderAndFamily(model)
 				if provider == "unknown" || family == "unknown" {
 					seen[model] = struct{}{}
@@ -7960,7 +8166,7 @@ func knownModelLimitNameShape(provider, name string) bool {
 	name = strings.TrimSpace(name)
 	switch strings.TrimSpace(provider) {
 	case "amp":
-		return name == "amp-nostromo-v1"
+		return name == "amp-nostromo-v1" || strings.HasPrefix(name, "glm-")
 	case "anthropic":
 		return strings.HasPrefix(name, "claude-")
 	case "baseten":
@@ -7968,7 +8174,7 @@ func knownModelLimitNameShape(provider, name string) bool {
 	case "cerebras":
 		return strings.HasPrefix(name, "zai-") || strings.HasPrefix(name, "moonshotai-")
 	case "fireworks":
-		return strings.HasPrefix(name, "accounts/fireworks/models/") || strings.HasPrefix(name, "accounts/amp/deployments/")
+		return strings.HasPrefix(name, "accounts/fireworks/models/") || strings.HasPrefix(name, "accounts/fireworks/routers/") || strings.HasPrefix(name, "accounts/amp/deployments/")
 	case "google":
 		return strings.HasPrefix(name, "gemini-")
 	case "moonshotai":
@@ -7991,7 +8197,7 @@ func parsePositiveIntField(value string) (int, bool) {
 
 func knownModelLimitContext(context int) bool {
 	switch context {
-	case 128000, 131000, 162752, 200000, 202800, 230144, 256000, 262144, 332000, 400000, 1000000, 1040000, 1048576, 1050000:
+	case 128000, 131000, 162752, 200000, 202800, 230144, 256000, 262144, 332000, 400000, 500000, 1000000, 1040000, 1048576, 1050000:
 		return true
 	default:
 		return false
