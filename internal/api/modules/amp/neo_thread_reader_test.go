@@ -248,6 +248,14 @@ func TestNeoReadThreadCorpusUsesVisibleRootMessages(t *testing.T) {
 	if numberFrom(latestRange["startIndex"]) != 5 || numberFrom(latestRange["endIndex"]) != 7 {
 		t.Fatalf("latest mixed range = %#v, want original indexes 5-7", latestRange)
 	}
+	sparseRead, sparseEnd, err := neoReadThreadRead(corpus, map[string]any{"startIndex": 4, "endIndex": 4})
+	if err != nil {
+		t.Fatalf("read sparse gap: %v", err)
+	}
+	sparseRange := mapValue(sparseRead["range"])
+	if sparseEnd != 5 || numberFrom(sparseRange["startIndex"]) != 3 || numberFrom(sparseRange["endIndex"]) != 5 || !boolValue(sparseRead["sparseRangeNormalized"]) {
+		t.Fatalf("sparse read = %#v end=%d, want normalized boundary range 3-5", sparseRead, sparseEnd)
+	}
 	if _, _, err := neoReadThreadRead(corpus, map[string]any{"startIndex": 99}); err == nil || !strings.Contains(err.Error(), "outside thread message range") {
 		t.Fatalf("read past sparse tail err = %v, want out-of-range", err)
 	}
@@ -311,7 +319,7 @@ func TestNeoReadThreadAgentToolBudgetsAndDeduplicates(t *testing.T) {
 	}
 
 	state := neoReadThreadAgentState{}
-	search := neoToolCall{ID: "TU-search-1", Name: "search_thread_messages", Input: map[string]any{"query": " Alpha   Decision ", "limit": 50}}
+	search := neoToolCall{ID: "TU-search-1", Name: "search_thread_messages", Input: map[string]any{"query": " Alpha   Decision ", "limit": 10}}
 	if run, accepted := neoReadThreadExecuteAgentTool(&state, corpus, search, 0); !accepted || stringValue(run["status"]) != "done" {
 		t.Fatalf("first search accepted=%v run=%#v", accepted, run)
 	}
@@ -319,7 +327,7 @@ func TestNeoReadThreadAgentToolBudgetsAndDeduplicates(t *testing.T) {
 	if err != nil || stringValue(normalizedSearch["query"]) != "Alpha Decision" {
 		t.Fatalf("normalized search query=%#v err=%v", normalizedSearch["query"], err)
 	}
-	duplicate := neoToolCall{ID: "TU-search-2", Name: "search_thread_messages", Input: map[string]any{"query": "alpha decision", "limit": 40}}
+	duplicate := neoToolCall{ID: "TU-search-2", Name: "search_thread_messages", Input: map[string]any{"query": "alpha decision", "limit": 20}}
 	if run, accepted := neoReadThreadExecuteAgentTool(&state, corpus, duplicate, 1); accepted || !strings.Contains(runToText(run), "duplicate") {
 		t.Fatalf("duplicate search accepted=%v run=%#v", accepted, run)
 	}
@@ -331,13 +339,103 @@ func TestNeoReadThreadAgentToolBudgetsAndDeduplicates(t *testing.T) {
 	if run, accepted := neoReadThreadExecuteAgentTool(&state, corpus, equivalentTailRead, 2); accepted || !strings.Contains(runToText(run), "duplicate") {
 		t.Fatalf("equivalent tail read accepted=%v run=%#v", accepted, run)
 	}
-	forwardRead := neoToolCall{ID: "TU-read-3", Name: "read_thread_messages", Input: map[string]any{"startIndex": 0, "count": 2}}
-	if run, accepted := neoReadThreadExecuteAgentTool(&state, corpus, forwardRead, 2); !accepted || stringValue(run["status"]) != "done" {
-		t.Fatalf("forward read accepted=%v run=%#v", accepted, run)
+	forwardRead := neoToolCall{ID: "TU-read-3", Name: "read_thread_messages", Input: map[string]any{"startIndex": 0, "count": 1}}
+	if run, accepted := neoReadThreadExecuteAgentTool(&state, corpus, forwardRead, 2); accepted || !strings.Contains(runToText(run), "already covered") {
+		t.Fatalf("covered forward read accepted=%v run=%#v", accepted, run)
 	}
 	unique := neoToolCall{ID: "TU-search-3", Name: "search_thread_messages", Input: map[string]any{"query": "latest alpha"}}
 	if run, accepted := neoReadThreadExecuteAgentTool(&state, corpus, unique, neoReadThreadMaxCallsPerTurn); accepted || !strings.Contains(runToText(run), "per model turn") {
 		t.Fatalf("per-turn overflow accepted=%v run=%#v", accepted, run)
+	}
+}
+
+func TestNeoReadThreadForcesFinalWithReservedToolBudget(t *testing.T) {
+	messages := make([]neoReadThreadMessage, 50)
+	for i := range messages {
+		messages[i] = neoReadThreadMessage{Index: i, Role: "assistant", MessageID: fmt.Sprintf("M-%d", i), Text: fmt.Sprintf("roadmap evidence %d", i)}
+	}
+	corpus := neoReadThreadCorpus{ThreadID: "T-reserved-final", Source: "test", Messages: messages}
+	var captured []neoInferenceRequest
+	rt := newNeoRuntime(&config.Config{})
+	rt.inferStream = func(_ *neoRuntime, request neoInferenceRequest, _ neoStreamCallback) (neoInferenceResult, error) {
+		turn := len(captured)
+		captured = append(captured, request)
+		if len(request.Tools) == 0 {
+			if request.ResponseMimeType != "application/json" || len(request.ResponseJSONSchema) == 0 {
+				t.Fatalf("forced final response contract = mime:%q schema:%#v", request.ResponseMimeType, request.ResponseJSONSchema)
+			}
+			historyText := neoHistoryTestText(request.History)
+			if !strings.Contains(historyText, "Grounded evidence retained") || !strings.Contains(historyText, "roadmap evidence 0") {
+				t.Fatalf("forced final history missing retained evidence: %s", historyText)
+			}
+			return neoInferenceResult{Text: neoReadThreadTestFinalJSON("[message 49] roadmap evidence was synthesized before exhausting the tool budget.")}, nil
+		}
+		calls := make([]neoToolCall, 0, neoReadThreadMaxCallsPerTurn)
+		switch turn {
+		case 0, 2, 4:
+			for i := 0; i < neoReadThreadMaxCallsPerTurn; i++ {
+				calls = append(calls, neoToolCall{ID: fmt.Sprintf("TU-search-%d-%d", turn, i), Name: "search_thread_messages", Input: map[string]any{"query": fmt.Sprintf("roadmap evidence query %d", turn*neoReadThreadMaxCallsPerTurn+i)}})
+			}
+		case 1:
+			for i := 0; i < neoReadThreadMaxCallsPerTurn-1; i++ {
+				calls = append(calls, neoToolCall{ID: fmt.Sprintf("TU-read-%d-%d", turn, i), Name: "read_thread_messages", Input: map[string]any{"startIndex": i * 5, "count": 5}})
+			}
+			calls = append(calls, neoToolCall{ID: "TU-read-latest", Name: "read_thread_messages", Input: map[string]any{"latest": true, "count": 5}})
+		case 3:
+			for i := 0; i < neoReadThreadMaxCallsPerTurn; i++ {
+				calls = append(calls, neoToolCall{ID: fmt.Sprintf("TU-read-%d-%d", turn, i), Name: "read_thread_messages", Input: map[string]any{"startIndex": 15 + i*5, "count": 5}})
+			}
+		default:
+			t.Fatalf("unexpected normal read_thread turn %d", turn)
+		}
+		return neoInferenceResult{ToolCalls: calls}, nil
+	}
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-current-reserved", "T-current-reserved", neoActorRecord("actor-test", "thread-actor", "T-current-reserved"), nil)
+
+	text, err := actor.executeLocalReadThreadAgent(neoPendingTool{ID: "TU-read", Name: "read_thread", Input: map[string]any{"threadID": corpus.ThreadID, "question": "Extract roadmap evidence."}, AgentMode: "deep"}, actor.generation, corpus, "Extract roadmap evidence.")
+	if err != nil {
+		t.Fatalf("executeLocalReadThreadAgent error: %v", err)
+	}
+	if !strings.Contains(text, "synthesized before exhausting") {
+		t.Fatalf("read_thread text = %q, want forced synthesis", text)
+	}
+	if len(captured) != 6 {
+		t.Fatalf("captured requests = %d, want five tool turns and one forced final", len(captured))
+	}
+}
+
+func TestNeoReadThreadUncitedJSONUsesForcedFinal(t *testing.T) {
+	corpus := neoReadThreadCorpus{ThreadID: "T-grounded-final", Source: "test", Messages: []neoReadThreadMessage{
+		{Index: 0, Role: "user", Text: "Initial roadmap."},
+		{Index: 1, Role: "assistant", Text: "Final roadmap decision."},
+	}}
+	var captured []neoInferenceRequest
+	rt := newNeoRuntime(&config.Config{})
+	rt.inferStream = func(_ *neoRuntime, request neoInferenceRequest, _ neoStreamCallback) (neoInferenceResult, error) {
+		turn := len(captured)
+		captured = append(captured, request)
+		switch turn {
+		case 0:
+			return neoInferenceResult{ToolCalls: []neoToolCall{{ID: "TU-search", Name: "search_thread_messages", Input: map[string]any{"query": "roadmap"}}}}, nil
+		case 1:
+			return neoInferenceResult{ToolCalls: []neoToolCall{{ID: "TU-latest", Name: "read_thread_messages", Input: map[string]any{"latest": true, "count": 2}}}}, nil
+		case 2:
+			return neoInferenceResult{Text: neoReadThreadTestFinalJSON("Unable to complete extraction within the available tool window.")}, nil
+		default:
+			if len(request.Tools) != 0 || request.ResponseMimeType != "application/json" {
+				t.Fatalf("forced final request = tools:%#v mime:%q", request.Tools, request.ResponseMimeType)
+			}
+			return neoInferenceResult{Text: neoReadThreadTestFinalJSON("[message 1] Final roadmap decision.")}, nil
+		}
+	}
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-current-grounded", "T-current-grounded", neoActorRecord("actor-test", "thread-actor", "T-current-grounded"), nil)
+
+	text, err := actor.executeLocalReadThreadAgent(neoPendingTool{ID: "TU-read", Name: "read_thread", AgentMode: "deep"}, actor.generation, corpus, "Extract the roadmap.")
+	if err != nil {
+		t.Fatalf("executeLocalReadThreadAgent error: %v", err)
+	}
+	if text != "[message 1] Final roadmap decision." || len(captured) != 4 {
+		t.Fatalf("read_thread text/calls = %q/%d, want grounded forced final in four calls", text, len(captured))
 	}
 }
 
@@ -608,9 +706,10 @@ func TestNeoReadThreadFinalHistoryFlattensToolContent(t *testing.T) {
 }
 
 func TestNeoReadThreadForcedFinalAnchorsLatestVisibleTail(t *testing.T) {
+	latestDetail := strings.Repeat("latest context padding ", 80) + "EXACT_LATE_TAIL_MARKER"
 	corpus := neoReadThreadCorpus{ThreadID: "T-final-tail", Source: "test", Title: "final tail", Messages: []neoReadThreadMessage{
 		{Index: 0, Role: "user", MessageID: "M-old", Text: "Old summary says wait for review cooldown."},
-		{Index: 1, Role: "assistant", MessageID: "M-merged", Text: "Latest state: PR #1003 was merged and local main is synced."},
+		{Index: 1, Role: "assistant", MessageID: "M-merged", Text: "Latest state: PR #1003 was merged and local main is synced. " + latestDetail},
 	}}
 	var captured []neoInferenceRequest
 	rt := newNeoRuntime(&config.Config{})
@@ -646,7 +745,7 @@ func TestNeoReadThreadForcedFinalAnchorsLatestVisibleTail(t *testing.T) {
 		t.Fatalf("captured requests = %d, want 1", len(captured))
 	}
 	historyText := neoHistoryTestText(captured[0].History)
-	if !strings.Contains(historyText, "Authoritative latest visible target-thread messages") || !strings.Contains(historyText, "PR #1003 was merged") {
+	if !strings.Contains(historyText, "Authoritative latest visible target-thread messages") || !strings.Contains(historyText, "PR #1003 was merged") || !strings.Contains(historyText, "EXACT_LATE_TAIL_MARKER") {
 		t.Fatalf("forced final history missing latest visible tail: %s", historyText)
 	}
 	if !strings.Contains(historyText, neoReadThreadFinalPrompt) {
@@ -1246,6 +1345,11 @@ func TestNeoReadThreadMarkdownFallbackContentBoundaries(t *testing.T) {
 }
 
 func TestNeoReadThreadGroundedMarkdownFallbackRequiresMessageCitation(t *testing.T) {
+	corpus := neoReadThreadCorpus{Messages: []neoReadThreadMessage{
+		{Index: 1},
+		{Index: 2},
+		{Index: 3},
+	}}
 	tests := []struct {
 		name  string
 		input string
@@ -1260,13 +1364,35 @@ func TestNeoReadThreadGroundedMarkdownFallbackRequiresMessageCitation(t *testing
 		{"message word", "* [messagepack] approach D survived.", ""},
 		{"message without closing bracket", "* [message 1 approach D survived.", ""},
 		{"message nonnumeric", "* [message one] approach D survived.", ""},
+		{"nonexistent message", "* [message 999] approach D survived.", ""},
 		{"ungrounded progress note", "## Verifying Deployment Steps\n\nI'm now focused on final validation procedures.", ""},
 		{"json still rejected", `{"relevantContent":"partial"`, ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := neoReadThreadGroundedMarkdownFallbackContent(tt.input); got != tt.want {
+			if got := neoReadThreadGroundedMarkdownFallbackContent(tt.input, corpus); got != tt.want {
 				t.Fatalf("neoReadThreadGroundedMarkdownFallbackContent() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNeoReadThreadGroundedRelevantContentRequiresVisibleMessageCitation(t *testing.T) {
+	corpus := neoReadThreadCorpus{Messages: []neoReadThreadMessage{{Index: 2}, {Index: 7}}}
+
+	for _, tt := range []struct {
+		name    string
+		content string
+		wantErr bool
+	}{
+		{name: "visible sparse index", content: "[message 7] latest decision"},
+		{name: "hidden sparse gap", content: "[message 3] unsupported decision", wantErr: true},
+		{name: "nonexistent index", content: "[message 999] unsupported decision", wantErr: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := neoReadThreadGroundedRelevantContent(neoReadThreadTestFinalJSON(tt.content), corpus)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("neoReadThreadGroundedRelevantContent() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
 	}

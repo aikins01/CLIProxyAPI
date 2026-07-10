@@ -698,7 +698,7 @@ func TestNeoSubagentRunsSyntheticReadThreadAgentWhenExecutorOmitsIt(t *testing.T
 				return neoInferenceResult{ToolCalls: []neoToolCall{{ID: "TU-read-messages", Name: "read_thread_messages", Input: map[string]any{"latest": true, "count": 1}}}}, nil
 			default:
 				readTurns++
-				return neoInferenceResult{Text: `{"relevantContent":"subagent extracted context"}`}, nil
+				return neoInferenceResult{Text: `{"relevantContent":"[message 0] subagent extracted context"}`}, nil
 			}
 		}
 		oracleTurns++

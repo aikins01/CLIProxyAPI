@@ -11002,6 +11002,7 @@ func TestNeoActorQueuedWorkRespawnsIdleStoppedWebLocalExecutor(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("test uses POSIX shell script")
 	}
+	enabled := true
 	dir := t.TempDir()
 	pidDir := filepath.Join(dir, "pids")
 	if err := os.MkdirAll(pidDir, 0o700); err != nil {
@@ -11014,6 +11015,7 @@ func TestNeoActorQueuedWorkRespawnsIdleStoppedWebLocalExecutor(t *testing.T) {
 		t.Fatalf("write executor command: %v", err)
 	}
 	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
+		Enabled:                    &enabled,
 		ExecutorCommand:            command,
 		ExecutorIdleTimeoutSeconds: 60,
 	}}})
@@ -11099,6 +11101,7 @@ func TestNeoActorQueuedWorkRespawnsDisconnectedWebLocalExecutorAfterWait(t *test
 	if runtime.GOOS == "windows" {
 		t.Skip("test uses POSIX shell script")
 	}
+	enabled := true
 	dir := t.TempDir()
 	pidDir := filepath.Join(dir, "pids")
 	if err := os.MkdirAll(pidDir, 0o700); err != nil {
@@ -11111,6 +11114,7 @@ func TestNeoActorQueuedWorkRespawnsDisconnectedWebLocalExecutorAfterWait(t *test
 		t.Fatalf("write executor command: %v", err)
 	}
 	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
+		Enabled:                    &enabled,
 		ExecutorCommand:            command,
 		ExecutorIdleTimeoutSeconds: 60,
 	}}})
@@ -11193,6 +11197,7 @@ func TestNeoActorPendingInferenceRespawnsDisconnectedWebLocalExecutorAfterWait(t
 	if runtime.GOOS == "windows" {
 		t.Skip("test uses POSIX shell script")
 	}
+	enabled := true
 	dir := t.TempDir()
 	pidDir := filepath.Join(dir, "pids")
 	if err := os.MkdirAll(pidDir, 0o700); err != nil {
@@ -11205,6 +11210,7 @@ func TestNeoActorPendingInferenceRespawnsDisconnectedWebLocalExecutorAfterWait(t
 		t.Fatalf("write executor command: %v", err)
 	}
 	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
+		Enabled:         &enabled,
 		ExecutorCommand: command,
 	}}})
 	threadID := "T-019f4000-0000-4000-8000-00000000002e"
@@ -20895,7 +20901,7 @@ func TestNeoActorRunsReadThreadAgentEvenWhenExecutorRegistersIt(t *testing.T) {
 	var captured []neoInferenceRequest
 	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{UpstreamURL: upstream.URL}})
 	rt.setSecretSource(NewStaticSecretSource("secret"))
-	rt.inferStream = neoReadThreadScriptedInfer(t, "extracted local target", "local target", &captured, nil)
+	rt.inferStream = neoReadThreadScriptedInfer(t, "[message 0] extracted local target", "local target", &captured, nil)
 	actor := newNeoActor(rt, "actor-test", "thread-actor", currentThreadID, currentThreadID, neoActorRecord("actor-test", "thread-actor", currentThreadID), nil)
 	actor.executorBootstrapComplete = true
 	actor.tools["read_thread"] = neoReadThreadToolSpec()
@@ -20918,7 +20924,7 @@ func TestNeoActorRunsReadThreadAgentEvenWhenExecutorRegistersIt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("executeLocalReadThread error: %v", err)
 	}
-	if text != "extracted local target" {
+	if text != "[message 0] extracted local target" {
 		t.Fatalf("read_thread text = %q", text)
 	}
 	if len(captured) != 3 {
@@ -20970,7 +20976,7 @@ func TestNeoActorReadThreadFallsBackToUpstreamMarkdownCorpus(t *testing.T) {
 	var captured []neoInferenceRequest
 	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{UpstreamURL: upstream.URL}})
 	rt.setSecretSource(NewStaticSecretSource("secret"))
-	rt.inferStream = neoReadThreadScriptedInfer(t, "remote extracted", "remote markdown", &captured, func(turn int, request neoInferenceRequest) {
+	rt.inferStream = neoReadThreadScriptedInfer(t, "[message 0] remote extracted", "remote markdown", &captured, func(turn int, request neoInferenceRequest) {
 		if turn == 0 && strings.Contains(request.History[0].Text, "remote markdown content") {
 			t.Fatalf("initial read_thread prompt included whole upstream markdown: %q", request.History[0].Text)
 		}
@@ -20990,7 +20996,7 @@ func TestNeoActorReadThreadFallsBackToUpstreamMarkdownCorpus(t *testing.T) {
 	if err != nil {
 		t.Fatalf("executeLocalReadThread error: %v", err)
 	}
-	if text != "remote extracted" {
+	if text != "[message 0] remote extracted" {
 		t.Fatalf("read_thread text = %q", text)
 	}
 	if !sawUpstream {
@@ -21028,7 +21034,7 @@ func TestNeoActorReadThreadUsesMappedUpstreamSecret(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{UpstreamURL: upstream.URL}})
 	rt.setSecretSource(source)
 	var captured []neoInferenceRequest
-	rt.inferStream = neoReadThreadScriptedInfer(t, "mapped remote extracted", "mapped remote", &captured, func(turn int, request neoInferenceRequest) {
+	rt.inferStream = neoReadThreadScriptedInfer(t, "[message 0] mapped remote extracted", "mapped remote", &captured, func(turn int, request neoInferenceRequest) {
 		if turn%3 == 2 && !strings.Contains(neoHistoryTestText(request.History), "mapped remote markdown content") {
 			t.Fatalf("history = %#v, want mapped upstream markdown from internal tool results", request.History)
 		}
@@ -21047,7 +21053,7 @@ func TestNeoActorReadThreadUsesMappedUpstreamSecret(t *testing.T) {
 		if err != nil {
 			t.Fatalf("executeLocalReadThread error: %v", err)
 		}
-		if text != "mapped remote extracted" {
+		if text != "[message 0] mapped remote extracted" {
 			t.Fatalf("read_thread text = %q", text)
 		}
 	}
@@ -25461,6 +25467,7 @@ func TestNeoActorImportSpawnsWebLocalExecutorForRestoredPendingInference(t *test
 		t.Skip("fake Amp executor script uses /bin/sh")
 	}
 
+	enabled := true
 	dir := t.TempDir()
 	pidDir := filepath.Join(dir, "pids")
 	if err := os.MkdirAll(pidDir, 0o700); err != nil {
@@ -25475,6 +25482,7 @@ func TestNeoActorImportSpawnsWebLocalExecutorForRestoredPendingInference(t *test
 	rt := newNeoRuntime(&config.Config{
 		SDKConfig: config.SDKConfig{APIKeys: []string{"local-key"}},
 		AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
+			Enabled:         &enabled,
 			ExecutorCommand: command,
 		}},
 	})
@@ -26912,9 +26920,13 @@ func TestNeoActorExecutorDisconnectPreservesPendingInferenceForRestart(t *testin
 	}
 	restored.mu.Lock()
 	restoredPending := cloneNeoInferenceInflight(restored.pendingInference)
+	spawnedExecutors := len(restored.spawnedExecutors)
 	restored.mu.Unlock()
 	if restoredPending == nil || restoredPending.agentMode != "deep" || restoredPending.reasoningEffort != "xhigh" {
 		t.Fatalf("restored pendingInference = %#v, want restart continuation", restoredPending)
+	}
+	if spawnedExecutors != 0 {
+		t.Fatalf("disabled runtime spawned %d restored executors", spawnedExecutors)
 	}
 }
 

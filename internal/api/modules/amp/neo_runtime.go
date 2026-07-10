@@ -4561,7 +4561,7 @@ func (a *neoActor) maybeSpawnWebLocalExecutorForPendingWork() {
 }
 
 func (a *neoActor) shouldSpawnWebLocalExecutorForPendingWork() bool {
-	if a == nil {
+	if a == nil || a.runtime == nil || !neoRuntimeEnabled(a.runtime.configSnapshot()) {
 		return false
 	}
 	a.mu.Lock()

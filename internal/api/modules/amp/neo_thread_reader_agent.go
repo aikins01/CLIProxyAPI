@@ -38,12 +38,15 @@ const (
 	neoReadThreadMaxSearchCalls     = 12
 	neoReadThreadMaxReadCalls       = 12
 	neoReadThreadMaxCallsPerTurn    = 4
+	neoReadThreadForceFinalCalls    = neoReadThreadMaxToolCalls - neoReadThreadMaxCallsPerTurn
 	neoReadThreadStoredHitCount     = 12
 	neoReadThreadStoredMessageCount = 12
 	neoReadThreadStoredExcerptChars = 600
 	neoReadThreadStoredMessageChars = 1000
 	neoReadThreadStoredResultChars  = 600
 	neoReadThreadStoredToolBlocks   = 4
+	neoReadThreadEvidenceEntries    = 8
+	neoReadThreadEvidenceEntryChars = 7000
 )
 
 const neoReadThreadAgentSystemPrompt = `You are Amp's read_thread subagent. Your job is to search and read a target thread, then extract the information relevant to the caller's goal.
@@ -55,7 +58,8 @@ Rules:
 - Tool calls record attempted actions, not outcomes. Trust an action only after reading the corresponding tool result and its status.
 - Use compactions and summaries for orientation, but inspect original messages when exact requirements, wording, code, commands, chronology, edits, or verification matter.
 - Prefer the latest unreverted decision when the thread contains multiple revisions.
-- Do not repeat an identical tool call. Refine the query or read a different range when more evidence is needed.
+- Do not repeat a search with only a larger limit. Refine the query when more evidence is needed.
+- Use each search hit's recommendedRead range, and do not reread a range already covered by an earlier result.
 - For continuation or handoff goals, identify the latest explicit user objective first, then read the assistant and tool outcomes that followed it.
 - Preserve exact technical details: file paths, commands, model names, errors, decisions, and code snippets.
 - When reporting verification or build status, include the complete command string that ran and the latest pass/fail result.
@@ -107,6 +111,11 @@ type neoReadThreadToolObservation struct {
 	ReadEnd  int
 }
 
+type neoReadThreadPositionRange struct {
+	Start int
+	End   int
+}
+
 type neoReadThreadAgentState struct {
 	SawOverview bool
 	SawSearch   bool
@@ -116,6 +125,7 @@ type neoReadThreadAgentState struct {
 	SearchCalls int
 	ReadCalls   int
 	SeenCalls   map[string]struct{}
+	ReadRanges  []neoReadThreadPositionRange
 }
 
 func (a *neoActor) readThreadCorpus(threadID, clientAPIKey string) (neoReadThreadCorpus, error) {
@@ -411,6 +421,7 @@ func (a *neoActor) executeLocalReadThreadAgentWithRoute(pending neoPendingTool, 
 		SawLatest: len(corpus.Messages) <= 1,
 		SeenCalls: map[string]struct{}{},
 	}
+	evidence := make([]string, 0)
 	var lastErr error
 
 	for turn := 0; turn < neoReadThreadMaxTurns; turn++ {
@@ -444,12 +455,12 @@ func (a *neoActor) executeLocalReadThreadAgentWithRoute(pending neoPendingTool, 
 				conversation = append(conversation, neoHistoryMessage{Role: "user", Text: correction})
 				continue
 			}
-			text, parseErr := neoReadThreadRelevantContent(result.Text)
+			text, parseErr := neoReadThreadGroundedRelevantContent(result.Text, corpus)
 			if parseErr == nil {
 				return text, nil
 			}
 			lastErr = parseErr
-			forcedText, forcedErr := a.forceLocalReadThreadFinal(pending, generation, route, effort, actorID, currentThreadID, agentMode, maxTokens, settings, environment, conversation, corpus)
+			forcedText, forcedErr := a.forceLocalReadThreadFinalWithEvidence(pending, generation, route, effort, actorID, currentThreadID, agentMode, maxTokens, settings, environment, conversation, corpus, evidence)
 			if forcedErr == nil {
 				return forcedText, nil
 			}
@@ -467,6 +478,9 @@ func (a *neoActor) executeLocalReadThreadAgentWithRoute(pending neoPendingTool, 
 			if accepted {
 				acceptedThisTurn++
 				exchanges = append(exchanges, neoSubagentToolExchange{Call: call, Run: neoReadThreadPersistedRun(call.Name, run)})
+				if entry := neoReadThreadEvidenceEntry(call.Name, run); entry != "" {
+					evidence = append(evidence, entry)
+				}
 			}
 			conversation = append(conversation, neoHistoryMessage{
 				Role:            "tool",
@@ -478,6 +492,9 @@ func (a *neoActor) executeLocalReadThreadAgentWithRoute(pending neoPendingTool, 
 			})
 		}
 		a.storeSubagentToolExchanges(exchanges, pending.ID)
+		if neoReadThreadReadyToForceFinal(state) {
+			return a.forceLocalReadThreadFinalWithEvidence(pending, generation, route, effort, actorID, currentThreadID, agentMode, maxTokens, settings, environment, conversation, corpus, evidence)
+		}
 	}
 
 	if a.subagentGenerationStale(generation) {
@@ -499,7 +516,7 @@ func (a *neoActor) executeLocalReadThreadAgentWithRoute(pending neoPendingTool, 
 	if correction := neoReadThreadGateCorrection(state.SawSearch, state.SawRead, state.SawLatest, corpus); correction != "" {
 		return "", fmt.Errorf("read_thread subagent did not complete required search/read checks after %d turns: %s", neoReadThreadMaxTurns, correction)
 	}
-	forcedText, forcedErr := a.forceLocalReadThreadFinal(pending, generation, route, effort, actorID, currentThreadID, agentMode, maxTokens, settings, environment, conversation, corpus)
+	forcedText, forcedErr := a.forceLocalReadThreadFinalWithEvidence(pending, generation, route, effort, actorID, currentThreadID, agentMode, maxTokens, settings, environment, conversation, corpus, evidence)
 	if forcedErr != nil {
 		if lastErr != nil {
 			return "", lastErr
@@ -510,10 +527,17 @@ func (a *neoActor) executeLocalReadThreadAgentWithRoute(pending neoPendingTool, 
 }
 
 func (a *neoActor) forceLocalReadThreadFinal(pending neoPendingTool, generation int, route neoModelRoute, effort, actorID, currentThreadID, agentMode string, maxTokens any, settings, environment map[string]any, conversation []neoHistoryMessage, corpus neoReadThreadCorpus) (string, error) {
+	return a.forceLocalReadThreadFinalWithEvidence(pending, generation, route, effort, actorID, currentThreadID, agentMode, maxTokens, settings, environment, conversation, corpus, nil)
+}
+
+func (a *neoActor) forceLocalReadThreadFinalWithEvidence(pending neoPendingTool, generation int, route neoModelRoute, effort, actorID, currentThreadID, agentMode string, maxTokens any, settings, environment map[string]any, conversation []neoHistoryMessage, corpus neoReadThreadCorpus, evidence []string) (string, error) {
 	if a.subagentGenerationStale(generation) {
 		return "", nil
 	}
 	forced := append([]neoHistoryMessage(nil), conversation...)
+	if evidenceContext := neoReadThreadFinalEvidence(evidence); evidenceContext != "" {
+		forced = append(forced, neoHistoryMessage{Role: "user", Text: evidenceContext})
+	}
 	if latestContext := neoReadThreadLatestFinalContext(corpus); latestContext != "" {
 		forced = append(forced, neoHistoryMessage{Role: "user", Text: latestContext})
 	}
@@ -547,11 +571,11 @@ func (a *neoActor) forceLocalReadThreadFinal(pending neoPendingTool, generation 
 	if a.subagentGenerationStale(generation) {
 		return "", nil
 	}
-	text, parseErr := neoReadThreadRelevantContent(result.Text)
+	text, parseErr := neoReadThreadGroundedRelevantContent(result.Text, corpus)
 	if parseErr == nil {
 		return text, nil
 	}
-	if fallback := neoReadThreadGroundedMarkdownFallbackContent(result.Text); fallback != "" {
+	if fallback := neoReadThreadGroundedMarkdownFallbackContent(result.Text, corpus); fallback != "" {
 		return fallback, nil
 	}
 	return "", fmt.Errorf("read_thread forced final did not return valid JSON or markdown fallback: %w", parseErr)
@@ -570,6 +594,26 @@ func neoReadThreadLatestFinalContext(corpus neoReadThreadCorpus) string {
 		return ""
 	}
 	return "Authoritative latest visible target-thread messages before finalization. Prefer this tail over older summaries or earlier search hits when they conflict.\n\n" + runToText(map[string]any{"status": "done", "result": latest})
+}
+
+func neoReadThreadFinalEvidence(entries []string) string {
+	positions := neoReadThreadStoredPositions(len(entries), neoReadThreadEvidenceEntries)
+	if len(positions) == 0 {
+		return ""
+	}
+	selected := make([]string, 0, len(positions))
+	for _, position := range positions {
+		selected = append(selected, entries[position])
+	}
+	return "Grounded evidence retained from completed read_thread tools. Use these observations and the authoritative latest tail to synthesize the answer; do not resume searching.\n\n" + strings.Join(selected, "\n\n")
+}
+
+func neoReadThreadEvidenceEntry(toolName string, run map[string]any) string {
+	if stringValue(run["status"]) != "done" || (toolName != "search_thread_messages" && toolName != "read_thread_messages") {
+		return ""
+	}
+	compacted := neoReadThreadPersistedRun(toolName, run)
+	return toolName + " evidence:\n" + neoClipRunes(runToText(compacted), neoReadThreadEvidenceEntryChars)
 }
 
 func neoReadThreadRequestHistory(history []neoHistoryMessage) []neoHistoryMessage {
@@ -970,6 +1014,10 @@ func neoReadThreadInternalToolSpecsForAgentState(state neoReadThreadAgentState) 
 	return out
 }
 
+func neoReadThreadReadyToForceFinal(state neoReadThreadAgentState) bool {
+	return state.ToolCalls >= neoReadThreadForceFinalCalls && state.SawSearch && state.SawRead
+}
+
 func neoReadThreadExecuteAgentTool(state *neoReadThreadAgentState, corpus neoReadThreadCorpus, call neoToolCall, acceptedThisTurn int) (map[string]any, bool) {
 	name := strings.TrimSpace(call.Name)
 	if acceptedThisTurn >= neoReadThreadMaxCallsPerTurn {
@@ -978,12 +1026,20 @@ func neoReadThreadExecuteAgentTool(state *neoReadThreadAgentState, corpus neoRea
 	if state.ToolCalls >= neoReadThreadMaxToolCalls {
 		return neoReadThreadRejectedRun("read_thread tool-call budget is exhausted; synthesize the answer from completed results"), false
 	}
+	if neoReadThreadReadyToForceFinal(*state) {
+		return neoReadThreadRejectedRun("read_thread reserved the remaining tool budget for synthesis from completed results"), false
+	}
 	if state.SeenCalls == nil {
 		state.SeenCalls = map[string]struct{}{}
 	}
 	key := neoReadThreadToolCallKey(corpus, call)
 	if _, duplicate := state.SeenCalls[key]; duplicate {
 		return neoReadThreadRejectedRun("duplicate read_thread tool call; use the earlier result or refine the query/range"), false
+	}
+	if name == "read_thread_messages" {
+		if start, end, err := neoReadThreadRangeForCorpus(call.Input, corpus); err == nil && neoReadThreadPositionRangeCovered(state.ReadRanges, start, end) {
+			return neoReadThreadRejectedRun("read_thread message range was already covered; use the earlier result or read a different range"), false
+		}
 	}
 	switch name {
 	case "search_thread_messages":
@@ -1010,11 +1066,48 @@ func neoReadThreadExecuteAgentTool(state *neoReadThreadAgentState, corpus neoRea
 	}
 	if observation.Read {
 		state.SawRead = true
+		if readRange, ok := neoReadThreadResultPositionRange(run, corpus); ok {
+			state.ReadRanges = append(state.ReadRanges, readRange)
+		}
 		if observation.ReadEnd >= neoReadThreadLatestMessageIndex(corpus) {
 			state.SawLatest = true
 		}
 	}
 	return run, true
+}
+
+func neoReadThreadPositionRangeCovered(ranges []neoReadThreadPositionRange, start, end int) bool {
+	if start < 0 || end < start || len(ranges) == 0 {
+		return false
+	}
+	for position := start; position <= end; position++ {
+		covered := false
+		for _, readRange := range ranges {
+			if position >= readRange.Start && position <= readRange.End {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			return false
+		}
+	}
+	return true
+}
+
+func neoReadThreadResultPositionRange(run map[string]any, corpus neoReadThreadCorpus) (neoReadThreadPositionRange, bool) {
+	resultRange := mapValue(mapValue(run["result"])["range"])
+	rawStart, hasStart := neoReadThreadInputInt(resultRange, "startIndex")
+	rawEnd, hasEnd := neoReadThreadInputInt(resultRange, "endIndex")
+	if !hasStart || !hasEnd {
+		return neoReadThreadPositionRange{}, false
+	}
+	start := neoReadThreadFirstVisiblePositionAtOrAfter(corpus, rawStart)
+	end := neoReadThreadLastVisiblePositionAtOrBefore(corpus, rawEnd)
+	if start < 0 || end < start {
+		return neoReadThreadPositionRange{}, false
+	}
+	return neoReadThreadPositionRange{Start: start, End: end}, true
 }
 
 func neoReadThreadRejectedRun(message string) map[string]any {
@@ -1151,14 +1244,7 @@ func neoReadThreadToolCallKey(corpus neoReadThreadCorpus, call neoToolCall) stri
 			sort.Strings(roles)
 			input["roles"] = roles
 		}
-		limit := numberFrom(input["limit"])
-		if limit <= 0 {
-			limit = neoReadThreadSearchLimit
-		}
-		if limit > neoReadThreadSearchLimitMax {
-			limit = neoReadThreadSearchLimitMax
-		}
-		input["limit"] = limit
+		delete(input, "limit")
 	}
 	raw, _ := json.Marshal(input)
 	return name + ":" + string(raw)
@@ -1353,6 +1439,7 @@ func neoReadThreadRead(corpus neoReadThreadCorpus, input map[string]any) (map[st
 			result["truncated"] = true
 			result["previousEndIndex"] = corpus.Messages[actualStartPosition-1].Index
 		}
+		neoReadThreadAnnotateSparseRange(result, input)
 		return result, corpus.Messages[end].Index, nil
 	}
 	messages := make([]any, 0, end-start+1)
@@ -1392,7 +1479,30 @@ func neoReadThreadRead(corpus neoReadThreadCorpus, input map[string]any) (map[st
 			}
 		}
 	}
+	neoReadThreadAnnotateSparseRange(result, input)
 	return result, actualEnd, nil
+}
+
+func neoReadThreadAnnotateSparseRange(result, input map[string]any) {
+	if neoReadThreadLatestRequested(input) {
+		return
+	}
+	if _, hasAfter := neoReadThreadInputInt(input, "afterIndex"); hasAfter {
+		return
+	}
+	requestedStart, hasStart := neoReadThreadInputInt(input, "startIndex", "messageIndex", "index")
+	requestedEnd, hasEnd := neoReadThreadInputInt(input, "endIndex")
+	if !hasStart || !hasEnd {
+		return
+	}
+	actualRange := mapValue(result["range"])
+	actualStart, actualStartOK := neoReadThreadInputInt(actualRange, "startIndex")
+	actualEnd, actualEndOK := neoReadThreadInputInt(actualRange, "endIndex")
+	if !actualStartOK || !actualEndOK || (actualStart >= requestedStart && actualEnd <= requestedEnd) {
+		return
+	}
+	result["sparseRangeNormalized"] = true
+	result["requestedRange"] = map[string]any{"startIndex": requestedStart, "endIndex": requestedEnd}
 }
 
 func neoReadThreadLatestRequested(input map[string]any) bool {
@@ -1415,7 +1525,8 @@ func neoReadThreadRangeForCorpus(input map[string]any, corpus neoReadThreadCorpu
 	start := 0
 	hasStart := false
 	explicitIndexLookup := false
-	if rawStart, ok := neoReadThreadInputInt(input, "startIndex", "messageIndex", "index"); ok {
+	rawStart, hasRawStart := neoReadThreadInputInt(input, "startIndex", "messageIndex", "index")
+	if hasRawStart {
 		start = neoReadThreadFirstVisiblePositionAtOrAfter(corpus, rawStart)
 		hasStart = true
 		explicitIndexLookup = true
@@ -1424,16 +1535,19 @@ func neoReadThreadRangeForCorpus(input map[string]any, corpus neoReadThreadCorpu
 		start = len(corpus.Messages) - count
 		hasStart = true
 		explicitIndexLookup = false
+		hasRawStart = false
 	}
 	if position := strings.ToLower(strings.TrimSpace(stringValue(input["position"]))); position == "latest" || position == "tail" {
 		start = len(corpus.Messages) - count
 		hasStart = true
 		explicitIndexLookup = false
+		hasRawStart = false
 	}
 	if after, ok := neoReadThreadInputInt(input, "afterIndex"); ok {
 		start = neoReadThreadFirstVisiblePositionAfter(corpus, after)
 		hasStart = true
 		explicitIndexLookup = true
+		hasRawStart = false
 	}
 	if !hasStart {
 		start = 0
@@ -1449,13 +1563,29 @@ func neoReadThreadRangeForCorpus(input map[string]any, corpus neoReadThreadCorpu
 	}
 
 	end := start + count - 1
-	if rawEnd, hasEnd := neoReadThreadInputInt(input, "endIndex"); hasEnd {
+	rawEnd, hasRawEnd := neoReadThreadInputInt(input, "endIndex")
+	if hasRawEnd {
+		if hasRawStart && rawEnd < rawStart {
+			return 0, 0, fmt.Errorf("endIndex is before startIndex")
+		}
 		end = neoReadThreadLastVisiblePositionAtOrBefore(corpus, rawEnd)
 	}
 	if end >= len(corpus.Messages) {
 		end = len(corpus.Messages) - 1
 	}
 	if end < start {
+		if hasRawStart && hasRawEnd {
+			before := neoReadThreadLastVisiblePositionAtOrBefore(corpus, rawEnd)
+			after := neoReadThreadFirstVisiblePositionAtOrAfter(corpus, rawStart)
+			switch {
+			case before >= 0 && after >= 0 && before < after:
+				return before, after, nil
+			case after >= 0:
+				return after, after, nil
+			case before >= 0:
+				return before, before, nil
+			}
+		}
 		return 0, 0, fmt.Errorf("endIndex is before startIndex")
 	}
 	return start, end, nil

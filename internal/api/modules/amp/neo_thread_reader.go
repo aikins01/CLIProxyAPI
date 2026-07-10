@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"unicode"
 
@@ -225,6 +226,17 @@ func neoReadThreadRelevantContent(text string) (string, error) {
 	return strings.TrimSpace(parsed.RelevantContent), nil
 }
 
+func neoReadThreadGroundedRelevantContent(text string, corpus neoReadThreadCorpus) (string, error) {
+	content, err := neoReadThreadRelevantContent(text)
+	if err != nil {
+		return "", err
+	}
+	if !neoReadThreadHasValidMessageCitation(content, corpus) {
+		return "", fmt.Errorf("thread extraction result must cite at least one visible target message index")
+	}
+	return content, nil
+}
+
 func neoReadThreadResponseJSONSchema() map[string]any {
 	return map[string]any{
 		"type": "object",
@@ -253,15 +265,19 @@ func neoReadThreadMarkdownFallbackContent(text string) string {
 	return raw
 }
 
-func neoReadThreadGroundedMarkdownFallbackContent(text string) string {
+func neoReadThreadGroundedMarkdownFallbackContent(text string, corpus neoReadThreadCorpus) string {
 	fallback := neoReadThreadMarkdownFallbackContent(text)
-	if fallback == "" || !neoReadThreadFallbackHasMessageCitation(fallback) {
+	if fallback == "" || !neoReadThreadHasValidMessageCitation(fallback, corpus) {
 		return ""
 	}
 	return fallback
 }
 
-func neoReadThreadFallbackHasMessageCitation(text string) bool {
+func neoReadThreadHasValidMessageCitation(text string, corpus neoReadThreadCorpus) bool {
+	visibleIndexes := make(map[int]struct{}, len(corpus.Messages))
+	for _, message := range corpus.Messages {
+		visibleIndexes[message.Index] = struct{}{}
+	}
 	lower := strings.ToLower(text)
 	for {
 		index := strings.Index(lower, "[message")
@@ -269,14 +285,15 @@ func neoReadThreadFallbackHasMessageCitation(text string) bool {
 			return false
 		}
 		rest := lower[index+len("[message"):]
-		if rest == "" || !unicode.IsSpace(rune(rest[0])) {
+		trimmed := strings.TrimLeftFunc(rest, unicode.IsSpace)
+		if rest == trimmed {
 			lower = lower[index+1:]
 			continue
 		}
-		rest = strings.TrimLeftFunc(rest, unicode.IsSpace)
+		rest = trimmed
 		digitCount := 0
-		for _, r := range rest {
-			if !unicode.IsDigit(r) {
+		for digitCount < len(rest) {
+			if rest[digitCount] < '0' || rest[digitCount] > '9' {
 				break
 			}
 			digitCount++
@@ -288,7 +305,12 @@ func neoReadThreadFallbackHasMessageCitation(text string) bool {
 		rest = rest[digitCount:]
 		rest = strings.TrimLeftFunc(rest, unicode.IsSpace)
 		if strings.HasPrefix(rest, "]") {
-			return true
+			messageIndex, err := strconv.Atoi(trimmed[:digitCount])
+			if err == nil {
+				if _, ok := visibleIndexes[messageIndex]; ok {
+					return true
+				}
+			}
 		}
 		lower = lower[index+1:]
 	}

@@ -78,7 +78,7 @@ func TestNeoReadThreadSyntheticBenchmarkFixtures(t *testing.T) {
 			if err != nil {
 				t.Fatalf("latest read error: %v", err)
 			}
-			if end != len(corpus.Messages)-1 || len(arrayValue(latest["messages"])) == 0 {
+			if end != neoReadThreadLatestMessageIndex(corpus) || len(arrayValue(latest["messages"])) == 0 {
 				t.Fatalf("latest read = %#v end=%d", latest, end)
 			}
 			if tc.MaxOverviewBytes > 0 {
@@ -566,6 +566,21 @@ func neoReadThreadSyntheticBenchmarkCases() []neoReadThreadSyntheticCase {
 			SearchQueries: []string{"ComplaintData.age", "Sentry SDK"},
 			MustInclude:   []string{"ComplaintData.age", "String?", "Sentry", "8.32.0", "9.4.1", "HealthlineViewModel", "MATCH_GIT_BASIC_AUTHORIZATION", "commit and merge"},
 		},
+		{
+			Name:             "large sparse AI memory roadmap",
+			ThreadID:         "T-019e65c0-0310-77a8-b233-4b84d9c06219",
+			Title:            "Future work direction planning",
+			Goal:             "Extract completed concurrency work, the AI-memory product position, proposed SDK surface, remaining validation gate, and agreed sequencing. Distinguish shipped foundations from proposals.",
+			Messages:         neoReadThreadLargeSparseRoadmapMessages(),
+			SearchQueries:    []string{"MEMORY_ENGINE_POSITIONING", "CONCURRENCY_VALIDATION_GATE", "remember recall"},
+			MustInclude:      []string{"MEMORY_ENGINE_POSITIONING=embedded-primitives", "remember", "recall", "CONCURRENCY_VALIDATION_GATE=endpoint-identity", "Python", "TypeScript"},
+			MustIncludeOneOf: []string{"proposed", "proposal", "not shipped", "not implemented"},
+			MustNotInclude:   []string{"concurrency work is complete"},
+			LatestReadCount:  neoReadThreadLatestReadCount,
+			MaxToolCalls:     neoReadThreadMaxToolCalls,
+			MaxTurns:         neoReadThreadMaxTurns + 1,
+			MaxNestedBytes:   500000,
+		},
 	}
 }
 
@@ -793,6 +808,25 @@ func neoReadThreadToolResultMessage(id, toolUseID, status, text string) map[stri
 		run["output"] = text
 	}
 	return map[string]any{"role": "user", "messageId": id, "content": []any{map[string]any{"type": "tool_result", "toolUseID": toolUseID, "run": run}}}
+}
+
+func neoReadThreadLargeSparseRoadmapMessages() []any {
+	messages := make([]any, 954)
+	for i := range messages {
+		text := fmt.Sprintf("Background planning and tool output %03d.\n%s", i, strings.Repeat("irrelevant tool output ", 300))
+		message := neoReadThreadTextMessage("assistant", fmt.Sprintf("M-roadmap-%03d", i), text)
+		if i%4 == 1 {
+			message["parentToolUseId"] = "TU-roadmap-noise"
+		}
+		messages[i] = message
+	}
+	messages[148] = neoReadThreadTextMessage("assistant", "M-roadmap-concurrency", "Completed foundation: serialized commit ordering and local relationship endpoint remapping are implemented. Concurrent-write mode remains experimental.")
+	messages[300] = neoReadThreadTextMessage("user", "M-roadmap-position", "Final product position: MEMORY_ENGINE_POSITIONING=embedded-primitives. Keep Kuzu an embedded graph/vector/FTS engine for AI memory rather than embedding an opinionated memory framework in C++.")
+	messages[448] = neoReadThreadTextMessage("assistant", "M-roadmap-sdk", "Proposed SDK, not shipped: Python-first remember and recall APIs with automatic schema/index setup, pluggable embeddings, hybrid retrieval, provenance, and direct Cypher as an escape hatch. Add TypeScript parity after Python validation.")
+	messages[676] = neoReadThreadTextMessage("assistant", "M-roadmap-validation", "Remaining gate: CONCURRENCY_VALIDATION_GATE=endpoint-identity. Count-only stress checks can miss cardinality-preserving relationship corruption, so deterministic endpoint assertions must pass after checkpoint and reopen.")
+	messages[812] = neoReadThreadTextMessage("user", "M-roadmap-sequence", "Agreed sequence: finish concurrency and crash-recovery validation, verify graph/vector/FTS primitives, then build the thin Python memory SDK, TypeScript parity, adapters, and MCP surfaces. Policy-heavy consolidation and forgetting come later.")
+	messages[952] = neoReadThreadTextMessage("user", "M-roadmap-latest", "Latest clarification: packaging and extension delivery are shipped foundations. The remember/recall SDK and endpoint-identity validation remain next work, not completed features.")
+	return messages
 }
 
 func neoReadThreadTextMessage(role, id, text string) map[string]any {
