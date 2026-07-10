@@ -69,12 +69,13 @@ type neoSubagentDef struct {
 
 var neoSubagentDefs = map[string]neoSubagentDef{
 	"finder": {
-		Key:          "finder",
-		DisplayName:  "Finder",
-		Route:        neoModelRoute{Provider: "anthropic", Model: "claude-haiku-4-5-20251001"},
-		IncludeTools: []string{"Grep", "glob", "Read"},
-		SystemPrompt: neoFinderSubagentPrompt,
-		MaxTurns:     6,
+		Key:             "finder",
+		DisplayName:     "Finder",
+		Route:           neoModelRoute{Provider: "google", Model: "gemini-3.5-flash"},
+		IncludeTools:    []string{"Grep", "glob", "Read"},
+		SystemPrompt:    neoFinderSubagentPrompt,
+		ReasoningEffort: "low",
+		MaxTurns:        6,
 	},
 	"oracle": {
 		Key:             "oracle",
@@ -244,6 +245,9 @@ func (a *neoActor) executeSubagentRun(name string, input map[string]any, parentT
 	settings := cloneMap(a.settings)
 	if def.ReasoningEffort != "" {
 		settings["reasoning.effort"] = def.ReasoningEffort
+		if (route.Provider == "google" || route.Provider == "vertexai") && validNeoGeminiThinkingLevel(def.ReasoningEffort) {
+			settings["gemini.thinkingLevel"] = def.ReasoningEffort
+		}
 	}
 	environment := cloneMap(a.environment)
 	maxTokens := a.maxTokens

@@ -21,7 +21,7 @@ func TestNeoSubagentRegistryMatchesLocalContract(t *testing.T) {
 		effort   string
 		tools    []string
 	}{
-		{"finder", "anthropic", "claude-haiku-4-5-20251001", "", []string{"Grep", "glob", "Read"}},
+		{"finder", "google", "gemini-3.5-flash", "low", []string{"Grep", "glob", "Read"}},
 		{"oracle", "anthropic", "claude-fable-5", "high", []string{"Read", "Grep", "glob", "web_search", "read_web_page", "read_thread", "find_thread"}},
 		{"librarian", "openai", "gpt-5.6-sol", "none", []string{"read_github", "search_github", "commit_search", "diff", "list_directory_github", "list_repositories", "glob_github"}},
 		{"run_check", "openai", "gpt-5.6-terra", "low", []string{"Read", "Grep", "glob", "Bash"}},
@@ -121,6 +121,44 @@ func TestNeoOracleSubagentIgnoresConfigModeModel(t *testing.T) {
 	got := captureNeoSubagentRouteForTest(t, "oracle", "oracle-mode", cfg, "smart", nil)
 	if got.Provider != "anthropic" || got.Model != "claude-fable-5" {
 		t.Fatalf("oracle route = %#v, want fixed route anthropic/claude-fable-5", got)
+	}
+}
+
+func TestNeoFinderSubagentUsesGemini35FlashLow(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-finder", "thread-actor", "T-finder", "T-finder", neoActorRecord("actor-finder", "thread-actor", "T-finder"), nil)
+	actor.currentAgentMode = "high"
+	actor.settings = map[string]any{"reasoning.effort": "xhigh", "gemini.thinkingLevel": "high"}
+	actor.tools = map[string]neoToolSpec{
+		"Read": {Name: "Read", InputSchema: map[string]any{"type": "object"}},
+		"Grep": {Name: "Grep", InputSchema: map[string]any{"type": "object"}},
+		"glob": {Name: "glob", InputSchema: map[string]any{"type": "object"}},
+	}
+
+	var seen []neoInferenceRequest
+	rt.inferStream = func(_ *neoRuntime, req neoInferenceRequest, _ neoStreamCallback) (neoInferenceResult, error) {
+		seen = append(seen, req)
+		return neoInferenceResult{Text: "done"}, nil
+	}
+
+	if _, err := actor.executeSubagentRun("finder", map[string]any{"query": "find local actor routing"}, "TU-finder", "M-1", actor.generation, 0, ""); err != nil {
+		t.Fatalf("finder subagent failed: %v", err)
+	}
+	if len(seen) != 1 {
+		t.Fatalf("finder requests = %#v, want exactly one", seen)
+	}
+	route := seen[0].ModelRouteOverride
+	if route == nil || route.Provider != "google" || route.Model != "gemini-3.5-flash" {
+		t.Fatalf("finder route = %#v, want google/gemini-3.5-flash", route)
+	}
+	if seen[0].ReasoningEffort != "low" || stringValue(seen[0].Settings["reasoning.effort"]) != "low" {
+		t.Fatalf("finder effort request=%q settings=%#v, want low", seen[0].ReasoningEffort, seen[0].Settings)
+	}
+	if stringValue(seen[0].Settings["gemini.thinkingLevel"]) != "low" {
+		t.Fatalf("finder Gemini thinking level settings=%#v, want low", seen[0].Settings)
+	}
+	if !neoSubagentHasTools(seen[0].Tools, "Read", "Grep", "glob") {
+		t.Fatalf("finder tools = %#v, want search tools", seen[0].Tools)
 	}
 }
 
