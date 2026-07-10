@@ -20921,6 +20921,7 @@ type neoInferenceRequest struct {
 	ProviderFeature          string
 	ResponseMimeType         string
 	ResponseJSONSchema       map[string]any
+	DisableParallelToolCalls bool
 	// ModelRouteOverride forces a specific model/provider regardless of
 	// AgentMode. Used by local subagent runs (finder/oracle/librarian).
 	ModelRouteOverride *neoModelRoute
@@ -21391,7 +21392,11 @@ func inferNeoAnthropic(rt *neoRuntime, request neoInferenceRequest, route neoMod
 	neoApplyAnthropicRequestSettings(body, route, request)
 	if len(request.Tools) > 0 {
 		body["tools"] = anthropicNeoTools(request.Tools)
-		body["tool_choice"] = map[string]any{"type": "auto"}
+		toolChoice := map[string]any{"type": "auto"}
+		if request.DisableParallelToolCalls {
+			toolChoice["disable_parallel_tool_use"] = true
+		}
+		body["tool_choice"] = toolChoice
 	}
 	neoApplyAnthropicCacheBreakpoints(body)
 
@@ -21479,6 +21484,9 @@ func inferNeoOpenAIChatProvider(rt *neoRuntime, request neoInferenceRequest, rou
 		"model":    route.Model,
 		"stream":   false,
 		"messages": openAINeoMessages(request.History, neoSystemPrompt(request, route)),
+	}
+	if provider == "openai" {
+		body["parallel_tool_calls"] = !request.DisableParallelToolCalls
 	}
 	if len(request.Tools) > 0 {
 		body["tools"] = openAINeoTools(request.Tools)
@@ -21573,7 +21581,11 @@ func inferNeoAnthropicStream(rt *neoRuntime, request neoInferenceRequest, route 
 	neoApplyAnthropicRequestSettings(body, route, request)
 	if len(request.Tools) > 0 {
 		body["tools"] = anthropicNeoTools(request.Tools)
-		body["tool_choice"] = map[string]any{"type": "auto"}
+		toolChoice := map[string]any{"type": "auto"}
+		if request.DisableParallelToolCalls {
+			toolChoice["disable_parallel_tool_use"] = true
+		}
+		body["tool_choice"] = toolChoice
 	}
 	neoApplyAnthropicCacheBreakpoints(body)
 
@@ -22271,6 +22283,9 @@ func inferNeoOpenAIChatStreamProvider(rt *neoRuntime, request neoInferenceReques
 		"model":    route.Model,
 		"stream":   true,
 		"messages": openAINeoMessages(request.History, neoSystemPrompt(request, route)),
+	}
+	if provider == "openai" {
+		body["parallel_tool_calls"] = !request.DisableParallelToolCalls
 	}
 	if len(request.Tools) > 0 {
 		body["tools"] = openAINeoTools(request.Tools)
@@ -25793,7 +25808,7 @@ func openAIResponsesNeoBody(request neoInferenceRequest, route neoModelRoute, st
 		"include":             []any{"reasoning.encrypted_content"},
 		"stream":              stream,
 		"prompt_cache_key":    request.ThreadID,
-		"parallel_tool_calls": true,
+		"parallel_tool_calls": !request.DisableParallelToolCalls,
 		"tools":               openAIResponsesNeoTools(request.Tools),
 	}
 	if stream {

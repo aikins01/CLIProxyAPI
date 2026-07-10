@@ -457,6 +457,46 @@ func (a *neoActor) storeSubagentToolResultMessage(toolCallID string, run map[str
 	a.syncCloudAsync()
 }
 
+type neoSubagentToolExchange struct {
+	Call neoToolCall
+	Run  map[string]any
+}
+
+func (a *neoActor) storeSubagentToolExchanges(exchanges []neoSubagentToolExchange, parentToolCallID string) {
+	if len(exchanges) == 0 {
+		return
+	}
+	events := make([]map[string]any, 0, len(exchanges)*2)
+	a.mu.Lock()
+	for _, exchange := range exchanges {
+		_, useEvent := a.storeMessageEventLocked(neoMessage{
+			ThreadID:        a.threadID,
+			Role:            "assistant",
+			MessageID:       newNeoMessageID(),
+			Content:         []any{neoToolUseBlock(exchange.Call, true)},
+			State:           map[string]any{"type": "complete", "stopReason": "tool_use"},
+			CreatedAt:       time.Now().UTC().Format(time.RFC3339Nano),
+			ParentToolUseID: parentToolCallID,
+		})
+		events = append(events, useEvent)
+		_, resultEvent := a.storeMessageEventLocked(neoMessage{
+			ThreadID:        a.threadID,
+			Role:            "user",
+			MessageID:       toolResultMessageID(exchange.Call.ID),
+			Content:         []any{map[string]any{"type": "tool_result", "toolUseID": exchange.Call.ID, "run": exchange.Run}},
+			CreatedAt:       time.Now().UTC().Format(time.RFC3339Nano),
+			ParentToolUseID: parentToolCallID,
+		})
+		events = append(events, resultEvent)
+	}
+	a.mu.Unlock()
+
+	for _, event := range events {
+		a.broadcast(event)
+	}
+	a.syncCloudAsync()
+}
+
 // execSubagentLeafTool leases a subagent's leaf-tool call to the executor and
 // blocks until the executor returns a terminal run, routed back via a waiter.
 func (a *neoActor) execSubagentLeafTool(call neoToolCall, parentToolCallID, childMessageID string, generation int) map[string]any {

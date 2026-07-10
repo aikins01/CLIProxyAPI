@@ -25,6 +25,10 @@ type neoReadThreadSyntheticCase struct {
 	MustIncludeOneOf []string
 	MustNotInclude   []string
 	MaxOverviewBytes int
+	LatestReadCount  int
+	MaxToolCalls     int
+	MaxTurns         int
+	MaxNestedBytes   int
 }
 
 type neoReadThreadBenchmarkCandidate struct {
@@ -66,7 +70,11 @@ func TestNeoReadThreadSyntheticBenchmarkFixtures(t *testing.T) {
 					t.Fatalf("search %q returned no hits", query)
 				}
 			}
-			latest, end, err := neoReadThreadRead(corpus, map[string]any{"latest": true, "count": 2})
+			latestReadCount := tc.LatestReadCount
+			if latestReadCount <= 0 {
+				latestReadCount = 2
+			}
+			latest, end, err := neoReadThreadRead(corpus, map[string]any{"latest": true, "count": latestReadCount})
 			if err != nil {
 				t.Fatalf("latest read error: %v", err)
 			}
@@ -176,25 +184,52 @@ func neoReadThreadRunSyntheticModelBenchmark(t *testing.T, candidate neoReadThre
 	text, err := actor.executeLocalReadThreadAgentWithRoute(neoPendingTool{ID: "TU-read-benchmark", Name: "read_thread", Input: map[string]any{"threadID": tc.ThreadID, "question": tc.Goal}, AgentMode: "deep"}, actor.generation, tc.corpus(), tc.Goal, candidate.Route, candidate.Effort)
 	duration := time.Since(started)
 	passed, missing, forbidden := neoReadThreadBenchmarkRubric(text, tc)
+	nestedBytes := 0
+	persistedToolCalls := 0
+	actor.mu.Lock()
+	for _, message := range actor.messages {
+		if message.ParentToolUseID != "TU-read-benchmark" {
+			continue
+		}
+		raw, _ := json.Marshal(message)
+		nestedBytes += len(raw)
+		if message.Role == "assistant" {
+			persistedToolCalls++
+		}
+	}
+	actor.mu.Unlock()
+	efficiencyFailures := make([]string, 0)
+	if tc.MaxToolCalls > 0 && metrics.ToolCalls > tc.MaxToolCalls {
+		efficiencyFailures = append(efficiencyFailures, fmt.Sprintf("toolCalls=%d > %d", metrics.ToolCalls, tc.MaxToolCalls))
+	}
+	if tc.MaxTurns > 0 && metrics.Turns > tc.MaxTurns {
+		efficiencyFailures = append(efficiencyFailures, fmt.Sprintf("turns=%d > %d", metrics.Turns, tc.MaxTurns))
+	}
+	if tc.MaxNestedBytes > 0 && nestedBytes > tc.MaxNestedBytes {
+		efficiencyFailures = append(efficiencyFailures, fmt.Sprintf("nestedBytes=%d > %d", nestedBytes, tc.MaxNestedBytes))
+	}
 	result := map[string]any{
-		"candidate":        candidate.Name,
-		"provider":         candidate.Route.Provider,
-		"model":            candidate.Route.Model,
-		"effort":           candidate.Effort,
-		"case":             tc.Name,
-		"rep":              rep,
-		"passed":           passed && err == nil,
-		"durationMillis":   duration.Milliseconds(),
-		"modelMillis":      metrics.ModelMillis,
-		"turns":            metrics.Turns,
-		"toolCalls":        metrics.ToolCalls,
-		"forcedFinals":     metrics.ForcedFinals,
-		"inputTokens":      metrics.InputTokens,
-		"outputTokens":     metrics.OutputTokens,
-		"totalInputTokens": metrics.TotalInputTokens,
-		"missing":          missing,
-		"forbidden":        forbidden,
-		"output":           neoClipRunes(text, 1600),
+		"candidate":          candidate.Name,
+		"provider":           candidate.Route.Provider,
+		"model":              candidate.Route.Model,
+		"effort":             candidate.Effort,
+		"case":               tc.Name,
+		"rep":                rep,
+		"passed":             passed && err == nil && len(efficiencyFailures) == 0,
+		"durationMillis":     duration.Milliseconds(),
+		"modelMillis":        metrics.ModelMillis,
+		"turns":              metrics.Turns,
+		"toolCalls":          metrics.ToolCalls,
+		"forcedFinals":       metrics.ForcedFinals,
+		"inputTokens":        metrics.InputTokens,
+		"outputTokens":       metrics.OutputTokens,
+		"totalInputTokens":   metrics.TotalInputTokens,
+		"persistedToolCalls": persistedToolCalls,
+		"nestedBytes":        nestedBytes,
+		"efficiencyFailures": efficiencyFailures,
+		"missing":            missing,
+		"forbidden":          forbidden,
+		"output":             neoClipRunes(text, 1600),
 	}
 	if err != nil {
 		result["error"] = err.Error()
@@ -422,6 +457,20 @@ func neoReadThreadSyntheticBenchmarkCases() []neoReadThreadSyntheticCase {
 			MustNotInclude:   []string{"position mark storage/query path", "signal-status ranking"},
 		},
 		{
+			Name:            "dense latest tail stays authoritative",
+			ThreadID:        "T-019e65c0-0310-77a8-b233-4b84d9c06218",
+			Title:           "Read thread dense tail recovery",
+			Goal:            "Extract the final read_thread architecture decision from the latest tail, including the exact marker and file. Do not report the earlier forward-scan proposal as current.",
+			Messages:        neoReadThreadDenseLatestTailMessages(),
+			SearchQueries:   []string{"FINAL_READER_ARCHITECTURE", "forward scan"},
+			MustInclude:     []string{"FINAL_READER_ARCHITECTURE=suffix-tail", "internal/api/modules/amp/neo_thread_reader_agent.go", "latest:true", "backward"},
+			MustNotInclude:  []string{"FINAL_READER_ARCHITECTURE=forward-scan survived"},
+			LatestReadCount: neoReadThreadLatestReadCount,
+			MaxToolCalls:    neoReadThreadMaxTurns,
+			MaxTurns:        neoReadThreadMaxTurns + 1,
+			MaxNestedBytes:  500000,
+		},
+		{
 			Name:             "read thread overview loop noise",
 			ThreadID:         "T-019e65c0-0310-77a8-b233-4b84d9c06217",
 			Title:            "Read thread turn limit and compaction pressure",
@@ -460,13 +509,14 @@ func neoReadThreadSyntheticBenchmarkCases() []neoReadThreadSyntheticCase {
 			MustInclude:   []string{"MODE_BETA", "internal/config/beta.go", "AMP_BETA_ROLLOUT=1", "go test ./internal/config -run TestBetaRollout"},
 		},
 		{
-			Name:          "late user scope change overrides shipping",
-			ThreadID:      "T-019e65c0-0310-77a8-b233-4b84d9c06210",
-			Title:         "Shipping instructions changed",
-			Goal:          "What are the latest shipping instructions from the user?",
-			Messages:      neoReadThreadLateScopeChangeMessages(),
-			SearchQueries: []string{"do not push", "leave patch uncommitted"},
-			MustInclude:   []string{"do not push", "do not restart brew", "leave the patch uncommitted", "report the tests"},
+			Name:             "late user scope change overrides shipping",
+			ThreadID:         "T-019e65c0-0310-77a8-b233-4b84d9c06210",
+			Title:            "Shipping instructions changed",
+			Goal:             "What are the latest shipping instructions from the user?",
+			Messages:         neoReadThreadLateScopeChangeMessages(),
+			SearchQueries:    []string{"do not push", "leave patch uncommitted"},
+			MustInclude:      []string{"do not push", "do not restart brew", "leave the patch uncommitted"},
+			MustIncludeOneOf: []string{"report the tests", "report only the test results"},
 		},
 		{
 			Name:          "cliproxyapi binary shipping workflow",
@@ -597,6 +647,21 @@ func neoReadThreadHiddenContinuationTailMessages() []any {
 	for i := 235; i < 254; i++ {
 		messages = append(messages, neoReadThreadToolResultMessage(fmt.Sprintf("M-hidden-tool-%03d", i), fmt.Sprintf("TU-hidden-%03d", i), "done", fmt.Sprintf("tool result after latest user task %03d", i)))
 	}
+	return messages
+}
+
+func neoReadThreadDenseLatestTailMessages() []any {
+	messages := make([]any, 0, 48)
+	messages = append(messages,
+		neoReadThreadTextMessage("user", "M-dense-000", "Investigate why read_thread misses the end of large threads."),
+		neoReadThreadTextMessage("assistant", "M-dense-001", "Initial proposal: keep latest:true as a forward scan from the first message in the requested tail."),
+		neoReadThreadTextMessage("assistant", "M-dense-002", "Earlier draft claimed FINAL_READER_ARCHITECTURE=forward-scan survived, but this has not been validated against a dense tail."),
+	)
+	for i := 3; i < 47; i++ {
+		text := fmt.Sprintf("Large tool and implementation observation %03d. %s", i, strings.Repeat("dense-observation ", 1200))
+		messages = append(messages, neoReadThreadTextMessage("assistant", fmt.Sprintf("M-dense-%03d", i), text))
+	}
+	messages = append(messages, neoReadThreadTextMessage("user", "M-dense-047", "Final decision: FINAL_READER_ARCHITECTURE=suffix-tail in internal/api/modules/amp/neo_thread_reader_agent.go. For latest:true, accumulate messages backward from the actual final message within the byte budget, then restore chronological order. The earlier forward-scan proposal is superseded."))
 	return messages
 }
 

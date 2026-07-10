@@ -14333,6 +14333,9 @@ func TestInferNeoOpenAIChatProviderAppliesResponseJSONSchema(t *testing.T) {
 				if gotSchema["additionalProperties"] != false || len(mapValue(gotSchema["properties"])) == 0 {
 					t.Fatalf("json_schema.schema = %#v, want cloned schema", gotSchema)
 				}
+				if payload["parallel_tool_calls"] != false {
+					t.Fatalf("parallel_tool_calls = %#v, want false", payload["parallel_tool_calls"])
+				}
 				if stream {
 					w.Header().Set("Content-Type", "text/event-stream")
 					_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"{\\\"relevantContent\\\":\\\"ok\\\"}\"}}]}\n\ndata: [DONE]\n\n"))
@@ -14344,11 +14347,12 @@ func TestInferNeoOpenAIChatProviderAppliesResponseJSONSchema(t *testing.T) {
 			defer upstream.Close()
 
 			request := neoInferenceRequest{
-				ThreadID:           "T-openai-chat-schema",
-				History:            []neoHistoryMessage{{Role: "user", Text: "hi"}},
-				ResponseMimeType:   "application/json",
-				ResponseJSONSchema: schema,
-				ProviderFeature:    "amp.read-thread",
+				ThreadID:                 "T-openai-chat-schema",
+				History:                  []neoHistoryMessage{{Role: "user", Text: "hi"}},
+				ResponseMimeType:         "application/json",
+				ResponseJSONSchema:       schema,
+				ProviderFeature:          "amp.read-thread",
+				DisableParallelToolCalls: true,
 			}
 			var (
 				result neoInferenceResult
@@ -18052,6 +18056,17 @@ func TestOpenAIResponsesNeoBodyMatchesBinaryBaseEnvelopeWithoutTools(t *testing.
 	}
 }
 
+func TestOpenAIResponsesNeoBodyCanDisableParallelToolCalls(t *testing.T) {
+	body := openAIResponsesNeoBody(neoInferenceRequest{
+		ThreadID:                 "T-read-thread",
+		History:                  []neoHistoryMessage{{Role: "user", Text: "search the thread"}},
+		DisableParallelToolCalls: true,
+	}, neoModelRoute{Provider: "openai", Model: "gpt-5.6-sol"}, true)
+	if body["parallel_tool_calls"] != false {
+		t.Fatalf("parallel_tool_calls = %#v, want false", body["parallel_tool_calls"])
+	}
+}
+
 func TestOpenAIResponsesNeoBodyAppliesResponseJSONSchema(t *testing.T) {
 	schema := map[string]any{
 		"type": "object",
@@ -18920,6 +18935,50 @@ func TestInferNeoAnthropicStreamMatchesBinaryRequestEnvelope(t *testing.T) {
 	}
 	if result.Text != "retried" || strings.Join(deltas, "") != "retried" {
 		t.Fatalf("text=%q deltas=%#v", result.Text, deltas)
+	}
+}
+
+func TestInferNeoAnthropicCanDisableParallelToolCalls(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream_%t", stream), func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				toolChoice := mapValue(readNeoJSON(r.Body)["tool_choice"])
+				if toolChoice["type"] != "auto" || toolChoice["disable_parallel_tool_use"] != true {
+					t.Fatalf("tool_choice = %#v, want auto with parallel use disabled", toolChoice)
+				}
+				if stream {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = w.Write([]byte("event: message_start\n" +
+						`data: {"type":"message_start","message":{"usage":{"input_tokens":1}}}` + "\n\n" +
+						"event: content_block_start\n" +
+						`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}` + "\n\n" +
+						"event: content_block_delta\n" +
+						`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}` + "\n\n" +
+						"event: message_stop\n" +
+						`data: {"type":"message_stop"}` + "\n\n"))
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"content":[{"type":"text","text":"ok"}]}`))
+			}))
+			defer upstream.Close()
+
+			request := neoInferenceRequest{
+				ThreadID:                 "T-anthropic-sequential-tools",
+				History:                  []neoHistoryMessage{{Role: "user", Text: "search"}},
+				Tools:                    []neoToolSpec{{Name: "search_thread_messages", InputSchema: map[string]any{"type": "object"}}},
+				DisableParallelToolCalls: true,
+			}
+			var err error
+			if stream {
+				_, err = inferNeoAnthropicStream(testNeoRuntimeForServer(t, upstream), request, neoModelRoute{Provider: "anthropic", Model: "claude-test"}, nil)
+			} else {
+				_, err = inferNeoAnthropic(testNeoRuntimeForServer(t, upstream), request, neoModelRoute{Provider: "anthropic", Model: "claude-test"})
+			}
+			if err != nil {
+				t.Fatalf("Anthropic inference stream=%v error: %v", stream, err)
+			}
+		})
 	}
 }
 

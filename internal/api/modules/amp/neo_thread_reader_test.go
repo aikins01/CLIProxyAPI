@@ -54,6 +54,9 @@ func neoReadThreadAssertAgentRequest(t *testing.T, request neoInferenceRequest) 
 	if request.ProviderFeature != "amp.read-thread" {
 		t.Fatalf("provider feature = %q, want amp.read-thread", request.ProviderFeature)
 	}
+	if !request.DisableParallelToolCalls {
+		t.Fatal("read_thread request enabled parallel tool calls")
+	}
 	if !strings.Contains(request.SystemPromptOverride, "read_thread subagent") {
 		t.Fatalf("system prompt override = %q", request.SystemPromptOverride)
 	}
@@ -250,6 +253,128 @@ func TestNeoReadThreadCorpusUsesVisibleRootMessages(t *testing.T) {
 	}
 	if _, _, err := neoReadThreadRead(corpus, map[string]any{"afterIndex": 99}); err == nil || !strings.Contains(err.Error(), "outside thread message range") {
 		t.Fatalf("read after sparse tail err = %v, want out-of-range", err)
+	}
+}
+
+func TestNeoReadThreadLatestReadKeepsDenseTail(t *testing.T) {
+	messages := make([]neoReadThreadMessage, neoReadThreadLatestReadCount)
+	for i := range messages {
+		messages[i] = neoReadThreadMessage{
+			Index:     i,
+			Role:      "assistant",
+			MessageID: fmt.Sprintf("M-dense-%02d", i),
+			Text:      fmt.Sprintf("dense message %02d %s", i, strings.Repeat("payload ", 2500)),
+		}
+	}
+	messages[len(messages)-1].Text = "LATEST_DENSE_TAIL_DECISION=ship-suffix-reader " + messages[len(messages)-1].Text
+	corpus := neoReadThreadCorpus{ThreadID: "T-dense-tail", Source: "test", Messages: messages}
+
+	read, end, err := neoReadThreadRead(corpus, map[string]any{"latest": true, "count": neoReadThreadLatestReadCount})
+	if err != nil {
+		t.Fatalf("latest dense read error: %v", err)
+	}
+	if end != len(messages)-1 {
+		t.Fatalf("latest dense read end = %d, want %d", end, len(messages)-1)
+	}
+	readMessages := arrayValue(read["messages"])
+	if len(readMessages) == 0 || len(readMessages) >= len(messages) {
+		t.Fatalf("latest dense messages = %d, want a non-empty byte-bounded suffix", len(readMessages))
+	}
+	last := mapValue(readMessages[len(readMessages)-1])
+	if numberFrom(last["index"]) != len(messages)-1 || !strings.Contains(stringValue(last["text"]), "LATEST_DENSE_TAIL_DECISION") {
+		t.Fatalf("latest dense tail = %#v, want actual final message", last)
+	}
+	readRange := mapValue(read["range"])
+	if numberFrom(readRange["startIndex"]) <= 0 || numberFrom(readRange["endIndex"]) != len(messages)-1 || !boolValue(read["truncated"]) {
+		t.Fatalf("latest dense range = %#v truncated=%#v", readRange, read["truncated"])
+	}
+	if numberFrom(read["previousEndIndex"]) != numberFrom(readRange["startIndex"])-1 {
+		t.Fatalf("previousEndIndex = %#v range=%#v", read["previousEndIndex"], readRange)
+	}
+}
+
+func TestNeoReadThreadAgentToolBudgetsAndDeduplicates(t *testing.T) {
+	corpus := neoReadThreadCorpus{ThreadID: "T-tool-budget", Source: "test", Messages: []neoReadThreadMessage{
+		{Index: 0, Role: "user", Text: "alpha decision"},
+		{Index: 1, Role: "assistant", Text: "latest alpha outcome"},
+	}}
+	recoveryState := neoReadThreadAgentState{}
+	prematureRead := neoToolCall{ID: "TU-read-premature", Name: "read_thread_messages", Input: map[string]any{"latest": true, "count": 2}}
+	if run, accepted := neoReadThreadExecuteAgentTool(&recoveryState, corpus, prematureRead, 0); !accepted || stringValue(run["status"]) != "error" || len(recoveryState.SeenCalls) != 0 {
+		t.Fatalf("premature read accepted=%v state=%#v run=%#v", accepted, recoveryState, run)
+	}
+	if run, accepted := neoReadThreadExecuteAgentTool(&recoveryState, corpus, neoToolCall{ID: "TU-search-recovery", Name: "search_thread_messages", Input: map[string]any{"query": "alpha"}}, 1); !accepted || stringValue(run["status"]) != "done" {
+		t.Fatalf("recovery search accepted=%v run=%#v", accepted, run)
+	}
+	if run, accepted := neoReadThreadExecuteAgentTool(&recoveryState, corpus, prematureRead, 2); !accepted || stringValue(run["status"]) != "done" || !recoveryState.SawLatest {
+		t.Fatalf("recovered read accepted=%v state=%#v run=%#v", accepted, recoveryState, run)
+	}
+
+	state := neoReadThreadAgentState{}
+	search := neoToolCall{ID: "TU-search-1", Name: "search_thread_messages", Input: map[string]any{"query": " Alpha   Decision ", "limit": 50}}
+	if run, accepted := neoReadThreadExecuteAgentTool(&state, corpus, search, 0); !accepted || stringValue(run["status"]) != "done" {
+		t.Fatalf("first search accepted=%v run=%#v", accepted, run)
+	}
+	normalizedSearch, err := neoReadThreadSearch(corpus, search.Input)
+	if err != nil || stringValue(normalizedSearch["query"]) != "Alpha Decision" {
+		t.Fatalf("normalized search query=%#v err=%v", normalizedSearch["query"], err)
+	}
+	duplicate := neoToolCall{ID: "TU-search-2", Name: "search_thread_messages", Input: map[string]any{"query": "alpha decision", "limit": 40}}
+	if run, accepted := neoReadThreadExecuteAgentTool(&state, corpus, duplicate, 1); accepted || !strings.Contains(runToText(run), "duplicate") {
+		t.Fatalf("duplicate search accepted=%v run=%#v", accepted, run)
+	}
+	read := neoToolCall{ID: "TU-read-1", Name: "read_thread_messages", Input: map[string]any{"latest": true, "count": 40}}
+	if run, accepted := neoReadThreadExecuteAgentTool(&state, corpus, read, 1); !accepted || stringValue(run["status"]) != "done" || !state.SawLatest {
+		t.Fatalf("latest read accepted=%v state=%#v run=%#v", accepted, state, run)
+	}
+	equivalentTailRead := neoToolCall{ID: "TU-read-2", Name: "read_thread_messages", Input: map[string]any{"position": "tail", "count": 2}}
+	if run, accepted := neoReadThreadExecuteAgentTool(&state, corpus, equivalentTailRead, 2); accepted || !strings.Contains(runToText(run), "duplicate") {
+		t.Fatalf("equivalent tail read accepted=%v run=%#v", accepted, run)
+	}
+	forwardRead := neoToolCall{ID: "TU-read-3", Name: "read_thread_messages", Input: map[string]any{"startIndex": 0, "count": 2}}
+	if run, accepted := neoReadThreadExecuteAgentTool(&state, corpus, forwardRead, 2); !accepted || stringValue(run["status"]) != "done" {
+		t.Fatalf("forward read accepted=%v run=%#v", accepted, run)
+	}
+	unique := neoToolCall{ID: "TU-search-3", Name: "search_thread_messages", Input: map[string]any{"query": "latest alpha"}}
+	if run, accepted := neoReadThreadExecuteAgentTool(&state, corpus, unique, neoReadThreadMaxCallsPerTurn); accepted || !strings.Contains(runToText(run), "per model turn") {
+		t.Fatalf("per-turn overflow accepted=%v run=%#v", accepted, run)
+	}
+}
+
+func TestNeoReadThreadPersistedRunIsBoundedAndKeepsEndpoints(t *testing.T) {
+	messages := make([]any, 20)
+	for i := range messages {
+		results := make([]any, 8)
+		for j := range results {
+			results[j] = map[string]any{"toolUseID": fmt.Sprintf("TU-%d-%d", i, j), "text": strings.Repeat("result ", 1000)}
+		}
+		toolUses := []any{map[string]any{"id": fmt.Sprintf("TU-input-%d", i), "name": "edit_file", "input": map[string]any{"patch": strings.Repeat("large-input ", 100000)}}}
+		messages[i] = map[string]any{"index": i, "role": "assistant", "text": strings.Repeat("message ", 2000), "toolUses": toolUses, "toolResults": results}
+	}
+	run := map[string]any{"status": "done", "result": map[string]any{"messages": messages, "range": map[string]any{"startIndex": 0, "endIndex": 19}}}
+	stored := neoReadThreadPersistedRun("read_thread_messages", run)
+	raw, err := json.Marshal(stored)
+	if err != nil {
+		t.Fatalf("marshal persisted run: %v", err)
+	}
+	if len(raw) > 60000 {
+		t.Fatalf("persisted run bytes = %d, want <= 60000", len(raw))
+	}
+	storedResult := mapValue(stored["result"])
+	storedMessages := arrayValue(storedResult["messages"])
+	if len(storedMessages) != neoReadThreadStoredMessageCount {
+		t.Fatalf("persisted messages = %d, want %d", len(storedMessages), neoReadThreadStoredMessageCount)
+	}
+	if numberFrom(mapValue(storedMessages[0])["index"]) != 0 || numberFrom(mapValue(storedMessages[len(storedMessages)-1])["index"]) != 19 {
+		t.Fatalf("persisted endpoints = first:%#v last:%#v", storedMessages[0], storedMessages[len(storedMessages)-1])
+	}
+	if numberFrom(storedResult["persistedMessagesOmitted"]) != 8 {
+		t.Fatalf("persistedMessagesOmitted = %#v, want 8", storedResult["persistedMessagesOmitted"])
+	}
+	firstToolUse := mapValue(arrayValue(mapValue(storedMessages[0])["toolUses"])[0])
+	storedInput := mapValue(firstToolUse["input"])
+	if !boolValue(storedInput["persistedInputTruncated"]) || len([]rune(stringValue(storedInput["preview"]))) > neoReadThreadStoredResultChars+128 {
+		t.Fatalf("persisted tool input = %#v, want bounded truncation marker", storedInput)
 	}
 }
 
