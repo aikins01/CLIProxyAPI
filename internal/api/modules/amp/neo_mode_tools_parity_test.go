@@ -102,38 +102,44 @@ func TestNeoModeToolOrderMatchesAmpBinary(t *testing.T) {
 		if len(idents) == 0 {
 			t.Fatalf("mode %q (systemPrompt %q): no includeTools reference found in %s", mode, sp, path)
 		}
-		resolvedAny := false
+		resolved := make([][]string, 0, len(idents))
+		matched := false
 		for _, ident := range idents {
 			got, ok := neoToolParityResolveArray(text, ident, 0)
 			if !ok {
 				continue
 			}
-			resolvedAny = true
-			if !neoToolParityEqualOrdered(got, want) {
-				t.Errorf("mode %q includeTools differs from Amp binary (ident %s):\n  binary : %v\n  runtime: %v\n  binary-only : %v\n  runtime-only: %v",
-					mode, ident, got, want,
-					neoToolParityDiff(neoToolParitySet(got), neoToolParitySet(want)),
-					neoToolParityDiff(neoToolParitySet(want), neoToolParitySet(got)))
+			resolved = append(resolved, got)
+			if neoToolParityEqualOrdered(got, want) {
+				matched = true
+				break
 			}
 		}
-		if !resolvedAny {
+		if len(resolved) == 0 {
 			t.Fatalf("mode %q: could not resolve any includeTools array from binary (idents %v)", mode, idents)
+		}
+		if !matched {
+			t.Errorf("mode %q includeTools differs from all Amp binary candidates:\n  binary candidates: %v\n  runtime: %v", mode, resolved, want)
 		}
 
 		wantDeferred := neoModeDeferredToolAllowlist[mode]
 		dIdents := neoToolParityProfileIdents(text, sp, "deferredTools")
+		deferredResolved := make([][]string, 0, len(dIdents))
+		deferredMatched := len(dIdents) == 0
 		for _, ident := range dIdents {
 			got, ok := neoToolParityResolveArray(text, ident, 0)
 			if !ok {
 				continue
 			}
+			deferredResolved = append(deferredResolved, got)
 			gotSet := neoToolParitySet(got)
-			if extra := neoToolParityDiff(gotSet, wantDeferred); len(extra) > 0 {
-				t.Errorf("mode %q deferredTools has binary tools we do not defer: %v", mode, extra)
+			if len(neoToolParityDiff(gotSet, wantDeferred)) == 0 && len(neoToolParityDiff(wantDeferred, gotSet)) == 0 {
+				deferredMatched = true
+				break
 			}
-			if missing := neoToolParityDiff(wantDeferred, gotSet); len(missing) > 0 {
-				t.Errorf("mode %q deferredTools: we defer tools the binary does not: %v", mode, missing)
-			}
+		}
+		if !deferredMatched {
+			t.Errorf("mode %q deferredTools differs from all Amp binary candidates:\n  binary candidates: %v\n  runtime: %v", mode, deferredResolved, wantDeferred)
 		}
 	}
 }

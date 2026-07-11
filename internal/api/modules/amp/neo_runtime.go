@@ -65,6 +65,7 @@ const (
 	neoRecentThreadsCloudSeedMin     = 20
 	neoRecentThreadsCloudSeedMax     = 100
 	neoReplayEventLimit              = 512
+	neoFilesystemWriteMaxBytes       = 4 * 1024 * 1024
 	neoActorIdleTTL                  = 30 * time.Minute
 	neoActorPruneInterval            = 5 * time.Minute
 	neoExecutorReconnectGrace        = 15 * time.Second
@@ -129,17 +130,17 @@ var (
 	neoInboundMessageHook         func(actor *neoActor, msg map[string]any)
 	errNeoLocalEmptyStream        = errors.New("local provider stream closed before first payload")
 	neoModeToolOrder              = map[string][]string{
-		"smart":    toolList("finder", "shell_command", "shell_command_status", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "load_plugin", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "archive_current_thread", "manage_automation", "slack_write", "slack_read", "send_message_to_agg"),
-		"large":    toolList("finder", "shell_command", "shell_command_status", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "load_plugin", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "archive_current_thread", "manage_automation", "slack_write", "slack_read", "send_message_to_agg"),
-		"rush":     toolList("finder", "shell_command", "shell_command_status", "apply_patch", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "load_plugin", "oracle", "librarian", "Task", "view_media", "painter", "archive_current_thread", "manage_automation", "slack_write", "slack_read", "send_message_to_agg"),
-		"agg-man":  toolList("find_thread", "read_thread", "web_search", "read_web_page", "docs_list", "docs_read", "docs_write", "create_project", "list_agent_modes", "create_thread", "archive_thread", "archive_threads", "unarchive_thread", "send_message_to_thread", "publish_thread_artifacts", "manage_automation", "slack_write", "slack_read", "github_repo_ci_status", "read_github", "search_github", "commit_search", "list_directory_github", "list_repositories", "glob_github", "diff"),
-		"deep":     toolList("shell_command", "shell_command_status", "apply_patch", "web_search", "read_web_page", "Task", "skill", "load_plugin", "read_thread", "find_thread", "librarian", "oracle", "finder", "view_media", "painter", "archive_current_thread", "manage_automation", "slack_write", "slack_read", "send_message_to_agg"),
-		"review":   toolList("shell_command", "run_check", "submit_review"),
-		"nostromo": toolList("finder", "shell_command", "shell_command_status", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "load_plugin", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "archive_current_thread", "manage_automation", "slack_write", "slack_read", "send_message_to_agg", "apply_patch"),
-		"low":      toolList("finder", "shell_command", "shell_command_status", "apply_patch", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "load_plugin", "oracle", "librarian", "Task", "view_media", "painter", "archive_current_thread", "manage_automation", "slack_write", "slack_read", "send_message_to_agg"),
-		"medium":   toolList("shell_command", "shell_command_status", "apply_patch", "web_search", "read_web_page", "Task", "skill", "load_plugin", "read_thread", "find_thread", "librarian", "oracle", "finder", "view_media", "painter", "archive_current_thread", "manage_automation", "slack_write", "slack_read", "send_message_to_agg"),
-		"high":     toolList("shell_command", "shell_command_status", "apply_patch", "web_search", "read_web_page", "Task", "skill", "load_plugin", "read_thread", "find_thread", "librarian", "oracle", "finder", "view_media", "painter", "archive_current_thread", "manage_automation", "slack_write", "slack_read", "send_message_to_agg"),
-		"ultra":    toolList("finder", "shell_command", "shell_command_status", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "load_plugin", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "archive_current_thread", "manage_automation", "slack_write", "slack_read", "send_message_to_agg"),
+		"smart":    toolList("finder", "shell_command", "shell_command_status", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "skill", "load_plugin", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "archive_current_thread", "manage_automation", "slack_write", "slack_read", "send_message_to_agg"),
+		"large":    toolList("finder", "shell_command", "shell_command_status", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "skill", "load_plugin", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "archive_current_thread", "manage_automation", "slack_write", "slack_read", "send_message_to_agg"),
+		"rush":     toolList("finder", "shell_command", "shell_command_status", "apply_patch", "web_search", "read_web_page", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "skill", "load_plugin", "oracle", "librarian", "Task", "view_media", "painter", "archive_current_thread", "manage_automation", "slack_write", "slack_read", "send_message_to_agg"),
+		"agg-man":  toolList("find_thread", "read_thread", "web_search", "read_web_page", "docs_list", "docs_read", "docs_write", "create_project", "list_agent_modes", "list_runners", "create_thread", "archive_thread", "archive_threads", "unarchive_thread", "send_message_to_thread", "sleep", "publish_thread_artifacts", "manage_automation", "slack_write", "slack_read", "github_repo_ci_status", "read_github", "search_github", "commit_search", "list_directory_github", "list_repositories", "glob_github", "diff"),
+		"deep":     toolList("shell_command", "shell_command_status", "apply_patch", "web_search", "read_web_page", "Task", "skill", "load_plugin", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "librarian", "oracle", "finder", "view_media", "painter", "archive_current_thread", "manage_automation", "slack_write", "slack_read", "send_message_to_agg"),
+		"review":   toolList("shell_command", "run_check", "submit_review", "list_agent_modes", "list_runners", "create_thread"),
+		"nostromo": toolList("finder", "shell_command", "shell_command_status", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "skill", "load_plugin", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "archive_current_thread", "manage_automation", "slack_write", "slack_read", "send_message_to_agg", "apply_patch"),
+		"low":      toolList("finder", "shell_command", "shell_command_status", "apply_patch", "web_search", "read_web_page", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "skill", "load_plugin", "oracle", "librarian", "Task", "view_media", "painter", "archive_current_thread", "manage_automation", "slack_write", "slack_read", "send_message_to_agg"),
+		"medium":   toolList("shell_command", "shell_command_status", "apply_patch", "web_search", "read_web_page", "Task", "skill", "load_plugin", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "librarian", "oracle", "finder", "view_media", "painter", "archive_current_thread", "manage_automation", "slack_write", "slack_read", "send_message_to_agg"),
+		"high":     toolList("shell_command", "shell_command_status", "apply_patch", "web_search", "read_web_page", "Task", "skill", "load_plugin", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "librarian", "oracle", "finder", "view_media", "painter", "archive_current_thread", "manage_automation", "slack_write", "slack_read", "send_message_to_agg"),
+		"ultra":    toolList("finder", "shell_command", "shell_command_status", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "skill", "load_plugin", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "archive_current_thread", "manage_automation", "slack_write", "slack_read", "send_message_to_agg"),
 	}
 	neoModeToolAllowlist         = orderedToolSets(neoModeToolOrder)
 	neoModeDeferredToolAllowlist = map[string]map[string]bool{
@@ -156,7 +157,7 @@ var (
 		"librarian", "Task", "view_media", "painter",
 		"gmail_read", "gmail_write",
 		"shell_command", "shell_command_status", "apply_patch", "archive_current_thread", "send_message_to_agg", "run_check", "submit_review", "docs_list", "docs_read", "docs_write",
-		"create_project", "list_agent_modes", "create_thread", "archive_thread", "archive_threads", "unarchive_thread", "send_message_to_thread", "publish_thread_artifacts", "manage_automation",
+		"create_project", "list_agent_modes", "list_runners", "create_thread", "archive_thread", "archive_threads", "unarchive_thread", "send_message_to_thread", "sleep", "publish_thread_artifacts", "manage_automation",
 		"slack_write", "slack_read", "github_repo_ci_status", "read_github", "search_github", "commit_search",
 		"list_directory_github", "list_repositories", "glob_github", "diff",
 	)
@@ -2961,6 +2962,12 @@ func (a *neoActor) handleForSocket(socket *neoSocket, msg map[string]any) any {
 		if payload, ok := normalizeNeoFilesystemRequest("executor_filesystem_read_file", msg); ok {
 			a.broadcast(payload)
 		}
+	case "client_filesystem_write_file":
+		a.bridgeFilesystemWriteRequest("executor_filesystem_write_file", "client_filesystem_write_file_result", msg)
+	case "client_orb_services_ensure":
+		if payload, ok := normalizeNeoOrbServicesEnsureRequest("executor_orb_services_ensure", msg); ok {
+			a.broadcast(payload)
+		}
 	case "client_git_command":
 		if payload, ok := normalizeNeoClientGitCommand(msg); ok {
 			a.handleClientGitCommand(payload)
@@ -2971,6 +2978,12 @@ func (a *neoActor) handleForSocket(socket *neoSocket, msg map[string]any) any {
 		}
 	case "executor_filesystem_read_file":
 		if payload, ok := normalizeNeoFilesystemRequest("client_filesystem_read_file", msg); ok {
+			a.broadcast(payload)
+		}
+	case "executor_filesystem_write_file":
+		a.bridgeFilesystemWriteRequest("client_filesystem_write_file", "executor_filesystem_write_file_result", msg)
+	case "executor_orb_services_ensure":
+		if payload, ok := normalizeNeoOrbServicesEnsureRequest("client_orb_services_ensure", msg); ok {
 			a.broadcast(payload)
 		}
 	case "executor_git_command":
@@ -2985,6 +2998,14 @@ func (a *neoActor) handleForSocket(socket *neoSocket, msg map[string]any) any {
 		if payload, ok := normalizeNeoFilesystemFileResult("client_filesystem_read_file_result", msg); ok {
 			a.broadcast(payload)
 		}
+	case "executor_filesystem_write_file_result":
+		if payload, ok := normalizeNeoFilesystemWriteResult("client_filesystem_write_file_result", msg); ok {
+			a.broadcast(payload)
+		}
+	case "executor_orb_services_ensure_result":
+		if payload, ok := normalizeNeoOrbServicesEnsureResult("client_orb_services_ensure_result", msg); ok {
+			a.broadcast(payload)
+		}
 	case "executor_git_command_result":
 		if payload, ok := normalizeNeoGitCommandResult("client_git_command_result", msg); ok {
 			a.broadcast(payload)
@@ -2995,6 +3016,14 @@ func (a *neoActor) handleForSocket(socket *neoSocket, msg map[string]any) any {
 		}
 	case "client_filesystem_read_file_result":
 		if payload, ok := normalizeNeoFilesystemFileResult("executor_filesystem_read_file_result", msg); ok {
+			a.broadcast(payload)
+		}
+	case "client_filesystem_write_file_result":
+		if payload, ok := normalizeNeoFilesystemWriteResult("executor_filesystem_write_file_result", msg); ok {
+			a.broadcast(payload)
+		}
+	case "client_orb_services_ensure_result":
+		if payload, ok := normalizeNeoOrbServicesEnsureResult("executor_orb_services_ensure_result", msg); ok {
 			a.broadcast(payload)
 		}
 	case "client_git_command_result":
@@ -3084,6 +3113,8 @@ func (a *neoActor) handleForSocket(socket *neoSocket, msg map[string]any) any {
 		if messageID := protocolMessageIDValue(msg["messageId"]); messageID != "" {
 			a.markMessageRead(messageID, false)
 		}
+	case "client_mark_thread_unread":
+		a.markThreadUnread()
 	case "client_upsert_notification_subscription":
 		if payload, ok := normalizeNeoClientNotificationSubscription(msg); ok {
 			a.upsertNotificationSubscription(payload)
@@ -16274,6 +16305,22 @@ func (a *neoActor) markMessageRead(messageID string, read bool) {
 	a.syncCloudAsync()
 }
 
+func (a *neoActor) markThreadUnread() {
+	a.mu.Lock()
+	messageID := ""
+	for i := len(a.messages) - 1; i >= 0; i-- {
+		message := a.messages[i]
+		if (message.Role == "user" || message.Role == "assistant") && message.ReadAt != "" {
+			messageID = message.MessageID
+			break
+		}
+	}
+	a.mu.Unlock()
+	if messageID != "" {
+		a.markMessageRead(messageID, false)
+	}
+}
+
 func (a *neoActor) importThread(thread map[string]any) error {
 	return a.importThreadWithSync(thread, true)
 }
@@ -17448,6 +17495,59 @@ func normalizeNeoFilesystemRequest(outboundType string, msg map[string]any) (map
 	return map[string]any{"type": outboundType, "requestId": requestID, "uri": uri}, true
 }
 
+func normalizeNeoFilesystemWriteRequest(outboundType string, msg map[string]any) (map[string]any, bool) {
+	request, ok := normalizeNeoFilesystemRequest(outboundType, msg)
+	if !ok {
+		return nil, false
+	}
+	content, ok := msg["contentBase64"].(string)
+	if !ok {
+		return nil, false
+	}
+	decoded, err := base64.StdEncoding.DecodeString(content)
+	if err != nil || base64.StdEncoding.EncodeToString(decoded) != content || len(decoded) > neoFilesystemWriteMaxBytes {
+		return nil, false
+	}
+	request["contentBase64"] = content
+	return request, true
+}
+
+func (a *neoActor) bridgeFilesystemWriteRequest(requestType, resultType string, msg map[string]any) {
+	if request, ok := normalizeNeoFilesystemWriteRequest(requestType, msg); ok {
+		a.broadcast(request)
+		return
+	}
+	requestID, ok := neoRequiredString(msg["requestId"])
+	if !ok {
+		return
+	}
+	content, ok := msg["contentBase64"].(string)
+	if !ok {
+		return
+	}
+	decoded, err := base64.StdEncoding.DecodeString(content)
+	if err != nil || base64.StdEncoding.EncodeToString(decoded) != content || len(decoded) <= neoFilesystemWriteMaxBytes {
+		return
+	}
+	a.broadcast(map[string]any{
+		"type":      resultType,
+		"requestId": requestID,
+		"ok":        false,
+		"error": map[string]any{
+			"code":    "TOO_LARGE",
+			"message": "Filesystem write exceeds 4 MiB limit",
+		},
+	})
+}
+
+func normalizeNeoOrbServicesEnsureRequest(outboundType string, msg map[string]any) (map[string]any, bool) {
+	requestID, ok := neoRequiredString(msg["requestId"])
+	if !ok {
+		return nil, false
+	}
+	return map[string]any{"type": outboundType, "requestId": requestID}, true
+}
+
 func normalizeNeoFilesystemDirectoryResult(outboundType string, msg map[string]any) (map[string]any, bool) {
 	requestID, ok := neoRequiredString(msg["requestId"])
 	if !ok {
@@ -17510,6 +17610,188 @@ func normalizeNeoFilesystemFileResult(outboundType string, msg map[string]any) (
 	}
 	out["error"] = errPayload
 	return out, true
+}
+
+func normalizeNeoFilesystemWriteResult(outboundType string, msg map[string]any) (map[string]any, bool) {
+	requestID, ok := neoRequiredString(msg["requestId"])
+	if !ok {
+		return nil, false
+	}
+	okValue, ok := msg["ok"].(bool)
+	if !ok {
+		return nil, false
+	}
+	out := map[string]any{"type": outboundType, "requestId": requestID, "ok": okValue}
+	if okValue {
+		if _, exists := msg["error"]; exists {
+			return nil, false
+		}
+		return out, true
+	}
+	errPayload, ok := normalizeNeoFilesystemError(msg["error"])
+	if !ok {
+		return nil, false
+	}
+	out["error"] = errPayload
+	return out, true
+}
+
+func normalizeNeoOrbServicesEnsureResult(outboundType string, msg map[string]any) (map[string]any, bool) {
+	requestID, ok := neoRequiredString(msg["requestId"])
+	if !ok {
+		return nil, false
+	}
+	result, ok := normalizeNeoOrbServicesEnsurePayload(msg["result"])
+	if !ok {
+		return nil, false
+	}
+	return map[string]any{"type": outboundType, "requestId": requestID, "result": result}, true
+}
+
+func normalizeNeoOrbServicesEnsurePayload(raw any) (map[string]any, bool) {
+	value, ok := asMap(raw)
+	if !ok {
+		return nil, false
+	}
+	okValue, ok := value["ok"].(bool)
+	if !ok {
+		return nil, false
+	}
+	noConfig, ok := value["noConfig"].(bool)
+	if !ok {
+		return nil, false
+	}
+	services, ok := arrayValueOK(value["services"])
+	if !ok {
+		return nil, false
+	}
+	normalizedServices := make([]any, 0, len(services))
+	for _, rawService := range services {
+		service, ok := normalizeNeoOrbService(rawService)
+		if !ok {
+			return nil, false
+		}
+		normalizedServices = append(normalizedServices, service)
+	}
+	out := map[string]any{"ok": okValue, "noConfig": noConfig, "services": normalizedServices}
+	if errText, exists := value["error"]; exists {
+		if _, ok := errText.(string); !ok {
+			return nil, false
+		}
+		out["error"] = errText
+	}
+	return out, true
+}
+
+func normalizeNeoOrbService(raw any) (map[string]any, bool) {
+	value, ok := asMap(raw)
+	if !ok {
+		return nil, false
+	}
+	name, ok := value["name"].(string)
+	if !ok {
+		return nil, false
+	}
+	okValue, ok := value["ok"].(bool)
+	if !ok {
+		return nil, false
+	}
+	portals, ok := arrayValueOK(value["portals"])
+	if !ok {
+		return nil, false
+	}
+	normalizedPortals := make([]any, 0, len(portals))
+	for _, rawPortal := range portals {
+		portal, ok := normalizeNeoOrbPortal(rawPortal)
+		if !ok {
+			return nil, false
+		}
+		normalizedPortals = append(normalizedPortals, portal)
+	}
+	out := map[string]any{"name": name, "ok": okValue, "portals": normalizedPortals}
+	for _, key := range []string{"error", "baseURL", "healthError"} {
+		if value, exists := value[key]; exists {
+			if _, ok := value.(string); !ok {
+				return nil, false
+			}
+			out[key] = value
+		}
+	}
+	for _, key := range []string{"port", "healthStatus"} {
+		if value, exists := value[key]; exists {
+			if _, ok := neoProtocolInteger(value); !ok {
+				return nil, false
+			}
+			out[key] = value
+		}
+	}
+	return out, true
+}
+
+func normalizeNeoOrbPortal(raw any) (map[string]any, bool) {
+	value, ok := asMap(raw)
+	if !ok {
+		return nil, false
+	}
+	title, titleOK := value["title"].(string)
+	urlValue, urlOK := value["url"].(string)
+	if !titleOK || !urlOK {
+		return nil, false
+	}
+	out := map[string]any{"title": title, "url": urlValue}
+	if description, exists := value["description"]; exists {
+		if _, ok := description.(string); !ok {
+			return nil, false
+		}
+		out["description"] = description
+	}
+	return out, true
+}
+
+func neoProtocolInteger(raw any) (int, bool) {
+	switch value := raw.(type) {
+	case int:
+		return value, true
+	case int8:
+		return int(value), true
+	case int16:
+		return int(value), true
+	case int32:
+		return int(value), true
+	case int64:
+		converted := int(value)
+		return converted, int64(converted) == value
+	case uint:
+		converted := int(value)
+		return converted, converted >= 0 && uint(converted) == value
+	case uint8:
+		return int(value), true
+	case uint16:
+		return int(value), true
+	case uint32:
+		converted := int(value)
+		return converted, converted >= 0 && uint32(converted) == value
+	case uint64:
+		converted := int(value)
+		return converted, converted >= 0 && uint64(converted) == value
+	case float64:
+		converted := int(value)
+		return converted, float64(converted) == value
+	case json.Number:
+		parsed, err := value.Int64()
+		if err != nil {
+			return 0, false
+		}
+		converted := int(parsed)
+		return converted, int64(converted) == parsed
+	default:
+		return 0, false
+	}
+}
+
+func arrayValueOK(raw any) ([]any, bool) {
+	values, ok := raw.([]any)
+	return values, ok
 }
 
 func normalizeNeoFilesystemEntries(raw any) ([]any, bool) {
@@ -17590,7 +17872,7 @@ func normalizeNeoFilesystemError(raw any) (map[string]any, bool) {
 
 func validNeoFilesystemErrorCode(code string) bool {
 	switch code {
-	case "INVALID_URI", "EXECUTOR_NOT_CONNECTED", "NOT_FOUND", "NOT_DIRECTORY", "IS_DIRECTORY", "ACCESS_DENIED", "INTERNAL_ERROR":
+	case "INVALID_URI", "EXECUTOR_NOT_CONNECTED", "NOT_FOUND", "NOT_DIRECTORY", "IS_DIRECTORY", "TOO_LARGE", "ACCESS_DENIED", "INTERNAL_ERROR":
 		return true
 	default:
 		return false
@@ -19448,6 +19730,7 @@ func (a *neoActor) cancelToolResultMessagesLocked(toolCallIDs []string, reason s
 	}
 
 	updates := make([]map[string]any, 0)
+	matched := make(map[string]bool, len(ids))
 	for i, message := range a.messages {
 		if message.Role != "user" || len(message.Content) == 0 {
 			continue
@@ -19470,6 +19753,7 @@ func (a *neoActor) cancelToolResultMessagesLocked(toolCallIDs []string, reason s
 				content[blockIndex] = clonedBlock
 				continue
 			}
+			matched[toolCallID] = true
 			run := cloneMap(mapValue(clonedBlock["run"]))
 			if neoToolRunTerminal(run) {
 				content[blockIndex] = clonedBlock
@@ -19492,6 +19776,22 @@ func (a *neoActor) cancelToolResultMessagesLocked(toolCallIDs []string, reason s
 		seq := a.nextSeqLocked()
 		event := map[string]any{"type": "message_updated", "message": message.protocol(), "seq": seq}
 		a.rememberReplayEventLocked(event)
+		updates = append(updates, event)
+	}
+	for _, toolCallID := range toolCallIDs {
+		if toolCallID == "" || matched[toolCallID] {
+			continue
+		}
+		matched[toolCallID] = true
+		ref, ok := a.storedToolUseLocked(toolCallID)
+		if !ok {
+			continue
+		}
+		run := map[string]any{"status": "cancelled"}
+		if reason != "" {
+			run["reason"] = reason
+		}
+		_, event := a.storeToolResultEventLocked(ref, map[string]any{"type": "tool_result", "toolUseID": toolCallID, "run": run}, "")
 		updates = append(updates, event)
 	}
 	if len(updates) > 0 {
@@ -20583,10 +20883,6 @@ func (s *neoSocket) send(payload any) {
 			return
 		}
 	}
-	if s.isWebLocalObserver() && neoOutboundPluginMessage(cleaned) {
-		log.Debugf("amp neo local runtime WS skip plugin message %s", neoProtocolSummary(cleaned))
-		return
-	}
 	if !s.allowsLocalExtensions() && neoOutboundLocalExtensionOnly(cleaned) {
 		log.Debugf("amp neo local runtime WS skip local extension %s", neoProtocolSummary(cleaned))
 		return
@@ -20782,10 +21078,6 @@ func neoOutboundLocalExtensionOnly(payload any) bool {
 	default:
 		return false
 	}
-}
-
-func neoOutboundPluginMessage(payload any) bool {
-	return stringValue(mapValue(payload)["type"]) == "plugin_message"
 }
 
 func neoInboundExecutorMessage(msgType string) bool {
@@ -21461,7 +21753,7 @@ func selectNeoModelRoute(agentMode string, settings map[string]any) neoModelRout
 	case "low":
 		return neoModelRoute{Provider: "amp", Model: "glm-5.2"}
 	case "medium", "high":
-		return neoModelRoute{Provider: "openai", Model: "gpt-5.5"}
+		return neoModelRoute{Provider: "openai", Model: "gpt-5.6-sol"}
 	case "ultra":
 		return neoModelRoute{Provider: "anthropic", Model: "claude-fable-5"}
 	case "deep":

@@ -4546,7 +4546,7 @@ func TestNeoRuntimeWebLocalInferenceObserverCannotClaimExecutor(t *testing.T) {
 	}
 }
 
-func TestNeoRuntimeWebLocalInferenceOriginSuppressesPluginMessages(t *testing.T) {
+func TestNeoRuntimeWebLocalInferenceOriginForwardsPluginMessages(t *testing.T) {
 	dir := t.TempDir()
 	missingCommand := filepath.Join(dir, "missing-amp")
 	enabled := true
@@ -4583,6 +4583,9 @@ func TestNeoRuntimeWebLocalInferenceOriginSuppressesPluginMessages(t *testing.T)
 
 	waitForNeoRivetBareInit(t, conn, 2*time.Second)
 	waitForNeoRivetBareEventType(t, conn, "executor_status", 2*time.Second)
+	observer := dialNeoActorWebSocket(t, server.URL, threadID)
+	defer observer.Close()
+	waitForNeoMessageType(t, observer, "agent_state", 2*time.Second)
 	actor := rt.store.lookupThreadActor(threadID)
 	if actor == nil {
 		t.Fatal("web local inference bootstrap did not create thread actor")
@@ -4590,20 +4593,54 @@ func TestNeoRuntimeWebLocalInferenceOriginSuppressesPluginMessages(t *testing.T)
 	actor.handle(map[string]any{
 		"type": "executor_plugin_message",
 		"message": map[string]any{
-			"type":  "event",
-			"event": "plugins.ready",
+			"type":   "request",
+			"id":     "plugin-request-1",
+			"method": "ui.select",
+			"params": map[string]any{"options": map[string]any{"title": "Choose", "options": []any{"Alpha", "Bravo"}}},
 		},
 	})
 
-	deadline := time.Now().Add(200 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		name, args, ok := readNeoRivetBareEvent(t, conn, time.Until(deadline))
-		if !ok {
-			return
-		}
-		if name == "plugin_message" {
-			t.Fatalf("web local inference socket received plugin message: %#v", args)
-		}
+	request := waitForNeoRivetBareEventTypeWhere(t, conn, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
+		message := mapValue(payload["message"])
+		return message["type"] == "request" && message["method"] == "ui.select"
+	})
+	if stringValue(mapValue(request["message"])["id"]) != "plugin-request-1" {
+		t.Fatalf("web plugin request = %#v", request)
+	}
+	observerRequest := waitForNeoMessageType(t, observer, "plugin_message", 2*time.Second)
+	if stringValue(mapValue(observerRequest["message"])["method"]) != "ui.select" {
+		t.Fatalf("observer plugin request = %#v", observerRequest)
+	}
+
+	if err := conn.WriteJSON(map[string]any{
+		"type": "plugin_message",
+		"message": map[string]any{
+			"type":   "response",
+			"id":     "plugin-request-1",
+			"result": "Bravo",
+		},
+	}); err != nil {
+		t.Fatalf("write web plugin response: %v", err)
+	}
+	observerResponse := waitForNeoMessageType(t, observer, "plugin_message", 2*time.Second)
+	if message := mapValue(observerResponse["message"]); message["type"] != "response" || message["result"] != "Bravo" {
+		t.Fatalf("observer plugin response = %#v", observerResponse)
+	}
+
+	actor.handle(map[string]any{
+		"type": "executor_plugin_message",
+		"message": map[string]any{
+			"type":  "event",
+			"event": "command.list",
+			"data":  map[string]any{"commands": []any{map[string]any{"id": "plugin-command"}}},
+		},
+	})
+	commandList := waitForNeoRivetBareEventTypeWhere(t, conn, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
+		message := mapValue(payload["message"])
+		return message["type"] == "event" && message["event"] == "command.list"
+	})
+	if stringValue(mapValue(commandList["message"])["event"]) != "command.list" {
+		t.Fatalf("web plugin command list = %#v", commandList)
 	}
 }
 
@@ -8094,6 +8131,95 @@ func TestNeoRuntimeFilesystemBridgeNormalizesBothDirections(t *testing.T) {
 	if result["requestId"] != "fs-1" || result["ok"] != true || result["contentBase64"] != "aGVsbG8=" {
 		t.Fatalf("filesystem result = %#v", result)
 	}
+
+	if err := client.WriteJSON(map[string]any{"type": "client_filesystem_write_file", "requestId": "write-1", "uri": "file:///tmp/a.txt", "contentBase64": "aGVsbG8="}); err != nil {
+		t.Fatalf("write client filesystem write request: %v", err)
+	}
+	writeRequest := waitForNeoMessageType(t, executor, "executor_filesystem_write_file", 2*time.Second)
+	if writeRequest["requestId"] != "write-1" || writeRequest["uri"] != "file:///tmp/a.txt" || writeRequest["contentBase64"] != "aGVsbG8=" {
+		t.Fatalf("filesystem write request = %#v", writeRequest)
+	}
+	if err := executor.WriteJSON(map[string]any{"type": "executor_filesystem_write_file_result", "requestId": "write-1", "ok": true}); err != nil {
+		t.Fatalf("write executor filesystem write result: %v", err)
+	}
+	writeResult := waitForNeoMessageType(t, client, "client_filesystem_write_file_result", 2*time.Second)
+	if writeResult["requestId"] != "write-1" || writeResult["ok"] != true {
+		t.Fatalf("filesystem write result = %#v", writeResult)
+	}
+
+	if err := executor.WriteJSON(map[string]any{"type": "executor_filesystem_write_file", "requestId": "write-2", "uri": "file:///tmp/b.txt", "contentBase64": "d29ybGQ="}); err != nil {
+		t.Fatalf("write executor filesystem write request: %v", err)
+	}
+	reverseWriteRequest := waitForNeoMessageType(t, client, "client_filesystem_write_file", 2*time.Second)
+	if reverseWriteRequest["requestId"] != "write-2" || reverseWriteRequest["contentBase64"] != "d29ybGQ=" {
+		t.Fatalf("reverse filesystem write request = %#v", reverseWriteRequest)
+	}
+	if err := client.WriteJSON(map[string]any{"type": "client_filesystem_write_file_result", "requestId": "write-2", "ok": false, "error": map[string]any{"code": "TOO_LARGE", "message": "too large"}}); err != nil {
+		t.Fatalf("write client filesystem write result: %v", err)
+	}
+	reverseWriteResult := waitForNeoMessageType(t, executor, "executor_filesystem_write_file_result", 2*time.Second)
+	if reverseWriteResult["requestId"] != "write-2" || stringValue(mapValue(reverseWriteResult["error"])["code"]) != "TOO_LARGE" {
+		t.Fatalf("reverse filesystem write result = %#v", reverseWriteResult)
+	}
+
+	oversizedContent := base64.StdEncoding.EncodeToString(make([]byte, neoFilesystemWriteMaxBytes+1))
+	if err := client.WriteJSON(map[string]any{"type": "client_filesystem_write_file", "requestId": "write-3", "uri": "file:///tmp/c.txt", "contentBase64": oversizedContent}); err != nil {
+		t.Fatalf("write oversized client filesystem request: %v", err)
+	}
+	oversizedClientResult := waitForNeoMessageType(t, client, "client_filesystem_write_file_result", 2*time.Second)
+	if oversizedClientResult["requestId"] != "write-3" || stringValue(mapValue(oversizedClientResult["error"])["code"]) != "TOO_LARGE" {
+		t.Fatalf("oversized client filesystem result = %#v", oversizedClientResult)
+	}
+
+	if err := executor.WriteJSON(map[string]any{"type": "executor_filesystem_write_file", "requestId": "write-4", "uri": "file:///tmp/d.txt", "contentBase64": oversizedContent}); err != nil {
+		t.Fatalf("write oversized executor filesystem request: %v", err)
+	}
+	oversizedExecutorResult := waitForNeoMessageType(t, executor, "executor_filesystem_write_file_result", 2*time.Second)
+	if oversizedExecutorResult["requestId"] != "write-4" || stringValue(mapValue(oversizedExecutorResult["error"])["code"]) != "TOO_LARGE" {
+		t.Fatalf("oversized executor filesystem result = %#v", oversizedExecutorResult)
+	}
+
+	if err := client.WriteJSON(map[string]any{"type": "client_orb_services_ensure", "requestId": "orb-1"}); err != nil {
+		t.Fatalf("write client Orb request: %v", err)
+	}
+	orbRequest := waitForNeoMessageType(t, executor, "executor_orb_services_ensure", 2*time.Second)
+	if orbRequest["requestId"] != "orb-1" {
+		t.Fatalf("Orb request = %#v", orbRequest)
+	}
+	orbPayload := map[string]any{
+		"ok":       true,
+		"noConfig": false,
+		"services": []any{map[string]any{
+			"name":         "preview",
+			"ok":           true,
+			"port":         3000,
+			"baseURL":      "http://127.0.0.1:3000",
+			"portals":      []any{map[string]any{"title": "Preview", "url": "http://127.0.0.1:3000"}},
+			"healthStatus": 200,
+		}},
+	}
+	if err := executor.WriteJSON(map[string]any{"type": "executor_orb_services_ensure_result", "requestId": "orb-1", "result": orbPayload}); err != nil {
+		t.Fatalf("write executor Orb result: %v", err)
+	}
+	orbResult := waitForNeoMessageType(t, client, "client_orb_services_ensure_result", 2*time.Second)
+	if orbResult["requestId"] != "orb-1" || mapValue(orbResult["result"])["ok"] != true {
+		t.Fatalf("Orb result = %#v", orbResult)
+	}
+
+	if err := executor.WriteJSON(map[string]any{"type": "executor_orb_services_ensure", "requestId": "orb-2"}); err != nil {
+		t.Fatalf("write executor Orb request: %v", err)
+	}
+	reverseOrbRequest := waitForNeoMessageType(t, client, "client_orb_services_ensure", 2*time.Second)
+	if reverseOrbRequest["requestId"] != "orb-2" {
+		t.Fatalf("reverse Orb request = %#v", reverseOrbRequest)
+	}
+	if err := client.WriteJSON(map[string]any{"type": "client_orb_services_ensure_result", "requestId": "orb-2", "result": orbPayload}); err != nil {
+		t.Fatalf("write client Orb result: %v", err)
+	}
+	reverseOrbResult := waitForNeoMessageType(t, executor, "executor_orb_services_ensure_result", 2*time.Second)
+	if reverseOrbResult["requestId"] != "orb-2" || mapValue(reverseOrbResult["result"])["ok"] != true {
+		t.Fatalf("reverse Orb result = %#v", reverseOrbResult)
+	}
 }
 
 func TestNeoRuntimeTerminalBridgeRetypesBothDirections(t *testing.T) {
@@ -8347,6 +8473,35 @@ func TestNeoFilesystemAndGitBridgeMatchesBinarySchema(t *testing.T) {
 	}
 	if _, ok := normalizeNeoFilesystemFileResult("executor_filesystem_read_file_result", map[string]any{"requestId": "fs-file", "ok": true, "content": "legacy"}); ok {
 		t.Fatal("content alias was accepted for filesystem file result")
+	}
+	if _, ok := normalizeNeoFilesystemWriteRequest("executor_filesystem_write_file", map[string]any{"requestId": "fs-write", "uri": "file:///tmp/a.txt", "contentBase64": "not-base64"}); ok {
+		t.Fatal("invalid base64 was accepted for filesystem write request")
+	}
+	if _, ok := normalizeNeoFilesystemWriteRequest("executor_filesystem_write_file", map[string]any{"requestId": "fs-write", "uri": "file:///tmp/a.txt", "contentBase64": "YQ==\n"}); ok {
+		t.Fatal("noncanonical base64 was accepted for filesystem write request")
+	}
+	if _, ok := normalizeNeoFilesystemWriteResult("executor_filesystem_write_file_result", map[string]any{"requestId": "fs-write", "ok": false, "error": map[string]any{"code": "TOO_LARGE", "message": "too large"}}); !ok {
+		t.Fatal("TOO_LARGE filesystem write result was rejected")
+	}
+	if _, ok := normalizeNeoOrbServicesEnsureResult("executor_orb_services_ensure_result", map[string]any{
+		"requestId": "orb-1",
+		"result": map[string]any{
+			"ok":       true,
+			"noConfig": false,
+			"services": []any{map[string]any{"name": "preview", "ok": true}},
+		},
+	}); ok {
+		t.Fatal("Orb service without portals was accepted")
+	}
+	if _, ok := normalizeNeoOrbServicesEnsureResult("executor_orb_services_ensure_result", map[string]any{
+		"requestId": "orb-1",
+		"result": map[string]any{
+			"ok":       true,
+			"noConfig": false,
+			"services": []any{map[string]any{"name": "preview", "ok": true, "port": uint64(3000), "healthStatus": uint64(200), "portals": []any{}}},
+		},
+	}); !ok {
+		t.Fatal("Orb result with CBOR unsigned integers was rejected")
 	}
 
 	gitCommand, ok := normalizeNeoClientGitCommand(map[string]any{"requestId": "git-1", "operation": map[string]any{"type": "file_diff", "path": "main.go", "changeType": "modified", "full": false}})
@@ -13381,6 +13536,10 @@ func handledNeoInboundTypesForTest() map[string]bool {
 		"client_filesystem_read_directory_result",
 		"client_filesystem_read_file",
 		"client_filesystem_read_file_result",
+		"client_filesystem_write_file",
+		"client_filesystem_write_file_result",
+		"client_orb_services_ensure",
+		"client_orb_services_ensure_result",
 		"client_git_command",
 		"client_git_command_result",
 		"client_git_diff_snapshot",
@@ -13400,6 +13559,7 @@ func handledNeoInboundTypesForTest() map[string]bool {
 		"client_fork_thread",
 		"client_mark_message_read",
 		"client_mark_message_unread",
+		"client_mark_thread_unread",
 		"client_remove_queued_msg",
 		"client_resume",
 		"client_retry",
@@ -13437,6 +13597,10 @@ func handledNeoInboundTypesForTest() map[string]bool {
 		"executor_filesystem_read_directory_result",
 		"executor_filesystem_read_file",
 		"executor_filesystem_read_file_result",
+		"executor_filesystem_write_file",
+		"executor_filesystem_write_file_result",
+		"executor_orb_services_ensure",
+		"executor_orb_services_ensure_result",
 		"executor_git_command",
 		"executor_git_command_result",
 		"executor_guidance_discovery",
@@ -13850,11 +14014,16 @@ func TestHandledNeoInboundTypesCoverLegacyCompatibilityAliases(t *testing.T) {
 		"client_filesystem_read_directory_result",
 		"client_filesystem_read_file",
 		"client_filesystem_read_file_result",
+		"client_filesystem_write_file",
+		"client_filesystem_write_file_result",
 		"client_fork_thread",
 		"client_git_command",
 		"client_git_command_result",
+		"client_orb_services_ensure",
+		"client_orb_services_ensure_result",
 		"client_mark_message_read",
 		"client_mark_message_unread",
+		"client_mark_thread_unread",
 		"client_remove_queued_msg",
 		"client_resume",
 		"client_retry",
@@ -13894,8 +14063,12 @@ func TestHandledNeoInboundTypesCoverLegacyCompatibilityAliases(t *testing.T) {
 		"executor_filesystem_read_directory_result",
 		"executor_filesystem_read_file",
 		"executor_filesystem_read_file_result",
+		"executor_filesystem_write_file",
+		"executor_filesystem_write_file_result",
 		"executor_git_command",
 		"executor_git_command_result",
+		"executor_orb_services_ensure",
+		"executor_orb_services_ensure_result",
 		"executor_guidance_discovery",
 		"executor_guidance_snapshot",
 		"executor_guidance_update",
@@ -14470,8 +14643,8 @@ func TestSelectNeoModelRouteDefaultsVisibleModesToAmpBinaryRoutes(t *testing.T) 
 		model    string
 	}{
 		{mode: "low", provider: "amp", model: "glm-5.2"},
-		{mode: "medium", provider: "openai", model: "gpt-5.5"},
-		{mode: "high", provider: "openai", model: "gpt-5.5"},
+		{mode: "medium", provider: "openai", model: "gpt-5.6-sol"},
+		{mode: "high", provider: "openai", model: "gpt-5.6-sol"},
 		{mode: "ultra", provider: "anthropic", model: "claude-fable-5"},
 	} {
 		t.Run(tc.mode, func(t *testing.T) {
@@ -17567,7 +17740,7 @@ func TestNeoReviewModeExposesServerReviewTools(t *testing.T) {
 		names = append(names, tool.Name)
 		specs[tool.Name] = tool
 	}
-	want := []string{"run_check", "shell_command", "submit_review"}
+	want := []string{"create_thread", "run_check", "shell_command", "submit_review"}
 	if !reflect.DeepEqual(names, want) {
 		t.Fatalf("review mode tools = %#v, want %#v (request order is alphabetical)", names, want)
 	}
@@ -22017,6 +22190,14 @@ func TestNeoActorHandlesMessageReadState(t *testing.T) {
 		t.Fatalf("protocol readAt = %#v, want %q", got, readAt)
 	}
 
+	actor.handle(map[string]any{"type": "client_mark_thread_unread"})
+	actor.mu.Lock()
+	if actor.messages[0].ReadAt != "" {
+		t.Fatalf("thread unread readAt = %q, want cleared", actor.messages[0].ReadAt)
+	}
+	actor.mu.Unlock()
+
+	actor.handle(map[string]any{"type": "client_mark_message_read", "messageId": "M-0000000000000000000001"})
 	actor.handle(map[string]any{"type": "client_mark_message_unread", "messageId": "M-0000000000000000000001"})
 
 	actor.mu.Lock()
@@ -22032,8 +22213,22 @@ func TestNeoActorHandlesMessageReadState(t *testing.T) {
 func TestNeoActorHandlesToolLeaseRevoked(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
-	actor.pendingTools["TU-test"] = neoPendingTool{ID: "TU-test", Name: "Bash", AgentMode: "smart", MessageID: "M-assistant"}
+	actor.messages = []neoMessage{{
+		ThreadID:  "T-test",
+		MessageID: "M-assistant",
+		Role:      "assistant",
+		Content: []any{map[string]any{
+			"type":  "tool_use",
+			"id":    "TU-test",
+			"name":  "Task",
+			"input": map[string]any{"task": "inspect"},
+		}},
+		State: map[string]any{"type": "complete", "stopReason": "tool_use"},
+		Seq:   1,
+	}}
+	actor.pendingTools["TU-test"] = neoPendingTool{ID: "TU-test", Name: "Task", AgentMode: "smart", MessageID: "M-assistant"}
 	actor.agentState = "running_tools"
+	actor.rebuildHistoryLocked()
 
 	actor.handle(map[string]any{"type": "executor_tool_lease_revoked", "toolCallId": "TU-test", "reason": "reassigned"})
 
@@ -22044,6 +22239,17 @@ func TestNeoActorHandlesToolLeaseRevoked(t *testing.T) {
 	}
 	if actor.agentState != "idle" {
 		t.Fatalf("agentState = %q, want idle", actor.agentState)
+	}
+	if len(actor.messages) != 2 {
+		t.Fatalf("messages = %#v, want synthetic cancelled tool result", actor.messages)
+	}
+	result := mapValue(actor.messages[1].Content[0])
+	run := mapValue(result["run"])
+	if result["type"] != "tool_result" || result["toolUseID"] != "TU-test" || run["status"] != "cancelled" || run["reason"] != "system:disposed" {
+		t.Fatalf("cancelled tool result = %#v", result)
+	}
+	if len(actor.history) != 2 || actor.history[1].Role != "tool" || actor.history[1].ToolCallID != "TU-test" {
+		t.Fatalf("history = %#v", actor.history)
 	}
 }
 
