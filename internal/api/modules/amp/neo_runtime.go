@@ -2800,6 +2800,14 @@ func (a *neoActor) handle(msg map[string]any) {
 func (a *neoActor) handleForSocket(socket *neoSocket, msg map[string]any) any {
 	a.touch()
 	msgType := stringValue(msg["type"])
+	if socket != nil && socket.isWebLocalObserver() && msgType == "executor_plugin_message" {
+		message := normalizeNeoExecutorPluginMessage(msg)
+		if a.webLocalObserverPluginResponseAllowed(message) {
+			log.Debugf("amp neo local runtime WS recv web plugin response")
+			a.handleProtocolPluginMessage(socket, map[string]any{"message": message})
+			return nil
+		}
+	}
 	if socket != nil && socket.isWebLocalObserver() && neoInboundWebLocalObserverBlockedMessage(msgType) {
 		log.Debugf("amp neo local runtime ignored web local observer executor message %s", msgType)
 		return nil
@@ -3522,6 +3530,31 @@ func (a *neoActor) handleProtocolPluginMessage(source *neoSocket, msg map[string
 		a.drainReadyWork()
 	}
 	return true
+}
+
+func (a *neoActor) webLocalObserverPluginResponseAllowed(raw any) bool {
+	message, ok := normalizeNeoProtocolPluginMessage(raw)
+	if !ok {
+		return false
+	}
+	requestID := ""
+	switch stringValue(message["type"]) {
+	case "response":
+		requestID = stringValue(message["id"])
+	case "request":
+		if stringValue(message["method"]) != "plugin.ui.respond" {
+			return false
+		}
+		requestID = stringValue(mapValue(message["params"])["requestId"])
+	default:
+		return false
+	}
+	if requestID == "" {
+		return false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return stringValue(a.pluginUIRequests[requestID]["status"]) == "pending"
 }
 
 func (a *neoActor) handleExecutorPluginMessage(source *neoSocket, raw any) {

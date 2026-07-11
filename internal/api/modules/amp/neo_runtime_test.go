@@ -4678,7 +4678,7 @@ func TestNeoRuntimeWebLocalInferenceOriginForwardsPluginMessages(t *testing.T) {
 	}
 
 	if err := conn.WriteJSON(map[string]any{
-		"type": "plugin_message",
+		"type": "executor_plugin_message",
 		"message": map[string]any{
 			"type":   "request",
 			"id":     "plugin-ui-respond-1",
@@ -4686,7 +4686,7 @@ func TestNeoRuntimeWebLocalInferenceOriginForwardsPluginMessages(t *testing.T) {
 			"params": map[string]any{"requestId": "plugin-request-1", "result": "Bravo"},
 		},
 	}); err != nil {
-		t.Fatalf("write web plugin response: %v", err)
+		t.Fatalf("write web executor plugin response: %v", err)
 	}
 	settled := waitForNeoMessageTypeWhere(t, observer, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
 		return stringValue(mapValue(payload["message"])["event"]) == "plugin.ui.request_settled"
