@@ -1,9 +1,11 @@
 package amp
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
+	"os"
 	"os/exec"
 	"regexp"
 	"strings"
@@ -18,6 +20,7 @@ const (
 	ampClientVersionAuto          = "auto"
 	ampClientVersionLatest        = "latest"
 	ampClientVersionCacheDuration = time.Hour
+	ampClientVersionProbeTimeout  = 5 * time.Second
 	ampCLINPMLatestURL            = "https://registry.npmjs.org/@ampcode%2fcli/latest"
 )
 
@@ -27,10 +30,13 @@ var (
 )
 
 type ampClientVersionResolver struct {
-	mu         sync.Mutex
-	value      string
-	expiresAt  time.Time
-	refreshing bool
+	mu               sync.Mutex
+	value            string
+	expiresAt        time.Time
+	refreshing       bool
+	localProbeDone   chan struct{}
+	installedVersion func(string) string
+	latestVersion    func() string
 }
 
 func ampUpstreamClientVersionProvider(settings *config.AmpCode) func() string {
@@ -69,27 +75,47 @@ func (r *ampClientVersionResolver) latest(executorCommand string) string {
 		r.mu.Unlock()
 		return value
 	}
-	if !r.refreshing {
-		r.refreshing = true
-		go r.refresh(executorCommand)
-	}
-	value := r.value
-	r.mu.Unlock()
-	if value != "" {
+	if r.value != "" {
+		if !r.refreshing {
+			r.refreshing = true
+			go r.refresh()
+		}
+		value := r.value
+		r.mu.Unlock()
 		return value
 	}
-	if local := ampInstalledClientVersion(executorCommand); local != "" {
-		r.set(local, now.Add(ampClientVersionCacheDuration/4))
-		return local
+	if !r.refreshing {
+		r.refreshing = true
+		r.localProbeDone = make(chan struct{})
+		probeDone := r.localProbeDone
+		r.mu.Unlock()
+		local := r.resolveInstalledVersion(executorCommand)
+		r.mu.Lock()
+		if local != "" {
+			r.value = local
+			r.expiresAt = time.Now().Add(ampClientVersionCacheDuration / 4)
+		}
+		close(probeDone)
+		r.localProbeDone = nil
+		value := r.value
+		r.mu.Unlock()
+		go r.refresh()
+		return value
 	}
-	return ""
+	value := r.value
+	probeDone := r.localProbeDone
+	r.mu.Unlock()
+	if value == "" && probeDone != nil {
+		<-probeDone
+		r.mu.Lock()
+		value = r.value
+		r.mu.Unlock()
+	}
+	return value
 }
 
-func (r *ampClientVersionResolver) refresh(executorCommand string) {
-	version := fetchAmpCLINPMLatestVersion()
-	if version == "" {
-		version = ampInstalledClientVersion(executorCommand)
-	}
+func (r *ampClientVersionResolver) refresh() {
+	version := r.resolveLatestVersion()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if version != "" {
@@ -97,6 +123,20 @@ func (r *ampClientVersionResolver) refresh(executorCommand string) {
 		r.expiresAt = time.Now().Add(ampClientVersionCacheDuration)
 	}
 	r.refreshing = false
+}
+
+func (r *ampClientVersionResolver) resolveInstalledVersion(executorCommand string) string {
+	if r != nil && r.installedVersion != nil {
+		return r.installedVersion(executorCommand)
+	}
+	return ampInstalledClientVersion(executorCommand)
+}
+
+func (r *ampClientVersionResolver) resolveLatestVersion() string {
+	if r != nil && r.latestVersion != nil {
+		return r.latestVersion()
+	}
+	return fetchAmpCLINPMLatestVersion()
 }
 
 func (r *ampClientVersionResolver) set(version string, expiresAt time.Time) {
@@ -147,12 +187,28 @@ func ampInstalledClientVersion(executorCommand string) string {
 		log.Debugf("amp client version: installed amp lookup failed: %v", err)
 		return ""
 	}
-	out, err := exec.Command(command, "--version").Output()
+	ctx, cancel := context.WithTimeout(context.Background(), ampClientVersionProbeTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, command, "--version")
+	cmd.Env = ampClientVersionProbeEnv(os.Environ())
+	out, err := cmd.Output()
 	if err != nil {
 		log.Debugf("amp client version: %s --version failed: %v", command, err)
 		return ""
 	}
 	return ampClientVersionFromOutput(string(out))
+}
+
+func ampClientVersionProbeEnv(base []string) []string {
+	out := make([]string, 0, len(base))
+	for _, value := range base {
+		key, _, _ := strings.Cut(value, "=")
+		if key == "AMP_REMOTE_CONTROL_TERMINAL" {
+			continue
+		}
+		out = append(out, value)
+	}
+	return out
 }
 
 func ampClientVersionFromOutput(output string) string {
