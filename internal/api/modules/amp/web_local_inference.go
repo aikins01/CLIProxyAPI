@@ -236,7 +236,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	return fmt.Sprintf(`// ==UserScript==
 // @name CLIProxyAPI Amp Local Inference
 // @namespace https://github.com/router-for-me/CLIProxyAPI
-// @version 0.1.61
+// @version 0.1.62
 %s
 // @updateURL %s
 // @downloadURL %s
@@ -248,7 +248,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	"use strict";
 
 	const bridgeHeader = %s;
-	const userscriptVersion = "0.1.61";
+	const userscriptVersion = "0.1.62";
 	const apiKeyStorageKey = "cliproxyapi.ampLocalInference.apiKey";
 	const workingDirectoryStorageKey = "cliproxyapi.ampLocalInference.workingDirectory";
 	const selectedLocalProjectStorageKey = "cliproxyapi.ampLocalInference.selectedLocalProject";
@@ -3015,6 +3015,11 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	}
 
 	function localProjectPickerCurrentDirectory(projects) {
+		const selectedProject = selectedLocalProject();
+		const selectedDirectory = normalizeWorkingDirectory(selectedProject?.workingDirectory);
+		if (selectedProject?.name === "~" && selectedDirectory === defaultLocalWorkingDirectory()) {
+			return selectedDirectory;
+		}
 		const activeDirectory = activeThreadWorkingDirectory();
 		if (activeDirectory) {
 			return activeDirectory;
@@ -3049,6 +3054,11 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			}
 			const project = { name: "~", workingDirectory };
 			rememberSelectedLocalProject(project);
+			const list = commandPaletteList(picker);
+			if (list) {
+				setProjectPickerSelectedItem(list, noProject);
+				setLocalProjectPickerCurrentDirectory(list, workingDirectory);
+			}
 			refreshLocalProjectActivators(project, picker, true);
 			setTimeout(() => refreshLocalProjectActivators(project, picker, true), 50);
 			refreshCreateThreadProjectActivatorsAfterSelection(project);
@@ -3170,6 +3180,18 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		selected?.scrollIntoView?.({ block: "nearest" });
 	}
 
+	function setLocalProjectPickerCurrentDirectory(list, workingDirectory) {
+		const currentDirectory = normalizeWorkingDirectory(workingDirectory);
+		for (const item of list.querySelectorAll("[data-cliproxy-local-project-item]")) {
+			const isCurrent = normalizeWorkingDirectory(item.dataset.cliproxyLocalProjectWorkingDirectory) === currentDirectory;
+			item.dataset.cliproxyLocalProjectCurrent = isCurrent ? "1" : "0";
+			const check = item.querySelector('[data-slot="project-check"]');
+			if (check) {
+				check.textContent = isCurrent ? "✓" : "";
+			}
+		}
+	}
+
 	function activateLocalProjectPickerItem(picker, item, event) {
 		event?.preventDefault?.();
 		event?.stopPropagation?.();
@@ -3182,6 +3204,11 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			workingDirectory,
 		};
 		rememberSelectedLocalProject(selectedProject);
+		const list = commandPaletteList(picker);
+		if (list) {
+			setProjectPickerSelectedItem(list, item);
+			setLocalProjectPickerCurrentDirectory(list, workingDirectory);
+		}
 		refreshLocalProjectActivators(selectedProject, picker, true);
 		refreshCreateThreadProjectActivatorsAfterSelection(selectedProject);
 		setTimeout(() => {
@@ -3206,6 +3233,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			setProjectPickerSelectedItem(list, item);
 			const workingDirectory = normalizeWorkingDirectory(item.dataset?.cliproxyLocalProjectWorkingDirectory);
 			if (workingDirectory) {
+				setLocalProjectPickerCurrentDirectory(list, workingDirectory);
 				const selectedProject = {
 					name: projectPickerItemPrimaryText(item),
 					workingDirectory,
@@ -3221,6 +3249,11 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	}
 
 	function currentProjectPickerItem(picker) {
+		const selectedProject = selectedLocalProject();
+		const selectedDirectory = normalizeWorkingDirectory(selectedProject?.workingDirectory);
+		if (selectedProject?.name === "~" && selectedDirectory === defaultLocalWorkingDirectory()) {
+			return localProjectPickerNoProjectItem(picker);
+		}
 		const workingDirectory = localProjectPickerCurrentDirectory(localProjectsCache.projects);
 		const targetNames = new Set();
 		if (workingDirectory) {

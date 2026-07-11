@@ -4679,7 +4679,7 @@ func TestNeoRuntimeWebLocalInferenceOriginForwardsPluginMessages(t *testing.T) {
 		message := mapValue(payload["message"])
 		return message["type"] == "response" && message["id"] == "plugin-request-1"
 	})
-	if message := mapValue(observerResponse["message"]); message["type"] != "response" || message["result"] != "Bravo" {
+	if message := mapValue(observerResponse["message"]); message["type"] != "response" || message["result"] != "Bravo" || stringValue(mapValue(message["target"])["connectionId"]) != "web-choice-1" {
 		t.Fatalf("observer plugin response = %#v", observerResponse)
 	}
 	removed := waitForNeoMessageTypeWhere(t, observer, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
@@ -4696,6 +4696,7 @@ func TestNeoRuntimeWebLocalInferenceOriginForwardsPluginMessages(t *testing.T) {
 			"id":     "plugin-request-direct",
 			"method": "ui.confirm",
 			"params": map[string]any{"options": map[string]any{"title": "Confirm"}},
+			"target": map[string]any{"kind": "connection", "connectionId": "web-choice-direct"},
 		},
 	})
 	waitForNeoMessageTypeWhere(t, observer, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
@@ -4720,11 +4721,13 @@ func TestNeoRuntimeWebLocalInferenceOriginForwardsPluginMessages(t *testing.T) {
 	if request := mapValue(mapValue(mapValue(directSettled["message"])["data"])["request"]); request["status"] != "responded" || request["response"] != true {
 		t.Fatalf("direct settled plugin UI request = %#v", directSettled)
 	}
-	waitForNeoMessageTypeWhere(t, observer, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
+	directResponse := waitForNeoMessageTypeWhere(t, observer, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
 		message := mapValue(payload["message"])
-		return message["event"] == "plugin.ui.request_removed" && mapValue(message["data"])["requestId"] == "plugin-request-direct"
+		return message["type"] == "response" && message["id"] == "plugin-request-direct"
 	})
-
+	if connectionID := stringValue(mapValue(mapValue(directResponse["message"])["target"])["connectionId"]); connectionID != "web-choice-direct" {
+		t.Fatalf("direct plugin response target = %q; response=%#v", connectionID, directResponse)
+	}
 	actor.handle(map[string]any{
 		"type": "executor_plugin_message",
 		"message": map[string]any{

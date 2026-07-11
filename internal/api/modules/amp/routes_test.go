@@ -436,7 +436,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 	}
 	for _, want := range []string{
 		"// ==UserScript==",
-		"@version 0.1.61",
+		"@version 0.1.62",
 		"@match https://ampcode.com/*",
 		"@updateURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
 		"@downloadURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
@@ -451,7 +451,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"commandPaletteIntegrationCount",
 		"localThreadPickerOpenCount",
 		"removedLocalThreadControlCount",
-		`const userscriptVersion = "0.1.61"`,
+		`const userscriptVersion = "0.1.62"`,
 		"userscriptVersion",
 		"lastPatchedThreadActorBaseURL",
 		"lastPatchedThreadID",
@@ -499,6 +499,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"filterLocalProjectPickerItems",
 		"installLocalProjectNoProjectSelectionHandler",
 		"refreshCreateThreadProjectActivatorsAfterSelection",
+		"setLocalProjectPickerCurrentDirectory",
 		"localProjectPickerLooksLikeProjectPicker",
 		"if (!item || projectPickerItemSelected(item))",
 		"closeLocalProjectPickerViaNoProject",
@@ -878,7 +879,7 @@ if (typeof globalThis.btoa !== "function") {
 }
 require(scriptPath);
 const bridge = globalThis.__cliproxyAmpLocalInference;
-assert(bridge && bridge.userscriptVersion === "0.1.61", "bridge userscript version was not exposed");
+assert(bridge && bridge.userscriptVersion === "0.1.62", "bridge userscript version was not exposed");
 	globalThis.localStorage.setItem(bridge.localThreadIDsStorageKey, JSON.stringify([threadID, secondThreadID]));
 	globalThis.localStorage.setItem(bridge.apiKeyStorageKey, "local-key");
 	globalThis.localStorage.setItem(bridge.workingDirectoryStorageKey, createdThreadWorkDir);
@@ -1515,6 +1516,8 @@ noProject.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: tru
 await new Promise((resolve) => setTimeout(resolve, 75));
 const homeSelection = JSON.parse(globalThis.sessionStorage.getItem("cliproxyapi.ampLocalInference.selectedLocalProject"));
 assert(homeSelection.name === "~" && homeSelection.workingDirectory === "/Users/aikins01", "No Project did not select home: " + JSON.stringify(homeSelection));
+assert(noProject.getAttribute("aria-selected") === "true" && noProject.dataset.selected === "true", "No Project was not the selected picker item");
+assert(localItems.every((item) => item.dataset.cliproxyLocalProjectCurrent === "0" && !(item.querySelector('[data-slot="project-check"]')?.textContent || "")), "No Project left a local project check selected");
 assert(popupProjectButton.textContent.includes("~"), "No Project did not refresh project button: " + popupProjectButton.textContent);
 assert(unrelatedProjectButton.textContent === "Project: unrelated", "project refresh rewrote unrelated control: " + unrelatedProjectButton.textContent);
 unrelatedProjectButton.remove();

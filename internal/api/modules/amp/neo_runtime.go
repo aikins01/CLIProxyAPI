@@ -3563,6 +3563,9 @@ func (a *neoActor) settlePluginUIRequestFromResponse(message map[string]any) (bo
 		a.mu.Unlock()
 		return true, false
 	}
+	if target := mapValue(request["target"]); len(target) > 0 {
+		message["target"] = cloneNeoJSONMap(target)
+	}
 	if errText, ok := message["error"].(string); ok {
 		request["status"] = "errored"
 		request["error"] = errText
@@ -3636,7 +3639,7 @@ func (a *neoActor) respondToPluginUIRequest(message map[string]any) {
 		}})
 		return
 	}
-	response := map[string]any{"type": "response", "id": requestID}
+	response := map[string]any{"type": "response", "id": requestID, "target": cloneNeoJSONValue(request["target"])}
 	if errText, ok := params["error"].(string); ok {
 		request["status"] = "errored"
 		request["error"] = errText
