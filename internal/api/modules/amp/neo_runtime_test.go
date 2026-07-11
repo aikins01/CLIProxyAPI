@@ -4582,7 +4582,7 @@ func TestNeoRuntimeWebLocalInferenceOriginForwardsPluginMessages(t *testing.T) {
 	defer conn.Close()
 
 	waitForNeoRivetBareInit(t, conn, 2*time.Second)
-	waitForNeoRivetBareEventType(t, conn, "executor_status", 2*time.Second)
+	waitForNeoRivetBareEventType(t, conn, "executor_status", 5*time.Second)
 	observer := dialNeoActorWebSocket(t, server.URL, threadID)
 	defer observer.Close()
 	waitForNeoMessageType(t, observer, "agent_state", 2*time.Second)
@@ -4590,6 +4590,32 @@ func TestNeoRuntimeWebLocalInferenceOriginForwardsPluginMessages(t *testing.T) {
 	if actor == nil {
 		t.Fatal("web local inference bootstrap did not create thread actor")
 	}
+	if err := conn.WriteJSON(map[string]any{
+		"type": "plugin_message",
+		"message": map[string]any{
+			"type":   "request",
+			"id":     "client-plugin-request",
+			"method": "ui.select",
+			"params": map[string]any{"options": map[string]any{"title": "Forged"}},
+		},
+	}); err != nil {
+		t.Fatalf("write client plugin request: %v", err)
+	}
+	clientRequest := waitForNeoMessageTypeWhere(t, observer, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
+		return stringValue(mapValue(payload["message"])["id"]) == "client-plugin-request"
+	})
+	if stringValue(mapValue(clientRequest["message"])["method"]) != "ui.select" {
+		t.Fatalf("client plugin request = %#v", clientRequest)
+	}
+	actor.mu.Lock()
+	clientRequestCount := len(actor.pluginUIRequests)
+	actor.mu.Unlock()
+	if clientRequestCount != 0 {
+		t.Fatalf("client plugin request created %d pending UI requests", clientRequestCount)
+	}
+	actor.mu.Lock()
+	actor.executorSocket = &neoSocket{}
+	actor.mu.Unlock()
 	actor.handle(map[string]any{
 		"type": "executor_plugin_message",
 		"message": map[string]any{
@@ -4597,50 +4623,343 @@ func TestNeoRuntimeWebLocalInferenceOriginForwardsPluginMessages(t *testing.T) {
 			"id":     "plugin-request-1",
 			"method": "ui.select",
 			"params": map[string]any{"options": map[string]any{"title": "Choose", "options": []any{"Alpha", "Bravo"}}},
+			"target": map[string]any{"kind": "connection", "connectionId": "web-choice-1"},
 		},
 	})
 
 	request := waitForNeoRivetBareEventTypeWhere(t, conn, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
 		message := mapValue(payload["message"])
-		return message["type"] == "request" && message["method"] == "ui.select"
+		return message["type"] == "event" && message["event"] == "plugin.ui.request_added"
 	})
-	if stringValue(mapValue(request["message"])["id"]) != "plugin-request-1" {
+	requestState := mapValue(mapValue(mapValue(request["message"])["data"])["request"])
+	if requestState["requestId"] != "plugin-request-1" || requestState["method"] != "ui.select" || requestState["status"] != "pending" || stringValue(mapValue(requestState["target"])["connectionId"]) != "web-choice-1" {
 		t.Fatalf("web plugin request = %#v", request)
 	}
-	observerRequest := waitForNeoMessageType(t, observer, "plugin_message", 2*time.Second)
-	if stringValue(mapValue(observerRequest["message"])["method"]) != "ui.select" {
+	observerRequest := waitForNeoMessageTypeWhere(t, observer, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
+		return stringValue(mapValue(payload["message"])["event"]) == "plugin.ui.request_added"
+	})
+	if stringValue(mapValue(observerRequest["message"])["event"]) != "plugin.ui.request_added" {
 		t.Fatalf("observer plugin request = %#v", observerRequest)
+	}
+	replayObserver := dialNeoActorWebSocket(t, server.URL, threadID)
+	defer replayObserver.Close()
+	replayed := waitForNeoMessageTypeWhere(t, replayObserver, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
+		return stringValue(mapValue(payload["message"])["event"]) == "plugin.ui.snapshot"
+	})
+	replayedRequests := arrayValue(mapValue(mapValue(replayed["message"])["data"])["requests"])
+	if len(replayedRequests) != 1 || stringValue(mapValue(replayedRequests[0])["requestId"]) != "plugin-request-1" {
+		t.Fatalf("replayed plugin UI requests = %#v", replayed)
 	}
 
 	if err := conn.WriteJSON(map[string]any{
 		"type": "plugin_message",
 		"message": map[string]any{
-			"type":   "response",
-			"id":     "plugin-request-1",
-			"result": "Bravo",
+			"type":   "request",
+			"id":     "plugin-ui-respond-1",
+			"method": "plugin.ui.respond",
+			"params": map[string]any{"requestId": "plugin-request-1", "result": "Bravo"},
 		},
 	}); err != nil {
 		t.Fatalf("write web plugin response: %v", err)
 	}
-	observerResponse := waitForNeoMessageType(t, observer, "plugin_message", 2*time.Second)
+	settled := waitForNeoMessageTypeWhere(t, observer, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
+		return stringValue(mapValue(payload["message"])["event"]) == "plugin.ui.request_settled"
+	})
+	settledState := mapValue(mapValue(mapValue(settled["message"])["data"])["request"])
+	if settledState["status"] != "responded" || settledState["response"] != "Bravo" {
+		t.Fatalf("settled plugin UI request = %#v", settled)
+	}
+	actor.mu.Lock()
+	_, settledRequestRetained := actor.pluginUIRequests["plugin-request-1"]
+	actor.mu.Unlock()
+	if settledRequestRetained {
+		t.Fatal("settled plugin UI request remained eligible for cleanup")
+	}
+	observerResponse := waitForNeoMessageTypeWhere(t, observer, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
+		message := mapValue(payload["message"])
+		return message["type"] == "response" && message["id"] == "plugin-request-1"
+	})
 	if message := mapValue(observerResponse["message"]); message["type"] != "response" || message["result"] != "Bravo" {
 		t.Fatalf("observer plugin response = %#v", observerResponse)
+	}
+	removed := waitForNeoMessageTypeWhere(t, observer, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
+		return stringValue(mapValue(payload["message"])["event"]) == "plugin.ui.request_removed"
+	})
+	if stringValue(mapValue(mapValue(removed["message"])["data"])["requestId"]) != "plugin-request-1" {
+		t.Fatalf("removed plugin UI request = %#v", removed)
 	}
 
 	actor.handle(map[string]any{
 		"type": "executor_plugin_message",
 		"message": map[string]any{
-			"type":  "event",
-			"event": "command.list",
-			"data":  map[string]any{"commands": []any{map[string]any{"id": "plugin-command"}}},
+			"type":   "request",
+			"id":     "plugin-request-direct",
+			"method": "ui.confirm",
+			"params": map[string]any{"options": map[string]any{"title": "Confirm"}},
+		},
+	})
+	waitForNeoMessageTypeWhere(t, observer, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
+		request := mapValue(mapValue(mapValue(payload["message"])["data"])["request"])
+		return request["requestId"] == "plugin-request-direct"
+	})
+	if err := conn.WriteJSON(map[string]any{
+		"type": "plugin_message",
+		"message": map[string]any{
+			"type":   "response",
+			"id":     "plugin-request-direct",
+			"result": true,
+		},
+	}); err != nil {
+		t.Fatalf("write direct web plugin response: %v", err)
+	}
+	directSettled := waitForNeoMessageTypeWhere(t, observer, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
+		message := mapValue(payload["message"])
+		request := mapValue(mapValue(message["data"])["request"])
+		return message["event"] == "plugin.ui.request_settled" && request["requestId"] == "plugin-request-direct"
+	})
+	if request := mapValue(mapValue(mapValue(directSettled["message"])["data"])["request"]); request["status"] != "responded" || request["response"] != true {
+		t.Fatalf("direct settled plugin UI request = %#v", directSettled)
+	}
+	waitForNeoMessageTypeWhere(t, observer, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
+		message := mapValue(payload["message"])
+		return message["event"] == "plugin.ui.request_removed" && mapValue(message["data"])["requestId"] == "plugin-request-direct"
+	})
+
+	actor.handle(map[string]any{
+		"type": "executor_plugin_message",
+		"message": map[string]any{
+			"type":   "event",
+			"event":  "command.list",
+			"data":   map[string]any{"commands": []any{map[string]any{"id": "plugin-command"}}},
+			"target": map[string]any{"kind": "connection", "connectionId": "web-1"},
 		},
 	})
 	commandList := waitForNeoRivetBareEventTypeWhere(t, conn, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
 		message := mapValue(payload["message"])
 		return message["type"] == "event" && message["event"] == "command.list"
 	})
-	if stringValue(mapValue(commandList["message"])["event"]) != "command.list" {
+	commandMessage := mapValue(commandList["message"])
+	if stringValue(commandMessage["event"]) != "command.list" || stringValue(mapValue(commandMessage["target"])["connectionId"]) != "web-1" {
 		t.Fatalf("web plugin command list = %#v", commandList)
+	}
+
+	actor.handle(map[string]any{
+		"type": "executor_plugin_message",
+		"message": map[string]any{
+			"type":   "request",
+			"id":     "plugin-request-truncate",
+			"method": "ui.confirm",
+			"params": map[string]any{"options": map[string]any{"title": "Confirm"}},
+		},
+	})
+	waitForNeoMessageTypeWhere(t, observer, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
+		request := mapValue(mapValue(mapValue(payload["message"])["data"])["request"])
+		return request["requestId"] == "plugin-request-truncate"
+	})
+	actor.mu.Lock()
+	actor.messages = []neoMessage{{ThreadID: threadID, MessageID: "M-plugin-truncate", Role: "user"}}
+	actor.mu.Unlock()
+	actor.handleBinaryThreadTruncate(map[string]any{"type": "thread:truncate", "fromIndex": 0})
+	truncateResponse := waitForNeoMessageTypeWhere(t, observer, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
+		message := mapValue(payload["message"])
+		return message["type"] == "response" && message["id"] == "plugin-request-truncate"
+	})
+	if stringValue(mapValue(truncateResponse["message"])["error"]) == "" {
+		t.Fatalf("thread truncate did not reject plugin UI request = %#v", truncateResponse)
+	}
+	waitForNeoMessageTypeWhere(t, observer, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
+		message := mapValue(payload["message"])
+		return message["event"] == "plugin.ui.request_removed" && mapValue(message["data"])["requestId"] == "plugin-request-truncate"
+	})
+
+	actor.handle(map[string]any{
+		"type": "executor_plugin_message",
+		"message": map[string]any{
+			"target":  "web",
+			"payload": map[string]any{"notification": "plugin-ready"},
+		},
+	})
+	notification := waitForNeoRivetBareEventTypeWhere(t, conn, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
+		message := mapValue(payload["message"])
+		return message["target"] == "web"
+	})
+	if stringValue(mapValue(mapValue(notification["message"])["payload"])["notification"]) != "plugin-ready" {
+		t.Fatalf("non-standard executor plugin message = %#v", notification)
+	}
+
+	actor.handle(map[string]any{
+		"type": "executor_plugin_message",
+		"message": map[string]any{
+			"type":   "request",
+			"id":     "plugin-request-interrupt",
+			"method": "ui.input",
+			"params": map[string]any{"options": map[string]any{"title": "Input"}},
+		},
+	})
+	waitForNeoMessageTypeWhere(t, observer, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
+		request := mapValue(mapValue(mapValue(payload["message"])["data"])["request"])
+		return request["requestId"] == "plugin-request-interrupt"
+	})
+	actor.mu.Lock()
+	actor.currentInference = &neoInferenceInflight{messageID: "M-plugin-interrupt"}
+	actor.agentState = "running_tools"
+	actor.retryScheduled = true
+	actor.mu.Unlock()
+	actor.interruptActiveToolResultsForBinaryUserMessage()
+	interruptResponse := waitForNeoMessageTypeWhere(t, observer, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
+		message := mapValue(payload["message"])
+		return message["type"] == "response" && message["id"] == "plugin-request-interrupt"
+	})
+	if stringValue(mapValue(interruptResponse["message"])["error"]) == "" {
+		t.Fatalf("plugin UI interruption did not reject request = %#v", interruptResponse)
+	}
+	waitForNeoMessageTypeWhere(t, observer, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
+		message := mapValue(payload["message"])
+		return message["event"] == "plugin.ui.request_removed" && mapValue(message["data"])["requestId"] == "plugin-request-interrupt"
+	})
+	actor.mu.Lock()
+	interruptedInference := actor.currentInference
+	interruptedState := actor.agentState
+	interruptedRetry := actor.retryScheduled
+	actor.mu.Unlock()
+	if interruptedInference != nil || interruptedState != "idle" || interruptedRetry {
+		t.Fatalf("plugin UI interruption left active work inference=%#v state=%q retry=%v", interruptedInference, interruptedState, interruptedRetry)
+	}
+
+	actor.handle(map[string]any{
+		"type": "executor_plugin_message",
+		"message": map[string]any{
+			"type":   "request",
+			"id":     "plugin-request-disconnect",
+			"method": "ui.input",
+			"params": map[string]any{"options": map[string]any{"title": "Input"}},
+		},
+	})
+	waitForNeoMessageTypeWhere(t, observer, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
+		request := mapValue(mapValue(mapValue(payload["message"])["data"])["request"])
+		return request["requestId"] == "plugin-request-disconnect"
+	})
+	actor.disconnectExecutorForStop()
+	disconnectResponse := waitForNeoMessageTypeWhere(t, observer, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
+		message := mapValue(payload["message"])
+		return message["type"] == "response" && message["id"] == "plugin-request-disconnect"
+	})
+	if stringValue(mapValue(disconnectResponse["message"])["error"]) == "" {
+		t.Fatalf("executor cleanup did not reject plugin UI request = %#v", disconnectResponse)
+	}
+	waitForNeoMessageTypeWhere(t, observer, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
+		message := mapValue(payload["message"])
+		return message["event"] == "plugin.ui.request_removed" && mapValue(message["data"])["requestId"] == "plugin-request-disconnect"
+	})
+	cleanObserver := dialNeoActorWebSocket(t, server.URL, threadID)
+	defer cleanObserver.Close()
+	cleanSnapshot := waitForNeoMessageTypeWhere(t, cleanObserver, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
+		return stringValue(mapValue(payload["message"])["event"]) == "plugin.ui.snapshot"
+	})
+	if requests := arrayValue(mapValue(mapValue(cleanSnapshot["message"])["data"])["requests"]); len(requests) != 0 {
+		t.Fatalf("plugin UI requests survived executor cleanup = %#v", cleanSnapshot)
+	}
+}
+
+func TestNeoActorPluginUIRequestCountsAsActiveExecutorWork(t *testing.T) {
+	actor := newNeoActor(newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{ExecutorIdleTimeoutSeconds: 60}}}), "actor", "threadActor", "T-plugin-ui", "T-plugin-ui", nil, nil)
+	actor.mu.Lock()
+	actor.executorID = "cli-headless-plugin-ui"
+	actor.executorReady = true
+	actor.agentState = "idle"
+	actor.spawnedExecutors = map[string]*neoSpawnedExecutor{"spawn": {}}
+	actor.pluginUIRequests["plugin-request"] = map[string]any{"requestId": "plugin-request", "status": "pending"}
+	active := actor.executorWorkActiveLocked()
+	idleEligible := actor.executorIdleStopEligibleLocked()
+	reconnectingRejected := actor.shouldRejectReconnectingExecutorLocked("another-executor")
+	actor.mu.Unlock()
+
+	if !active {
+		t.Fatal("pending plugin UI request was not active executor work")
+	}
+	if idleEligible {
+		t.Fatal("executor with pending plugin UI request was idle-stop eligible")
+	}
+	if !reconnectingRejected {
+		t.Fatal("pending plugin UI request allowed a replacement executor")
+	}
+	stateRequests := arrayValue(actor.stateSnapshotResponse()["pluginUIRequests"])
+	if len(stateRequests) != 1 || stringValue(mapValue(stateRequests[0])["requestId"]) != "plugin-request" {
+		t.Fatalf("state snapshot plugin UI requests = %#v", stateRequests)
+	}
+	actor.respondToPluginUIRequest(map[string]any{
+		"id":     "response-during-reconnect",
+		"params": map[string]any{"requestId": "plugin-request", "result": "choice"},
+	})
+	actor.mu.Lock()
+	reconnectingRequest := cloneNeoJSONMap(actor.pluginUIRequests["plugin-request"])
+	actor.mu.Unlock()
+	if stringValue(reconnectingRequest["status"]) != "pending" {
+		t.Fatalf("response without executor settled plugin UI request: %#v", reconnectingRequest)
+	}
+	actor.handleProtocolPluginMessage(map[string]any{"message": map[string]any{
+		"type": "response", "id": "plugin-request", "result": "direct-choice",
+	}})
+	actor.mu.Lock()
+	directReconnectRequest := cloneNeoJSONMap(actor.pluginUIRequests["plugin-request"])
+	actor.mu.Unlock()
+	if stringValue(directReconnectRequest["status"]) != "pending" {
+		t.Fatalf("direct response without executor settled plugin UI request: %#v", directReconnectRequest)
+	}
+	actor.receiveUserMessage(nil, map[string]any{
+		"type":      "client_append_user_msg",
+		"messageId": "M-0000000000000000000002",
+		"content":   []any{map[string]any{"type": "text", "text": "wait for the choice"}},
+	})
+	actor.mu.Lock()
+	queuedMessages := len(actor.queue)
+	startedMessages := len(actor.messages)
+	actor.mu.Unlock()
+	if queuedMessages != 1 || startedMessages != 0 {
+		t.Fatalf("pending plugin UI request did not gate user message: queued=%d started=%d", queuedMessages, startedMessages)
+	}
+	actor.dequeueQueuedMessage()
+	actor.mu.Lock()
+	queuedAfterDequeue := len(actor.queue)
+	startedAfterDequeue := len(actor.messages)
+	actor.queue = nil
+	actor.mu.Unlock()
+	if queuedAfterDequeue != 1 || startedAfterDequeue != 0 {
+		t.Fatalf("plugin UI blocked dequeue lost work: queued=%d started=%d", queuedAfterDequeue, startedAfterDequeue)
+	}
+
+	actor.mu.Lock()
+	delete(actor.pluginUIRequests, "plugin-request")
+	generation := actor.executorIdleGeneration
+	actor.mu.Unlock()
+	actor.broadcastPluginUIRequestRemovals([]string{"plugin-request"})
+	actor.mu.Lock()
+	rescheduledGeneration := actor.executorIdleGeneration
+	actor.mu.Unlock()
+	if rescheduledGeneration <= generation {
+		t.Fatalf("plugin UI cleanup did not reschedule idle stop: generation=%d want > %d", rescheduledGeneration, generation)
+	}
+}
+
+func TestNeoActorPluginUICleanupCompletesDeferredExecutorHandoff(t *testing.T) {
+	actor := newNeoActor(newNeoRuntime(&config.Config{}), "actor", "threadActor", "T-plugin-handoff", "T-plugin-handoff", nil, nil)
+	socket := &neoSocket{}
+	actor.mu.Lock()
+	actor.sockets[socket] = struct{}{}
+	actor.pendingExecutorHandoff = &neoPendingExecutorHandoff{
+		socket: socket,
+		msg:    map[string]any{"executorId": "replacement-executor"},
+	}
+	actor.mu.Unlock()
+
+	actor.broadcastPluginUIRequestRemovals([]string{"plugin-request"})
+
+	actor.mu.Lock()
+	pending := actor.pendingExecutorHandoff
+	executorID := actor.executorID
+	actor.mu.Unlock()
+	if pending != nil || executorID != "replacement-executor" {
+		t.Fatalf("plugin UI cleanup left deferred handoff pending=%#v executorID=%q", pending, executorID)
 	}
 }
 

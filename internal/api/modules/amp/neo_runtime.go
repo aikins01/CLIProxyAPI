@@ -2171,6 +2171,7 @@ func (a *neoActor) hasLocalThreadStateLocked() bool {
 		len(a.queue) > 0 ||
 		len(a.pendingTools) > 0 ||
 		len(a.approvalQueue) > 0 ||
+		len(a.pluginUIRequests) > 0 ||
 		len(a.artifacts) > 0 ||
 		len(a.kv) > 0 ||
 		len(a.compactionRecords) > 0 ||
@@ -2474,6 +2475,7 @@ type neoActor struct {
 	maxTokens                   any
 	mainThreadID                string
 	notificationSubs            map[string]map[string]any
+	pluginUIRequests            map[string]map[string]any
 	userRunners                 map[string]neoUserExecutorRunner
 	lastUsed                    time.Time
 	syncRunning                 bool
@@ -2631,6 +2633,7 @@ func newNeoActor(rt *neoRuntime, id, name, key, threadID string, record map[stri
 		meta:                   map[string]any{},
 		debug:                  map[string]any{},
 		notificationSubs:       map[string]map[string]any{},
+		pluginUIRequests:       map[string]map[string]any{},
 		lastUsed:               time.Now(),
 		seq:                    1,
 		agentState:             "idle",
@@ -2723,12 +2726,13 @@ func (a *neoActor) stopSpawnedExecutorsForRebind() {
 	a.executorSocket = nil
 	a.executorBootstrapComplete = false
 	a.executorResumeBootstrap = false
-	a.clearExecutorWorkForDisconnectLocked(true)
+	cleanup := a.clearExecutorWorkForDisconnectLocked(true)
 	a.agentState = "idle"
 	a.mu.Unlock()
 	for _, executor := range executors {
 		executor.stop()
 	}
+	a.broadcastExecutorWorkCleanup(cleanup)
 }
 
 func (a *neoActor) closeSocketsWithOptions(closeReason string, transportClose bool) {
@@ -2773,7 +2777,7 @@ func (a *neoActor) prunable(now time.Time, ttl time.Duration, localThreadSnapsho
 	if len(a.sockets) > 0 || a.executorID != "" || a.agentState != "idle" || a.syncRunning || a.syncPending || a.localSyncRunning || a.localSyncPending {
 		return false
 	}
-	if len(a.pendingTools) > 0 || len(a.approvalQueue) > 0 || len(a.queue) > 0 || len(a.spawnedExecutors) > 0 || a.currentInference != nil || a.pendingInference != nil || a.retryScheduled || a.compacting {
+	if len(a.pendingTools) > 0 || len(a.approvalQueue) > 0 || len(a.pluginUIRequests) > 0 || len(a.queue) > 0 || len(a.spawnedExecutors) > 0 || a.currentInference != nil || a.pendingInference != nil || a.retryScheduled || a.compacting {
 		return false
 	}
 	threadID := firstNonEmptyString(a.threadID, a.key)
@@ -3052,7 +3056,7 @@ func (a *neoActor) handleForSocket(socket *neoSocket, msg map[string]any) any {
 	case "client_upload_assets_result":
 		a.broadcast(neoRetypedMessage(msg, "executor_upload_assets_result"))
 	case "executor_plugin_message":
-		a.broadcast(map[string]any{"type": "plugin_message", "message": normalizeNeoExecutorPluginMessage(msg)})
+		a.handleExecutorPluginMessage(normalizeNeoExecutorPluginMessage(msg))
 	case "plugin_message":
 		a.handleProtocolPluginMessage(msg)
 	case "executor_artifact_upsert":
@@ -3491,12 +3495,250 @@ func (a *neoActor) handleProtocolQueuedMessageRemoved(msg map[string]any) {
 	}
 }
 
-func (a *neoActor) handleProtocolPluginMessage(msg map[string]any) {
+func (a *neoActor) handleProtocolPluginMessage(msg map[string]any) bool {
 	message, ok := normalizeNeoProtocolPluginMessage(msg["message"])
 	if !ok {
-		return
+		return false
+	}
+	if message["type"] == "response" {
+		matched, settled := a.settlePluginUIRequestFromResponse(message)
+		if matched && !settled {
+			return true
+		}
+	}
+	if message["type"] == "request" {
+		switch stringValue(message["method"]) {
+		case "plugin.ui.respond":
+			a.respondToPluginUIRequest(message)
+			return true
+		}
 	}
 	a.broadcast(map[string]any{"type": "plugin_message", "message": message})
+	if message["type"] == "response" {
+		a.scheduleExecutorIdleStopIfNeeded()
+		a.maybeCompletePendingExecutorHandoff()
+		a.drainReadyWork()
+	}
+	return true
+}
+
+func (a *neoActor) handleExecutorPluginMessage(raw any) {
+	message, ok := normalizeNeoProtocolPluginMessage(raw)
+	if ok && message["type"] == "request" {
+		if target, exists := mapValue(raw)["target"]; exists {
+			message["target"] = cloneNeoJSONValue(target)
+		}
+		switch stringValue(message["method"]) {
+		case "ui.input", "ui.confirm", "ui.select":
+			a.addPluginUIRequest(message)
+			return
+		case "plugin.ui.respond":
+			a.respondToPluginUIRequest(message)
+			return
+		}
+	}
+	if ok && message["type"] == "response" {
+		a.settlePluginUIRequestFromResponse(message)
+	}
+	a.broadcast(map[string]any{"type": "plugin_message", "message": raw})
+	if ok && message["type"] == "response" {
+		a.scheduleExecutorIdleStopIfNeeded()
+		a.maybeCompletePendingExecutorHandoff()
+		a.drainReadyWork()
+	}
+}
+
+func (a *neoActor) settlePluginUIRequestFromResponse(message map[string]any) (bool, bool) {
+	requestID := stringValue(message["id"])
+	if requestID == "" {
+		return false, false
+	}
+	a.mu.Lock()
+	request := cloneNeoJSONMap(a.pluginUIRequests[requestID])
+	if len(request) == 0 || stringValue(request["status"]) != "pending" {
+		a.mu.Unlock()
+		return false, false
+	}
+	if a.executorSocket == nil {
+		a.mu.Unlock()
+		return true, false
+	}
+	if errText, ok := message["error"].(string); ok {
+		request["status"] = "errored"
+		request["error"] = errText
+	} else {
+		request["status"] = "responded"
+		if result, exists := message["result"]; exists {
+			request["response"] = cloneNeoJSONValue(result)
+		}
+	}
+	request["updatedAt"] = time.Now().UTC().Format(time.RFC3339Nano)
+	delete(a.pluginUIRequests, requestID)
+	a.executorIdleGeneration++
+	a.mu.Unlock()
+	a.broadcast(neoPluginUIStateEvent("plugin.ui.request_settled", map[string]any{"request": request}))
+	a.broadcast(neoPluginUIStateEvent("plugin.ui.request_removed", map[string]any{"requestId": requestID}))
+	return true, true
+}
+
+func (a *neoActor) addPluginUIRequest(message map[string]any) {
+	requestID := stringValue(message["id"])
+	method := stringValue(message["method"])
+	if requestID == "" || !neoPluginUIMethod(method) {
+		return
+	}
+	invocation := normalizeNeoPluginUIInvocation(message["invocation"], requestID)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	request := map[string]any{
+		"requestId":  requestID,
+		"method":     method,
+		"params":     cloneNeoJSONValue(message["params"]),
+		"invocation": invocation,
+		"target":     normalizeNeoPluginUITarget(message["target"]),
+		"status":     "pending",
+		"createdAt":  now,
+		"updatedAt":  now,
+	}
+	a.mu.Lock()
+	if existing := a.pluginUIRequests[requestID]; len(existing) > 0 {
+		request["createdAt"] = existing["createdAt"]
+	}
+	a.pluginUIRequests[requestID] = request
+	a.executorIdleGeneration++
+	a.mu.Unlock()
+	a.broadcast(neoPluginUIStateEvent("plugin.ui.request_added", map[string]any{"request": request}))
+}
+
+func (a *neoActor) inferenceStartBlockedLocked() bool {
+	return a.agentState != "idle" || len(a.pluginUIRequests) > 0
+}
+
+func (a *neoActor) respondToPluginUIRequest(message map[string]any) {
+	responseID := stringValue(message["id"])
+	params := mapValue(message["params"])
+	requestID := stringValue(params["requestId"])
+	if responseID == "" || requestID == "" {
+		return
+	}
+	a.mu.Lock()
+	request := cloneNeoJSONMap(a.pluginUIRequests[requestID])
+	if len(request) == 0 || stringValue(request["status"]) != "pending" {
+		a.mu.Unlock()
+		a.broadcast(map[string]any{"type": "plugin_message", "message": map[string]any{
+			"type": "response", "id": responseID, "result": map[string]any{"status": "not_pending"},
+		}})
+		return
+	}
+	if a.executorSocket == nil {
+		a.mu.Unlock()
+		a.broadcast(map[string]any{"type": "plugin_message", "message": map[string]any{
+			"type": "response", "id": responseID, "result": map[string]any{"status": "executor_unavailable"},
+		}})
+		return
+	}
+	response := map[string]any{"type": "response", "id": requestID}
+	if errText, ok := params["error"].(string); ok {
+		request["status"] = "errored"
+		request["error"] = errText
+		response["error"] = errText
+	} else {
+		request["status"] = "responded"
+		if result, exists := params["result"]; exists {
+			request["response"] = cloneNeoJSONValue(result)
+			response["result"] = cloneNeoJSONValue(result)
+		}
+	}
+	request["updatedAt"] = time.Now().UTC().Format(time.RFC3339Nano)
+	delete(a.pluginUIRequests, requestID)
+	a.executorIdleGeneration++
+	a.mu.Unlock()
+
+	a.broadcast(neoPluginUIStateEvent("plugin.ui.request_settled", map[string]any{"request": request}))
+	a.broadcast(map[string]any{"type": "plugin_message", "message": response})
+	a.broadcast(map[string]any{"type": "plugin_message", "message": map[string]any{
+		"type": "response", "id": responseID, "result": map[string]any{"status": "accepted", "state": request},
+	}})
+	a.broadcast(neoPluginUIStateEvent("plugin.ui.request_removed", map[string]any{"requestId": requestID}))
+	a.scheduleExecutorIdleStopIfNeeded()
+	a.maybeCompletePendingExecutorHandoff()
+	a.drainReadyWork()
+}
+
+func neoPluginUIMethod(method string) bool {
+	switch method {
+	case "ui.input", "ui.confirm", "ui.select":
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeNeoPluginUIInvocation(raw any, fallbackID string) map[string]any {
+	invocation := mapValue(raw)
+	kind := stringValue(invocation["kind"])
+	id := stringValue(invocation["id"])
+	if (kind != "tool" && kind != "command") || id == "" {
+		return map[string]any{"kind": "tool", "id": fallbackID}
+	}
+	return map[string]any{"kind": kind, "id": id}
+}
+
+func normalizeNeoPluginUITarget(raw any) map[string]any {
+	target := mapValue(raw)
+	if stringValue(target["kind"]) == "connection" {
+		if connectionID := stringValue(target["connectionId"]); connectionID != "" {
+			return map[string]any{"kind": "connection", "connectionId": connectionID}
+		}
+	}
+	return map[string]any{"kind": "interactive"}
+}
+
+func neoPluginUIStateEvent(event string, data map[string]any) map[string]any {
+	return map[string]any{"type": "plugin_message", "message": map[string]any{
+		"type": "event", "event": event, "data": data,
+	}}
+}
+
+func (a *neoActor) pluginUIRequestListLocked() []any {
+	requests := make([]map[string]any, 0, len(a.pluginUIRequests))
+	for _, request := range a.pluginUIRequests {
+		if stringValue(request["status"]) == "pending" {
+			requests = append(requests, cloneNeoJSONMap(request))
+		}
+	}
+	sort.Slice(requests, func(i, j int) bool {
+		return stringValue(requests[i]["requestId"]) < stringValue(requests[j]["requestId"])
+	})
+	out := make([]any, 0, len(requests))
+	for _, request := range requests {
+		out = append(out, request)
+	}
+	return out
+}
+
+func (a *neoActor) clearPluginUIRequestsLocked() []string {
+	requestIDs := make([]string, 0, len(a.pluginUIRequests))
+	for requestID := range a.pluginUIRequests {
+		requestIDs = append(requestIDs, requestID)
+	}
+	sort.Strings(requestIDs)
+	a.pluginUIRequests = map[string]map[string]any{}
+	if len(requestIDs) > 0 {
+		a.executorIdleGeneration++
+	}
+	return requestIDs
+}
+
+func (a *neoActor) broadcastPluginUIRequestRemovals(requestIDs []string) {
+	for _, requestID := range requestIDs {
+		a.broadcast(map[string]any{"type": "plugin_message", "message": map[string]any{
+			"type": "response", "id": requestID, "error": "Plugin UI request cancelled",
+		}})
+		a.broadcast(neoPluginUIStateEvent("plugin.ui.request_removed", map[string]any{"requestId": requestID}))
+	}
+	if len(requestIDs) > 0 && !a.maybeCompletePendingExecutorHandoff() {
+		a.scheduleExecutorIdleStopIfNeeded()
+	}
 }
 
 func normalizeNeoExecutorPluginMessage(msg map[string]any) any {
@@ -4036,7 +4278,7 @@ func (a *neoActor) executorConnect(msg map[string]any) {
 func (a *neoActor) executorConnectForSocket(socket *neoSocket, msg map[string]any) {
 	a.mu.Lock()
 	incomingExecutorID := firstNonEmptyString(msg["clientId"], msg["executorId"])
-	resumePendingWork := incomingExecutorID != "" && incomingExecutorID == a.resumeExecutorID && (len(a.pendingTools) > 0 || len(a.approvalQueue) > 0)
+	resumePendingWork := incomingExecutorID != "" && incomingExecutorID == a.resumeExecutorID && (len(a.pendingTools) > 0 || len(a.approvalQueue) > 0 || len(a.pluginUIRequests) > 0)
 	if a.shouldDeferConcurrentExecutorHandoffLocked(socket, msg) {
 		a.pendingExecutorHandoff = &neoPendingExecutorHandoff{
 			socket:     socket,
@@ -4060,7 +4302,7 @@ func (a *neoActor) executorConnectForSocket(socket *neoSocket, msg map[string]an
 		(socket != nil && a.executorSocket != nil && a.executorSocket != socket) ||
 		a.executorReady ||
 		a.executorBootstrapComplete ||
-		(!resumePendingWork && (len(a.pendingTools) > 0 || len(a.approvalQueue) > 0 || a.currentInference != nil)) {
+		(!resumePendingWork && (len(a.pendingTools) > 0 || len(a.approvalQueue) > 0 || len(a.pluginUIRequests) > 0 || a.currentInference != nil)) {
 		cleanup = a.clearStaleExecutorWorkForDisconnectLocked()
 	}
 	clientID := firstNonEmptyString(incomingExecutorID, a.executorID)
@@ -4219,7 +4461,7 @@ func (a *neoActor) shouldRejectReconnectingExecutorLocked(incomingExecutorID str
 	return a.executorSocket == nil &&
 		a.executorID != "" &&
 		incomingExecutorID != a.executorID &&
-		(len(a.pendingTools) > 0 || len(a.approvalQueue) > 0)
+		(len(a.pendingTools) > 0 || len(a.approvalQueue) > 0 || len(a.pluginUIRequests) > 0)
 }
 
 func (a *neoActor) shouldDeferConcurrentExecutorHandoffLocked(socket *neoSocket, msg map[string]any) bool {
@@ -4243,7 +4485,7 @@ func (a *neoActor) currentExecutorIsSpawnedHeadlessLocked() bool {
 }
 
 func (a *neoActor) executorWorkActiveLocked() bool {
-	if len(a.pendingTools) > 0 || len(a.approvalQueue) > 0 || a.currentInference != nil {
+	if len(a.pendingTools) > 0 || len(a.approvalQueue) > 0 || len(a.pluginUIRequests) > 0 || a.currentInference != nil {
 		return true
 	}
 	switch normalizeNeoAgentState(a.agentState) {
@@ -4383,10 +4625,11 @@ func (a *neoActor) disconnectExecutorForStop() {
 	a.executorSocket = nil
 	a.executorBootstrapComplete = false
 	a.executorResumeBootstrap = false
-	a.clearExecutorWorkForDisconnectLocked(false)
+	cleanup := a.clearExecutorWorkForDisconnectLocked(false)
 	a.pendingInference = nil
 	a.agentState = "idle"
 	a.mu.Unlock()
+	a.broadcastExecutorWorkCleanup(cleanup)
 }
 
 func (a *neoActor) deferExecutorDisconnectForSocket(socket *neoSocket, executorID string) bool {
@@ -4394,7 +4637,7 @@ func (a *neoActor) deferExecutorDisconnectForSocket(socket *neoSocket, executorI
 		return false
 	}
 	a.mu.Lock()
-	if a.executorSocket != socket || (len(a.pendingTools) == 0 && len(a.approvalQueue) == 0) {
+	if a.executorSocket != socket || (len(a.pendingTools) == 0 && len(a.approvalQueue) == 0 && len(a.pluginUIRequests) == 0) {
 		a.mu.Unlock()
 		return false
 	}
@@ -4506,16 +4749,18 @@ func (a *neoActor) executorDisconnectedForSocket(socket *neoSocket, msg map[stri
 }
 
 type neoExecutorWorkCleanup struct {
-	pending         []string
-	hadApprovals    bool
-	updateEvents    []map[string]any
-	changed         bool
-	agentMode       string
-	reasoningEffort string
+	pending            []string
+	pluginUIRequestIDs []string
+	hadApprovals       bool
+	updateEvents       []map[string]any
+	changed            bool
+	agentMode          string
+	reasoningEffort    string
 }
 
 func (a *neoActor) clearExecutorWorkForDisconnectLocked(preserveResume bool) neoExecutorWorkCleanup {
 	pending := a.pendingToolIDsLocked()
+	pluginUIRequestIDs := a.clearPluginUIRequestsLocked()
 	hadPending := len(a.pendingTools) > 0
 	hadApprovals := len(a.approvalQueue) > 0
 	hadCurrentInference := a.currentInference != nil
@@ -4540,14 +4785,15 @@ func (a *neoActor) clearExecutorWorkForDisconnectLocked(preserveResume bool) neo
 		a.pendingInference = resume
 	}
 	updateEvents = append(finalizeEvents, updateEvents...)
-	changed := hadPending || hadApprovals || hadCurrentInference || len(updateEvents) > 0 || stateChanged
+	changed := hadPending || len(pluginUIRequestIDs) > 0 || hadApprovals || hadCurrentInference || len(updateEvents) > 0 || stateChanged
 	return neoExecutorWorkCleanup{
-		pending:         pending,
-		hadApprovals:    hadApprovals,
-		updateEvents:    updateEvents,
-		changed:         changed,
-		agentMode:       a.currentAgentMode,
-		reasoningEffort: a.currentReasoningEffort,
+		pending:            pending,
+		pluginUIRequestIDs: pluginUIRequestIDs,
+		hadApprovals:       hadApprovals,
+		updateEvents:       updateEvents,
+		changed:            changed,
+		agentMode:          a.currentAgentMode,
+		reasoningEffort:    a.currentReasoningEffort,
 	}
 }
 
@@ -4612,6 +4858,7 @@ func (a *neoActor) broadcastExecutorWorkCleanup(cleanup neoExecutorWorkCleanup) 
 	for _, toolCallID := range cleanup.pending {
 		a.broadcast(map[string]any{"type": "executor_tool_lease_revoked", "toolCallId": toolCallID, "reason": "executor_disconnected"})
 	}
+	a.broadcastPluginUIRequestRemovals(cleanup.pluginUIRequestIDs)
 	if cleanup.hadApprovals {
 		a.broadcast(toolApprovalQueuePayload(nil))
 	}
@@ -4832,7 +5079,7 @@ func (a *neoActor) shouldSpawnWebLocalExecutorForPendingWork() bool {
 	threadID := firstNonEmptyString(a.threadID, a.key)
 	hasPendingWork := len(a.queue) > 0 || a.pendingInference != nil || a.retryScheduled
 	executorInFlight := a.executorReady || a.executorID != "" || a.executorBootstrapComplete || len(a.spawnedExecutors) > 0
-	agentIdle := normalizeNeoAgentState(a.agentState) == "idle"
+	agentIdle := normalizeNeoAgentState(a.agentState) == "idle" && len(a.pluginUIRequests) == 0
 	a.mu.Unlock()
 	if !strings.EqualFold(bootstrapExecutorType, "local-client") || !hasPendingWork || executorInFlight || !agentIdle {
 		return false
@@ -5141,6 +5388,7 @@ func (a *neoActor) executorIdleStopEligibleLocked() bool {
 		len(a.spawnedExecutors) > 0 &&
 		len(a.pendingTools) == 0 &&
 		len(a.approvalQueue) == 0 &&
+		len(a.pluginUIRequests) == 0 &&
 		len(a.queue) == 0 &&
 		!a.retryScheduled &&
 		a.currentInference == nil &&
@@ -5810,6 +6058,7 @@ func (a *neoActor) handleProtocolThreadTruncated(msg map[string]any) {
 	a.mu.Lock()
 	seq := a.protocolSeqLocked(msg)
 	index := a.messageIndexLocked(truncateFromMessage)
+	pluginUIRequestIDs := []string(nil)
 	if index >= 0 {
 		trimmed := make([]neoMessage, index)
 		copy(trimmed, a.messages[:index])
@@ -5818,6 +6067,7 @@ func (a *neoActor) handleProtocolThreadTruncated(msg map[string]any) {
 		a.rebuildHistoryLocked()
 		a.filterPendingToolsToMessagesLocked()
 		a.approvalQueue = nil
+		pluginUIRequestIDs = a.clearPluginUIRequestsLocked()
 		if a.currentInference != nil && a.messageIndexLocked(a.currentInference.messageID) < 0 {
 			a.currentInference = nil
 		}
@@ -5826,6 +6076,7 @@ func (a *neoActor) handleProtocolThreadTruncated(msg map[string]any) {
 	a.rememberReplayEventLocked(event)
 	a.mu.Unlock()
 
+	a.broadcastPluginUIRequestRemovals(pluginUIRequestIDs)
 	a.broadcast(event)
 	a.syncCloudAsync()
 }
@@ -5928,6 +6179,7 @@ func (a *neoActor) handleProtocolCancelled(msg map[string]any) {
 	}
 	pending := a.pendingToolIDsLocked()
 	cancelToolIDs := append(append([]string(nil), pending...), a.approvalToolIDsLocked()...)
+	pluginUIRequestIDs := a.clearPluginUIRequestsLocked()
 	a.pendingTools = map[string]neoPendingTool{}
 	a.approvalQueue = nil
 	a.currentInference = nil
@@ -5953,6 +6205,7 @@ func (a *neoActor) handleProtocolCancelled(msg map[string]any) {
 	a.rememberReplayEventLocked(event)
 	a.mu.Unlock()
 
+	a.broadcastPluginUIRequestRemovals(pluginUIRequestIDs)
 	a.broadcast(toolApprovalQueuePayload(nil))
 	for _, cleanupEvent := range cleanupEvents {
 		a.broadcast(cleanupEvent)
@@ -6693,6 +6946,7 @@ func (a *neoActor) handleBinaryThreadTruncate(msg map[string]any) {
 	}
 	a.mu.Lock()
 	truncateFromMessage := ""
+	pluginUIRequestIDs := []string(nil)
 	if fromIndex < len(a.messages) {
 		truncateFromMessage = a.messages[fromIndex].MessageID
 		if truncateFromMessage == "" {
@@ -6703,6 +6957,7 @@ func (a *neoActor) handleBinaryThreadTruncate(msg map[string]any) {
 		a.rebuildHistoryLocked()
 		a.filterPendingToolsToMessagesLocked()
 		a.approvalQueue = nil
+		pluginUIRequestIDs = a.clearPluginUIRequestsLocked()
 		if a.currentInference != nil && a.messageIndexLocked(a.currentInference.messageID) < 0 {
 			a.currentInference = nil
 		}
@@ -6716,6 +6971,7 @@ func (a *neoActor) handleBinaryThreadTruncate(msg map[string]any) {
 	a.rememberReplayEventLocked(event)
 	a.mu.Unlock()
 
+	a.broadcastPluginUIRequestRemovals(pluginUIRequestIDs)
 	a.broadcast(event)
 	a.syncCloudAsync()
 }
@@ -7949,7 +8205,7 @@ func (a *neoActor) receiveUserMessage(socket *neoSocket, msg map[string]any) {
 	a.mu.Lock()
 	a.touchLocked()
 	a.draft = nil
-	if a.agentState != "idle" || !a.executorReady {
+	if a.inferenceStartBlockedLocked() || !a.executorReady {
 		if user.Steer {
 			a.queue = append([]neoQueuedMessage{user}, a.queue...)
 		} else {
@@ -8302,6 +8558,7 @@ func (a *neoActor) interruptActiveToolResultsForBinaryUserMessage() {
 	a.mu.Lock()
 	pending := a.pendingToolIDsLocked()
 	cancelToolIDs := append(append([]string(nil), pending...), a.approvalToolIDsLocked()...)
+	pluginUIRequestIDs := a.clearPluginUIRequestsLocked()
 	hadApprovals := len(a.approvalQueue) > 0
 	updateEvents := a.cancelToolResultMessagesLocked(cancelToolIDs, "user:interrupted")
 	if len(pending) > 0 {
@@ -8310,7 +8567,7 @@ func (a *neoActor) interruptActiveToolResultsForBinaryUserMessage() {
 	if hadApprovals {
 		a.approvalQueue = nil
 	}
-	if len(cancelToolIDs) > 0 || hadApprovals {
+	if len(cancelToolIDs) > 0 || len(pluginUIRequestIDs) > 0 || hadApprovals {
 		a.currentInference = nil
 		a.pendingInference = nil
 		a.retryScheduled = false
@@ -8319,6 +8576,7 @@ func (a *neoActor) interruptActiveToolResultsForBinaryUserMessage() {
 	}
 	a.mu.Unlock()
 
+	a.broadcastPluginUIRequestRemovals(pluginUIRequestIDs)
 	for _, toolCallID := range pending {
 		a.broadcast(map[string]any{"type": "executor_tool_lease_revoked", "toolCallId": toolCallID, "reason": "user_canceled"})
 	}
@@ -8328,7 +8586,7 @@ func (a *neoActor) interruptActiveToolResultsForBinaryUserMessage() {
 	for _, event := range updateEvents {
 		a.broadcast(event)
 	}
-	if len(updateEvents) > 0 || hadApprovals {
+	if len(updateEvents) > 0 || len(pluginUIRequestIDs) > 0 || hadApprovals {
 		a.syncCloudAsync()
 	}
 	a.scheduleExecutorIdleStopIfNeeded()
@@ -8563,6 +8821,7 @@ func (a *neoActor) replaceBinaryUserMessageAtIndex(index int, user neoQueuedMess
 	a.rebuildHistoryLocked()
 	a.filterPendingToolsToMessagesLocked()
 	a.approvalQueue = nil
+	pluginUIRequestIDs := a.clearPluginUIRequestsLocked()
 	a.agentState = "idle"
 	a.pendingInference = nil
 	var truncateEvent map[string]any
@@ -8575,6 +8834,7 @@ func (a *neoActor) replaceBinaryUserMessageAtIndex(index int, user neoQueuedMess
 	a.rememberReplayEventLocked(added)
 	a.mu.Unlock()
 
+	a.broadcastPluginUIRequestRemovals(pluginUIRequestIDs)
 	a.broadcast(added)
 	if truncateEvent != nil {
 		a.broadcast(truncateEvent)
@@ -8683,9 +8943,15 @@ func (a *neoActor) nextQueuedMessageIDLocked() string {
 }
 
 func (a *neoActor) dequeueQueuedMessage() {
+	a.mu.Lock()
+	blocked := a.inferenceStartBlockedLocked()
+	a.mu.Unlock()
+	if blocked {
+		return
+	}
 	a.cleanupPriorAssistantForBinaryDelta()
 	a.mu.Lock()
-	if len(a.queue) == 0 {
+	if a.inferenceStartBlockedLocked() || len(a.queue) == 0 {
 		a.mu.Unlock()
 		return
 	}
@@ -8693,11 +8959,11 @@ func (a *neoActor) dequeueQueuedMessage() {
 	next := a.queue[nextIndex]
 	a.queue = append(a.queue[:nextIndex], a.queue[nextIndex+1:]...)
 	seq := a.nextSeqLocked()
-	ready := a.agentState == "idle" && a.executorReady
+	ready := !a.inferenceStartBlockedLocked() && a.executorReady
 	settingsUpdate := a.seedInitialUserModeLocked(next)
 	message, mode, effort := a.storeQueuedUserMessageLocked(next, true)
 	pendingInference := false
-	if !a.executorReady && a.agentState == "idle" {
+	if !a.executorReady && !a.inferenceStartBlockedLocked() {
 		a.pendingInference = &neoInferenceInflight{agentMode: mode, reasoningEffort: effort, clientAPIKey: next.ClientAPIKey}
 		pendingInference = true
 	}
@@ -8850,6 +9116,7 @@ func (a *neoActor) editMessage(socket *neoSocket, msg map[string]any) {
 		a.rebuildHistoryLocked()
 		a.pendingTools = map[string]neoPendingTool{}
 		a.approvalQueue = nil
+		pluginUIRequestIDs := a.clearPluginUIRequestsLocked()
 		a.agentState = "idle"
 		truncateEvent := map[string]any{"type": "thread_truncated", "seq": truncateSeq, "truncateFromMessage": messageID}
 		a.rememberReplayEventLocked(truncateEvent)
@@ -8873,6 +9140,7 @@ func (a *neoActor) editMessage(socket *neoSocket, msg map[string]any) {
 		}
 		a.mu.Unlock()
 
+		a.broadcastPluginUIRequestRemovals(pluginUIRequestIDs)
 		a.broadcast(truncateEvent)
 		a.broadcast(addedEvent)
 		a.syncCloudAsync()
@@ -8900,6 +9168,7 @@ func (a *neoActor) editMessage(socket *neoSocket, msg map[string]any) {
 	}
 	a.rebuildHistoryLocked()
 	a.pendingTools = map[string]neoPendingTool{}
+	pluginUIRequestIDs := a.clearPluginUIRequestsLocked()
 	a.agentState = "idle"
 	if updated.Seq == 0 {
 		updated.Seq = a.nextSeqLocked()
@@ -8932,6 +9201,7 @@ func (a *neoActor) editMessage(socket *neoSocket, msg map[string]any) {
 	}
 	a.mu.Unlock()
 
+	a.broadcastPluginUIRequestRemovals(pluginUIRequestIDs)
 	a.broadcast(updateEvent)
 	if truncateEvent != nil {
 		a.broadcast(truncateEvent)
@@ -15524,6 +15794,7 @@ func (a *neoActor) stateSnapshotResponse() map[string]any {
 		"messages":          messages,
 		"queuedMessages":    queue,
 		"toolApprovalQueue": a.approvalQueueListLocked(),
+		"pluginUIRequests":  a.pluginUIRequestListLocked(),
 		"relationships":     relationships,
 		"artifacts":         a.artifactListLocked(),
 		"compactionRecords": a.compactionRecordListLocked(),
@@ -15765,6 +16036,7 @@ func (a *neoActor) sendSnapshot(socket *neoSocket, sinceSeq int) {
 	artifacts := a.artifactListLocked()
 	compactionRecords := neoProtocolCompactionRecordList(a.compactionRecordListLocked())
 	approvals := a.approvalQueueListLocked()
+	pluginUIRequests := a.pluginUIRequestListLocked()
 	if len(approvals) > 0 {
 		agentState = "awaiting_approval"
 	}
@@ -15854,6 +16126,7 @@ func (a *neoActor) sendSnapshot(socket *neoSocket, sinceSeq int) {
 	send(map[string]any{"type": "thread_relationships", "seq": seq, "relationships": relationships})
 	send(map[string]any{"type": "compaction_records", "records": compactionRecords})
 	send(map[string]any{"type": "artifacts_snapshot", "artifacts": artifacts})
+	send(neoPluginUIStateEvent("plugin.ui.snapshot", map[string]any{"requests": pluginUIRequests}))
 	send(map[string]any{"type": "agent_state", "state": agentState, "agentMode": agentMode, "reasoningEffort": omitEmpty(effort)})
 	if inflightInference != nil {
 		toolsList := make([]any, 0, len(inflightInference.tools))
@@ -16741,7 +17014,7 @@ func neoMessageFromImportedThread(threadID string, raw any, index int) neoMessag
 
 func (a *neoActor) processQueue() {
 	a.mu.Lock()
-	if a.agentState != "idle" || len(a.queue) == 0 {
+	if a.inferenceStartBlockedLocked() || len(a.queue) == 0 {
 		a.mu.Unlock()
 		return
 	}
@@ -16816,7 +17089,7 @@ func (a *neoActor) steerQueuedMessage(messageID string) {
 	for _, item := range a.queue {
 		messages = append(messages, item.queueProtocol())
 	}
-	shouldProcess := a.agentState == "idle" && a.executorReady
+	shouldProcess := !a.inferenceStartBlockedLocked() && a.executorReady
 	a.mu.Unlock()
 	a.broadcast(map[string]any{"type": "queued_messages", "messages": messages})
 	a.syncCloudAsync()
@@ -16835,7 +17108,7 @@ func (a *neoActor) drainReadyWork() {
 
 func (a *neoActor) retry() {
 	a.mu.Lock()
-	if a.agentState != "idle" {
+	if a.inferenceStartBlockedLocked() {
 		a.retryScheduled = false
 		a.executorIdleGeneration++
 		a.mu.Unlock()
@@ -16872,7 +17145,7 @@ func (a *neoActor) retry() {
 
 func (a *neoActor) processRetryIfReady() bool {
 	a.mu.Lock()
-	if a.agentState != "idle" || !a.executorReady || !a.retryScheduled {
+	if a.inferenceStartBlockedLocked() || !a.executorReady || !a.retryScheduled {
 		a.mu.Unlock()
 		return false
 	}
@@ -16899,7 +17172,7 @@ func (a *neoActor) processRetryIfReady() bool {
 
 func (a *neoActor) processPendingInferenceIfReady() bool {
 	a.mu.Lock()
-	if a.agentState != "idle" || !a.executorReady || a.pendingInference == nil {
+	if a.inferenceStartBlockedLocked() || !a.executorReady || a.pendingInference == nil {
 		a.mu.Unlock()
 		return false
 	}
@@ -17268,6 +17541,7 @@ func (a *neoActor) cancel() {
 	abortMessageID := a.abortableAssistantMessageIDLocked(messageID)
 	pending := a.pendingToolIDsLocked()
 	cancelToolIDs := append(append([]string(nil), pending...), a.approvalToolIDsLocked()...)
+	pluginUIRequestIDs := a.clearPluginUIRequestsLocked()
 	cleanupEvents := a.cleanupPriorAssistantForBinaryDeltaLocked("user:cancelled", nil)
 	updateEvents := a.cancelToolResultMessagesLocked(cancelToolIDs, "user:cancelled")
 	a.pendingTools = map[string]neoPendingTool{}
@@ -17283,6 +17557,7 @@ func (a *neoActor) cancel() {
 	cancelEvent := map[string]any{"type": "cancelled", "seq": seq, "messageId": omitEmpty(messageID)}
 	a.rememberReplayEventLocked(cancelEvent)
 	a.mu.Unlock()
+	a.broadcastPluginUIRequestRemovals(pluginUIRequestIDs)
 	for _, toolCallID := range pending {
 		a.broadcast(map[string]any{"type": "executor_tool_lease_revoked", "toolCallId": toolCallID, "reason": "user_canceled"})
 	}

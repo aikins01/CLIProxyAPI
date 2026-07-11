@@ -436,7 +436,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 	}
 	for _, want := range []string{
 		"// ==UserScript==",
-		"@version 0.1.59",
+		"@version 0.1.60",
 		"@match https://ampcode.com/*",
 		"@updateURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
 		"@downloadURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
@@ -451,7 +451,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"commandPaletteIntegrationCount",
 		"localThreadPickerOpenCount",
 		"removedLocalThreadControlCount",
-		`const userscriptVersion = "0.1.59"`,
+		`const userscriptVersion = "0.1.60"`,
 		"userscriptVersion",
 		"lastPatchedThreadActorBaseURL",
 		"lastPatchedThreadID",
@@ -610,6 +610,25 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 	selectedLocalProjectIndex := strings.Index(body, "const fromSelectedLocalProject = selectedLocalProjectWorkingDirectory();")
 	if selectedLocalProjectIndex < 0 || visibleProjectIndex < 0 || visibleProjectIndex > selectedLocalProjectIndex {
 		t.Fatalf("userscript must prefer visible project before stale selected local project for create-thread working directory")
+	}
+	localWorkingDirectoryIndex := strings.Index(body, "function localWorkingDirectory()")
+	selectedDirectoryIndex := strings.Index(body[localWorkingDirectoryIndex:], "const selectedDirectory = selectedLocalProjectWorkingDirectory();")
+	activeDirectoryIndex := strings.Index(body[localWorkingDirectoryIndex:], "const activeDirectory = activeThreadWorkingDirectory();")
+	if localWorkingDirectoryIndex < 0 || selectedDirectoryIndex < 0 || activeDirectoryIndex < 0 || activeDirectoryIndex > selectedDirectoryIndex {
+		t.Fatalf("userscript must preserve the active thread working directory before a new-thread project selection")
+	}
+	newLocalWorkingDirectoryIndex := strings.Index(body, "function newLocalThreadWorkingDirectory()")
+	if newLocalWorkingDirectoryIndex < 0 {
+		t.Fatal("userscript missing new-thread working directory selection")
+	}
+	newLocalWorkingDirectoryBody := body[newLocalWorkingDirectoryIndex:]
+	newVisibleDirectoryIndex := strings.Index(newLocalWorkingDirectoryBody, "visibleProjectWorkingDirectory(visibleCreateThreadProjectName())")
+	newSelectedDirectoryIndex := strings.Index(newLocalWorkingDirectoryBody, "selectedDirectory ||")
+	if newVisibleDirectoryIndex < 0 || newSelectedDirectoryIndex < 0 || newVisibleDirectoryIndex > newSelectedDirectoryIndex {
+		t.Fatal("userscript must prefer the visible create-thread project before a stale selected project")
+	}
+	if !strings.Contains(newLocalWorkingDirectoryBody, `selectedProject?.name === "~" && selectedDirectory === defaultLocalWorkingDirectory()`) {
+		t.Fatal("userscript must preserve an explicit No Project home selection for local thread creation")
 	}
 	for _, unwanted := range []string{
 		"installLocalThreadKeyboardShortcut();",
@@ -858,7 +877,7 @@ if (typeof globalThis.btoa !== "function") {
 }
 require(scriptPath);
 const bridge = globalThis.__cliproxyAmpLocalInference;
-assert(bridge && bridge.userscriptVersion === "0.1.59", "bridge userscript version was not exposed");
+assert(bridge && bridge.userscriptVersion === "0.1.60", "bridge userscript version was not exposed");
 	globalThis.localStorage.setItem(bridge.localThreadIDsStorageKey, JSON.stringify([threadID, secondThreadID]));
 	globalThis.localStorage.setItem(bridge.apiKeyStorageKey, "local-key");
 	globalThis.localStorage.setItem(bridge.workingDirectoryStorageKey, createdThreadWorkDir);
@@ -1427,6 +1446,7 @@ headerContainer.append(moreActions, headerProjectLink);
 const picker = new FakeElement("div");
 picker.setAttribute("role", "dialog");
 const input = new FakeElement("input");
+input.textContent = "Choose a project…";
 const title = new FakeElement("div");
 title.textContent = "Projects";
 const popupProjectButton = new FakeElement("button");
@@ -1477,13 +1497,49 @@ list.appendChild(actions);
 	headerProjectLink.setAttribute("href", "https://github.com/telemetry-dev/telemetry.dev/tree/6bcbce6911b604cfc8dd8255bc9215a930222dfb");
 	popupProjectButton.textContent = "Project: telemetry.dev";
 	await new Promise((resolve) => setTimeout(resolve, 25));
-	const localItems = list.querySelectorAll("[data-cliproxy-local-project-item]");
+const localItems = list.querySelectorAll("[data-cliproxy-local-project-item]");
 assert(localItems.length === 4, "expected four local project items, got " + localItems.length);
+assert(localItems.every((item) => !item.hidden && item.style.display !== "none"), "empty project search treated placeholder text as a query");
 const selected = localItems.find((item) => item.getAttribute("aria-selected") === "true" || item.dataset.selected === "true");
 assert(selected, "no injected local project item was selected");
 assert(selected.dataset.cliproxyLocalProjectWorkingDirectory === "/Users/aikins01/Developer/telemetry.dev", "visible project was not selected: " + selected.innerText);
-	assert(selected.dataset.cliproxyLocalProjectCurrent === "1", "visible project item was not marked current");
+assert(selected.dataset.cliproxyLocalProjectCurrent === "1", "visible project item was not marked current");
 assert(popupProjectButton.textContent.includes("Project: telemetry.dev"), "popup project button stayed stale: " + popupProjectButton.textContent);
+const unrelatedProjectButton = new FakeElement("button");
+unrelatedProjectButton.textContent = "Project: unrelated";
+body.appendChild(unrelatedProjectButton);
+noProject.addEventListener("click", () => { popupProjectButton.textContent = "No Project"; });
+noProject.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, cancelable: true }));
+noProject.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+await new Promise((resolve) => setTimeout(resolve, 75));
+const homeSelection = JSON.parse(globalThis.sessionStorage.getItem("cliproxyapi.ampLocalInference.selectedLocalProject"));
+assert(homeSelection.name === "~" && homeSelection.workingDirectory === "/Users/aikins01", "No Project did not select home: " + JSON.stringify(homeSelection));
+assert(popupProjectButton.textContent.includes("~"), "No Project did not refresh project button: " + popupProjectButton.textContent);
+assert(unrelatedProjectButton.textContent === "Project: unrelated", "project refresh rewrote unrelated control: " + unrelatedProjectButton.textContent);
+unrelatedProjectButton.remove();
+lastFetchURL = "";
+await globalThis.fetch("https://ampcode.com/_app/remote/3abror/createProjectThread", {
+	method: "POST",
+	headers: { "Content-Type": "application/json" },
+	body: JSON.stringify({ payload: "" }),
+});
+const homeCreateURL = new URL(lastFetchURL);
+assert(homeCreateURL.searchParams.get("cliproxy-working-directory") === "/Users/aikins01", "No Project create did not use home: " + lastFetchURL);
+lastFetchURL = "";
+await globalThis.fetch("https://ampcode.com/_app/remote/3abror/createProjectThread", {
+	method: "POST",
+	headers: { "Content-Type": "application/json" },
+	body: JSON.stringify({ payload: encodeDevalue([{ projectID: 1 }, "75616c3b-f4de-48b7-8b83-c1af6978a034"]) }),
+});
+const homeProjectIDCreateURL = new URL(lastFetchURL);
+assert(homeProjectIDCreateURL.searchParams.get("cliproxy-working-directory") === "/Users/aikins01", "No Project create with projectID did not use home: " + lastFetchURL);
+globalThis.sessionStorage.setItem("cliproxyapi.ampLocalInference.selectedLocalProject", JSON.stringify({
+	name: "telemetry.dev",
+	workingDirectory: "/Users/aikins01/Developer/telemetry.dev",
+	selectedAt: Date.now(),
+}));
+globalThis.localStorage.setItem("cliproxyapi.ampLocalInference.workingDirectory", "/Users/aikins01/Developer/telemetry.dev");
+popupProjectButton.textContent = "Project: telemetry.dev";
 input.value = "Developer/telemetry.dev";
 input.dispatchEvent(new FakeEvent("input", { bubbles: true }));
 await new Promise((resolve) => setTimeout(resolve, 25));

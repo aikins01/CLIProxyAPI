@@ -236,7 +236,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	return fmt.Sprintf(`// ==UserScript==
 // @name CLIProxyAPI Amp Local Inference
 // @namespace https://github.com/router-for-me/CLIProxyAPI
-// @version 0.1.59
+// @version 0.1.60
 %s
 // @updateURL %s
 // @downloadURL %s
@@ -248,7 +248,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	"use strict";
 
 	const bridgeHeader = %s;
-	const userscriptVersion = "0.1.59";
+	const userscriptVersion = "0.1.60";
 	const apiKeyStorageKey = "cliproxyapi.ampLocalInference.apiKey";
 	const workingDirectoryStorageKey = "cliproxyapi.ampLocalInference.workingDirectory";
 	const selectedLocalProjectStorageKey = "cliproxyapi.ampLocalInference.selectedLocalProject";
@@ -373,10 +373,22 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		return storedLocalWorkingDirectory() || defaultLocalWorkingDirectory();
 	}
 
+	function newLocalThreadWorkingDirectory() {
+		const selectedProject = selectedLocalProject();
+		const selectedDirectory = normalizeWorkingDirectory(selectedProject?.workingDirectory);
+		if (selectedProject?.name === "~" && selectedDirectory === defaultLocalWorkingDirectory()) {
+			return selectedDirectory;
+		}
+		return visibleProjectWorkingDirectory(visibleCreateThreadProjectName()) ||
+			selectedDirectory ||
+			storedLocalWorkingDirectory() ||
+			defaultLocalWorkingDirectory();
+	}
+
 	function currentLocalProjectWorkingDirectory() {
-		return activeThreadWorkingDirectory() ||
+		return selectedLocalProjectWorkingDirectory() ||
+			activeThreadWorkingDirectory() ||
 			visibleProjectWorkingDirectory() ||
-			selectedLocalProjectWorkingDirectory() ||
 			storedLocalWorkingDirectory() ||
 			defaultLocalWorkingDirectory();
 	}
@@ -1763,6 +1775,25 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		return "";
 	}
 
+	function visibleCreateLocalProjectWorkingDirectory() {
+		const selectedProject = selectedLocalProject();
+		const homeDirectory = defaultLocalWorkingDirectory();
+		if (selectedProject?.name !== "~" || !homeDirectory || normalizeWorkingDirectory(selectedProject.workingDirectory) !== homeDirectory) {
+			return "";
+		}
+		const dialogSelector = '[cmdk-root],[data-cmdk-root],[data-slot="dialog-content"],[role="dialog"]';
+		for (const element of globalThis.document.querySelectorAll("button,[role='button']")) {
+			if (!element.closest(dialogSelector) || element.dataset?.cliproxyLocalProjectActivator !== "1" || !elementVisible(element)) {
+				continue;
+			}
+			const workingDirectory = normalizeWorkingDirectory(element.dataset.cliproxyLocalProjectWorkingDirectory);
+			if (workingDirectory === homeDirectory) {
+				return workingDirectory;
+			}
+		}
+		return "";
+	}
+
 	function visibleProjectNameFromDocument() {
 		for (const element of globalThis.document.querySelectorAll("button,[role='button'],[aria-haspopup],a")) {
 			if (element.closest('[cmdk-root],[data-cmdk-root],[data-slot="dialog-content"],[role="dialog"],article,[data-message-id],[data-message]')) {
@@ -1796,6 +1827,10 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	function unresolvedCreateThreadDialogProject() {
 		const createName = visibleCreateProjectName(false);
 		const pageName = visibleProjectName();
+		const selectedProject = selectedLocalProject();
+		if (selectedProject?.name === "~" && normalizeWorkingDirectory(selectedProject.workingDirectory) === defaultLocalWorkingDirectory()) {
+			return false;
+		}
 		return !!createName && !!pageName &&
 			normalizeProjectPickerName(createName) !== normalizeProjectPickerName(pageName) &&
 			!visibleLocalProjectWorkingDirectory(createName);
@@ -1879,6 +1914,11 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		if (fromMention) {
 			return fromMention;
 		}
+		const selectedProject = selectedLocalProject();
+		const selectedDirectory = normalizeWorkingDirectory(selectedProject?.workingDirectory);
+		if (selectedProject?.name === "~" && selectedDirectory === defaultLocalWorkingDirectory()) {
+			return selectedDirectory;
+		}
 		const projectID = isPlainObject(decoded) ? firstString(decoded.projectID, decoded.projectId, decoded.project_id) : "";
 		if (projectID) {
 			const fromProjectID = normalizeWorkingDirectory(localProjectByID(localProjectsCache.projects, projectID)?.workingDirectory);
@@ -1893,6 +1933,10 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 				return fromVisibleLocalProject;
 			}
 			return "";
+		}
+		const fromVisibleLocalSelection = visibleCreateLocalProjectWorkingDirectory();
+		if (fromVisibleLocalSelection) {
+			return fromVisibleLocalSelection;
 		}
 		if (unresolvedCreateThreadDialogProject()) {
 			return "";
@@ -2074,7 +2118,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		if (promptText === null) {
 			return;
 		}
-		let workingDirectory = localWorkingDirectory();
+		let workingDirectory = newLocalThreadWorkingDirectory();
 		if (!workingDirectory) {
 			workingDirectory = await ensureDefaultWorkingDirectory(false);
 		}
@@ -2088,7 +2132,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	}
 
 	function openLocalThreadFromMenu(modeOptions) {
-		createLocalThread("", localWorkingDirectory(), modeOptions).catch((error) => {
+		createLocalThread("", newLocalThreadWorkingDirectory(), modeOptions).catch((error) => {
 			globalThis.alert("Local Amp thread failed: " + (error && error.message ? error.message : String(error)));
 		});
 	}
@@ -2268,7 +2312,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		globalThis.document.getElementById("cliproxy-amp-local-thread-picker")?.remove();
 	}
 
-	function showLocalThreadPicker(anchor, promptText = "", workingDirectory = localWorkingDirectory()) {
+	function showLocalThreadPicker(anchor, promptText = "", workingDirectory = newLocalThreadWorkingDirectory()) {
 		removeLocalThreadPicker();
 		const panel = globalThis.document.createElement("div");
 		panel.id = "cliproxy-amp-local-thread-picker";
@@ -2570,7 +2614,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		diagnostics.localProjectActivatorIntegrationCount += 1;
 	}
 
-	function refreshLocalProjectActivators(project) {
+	function refreshLocalProjectActivators(project, root = globalThis.document, includeProjectLabels = false) {
 		const workingDirectory = normalizeWorkingDirectory(project?.workingDirectory);
 		if (!workingDirectory) {
 			return;
@@ -2579,8 +2623,8 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		if (!label) {
 			return;
 		}
-		for (const activator of localProjectActivatorCandidates(globalThis.document)) {
-			if (localProjectActivatorLooksUnset(activator) || activator.dataset?.cliproxyLocalProjectActivator === "1") {
+		for (const activator of localProjectActivatorCandidates(root)) {
+			if (localProjectActivatorLooksUnset(activator) || activator.dataset?.cliproxyLocalProjectActivator === "1" || (includeProjectLabels && localProjectActivatorProjectLabel(activator))) {
 				patchLocalProjectActivator(activator, label, workingDirectory);
 			}
 		}
@@ -2740,7 +2784,13 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 
 	function localProjectPickerSearchQuery(picker) {
 		const target = localProjectPickerSearchTarget(picker);
-		return normalizeProjectPickerName(target?.value || target?.textContent || "");
+		if (!target) {
+			return "";
+		}
+		if ("value" in target) {
+			return normalizeProjectPickerName(target.value);
+		}
+		return normalizeProjectPickerName(target.textContent || "");
 	}
 
 	function filterLocalProjectPickerItems(picker, list) {
@@ -2973,7 +3023,15 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			if (noProject.dataset.cliproxySuppressLocalProjectClear === "1") {
 				return;
 			}
-			clearSelectedLocalProject(true);
+			const workingDirectory = defaultLocalWorkingDirectory();
+			if (!workingDirectory) {
+				clearSelectedLocalProject(true);
+				return;
+			}
+			const project = { name: "~", workingDirectory };
+			rememberSelectedLocalProject(project);
+			refreshLocalProjectActivators(project, picker, true);
+			setTimeout(() => refreshLocalProjectActivators(project, picker, true), 50);
 		};
 		noProject.addEventListener("pointerdown", clear, true);
 		noProject.addEventListener("click", clear, true);
@@ -3104,10 +3162,10 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			workingDirectory,
 		};
 		rememberSelectedLocalProject(selectedProject);
-		refreshLocalProjectActivators(selectedProject);
+		refreshLocalProjectActivators(selectedProject, picker, true);
 		setTimeout(() => {
 			closeLocalProjectPickerViaNoProject(picker);
-			setTimeout(() => refreshLocalProjectActivators(selectedProject), 50);
+			setTimeout(() => refreshLocalProjectActivators(selectedProject, picker, true), 50);
 		}, 0);
 	}
 
@@ -3132,7 +3190,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 					workingDirectory,
 				};
 				rememberSelectedLocalProject(selectedProject);
-				refreshLocalProjectActivators(selectedProject);
+				refreshLocalProjectActivators(selectedProject, picker, true);
 			}
 		}, 0);
 	}
