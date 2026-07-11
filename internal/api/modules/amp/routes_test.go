@@ -436,7 +436,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 	}
 	for _, want := range []string{
 		"// ==UserScript==",
-		"@version 0.1.60",
+		"@version 0.1.61",
 		"@match https://ampcode.com/*",
 		"@updateURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
 		"@downloadURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
@@ -451,7 +451,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"commandPaletteIntegrationCount",
 		"localThreadPickerOpenCount",
 		"removedLocalThreadControlCount",
-		`const userscriptVersion = "0.1.60"`,
+		`const userscriptVersion = "0.1.61"`,
 		"userscriptVersion",
 		"lastPatchedThreadActorBaseURL",
 		"lastPatchedThreadID",
@@ -498,6 +498,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"installLocalProjectPickerSearch",
 		"filterLocalProjectPickerItems",
 		"installLocalProjectNoProjectSelectionHandler",
+		"refreshCreateThreadProjectActivatorsAfterSelection",
 		"localProjectPickerLooksLikeProjectPicker",
 		"if (!item || projectPickerItemSelected(item))",
 		"closeLocalProjectPickerViaNoProject",
@@ -877,7 +878,7 @@ if (typeof globalThis.btoa !== "function") {
 }
 require(scriptPath);
 const bridge = globalThis.__cliproxyAmpLocalInference;
-assert(bridge && bridge.userscriptVersion === "0.1.60", "bridge userscript version was not exposed");
+assert(bridge && bridge.userscriptVersion === "0.1.61", "bridge userscript version was not exposed");
 	globalThis.localStorage.setItem(bridge.localThreadIDsStorageKey, JSON.stringify([threadID, secondThreadID]));
 	globalThis.localStorage.setItem(bridge.apiKeyStorageKey, "local-key");
 	globalThis.localStorage.setItem(bridge.workingDirectoryStorageKey, createdThreadWorkDir);

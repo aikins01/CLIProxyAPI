@@ -236,7 +236,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	return fmt.Sprintf(`// ==UserScript==
 // @name CLIProxyAPI Amp Local Inference
 // @namespace https://github.com/router-for-me/CLIProxyAPI
-// @version 0.1.60
+// @version 0.1.61
 %s
 // @updateURL %s
 // @downloadURL %s
@@ -248,7 +248,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	"use strict";
 
 	const bridgeHeader = %s;
-	const userscriptVersion = "0.1.60";
+	const userscriptVersion = "0.1.61";
 	const apiKeyStorageKey = "cliproxyapi.ampLocalInference.apiKey";
 	const workingDirectoryStorageKey = "cliproxyapi.ampLocalInference.workingDirectory";
 	const selectedLocalProjectStorageKey = "cliproxyapi.ampLocalInference.selectedLocalProject";
@@ -2630,6 +2630,25 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		}
 	}
 
+	function refreshCreateThreadProjectActivators(project) {
+		for (const palette of commandPaletteCandidates(globalThis.document)) {
+			if (!elementVisible(palette)) {
+				continue;
+			}
+			const text = (palette.innerText || palette.textContent || "").replace(/\s+/g, " ").trim();
+			if (!text.includes("Create Thread") || !/\bProject:/.test(text)) {
+				continue;
+			}
+			refreshLocalProjectActivators(project, palette, true);
+		}
+	}
+
+	function refreshCreateThreadProjectActivatorsAfterSelection(project) {
+		for (const delay of [0, 50, 150]) {
+			setTimeout(() => refreshCreateThreadProjectActivators(project), delay);
+		}
+	}
+
 	function localProjectByWorkingDirectory(projects, workingDirectory) {
 		const target = normalizeWorkingDirectory(workingDirectory);
 		for (const project of projects || []) {
@@ -3032,6 +3051,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			rememberSelectedLocalProject(project);
 			refreshLocalProjectActivators(project, picker, true);
 			setTimeout(() => refreshLocalProjectActivators(project, picker, true), 50);
+			refreshCreateThreadProjectActivatorsAfterSelection(project);
 		};
 		noProject.addEventListener("pointerdown", clear, true);
 		noProject.addEventListener("click", clear, true);
@@ -3163,6 +3183,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		};
 		rememberSelectedLocalProject(selectedProject);
 		refreshLocalProjectActivators(selectedProject, picker, true);
+		refreshCreateThreadProjectActivatorsAfterSelection(selectedProject);
 		setTimeout(() => {
 			closeLocalProjectPickerViaNoProject(picker);
 			setTimeout(() => refreshLocalProjectActivators(selectedProject, picker, true), 50);
