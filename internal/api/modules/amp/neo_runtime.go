@@ -67,6 +67,7 @@ const (
 	neoReplayEventLimit              = 512
 	neoActorIdleTTL                  = 30 * time.Minute
 	neoActorPruneInterval            = 5 * time.Minute
+	neoExecutorReconnectGrace        = 15 * time.Second
 	neoWSReadLimit                   = 16 * 1024 * 1024
 	neoHeadlessLoginShellPathTimeout = 3 * time.Second
 	neoCompactionMinMessages         = 24
@@ -1692,8 +1693,11 @@ func neoWebLocalInferenceSocketRequested(r *http.Request, actor *neoActor) bool 
 	if strings.TrimSpace(r.Header.Get(neoInternalClientAPIKeyHeader)) == "" {
 		return false
 	}
+	if strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("cliproxy-client")), "amp-web-local-inference") {
+		return true
+	}
 	origin := strings.TrimSpace(r.Header.Get("Origin"))
-	return ampWebLocalInferenceOriginAllowed(origin, cfg.AmpCode.WebLocalInference.AllowedOrigins)
+	return ampWebLocalInferenceRequestOriginAllowed(origin, cfg.AmpCode.WebLocalInference)
 }
 
 func (s *neoActorStore) gatewayThreadActorWithCloudState(r *http.Request, actor *neoActor, target, key string) *neoActor {
@@ -2154,6 +2158,7 @@ func (a *neoActor) hasLocalThreadStateLocked() bool {
 		len(a.compactionRecords) > 0 ||
 		len(a.relationships) > 0 ||
 		len(a.meta) > 0 ||
+		len(a.debug) > 0 ||
 		len(a.draft) > 0 ||
 		a.currentInference != nil ||
 		a.pendingInference != nil ||
@@ -2326,14 +2331,42 @@ func (s *neoActorStore) pruneIdle(now time.Time, ttl time.Duration) int {
 	if s == nil || ttl <= 0 {
 		return 0
 	}
-	s.mu.Lock()
-	stale := make([]*neoActor, 0)
+	localThreadSnapshotsEnabled := s.runtime != nil && s.runtime.localThreadSnapshotsEnabled()
+	type candidate struct {
+		id        string
+		actor     *neoActor
+		persisted bool
+	}
+	s.mu.RLock()
+	candidates := make([]candidate, 0)
 	for id, actor := range s.actors {
-		if actor == nil || !actor.prunable(now, ttl) {
+		if actor == nil || !actor.prunable(now, ttl, localThreadSnapshotsEnabled) {
+			continue
+		}
+		candidates = append(candidates, candidate{id: id, actor: actor})
+	}
+	s.mu.RUnlock()
+
+	for i := range candidates {
+		actor := candidates[i].actor
+		if !actor.hasLocalThreadState() {
+			candidates[i].persisted = true
+			continue
+		}
+		if actor.localThreadSnapshotsEnabled() {
+			candidates[i].persisted = actor.syncLocalThreadSnapshotForShutdownNow()
+		}
+	}
+
+	s.mu.Lock()
+	stale := make([]*neoActor, 0, len(candidates))
+	for _, candidate := range candidates {
+		actor := candidate.actor
+		if !candidate.persisted || s.actors[candidate.id] != actor || !actor.prunable(now, ttl, localThreadSnapshotsEnabled) {
 			continue
 		}
 		stale = append(stale, actor)
-		delete(s.actors, id)
+		delete(s.actors, candidate.id)
 		if actor.key != "" {
 			delete(s.byNameKey, actor.name+"\x00"+actor.key)
 		}
@@ -2417,6 +2450,7 @@ type neoActor struct {
 	currentAgentMode            string
 	currentReasoningEffort      string
 	executorIdleGeneration      int
+	reconnectGeneration         int
 	generation                  int
 	currentInference            *neoInferenceInflight
 	preserveExecutorWorkOnClose bool
@@ -2469,6 +2503,7 @@ type neoSpawnedExecutor struct {
 	logPath       string
 	cmd           *exec.Cmd
 	startedAt     time.Time
+	connected     bool
 	stopping      bool
 	respawnOnStop bool
 }
@@ -2577,6 +2612,9 @@ func (a *neoActor) close(socket *neoSocket) {
 		if preserveExecutorWork {
 			return
 		}
+		if a.deferExecutorDisconnectForSocket(socket, executorID) {
+			return
+		}
 		a.executorDisconnectedForSocket(socket, map[string]any{"executorId": executorID, "message": "Executor disconnected"})
 		return
 	}
@@ -2637,7 +2675,7 @@ func (a *neoActor) lastUsedAt() time.Time {
 	return a.lastUsed
 }
 
-func (a *neoActor) prunable(now time.Time, ttl time.Duration) bool {
+func (a *neoActor) prunable(now time.Time, ttl time.Duration, localThreadSnapshotsEnabled bool) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.lastUsed.IsZero() || now.Sub(a.lastUsed) < ttl {
@@ -2646,8 +2684,12 @@ func (a *neoActor) prunable(now time.Time, ttl time.Duration) bool {
 	if len(a.sockets) > 0 || a.executorID != "" || a.agentState != "idle" || a.syncRunning || a.syncPending {
 		return false
 	}
-	if len(a.pendingTools) > 0 || len(a.approvalQueue) > 0 || len(a.queue) > 0 || len(a.spawnedExecutors) > 0 {
+	if len(a.pendingTools) > 0 || len(a.approvalQueue) > 0 || len(a.queue) > 0 || len(a.spawnedExecutors) > 0 || a.currentInference != nil || a.pendingInference != nil || a.retryScheduled || a.compacting {
 		return false
+	}
+	threadID := firstNonEmptyString(a.threadID, a.key)
+	if neoThreadIDExactPattern.MatchString(threadID) && localThreadSnapshotsEnabled {
+		return true
 	}
 	if len(a.kv) > 0 {
 		return false
@@ -3887,7 +3929,7 @@ func (a *neoActor) executorConnectForSocket(socket *neoSocket, msg map[string]an
 		a.deferConcurrentExecutorHandoff(socket, incomingExecutorID, existingExecutorID)
 		return
 	}
-	if a.shouldRejectConcurrentExecutorLocked(socket) {
+	if a.shouldRejectConcurrentExecutorLocked(socket) || a.shouldRejectReconnectingExecutorLocked(incomingExecutorID) {
 		existingExecutorID := a.executorID
 		a.mu.Unlock()
 		a.rejectConcurrentExecutor(socket, incomingExecutorID, existingExecutorID)
@@ -3899,13 +3941,13 @@ func (a *neoActor) executorConnectForSocket(socket *neoSocket, msg map[string]an
 		(socket != nil && a.executorSocket != nil && a.executorSocket != socket) ||
 		a.executorReady ||
 		a.executorBootstrapComplete ||
-		(!resumePendingWork && (len(a.pendingTools) > 0 || len(a.approvalQueue) > 0)) ||
-		a.currentInference != nil {
+		(!resumePendingWork && (len(a.pendingTools) > 0 || len(a.approvalQueue) > 0 || a.currentInference != nil)) {
 		cleanup = a.clearStaleExecutorWorkForDisconnectLocked()
 	}
 	clientID := firstNonEmptyString(incomingExecutorID, a.executorID)
 	a.executorID = clientID
 	a.resumeExecutorID = clientID
+	a.rememberExecutorTypeLocked(msg)
 	a.replacingExecutorID = ""
 	if socket != nil {
 		socket.markExecutor(clientID)
@@ -3914,6 +3956,7 @@ func (a *neoActor) executorConnectForSocket(socket *neoSocket, msg map[string]an
 	a.executorReady = false
 	a.executorResumeBootstrap = resumePendingWork
 	a.executorBootstrapComplete = false
+	a.reconnectGeneration++
 	a.tools = map[string]neoToolSpec{}
 	a.toolOrder = nil
 	a.guidanceSnapshot = map[string]any{}
@@ -3938,6 +3981,7 @@ func (a *neoActor) executorToolsBootstrapComplete(msg map[string]any) {
 	a.mu.Lock()
 	a.executorReady = true
 	a.executorBootstrapComplete = true
+	a.markSpawnedExecutorsConnectedLocked()
 	a.executorIdleGeneration++
 	resumeBootstrap := a.executorResumeBootstrap
 	a.executorResumeBootstrap = false
@@ -3969,7 +4013,7 @@ func (a *neoActor) executorConnectedForSocket(socket *neoSocket, msg map[string]
 		a.deferConcurrentExecutorHandoff(socket, incomingExecutorID, existingExecutorID)
 		return
 	}
-	if a.shouldRejectConcurrentExecutorLocked(socket) {
+	if a.shouldRejectConcurrentExecutorLocked(socket) || a.shouldRejectReconnectingExecutorLocked(incomingExecutorID) {
 		existingExecutorID := a.executorID
 		a.mu.Unlock()
 		a.rejectConcurrentExecutor(socket, incomingExecutorID, existingExecutorID)
@@ -3987,6 +4031,7 @@ func (a *neoActor) executorConnectedForSocket(socket *neoSocket, msg map[string]
 	a.touchLocked()
 	a.executorID = executorID
 	a.resumeExecutorID = executorID
+	a.rememberExecutorTypeLocked(msg)
 	a.replacingExecutorID = ""
 	if socket != nil {
 		socket.markExecutor(executorID)
@@ -3994,8 +4039,10 @@ func (a *neoActor) executorConnectedForSocket(socket *neoSocket, msg map[string]
 	}
 	a.executorReady = true
 	a.executorBootstrapComplete = true
+	a.markSpawnedExecutorsConnectedLocked()
 	a.executorResumeBootstrap = false
 	a.executorIdleGeneration++
+	a.reconnectGeneration++
 	a.pendingExecutorHandoff = nil
 	registeredToolCount := numberFrom(msg["registeredToolCount"], len(a.tools))
 	guidanceInventory := neoGuidanceInventory(a.guidanceSnapshot)
@@ -4021,12 +4068,39 @@ func (a *neoActor) executorConnectedForSocket(socket *neoSocket, msg map[string]
 	a.scheduleExecutorIdleStopIfNeeded()
 }
 
+func (a *neoActor) rememberExecutorTypeLocked(msg map[string]any) {
+	executorType := firstNonEmptyString(a.bootstrapExecutorType, msg["executorType"], nestedString(msg["details"], "executorType"), a.meta["executorType"])
+	if executorType == "" {
+		executorType = "local-client"
+	}
+	a.bootstrapExecutorType = executorType
+	if a.meta == nil {
+		a.meta = map[string]any{}
+	}
+	a.meta["executorType"] = executorType
+}
+
+func (a *neoActor) markSpawnedExecutorsConnectedLocked() {
+	for _, spawned := range a.spawnedExecutors {
+		if spawned != nil && !spawned.stopping {
+			spawned.connected = true
+		}
+	}
+}
+
 func (a *neoActor) shouldRejectConcurrentExecutorLocked(socket *neoSocket) bool {
 	return socket != nil &&
 		a.replacingExecutorID == "" &&
 		a.executorSocket != nil &&
 		a.executorSocket != socket &&
 		a.executorWorkActiveLocked()
+}
+
+func (a *neoActor) shouldRejectReconnectingExecutorLocked(incomingExecutorID string) bool {
+	return a.executorSocket == nil &&
+		a.executorID != "" &&
+		incomingExecutorID != a.executorID &&
+		(len(a.pendingTools) > 0 || len(a.approvalQueue) > 0)
 }
 
 func (a *neoActor) shouldDeferConcurrentExecutorHandoffLocked(socket *neoSocket, msg map[string]any) bool {
@@ -4174,9 +4248,56 @@ func (a *neoActor) executorDisconnected(msg map[string]any) {
 	a.executorDisconnectedForSocket(nil, msg)
 }
 
+func (a *neoActor) deferExecutorDisconnectForSocket(socket *neoSocket, executorID string) bool {
+	if socket == nil {
+		return false
+	}
+	a.mu.Lock()
+	if a.executorSocket != socket || (len(a.pendingTools) == 0 && len(a.approvalQueue) == 0) {
+		a.mu.Unlock()
+		return false
+	}
+	if executorID == "" {
+		executorID = a.executorID
+	}
+	a.reconnectGeneration++
+	generation := a.reconnectGeneration
+	a.executorSocket = nil
+	a.executorReady = false
+	a.executorBootstrapComplete = false
+	a.resumeExecutorID = executorID
+	a.mu.Unlock()
+
+	a.broadcastExecutorStatusPayload(map[string]any{
+		"type":    "executor_status",
+		"status":  "running",
+		"message": "Waiting for executor to reconnect.",
+		"details": map[string]any{"reasonCode": "executor_reconnect_grace"},
+	})
+	a.broadcastObservers()
+	time.AfterFunc(neoExecutorReconnectGrace, func() {
+		a.finalizeDeferredExecutorDisconnect(executorID, generation)
+	})
+	return true
+}
+
+func (a *neoActor) finalizeDeferredExecutorDisconnect(executorID string, generation int) {
+	a.executorDisconnectedForSocket(nil, map[string]any{
+		"executorId":                  executorID,
+		"message":                     "Executor did not reconnect.",
+		"cliproxyReconnectGeneration": generation,
+		"details":                     map[string]any{"reasonCode": "executor_reconnect_timeout"},
+	})
+}
+
 func (a *neoActor) executorDisconnectedForSocket(socket *neoSocket, msg map[string]any) {
 	msgExecutorID := firstNonEmptyString(msg["executorId"], msg["clientId"])
 	a.mu.Lock()
+	if generation := int(numberFrom(msg["cliproxyReconnectGeneration"])); generation > 0 &&
+		(generation != a.reconnectGeneration || a.executorSocket != nil || a.executorID != msgExecutorID) {
+		a.mu.Unlock()
+		return
+	}
 	if socket != nil && a.preserveExecutorWorkOnClose {
 		a.mu.Unlock()
 		return
@@ -4204,6 +4325,7 @@ func (a *neoActor) executorDisconnectedForSocket(socket *neoSocket, msg map[stri
 	}
 	a.touchLocked()
 	a.executorIdleGeneration++
+	a.reconnectGeneration++
 	a.executorReady = false
 	a.executorID = ""
 	a.replacingExecutorID = ""
@@ -4680,17 +4802,22 @@ func (a *neoActor) spawnExecutor(msg map[string]any) map[string]any {
 		cmd:       cmd,
 		startedAt: time.Now(),
 	}
-	a.mu.Lock()
-	if a.spawnedExecutors == nil {
-		a.spawnedExecutors = map[string]*neoSpawnedExecutor{}
-	}
-	a.spawnedExecutors[spawnID] = spawned
-	a.mu.Unlock()
+	a.trackSpawnedExecutor(spawnID, spawned)
 
 	status := a.broadcastExecutorStatus(spawnID, "running", "Waiting for local Amp headless executor to connect.", map[string]any{"reasonCode": "waiting_for_executor_connect", "pid": spawned.pid(), "threadId": threadID, "logFile": omitEmpty(logPath)})
 	go a.waitSpawnedExecutor(spawnID, spawned, logFile)
 	go a.watchSpawnedExecutorConnectTimeout(spawnID, spawned, neoExecutorConnectTimeout(cfg))
 	return status
+}
+
+func (a *neoActor) trackSpawnedExecutor(spawnID string, spawned *neoSpawnedExecutor) {
+	a.mu.Lock()
+	spawned.connected = spawned.connected || a.executorConnectedLocked()
+	if a.spawnedExecutors == nil {
+		a.spawnedExecutors = map[string]*neoSpawnedExecutor{}
+	}
+	a.spawnedExecutors[spawnID] = spawned
+	a.mu.Unlock()
 }
 
 func neoHeadlessExecutorSpawnOptions(msg map[string]any) map[string]any {
@@ -4770,7 +4897,7 @@ func (a *neoActor) waitSpawnedExecutor(spawnID string, spawned *neoSpawnedExecut
 	if current == spawned {
 		delete(a.spawnedExecutors, spawnID)
 	}
-	ready := a.executorReady
+	connected := spawned.connected
 	stopping := spawned.stopping
 	respawnOnStop := spawned.respawnOnStop
 	a.mu.Unlock()
@@ -4784,7 +4911,7 @@ func (a *neoActor) waitSpawnedExecutor(spawnID string, spawned *neoSpawnedExecut
 		}
 		return
 	}
-	if !ready {
+	if !connected {
 		message := "Local Amp headless executor exited before connecting."
 		if err != nil {
 			message = "Local Amp headless executor exited before connecting: " + err.Error()
@@ -4813,8 +4940,8 @@ func (a *neoActor) watchSpawnedExecutorConnectTimeout(spawnID string, spawned *n
 
 	a.mu.Lock()
 	current := a.spawnedExecutors[spawnID]
-	ready := a.executorReady
-	if current != spawned || ready {
+	connected := spawned.connected
+	if current != spawned || connected {
 		a.mu.Unlock()
 		return
 	}
@@ -10448,7 +10575,7 @@ func (a *neoActor) syncCloudLoop() {
 	}
 }
 
-func (a *neoActor) syncLocalThreadSnapshotForShutdownNow() {
+func (a *neoActor) syncLocalThreadSnapshotForShutdownNow() bool {
 	a.closeLocalSnapshotSyncs()
 	defer a.reopenLocalSnapshotSyncs()
 	snapshot, ok := a.threadSnapshotWithOptions(neoThreadSnapshotOptions{
@@ -10456,14 +10583,16 @@ func (a *neoActor) syncLocalThreadSnapshotForShutdownNow() {
 		preserveMissingCurrentInference: true,
 	})
 	if !ok {
-		return
+		return false
 	}
 	if snapshot.pendingInference == nil && snapshot.currentInference != nil {
 		snapshot.pendingInference = cloneNeoInferenceInflight(snapshot.currentInference)
 	}
 	if err := writeNeoLocalThreadSnapshotToDir(snapshot, a.threadStoreDir()); err != nil {
 		log.Warnf("amp neo local runtime thread store sync failed thread=%s: %v", snapshot.threadID, err)
+		return false
 	}
+	return true
 }
 
 func (a *neoActor) localSnapshotSyncEpoch() uint64 {
@@ -10540,13 +10669,12 @@ func (a *neoActor) threadSnapshotWithOptions(options neoThreadSnapshotOptions) (
 		pending = cloneNeoInferenceInflight(a.pendingInference)
 	}
 	executorConnected := a.executorConnectedLocked()
-	executorType := ""
 	meta := cloneNeoJSONMap(a.meta)
 	if meta == nil {
 		meta = map[string]any{}
 	}
+	executorType := firstNonEmptyString(a.bootstrapExecutorType, stringValue(meta["executorType"]))
 	if executorConnected {
-		executorType = firstNonEmptyString(a.bootstrapExecutorType, stringValue(a.meta["executorType"]))
 		if executorType == "" && a.executorID != "" {
 			executorType = "local-client"
 		}
@@ -13192,6 +13320,9 @@ func (rt *neoRuntime) neoWebLocalCreateProjectThread(ctx context.Context, query 
 	if projectID != "" && !neoUUIDExactPattern.MatchString(projectID) {
 		projectID = ""
 	}
+	if query.Get("cliproxy-local-project") == "1" {
+		projectID = ""
+	}
 	prompt := strings.TrimSpace(neoWebLocalProjectThreadContentText(request["content"]))
 	workingDirectory := rt.neoWebLocalResolveWorkingDirectory(query, request, prompt, projectID)
 	spawnExecutorValue, spawnExecutorProvided := request["spawnExecutor"]
@@ -14262,11 +14393,7 @@ func neoCloudThread(snapshot neoCloudThreadSnapshot) map[string]any {
 	threadStatus := neoThreadStatusValue(snapshot.threadStatus)
 	relationships := neoMergeThreadRelationshipsWithExplicit(neoThreadRelationships(messages), snapshot.relationships)
 	meta := neoThreadActorImportedMeta(snapshot.meta)
-	if !snapshot.executorConnected {
-		delete(meta, "executorType")
-		delete(meta, "usesDtw")
-		delete(meta, "usesThreadActors")
-	} else if snapshot.executorType != "" {
+	if snapshot.executorType != "" {
 		meta["executorType"] = snapshot.executorType
 	}
 	agentMode := neoCloudAgentMode(snapshot, messages)

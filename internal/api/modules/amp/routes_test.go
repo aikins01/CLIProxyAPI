@@ -390,6 +390,24 @@ func TestWebLocalInferenceOriginAllowlistRequiresOriginOnly(t *testing.T) {
 	}
 }
 
+func TestWebLocalInferenceConfiguredBaseURLOriginIsAllowed(t *testing.T) {
+	settings := config.AmpWebLocalInference{
+		Enabled:        true,
+		AllowedOrigins: []string{"https://ampcode.com"},
+		BaseURL:        "https://aikinss-macbook-pro.taila39f5b.ts.net/",
+	}
+	if !ampWebLocalInferenceRequestOriginAllowed("https://aikinss-macbook-pro.taila39f5b.ts.net", settings) {
+		t.Fatal("configured base URL origin was not allowed")
+	}
+	if ampWebLocalInferenceRequestOriginAllowed("https://example.com", settings) {
+		t.Fatal("unconfigured origin was allowed")
+	}
+	settings.BaseURL = "https://aikinss-macbook-pro.taila39f5b.ts.net/?token=ignored#fragment"
+	if !ampWebLocalInferenceRequestOriginAllowed("https://aikinss-macbook-pro.taila39f5b.ts.net", settings) {
+		t.Fatal("sanitized configured base URL origin was not allowed")
+	}
+}
+
 func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
@@ -418,7 +436,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 	}
 	for _, want := range []string{
 		"// ==UserScript==",
-		"@version 0.1.57",
+		"@version 0.1.59",
 		"@match https://ampcode.com/*",
 		"@updateURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
 		"@downloadURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
@@ -433,7 +451,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"commandPaletteIntegrationCount",
 		"localThreadPickerOpenCount",
 		"removedLocalThreadControlCount",
-		`const userscriptVersion = "0.1.57"`,
+		`const userscriptVersion = "0.1.59"`,
 		"userscriptVersion",
 		"lastPatchedThreadActorBaseURL",
 		"lastPatchedThreadID",
@@ -840,7 +858,7 @@ if (typeof globalThis.btoa !== "function") {
 }
 require(scriptPath);
 const bridge = globalThis.__cliproxyAmpLocalInference;
-	assert(bridge && bridge.userscriptVersion === "0.1.57", "bridge userscript version was not exposed");
+assert(bridge && bridge.userscriptVersion === "0.1.59", "bridge userscript version was not exposed");
 	globalThis.localStorage.setItem(bridge.localThreadIDsStorageKey, JSON.stringify([threadID, secondThreadID]));
 	globalThis.localStorage.setItem(bridge.apiKeyStorageKey, "local-key");
 	globalThis.localStorage.setItem(bridge.workingDirectoryStorageKey, createdThreadWorkDir);
@@ -953,6 +971,11 @@ const createRequestBody = JSON.stringify({
 	]),
 	refreshes: [],
 });
+globalThis.sessionStorage.setItem(bridge.selectedLocalProjectStorageKey, JSON.stringify({
+	name: "local-project",
+	workingDirectory: createdThreadWorkDir,
+	selectedAt: Date.now(),
+}));
 await fetch("https://ampcode.com/_app/remote/3abror/createProjectThread", {
 	method: "POST",
 	headers: { "Content-Type": "application/json" },
@@ -961,6 +984,7 @@ await fetch("https://ampcode.com/_app/remote/3abror/createProjectThread", {
 const bridgedCreateURL = new URL(createFetchURL);
 assert(bridgedCreateURL.origin === "http://127.0.0.1:8317", "create fetch was not bridged to local base");
 assert(bridgedCreateURL.searchParams.get("cliproxy-working-directory") === createdThreadWorkDir, "create fetch missing working directory");
+assert(bridgedCreateURL.searchParams.get("cliproxy-local-project") === "1", "create fetch missing local project marker");
 assert(JSON.parse(globalThis.localStorage.getItem(bridge.localThreadIDsStorageKey)).includes(createdThreadID), "created thread was not remembered before route-data parse");
 globalThis.location = new URL("https://ampcode.com/threads/" + createdThreadID);
 const staleSidebarThreadID = "T-019f3586-fb79-7309-a219-4a279ef2900c";
@@ -2221,6 +2245,9 @@ func TestWebLocalInferenceUserscriptMatchesAllowedOrigins(t *testing.T) {
 	if strings.Count(body, "// @match https://ampcode.example.test/*") != 1 {
 		t.Fatalf("userscript did not deduplicate normalized origins:\n%s", body)
 	}
+	if !strings.Contains(body, "// @match http://127.0.0.1:8317/*") {
+		t.Fatalf("userscript missing configured base URL origin match:\n%s", body)
+	}
 }
 
 func TestWebLocalInferenceUserscriptRouteUsesConfiguredBaseURL(t *testing.T) {
@@ -2886,6 +2913,10 @@ func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.
 	if _, ok := createThreadDataThread["messages"].([]any); !ok {
 		t.Fatalf("create threadData thread messages = %#v", createThreadDataThread["messages"])
 	}
+	createThreadDataMeta := mapValue(createThreadDataThread["meta"])
+	if stringValue(createThreadDataMeta["executorType"]) != "local-client" || createThreadDataMeta["usesThreadActors"] != true {
+		t.Fatalf("create threadData runtime identity = %#v", createThreadDataMeta)
+	}
 	if createThreadDataThread["hasExecutor"] == false || createThreadDataThread["executorConnected"] == false {
 		t.Fatalf("create threadData leaked disconnected executor state: %#v", createThreadDataThread)
 	}
@@ -2920,6 +2951,39 @@ func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.
 	}
 	if bootstrapExecutorType != "local-client" || spawnedCount != 1 {
 		t.Fatalf("executor bootstrap = type:%q spawned:%d", bootstrapExecutorType, spawnedCount)
+	}
+
+	localProjectThreadID := "T-019f20b2-5e05-7501-8ddd-994e151ee959"
+	localProjectBody := neoSvelteKitRemoteCommandBodyForTest(t, map[string]any{
+		"content":       []any{map[string]any{"type": "text", "text": "Use injected local project"}},
+		"agentMode":     "medium",
+		"spawnExecutor": true,
+		"threadID":      localProjectThreadID,
+		"projectID":     projectID,
+	})
+	localProjectReq := httptest.NewRequest(http.MethodPost, "/_app/remote/3abror/createProjectThread?"+ampWebLocalInferenceAPIKeyQuery+"=local-key&cliproxy-working-directory="+url.QueryEscape(expectedWorkDir)+"&cliproxy-local-project=1", strings.NewReader(localProjectBody))
+	localProjectReq.Header.Set("Content-Type", "application/json")
+	localProjectReq.Header.Set("Origin", "https://ampcode.com")
+	localProjectReq.Header.Set(ampWebLocalInferenceHeader, "1")
+	localProjectRec := httptest.NewRecorder()
+	r.ServeHTTP(localProjectRec, localProjectReq)
+	if localProjectRec.Code != http.StatusOK {
+		t.Fatalf("local-project create status = %d, body=%s", localProjectRec.Code, localProjectRec.Body.String())
+	}
+	localProjectActor := rt.store.lookupThreadActor(localProjectThreadID)
+	if localProjectActor == nil {
+		t.Fatal("local-project thread actor not found")
+	}
+	localProjectActor.mu.Lock()
+	localProjectMeta := cloneMap(localProjectActor.meta)
+	localProjectEnvironment := cloneMap(localProjectActor.environment)
+	localProjectActor.mu.Unlock()
+	if stringValue(localProjectMeta["projectID"]) != "" {
+		t.Fatalf("local-project create kept stale project ID: %#v", localProjectMeta)
+	}
+	workspace := neoRecentThreadWorkspace(localProjectEnvironment)
+	if stringValue(workspace["uri"]) != (&url.URL{Scheme: "file", Path: expectedWorkDir}).String() {
+		t.Fatalf("local-project workspace = %#v, want %q", workspace, expectedWorkDir)
 	}
 
 	projectOnlyThreadID := "T-019f20b2-5e05-7501-8ddd-994e151ee952"

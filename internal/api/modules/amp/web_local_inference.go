@@ -75,10 +75,26 @@ func (m *AmpModule) webLocalInferenceCORSAllowed(r *http.Request) bool {
 		return false
 	}
 	origin := strings.TrimSpace(r.Header.Get("Origin"))
-	if origin == "" || !ampWebLocalInferenceOriginAllowed(origin, settings.AllowedOrigins) {
+	if origin == "" || !ampWebLocalInferenceRequestOriginAllowed(origin, settings) {
 		return false
 	}
 	return ampWebLocalInferencePath(r.URL.Path)
+}
+
+func ampWebLocalInferenceRequestOriginAllowed(origin string, settings config.AmpWebLocalInference) bool {
+	if ampWebLocalInferenceOriginAllowed(origin, settings.AllowedOrigins) {
+		return true
+	}
+	baseOrigin := ampWebLocalInferenceBaseOrigin(settings.BaseURL)
+	return baseOrigin != "" && baseOrigin == normalizeAmpWebLocalInferenceOrigin(origin)
+}
+
+func ampWebLocalInferenceBaseOrigin(rawBaseURL string) string {
+	parsed, err := url.Parse(ampWebLocalInferenceSafeBaseURL(rawBaseURL))
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.User != nil {
+		return ""
+	}
+	return strings.ToLower(parsed.Scheme + "://" + parsed.Host)
 }
 
 func (m *AmpModule) webLocalInferenceSettings() config.AmpWebLocalInference {
@@ -211,11 +227,16 @@ func (m *AmpModule) serveWebLocalProjects(c *gin.Context) {
 func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []string) string {
 	baseURL := ampWebLocalInferenceSafeBaseURL(defaultBaseURL)
 	userscriptURL := strings.NewReplacer("\r", "", "\n", "").Replace(baseURL + "/ampcode/local-inference.user.js")
-	matchLines := ampWebLocalInferenceUserscriptMatches(allowedOrigins)
+	matchOrigins := append([]string(nil), allowedOrigins...)
+	if allowedOrigins == nil {
+		matchOrigins = append(matchOrigins, defaultAmpWebLocalInferenceOrigins...)
+	}
+	matchOrigins = append(matchOrigins, baseURL)
+	matchLines := ampWebLocalInferenceUserscriptMatches(matchOrigins)
 	return fmt.Sprintf(`// ==UserScript==
 // @name CLIProxyAPI Amp Local Inference
 // @namespace https://github.com/router-for-me/CLIProxyAPI
-// @version 0.1.57
+// @version 0.1.59
 %s
 // @updateURL %s
 // @downloadURL %s
@@ -227,7 +248,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	"use strict";
 
 	const bridgeHeader = %s;
-	const userscriptVersion = "0.1.57";
+	const userscriptVersion = "0.1.59";
 	const apiKeyStorageKey = "cliproxyapi.ampLocalInference.apiKey";
 	const workingDirectoryStorageKey = "cliproxyapi.ampLocalInference.workingDirectory";
 	const selectedLocalProjectStorageKey = "cliproxyapi.ampLocalInference.selectedLocalProject";
@@ -1613,6 +1634,9 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			const workingDirectory = remoteCreateProjectThreadWorkingDirectory(body);
 			if (workingDirectory && !local.searchParams.has("cliproxy-working-directory")) {
 				local.searchParams.set("cliproxy-working-directory", workingDirectory);
+			}
+			if (workingDirectory && workingDirectory === selectedLocalProjectWorkingDirectory()) {
+				local.searchParams.set("cliproxy-local-project", "1");
 			}
 		}
 		return local.href;
