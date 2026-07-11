@@ -4590,6 +4590,35 @@ func TestNeoRuntimeWebLocalInferenceOriginForwardsPluginMessages(t *testing.T) {
 	if actor == nil {
 		t.Fatal("web local inference bootstrap did not create thread actor")
 	}
+	actor.mu.Lock()
+	existingSockets := make(map[*neoSocket]struct{}, len(actor.sockets))
+	for socket := range actor.sockets {
+		existingSockets[socket] = struct{}{}
+	}
+	actor.mu.Unlock()
+	executorConn := dialNeoActorWebSocketWithoutResume(t, server.URL, threadID, "rvt-skip-ready-wait=true")
+	defer executorConn.Close()
+	var executorSocket *neoSocket
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline) && executorSocket == nil; {
+		actor.mu.Lock()
+		for socket := range actor.sockets {
+			if _, exists := existingSockets[socket]; !exists {
+				executorSocket = socket
+				break
+			}
+		}
+		actor.mu.Unlock()
+		if executorSocket == nil {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	if executorSocket == nil {
+		t.Fatal("executor websocket was not registered")
+	}
+	executorSocket.markExecutor("plugin-ui-test-executor")
+	actor.mu.Lock()
+	actor.executorSocket = executorSocket
+	actor.mu.Unlock()
 	if err := conn.WriteJSON(map[string]any{
 		"type": "plugin_message",
 		"message": map[string]any{
@@ -4601,7 +4630,7 @@ func TestNeoRuntimeWebLocalInferenceOriginForwardsPluginMessages(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("write client plugin request: %v", err)
 	}
-	clientRequest := waitForNeoMessageTypeWhere(t, observer, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
+	clientRequest := waitForNeoMessageTypeWhere(t, executorConn, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
 		return stringValue(mapValue(payload["message"])["id"]) == "client-plugin-request"
 	})
 	if stringValue(mapValue(clientRequest["message"])["method"]) != "ui.select" {
@@ -4613,9 +4642,6 @@ func TestNeoRuntimeWebLocalInferenceOriginForwardsPluginMessages(t *testing.T) {
 	if clientRequestCount != 0 {
 		t.Fatalf("client plugin request created %d pending UI requests", clientRequestCount)
 	}
-	actor.mu.Lock()
-	actor.executorSocket = &neoSocket{}
-	actor.mu.Unlock()
 	actor.handle(map[string]any{
 		"type": "executor_plugin_message",
 		"message": map[string]any{
@@ -4675,12 +4701,12 @@ func TestNeoRuntimeWebLocalInferenceOriginForwardsPluginMessages(t *testing.T) {
 	if settledRequestRetained {
 		t.Fatal("settled plugin UI request remained eligible for cleanup")
 	}
-	observerResponse := waitForNeoMessageTypeWhere(t, observer, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
+	executorResponse := waitForNeoMessageTypeWhere(t, executorConn, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
 		message := mapValue(payload["message"])
 		return message["type"] == "response" && message["id"] == "plugin-request-1"
 	})
-	if message := mapValue(observerResponse["message"]); message["type"] != "response" || message["result"] != "Bravo" || stringValue(mapValue(message["target"])["connectionId"]) != "web-choice-1" {
-		t.Fatalf("observer plugin response = %#v", observerResponse)
+	if message := mapValue(executorResponse["message"]); message["type"] != "response" || message["result"] != "Bravo" || message["target"] != nil {
+		t.Fatalf("executor plugin response = %#v", executorResponse)
 	}
 	removed := waitForNeoMessageTypeWhere(t, observer, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
 		return stringValue(mapValue(payload["message"])["event"]) == "plugin.ui.request_removed"
@@ -4703,6 +4729,13 @@ func TestNeoRuntimeWebLocalInferenceOriginForwardsPluginMessages(t *testing.T) {
 		request := mapValue(mapValue(mapValue(payload["message"])["data"])["request"])
 		return request["requestId"] == "plugin-request-direct"
 	})
+	actor.mu.Lock()
+	actor.executorReady = true
+	actor.queue = append(actor.queue, neoQueuedMessage{
+		MessageID: "M-plugin-queued",
+		Content:   []any{map[string]any{"type": "text", "text": "continue after the choice"}},
+	})
+	actor.mu.Unlock()
 	if err := conn.WriteJSON(map[string]any{
 		"type": "plugin_message",
 		"message": map[string]any{
@@ -4721,13 +4754,25 @@ func TestNeoRuntimeWebLocalInferenceOriginForwardsPluginMessages(t *testing.T) {
 	if request := mapValue(mapValue(mapValue(directSettled["message"])["data"])["request"]); request["status"] != "responded" || request["response"] != true {
 		t.Fatalf("direct settled plugin UI request = %#v", directSettled)
 	}
-	directResponse := waitForNeoMessageTypeWhere(t, observer, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
+	directResponse := waitForNeoMessageTypeWhere(t, executorConn, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
 		message := mapValue(payload["message"])
 		return message["type"] == "response" && message["id"] == "plugin-request-direct"
 	})
-	if connectionID := stringValue(mapValue(mapValue(directResponse["message"])["target"])["connectionId"]); connectionID != "web-choice-direct" {
-		t.Fatalf("direct plugin response target = %q; response=%#v", connectionID, directResponse)
+	if message := mapValue(directResponse["message"]); message["result"] != true || message["target"] != nil {
+		t.Fatalf("direct executor plugin response = %#v", directResponse)
 	}
+	dequeued := waitForNeoMessageTypeWhere(t, observer, "queued_message_dequeued", 2*time.Second, func(payload map[string]any) bool {
+		return payload["queuedMessageId"] == "M-plugin-queued"
+	})
+	if dequeued["queuedMessageId"] != "M-plugin-queued" {
+		t.Fatalf("direct plugin response did not resume queued work: %#v", dequeued)
+	}
+	actor.mu.Lock()
+	actor.generation++
+	actor.currentInference = nil
+	actor.pendingInference = nil
+	actor.agentState = "idle"
+	actor.mu.Unlock()
 	actor.handle(map[string]any{
 		"type": "executor_plugin_message",
 		"message": map[string]any{
@@ -4763,7 +4808,7 @@ func TestNeoRuntimeWebLocalInferenceOriginForwardsPluginMessages(t *testing.T) {
 	actor.messages = []neoMessage{{ThreadID: threadID, MessageID: "M-plugin-truncate", Role: "user"}}
 	actor.mu.Unlock()
 	actor.handleBinaryThreadTruncate(map[string]any{"type": "thread:truncate", "fromIndex": 0})
-	truncateResponse := waitForNeoMessageTypeWhere(t, observer, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
+	truncateResponse := waitForNeoMessageTypeWhere(t, executorConn, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
 		message := mapValue(payload["message"])
 		return message["type"] == "response" && message["id"] == "plugin-request-truncate"
 	})
@@ -4809,7 +4854,7 @@ func TestNeoRuntimeWebLocalInferenceOriginForwardsPluginMessages(t *testing.T) {
 	actor.retryScheduled = true
 	actor.mu.Unlock()
 	actor.interruptActiveToolResultsForBinaryUserMessage()
-	interruptResponse := waitForNeoMessageTypeWhere(t, observer, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
+	interruptResponse := waitForNeoMessageTypeWhere(t, executorConn, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
 		message := mapValue(payload["message"])
 		return message["type"] == "response" && message["id"] == "plugin-request-interrupt"
 	})
@@ -4843,13 +4888,6 @@ func TestNeoRuntimeWebLocalInferenceOriginForwardsPluginMessages(t *testing.T) {
 		return request["requestId"] == "plugin-request-disconnect"
 	})
 	actor.disconnectExecutorForStop()
-	disconnectResponse := waitForNeoMessageTypeWhere(t, observer, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
-		message := mapValue(payload["message"])
-		return message["type"] == "response" && message["id"] == "plugin-request-disconnect"
-	})
-	if stringValue(mapValue(disconnectResponse["message"])["error"]) == "" {
-		t.Fatalf("executor cleanup did not reject plugin UI request = %#v", disconnectResponse)
-	}
 	waitForNeoMessageTypeWhere(t, observer, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
 		message := mapValue(payload["message"])
 		return message["event"] == "plugin.ui.request_removed" && mapValue(message["data"])["requestId"] == "plugin-request-disconnect"
@@ -4890,7 +4928,7 @@ func TestNeoActorPluginUIRequestCountsAsActiveExecutorWork(t *testing.T) {
 	if len(stateRequests) != 1 || stringValue(mapValue(stateRequests[0])["requestId"]) != "plugin-request" {
 		t.Fatalf("state snapshot plugin UI requests = %#v", stateRequests)
 	}
-	actor.respondToPluginUIRequest(map[string]any{
+	actor.respondToPluginUIRequest(nil, map[string]any{
 		"id":     "response-during-reconnect",
 		"params": map[string]any{"requestId": "plugin-request", "result": "choice"},
 	})
@@ -4900,7 +4938,7 @@ func TestNeoActorPluginUIRequestCountsAsActiveExecutorWork(t *testing.T) {
 	if stringValue(reconnectingRequest["status"]) != "pending" {
 		t.Fatalf("response without executor settled plugin UI request: %#v", reconnectingRequest)
 	}
-	actor.handleProtocolPluginMessage(map[string]any{"message": map[string]any{
+	actor.handleProtocolPluginMessage(nil, map[string]any{"message": map[string]any{
 		"type": "response", "id": "plugin-request", "result": "direct-choice",
 	}})
 	actor.mu.Lock()

@@ -3056,9 +3056,9 @@ func (a *neoActor) handleForSocket(socket *neoSocket, msg map[string]any) any {
 	case "client_upload_assets_result":
 		a.broadcast(neoRetypedMessage(msg, "executor_upload_assets_result"))
 	case "executor_plugin_message":
-		a.handleExecutorPluginMessage(normalizeNeoExecutorPluginMessage(msg))
+		a.handleExecutorPluginMessage(socket, normalizeNeoExecutorPluginMessage(msg))
 	case "plugin_message":
-		a.handleProtocolPluginMessage(msg)
+		a.handleProtocolPluginMessage(socket, msg)
 	case "executor_artifact_upsert":
 		a.upsertArtifact(neoArtifactPayloadFromExecutorMessage(msg), firstNonEmptyString(msg["toolCallId"], msg["toolUseId"], msg["toolUseID"]))
 	case "executor_artifact_delete":
@@ -3495,25 +3495,27 @@ func (a *neoActor) handleProtocolQueuedMessageRemoved(msg map[string]any) {
 	}
 }
 
-func (a *neoActor) handleProtocolPluginMessage(msg map[string]any) bool {
+func (a *neoActor) handleProtocolPluginMessage(source *neoSocket, msg map[string]any) bool {
 	message, ok := normalizeNeoProtocolPluginMessage(msg["message"])
 	if !ok {
 		return false
 	}
 	if message["type"] == "response" {
-		matched, settled := a.settlePluginUIRequestFromResponse(message)
-		if matched && !settled {
+		if a.settlePluginUIRequestFromResponse(message) {
+			a.scheduleExecutorIdleStopIfNeeded()
+			a.maybeCompletePendingExecutorHandoff()
+			a.drainReadyWork()
 			return true
 		}
 	}
 	if message["type"] == "request" {
 		switch stringValue(message["method"]) {
 		case "plugin.ui.respond":
-			a.respondToPluginUIRequest(message)
+			a.respondToPluginUIRequest(source, message)
 			return true
 		}
 	}
-	a.broadcast(map[string]any{"type": "plugin_message", "message": message})
+	a.sendPluginMessageToExecutor(source, message)
 	if message["type"] == "response" {
 		a.scheduleExecutorIdleStopIfNeeded()
 		a.maybeCompletePendingExecutorHandoff()
@@ -3522,7 +3524,7 @@ func (a *neoActor) handleProtocolPluginMessage(msg map[string]any) bool {
 	return true
 }
 
-func (a *neoActor) handleExecutorPluginMessage(raw any) {
+func (a *neoActor) handleExecutorPluginMessage(source *neoSocket, raw any) {
 	message, ok := normalizeNeoProtocolPluginMessage(raw)
 	if ok && message["type"] == "request" {
 		if target, exists := mapValue(raw)["target"]; exists {
@@ -3533,14 +3535,11 @@ func (a *neoActor) handleExecutorPluginMessage(raw any) {
 			a.addPluginUIRequest(message)
 			return
 		case "plugin.ui.respond":
-			a.respondToPluginUIRequest(message)
+			a.respondToPluginUIRequest(source, message)
 			return
 		}
 	}
-	if ok && message["type"] == "response" {
-		a.settlePluginUIRequestFromResponse(message)
-	}
-	a.broadcast(map[string]any{"type": "plugin_message", "message": raw})
+	a.broadcastPluginMessageToObservers(source, raw)
 	if ok && message["type"] == "response" {
 		a.scheduleExecutorIdleStopIfNeeded()
 		a.maybeCompletePendingExecutorHandoff()
@@ -3548,23 +3547,21 @@ func (a *neoActor) handleExecutorPluginMessage(raw any) {
 	}
 }
 
-func (a *neoActor) settlePluginUIRequestFromResponse(message map[string]any) (bool, bool) {
+func (a *neoActor) settlePluginUIRequestFromResponse(message map[string]any) bool {
 	requestID := stringValue(message["id"])
 	if requestID == "" {
-		return false, false
+		return false
 	}
 	a.mu.Lock()
 	request := cloneNeoJSONMap(a.pluginUIRequests[requestID])
 	if len(request) == 0 || stringValue(request["status"]) != "pending" {
 		a.mu.Unlock()
-		return false, false
+		return false
 	}
-	if a.executorSocket == nil {
+	executorSocket := a.executorSocket
+	if executorSocket == nil {
 		a.mu.Unlock()
-		return true, false
-	}
-	if target := mapValue(request["target"]); len(target) > 0 {
-		message["target"] = cloneNeoJSONMap(target)
+		return true
 	}
 	if errText, ok := message["error"].(string); ok {
 		request["status"] = "errored"
@@ -3579,9 +3576,10 @@ func (a *neoActor) settlePluginUIRequestFromResponse(message map[string]any) (bo
 	delete(a.pluginUIRequests, requestID)
 	a.executorIdleGeneration++
 	a.mu.Unlock()
-	a.broadcast(neoPluginUIStateEvent("plugin.ui.request_settled", map[string]any{"request": request}))
-	a.broadcast(neoPluginUIStateEvent("plugin.ui.request_removed", map[string]any{"requestId": requestID}))
-	return true, true
+	executorSocket.send(map[string]any{"type": "plugin_message", "message": message})
+	a.broadcastPluginUIState("plugin.ui.request_settled", map[string]any{"request": request})
+	a.broadcastPluginUIState("plugin.ui.request_removed", map[string]any{"requestId": requestID})
+	return true
 }
 
 func (a *neoActor) addPluginUIRequest(message map[string]any) {
@@ -3609,14 +3607,14 @@ func (a *neoActor) addPluginUIRequest(message map[string]any) {
 	a.pluginUIRequests[requestID] = request
 	a.executorIdleGeneration++
 	a.mu.Unlock()
-	a.broadcast(neoPluginUIStateEvent("plugin.ui.request_added", map[string]any{"request": request}))
+	a.broadcastPluginUIState("plugin.ui.request_added", map[string]any{"request": request})
 }
 
 func (a *neoActor) inferenceStartBlockedLocked() bool {
 	return a.agentState != "idle" || len(a.pluginUIRequests) > 0
 }
 
-func (a *neoActor) respondToPluginUIRequest(message map[string]any) {
+func (a *neoActor) respondToPluginUIRequest(source *neoSocket, message map[string]any) {
 	responseID := stringValue(message["id"])
 	params := mapValue(message["params"])
 	requestID := stringValue(params["requestId"])
@@ -3627,19 +3625,20 @@ func (a *neoActor) respondToPluginUIRequest(message map[string]any) {
 	request := cloneNeoJSONMap(a.pluginUIRequests[requestID])
 	if len(request) == 0 || stringValue(request["status"]) != "pending" {
 		a.mu.Unlock()
-		a.broadcast(map[string]any{"type": "plugin_message", "message": map[string]any{
+		a.sendPluginMessage(source, map[string]any{
 			"type": "response", "id": responseID, "result": map[string]any{"status": "not_pending"},
-		}})
+		})
 		return
 	}
-	if a.executorSocket == nil {
+	executorSocket := a.executorSocket
+	if executorSocket == nil {
 		a.mu.Unlock()
-		a.broadcast(map[string]any{"type": "plugin_message", "message": map[string]any{
+		a.sendPluginMessage(source, map[string]any{
 			"type": "response", "id": responseID, "result": map[string]any{"status": "executor_unavailable"},
-		}})
+		})
 		return
 	}
-	response := map[string]any{"type": "response", "id": requestID, "target": cloneNeoJSONValue(request["target"])}
+	response := map[string]any{"type": "response", "id": requestID}
 	if errText, ok := params["error"].(string); ok {
 		request["status"] = "errored"
 		request["error"] = errText
@@ -3656,12 +3655,12 @@ func (a *neoActor) respondToPluginUIRequest(message map[string]any) {
 	a.executorIdleGeneration++
 	a.mu.Unlock()
 
-	a.broadcast(neoPluginUIStateEvent("plugin.ui.request_settled", map[string]any{"request": request}))
-	a.broadcast(map[string]any{"type": "plugin_message", "message": response})
-	a.broadcast(map[string]any{"type": "plugin_message", "message": map[string]any{
+	executorSocket.send(map[string]any{"type": "plugin_message", "message": response})
+	a.broadcastPluginUIState("plugin.ui.request_settled", map[string]any{"request": request})
+	a.sendPluginMessage(source, map[string]any{
 		"type": "response", "id": responseID, "result": map[string]any{"status": "accepted", "state": request},
-	}})
-	a.broadcast(neoPluginUIStateEvent("plugin.ui.request_removed", map[string]any{"requestId": requestID}))
+	})
+	a.broadcastPluginUIState("plugin.ui.request_removed", map[string]any{"requestId": requestID})
 	a.scheduleExecutorIdleStopIfNeeded()
 	a.maybeCompletePendingExecutorHandoff()
 	a.drainReadyWork()
@@ -3702,6 +3701,43 @@ func neoPluginUIStateEvent(event string, data map[string]any) map[string]any {
 	}}
 }
 
+func (a *neoActor) sendPluginMessageToExecutor(source *neoSocket, message any) {
+	a.mu.Lock()
+	executorSocket := a.executorSocket
+	a.mu.Unlock()
+	if executorSocket == nil || executorSocket == source {
+		return
+	}
+	executorSocket.send(map[string]any{"type": "plugin_message", "message": message})
+}
+
+func (a *neoActor) sendPluginMessage(socket *neoSocket, message any) {
+	if socket == nil {
+		return
+	}
+	socket.send(map[string]any{"type": "plugin_message", "message": message})
+}
+
+func (a *neoActor) broadcastPluginMessageToObservers(source *neoSocket, message any) {
+	payload := map[string]any{"type": "plugin_message", "message": message}
+	for _, socket := range a.socketList() {
+		if socket == nil || socket.conn == nil || socket == source || socket.isExecutor() {
+			continue
+		}
+		socket.send(payload)
+	}
+}
+
+func (a *neoActor) broadcastPluginUIState(event string, data map[string]any) {
+	payload := neoPluginUIStateEvent(event, data)
+	for _, socket := range a.socketList() {
+		if socket == nil || socket.conn == nil || socket.isExecutor() {
+			continue
+		}
+		socket.send(payload)
+	}
+}
+
 func (a *neoActor) pluginUIRequestListLocked() []any {
 	requests := make([]map[string]any, 0, len(a.pluginUIRequests))
 	for _, request := range a.pluginUIRequests {
@@ -3734,10 +3770,10 @@ func (a *neoActor) clearPluginUIRequestsLocked() []string {
 
 func (a *neoActor) broadcastPluginUIRequestRemovals(requestIDs []string) {
 	for _, requestID := range requestIDs {
-		a.broadcast(map[string]any{"type": "plugin_message", "message": map[string]any{
+		a.sendPluginMessageToExecutor(nil, map[string]any{
 			"type": "response", "id": requestID, "error": "Plugin UI request cancelled",
-		}})
-		a.broadcast(neoPluginUIStateEvent("plugin.ui.request_removed", map[string]any{"requestId": requestID}))
+		})
+		a.broadcastPluginUIState("plugin.ui.request_removed", map[string]any{"requestId": requestID})
 	}
 	if len(requestIDs) > 0 && !a.maybeCompletePendingExecutorHandoff() {
 		a.scheduleExecutorIdleStopIfNeeded()
