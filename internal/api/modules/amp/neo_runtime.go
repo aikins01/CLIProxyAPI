@@ -163,25 +163,27 @@ var (
 )
 
 type neoRuntime struct {
-	mu                 sync.RWMutex
-	cfg                *config.Config
-	host               string
-	port               int
-	server             *http.Server
-	store              *neoActorStore
-	started            bool
-	cleanup            context.CancelFunc
-	modelMapper        ModelMapper
-	secretSource       SecretSource
-	connMu             sync.Mutex
-	connections        map[net.Conn]struct{}
-	threadDir          string
-	githubClient       *http.Client
-	githubAPIBase      string
-	githubRawBase      string
-	projectIndexMu     sync.Mutex
-	projectIndexCache  []any
-	projectIndexLoaded bool
+	mu                  sync.RWMutex
+	cfg                 *config.Config
+	host                string
+	port                int
+	server              *http.Server
+	store               *neoActorStore
+	started             bool
+	cleanup             context.CancelFunc
+	modelMapper         ModelMapper
+	secretSource        SecretSource
+	connMu              sync.Mutex
+	connections         map[net.Conn]struct{}
+	threadDir           string
+	githubClient        *http.Client
+	githubAPIBase       string
+	githubRawBase       string
+	projectIndexMu      sync.Mutex
+	projectIndexCache   []any
+	projectIndexLoaded  bool
+	writeLocalSnapshot  func(neoCloudThreadSnapshot, string) error
+	asyncLocalSnapshots bool
 	// inferStream overrides the provider inference call used by the local agent
 	// and subagent loops. Defaults to inferNeoLocalStream; tests set it to replay
 	// a scripted session deterministically without a live provider.
@@ -200,12 +202,13 @@ func (rt *neoRuntime) subagentInfer(request neoInferenceRequest, onDelta neoStre
 func newNeoRuntime(cfg *config.Config) *neoRuntime {
 	host, port := neoRuntimeAddress(cfg)
 	rt := &neoRuntime{
-		cfg:         cfg,
-		host:        host,
-		port:        port,
-		store:       newNeoActorStore(),
-		connections: map[net.Conn]struct{}{},
-		threadDir:   neoAmpThreadStoreDir(),
+		cfg:                cfg,
+		host:               host,
+		port:               port,
+		store:              newNeoActorStore(),
+		connections:        map[net.Conn]struct{}{},
+		threadDir:          neoAmpThreadStoreDir(),
+		writeLocalSnapshot: writeNeoLocalThreadSnapshotToDir,
 	}
 	rt.store.runtime = rt
 	return rt
@@ -355,32 +358,37 @@ func neoRuntimeBindRetryable(err error) bool {
 
 func (rt *neoRuntime) stop(ctx context.Context) error {
 	return rt.stopWithOptions(ctx, neoRuntimeStopOptions{
-		stopExecutors: true,
-		closeReason:   "Actor stopped",
+		stopExecutors:       true,
+		closeReason:         "Actor stopped",
+		transportClose:      true,
+		flushLocalSnapshots: true,
 	})
 }
 
 func (rt *neoRuntime) shutdown(ctx context.Context) error {
 	return rt.stopWithOptions(ctx, neoRuntimeStopOptions{
-		stopExecutors:       false,
-		transportClose:      true,
-		flushLocalSnapshots: true,
+		stopExecutors:        false,
+		transportClose:       true,
+		flushLocalSnapshots:  true,
+		preserveExecutorWork: true,
 	})
 }
 
 func (rt *neoRuntime) rebind(ctx context.Context) error {
 	return rt.stopWithOptions(ctx, neoRuntimeStopOptions{
-		stopExecutors:       true,
-		transportClose:      true,
-		flushLocalSnapshots: true,
+		stopExecutors:        true,
+		transportClose:       true,
+		flushLocalSnapshots:  true,
+		preserveExecutorWork: true,
 	})
 }
 
 type neoRuntimeStopOptions struct {
-	stopExecutors       bool
-	closeReason         string
-	transportClose      bool
-	flushLocalSnapshots bool
+	stopExecutors        bool
+	closeReason          string
+	transportClose       bool
+	flushLocalSnapshots  bool
+	preserveExecutorWork bool
 }
 
 func (rt *neoRuntime) stopWithOptions(ctx context.Context, options neoRuntimeStopOptions) error {
@@ -400,13 +408,14 @@ func (rt *neoRuntime) stopWithOptions(ctx context.Context, options neoRuntimeSto
 	server := rt.server
 	rt.server = nil
 	flushLocalSnapshots := options.flushLocalSnapshots && rt.localThreadSnapshotsEnabledLocked()
-	stopExecutorsOnDispose := options.stopExecutors
-	if flushLocalSnapshots && !options.stopExecutors {
+	if flushLocalSnapshots && options.preserveExecutorWork {
 		rt.store.preserveExecutorWorkOnClose()
 	}
 	if flushLocalSnapshots && options.stopExecutors {
-		rt.store.stopAllSpawnedExecutors()
-		stopExecutorsOnDispose = false
+		rt.store.stopAllSpawnedExecutors(options.preserveExecutorWork)
+		if !options.preserveExecutorWork {
+			rt.store.disconnectAllExecutors()
+		}
 	}
 	if options.transportClose {
 		err := server.Close()
@@ -415,17 +424,25 @@ func (rt *neoRuntime) stopWithOptions(ctx context.Context, options neoRuntimeSto
 		}
 		rt.store.closeAllSockets(options.closeReason, true)
 		rt.closeTrackedConnections()
+		if options.stopExecutors {
+			rt.store.stopAllSpawnedExecutors(options.preserveExecutorWork)
+			if !options.preserveExecutorWork {
+				rt.store.disconnectAllExecutors()
+			}
+		}
 		if flushLocalSnapshots {
 			rt.store.syncLocalThreadSnapshots()
 		}
-		rt.store.disposeAll(stopExecutorsOnDispose, options.closeReason, options.transportClose)
+		rt.store.closeLocalSnapshotSyncs()
+		rt.store.disposeAll(options.stopExecutors, options.closeReason, options.transportClose)
 		return err
 	}
 	err := server.Shutdown(ctx)
 	if flushLocalSnapshots {
 		rt.store.syncLocalThreadSnapshots()
 	}
-	rt.store.disposeAll(stopExecutorsOnDispose, options.closeReason, options.transportClose)
+	rt.store.closeLocalSnapshotSyncs()
+	rt.store.disposeAll(options.stopExecutors, options.closeReason, options.transportClose)
 	rt.closeTrackedConnections()
 	return err
 }
@@ -2265,7 +2282,7 @@ func (s *neoActorStore) disposeAll(stopExecutors bool, closeReason string, trans
 	}
 }
 
-func (s *neoActorStore) stopAllSpawnedExecutors() {
+func (s *neoActorStore) stopAllSpawnedExecutors(preserveWork bool) {
 	if s == nil {
 		return
 	}
@@ -2276,7 +2293,26 @@ func (s *neoActorStore) stopAllSpawnedExecutors() {
 	}
 	s.mu.RUnlock()
 	for _, actor := range actors {
-		actor.stopSpawnedExecutors()
+		if preserveWork {
+			actor.stopSpawnedExecutorsForRebind()
+		} else {
+			actor.stopSpawnedExecutors()
+		}
+	}
+}
+
+func (s *neoActorStore) disconnectAllExecutors() {
+	if s == nil {
+		return
+	}
+	s.mu.RLock()
+	actors := make([]*neoActor, 0, len(s.actors))
+	for _, actor := range s.actors {
+		actors = append(actors, actor)
+	}
+	s.mu.RUnlock()
+	for _, actor := range actors {
+		actor.disconnectExecutorForStop()
 	}
 }
 
@@ -2307,7 +2343,15 @@ func (s *neoActorStore) preserveExecutorWorkOnClose() {
 	s.mu.RUnlock()
 	for _, actor := range actors {
 		actor.mu.Lock()
+		actor.reconnectGeneration++
 		actor.preserveExecutorWorkOnClose = true
+		resumeExecutorID := firstNonEmptyString(actor.resumeExecutorID, actor.executorID)
+		if resumeExecutorID != "" {
+			if actor.meta == nil {
+				actor.meta = map[string]any{}
+			}
+			actor.meta[neoResumeExecutorIDMetaKey] = resumeExecutorID
+		}
 		actor.mu.Unlock()
 	}
 }
@@ -2324,6 +2368,21 @@ func (s *neoActorStore) syncLocalThreadSnapshots() {
 	s.mu.RUnlock()
 	for _, actor := range actors {
 		actor.syncLocalThreadSnapshotForShutdownNow()
+	}
+}
+
+func (s *neoActorStore) closeLocalSnapshotSyncs() {
+	if s == nil {
+		return
+	}
+	s.mu.RLock()
+	actors := make([]*neoActor, 0, len(s.actors))
+	for _, actor := range s.actors {
+		actors = append(actors, actor)
+	}
+	s.mu.RUnlock()
+	for _, actor := range actors {
+		actor.closeLocalSnapshotSyncs()
 	}
 }
 
@@ -2418,6 +2477,8 @@ type neoActor struct {
 	lastUsed                    time.Time
 	syncRunning                 bool
 	syncPending                 bool
+	localSyncRunning            bool
+	localSyncPending            bool
 	syncWG                      sync.WaitGroup
 	localSnapshotClosing        bool
 	localSnapshotEpoch          uint64
@@ -2642,6 +2703,33 @@ func (a *neoActor) stopSpawnedExecutors() {
 	}
 }
 
+func (a *neoActor) stopSpawnedExecutorsForRebind() {
+	a.mu.Lock()
+	executors := a.spawnedExecutorListLocked()
+	if len(executors) == 0 {
+		a.mu.Unlock()
+		return
+	}
+	a.spawnedExecutors = map[string]*neoSpawnedExecutor{}
+	a.touchLocked()
+	a.executorIdleGeneration++
+	a.reconnectGeneration++
+	a.executorReady = false
+	a.executorID = ""
+	a.resumeExecutorID = ""
+	delete(a.meta, neoResumeExecutorIDMetaKey)
+	a.replacingExecutorID = ""
+	a.executorSocket = nil
+	a.executorBootstrapComplete = false
+	a.executorResumeBootstrap = false
+	a.clearExecutorWorkForDisconnectLocked(true)
+	a.agentState = "idle"
+	a.mu.Unlock()
+	for _, executor := range executors {
+		executor.stop()
+	}
+}
+
 func (a *neoActor) closeSocketsWithOptions(closeReason string, transportClose bool) {
 	if a == nil {
 		return
@@ -2681,7 +2769,7 @@ func (a *neoActor) prunable(now time.Time, ttl time.Duration, localThreadSnapsho
 	if a.lastUsed.IsZero() || now.Sub(a.lastUsed) < ttl {
 		return false
 	}
-	if len(a.sockets) > 0 || a.executorID != "" || a.agentState != "idle" || a.syncRunning || a.syncPending {
+	if len(a.sockets) > 0 || a.executorID != "" || a.agentState != "idle" || a.syncRunning || a.syncPending || a.localSyncRunning || a.localSyncPending {
 		return false
 	}
 	if len(a.pendingTools) > 0 || len(a.approvalQueue) > 0 || len(a.queue) > 0 || len(a.spawnedExecutors) > 0 || a.currentInference != nil || a.pendingInference != nil || a.retryScheduled || a.compacting {
@@ -4246,6 +4334,28 @@ func (a *neoActor) closeSupersededExecutorSockets(active *neoSocket, reason stri
 
 func (a *neoActor) executorDisconnected(msg map[string]any) {
 	a.executorDisconnectedForSocket(nil, msg)
+}
+
+func (a *neoActor) disconnectExecutorForStop() {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	a.touchLocked()
+	a.executorIdleGeneration++
+	a.reconnectGeneration++
+	a.executorReady = false
+	a.executorID = ""
+	a.resumeExecutorID = ""
+	delete(a.meta, neoResumeExecutorIDMetaKey)
+	a.replacingExecutorID = ""
+	a.executorSocket = nil
+	a.executorBootstrapComplete = false
+	a.executorResumeBootstrap = false
+	a.clearExecutorWorkForDisconnectLocked(false)
+	a.pendingInference = nil
+	a.agentState = "idle"
+	a.mu.Unlock()
 }
 
 func (a *neoActor) deferExecutorDisconnectForSocket(socket *neoSocket, executorID string) bool {
@@ -10516,20 +10626,9 @@ func (a *neoActor) syncCloudAsync() {
 	if a == nil {
 		return
 	}
-	localSnapshotSync := a.localThreadSnapshotsEnabled()
-	localSnapshotEpoch := uint64(0)
-	if localSnapshotSync {
-		localSnapshotEpoch = a.localSnapshotSyncEpoch()
-	}
-	snapshot, ok := a.threadSnapshot()
-	if !ok {
+	a.syncLocalThreadSnapshotAsync()
+	if !a.cloudThreadSyncEnabled() {
 		return
-	}
-	if localSnapshotSync && a.beginLocalSnapshotSync(localSnapshotEpoch) {
-		if err := writeNeoLocalThreadSnapshotToDir(snapshot, a.threadStoreDir()); err != nil {
-			log.Warnf("amp neo local runtime thread store sync failed thread=%s: %v", snapshot.threadID, err)
-		}
-		a.syncWG.Done()
 	}
 
 	a.mu.Lock()
@@ -10540,16 +10639,89 @@ func (a *neoActor) syncCloudAsync() {
 	}
 	a.syncRunning = true
 	a.mu.Unlock()
+	go a.syncCloudLoop()
+}
 
-	if _, ok := a.cloudThreadSnapshot(snapshot); !ok {
+func (a *neoActor) syncLocalThreadSnapshotAsync() {
+	if !a.localThreadSnapshotsEnabled() {
+		return
+	}
+	if a.runtime != nil && !a.runtime.asyncLocalSnapshots {
 		a.mu.Lock()
-		a.syncRunning = false
-		a.syncPending = false
+		if a.localSnapshotClosing {
+			a.mu.Unlock()
+			return
+		}
+		epoch := a.localSnapshotEpoch
+		a.syncWG.Add(1)
+		a.mu.Unlock()
+		defer a.syncWG.Done()
+		if snapshot, ok := a.threadSnapshot(); ok {
+			if a.localSnapshotWriterAllowed(epoch) {
+				if err := a.runtime.writeThreadSnapshot(snapshot, a.threadStoreDir()); err != nil {
+					log.Warnf("amp neo local runtime thread store sync failed thread=%s: %v", snapshot.threadID, err)
+				}
+			}
+		}
+		return
+	}
+	a.mu.Lock()
+	if a.localSnapshotClosing {
 		a.mu.Unlock()
 		return
 	}
+	if a.localSyncRunning {
+		a.localSyncPending = true
+		a.mu.Unlock()
+		return
+	}
+	a.localSyncRunning = true
+	epoch := a.localSnapshotEpoch
+	a.syncWG.Add(1)
+	a.mu.Unlock()
+	go a.syncLocalThreadSnapshotLoop(epoch)
+}
 
-	go a.syncCloudLoop()
+func (a *neoActor) syncLocalThreadSnapshotLoop(epoch uint64) {
+	defer a.syncWG.Done()
+	for {
+		snapshot, ok := a.threadSnapshot()
+		if ok && a.localSnapshotWriterAllowed(epoch) {
+			if err := a.runtime.writeThreadSnapshot(snapshot, a.threadStoreDir()); err != nil {
+				log.Warnf("amp neo local runtime thread store sync failed thread=%s: %v", snapshot.threadID, err)
+			}
+		}
+
+		a.mu.Lock()
+		if a.localSnapshotClosing || a.localSnapshotEpoch != epoch {
+			a.localSyncRunning = false
+			a.localSyncPending = false
+			a.mu.Unlock()
+			return
+		}
+		if a.localSyncPending {
+			a.localSyncPending = false
+			a.mu.Unlock()
+			continue
+		}
+		a.localSyncRunning = false
+		a.mu.Unlock()
+		return
+	}
+}
+
+func (a *neoActor) localSnapshotWriterAllowed(epoch uint64) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return !a.localSnapshotClosing && a.localSnapshotEpoch == epoch
+}
+
+func (a *neoActor) cloudThreadSyncEnabled() bool {
+	if a == nil || a.runtime == nil {
+		return false
+	}
+	cfg := a.runtime.configSnapshot()
+	return cfg != nil && strings.TrimSpace(cfg.AmpCode.UpstreamURL) != "" && strings.TrimSpace(cfg.AmpCode.UpstreamAPIKey) != ""
 }
 
 func (a *neoActor) syncCloudLoop() {
@@ -10588,26 +10760,10 @@ func (a *neoActor) syncLocalThreadSnapshotForShutdownNow() bool {
 	if snapshot.pendingInference == nil && snapshot.currentInference != nil {
 		snapshot.pendingInference = cloneNeoInferenceInflight(snapshot.currentInference)
 	}
-	if err := writeNeoLocalThreadSnapshotToDir(snapshot, a.threadStoreDir()); err != nil {
+	if err := a.runtime.writeThreadSnapshot(snapshot, a.threadStoreDir()); err != nil {
 		log.Warnf("amp neo local runtime thread store sync failed thread=%s: %v", snapshot.threadID, err)
 		return false
 	}
-	return true
-}
-
-func (a *neoActor) localSnapshotSyncEpoch() uint64 {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.localSnapshotEpoch
-}
-
-func (a *neoActor) beginLocalSnapshotSync(epoch uint64) bool {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.localSnapshotClosing || a.localSnapshotEpoch != epoch {
-		return false
-	}
-	a.syncWG.Add(1)
 	return true
 }
 
@@ -10615,6 +10771,7 @@ func (a *neoActor) closeLocalSnapshotSyncs() {
 	a.mu.Lock()
 	a.localSnapshotClosing = true
 	a.localSnapshotEpoch++
+	a.localSyncPending = false
 	a.mu.Unlock()
 	a.syncWG.Wait()
 }
@@ -11713,6 +11870,13 @@ func writeNeoLocalThreadSnapshotToDir(snapshot neoCloudThreadSnapshot, dir strin
 	}
 	log.Debugf("amp neo local runtime thread store sync complete thread=%s path=%s", snapshot.threadID, path)
 	return nil
+}
+
+func (rt *neoRuntime) writeThreadSnapshot(snapshot neoCloudThreadSnapshot, dir string) error {
+	if rt != nil && rt.writeLocalSnapshot != nil {
+		return rt.writeLocalSnapshot(snapshot, dir)
+	}
+	return writeNeoLocalThreadSnapshotToDir(snapshot, dir)
 }
 
 func neoLocalThreadSnapshotSettings(snapshot neoCloudThreadSnapshot) map[string]any {

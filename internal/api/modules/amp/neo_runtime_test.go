@@ -3364,46 +3364,78 @@ func TestNeoActorStoreDoesNotPruneDeferredInference(t *testing.T) {
 	}
 }
 
-func TestNeoActorSyncCloudAsyncCoalescesWhileRunning(t *testing.T) {
-	dir := t.TempDir()
-	oldStoreDir := neoAmpDataDir
-	neoAmpDataDir = func() string { return dir }
-	t.Cleanup(func() { neoAmpDataDir = oldStoreDir })
+func TestNeoActorSyncCloudAsyncCoalescesLocalSnapshots(t *testing.T) {
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled}}})
+	rt.threadDir = t.TempDir()
+	rt.asyncLocalSnapshots = true
+	threadID := "T-019f4000-0000-4000-8000-000000000051"
+	actor := newNeoActor(rt, "actor-test", "thread-actor", threadID, threadID, neoActorRecord("actor-test", "thread-actor", threadID), nil)
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var writesMu sync.Mutex
+	writes := make([]string, 0, 2)
+	rt.writeLocalSnapshot = func(snapshot neoCloudThreadSnapshot, _ string) error {
+		writesMu.Lock()
+		writes = append(writes, snapshot.title)
+		writeNumber := len(writes)
+		writesMu.Unlock()
+		if writeNumber == 1 {
+			close(firstStarted)
+			<-releaseFirst
+		}
+		return nil
+	}
 
-	rt := newNeoRuntime(&config.Config{})
-	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-sync-coalesce", "T-sync-coalesce", neoActorRecord("actor-test", "thread-actor", "T-sync-coalesce"), nil)
 	actor.mu.Lock()
-	actor.syncRunning = true
+	actor.title = "first"
 	actor.mu.Unlock()
+	actor.syncCloudAsync()
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first local snapshot did not start")
+	}
 
+	actor.mu.Lock()
+	actor.title = "latest"
+	actor.mu.Unlock()
 	for i := 0; i < 20; i++ {
 		actor.syncCloudAsync()
 	}
-	actor.mu.Lock()
-	if !actor.syncRunning || !actor.syncPending {
-		t.Fatalf("sync state = running:%v pending:%v, want running and pending", actor.syncRunning, actor.syncPending)
+	close(releaseFirst)
+	waitForNeoActorSyncIdle(t, actor)
+
+	writesMu.Lock()
+	defer writesMu.Unlock()
+	if !reflect.DeepEqual(writes, []string{"first", "latest"}) {
+		t.Fatalf("local snapshot titles = %#v, want first and latest only", writes)
 	}
+}
+
+func TestNeoActorSyncCloudAsyncDoesNotCloneWhileCloudSyncRunning(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{UpstreamURL: "http://127.0.0.1:1", UpstreamAPIKey: "secret"}})
+	rt.threadDir = ""
+	rt.asyncLocalSnapshots = true
+	threadID := "T-019f4000-0000-4000-8000-000000000052"
+	actor := newNeoActor(rt, "actor-test", "thread-actor", threadID, threadID, neoActorRecord("actor-test", "thread-actor", threadID), nil)
+	content := make([]any, 2000)
+	for i := range content {
+		content[i] = map[string]any{"type": "text", "text": strings.Repeat("x", 128)}
+	}
+	actor.mu.Lock()
+	actor.messages = []neoMessage{{MessageID: "M-large", ThreadID: threadID, Role: "user", Content: content}}
+	actor.syncRunning = true
+	actor.mu.Unlock()
+
+	allocs := testing.AllocsPerRun(20, actor.syncCloudAsync)
+	actor.mu.Lock()
 	actor.syncRunning = false
 	actor.syncPending = false
 	actor.mu.Unlock()
-
-	actor.syncCloudAsync()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		actor.mu.Lock()
-		running := actor.syncRunning
-		actor.mu.Unlock()
-		if !running {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	actor.mu.Lock()
-	running := actor.syncRunning
-	pending := actor.syncPending
-	actor.mu.Unlock()
-	if running || pending {
-		t.Fatalf("sync state after worker = running:%v pending:%v, want idle", running, pending)
+	t.Logf("coalesced sync allocations = %.1f", allocs)
+	if allocs > 8 {
+		t.Fatalf("sync requests allocated %.1f objects while coalescing, want at most 8", allocs)
 	}
 }
 
@@ -5079,6 +5111,233 @@ func TestNeoRuntimeShutdownPreservesPendingExecutorToolForReconnect(t *testing.T
 	if got := stringValue(resultAfterReconnect["status"]); got != "done" {
 		t.Fatalf("restored review result status = %q, want done", got)
 	}
+	waitForNeoActorSyncIdle(t, restored)
+	waitForNeoActorSyncIdle(t, replacement)
+}
+
+func TestNeoRuntimeRebindPreservesPendingExecutorToolForReconnect(t *testing.T) {
+	useTempNeoThreadStore(t)
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
+		Enabled: &enabled,
+		Host:    "127.0.0.1",
+		Port:    freeTCPPortForTest(t),
+	}}})
+	if err := rt.start(); err != nil {
+		t.Fatalf("start runtime: %v", err)
+	}
+
+	threadID := "T-019f4899-7bfa-78aa-9d42-ca39216d818d"
+	toolCallID := "TU-0000000000000000000003"
+	actor := rt.store.ensureThreadActor(threadID)
+	executorSocket := &neoSocket{}
+	executorSocket.markExecutor("executor-rebind")
+	actor.mu.Lock()
+	actor.executorID = "executor-rebind"
+	actor.executorSocket = executorSocket
+	actor.executorReady = true
+	actor.executorBootstrapComplete = true
+	actor.currentAgentMode = "high"
+	actor.currentReasoningEffort = "xhigh"
+	actor.storeMessageLocked(neoMessage{ThreadID: threadID, MessageID: "M-user", Role: "user", AgentMode: "high", ReasoningEffort: "xhigh", Content: []any{map[string]any{"type": "text", "text": "continue after rebind"}}})
+	actor.storeMessageLocked(neoMessage{ThreadID: threadID, MessageID: "M-assistant", Role: "assistant", AgentMode: "high", ReasoningEffort: "xhigh", State: map[string]any{"type": "complete", "stopReason": "tool_use"}, Content: []any{map[string]any{"type": "tool_use", "id": toolCallID, "name": "shell_command", "input": map[string]any{"command": "go test ./..."}}}})
+	actor.storeMessageLocked(neoMessage{ThreadID: threadID, MessageID: toolResultMessageID(toolCallID), Role: "user", Content: []any{map[string]any{"type": "tool_result", "toolUseID": toolCallID, "run": map[string]any{"status": "in-progress", "progress": "testing"}}}, CompletionStatus: "tool_progress"})
+	actor.pendingTools[toolCallID] = neoPendingTool{ID: toolCallID, Name: "shell_command", AgentMode: "high", ReasoningEffort: "xhigh", MessageID: "M-assistant"}
+	actor.agentState = "running_tools"
+	actor.reconnectGeneration = 7
+	actor.resumeExecutorID = "executor-rebind"
+	actor.executorSocket = nil
+	actor.executorReady = false
+	actor.executorBootstrapComplete = false
+	actor.rebuildHistoryLocked()
+	actor.mu.Unlock()
+	rt.store.preserveExecutorWorkOnClose()
+	actor.finalizeDeferredExecutorDisconnect("executor-rebind", 7)
+	actor.mu.Lock()
+	_, pendingAfterStaleTimer := actor.pendingTools[toolCallID]
+	actor.mu.Unlock()
+	if !pendingAfterStaleTimer {
+		t.Fatal("stale reconnect timer cleared work preserved for rebind")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := rt.rebind(ctx); err != nil {
+		t.Fatalf("rebind runtime: %v", err)
+	}
+
+	stored, ok := loadNeoThreadFromDir(threadID, neoAmpThreadStoreDir())
+	if !ok {
+		t.Fatal("rebind snapshot was not persisted")
+	}
+	if got := stringValue(mapValue(stored["meta"])[neoResumeExecutorIDMetaKey]); got != "executor-rebind" {
+		t.Fatalf("resume executor id = %q, want executor-rebind", got)
+	}
+	restored := newNeoActor(newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled}}}), "actor-restored", "thread-actor", threadID, threadID, neoActorRecord("actor-restored", "thread-actor", threadID), nil)
+	if err := restored.importThreadLocalOnly(stored); err != nil {
+		t.Fatalf("import rebind snapshot: %v", err)
+	}
+	restored.mu.Lock()
+	pending := restored.pendingTools[toolCallID]
+	result := mapValue(mapValue(restored.messages[2].Content[0])["run"])
+	restored.mu.Unlock()
+	if pending.ID != toolCallID || stringValue(result["status"]) != "in-progress" {
+		t.Fatalf("rebind work = pending:%#v run:%#v", pending, result)
+	}
+}
+
+func TestNeoRuntimeRebindConvertsSpawnedExecutorWorkToPendingInference(t *testing.T) {
+	useTempNeoThreadStore(t)
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
+		Enabled: &enabled,
+		Host:    "127.0.0.1",
+		Port:    freeTCPPortForTest(t),
+	}}})
+	if err := rt.start(); err != nil {
+		t.Fatalf("start runtime: %v", err)
+	}
+
+	threadID := "T-019f4899-7bfa-78aa-9d42-ca39216d818f"
+	toolCallID := "TU-0000000000000000000005"
+	actor := rt.store.ensureThreadActor(threadID)
+	actor.mu.Lock()
+	actor.bootstrapExecutorType = "local-client"
+	actor.executorID = "cli-headless-old"
+	actor.executorReady = true
+	actor.executorBootstrapComplete = true
+	actor.spawnedExecutors["spawn-old"] = &neoSpawnedExecutor{spawnID: "spawn-old", threadID: threadID}
+	actor.currentAgentMode = "high"
+	actor.currentReasoningEffort = "xhigh"
+	actor.storeMessageLocked(neoMessage{ThreadID: threadID, MessageID: "M-assistant", Role: "assistant", State: map[string]any{"type": "complete", "stopReason": "tool_use"}, Content: []any{map[string]any{"type": "tool_use", "id": toolCallID, "name": "shell_command", "input": map[string]any{"command": "go test ./..."}}}})
+	actor.storeMessageLocked(neoMessage{ThreadID: threadID, MessageID: toolResultMessageID(toolCallID), Role: "user", Content: []any{map[string]any{"type": "tool_result", "toolUseID": toolCallID, "run": map[string]any{"status": "in-progress"}}}, CompletionStatus: "tool_progress"})
+	actor.pendingTools[toolCallID] = neoPendingTool{ID: toolCallID, Name: "shell_command", AgentMode: "high", ReasoningEffort: "xhigh", MessageID: "M-assistant"}
+	actor.agentState = "running_tools"
+	actor.rebuildHistoryLocked()
+	actor.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := rt.rebind(ctx); err != nil {
+		t.Fatalf("rebind runtime: %v", err)
+	}
+
+	stored, ok := loadNeoThreadFromDir(threadID, neoAmpThreadStoreDir())
+	if !ok {
+		t.Fatal("rebind snapshot was not persisted")
+	}
+	if got := stringValue(mapValue(stored["meta"])[neoResumeExecutorIDMetaKey]); got != "" {
+		t.Fatalf("spawned executor resume id = %q, want empty", got)
+	}
+	if pending := mapValue(stored["pendingInference"]); stringValue(pending["agentMode"]) != "high" || stringValue(pending["reasoningEffort"]) != "xhigh" {
+		t.Fatalf("spawned executor continuation = %#v", pending)
+	}
+
+	disabled := false
+	restarted := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &disabled}}})
+	restored := newNeoActor(restarted, "actor-restored", "thread-actor", threadID, threadID, neoActorRecord("actor-restored", "thread-actor", threadID), nil)
+	if err := restored.importThreadLocalOnly(stored); err != nil {
+		t.Fatalf("import rebind snapshot: %v", err)
+	}
+	restored.mu.Lock()
+	_, stillPending := restored.pendingTools[toolCallID]
+	pendingInference := cloneNeoInferenceInflight(restored.pendingInference)
+	agentState := restored.agentState
+	restored.mu.Unlock()
+	if stillPending || pendingInference == nil || agentState != "idle" {
+		t.Fatalf("restored spawned work = pendingTool:%v pendingInference:%#v state:%q", stillPending, pendingInference, agentState)
+	}
+}
+
+func TestNeoRuntimeStopClearsPendingExecutorWork(t *testing.T) {
+	useTempNeoThreadStore(t)
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
+		Enabled: &enabled,
+		Host:    "127.0.0.1",
+		Port:    freeTCPPortForTest(t),
+	}}})
+	if err := rt.start(); err != nil {
+		t.Fatalf("start runtime: %v", err)
+	}
+
+	threadID := "T-019f4899-7bfa-78aa-9d42-ca39216d818e"
+	toolCallID := "TU-0000000000000000000004"
+	actor := rt.store.ensureThreadActor(threadID)
+	actor.mu.Lock()
+	actor.resumeExecutorID = "executor-disabled"
+	actor.meta[neoResumeExecutorIDMetaKey] = "executor-disabled"
+	actor.currentAgentMode = "high"
+	actor.currentReasoningEffort = "xhigh"
+	actor.currentInference = &neoInferenceInflight{messageID: "M-assistant", agentMode: "high", reasoningEffort: "xhigh"}
+	actor.pendingInference = &neoInferenceInflight{messageID: "M-pending", agentMode: "high", reasoningEffort: "xhigh"}
+	actor.storeMessageLocked(neoMessage{ThreadID: threadID, MessageID: "M-assistant", Role: "assistant", State: map[string]any{"type": "complete", "stopReason": "tool_use"}, Content: []any{map[string]any{"type": "tool_use", "id": toolCallID, "name": "shell_command", "input": map[string]any{"command": "go test ./..."}}}})
+	actor.storeMessageLocked(neoMessage{ThreadID: threadID, MessageID: toolResultMessageID(toolCallID), Role: "user", Content: []any{map[string]any{"type": "tool_result", "toolUseID": toolCallID, "run": map[string]any{"status": "in-progress"}}}, CompletionStatus: "tool_progress"})
+	actor.pendingTools[toolCallID] = neoPendingTool{ID: toolCallID, Name: "shell_command", AgentMode: "high", ReasoningEffort: "xhigh", MessageID: "M-assistant"}
+	actor.agentState = "running_tools"
+	actor.rebuildHistoryLocked()
+	actor.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := rt.stop(ctx); err != nil {
+		t.Fatalf("stop runtime: %v", err)
+	}
+	actor.mu.Lock()
+	currentAfterStop := cloneNeoInferenceInflight(actor.currentInference)
+	pendingAfterStop := cloneNeoInferenceInflight(actor.pendingInference)
+	executorIDAfterStop := actor.executorID
+	resumeExecutorIDAfterStop := actor.resumeExecutorID
+	actor.mu.Unlock()
+	if currentAfterStop != nil || pendingAfterStop != nil || executorIDAfterStop != "" || resumeExecutorIDAfterStop != "" {
+		t.Fatalf("deliberate stop retained executor work: current=%#v pending=%#v executor=%q resume=%q", currentAfterStop, pendingAfterStop, executorIDAfterStop, resumeExecutorIDAfterStop)
+	}
+
+	stored, ok := loadNeoThreadFromDir(threadID, neoAmpThreadStoreDir())
+	if !ok {
+		t.Fatal("stop snapshot was not persisted")
+	}
+	if pending := mapValue(stored["pendingInference"]); len(pending) != 0 {
+		t.Fatalf("deliberate stop persisted pending inference: %#v", pending)
+	}
+	if got := stringValue(mapValue(stored["meta"])[neoResumeExecutorIDMetaKey]); got != "" {
+		t.Fatalf("deliberate stop persisted resume executor id %q", got)
+	}
+	if got := stringValue(stored["agentState"]); got != "idle" {
+		t.Fatalf("deliberate stop agent state = %q, want idle", got)
+	}
+}
+
+func TestNeoRuntimeStopCleansExecutorSpawnedDuringFinalFlush(t *testing.T) {
+	useTempNeoThreadStore(t)
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
+		Enabled: &enabled,
+		Host:    "127.0.0.1",
+		Port:    freeTCPPortForTest(t),
+	}}})
+	if err := rt.start(); err != nil {
+		t.Fatalf("start runtime: %v", err)
+	}
+	actor := rt.store.ensureThreadActor("T-019f4899-7bfa-78aa-9d42-ca39216d8190")
+	rt.writeLocalSnapshot = func(neoCloudThreadSnapshot, string) error {
+		actor.mu.Lock()
+		actor.spawnedExecutors["spawn-late"] = &neoSpawnedExecutor{spawnID: "spawn-late", threadID: actor.threadID}
+		actor.mu.Unlock()
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := rt.stop(ctx); err != nil {
+		t.Fatalf("stop runtime: %v", err)
+	}
+	actor.mu.Lock()
+	spawned := len(actor.spawnedExecutors)
+	actor.mu.Unlock()
+	if spawned != 0 {
+		t.Fatalf("late spawned executors after stop = %d, want 0", spawned)
+	}
 }
 
 func TestNeoRuntimeShutdownPersistsLocalReasoningEffortSetting(t *testing.T) {
@@ -5237,23 +5496,143 @@ func TestWriteNeoLocalThreadFileTightensExistingDirectoryPermissions(t *testing.
 	}
 }
 
-func TestNeoActorLocalSnapshotEpochRejectsPreFlushWriters(t *testing.T) {
-	rt := newNeoRuntime(&config.Config{})
-	actor := newNeoActor(rt, "actor-snapshot-epoch", "thread-actor", "T-snapshot-epoch", "T-snapshot-epoch", neoActorRecord("actor-snapshot-epoch", "thread-actor", "T-snapshot-epoch"), nil)
-	staleEpoch := actor.localSnapshotSyncEpoch()
-
-	actor.closeLocalSnapshotSyncs()
-	actor.reopenLocalSnapshotSyncs()
-
-	if actor.beginLocalSnapshotSync(staleEpoch) {
-		actor.syncWG.Done()
-		t.Fatal("stale pre-flush snapshot writer was allowed after final flush")
+func TestNeoActorFinalLocalSnapshotWaitsForAsyncWriter(t *testing.T) {
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled}}})
+	rt.threadDir = t.TempDir()
+	rt.asyncLocalSnapshots = true
+	threadID := "T-019f4000-0000-4000-8000-000000000053"
+	actor := newNeoActor(rt, "actor-snapshot-epoch", "thread-actor", threadID, threadID, neoActorRecord("actor-snapshot-epoch", "thread-actor", threadID), nil)
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var writes atomic.Int32
+	rt.writeLocalSnapshot = func(neoCloudThreadSnapshot, string) error {
+		if writes.Add(1) == 1 {
+			close(firstStarted)
+			<-releaseFirst
+		}
+		return nil
 	}
-	freshEpoch := actor.localSnapshotSyncEpoch()
-	if !actor.beginLocalSnapshotSync(freshEpoch) {
-		t.Fatal("fresh post-flush snapshot writer was rejected")
+
+	actor.syncCloudAsync()
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("async local snapshot did not start")
 	}
-	actor.syncWG.Done()
+	finished := make(chan bool, 1)
+	go func() {
+		finished <- actor.syncLocalThreadSnapshotForShutdownNow()
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		actor.mu.Lock()
+		closing := actor.localSnapshotClosing
+		actor.mu.Unlock()
+		if closing {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("final snapshot did not close async writers")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	actor.syncCloudAsync()
+	select {
+	case <-finished:
+		t.Fatal("final snapshot completed before async writer")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(releaseFirst)
+	select {
+	case ok := <-finished:
+		if !ok {
+			t.Fatal("final local snapshot failed")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("final local snapshot did not complete")
+	}
+	if got := writes.Load(); got != 2 {
+		t.Fatalf("local snapshot writes = %d, want in-flight plus final only", got)
+	}
+}
+
+func TestNeoRuntimeStopWaitsForAsyncLocalSnapshot(t *testing.T) {
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
+		Enabled: &enabled,
+		Host:    "127.0.0.1",
+		Port:    freeTCPPortForTest(t),
+	}}})
+	rt.threadDir = t.TempDir()
+	rt.asyncLocalSnapshots = true
+	if err := rt.start(); err != nil {
+		t.Fatalf("start runtime: %v", err)
+	}
+	threadID := "T-019f4000-0000-4000-8000-000000000054"
+	actor := rt.store.ensureThreadActor(threadID)
+	executorSocket := &neoSocket{}
+	executorSocket.markExecutor("executor-stop")
+	actor.mu.Lock()
+	actor.executorID = "executor-stop"
+	actor.executorSocket = executorSocket
+	actor.executorReady = true
+	actor.executorBootstrapComplete = true
+	actor.pendingTools["TU-stop"] = neoPendingTool{ID: "TU-stop", Name: "shell_command"}
+	actor.agentState = "running_tools"
+	actor.mu.Unlock()
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var writes atomic.Int32
+	rt.writeLocalSnapshot = func(neoCloudThreadSnapshot, string) error {
+		if writes.Add(1) == 1 {
+			close(firstStarted)
+			<-releaseFirst
+		}
+		return nil
+	}
+
+	actor.syncCloudAsync()
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("async local snapshot did not start")
+	}
+	stopped := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		stopped <- rt.stop(ctx)
+	}()
+	select {
+	case err := <-stopped:
+		t.Fatalf("runtime stopped before async writer completed: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(releaseFirst)
+	select {
+	case err := <-stopped:
+		if err != nil {
+			t.Fatalf("stop runtime: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runtime stop did not wait for local snapshots")
+	}
+	actor.mu.Lock()
+	closing := actor.localSnapshotClosing
+	running := actor.localSyncRunning
+	executorID := actor.executorID
+	pendingTools := len(actor.pendingTools)
+	agentState := actor.agentState
+	actor.mu.Unlock()
+	if !closing || running || executorID != "" || pendingTools != 0 || agentState != "idle" {
+		t.Fatalf("stopped actor state = closing:%v running:%v executor:%q pending:%d agent:%q", closing, running, executorID, pendingTools, agentState)
+	}
+	writesBefore := writes.Load()
+	actor.syncCloudAsync()
+	if got := writes.Load(); got != writesBefore {
+		t.Fatalf("stopped actor scheduled another local snapshot: writes=%d, want %d", got, writesBefore)
+	}
 }
 
 func TestNeoRuntimeShutdownClosesActorWebSocketsAsTransportFailure(t *testing.T) {
@@ -8610,8 +8989,8 @@ func waitForNeoActorSyncIdle(t *testing.T, actor *neoActor) {
 	var idleSince time.Time
 	for time.Now().Before(deadline) {
 		actor.mu.Lock()
-		running := actor.syncRunning
-		pending := actor.syncPending
+		running := actor.syncRunning || actor.localSyncRunning
+		pending := actor.syncPending || actor.localSyncPending
 		actor.mu.Unlock()
 		if !running && !pending {
 			if idleSince.IsZero() {

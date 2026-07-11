@@ -344,6 +344,7 @@ func (m *AmpModule) applyNeoRuntime(cfg *config.Config) {
 	}
 
 	rt := newNeoRuntime(cfg)
+	rt.asyncLocalSnapshots = true
 	rt.setModelMapper(m.modelMapper)
 	rt.setSecretSource(m.secretSource)
 	if err := rt.start(); err != nil {
