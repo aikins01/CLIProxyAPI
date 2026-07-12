@@ -30360,6 +30360,47 @@ func TestWriteNeoLocalThreadSnapshotCanonicalizesModeEffortAndExecutorState(t *t
 	}
 }
 
+func TestLoadNeoThreadFromDirNormalizesOwnedDataDocument(t *testing.T) {
+	dir := t.TempDir()
+	threadID := "T-019e0e6e-f3f1-7078-b5dd-748f66f8c266"
+	raw, err := json.Marshal(map[string]any{
+		"title": "outer title",
+		"meta": map[string]any{
+			"cliProxyAPILocalNeo": true,
+			"outer":               "preserved",
+			"shared":              "outer",
+		},
+		"data": map[string]any{
+			"id":        threadID,
+			"title":     "inner title",
+			"agentMode": "deep",
+			"messages":  []any{},
+			"meta": map[string]any{
+				"inner":  "preserved",
+				"shared": "inner",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal thread: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, threadID+".json"), raw, 0o600); err != nil {
+		t.Fatalf("write thread: %v", err)
+	}
+
+	thread, ok := loadNeoThreadFromDir(threadID, dir)
+	if !ok {
+		t.Fatal("load data-wrapped thread")
+	}
+	if thread["title"] != "inner title" || thread["data"] != nil {
+		t.Fatalf("normalized thread = %#v", thread)
+	}
+	meta := mapValue(thread["meta"])
+	if meta["cliProxyAPILocalNeo"] != true || meta["outer"] != "preserved" || meta["inner"] != "preserved" || meta["shared"] != "inner" {
+		t.Fatalf("normalized meta = %#v", meta)
+	}
+}
+
 func TestNeoRuntimeProjectIndexUpdateSkipsUnchangedProject(t *testing.T) {
 	threadDir := t.TempDir()
 	rt := newNeoRuntime(&config.Config{})

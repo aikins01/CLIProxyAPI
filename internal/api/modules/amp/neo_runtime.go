@@ -12735,7 +12735,7 @@ func loadNeoThreadFromDir(threadID, dir string) (map[string]any, bool) {
 		log.Warnf("amp neo local thread store read failed thread=%s: %v", threadID, err)
 		return nil, false
 	}
-	thread := neoCloudThreadDocumentForImport(decoded, threadID)
+	thread := neoCloudThreadDocumentForImportOwned(decoded, threadID)
 	if firstNonEmptyString(thread["id"], findThreadID(thread)) != threadID {
 		return nil, false
 	}
@@ -15213,25 +15213,29 @@ func neoCloudThreadFromGetThreadResponse(decoded map[string]any, threadID string
 }
 
 func neoCloudThreadDocumentForImport(thread map[string]any, threadID string) map[string]any {
+	return neoCloudThreadDocumentForImportOwned(cloneNeoJSONMap(thread), threadID)
+}
+
+func neoCloudThreadDocumentForImportOwned(thread map[string]any, threadID string) map[string]any {
 	if len(thread) == 0 {
 		return nil
 	}
-	out := cloneNeoJSONMap(thread)
+	out := thread
 	if data := mapValue(thread["data"]); len(data) > 0 {
-		out = cloneNeoJSONMap(data)
+		out = data
 		for key, value := range thread {
 			if key == "data" {
 				continue
 			}
 			if _, exists := out[key]; !exists || out[key] == nil {
-				out[key] = cloneNeoJSONValue(value)
+				out[key] = value
 			}
 		}
 		if meta := mapValue(thread["meta"]); len(meta) > 0 {
-			merged := cloneMap(mapValue(out["meta"]))
+			merged := mapValue(out["meta"])
 			for key, value := range meta {
 				if _, exists := merged[key]; !exists || merged[key] == nil {
-					merged[key] = cloneNeoJSONValue(value)
+					merged[key] = value
 				}
 			}
 			out["meta"] = merged
