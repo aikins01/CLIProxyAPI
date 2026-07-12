@@ -184,6 +184,8 @@ type neoRuntime struct {
 	projectIndexMu           sync.Mutex
 	projectIndexCache        []any
 	projectIndexLoaded       bool
+	projectIndexStamp        neoWebLocalFileStamp
+	projectHistoryStamp      neoWebLocalFileStamp
 	writeLocalSnapshot       func(neoCloudThreadSnapshot, string) error
 	asyncLocalSnapshots      bool
 	localSnapshotMinInterval time.Duration
@@ -191,6 +193,12 @@ type neoRuntime struct {
 	// and subagent loops. Defaults to inferNeoLocalStream; tests set it to replay
 	// a scripted session deterministically without a live provider.
 	inferStream func(*neoRuntime, neoInferenceRequest, neoStreamCallback) (neoInferenceResult, error)
+}
+
+type neoWebLocalFileStamp struct {
+	exists       bool
+	size         int64
+	modifiedNano int64
 }
 
 // subagentInfer runs one inference for a local subagent loop, honoring a test
@@ -211,7 +219,6 @@ func newNeoRuntime(cfg *config.Config) *neoRuntime {
 		store:                    newNeoActorStore(),
 		connections:              map[net.Conn]struct{}{},
 		threadDir:                neoAmpThreadStoreDir(),
-		writeLocalSnapshot:       writeNeoLocalThreadSnapshotToDir,
 		localSnapshotMinInterval: neoLocalSnapshotMinInterval,
 	}
 	rt.store.runtime = rt
@@ -2483,6 +2490,7 @@ type neoActor struct {
 	mainThreadID                string
 	notificationSubs            map[string]map[string]any
 	pluginUIRequests            map[string]map[string]any
+	pluginUIResponses           map[string]map[string]any
 	userRunners                 map[string]neoUserExecutorRunner
 	lastUsed                    time.Time
 	syncRunning                 bool
@@ -2642,6 +2650,7 @@ func newNeoActor(rt *neoRuntime, id, name, key, threadID string, record map[stri
 		debug:                  map[string]any{},
 		notificationSubs:       map[string]map[string]any{},
 		pluginUIRequests:       map[string]map[string]any{},
+		pluginUIResponses:      map[string]map[string]any{},
 		localSnapshotWake:      make(chan struct{}, 1),
 		lastUsed:               time.Now(),
 		seq:                    1,
@@ -3601,9 +3610,19 @@ func (a *neoActor) settlePluginUIRequestFromResponse(message map[string]any) boo
 		return false
 	}
 	executorSocket := a.executorSocket
-	if executorSocket == nil {
+	queuedResponse := cloneNeoJSONMap(a.pluginUIResponses[requestID])
+	if executorSocket == nil || !a.executorReady || !a.executorBootstrapComplete {
+		if a.pluginUIResponses == nil {
+			a.pluginUIResponses = map[string]map[string]any{}
+		}
+		if _, exists := a.pluginUIResponses[requestID]; !exists {
+			a.pluginUIResponses[requestID] = cloneNeoJSONMap(message)
+		}
 		a.mu.Unlock()
 		return true
+	}
+	if len(queuedResponse) > 0 {
+		message = queuedResponse
 	}
 	if errText, ok := message["error"].(string); ok {
 		request["status"] = "errored"
@@ -3616,6 +3635,7 @@ func (a *neoActor) settlePluginUIRequestFromResponse(message map[string]any) boo
 	}
 	request["updatedAt"] = time.Now().UTC().Format(time.RFC3339Nano)
 	delete(a.pluginUIRequests, requestID)
+	delete(a.pluginUIResponses, requestID)
 	a.executorIdleGeneration++
 	a.mu.Unlock()
 	executorSocket.send(map[string]any{"type": "plugin_message", "message": message})
@@ -3673,27 +3693,41 @@ func (a *neoActor) respondToPluginUIRequest(source *neoSocket, message map[strin
 		return
 	}
 	executorSocket := a.executorSocket
-	if executorSocket == nil {
+	response := map[string]any{"type": "response", "id": requestID}
+	if errText, ok := params["error"].(string); ok {
+		response["error"] = errText
+	} else if result, exists := params["result"]; exists {
+		response["result"] = cloneNeoJSONValue(result)
+	}
+	queuedResponse := cloneNeoJSONMap(a.pluginUIResponses[requestID])
+	if executorSocket == nil || !a.executorReady || !a.executorBootstrapComplete {
+		if a.pluginUIResponses == nil {
+			a.pluginUIResponses = map[string]map[string]any{}
+		}
+		if _, exists := a.pluginUIResponses[requestID]; !exists {
+			a.pluginUIResponses[requestID] = cloneNeoJSONMap(response)
+		}
 		a.mu.Unlock()
 		a.sendPluginMessage(source, map[string]any{
-			"type": "response", "id": responseID, "result": map[string]any{"status": "executor_unavailable"},
+			"type": "response", "id": responseID, "result": map[string]any{"status": "accepted", "state": request},
 		})
 		return
 	}
-	response := map[string]any{"type": "response", "id": requestID}
-	if errText, ok := params["error"].(string); ok {
+	if len(queuedResponse) > 0 {
+		response = queuedResponse
+	}
+	if errText, ok := response["error"].(string); ok {
 		request["status"] = "errored"
 		request["error"] = errText
-		response["error"] = errText
 	} else {
 		request["status"] = "responded"
-		if result, exists := params["result"]; exists {
+		if result, exists := response["result"]; exists {
 			request["response"] = cloneNeoJSONValue(result)
-			response["result"] = cloneNeoJSONValue(result)
 		}
 	}
 	request["updatedAt"] = time.Now().UTC().Format(time.RFC3339Nano)
 	delete(a.pluginUIRequests, requestID)
+	delete(a.pluginUIResponses, requestID)
 	a.executorIdleGeneration++
 	a.mu.Unlock()
 
@@ -3804,10 +3838,28 @@ func (a *neoActor) clearPluginUIRequestsLocked() []string {
 	}
 	sort.Strings(requestIDs)
 	a.pluginUIRequests = map[string]map[string]any{}
+	a.pluginUIResponses = map[string]map[string]any{}
 	if len(requestIDs) > 0 {
 		a.executorIdleGeneration++
 	}
 	return requestIDs
+}
+
+func (a *neoActor) flushPluginUIResponses() {
+	a.mu.Lock()
+	requestIDs := make([]string, 0, len(a.pluginUIResponses))
+	for requestID := range a.pluginUIResponses {
+		requestIDs = append(requestIDs, requestID)
+	}
+	sort.Strings(requestIDs)
+	responses := make([]map[string]any, 0, len(requestIDs))
+	for _, requestID := range requestIDs {
+		responses = append(responses, cloneNeoJSONMap(a.pluginUIResponses[requestID]))
+	}
+	a.mu.Unlock()
+	for _, response := range responses {
+		a.settlePluginUIRequestFromResponse(response)
+	}
 }
 
 func (a *neoActor) broadcastPluginUIRequestRemovals(requestIDs []string) {
@@ -4432,6 +4484,7 @@ func (a *neoActor) executorToolsBootstrapComplete(msg map[string]any) {
 	a.sendExecutorConnected(nil, resumeBootstrap)
 	a.broadcastExecutorConnectedStatus(executorID)
 	a.broadcastObservers()
+	a.flushPluginUIResponses()
 	a.drainReadyWork()
 	a.syncCloudAsync()
 	a.scheduleExecutorIdleStopIfNeeded()
@@ -4506,6 +4559,7 @@ func (a *neoActor) executorConnectedForSocket(socket *neoSocket, msg map[string]
 	a.broadcastExecutorConnectedStatus(executorID)
 	a.broadcastObservers()
 	a.syncCloudAsync()
+	a.flushPluginUIResponses()
 	a.drainReadyWork()
 	a.scheduleExecutorIdleStopIfNeeded()
 }
@@ -12267,8 +12321,17 @@ func neoAmpThreadStoreDir() string {
 }
 
 func writeNeoLocalThreadSnapshotToDir(snapshot neoCloudThreadSnapshot, dir string) error {
+	_, path, err := writeNeoLocalThreadSnapshotFile(snapshot, dir)
+	if err != nil {
+		return err
+	}
+	log.Debugf("amp neo local runtime thread store sync complete thread=%s path=%s", snapshot.threadID, path)
+	return nil
+}
+
+func writeNeoLocalThreadSnapshotFile(snapshot neoCloudThreadSnapshot, dir string) (map[string]any, string, error) {
 	if !neoThreadIDExactPattern.MatchString(snapshot.threadID) {
-		return fmt.Errorf("invalid thread id %q", snapshot.threadID)
+		return nil, "", fmt.Errorf("invalid thread id %q", snapshot.threadID)
 	}
 	thread := neoCloudThread(snapshot)
 	if settings := neoLocalThreadSnapshotSettings(snapshot); len(settings) > 0 {
@@ -12282,20 +12345,24 @@ func writeNeoLocalThreadSnapshotToDir(snapshot neoCloudThreadSnapshot, dir strin
 	}
 	path, err := writeNeoLocalThreadFileInDir(dir, snapshot.threadID, thread)
 	if err != nil {
-		return err
+		return nil, "", err
 	}
-	if err := updateNeoWebLocalProjectIndexFromThread(dir, thread); err != nil {
-		log.Debugf("amp neo local runtime project index update failed thread=%s: %v", snapshot.threadID, err)
-	}
-	log.Debugf("amp neo local runtime thread store sync complete thread=%s path=%s", snapshot.threadID, path)
-	return nil
+	return thread, path, nil
 }
 
 func (rt *neoRuntime) writeThreadSnapshot(snapshot neoCloudThreadSnapshot, dir string) error {
 	if rt != nil && rt.writeLocalSnapshot != nil {
 		return rt.writeLocalSnapshot(snapshot, dir)
 	}
-	return writeNeoLocalThreadSnapshotToDir(snapshot, dir)
+	thread, path, err := writeNeoLocalThreadSnapshotFile(snapshot, dir)
+	if err != nil {
+		return err
+	}
+	if err := rt.updateNeoWebLocalProjectIndexFromThread(dir, thread); err != nil {
+		log.Debugf("amp neo local runtime project index update failed thread=%s: %v", snapshot.threadID, err)
+	}
+	log.Debugf("amp neo local runtime thread store sync complete thread=%s path=%s", snapshot.threadID, path)
+	return nil
 }
 
 func neoLocalThreadSnapshotSettings(snapshot neoCloudThreadSnapshot) map[string]any {
@@ -12348,15 +12415,37 @@ func writeNeoLocalThreadFileInDir(dir, threadID string, thread map[string]any) (
 	return path, writeNeoAtomicFile(path, append(raw, '\n'), 0o600)
 }
 
-func updateNeoWebLocalProjectIndexFromThread(threadDir string, thread map[string]any) error {
+func (rt *neoRuntime) updateNeoWebLocalProjectIndexFromThread(threadDir string, thread map[string]any) error {
 	project := neoWebLocalProjectFromThread(thread)
 	if len(project) == 0 {
 		return nil
 	}
+	indexPath := neoWebLocalProjectIndexPath(threadDir)
+	rt.projectIndexMu.Lock()
+	defer rt.projectIndexMu.Unlock()
+	indexStamp := neoWebLocalFileSourceStamp(indexPath)
+	if rt.projectIndexLoaded && indexStamp == rt.projectIndexStamp {
+		projects := neoWebLocalMergeProjects(rt.projectIndexCache, []any{project})
+		if reflect.DeepEqual(rt.projectIndexCache, projects) {
+			return nil
+		}
+	}
 	neoWebLocalProjectIndexMu.Lock()
 	defer neoWebLocalProjectIndexMu.Unlock()
-	projects := neoWebLocalMergeProjects(readNeoWebLocalProjectIndexUnlocked(threadDir), []any{project})
-	return writeNeoWebLocalProjectIndexUnlocked(threadDir, projects)
+	current := readNeoWebLocalProjectIndexUnlocked(threadDir)
+	projects := neoWebLocalMergeProjects(current, []any{project})
+	var err error
+	if !reflect.DeepEqual(current, projects) {
+		err = writeNeoWebLocalProjectIndexUnlocked(threadDir, projects)
+	}
+	indexStamp = neoWebLocalFileSourceStamp(indexPath)
+	if err != nil {
+		indexStamp = neoWebLocalFileStamp{exists: true, size: -1}
+	}
+	rt.projectIndexCache = projects
+	rt.projectIndexLoaded = true
+	rt.projectIndexStamp = indexStamp
+	return err
 }
 
 func readNeoWebLocalProjectIndex(threadDir string) []any {
@@ -14222,18 +14311,46 @@ func (rt *neoRuntime) reloadNeoWebLocalProjectCache() []any {
 	if rt == nil || !rt.localThreadSnapshotsEnabled() {
 		return nil
 	}
-	projects := neoWebLocalMergeProjects(readNeoWebLocalProjectIndex(rt.threadDir), scanNeoWebLocalHistoryProjects(rt.threadDir))
-	if len(projects) > 0 {
-		if err := writeNeoWebLocalProjectIndex(rt.threadDir, projects); err != nil {
+	indexPath := neoWebLocalProjectIndexPath(rt.threadDir)
+	historyPath := neoWebLocalHistoryPath(rt.threadDir)
+	rt.projectIndexMu.Lock()
+	indexStamp := neoWebLocalFileSourceStamp(indexPath)
+	historyStamp := neoWebLocalFileSourceStamp(historyPath)
+	if rt.projectIndexLoaded && indexStamp == rt.projectIndexStamp && historyStamp == rt.projectHistoryStamp {
+		projects := cloneArray(rt.projectIndexCache)
+		rt.projectIndexMu.Unlock()
+		return projects
+	}
+	historyProjects := scanNeoWebLocalHistoryProjects(rt.threadDir)
+	neoWebLocalProjectIndexMu.Lock()
+	current := readNeoWebLocalProjectIndexUnlocked(rt.threadDir)
+	projects := neoWebLocalMergeProjects(current, historyProjects)
+	writeFailed := false
+	if !reflect.DeepEqual(current, projects) {
+		if err := writeNeoWebLocalProjectIndexUnlocked(rt.threadDir, projects); err != nil {
 			log.Debugf("amp neo local runtime project index seed failed: %v", err)
+			writeFailed = true
 		}
 	}
-
-	rt.projectIndexMu.Lock()
+	indexStamp = neoWebLocalFileSourceStamp(indexPath)
+	neoWebLocalProjectIndexMu.Unlock()
+	if writeFailed {
+		indexStamp = neoWebLocalFileStamp{exists: true, size: -1}
+	}
 	rt.projectIndexCache = projects
 	rt.projectIndexLoaded = true
+	rt.projectIndexStamp = indexStamp
+	rt.projectHistoryStamp = historyStamp
 	rt.projectIndexMu.Unlock()
 	return cloneArray(projects)
+}
+
+func neoWebLocalFileSourceStamp(path string) neoWebLocalFileStamp {
+	info, err := os.Stat(path)
+	if err != nil {
+		return neoWebLocalFileStamp{}
+	}
+	return neoWebLocalFileStamp{exists: true, size: info.Size(), modifiedNano: info.ModTime().UnixNano()}
 }
 
 func scanNeoWebLocalHistoryProjects(threadDir string) []any {

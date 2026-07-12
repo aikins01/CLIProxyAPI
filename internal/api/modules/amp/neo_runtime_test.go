@@ -4669,6 +4669,8 @@ func TestNeoRuntimeWebLocalInferenceOriginForwardsPluginMessages(t *testing.T) {
 	executorSocket.markExecutor("plugin-ui-test-executor")
 	actor.mu.Lock()
 	actor.executorSocket = executorSocket
+	actor.executorReady = true
+	actor.executorBootstrapComplete = true
 	actor.mu.Unlock()
 	if err := conn.WriteJSON(map[string]any{
 		"type": "plugin_message",
@@ -4782,6 +4784,7 @@ func TestNeoRuntimeWebLocalInferenceOriginForwardsPluginMessages(t *testing.T) {
 	})
 	actor.mu.Lock()
 	actor.executorReady = true
+	actor.executorBootstrapComplete = true
 	actor.queue = append(actor.queue, neoQueuedMessage{
 		MessageID: "M-plugin-queued",
 		Content:   []any{map[string]any{"type": "text", "text": "continue after the choice"}},
@@ -4988,18 +4991,26 @@ func TestNeoActorPluginUIRequestCountsAsActiveExecutorWork(t *testing.T) {
 	})
 	actor.mu.Lock()
 	reconnectingRequest := cloneNeoJSONMap(actor.pluginUIRequests["plugin-request"])
+	reconnectingResponse := cloneNeoJSONMap(actor.pluginUIResponses["plugin-request"])
 	actor.mu.Unlock()
 	if stringValue(reconnectingRequest["status"]) != "pending" {
 		t.Fatalf("response without executor settled plugin UI request: %#v", reconnectingRequest)
+	}
+	if reconnectingResponse["result"] != "choice" {
+		t.Fatalf("response envelope without executor was not retained: %#v", reconnectingResponse)
 	}
 	actor.handleProtocolPluginMessage(nil, map[string]any{"message": map[string]any{
 		"type": "response", "id": "plugin-request", "result": "direct-choice",
 	}})
 	actor.mu.Lock()
 	directReconnectRequest := cloneNeoJSONMap(actor.pluginUIRequests["plugin-request"])
+	queuedReconnectResponse := cloneNeoJSONMap(actor.pluginUIResponses["plugin-request"])
 	actor.mu.Unlock()
 	if stringValue(directReconnectRequest["status"]) != "pending" {
 		t.Fatalf("direct response without executor settled plugin UI request: %#v", directReconnectRequest)
+	}
+	if queuedReconnectResponse["result"] != "choice" {
+		t.Fatalf("later direct response overwrote retained response envelope: %#v", queuedReconnectResponse)
 	}
 	actor.receiveUserMessage(nil, map[string]any{
 		"type":      "client_append_user_msg",
@@ -5033,6 +5044,62 @@ func TestNeoActorPluginUIRequestCountsAsActiveExecutorWork(t *testing.T) {
 	actor.mu.Unlock()
 	if rescheduledGeneration <= generation {
 		t.Fatalf("plugin UI cleanup did not reschedule idle stop: generation=%d want > %d", rescheduledGeneration, generation)
+	}
+}
+
+func TestNeoActorFlushesPluginUIResponseAfterExecutorReconnect(t *testing.T) {
+	connected := make(chan *websocket.Conn, 1)
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := (&websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}).Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		connected <- conn
+		<-release
+		_ = conn.Close()
+	}))
+	t.Cleanup(server.Close)
+	client, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	if err != nil {
+		close(release)
+		t.Fatalf("dial plugin reconnect websocket: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = client.Close()
+		close(release)
+	})
+	executorConn := <-connected
+	actor := newNeoActor(newNeoRuntime(&config.Config{}), "actor", "threadActor", "T-plugin-reconnect", "T-plugin-reconnect", nil, nil)
+	actor.pluginUIRequests["plugin-request"] = map[string]any{"requestId": "plugin-request", "status": "pending"}
+	actor.executorSocket = &neoSocket{conn: executorConn}
+	if !actor.settlePluginUIRequestFromResponse(map[string]any{"type": "response", "id": "plugin-request", "result": "choice"}) {
+		t.Fatal("plugin UI response was not handled during executor bootstrap")
+	}
+	if !actor.settlePluginUIRequestFromResponse(map[string]any{"type": "response", "id": "plugin-request", "result": "later-choice"}) {
+		t.Fatal("duplicate plugin UI response was not handled during executor bootstrap")
+	}
+	actor.mu.Lock()
+	actor.executorReady = true
+	actor.executorBootstrapComplete = true
+	actor.mu.Unlock()
+
+	actor.flushPluginUIResponses()
+	var delivered map[string]any
+	if err := client.ReadJSON(&delivered); err != nil {
+		t.Fatalf("read replayed plugin UI response: %v", err)
+	}
+	message := mapValue(delivered["message"])
+	if delivered["type"] != "plugin_message" || message["id"] != "plugin-request" || message["result"] != "choice" {
+		t.Fatalf("replayed plugin UI response = %#v", delivered)
+	}
+
+	actor.mu.Lock()
+	request := cloneNeoJSONMap(actor.pluginUIRequests["plugin-request"])
+	response := cloneNeoJSONMap(actor.pluginUIResponses["plugin-request"])
+	actor.mu.Unlock()
+	if len(request) != 0 || len(response) != 0 {
+		t.Fatalf("reconnected plugin UI work remained pending request=%#v response=%#v", request, response)
 	}
 }
 
@@ -28971,6 +29038,41 @@ func TestWriteNeoLocalThreadSnapshotCanonicalizesModeEffortAndExecutorState(t *t
 	}
 	if meta := mapValue(thread["meta"]); meta["executorType"] != "local-client" {
 		t.Fatalf("stored meta = %#v", meta)
+	}
+}
+
+func TestNeoRuntimeProjectIndexUpdateSkipsUnchangedProject(t *testing.T) {
+	threadDir := t.TempDir()
+	rt := newNeoRuntime(&config.Config{})
+	workDir := neoExistingDirectory(t.TempDir())
+	snapshot := neoCloudThreadSnapshot{
+		threadID:  "T-019f53ba-a774-73a1-95a9-1a78fd1638f2",
+		createdMs: time.Now().UnixMilli(),
+		environment: map[string]any{
+			"workingDirectory": workDir,
+		},
+		meta: map[string]any{
+			"projectID":   "75616c3b-f4de-48b7-8b83-c1af6978a035",
+			"projectName": "local-project",
+		},
+	}
+	if err := rt.writeThreadSnapshot(snapshot, threadDir); err != nil {
+		t.Fatalf("initial project index update: %v", err)
+	}
+	path := neoWebLocalProjectIndexPath(threadDir)
+	sentinel := time.Unix(1_700_000_000, 0)
+	if err := os.Chtimes(path, sentinel, sentinel); err != nil {
+		t.Fatalf("set project index timestamp: %v", err)
+	}
+	if err := rt.writeThreadSnapshot(snapshot, threadDir); err != nil {
+		t.Fatalf("unchanged project index update: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat project index: %v", err)
+	}
+	if !info.ModTime().Equal(sentinel) {
+		t.Fatalf("unchanged project rewrote index mtime=%s want=%s", info.ModTime(), sentinel)
 	}
 }
 

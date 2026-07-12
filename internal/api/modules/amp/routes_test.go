@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -2912,6 +2913,27 @@ func TestWebLocalInferenceLocalProjectsRoute(t *testing.T) {
 	}
 	if !foundHistoryProject {
 		t.Fatalf("refreshed projects missing history project id=%q dir=%q: %#v", historyID, historyDir, refreshedProjects)
+	}
+	indexPath := neoWebLocalProjectIndexPath(rt.threadDir)
+	indexInfo, err := os.Stat(indexPath)
+	if err != nil {
+		t.Fatalf("stat refreshed project index: %v", err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	repeatedReq := httptest.NewRequest(http.MethodGet, "/ampcode/local-projects.json?"+ampWebLocalInferenceAPIKeyQuery+"=local-key", nil)
+	repeatedReq.Header.Set("Origin", "https://ampcode.com")
+	repeatedReq.Header.Set(ampWebLocalInferenceHeader, "1")
+	repeatedRec := httptest.NewRecorder()
+	r.ServeHTTP(repeatedRec, repeatedReq)
+	if repeatedRec.Code != http.StatusOK {
+		t.Fatalf("repeated local projects status = %d, body=%s", repeatedRec.Code, repeatedRec.Body.String())
+	}
+	repeatedIndexInfo, err := os.Stat(indexPath)
+	if err != nil {
+		t.Fatalf("stat repeated project index: %v", err)
+	}
+	if !repeatedIndexInfo.ModTime().Equal(indexInfo.ModTime()) {
+		t.Fatalf("unchanged local projects request rewrote index mtime=%s want=%s", repeatedIndexInfo.ModTime(), indexInfo.ModTime())
 	}
 
 	unmarkedReq := httptest.NewRequest(http.MethodGet, "/ampcode/local-projects.json?"+ampWebLocalInferenceAPIKeyQuery+"=local-key", nil)

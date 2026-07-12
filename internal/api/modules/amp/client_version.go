@@ -20,12 +20,11 @@ const (
 	ampClientVersionAuto          = "auto"
 	ampClientVersionLatest        = "latest"
 	ampClientVersionCacheDuration = time.Hour
-	ampClientVersionProbeTimeout  = 5 * time.Second
 	ampCLINPMLatestURL            = "https://registry.npmjs.org/@ampcode%2fcli/latest"
 )
 
 var (
-	ampClientVersionPattern = regexp.MustCompile(`\b\d+\.\d+\.\d+(?:[-+][0-9A-Za-z][0-9A-Za-z._-]*)?\b`)
+	ampClientVersionPattern = regexp.MustCompile(`(?:^|[^0-9A-Za-z_.+-])(\d+\.\d+\.\d+(?:-[0-9A-Za-z_-]+(?:\.[0-9A-Za-z_-]+)*)?(?:\+[0-9A-Za-z_-]+(?:\.[0-9A-Za-z_-]+)*)?)(?:$|[^0-9A-Za-z_.+-])`)
 	ampClientVersions       = &ampClientVersionResolver{}
 )
 
@@ -35,11 +34,11 @@ type ampClientVersionResolver struct {
 	expiresAt        time.Time
 	refreshing       bool
 	localProbeDone   chan struct{}
-	installedVersion func(string) string
-	latestVersion    func() string
+	installedVersion func(context.Context, string) string
+	latestVersion    func(context.Context) string
 }
 
-func ampUpstreamClientVersionProvider(settings *config.AmpCode) func() string {
+func ampUpstreamClientVersionProvider(settings *config.AmpCode, refreshCtx context.Context) func(context.Context) string {
 	if settings == nil {
 		return nil
 	}
@@ -48,25 +47,29 @@ func ampUpstreamClientVersionProvider(settings *config.AmpCode) func() string {
 		return nil
 	}
 	if !strings.EqualFold(value, ampClientVersionAuto) && !strings.EqualFold(value, ampClientVersionLatest) {
-		return func() string { return value }
+		return func(context.Context) string { return value }
 	}
 	executorCommand := strings.TrimSpace(settings.NeoLocalRuntime.ExecutorCommand)
-	return func() string {
-		return ampClientVersions.latest(executorCommand)
+	return func(ctx context.Context) string {
+		return ampClientVersions.latest(ctx, refreshCtx, executorCommand)
 	}
 }
 
 func ampUpstreamClientVersion(settings *config.AmpCode) string {
-	provider := ampUpstreamClientVersionProvider(settings)
+	provider := ampUpstreamClientVersionProvider(settings, nil)
 	if provider == nil {
 		return ""
 	}
-	return strings.TrimSpace(provider())
+	return strings.TrimSpace(provider(context.Background()))
 }
 
-func (r *ampClientVersionResolver) latest(executorCommand string) string {
+func (r *ampClientVersionResolver) latest(ctx, refreshCtx context.Context, executorCommand string) string {
 	if r == nil {
 		return ""
+	}
+	refreshAllowed := refreshCtx != nil && refreshCtx.Done() != nil
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	now := time.Now()
 	r.mu.Lock()
@@ -76,20 +79,24 @@ func (r *ampClientVersionResolver) latest(executorCommand string) string {
 		return value
 	}
 	if r.value != "" {
-		if !r.refreshing {
+		if !r.refreshing && refreshAllowed {
 			r.refreshing = true
-			go r.refresh()
+			go r.refresh(refreshCtx)
 		}
 		value := r.value
 		r.mu.Unlock()
 		return value
+	}
+	if ctx.Done() == nil {
+		r.mu.Unlock()
+		return ""
 	}
 	if !r.refreshing {
 		r.refreshing = true
 		r.localProbeDone = make(chan struct{})
 		probeDone := r.localProbeDone
 		r.mu.Unlock()
-		local := r.resolveInstalledVersion(executorCommand)
+		local := r.resolveInstalledVersion(ctx, executorCommand)
 		r.mu.Lock()
 		if local != "" {
 			r.value = local
@@ -98,15 +105,24 @@ func (r *ampClientVersionResolver) latest(executorCommand string) string {
 		close(probeDone)
 		r.localProbeDone = nil
 		value := r.value
+		if !refreshAllowed {
+			r.refreshing = false
+		}
 		r.mu.Unlock()
-		go r.refresh()
+		if refreshAllowed {
+			go r.refresh(refreshCtx)
+		}
 		return value
 	}
 	value := r.value
 	probeDone := r.localProbeDone
 	r.mu.Unlock()
 	if value == "" && probeDone != nil {
-		<-probeDone
+		select {
+		case <-probeDone:
+		case <-ctx.Done():
+			return ""
+		}
 		r.mu.Lock()
 		value = r.value
 		r.mu.Unlock()
@@ -114,29 +130,31 @@ func (r *ampClientVersionResolver) latest(executorCommand string) string {
 	return value
 }
 
-func (r *ampClientVersionResolver) refresh() {
-	version := r.resolveLatestVersion()
+func (r *ampClientVersionResolver) refresh(ctx context.Context) {
+	version := r.resolveLatestVersion(ctx)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if version != "" {
 		r.value = version
 		r.expiresAt = time.Now().Add(ampClientVersionCacheDuration)
+	} else if ctx.Err() == nil && r.value != "" {
+		r.expiresAt = time.Now().Add(ampClientVersionCacheDuration / 4)
 	}
 	r.refreshing = false
 }
 
-func (r *ampClientVersionResolver) resolveInstalledVersion(executorCommand string) string {
+func (r *ampClientVersionResolver) resolveInstalledVersion(ctx context.Context, executorCommand string) string {
 	if r != nil && r.installedVersion != nil {
-		return r.installedVersion(executorCommand)
+		return r.installedVersion(ctx, executorCommand)
 	}
-	return ampInstalledClientVersion(executorCommand)
+	return ampInstalledClientVersion(ctx, executorCommand)
 }
 
-func (r *ampClientVersionResolver) resolveLatestVersion() string {
+func (r *ampClientVersionResolver) resolveLatestVersion(ctx context.Context) string {
 	if r != nil && r.latestVersion != nil {
-		return r.latestVersion()
+		return r.latestVersion(ctx)
 	}
-	return fetchAmpCLINPMLatestVersion()
+	return fetchAmpCLINPMLatestVersion(ctx)
 }
 
 func (r *ampClientVersionResolver) set(version string, expiresAt time.Time) {
@@ -150,8 +168,16 @@ func (r *ampClientVersionResolver) set(version string, expiresAt time.Time) {
 	r.expiresAt = expiresAt
 }
 
-func fetchAmpCLINPMLatestVersion() string {
-	resp, err := http.Get(ampCLINPMLatestURL)
+func fetchAmpCLINPMLatestVersion(ctx context.Context) string {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ampCLINPMLatestURL, nil)
+	if err != nil {
+		log.Debugf("amp client version: create npm latest request failed: %v", err)
+		return ""
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		log.Debugf("amp client version: npm latest lookup failed: %v", err)
 		return ""
@@ -180,15 +206,16 @@ func fetchAmpCLINPMLatestVersion() string {
 	return strings.TrimSpace(payload.Version)
 }
 
-func ampInstalledClientVersion(executorCommand string) string {
+func ampInstalledClientVersion(ctx context.Context, executorCommand string) string {
 	cfg := &config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{ExecutorCommand: strings.TrimSpace(executorCommand)}}}
 	command, err := neoAmpExecutorCommand(cfg)
 	if err != nil {
 		log.Debugf("amp client version: installed amp lookup failed: %v", err)
 		return ""
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), ampClientVersionProbeTimeout)
-	defer cancel()
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	cmd := exec.CommandContext(ctx, command, "--version")
 	cmd.Env = ampClientVersionProbeEnv(os.Environ())
 	out, err := cmd.Output()
@@ -212,5 +239,9 @@ func ampClientVersionProbeEnv(base []string) []string {
 }
 
 func ampClientVersionFromOutput(output string) string {
-	return strings.TrimSpace(ampClientVersionPattern.FindString(output))
+	match := ampClientVersionPattern.FindStringSubmatch(output)
+	if len(match) < 2 {
+		return ""
+	}
+	return strings.TrimSpace(match[1])
 }

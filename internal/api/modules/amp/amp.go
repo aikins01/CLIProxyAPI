@@ -35,6 +35,8 @@ type AmpModule struct {
 	modelMapper      *DefaultModelMapper
 	fallbackMapper   *DefaultModelMapper
 	neoRuntime       *neoRuntime
+	clientVersionCtx context.Context
+	clientVersionEnd context.CancelFunc
 	enabled          bool
 	registerOnce     sync.Once
 	fallbackMu       sync.RWMutex
@@ -60,8 +62,11 @@ type AmpModule struct {
 //	    amp.WithSecretSource(customSecret),
 //	)
 func New(opts ...Option) *AmpModule {
+	clientVersionCtx, clientVersionEnd := context.WithCancel(context.Background())
 	m := &AmpModule{
-		secretSource: nil, // Will be created on demand if not provided
+		secretSource:     nil, // Will be created on demand if not provided
+		clientVersionCtx: clientVersionCtx,
+		clientVersionEnd: clientVersionEnd,
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -270,7 +275,7 @@ func (m *AmpModule) OnConfigUpdated(cfg *config.Config) error {
 		} else if oldUpstreamURL != "" && newUpstreamURL != "" &&
 			(newUpstreamURL != oldUpstreamURL || newClientVersionOverride != oldClientVersionOverride) {
 			// Recreate proxy with new URL
-			proxy, err := createReverseProxyWithClientVersionProvider(newUpstreamURL, m.secretSource, ampUpstreamClientVersionProvider(&newSettings))
+			proxy, err := createReverseProxyWithClientVersionProvider(newUpstreamURL, m.secretSource, ampUpstreamClientVersionProvider(&newSettings, m.clientVersionCtx))
 			if err != nil {
 				log.Errorf("amp config: failed to create proxy for new upstream URL %s: %v", newUpstreamURL, err)
 			} else {
@@ -355,7 +360,13 @@ func (m *AmpModule) applyNeoRuntime(cfg *config.Config) {
 }
 
 func (m *AmpModule) Shutdown(ctx context.Context) error {
-	if m == nil || m.neoRuntime == nil {
+	if m == nil {
+		return nil
+	}
+	if m.clientVersionEnd != nil {
+		m.clientVersionEnd()
+	}
+	if m.neoRuntime == nil {
 		return nil
 	}
 	if ctx == nil {
@@ -405,7 +416,7 @@ func (m *AmpModule) enableUpstreamProxy(upstreamURL string, settings *config.Amp
 		m.secretSource = mappedSource
 	}
 
-	proxy, err := createReverseProxyWithClientVersionProvider(upstreamURL, m.secretSource, ampUpstreamClientVersionProvider(settings))
+	proxy, err := createReverseProxyWithClientVersionProvider(upstreamURL, m.secretSource, ampUpstreamClientVersionProvider(settings, m.clientVersionCtx))
 	if err != nil {
 		return err
 	}
