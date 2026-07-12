@@ -5264,6 +5264,7 @@ func TestNeoRuntimeGatewayWebSocketJSONRPCSkipReadyWaitSubprotocolDefersSnapshot
 		{ThreadID: threadID, MessageID: "M-old", Role: "user", Content: []any{map[string]any{"type": "text", "text": "old"}}, Seq: 1},
 		{ThreadID: threadID, MessageID: "M-new", Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "new"}}, Seq: 2},
 	}
+	actor.replayEvents = []neoReplayEvent{{Seq: 2, Payload: neoMessageAddedPayload(actor.messages[1])}}
 	actor.seq = 3
 	actor.mu.Unlock()
 
@@ -8952,6 +8953,7 @@ func TestNeoRuntimeClientResumeIsSocketScoped(t *testing.T) {
 		{ThreadID: threadID, MessageID: "M-old", Role: "user", Content: []any{map[string]any{"type": "text", "text": "old"}}, Seq: 1},
 		{ThreadID: threadID, MessageID: "M-new", Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "new"}}, Seq: 2},
 	}
+	actor.replayEvents = []neoReplayEvent{{Seq: 2, Payload: neoMessageAddedPayload(actor.messages[1])}}
 	actor.seq = 3
 	actor.mu.Unlock()
 
@@ -9014,6 +9016,9 @@ func TestNeoRuntimeWebSocketFullResumePreservesLargeTranscript(t *testing.T) {
 			message.Role = "user"
 			message.Content = []any{map[string]any{"type": "tool_result", "toolUseID": toolUseID, "content": "/workspace"}}
 		}
+		if i == 0 {
+			message.Seq = 0
+		}
 		messages = append(messages, message)
 	}
 	cutMessageID := messages[messageCount/2].MessageID
@@ -9070,6 +9075,242 @@ func TestNeoRuntimeWebSocketFullResumePreservesLargeTranscript(t *testing.T) {
 		}
 	}
 	t.Fatal("timed out waiting for full resume snapshot")
+}
+
+func TestNeoRuntimeImportedPositiveResumeFallsBackToCompleteSnapshot(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019e0e6e-f3f1-7080-b5dd-748f66f8c26e"
+	relatedThreadID := "T-019e0e6e-f3f1-7080-b5dd-748f66f8c272"
+	actor, _ := rt.store.upsert(map[string]any{"name": "threadActor", "key": threadID, "input": map[string]any{"threadId": threadID}}, true)
+	if err := actor.importThreadLocalOnly(map[string]any{
+		"id":              threadID,
+		"v":               10_000,
+		"agentMode":       "deep",
+		"reasoningEffort": "xhigh",
+		"messages": []any{
+			map[string]any{"messageId": "M-0000000000000000000001", "role": "user", "content": []any{map[string]any{"type": "text", "text": "preserve everything"}}},
+			map[string]any{"messageId": "M-0000000000000000000002", "role": "assistant", "content": []any{
+				map[string]any{"type": "thinking", "thinking": "reasoning", "blockState": "complete"},
+				map[string]any{"type": "tool_use", "id": "TU-stable", "name": "shell_command", "input": map[string]any{"command": "go test ./..."}},
+			}},
+			map[string]any{"messageId": "M-0000000000000000000003", "role": "user", "content": []any{map[string]any{"type": "tool_result", "toolUseID": "TU-stable", "content": "passed"}}},
+			map[string]any{"messageId": "M-0000000000000000000004", "role": "info", "content": []any{
+				map[string]any{"type": "summary", "summary": map[string]any{"type": "message", "summary": "preserved summary"}},
+				map[string]any{"type": "manual_bash_invocation", "args": map[string]any{"cmd": "git status --short"}, "toolRun": map[string]any{"status": "done", "result": "clean"}},
+			}},
+		},
+		"compactionRecords": []any{map[string]any{"cutMessageId": "M-0000000000000000000001", "createdAt": "2026-07-12T00:00:00Z"}},
+		"relationships":     []any{map[string]any{"threadID": relatedThreadID, "type": "mention", "role": "parent"}},
+	}); err != nil {
+		t.Fatalf("import thread: %v", err)
+	}
+	actor.bumpSeqAndRemember(map[string]any{"type": "resume_probe"})
+	if actor.canReplayFrom(9_000) {
+		t.Fatal("imported actor unexpectedly proved replay continuity")
+	}
+	actor.mu.Lock()
+	retainedSummary := len(actor.messages) == 4 && len(actor.messages[3].Content) == 2 && neoCompactionSummaryText(mapValue(mapValue(actor.messages[3].Content[0])["summary"])) == "preserved summary"
+	actor.mu.Unlock()
+	if !retainedSummary {
+		t.Fatal("imported summary block was not retained")
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	t.Cleanup(server.Close)
+	conn := dialNeoActorWebSocketWithoutResume(t, server.URL, threadID, "")
+	defer conn.Close()
+	if err := conn.WriteJSON(map[string]any{"type": "client_resume", "version": 9_000}); err != nil {
+		t.Fatalf("write positive client_resume: %v", err)
+	}
+
+	wantIDs := []string{"M-0000000000000000000001", "M-0000000000000000000002", "M-0000000000000000000003", "M-0000000000000000000004"}
+	messageIDs := make([]string, 0, len(wantIDs))
+	sawThinking := false
+	sawToolUse := false
+	sawToolResult := false
+	sawManualBash := false
+	sawCompactionRecord := false
+	sawRelationship := false
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		msg, ok := readNeoMessage(t, conn, time.Until(deadline))
+		if !ok {
+			break
+		}
+		switch msg["type"] {
+		case "message_added":
+			message := mapValue(msg["message"])
+			messageIDs = append(messageIDs, stringValue(message["messageId"]))
+			for _, rawBlock := range arrayValue(message["content"]) {
+				switch stringValue(mapValue(rawBlock)["type"]) {
+				case "thinking":
+					sawThinking = true
+				case "tool_use":
+					sawToolUse = stringValue(mapValue(rawBlock)["id"]) == "TU-stable"
+				case "tool_result":
+					sawToolResult = stringValue(mapValue(rawBlock)["toolUseID"]) == "TU-stable" && stringValue(mapValue(rawBlock)["content"]) == "passed"
+				case "manual_bash_invocation":
+					sawManualBash = true
+				}
+			}
+		case "compaction_records":
+			records := arrayValue(msg["records"])
+			sawCompactionRecord = len(records) == 1 && stringValue(mapValue(records[0])["cutMessageId"]) == wantIDs[0]
+		case "thread_relationships":
+			relationships := arrayValue(msg["relationships"])
+			sawRelationship = len(relationships) == 1 && stringValue(mapValue(relationships[0])["threadID"]) == relatedThreadID
+		case "agent_state":
+			if !reflect.DeepEqual(messageIDs, wantIDs) || !sawThinking || !sawToolUse || !sawToolResult || !sawManualBash || !sawCompactionRecord || !sawRelationship {
+				t.Fatalf("fallback completeness ids=%v thinking=%v toolUse=%v toolResult=%v manualBash=%v compaction=%v relationship=%v", messageIDs, sawThinking, sawToolUse, sawToolResult, sawManualBash, sawCompactionRecord, sawRelationship)
+			}
+			return
+		}
+	}
+	t.Fatal("timed out waiting for imported fallback snapshot")
+}
+
+func TestNeoRuntimeImportedPositiveResumePreservesTranscriptBeyondReplayLimit(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019e0e6e-f3f1-7080-b5dd-748f66f8c26f"
+	actor, _ := rt.store.upsert(map[string]any{"name": "threadActor", "key": threadID, "input": map[string]any{"threadId": threadID}}, true)
+	const messageCount = neoReplayEventLimit + 88
+	messages := make([]any, messageCount)
+	for index := range messages {
+		messages[index] = map[string]any{
+			"messageId": fmt.Sprintf("M-%022d", index+1),
+			"role":      "assistant",
+			"content":   []any{map[string]any{"type": "text", "text": fmt.Sprintf("message %d", index+1)}},
+		}
+	}
+	if err := actor.importThreadLocalOnly(map[string]any{"id": threadID, "v": 50_000, "agentMode": "deep", "messages": messages}); err != nil {
+		t.Fatalf("import thread: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	t.Cleanup(server.Close)
+	conn := dialNeoActorWebSocketWithoutResume(t, server.URL, threadID, "")
+	defer conn.Close()
+	if err := conn.WriteJSON(map[string]any{"type": "client_resume", "version": 49_000}); err != nil {
+		t.Fatalf("write positive client_resume: %v", err)
+	}
+
+	messageCountReceived := 0
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		msg, ok := readNeoMessage(t, conn, time.Until(deadline))
+		if !ok {
+			break
+		}
+		switch msg["type"] {
+		case "message_added":
+			messageCountReceived++
+		case "agent_state":
+			if messageCountReceived != messageCount {
+				t.Fatalf("fallback messages = %d, want %d", messageCountReceived, messageCount)
+			}
+			return
+		}
+	}
+	t.Fatal("timed out waiting for large imported fallback snapshot")
+}
+
+func TestNeoRuntimeResumeBeforeReplayFloorFallsBackToCompleteSnapshot(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019e0e6e-f3f1-7080-b5dd-748f66f8c270"
+	actor, _ := rt.store.upsert(map[string]any{"name": "threadActor", "key": threadID, "input": map[string]any{"threadId": threadID}}, true)
+	actor.mu.Lock()
+	actor.messages = []neoMessage{
+		{ThreadID: threadID, MessageID: "M-before-floor", Role: "user", Content: []any{map[string]any{"type": "text", "text": "must survive"}}, Seq: 1},
+		{ThreadID: threadID, MessageID: "M-after-floor", Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "later"}}, Seq: neoReplayEventLimit + 99},
+	}
+	for seq := 1; seq < neoReplayEventLimit+100; seq++ {
+		actor.rememberReplayEventLocked(map[string]any{"type": "resume_probe", "seq": seq})
+	}
+	actor.seq = neoReplayEventLimit + 100
+	actor.mu.Unlock()
+	if actor.canReplayFrom(98) {
+		t.Fatal("base before replay floor unexpectedly accepted")
+	}
+	if !actor.canReplayFrom(99) {
+		t.Fatal("base at replay floor unexpectedly rejected")
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	t.Cleanup(server.Close)
+	conn := dialNeoActorWebSocketWithoutResume(t, server.URL, threadID, "")
+	defer conn.Close()
+	if err := conn.WriteJSON(map[string]any{"type": "client_resume", "version": 98}); err != nil {
+		t.Fatalf("write client_resume: %v", err)
+	}
+	first := waitForNeoMessageType(t, conn, "message_added", 2*time.Second)
+	if got := stringValue(mapValue(first["message"])["messageId"]); got != "M-before-floor" {
+		t.Fatalf("first fallback message = %q, want M-before-floor", got)
+	}
+}
+
+func TestNeoActorCanReplayFromRequiresRetainedContinuity(t *testing.T) {
+	newActor := func(events []neoReplayEvent) *neoActor {
+		actor := newNeoActor(nil, "actor-replay-continuity", "thread-actor", "T-test", "T-test", neoActorRecord("actor-replay-continuity", "thread-actor", "T-test"), nil)
+		actor.replayEvents = events
+		actor.seq = 13
+		return actor
+	}
+	valid := []neoReplayEvent{
+		{Seq: 10, Payload: map[string]any{"type": "resume_probe", "seq": 10}},
+		{Seq: 12, Payload: map[string]any{"type": "resume_probe", "seq": 12}},
+	}
+	tests := []struct {
+		name  string
+		actor *neoActor
+		base  int
+		want  bool
+	}{
+		{name: "nil actor", base: 9},
+		{name: "zero base", actor: newActor(valid), base: 0},
+		{name: "negative base", actor: newActor(valid), base: -1},
+		{name: "no replay events", actor: newActor(nil), base: 9},
+		{name: "base at replay floor", actor: newActor(valid), base: 9, want: true},
+		{name: "base before replay floor", actor: newActor(valid), base: 8},
+		{name: "base ahead of actor", actor: newActor(valid), base: 13},
+		{name: "base at actor high water", actor: newActor(valid), base: 12, want: true},
+		{name: "proven live base", actor: newActor(valid), base: 10, want: true},
+		{name: "duplicate replay sequence", actor: newActor([]neoReplayEvent{{Seq: 10}, {Seq: 10}}), base: 9},
+		{name: "out of order replay sequence", actor: newActor([]neoReplayEvent{{Seq: 10}, {Seq: 9}}), base: 9},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := test.actor.canReplayFrom(test.base); got != test.want {
+				t.Fatalf("canReplayFrom(%d) = %t, want %t", test.base, got, test.want)
+			}
+		})
+	}
+}
+
+func TestNeoRuntimeEagerSnapshotSkipsUnprovablePositiveResume(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019e0e6e-f3f1-7080-b5dd-748f66f8c271"
+	actor, _ := rt.store.upsert(map[string]any{"name": "threadActor", "key": threadID, "input": map[string]any{"threadId": threadID}}, true)
+	if err := actor.importThreadLocalOnly(map[string]any{
+		"id":        threadID,
+		"v":         1_000,
+		"agentMode": "deep",
+		"messages":  []any{map[string]any{"messageId": "M-complete", "role": "user", "content": []any{map[string]any{"type": "text", "text": "once"}}}},
+	}); err != nil {
+		t.Fatalf("import thread: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	t.Cleanup(server.Close)
+	conn := dialNeoActorWebSocket(t, server.URL, threadID)
+	defer conn.Close()
+	waitForNeoMessageType(t, conn, "agent_state", 2*time.Second)
+	waitForNeoMessageType(t, conn, "observers", 2*time.Second)
+	if err := conn.WriteJSON(map[string]any{"type": "client_resume", "version": 900}); err != nil {
+		t.Fatalf("write positive client_resume: %v", err)
+	}
+	if msg, ok := readNeoMessage(t, conn, 150*time.Millisecond); ok {
+		t.Fatalf("unprovable positive resume duplicated eager snapshot: %#v", msg)
+	}
 }
 
 func TestNeoRuntimeWebSocketOutboundJSONNormalization(t *testing.T) {
@@ -9520,7 +9761,8 @@ func TestNeoRuntimeSkipReadyWaitDefersSnapshotUntilClientResume(t *testing.T) {
 		{ThreadID: threadID, MessageID: "M-old", Role: "user", Content: []any{map[string]any{"type": "text", "text": "old"}}, Seq: 1},
 		{ThreadID: threadID, MessageID: "M-seen", Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "seen"}}, Seq: 2},
 	}
-	actor.seq = 3
+	actor.replayEvents = []neoReplayEvent{{Seq: 3, Payload: map[string]any{"type": "resume_probe", "seq": 3}}}
+	actor.seq = 4
 	actor.mu.Unlock()
 
 	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))

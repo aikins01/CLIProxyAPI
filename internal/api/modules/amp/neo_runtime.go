@@ -2519,6 +2519,7 @@ type neoActor struct {
 	retryScheduled              bool
 	pendingInference            *neoInferenceInflight
 	replayEvents                []neoReplayEvent
+	replayContinuityKnown       bool
 	activeError                 map[string]any
 	activeErrorSeq              int
 	seq                         int
@@ -2665,6 +2666,7 @@ func newNeoActor(rt *neoRuntime, id, name, key, threadID string, record map[stri
 		pluginUIResponses:      map[string]map[string]any{},
 		localSnapshotWake:      make(chan struct{}, 1),
 		lastUsed:               time.Now(),
+		replayContinuityKnown:  true,
 		seq:                    1,
 		agentState:             "idle",
 		currentAgentMode:       agentMode,
@@ -2853,11 +2855,7 @@ func (a *neoActor) handleForSocket(socket *neoSocket, msg map[string]any) any {
 		if !ok {
 			return nil
 		}
-		if version <= 0 && socket != nil && socket.hasSnapshotSent() {
-			return nil
-		}
-		a.sendSnapshot(socket, version)
-		if socket != nil {
+		if a.sendSnapshot(socket, version) && socket != nil {
 			socket.markSnapshotSent()
 		}
 	case "client_update_thread_settings":
@@ -16488,8 +16486,17 @@ func neoEstimateTextTokens(text string) int {
 	return len(text)/neoCompactionApproxCharsPerToken + 1
 }
 
-func (a *neoActor) sendSnapshot(socket *neoSocket, sinceSeq int) {
+func (a *neoActor) sendSnapshot(socket *neoSocket, sinceSeq int) bool {
+	snapshotSent := socket != nil && socket.hasSnapshotSent()
 	a.mu.Lock()
+	seq := a.lastSeqLocked()
+	if sinceSeq > 0 && !a.canReplayFromLocked(sinceSeq, seq) {
+		sinceSeq = 0
+	}
+	if sinceSeq <= 0 && snapshotSent {
+		a.mu.Unlock()
+		return false
+	}
 	settings := cloneMap(a.settings)
 	queue := make([]any, 0, len(a.queue))
 	for _, item := range a.queue {
@@ -16507,7 +16514,7 @@ func (a *neoActor) sendSnapshot(socket *neoSocket, sinceSeq int) {
 		includedToolCallIDs = make(map[string]bool)
 	}
 	for _, message := range a.messages {
-		if message.Seq > sinceSeq {
+		if sinceSeq <= 0 || message.Seq > sinceSeq {
 			message.OriginalToolUseInput = cloneMap(message.OriginalToolUseInput)
 			messages = append(messages, message)
 			i := len(messages) - 1
@@ -16539,7 +16546,6 @@ func (a *neoActor) sendSnapshot(socket *neoSocket, sinceSeq int) {
 	effort := a.reasoningEffortForModeLocked(agentMode)
 	a.currentAgentMode = agentMode
 	a.currentReasoningEffort = effort
-	seq := a.lastSeqLocked()
 	hasExecutor := a.executorConnectedLocked()
 	executorID := a.executorID
 	observerCount := len(a.sockets)
@@ -16657,6 +16663,7 @@ func (a *neoActor) sendSnapshot(socket *neoSocket, sinceSeq int) {
 		}
 		send(withNeoParentToolCallID(payload, inflightInference.parentToolCallID))
 	}
+	return true
 }
 
 func (a *neoActor) sendExecutorConnected(socket *neoSocket, resumeBootstrap bool) {
@@ -17242,6 +17249,7 @@ func (a *neoActor) importThreadWithSyncOptions(thread map[string]any, syncCloud,
 	a.currentInference = nil
 	a.pendingInference = pendingInference
 	a.replayEvents = nil
+	a.replayContinuityKnown = false
 	a.activeError = nil
 	a.activeErrorSeq = 0
 	a.queue = queuedMessages
@@ -20940,6 +20948,33 @@ func (a *neoActor) lastSeqLocked() int {
 		last = a.activeErrorSeq
 	}
 	return last
+}
+
+func (a *neoActor) canReplayFrom(sinceSeq int) bool {
+	if a == nil || sinceSeq <= 0 {
+		return false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.canReplayFromLocked(sinceSeq, a.lastSeqLocked())
+}
+
+func (a *neoActor) canReplayFromLocked(sinceSeq, lastSeq int) bool {
+	if !a.replayContinuityKnown || len(a.replayEvents) == 0 || sinceSeq > lastSeq {
+		return false
+	}
+	firstSeq := a.replayEvents[0].Seq
+	if firstSeq <= 0 || sinceSeq < firstSeq-1 {
+		return false
+	}
+	previousSeq := 0
+	for _, event := range a.replayEvents {
+		if event.Seq <= previousSeq {
+			return false
+		}
+		previousSeq = event.Seq
+	}
+	return true
 }
 
 func (a *neoActor) rememberReplayEventLocked(payload map[string]any) {
