@@ -69,6 +69,8 @@ const (
 	neoActorIdleTTL                  = 30 * time.Minute
 	neoActorPruneInterval            = 5 * time.Minute
 	neoLocalSnapshotMinInterval      = 500 * time.Millisecond
+	neoLocalSnapshotCacheMaxBytes    = 32 * 1024 * 1024
+	neoLocalSnapshotCacheMaxMessages = 10000
 	neoExecutorReconnectGrace        = 15 * time.Second
 	neoWSReadLimit                   = 16 * 1024 * 1024
 	neoHeadlessLoginShellPathTimeout = 3 * time.Second
@@ -2501,6 +2503,8 @@ type neoActor struct {
 	localSnapshotWake           chan struct{}
 	localSnapshotClosing        bool
 	localSnapshotEpoch          uint64
+	localSnapshotMessageCache   map[string]neoLocalSnapshotMessageCache
+	localSnapshotMessageGen     uint64
 	title                       string
 	titleSource                 string
 	titleGenerationStarted      bool
@@ -11045,6 +11049,7 @@ type neoCloudThreadSnapshot struct {
 	agentState        string
 	settings          map[string]any
 	messages          []neoMessage
+	messageJSON       []neoLocalSnapshotMessageJSON
 	environment       map[string]any
 	artifacts         []any
 	actorKV           map[string]any
@@ -11063,6 +11068,14 @@ type neoCloudThreadSnapshot struct {
 	executorConnected bool
 	executorType      string
 }
+
+type neoLocalSnapshotMessageCache struct {
+	message    neoMessage
+	json       neoLocalSnapshotMessageJSON
+	generation uint64
+}
+
+type neoLocalSnapshotMessageJSON []byte
 
 func (a *neoActor) syncCloudAsync() {
 	if a == nil {
@@ -11284,6 +11297,7 @@ func (a *neoActor) threadSnapshotWithOptions(options neoThreadSnapshotOptions) (
 		return neoCloudThreadSnapshot{}, false
 	}
 	messages := cloneNeoMessages(a.messages)
+	messageJSON := a.localSnapshotMessageJSONLocked(messages)
 	var inflight *neoInferenceInflight
 	preserveMissingCurrent := options.preserveMissingCurrentInference || a.shouldPreserveMissingCurrentInferenceLocked()
 	a.currentInferenceMessageIndexLocked(preserveMissingCurrent)
@@ -11323,6 +11337,7 @@ func (a *neoActor) threadSnapshotWithOptions(options neoThreadSnapshotOptions) (
 		agentState:        neoAgentStateOrIdle(a.agentState),
 		settings:          cloneNeoJSONMap(a.settings),
 		messages:          messages,
+		messageJSON:       messageJSON,
 		environment:       cloneNeoJSONMap(a.environment),
 		artifacts:         cloneNeoJSONArray(a.artifactListLocked()),
 		actorKV:           cloneNeoJSONMap(a.kv),
@@ -11341,6 +11356,44 @@ func (a *neoActor) threadSnapshotWithOptions(options neoThreadSnapshotOptions) (
 		executorConnected: executorConnected,
 		executorType:      executorType,
 	}, true
+}
+
+func (a *neoActor) localSnapshotMessageJSONLocked(messages []neoMessage) []neoLocalSnapshotMessageJSON {
+	encoded := make([]neoLocalSnapshotMessageJSON, len(messages))
+	cache := make(map[string]neoLocalSnapshotMessageCache, len(messages))
+	occurrences := make(map[string]int)
+	cacheBytes := 0
+	for index, message := range messages {
+		occurrence := occurrences[message.MessageID]
+		occurrences[message.MessageID] = occurrence + 1
+		key := message.MessageID + "\x00" + strconv.Itoa(occurrence)
+		cached, ok := a.localSnapshotMessageCache[key]
+		if ok && reflect.DeepEqual(cached.message, message) {
+			cache[key] = cached
+			encoded[index] = cached.json
+			cacheBytes += len(cached.json)
+			continue
+		}
+		raw, err := json.Marshal(neoCloudMessage(message))
+		if err != nil {
+			continue
+		}
+		a.localSnapshotMessageGen++
+		cached = neoLocalSnapshotMessageCache{message: message, json: raw, generation: a.localSnapshotMessageGen}
+		cache[key] = cached
+		encoded[index] = cached.json
+		cacheBytes += len(cached.json)
+	}
+	if neoLocalSnapshotMessageCacheAllowed(len(cache), cacheBytes) {
+		a.localSnapshotMessageCache = cache
+	} else {
+		a.localSnapshotMessageCache = nil
+	}
+	return encoded
+}
+
+func neoLocalSnapshotMessageCacheAllowed(messages, bytes int) bool {
+	return messages <= neoLocalSnapshotCacheMaxMessages && bytes <= neoLocalSnapshotCacheMaxBytes
 }
 
 func (a *neoActor) shouldPreserveMissingCurrentInferenceLocked() bool {
@@ -12349,6 +12402,19 @@ func writeNeoLocalThreadSnapshotFile(snapshot neoCloudThreadSnapshot, dir string
 	if snapshot.pendingInference != nil {
 		thread["pendingInference"] = neoInferenceInflightThreadMap(snapshot.pendingInference)
 	}
+	cloudMessages := arrayValue(thread["messages"])
+	if len(snapshot.messageJSON) == len(cloudMessages) {
+		messages := make([]any, len(cloudMessages))
+		for index, raw := range snapshot.messageJSON {
+			if len(raw) == 0 {
+				messages[index] = cloudMessages[index]
+				continue
+			}
+			messages[index] = raw
+		}
+		thread["messages"] = messages
+		defer func() { thread["messages"] = cloudMessages }()
+	}
 	path, err := writeNeoLocalThreadFileInDir(dir, snapshot.threadID, thread)
 	if err != nil {
 		return nil, "", err
@@ -12581,6 +12647,12 @@ func writeNeoJSONArray(writer io.Writer, values []any) error {
 			if _, err := io.WriteString(writer, ","); err != nil {
 				return err
 			}
+		}
+		if encoded, ok := value.(neoLocalSnapshotMessageJSON); ok {
+			if _, err := writer.Write(encoded); err != nil {
+				return err
+			}
+			continue
 		}
 		encoded, err := json.Marshal(value)
 		if err != nil {
@@ -30778,8 +30850,36 @@ func cloneNeoJSONValue(value any) any {
 		return cloneNeoJSONMap(v)
 	case []any:
 		return cloneNeoJSONArray(v)
+	case json.RawMessage:
+		if v == nil {
+			return json.RawMessage(nil)
+		}
+		out := make(json.RawMessage, len(v))
+		copy(out, v)
+		return out
+	case []byte:
+		if v == nil {
+			return []byte(nil)
+		}
+		out := make([]byte, len(v))
+		copy(out, v)
+		return out
+	case []map[string]any:
+		if v == nil {
+			return []map[string]any(nil)
+		}
+		out := make([]map[string]any, len(v))
+		for index, item := range v {
+			out[index] = cloneNeoJSONMap(item)
+		}
+		return out
 	case []string:
-		return append([]string(nil), v...)
+		if v == nil {
+			return []string(nil)
+		}
+		out := make([]string, len(v))
+		copy(out, v)
+		return out
 	case map[string]string:
 		out := make(map[string]string, len(v))
 		for key, item := range v {

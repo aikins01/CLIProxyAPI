@@ -6036,6 +6036,278 @@ func TestWriteNeoJSONObjectMatchesJSONMarshal(t *testing.T) {
 	}
 }
 
+func TestNeoActorLocalSnapshotCachesUnchangedMessageJSON(t *testing.T) {
+	threadID := "T-019f4000-0000-4000-8000-000000000061"
+	actor := newNeoActor(nil, "actor-snapshot-cache", "thread-actor", threadID, threadID, neoActorRecord("actor-snapshot-cache", "thread-actor", threadID), nil)
+	bytesValue := []byte("bytes")
+	rawValue := json.RawMessage(`{"value":"raw"}`)
+	typedMaps := []map[string]any{{"type": "text", "text": "typed"}}
+	actor.messages = []neoMessage{
+		{ThreadID: threadID, MessageID: "M-1", Role: "user", AgentMode: "smart", Content: []any{map[string]any{"type": "text", "text": "first"}}, Seq: 1},
+		{ThreadID: threadID, MessageID: "M-2", Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "second"}, bytesValue, rawValue, typedMaps}, State: map[string]any{"type": "complete"}, Usage: map[string]any{"inputTokens": 1}, OriginalToolUseInput: map[string]any{"call": map[string]any{"value": "first"}}, Seq: 2},
+	}
+	actor.compactionRecords = []map[string]any{{"cutMessageId": "M-1", "summary": "generated summary"}}
+
+	first, ok := actor.threadSnapshot()
+	if !ok {
+		t.Fatal("first snapshot unavailable")
+	}
+	firstGeneration := actor.localSnapshotMessageCache["M-1\x000"].generation
+	secondGeneration := actor.localSnapshotMessageCache["M-2\x000"].generation
+	second, ok := actor.threadSnapshot()
+	if !ok {
+		t.Fatal("second snapshot unavailable")
+	}
+	if actor.localSnapshotMessageCache["M-1\x000"].generation != firstGeneration || actor.localSnapshotMessageCache["M-2\x000"].generation != secondGeneration {
+		t.Fatalf("unchanged generations = (%d, %d), want (%d, %d)", actor.localSnapshotMessageCache["M-1\x000"].generation, actor.localSnapshotMessageCache["M-2\x000"].generation, firstGeneration, secondGeneration)
+	}
+	if &first.messageJSON[0][0] != &second.messageJSON[0][0] || &first.messageJSON[1][0] != &second.messageJSON[1][0] {
+		t.Fatal("unchanged snapshot message JSON was reallocated")
+	}
+
+	actor.mu.Lock()
+	mapValue(actor.messages[1].Content[0])["text"] = "changed"
+	actor.mu.Unlock()
+	third, ok := actor.threadSnapshot()
+	if !ok {
+		t.Fatal("third snapshot unavailable")
+	}
+	if actor.localSnapshotMessageCache["M-1\x000"].generation != firstGeneration {
+		t.Fatal("unchanged message generation changed")
+	}
+	if actor.localSnapshotMessageCache["M-2\x000"].generation <= secondGeneration {
+		t.Fatal("mutated message generation did not advance")
+	}
+	if &second.messageJSON[0][0] != &third.messageJSON[0][0] {
+		t.Fatal("unchanged message JSON was not reused after another message changed")
+	}
+	if bytes.Equal(second.messageJSON[1], third.messageJSON[1]) {
+		t.Fatal("mutated message JSON was not refreshed")
+	}
+
+	thirdGeneration := actor.localSnapshotMessageCache["M-2\x000"].generation
+	actor.mu.Lock()
+	bytesValue[0] = 'B'
+	rawValue[10] = 'R'
+	typedMaps[0]["text"] = "changed typed"
+	actor.messages[1].State["stopReason"] = "end_turn"
+	actor.messages[1].Usage["outputTokens"] = 2
+	mapValue(actor.messages[1].OriginalToolUseInput["call"])["value"] = "second"
+	actor.mu.Unlock()
+	fourth, ok := actor.threadSnapshot()
+	if !ok {
+		t.Fatal("fourth snapshot unavailable")
+	}
+	if actor.localSnapshotMessageCache["M-2\x000"].generation <= thirdGeneration {
+		t.Fatal("byte-backed or secondary-field mutation did not invalidate cached JSON")
+	}
+	if bytes.Equal(third.messageJSON[1], fourth.messageJSON[1]) {
+		t.Fatal("byte-backed or secondary-field mutation did not refresh JSON")
+	}
+
+	fourthGeneration := actor.localSnapshotMessageCache["M-2\x000"].generation
+	actor.mu.Lock()
+	replacement := actor.messages[1]
+	replacement.CompletionStatus = "complete"
+	actor.messages[1] = replacement
+	actor.mu.Unlock()
+	fifth, ok := actor.threadSnapshot()
+	if !ok {
+		t.Fatal("fifth snapshot unavailable")
+	}
+	if actor.localSnapshotMessageCache["M-2\x000"].generation <= fourthGeneration {
+		t.Fatal("whole-message replacement did not invalidate cached JSON")
+	}
+
+	wantThread := neoCloudThread(fifth)
+	if settings := neoLocalThreadSnapshotSettings(fifth); len(settings) > 0 {
+		wantThread["settings"] = settings
+	}
+	want, err := json.Marshal(wantThread)
+	if err != nil {
+		t.Fatalf("marshal expected thread: %v", err)
+	}
+	want = append(want, '\n')
+	_, path, err := writeNeoLocalThreadSnapshotFile(fifth, t.TempDir())
+	if err != nil {
+		t.Fatalf("write cached snapshot: %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read cached snapshot: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("cached snapshot bytes differ from complete thread encoding")
+	}
+}
+
+func TestNeoActorLocalSnapshotCacheHandlesDuplicateMessageIDs(t *testing.T) {
+	threadID := "T-019f4000-0000-4000-8000-000000000063"
+	actor := newNeoActor(nil, "actor-snapshot-cache-duplicates", "thread-actor", threadID, threadID, neoActorRecord("actor-snapshot-cache-duplicates", "thread-actor", threadID), nil)
+	actor.messages = []neoMessage{
+		{ThreadID: threadID, MessageID: "M-duplicate", Role: "user", Content: []any{map[string]any{"type": "text", "text": "first"}}},
+		{ThreadID: threadID, MessageID: "M-duplicate", Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "second"}}},
+	}
+	first, ok := actor.threadSnapshot()
+	if !ok {
+		t.Fatal("first duplicate snapshot unavailable")
+	}
+	second, ok := actor.threadSnapshot()
+	if !ok {
+		t.Fatal("second duplicate snapshot unavailable")
+	}
+	if len(actor.localSnapshotMessageCache) != 2 {
+		t.Fatalf("duplicate cache entries = %d, want 2", len(actor.localSnapshotMessageCache))
+	}
+	if &first.messageJSON[0][0] != &second.messageJSON[0][0] || &first.messageJSON[1][0] != &second.messageJSON[1][0] {
+		t.Fatal("unchanged duplicate-ID messages were not reused independently")
+	}
+	actor.mu.Lock()
+	mapValue(actor.messages[1].Content[0])["text"] = "changed"
+	actor.mu.Unlock()
+	third, ok := actor.threadSnapshot()
+	if !ok {
+		t.Fatal("third duplicate snapshot unavailable")
+	}
+	if &second.messageJSON[0][0] != &third.messageJSON[0][0] {
+		t.Fatal("first duplicate-ID message was invalidated by second duplicate")
+	}
+	if bytes.Equal(second.messageJSON[1], third.messageJSON[1]) {
+		t.Fatal("mutated duplicate-ID message JSON was not refreshed")
+	}
+}
+
+func TestCloneNeoJSONValuePreservesByteBackedNilAndEmptyValues(t *testing.T) {
+	tests := []struct {
+		name  string
+		value any
+	}{
+		{name: "nil bytes", value: []byte(nil)},
+		{name: "empty bytes", value: make([]byte, 0)},
+		{name: "nil raw message", value: json.RawMessage(nil)},
+		{name: "empty raw message", value: make(json.RawMessage, 0)},
+		{name: "nil strings", value: []string(nil)},
+		{name: "empty strings", value: make([]string, 0)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			before, beforeErr := json.Marshal(test.value)
+			cloned := cloneNeoJSONValue(test.value)
+			after, afterErr := json.Marshal(cloned)
+			if !bytes.Equal(before, after) || (beforeErr == nil) != (afterErr == nil) {
+				t.Fatalf("clone encoding = (%q, %v), want (%q, %v)", after, afterErr, before, beforeErr)
+			}
+		})
+	}
+}
+
+func TestNeoLocalSnapshotMessageCacheAllowed(t *testing.T) {
+	tests := []struct {
+		name     string
+		messages int
+		bytes    int
+		want     bool
+	}{
+		{name: "within limits", messages: neoLocalSnapshotCacheMaxMessages, bytes: neoLocalSnapshotCacheMaxBytes, want: true},
+		{name: "too many messages", messages: neoLocalSnapshotCacheMaxMessages + 1, bytes: 1},
+		{name: "too many bytes", messages: 1, bytes: neoLocalSnapshotCacheMaxBytes + 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := neoLocalSnapshotMessageCacheAllowed(test.messages, test.bytes); got != test.want {
+				t.Fatalf("allowed = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
+func TestNeoActorOverLimitSnapshotWritesCompleteImportableThread(t *testing.T) {
+	threadID := "T-019f4000-0000-4000-8000-000000000064"
+	actor := newNeoActor(nil, "actor-snapshot-cache-limit", "thread-actor", threadID, threadID, neoActorRecord("actor-snapshot-cache-limit", "thread-actor", threadID), nil)
+	actor.messages = make([]neoMessage, neoLocalSnapshotCacheMaxMessages+1)
+	for index := range actor.messages {
+		actor.messages[index] = neoMessage{
+			ThreadID:  threadID,
+			MessageID: fmt.Sprintf("M-%022d", index),
+			Role:      "user",
+			AgentMode: "smart",
+			Content:   []any{map[string]any{"type": "text", "text": "generated"}},
+			Seq:       index + 1,
+		}
+	}
+	actor.compactionRecords = []map[string]any{{"cutMessageId": "M-0000000000000000005000", "summary": "generated summary"}}
+	snapshot, ok := actor.threadSnapshot()
+	if !ok {
+		t.Fatal("over-limit snapshot unavailable")
+	}
+	if actor.localSnapshotMessageCache != nil {
+		t.Fatalf("over-limit cache entries = %d, want disabled", len(actor.localSnapshotMessageCache))
+	}
+	dir := t.TempDir()
+	if _, _, err := writeNeoLocalThreadSnapshotFile(snapshot, dir); err != nil {
+		t.Fatalf("write over-limit snapshot: %v", err)
+	}
+	thread, ok := loadNeoThreadFromDir(threadID, dir)
+	if !ok {
+		t.Fatal("load over-limit snapshot")
+	}
+	restored := newNeoActor(nil, "actor-snapshot-cache-restored", "thread-actor", threadID, threadID, neoActorRecord("actor-snapshot-cache-restored", "thread-actor", threadID), nil)
+	if err := restored.importThreadLocalOnly(thread); err != nil {
+		t.Fatalf("import over-limit snapshot: %v", err)
+	}
+	if len(restored.messages) != len(actor.messages) {
+		t.Fatalf("restored messages = %d, want %d", len(restored.messages), len(actor.messages))
+	}
+	if restored.messages[0].MessageID != "M-0000000000000000000000" || restored.messages[len(restored.messages)-1].MessageID != fmt.Sprintf("M-%022d", neoLocalSnapshotCacheMaxMessages) {
+		t.Fatalf("restored message boundary IDs = (%q, %q)", restored.messages[0].MessageID, restored.messages[len(restored.messages)-1].MessageID)
+	}
+	if len(restored.compactionRecords) != 1 || stringValue(restored.compactionRecords[0]["cutMessageId"]) != "M-0000000000000000005000" {
+		t.Fatalf("restored compaction records = %#v", restored.compactionRecords)
+	}
+}
+
+func BenchmarkNeoActorCachedThreadSnapshot(b *testing.B) {
+	newActor := func() *neoActor {
+		threadID := "T-019f4000-0000-4000-8000-000000000062"
+		actor := newNeoActor(nil, "actor-snapshot-benchmark", "thread-actor", threadID, threadID, neoActorRecord("actor-snapshot-benchmark", "thread-actor", threadID), nil)
+		actor.messages = make([]neoMessage, 2000)
+		for index := range actor.messages {
+			actor.messages[index] = neoMessage{
+				ThreadID:  threadID,
+				MessageID: fmt.Sprintf("M-%d", index),
+				Role:      "assistant",
+				Content:   []any{map[string]any{"type": "text", "text": strings.Repeat("x", 2048)}},
+				Seq:       index + 1,
+			}
+		}
+		return actor
+	}
+	b.Run("cold", func(b *testing.B) {
+		actor := newActor()
+		b.ReportAllocs()
+		for b.Loop() {
+			actor.localSnapshotMessageCache = nil
+			if _, ok := actor.threadSnapshot(); !ok {
+				b.Fatal("cold snapshot unavailable")
+			}
+		}
+	})
+	b.Run("cached", func(b *testing.B) {
+		actor := newActor()
+		if _, ok := actor.threadSnapshot(); !ok {
+			b.Fatal("warm snapshot unavailable")
+		}
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			snapshot, ok := actor.threadSnapshot()
+			if !ok || len(snapshot.messageJSON) != len(actor.messages) {
+				b.Fatal("cached snapshot unavailable")
+			}
+		}
+	})
+}
+
 func TestNeoActorFinalLocalSnapshotWaitsForAsyncWriter(t *testing.T) {
 	enabled := true
 	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled}}})
