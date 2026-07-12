@@ -68,6 +68,7 @@ const (
 	neoFilesystemWriteMaxBytes       = 4 * 1024 * 1024
 	neoActorIdleTTL                  = 30 * time.Minute
 	neoActorPruneInterval            = 5 * time.Minute
+	neoLocalSnapshotMinInterval      = 500 * time.Millisecond
 	neoExecutorReconnectGrace        = 15 * time.Second
 	neoWSReadLimit                   = 16 * 1024 * 1024
 	neoHeadlessLoginShellPathTimeout = 3 * time.Second
@@ -164,27 +165,28 @@ var (
 )
 
 type neoRuntime struct {
-	mu                  sync.RWMutex
-	cfg                 *config.Config
-	host                string
-	port                int
-	server              *http.Server
-	store               *neoActorStore
-	started             bool
-	cleanup             context.CancelFunc
-	modelMapper         ModelMapper
-	secretSource        SecretSource
-	connMu              sync.Mutex
-	connections         map[net.Conn]struct{}
-	threadDir           string
-	githubClient        *http.Client
-	githubAPIBase       string
-	githubRawBase       string
-	projectIndexMu      sync.Mutex
-	projectIndexCache   []any
-	projectIndexLoaded  bool
-	writeLocalSnapshot  func(neoCloudThreadSnapshot, string) error
-	asyncLocalSnapshots bool
+	mu                       sync.RWMutex
+	cfg                      *config.Config
+	host                     string
+	port                     int
+	server                   *http.Server
+	store                    *neoActorStore
+	started                  bool
+	cleanup                  context.CancelFunc
+	modelMapper              ModelMapper
+	secretSource             SecretSource
+	connMu                   sync.Mutex
+	connections              map[net.Conn]struct{}
+	threadDir                string
+	githubClient             *http.Client
+	githubAPIBase            string
+	githubRawBase            string
+	projectIndexMu           sync.Mutex
+	projectIndexCache        []any
+	projectIndexLoaded       bool
+	writeLocalSnapshot       func(neoCloudThreadSnapshot, string) error
+	asyncLocalSnapshots      bool
+	localSnapshotMinInterval time.Duration
 	// inferStream overrides the provider inference call used by the local agent
 	// and subagent loops. Defaults to inferNeoLocalStream; tests set it to replay
 	// a scripted session deterministically without a live provider.
@@ -203,13 +205,14 @@ func (rt *neoRuntime) subagentInfer(request neoInferenceRequest, onDelta neoStre
 func newNeoRuntime(cfg *config.Config) *neoRuntime {
 	host, port := neoRuntimeAddress(cfg)
 	rt := &neoRuntime{
-		cfg:                cfg,
-		host:               host,
-		port:               port,
-		store:              newNeoActorStore(),
-		connections:        map[net.Conn]struct{}{},
-		threadDir:          neoAmpThreadStoreDir(),
-		writeLocalSnapshot: writeNeoLocalThreadSnapshotToDir,
+		cfg:                      cfg,
+		host:                     host,
+		port:                     port,
+		store:                    newNeoActorStore(),
+		connections:              map[net.Conn]struct{}{},
+		threadDir:                neoAmpThreadStoreDir(),
+		writeLocalSnapshot:       writeNeoLocalThreadSnapshotToDir,
+		localSnapshotMinInterval: neoLocalSnapshotMinInterval,
 	}
 	rt.store.runtime = rt
 	return rt
@@ -2220,6 +2223,10 @@ func (s *neoActorStore) lookupThreadActor(threadID string) *neoActor {
 }
 
 func (s *neoActorStore) ensureThreadActor(threadID string) *neoActor {
+	return s.ensureThreadActorWithLocalImport(threadID, true)
+}
+
+func (s *neoActorStore) ensureThreadActorWithLocalImport(threadID string, importLocal bool) *neoActor {
 	s.mu.Lock()
 	for _, actor := range s.actors {
 		if actor.threadID == threadID || actor.key == threadID {
@@ -2229,7 +2236,7 @@ func (s *neoActorStore) ensureThreadActor(threadID string) *neoActor {
 				storeDir = rt.threadDir
 			}
 			s.mu.Unlock()
-			if rt != nil && neoThreadIDExactPattern.MatchString(threadID) {
+			if importLocal && rt != nil && neoThreadIDExactPattern.MatchString(threadID) {
 				rt.autoImportThreadActor(actor, threadID, storeDir)
 			}
 			return actor
@@ -2249,7 +2256,7 @@ func (s *neoActorStore) ensureThreadActor(threadID string) *neoActor {
 		storeDir = rt.threadDir
 	}
 	s.mu.Unlock()
-	if rt != nil && neoThreadIDExactPattern.MatchString(threadID) {
+	if importLocal && rt != nil && neoThreadIDExactPattern.MatchString(threadID) {
 		rt.autoImportThreadActor(actor, threadID, storeDir)
 	}
 	return actor
@@ -2483,6 +2490,7 @@ type neoActor struct {
 	localSyncRunning            bool
 	localSyncPending            bool
 	syncWG                      sync.WaitGroup
+	localSnapshotWake           chan struct{}
 	localSnapshotClosing        bool
 	localSnapshotEpoch          uint64
 	title                       string
@@ -2634,6 +2642,7 @@ func newNeoActor(rt *neoRuntime, id, name, key, threadID string, record map[stri
 		debug:                  map[string]any{},
 		notificationSubs:       map[string]map[string]any{},
 		pluginUIRequests:       map[string]map[string]any{},
+		localSnapshotWake:      make(chan struct{}, 1),
 		lastUsed:               time.Now(),
 		seq:                    1,
 		agentState:             "idle",
@@ -11075,6 +11084,28 @@ func (a *neoActor) syncLocalThreadSnapshotLoop(epoch uint64) {
 		if a.localSyncPending {
 			a.localSyncPending = false
 			a.mu.Unlock()
+			if interval := a.runtime.localSnapshotMinInterval; interval > 0 {
+				timer := time.NewTimer(interval)
+				select {
+				case <-timer.C:
+				case <-a.localSnapshotWake:
+					if !timer.Stop() {
+						select {
+						case <-timer.C:
+						default:
+						}
+					}
+				}
+			}
+			a.mu.Lock()
+			if a.localSnapshotClosing || a.localSnapshotEpoch != epoch {
+				a.localSyncRunning = false
+				a.localSyncPending = false
+				a.mu.Unlock()
+				return
+			}
+			a.localSyncPending = false
+			a.mu.Unlock()
 			continue
 		}
 		a.localSyncRunning = false
@@ -11145,12 +11176,22 @@ func (a *neoActor) closeLocalSnapshotSyncs() {
 	a.localSnapshotClosing = true
 	a.localSnapshotEpoch++
 	a.localSyncPending = false
+	if a.localSyncRunning {
+		select {
+		case a.localSnapshotWake <- struct{}{}:
+		default:
+		}
+	}
 	a.mu.Unlock()
 	a.syncWG.Wait()
 }
 
 func (a *neoActor) reopenLocalSnapshotSyncs() {
 	a.mu.Lock()
+	select {
+	case <-a.localSnapshotWake:
+	default:
+	}
 	a.localSnapshotClosing = false
 	a.mu.Unlock()
 }
@@ -11792,7 +11833,12 @@ func neoJSONMessageMetaSentAtMillis(message gjson.Result) int {
 }
 
 func neoThreadUserLastInteractedAtFromMessages(thread map[string]any, messages []any) int {
-	last := firstNonZero(numberFrom(thread["created"]), neoTimeStringMillis(stringValue(thread["createdAt"])))
+	last := firstNonZero(
+		numberFrom(thread["userLastInteractedAt"]),
+		neoTimeStringMillis(stringValue(thread["userLastInteractedAt"])),
+		numberFrom(thread["created"]),
+		neoTimeStringMillis(stringValue(thread["createdAt"])),
+	)
 	for _, raw := range messages {
 		message := mapValue(raw)
 		if stringValue(message["role"]) != "user" {
@@ -14503,35 +14549,60 @@ func (rt *neoRuntime) seedRecentThreadsFromCloud(ctx context.Context, limit, sin
 	if !neoRuntimeEnabled(rt.configSnapshot()) {
 		return
 	}
-	if limit > 0 && len(rt.store.recentThreadStatuses(limit, sinceMs)) >= limit {
+	statuses := rt.store.recentThreadStatuses(limit, sinceMs)
+	if limit > 0 && len(statuses) >= limit {
 		return
 	}
-	threadIDs, err := rt.fetchNeoCloudRecentThreadIDs(ctx, limit, sinceMs)
+	seen := make(map[string]struct{}, len(statuses))
+	for _, rawStatus := range statuses {
+		if threadID := stringValue(mapValue(rawStatus)["threadId"]); threadID != "" {
+			seen[threadID] = struct{}{}
+		}
+	}
+	threads, err := rt.fetchNeoCloudRecentThreads(ctx, limit, sinceMs)
 	if err != nil {
 		log.Debugf("amp neo local runtime cloud recent list failed: %v", err)
 		return
 	}
-	for _, threadID := range threadIDs {
-		if limit > 0 && len(rt.store.recentThreadStatuses(limit, sinceMs)) >= limit {
+	for _, rawThread := range threads {
+		if limit > 0 && len(statuses) >= limit {
 			return
 		}
+		thread := neoCloudRecentThreadSummary(rawThread)
+		threadID := neoCloudRecentListThreadID(thread)
+		if !neoThreadIDExactPattern.MatchString(threadID) {
+			continue
+		}
+		if _, exists := seen[threadID]; exists {
+			continue
+		}
+		seen[threadID] = struct{}{}
 		if actor := rt.store.lookupThreadActor(threadID); actor != nil && actor.hasLocalThreadState() {
 			continue
 		}
-		thread, err := rt.fetchNeoCloudThread(ctx, threadID)
-		if err != nil {
-			log.Debugf("amp neo local runtime cloud recent thread probe failed thread=%s: %v", threadID, err)
-			continue
+		if !neoCloudRecentThreadUsesLocalRuntime(thread) {
+			if neoCloudRecentThreadRuntimeClassified(thread) {
+				continue
+			}
+			thread, err = rt.fetchNeoCloudThread(ctx, threadID)
+			if err != nil {
+				log.Debugf("amp neo local runtime cloud recent thread probe failed thread=%s: %v", threadID, err)
+				continue
+			}
+			if !neoCloudThreadHasLocalNeoMarker(thread) {
+				continue
+			}
 		}
-		if !neoCloudThreadHasLocalNeoMarker(thread) {
-			continue
+		if stringValue(thread["id"]) == "" {
+			thread["id"] = threadID
 		}
 		status, updatedMs := neoRecentThreadStatusFromThreadMap(thread)
 		rt.store.upsertRecentThreadStatus(status, updatedMs)
+		statuses = append(statuses, status)
 	}
 }
 
-func (rt *neoRuntime) fetchNeoCloudRecentThreadIDs(ctx context.Context, limit, sinceMs int) ([]string, error) {
+func (rt *neoRuntime) fetchNeoCloudRecentThreads(ctx context.Context, limit, sinceMs int) ([]any, error) {
 	if rt == nil {
 		return nil, errors.New("neo runtime unavailable")
 	}
@@ -14597,7 +14668,7 @@ func (rt *neoRuntime) fetchNeoCloudRecentThreadIDs(ctx context.Context, limit, s
 	if decoded["ok"] == false {
 		return nil, fmt.Errorf("listThreads failed: %s", clipNeoErrorBody(respBody))
 	}
-	return neoCloudRecentThreadIDsFromListThreadsResponse(decoded), nil
+	return neoCloudRecentThreadListItems(decoded), nil
 }
 
 func neoRecentThreadsCloudSeedLimit(limit int) int {
@@ -14612,24 +14683,6 @@ func neoRecentThreadsCloudSeedLimit(limit int) int {
 		seedLimit = neoRecentThreadsCloudSeedMax
 	}
 	return seedLimit
-}
-
-func neoCloudRecentThreadIDsFromListThreadsResponse(decoded map[string]any) []string {
-	items := neoCloudRecentThreadListItems(decoded)
-	ids := make([]string, 0, len(items))
-	seen := map[string]struct{}{}
-	for _, item := range items {
-		threadID := neoCloudRecentListThreadID(item)
-		if !neoThreadIDExactPattern.MatchString(threadID) {
-			continue
-		}
-		if _, exists := seen[threadID]; exists {
-			continue
-		}
-		seen[threadID] = struct{}{}
-		ids = append(ids, threadID)
-	}
-	return ids
 }
 
 func neoCloudRecentThreadListItems(decoded map[string]any) []any {
@@ -14665,6 +14718,58 @@ func neoCloudRecentListThreadID(value any) string {
 	)
 }
 
+func neoCloudRecentThreadSummary(value any) map[string]any {
+	item := mapValue(value)
+	threadID := neoCloudRecentListThreadID(item)
+	if nested := mapValue(item["thread"]); len(nested) > 0 {
+		merged := cloneNeoJSONMap(nested)
+		for key, field := range item {
+			if key == "thread" {
+				continue
+			}
+			if _, exists := merged[key]; !exists || merged[key] == nil {
+				merged[key] = cloneNeoJSONValue(field)
+			}
+		}
+		item = merged
+	}
+	return neoCloudThreadDocumentForImport(item, threadID)
+}
+
+func neoCloudRecentThreadUsesLocalRuntime(thread map[string]any) bool {
+	if neoCloudThreadHasLocalNeoMarker(thread) {
+		return true
+	}
+	if neoCloudRecentThreadStatusSummary(thread) {
+		return true
+	}
+	executorType := strings.TrimSpace(firstNonEmptyString(thread["executorType"], nestedValue(thread["meta"], "executorType")))
+	if strings.EqualFold(executorType, "local-client") {
+		return true
+	}
+	usesThreadActors := boolValue(firstNonNil(thread["usesThreadActors"], nestedValue(thread["meta"], "usesThreadActors")))
+	return strings.EqualFold(executorType, "sandbox") && usesThreadActors
+}
+
+func neoCloudRecentThreadRuntimeClassified(thread map[string]any) bool {
+	if neoCloudThreadHasLocalNeoMarker(thread) || neoCloudRecentThreadStatusSummary(thread) {
+		return true
+	}
+	executorType := strings.TrimSpace(firstNonEmptyString(thread["executorType"], nestedValue(thread["meta"], "executorType")))
+	return executorType != ""
+}
+
+func neoCloudRecentThreadStatusSummary(thread map[string]any) bool {
+	threadID := firstNonEmptyString(thread["threadId"], thread["threadID"])
+	_, hasState := thread["state"].(string)
+	_, hasAgentState := thread["agentState"].(string)
+	_, hasExecutor := thread["hasExecutor"].(bool)
+	_, hasExecutorConnected := thread["executorConnected"].(bool)
+	return neoThreadIDExactPattern.MatchString(threadID) &&
+		strings.TrimSpace(stringValue(thread["lastUserMessageAt"])) != "" &&
+		hasState && hasAgentState && hasExecutor && hasExecutorConnected
+}
+
 func (rt *neoRuntime) tryImportNeoCloudLocalThreadActor(ctx context.Context, threadID string) bool {
 	if rt == nil || rt.store == nil || !neoThreadIDExactPattern.MatchString(threadID) {
 		return false
@@ -14678,7 +14783,7 @@ func (rt *neoRuntime) tryImportNeoCloudLocalThreadActor(ctx context.Context, thr
 		return false
 	}
 
-	actor := rt.store.ensureThreadActor(threadID)
+	actor := rt.store.ensureThreadActorWithLocalImport(threadID, false)
 	actor.mu.Lock()
 	hydrated := actor.hasLocalThreadStateLocked()
 	actor.mu.Unlock()

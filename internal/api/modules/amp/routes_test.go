@@ -436,7 +436,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 	}
 	for _, want := range []string{
 		"// ==UserScript==",
-		"@version 0.1.62",
+		"@version 0.1.63",
 		"@match https://ampcode.com/*",
 		"@updateURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
 		"@downloadURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
@@ -451,7 +451,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"commandPaletteIntegrationCount",
 		"localThreadPickerOpenCount",
 		"removedLocalThreadControlCount",
-		`const userscriptVersion = "0.1.62"`,
+		`const userscriptVersion = "0.1.63"`,
 		"userscriptVersion",
 		"lastPatchedThreadActorBaseURL",
 		"lastPatchedThreadID",
@@ -541,6 +541,9 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"devalueThreadWorkingDirectory",
 		"rememberPlainThreadRuntime",
 		"rememberDevalueThreadRuntime",
+		"rememberLoadedThreadBase",
+		"rewriteClientResumePayload",
+		"clientResumeRewriteCount",
 		"TextDecoder",
 		`.split(/[\\/]+/)`,
 		"parsedTextLocalInferencePatchOptions",
@@ -782,9 +785,11 @@ class NativeWebSocket {
 		this.protocols = protocols;
 		this.readyState = NativeWebSocket.CONNECTING;
 		this.listeners = {};
+		this.sent = [];
 		NativeWebSocket.instances.push(this);
 	}
 	addEventListener(name, callback) { this.listeners[name] = callback; }
+	send(payload) { this.sent.push(payload); }
 	close() { this.readyState = NativeWebSocket.CLOSED; }
 }
 globalThis.location = new URL("https://ampcode.com/threads/" + threadID);
@@ -879,7 +884,7 @@ if (typeof globalThis.btoa !== "function") {
 }
 require(scriptPath);
 const bridge = globalThis.__cliproxyAmpLocalInference;
-assert(bridge && bridge.userscriptVersion === "0.1.62", "bridge userscript version was not exposed");
+assert(bridge && bridge.userscriptVersion === "0.1.63", "bridge userscript version was not exposed");
 	globalThis.localStorage.setItem(bridge.localThreadIDsStorageKey, JSON.stringify([threadID, secondThreadID]));
 	globalThis.localStorage.setItem(bridge.apiKeyStorageKey, "local-key");
 	globalThis.localStorage.setItem(bridge.workingDirectoryStorageKey, createdThreadWorkDir);
@@ -887,11 +892,14 @@ assert(bridge && bridge.userscriptVersion === "0.1.62", "bridge userscript versi
 	const modeLow = new FakeElement("button", "Low");
 	modeLow.setAttribute("aria-haspopup", "menu");
 	documentQueryElements = [strayHigh, modeLow];
-		new WebSocket("wss://ampcode.com/gateway?key=" + encodeURIComponent(threadID));
+		const inheritedModeSocket = new WebSocket("wss://ampcode.com/gateway?key=" + encodeURIComponent(threadID));
 		const inheritedModeURL = new URL(NativeWebSocket.instances.at(-1).url);
 		assert(inheritedModeURL.origin === "ws://127.0.0.1:8317", "gateway websocket was not bridged locally");
 		assert(inheritedModeURL.searchParams.get("cliproxy-agent-mode") === "low", "unrelated High text overrode real mode control");
 		assert(inheritedModeURL.searchParams.get("cliproxy-reasoning-effort") === "medium", "low mode reasoning effort was not inherited");
+		const missingBaseResume = '{"type":"client_resume","version":0}';
+		inheritedModeSocket.send(missingBaseResume);
+		assert(inheritedModeSocket.sent.at(-1) === missingBaseResume, "zero resume changed without a loaded base");
 		const genericAriaModeHigh = new FakeElement("button", "High");
 		genericAriaModeHigh.setAttribute("aria-label", "Agent mode");
 		documentQueryElements = [genericAriaModeHigh];
@@ -927,10 +935,46 @@ const assertPlainConfig = (config, label) => {
 	assert(config.requiresSudoForTerminal === false, label + " requiresSudoForTerminal mismatch");
 	assert(config.threadActorTransport === "json-rpc", label + " threadActorTransport mismatch");
 };
-const plain = JSON.parse(JSON.stringify({ current: { thread: { id: threadID, title: "Local" }, threadActorConfig: null } }));
+const plainThreadSource = {
+	id: threadID,
+	v: 23,
+	title: "Local",
+	messages: [
+		{ messageId: "M-0000000000000000000001", role: "assistant", content: [{ type: "tool_use", id: "TU-plain", name: "shell_command", input: { command: "pwd" } }] },
+		{ messageId: "M-0000000000000000000002", role: "user", content: [{ type: "tool_result", toolUseID: "TU-plain", content: "/workspace" }] },
+	],
+	compactionRecords: [{ cutMessageId: "M-0000000000000000000002", createdAt: "2026-07-12T00:00:00Z" }],
+};
+const preservedPlainTranscript = JSON.stringify({ messages: plainThreadSource.messages, compactionRecords: plainThreadSource.compactionRecords });
+const plain = JSON.parse(JSON.stringify({ current: { thread: plainThreadSource, threadActorConfig: null } }));
 assertPlainConfig(plain.current.threadActorConfig, "plain");
 assert(bridge.diagnostics.lastPatchedThreadID === threadID, "plain patch did not record thread ID");
-const values = JSON.parse(JSON.stringify([{ current: 1 }, { thread: 2 }, { id: 3, title: 4 }, threadID, "Local" ]));
+assert(JSON.stringify({ messages: plain.current.thread.messages, compactionRecords: plain.current.thread.compactionRecords }) === preservedPlainTranscript, "plain route patch changed transcript IDs, tool blocks, or compaction records");
+const rawZeroResume = '{ "type": "client_resume", "version": 0 }';
+inheritedModeSocket.send(rawZeroResume);
+const rewrittenRawResume = inheritedModeSocket.sent.at(-1);
+assert(typeof rewrittenRawResume === "string", "raw resume payload type changed");
+assert(JSON.parse(rewrittenRawResume).version === 23, "matching plain loaded base did not rewrite raw zero resume");
+JSON.parse(JSON.stringify({ id: threadID, v: 17, data: { messages: [] } }));
+inheritedModeSocket.send(rawZeroResume);
+assert(JSON.parse(inheritedModeSocket.sent.at(-1)).version === 17, "plain envelope with outer identity and nested transcript did not rewrite zero resume");
+const positiveResume = '{ "type": "client_resume", "version": 11 }';
+inheritedModeSocket.send(positiveResume);
+assert(inheritedModeSocket.sent.at(-1) === positiveResume, "positive resume was changed");
+const unrelatedFrame = '{ "type": "client_set_thread_title", "title": "unchanged" }';
+inheritedModeSocket.send(unrelatedFrame);
+assert(inheritedModeSocket.sent.at(-1) === unrelatedFrame, "unrelated websocket frame was changed");
+const binaryFrame = new Uint8Array([1, 2, 3]);
+inheritedModeSocket.send(binaryFrame);
+assert(inheritedModeSocket.sent.at(-1) === binaryFrame, "binary websocket frame was changed");
+const userActorSocket = new WebSocket("wss://ampcode.com/gateway/userActor/?rvt-method=get&rvt-key=user-local");
+userActorSocket.send(rawZeroResume);
+assert(userActorSocket.sent.at(-1) === rawZeroResume, "user actor resume frame was changed");
+const noBaseSocket = new WebSocket("wss://ampcode.com/gateway/threadActor/?rvt-method=get&rvt-key=" + encodeURIComponent(secondThreadID));
+const noBaseResume = '{"type":"client_resume","version":0}';
+noBaseSocket.send(noBaseResume);
+assert(noBaseSocket.sent.at(-1) === noBaseResume, "mismatched or missing loaded base changed zero resume");
+const values = JSON.parse(JSON.stringify([{ current: 1 }, { thread: 2 }, { id: 3, title: 4, v: 5, messages: 6 }, threadID, "Local", 37, [] ]));
 const configIndex = values[1].threadActorConfig;
 assert(Number.isInteger(configIndex), "devalue threadActorConfig was not a reference");
 const devalueConfig = values[configIndex];
@@ -954,12 +998,28 @@ const nullDeref = (value) => Number.isInteger(value) ? nullConfigValues[value] :
 assert(nullDeref(nullConfig.threadId) === threadID, "null-ref devalue threadId mismatch");
 assert(nullDeref(nullConfig.wsToken) === "local-neo", "null-ref devalue wsToken mismatch");
 globalThis.location = new URL("https://ampcode.com/threads/" + secondThreadID);
-const secondValues = JSON.parse(JSON.stringify([{ current: 1 }, { thread: 2 }, { id: 3, title: 4 }, secondThreadID, "Second" ]));
+const secondValues = JSON.parse(JSON.stringify([{ current: 1 }, { thread: 2 }, { id: 3, title: 4, v: 5, messages: 6 }, secondThreadID, "Second", 41, [] ]));
 const secondConfigIndex = secondValues[1].threadActorConfig;
 assert(Number.isInteger(secondConfigIndex), "second devalue threadActorConfig was not patched after local navigation");
 const secondConfig = secondValues[secondConfigIndex];
 const secondDeref = (value) => Number.isInteger(value) ? secondValues[value] : value;
 assert(secondDeref(secondConfig.threadId) === secondThreadID, "second devalue threadId mismatch");
+const jsonRPCZeroResume = '{"jsonrpc":"2.0","id":"resume-1","method":"client_resume","params":{"version":0}}';
+noBaseSocket.send(jsonRPCZeroResume);
+const rewrittenJSONRPCResume = noBaseSocket.sent.at(-1);
+assert(typeof rewrittenJSONRPCResume === "string", "JSON-RPC resume payload type changed");
+const parsedJSONRPCResume = JSON.parse(rewrittenJSONRPCResume);
+assert(parsedJSONRPCResume.id === "resume-1", "JSON-RPC resume id changed");
+assert(parsedJSONRPCResume.params.version === 41, "matching devalue loaded base did not rewrite JSON-RPC zero resume");
+assert(bridge.diagnostics.clientResumeRewriteCount === 3, "resume rewrite diagnostics count mismatch");
+assert(bridge.diagnostics.lastClientResumeThreadID === secondThreadID, "resume rewrite diagnostics thread mismatch");
+assert(bridge.diagnostics.lastClientResumeBaseVersion === 41, "resume rewrite diagnostics version mismatch");
+JSON.parse(JSON.stringify([{ thread: 1 }, { id: 2, data: 3 }, secondThreadID, { v: 4, messages: 5 }, 29, []]));
+noBaseSocket.send(jsonRPCZeroResume);
+assert(JSON.parse(noBaseSocket.sent.at(-1)).params.version === 29, "devalue envelope with outer identity and nested transcript did not rewrite zero resume");
+JSON.parse(JSON.stringify([{ thread: 1 }, { id: 2, v: 3, messages: 4 }, secondThreadID, 19, []]));
+noBaseSocket.send(jsonRPCZeroResume);
+assert(JSON.parse(noBaseSocket.sent.at(-1)).params.version === 19, "newly loaded lower thread version did not replace a stale higher base");
 const failedRequestBody = JSON.stringify({
 	payload: encodeDevalue([
 		{ content: 1, agentMode: 5, threadID: 6, reasoningEffort: 7 },
@@ -1190,7 +1250,7 @@ assert(localHTTPRewritten.protocol === "ws:", "local http websocket protocol was
 assert(localHTTPRewritten.host === "127.0.0.1:8317", "local http websocket host changed");
 assert(localHTTPRewritten.searchParams.get("cliproxy-api-key") === "local-key", "local http websocket localStorage API key was not applied");
 assert(bridge.diagnostics.decodedConfigPatchCount >= 2, "decoded config patches were not recorded");
-assert(bridge.diagnostics.webSocketBootstrapCount === 5, "websocket bootstrap was not recorded");
+assert(bridge.diagnostics.webSocketBootstrapCount === 6, "websocket bootstrap was not recorded");
 })().catch((error) => {
 	console.error(error && error.stack ? error.stack : error);
 	process.exit(1);

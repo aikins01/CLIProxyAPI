@@ -3369,15 +3369,18 @@ func TestNeoActorSyncCloudAsyncCoalescesLocalSnapshots(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled}}})
 	rt.threadDir = t.TempDir()
 	rt.asyncLocalSnapshots = true
+	rt.localSnapshotMinInterval = 40 * time.Millisecond
 	threadID := "T-019f4000-0000-4000-8000-000000000051"
 	actor := newNeoActor(rt, "actor-test", "thread-actor", threadID, threadID, neoActorRecord("actor-test", "thread-actor", threadID), nil)
 	firstStarted := make(chan struct{})
 	releaseFirst := make(chan struct{})
 	var writesMu sync.Mutex
 	writes := make([]string, 0, 2)
+	writeTimes := make([]time.Time, 0, 2)
 	rt.writeLocalSnapshot = func(snapshot neoCloudThreadSnapshot, _ string) error {
 		writesMu.Lock()
 		writes = append(writes, snapshot.title)
+		writeTimes = append(writeTimes, time.Now())
 		writeNumber := len(writes)
 		writesMu.Unlock()
 		if writeNumber == 1 {
@@ -3410,6 +3413,54 @@ func TestNeoActorSyncCloudAsyncCoalescesLocalSnapshots(t *testing.T) {
 	defer writesMu.Unlock()
 	if !reflect.DeepEqual(writes, []string{"first", "latest"}) {
 		t.Fatalf("local snapshot titles = %#v, want first and latest only", writes)
+	}
+	if delay := writeTimes[1].Sub(writeTimes[0]); delay < 30*time.Millisecond {
+		t.Fatalf("local snapshot write delay = %s, want at least 30ms", delay)
+	}
+}
+
+func TestNeoActorLocalSnapshotThrottleDoesNotBlockClose(t *testing.T) {
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled}}})
+	rt.threadDir = t.TempDir()
+	rt.asyncLocalSnapshots = true
+	rt.localSnapshotMinInterval = 2 * time.Second
+	threadID := "T-019f4000-0000-4000-8000-000000000057"
+	actor := newNeoActor(rt, "actor-test", "thread-actor", threadID, threadID, neoActorRecord("actor-test", "thread-actor", threadID), nil)
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	firstReturned := make(chan struct{})
+	var writes atomic.Int32
+	rt.writeLocalSnapshot = func(neoCloudThreadSnapshot, string) error {
+		if writes.Add(1) == 1 {
+			close(firstStarted)
+			<-releaseFirst
+			close(firstReturned)
+		}
+		return nil
+	}
+
+	actor.syncCloudAsync()
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first local snapshot did not start")
+	}
+	actor.syncCloudAsync()
+	close(releaseFirst)
+	select {
+	case <-firstReturned:
+	case <-time.After(time.Second):
+		t.Fatal("first local snapshot did not return")
+	}
+	time.Sleep(20 * time.Millisecond)
+	started := time.Now()
+	actor.closeLocalSnapshotSyncs()
+	if elapsed := time.Since(started); elapsed > 250*time.Millisecond {
+		t.Fatalf("closing local snapshot syncs took %s during throttle interval", elapsed)
+	}
+	if got := writes.Load(); got != 1 {
+		t.Fatalf("local snapshot writes = %d, want 1 before close", got)
 	}
 }
 
@@ -4767,6 +4818,9 @@ func TestNeoRuntimeWebLocalInferenceOriginForwardsPluginMessages(t *testing.T) {
 	if dequeued["queuedMessageId"] != "M-plugin-queued" {
 		t.Fatalf("direct plugin response did not resume queued work: %#v", dequeued)
 	}
+	waitForNeoMessageTypeWhere(t, observer, "agent_state", 2*time.Second, func(payload map[string]any) bool {
+		return payload["state"] == "working"
+	})
 	actor.mu.Lock()
 	actor.generation++
 	actor.currentInference = nil
@@ -7017,33 +7071,20 @@ func TestNeoUserActorGetRecentThreadsSeedsMarkedCloudThread(t *testing.T) {
 			if params["limit"] != float64(20) {
 				t.Fatalf("listThreads limit = %#v, want 20", params["limit"])
 			}
-			writeNeoJSON(w, http.StatusOK, map[string]any{"ok": true, "result": map[string]any{"threads": []any{map[string]any{"id": threadID}}}})
+			writeNeoJSON(w, http.StatusOK, map[string]any{"ok": true, "result": map[string]any{"threads": []any{map[string]any{
+				"thread": map[string]any{
+					"data": map[string]any{
+						"id":                   threadID,
+						"title":                "Cloud seeded sidebar",
+						"agentMode":            "deep",
+						"userLastInteractedAt": "2026-06-20T12:00:00Z",
+					},
+					"meta": map[string]any{"executorType": "local-client"},
+				},
+			}}}})
 		case "getThread":
 			getRequests++
-			writeNeoJSON(w, http.StatusOK, map[string]any{
-				"ok": true,
-				"result": map[string]any{
-					"thread": map[string]any{
-						"id":   threadID,
-						"v":    4,
-						"meta": map[string]any{"cliProxyAPILocalNeo": true},
-						"data": map[string]any{
-							"id":        threadID,
-							"title":     "Cloud seeded sidebar",
-							"agentMode": "deep",
-							"messages": []any{
-								map[string]any{
-									"messageId": "M-cloud-sidebar-user",
-									"role":      "user",
-									"createdAt": "2026-06-20T12:00:00Z",
-									"agentMode": "deep",
-									"content":   []any{map[string]any{"type": "text", "text": "restore sidebar after restart"}},
-								},
-							},
-						},
-					},
-				},
-			})
+			t.Fatal("recent thread seeding fetched a full thread")
 		default:
 			t.Fatalf("unexpected upstream request path=%s query=%s", r.URL.Path, r.URL.RawQuery)
 		}
@@ -7076,6 +7117,71 @@ func TestNeoUserActorGetRecentThreadsSeedsMarkedCloudThread(t *testing.T) {
 	}
 	if item["lastUserMessageAt"] != "2026-06-20T12:00:00Z" {
 		t.Fatalf("lastUserMessageAt = %#v", item["lastUserMessageAt"])
+	}
+	if listRequests != 1 || getRequests != 0 {
+		t.Fatalf("upstream requests = list:%d get:%d, want list:1 get:0", listRequests, getRequests)
+	}
+}
+
+func TestNeoUserActorGetRecentThreadsSeedsMarkedCloudThreadFromIDOnlyListItem(t *testing.T) {
+	enabled := true
+	threadID := "T-019e0e6e-f3f1-7078-b5dd-748f66f8c268"
+	listRequests := 0
+	getRequests := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.RawQuery {
+		case "listThreads":
+			listRequests++
+			writeNeoJSON(w, http.StatusOK, map[string]any{"ok": true, "result": map[string]any{"threads": []any{map[string]any{"id": threadID}}}})
+		case "getThread":
+			getRequests++
+			writeNeoJSON(w, http.StatusOK, map[string]any{
+				"ok": true,
+				"result": map[string]any{"thread": map[string]any{
+					"id":   threadID,
+					"v":    4,
+					"meta": map[string]any{"cliProxyAPILocalNeo": true},
+					"data": map[string]any{
+						"id":                   threadID,
+						"title":                "Cloud fallback sidebar",
+						"agentMode":            "deep",
+						"userLastInteractedAt": "2026-06-20T12:30:00Z",
+						"messages": []any{map[string]any{
+							"messageId": "M-cloud-fallback-user",
+							"role":      "user",
+							"createdAt": "2026-06-20T12:30:00Z",
+							"agentMode": "deep",
+							"content":   []any{map[string]any{"type": "text", "text": "restore fallback sidebar"}},
+						}},
+					},
+				}},
+			})
+		default:
+			t.Fatalf("unexpected upstream request path=%s query=%s", r.URL.Path, r.URL.RawQuery)
+		}
+	}))
+	t.Cleanup(upstream.Close)
+
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+		UpstreamURL:    upstream.URL,
+		UpstreamAPIKey: "secret",
+		NeoLocalRuntime: config.AmpNeoLocalRuntime{
+			Enabled: &enabled,
+		},
+	}})
+	userActor, _ := rt.store.upsert(map[string]any{"name": "userActor", "key": "user-local"}, true)
+
+	result := userActor.handleForSocket(nil, map[string]any{
+		"type": "getRecentThreads",
+		"args": []any{map[string]any{"limit": 5}},
+	})
+	items := arrayValue(result)
+	if len(items) != 1 {
+		t.Fatalf("getRecentThreads result = %#v, want one fallback cloud thread", result)
+	}
+	item := mapValue(items[0])
+	if item["threadId"] != threadID || item["title"] != "Cloud fallback sidebar" {
+		t.Fatalf("fallback recent thread summary = %#v", item)
 	}
 	if listRequests != 1 || getRequests != 1 {
 		t.Fatalf("upstream requests = list:%d get:%d, want 1 each", listRequests, getRequests)
@@ -7122,6 +7228,57 @@ func TestNeoUserActorGetRecentThreadsPrefersLiveActorOverCachedSummary(t *testin
 	}
 }
 
+func TestNeoUserActorGetRecentThreadsSeedsCLIProxyAPISummary(t *testing.T) {
+	enabled := true
+	threadID := "T-019e0e6e-f3f1-7078-b5dd-748f66f8c267"
+	getRequests := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.RawQuery {
+		case "listThreads":
+			writeNeoJSON(w, http.StatusOK, map[string]any{"ok": true, "result": map[string]any{"threads": []any{map[string]any{
+				"threadId":          threadID,
+				"title":             "Chained proxy summary",
+				"lastUserMessageAt": "2026-06-20T13:00:00Z",
+				"state":             "idle",
+				"agentState":        "idle",
+				"hasExecutor":       false,
+				"executorConnected": false,
+			}}}})
+		case "getThread":
+			getRequests++
+			t.Fatal("recent thread seeding fetched a full thread")
+		default:
+			t.Fatalf("unexpected upstream request path=%s query=%s", r.URL.Path, r.URL.RawQuery)
+		}
+	}))
+	t.Cleanup(upstream.Close)
+
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+		UpstreamURL:    upstream.URL,
+		UpstreamAPIKey: "secret",
+		NeoLocalRuntime: config.AmpNeoLocalRuntime{
+			Enabled: &enabled,
+		},
+	}})
+	userActor, _ := rt.store.upsert(map[string]any{"name": "userActor", "key": "user-local"}, true)
+
+	result := userActor.handleForSocket(nil, map[string]any{
+		"type": "getRecentThreads",
+		"args": []any{map[string]any{"limit": 5}},
+	})
+	items := arrayValue(result)
+	if len(items) != 1 {
+		t.Fatalf("getRecentThreads result = %#v, want one chained proxy summary", result)
+	}
+	item := mapValue(items[0])
+	if item["threadId"] != threadID || item["title"] != "Chained proxy summary" {
+		t.Fatalf("recent thread summary = %#v", item)
+	}
+	if getRequests != 0 {
+		t.Fatalf("getThread requests = %d, want 0", getRequests)
+	}
+}
+
 func TestNeoUserActorGetRecentThreadsDoesNotSeedUnmarkedCloudThread(t *testing.T) {
 	enabled := true
 	threadID := "T-019e0e6e-f3f1-7078-b5dd-748f66f8c263"
@@ -7136,17 +7293,15 @@ func TestNeoUserActorGetRecentThreadsDoesNotSeedUnmarkedCloudThread(t *testing.T
 			getRequests++
 			writeNeoJSON(w, http.StatusOK, map[string]any{
 				"ok": true,
-				"result": map[string]any{
-					"thread": map[string]any{
-						"id": threadID,
-						"data": map[string]any{
-							"id":        threadID,
-							"title":     "Remote cloud only",
-							"agentMode": "deep",
-							"messages":  []any{map[string]any{"messageId": "M-remote-only-user", "role": "user", "createdAt": "2026-06-20T13:00:00Z", "agentMode": "deep"}},
-						},
+				"result": map[string]any{"thread": map[string]any{
+					"id": threadID,
+					"data": map[string]any{
+						"id":        threadID,
+						"title":     "Remote cloud only",
+						"agentMode": "deep",
+						"messages":  []any{map[string]any{"messageId": "M-remote-only-user", "role": "user", "createdAt": "2026-06-20T13:00:00Z", "agentMode": "deep"}},
 					},
-				},
+				}},
 			})
 		default:
 			t.Fatalf("unexpected upstream request path=%s query=%s", r.URL.Path, r.URL.RawQuery)
@@ -7810,6 +7965,23 @@ func TestNeoRuntimeThreadActorGatewayImportsMarkedCloudThread(t *testing.T) {
 			Enabled: &enabled,
 		},
 	}})
+	rt.threadDir = t.TempDir()
+	if err := writeNeoLocalThreadSnapshotToDir(neoCloudThreadSnapshot{
+		threadID:  threadID,
+		seq:       1,
+		createdMs: time.Now().Add(-time.Hour).UnixMilli(),
+		title:     "stale disk state",
+		messages: []neoMessage{{
+			ThreadID:  threadID,
+			MessageID: "M-stale",
+			Role:      "user",
+			AgentMode: "deep",
+			Content:   []any{map[string]any{"type": "text", "text": "stale disk message"}},
+			Seq:       1,
+		}},
+	}, rt.threadDir); err != nil {
+		t.Fatalf("write stale local thread: %v", err)
+	}
 	req := httptest.NewRequest(http.MethodGet, "http://localhost:8317/gateway/threadActor/connect?rvt-method=getOrCreate&rvt-key="+url.QueryEscape(threadID), nil)
 	actor := rt.store.actorForGatewayRequest(req)
 	if actor == nil {
@@ -8224,6 +8396,126 @@ func TestNeoRuntimeClientResumeIsSocketScoped(t *testing.T) {
 	if msg, ok := readNeoMessage(t, conn2, 150*time.Millisecond); ok {
 		t.Fatalf("client_resume snapshot leaked to another socket: %#v", msg)
 	}
+}
+
+func TestNeoRuntimePositiveResumePreservesLoadedTranscriptAndReplaysOnlySubsequentEvents(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019e0e6e-f3f1-7080-b5dd-748f66f8c26d"
+	actor, _ := rt.store.upsert(map[string]any{"name": "threadActor", "key": threadID, "input": map[string]any{"threadId": threadID}}, true)
+	baseMessages := []neoMessage{
+		{ThreadID: threadID, MessageID: "M-0000000000000000000001", Role: "user", Content: []any{map[string]any{"type": "text", "text": "inspect the repository"}}, Seq: 1},
+		{ThreadID: threadID, MessageID: "M-0000000000000000000002", Role: "assistant", Content: []any{
+			map[string]any{"type": "text", "text": "I will inspect it."},
+			map[string]any{"type": "tool_use", "id": "TU-base", "name": "shell_command", "input": map[string]any{"command": "pwd"}},
+		}, Seq: 2},
+		{ThreadID: threadID, MessageID: "M-0000000000000000000003", Role: "user", Content: []any{
+			map[string]any{"type": "tool_result", "toolUseID": "TU-base", "content": "/workspace"},
+		}, Seq: 3},
+	}
+	preloadedIDs := make(map[string]bool, len(baseMessages))
+	sawToolUse := false
+	sawToolResult := false
+	for _, message := range baseMessages {
+		preloadedIDs[message.MessageID] = true
+		for _, rawBlock := range message.Content {
+			switch stringValue(mapValue(rawBlock)["type"]) {
+			case "tool_use":
+				sawToolUse = true
+			case "tool_result":
+				sawToolResult = true
+			}
+		}
+	}
+	if !sawToolUse || !sawToolResult {
+		t.Fatalf("preloaded transcript missing tool blocks: %#v", baseMessages)
+	}
+
+	actor.mu.Lock()
+	actor.messages = append(append([]neoMessage(nil), baseMessages...), neoMessage{
+		ThreadID: threadID, MessageID: "M-0000000000000000000004", Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "post-base result"}}, Seq: 5,
+	})
+	actor.replayEvents = []neoReplayEvent{
+		{Seq: 3, Payload: map[string]any{
+			"type": "message_updated",
+			"seq":  3,
+			"message": map[string]any{
+				"threadId":  threadID,
+				"messageId": "M-0000000000000000000001",
+				"role":      "user",
+				"content":   []any{map[string]any{"type": "text", "text": "at-base update must not replay"}},
+			},
+		}},
+		{Seq: 4, Payload: map[string]any{
+			"type": "message_updated",
+			"seq":  4,
+			"message": map[string]any{
+				"threadId":  threadID,
+				"messageId": "M-0000000000000000000002",
+				"role":      "assistant",
+				"content": []any{
+					map[string]any{"type": "text", "text": "I inspected it."},
+					map[string]any{"type": "tool_use", "id": "TU-base", "name": "shell_command", "input": map[string]any{"command": "pwd"}},
+				},
+			},
+		}},
+	}
+	actor.compactionRecords = []map[string]any{{"cutMessageId": "M-0000000000000000000003", "createdAt": "2026-07-12T00:00:00Z"}}
+	actor.seq = 6
+	actor.mu.Unlock()
+
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	t.Cleanup(server.Close)
+	conn := dialNeoActorWebSocket(t, server.URL, threadID)
+	defer conn.Close()
+	waitForNeoMessageType(t, conn, "agent_state", 2*time.Second)
+
+	if err := conn.WriteJSON(map[string]any{"type": "client_resume", "version": 3}); err != nil {
+		t.Fatalf("write positive client_resume: %v", err)
+	}
+
+	sawUpdate := false
+	sawNewMessage := false
+	sawCompactionRecord := false
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		msg, ok := readNeoMessage(t, conn, time.Until(deadline))
+		if !ok {
+			break
+		}
+		switch msg["type"] {
+		case "message_added":
+			message := mapValue(msg["message"])
+			messageID := stringValue(message["messageId"])
+			if preloadedIDs[messageID] || numberFrom(msg["seq"]) <= 3 {
+				t.Fatalf("positive resume duplicated preloaded message: %#v", msg)
+			}
+			if messageID == "M-0000000000000000000004" {
+				sawNewMessage = true
+			}
+		case "message_updated":
+			if numberFrom(msg["seq"]) <= 3 {
+				t.Fatalf("positive resume replayed event at or before loaded base: %#v", msg)
+			}
+			messageID := stringValue(mapValue(msg["message"])["messageId"])
+			if !preloadedIDs[messageID] {
+				t.Fatalf("post-base update refers to unknown preloaded message ID: %#v", msg)
+			}
+			if messageID == "M-0000000000000000000002" && numberFrom(msg["seq"]) == 4 {
+				sawUpdate = true
+			}
+		case "compaction_records":
+			records := arrayValue(msg["records"])
+			if len(records) == 1 && stringValue(mapValue(records[0])["cutMessageId"]) == "M-0000000000000000000003" {
+				sawCompactionRecord = true
+			}
+		case "agent_state":
+			if !sawUpdate || !sawNewMessage || !sawCompactionRecord {
+				t.Fatalf("resume completeness update=%v new=%v compaction=%v", sawUpdate, sawNewMessage, sawCompactionRecord)
+			}
+			return
+		}
+	}
+	t.Fatal("timed out waiting for positive resume snapshot")
 }
 
 func TestNeoRuntimeSkipReadyWaitDefersSnapshotUntilClientResume(t *testing.T) {

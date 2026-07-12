@@ -236,7 +236,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	return fmt.Sprintf(`// ==UserScript==
 // @name CLIProxyAPI Amp Local Inference
 // @namespace https://github.com/router-for-me/CLIProxyAPI
-// @version 0.1.62
+// @version 0.1.63
 %s
 // @updateURL %s
 // @downloadURL %s
@@ -248,7 +248,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	"use strict";
 
 	const bridgeHeader = %s;
-	const userscriptVersion = "0.1.62";
+	const userscriptVersion = "0.1.63";
 	const apiKeyStorageKey = "cliproxyapi.ampLocalInference.apiKey";
 	const workingDirectoryStorageKey = "cliproxyapi.ampLocalInference.workingDirectory";
 	const selectedLocalProjectStorageKey = "cliproxyapi.ampLocalInference.selectedLocalProject";
@@ -263,6 +263,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	const originalFetch = globalThis.fetch.bind(globalThis);
 	const originalResponseJSON = globalThis.Response?.prototype?.json;
 	const NativeWebSocket = globalThis.WebSocket;
+	const loadedThreadBaseVersions = new Map();
 	const diagnostics = {
 		decodedConfigPatchCount: 0,
 		responseJSONPatchCount: 0,
@@ -273,6 +274,8 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		webSocketCloseCount: 0,
 		webSocketErrorCount: 0,
 		activeWebSocketCount: 0,
+		loadedThreadBaseCaptureCount: 0,
+		clientResumeRewriteCount: 0,
 		menuIntegrationCount: 0,
 		commandPaletteIntegrationCount: 0,
 		localProjectFetchCount: 0,
@@ -302,6 +305,10 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		lastWebSocketReadyState: -1,
 		lastWebSocketCloseCode: 0,
 		lastWebSocketCloseReason: "",
+		lastLoadedThreadBaseThreadID: "",
+		lastLoadedThreadBaseVersion: 0,
+		lastClientResumeThreadID: "",
+		lastClientResumeBaseVersion: 0,
 		lastInheritedWorkingDirectory: "",
 		lastInheritedWorkingDirectoryThreadID: "",
 		lastObservedThreadID: "",
@@ -987,6 +994,38 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		return values[object[key]];
 	}
 
+	function positiveThreadVersion(value) {
+		return Number.isSafeInteger(value) && value > 0 ? value : 0;
+	}
+
+	function rememberLoadedThreadBase(threadID, version, hasMessages) {
+		threadID = normalizeThreadIDValue(threadID);
+		version = positiveThreadVersion(version);
+		if (!threadID || threadID !== pathThreadID() || !version || !hasMessages) {
+			return;
+		}
+		const current = loadedThreadBaseVersions.get(threadID) || 0;
+		if (version === current) {
+			return;
+		}
+		loadedThreadBaseVersions.set(threadID, version);
+		diagnostics.loadedThreadBaseCaptureCount += 1;
+		diagnostics.lastLoadedThreadBaseThreadID = threadID;
+		diagnostics.lastLoadedThreadBaseVersion = version;
+	}
+
+	function rememberDevalueLoadedThreadBase(values, thread) {
+		if (!isPlainObject(thread)) {
+			return;
+		}
+		const data = devalueObjectField(values, thread, "data");
+		const threadID = devalueAnyThreadID(values, thread) || devalueAnyThreadID(values, data);
+		const version = positiveThreadVersion(devalueField(values, thread, "v")) || positiveThreadVersion(devalueField(values, data, "v"));
+		const messages = devalueField(values, thread, "messages");
+		const dataMessages = devalueField(values, data, "messages");
+		rememberLoadedThreadBase(threadID, version, Array.isArray(messages) || Array.isArray(dataMessages));
+	}
+
 	function devalueStringField(values, object, key) {
 		const value = devalueField(values, object, key);
 		return typeof value === "string" ? value : "";
@@ -1166,6 +1205,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			return false;
 		}
 		const thread = values[threadIndex];
+		rememberDevalueLoadedThreadBase(values, thread);
 		const activeThread = activeThreadID();
 		if (!isPlainObject(thread) || !activeThread || devalueThreadID(values, thread) !== activeThread) {
 			return false;
@@ -1215,6 +1255,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			if (!isPlainObject(entry)) {
 				continue;
 			}
+			rememberDevalueLoadedThreadBase(values, entry);
 			patched = clearDevalueStaleLocalThreadExecutorState(values, entry) || patched;
 			const entryThreadID = activeThread ? devalueContainerThreadIDValue(values, entry) : "";
 			if (entryThreadID && entryThreadID === activeThread) {
@@ -1272,6 +1313,14 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	}
 
 	function rememberPlainThreadRuntime(thread) {
+		if (isPlainObject(thread)) {
+			const data = isPlainObject(thread.data) ? thread.data : null;
+			rememberLoadedThreadBase(
+				normalizeThreadIDValue(thread.id) || normalizeThreadIDValue(data?.id),
+				positiveThreadVersion(thread.v) || positiveThreadVersion(data?.v),
+				Array.isArray(thread.messages) || Array.isArray(data?.messages),
+			);
+		}
 		if (!plainThreadMatchesActive(thread)) {
 			return false;
 		}
@@ -3727,6 +3776,36 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		}));
 	}
 
+	function rewriteClientResumePayload(payload, threadID) {
+		if (typeof payload !== "string" || !threadID) {
+			return payload;
+		}
+		const baseVersion = positiveThreadVersion(loadedThreadBaseVersions.get(threadID));
+		if (!baseVersion) {
+			return payload;
+		}
+		let parsed;
+		try {
+			parsed = originalJSONParse(payload);
+		} catch {
+			return payload;
+		}
+		let resume = null;
+		if (isPlainObject(parsed) && parsed.type === "client_resume") {
+			resume = parsed;
+		} else if (isPlainObject(parsed) && parsed.method === "client_resume" && isPlainObject(parsed.params)) {
+			resume = parsed.params;
+		}
+		if (!resume || resume.version !== 0) {
+			return payload;
+		}
+		resume.version = baseVersion;
+		diagnostics.clientResumeRewriteCount += 1;
+		diagnostics.lastClientResumeThreadID = threadID;
+		diagnostics.lastClientResumeBaseVersion = baseVersion;
+		return JSON.stringify(parsed);
+	}
+
 	globalThis.JSON.parse = function(text, reviver) {
 		const parsed = originalJSONParse(text, reviver);
 		try {
@@ -3825,13 +3904,23 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		construct(target, args, newTarget) {
 			diagnostics.lastWebSocketProtocols = webSocketProtocolDiagnostics(args.length > 1 ? args[1] : "");
 			let rememberLocalThreadIDOnOpen = "";
+			let resumeThreadID = "";
 			if (args.length > 0) {
+				const source = new URL(String(args[0]), globalThis.location.href);
 				args[0] = localWebSocketURL(args[0]);
 				rememberLocalThreadIDOnOpen = pendingLocalBootstrapThreadID;
 				pendingLocalBootstrapThreadID = "";
+				const rewritten = new URL(String(args[0]), globalThis.location.href);
+				if (gatewayActorPath(source.pathname) && !gatewayUserActorPath(source.pathname) && sameLocalWebSocketBase(rewritten, localBaseURL())) {
+					resumeThreadID = threadIDFromGatewayURL(source) || threadIDFromGatewayURL(rewritten);
+				}
 			}
 			const socket = Reflect.construct(target, args, newTarget);
 			try {
+				if (resumeThreadID && typeof socket.send === "function") {
+					const nativeSend = socket.send.bind(socket);
+					socket.send = (payload) => nativeSend(rewriteClientResumePayload(payload, resumeThreadID));
+				}
 				diagnostics.lastWebSocketState = "constructed";
 				diagnostics.lastWebSocketReadyState = Number(socket.readyState);
 				socket.addEventListener("open", () => {
