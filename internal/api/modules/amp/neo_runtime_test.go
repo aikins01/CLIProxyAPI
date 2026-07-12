@@ -8465,6 +8465,134 @@ func TestNeoRuntimeClientResumeIsSocketScoped(t *testing.T) {
 	}
 }
 
+func TestNeoRuntimeWebSocketFullResumePreservesLargeTranscript(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019e0e6e-f3f1-7080-b5dd-748f66f8c26c"
+	actor, _ := rt.store.upsert(map[string]any{"name": "threadActor", "key": threadID, "input": map[string]any{"threadId": threadID}}, true)
+	const messageCount = neoReplayEventLimit + 88
+	messages := make([]neoMessage, 0, messageCount)
+	for i := 0; i < messageCount; i++ {
+		messageID := fmt.Sprintf("M-%022d", i+1)
+		toolUseID := fmt.Sprintf("TU-%04d", i/2)
+		message := neoMessage{ThreadID: threadID, MessageID: messageID, Seq: i + 1}
+		if i%2 == 0 {
+			message.Role = "assistant"
+			message.Content = []any{map[string]any{"type": "tool_use", "id": toolUseID, "name": "shell_command", "input": map[string]any{"command": "pwd"}}}
+		} else {
+			message.Role = "user"
+			message.Content = []any{map[string]any{"type": "tool_result", "toolUseID": toolUseID, "content": "/workspace"}}
+		}
+		messages = append(messages, message)
+	}
+	cutMessageID := messages[messageCount/2].MessageID
+	actor.mu.Lock()
+	actor.messages = messages
+	actor.compactionRecords = []map[string]any{{"cutMessageId": cutMessageID, "createdAt": "2026-07-12T00:00:00Z"}}
+	actor.seq = messageCount + 1
+	actor.mu.Unlock()
+
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	t.Cleanup(server.Close)
+	conn := dialNeoActorWebSocketWithoutResume(t, server.URL, threadID, "")
+	defer conn.Close()
+	if err := conn.WriteJSON(map[string]any{"type": "client_resume", "version": 0}); err != nil {
+		t.Fatalf("write full client_resume: %v", err)
+	}
+
+	messageIndex := 0
+	toolUses := 0
+	toolResults := 0
+	sawCompactionRecord := false
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		msg, ok := readNeoMessage(t, conn, time.Until(deadline))
+		if !ok {
+			break
+		}
+		switch msg["type"] {
+		case "message_added":
+			if messageIndex >= len(messages) {
+				t.Fatalf("full resume sent too many messages: %#v", msg)
+			}
+			message := mapValue(msg["message"])
+			if got, want := stringValue(message["messageId"]), messages[messageIndex].MessageID; got != want {
+				t.Fatalf("full resume message %d ID = %q, want %q", messageIndex, got, want)
+			}
+			for _, rawBlock := range arrayValue(message["content"]) {
+				switch stringValue(mapValue(rawBlock)["type"]) {
+				case "tool_use":
+					toolUses++
+				case "tool_result":
+					toolResults++
+				}
+			}
+			messageIndex++
+		case "compaction_records":
+			records := arrayValue(msg["records"])
+			sawCompactionRecord = len(records) == 1 && stringValue(mapValue(records[0])["cutMessageId"]) == cutMessageID
+		case "agent_state":
+			if messageIndex != messageCount || toolUses != messageCount/2 || toolResults != messageCount/2 || !sawCompactionRecord {
+				t.Fatalf("full resume completeness messages=%d/%d toolUses=%d toolResults=%d compaction=%v", messageIndex, messageCount, toolUses, toolResults, sawCompactionRecord)
+			}
+			return
+		}
+	}
+	t.Fatal("timed out waiting for full resume snapshot")
+}
+
+func TestNeoReplayEventMessageIDClassifiesDeduplicatedFamilies(t *testing.T) {
+	messageID := "M-0000000000000000000001"
+	tests := []struct {
+		name    string
+		payload map[string]any
+		want    string
+	}{
+		{name: "delta", payload: map[string]any{"type": "delta", "messageId": messageID}, want: messageID},
+		{name: "message added", payload: map[string]any{"type": "message_added", "message": map[string]any{"messageId": messageID}}, want: messageID},
+		{name: "message updated", payload: map[string]any{"type": "message_updated", "message": map[string]any{"messageId": messageID}}, want: messageID},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := neoReplayEventMessageID(test.payload); got != test.want {
+				t.Fatalf("neoReplayEventMessageID() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestNeoReplayEventRepresentedByMessagesMatrix(t *testing.T) {
+	messageID := "M-0000000000000000000001"
+	toolCallID := "TU-00000000000000000001"
+	messageIDs := map[string]bool{messageID: true}
+	toolCallIDs := map[string]bool{toolCallID: true}
+	tests := []struct {
+		name    string
+		payload map[string]any
+		want    bool
+	}{
+		{name: "matching delta", payload: map[string]any{"type": "delta", "messageId": messageID}, want: true},
+		{name: "different delta", payload: map[string]any{"type": "delta", "messageId": "M-other"}},
+		{name: "empty delta ID", payload: map[string]any{"type": "delta"}},
+		{name: "matching message added", payload: map[string]any{"type": "message_added", "message": map[string]any{"messageId": messageID}}, want: true},
+		{name: "different message added", payload: map[string]any{"type": "message_added", "message": map[string]any{"messageId": "M-other"}}},
+		{name: "empty message added ID", payload: map[string]any{"type": "message_added", "message": map[string]any{}}},
+		{name: "matching message updated", payload: map[string]any{"type": "message_updated", "message": map[string]any{"messageId": messageID}}, want: true},
+		{name: "different message updated", payload: map[string]any{"type": "message_updated", "message": map[string]any{"messageId": "M-other"}}},
+		{name: "empty message updated ID", payload: map[string]any{"type": "message_updated", "message": map[string]any{}}},
+		{name: "matching tool progress", payload: map[string]any{"type": "tool_progress", "toolCallId": toolCallID}, want: true},
+		{name: "different tool progress", payload: map[string]any{"type": "tool_progress", "toolCallId": "TU-other"}},
+		{name: "empty tool progress ID", payload: map[string]any{"type": "tool_progress"}},
+		{name: "unrelated event with matching IDs", payload: map[string]any{"type": "usage", "messageId": messageID, "toolCallId": toolCallID}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := neoReplayEventRepresentedByMessages(test.payload, messageIDs, toolCallIDs); got != test.want {
+				t.Fatalf("neoReplayEventRepresentedByMessages() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
 func TestNeoRuntimePositiveResumePreservesLoadedTranscriptAndReplaysOnlySubsequentEvents(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	threadID := "T-019e0e6e-f3f1-7080-b5dd-748f66f8c26d"
@@ -8498,9 +8626,20 @@ func TestNeoRuntimePositiveResumePreservesLoadedTranscriptAndReplaysOnlySubseque
 	}
 
 	actor.mu.Lock()
-	actor.messages = append(append([]neoMessage(nil), baseMessages...), neoMessage{
-		ThreadID: threadID, MessageID: "M-0000000000000000000004", Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "post-base result"}}, Seq: 5,
-	})
+	actor.messages = append(append([]neoMessage(nil), baseMessages...),
+		neoMessage{
+			ThreadID: threadID, MessageID: "M-0000000000000000000004", Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "post-base result"}}, Seq: 5,
+		},
+		neoMessage{
+			ThreadID: threadID, MessageID: "legacy-grouped-result", Role: "user", Content: []any{
+				map[string]any{"type": "text", "text": "grouped result"},
+				map[string]any{"type": "tool_result", "toolUseID": "TU-tool-use-ID", "content": "/workspace"},
+				map[string]any{"type": "tool_result", "toolUseId": "TU-tool-use-Id", "content": "/workspace"},
+				map[string]any{"type": "tool_result", "tool_use_id": "TU-tool-use-id", "content": "/workspace"},
+				map[string]any{"type": "tool_result", "toolCallId": "TU-tool-call-Id", "content": "/workspace"},
+			}, Seq: 9,
+		},
+	)
 	actor.replayEvents = []neoReplayEvent{
 		{Seq: 3, Payload: map[string]any{
 			"type": "message_updated",
@@ -8525,9 +8664,93 @@ func TestNeoRuntimePositiveResumePreservesLoadedTranscriptAndReplaysOnlySubseque
 				},
 			},
 		}},
+		{Seq: 6, Payload: map[string]any{
+			"type": "message_updated",
+			"seq":  6,
+			"message": map[string]any{
+				"threadId":  threadID,
+				"messageId": "M-0000000000000000000004",
+				"role":      "assistant",
+				"content":   []any{map[string]any{"type": "text", "text": "duplicate post-base update must not replay"}},
+			},
+		}},
+		{Seq: 7, Payload: map[string]any{
+			"type":      "delta",
+			"seq":       7,
+			"messageId": "M-0000000000000000000004",
+			"role":      "assistant",
+			"blocks":    []any{map[string]any{"type": "text", "text": "duplicate delta must not replay"}},
+		}},
+		{Seq: 8, Payload: map[string]any{
+			"type": "message_added",
+			"seq":  8,
+			"message": map[string]any{
+				"threadId":  threadID,
+				"messageId": "M-0000000000000000000004",
+				"role":      "assistant",
+				"content":   []any{map[string]any{"type": "text", "text": "duplicate add must not replay"}},
+			},
+		}},
+		{Seq: 10, Payload: map[string]any{
+			"type":       "tool_progress",
+			"seq":        10,
+			"toolCallId": "TU-tool-use-ID",
+			"content":    "stale progress must not replay",
+		}},
+		{Seq: 11, Payload: map[string]any{
+			"type":       "tool_progress",
+			"seq":        11,
+			"toolCallId": "TU-tool-use-Id",
+			"content":    "stale progress must not replay",
+		}},
+		{Seq: 12, Payload: map[string]any{
+			"type":       "tool_progress",
+			"seq":        12,
+			"toolCallId": "TU-tool-use-id",
+			"content":    "stale progress must not replay",
+		}},
+		{Seq: 13, Payload: map[string]any{
+			"type":       "tool_progress",
+			"seq":        13,
+			"toolCallId": "TU-tool-call-Id",
+			"content":    "stale progress must not replay",
+		}},
+		{Seq: 14, Payload: map[string]any{
+			"type":       "tool_progress",
+			"seq":        14,
+			"toolCallId": "TU-other",
+			"content":    "unrelated progress",
+		}},
+		{Seq: 15, Payload: map[string]any{
+			"type":      "delta",
+			"seq":       15,
+			"messageId": "resume-delta-near-miss",
+			"role":      "assistant",
+			"blocks":    []any{map[string]any{"type": "text", "text": "unrelated delta"}},
+		}},
+		{Seq: 16, Payload: map[string]any{
+			"type": "message_added",
+			"seq":  16,
+			"message": map[string]any{
+				"threadId":  threadID,
+				"messageId": "resume-added-near-miss",
+				"role":      "assistant",
+				"content":   []any{map[string]any{"type": "text", "text": "unrelated add"}},
+			},
+		}},
+		{Seq: 17, Payload: map[string]any{
+			"type": "message_updated",
+			"seq":  17,
+			"message": map[string]any{
+				"threadId":  threadID,
+				"messageId": "resume-updated-near-miss",
+				"role":      "assistant",
+				"content":   []any{map[string]any{"type": "text", "text": "unrelated update"}},
+			},
+		}},
 	}
 	actor.compactionRecords = []map[string]any{{"cutMessageId": "M-0000000000000000000003", "createdAt": "2026-07-12T00:00:00Z"}}
-	actor.seq = 6
+	actor.seq = 18
 	actor.mu.Unlock()
 
 	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
@@ -8542,7 +8765,13 @@ func TestNeoRuntimePositiveResumePreservesLoadedTranscriptAndReplaysOnlySubseque
 
 	sawUpdate := false
 	sawNewMessage := false
+	sawLegacyToolResult := false
+	sawUnrelatedToolProgress := false
+	sawUnrelatedDelta := false
+	sawUnrelatedAdded := false
+	sawUnrelatedUpdated := false
 	sawCompactionRecord := false
+	replaySeqs := make([]int, 0, 7)
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		msg, ok := readNeoMessage(t, conn, time.Until(deadline))
@@ -8551,20 +8780,52 @@ func TestNeoRuntimePositiveResumePreservesLoadedTranscriptAndReplaysOnlySubseque
 		}
 		switch msg["type"] {
 		case "message_added":
+			replaySeqs = append(replaySeqs, numberFrom(msg["seq"]))
 			message := mapValue(msg["message"])
 			messageID := stringValue(message["messageId"])
 			if preloadedIDs[messageID] || numberFrom(msg["seq"]) <= 3 {
 				t.Fatalf("positive resume duplicated preloaded message: %#v", msg)
 			}
 			if messageID == "M-0000000000000000000004" {
+				if sawNewMessage {
+					t.Fatalf("positive resume duplicated post-base message: %#v", msg)
+				}
 				sawNewMessage = true
 			}
+			if messageID == "legacy-grouped-result" {
+				if sawLegacyToolResult {
+					t.Fatalf("positive resume duplicated legacy tool-result message: %#v", msg)
+				}
+				sawLegacyToolResult = true
+			}
+			if messageID == "resume-added-near-miss" {
+				sawUnrelatedAdded = true
+			}
+		case "delta":
+			replaySeqs = append(replaySeqs, numberFrom(msg["seq"]))
+			switch stringValue(msg["messageId"]) {
+			case "M-0000000000000000000004":
+				t.Fatalf("positive resume replayed delta already represented by post-base message: %#v", msg)
+			case "resume-delta-near-miss":
+				sawUnrelatedDelta = true
+			}
+		case "tool_progress":
+			replaySeqs = append(replaySeqs, numberFrom(msg["seq"]))
+			switch stringValue(msg["toolCallId"]) {
+			case "TU-tool-use-ID", "TU-tool-use-Id", "TU-tool-use-id", "TU-tool-call-Id":
+				t.Fatalf("positive resume replayed tool progress already represented by post-base result: %#v", msg)
+			case "TU-other":
+				sawUnrelatedToolProgress = true
+			}
 		case "message_updated":
+			replaySeqs = append(replaySeqs, numberFrom(msg["seq"]))
 			if numberFrom(msg["seq"]) <= 3 {
 				t.Fatalf("positive resume replayed event at or before loaded base: %#v", msg)
 			}
 			messageID := stringValue(mapValue(msg["message"])["messageId"])
-			if !preloadedIDs[messageID] {
+			if messageID == "resume-updated-near-miss" {
+				sawUnrelatedUpdated = true
+			} else if !preloadedIDs[messageID] {
 				t.Fatalf("post-base update refers to unknown preloaded message ID: %#v", msg)
 			}
 			if messageID == "M-0000000000000000000002" && numberFrom(msg["seq"]) == 4 {
@@ -8576,8 +8837,11 @@ func TestNeoRuntimePositiveResumePreservesLoadedTranscriptAndReplaysOnlySubseque
 				sawCompactionRecord = true
 			}
 		case "agent_state":
-			if !sawUpdate || !sawNewMessage || !sawCompactionRecord {
-				t.Fatalf("resume completeness update=%v new=%v compaction=%v", sawUpdate, sawNewMessage, sawCompactionRecord)
+			if !sawUpdate || !sawNewMessage || !sawLegacyToolResult || !sawUnrelatedToolProgress || !sawUnrelatedDelta || !sawUnrelatedAdded || !sawUnrelatedUpdated || !sawCompactionRecord {
+				t.Fatalf("resume completeness update=%v new=%v legacyToolResult=%v unrelatedToolProgress=%v unrelatedDelta=%v unrelatedAdded=%v unrelatedUpdated=%v compaction=%v", sawUpdate, sawNewMessage, sawLegacyToolResult, sawUnrelatedToolProgress, sawUnrelatedDelta, sawUnrelatedAdded, sawUnrelatedUpdated, sawCompactionRecord)
+			}
+			if want := []int{4, 5, 9, 14, 15, 16, 17}; !reflect.DeepEqual(replaySeqs, want) {
+				t.Fatalf("positive resume replay sequences = %v, want %v", replaySeqs, want)
 			}
 			return
 		}

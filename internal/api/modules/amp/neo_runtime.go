@@ -2576,6 +2576,12 @@ type neoReplayEvent struct {
 	Payload map[string]any
 }
 
+type neoSnapshotReplayFrame struct {
+	seq          int
+	messageIndex int
+	payload      map[string]any
+}
+
 type neoSpawnedExecutor struct {
 	spawnID       string
 	threadID      string
@@ -16293,14 +16299,30 @@ func (a *neoActor) sendSnapshot(socket *neoSocket, sinceSeq int) {
 	for _, item := range a.queue {
 		queue = append(queue, item.queueProtocol())
 	}
-	allMessages := append([]neoMessage(nil), a.messages...)
-	replayFrames := make([]neoReplayEvent, 0)
-	includedMessageIDs := map[string]bool{}
+	messages := make([]neoMessage, 0)
+	if sinceSeq <= 0 {
+		messages = make([]neoMessage, 0, len(a.messages))
+	}
+	replayFrames := make([]neoSnapshotReplayFrame, 0, cap(messages))
+	var includedMessageIDs map[string]bool
+	var includedToolCallIDs map[string]bool
+	if sinceSeq > 0 {
+		includedMessageIDs = make(map[string]bool)
+		includedToolCallIDs = make(map[string]bool)
+	}
 	for _, message := range a.messages {
 		if message.Seq > sinceSeq {
-			replayFrames = append(replayFrames, neoReplayEvent{Seq: message.Seq, Payload: neoMessageAddedPayload(message)})
-			if message.MessageID != "" {
+			message.OriginalToolUseInput = cloneMap(message.OriginalToolUseInput)
+			messages = append(messages, message)
+			i := len(messages) - 1
+			replayFrames = append(replayFrames, neoSnapshotReplayFrame{seq: message.Seq, messageIndex: i})
+			if includedMessageIDs != nil && message.MessageID != "" {
 				includedMessageIDs[message.MessageID] = true
+			}
+			if includedToolCallIDs != nil {
+				for toolCallID := range neoToolResultIDs(message.Content) {
+					includedToolCallIDs[toolCallID] = true
+				}
 			}
 		}
 	}
@@ -16336,7 +16358,7 @@ func (a *neoActor) sendSnapshot(socket *neoSocket, sinceSeq int) {
 	}
 	spawnedExecutorStatuses := a.spawnedExecutorStatusListLocked()
 	lastExecutorStatus := cloneNeoJSONMap(a.lastExecutorStatus)
-	relationships := a.threadProtocolRelationshipsLocked(allMessages)
+	relationships := a.threadProtocolRelationshipsLocked(a.messages)
 	var inflightInference *neoInferenceInflight
 	a.currentInferenceMessageIndexLocked(a.shouldPreserveMissingCurrentInferenceLocked())
 	if a.currentInference != nil {
@@ -16347,23 +16369,23 @@ func (a *neoActor) sendSnapshot(socket *neoSocket, sinceSeq int) {
 	agentState = normalizeNeoAgentState(agentState)
 	if activeErrorSeq > sinceSeq {
 		if len(activeError) > 0 {
-			replayFrames = append(replayFrames, neoReplayEvent{Seq: activeErrorSeq, Payload: map[string]any{"type": "error_set", "seq": activeErrorSeq, "error": activeError}})
+			replayFrames = append(replayFrames, neoSnapshotReplayFrame{seq: activeErrorSeq, messageIndex: -1, payload: map[string]any{"type": "error_set", "seq": activeErrorSeq, "error": activeError}})
 		} else {
-			replayFrames = append(replayFrames, neoReplayEvent{Seq: activeErrorSeq, Payload: map[string]any{"type": "error_cleared", "seq": activeErrorSeq}})
+			replayFrames = append(replayFrames, neoSnapshotReplayFrame{seq: activeErrorSeq, messageIndex: -1, payload: map[string]any{"type": "error_cleared", "seq": activeErrorSeq}})
 		}
 	}
 	if sinceSeq > 0 {
 		for _, event := range a.replayEvents {
 			if event.Seq > sinceSeq {
-				if messageID := neoReplayEventMessageID(event.Payload); messageID != "" && includedMessageIDs[messageID] {
+				if neoReplayEventRepresentedByMessages(event.Payload, includedMessageIDs, includedToolCallIDs) {
 					continue
 				}
-				replayFrames = append(replayFrames, neoReplayEvent{Seq: event.Seq, Payload: cloneNeoProtocolPayload(event.Payload)})
+				replayFrames = append(replayFrames, neoSnapshotReplayFrame{seq: event.Seq, messageIndex: -1, payload: cloneNeoProtocolPayload(event.Payload)})
 			}
 		}
 	}
 	a.mu.Unlock()
-	sort.SliceStable(replayFrames, func(i, j int) bool { return replayFrames[i].Seq < replayFrames[j].Seq })
+	sort.SliceStable(replayFrames, func(i, j int) bool { return replayFrames[i].seq < replayFrames[j].seq })
 
 	send := func(payload any) {
 		if socket != nil {
@@ -16415,7 +16437,11 @@ func (a *neoActor) sendSnapshot(socket *neoSocket, sinceSeq int) {
 		send(map[string]any{"type": "compaction_started"})
 	}
 	for _, frame := range replayFrames {
-		send(frame.Payload)
+		if frame.messageIndex >= 0 {
+			send(neoMessageAddedPayload(messages[frame.messageIndex]))
+			continue
+		}
+		send(frame.payload)
 	}
 	send(map[string]any{"type": "thread_relationships", "seq": seq, "relationships": relationships})
 	send(map[string]any{"type": "compaction_records", "records": compactionRecords})
@@ -20735,6 +20761,13 @@ func neoReplayEventMessageID(payload map[string]any) string {
 		return stringValue(mapValue(payload["message"])["messageId"])
 	}
 	return ""
+}
+
+func neoReplayEventRepresentedByMessages(payload map[string]any, messageIDs, toolCallIDs map[string]bool) bool {
+	if messageID := neoReplayEventMessageID(payload); messageID != "" && messageIDs[messageID] {
+		return true
+	}
+	return stringValue(payload["type"]) == "tool_progress" && toolCallIDs[stringValue(payload["toolCallId"])]
 }
 
 func cloneNeoProtocolPayload(payload map[string]any) map[string]any {
