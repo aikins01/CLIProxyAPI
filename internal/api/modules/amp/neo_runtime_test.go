@@ -6283,6 +6283,42 @@ func TestNeoLocalSnapshotMessageValues(t *testing.T) {
 	}
 }
 
+func TestNeoLocalSnapshotMessageValues(t *testing.T) {
+	tests := []struct {
+		name     string
+		messages []neoMessage
+		encoded  []neoLocalSnapshotMessageJSON
+		wantOK   bool
+	}{
+		{name: "complete", messages: make([]neoMessage, 2), encoded: []neoLocalSnapshotMessageJSON{[]byte(`{"messageId":"M-1"}`), []byte(`{"messageId":"M-2"}`)}, wantOK: true},
+		{name: "empty thread", messages: []neoMessage{}, encoded: []neoLocalSnapshotMessageJSON{}, wantOK: true},
+		{name: "missing message", messages: make([]neoMessage, 2), encoded: []neoLocalSnapshotMessageJSON{[]byte(`{"messageId":"M-1"}`)}},
+		{name: "failed encoding", messages: make([]neoMessage, 2), encoded: []neoLocalSnapshotMessageJSON{[]byte(`{"messageId":"M-1"}`), nil}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			values, ok := neoLocalSnapshotMessageValues(neoCloudThreadSnapshot{messages: test.messages, messageJSON: test.encoded})
+			if ok != test.wantOK {
+				t.Fatalf("available = %t, want %t", ok, test.wantOK)
+			}
+			if !ok {
+				if values != nil {
+					t.Fatalf("unavailable values = %#v, want nil", values)
+				}
+				return
+			}
+			if len(values) != len(test.messages) {
+				t.Fatalf("values = %d, want %d", len(values), len(test.messages))
+			}
+			for index, value := range values {
+				if _, ok := value.(neoLocalSnapshotMessageJSON); !ok {
+					t.Fatalf("value %d type = %T", index, value)
+				}
+			}
+		})
+	}
+}
+
 func TestNeoActorOverLimitSnapshotWritesCompleteImportableThread(t *testing.T) {
 	threadID := "T-019f4000-0000-4000-8000-000000000064"
 	actor := newNeoActor(nil, "actor-snapshot-cache-limit", "thread-actor", threadID, threadID, neoActorRecord("actor-snapshot-cache-limit", "thread-actor", threadID), nil)
