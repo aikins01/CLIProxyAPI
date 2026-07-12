@@ -8540,6 +8540,60 @@ func TestNeoRuntimeWebSocketFullResumePreservesLargeTranscript(t *testing.T) {
 	t.Fatal("timed out waiting for full resume snapshot")
 }
 
+func TestNeoRuntimeWebSocketOutboundJSONNormalization(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019e0e6e-f3f1-7080-b5dd-748f66f8c26b"
+	actor, _ := rt.store.upsert(map[string]any{"name": "threadActor", "key": threadID, "input": map[string]any{"threadId": threadID}}, true)
+	actor.mu.Lock()
+	actor.replayEvents = []neoReplayEvent{{Seq: 2, Payload: map[string]any{
+		"type":       "normalization_probe",
+		"seq":        2,
+		"drop":       nil,
+		"explicit":   neoExplicitNull,
+		"items":      []any{"first", nil, neoExplicitNull, map[string]any{"drop": nil, "keep": "value"}},
+		"typedMap":   map[string]any(nil),
+		"typedSlice": []any(nil),
+	}}}
+	actor.seq = 2
+	actor.mu.Unlock()
+
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	t.Cleanup(server.Close)
+	conn := dialNeoActorWebSocketWithoutResume(t, server.URL, threadID, "")
+	defer conn.Close()
+	if err := conn.WriteJSON(map[string]any{"type": "client_resume", "version": 1}); err != nil {
+		t.Fatalf("write client_resume: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		msg, ok := readNeoMessage(t, conn, time.Until(deadline))
+		if !ok {
+			break
+		}
+		if stringValue(msg["type"]) != "normalization_probe" {
+			continue
+		}
+		if _, ok := msg["drop"]; ok {
+			t.Fatalf("ordinary nil field survived on wire: %#v", msg)
+		}
+		if explicit, ok := msg["explicit"]; !ok || explicit != nil {
+			t.Fatalf("explicit null field = %#v, present=%v", explicit, ok)
+		}
+		items := arrayValue(msg["items"])
+		if len(items) != 3 || stringValue(items[0]) != "first" || items[1] != nil || stringValue(mapValue(items[2])["keep"]) != "value" {
+			t.Fatalf("normalized wire items = %#v", items)
+		}
+		typedMap, mapOK := msg["typedMap"].(map[string]any)
+		typedSlice, sliceOK := msg["typedSlice"].([]any)
+		if !mapOK || !sliceOK || len(typedMap) != 0 || len(typedSlice) != 0 {
+			t.Fatalf("typed nil wire containers = map:%#v slice:%#v", msg["typedMap"], msg["typedSlice"])
+		}
+		return
+	}
+	t.Fatal("timed out waiting for normalized WebSocket frame")
+}
+
 func TestNeoReplayEventMessageIDClassifiesDeduplicatedFamilies(t *testing.T) {
 	messageID := "M-0000000000000000000001"
 	tests := []struct {
@@ -8588,6 +8642,82 @@ func TestNeoReplayEventRepresentedByMessagesMatrix(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			if got := neoReplayEventRepresentedByMessages(test.payload, messageIDs, toolCallIDs); got != test.want {
 				t.Fatalf("neoReplayEventRepresentedByMessages() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestNormalizeNeoOutboundJSONCopyOnWrite(t *testing.T) {
+	clean := map[string]any{
+		"message": map[string]any{
+			"content": []any{map[string]any{"type": "text", "text": "complete"}},
+		},
+		"explicit": neoExplicitNull,
+	}
+	normalizedClean, changed := normalizeNeoOutboundJSONValue(clean)
+	if changed {
+		t.Fatal("clean outbound JSON was copied")
+	}
+	normalizedCleanMap := normalizedClean.(map[string]any)
+	normalizedCleanMap["identityProbe"] = true
+	if clean["identityProbe"] != true {
+		t.Fatal("clean outbound map identity was not preserved")
+	}
+	delete(clean, "identityProbe")
+	cleanSlice := []any{"value"}
+	normalizedCleanSlice, changed := normalizeNeoOutboundJSONValue(cleanSlice)
+	if changed || &normalizedCleanSlice.([]any)[0] != &cleanSlice[0] {
+		t.Fatal("clean outbound slice identity was not preserved")
+	}
+	if allocations := testing.AllocsPerRun(100, func() {
+		normalizeNeoOutboundJSON(clean)
+	}); allocations > 1 {
+		t.Fatalf("clean outbound JSON allocations = %v, want at most 1", allocations)
+	}
+
+	nested := map[string]any{"value": "unchanged"}
+	dirty := map[string]any{
+		"keep":       nested,
+		"drop":       nil,
+		"items":      []any{"first", nil, neoExplicitNull, map[string]any{"drop": nil, "keep": "value"}},
+		"explicit":   neoExplicitNull,
+		"typedMap":   map[string]any(nil),
+		"typedSlice": []any(nil),
+	}
+	normalized, changed := normalizeNeoOutboundJSONValue(dirty)
+	if !changed {
+		t.Fatal("dirty outbound JSON was not normalized")
+	}
+	raw, err := json.Marshal(normalized)
+	if err != nil {
+		t.Fatalf("marshal normalized outbound JSON: %v", err)
+	}
+	if got, want := string(raw), `{"explicit":null,"items":["first",null,{"keep":"value"}],"keep":{"value":"unchanged"},"typedMap":{},"typedSlice":[]}`; got != want {
+		t.Fatalf("normalized outbound JSON = %s, want %s", got, want)
+	}
+	if _, ok := dirty["drop"]; !ok || len(arrayValue(dirty["items"])) != 4 || nested["value"] != "unchanged" {
+		t.Fatalf("normalization mutated input structure")
+	}
+}
+
+func TestNormalizeNeoOutboundJSONChangeMatrix(t *testing.T) {
+	tests := []struct {
+		name        string
+		input       any
+		wantChanged bool
+	}{
+		{name: "clean scalar", input: "value"},
+		{name: "clean nested containers", input: map[string]any{"items": []any{map[string]any{"value": "clean"}}}},
+		{name: "nested nil map value", input: map[string]any{"nested": map[string]any{"drop": nil}}, wantChanged: true},
+		{name: "nested nil slice element", input: map[string]any{"nested": []any{"keep", nil}}, wantChanged: true},
+		{name: "typed nil map", input: map[string]any(nil), wantChanged: true},
+		{name: "typed nil slice", input: []any(nil), wantChanged: true},
+		{name: "explicit null in slice", input: []any{neoExplicitNull}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, changed := normalizeNeoOutboundJSONValue(test.input); changed != test.wantChanged {
+				t.Fatalf("normalizeNeoOutboundJSONValue() changed = %v, want %v", changed, test.wantChanged)
 			}
 		})
 	}

@@ -21802,29 +21802,67 @@ func (neoExplicitNullSentinel) MarshalJSON() ([]byte, error) {
 // produced by the runtime. Use neoExplicitNull when "null" carries semantic
 // meaning to the client (clear active error, no parent, reset value).
 func normalizeNeoOutboundJSON(value any) any {
+	normalized, _ := normalizeNeoOutboundJSONValue(value)
+	return normalized
+}
+
+func normalizeNeoOutboundJSONValue(value any) (any, bool) {
 	switch typed := value.(type) {
 	case neoExplicitNullSentinel:
-		return typed
+		return typed, false
 	case map[string]any:
-		out := make(map[string]any, len(typed))
+		if typed == nil {
+			return map[string]any{}, true
+		}
+		var out map[string]any
 		for key, item := range typed {
 			if item == nil {
+				if out == nil {
+					out = cloneMap(typed)
+				}
+				delete(out, key)
 				continue
 			}
-			out[key] = normalizeNeoOutboundJSON(item)
+			normalized, changed := normalizeNeoOutboundJSONValue(item)
+			if changed {
+				if out == nil {
+					out = cloneMap(typed)
+				}
+				out[key] = normalized
+			}
 		}
-		return out
+		if out != nil {
+			return out, true
+		}
+		return typed, false
 	case []any:
-		out := make([]any, 0, len(typed))
-		for _, item := range typed {
+		if typed == nil {
+			return []any{}, true
+		}
+		var out []any
+		for i, item := range typed {
 			if item == nil {
+				if out == nil {
+					out = make([]any, 0, len(typed)-1)
+					out = append(out, typed[:i]...)
+				}
 				continue
 			}
-			out = append(out, normalizeNeoOutboundJSON(item))
+			normalized, changed := normalizeNeoOutboundJSONValue(item)
+			if changed && out == nil {
+				out = make([]any, 0, len(typed))
+				out = append(out, typed[:i]...)
+			}
+			if out != nil {
+				out = append(out, normalized)
+			}
 		}
-		return out
+		if out != nil {
+			return out, true
+		}
+		return typed, false
 	default:
-		return value
+		return value, false
 	}
 }
 
