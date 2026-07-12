@@ -6383,6 +6383,81 @@ func TestNeoActorOverLimitSnapshotWritesCompleteImportableThread(t *testing.T) {
 	}
 }
 
+func BenchmarkNeoRuntimeColdLocalThreadImport(b *testing.B) {
+	enabled := true
+	threadID := "T-019f4000-0000-4000-8000-000000000066"
+	dir := b.TempDir()
+	messages := make([]any, 2000)
+	for index := range messages {
+		messages[index] = map[string]any{
+			"messageId": fmt.Sprintf("M-%022d", index),
+			"role":      "assistant",
+			"content": []any{
+				map[string]any{"type": "thinking", "thinking": strings.Repeat("r", 512), "blockState": "complete"},
+				map[string]any{"type": "text", "text": strings.Repeat("x", 2048)},
+			},
+			"state": map[string]any{"type": "complete", "stopReason": "end_turn"},
+		}
+	}
+	path, err := writeNeoLocalThreadFileInDir(dir, threadID, map[string]any{
+		"id":        threadID,
+		"v":         len(messages),
+		"agentMode": "deep",
+		"meta":      map[string]any{"ampcodeConnectorLocalNeo": true},
+		"messages":  messages,
+		"compactionRecords": []any{map[string]any{
+			"cutMessageId": "M-0000000000000000001000",
+			"summary":      strings.Repeat("s", 16*1024),
+		}},
+	})
+	if err != nil {
+		b.Fatalf("write benchmark thread: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		b.Fatalf("stat benchmark thread: %v", err)
+	}
+
+	b.Run("load", func(b *testing.B) {
+		b.SetBytes(info.Size())
+		b.ReportAllocs()
+		for b.Loop() {
+			thread, ok := loadNeoThreadFromDir(threadID, dir)
+			if !ok {
+				b.Fatal("load benchmark thread")
+			}
+			runtime.KeepAlive(thread)
+		}
+	})
+	b.Run("load_and_import", func(b *testing.B) {
+		b.SetBytes(info.Size())
+		b.ReportAllocs()
+		for b.Loop() {
+			thread, ok := loadNeoThreadFromDir(threadID, dir)
+			if !ok {
+				b.Fatal("load benchmark thread")
+			}
+			actor := newNeoActor(nil, "actor-import-benchmark", "thread-actor", threadID, threadID, neoActorRecord("actor-import-benchmark", "thread-actor", threadID), nil)
+			if err := actor.importThreadLocalOnly(thread); err != nil {
+				b.Fatalf("import benchmark thread: %v", err)
+			}
+			runtime.KeepAlive(actor)
+		}
+	})
+	b.Run("cold_try_import", func(b *testing.B) {
+		b.SetBytes(info.Size())
+		b.ReportAllocs()
+		for b.Loop() {
+			rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled}}})
+			rt.threadDir = dir
+			if !rt.tryImportNeoLocalThreadActor(threadID) {
+				b.Fatal("cold benchmark import")
+			}
+			runtime.KeepAlive(rt)
+		}
+	})
+}
+
 func BenchmarkNeoActorCachedThreadSnapshot(b *testing.B) {
 	newActor := func() *neoActor {
 		threadID := "T-019f4000-0000-4000-8000-000000000062"
@@ -27783,6 +27858,157 @@ func TestNeoActorLocalImportIfEmptyDoesNotReplaceExistingState(t *testing.T) {
 	defer actor.mu.Unlock()
 	if actor.title != "newer in memory" || len(actor.messages) != 1 || actor.messages[0].MessageID != "M-newer" || textFromBlocks(actor.messages[0].Content) != "newer message" {
 		t.Fatalf("actor was overwritten by stale local import: title=%q messages=%#v", actor.title, actor.messages)
+	}
+}
+
+func TestNeoRuntimeColdLocalThreadImportPreservesConversationState(t *testing.T) {
+	enabled := true
+	threadID := "T-019f5464-6bb4-7d2b-8faa-f093660aaab9"
+	dir := t.TempDir()
+	thread := map[string]any{
+		"id":              threadID,
+		"v":               41,
+		"title":           "persisted conversation",
+		"agentMode":       "deep",
+		"reasoningEffort": "xhigh",
+		"meta":            map[string]any{"ampcodeConnectorLocalNeo": true, "projectName": "memory-profile"},
+		"messages": []any{
+			map[string]any{
+				"messageId":       "M-0000000000000000000001",
+				"role":            "user",
+				"agentMode":       "deep",
+				"reasoningEffort": "xhigh",
+				"content":         []any{map[string]any{"type": "text", "text": "preserve the complete conversation"}},
+			},
+			map[string]any{
+				"messageId": "M-0000000000000000000002",
+				"role":      "assistant",
+				"state":     map[string]any{"type": "cancelled"},
+				"content": []any{
+					map[string]any{"type": "thinking", "thinking": "reasoning", "blockState": "complete"},
+					map[string]any{"type": "tool_use", "id": "TU-stable", "name": "shell_command", "input": map[string]any{"command": "go test ./..."}},
+				},
+			},
+			map[string]any{
+				"messageId": "M-0000000000000000000003",
+				"role":      "user",
+				"content": []any{map[string]any{
+					"type":      "tool_result",
+					"toolUseID": "TU-stable",
+					"content":   []any{map[string]any{"type": "text", "text": "all tests passed"}},
+				}},
+			},
+			map[string]any{
+				"messageId": "M-0000000000000000000004",
+				"role":      "info",
+				"content": []any{
+					map[string]any{"type": "summary", "summary": "preserved summary", "content": "preserved summary"},
+					map[string]any{"type": "manual_bash_invocation", "command": "git status --short"},
+				},
+			},
+		},
+		"compactionRecords": []any{map[string]any{
+			"cutMessageId": "M-0000000000000000000001",
+			"summary":      "preserved summary",
+			"createdAt":    "2026-07-12T20:00:00Z",
+		}},
+		"relationships": []any{map[string]any{
+			"threadID": "T-019f5464-6bb4-7d2b-8faa-f093660aaa00",
+			"type":     "mention",
+			"role":     "parent",
+		}},
+	}
+	if _, err := writeNeoLocalThreadFileInDir(dir, threadID, thread); err != nil {
+		t.Fatalf("write local thread: %v", err)
+	}
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled}}})
+	rt.threadDir = dir
+
+	if !rt.tryImportNeoLocalThreadActor(threadID) {
+		t.Fatal("cold local thread import failed")
+	}
+	actor := rt.store.lookupThreadActor(threadID)
+	if actor == nil {
+		t.Fatal("cold local thread actor missing")
+	}
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.title != "persisted conversation" || actor.currentAgentMode != "deep" || actor.currentReasoningEffort != "xhigh" {
+		t.Fatalf("actor state = title:%q mode:%q effort:%q", actor.title, actor.currentAgentMode, actor.currentReasoningEffort)
+	}
+	wantIDs := []string{"M-0000000000000000000001", "M-0000000000000000000002", "M-0000000000000000000003", "M-0000000000000000000004"}
+	if len(actor.messages) != len(wantIDs) {
+		t.Fatalf("messages = %d, want %d", len(actor.messages), len(wantIDs))
+	}
+	for index, wantID := range wantIDs {
+		if actor.messages[index].MessageID != wantID {
+			t.Fatalf("message %d id = %q, want %q", index, actor.messages[index].MessageID, wantID)
+		}
+	}
+	if got := mapValue(actor.messages[1].Content[1]); got["id"] != "TU-stable" || stringValue(mapValue(got["input"])["command"]) != "go test ./..." {
+		t.Fatalf("tool use = %#v", got)
+	}
+	if got := mapValue(actor.messages[2].Content[0]); got["toolUseID"] != "TU-stable" || textFromBlocks(arrayValue(got["content"])) != "all tests passed" {
+		t.Fatalf("tool result = %#v", got)
+	}
+	if len(actor.messages[3].Content) != 2 || stringValue(mapValue(actor.messages[3].Content[0])["type"]) != "summary" || stringValue(mapValue(actor.messages[3].Content[1])["type"]) != "manual_bash_invocation" {
+		t.Fatalf("compaction message = %#v", actor.messages[3].Content)
+	}
+	if len(actor.compactionRecords) != 1 || stringValue(actor.compactionRecords[0]["cutMessageId"]) != "M-0000000000000000000001" {
+		t.Fatalf("compaction records = %#v", actor.compactionRecords)
+	}
+	if len(actor.relationships) != 1 || len(actor.replayEvents) != 0 {
+		t.Fatalf("relationships/replay = %#v/%#v", actor.relationships, actor.replayEvents)
+	}
+}
+
+func TestNeoRuntimeConcurrentColdLocalThreadImportsShareHydratedActor(t *testing.T) {
+	enabled := true
+	threadID := "T-019f5464-6bb4-7d2b-8faa-f093660aaaba"
+	dir := t.TempDir()
+	if _, err := writeNeoLocalThreadFileInDir(dir, threadID, map[string]any{
+		"id":        threadID,
+		"agentMode": "deep",
+		"meta":      map[string]any{"ampcodeConnectorLocalNeo": true},
+		"messages": []any{
+			map[string]any{"messageId": "M-0000000000000000000001", "role": "user", "content": []any{map[string]any{"type": "text", "text": "hydrate once"}}},
+		},
+	}); err != nil {
+		t.Fatalf("write local thread: %v", err)
+	}
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled}}})
+	rt.threadDir = dir
+
+	start := make(chan struct{})
+	results := make(chan bool, 16)
+	var workers sync.WaitGroup
+	for range 16 {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			<-start
+			results <- rt.tryImportNeoLocalThreadActor(threadID)
+		}()
+	}
+	close(start)
+	workers.Wait()
+	close(results)
+	for imported := range results {
+		if !imported {
+			t.Fatal("concurrent local thread import failed")
+		}
+	}
+	rt.store.mu.Lock()
+	actorCount := len(rt.store.actors)
+	rt.store.mu.Unlock()
+	if actorCount != 1 {
+		t.Fatalf("actor count = %d, want 1", actorCount)
+	}
+	actor := rt.store.lookupThreadActor(threadID)
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.messages) != 1 || actor.messages[0].MessageID != "M-0000000000000000000001" || textFromBlocks(actor.messages[0].Content) != "hydrate once" {
+		t.Fatalf("hydrated messages = %#v", actor.messages)
 	}
 }
 

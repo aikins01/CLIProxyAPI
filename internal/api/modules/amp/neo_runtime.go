@@ -46,6 +46,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	ugorjicodec "github.com/ugorji/go/codec"
+	"golang.org/x/sync/singleflight"
 	"golang.org/x/sys/unix"
 	"gopkg.in/yaml.v3"
 )
@@ -188,6 +189,7 @@ type neoRuntime struct {
 	projectIndexLoaded       bool
 	projectIndexStamp        neoWebLocalFileStamp
 	projectHistoryStamp      neoWebLocalFileStamp
+	localThreadImportGroup   singleflight.Group
 	writeLocalSnapshot       func(neoCloudThreadSnapshot, string) error
 	asyncLocalSnapshots      bool
 	localSnapshotMinInterval time.Duration
@@ -2165,7 +2167,7 @@ func (rt *neoRuntime) autoImportThreadActor(actor *neoActor, threadID, storeDir 
 		return
 	}
 	if err := actor.importThreadLocalOnlyIfEmpty(thread); err != nil {
-		log.Debugf("amp neo local runtime auto-import failed thread=%s: %v", threadID, err)
+		log.Warnf("amp neo local runtime auto-import failed: %v", err)
 	}
 }
 
@@ -13582,15 +13584,29 @@ func (rt *neoRuntime) tryImportNeoLocalThreadActor(threadID string) bool {
 	if rt == nil || rt.store == nil || !rt.localThreadSnapshotsEnabled() || !neoThreadIDExactPattern.MatchString(threadID) {
 		return false
 	}
-	if actor := rt.store.lookupThreadActor(threadID); actor != nil {
-		rt.autoImportThreadActor(actor, threadID, rt.threadDir)
-		return actor.hasLocalThreadState()
-	}
-	if _, ok := loadNeoThreadFromDir(threadID, rt.threadDir); !ok {
-		return false
-	}
-	actor := rt.store.ensureThreadActor(threadID)
-	return actor != nil && actor.hasLocalThreadState()
+	result, _, _ := rt.localThreadImportGroup.Do(threadID, func() (any, error) {
+		if actor := rt.store.lookupThreadActor(threadID); actor != nil {
+			rt.autoImportThreadActor(actor, threadID, rt.threadDir)
+			return actor.hasLocalThreadState(), nil
+		}
+		thread, ok := loadNeoThreadFromDir(threadID, rt.threadDir)
+		if !ok {
+			return false, nil
+		}
+		actor := rt.store.ensureThreadActorWithLocalImport(threadID, false)
+		if actor == nil {
+			return false, nil
+		}
+		if actor.hasLocalThreadState() {
+			return true, nil
+		}
+		if err := actor.importThreadLocalOnlyIfEmpty(thread); err != nil {
+			log.Warnf("amp neo local runtime auto-import failed: %v", err)
+		}
+		return actor.hasLocalThreadState(), nil
+	})
+	imported, _ := result.(bool)
+	return imported
 }
 
 func (m *AmpModule) shouldServeNeoLocalExistingThreadActorBootstrap(threadID string, body map[string]any) bool {
@@ -17193,8 +17209,12 @@ func (a *neoActor) importThreadWithSyncOptions(thread map[string]any, syncCloud,
 			pendingInference.reasoningEffort = defaultNeoReasoningEffort(pendingInference.agentMode)
 		}
 	}
-	a.threadID = threadID
-	a.key = fallbackString(a.key, threadID)
+	if a.threadID != threadID {
+		a.threadID = threadID
+	}
+	if a.key == "" {
+		a.key = threadID
+	}
 	if syncCloud {
 		a.touchLocked()
 	}
