@@ -11207,7 +11207,9 @@ func (a *neoActor) cloudThreadSyncEnabled() bool {
 
 func (a *neoActor) syncCloudLoop() {
 	for {
-		snapshot, ok := a.threadSnapshot()
+		snapshot, ok := a.threadSnapshotWithOptions(neoThreadSnapshotOptions{
+			skipLocalMessageJSON: true,
+		})
 		if ok {
 			if cloudSnapshot, ok := a.cloudThreadSnapshot(snapshot); ok {
 				if err := uploadNeoCloudThread(cloudSnapshot); err != nil {
@@ -11291,6 +11293,7 @@ func (a *neoActor) threadSnapshot() (neoCloudThreadSnapshot, bool) {
 type neoThreadSnapshotOptions struct {
 	markCompactingPreflightChecked  bool
 	preserveMissingCurrentInference bool
+	skipLocalMessageJSON            bool
 }
 
 func (a *neoActor) threadSnapshotWithOptions(options neoThreadSnapshotOptions) (neoCloudThreadSnapshot, bool) {
@@ -11301,7 +11304,10 @@ func (a *neoActor) threadSnapshotWithOptions(options neoThreadSnapshotOptions) (
 		return neoCloudThreadSnapshot{}, false
 	}
 	messages := cloneNeoMessages(a.messages)
-	messageJSON := a.localSnapshotMessageJSONLocked(messages)
+	var messageJSON []neoLocalSnapshotMessageJSON
+	if !options.skipLocalMessageJSON {
+		messageJSON = a.localSnapshotMessageJSONLocked(messages)
+	}
 	var inflight *neoInferenceInflight
 	preserveMissingCurrent := options.preserveMissingCurrentInference || a.shouldPreserveMissingCurrentInferenceLocked()
 	a.currentInferenceMessageIndexLocked(preserveMissingCurrent)
@@ -14257,7 +14263,9 @@ func (rt *neoRuntime) neoWebLocalCreateProjectThread(ctx context.Context, query 
 			"messages":      []any{},
 		}
 		if actor := rt.store.lookupThreadActor(createdThreadID); actor != nil {
-			if snapshot, ok := actor.threadSnapshot(); ok {
+			if snapshot, ok := actor.threadSnapshotWithOptions(neoThreadSnapshotOptions{
+				skipLocalMessageJSON: true,
+			}); ok {
 				threadDataThread = neoCloudThread(snapshot)
 			}
 		}

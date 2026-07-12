@@ -157,7 +157,9 @@ func (a *neoActor) liveReadThreadCorpus(threadID string) (neoReadThreadCorpus, b
 	if target == nil || !target.hasLocalThreadState() {
 		return neoReadThreadCorpus{}, false
 	}
-	snapshot, ok := target.threadSnapshot()
+	snapshot, ok := target.threadSnapshotWithOptions(neoThreadSnapshotOptions{
+		skipLocalMessageJSON: true,
+	})
 	if !ok {
 		return neoReadThreadCorpus{}, false
 	}
