@@ -12413,12 +12413,8 @@ func writeNeoLocalThreadFileInDir(dir, threadID string, thread map[string]any) (
 	if err := os.Chmod(dir, 0o700); err != nil {
 		return "", err
 	}
-	raw, err := json.Marshal(thread)
-	if err != nil {
-		return "", err
-	}
 	path := filepath.Join(dir, threadID+".json")
-	return path, writeNeoAtomicFile(path, append(raw, '\n'), 0o600)
+	return path, writeNeoAtomicJSONObjectFile(path, thread, 0o600)
 }
 
 func (rt *neoRuntime) updateNeoWebLocalProjectIndexFromThread(threadDir string, thread map[string]any) error {
@@ -12511,6 +12507,94 @@ func neoWebLocalProjectIndexPath(threadDir string) string {
 }
 
 func writeNeoAtomicFile(path string, data []byte, perm os.FileMode) error {
+	return writeNeoAtomicFileWith(path, perm, func(tmp *os.File) error {
+		_, err := tmp.Write(data)
+		return err
+	})
+}
+
+func writeNeoAtomicJSONObjectFile(path string, value map[string]any, perm os.FileMode) error {
+	return writeNeoAtomicFileWith(path, perm, func(tmp *os.File) error {
+		writer := bufio.NewWriter(tmp)
+		if err := writeNeoJSONObject(writer, value); err != nil {
+			return err
+		}
+		return writer.Flush()
+	})
+}
+
+func writeNeoJSONObject(writer io.Writer, value map[string]any) error {
+	keys := make([]string, 0, len(value))
+	for key := range value {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	if _, err := io.WriteString(writer, "{"); err != nil {
+		return err
+	}
+	for index, key := range keys {
+		if index > 0 {
+			if _, err := io.WriteString(writer, ","); err != nil {
+				return err
+			}
+		}
+		encodedKey, err := json.Marshal(key)
+		if err != nil {
+			return err
+		}
+		if _, err := writer.Write(encodedKey); err != nil {
+			return err
+		}
+		if _, err := io.WriteString(writer, ":"); err != nil {
+			return err
+		}
+		if values, ok := value[key].([]any); ok {
+			if values == nil {
+				if _, err := io.WriteString(writer, "null"); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := writeNeoJSONArray(writer, values); err != nil {
+				return err
+			}
+			continue
+		}
+		encodedValue, err := json.Marshal(value[key])
+		if err != nil {
+			return err
+		}
+		if _, err := writer.Write(encodedValue); err != nil {
+			return err
+		}
+	}
+	_, err := io.WriteString(writer, "}\n")
+	return err
+}
+
+func writeNeoJSONArray(writer io.Writer, values []any) error {
+	if _, err := io.WriteString(writer, "["); err != nil {
+		return err
+	}
+	for index, value := range values {
+		if index > 0 {
+			if _, err := io.WriteString(writer, ","); err != nil {
+				return err
+			}
+		}
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return err
+		}
+		if _, err := writer.Write(encoded); err != nil {
+			return err
+		}
+	}
+	_, err := io.WriteString(writer, "]")
+	return err
+}
+
+func writeNeoAtomicFileWith(path string, perm os.FileMode, write func(*os.File) error) error {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".*.tmp")
 	if err != nil {
@@ -12531,7 +12615,7 @@ func writeNeoAtomicFile(path string, data []byte, perm os.FileMode) error {
 			}
 		}
 	}()
-	if _, err := tmp.Write(data); err != nil {
+	if err := write(tmp); err != nil {
 		return err
 	}
 	if err := tmp.Chmod(perm); err != nil {

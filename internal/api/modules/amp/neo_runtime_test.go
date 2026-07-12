@@ -6014,6 +6014,28 @@ func TestWriteNeoLocalThreadFileTightensExistingDirectoryPermissions(t *testing.
 	}
 }
 
+func TestWriteNeoJSONObjectMatchesJSONMarshal(t *testing.T) {
+	value := map[string]any{
+		"z":        neoExplicitNull,
+		"messages": []any{map[string]any{"content": []any{map[string]any{"text": "<>&\u2028", "type": "text"}}, "messageId": "M-1"}, nil, []any{"tail", 3.5}},
+		"empty":    []any{},
+		"typedNil": []any(nil),
+		"meta":     map[string]any{"nested": true, "nil": nil},
+	}
+	want, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("marshal expected object: %v", err)
+	}
+	want = append(want, '\n')
+	var got bytes.Buffer
+	if err := writeNeoJSONObject(&got, value); err != nil {
+		t.Fatalf("write object: %v", err)
+	}
+	if !bytes.Equal(got.Bytes(), want) {
+		t.Fatalf("object bytes = %q, want %q", got.Bytes(), want)
+	}
+}
+
 func TestNeoActorFinalLocalSnapshotWaitsForAsyncWriter(t *testing.T) {
 	enabled := true
 	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled}}})
