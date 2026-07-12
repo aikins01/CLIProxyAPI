@@ -6039,6 +6039,7 @@ func TestWriteNeoJSONObjectMatchesJSONMarshal(t *testing.T) {
 func TestNeoActorLocalSnapshotCachesUnchangedMessageJSON(t *testing.T) {
 	threadID := "T-019f4000-0000-4000-8000-000000000061"
 	actor := newNeoActor(nil, "actor-snapshot-cache", "thread-actor", threadID, threadID, neoActorRecord("actor-snapshot-cache", "thread-actor", threadID), nil)
+	actor.environment = map[string]any{"workingDirectory": t.TempDir()}
 	bytesValue := []byte("bytes")
 	rawValue := json.RawMessage(`{"value":"raw"}`)
 	typedMaps := []map[string]any{{"type": "text", "text": "typed"}}
@@ -6128,9 +6129,19 @@ func TestNeoActorLocalSnapshotCachesUnchangedMessageJSON(t *testing.T) {
 		t.Fatalf("marshal expected thread: %v", err)
 	}
 	want = append(want, '\n')
-	_, path, err := writeNeoLocalThreadSnapshotFile(fifth, t.TempDir())
+	writtenThread, path, err := writeNeoLocalThreadSnapshotFile(fifth, t.TempDir())
 	if err != nil {
 		t.Fatalf("write cached snapshot: %v", err)
+	}
+	if got, want := neoWebLocalProjectFromThread(writtenThread), neoWebLocalProjectFromThread(wantThread); !reflect.DeepEqual(got, want) {
+		t.Fatalf("cached snapshot project = %#v, want %#v", got, want)
+	}
+	remarshaled, err := json.Marshal(writtenThread)
+	if err != nil {
+		t.Fatalf("remarshal cached snapshot: %v", err)
+	}
+	if !bytes.Equal(remarshaled, bytes.TrimSuffix(want, []byte{'\n'})) {
+		t.Fatal("remarshaled cached snapshot differs from complete thread encoding")
 	}
 	got, err := os.ReadFile(path)
 	if err != nil {
@@ -6138,6 +6149,21 @@ func TestNeoActorLocalSnapshotCachesUnchangedMessageJSON(t *testing.T) {
 	}
 	if !bytes.Equal(got, want) {
 		t.Fatal("cached snapshot bytes differ from complete thread encoding")
+	}
+
+	fallback := fifth
+	fallback.messageJSON = append([]neoLocalSnapshotMessageJSON(nil), fifth.messageJSON...)
+	fallback.messageJSON[1] = nil
+	_, fallbackPath, err := writeNeoLocalThreadSnapshotFile(fallback, t.TempDir())
+	if err != nil {
+		t.Fatalf("write fallback snapshot: %v", err)
+	}
+	fallbackBytes, err := os.ReadFile(fallbackPath)
+	if err != nil {
+		t.Fatalf("read fallback snapshot: %v", err)
+	}
+	if !bytes.Equal(fallbackBytes, want) {
+		t.Fatal("fallback snapshot bytes differ from complete thread encoding")
 	}
 }
 
@@ -6216,6 +6242,42 @@ func TestNeoLocalSnapshotMessageCacheAllowed(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			if got := neoLocalSnapshotMessageCacheAllowed(test.messages, test.bytes); got != test.want {
 				t.Fatalf("allowed = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
+func TestNeoLocalSnapshotMessageValues(t *testing.T) {
+	tests := []struct {
+		name     string
+		messages []neoMessage
+		encoded  []neoLocalSnapshotMessageJSON
+		wantOK   bool
+	}{
+		{name: "complete", messages: make([]neoMessage, 2), encoded: []neoLocalSnapshotMessageJSON{[]byte(`{"messageId":"M-1"}`), []byte(`{"messageId":"M-2"}`)}, wantOK: true},
+		{name: "empty thread", messages: []neoMessage{}, encoded: []neoLocalSnapshotMessageJSON{}, wantOK: true},
+		{name: "missing message", messages: make([]neoMessage, 2), encoded: []neoLocalSnapshotMessageJSON{[]byte(`{"messageId":"M-1"}`)}},
+		{name: "failed encoding", messages: make([]neoMessage, 2), encoded: []neoLocalSnapshotMessageJSON{[]byte(`{"messageId":"M-1"}`), nil}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			values, ok := neoLocalSnapshotMessageValues(neoCloudThreadSnapshot{messages: test.messages, messageJSON: test.encoded})
+			if ok != test.wantOK {
+				t.Fatalf("available = %t, want %t", ok, test.wantOK)
+			}
+			if !ok {
+				if values != nil {
+					t.Fatalf("unavailable values = %#v, want nil", values)
+				}
+				return
+			}
+			if len(values) != len(test.messages) {
+				t.Fatalf("values = %d, want %d", len(values), len(test.messages))
+			}
+			for index, value := range values {
+				if _, ok := value.(neoLocalSnapshotMessageJSON); !ok {
+					t.Fatalf("value %d type = %T", index, value)
+				}
 			}
 		})
 	}
@@ -6306,6 +6368,36 @@ func BenchmarkNeoActorCachedThreadSnapshot(b *testing.B) {
 			}
 		}
 	})
+}
+
+func BenchmarkNeoActorCachedThreadPersistence(b *testing.B) {
+	threadID := "T-019f4000-0000-4000-8000-000000000065"
+	actor := newNeoActor(nil, "actor-persistence-benchmark", "thread-actor", threadID, threadID, neoActorRecord("actor-persistence-benchmark", "thread-actor", threadID), nil)
+	actor.messages = make([]neoMessage, 2000)
+	for index := range actor.messages {
+		actor.messages[index] = neoMessage{
+			ThreadID:  threadID,
+			MessageID: fmt.Sprintf("M-%022d", index),
+			Role:      "assistant",
+			Content:   []any{map[string]any{"type": "text", "text": strings.Repeat("x", 2048)}},
+			Seq:       index + 1,
+		}
+	}
+	if _, ok := actor.threadSnapshot(); !ok {
+		b.Fatal("warm snapshot unavailable")
+	}
+	dir := b.TempDir()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		snapshot, ok := actor.threadSnapshot()
+		if !ok {
+			b.Fatal("cached snapshot unavailable")
+		}
+		if _, _, err := writeNeoLocalThreadSnapshotFile(snapshot, dir); err != nil {
+			b.Fatalf("write cached snapshot: %v", err)
+		}
+	}
 }
 
 func TestNeoActorFinalLocalSnapshotWaitsForAsyncWriter(t *testing.T) {

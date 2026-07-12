@@ -11077,6 +11077,10 @@ type neoLocalSnapshotMessageCache struct {
 
 type neoLocalSnapshotMessageJSON []byte
 
+func (encoded neoLocalSnapshotMessageJSON) MarshalJSON() ([]byte, error) {
+	return encoded, nil
+}
+
 func (a *neoActor) syncCloudAsync() {
 	if a == nil {
 		return
@@ -12392,45 +12396,52 @@ func writeNeoLocalThreadSnapshotFile(snapshot neoCloudThreadSnapshot, dir string
 	if !neoThreadIDExactPattern.MatchString(snapshot.threadID) {
 		return nil, "", fmt.Errorf("invalid thread id %q", snapshot.threadID)
 	}
-	thread := neoCloudThread(snapshot)
+	messageValues, cached := neoLocalSnapshotMessageValues(snapshot)
+	var persistedThread map[string]any
+	if cached {
+		persistedThread = neoCloudThreadWithMessageValues(snapshot, messageValues)
+	} else {
+		persistedThread = neoCloudThread(snapshot)
+	}
 	if settings := neoLocalThreadSnapshotSettings(snapshot); len(settings) > 0 {
-		thread["settings"] = settings
+		persistedThread["settings"] = settings
 	}
 	if len(snapshot.actorKV) > 0 {
-		thread["actorKV"] = cloneMap(snapshot.actorKV)
+		persistedThread["actorKV"] = cloneMap(snapshot.actorKV)
 	}
 	if snapshot.pendingInference != nil {
-		thread["pendingInference"] = neoInferenceInflightThreadMap(snapshot.pendingInference)
+		persistedThread["pendingInference"] = neoInferenceInflightThreadMap(snapshot.pendingInference)
 	}
-	cloudMessages := arrayValue(thread["messages"])
-	if len(snapshot.messageJSON) == len(cloudMessages) {
-		messages := make([]any, len(cloudMessages))
-		for index, raw := range snapshot.messageJSON {
-			if len(raw) == 0 {
-				messages[index] = cloudMessages[index]
-				continue
-			}
-			messages[index] = raw
-		}
-		thread["messages"] = messages
-		defer func() { thread["messages"] = cloudMessages }()
-	}
-	path, err := writeNeoLocalThreadFileInDir(dir, snapshot.threadID, thread)
+	path, err := writeNeoLocalThreadFileInDir(dir, snapshot.threadID, persistedThread)
 	if err != nil {
 		return nil, "", err
 	}
-	return thread, path, nil
+	return persistedThread, path, nil
+}
+
+func neoLocalSnapshotMessageValues(snapshot neoCloudThreadSnapshot) ([]any, bool) {
+	if len(snapshot.messageJSON) != len(snapshot.messages) {
+		return nil, false
+	}
+	messages := make([]any, len(snapshot.messageJSON))
+	for index, raw := range snapshot.messageJSON {
+		if len(raw) == 0 {
+			return nil, false
+		}
+		messages[index] = raw
+	}
+	return messages, true
 }
 
 func (rt *neoRuntime) writeThreadSnapshot(snapshot neoCloudThreadSnapshot, dir string) error {
 	if rt != nil && rt.writeLocalSnapshot != nil {
 		return rt.writeLocalSnapshot(snapshot, dir)
 	}
-	thread, path, err := writeNeoLocalThreadSnapshotFile(snapshot, dir)
+	persistedThread, path, err := writeNeoLocalThreadSnapshotFile(snapshot, dir)
 	if err != nil {
 		return err
 	}
-	if err := rt.updateNeoWebLocalProjectIndexFromThread(dir, thread); err != nil {
+	if err := rt.updateNeoWebLocalProjectIndexFromThread(dir, persistedThread); err != nil {
 		log.Debugf("amp neo local runtime project index update failed thread=%s: %v", snapshot.threadID, err)
 	}
 	log.Debugf("amp neo local runtime thread store sync complete thread=%s path=%s", snapshot.threadID, path)
@@ -15300,15 +15311,20 @@ func neoThreadMessagesAgentMode(raw any) string {
 }
 
 func neoCloudThread(snapshot neoCloudThreadSnapshot) map[string]any {
-	messages := append([]neoMessage(nil), snapshot.messages...)
+	cloudMessages := make([]any, 0, len(snapshot.messages))
+	for _, message := range snapshot.messages {
+		cloudMessages = append(cloudMessages, neoCloudMessage(message))
+	}
+	return neoCloudThreadWithMessageValues(snapshot, cloudMessages)
+}
 
-	cloudMessages := make([]any, 0, len(messages))
+func neoCloudThreadWithMessageValues(snapshot neoCloudThreadSnapshot, cloudMessages []any) map[string]any {
+	messages := append([]neoMessage(nil), snapshot.messages...)
 	version := snapshot.seq
 	for _, message := range messages {
 		if message.Seq > version {
 			version = message.Seq
 		}
-		cloudMessages = append(cloudMessages, neoCloudMessage(message))
 	}
 
 	threadStatus := neoThreadStatusValue(snapshot.threadStatus)
