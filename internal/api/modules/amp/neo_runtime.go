@@ -2531,7 +2531,6 @@ type neoActor struct {
 	executorID                  string
 	replacingExecutorID         string
 	executorSocket              *neoSocket
-	pendingExecutorHandoff      *neoPendingExecutorHandoff
 	bootstrapExecutorType       string
 	bootstrapThreadActorFlow    bool
 	executorReady               bool
@@ -2774,12 +2773,6 @@ type neoSpawnedExecutor struct {
 	respawnOnStop bool
 }
 
-type neoPendingExecutorHandoff struct {
-	socket     *neoSocket
-	msg        map[string]any
-	connecting bool
-}
-
 func (e *neoSpawnedExecutor) pid() int {
 	if e == nil || e.cmd == nil || e.cmd.Process == nil {
 		return 0
@@ -2869,9 +2862,6 @@ func (a *neoActor) close(socket *neoSocket) {
 	}
 	a.mu.Lock()
 	delete(a.sockets, socket)
-	if a.pendingExecutorHandoff != nil && a.pendingExecutorHandoff.socket == socket {
-		a.pendingExecutorHandoff = nil
-	}
 	activeExecutorSocket := socket != nil && a.executorSocket == socket
 	preserveExecutorWork := a.preserveExecutorWorkOnClose
 	if executorSocket && executorID == "" && activeExecutorSocket {
@@ -3643,9 +3633,7 @@ func (a *neoActor) handleProtocolToolApprovalQueue(msg map[string]any) {
 	if stateChanged {
 		a.broadcast(map[string]any{"type": "agent_state", "state": state, "agentMode": agentMode, "reasoningEffort": omitEmpty(reasoningEffort)})
 		a.syncCloudAsync()
-		if state != "idle" || !a.maybeCompletePendingExecutorHandoff() {
-			a.scheduleExecutorIdleStopIfNeeded()
-		}
+		a.scheduleExecutorIdleStopIfNeeded()
 	}
 }
 
@@ -3713,7 +3701,6 @@ func (a *neoActor) handleProtocolPluginMessage(source *neoSocket, msg map[string
 	if message["type"] == "response" {
 		if a.settlePluginUIRequestFromResponse(message) {
 			a.scheduleExecutorIdleStopIfNeeded()
-			a.maybeCompletePendingExecutorHandoff()
 			a.drainReadyWork()
 			return true
 		}
@@ -3728,7 +3715,6 @@ func (a *neoActor) handleProtocolPluginMessage(source *neoSocket, msg map[string
 	a.sendPluginMessageToExecutor(source, message)
 	if message["type"] == "response" {
 		a.scheduleExecutorIdleStopIfNeeded()
-		a.maybeCompletePendingExecutorHandoff()
 		a.drainReadyWork()
 	}
 	return true
@@ -3777,7 +3763,6 @@ func (a *neoActor) handleExecutorPluginMessage(source *neoSocket, raw any) {
 	a.broadcastPluginMessageToObservers(source, raw)
 	if ok && message["type"] == "response" {
 		a.scheduleExecutorIdleStopIfNeeded()
-		a.maybeCompletePendingExecutorHandoff()
 		a.drainReadyWork()
 	}
 }
@@ -3922,7 +3907,6 @@ func (a *neoActor) respondToPluginUIRequest(source *neoSocket, message map[strin
 	})
 	a.broadcastPluginUIState("plugin.ui.request_removed", map[string]any{"requestId": requestID})
 	a.scheduleExecutorIdleStopIfNeeded()
-	a.maybeCompletePendingExecutorHandoff()
 	a.drainReadyWork()
 }
 
@@ -4053,7 +4037,7 @@ func (a *neoActor) broadcastPluginUIRequestRemovals(requestIDs []string) {
 		})
 		a.broadcastPluginUIState("plugin.ui.request_removed", map[string]any{"requestId": requestID})
 	}
-	if len(requestIDs) > 0 && !a.maybeCompletePendingExecutorHandoff() {
+	if len(requestIDs) > 0 {
 		a.scheduleExecutorIdleStopIfNeeded()
 	}
 }
@@ -4583,9 +4567,7 @@ func (a *neoActor) handleToolApprovalResponse(msg map[string]any) {
 	if stateChanged {
 		a.broadcast(map[string]any{"type": "agent_state", "state": state, "agentMode": agentMode, "reasoningEffort": omitEmpty(reasoningEffort)})
 		a.syncCloudAsync()
-		if state != "idle" || !a.maybeCompletePendingExecutorHandoff() {
-			a.scheduleExecutorIdleStopIfNeeded()
-		}
+		a.scheduleExecutorIdleStopIfNeeded()
 	}
 }
 
@@ -4597,21 +4579,10 @@ func (a *neoActor) executorConnectForSocket(socket *neoSocket, msg map[string]an
 	a.mu.Lock()
 	incomingExecutorID := firstNonEmptyString(msg["clientId"], msg["executorId"])
 	resumePendingWork := incomingExecutorID != "" && incomingExecutorID == a.resumeExecutorID && (len(a.pendingTools) > 0 || len(a.approvalQueue) > 0 || len(a.pluginUIRequests) > 0)
-	if a.shouldDeferConcurrentExecutorHandoffLocked(socket, msg) {
-		a.pendingExecutorHandoff = &neoPendingExecutorHandoff{
-			socket:     socket,
-			msg:        cloneMap(msg),
-			connecting: true,
-		}
-		existingExecutorID := a.executorID
-		a.mu.Unlock()
-		a.deferConcurrentExecutorHandoff(socket, incomingExecutorID, existingExecutorID)
-		return
-	}
 	if a.shouldRejectConcurrentExecutorLocked(socket) || a.shouldRejectReconnectingExecutorLocked(incomingExecutorID) {
 		existingExecutorID := a.executorID
 		a.mu.Unlock()
-		a.rejectConcurrentExecutor(socket, incomingExecutorID, existingExecutorID)
+		a.rejectConcurrentExecutor(socket, existingExecutorID)
 		return
 	}
 	stopExecutors := a.spawnedExecutorsForAcceptedHandoffLocked(socket, msg)
@@ -4641,7 +4612,6 @@ func (a *neoActor) executorConnectForSocket(socket *neoSocket, msg map[string]an
 	a.guidanceSnapshot = map[string]any{}
 	a.skillSnapshot = map[string]any{}
 	a.capabilities = mapValue(msg["capabilities"])
-	a.pendingExecutorHandoff = nil
 	a.mu.Unlock()
 	for _, executor := range stopExecutors {
 		executor.stop()
@@ -4682,21 +4652,10 @@ func (a *neoActor) executorConnected(msg map[string]any) {
 func (a *neoActor) executorConnectedForSocket(socket *neoSocket, msg map[string]any) {
 	a.mu.Lock()
 	incomingExecutorID := firstNonEmptyString(msg["executorId"], msg["clientId"])
-	if a.shouldDeferConcurrentExecutorHandoffLocked(socket, msg) {
-		a.pendingExecutorHandoff = &neoPendingExecutorHandoff{
-			socket:     socket,
-			msg:        cloneMap(msg),
-			connecting: false,
-		}
-		existingExecutorID := a.executorID
-		a.mu.Unlock()
-		a.deferConcurrentExecutorHandoff(socket, incomingExecutorID, existingExecutorID)
-		return
-	}
 	if a.shouldRejectConcurrentExecutorLocked(socket) || a.shouldRejectReconnectingExecutorLocked(incomingExecutorID) {
 		existingExecutorID := a.executorID
 		a.mu.Unlock()
-		a.rejectConcurrentExecutor(socket, incomingExecutorID, existingExecutorID)
+		a.rejectConcurrentExecutor(socket, existingExecutorID)
 		return
 	}
 	stopExecutors := a.spawnedExecutorsForAcceptedHandoffLocked(socket, msg)
@@ -4723,7 +4682,6 @@ func (a *neoActor) executorConnectedForSocket(socket *neoSocket, msg map[string]
 	a.executorResumeBootstrap = false
 	a.executorIdleGeneration++
 	a.reconnectGeneration++
-	a.pendingExecutorHandoff = nil
 	registeredToolCount := numberFrom(msg["registeredToolCount"], len(a.tools))
 	guidanceInventory := neoGuidanceInventory(a.guidanceSnapshot)
 	a.mu.Unlock()
@@ -4784,26 +4742,6 @@ func (a *neoActor) shouldRejectReconnectingExecutorLocked(incomingExecutorID str
 		(len(a.pendingTools) > 0 || len(a.approvalQueue) > 0 || len(a.pluginUIRequests) > 0)
 }
 
-func (a *neoActor) shouldDeferConcurrentExecutorHandoffLocked(socket *neoSocket, msg map[string]any) bool {
-	return socket != nil &&
-		a.replacingExecutorID == "" &&
-		a.executorSocket != nil &&
-		a.executorSocket != socket &&
-		a.executorWorkActiveLocked() &&
-		a.currentExecutorIsSpawnedHeadlessLocked() &&
-		!neoIncomingExecutorIsSpawnedHeadless(msg)
-}
-
-func (a *neoActor) currentExecutorIsSpawnedHeadlessLocked() bool {
-	if strings.HasPrefix(a.executorID, "cli-headless-") {
-		return true
-	}
-	if len(a.spawnedExecutors) == 0 {
-		return false
-	}
-	return strings.EqualFold(a.bootstrapExecutorType, "sandbox") || strings.EqualFold(stringValue(a.meta["executorType"]), "sandbox")
-}
-
 func (a *neoActor) executorWorkActiveLocked() bool {
 	if len(a.pendingTools) > 0 || len(a.approvalQueue) > 0 || len(a.pluginUIRequests) > 0 || a.currentInference != nil {
 		return true
@@ -4831,80 +4769,23 @@ func neoIncomingExecutorIsSpawnedHeadless(msg map[string]any) bool {
 	return strings.EqualFold(stringValue(msg["executorType"]), "sandbox")
 }
 
-func (a *neoActor) rejectConcurrentExecutor(socket *neoSocket, incomingExecutorID, existingExecutorID string) {
-	if socket != nil {
-		socket.clearExecutor()
-		if socket.conn != nil {
-			existingExecutorInfo := neoExistingExecutorInfo(existingExecutorID)
-			payload := map[string]any{
-				"type":                 "executor_connect_rejected",
-				"message":              "Executor already connected.",
-				"reason":               "executor_already_connected",
-				"existingExecutorInfo": existingExecutorInfo,
-				"details": map[string]any{
-					"reasonCode":           "executor_connect_rejected",
-					"existingExecutorId":   omitEmpty(existingExecutorID),
-					"existingExecutorInfo": existingExecutorInfo,
-				},
-			}
-			if incomingExecutorID != "" {
-				payload["executorId"] = incomingExecutorID
-				payload["clientId"] = incomingExecutorID
-			}
-			socket.send(payload)
-		}
-	}
-	a.broadcastObservers()
-}
-
-func (a *neoActor) deferConcurrentExecutorHandoff(socket *neoSocket, incomingExecutorID, existingExecutorID string) {
+func (a *neoActor) rejectConcurrentExecutor(socket *neoSocket, existingExecutorID string) {
 	if socket != nil {
 		socket.clearExecutor()
 		if socket.conn != nil {
 			socket.send(map[string]any{
-				"type":    "executor_status",
-				"status":  "running",
-				"message": "Waiting for active headless executor to finish before handoff.",
-				"details": map[string]any{
-					"reasonCode":         "executor_handoff_deferred",
-					"incomingExecutorId": omitEmpty(incomingExecutorID),
-					"existingExecutorId": omitEmpty(existingExecutorID),
-				},
+				"type":                 "executor_error",
+				"message":              "Executor already connected.",
+				"code":                 "EXECUTOR_ALREADY_CONNECTED",
+				"existingExecutorInfo": neoExistingExecutorInfo(existingExecutorID),
 			})
 		}
 	}
 	a.broadcastObservers()
 }
 
-func (a *neoActor) maybeCompletePendingExecutorHandoff() bool {
-	if a == nil {
-		return false
-	}
-	a.mu.Lock()
-	pending := a.pendingExecutorHandoff
-	if pending == nil {
-		a.mu.Unlock()
-		return false
-	}
-	if _, exists := a.sockets[pending.socket]; !exists || a.executorWorkActiveLocked() || normalizeNeoAgentState(a.agentState) != "idle" {
-		a.mu.Unlock()
-		return false
-	}
-	a.pendingExecutorHandoff = nil
-	msg := cloneMap(pending.msg)
-	socket := pending.socket
-	connecting := pending.connecting
-	a.mu.Unlock()
-	if connecting {
-		a.executorConnectForSocket(socket, msg)
-	} else {
-		a.executorConnectedForSocket(socket, msg)
-	}
-	return true
-}
-
 func neoExistingExecutorInfo(executorID string) map[string]any {
-	info := map[string]any{"executorId": omitEmpty(executorID)}
+	info := map[string]any{}
 	if strings.HasPrefix(executorID, "cli-headless-") {
 		info["executorType"] = "sandbox"
 	} else if executorID != "" {
@@ -5704,7 +5585,6 @@ func (a *neoActor) executorIdleStopEligibleLocked() bool {
 	return a.executorID != "" &&
 		a.executorReady &&
 		normalizeNeoAgentState(a.agentState) == "idle" &&
-		a.pendingExecutorHandoff == nil &&
 		len(a.spawnedExecutors) > 0 &&
 		len(a.pendingTools) == 0 &&
 		len(a.approvalQueue) == 0 &&
@@ -6131,9 +6011,7 @@ func (a *neoActor) handleProtocolAgentState(msg map[string]any) {
 		a.dispatchNotification("agent", "agent_idle", map[string]any{"messageId": omitEmpty(messageID), "agentMode": agentMode})
 	}
 	a.syncCloudAsync()
-	if state != "idle" || !a.maybeCompletePendingExecutorHandoff() {
-		a.scheduleExecutorIdleStopIfNeeded()
-	}
+	a.scheduleExecutorIdleStopIfNeeded()
 }
 
 func (a *neoActor) handleProtocolInferenceTools(msg map[string]any) {
@@ -17102,9 +16980,7 @@ func (a *neoActor) setAgentState(state, messageID, agentMode, reasoningEffort st
 		a.dispatchNotification("agent", "agent_idle", map[string]any{"messageId": omitEmpty(messageID), "agentMode": agentMode})
 	}
 	a.syncCloudAsync()
-	if state != "idle" || !a.maybeCompletePendingExecutorHandoff() {
-		a.scheduleExecutorIdleStopIfNeeded()
-	}
+	a.scheduleExecutorIdleStopIfNeeded()
 }
 
 func (a *neoActor) clearCurrentInference(messageID string) {
@@ -17113,9 +16989,7 @@ func (a *neoActor) clearCurrentInference(messageID string) {
 	a.mu.Unlock()
 	if cleared {
 		a.syncCloudAsync()
-		if !a.maybeCompletePendingExecutorHandoff() {
-			a.scheduleExecutorIdleStopIfNeeded()
-		}
+		a.scheduleExecutorIdleStopIfNeeded()
 	}
 }
 

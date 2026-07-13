@@ -5442,28 +5442,6 @@ func TestNeoActorFlushesPluginUIResponseAfterExecutorReconnect(t *testing.T) {
 	}
 }
 
-func TestNeoActorPluginUICleanupCompletesDeferredExecutorHandoff(t *testing.T) {
-	actor := newNeoActor(newNeoRuntime(&config.Config{}), "actor", "threadActor", "T-plugin-handoff", "T-plugin-handoff", nil, nil)
-	socket := &neoSocket{}
-	actor.mu.Lock()
-	actor.sockets[socket] = struct{}{}
-	actor.pendingExecutorHandoff = &neoPendingExecutorHandoff{
-		socket: socket,
-		msg:    map[string]any{"executorId": "replacement-executor"},
-	}
-	actor.mu.Unlock()
-
-	actor.broadcastPluginUIRequestRemovals([]string{"plugin-request"})
-
-	actor.mu.Lock()
-	pending := actor.pendingExecutorHandoff
-	executorID := actor.executorID
-	actor.mu.Unlock()
-	if pending != nil || executorID != "replacement-executor" {
-		t.Fatalf("plugin UI cleanup left deferred handoff pending=%#v executorID=%q", pending, executorID)
-	}
-}
-
 func TestNeoRuntimeGatewayWebSocketJSONRPCTransport(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
@@ -11651,12 +11629,12 @@ func TestNeoRuntimeConcurrentExecutorConnectWithActiveWorkSendsRejected(t *testi
 	if err := newExecutor.WriteJSON(map[string]any{"type": "executor_connect", "clientId": "neo-cli"}); err != nil {
 		t.Fatalf("write concurrent executor_connect: %v", err)
 	}
-	rejected := waitForNeoMessageType(t, newExecutor, "executor_connect_rejected", 2*time.Second)
-	if rejected["clientId"] != "neo-cli" || rejected["reason"] != "executor_already_connected" {
+	rejected := waitForNeoMessageType(t, newExecutor, "executor_error", 2*time.Second)
+	if rejected["code"] != "EXECUTOR_ALREADY_CONNECTED" || stringValue(rejected["message"]) == "" {
 		t.Fatalf("rejected payload = %#v", rejected)
 	}
 	existingInfo := mapValue(rejected["existingExecutorInfo"])
-	if existingInfo["executorId"] != "local-active" || existingInfo["executorType"] != "local-client" {
+	if existingInfo["executorType"] != "local-client" {
 		t.Fatalf("existing executor info = %#v", existingInfo)
 	}
 	assertNoNeoMessageType(t, activeExecutor, "executor_tool_lease_revoked", 150*time.Millisecond)
@@ -11668,7 +11646,7 @@ func TestNeoRuntimeConcurrentExecutorConnectWithActiveWorkSendsRejected(t *testi
 	}
 }
 
-func TestNeoRuntimeHeadlessExecutorConnectDefersUntilIdle(t *testing.T) {
+func TestNeoRuntimeHeadlessExecutorConnectWithActiveWorkSendsRejected(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
 	t.Cleanup(server.Close)
@@ -11696,47 +11674,25 @@ func TestNeoRuntimeHeadlessExecutorConnectDefersUntilIdle(t *testing.T) {
 	newExecutor := dialNeoActorWebSocket(t, server.URL, threadID)
 	defer newExecutor.Close()
 	if err := newExecutor.WriteJSON(map[string]any{"type": "executor_connect", "clientId": "neo-cli"}); err != nil {
-		t.Fatalf("write deferred executor_connect: %v", err)
+		t.Fatalf("write concurrent executor_connect: %v", err)
 	}
-	status := waitForNeoMessageTypeWhere(t, newExecutor, "executor_status", 2*time.Second, func(msg map[string]any) bool {
-		return mapValue(msg["details"])["reasonCode"] == "executor_handoff_deferred"
-	})
-	if details := mapValue(status["details"]); details["reasonCode"] != "executor_handoff_deferred" {
-		t.Fatalf("deferred status = %#v", status)
+	rejected := waitForNeoMessageType(t, newExecutor, "executor_error", 2*time.Second)
+	if rejected["code"] != "EXECUTOR_ALREADY_CONNECTED" {
+		t.Fatalf("rejected payload = %#v", rejected)
 	}
-	actor.mu.Lock()
-	if actor.pendingExecutorHandoff == nil {
-		actor.mu.Unlock()
-		t.Fatal("executor_connect was not held as a pending handoff")
+	if existingInfo := mapValue(rejected["existingExecutorInfo"]); existingInfo["executorType"] != "sandbox" {
+		t.Fatalf("existing executor info = %#v", existingInfo)
 	}
-	actor.mu.Unlock()
-
-	actor.mu.Lock()
-	actor.pendingTools = map[string]neoPendingTool{}
-	actor.mu.Unlock()
-	actor.setAgentState("idle", "", "smart", defaultNeoReasoningEffort("smart"))
-
-	actor.mu.Lock()
-	acceptedID := actor.executorID
-	pendingHandoff := actor.pendingExecutorHandoff
-	_, newSocketRegistered := actor.sockets[actor.executorSocket]
-	acceptedSocketIsExecutor := false
-	if actor.executorSocket != nil {
-		acceptedSocketIsExecutor = actor.executorSocket.isExecutor()
-	}
-	actor.mu.Unlock()
-	if acceptedID != "neo-cli" || pendingHandoff != nil {
-		t.Fatalf("deferred handoff did not accept before frame wait: id=%q pending=%#v registered=%v isExecutor=%v", acceptedID, pendingHandoff, newSocketRegistered, acceptedSocketIsExecutor)
+	actor.broadcast(map[string]any{"type": "thread_title_updated", "title": "Still observing"})
+	observed := waitForNeoMessageType(t, newExecutor, "thread_title_updated", 2*time.Second)
+	if observed["title"] != "Still observing" {
+		t.Fatalf("observer event after rejected connect = %#v", observed)
 	}
 
-	connected := waitForNeoMessageType(t, newExecutor, "executor_connected", 2*time.Second)
-	if connected["executorId"] != "neo-cli" {
-		t.Fatalf("executor_connected = %#v", connected)
-	}
 	actor.mu.Lock()
 	defer actor.mu.Unlock()
-	if actor.executorID != "neo-cli" || actor.executorSocket == nil || actor.executorReady || actor.executorBootstrapComplete || len(actor.spawnedExecutors) != 0 || actor.pendingExecutorHandoff != nil {
-		t.Fatalf("deferred handoff state = id:%q socket:%p ready:%v bootstrap:%v spawned:%d pending:%#v", actor.executorID, actor.executorSocket, actor.executorReady, actor.executorBootstrapComplete, len(actor.spawnedExecutors), actor.pendingExecutorHandoff)
+	if actor.executorID != "cli-headless-active" || actor.executorSocket == nil || !actor.executorReady || !actor.executorBootstrapComplete || len(actor.pendingTools) != 1 || len(actor.spawnedExecutors) != 1 {
+		t.Fatalf("active headless state after rejected connect = id:%q socket:%p ready:%v bootstrap:%v pending:%d spawned:%d", actor.executorID, actor.executorSocket, actor.executorReady, actor.executorBootstrapComplete, len(actor.pendingTools), len(actor.spawnedExecutors))
 	}
 }
 
@@ -14625,97 +14581,6 @@ func TestNeoActorIdleExecutorHandoffClearsSpawnedHeadless(t *testing.T) {
 	}
 	if len(actor.spawnedExecutors) != 0 {
 		t.Fatalf("spawned executors after idle CLI handoff = %#v, want none", actor.spawnedExecutors)
-	}
-}
-
-func TestNeoActorHeadlessExecutorHandoffCompletesWhenIdle(t *testing.T) {
-	rt := newNeoRuntime(&config.Config{})
-	threadID := "T-019f4000-0000-4000-8000-000000000034"
-	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
-	oldSocket := &neoSocket{}
-	oldSocket.markExecutor("cli-headless-active")
-	newSocket := &neoSocket{}
-	newSocket.markExecutor("neo-cli")
-	actor.mu.Lock()
-	actor.sockets[oldSocket] = struct{}{}
-	actor.sockets[newSocket] = struct{}{}
-	actor.executorID = "cli-headless-active"
-	actor.executorReady = true
-	actor.executorBootstrapComplete = true
-	actor.executorSocket = oldSocket
-	actor.agentState = "running_tools"
-	actor.pendingTools["tool-1"] = neoPendingTool{ID: "tool-1"}
-	actor.spawnedExecutors = map[string]*neoSpawnedExecutor{
-		"spawn-1": {spawnID: "spawn-1", threadID: threadID},
-	}
-	actor.mu.Unlock()
-
-	actor.executorConnectForSocket(newSocket, map[string]any{"clientId": "neo-cli"})
-
-	actor.mu.Lock()
-	if actor.executorID != "cli-headless-active" || actor.executorSocket != oldSocket || actor.pendingExecutorHandoff == nil || newSocket.isExecutor() {
-		actor.mu.Unlock()
-		t.Fatalf("handoff was not deferred: id=%q socket=%p pending=%#v newExecutor=%v", actor.executorID, actor.executorSocket, actor.pendingExecutorHandoff, newSocket.isExecutor())
-	}
-	actor.pendingTools = map[string]neoPendingTool{}
-	actor.agentState = "idle"
-	actor.mu.Unlock()
-
-	if !actor.maybeCompletePendingExecutorHandoff() {
-		t.Fatal("pending handoff did not complete")
-	}
-
-	actor.mu.Lock()
-	defer actor.mu.Unlock()
-	if actor.executorID != "neo-cli" || actor.executorSocket != newSocket || actor.executorReady || actor.executorBootstrapComplete || actor.pendingExecutorHandoff != nil {
-		t.Fatalf("completed handoff state = id:%q socket:%p ready:%v bootstrap:%v pending:%#v", actor.executorID, actor.executorSocket, actor.executorReady, actor.executorBootstrapComplete, actor.pendingExecutorHandoff)
-	}
-	if len(actor.spawnedExecutors) != 0 {
-		t.Fatalf("spawned executors after deferred handoff = %#v, want none", actor.spawnedExecutors)
-	}
-}
-
-func TestNeoActorHeadlessExecutorHandoffCompletesOnProtocolIdle(t *testing.T) {
-	rt := newNeoRuntime(&config.Config{})
-	threadID := "T-019f4000-0000-4000-8000-000000000035"
-	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
-	oldSocket := &neoSocket{}
-	oldSocket.markExecutor("cli-headless-active")
-	newSocket := &neoSocket{}
-	newSocket.markExecutor("neo-cli")
-	actor.mu.Lock()
-	actor.sockets[oldSocket] = struct{}{}
-	actor.sockets[newSocket] = struct{}{}
-	actor.executorID = "cli-headless-active"
-	actor.executorReady = true
-	actor.executorBootstrapComplete = true
-	actor.executorSocket = oldSocket
-	actor.agentState = "running_tools"
-	actor.pendingTools["tool-1"] = neoPendingTool{ID: "tool-1"}
-	actor.spawnedExecutors = map[string]*neoSpawnedExecutor{
-		"spawn-1": {spawnID: "spawn-1", threadID: threadID},
-	}
-	actor.mu.Unlock()
-
-	actor.executorConnectForSocket(newSocket, map[string]any{"clientId": "neo-cli"})
-
-	actor.mu.Lock()
-	if actor.pendingExecutorHandoff == nil {
-		actor.mu.Unlock()
-		t.Fatal("handoff was not deferred")
-	}
-	actor.pendingTools = map[string]neoPendingTool{}
-	actor.mu.Unlock()
-
-	actor.handleProtocolAgentState(map[string]any{"type": "agent_state", "state": "idle"})
-
-	actor.mu.Lock()
-	defer actor.mu.Unlock()
-	if actor.executorID != "neo-cli" || actor.executorSocket != newSocket || actor.executorReady || actor.executorBootstrapComplete || actor.pendingExecutorHandoff != nil {
-		t.Fatalf("protocol idle handoff state = id:%q socket:%p ready:%v bootstrap:%v pending:%#v", actor.executorID, actor.executorSocket, actor.executorReady, actor.executorBootstrapComplete, actor.pendingExecutorHandoff)
-	}
-	if len(actor.spawnedExecutors) != 0 {
-		t.Fatalf("spawned executors after protocol idle handoff = %#v, want none", actor.spawnedExecutors)
 	}
 }
 
