@@ -6366,13 +6366,99 @@ func TestWriteNeoJSONObjectMatchesJSONMarshal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal expected object: %v", err)
 	}
-	want = append(want, '\n')
+	var valueBytes bytes.Buffer
+	if err := writeNeoJSONObjectValue(&valueBytes, value); err != nil {
+		t.Fatalf("write object value: %v", err)
+	}
+	if !bytes.Equal(valueBytes.Bytes(), want) {
+		t.Fatalf("object value bytes = %q, want %q", valueBytes.Bytes(), want)
+	}
 	var got bytes.Buffer
 	if err := writeNeoJSONObject(&got, value); err != nil {
 		t.Fatalf("write object: %v", err)
 	}
+	wantFile := append(append([]byte(nil), want...), '\n')
+	if !bytes.Equal(got.Bytes(), wantFile) {
+		t.Fatalf("object bytes = %q, want %q", got.Bytes(), wantFile)
+	}
+}
+
+func TestWriteNeoCloudUploadPayloadMatchesJSONMarshal(t *testing.T) {
+	thread := map[string]any{
+		"id":       "T-test",
+		"messages": []any{map[string]any{"content": []any{map[string]any{"text": "Amp ☃ <>&\n", "type": "text"}}, "messageId": "M-1"}, nil},
+		"empty":    []any{},
+		"typedNil": []any(nil),
+		"meta":     map[string]any{"nested": true, "nil": nil},
+	}
+	want, err := json.Marshal(map[string]any{
+		"method": "uploadThread",
+		"params": map[string]any{
+			"thread":          thread,
+			"createdOnServer": false,
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal expected upload payload: %v", err)
+	}
+	var got bytes.Buffer
+	if err := writeNeoCloudUploadPayload(&got, thread); err != nil {
+		t.Fatalf("write upload payload: %v", err)
+	}
 	if !bytes.Equal(got.Bytes(), want) {
-		t.Fatalf("object bytes = %q, want %q", got.Bytes(), want)
+		t.Fatalf("upload payload bytes = %q, want %q", got.Bytes(), want)
+	}
+}
+
+func TestNeoCloudUploadBodyThreshold(t *testing.T) {
+	tests := []struct {
+		name       string
+		size       int
+		chunkBytes int
+		compressed bool
+	}{
+		{name: "below", size: neoCloudGzipBytes - 1, chunkBytes: neoCloudGzipBytes - 1},
+		{name: "exact", size: neoCloudGzipBytes, chunkBytes: 64 * 1024, compressed: true},
+		{name: "above", size: neoCloudGzipBytes + 1, chunkBytes: neoCloudGzipBytes + 1, compressed: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			want := bytes.Repeat([]byte("x"), test.size)
+			var body neoCloudUploadBody
+			for offset := 0; offset < len(want); offset += test.chunkBytes {
+				end := min(offset+test.chunkBytes, len(want))
+				written, err := body.Write(want[offset:end])
+				if err != nil || written != end-offset {
+					t.Fatalf("write bytes = %d, %v", written, err)
+				}
+			}
+			if err := body.Close(); err != nil {
+				t.Fatalf("close body: %v", err)
+			}
+			if body.Compressed() != test.compressed {
+				t.Fatalf("compressed = %t, want %t", body.Compressed(), test.compressed)
+			}
+			if body.serializedBytes != int64(len(want)) {
+				t.Fatalf("serialized bytes = %d, want %d", body.serializedBytes, len(want))
+			}
+			got := body.Bytes()
+			if test.compressed {
+				gz, err := gzip.NewReader(bytes.NewReader(got))
+				if err != nil {
+					t.Fatalf("open gzip body: %v", err)
+				}
+				got, err = io.ReadAll(gz)
+				if err != nil {
+					t.Fatalf("read gzip body: %v", err)
+				}
+				if err := gz.Close(); err != nil {
+					t.Fatalf("close gzip body: %v", err)
+				}
+			}
+			if !bytes.Equal(got, want) {
+				t.Fatal("round-trip body differs")
+			}
+		})
 	}
 }
 
@@ -7392,6 +7478,35 @@ func BenchmarkNeoLargeThreadMemoryPressure(b *testing.B) {
 			}
 		}
 	})
+	b.Run("prepared_snapshot_baseline", func(b *testing.B) {
+		actor := loadActor(nil)
+		snapshot, ok := actor.threadSnapshotWithOptions(neoThreadSnapshotOptions{skipLocalMessageJSON: true})
+		if !ok {
+			b.Fatal("prepared snapshot unavailable")
+		}
+		b.SetBytes(info.Size())
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			runtime.KeepAlive(snapshot)
+		}
+	})
+	b.Run("prepared_local_serialization", func(b *testing.B) {
+		actor := loadActor(nil)
+		snapshot, ok := actor.threadSnapshot()
+		if !ok {
+			b.Fatal("prepared local snapshot unavailable")
+		}
+		outputDir := b.TempDir()
+		b.SetBytes(info.Size())
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			if _, _, err := writeNeoLocalThreadSnapshotFile(snapshot, outputDir); err != nil {
+				b.Fatalf("write prepared local snapshot: %v", err)
+			}
+		}
+	})
 
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		reader := io.Reader(r.Body)
@@ -7422,6 +7537,23 @@ func BenchmarkNeoLargeThreadMemoryPressure(b *testing.B) {
 			snapshot.apiKey = "benchmark"
 			if _, err := uploadNeoCloudThread(snapshot); err != nil {
 				b.Fatalf("upload cloud snapshot: %v", err)
+			}
+		}
+	})
+	b.Run("prepared_cloud_serialization", func(b *testing.B) {
+		actor := loadActor(nil)
+		snapshot, ok := actor.threadSnapshotWithOptions(neoThreadSnapshotOptions{skipLocalMessageJSON: true})
+		if !ok {
+			b.Fatal("prepared cloud snapshot unavailable")
+		}
+		snapshot.upstreamURL = upstream.URL
+		snapshot.apiKey = "benchmark"
+		b.SetBytes(info.Size())
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			if _, err := uploadNeoCloudThread(snapshot); err != nil {
+				b.Fatalf("upload prepared cloud snapshot: %v", err)
 			}
 		}
 	})
@@ -7503,6 +7635,61 @@ func BenchmarkNeoLargeThreadMemoryPressure(b *testing.B) {
 			b.ReportMetric(float64(measured.PeakRetainedRevisions), "peak-retained-revisions")
 			b.ReportMetric(float64(measured.PeakRetainedGraphs), "peak-retained-graphs")
 		}
+	})
+	b.Run("retained_heap_20_cycles", func(b *testing.B) {
+		enabled := true
+		rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+			UpstreamURL:    upstream.URL,
+			UpstreamAPIKey: "benchmark",
+			NeoLocalRuntime: config.AmpNeoLocalRuntime{
+				Enabled: &enabled,
+			},
+		}})
+		rt.threadDir = b.TempDir()
+		rt.asyncLocalSnapshots = true
+		rt.localSnapshotMinInterval = 0
+		actor := loadActor(rt)
+		for index := 0; index < 3; index++ {
+			actor.mu.Lock()
+			actor.title = fmt.Sprintf("retained-warmup-%d", index)
+			actor.mu.Unlock()
+			actor.syncCloudAsync()
+			waitForNeoActorSyncIdleBenchmark(b, actor)
+		}
+		median := func(samples []uint64) uint64 {
+			values := append([]uint64(nil), samples...)
+			slices.Sort(values)
+			return values[len(values)/2]
+		}
+		var initialLiveBytes uint64
+		var finalLiveBytes uint64
+		b.SetBytes(info.Size() * 20)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			samples := make([]uint64, 20)
+			for index := range samples {
+				actor.mu.Lock()
+				actor.title = fmt.Sprintf("retained-cycle-%d", index)
+				actor.mu.Unlock()
+				actor.syncCloudAsync()
+				waitForNeoActorSyncIdleBenchmark(b, actor)
+				runtime.GC()
+				var stats runtime.MemStats
+				runtime.ReadMemStats(&stats)
+				samples[index] = stats.HeapAlloc
+			}
+			initialLiveBytes = median(samples[:5])
+			finalLiveBytes = median(samples[15:])
+		}
+		growthPercent := 100 * (float64(finalLiveBytes) - float64(initialLiveBytes)) / float64(initialLiveBytes)
+		measured := actor.measurementSnapshot()
+		b.ReportMetric(float64(initialLiveBytes), "initial-live-bytes")
+		b.ReportMetric(float64(finalLiveBytes), "final-live-bytes")
+		b.ReportMetric(growthPercent, "retained-growth-percent")
+		b.ReportMetric(float64(measured.RetainedRevisions), "retained-revisions")
+		b.ReportMetric(float64(measured.RetainedGraphs), "retained-graphs")
+		runtime.KeepAlive(actor)
 	})
 	b.Run("known_replay_reconnect", func(b *testing.B) {
 		actor := loadActor(nil)
@@ -31335,6 +31522,47 @@ func TestNeoRuntimeThreadActorBootstrapDoesNotFetchCloudThread(t *testing.T) {
 	}
 	if upstreamRequests != 0 {
 		t.Fatalf("runtime fetched upstream thread %d time(s)", upstreamRequests)
+	}
+}
+
+func TestUploadNeoCloudThreadKeepsSmallPayloadUncompressed(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	var received []byte
+	var contentLength int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Content-Encoding"); got != "" {
+			t.Errorf("Content-Encoding = %q, want empty", got)
+		}
+		contentLength = r.ContentLength
+		var err error
+		received, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read payload: %v", err)
+		}
+		writeNeoJSON(w, http.StatusOK, map[string]any{"ok": true})
+	}))
+	defer upstream.Close()
+
+	serializedBytes, err := uploadNeoCloudThread(neoCloudThreadSnapshot{
+		upstreamURL: upstream.URL,
+		apiKey:      "secret",
+		threadID:    "T-small-upload",
+		seq:         1,
+		createdMs:   1778170000000,
+		title:       "Small upload",
+	})
+	if err != nil {
+		t.Fatalf("uploadNeoCloudThread error: %v", err)
+	}
+	if contentLength != int64(len(received)) || serializedBytes != int64(len(received)) {
+		t.Fatalf("payload bytes = content-length:%d serialized:%d received:%d", contentLength, serializedBytes, len(received))
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(received, &payload); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	if stringValue(payload["method"]) != "uploadThread" || stringValue(mapValue(mapValue(payload["params"])["thread"])["id"]) != "T-small-upload" {
+		t.Fatalf("payload = %#v", payload)
 	}
 }
 

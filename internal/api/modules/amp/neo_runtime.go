@@ -11731,70 +11731,105 @@ func (a *neoActor) cloudThreadSnapshot(snapshot neoCloudThreadSnapshot) (neoClou
 	return snapshot, true
 }
 
+type neoCloudUploadBody struct {
+	plain           bytes.Buffer
+	compressedBody  bytes.Buffer
+	gzipWriter      *gzip.Writer
+	serializedBytes int64
+}
+
+func (b *neoCloudUploadBody) Write(data []byte) (int, error) {
+	if b.gzipWriter == nil && b.plain.Len()+len(data) < neoCloudGzipBytes {
+		written, err := b.plain.Write(data)
+		b.serializedBytes += int64(written)
+		return written, err
+	}
+	if b.gzipWriter == nil {
+		b.gzipWriter = gzip.NewWriter(&b.compressedBody)
+		if _, err := b.gzipWriter.Write(b.plain.Bytes()); err != nil {
+			return 0, err
+		}
+		b.plain = bytes.Buffer{}
+	}
+	written, err := b.gzipWriter.Write(data)
+	b.serializedBytes += int64(written)
+	return written, err
+}
+
+func (b *neoCloudUploadBody) Close() error {
+	if b.gzipWriter == nil {
+		return nil
+	}
+	return b.gzipWriter.Close()
+}
+
+func (b *neoCloudUploadBody) Bytes() []byte {
+	if b.gzipWriter != nil {
+		return b.compressedBody.Bytes()
+	}
+	return b.plain.Bytes()
+}
+
+func (b *neoCloudUploadBody) Compressed() bool {
+	return b.gzipWriter != nil
+}
+
+func writeNeoCloudUploadPayload(writer io.Writer, thread map[string]any) error {
+	if _, err := io.WriteString(writer, `{"method":"uploadThread","params":{"createdOnServer":false,"thread":`); err != nil {
+		return err
+	}
+	if err := writeNeoJSONObjectValue(writer, thread); err != nil {
+		return err
+	}
+	_, err := io.WriteString(writer, `}}`)
+	return err
+}
+
 func uploadNeoCloudThread(snapshot neoCloudThreadSnapshot) (int64, error) {
 	thread := neoCloudThread(snapshot)
-	payload := map[string]any{
-		"method": "uploadThread",
-		"params": map[string]any{
-			"thread":          thread,
-			"createdOnServer": false,
-		},
-	}
-	raw, err := json.Marshal(payload)
-	if err != nil {
+	var body neoCloudUploadBody
+	if err := writeNeoCloudUploadPayload(&body, thread); err != nil {
 		return 0, err
 	}
-	serializedBytes := int64(len(raw))
-
-	var body bytes.Buffer
-	if len(raw) >= neoCloudGzipBytes {
-		gz := gzip.NewWriter(&body)
-		if _, err := gz.Write(raw); err != nil {
-			_ = gz.Close()
-			return serializedBytes, err
-		}
-		if err := gz.Close(); err != nil {
-			return serializedBytes, err
-		}
-	} else {
-		body.Write(raw)
+	if err := body.Close(); err != nil {
+		return body.serializedBytes, err
 	}
 
 	base, err := url.Parse(snapshot.upstreamURL)
 	if err != nil {
-		return serializedBytes, err
+		return body.serializedBytes, err
 	}
 	base.Path = strings.TrimRight(base.Path, "/") + "/api/internal"
 	base.RawQuery = url.QueryEscape("uploadThread")
 
 	req, err := http.NewRequest(http.MethodPost, base.String(), bytes.NewReader(body.Bytes()))
 	if err != nil {
-		return serializedBytes, err
+		return body.serializedBytes, err
 	}
 	req.Header.Set("Authorization", "Bearer "+snapshot.apiKey)
 	req.Header.Set("Content-Type", "application/json")
 	setAmpInternalClientHeaders(req, snapshot.clientVersion)
-	if len(raw) >= neoCloudGzipBytes {
+	if body.Compressed() {
 		req.Header.Set("Content-Encoding", "gzip")
 	}
 
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
-		return serializedBytes, err
+		return body.serializedBytes, err
 	}
 	defer resp.Body.Close()
 
 	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return serializedBytes, fmt.Errorf("HTTP %d: %s", resp.StatusCode, clipNeoErrorBody(respBody))
+		return body.serializedBytes, fmt.Errorf("HTTP %d: %s", resp.StatusCode, clipNeoErrorBody(respBody))
 	}
 	var decoded map[string]any
 	if err := json.Unmarshal(respBody, &decoded); err == nil && decoded["ok"] == false {
-		return serializedBytes, fmt.Errorf("uploadThread failed: %s", clipNeoErrorBody(respBody))
+		return body.serializedBytes, fmt.Errorf("uploadThread failed: %s", clipNeoErrorBody(respBody))
 	}
 	log.Debugf("amp neo local runtime cloud sync complete thread=%s", snapshot.threadID)
-	return serializedBytes, nil
+	return body.serializedBytes, nil
 }
 
 func setAmpInternalClientHeaders(req *http.Request, clientVersionOverride ...string) {
@@ -12937,6 +12972,14 @@ func (w *neoCountingWriter) Write(data []byte) (int, error) {
 }
 
 func writeNeoJSONObject(writer io.Writer, value map[string]any) error {
+	if err := writeNeoJSONObjectValue(writer, value); err != nil {
+		return err
+	}
+	_, err := io.WriteString(writer, "\n")
+	return err
+}
+
+func writeNeoJSONObjectValue(writer io.Writer, value map[string]any) error {
 	keys := make([]string, 0, len(value))
 	for key := range value {
 		keys = append(keys, key)
@@ -12981,7 +13024,7 @@ func writeNeoJSONObject(writer io.Writer, value map[string]any) error {
 			return err
 		}
 	}
-	_, err := io.WriteString(writer, "}\n")
+	_, err := io.WriteString(writer, "}")
 	return err
 }
 
