@@ -3420,9 +3420,52 @@ func TestNeoActorSyncCloudAsyncCoalescesLocalSnapshots(t *testing.T) {
 }
 
 func TestNeoActorMeasurementsTrackBlockedSinkCoalescing(t *testing.T) {
+	type capturedCloudUpload struct {
+		authorization string
+		body          []byte
+		payload       map[string]any
+	}
+	var uploadsMu sync.Mutex
+	var uploads []capturedCloudUpload
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/internal" || r.URL.RawQuery != "uploadThread" || r.Header.Get("Content-Type") != "application/json" {
+			http.Error(w, "invalid upload request", http.StatusBadRequest)
+			return
+		}
+		if r.Header.Get("X-Amp-Client-Application") != "CLI" || r.Header.Get("X-Amp-Client-Type") != "cli" || strings.TrimSpace(r.Header.Get("X-Amp-Client-Version")) == "" {
+			http.Error(w, "missing upload client headers", http.StatusBadRequest)
+			return
+		}
+		reader := io.Reader(r.Body)
+		if r.Header.Get("Content-Encoding") == "gzip" {
+			gz, err := gzip.NewReader(r.Body)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			defer gz.Close()
+			reader = gz
+		}
+		body, err := io.ReadAll(reader)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(body, &payload); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		uploadsMu.Lock()
+		uploads = append(uploads, capturedCloudUpload{authorization: r.Header.Get("Authorization"), body: body, payload: payload})
+		uploadsMu.Unlock()
+		writeNeoJSON(w, http.StatusOK, map[string]any{"ok": true})
+	}))
+	defer upstream.Close()
+
 	enabled := true
 	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
-		UpstreamURL:    "http://127.0.0.1:1",
+		UpstreamURL:    upstream.URL,
 		UpstreamAPIKey: "secret",
 		NeoLocalRuntime: config.AmpNeoLocalRuntime{
 			Enabled: &enabled,
@@ -3519,11 +3562,14 @@ func TestNeoActorMeasurementsTrackBlockedSinkCoalescing(t *testing.T) {
 	var cloudOnce sync.Once
 	var localRevisionsMu sync.Mutex
 	localRevisions := make([]uint64, 0, 2)
+	localSnapshots := make(map[uint64]neoCloudThreadSnapshot)
 	var cloudRevisionsMu sync.Mutex
 	cloudRevisions := make([]uint64, 0, 2)
+	cloudSnapshots := make(map[uint64]neoCloudThreadSnapshot)
 	rt.writeLocalSnapshot = func(snapshot neoCloudThreadSnapshot, dir string) (int64, error) {
 		localRevisionsMu.Lock()
 		localRevisions = append(localRevisions, snapshot.revision)
+		localSnapshots[snapshot.revision] = snapshot
 		call := len(localRevisions)
 		localRevisionsMu.Unlock()
 		if call == 1 {
@@ -3536,13 +3582,14 @@ func TestNeoActorMeasurementsTrackBlockedSinkCoalescing(t *testing.T) {
 	rt.uploadCloudSnapshot = func(snapshot neoCloudThreadSnapshot) (int64, error) {
 		cloudRevisionsMu.Lock()
 		cloudRevisions = append(cloudRevisions, snapshot.revision)
+		cloudSnapshots[snapshot.revision] = snapshot
 		call := len(cloudRevisions)
 		cloudRevisionsMu.Unlock()
 		if call == 1 {
 			cloudOnce.Do(func() { close(cloudStarted) })
 			<-releaseCloud
 		}
-		return int64(len(snapshot.title) + len(snapshot.messages)), nil
+		return uploadNeoCloudThread(snapshot)
 	}
 
 	actor.syncCloudAsync()
@@ -3572,8 +3619,8 @@ func TestNeoActorMeasurementsTrackBlockedSinkCoalescing(t *testing.T) {
 	if blocked.RetainedRevisions != 2 || blocked.PeakRetainedRevisions != 2 {
 		t.Fatalf("blocked retained revisions = current:%d peak:%d, want 2", blocked.RetainedRevisions, blocked.PeakRetainedRevisions)
 	}
-	if blocked.RetainedGraphs != 3 || blocked.PeakRetainedGraphs != 3 {
-		t.Fatalf("blocked retained graphs = current:%d peak:%d, want 3", blocked.RetainedGraphs, blocked.PeakRetainedGraphs)
+	if blocked.RetainedGraphs != 2 || blocked.PeakRetainedGraphs != 2 {
+		t.Fatalf("blocked retained graphs = current:%d peak:%d, want 2", blocked.RetainedGraphs, blocked.PeakRetainedGraphs)
 	}
 	close(releaseLocal)
 	close(releaseCloud)
@@ -3583,7 +3630,7 @@ func TestNeoActorMeasurementsTrackBlockedSinkCoalescing(t *testing.T) {
 	if measured.LocalStartedRevision != 23 || measured.LocalCompletedRevision != 23 || measured.CloudStartedRevision != 23 || measured.CloudCompletedRevision != 23 {
 		t.Fatalf("completed revisions = local:%d/%d cloud:%d/%d, want 23", measured.LocalStartedRevision, measured.LocalCompletedRevision, measured.CloudStartedRevision, measured.CloudCompletedRevision)
 	}
-	if measured.RetainedRevisions != 1 || measured.RetainedGraphs != 1 || measured.LocalSerializedBytes == 0 || measured.CloudSerializedBytes == 0 {
+	if measured.RetainedRevisions != 1 || measured.RetainedGraphs != 2 || measured.LocalSerializedBytes == 0 || measured.CloudSerializedBytes == 0 {
 		t.Fatalf("completed measurements = revisions:%d graphs:%d localBytes:%d cloudBytes:%d", measured.RetainedRevisions, measured.RetainedGraphs, measured.LocalSerializedBytes, measured.CloudSerializedBytes)
 	}
 	info, err := os.Stat(filepath.Join(rt.threadDir, threadID+".json"))
@@ -3598,12 +3645,87 @@ func TestNeoActorMeasurementsTrackBlockedSinkCoalescing(t *testing.T) {
 	}
 	localRevisionsMu.Lock()
 	gotLocalRevisions := append([]uint64(nil), localRevisions...)
+	gotLocalSnapshots := make(map[uint64]neoCloudThreadSnapshot, len(localSnapshots))
+	for revision, snapshot := range localSnapshots {
+		gotLocalSnapshots[revision] = snapshot
+	}
 	localRevisionsMu.Unlock()
 	cloudRevisionsMu.Lock()
 	gotCloudRevisions := append([]uint64(nil), cloudRevisions...)
+	gotCloudSnapshots := make(map[uint64]neoCloudThreadSnapshot, len(cloudSnapshots))
+	for revision, snapshot := range cloudSnapshots {
+		gotCloudSnapshots[revision] = snapshot
+	}
 	cloudRevisionsMu.Unlock()
 	if !reflect.DeepEqual(gotLocalRevisions, []uint64{3, 23}) || !reflect.DeepEqual(gotCloudRevisions, []uint64{3, 23}) {
 		t.Fatalf("sink revisions = local:%v cloud:%v, want [3 23]", gotLocalRevisions, gotCloudRevisions)
+	}
+	actor.mu.Lock()
+	actorMessages := actor.messages
+	actor.mu.Unlock()
+	for _, revision := range []uint64{3, 23} {
+		localSnapshot := gotLocalSnapshots[revision]
+		cloudSnapshot := gotCloudSnapshots[revision]
+		if len(localSnapshot.messages) == 0 || len(cloudSnapshot.messages) == 0 || len(actorMessages) == 0 {
+			t.Fatalf("revision %d missing messages", revision)
+		}
+		if &localSnapshot.messages[0] == &actorMessages[0] || &cloudSnapshot.messages[0] == &actorMessages[0] {
+			t.Fatalf("revision %d worker messages share actor outer backing", revision)
+		}
+		if &localSnapshot.messages[0] != &cloudSnapshot.messages[0] || &localSnapshot.messages[0].Content[0] != &cloudSnapshot.messages[0].Content[0] {
+			t.Fatalf("revision %d worker snapshots do not share canonical nested message content", revision)
+		}
+		if &localSnapshot.messages[0].Content[0] == &actorMessages[0].Content[0] {
+			t.Fatalf("revision %d worker snapshot shares mutable actor message content", revision)
+		}
+		if len(localSnapshot.messageJSON) != len(localSnapshot.messages) || cloudSnapshot.messageJSON != nil {
+			t.Fatalf("revision %d message JSON = local:%d cloud:%v", revision, len(localSnapshot.messageJSON), cloudSnapshot.messageJSON)
+		}
+		if localSnapshot.apiKey != "" || localSnapshot.upstreamURL != "" || cloudSnapshot.apiKey != "secret" || cloudSnapshot.upstreamURL != upstream.URL {
+			t.Fatalf("revision %d credentials = local:%q/%q cloud:%q/%q", revision, localSnapshot.upstreamURL, localSnapshot.apiKey, cloudSnapshot.upstreamURL, cloudSnapshot.apiKey)
+		}
+	}
+	loaded, ok := loadNeoThreadFromDir(threadID, rt.threadDir)
+	if !ok {
+		t.Fatal("load persisted worker revision")
+	}
+	if stringValue(loaded["title"]) != "revision-19" || len(arrayValue(loaded["messages"])) != 1 {
+		t.Fatalf("persisted worker revision = title:%q messages:%d", stringValue(loaded["title"]), len(arrayValue(loaded["messages"])))
+	}
+	localRaw, err := os.ReadFile(filepath.Join(rt.threadDir, threadID+".json"))
+	if err != nil {
+		t.Fatalf("read persisted worker revision: %v", err)
+	}
+	if bytes.Contains(localRaw, []byte("secret")) {
+		t.Fatal("persisted worker revision contains cloud credential")
+	}
+	restored := newNeoActor(nil, "actor-measurements-restored", "thread-actor", threadID, threadID, neoActorRecord("actor-measurements-restored", "thread-actor", threadID), nil)
+	if err := restored.importThreadLocalOnly(loaded); err != nil {
+		t.Fatalf("import persisted worker revision: %v", err)
+	}
+	restoredSnapshot, ok := restored.threadSnapshotWithOptions(neoThreadSnapshotOptions{skipLocalMessageJSON: true})
+	if !ok || restoredSnapshot.title != "revision-19" || len(restoredSnapshot.messages) != 1 || textFromBlocks(restoredSnapshot.messages[0].Content) != "measure blocked sinks" {
+		t.Fatalf("restored worker revision = title:%q messages:%d", restoredSnapshot.title, len(restoredSnapshot.messages))
+	}
+	uploadsMu.Lock()
+	gotUploads := append([]capturedCloudUpload(nil), uploads...)
+	uploadsMu.Unlock()
+	if len(gotUploads) != 2 {
+		t.Fatalf("cloud uploads = %d, want 2", len(gotUploads))
+	}
+	latestUpload := gotUploads[len(gotUploads)-1]
+	if latestUpload.authorization != "Bearer secret" || stringValue(latestUpload.payload["method"]) != "uploadThread" || bytes.Contains(latestUpload.body, []byte("secret")) {
+		t.Fatalf("latest cloud upload = authorization:%q method:%q", latestUpload.authorization, stringValue(latestUpload.payload["method"]))
+	}
+	uploadedThread := mapValue(mapValue(latestUpload.payload["params"])["thread"])
+	if stringValue(uploadedThread["title"]) != "revision-19" || len(arrayValue(uploadedThread["messages"])) != 1 {
+		t.Fatalf("uploaded worker revision = title:%q messages:%d", stringValue(uploadedThread["title"]), len(arrayValue(uploadedThread["messages"])))
+	}
+	if _, exists := uploadedThread["apiKey"]; exists {
+		t.Fatal("uploaded thread contains API key field")
+	}
+	if _, exists := uploadedThread["upstreamURL"]; exists {
+		t.Fatal("uploaded thread contains upstream URL field")
 	}
 }
 
@@ -3615,7 +3737,7 @@ func TestNeoActorMeasurementsTrackConcurrentLocalSnapshots(t *testing.T) {
 	actor.beginLocalSnapshot(2)
 	actor.beginLocalSnapshot(3)
 	measured := actor.measurementSnapshot()
-	if measured.LocalStartedRevision != 3 || measured.RetainedRevisions != 3 || measured.RetainedGraphs != 4 || measured.PeakRetainedRevisions != 3 || measured.PeakRetainedGraphs != 4 {
+	if measured.LocalStartedRevision != 3 || measured.RetainedRevisions != 3 || measured.RetainedGraphs != 3 || measured.PeakRetainedRevisions != 3 || measured.PeakRetainedGraphs != 3 {
 		t.Fatalf("concurrent local measurements = started:%d revisions:%d/%d graphs:%d/%d", measured.LocalStartedRevision, measured.RetainedRevisions, measured.PeakRetainedRevisions, measured.RetainedGraphs, measured.PeakRetainedGraphs)
 	}
 
@@ -6460,6 +6582,9 @@ func TestNeoActorSnapshotCanSkipLocalMessageJSON(t *testing.T) {
 	if got, want := neoCloudThread(lean), neoCloudThread(full); !reflect.DeepEqual(got, want) {
 		t.Fatalf("cloud thread without local message JSON = %#v, want %#v", got, want)
 	}
+	if &lean.messages[1] == &actor.messages[1] || &full.messages[1] == &actor.messages[1] || &lean.messages[1].Content[0] == &actor.messages[1].Content[0] || &full.messages[1].Content[0] == &actor.messages[1].Content[0] {
+		t.Fatal("general thread snapshot did not deep-clone messages")
+	}
 	written, _, err := writeNeoLocalThreadSnapshotFile(lean, t.TempDir())
 	if err != nil {
 		t.Fatalf("write snapshot without local message JSON: %v", err)
@@ -6473,6 +6598,256 @@ func TestNeoActorSnapshotCanSkipLocalMessageJSON(t *testing.T) {
 	actor.mu.Unlock()
 	if got := stringValue(mapValue(lean.messages[1].Content[0])["text"]); got != "changed" {
 		t.Fatalf("isolated snapshot text = %q, want changed", got)
+	}
+}
+
+func TestNeoActorWorkerRevisionToolProcessedCOW(t *testing.T) {
+	threadID := "T-019f4000-0000-4000-8000-000000000074"
+	toolCallID := "TU-0000000000000000000074"
+	actor := newNeoActor(nil, "actor-worker-tool-cow", "thread-actor", threadID, threadID, neoActorRecord("actor-worker-tool-cow", "thread-actor", threadID), nil)
+	actor.messages = []neoMessage{{
+		ThreadID:  threadID,
+		MessageID: "M-tool-cow",
+		Role:      "assistant",
+		Content: []any{map[string]any{
+			"type":  "tool_use",
+			"id":    toolCallID,
+			"name":  "Bash",
+			"input": map[string]any{"command": map[string]any{"text": "original"}},
+		}},
+		OriginalToolUseInput: map[string]any{"existing": map[string]any{"value": "stable"}},
+	}}
+
+	published, ok := actor.workerThreadSnapshot(false)
+	if !ok {
+		t.Fatal("worker revision unavailable")
+	}
+	before, err := json.Marshal(neoCloudThread(published))
+	if err != nil {
+		t.Fatalf("marshal published revision: %v", err)
+	}
+	newArgs := map[string]any{"command": map[string]any{"text": "processed"}}
+	actor.handleBinaryToolProcessed(map[string]any{"toolUseID": toolCallID, "newArgs": newArgs})
+	newArgsCommand := mapValue(newArgs["command"])
+	newArgsCommand["text"] = "inbound mutation"
+
+	after, err := json.Marshal(neoCloudThread(published))
+	if err != nil {
+		t.Fatalf("remarshal published revision: %v", err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatal("published revision changed after tool processing")
+	}
+	if _, exists := published.messages[0].OriginalToolUseInput[toolCallID]; exists {
+		t.Fatal("published OriginalToolUseInput gained processed tool key")
+	}
+
+	actor.mu.Lock()
+	storedOriginal := mapValue(actor.messages[0].OriginalToolUseInput[toolCallID])
+	mapValue(actor.messages[0].OriginalToolUseInput["existing"])["value"] = "actor mutation"
+	currentInput := mapValue(mapValue(actor.messages[0].Content[0])["input"])
+	actor.mu.Unlock()
+	if got := stringValue(mapValue(storedOriginal["command"])["text"]); got != "original" {
+		t.Fatalf("stored original input = %q, want original", got)
+	}
+	mapValue(storedOriginal["command"])["text"] = "stored mutation"
+	if got := stringValue(mapValue(mapValue(mapValue(published.messages[0].Content[0])["input"])["command"])["text"]); got != "original" {
+		t.Fatalf("published tool input = %q, want original", got)
+	}
+	if got := stringValue(mapValue(published.messages[0].OriginalToolUseInput["existing"])["value"]); got != "stable" {
+		t.Fatalf("published existing original input = %q, want stable", got)
+	}
+	if got := stringValue(mapValue(currentInput["command"])["text"]); got != "processed" {
+		t.Fatalf("actor processed input = %q, want processed", got)
+	}
+}
+
+func TestNeoActorWorkerRevisionAppendContentCOW(t *testing.T) {
+	threadID := "T-019f4000-0000-4000-8000-000000000075"
+	actor := newNeoActor(nil, "actor-worker-content-cow", "thread-actor", threadID, threadID, neoActorRecord("actor-worker-content-cow", "thread-actor", threadID), nil)
+	backing := make([]any, 2, 4)
+	backing[0] = map[string]any{"type": "text", "text": "original"}
+	backing[1] = map[string]any{"type": "text", "text": "spare sentinel"}
+	actor.messages = []neoMessage{{ThreadID: threadID, MessageID: "M-content-cow", Role: "user", Content: backing[:1]}}
+
+	published, ok := actor.workerThreadSnapshot(false)
+	if !ok {
+		t.Fatal("worker revision unavailable")
+	}
+	before, err := json.Marshal(neoCloudThread(published))
+	if err != nil {
+		t.Fatalf("marshal published revision: %v", err)
+	}
+	inbound := map[string]any{"type": "text", "text": "appended"}
+	actor.appendUserMessageContent(map[string]any{"messageId": "M-content-cow", "content": []any{inbound}})
+	inbound["text"] = "inbound mutation"
+
+	after, err := json.Marshal(neoCloudThread(published))
+	if err != nil {
+		t.Fatalf("remarshal published revision: %v", err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatal("published revision changed after content append")
+	}
+	if len(published.messages[0].Content) != 1 || stringValue(mapValue(backing[1])["text"]) != "spare sentinel" {
+		t.Fatalf("published or spare content changed: published=%#v spare=%#v", published.messages[0].Content, backing[1])
+	}
+	actor.mu.Lock()
+	actorContent := actor.messages[0].Content
+	actor.mu.Unlock()
+	if len(actorContent) != 2 || stringValue(mapValue(actorContent[1])["text"]) != "appended" {
+		t.Fatalf("actor appended content = %#v", actorContent)
+	}
+	if &actorContent[0] == &published.messages[0].Content[0] {
+		t.Fatal("actor append reused published content backing")
+	}
+}
+
+func TestNeoActorWorkerRevisionRemainsImmutableAcrossMessageMutations(t *testing.T) {
+	threadID := "T-019f4000-0000-4000-8000-000000000076"
+	toolCallID := "TU-0000000000000000000076"
+	newActor := func() *neoActor {
+		actor := newNeoActor(nil, "actor-worker-mutation-cow", "thread-actor", threadID, threadID, neoActorRecord("actor-worker-mutation-cow", "thread-actor", threadID), nil)
+		actor.messages = []neoMessage{
+			{
+				ThreadID:  threadID,
+				MessageID: "M-assistant-cow",
+				Role:      "assistant",
+				Content: []any{
+					map[string]any{"type": "thinking", "thinking": "before", "blockState": "streaming"},
+					map[string]any{"type": "tool_use", "id": toolCallID, "name": "Bash", "input": map[string]any{"command": "pwd"}, "complete": true},
+				},
+				State:                map[string]any{"type": "streaming"},
+				Usage:                map[string]any{"inputTokens": 1},
+				OriginalToolUseInput: map[string]any{"existing": map[string]any{"command": "ls"}},
+				Seq:                  1,
+			},
+			{
+				ThreadID:  threadID,
+				MessageID: "M-user-cow",
+				Role:      "user",
+				Content: []any{map[string]any{
+					"type":      "tool_result",
+					"toolUseID": toolCallID,
+					"run":       map[string]any{"status": "running"},
+				}},
+				Seq: 2,
+			},
+		}
+		actor.seq = 3
+		actor.currentInference = &neoInferenceInflight{messageID: "M-assistant-cow", agentMode: "smart", tools: []string{"Bash"}}
+		return actor
+	}
+	tests := []struct {
+		name   string
+		mutate func(*neoActor)
+	}{
+		{
+			name: "assistant delta",
+			mutate: func(actor *neoActor) {
+				actor.handleProtocolDelta(map[string]any{
+					"type":       "delta",
+					"messageId":  "M-assistant-cow",
+					"role":       "assistant",
+					"state":      "generating",
+					"blockIndex": 0,
+					"blocks":     []any{map[string]any{"type": "thinking", "thinking": " after"}},
+				})
+			},
+		},
+		{
+			name: "user delta",
+			mutate: func(actor *neoActor) {
+				actor.handleProtocolDelta(map[string]any{
+					"type":      "delta",
+					"messageId": "M-user-cow",
+					"role":      "user",
+					"blocks":    []any{map[string]any{"type": "text", "text": "after"}},
+				})
+			},
+		},
+		{
+			name: "tool result update",
+			mutate: func(actor *neoActor) {
+				actor.mu.Lock()
+				actor.storeToolResultEventLocked(neoStoredToolUseRef{MessageIndex: 0, BlockIndex: 1}, map[string]any{
+					"type":      "tool_result",
+					"toolUseID": toolCallID,
+					"run":       map[string]any{"status": "done", "result": "after"},
+				}, "")
+				actor.mu.Unlock()
+			},
+		},
+		{
+			name: "tool result cancellation",
+			mutate: func(actor *neoActor) {
+				actor.mu.Lock()
+				actor.cancelToolResultMessagesLocked([]string{toolCallID}, "user:cancelled")
+				actor.mu.Unlock()
+			},
+		},
+		{
+			name: "assistant cleanup",
+			mutate: func(actor *neoActor) {
+				actor.cleanupPriorAssistantForBinaryDeltaWithReason("user:cancelled")
+			},
+		},
+		{
+			name: "inference usage",
+			mutate: func(actor *neoActor) {
+				actor.handleBinaryInferenceCompleted(map[string]any{"model": "gpt-5", "usage": map[string]any{"outputTokens": 2}})
+			},
+		},
+		{
+			name: "message read",
+			mutate: func(actor *neoActor) {
+				actor.markMessageRead("M-user-cow", true)
+			},
+		},
+		{
+			name: "whole message replacement",
+			mutate: func(actor *neoActor) {
+				actor.storeMessage(neoMessage{
+					ThreadID:  threadID,
+					MessageID: "M-assistant-cow",
+					Role:      "assistant",
+					Content:   []any{map[string]any{"type": "text", "text": "after"}},
+					State:     map[string]any{"type": "complete"},
+				})
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			actor := newActor()
+			published, ok := actor.workerThreadSnapshot(false)
+			if !ok {
+				t.Fatal("worker revision unavailable")
+			}
+			before, err := json.Marshal(neoCloudThread(published))
+			if err != nil {
+				t.Fatalf("marshal published revision: %v", err)
+			}
+			tt.mutate(actor)
+			after, err := json.Marshal(neoCloudThread(published))
+			if err != nil {
+				t.Fatalf("remarshal published revision: %v", err)
+			}
+			if !bytes.Equal(after, before) {
+				t.Fatal("published revision changed after actor mutation")
+			}
+			current, ok := actor.threadSnapshotWithOptions(neoThreadSnapshotOptions{skipLocalMessageJSON: true})
+			if !ok {
+				t.Fatal("current snapshot unavailable")
+			}
+			currentBytes, err := json.Marshal(neoCloudThread(current))
+			if err != nil {
+				t.Fatalf("marshal current snapshot: %v", err)
+			}
+			if bytes.Equal(currentBytes, before) {
+				t.Fatal("mutation did not change current actor state")
+			}
+		})
 	}
 }
 
@@ -6507,8 +6882,9 @@ func TestNeoLocalSnapshotMessageCacheAllowed(t *testing.T) {
 		bytes    int
 		want     bool
 	}{
-		{name: "within limits", messages: neoLocalSnapshotCacheMaxMessages, bytes: neoLocalSnapshotCacheMaxBytes, want: true},
+		{name: "maximum messages", messages: neoLocalSnapshotCacheMaxMessages, bytes: 1, want: true},
 		{name: "too many messages", messages: neoLocalSnapshotCacheMaxMessages + 1, bytes: 1},
+		{name: "maximum bytes", messages: 1, bytes: neoLocalSnapshotCacheMaxBytes, want: true},
 		{name: "too many bytes", messages: 1, bytes: neoLocalSnapshotCacheMaxBytes + 1},
 	}
 	for _, test := range tests {
@@ -30611,6 +30987,7 @@ func TestUploadNeoCloudThreadUsesAmpInternalClientHeaders(t *testing.T) {
 	}
 
 	threadID := "T-019e65c0-0310-77a8-b233-4b84d9c0612b"
+	largeText := strings.Repeat("x", neoCloudGzipBytes)
 	var sawRequest bool
 	var receivedBytes atomic.Int64
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -30621,14 +30998,20 @@ func TestUploadNeoCloudThreadUsesAmpInternalClientHeaders(t *testing.T) {
 		if got := r.Header.Get("Authorization"); got != "Bearer secret" {
 			t.Fatalf("Authorization = %q", got)
 		}
+		if got := r.Header.Get("Content-Type"); got != "application/json" {
+			t.Fatalf("Content-Type = %q", got)
+		}
+		if got := r.Header.Get("Content-Encoding"); got != "gzip" {
+			t.Fatalf("Content-Encoding = %q", got)
+		}
 		if got := r.Header.Get("X-Amp-Client-Application"); got != "CLI" {
 			t.Fatalf("X-Amp-Client-Application = %q", got)
 		}
 		if got := r.Header.Get("X-Amp-Client-Type"); got != "cli" {
 			t.Fatalf("X-Amp-Client-Type = %q", got)
 		}
-		if got := r.Header.Get("X-Amp-Client-Version"); strings.TrimSpace(got) == "" {
-			t.Fatalf("X-Amp-Client-Version missing")
+		if got := r.Header.Get("X-Amp-Client-Version"); got != "test-client-version" {
+			t.Fatalf("X-Amp-Client-Version = %q", got)
 		}
 		if got := r.Header.Get("X-Amp-Installation-ID"); got != "upload-install-123" {
 			t.Fatalf("X-Amp-Installation-ID = %q", got)
@@ -30636,7 +31019,12 @@ func TestUploadNeoCloudThreadUsesAmpInternalClientHeaders(t *testing.T) {
 		if got, want := r.Header.Get("X-Amp-Device-Fingerprint"), neoAmpDeviceFingerprint(); got != want {
 			t.Fatalf("X-Amp-Device-Fingerprint = %q, want %q", got, want)
 		}
-		body, err := io.ReadAll(r.Body)
+		gz, err := gzip.NewReader(r.Body)
+		if err != nil {
+			t.Fatalf("open gzip payload: %v", err)
+		}
+		defer gz.Close()
+		body, err := io.ReadAll(gz)
 		if err != nil {
 			t.Fatalf("read payload: %v", err)
 		}
@@ -30661,14 +31049,15 @@ func TestUploadNeoCloudThreadUsesAmpInternalClientHeaders(t *testing.T) {
 	defer upstream.Close()
 
 	serializedBytes, err := uploadNeoCloudThread(neoCloudThreadSnapshot{
-		upstreamURL: upstream.URL,
-		apiKey:      "secret",
-		threadID:    threadID,
-		seq:         1,
-		createdMs:   1778170000000,
-		title:       "Header parity",
+		upstreamURL:   upstream.URL,
+		apiKey:        "secret",
+		clientVersion: "test-client-version",
+		threadID:      threadID,
+		seq:           1,
+		createdMs:     1778170000000,
+		title:         "Header parity",
 		messages: []neoMessage{
-			{ThreadID: threadID, MessageID: "M-user", Role: "user", Content: []any{map[string]any{"type": "text", "text": "hello"}}, Seq: 1},
+			{ThreadID: threadID, MessageID: "M-user", Role: "user", Content: []any{map[string]any{"type": "text", "text": largeText}}, Seq: 1},
 		},
 	})
 	if err != nil {

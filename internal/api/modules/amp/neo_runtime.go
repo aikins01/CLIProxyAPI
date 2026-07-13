@@ -2508,6 +2508,7 @@ type neoActor struct {
 	localSnapshotEpoch          uint64
 	localSnapshotMessageCache   map[string]neoLocalSnapshotMessageCache
 	localSnapshotMessageGen     uint64
+	workerRevision              *neoThreadRevision
 	measurements                neoActorMeasurements
 	title                       string
 	titleSource                 string
@@ -2657,29 +2658,38 @@ func (a *neoActor) measurementSnapshot() neoActorMeasurementSnapshot {
 }
 
 func (a *neoActor) retainedRevisionCountLocked() int {
-	currentRevision := a.measurements.revision
-	count := 0
-	if currentRevision != 0 {
-		count = 1
+	revisions := make(map[uint64]struct{}, len(a.measurements.localActiveRevisions)+2)
+	if currentRevision := a.measurements.revision; currentRevision != 0 {
+		revisions[currentRevision] = struct{}{}
+	}
+	if a.workerRevision != nil && a.workerRevision.revision != 0 {
+		revisions[a.workerRevision.revision] = struct{}{}
 	}
 	for revision := range a.measurements.localActiveRevisions {
-		if revision != 0 && revision != currentRevision {
-			count++
+		if revision != 0 {
+			revisions[revision] = struct{}{}
 		}
 	}
-	cloudRevision := a.measurements.cloudActiveRevision
-	if cloudRevision != 0 && cloudRevision != currentRevision && a.measurements.localActiveRevisions[cloudRevision] == 0 {
-		count++
+	if cloudRevision := a.measurements.cloudActiveRevision; cloudRevision != 0 {
+		revisions[cloudRevision] = struct{}{}
 	}
-	return count
+	return len(revisions)
 }
 
 func (a *neoActor) retainedGraphCountLocked() int {
 	count := 1
-	for _, holders := range a.measurements.localActiveRevisions {
-		count += holders
+	workerRevision := uint64(0)
+	if a.workerRevision != nil {
+		count++
+		workerRevision = a.workerRevision.revision
 	}
-	if a.measurements.cloudActiveRevision != 0 {
+	for revision := range a.measurements.localActiveRevisions {
+		if revision != 0 && revision != workerRevision {
+			count++
+		}
+	}
+	cloudRevision := a.measurements.cloudActiveRevision
+	if cloudRevision != 0 && cloudRevision != workerRevision && a.measurements.localActiveRevisions[cloudRevision] == 0 {
 		count++
 	}
 	return count
@@ -4482,7 +4492,7 @@ func (a *neoActor) handleBinaryUserToolInput(msg map[string]any) {
 
 func (a *neoActor) handleBinaryToolProcessed(msg map[string]any) {
 	toolCallID := neoToolCallIDFromMessage(msg)
-	newArgs := cloneMap(mapValue(msg["newArgs"]))
+	newArgs := cloneNeoJSONMap(mapValue(msg["newArgs"]))
 	if toolCallID == "" {
 		return
 	}
@@ -4495,10 +4505,11 @@ func (a *neoActor) handleBinaryToolProcessed(msg map[string]any) {
 	message := a.messages[ref.MessageIndex]
 	content := cloneArray(message.Content)
 	block := cloneMap(mapValue(content[ref.BlockIndex]))
+	message.OriginalToolUseInput = cloneNeoJSONMap(message.OriginalToolUseInput)
 	if message.OriginalToolUseInput == nil {
 		message.OriginalToolUseInput = map[string]any{}
 	}
-	message.OriginalToolUseInput[toolCallID] = cloneMap(mapValue(block["input"]))
+	message.OriginalToolUseInput[toolCallID] = cloneNeoJSONMap(mapValue(block["input"]))
 	block["input"] = newArgs
 	content[ref.BlockIndex] = block
 	message.Content = content
@@ -9152,7 +9163,7 @@ func (a *neoActor) replaceBinaryUserMessageAtIndex(index int, user neoQueuedMess
 
 func (a *neoActor) appendUserMessageContent(msg map[string]any) {
 	messageID := messageIDValue(msg["messageId"])
-	content := neoContentFromBinaryValue(msg["content"])
+	content := cloneNeoJSONArray(neoContentFromBinaryValue(msg["content"]))
 	if messageID == "" || len(content) == 0 {
 		return
 	}
@@ -9163,7 +9174,10 @@ func (a *neoActor) appendUserMessageContent(msg map[string]any) {
 		return
 	}
 	message := a.messages[index]
-	message.Content = append(message.Content, content...)
+	updatedContent := make([]any, 0, len(message.Content)+len(content))
+	updatedContent = append(updatedContent, message.Content...)
+	updatedContent = append(updatedContent, content...)
+	message.Content = updatedContent
 	a.messages[index] = message
 	seq := a.nextSeqLocked()
 	event := map[string]any{"type": "message_updated", "message": message.protocol(), "seq": seq}
@@ -11233,6 +11247,11 @@ type neoCloudThreadSnapshot struct {
 	executorType      string
 }
 
+type neoThreadRevision struct {
+	revision uint64
+	snapshot neoCloudThreadSnapshot
+}
+
 type neoLocalSnapshotMessageCache struct {
 	message    neoMessage
 	json       neoLocalSnapshotMessageJSON
@@ -11299,7 +11318,7 @@ func (a *neoActor) syncLocalThreadSnapshotAsync() {
 		a.syncWG.Add(1)
 		a.mu.Unlock()
 		defer a.syncWG.Done()
-		if snapshot, ok := a.threadSnapshot(); ok {
+		if snapshot, ok := a.workerThreadSnapshot(true); ok {
 			if a.localSnapshotWriterAllowed(epoch) {
 				if err := a.writeMeasuredLocalSnapshot(snapshot); err != nil {
 					log.Warnf("amp neo local runtime thread store sync failed thread=%s: %v", snapshot.threadID, err)
@@ -11329,7 +11348,7 @@ func (a *neoActor) syncLocalThreadSnapshotAsync() {
 func (a *neoActor) syncLocalThreadSnapshotLoop(epoch uint64) {
 	defer a.syncWG.Done()
 	for {
-		snapshot, ok := a.threadSnapshot()
+		snapshot, ok := a.workerThreadSnapshot(true)
 		if ok && a.localSnapshotWriterAllowed(epoch) {
 			if err := a.writeMeasuredLocalSnapshot(snapshot); err != nil {
 				log.Warnf("amp neo local runtime thread store sync failed thread=%s: %v", snapshot.threadID, err)
@@ -11392,9 +11411,7 @@ func (a *neoActor) cloudThreadSyncEnabled() bool {
 
 func (a *neoActor) syncCloudLoop() {
 	for {
-		snapshot, ok := a.threadSnapshotWithOptions(neoThreadSnapshotOptions{
-			skipLocalMessageJSON: true,
-		})
+		snapshot, ok := a.workerThreadSnapshot(false)
 		if ok {
 			if cloudSnapshot, ok := a.cloudThreadSnapshot(snapshot); ok {
 				a.beginCloudSnapshot(cloudSnapshot.revision)
@@ -11487,6 +11504,28 @@ func (a *neoActor) threadStoreDir() string {
 	return neoAmpThreadStoreDir()
 }
 
+func (a *neoActor) workerThreadSnapshot(local bool) (neoCloudThreadSnapshot, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	revision := a.measurements.revision
+	if a.workerRevision == nil || a.workerRevision.revision != revision {
+		snapshot, ok := a.threadSnapshotLocked(neoThreadSnapshotOptions{skipLocalMessageJSON: true})
+		if !ok {
+			return neoCloudThreadSnapshot{}, false
+		}
+		a.workerRevision = &neoThreadRevision{revision: revision, snapshot: snapshot}
+		a.updatePeakRetainedRevisionsLocked()
+	}
+	snapshot := a.workerRevision.snapshot
+	if local {
+		snapshot.messageJSON = a.localSnapshotMessageJSONLocked(snapshot.messages)
+	} else {
+		snapshot.messageJSON = nil
+	}
+	return snapshot, true
+}
+
 func (a *neoActor) threadSnapshot() (neoCloudThreadSnapshot, bool) {
 	return a.threadSnapshotWithOptions(neoThreadSnapshotOptions{})
 }
@@ -11500,7 +11539,10 @@ type neoThreadSnapshotOptions struct {
 func (a *neoActor) threadSnapshotWithOptions(options neoThreadSnapshotOptions) (neoCloudThreadSnapshot, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	return a.threadSnapshotLocked(options)
+}
 
+func (a *neoActor) threadSnapshotLocked(options neoThreadSnapshotOptions) (neoCloudThreadSnapshot, bool) {
 	if a.threadID == "" {
 		return neoCloudThreadSnapshot{}, false
 	}
@@ -11601,6 +11643,7 @@ func (a *neoActor) localSnapshotMessageJSONLocked(messages []neoMessage) []neoLo
 	} else {
 		a.localSnapshotMessageCache = nil
 	}
+	a.updatePeakRetainedRevisionsLocked()
 	return encoded
 }
 
