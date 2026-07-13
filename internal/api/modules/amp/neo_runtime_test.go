@@ -3377,7 +3377,7 @@ func TestNeoActorSyncCloudAsyncCoalescesLocalSnapshots(t *testing.T) {
 	var writesMu sync.Mutex
 	writes := make([]string, 0, 2)
 	writeTimes := make([]time.Time, 0, 2)
-	rt.writeLocalSnapshot = func(snapshot neoCloudThreadSnapshot, _ string) error {
+	rt.writeLocalSnapshot = func(snapshot neoCloudThreadSnapshot, _ string) (int64, error) {
 		writesMu.Lock()
 		writes = append(writes, snapshot.title)
 		writeTimes = append(writeTimes, time.Now())
@@ -3387,7 +3387,7 @@ func TestNeoActorSyncCloudAsyncCoalescesLocalSnapshots(t *testing.T) {
 			close(firstStarted)
 			<-releaseFirst
 		}
-		return nil
+		return 0, nil
 	}
 
 	actor.mu.Lock()
@@ -3419,6 +3419,223 @@ func TestNeoActorSyncCloudAsyncCoalescesLocalSnapshots(t *testing.T) {
 	}
 }
 
+func TestNeoActorMeasurementsTrackBlockedSinkCoalescing(t *testing.T) {
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+		UpstreamURL:    "http://127.0.0.1:1",
+		UpstreamAPIKey: "secret",
+		NeoLocalRuntime: config.AmpNeoLocalRuntime{
+			Enabled: &enabled,
+		},
+	}})
+	rt.threadDir = t.TempDir()
+	rt.asyncLocalSnapshots = true
+	rt.localSnapshotMinInterval = 0
+	threadID := "T-019f4000-0000-4000-8000-000000000068"
+	actor := newNeoActor(rt, "actor-measurements", "thread-actor", threadID, threadID, neoActorRecord("actor-measurements", "thread-actor", threadID), nil)
+	if err := actor.importThreadLocalOnly(map[string]any{
+		"id":        threadID,
+		"v":         900_000,
+		"agentMode": "deep",
+		"messages": []any{map[string]any{
+			"messageId": "M-measurements",
+			"role":      "user",
+			"content":   []any{map[string]any{"type": "text", "text": "measure blocked sinks"}},
+		}},
+	}); err != nil {
+		t.Fatalf("import thread: %v", err)
+	}
+	if got := actor.measurementSnapshot().Revision; got != 2 {
+		t.Fatalf("internal revision after persisted v import = %d, want 2", got)
+	}
+	if !actor.sendSnapshot(nil, 899_999) {
+		t.Fatal("socket-less fallback suppressed snapshot attempt")
+	}
+	if got := actor.measurementSnapshot().ReplayFallbackSnapshots; got != 0 {
+		t.Fatalf("fallback snapshots after socket-less broadcast = %d, want 0", got)
+	}
+	var rivetFrames atomic.Int32
+	rivetSocket := &neoSocket{localExtensions: true, rivetAction: true, writeMessage: func(int, []byte) error {
+		rivetFrames.Add(1)
+		return nil
+	}}
+	if !actor.sendSnapshot(rivetSocket, 899_999) {
+		t.Fatal("unframeable Rivet fallback suppressed snapshot attempt")
+	}
+	if rivetFrames.Load() != 0 {
+		t.Fatalf("unframeable Rivet fallback emitted %d frames, want 0", rivetFrames.Load())
+	}
+	if got := actor.measurementSnapshot().ReplayFallbackSnapshots; got != 0 {
+		t.Fatalf("fallback snapshots after unframeable Rivet emission = %d, want 0", got)
+	}
+	var failedFrames atomic.Int32
+	failingSocket := &neoSocket{localExtensions: true, writeMessage: func(int, []byte) error {
+		if failedFrames.Add(1) == 3 {
+			return errors.New("recording transport failed")
+		}
+		return nil
+	}}
+	if !actor.sendSnapshot(failingSocket, 899_999) {
+		t.Fatal("failed fallback transport suppressed snapshot attempt")
+	}
+	if failedFrames.Load() <= 3 {
+		t.Fatalf("fallback transport stopped after failed frame: wrote %d frames", failedFrames.Load())
+	}
+	if got := actor.measurementSnapshot().ReplayFallbackSnapshots; got != 0 {
+		t.Fatalf("fallback snapshots after incomplete emission = %d, want 0", got)
+	}
+	filteredSocket := &neoSocket{writeMessage: func(int, []byte) error { return nil }}
+	if !actor.sendSnapshot(filteredSocket, 899_999) {
+		t.Fatal("filtered fallback transport suppressed snapshot attempt")
+	}
+	if got := actor.measurementSnapshot().ReplayFallbackSnapshots; got != 0 {
+		t.Fatalf("fallback snapshots after filtered emission = %d, want 0", got)
+	}
+	var fallbackFrames atomic.Int32
+	hydratedSocket := &neoSocket{localExtensions: true, writeMessage: func(int, []byte) error {
+		fallbackFrames.Add(1)
+		return nil
+	}}
+	actor.sendSnapshot(hydratedSocket, 899_999)
+	if got := actor.measurementSnapshot().ReplayFallbackSnapshots; got != 1 {
+		t.Fatalf("fallback snapshots = %d, want 1", got)
+	}
+	if fallbackFrames.Load() == 0 {
+		t.Fatal("fallback snapshot emitted no frames")
+	}
+	hydratedSocket.markSnapshotSent()
+	if actor.sendSnapshot(hydratedSocket, 899_999) {
+		t.Fatal("hydrated socket emitted duplicate fallback snapshot")
+	}
+	if got := actor.measurementSnapshot().ReplayFallbackSnapshots; got != 1 {
+		t.Fatalf("fallback snapshots after suppressed send = %d, want 1", got)
+	}
+
+	localStarted := make(chan struct{})
+	cloudStarted := make(chan struct{})
+	releaseLocal := make(chan struct{})
+	releaseCloud := make(chan struct{})
+	var localOnce sync.Once
+	var cloudOnce sync.Once
+	var localRevisionsMu sync.Mutex
+	localRevisions := make([]uint64, 0, 2)
+	var cloudRevisionsMu sync.Mutex
+	cloudRevisions := make([]uint64, 0, 2)
+	rt.writeLocalSnapshot = func(snapshot neoCloudThreadSnapshot, dir string) (int64, error) {
+		localRevisionsMu.Lock()
+		localRevisions = append(localRevisions, snapshot.revision)
+		call := len(localRevisions)
+		localRevisionsMu.Unlock()
+		if call == 1 {
+			localOnce.Do(func() { close(localStarted) })
+			<-releaseLocal
+		}
+		serializedBytes, _, err := writeNeoLocalThreadSnapshotToDirMeasured(snapshot, dir)
+		return serializedBytes, err
+	}
+	rt.uploadCloudSnapshot = func(snapshot neoCloudThreadSnapshot) (int64, error) {
+		cloudRevisionsMu.Lock()
+		cloudRevisions = append(cloudRevisions, snapshot.revision)
+		call := len(cloudRevisions)
+		cloudRevisionsMu.Unlock()
+		if call == 1 {
+			cloudOnce.Do(func() { close(cloudStarted) })
+			<-releaseCloud
+		}
+		return int64(len(snapshot.title) + len(snapshot.messages)), nil
+	}
+
+	actor.syncCloudAsync()
+	select {
+	case <-localStarted:
+	case <-time.After(time.Second):
+		t.Fatal("local sink did not start")
+	}
+	select {
+	case <-cloudStarted:
+	case <-time.After(time.Second):
+		t.Fatal("cloud sink did not start")
+	}
+	for index := 0; index < 20; index++ {
+		actor.mu.Lock()
+		actor.title = fmt.Sprintf("revision-%02d", index)
+		actor.mu.Unlock()
+		actor.syncCloudAsync()
+	}
+	blocked := actor.measurementSnapshot()
+	if blocked.Revision != 23 || blocked.LocalRequestedRevision != 23 || blocked.CloudRequestedRevision != 23 {
+		t.Fatalf("blocked requested revisions = actor:%d local:%d cloud:%d, want 23", blocked.Revision, blocked.LocalRequestedRevision, blocked.CloudRequestedRevision)
+	}
+	if blocked.LocalCoalesced != 20 || blocked.CloudCoalesced != 20 {
+		t.Fatalf("blocked coalescing = local:%d cloud:%d, want 20 each", blocked.LocalCoalesced, blocked.CloudCoalesced)
+	}
+	if blocked.RetainedRevisions != 2 || blocked.PeakRetainedRevisions != 2 {
+		t.Fatalf("blocked retained revisions = current:%d peak:%d, want 2", blocked.RetainedRevisions, blocked.PeakRetainedRevisions)
+	}
+	if blocked.RetainedGraphs != 3 || blocked.PeakRetainedGraphs != 3 {
+		t.Fatalf("blocked retained graphs = current:%d peak:%d, want 3", blocked.RetainedGraphs, blocked.PeakRetainedGraphs)
+	}
+	close(releaseLocal)
+	close(releaseCloud)
+	waitForNeoActorSyncIdle(t, actor)
+
+	measured := actor.measurementSnapshot()
+	if measured.LocalStartedRevision != 23 || measured.LocalCompletedRevision != 23 || measured.CloudStartedRevision != 23 || measured.CloudCompletedRevision != 23 {
+		t.Fatalf("completed revisions = local:%d/%d cloud:%d/%d, want 23", measured.LocalStartedRevision, measured.LocalCompletedRevision, measured.CloudStartedRevision, measured.CloudCompletedRevision)
+	}
+	if measured.RetainedRevisions != 1 || measured.RetainedGraphs != 1 || measured.LocalSerializedBytes == 0 || measured.CloudSerializedBytes == 0 {
+		t.Fatalf("completed measurements = revisions:%d graphs:%d localBytes:%d cloudBytes:%d", measured.RetainedRevisions, measured.RetainedGraphs, measured.LocalSerializedBytes, measured.CloudSerializedBytes)
+	}
+	info, err := os.Stat(filepath.Join(rt.threadDir, threadID+".json"))
+	if err != nil {
+		t.Fatalf("stat measured local snapshot: %v", err)
+	}
+	if measured.LocalSerializedBytes != info.Size() {
+		t.Fatalf("local serialized bytes = %d, file size = %d", measured.LocalSerializedBytes, info.Size())
+	}
+	if measured.LocalPersistenceDuration <= 0 || measured.CloudUploadDuration <= 0 {
+		t.Fatalf("sink durations = local:%s cloud:%s", measured.LocalPersistenceDuration, measured.CloudUploadDuration)
+	}
+	localRevisionsMu.Lock()
+	gotLocalRevisions := append([]uint64(nil), localRevisions...)
+	localRevisionsMu.Unlock()
+	cloudRevisionsMu.Lock()
+	gotCloudRevisions := append([]uint64(nil), cloudRevisions...)
+	cloudRevisionsMu.Unlock()
+	if !reflect.DeepEqual(gotLocalRevisions, []uint64{3, 23}) || !reflect.DeepEqual(gotCloudRevisions, []uint64{3, 23}) {
+		t.Fatalf("sink revisions = local:%v cloud:%v, want [3 23]", gotLocalRevisions, gotCloudRevisions)
+	}
+}
+
+func TestNeoActorMeasurementsTrackConcurrentLocalSnapshots(t *testing.T) {
+	threadID := "T-019f4000-0000-4000-8000-000000000072"
+	actor := newNeoActor(nil, "actor-concurrent-measurements", "thread-actor", threadID, threadID, neoActorRecord("actor-concurrent-measurements", "thread-actor", threadID), nil)
+
+	actor.beginLocalSnapshot(2)
+	actor.beginLocalSnapshot(2)
+	actor.beginLocalSnapshot(3)
+	measured := actor.measurementSnapshot()
+	if measured.LocalStartedRevision != 3 || measured.RetainedRevisions != 3 || measured.RetainedGraphs != 4 || measured.PeakRetainedRevisions != 3 || measured.PeakRetainedGraphs != 4 {
+		t.Fatalf("concurrent local measurements = started:%d revisions:%d/%d graphs:%d/%d", measured.LocalStartedRevision, measured.RetainedRevisions, measured.PeakRetainedRevisions, measured.RetainedGraphs, measured.PeakRetainedGraphs)
+	}
+
+	actor.completeLocalSnapshot(2, 100, time.Millisecond, true)
+	measured = actor.measurementSnapshot()
+	if measured.LocalCompletedRevision != 2 || measured.RetainedRevisions != 3 || measured.RetainedGraphs != 3 {
+		t.Fatalf("first local completion = completed:%d revisions:%d graphs:%d", measured.LocalCompletedRevision, measured.RetainedRevisions, measured.RetainedGraphs)
+	}
+	actor.completeLocalSnapshot(2, 100, time.Millisecond, true)
+	measured = actor.measurementSnapshot()
+	if measured.RetainedRevisions != 2 || measured.RetainedGraphs != 2 {
+		t.Fatalf("second local completion = revisions:%d graphs:%d", measured.RetainedRevisions, measured.RetainedGraphs)
+	}
+	actor.completeLocalSnapshot(3, 200, 2*time.Millisecond, true)
+	measured = actor.measurementSnapshot()
+	if measured.LocalCompletedRevision != 3 || measured.LocalSerializedBytes != 200 || measured.LocalPersistenceDuration != 2*time.Millisecond || measured.RetainedRevisions != 1 || measured.RetainedGraphs != 1 {
+		t.Fatalf("final local completion = completed:%d bytes:%d duration:%s revisions:%d graphs:%d", measured.LocalCompletedRevision, measured.LocalSerializedBytes, measured.LocalPersistenceDuration, measured.RetainedRevisions, measured.RetainedGraphs)
+	}
+}
+
 func TestNeoActorLocalSnapshotThrottleDoesNotBlockClose(t *testing.T) {
 	enabled := true
 	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled}}})
@@ -3431,13 +3648,13 @@ func TestNeoActorLocalSnapshotThrottleDoesNotBlockClose(t *testing.T) {
 	releaseFirst := make(chan struct{})
 	firstReturned := make(chan struct{})
 	var writes atomic.Int32
-	rt.writeLocalSnapshot = func(neoCloudThreadSnapshot, string) error {
+	rt.writeLocalSnapshot = func(neoCloudThreadSnapshot, string) (int64, error) {
 		if writes.Add(1) == 1 {
 			close(firstStarted)
 			<-releaseFirst
 			close(firstReturned)
 		}
-		return nil
+		return 0, nil
 	}
 
 	actor.syncCloudAsync()
@@ -5839,11 +6056,11 @@ func TestNeoRuntimeStopCleansExecutorSpawnedDuringFinalFlush(t *testing.T) {
 		t.Fatalf("start runtime: %v", err)
 	}
 	actor := rt.store.ensureThreadActor("T-019f4899-7bfa-78aa-9d42-ca39216d8190")
-	rt.writeLocalSnapshot = func(neoCloudThreadSnapshot, string) error {
+	rt.writeLocalSnapshot = func(neoCloudThreadSnapshot, string) (int64, error) {
 		actor.mu.Lock()
 		actor.spawnedExecutors["spawn-late"] = &neoSpawnedExecutor{spawnID: "spawn-late", threadID: actor.threadID}
 		actor.mu.Unlock()
-		return nil
+		return 0, nil
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -6384,6 +6601,429 @@ func TestNeoActorOverLimitSnapshotWritesCompleteImportableThread(t *testing.T) {
 	}
 }
 
+func neoMemoryPressureThreadFixture(threadID string, messageCount, payloadBytes int) map[string]any {
+	messages := make([]any, messageCount)
+	payload := strings.Repeat("memory-pressure-payload-", payloadBytes/24+1)[:payloadBytes]
+	thinking := payload[:payloadBytes/3]
+	text := payload[payloadBytes/3 : 2*payloadBytes/3]
+	command := payload[2*payloadBytes/3:]
+	for index := range messages {
+		messageID := fmt.Sprintf("M-%022d", index+1)
+		toolID := fmt.Sprintf("TU-%022d", index/4+1)
+		switch index % 4 {
+		case 0:
+			messages[index] = map[string]any{
+				"messageId":       messageID,
+				"role":            "user",
+				"agentMode":       "deep",
+				"reasoningEffort": "xhigh",
+				"content":         []any{map[string]any{"type": "text", "text": payload}},
+				"userState":       map[string]any{"selection": map[string]any{"path": "internal/api/modules/amp/neo_runtime.go", "line": index + 1}},
+				"fileMentions":    map[string]any{"neo_runtime.go": map[string]any{"path": "internal/api/modules/amp/neo_runtime.go"}},
+				"createdAt":       "2026-07-12T00:00:00Z",
+			}
+		case 1:
+			messages[index] = map[string]any{
+				"messageId": messageID,
+				"role":      "assistant",
+				"content": []any{
+					map[string]any{"type": "thinking", "thinking": thinking, "blockState": "complete"},
+					map[string]any{"type": "text", "text": text},
+					map[string]any{"type": "tool_use", "id": toolID, "name": "shell_command", "input": map[string]any{"command": command}},
+				},
+				"state": map[string]any{"type": "complete", "stopReason": "tool_use"},
+				"usage": map[string]any{"inputTokens": index + 100, "outputTokens": 200},
+			}
+		case 2:
+			messages[index] = map[string]any{
+				"messageId":       messageID,
+				"role":            "user",
+				"parentToolUseId": toolID,
+				"content": []any{map[string]any{
+					"type":      "tool_result",
+					"toolUseID": toolID,
+					"content":   payload,
+					"run":       map[string]any{"status": "done", "result": "command completed"},
+				}},
+			}
+		case 3:
+			content := []any{map[string]any{
+				"type":    "manual_bash_invocation",
+				"args":    map[string]any{"cmd": "git status --short"},
+				"toolRun": map[string]any{"status": "done", "result": payload},
+			}}
+			if index == messageCount-4 {
+				content = append(content, map[string]any{"type": "summary", "summary": map[string]any{"type": "message", "summary": strings.Repeat("compaction summary ", 1024)}})
+			}
+			messages[index] = map[string]any{"messageId": messageID, "role": "info", "content": content}
+		}
+	}
+	lastAssistantIndex := messageCount - 1
+	for lastAssistantIndex > 0 && lastAssistantIndex%4 != 1 {
+		lastAssistantIndex--
+	}
+	lastAssistantID := fmt.Sprintf("M-%022d", lastAssistantIndex+1)
+	return map[string]any{
+		"id":              threadID,
+		"v":               messageCount + 400,
+		"created":         int64(1783814400000),
+		"title":           "Deterministic memory pressure fixture",
+		"agentMode":       "deep",
+		"reasoningEffort": "xhigh",
+		"threadStatus":    "active",
+		"state":           "working",
+		"settings": map[string]any{
+			"agentMode":                           "deep",
+			"reasoning.effort":                    "xhigh",
+			"internal.compactionThresholdPercent": float64(80),
+			"compactionControl":                   map[string]any{"enabled": true, "contextTokenThreshold": float64(120000)},
+		},
+		"meta": map[string]any{
+			"ampcodeConnectorLocalNeo": true,
+			"executorType":             "local-client",
+			"usesThreadActors":         true,
+		},
+		"env":      map[string]any{"workingDirectory": "/workspace/CLIProxyAPI", "platform": "darwin", "shell": "zsh"},
+		"messages": messages,
+		"artifacts": []any{
+			map[string]any{"key": "memory-report", "type": "text", "value": strings.Repeat("artifact ", 2048)},
+		},
+		"actorKV": map[string]any{"plugin-state": map[string]any{"expanded": true, "selectedMessageId": lastAssistantID}},
+		"compactionRecords": []any{
+			map[string]any{"cutMessageId": fmt.Sprintf("M-%022d", messageCount/3), "createdAt": "2026-07-12T00:00:00Z", "summary": strings.Repeat("first summary ", 512)},
+			map[string]any{"cutMessageId": fmt.Sprintf("M-%022d", 2*messageCount/3), "createdAt": "2026-07-12T01:00:00Z", "summary": strings.Repeat("second summary ", 512)},
+		},
+		"relationships": []any{
+			map[string]any{"threadID": "T-019f4000-0000-4000-8000-000000000070", "type": "mention", "role": "parent", "messageId": fmt.Sprintf("M-%022d", messageCount/2)},
+			map[string]any{"threadID": "T-019f4000-0000-4000-8000-000000000071", "type": "handoff", "role": "child", "messageId": lastAssistantID},
+		},
+		"queuedMessages": []any{
+			map[string]any{"id": "Q-memory-1", "steer": true, "queuedMessage": map[string]any{"messageId": "M-queued-1", "role": "user", "content": []any{map[string]any{"type": "text", "text": "inspect retained revisions"}}, "agentMode": "deep", "reasoningEffort": "xhigh"}},
+			map[string]any{"id": "Q-memory-2", "steer": false, "queuedMessage": map[string]any{"messageId": "M-queued-2", "role": "user", "content": []any{map[string]any{"type": "text", "text": "measure serialization"}}, "agentMode": "review", "reasoningEffort": "high"}},
+		},
+		"pendingInference": map[string]any{"messageId": lastAssistantID, "agentMode": "deep", "reasoningEffort": "xhigh", "tools": []any{"shell_command", "apply_patch"}, "parentToolCallId": "TU-parent"},
+		"draft":            []any{map[string]any{"type": "text", "text": "continue memory remediation"}},
+		"autoSubmitDraft":  true,
+		"mainThreadID":     "T-019f4000-0000-4000-8000-000000000070",
+	}
+}
+
+func waitForNeoActorSyncIdleBenchmark(b *testing.B, actor *neoActor) {
+	b.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		actor.mu.Lock()
+		idle := !actor.syncRunning && !actor.localSyncRunning && !actor.syncPending && !actor.localSyncPending
+		actor.mu.Unlock()
+		if idle {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	b.Fatal("timed out waiting for benchmark sinks")
+}
+
+func BenchmarkNeoLargeThreadMemoryPressure(b *testing.B) {
+	const messageCount = 12_235
+	const payloadBytes = 5_200
+	threadID := "T-019f4000-0000-4000-8000-000000000069"
+	dir := b.TempDir()
+	path, err := writeNeoLocalThreadFileInDir(dir, threadID, neoMemoryPressureThreadFixture(threadID, messageCount, payloadBytes))
+	if err != nil {
+		b.Fatalf("write memory pressure fixture: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		b.Fatalf("stat memory pressure fixture: %v", err)
+	}
+	if info.Size() < 60<<20 || info.Size() > 74<<20 {
+		b.Fatalf("memory pressure fixture size = %.2f MiB, want 60-74 MiB", float64(info.Size())/(1<<20))
+	}
+	b.Logf("fixture bytes=%d messages=%d", info.Size(), messageCount)
+	firstCutMessageID := fmt.Sprintf("M-%022d", messageCount/3)
+	secondCutMessageID := fmt.Sprintf("M-%022d", 2*messageCount/3)
+	lastAssistantID := fmt.Sprintf("M-%022d", messageCount-1)
+	expectedPayload := strings.Repeat("memory-pressure-payload-", payloadBytes/24+1)[:payloadBytes]
+	expectedThinking := expectedPayload[:payloadBytes/3]
+	expectedText := expectedPayload[payloadBytes/3 : 2*payloadBytes/3]
+	expectedCommand := expectedPayload[2*payloadBytes/3:]
+	expectedArtifact := strings.Repeat("artifact ", 2048)
+	expectedFirstCompactionSummary := strings.Repeat("first summary ", 512)
+	expectedSecondCompactionSummary := strings.Repeat("second summary ", 512)
+	expectedSummary := strings.Repeat("compaction summary ", 1024)
+
+	loadActor := func(rt *neoRuntime) *neoActor {
+		thread, ok := loadNeoThreadFromDir(threadID, dir)
+		if !ok {
+			b.Fatal("load memory pressure fixture")
+		}
+		rawCompactionRecords := arrayValue(thread["compactionRecords"])
+		rawFixtureComplete := len(rawCompactionRecords) == 2 && stringValue(mapValue(rawCompactionRecords[0])["summary"]) == expectedFirstCompactionSummary && stringValue(mapValue(rawCompactionRecords[1])["summary"]) == expectedSecondCompactionSummary
+		actor := newNeoActor(rt, "actor-memory-pressure", "thread-actor", threadID, threadID, neoActorRecord("actor-memory-pressure", "thread-actor", threadID), nil)
+		if err := actor.importThreadLocalOnly(thread); err != nil {
+			b.Fatalf("import memory pressure fixture: %v", err)
+		}
+		actor.mu.Lock()
+		compactionControl := mapValue(actor.settings["compactionControl"])
+		threadStateComplete := len(actor.messages) == messageCount &&
+			len(actor.compactionRecords) == 2 && len(actor.relationships) == 2 && len(actor.queue) == 2 && actor.pendingInference != nil && len(actor.history) > 0 &&
+			stringValue(actor.settings["agentMode"]) == "deep" && stringValue(actor.settings["reasoning.effort"]) == "xhigh" && stringValue(actor.environment["workingDirectory"]) == "/workspace/CLIProxyAPI" &&
+			numberFrom(actor.settings["internal.compactionThresholdPercent"]) == 80 && boolValue(compactionControl["enabled"]) && numberFrom(compactionControl["contextTokenThreshold"]) == 120000 &&
+			stringValue(actor.environment["platform"]) == "darwin" && stringValue(actor.environment["shell"]) == "zsh" &&
+			textFromBlocks(actor.draft) == "continue memory remediation" && actor.autoSubmitDraft && actor.mainThreadID == "T-019f4000-0000-4000-8000-000000000070"
+		artifact := mapValue(actor.artifacts["memory-report"])
+		pluginState := mapValue(actor.kv["plugin-state"])
+		auxiliaryStateComplete := stringValue(artifact["type"]) == "text" && stringValue(artifact["value"]) == expectedArtifact && boolValue(pluginState["expanded"]) && stringValue(pluginState["selectedMessageId"]) == lastAssistantID
+		compactionStateComplete := len(actor.compactionRecords) == 2 && stringValue(actor.compactionRecords[0]["cutMessageId"]) == firstCutMessageID && stringValue(actor.compactionRecords[0]["createdAt"]) == "2026-07-12T00:00:00Z" && stringValue(actor.compactionRecords[1]["cutMessageId"]) == secondCutMessageID && stringValue(actor.compactionRecords[1]["createdAt"]) == "2026-07-12T01:00:00Z"
+		relationshipStateComplete := len(actor.relationships) == 2 && stringValue(actor.relationships[0]["threadID"]) == "T-019f4000-0000-4000-8000-000000000070" && stringValue(actor.relationships[0]["type"]) == "mention" && stringValue(actor.relationships[0]["role"]) == "parent" && stringValue(actor.relationships[1]["threadID"]) == "T-019f4000-0000-4000-8000-000000000071" && stringValue(actor.relationships[1]["type"]) == "handoff" && stringValue(actor.relationships[1]["role"]) == "child"
+		queueStateComplete := len(actor.queue) == 2 && actor.queue[0].ID == "Q-memory-1" && actor.queue[0].MessageID == "M-queued-1" && actor.queue[0].Steer && textFromBlocks(actor.queue[0].Content) == "inspect retained revisions" && actor.queue[0].AgentMode == "deep" && actor.queue[0].ReasoningEffort == "xhigh" && actor.queue[1].ID == "Q-memory-2" && actor.queue[1].MessageID == "M-queued-2" && !actor.queue[1].Steer && textFromBlocks(actor.queue[1].Content) == "measure serialization" && actor.queue[1].AgentMode == "review" && actor.queue[1].ReasoningEffort == "high"
+		pendingStateComplete := actor.pendingInference != nil && actor.pendingInference.messageID == lastAssistantID && actor.pendingInference.agentMode == "deep" && actor.pendingInference.reasoningEffort == "xhigh" && actor.pendingInference.parentToolCallID == "TU-parent" && slices.Equal(actor.pendingInference.tools, []string{"shell_command", "apply_patch"})
+		historyStateComplete := len(actor.history) == 4 && actor.history[0].Role == "user" && actor.history[0].Text == strings.TrimSpace(expectedSummary) && actor.history[2].Role == "assistant" && actor.history[2].Text == expectedText && len(actor.history[2].ThinkingBlocks) == 1 && actor.history[2].ThinkingBlocks[0].Thinking == expectedThinking && len(actor.history[2].ToolCalls) == 1 && actor.history[2].ToolCalls[0].Name == "shell_command" && stringValue(actor.history[2].ToolCalls[0].Input["command"]) == expectedCommand && actor.history[3].Role == "tool" && actor.history[3].ToolCallID == actor.history[2].ToolCalls[0].ID
+		userStateComplete := false
+		messageShapeComplete := false
+		assistantStateComplete := false
+		toolResultStateComplete := false
+		infoStateComplete := false
+		summaryStateComplete := false
+		if len(actor.messages) == messageCount {
+			user := actor.messages[0]
+			assistant := actor.messages[1]
+			toolResultMessage := actor.messages[2]
+			infoMessage := actor.messages[3]
+			summaryMessage := actor.messages[messageCount-4]
+			messageShapeComplete = len(user.Content) >= 1 && len(assistant.Content) >= 3 && len(toolResultMessage.Content) >= 1 && len(infoMessage.Content) >= 1 && len(summaryMessage.Content) >= 2
+			if messageShapeComplete {
+				userBlock := mapValue(user.Content[0])
+				selection := mapValue(mapValue(user.UserState)["selection"])
+				fileMention := mapValue(user.FileMentions["neo_runtime.go"])
+				thinkingBlock := mapValue(assistant.Content[0])
+				textBlock := mapValue(assistant.Content[1])
+				toolUseBlock := mapValue(assistant.Content[2])
+				toolResultBlock := mapValue(toolResultMessage.Content[0])
+				manualBashBlock := mapValue(infoMessage.Content[0])
+				summaryBlock := mapValue(summaryMessage.Content[1])
+				userStateComplete = user.Role == "user" && user.AgentMode == "deep" && user.ReasoningEffort == "xhigh" && stringValue(userBlock["type"]) == "text" && stringValue(userBlock["text"]) == expectedPayload && stringValue(selection["path"]) == "internal/api/modules/amp/neo_runtime.go" && numberFrom(selection["line"]) == 1 && stringValue(fileMention["path"]) == "internal/api/modules/amp/neo_runtime.go"
+				assistantStateComplete = assistant.Role == "assistant" && stringValue(thinkingBlock["type"]) == "thinking" && stringValue(thinkingBlock["thinking"]) == expectedThinking && stringValue(thinkingBlock["blockState"]) == "complete" && stringValue(textBlock["type"]) == "text" && stringValue(textBlock["text"]) == expectedText &&
+					stringValue(toolUseBlock["type"]) == "tool_use" && stringValue(toolUseBlock["id"]) == "TU-0000000000000000000001" && stringValue(toolUseBlock["name"]) == "shell_command" && stringValue(mapValue(toolUseBlock["input"])["command"]) == expectedCommand
+				toolResultStateComplete = toolResultMessage.Role == "user" && toolResultMessage.ParentToolUseID == "TU-0000000000000000000001" && stringValue(toolResultBlock["type"]) == "tool_result" && stringValue(toolResultBlock["toolUseID"]) == "TU-0000000000000000000001" && stringValue(toolResultBlock["content"]) == expectedPayload && stringValue(mapValue(toolResultBlock["run"])["status"]) == "done" && stringValue(mapValue(toolResultBlock["run"])["result"]) == "command completed"
+				infoStateComplete = infoMessage.Role == "info" && stringValue(manualBashBlock["type"]) == "manual_bash_invocation" && stringValue(mapValue(manualBashBlock["args"])["cmd"]) == "git status --short" && stringValue(mapValue(manualBashBlock["toolRun"])["status"]) == "done" && stringValue(mapValue(manualBashBlock["toolRun"])["result"]) == expectedPayload
+				summaryStateComplete = summaryMessage.Role == "info" && stringValue(summaryBlock["type"]) == "summary" && stringValue(mapValue(summaryBlock["summary"])["type"]) == "message" && stringValue(mapValue(summaryBlock["summary"])["summary"]) == expectedSummary
+			}
+		}
+		actor.mu.Unlock()
+		if !rawFixtureComplete || !threadStateComplete || !auxiliaryStateComplete || !compactionStateComplete || !relationshipStateComplete || !queueStateComplete || !pendingStateComplete || !historyStateComplete || !userStateComplete || !messageShapeComplete || !assistantStateComplete || !toolResultStateComplete || !infoStateComplete || !summaryStateComplete {
+			b.Fatalf("memory pressure fixture state: raw=%t thread=%t auxiliary=%t compaction=%t relationships=%t queue=%t pending=%t history=%t user=%t shape=%t assistant=%t tool-result=%t info=%t summary=%t", rawFixtureComplete, threadStateComplete, auxiliaryStateComplete, compactionStateComplete, relationshipStateComplete, queueStateComplete, pendingStateComplete, historyStateComplete, userStateComplete, messageShapeComplete, assistantStateComplete, toolResultStateComplete, infoStateComplete, summaryStateComplete)
+		}
+		return actor
+	}
+
+	b.Run("cold_import", func(b *testing.B) {
+		b.SetBytes(info.Size())
+		b.ReportAllocs()
+		for b.Loop() {
+			actor := loadActor(nil)
+			runtime.KeepAlive(actor)
+		}
+	})
+	b.Run("replacement_import", func(b *testing.B) {
+		actor := loadActor(nil)
+		b.SetBytes(info.Size())
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			thread, ok := loadNeoThreadFromDir(threadID, dir)
+			if !ok {
+				b.Fatal("load replacement fixture")
+			}
+			if err := actor.importThreadLocalOnly(thread); err != nil {
+				b.Fatalf("replacement import: %v", err)
+			}
+			runtime.KeepAlive(actor)
+		}
+	})
+	b.Run("local_snapshot", func(b *testing.B) {
+		actor := loadActor(nil)
+		outputDir := b.TempDir()
+		b.SetBytes(info.Size())
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			snapshot, ok := actor.threadSnapshot()
+			if !ok {
+				b.Fatal("local snapshot unavailable")
+			}
+			if _, _, err := writeNeoLocalThreadSnapshotFile(snapshot, outputDir); err != nil {
+				b.Fatalf("write local snapshot: %v", err)
+			}
+		}
+	})
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reader := io.Reader(r.Body)
+		if r.Header.Get("Content-Encoding") == "gzip" {
+			gz, err := gzip.NewReader(r.Body)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			defer gz.Close()
+			reader = gz
+		}
+		_, _ = io.Copy(io.Discard, reader)
+		writeNeoJSON(w, http.StatusOK, map[string]any{"ok": true})
+	}))
+	b.Cleanup(upstream.Close)
+	b.Run("cloud_upload", func(b *testing.B) {
+		actor := loadActor(nil)
+		b.SetBytes(info.Size())
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			snapshot, ok := actor.threadSnapshotWithOptions(neoThreadSnapshotOptions{skipLocalMessageJSON: true})
+			if !ok {
+				b.Fatal("cloud snapshot unavailable")
+			}
+			snapshot.upstreamURL = upstream.URL
+			snapshot.apiKey = "benchmark"
+			if _, err := uploadNeoCloudThread(snapshot); err != nil {
+				b.Fatalf("upload cloud snapshot: %v", err)
+			}
+		}
+	})
+	b.Run("simultaneous_local_cloud_sync", func(b *testing.B) {
+		enabled := true
+		rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+			UpstreamURL:    upstream.URL,
+			UpstreamAPIKey: "benchmark",
+			NeoLocalRuntime: config.AmpNeoLocalRuntime{
+				Enabled: &enabled,
+			},
+		}})
+		rt.threadDir = b.TempDir()
+		rt.asyncLocalSnapshots = true
+		rt.localSnapshotMinInterval = 0
+		actor := loadActor(rt)
+		b.SetBytes(info.Size())
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			actor.syncCloudAsync()
+			waitForNeoActorSyncIdleBenchmark(b, actor)
+		}
+		measured := actor.measurementSnapshot()
+		b.ReportMetric(float64(measured.LocalSerializedBytes), "local-serialized-bytes")
+		b.ReportMetric(float64(measured.CloudSerializedBytes), "cloud-serialized-bytes")
+		b.ReportMetric(float64(measured.LocalPersistenceDuration.Nanoseconds()), "local-persist-ns")
+		b.ReportMetric(float64(measured.CloudUploadDuration.Nanoseconds()), "cloud-upload-ns")
+	})
+	b.Run("blocked_sinks_20_mutations", func(b *testing.B) {
+		enabled := true
+		rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+			UpstreamURL:    upstream.URL,
+			UpstreamAPIKey: "benchmark",
+			NeoLocalRuntime: config.AmpNeoLocalRuntime{
+				Enabled: &enabled,
+			},
+		}})
+		rt.threadDir = b.TempDir()
+		rt.asyncLocalSnapshots = true
+		rt.localSnapshotMinInterval = 0
+		actor := loadActor(rt)
+		b.SetBytes(info.Size())
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			localStarted := make(chan struct{})
+			cloudStarted := make(chan struct{})
+			release := make(chan struct{})
+			var localCalls atomic.Int32
+			var cloudCalls atomic.Int32
+			rt.writeLocalSnapshot = func(snapshot neoCloudThreadSnapshot, outputDir string) (int64, error) {
+				if localCalls.Add(1) == 1 {
+					close(localStarted)
+					<-release
+				}
+				serializedBytes, _, err := writeNeoLocalThreadSnapshotToDirMeasured(snapshot, outputDir)
+				return serializedBytes, err
+			}
+			rt.uploadCloudSnapshot = func(snapshot neoCloudThreadSnapshot) (int64, error) {
+				if cloudCalls.Add(1) == 1 {
+					close(cloudStarted)
+					<-release
+				}
+				return int64(len(snapshot.messages)), nil
+			}
+			actor.syncCloudAsync()
+			<-localStarted
+			<-cloudStarted
+			for index := 0; index < 20; index++ {
+				actor.mu.Lock()
+				actor.title = fmt.Sprintf("blocked-mutation-%d", index)
+				actor.mu.Unlock()
+				actor.syncCloudAsync()
+			}
+			close(release)
+			waitForNeoActorSyncIdleBenchmark(b, actor)
+			measured := actor.measurementSnapshot()
+			b.ReportMetric(float64(measured.PeakRetainedRevisions), "peak-retained-revisions")
+			b.ReportMetric(float64(measured.PeakRetainedGraphs), "peak-retained-graphs")
+		}
+	})
+	b.Run("known_replay_reconnect", func(b *testing.B) {
+		actor := loadActor(nil)
+		actor.mu.Lock()
+		actor.replayContinuityKnown = true
+		base := actor.lastSeqLocked() - 1
+		actor.replayEvents = []neoReplayEvent{{Seq: base + 1, Payload: map[string]any{"type": "resume_probe", "seq": base + 1}}}
+		actor.mu.Unlock()
+		var frames atomic.Int64
+		var wireBytes atomic.Int64
+		socket := &neoSocket{localExtensions: true, writeMessage: func(_ int, payload []byte) error {
+			frames.Add(1)
+			wireBytes.Add(int64(len(payload)))
+			return nil
+		}}
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			if !actor.sendSnapshot(socket, base) {
+				b.Fatal("known replay snapshot was not sent")
+			}
+		}
+		if actor.measurementSnapshot().ReplayFallbackSnapshots != 0 {
+			b.Fatal("known replay was counted as fallback")
+		}
+		b.ReportMetric(float64(frames.Load())/float64(b.N), "frames/op")
+		b.ReportMetric(float64(wireBytes.Load())/float64(b.N), "wire-bytes/op")
+	})
+	b.Run("imported_unprovable_replay_reconnect", func(b *testing.B) {
+		actor := loadActor(nil)
+		actor.mu.Lock()
+		base := actor.lastSeqLocked() - 1
+		actor.mu.Unlock()
+		var frames atomic.Int64
+		var wireBytes atomic.Int64
+		socket := &neoSocket{localExtensions: true, writeMessage: func(_ int, payload []byte) error {
+			frames.Add(1)
+			wireBytes.Add(int64(len(payload)))
+			return nil
+		}}
+		b.SetBytes(info.Size())
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			if !actor.sendSnapshot(socket, base) {
+				b.Fatal("fallback replay snapshot was not sent")
+			}
+		}
+		if got := actor.measurementSnapshot().ReplayFallbackSnapshots; got != uint64(b.N) {
+			b.Fatalf("fallback snapshots = %d, want %d", got, b.N)
+		}
+		b.ReportMetric(float64(frames.Load())/float64(b.N), "frames/op")
+		b.ReportMetric(float64(wireBytes.Load())/float64(b.N), "wire-bytes/op")
+	})
+}
+
 func BenchmarkNeoRuntimeColdLocalThreadImport(b *testing.B) {
 	enabled := true
 	threadID := "T-019f4000-0000-4000-8000-000000000066"
@@ -6557,12 +7197,12 @@ func TestNeoActorFinalLocalSnapshotWaitsForAsyncWriter(t *testing.T) {
 	firstStarted := make(chan struct{})
 	releaseFirst := make(chan struct{})
 	var writes atomic.Int32
-	rt.writeLocalSnapshot = func(neoCloudThreadSnapshot, string) error {
+	rt.writeLocalSnapshot = func(neoCloudThreadSnapshot, string) (int64, error) {
 		if writes.Add(1) == 1 {
 			close(firstStarted)
 			<-releaseFirst
 		}
-		return nil
+		return 0, nil
 	}
 
 	actor.syncCloudAsync()
@@ -6635,12 +7275,12 @@ func TestNeoRuntimeStopWaitsForAsyncLocalSnapshot(t *testing.T) {
 	firstStarted := make(chan struct{})
 	releaseFirst := make(chan struct{})
 	var writes atomic.Int32
-	rt.writeLocalSnapshot = func(neoCloudThreadSnapshot, string) error {
+	rt.writeLocalSnapshot = func(neoCloudThreadSnapshot, string) (int64, error) {
 		if writes.Add(1) == 1 {
 			close(firstStarted)
 			<-releaseFirst
 		}
-		return nil
+		return 0, nil
 	}
 
 	actor.syncCloudAsync()
@@ -29972,6 +30612,7 @@ func TestUploadNeoCloudThreadUsesAmpInternalClientHeaders(t *testing.T) {
 
 	threadID := "T-019e65c0-0310-77a8-b233-4b84d9c0612b"
 	var sawRequest bool
+	var receivedBytes atomic.Int64
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		sawRequest = true
 		if r.URL.Path != "/api/internal" || r.URL.RawQuery != "uploadThread" {
@@ -29995,8 +30636,13 @@ func TestUploadNeoCloudThreadUsesAmpInternalClientHeaders(t *testing.T) {
 		if got, want := r.Header.Get("X-Amp-Device-Fingerprint"), neoAmpDeviceFingerprint(); got != want {
 			t.Fatalf("X-Amp-Device-Fingerprint = %q, want %q", got, want)
 		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read payload: %v", err)
+		}
+		receivedBytes.Store(int64(len(body)))
 		var payload map[string]any
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		if err := json.Unmarshal(body, &payload); err != nil {
 			t.Fatalf("decode payload: %v", err)
 		}
 		if payload["method"] != "uploadThread" {
@@ -30014,7 +30660,7 @@ func TestUploadNeoCloudThreadUsesAmpInternalClientHeaders(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	err := uploadNeoCloudThread(neoCloudThreadSnapshot{
+	serializedBytes, err := uploadNeoCloudThread(neoCloudThreadSnapshot{
 		upstreamURL: upstream.URL,
 		apiKey:      "secret",
 		threadID:    threadID,
@@ -30030,6 +30676,9 @@ func TestUploadNeoCloudThreadUsesAmpInternalClientHeaders(t *testing.T) {
 	}
 	if !sawRequest {
 		t.Fatal("upstream did not receive uploadThread request")
+	}
+	if serializedBytes != receivedBytes.Load() {
+		t.Fatalf("serialized bytes = %d, received bytes = %d", serializedBytes, receivedBytes.Load())
 	}
 }
 
@@ -30416,7 +31065,7 @@ func TestNeoRuntimeProjectIndexUpdateSkipsUnchangedProject(t *testing.T) {
 			"projectName": "local-project",
 		},
 	}
-	if err := rt.writeThreadSnapshot(snapshot, threadDir); err != nil {
+	if _, err := rt.writeThreadSnapshot(snapshot, threadDir); err != nil {
 		t.Fatalf("initial project index update: %v", err)
 	}
 	path := neoWebLocalProjectIndexPath(threadDir)
@@ -30424,7 +31073,7 @@ func TestNeoRuntimeProjectIndexUpdateSkipsUnchangedProject(t *testing.T) {
 	if err := os.Chtimes(path, sentinel, sentinel); err != nil {
 		t.Fatalf("set project index timestamp: %v", err)
 	}
-	if err := rt.writeThreadSnapshot(snapshot, threadDir); err != nil {
+	if _, err := rt.writeThreadSnapshot(snapshot, threadDir); err != nil {
 		t.Fatalf("unchanged project index update: %v", err)
 	}
 	info, err := os.Stat(path)

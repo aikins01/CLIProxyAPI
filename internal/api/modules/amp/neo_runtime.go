@@ -190,7 +190,8 @@ type neoRuntime struct {
 	projectIndexStamp        neoWebLocalFileStamp
 	projectHistoryStamp      neoWebLocalFileStamp
 	localThreadImportGroup   singleflight.Group
-	writeLocalSnapshot       func(neoCloudThreadSnapshot, string) error
+	writeLocalSnapshot       func(neoCloudThreadSnapshot, string) (int64, error)
+	uploadCloudSnapshot      func(neoCloudThreadSnapshot) (int64, error)
 	asyncLocalSnapshots      bool
 	localSnapshotMinInterval time.Duration
 	// inferStream overrides the provider inference call used by the local agent
@@ -2507,6 +2508,7 @@ type neoActor struct {
 	localSnapshotEpoch          uint64
 	localSnapshotMessageCache   map[string]neoLocalSnapshotMessageCache
 	localSnapshotMessageGen     uint64
+	measurements                neoActorMeasurements
 	title                       string
 	titleSource                 string
 	titleGenerationStarted      bool
@@ -2581,6 +2583,166 @@ func cloneNeoInferenceInflight(inflight *neoInferenceInflight) *neoInferenceInfl
 type neoReplayEvent struct {
 	Seq     int
 	Payload map[string]any
+}
+
+type neoActorMeasurements struct {
+	revision                 uint64
+	localRequestedRevision   uint64
+	localStartedRevision     uint64
+	localCompletedRevision   uint64
+	localActiveRevisions     map[uint64]int
+	localCoalesced           uint64
+	localSerializedBytes     int64
+	localPersistenceDuration time.Duration
+	cloudRequestedRevision   uint64
+	cloudStartedRevision     uint64
+	cloudCompletedRevision   uint64
+	cloudActiveRevision      uint64
+	cloudCoalesced           uint64
+	cloudSerializedBytes     int64
+	cloudUploadDuration      time.Duration
+	replayFallbackSnapshots  uint64
+	peakRetainedRevisions    int
+	peakRetainedGraphs       int
+}
+
+type neoActorMeasurementSnapshot struct {
+	Revision                 uint64
+	LocalRequestedRevision   uint64
+	LocalStartedRevision     uint64
+	LocalCompletedRevision   uint64
+	LocalCoalesced           uint64
+	LocalSerializedBytes     int64
+	LocalPersistenceDuration time.Duration
+	CloudRequestedRevision   uint64
+	CloudStartedRevision     uint64
+	CloudCompletedRevision   uint64
+	CloudCoalesced           uint64
+	CloudSerializedBytes     int64
+	CloudUploadDuration      time.Duration
+	ReplayFallbackSnapshots  uint64
+	RetainedRevisions        int
+	PeakRetainedRevisions    int
+	RetainedGraphs           int
+	PeakRetainedGraphs       int
+}
+
+func (a *neoActor) measurementSnapshot() neoActorMeasurementSnapshot {
+	if a == nil {
+		return neoActorMeasurementSnapshot{}
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	m := a.measurements
+	return neoActorMeasurementSnapshot{
+		Revision:                 m.revision,
+		LocalRequestedRevision:   m.localRequestedRevision,
+		LocalStartedRevision:     m.localStartedRevision,
+		LocalCompletedRevision:   m.localCompletedRevision,
+		LocalCoalesced:           m.localCoalesced,
+		LocalSerializedBytes:     m.localSerializedBytes,
+		LocalPersistenceDuration: m.localPersistenceDuration,
+		CloudRequestedRevision:   m.cloudRequestedRevision,
+		CloudStartedRevision:     m.cloudStartedRevision,
+		CloudCompletedRevision:   m.cloudCompletedRevision,
+		CloudCoalesced:           m.cloudCoalesced,
+		CloudSerializedBytes:     m.cloudSerializedBytes,
+		CloudUploadDuration:      m.cloudUploadDuration,
+		ReplayFallbackSnapshots:  m.replayFallbackSnapshots,
+		RetainedRevisions:        a.retainedRevisionCountLocked(),
+		PeakRetainedRevisions:    m.peakRetainedRevisions,
+		RetainedGraphs:           a.retainedGraphCountLocked(),
+		PeakRetainedGraphs:       m.peakRetainedGraphs,
+	}
+}
+
+func (a *neoActor) retainedRevisionCountLocked() int {
+	currentRevision := a.measurements.revision
+	count := 0
+	if currentRevision != 0 {
+		count = 1
+	}
+	for revision := range a.measurements.localActiveRevisions {
+		if revision != 0 && revision != currentRevision {
+			count++
+		}
+	}
+	cloudRevision := a.measurements.cloudActiveRevision
+	if cloudRevision != 0 && cloudRevision != currentRevision && a.measurements.localActiveRevisions[cloudRevision] == 0 {
+		count++
+	}
+	return count
+}
+
+func (a *neoActor) retainedGraphCountLocked() int {
+	count := 1
+	for _, holders := range a.measurements.localActiveRevisions {
+		count += holders
+	}
+	if a.measurements.cloudActiveRevision != 0 {
+		count++
+	}
+	return count
+}
+
+func (a *neoActor) updatePeakRetainedRevisionsLocked() {
+	retained := a.retainedRevisionCountLocked()
+	if retained > a.measurements.peakRetainedRevisions {
+		a.measurements.peakRetainedRevisions = retained
+	}
+	graphs := a.retainedGraphCountLocked()
+	if graphs > a.measurements.peakRetainedGraphs {
+		a.measurements.peakRetainedGraphs = graphs
+	}
+}
+
+func (a *neoActor) beginLocalSnapshot(revision uint64) {
+	a.mu.Lock()
+	if revision >= a.measurements.localStartedRevision {
+		a.measurements.localStartedRevision = revision
+	}
+	if a.measurements.localActiveRevisions == nil {
+		a.measurements.localActiveRevisions = make(map[uint64]int)
+	}
+	a.measurements.localActiveRevisions[revision]++
+	a.updatePeakRetainedRevisionsLocked()
+	a.mu.Unlock()
+}
+
+func (a *neoActor) completeLocalSnapshot(revision uint64, serializedBytes int64, duration time.Duration, succeeded bool) {
+	a.mu.Lock()
+	if succeeded && revision >= a.measurements.localCompletedRevision {
+		a.measurements.localCompletedRevision = revision
+		a.measurements.localSerializedBytes = serializedBytes
+		a.measurements.localPersistenceDuration = duration
+	}
+	if holders := a.measurements.localActiveRevisions[revision]; holders <= 1 {
+		delete(a.measurements.localActiveRevisions, revision)
+	} else {
+		a.measurements.localActiveRevisions[revision] = holders - 1
+	}
+	a.mu.Unlock()
+}
+
+func (a *neoActor) beginCloudSnapshot(revision uint64) {
+	a.mu.Lock()
+	a.measurements.cloudStartedRevision = revision
+	a.measurements.cloudActiveRevision = revision
+	a.updatePeakRetainedRevisionsLocked()
+	a.mu.Unlock()
+}
+
+func (a *neoActor) completeCloudSnapshot(revision uint64, serializedBytes int64, duration time.Duration, succeeded bool) {
+	a.mu.Lock()
+	if succeeded && revision >= a.measurements.cloudCompletedRevision {
+		a.measurements.cloudCompletedRevision = revision
+		a.measurements.cloudSerializedBytes = serializedBytes
+		a.measurements.cloudUploadDuration = duration
+	}
+	if a.measurements.cloudActiveRevision == revision {
+		a.measurements.cloudActiveRevision = 0
+	}
+	a.mu.Unlock()
 }
 
 type neoSnapshotReplayFrame struct {
@@ -2667,6 +2829,7 @@ func newNeoActor(rt *neoRuntime, id, name, key, threadID string, record map[stri
 		localSnapshotWake:      make(chan struct{}, 1),
 		lastUsed:               time.Now(),
 		replayContinuityKnown:  true,
+		measurements:           neoActorMeasurements{revision: 1, peakRetainedRevisions: 1, peakRetainedGraphs: 1},
 		seq:                    1,
 		agentState:             "idle",
 		currentAgentMode:       agentMode,
@@ -11040,6 +11203,7 @@ type neoCloudThreadSnapshot struct {
 	upstreamURL       string
 	apiKey            string
 	clientVersion     string
+	revision          uint64
 	threadID          string
 	seq               int
 	createdMs         int64
@@ -11085,14 +11249,34 @@ func (a *neoActor) syncCloudAsync() {
 	if a == nil {
 		return
 	}
-	a.syncLocalThreadSnapshotAsync()
-	if !a.cloudThreadSyncEnabled() {
+	localEnabled := a.localThreadSnapshotsEnabled()
+	cloudEnabled := a.cloudThreadSyncEnabled()
+	if !localEnabled && !cloudEnabled {
+		return
+	}
+
+	a.mu.Lock()
+	a.measurements.revision++
+	revision := a.measurements.revision
+	if localEnabled {
+		a.measurements.localRequestedRevision = revision
+	}
+	if cloudEnabled {
+		a.measurements.cloudRequestedRevision = revision
+	}
+	a.updatePeakRetainedRevisionsLocked()
+	a.mu.Unlock()
+	if localEnabled {
+		a.syncLocalThreadSnapshotAsync()
+	}
+	if !cloudEnabled {
 		return
 	}
 
 	a.mu.Lock()
 	if a.syncRunning {
 		a.syncPending = true
+		a.measurements.cloudCoalesced++
 		a.mu.Unlock()
 		return
 	}
@@ -11117,7 +11301,7 @@ func (a *neoActor) syncLocalThreadSnapshotAsync() {
 		defer a.syncWG.Done()
 		if snapshot, ok := a.threadSnapshot(); ok {
 			if a.localSnapshotWriterAllowed(epoch) {
-				if err := a.runtime.writeThreadSnapshot(snapshot, a.threadStoreDir()); err != nil {
+				if err := a.writeMeasuredLocalSnapshot(snapshot); err != nil {
 					log.Warnf("amp neo local runtime thread store sync failed thread=%s: %v", snapshot.threadID, err)
 				}
 			}
@@ -11131,6 +11315,7 @@ func (a *neoActor) syncLocalThreadSnapshotAsync() {
 	}
 	if a.localSyncRunning {
 		a.localSyncPending = true
+		a.measurements.localCoalesced++
 		a.mu.Unlock()
 		return
 	}
@@ -11146,7 +11331,7 @@ func (a *neoActor) syncLocalThreadSnapshotLoop(epoch uint64) {
 	for {
 		snapshot, ok := a.threadSnapshot()
 		if ok && a.localSnapshotWriterAllowed(epoch) {
-			if err := a.runtime.writeThreadSnapshot(snapshot, a.threadStoreDir()); err != nil {
+			if err := a.writeMeasuredLocalSnapshot(snapshot); err != nil {
 				log.Warnf("amp neo local runtime thread store sync failed thread=%s: %v", snapshot.threadID, err)
 			}
 		}
@@ -11212,7 +11397,15 @@ func (a *neoActor) syncCloudLoop() {
 		})
 		if ok {
 			if cloudSnapshot, ok := a.cloudThreadSnapshot(snapshot); ok {
-				if err := uploadNeoCloudThread(cloudSnapshot); err != nil {
+				a.beginCloudSnapshot(cloudSnapshot.revision)
+				started := time.Now()
+				upload := uploadNeoCloudThread
+				if a.runtime != nil && a.runtime.uploadCloudSnapshot != nil {
+					upload = a.runtime.uploadCloudSnapshot
+				}
+				serializedBytes, err := upload(cloudSnapshot)
+				a.completeCloudSnapshot(cloudSnapshot.revision, serializedBytes, time.Since(started), err == nil)
+				if err != nil {
 					log.Warnf("amp neo local runtime cloud sync failed thread=%s: %v", snapshot.threadID, err)
 				}
 			}
@@ -11243,11 +11436,19 @@ func (a *neoActor) syncLocalThreadSnapshotForShutdownNow() bool {
 	if snapshot.pendingInference == nil && snapshot.currentInference != nil {
 		snapshot.pendingInference = cloneNeoInferenceInflight(snapshot.currentInference)
 	}
-	if err := a.runtime.writeThreadSnapshot(snapshot, a.threadStoreDir()); err != nil {
+	if err := a.writeMeasuredLocalSnapshot(snapshot); err != nil {
 		log.Warnf("amp neo local runtime thread store sync failed thread=%s: %v", snapshot.threadID, err)
 		return false
 	}
 	return true
+}
+
+func (a *neoActor) writeMeasuredLocalSnapshot(snapshot neoCloudThreadSnapshot) error {
+	a.beginLocalSnapshot(snapshot.revision)
+	started := time.Now()
+	serializedBytes, err := a.runtime.writeThreadSnapshot(snapshot, a.threadStoreDir())
+	a.completeLocalSnapshot(snapshot.revision, serializedBytes, time.Since(started), err == nil)
+	return err
 }
 
 func (a *neoActor) closeLocalSnapshotSyncs() {
@@ -11338,6 +11539,7 @@ func (a *neoActor) threadSnapshotWithOptions(options neoThreadSnapshotOptions) (
 		}
 	}
 	return neoCloudThreadSnapshot{
+		revision:          a.measurements.revision,
 		threadID:          a.threadID,
 		seq:               a.lastSeqLocked(),
 		createdMs:         neoCloudCreatedMillis(a.record),
@@ -11441,7 +11643,7 @@ func (a *neoActor) cloudThreadSnapshot(snapshot neoCloudThreadSnapshot) (neoClou
 	return snapshot, true
 }
 
-func uploadNeoCloudThread(snapshot neoCloudThreadSnapshot) error {
+func uploadNeoCloudThread(snapshot neoCloudThreadSnapshot) (int64, error) {
 	thread := neoCloudThread(snapshot)
 	payload := map[string]any{
 		"method": "uploadThread",
@@ -11452,18 +11654,19 @@ func uploadNeoCloudThread(snapshot neoCloudThreadSnapshot) error {
 	}
 	raw, err := json.Marshal(payload)
 	if err != nil {
-		return err
+		return 0, err
 	}
+	serializedBytes := int64(len(raw))
 
 	var body bytes.Buffer
 	if len(raw) >= neoCloudGzipBytes {
 		gz := gzip.NewWriter(&body)
 		if _, err := gz.Write(raw); err != nil {
 			_ = gz.Close()
-			return err
+			return serializedBytes, err
 		}
 		if err := gz.Close(); err != nil {
-			return err
+			return serializedBytes, err
 		}
 	} else {
 		body.Write(raw)
@@ -11471,14 +11674,14 @@ func uploadNeoCloudThread(snapshot neoCloudThreadSnapshot) error {
 
 	base, err := url.Parse(snapshot.upstreamURL)
 	if err != nil {
-		return err
+		return serializedBytes, err
 	}
 	base.Path = strings.TrimRight(base.Path, "/") + "/api/internal"
 	base.RawQuery = url.QueryEscape("uploadThread")
 
 	req, err := http.NewRequest(http.MethodPost, base.String(), bytes.NewReader(body.Bytes()))
 	if err != nil {
-		return err
+		return serializedBytes, err
 	}
 	req.Header.Set("Authorization", "Bearer "+snapshot.apiKey)
 	req.Header.Set("Content-Type", "application/json")
@@ -11490,20 +11693,20 @@ func uploadNeoCloudThread(snapshot neoCloudThreadSnapshot) error {
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		return serializedBytes, err
 	}
 	defer resp.Body.Close()
 
 	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, clipNeoErrorBody(respBody))
+		return serializedBytes, fmt.Errorf("HTTP %d: %s", resp.StatusCode, clipNeoErrorBody(respBody))
 	}
 	var decoded map[string]any
 	if err := json.Unmarshal(respBody, &decoded); err == nil && decoded["ok"] == false {
-		return fmt.Errorf("uploadThread failed: %s", clipNeoErrorBody(respBody))
+		return serializedBytes, fmt.Errorf("uploadThread failed: %s", clipNeoErrorBody(respBody))
 	}
 	log.Debugf("amp neo local runtime cloud sync complete thread=%s", snapshot.threadID)
-	return nil
+	return serializedBytes, nil
 }
 
 func setAmpInternalClientHeaders(req *http.Request, clientVersionOverride ...string) {
@@ -12390,17 +12593,27 @@ func neoAmpThreadStoreDir() string {
 }
 
 func writeNeoLocalThreadSnapshotToDir(snapshot neoCloudThreadSnapshot, dir string) error {
-	_, path, err := writeNeoLocalThreadSnapshotFile(snapshot, dir)
+	_, _, err := writeNeoLocalThreadSnapshotToDirMeasured(snapshot, dir)
+	return err
+}
+
+func writeNeoLocalThreadSnapshotToDirMeasured(snapshot neoCloudThreadSnapshot, dir string) (int64, string, error) {
+	_, path, serializedBytes, err := writeNeoLocalThreadSnapshotFileMeasured(snapshot, dir)
 	if err != nil {
-		return err
+		return 0, "", err
 	}
 	log.Debugf("amp neo local runtime thread store sync complete thread=%s path=%s", snapshot.threadID, path)
-	return nil
+	return serializedBytes, path, nil
 }
 
 func writeNeoLocalThreadSnapshotFile(snapshot neoCloudThreadSnapshot, dir string) (map[string]any, string, error) {
+	persistedThread, path, _, err := writeNeoLocalThreadSnapshotFileMeasured(snapshot, dir)
+	return persistedThread, path, err
+}
+
+func writeNeoLocalThreadSnapshotFileMeasured(snapshot neoCloudThreadSnapshot, dir string) (map[string]any, string, int64, error) {
 	if !neoThreadIDExactPattern.MatchString(snapshot.threadID) {
-		return nil, "", fmt.Errorf("invalid thread id %q", snapshot.threadID)
+		return nil, "", 0, fmt.Errorf("invalid thread id %q", snapshot.threadID)
 	}
 	messageValues, cached := neoLocalSnapshotMessageValues(snapshot)
 	var persistedThread map[string]any
@@ -12418,11 +12631,11 @@ func writeNeoLocalThreadSnapshotFile(snapshot neoCloudThreadSnapshot, dir string
 	if snapshot.pendingInference != nil {
 		persistedThread["pendingInference"] = neoInferenceInflightThreadMap(snapshot.pendingInference)
 	}
-	path, err := writeNeoLocalThreadFileInDir(dir, snapshot.threadID, persistedThread)
+	path, serializedBytes, err := writeNeoLocalThreadFileInDirMeasured(dir, snapshot.threadID, persistedThread)
 	if err != nil {
-		return nil, "", err
+		return nil, "", 0, err
 	}
-	return persistedThread, path, nil
+	return persistedThread, path, serializedBytes, nil
 }
 
 func neoLocalSnapshotMessageValues(snapshot neoCloudThreadSnapshot) ([]any, bool) {
@@ -12439,19 +12652,19 @@ func neoLocalSnapshotMessageValues(snapshot neoCloudThreadSnapshot) ([]any, bool
 	return messages, true
 }
 
-func (rt *neoRuntime) writeThreadSnapshot(snapshot neoCloudThreadSnapshot, dir string) error {
+func (rt *neoRuntime) writeThreadSnapshot(snapshot neoCloudThreadSnapshot, dir string) (int64, error) {
 	if rt != nil && rt.writeLocalSnapshot != nil {
 		return rt.writeLocalSnapshot(snapshot, dir)
 	}
-	persistedThread, path, err := writeNeoLocalThreadSnapshotFile(snapshot, dir)
+	persistedThread, path, serializedBytes, err := writeNeoLocalThreadSnapshotFileMeasured(snapshot, dir)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if err := rt.updateNeoWebLocalProjectIndexFromThread(dir, persistedThread); err != nil {
 		log.Debugf("amp neo local runtime project index update failed thread=%s: %v", snapshot.threadID, err)
 	}
 	log.Debugf("amp neo local runtime thread store sync complete thread=%s path=%s", snapshot.threadID, path)
-	return nil
+	return serializedBytes, nil
 }
 
 func neoLocalThreadSnapshotSettings(snapshot neoCloudThreadSnapshot) map[string]any {
@@ -12484,20 +12697,26 @@ func neoThreadModeSettingsPayload(settings map[string]any, agentMode, reasoningE
 }
 
 func writeNeoLocalThreadFileInDir(dir, threadID string, thread map[string]any) (string, error) {
+	path, _, err := writeNeoLocalThreadFileInDirMeasured(dir, threadID, thread)
+	return path, err
+}
+
+func writeNeoLocalThreadFileInDirMeasured(dir, threadID string, thread map[string]any) (string, int64, error) {
 	if dir == "" {
-		return "", errors.New("amp thread store directory unavailable")
+		return "", 0, errors.New("amp thread store directory unavailable")
 	}
 	if !neoThreadIDExactPattern.MatchString(threadID) {
-		return "", fmt.Errorf("invalid thread id %q", threadID)
+		return "", 0, fmt.Errorf("invalid thread id %q", threadID)
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", err
+		return "", 0, err
 	}
 	if err := os.Chmod(dir, 0o700); err != nil {
-		return "", err
+		return "", 0, err
 	}
 	path := filepath.Join(dir, threadID+".json")
-	return path, writeNeoAtomicJSONObjectFile(path, thread, 0o600)
+	serializedBytes, err := writeNeoAtomicJSONObjectFileMeasured(path, thread, 0o600)
+	return path, serializedBytes, err
 }
 
 func (rt *neoRuntime) updateNeoWebLocalProjectIndexFromThread(threadDir string, thread map[string]any) error {
@@ -12597,13 +12816,36 @@ func writeNeoAtomicFile(path string, data []byte, perm os.FileMode) error {
 }
 
 func writeNeoAtomicJSONObjectFile(path string, value map[string]any, perm os.FileMode) error {
-	return writeNeoAtomicFileWith(path, perm, func(tmp *os.File) error {
-		writer := bufio.NewWriter(tmp)
+	_, err := writeNeoAtomicJSONObjectFileMeasured(path, value, perm)
+	return err
+}
+
+func writeNeoAtomicJSONObjectFileMeasured(path string, value map[string]any, perm os.FileMode) (int64, error) {
+	var serializedBytes int64
+	err := writeNeoAtomicFileWith(path, perm, func(tmp *os.File) error {
+		counter := &neoCountingWriter{writer: tmp}
+		writer := bufio.NewWriter(counter)
 		if err := writeNeoJSONObject(writer, value); err != nil {
 			return err
 		}
-		return writer.Flush()
+		if err := writer.Flush(); err != nil {
+			return err
+		}
+		serializedBytes = counter.written
+		return nil
 	})
+	return serializedBytes, err
+}
+
+type neoCountingWriter struct {
+	writer  io.Writer
+	written int64
+}
+
+func (w *neoCountingWriter) Write(data []byte) (int, error) {
+	written, err := w.writer.Write(data)
+	w.written += int64(written)
+	return written, err
 }
 
 func writeNeoJSONObject(writer io.Writer, value map[string]any) error {
@@ -16494,7 +16736,9 @@ func (a *neoActor) sendSnapshot(socket *neoSocket, sinceSeq int) bool {
 	snapshotSent := socket != nil && socket.hasSnapshotSent()
 	a.mu.Lock()
 	seq := a.lastSeqLocked()
+	fallbackSnapshot := false
 	if sinceSeq > 0 && !a.canReplayFromLocked(sinceSeq, seq) {
+		fallbackSnapshot = true
 		sinceSeq = 0
 	}
 	if sinceSeq <= 0 && snapshotSent {
@@ -16593,9 +16837,12 @@ func (a *neoActor) sendSnapshot(socket *neoSocket, sinceSeq int) bool {
 	a.mu.Unlock()
 	sort.SliceStable(replayFrames, func(i, j int) bool { return replayFrames[i].seq < replayFrames[j].seq })
 
+	completeEmission := socket != nil
 	send := func(payload any) {
 		if socket != nil {
-			socket.send(payload)
+			if !socket.sendChecked(payload) {
+				completeEmission = false
+			}
 			return
 		}
 		a.broadcast(payload)
@@ -16666,6 +16913,11 @@ func (a *neoActor) sendSnapshot(socket *neoSocket, sinceSeq int) bool {
 			"tools":     toolsList,
 		}
 		send(withNeoParentToolCallID(payload, inflightInference.parentToolCallID))
+	}
+	if fallbackSnapshot && completeEmission {
+		a.mu.Lock()
+		a.measurements.replayFallbackSnapshots++
+		a.mu.Unlock()
 	}
 	return true
 }
@@ -17211,6 +17463,8 @@ func (a *neoActor) importThreadWithSyncOptions(thread map[string]any, syncCloud,
 		a.mu.Unlock()
 		return nil
 	}
+	a.measurements.revision++
+	a.updatePeakRetainedRevisionsLocked()
 	if pendingInference == nil && neoShouldPreservePendingInferenceOnImport(a.pendingInference, messages) {
 		pendingInference = cloneNeoInferenceInflight(a.pendingInference)
 		if pendingInference.agentMode == "" {
@@ -20142,7 +20396,7 @@ func neoObserversPayload(count int, hasExecutor bool) map[string]any {
 func (a *neoActor) broadcast(payload any) {
 	a.maybeBroadcastThreadStatusUpdated(payload)
 	for _, socket := range a.socketList() {
-		if socket == nil || socket.conn == nil {
+		if socket == nil || !socket.canSend() {
 			continue
 		}
 		socket.send(payload)
@@ -21546,6 +21800,7 @@ func (a *neoActor) approvalToolIDsLocked() []string {
 type neoSocket struct {
 	mu               sync.Mutex
 	conn             *websocket.Conn
+	writeMessage     func(int, []byte) error
 	snapshotSent     bool
 	jsonRPC          bool
 	rivetAction      bool
@@ -21635,6 +21890,15 @@ func (s *neoSocket) hasSnapshotSent() bool {
 	return s.snapshotSent
 }
 
+func (s *neoSocket) canSend() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.conn != nil || s.writeMessage != nil
+}
+
 func (s *neoSocket) setJSONRPC(enabled bool) {
 	if s == nil {
 		return
@@ -21715,18 +21979,25 @@ func neoWebLocalObserverPayload(payload any) (any, bool) {
 }
 
 func (s *neoSocket) send(payload any) {
+	_ = s.sendChecked(payload)
+}
+
+func (s *neoSocket) sendChecked(payload any) bool {
+	if s == nil {
+		return false
+	}
 	cleaned := normalizeNeoOutboundJSON(payload)
 	if s.isWebLocalObserver() {
 		var ok bool
 		cleaned, ok = neoWebLocalObserverPayload(cleaned)
 		if !ok {
 			log.Debugf("amp neo local runtime WS skip web local observer payload %s", neoProtocolSummary(payload))
-			return
+			return false
 		}
 	}
 	if !s.allowsLocalExtensions() && neoOutboundLocalExtensionOnly(cleaned) {
 		log.Debugf("amp neo local runtime WS skip local extension %s", neoProtocolSummary(cleaned))
-		return
+		return false
 	}
 	if s.isRivetAction() {
 		if frame, ok := neoRivetEventFrame(cleaned, s.isWebLocalObserver()); ok {
@@ -21734,38 +22005,36 @@ func (s *neoSocket) send(payload any) {
 				event := mapValue(mapValue(frame["body"])["val"])
 				data, err := neoRivetEncodeEventFrame(stringValue(event["name"]), event["args"])
 				if err != nil {
-					return
+					return false
 				}
 				log.Debugf("amp neo local runtime WS send %s", neoProtocolSummary(cleaned))
-				s.sendBinary(data)
-				return
+				return s.sendBinaryChecked(data)
 			}
 			data, err := json.Marshal(frame)
 			if err != nil {
-				return
+				return false
 			}
 			log.Debugf("amp neo local runtime WS send %s", neoProtocolSummary(cleaned))
-			s.sendText(string(data))
+			return s.sendTextChecked(string(data))
 		}
-		return
+		return false
 	}
 	if s.isJSONRPC() {
 		if frame, ok := neoJSONRPCNotification(cleaned); ok {
 			data, err := json.Marshal(frame)
 			if err != nil {
-				return
+				return false
 			}
 			log.Debugf("amp neo local runtime WS send %s", neoProtocolSummary(cleaned))
-			s.sendText(string(data))
-			return
+			return s.sendTextChecked(string(data))
 		}
 	}
 	data, err := json.Marshal(cleaned)
 	if err != nil {
-		return
+		return false
 	}
 	log.Debugf("amp neo local runtime WS send %s", neoProtocolSummary(cleaned))
-	s.sendText(string(data))
+	return s.sendTextChecked(string(data))
 }
 
 func (s *neoSocket) sendRivetInit(actorID string) {
@@ -21967,19 +22236,45 @@ func neoJSONRPCNotification(payload any) (map[string]any, bool) {
 }
 
 func (s *neoSocket) sendText(text string) {
+	_ = s.sendTextChecked(text)
+}
+
+func (s *neoSocket) sendTextChecked(text string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.conn.WriteMessage(websocket.TextMessage, []byte(text)); err != nil {
-		log.Debugf("amp neo local runtime WS send failed: %v", err)
+	writeMessage := s.writeMessage
+	if writeMessage == nil && s.conn != nil {
+		writeMessage = s.conn.WriteMessage
 	}
+	if writeMessage == nil {
+		return false
+	}
+	if err := writeMessage(websocket.TextMessage, []byte(text)); err != nil {
+		log.Debugf("amp neo local runtime WS send failed: %v", err)
+		return false
+	}
+	return true
 }
 
 func (s *neoSocket) sendBinary(data []byte) {
+	_ = s.sendBinaryChecked(data)
+}
+
+func (s *neoSocket) sendBinaryChecked(data []byte) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.conn.WriteMessage(websocket.BinaryMessage, data); err != nil {
-		log.Debugf("amp neo local runtime WS send failed: %v", err)
+	writeMessage := s.writeMessage
+	if writeMessage == nil && s.conn != nil {
+		writeMessage = s.conn.WriteMessage
 	}
+	if writeMessage == nil {
+		return false
+	}
+	if err := writeMessage(websocket.BinaryMessage, data); err != nil {
+		log.Debugf("amp neo local runtime WS send failed: %v", err)
+		return false
+	}
+	return true
 }
 
 func (s *neoSocket) close(code int, reason string) {
