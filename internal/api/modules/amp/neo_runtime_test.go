@@ -6505,6 +6505,45 @@ func TestNeoActorLocalSnapshotCachesUnchangedMessageJSON(t *testing.T) {
 	if !bytes.Equal(fallbackBytes, want) {
 		t.Fatal("fallback snapshot bytes differ from complete thread encoding")
 	}
+
+	for _, snapshotPath := range []struct {
+		name string
+		path string
+	}{
+		{name: "cached", path: path},
+		{name: "fallback", path: fallbackPath},
+	} {
+		t.Run(snapshotPath.name+" restore", func(t *testing.T) {
+			thread, ok := loadNeoThreadFromDir(threadID, filepath.Dir(snapshotPath.path))
+			if !ok {
+				t.Fatal("load persisted snapshot")
+			}
+			restored := newNeoActor(nil, "actor-snapshot-cache-restored", "thread-actor", threadID, threadID, neoActorRecord("actor-snapshot-cache-restored", "thread-actor", threadID), nil)
+			if err := restored.importThreadLocalOnly(thread); err != nil {
+				t.Fatalf("import persisted snapshot: %v", err)
+			}
+			if len(restored.messages) != 2 || restored.messages[0].Role != "user" || restored.messages[1].Role != "assistant" {
+				t.Fatalf("restored messages = %#v", restored.messages)
+			}
+			assistant := restored.messages[1]
+			if textFromBlocks(assistant.Content) != "changed" || assistant.CompletionStatus != "complete" || len(assistant.State) != 0 {
+				t.Fatalf("restored assistant state = %#v", assistant)
+			}
+			if numberFrom(assistant.Usage["inputTokens"]) != 1 || numberFrom(assistant.Usage["outputTokens"]) != 2 || stringValue(mapValue(assistant.OriginalToolUseInput["call"])["value"]) != "second" {
+				t.Fatalf("restored assistant metadata = usage:%#v tool-input:%#v", assistant.Usage, assistant.OriginalToolUseInput)
+			}
+			if len(assistant.Content) != 4 {
+				t.Fatalf("restored assistant content = %#v", assistant.Content)
+			}
+			typedContent := arrayValue(assistant.Content[3])
+			if stringValue(assistant.Content[1]) != "Qnl0ZXM=" || stringValue(mapValue(assistant.Content[2])["value"]) != "Raw" || len(typedContent) != 1 || stringValue(mapValue(typedContent[0])["text"]) != "changed typed" {
+				t.Fatalf("restored assistant content = %#v", assistant.Content)
+			}
+			if stringValue(restored.settings["agentMode"]) != "smart" || len(restored.compactionRecords) != 1 || stringValue(restored.compactionRecords[0]["cutMessageId"]) != "M-1" {
+				t.Fatalf("restored thread state = settings:%#v compaction:%#v", restored.settings, restored.compactionRecords)
+			}
+		})
+	}
 }
 
 func TestNeoActorLocalSnapshotCacheHandlesDuplicateMessageIDs(t *testing.T) {
@@ -6896,6 +6935,120 @@ func TestNeoLocalSnapshotMessageCacheAllowed(t *testing.T) {
 	}
 }
 
+func TestNeoActorLocalSnapshotCacheByteBudgetIsAllOrNothing(t *testing.T) {
+	threadID := "T-019f4000-0000-4000-8000-000000000067"
+	actor := newNeoActor(nil, "actor-snapshot-byte-budget", "thread-actor", threadID, threadID, neoActorRecord("actor-snapshot-byte-budget", "thread-actor", threadID), nil)
+	actor.messages = []neoMessage{
+		{ThreadID: threadID, MessageID: "M-0000000000000000000001", Role: "user", AgentMode: "smart", Content: []any{map[string]any{"type": "text", "text": "first"}}},
+		{ThreadID: threadID, MessageID: "M-0000000000000000000002", Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "second"}}},
+	}
+	actor.compactionRecords = []map[string]any{{"cutMessageId": "M-0000000000000000000001", "summary": "summary"}}
+	first, err := json.Marshal(neoCloudMessage(actor.messages[0]))
+	if err != nil {
+		t.Fatalf("marshal first message: %v", err)
+	}
+	second, err := json.Marshal(neoCloudMessage(actor.messages[1]))
+	if err != nil {
+		t.Fatalf("marshal second message: %v", err)
+	}
+	budget := 2 * (len(first) + len(second))
+
+	overBudgetEncoded := actor.localSnapshotMessageJSONWithByteLimitLocked(actor.messages, budget-1)
+	if len(overBudgetEncoded) != len(actor.messages) || !bytes.Equal(overBudgetEncoded[0], first) || !bytes.Equal(overBudgetEncoded[1], second) {
+		t.Fatalf("over-budget message JSON entries = %d, want one complete encoding", len(overBudgetEncoded))
+	}
+	if actor.localSnapshotMessageCache != nil {
+		t.Fatalf("over-budget cache entries = %d, want nil", len(actor.localSnapshotMessageCache))
+	}
+	if actor.localSnapshotMessageGen != 0 {
+		t.Fatalf("over-budget message generation = %d, want zero", actor.localSnapshotMessageGen)
+	}
+
+	exactBudgetEncoded := actor.localSnapshotMessageJSONWithByteLimitLocked(actor.messages, budget)
+	if len(exactBudgetEncoded) != len(actor.messages) || len(actor.localSnapshotMessageCache) != len(actor.messages) {
+		t.Fatalf("exact-budget cache = encoded:%d retained:%d, want %d", len(exactBudgetEncoded), len(actor.localSnapshotMessageCache), len(actor.messages))
+	}
+	snapshot, ok := actor.threadSnapshotWithOptions(neoThreadSnapshotOptions{skipLocalMessageJSON: true})
+	if !ok {
+		t.Fatal("byte-budget snapshot unavailable")
+	}
+	for _, boundary := range []struct {
+		name    string
+		encoded []neoLocalSnapshotMessageJSON
+	}{
+		{name: "exact budget", encoded: exactBudgetEncoded},
+		{name: "over budget", encoded: overBudgetEncoded},
+	} {
+		t.Run(boundary.name, func(t *testing.T) {
+			persisted := snapshot
+			persisted.messageJSON = boundary.encoded
+			dir := t.TempDir()
+			if _, _, err := writeNeoLocalThreadSnapshotFile(persisted, dir); err != nil {
+				t.Fatalf("write snapshot: %v", err)
+			}
+			thread, ok := loadNeoThreadFromDir(threadID, dir)
+			if !ok {
+				t.Fatal("load snapshot")
+			}
+			restored := newNeoActor(nil, "actor-snapshot-byte-budget-restored", "thread-actor", threadID, threadID, neoActorRecord("actor-snapshot-byte-budget-restored", "thread-actor", threadID), nil)
+			if err := restored.importThreadLocalOnly(thread); err != nil {
+				t.Fatalf("import snapshot: %v", err)
+			}
+			if len(restored.messages) != 2 || restored.messages[0].MessageID != "M-0000000000000000000001" || restored.messages[1].MessageID != "M-0000000000000000000002" || textFromBlocks(restored.messages[0].Content) != "first" || textFromBlocks(restored.messages[1].Content) != "second" {
+				t.Fatalf("restored messages = %#v", restored.messages)
+			}
+			if stringValue(restored.settings["agentMode"]) != "smart" || len(restored.compactionRecords) != 1 || stringValue(restored.compactionRecords[0]["cutMessageId"]) != "M-0000000000000000000001" {
+				t.Fatalf("restored thread state = settings:%#v compaction:%#v", restored.settings, restored.compactionRecords)
+			}
+		})
+	}
+}
+
+func TestNeoActorLocalSnapshotCacheMessageBoundary(t *testing.T) {
+	tests := []struct {
+		name     string
+		messages int
+		want     bool
+	}{
+		{name: "maximum", messages: neoLocalSnapshotCacheMaxMessages, want: true},
+		{name: "maximum plus one", messages: neoLocalSnapshotCacheMaxMessages + 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			actor := newNeoActor(nil, "actor-snapshot-message-boundary", "thread-actor", "T-test", "T-test", neoActorRecord("actor-snapshot-message-boundary", "thread-actor", "T-test"), nil)
+			actor.messages = make([]neoMessage, test.messages)
+			for index := range actor.messages {
+				actor.messages[index] = neoMessage{MessageID: fmt.Sprintf("M-%d", index), Role: "user"}
+			}
+			encoded := actor.localSnapshotMessageJSONLocked(actor.messages)
+			if test.want {
+				if len(encoded) != test.messages || len(actor.localSnapshotMessageCache) != test.messages {
+					t.Fatalf("maximum cache = encoded:%d retained:%d, want %d", len(encoded), len(actor.localSnapshotMessageCache), test.messages)
+				}
+				return
+			}
+			if encoded != nil || actor.localSnapshotMessageCache != nil || actor.localSnapshotMessageGen != 0 {
+				t.Fatalf("over-limit cache = encoded:%d retained:%d generation:%d, want preflight rejection", len(encoded), len(actor.localSnapshotMessageCache), actor.localSnapshotMessageGen)
+			}
+		})
+	}
+}
+
+func TestNormalizedNeoToolNameReusesReplacer(t *testing.T) {
+	if got := normalizedNeoToolName(" Shell_Command-Test "); got != "shellcommandtest" {
+		t.Fatalf("normalized tool name = %q", got)
+	}
+	normalizedNeoToolName("warm-up")
+	var normalized string
+	allocations := testing.AllocsPerRun(100, func() {
+		normalized = normalizedNeoToolName(" Shell_Command-Test ")
+	})
+	runtime.KeepAlive(normalized)
+	if allocations > 2 {
+		t.Fatalf("allocations per normalization = %.1f, want at most 2", allocations)
+	}
+}
+
 func TestNeoLocalSnapshotMessageValues(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -6950,6 +7103,12 @@ func TestNeoActorOverLimitSnapshotWritesCompleteImportableThread(t *testing.T) {
 	snapshot, ok := actor.threadSnapshot()
 	if !ok {
 		t.Fatal("over-limit snapshot unavailable")
+	}
+	if snapshot.messageJSON != nil {
+		t.Fatalf("over-limit message JSON entries = %d, want preflight fallback", len(snapshot.messageJSON))
+	}
+	if actor.localSnapshotMessageGen != 0 {
+		t.Fatalf("over-limit message generation = %d, want zero", actor.localSnapshotMessageGen)
 	}
 	if actor.localSnapshotMessageCache != nil {
 		t.Fatalf("over-limit cache entries = %d, want disabled", len(actor.localSnapshotMessageCache))
@@ -7531,6 +7690,66 @@ func BenchmarkNeoActorCachedThreadSnapshot(b *testing.B) {
 			}
 		}
 	})
+}
+
+func BenchmarkNeoActorStreamingDeltaHistory(b *testing.B) {
+	actor := newNeoActor(nil, "actor-streaming-history-benchmark", "thread-actor", "T-test", "T-test", neoActorRecord("actor-streaming-history-benchmark", "thread-actor", "T-test"), nil)
+	actor.messages = make([]neoMessage, 2001)
+	for index := 0; index < 2000; index++ {
+		actor.messages[index] = neoMessage{
+			ThreadID:  "T-test",
+			MessageID: fmt.Sprintf("M-%d", index),
+			Role:      "user",
+			Content:   []any{map[string]any{"type": "text", "text": strings.Repeat("x", 1024)}},
+			Seq:       index + 1,
+		}
+	}
+	actor.messages[2000] = neoMessage{
+		ThreadID:  "T-test",
+		MessageID: "M-streaming",
+		Role:      "assistant",
+		Content:   []any{map[string]any{"type": "text", "text": ""}},
+		State:     map[string]any{"type": "streaming"},
+		Seq:       2001,
+	}
+	actor.seq = 2002
+	actor.rebuildHistoryLocked()
+	actor.currentInference = &neoInferenceInflight{messageID: "M-streaming", agentMode: "smart"}
+	delta := map[string]any{
+		"type":       "delta",
+		"messageId":  "M-streaming",
+		"role":       "assistant",
+		"state":      "generating",
+		"blockIndex": 0,
+		"blocks":     []any{map[string]any{"type": "text", "text": ""}},
+	}
+	historyAddress := &actor.history[0]
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		actor.handleProtocolDelta(delta)
+	}
+	b.StopTimer()
+	if !actor.historyDirty || &actor.history[0] != historyAddress {
+		b.Fatal("streaming benchmark eagerly rebuilt provider history")
+	}
+}
+
+func BenchmarkNeoActorOverLimitLocalSnapshotCachePreflight(b *testing.B) {
+	actor := newNeoActor(nil, "actor-snapshot-preflight-benchmark", "thread-actor", "T-test", "T-test", neoActorRecord("actor-snapshot-preflight-benchmark", "thread-actor", "T-test"), nil)
+	actor.messages = make([]neoMessage, neoLocalSnapshotCacheMaxMessages+1)
+	for index := range actor.messages {
+		actor.messages[index] = neoMessage{MessageID: fmt.Sprintf("M-%d", index), Role: "user"}
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		if encoded := actor.localSnapshotMessageJSONLocked(actor.messages); encoded != nil {
+			b.Fatalf("over-limit message JSON entries = %d, want nil", len(encoded))
+		}
+	}
+	if actor.localSnapshotMessageGen != 0 {
+		b.Fatalf("over-limit message generation = %d, want zero", actor.localSnapshotMessageGen)
+	}
 }
 
 func BenchmarkNeoActorCachedThreadPersistence(b *testing.B) {
@@ -12570,6 +12789,88 @@ func TestNeoActorProtocolEmptyDeltasDoNotCreateMessages(t *testing.T) {
 	defer actor.mu.Unlock()
 	if len(actor.messages) != 1 || actor.messages[0].MessageID != "M-assistant" || stringValue(mapValue(actor.messages[0].State)["type"]) != "complete" {
 		t.Fatalf("terminal empty assistant delta should create complete message: %#v", actor.messages)
+	}
+}
+
+func TestNeoActorStreamingDeltaLazilyRebuildsProviderHistory(t *testing.T) {
+	actor := newNeoActor(nil, "actor-lazy-history", "threadActor", "T-test", "T-test", neoActorRecord("actor-lazy-history", "threadActor", "T-test"), nil)
+	actor.messages = []neoMessage{{
+		ThreadID:  "T-test",
+		MessageID: "M-user",
+		Role:      "user",
+		Content:   []any{map[string]any{"type": "text", "text": "before"}},
+		Seq:       1,
+	}}
+	actor.seq = 2
+	actor.rebuildHistoryLocked()
+	before := append([]neoHistoryMessage(nil), actor.history...)
+	beforeAddress := &actor.history[0]
+	revision := actor.measurements.revision
+
+	actor.handle(map[string]any{
+		"type":       "delta",
+		"messageId":  "M-assistant",
+		"role":       "assistant",
+		"state":      "generating",
+		"blockIndex": 0,
+		"blocks":     []any{map[string]any{"type": "text", "text": "partial"}},
+	})
+
+	actor.mu.Lock()
+	if !actor.historyDirty {
+		actor.mu.Unlock()
+		t.Fatal("streaming delta did not mark provider history dirty")
+	}
+	if &actor.history[0] != beforeAddress || !reflect.DeepEqual(actor.history, before) {
+		actor.mu.Unlock()
+		t.Fatal("streaming delta eagerly rebuilt provider history")
+	}
+	want := neoHistoryFromStoredMessages(actor.messages, actor.compactionRecords)
+	request := actor.inferenceRequestLocked("smart", "", "")
+	if actor.historyDirty {
+		actor.mu.Unlock()
+		t.Fatal("provider request left history dirty")
+	}
+	if !reflect.DeepEqual(request.History, want) {
+		actor.mu.Unlock()
+		t.Fatalf("provider history = %#v, want %#v", request.History, want)
+	}
+	if actor.measurements.revision != revision {
+		actor.mu.Unlock()
+		t.Fatalf("lazy history rebuild changed snapshot revision from %d to %d", revision, actor.measurements.revision)
+	}
+	actor.mu.Unlock()
+
+	actor.handle(map[string]any{
+		"type":       "delta",
+		"messageId":  "M-assistant",
+		"role":       "assistant",
+		"state":      "generating",
+		"blockIndex": 0,
+		"blocks":     []any{map[string]any{"type": "text", "text": " continued"}},
+	})
+	actor.mu.Lock()
+	actor.storeQueuedUserMessageLocked(neoQueuedMessage{
+		MessageID: "M-follow-up",
+		Content:   []any{map[string]any{"type": "text", "text": "after streaming"}},
+		CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+	}, false)
+	want = neoHistoryFromStoredMessages(actor.messages, actor.compactionRecords)
+	if actor.historyDirty || !reflect.DeepEqual(actor.history, want) {
+		actor.mu.Unlock()
+		t.Fatalf("user boundary history = %#v dirty=%t, want %#v", actor.history, actor.historyDirty, want)
+	}
+	actor.mu.Unlock()
+	actor.handle(map[string]any{"type": "delta", "messageId": "M-assistant", "role": "assistant", "state": "complete"})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.historyDirty {
+		t.Fatal("terminal delta left provider history dirty")
+	}
+	want = neoHistoryFromStoredMessages(actor.messages, actor.compactionRecords)
+	if !reflect.DeepEqual(actor.history, want) {
+		t.Fatalf("terminal provider history = %#v, want %#v", actor.history, want)
 	}
 }
 
@@ -29354,6 +29655,68 @@ func TestNeoActorImportRestoresPendingToolForPayloadRequiredStatusOnlyDone(t *te
 	}
 	if len(actor.history) != 3 || !strings.Contains(actor.history[2].Text, "review clean") {
 		t.Fatalf("history = %#v, want full shell_command result after completion", actor.history)
+	}
+}
+
+func TestNeoActorImportClassifiesRunTerminalCommandAlias(t *testing.T) {
+	tests := []struct {
+		name            string
+		toolName        string
+		wantPendingName string
+		wantCompletion  string
+		wantAgentState  string
+	}{
+		{name: "exact alias", toolName: "run_terminal_command", wantPendingName: "Bash", wantCompletion: "tool_progress", wantAgentState: "running_tools"},
+		{name: "near miss", toolName: "run_terminal_commands", wantAgentState: "idle"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			threadID := "T-019eb741-4031-702e-a552-6824b09e3aeb"
+			actor := newNeoActor(nil, "actor-terminal-alias", "thread-actor", threadID, threadID, neoActorRecord("actor-terminal-alias", "thread-actor", threadID), nil)
+			thread := map[string]any{
+				"id":        threadID,
+				"agentMode": "deep",
+				"messages": []any{
+					map[string]any{
+						"messageId": "M-0000000000000000000001",
+						"role":      "assistant",
+						"content": []any{map[string]any{
+							"type": "tool_use",
+							"id":   "TU-terminal-alias",
+							"name": test.toolName,
+						}},
+					},
+					map[string]any{
+						"messageId": "M-0000000000000000000002",
+						"role":      "user",
+						"content": []any{map[string]any{
+							"type":      "tool_result",
+							"toolUseID": "TU-terminal-alias",
+							"run":       map[string]any{"status": "done"},
+						}},
+					},
+				},
+			}
+			if err := actor.importThreadLocalOnly(thread); err != nil {
+				t.Fatalf("import thread: %v", err)
+			}
+			if actor.messages[1].CompletionStatus != test.wantCompletion {
+				t.Fatalf("completionStatus = %q, want %q", actor.messages[1].CompletionStatus, test.wantCompletion)
+			}
+			if actor.agentState != test.wantAgentState {
+				t.Fatalf("agentState = %q, want %q", actor.agentState, test.wantAgentState)
+			}
+			pending, ok := actor.pendingTools["TU-terminal-alias"]
+			if test.wantPendingName == "" {
+				if ok {
+					t.Fatalf("pending tool = %#v, want completed near miss", pending)
+				}
+				return
+			}
+			if !ok || pending.Name != test.wantPendingName {
+				t.Fatalf("pending tool = %#v, want %q", pending, test.wantPendingName)
+			}
+		})
 	}
 }
 

@@ -2476,6 +2476,7 @@ type neoActor struct {
 	skillSnapshot               map[string]any
 	messages                    []neoMessage
 	history                     []neoHistoryMessage
+	historyDirty                bool
 	queue                       []neoQueuedMessage
 	queuedIDSeq                 int
 	pendingTools                map[string]neoPendingTool
@@ -6282,7 +6283,7 @@ func (a *neoActor) handleProtocolDelta(msg map[string]any) {
 	}
 	stored := a.storeMessageLocked(message)
 	a.rememberReplayEventLocked(msg)
-	a.rebuildHistoryLocked()
+	a.refreshHistoryForStoredMessageLocked(stored)
 	clearedInference := false
 	if role == "assistant" && (state == "aborted" || state == "complete" || (state == "tool_use" && stringValue(mapValue(stored.State)["type"]) == "complete")) {
 		clearedInference = a.clearCurrentInferenceLocked(messageID)
@@ -9079,7 +9080,11 @@ func (a *neoActor) appendBinaryUserMessage(user neoQueuedMessage, msg map[string
 		CompletionStatus: "",
 	}
 	stored := a.storeMessageLocked(message)
-	a.history = append(a.history, neoHistoryMessage{Role: "user", Text: neoUserHistoryText(user.Content, user.UserState, user.FileMentions), Content: neoUserHistoryContent(user.Content, user.UserState, user.FileMentions), UserState: user.UserState})
+	if a.historyDirty {
+		a.rebuildHistoryLocked()
+	} else {
+		a.history = append(a.history, neoHistoryMessage{Role: "user", Text: neoUserHistoryText(user.Content, user.UserState, user.FileMentions), Content: neoUserHistoryContent(user.Content, user.UserState, user.FileMentions), UserState: user.UserState})
+	}
 	if a.draft != nil {
 		a.draft = nil
 	}
@@ -9599,7 +9604,11 @@ func (a *neoActor) storeQueuedUserMessageLocked(user neoQueuedMessage, preserveM
 		CreatedAt:        user.CreatedAt,
 		CompletionStatus: "",
 	})
-	a.history = append(a.history, neoHistoryMessage{Role: "user", Text: neoUserHistoryText(user.Content, user.UserState, user.FileMentions), Content: neoUserHistoryContent(user.Content, user.UserState, user.FileMentions), ParentToolUseID: user.ParentToolUseID, UserState: user.UserState})
+	if a.historyDirty {
+		a.rebuildHistoryLocked()
+	} else {
+		a.history = append(a.history, neoHistoryMessage{Role: "user", Text: neoUserHistoryText(user.Content, user.UserState, user.FileMentions), Content: neoUserHistoryContent(user.Content, user.UserState, user.FileMentions), ParentToolUseID: user.ParentToolUseID, UserState: user.UserState})
+	}
 	a.executorIdleGeneration++
 	return message, mode, effort
 }
@@ -10965,9 +10974,10 @@ func splitNeoImageDataURL(value string) (string, string, bool) {
 	return mediaType, value[comma+1:], mediaType != "" && comma+1 < len(value)
 }
 
+var neoToolNameReplacer = strings.NewReplacer(" ", "", "_", "", "-", "")
+
 func normalizedNeoToolName(name string) string {
-	replacer := strings.NewReplacer(" ", "", "_", "", "-", "")
-	return replacer.Replace(strings.ToLower(strings.TrimSpace(name)))
+	return neoToolNameReplacer.Replace(strings.ToLower(strings.TrimSpace(name)))
 }
 
 func neoToolRunImages(run map[string]any) []any {
@@ -11613,33 +11623,68 @@ func (a *neoActor) threadSnapshotLocked(options neoThreadSnapshotOptions) (neoCl
 }
 
 func (a *neoActor) localSnapshotMessageJSONLocked(messages []neoMessage) []neoLocalSnapshotMessageJSON {
+	if !neoLocalSnapshotMessageCacheAllowed(len(messages), 0) {
+		a.localSnapshotMessageCache = nil
+		a.updatePeakRetainedRevisionsLocked()
+		return nil
+	}
+	return a.localSnapshotMessageJSONWithByteLimitLocked(messages, neoLocalSnapshotCacheMaxBytes)
+}
+
+func (a *neoActor) localSnapshotMessageJSONWithByteLimitLocked(messages []neoMessage, maxBytes int) []neoLocalSnapshotMessageJSON {
 	encoded := make([]neoLocalSnapshotMessageJSON, len(messages))
 	cache := make(map[string]neoLocalSnapshotMessageCache, len(messages))
 	occurrences := make(map[string]int)
 	cacheBytes := 0
+	generation := a.localSnapshotMessageGen
+	cacheAllowed := true
 	for index, message := range messages {
+		if !cacheAllowed {
+			raw, err := json.Marshal(neoCloudMessage(message))
+			if err != nil {
+				a.localSnapshotMessageCache = nil
+				a.updatePeakRetainedRevisionsLocked()
+				return nil
+			}
+			encoded[index] = raw
+			continue
+		}
 		occurrence := occurrences[message.MessageID]
 		occurrences[message.MessageID] = occurrence + 1
 		key := message.MessageID + "\x00" + strconv.Itoa(occurrence)
 		cached, ok := a.localSnapshotMessageCache[key]
-		if ok && reflect.DeepEqual(cached.message, message) {
-			cache[key] = cached
-			encoded[index] = cached.json
-			cacheBytes += len(cached.json)
+		unchanged := ok && reflect.DeepEqual(cached.message, message)
+		var raw []byte
+		if unchanged {
+			raw = cached.json
+		} else {
+			var err error
+			raw, err = json.Marshal(neoCloudMessage(message))
+			if err != nil {
+				a.localSnapshotMessageCache = nil
+				a.updatePeakRetainedRevisionsLocked()
+				return nil
+			}
+		}
+		entryBytes := len(raw) * 2
+		if entryBytes > maxBytes-cacheBytes {
+			cacheAllowed = false
+			cache = nil
+			occurrences = nil
+			encoded[index] = raw
 			continue
 		}
-		raw, err := json.Marshal(neoCloudMessage(message))
-		if err != nil {
-			continue
+		if !unchanged {
+			generation++
+			cached = neoLocalSnapshotMessageCache{message: message, json: raw, generation: generation}
 		}
-		a.localSnapshotMessageGen++
-		cached = neoLocalSnapshotMessageCache{message: message, json: raw, generation: a.localSnapshotMessageGen}
 		cache[key] = cached
 		encoded[index] = cached.json
-		cacheBytes += len(cached.json)
+		cacheBytes += entryBytes
 	}
-	if neoLocalSnapshotMessageCacheAllowed(len(cache), cacheBytes) {
+	if cacheAllowed {
 		a.localSnapshotMessageCache = cache
+		a.localSnapshotMessageGen = generation
 	} else {
 		a.localSnapshotMessageCache = nil
 	}
@@ -16381,7 +16426,7 @@ func sortedMapKeys(m map[string]any) []string {
 }
 
 func (a *neoActor) inferenceRequestLocked(agentMode, reasoningEffort, parentToolCallID string) neoInferenceRequest {
-	history := scopedNeoHistory(a.history, parentToolCallID)
+	history := scopedNeoHistory(a.historyLocked(), parentToolCallID)
 	tools := a.toolsForModeLocked(agentMode, history)
 	sort.Slice(tools, func(i, j int) bool { return tools[i].Name < tools[j].Name })
 	var preparationError string
@@ -17090,7 +17135,7 @@ func (a *neoActor) titleGenerationRequest() (neoInferenceRequest, neoModelRoute,
 	}
 
 	a.mu.Lock()
-	history := append([]neoHistoryMessage(nil), a.history...)
+	history := append([]neoHistoryMessage(nil), a.historyLocked()...)
 	settings := cloneMap(a.settings)
 	threadID := a.threadID
 	agentMode := a.currentAgentMode
@@ -21119,6 +21164,22 @@ func (a *neoActor) toolResultRunLocked(toolCallID string) (map[string]any, any) 
 
 func (a *neoActor) rebuildHistoryLocked() {
 	a.history = neoHistoryFromStoredMessages(a.messages, a.compactionRecords)
+	a.historyDirty = false
+}
+
+func (a *neoActor) historyLocked() []neoHistoryMessage {
+	if a.historyDirty {
+		a.rebuildHistoryLocked()
+	}
+	return a.history
+}
+
+func (a *neoActor) refreshHistoryForStoredMessageLocked(message neoMessage) {
+	if message.Role == "assistant" && stringValue(mapValue(message.State)["type"]) == "streaming" {
+		a.historyDirty = true
+		return
+	}
+	a.rebuildHistoryLocked()
 }
 
 func neoHistoryFromStoredMessages(messages []neoMessage, records []map[string]any) []neoHistoryMessage {
@@ -21807,7 +21868,7 @@ func neoSplitBraceAlternatives(value string) []string {
 }
 
 func (a *neoActor) toolNamesLocked(agentMode string) []string {
-	tools := a.toolsForModeLocked(agentMode, a.history)
+	tools := a.toolsForModeLocked(agentMode, a.historyLocked())
 	names := make([]string, 0, len(tools))
 	for _, tool := range tools {
 		names = append(names, tool.Name)
