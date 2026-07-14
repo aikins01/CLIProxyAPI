@@ -395,6 +395,8 @@ func (a *neoActor) executeSubagentRun(name string, input map[string]any, parentT
 		}, func(neoInferenceDelta) {})
 		if err == nil {
 			finalText = result.Text
+		} else {
+			runErr = err
 		}
 		log.Debugf("amp neo subagent force-synthesis tool=%s text_len=%d err=%v", name, len(strings.TrimSpace(result.Text)), err)
 	}

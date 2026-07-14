@@ -162,6 +162,28 @@ func TestNeoFinderSubagentUsesGemini35FlashLow(t *testing.T) {
 	}
 }
 
+func TestNeoSubagentForcedSynthesisPropagatesProviderStopReason(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-finder", "thread-actor", "T-finder", "T-finder", neoActorRecord("actor-finder", "thread-actor", "T-finder"), nil)
+	actor.currentAgentMode = "smart"
+	calls := 0
+	rt.inferStream = func(_ *neoRuntime, _ neoInferenceRequest, _ neoStreamCallback) (neoInferenceResult, error) {
+		calls++
+		if calls == 1 {
+			return neoInferenceResult{}, nil
+		}
+		return neoInferenceResult{Text: "partial", StopReason: "max_tokens"}, nil
+	}
+
+	text, err := actor.executeSubagentRun("finder", map[string]any{"query": "find local actor routing"}, "TU-finder", "M-1", actor.generation, 0, "")
+	if err == nil || !strings.Contains(err.Error(), "max_tokens") {
+		t.Fatalf("forced synthesis error = %v, want max_tokens", err)
+	}
+	if text != "" || calls != 2 {
+		t.Fatalf("forced synthesis result = text:%q calls:%d, want empty text after two calls", text, calls)
+	}
+}
+
 func TestNeoLibrarianSubagentUsesGPT56SolNone(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	actor := newNeoActor(rt, "actor-librarian", "thread-actor", "T-librarian", "T-librarian", neoActorRecord("actor-librarian", "thread-actor", "T-librarian"), nil)
