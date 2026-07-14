@@ -5672,6 +5672,7 @@ func TestNeoRuntimeWebSocketFiltersLocalExtensionEventsForAmpClients(t *testing.
 		"main-thread":            true,
 		"max-tokens":             true,
 		"setPendingNavigation":   true,
+		"thread_relationships":   true,
 	}
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
@@ -5717,7 +5718,7 @@ func TestNeoRuntimeWebSocketAllowsLocalExtensionEventsForRemoteUI(t *testing.T) 
 			break
 		}
 	}
-	for _, msgType := range []string{"artifacts_snapshot", "draft", "main-thread", "max-tokens", "setPendingNavigation"} {
+	for _, msgType := range []string{"artifacts_snapshot", "draft", "main-thread", "max-tokens", "setPendingNavigation", "thread_relationships"} {
 		if !seen[msgType] {
 			t.Fatalf("remote UI did not receive local extension event %q; seen=%v", msgType, seen)
 		}
@@ -8529,7 +8530,7 @@ func TestNeoRuntimeSnapshotThreadRelationshipsIncludesSeq(t *testing.T) {
 	t.Cleanup(server.Close)
 
 	dialer := websocket.Dialer{Subprotocols: []string{"rivet", "rivet_encoding.4"}}
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/gateway/threadActor/?rvt-method=getOrCreate&rvt-key=T-seq"
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/gateway/threadActor/?rvt-method=getOrCreate&rvt-key=T-seq&cliproxy-client=neo-remote-ui"
 	conn, resp, err := dialer.Dial(wsURL, nil)
 	if err != nil {
 		status := 0
@@ -10509,6 +10510,7 @@ func TestNeoRuntimeImportedPositiveResumeFallsBackToCompleteSnapshot(t *testing.
 		t.Fatal("imported actor unexpectedly proved replay continuity")
 	}
 	actor.mu.Lock()
+	wantHighWater := actor.lastSeqLocked()
 	retainedSummary := len(actor.messages) == 4 && len(actor.messages[3].Content) == 2 && neoCompactionSummaryText(mapValue(mapValue(actor.messages[3].Content[0])["summary"])) == "preserved summary"
 	actor.mu.Unlock()
 	if !retainedSummary {
@@ -10530,7 +10532,7 @@ func TestNeoRuntimeImportedPositiveResumeFallsBackToCompleteSnapshot(t *testing.
 	sawToolResult := false
 	sawManualBash := false
 	sawCompactionRecord := false
-	sawRelationship := false
+	sawHighWater := false
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		msg, ok := readNeoMessage(t, conn, time.Until(deadline))
@@ -10556,12 +10558,11 @@ func TestNeoRuntimeImportedPositiveResumeFallsBackToCompleteSnapshot(t *testing.
 		case "compaction_records":
 			records := arrayValue(msg["records"])
 			sawCompactionRecord = len(records) == 1 && stringValue(mapValue(records[0])["cutMessageId"]) == wantIDs[0]
-		case "thread_relationships":
-			relationships := arrayValue(msg["relationships"])
-			sawRelationship = len(relationships) == 1 && stringValue(mapValue(relationships[0])["threadID"]) == relatedThreadID
+		case "error_cleared":
+			sawHighWater = numberFrom(msg["seq"]) == wantHighWater
 		case "agent_state":
-			if !reflect.DeepEqual(messageIDs, wantIDs) || !sawThinking || !sawToolUse || !sawToolResult || !sawManualBash || !sawCompactionRecord || !sawRelationship {
-				t.Fatalf("fallback completeness ids=%v thinking=%v toolUse=%v toolResult=%v manualBash=%v compaction=%v relationship=%v", messageIDs, sawThinking, sawToolUse, sawToolResult, sawManualBash, sawCompactionRecord, sawRelationship)
+			if !reflect.DeepEqual(messageIDs, wantIDs) || !sawThinking || !sawToolUse || !sawToolResult || !sawManualBash || !sawCompactionRecord || !sawHighWater {
+				t.Fatalf("fallback completeness ids=%v thinking=%v toolUse=%v toolResult=%v manualBash=%v compaction=%v highWater=%v", messageIDs, sawThinking, sawToolUse, sawToolResult, sawManualBash, sawCompactionRecord, sawHighWater)
 			}
 			return
 		}
@@ -10595,6 +10596,7 @@ func TestNeoRuntimeImportedPositiveResumePreservesTranscriptBeyondReplayLimit(t 
 	}
 
 	messageCountReceived := 0
+	sawHighWater := false
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		msg, ok := readNeoMessage(t, conn, time.Until(deadline))
@@ -10604,14 +10606,260 @@ func TestNeoRuntimeImportedPositiveResumePreservesTranscriptBeyondReplayLimit(t 
 		switch msg["type"] {
 		case "message_added":
 			messageCountReceived++
+		case "error_cleared":
+			sawHighWater = numberFrom(msg["seq"]) == 50_000
 		case "agent_state":
-			if messageCountReceived != messageCount {
-				t.Fatalf("fallback messages = %d, want %d", messageCountReceived, messageCount)
+			if messageCountReceived != messageCount || !sawHighWater {
+				t.Fatalf("fallback messages = %d, want %d; highWater=%v", messageCountReceived, messageCount, sawHighWater)
 			}
 			return
 		}
 	}
 	t.Fatal("timed out waiting for large imported fallback snapshot")
+}
+
+func TestNeoRuntimeImportedExactResumeSkipsCompleteSnapshot(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-imported-exact-resume"
+	actor, _ := rt.store.upsert(map[string]any{"name": "threadActor", "key": threadID, "input": map[string]any{"threadId": threadID}}, true)
+	if err := actor.importThreadLocalOnly(map[string]any{
+		"id":        threadID,
+		"v":         10_000,
+		"agentMode": "smart",
+		"messages": []any{
+			map[string]any{"messageId": "M-imported", "role": "user", "content": []any{map[string]any{"type": "text", "text": "already loaded locally"}}},
+		},
+	}); err != nil {
+		t.Fatalf("import thread: %v", err)
+	}
+	if !actor.canReplayFrom(10_000) {
+		t.Fatal("imported actor rejected its exact high-water version")
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	t.Cleanup(server.Close)
+	conn := dialNeoActorWebSocketWithoutResume(t, server.URL, threadID, "")
+	defer conn.Close()
+	if err := conn.WriteJSON(map[string]any{"type": "client_resume", "version": 10_000}); err != nil {
+		t.Fatalf("write exact client_resume: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		msg, ok := readNeoMessage(t, conn, time.Until(deadline))
+		if !ok {
+			break
+		}
+		if msg["type"] == "message_added" {
+			t.Fatalf("exact resume replayed an imported message: %#v", msg)
+		}
+		if msg["type"] == "error_set" || msg["type"] == "error_cleared" {
+			t.Fatalf("exact resume sent a fallback high-water event: %#v", msg)
+		}
+		if msg["type"] == "agent_state" {
+			if _, ok := msg["seq"]; ok {
+				t.Fatalf("agent_state included unsupported seq: %#v", msg)
+			}
+			return
+		}
+	}
+	t.Fatal("timed out waiting for exact-resume agent_state")
+}
+
+func TestNeoRuntimeImportedFallbackKeepsActiveErrorDismissible(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-imported-fallback-active-error"
+	actor, _ := rt.store.upsert(map[string]any{"name": "threadActor", "key": threadID, "input": map[string]any{"threadId": threadID}}, true)
+	if err := actor.importThreadLocalOnly(map[string]any{
+		"id":        threadID,
+		"v":         10_000,
+		"agentMode": "smart",
+		"messages":  []any{map[string]any{"messageId": "M-imported-error", "role": "user", "content": []any{map[string]any{"type": "text", "text": "restore the error"}}}},
+	}); err != nil {
+		t.Fatalf("import thread: %v", err)
+	}
+	actor.fail(errors.New("active failure"))
+	actor.mu.Lock()
+	wantErrorSeq := actor.activeErrorSeq
+	actor.mu.Unlock()
+	actor.bumpSeqAndRemember(map[string]any{"type": "resume_probe"})
+	actor.mu.Lock()
+	wantHighWater := actor.lastSeqLocked()
+	actor.mu.Unlock()
+	if wantHighWater <= wantErrorSeq {
+		t.Fatalf("high water = %d, want > active error seq %d", wantHighWater, wantErrorSeq)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	t.Cleanup(server.Close)
+	conn := dialNeoActorWebSocketWithoutResume(t, server.URL, threadID, "")
+	defer conn.Close()
+	if err := conn.WriteJSON(map[string]any{"type": "client_resume", "version": 9_000}); err != nil {
+		t.Fatalf("write positive client_resume: %v", err)
+	}
+
+	sawHighWater := false
+	advertisedErrorSeq := 0
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		msg, ok := readNeoMessage(t, conn, time.Until(deadline))
+		if !ok {
+			break
+		}
+		switch msg["type"] {
+		case "error_cleared":
+			if numberFrom(msg["seq"]) == wantHighWater {
+				sawHighWater = true
+			}
+		case "error_set":
+			advertisedErrorSeq = numberFrom(msg["seq"])
+			if !sawHighWater {
+				t.Fatalf("active error arrived before high-water marker: %#v", msg)
+			}
+		case "agent_state":
+			if !sawHighWater || advertisedErrorSeq != wantErrorSeq {
+				t.Fatalf("fallback active error highWater=%v advertisedSeq=%d wantSeq=%d", sawHighWater, advertisedErrorSeq, wantErrorSeq)
+			}
+			if err := conn.WriteJSON(map[string]any{"type": "client_dismiss_active_error", "seq": advertisedErrorSeq}); err != nil {
+				t.Fatalf("dismiss active error: %v", err)
+			}
+			cleared := waitForNeoMessageType(t, conn, "error_cleared", 2*time.Second)
+			if got := numberFrom(cleared["seq"]); got <= wantHighWater {
+				t.Fatalf("dismissal error_cleared seq = %d, want > %d: %#v", got, wantHighWater, cleared)
+			}
+			return
+		}
+	}
+	t.Fatal("timed out waiting for fallback active error snapshot")
+}
+
+func TestNeoRuntimeImportedFallbackReconnectRestoresActiveError(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-imported-fallback-error-reconnect"
+	actor, _ := rt.store.upsert(map[string]any{"name": "threadActor", "key": threadID, "input": map[string]any{"threadId": threadID}}, true)
+	if err := actor.importThreadLocalOnly(map[string]any{
+		"id":        threadID,
+		"v":         10_000,
+		"agentMode": "smart",
+		"messages":  []any{map[string]any{"messageId": "M-imported-error-reconnect", "role": "user", "content": []any{map[string]any{"type": "text", "text": "restore after reconnect"}}}},
+	}); err != nil {
+		t.Fatalf("import thread: %v", err)
+	}
+	actor.fail(errors.New("active reconnect failure"))
+	actor.mu.Lock()
+	wantErrorSeq := actor.activeErrorSeq
+	actor.mu.Unlock()
+	actor.bumpSeqAndRemember(map[string]any{"type": "resume_probe"})
+	actor.mu.Lock()
+	wantHighWater := actor.lastSeqLocked()
+	actor.mu.Unlock()
+
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	t.Cleanup(server.Close)
+	first := dialNeoActorWebSocketWithoutResume(t, server.URL, threadID, "")
+	if err := first.WriteJSON(map[string]any{"type": "client_resume", "version": 9_000}); err != nil {
+		t.Fatalf("write fallback client_resume: %v", err)
+	}
+	highWater := waitForNeoMessageType(t, first, "error_cleared", 2*time.Second)
+	if got := numberFrom(highWater["seq"]); got != wantHighWater {
+		t.Fatalf("fallback high-water seq = %d, want %d: %#v", got, wantHighWater, highWater)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("close fallback connection: %v", err)
+	}
+
+	second := dialNeoActorWebSocketWithoutResume(t, server.URL, threadID, "")
+	defer second.Close()
+	if err := second.WriteJSON(map[string]any{"type": "client_resume", "version": wantHighWater}); err != nil {
+		t.Fatalf("write exact client_resume: %v", err)
+	}
+	restored := waitForNeoMessageType(t, second, "error_set", 2*time.Second)
+	if got := numberFrom(restored["seq"]); got != wantErrorSeq {
+		t.Fatalf("restored error seq = %d, want %d: %#v", got, wantErrorSeq, restored)
+	}
+	if got := stringValue(mapValue(restored["error"])["message"]); got != "active reconnect failure" {
+		t.Fatalf("restored error message = %q: %#v", got, restored)
+	}
+}
+
+func TestNeoRuntimeImportedFallbackDoesNotClearConcurrentError(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-imported-fallback-concurrent-error"
+	actor, _ := rt.store.upsert(map[string]any{"name": "threadActor", "key": threadID, "input": map[string]any{"threadId": threadID}}, true)
+	if err := actor.importThreadLocalOnly(map[string]any{
+		"id":        threadID,
+		"v":         10_000,
+		"agentMode": "smart",
+		"messages":  []any{map[string]any{"messageId": "M-imported-concurrent-error", "role": "user", "content": []any{map[string]any{"type": "text", "text": "fail while resuming"}}}},
+	}); err != nil {
+		t.Fatalf("import thread: %v", err)
+	}
+
+	var framesMu sync.Mutex
+	frames := make([]map[string]any, 0)
+	failureDone := make(chan struct{})
+	var trigger sync.Once
+	socket := &neoSocket{writeMessage: func(_ int, raw []byte) error {
+		var frame map[string]any
+		if err := json.Unmarshal(raw, &frame); err != nil {
+			return err
+		}
+		framesMu.Lock()
+		frames = append(frames, frame)
+		framesMu.Unlock()
+		if frame["type"] == "message_added" {
+			trigger.Do(func() {
+				go func() {
+					actor.fail(errors.New("concurrent active failure"))
+					close(failureDone)
+				}()
+				deadline := time.Now().Add(time.Second)
+				for time.Now().Before(deadline) {
+					actor.mu.Lock()
+					active := stringValue(actor.activeError["message"]) == "concurrent active failure"
+					actor.mu.Unlock()
+					if active {
+						time.Sleep(20 * time.Millisecond)
+						return
+					}
+					runtime.Gosched()
+				}
+			})
+		}
+		return nil
+	}}
+	actor.mu.Lock()
+	actor.sockets[socket] = struct{}{}
+	actor.mu.Unlock()
+
+	if !actor.sendSnapshot(socket, 9_000) {
+		t.Fatal("fallback snapshot was not sent")
+	}
+	select {
+	case <-failureDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("concurrent failure did not finish")
+	}
+
+	framesMu.Lock()
+	defer framesMu.Unlock()
+	markerIndex := -1
+	errorIndexes := make([]int, 0, 2)
+	for i, frame := range frames {
+		switch frame["type"] {
+		case "error_cleared":
+			if numberFrom(frame["seq"]) == 10_000 {
+				markerIndex = i
+			}
+		case "error_set":
+			if stringValue(mapValue(frame["error"])["message"]) == "concurrent active failure" {
+				errorIndexes = append(errorIndexes, i)
+			}
+		}
+	}
+	if markerIndex < 0 || len(errorIndexes) < 2 || errorIndexes[0] > markerIndex || errorIndexes[len(errorIndexes)-1] < markerIndex {
+		t.Fatalf("concurrent error was not restored around fallback marker: marker=%d errors=%v frames=%#v", markerIndex, errorIndexes, frames)
+	}
 }
 
 func TestNeoRuntimeResumeBeforeReplayFloorFallsBackToCompleteSnapshot(t *testing.T) {
@@ -10669,6 +10917,7 @@ func TestNeoActorCanReplayFromRequiresRetainedContinuity(t *testing.T) {
 		{name: "zero base", actor: newActor(valid), base: 0},
 		{name: "negative base", actor: newActor(valid), base: -1},
 		{name: "no replay events", actor: newActor(nil), base: 9},
+		{name: "no replay events at actor high water", actor: newActor(nil), base: 12, want: true},
 		{name: "base at replay floor", actor: newActor(valid), base: 9, want: true},
 		{name: "base before replay floor", actor: newActor(valid), base: 8},
 		{name: "base ahead of actor", actor: newActor(valid), base: 13},
@@ -11520,6 +11769,36 @@ func TestNeoRuntimeFilesystemBridgeNormalizesBothDirections(t *testing.T) {
 		t.Fatalf("reverse filesystem write result = %#v", reverseWriteResult)
 	}
 
+	if err := client.WriteJSON(map[string]any{"type": "client_filesystem_delete", "requestId": "delete-1", "uri": "file:///tmp/a.txt", "recursive": true}); err != nil {
+		t.Fatalf("write client filesystem delete request: %v", err)
+	}
+	deleteRequest := waitForNeoMessageType(t, executor, "executor_filesystem_delete", 2*time.Second)
+	if deleteRequest["requestId"] != "delete-1" || deleteRequest["uri"] != "file:///tmp/a.txt" || deleteRequest["recursive"] != true {
+		t.Fatalf("filesystem delete request = %#v", deleteRequest)
+	}
+	if err := executor.WriteJSON(map[string]any{"type": "executor_filesystem_delete_result", "requestId": "delete-1", "ok": true}); err != nil {
+		t.Fatalf("write executor filesystem delete result: %v", err)
+	}
+	deleteResult := waitForNeoMessageType(t, client, "client_filesystem_delete_result", 2*time.Second)
+	if deleteResult["requestId"] != "delete-1" || deleteResult["ok"] != true {
+		t.Fatalf("filesystem delete result = %#v", deleteResult)
+	}
+
+	if err := executor.WriteJSON(map[string]any{"type": "executor_filesystem_delete", "requestId": "delete-2", "uri": "file:///tmp/b.txt", "recursive": false}); err != nil {
+		t.Fatalf("write executor filesystem delete request: %v", err)
+	}
+	reverseDeleteRequest := waitForNeoMessageType(t, client, "client_filesystem_delete", 2*time.Second)
+	if reverseDeleteRequest["requestId"] != "delete-2" || reverseDeleteRequest["uri"] != "file:///tmp/b.txt" || reverseDeleteRequest["recursive"] != false {
+		t.Fatalf("reverse filesystem delete request = %#v", reverseDeleteRequest)
+	}
+	if err := client.WriteJSON(map[string]any{"type": "client_filesystem_delete_result", "requestId": "delete-2", "ok": false, "error": map[string]any{"code": "NOT_FOUND", "message": "not found"}}); err != nil {
+		t.Fatalf("write client filesystem delete result: %v", err)
+	}
+	reverseDeleteResult := waitForNeoMessageType(t, executor, "executor_filesystem_delete_result", 2*time.Second)
+	if reverseDeleteResult["requestId"] != "delete-2" || stringValue(mapValue(reverseDeleteResult["error"])["code"]) != "NOT_FOUND" {
+		t.Fatalf("reverse filesystem delete result = %#v", reverseDeleteResult)
+	}
+
 	oversizedContent := base64.StdEncoding.EncodeToString(make([]byte, neoFilesystemWriteMaxBytes+1))
 	if err := client.WriteJSON(map[string]any{"type": "client_filesystem_write_file", "requestId": "write-3", "uri": "file:///tmp/c.txt", "contentBase64": oversizedContent}); err != nil {
 		t.Fatalf("write oversized client filesystem request: %v", err)
@@ -12302,6 +12581,7 @@ func seedNeoLocalExtensionStateForTest(t *testing.T, rt *neoRuntime, threadID st
 	actor.mainThreadID = "T-019e1046-656d-7132-879f-390ded941c16"
 	actor.draft = []any{map[string]any{"type": "text", "text": "draft text"}}
 	actor.pendingNavigation = "T-019e1046-656d-7132-879f-390ded941c16"
+	actor.relationships = []map[string]any{{"threadID": "T-related", "type": "mention", "role": "parent"}}
 	if actor.artifacts == nil {
 		actor.artifacts = map[string]any{}
 	}
@@ -16859,6 +17139,8 @@ func handledNeoInboundTypesForTest() map[string]bool {
 		"client_create_thread",
 		"client_dismiss_active_error",
 		"client_edit_message",
+		"client_filesystem_delete",
+		"client_filesystem_delete_result",
 		"client_filesystem_read_directory",
 		"client_filesystem_read_directory_result",
 		"client_filesystem_read_file",
@@ -16920,6 +17202,8 @@ func handledNeoInboundTypesForTest() map[string]bool {
 		"executor_environment_snapshot",
 		"executor_environment_update",
 		"executor_error",
+		"executor_filesystem_delete",
+		"executor_filesystem_delete_result",
 		"executor_filesystem_read_directory",
 		"executor_filesystem_read_directory_result",
 		"executor_filesystem_read_file",
@@ -17337,6 +17621,8 @@ func TestHandledNeoInboundTypesCoverLegacyCompatibilityAliases(t *testing.T) {
 		"client_create_thread",
 		"client_dismiss_active_error",
 		"client_edit_message",
+		"client_filesystem_delete",
+		"client_filesystem_delete_result",
 		"client_filesystem_read_directory",
 		"client_filesystem_read_directory_result",
 		"client_filesystem_read_file",
@@ -17386,6 +17672,8 @@ func TestHandledNeoInboundTypesCoverLegacyCompatibilityAliases(t *testing.T) {
 		"executor_environment_snapshot",
 		"executor_environment_update",
 		"executor_error",
+		"executor_filesystem_delete",
+		"executor_filesystem_delete_result",
 		"executor_filesystem_read_directory",
 		"executor_filesystem_read_directory_result",
 		"executor_filesystem_read_file",
@@ -20766,10 +21054,18 @@ func TestNeoActorFiltersAmpBuiltInToolsByMode(t *testing.T) {
 		"apply_patch":              {Name: "apply_patch"},
 		"archive_current_thread":   {Name: "archive_current_thread"},
 		"manage_automation":        {Name: "manage_automation"},
+		"get_automation":           {Name: "get_automation"},
+		"create_cron_automation":   {Name: "create_cron_automation"},
+		"create_slack_automation":  {Name: "create_slack_automation"},
+		"create_github_automation": {Name: "create_github_automation"},
+		"update_automation":        {Name: "update_automation"},
+		"delete_automation":        {Name: "delete_automation"},
 		"slack_write":              {Name: "slack_write"},
 		"slack_read":               {Name: "slack_read"},
+		"github_repo_ci_status":    {Name: "github_repo_ci_status"},
 		"send_message_to_agg":      {Name: "send_message_to_agg"},
 		"send_message_to_aggman":   {Name: "send_message_to_aggman"},
+		"send_message_to_thread":   {Name: "send_message_to_thread"},
 		"search_documents":         {Name: "search_documents"},
 		"get_document":             {Name: "get_document"},
 		"docs_read":                {Name: "docs_read"},
@@ -20805,12 +21101,12 @@ func TestNeoActorFiltersAmpBuiltInToolsByMode(t *testing.T) {
 
 	deepNames := requestNames("deep")
 	assertMode("deep", deepNames,
-		[]string{"Task", "read_thread", "shell_command", "apply_patch", "load_plugin", "manage_automation", "slack_write", "slack_read", "view_media", "tb__gemini-oracle"},
-		[]string{"Read", "Grep", "glob", "Glob", "Bash", "create_file", "edit_file", "get_diagnostics", "advisor", "chart", "look_at", "handoff", "task_list", "todo_write", "file_tree", "code_review", "deferred_custom", "docs_read"})
+		[]string{"Task", "read_thread", "shell_command", "apply_patch", "load_plugin", "send_message_to_thread", "view_media", "get_automation", "create_cron_automation", "create_slack_automation", "create_github_automation", "update_automation", "delete_automation", "slack_write", "slack_read", "github_repo_ci_status", "tb__gemini-oracle"},
+		[]string{"Read", "Grep", "glob", "Glob", "Bash", "create_file", "edit_file", "get_diagnostics", "advisor", "chart", "look_at", "handoff", "task_list", "todo_write", "file_tree", "code_review", "deferred_custom", "docs_read", "manage_automation", "send_message_to_agg"})
 
 	smartNames := requestNames("smart")
 	assertMode("smart", smartNames,
-		[]string{"shell_command", "shell_command_status", "create_file", "edit_file", "load_plugin", "manage_automation", "slack_write", "slack_read", "Task", "view_media", "send_message_to_agg", "tb__gemini-oracle"},
+		[]string{"shell_command", "shell_command_status", "create_file", "edit_file", "load_plugin", "Task", "view_media", "send_message_to_thread", "tb__gemini-oracle"},
 		[]string{"Grep", "glob", "Glob", "Bash", "delete_file", "get_diagnostics", "advisor", "apply_patch", "chart", "look_at", "handoff", "task_list", "todo_write", "file_tree", "code_review", "deferred_custom", "search_documents", "get_document", "docs_read"})
 
 	smartPromptNames := map[string]bool{}
@@ -20823,47 +21119,47 @@ func TestNeoActorFiltersAmpBuiltInToolsByMode(t *testing.T) {
 
 	rushNames := requestNames("rush")
 	assertMode("rush", rushNames,
-		[]string{"Task", "shell_command", "apply_patch", "load_plugin", "manage_automation", "slack_write", "slack_read", "view_media", "tb__gemini-oracle"},
+		[]string{"Task", "shell_command", "apply_patch", "load_plugin", "send_message_to_thread", "view_media", "tb__gemini-oracle"},
 		[]string{"Read", "Grep", "glob", "Glob", "Bash", "create_file", "edit_file", "read_mcp_resource", "get_diagnostics", "advisor", "chart", "look_at", "handoff", "task_list", "todo_write", "file_tree", "code_review", "deferred_custom", "docs_read"})
 
 	largeNames := requestNames("large")
 	assertMode("large", largeNames,
-		[]string{"shell_command", "shell_command_status", "create_file", "edit_file", "load_plugin", "manage_automation", "slack_write", "slack_read", "Task", "view_media", "send_message_to_agg", "tb__gemini-oracle"},
+		[]string{"shell_command", "shell_command_status", "create_file", "edit_file", "load_plugin", "Task", "view_media", "send_message_to_thread", "tb__gemini-oracle"},
 		[]string{"Grep", "glob", "Glob", "Bash", "get_diagnostics", "advisor", "apply_patch", "chart", "look_at", "handoff", "task_list", "todo_write", "file_tree", "code_review", "deferred_custom", "docs_read"})
 
 	unknownModeNames := requestNames("frontier")
 	assertMode("unknown mode", unknownModeNames,
-		[]string{"shell_command", "shell_command_status", "create_file", "edit_file", "load_plugin", "manage_automation", "slack_write", "slack_read", "Task", "view_media", "send_message_to_agg", "tb__gemini-oracle"},
+		[]string{"shell_command", "shell_command_status", "create_file", "edit_file", "load_plugin", "Task", "view_media", "send_message_to_thread", "tb__gemini-oracle"},
 		[]string{"Bash", "advisor", "apply_patch", "chart", "handoff", "code_review", "deferred_custom"})
 
 	aggNames := requestNames("agg-man")
 	assertMode("agg-man", aggNames,
-		[]string{"read_thread", "web_search", "docs_read", "diff", "archive_threads", "publish_thread_artifacts", "manage_automation", "tb__gemini-oracle"},
-		[]string{"Read", "Grep", "glob", "Glob", "Task", "shell_command", "load_plugin", "chart", "view_media", "todo_write", "file_tree", "delete_file", "search_documents", "get_document", "code_review", "deferred_custom"})
+		[]string{"read_thread", "web_search", "docs_read", "diff", "archive_threads", "publish_thread_artifacts", "send_message_to_thread", "slack_write", "slack_read", "tb__gemini-oracle"},
+		[]string{"Read", "Grep", "glob", "Glob", "Task", "shell_command", "load_plugin", "chart", "view_media", "todo_write", "file_tree", "delete_file", "search_documents", "get_document", "code_review", "deferred_custom", "manage_automation"})
 
 	nostromoNames := requestNames("nostromo")
 	assertMode("nostromo", nostromoNames,
-		[]string{"shell_command", "shell_command_status", "create_file", "edit_file", "load_plugin", "manage_automation", "slack_write", "slack_read", "Task", "apply_patch", "view_media", "send_message_to_agg", "tb__gemini-oracle"},
+		[]string{"shell_command", "shell_command_status", "create_file", "edit_file", "load_plugin", "Task", "apply_patch", "view_media", "send_message_to_thread", "tb__gemini-oracle"},
 		[]string{"Grep", "glob", "Glob", "get_diagnostics", "advisor", "chart", "look_at", "handoff", "task_list", "todo_write", "file_tree", "code_review", "deferred_custom", "docs_read"})
 
 	lowNames := requestNames("low")
 	assertMode("low", lowNames,
-		[]string{"Task", "shell_command", "apply_patch", "load_plugin", "manage_automation", "slack_write", "slack_read", "view_media", "tb__gemini-oracle"},
+		[]string{"Task", "shell_command", "apply_patch", "load_plugin", "send_message_to_thread", "view_media", "tb__gemini-oracle"},
 		[]string{"create_file", "edit_file", "read_mcp_resource", "code_review", "deferred_custom"})
 
 	mediumNames := requestNames("medium")
 	assertMode("medium", mediumNames,
-		[]string{"Task", "read_thread", "shell_command", "apply_patch", "load_plugin", "manage_automation", "slack_write", "slack_read", "view_media", "tb__gemini-oracle"},
+		[]string{"Task", "read_thread", "shell_command", "apply_patch", "load_plugin", "send_message_to_thread", "view_media", "tb__gemini-oracle"},
 		[]string{"create_file", "edit_file", "read_mcp_resource", "code_review", "deferred_custom"})
 
 	highNames := requestNames("high")
 	assertMode("high", highNames,
-		[]string{"Task", "read_thread", "shell_command", "apply_patch", "load_plugin", "manage_automation", "slack_write", "slack_read", "view_media", "tb__gemini-oracle"},
+		[]string{"Task", "read_thread", "shell_command", "apply_patch", "load_plugin", "send_message_to_thread", "view_media", "tb__gemini-oracle"},
 		[]string{"create_file", "edit_file", "read_mcp_resource", "code_review", "deferred_custom"})
 
 	ultraNames := requestNames("ultra")
 	assertMode("ultra", ultraNames,
-		[]string{"shell_command", "shell_command_status", "create_file", "edit_file", "load_plugin", "manage_automation", "slack_write", "slack_read", "Task", "view_media", "send_message_to_agg", "tb__gemini-oracle"},
+		[]string{"shell_command", "shell_command_status", "create_file", "edit_file", "load_plugin", "Task", "view_media", "send_message_to_thread", "tb__gemini-oracle"},
 		[]string{"apply_patch", "code_review", "deferred_custom"})
 }
 
@@ -20871,7 +21167,7 @@ func TestNeoActorToolsForModeFollowBinaryModeOrder(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
 	binaryNostromoOrder := []string{
-		"finder", "shell_command", "shell_command_status", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "skill", "load_plugin", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "archive_current_thread", "manage_automation", "slack_write", "slack_read", "send_message_to_agg", "apply_patch",
+		"finder", "shell_command", "shell_command_status", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "send_message_to_thread", "skill", "load_plugin", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "archive_current_thread", "get_automation", "create_cron_automation", "create_slack_automation", "create_github_automation", "update_automation", "delete_automation", "slack_write", "slack_read", "github_repo_ci_status", "apply_patch",
 	}
 	rawTools := []any{map[string]any{"name": "external_tool", "source": map[string]any{"plugin": "test"}}}
 	for i := len(binaryNostromoOrder) - 1; i >= 0; i-- {

@@ -570,14 +570,15 @@ func TestCommittedBaselineMatchesInstalledAmpBinaryWhenPathMatches(t *testing.T)
 }
 
 var knownPromptTagSetCountValues = map[string]int{
-	"prompt/compaction":                 6,
-	"prompt/guidance":                   6,
-	"prompt/painter":                    1,
-	"prompt/painter,skills":             1,
-	"prompt/skills":                     4,
-	"prompt/skills,system-prompt,tools": 1,
-	"prompt/skills,tools":               2,
-	"prompt/tools":                      34,
+	"prompt/artifacts,painter,skills,tools":             1,
+	"prompt/compaction":                                 6,
+	"prompt/guidance":                                   6,
+	"prompt/painter":                                    1,
+	"prompt/painter,skills":                             1,
+	"prompt/skills":                                     5,
+	"prompt/skills,system-prompt,tools":                 1,
+	"prompt/skills,tools":                               2,
+	"prompt/tools":                                      33,
 	"source/artifacts,compaction,guidance,skills,tools": 1,
 	"source/artifacts,code-review,painter,skills,tools": 1,
 	"source/code-review,guidance,settings":              1,
@@ -601,11 +602,12 @@ var knownPromptTagSetCountValues = map[string]int{
 	"source/settings,tools":                             9,
 	"source/skills":                                     12,
 	"source/skills,tools":                               15,
-	"source/tools":                                      100,
+	"source/tools":                                      101,
 }
 
 func TestLifecycleChecklistKnownPromptTagCountsRunFocusedChecks(t *testing.T) {
 	cases := map[string][]string{
+		"prompt/artifacts":     {"remote web control surface"},
 		"prompt/compaction":    {"compaction and continuation prompts"},
 		"prompt/guidance":      {"compaction and continuation prompts", "streaming assistant and tool edits"},
 		"prompt/painter":       {"tools, code review, skills, and images"},
@@ -3278,6 +3280,7 @@ func TestLifecycleChecklistCommittedPromptTagCountsMapToFocusedChecks(t *testing
 		t.Fatalf("read committed baseline: %v", err)
 	}
 	expectedAreas := map[string][]string{
+		"prompt/artifacts":     {"remote web control surface"},
 		"prompt/compaction":    {"compaction and continuation prompts"},
 		"prompt/guidance":      {"streaming assistant and tool edits", "compaction and continuation prompts"},
 		"prompt/painter":       {"tools, code review, skills, and images"},
@@ -3585,7 +3588,7 @@ func TestLifecycleChecklistUnknownPromptTagRunsTriage(t *testing.T) {
 		SHA256: "prompt",
 		Length: 240,
 		Kind:   "prompt",
-		Tags:   []string{"artifacts"},
+		Tags:   []string{"future-prompt-surface"},
 	}}}}
 
 	check := lifecycleCheckByArea(t, lifecycleChecklist(Snapshot{}, diff, false), "unknown signal triage")
@@ -3633,7 +3636,7 @@ func TestLifecycleChecklistUnknownSourceTagCountRunsTriage(t *testing.T) {
 func TestLifecycleChecklistUnknownPromptTagCountRunsTriage(t *testing.T) {
 	diff := auditDiff{Categories: []categoryDiff{{
 		Name:  "prompt-tag-counts",
-		Added: []string{"prompt/artifacts=1"},
+		Added: []string{"prompt/future-prompt-surface=1"},
 	}}}
 
 	check := lifecycleCheckByArea(t, lifecycleChecklist(Snapshot{}, diff, false), "unknown signal triage")
