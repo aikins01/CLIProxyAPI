@@ -10713,6 +10713,77 @@ func TestNeoRuntimeEagerSnapshotSkipsUnprovablePositiveResume(t *testing.T) {
 	}
 }
 
+func TestNeoSocketMarshaledTextFrameParity(t *testing.T) {
+	payload := map[string]any{"type": "probe", "value": "<>&\u2028"}
+	tests := []struct {
+		name   string
+		socket neoSocket
+		want   string
+	}{
+		{
+			name: "plain",
+			want: `{"type":"probe","value":"\u003c\u003e\u0026\u2028"}`,
+		},
+		{
+			name:   "json rpc",
+			socket: neoSocket{jsonRPC: true},
+			want:   `{"jsonrpc":"2.0","method":"probe","params":{"value":"\u003c\u003e\u0026\u2028"}}`,
+		},
+		{
+			name:   "rivet observer",
+			socket: neoSocket{rivetAction: true, webLocalObserver: true},
+			want:   `{"body":{"tag":"Event","val":{"args":[{"type":"probe","value":"\u003c\u003e\u0026\u2028"}],"name":"probe"}}}`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var messageType int
+			var frame []byte
+			socket := test.socket
+			socket.writeMessage = func(gotType int, data []byte) error {
+				messageType = gotType
+				frame = append([]byte(nil), data...)
+				return nil
+			}
+			if !socket.sendChecked(payload) {
+				t.Fatal("sendChecked() = false")
+			}
+			if messageType != websocket.TextMessage {
+				t.Fatalf("message type = %d, want %d", messageType, websocket.TextMessage)
+			}
+			if got := string(frame); got != test.want {
+				t.Fatalf("frame = %s, want %s", got, test.want)
+			}
+		})
+	}
+
+	t.Run("string caller", func(t *testing.T) {
+		var frame []byte
+		socket := &neoSocket{writeMessage: func(messageType int, data []byte) error {
+			if messageType != websocket.TextMessage {
+				t.Fatalf("message type = %d, want %d", messageType, websocket.TextMessage)
+			}
+			frame = append([]byte(nil), data...)
+			return nil
+		}}
+		if !socket.sendTextChecked(`{"raw":true}`) {
+			t.Fatal("sendTextChecked() = false")
+		}
+		if got, want := string(frame), `{"raw":true}`; got != want {
+			t.Fatalf("frame = %s, want %s", got, want)
+		}
+	})
+
+	t.Run("writer failure", func(t *testing.T) {
+		socket := &neoSocket{writeMessage: func(int, []byte) error {
+			return errors.New("write failed")
+		}}
+		if socket.sendChecked(payload) {
+			t.Fatal("sendChecked() = true after writer failure")
+		}
+	})
+}
+
 func TestNeoRuntimeWebSocketOutboundJSONNormalization(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	threadID := "T-019e0e6e-f3f1-7080-b5dd-748f66f8c26b"

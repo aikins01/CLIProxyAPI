@@ -22036,7 +22036,7 @@ func (s *neoSocket) sendChecked(payload any) bool {
 				return false
 			}
 			log.Debugf("amp neo local runtime WS send %s", neoProtocolSummary(cleaned))
-			return s.sendTextChecked(string(data))
+			return s.sendTextBytesChecked(data)
 		}
 		return false
 	}
@@ -22047,7 +22047,7 @@ func (s *neoSocket) sendChecked(payload any) bool {
 				return false
 			}
 			log.Debugf("amp neo local runtime WS send %s", neoProtocolSummary(cleaned))
-			return s.sendTextChecked(string(data))
+			return s.sendTextBytesChecked(data)
 		}
 	}
 	data, err := json.Marshal(cleaned)
@@ -22055,7 +22055,7 @@ func (s *neoSocket) sendChecked(payload any) bool {
 		return false
 	}
 	log.Debugf("amp neo local runtime WS send %s", neoProtocolSummary(cleaned))
-	return s.sendTextChecked(string(data))
+	return s.sendTextBytesChecked(data)
 }
 
 func (s *neoSocket) sendRivetInit(actorID string) {
@@ -22261,6 +22261,10 @@ func (s *neoSocket) sendText(text string) {
 }
 
 func (s *neoSocket) sendTextChecked(text string) bool {
+	return s.sendTextBytesChecked([]byte(text))
+}
+
+func (s *neoSocket) sendTextBytesChecked(data []byte) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	writeMessage := s.writeMessage
@@ -22270,7 +22274,7 @@ func (s *neoSocket) sendTextChecked(text string) bool {
 	if writeMessage == nil {
 		return false
 	}
-	if err := writeMessage(websocket.TextMessage, []byte(text)); err != nil {
+	if err := writeMessage(websocket.TextMessage, data); err != nil {
 		log.Debugf("amp neo local runtime WS send failed: %v", err)
 		return false
 	}
