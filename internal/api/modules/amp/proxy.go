@@ -66,12 +66,12 @@ func createReverseProxy(upstreamURL string, secretSource SecretSource) (*httputi
 
 func createReverseProxyWithClientVersionOverride(upstreamURL string, secretSource SecretSource, clientVersionOverride string) (*httputil.ReverseProxy, error) {
 	clientVersionOverride = strings.TrimSpace(clientVersionOverride)
-	return createReverseProxyWithClientVersionProvider(upstreamURL, secretSource, func() string {
+	return createReverseProxyWithClientVersionProvider(upstreamURL, secretSource, func(context.Context) string {
 		return clientVersionOverride
 	})
 }
 
-func createReverseProxyWithClientVersionProvider(upstreamURL string, secretSource SecretSource, clientVersionProvider func() string) (*httputil.ReverseProxy, error) {
+func createReverseProxyWithClientVersionProvider(upstreamURL string, secretSource SecretSource, clientVersionProvider func(context.Context) string) (*httputil.ReverseProxy, error) {
 	parsed, err := url.Parse(upstreamURL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid amp upstream url: %w", err)
@@ -111,7 +111,7 @@ func createReverseProxyWithClientVersionProvider(upstreamURL string, secretSourc
 		}
 
 		if clientVersionProvider != nil {
-			if version := strings.TrimSpace(clientVersionProvider()); version != "" {
+			if version := strings.TrimSpace(clientVersionProvider(req.Context())); version != "" {
 				req.Header.Set("X-Amp-Client-Version", version)
 			}
 		}

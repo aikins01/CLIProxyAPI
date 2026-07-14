@@ -3243,46 +3243,589 @@ func TestNeoActorStorePrunesIdleActors(t *testing.T) {
 	}
 }
 
-func TestNeoActorSyncCloudAsyncCoalescesWhileRunning(t *testing.T) {
-	dir := t.TempDir()
-	oldStoreDir := neoAmpDataDir
-	neoAmpDataDir = func() string { return dir }
-	t.Cleanup(func() { neoAmpDataDir = oldStoreDir })
+func TestNeoActorStorePrunesPersistedThreadWithMetadata(t *testing.T) {
+	useTempNeoThreadStore(t)
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled}}})
+	threadID := "T-019f4000-0000-4000-8000-000000000043"
+	stale, _ := rt.store.upsert(map[string]any{"name": "thread-actor", "key": threadID, "input": map[string]any{"threadId": threadID}}, true)
+	now := time.Now()
+	stale.mu.Lock()
+	stale.lastUsed = now.Add(-time.Hour)
+	stale.meta = map[string]any{"executorType": "local-client", "usesThreadActors": true}
+	stale.kv = map[string]any{"plugin-state": map[string]any{"enabled": true}}
+	stale.messages = []neoMessage{{ThreadID: threadID, MessageID: "M-prune", Role: "user", Content: []any{map[string]any{"type": "text", "text": "persist me"}}, Seq: 1}}
+	stale.rebuildHistoryLocked()
+	stale.mu.Unlock()
 
-	rt := newNeoRuntime(&config.Config{})
-	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-sync-coalesce", "T-sync-coalesce", neoActorRecord("actor-test", "thread-actor", "T-sync-coalesce"), nil)
+	if pruned := rt.store.pruneIdle(now, 30*time.Minute); pruned != 1 {
+		t.Fatalf("pruned = %d, want 1", pruned)
+	}
+	if got := rt.store.lookupThreadActor(threadID); got != nil {
+		t.Fatal("persisted idle actor remained in memory")
+	}
+	stored, ok := loadNeoThreadFromDir(threadID, rt.threadDir)
+	if !ok {
+		t.Fatal("pruned actor snapshot was not persisted")
+	}
+	if len(arrayValue(stored["messages"])) != 1 {
+		t.Fatalf("stored messages = %#v", stored["messages"])
+	}
+	if !boolValue(mapValue(stored["meta"])["cliProxyAPILocalNeo"]) {
+		t.Fatalf("stored meta = %#v", stored["meta"])
+	}
+	if len(mapValue(stored["actorKV"])) != 1 {
+		t.Fatalf("stored actorKV = %#v", stored["actorKV"])
+	}
+}
+
+func TestNeoActorStorePrunesEmptyThreadWithoutPersisting(t *testing.T) {
+	useTempNeoThreadStore(t)
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled}}})
+	threadID := "T-019f4000-0000-4000-8000-000000000045"
+	stale, _ := rt.store.upsert(map[string]any{"name": "thread-actor", "key": threadID, "input": map[string]any{"threadId": threadID}}, true)
+	now := time.Now()
+	stale.mu.Lock()
+	stale.lastUsed = now.Add(-time.Hour)
+	stale.mu.Unlock()
+
+	if pruned := rt.store.pruneIdle(now, 30*time.Minute); pruned != 1 {
+		t.Fatalf("pruned = %d, want 1", pruned)
+	}
+	if got := rt.store.lookupThreadActor(threadID); got != nil {
+		t.Fatal("empty idle actor remained in memory")
+	}
+	if stored, ok := loadNeoThreadFromDir(threadID, rt.threadDir); ok {
+		t.Fatalf("empty idle actor was persisted: %#v", stored)
+	}
+}
+
+func TestNeoActorStorePrunesDebugThreadAfterPersisting(t *testing.T) {
+	useTempNeoThreadStore(t)
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled}}})
+	threadID := "T-019f4000-0000-4000-8000-000000000046"
+	stale, _ := rt.store.upsert(map[string]any{"name": "thread-actor", "key": threadID, "input": map[string]any{"threadId": threadID}}, true)
+	now := time.Now()
+	stale.mu.Lock()
+	stale.lastUsed = now.Add(-time.Hour)
+	stale.debug = map[string]any{"trace": "retained"}
+	stale.mu.Unlock()
+
+	if pruned := rt.store.pruneIdle(now, 30*time.Minute); pruned != 1 {
+		t.Fatalf("pruned = %d, want 1", pruned)
+	}
+	stored, ok := loadNeoThreadFromDir(threadID, rt.threadDir)
+	if !ok || stringValue(mapValue(stored["~debug"])["trace"]) != "retained" {
+		t.Fatalf("debug idle actor snapshot = %#v", stored)
+	}
+}
+
+func TestNeoActorStoreKeepsThreadWhenPrunePersistenceFails(t *testing.T) {
+	useTempNeoThreadStore(t)
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled}}})
+	badStore := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(badStore, []byte("blocked"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rt.threadDir = badStore
+	threadID := "T-019f4000-0000-4000-8000-000000000048"
+	stale, _ := rt.store.upsert(map[string]any{"name": "thread-actor", "key": threadID, "input": map[string]any{"threadId": threadID}}, true)
+	now := time.Now()
+	stale.mu.Lock()
+	stale.lastUsed = now.Add(-time.Hour)
+	stale.meta = map[string]any{"executorType": "local-client"}
+	stale.mu.Unlock()
+
+	if pruned := rt.store.pruneIdle(now, 30*time.Minute); pruned != 0 {
+		t.Fatalf("pruned = %d, want 0", pruned)
+	}
+	if got := rt.store.lookupThreadActor(threadID); got != stale {
+		t.Fatalf("actor after failed persistence = %p, want %p", got, stale)
+	}
+}
+
+func TestNeoActorStoreDoesNotPruneDeferredInference(t *testing.T) {
+	useTempNeoThreadStore(t)
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled}}})
+	threadID := "T-019f4000-0000-4000-8000-000000000044"
+	actor, _ := rt.store.upsert(map[string]any{"name": "thread-actor", "key": threadID, "input": map[string]any{"threadId": threadID}}, true)
+	now := time.Now()
 	actor.mu.Lock()
-	actor.syncRunning = true
+	actor.lastUsed = now.Add(-time.Hour)
+	actor.pendingInference = &neoInferenceInflight{agentMode: "deep", reasoningEffort: "xhigh"}
 	actor.mu.Unlock()
 
+	if pruned := rt.store.pruneIdle(now, 30*time.Minute); pruned != 0 {
+		t.Fatalf("pruned = %d, want 0", pruned)
+	}
+}
+
+func TestNeoActorSyncCloudAsyncCoalescesLocalSnapshots(t *testing.T) {
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled}}})
+	rt.threadDir = t.TempDir()
+	rt.asyncLocalSnapshots = true
+	rt.localSnapshotMinInterval = 40 * time.Millisecond
+	threadID := "T-019f4000-0000-4000-8000-000000000051"
+	actor := newNeoActor(rt, "actor-test", "thread-actor", threadID, threadID, neoActorRecord("actor-test", "thread-actor", threadID), nil)
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var writesMu sync.Mutex
+	writes := make([]string, 0, 2)
+	writeTimes := make([]time.Time, 0, 2)
+	rt.writeLocalSnapshot = func(snapshot neoCloudThreadSnapshot, _ string) (int64, error) {
+		writesMu.Lock()
+		writes = append(writes, snapshot.title)
+		writeTimes = append(writeTimes, time.Now())
+		writeNumber := len(writes)
+		writesMu.Unlock()
+		if writeNumber == 1 {
+			close(firstStarted)
+			<-releaseFirst
+		}
+		return 0, nil
+	}
+
+	actor.mu.Lock()
+	actor.title = "first"
+	actor.mu.Unlock()
+	actor.syncCloudAsync()
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first local snapshot did not start")
+	}
+
+	actor.mu.Lock()
+	actor.title = "latest"
+	actor.mu.Unlock()
 	for i := 0; i < 20; i++ {
 		actor.syncCloudAsync()
 	}
-	actor.mu.Lock()
-	if !actor.syncRunning || !actor.syncPending {
-		t.Fatalf("sync state = running:%v pending:%v, want running and pending", actor.syncRunning, actor.syncPending)
+	close(releaseFirst)
+	waitForNeoActorSyncIdle(t, actor)
+
+	writesMu.Lock()
+	defer writesMu.Unlock()
+	if !reflect.DeepEqual(writes, []string{"first", "latest"}) {
+		t.Fatalf("local snapshot titles = %#v, want first and latest only", writes)
 	}
+	if delay := writeTimes[1].Sub(writeTimes[0]); delay < 30*time.Millisecond {
+		t.Fatalf("local snapshot write delay = %s, want at least 30ms", delay)
+	}
+}
+
+func TestNeoActorMeasurementsTrackBlockedSinkCoalescing(t *testing.T) {
+	type capturedCloudUpload struct {
+		authorization string
+		body          []byte
+		payload       map[string]any
+	}
+	var uploadsMu sync.Mutex
+	var uploads []capturedCloudUpload
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/internal" || r.URL.RawQuery != "uploadThread" || r.Header.Get("Content-Type") != "application/json" {
+			http.Error(w, "invalid upload request", http.StatusBadRequest)
+			return
+		}
+		if r.Header.Get("X-Amp-Client-Application") != "CLI" || r.Header.Get("X-Amp-Client-Type") != "cli" || strings.TrimSpace(r.Header.Get("X-Amp-Client-Version")) == "" {
+			http.Error(w, "missing upload client headers", http.StatusBadRequest)
+			return
+		}
+		reader := io.Reader(r.Body)
+		if r.Header.Get("Content-Encoding") == "gzip" {
+			gz, err := gzip.NewReader(r.Body)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			defer gz.Close()
+			reader = gz
+		}
+		body, err := io.ReadAll(reader)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(body, &payload); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		uploadsMu.Lock()
+		uploads = append(uploads, capturedCloudUpload{authorization: r.Header.Get("Authorization"), body: body, payload: payload})
+		uploadsMu.Unlock()
+		writeNeoJSON(w, http.StatusOK, map[string]any{"ok": true})
+	}))
+	defer upstream.Close()
+
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+		UpstreamURL:    upstream.URL,
+		UpstreamAPIKey: "secret",
+		NeoLocalRuntime: config.AmpNeoLocalRuntime{
+			Enabled: &enabled,
+		},
+	}})
+	rt.threadDir = t.TempDir()
+	rt.asyncLocalSnapshots = true
+	rt.localSnapshotMinInterval = 0
+	threadID := "T-019f4000-0000-4000-8000-000000000068"
+	actor := newNeoActor(rt, "actor-measurements", "thread-actor", threadID, threadID, neoActorRecord("actor-measurements", "thread-actor", threadID), nil)
+	if err := actor.importThreadLocalOnly(map[string]any{
+		"id":        threadID,
+		"v":         900_000,
+		"agentMode": "deep",
+		"messages": []any{map[string]any{
+			"messageId": "M-measurements",
+			"role":      "user",
+			"content":   []any{map[string]any{"type": "text", "text": "measure blocked sinks"}},
+		}},
+	}); err != nil {
+		t.Fatalf("import thread: %v", err)
+	}
+	if got := actor.measurementSnapshot().Revision; got != 2 {
+		t.Fatalf("internal revision after persisted v import = %d, want 2", got)
+	}
+	if !actor.sendSnapshot(nil, 899_999) {
+		t.Fatal("socket-less fallback suppressed snapshot attempt")
+	}
+	if got := actor.measurementSnapshot().ReplayFallbackSnapshots; got != 0 {
+		t.Fatalf("fallback snapshots after socket-less broadcast = %d, want 0", got)
+	}
+	var rivetFrames atomic.Int32
+	rivetSocket := &neoSocket{localExtensions: true, rivetAction: true, writeMessage: func(int, []byte) error {
+		rivetFrames.Add(1)
+		return nil
+	}}
+	if !actor.sendSnapshot(rivetSocket, 899_999) {
+		t.Fatal("unframeable Rivet fallback suppressed snapshot attempt")
+	}
+	if rivetFrames.Load() != 0 {
+		t.Fatalf("unframeable Rivet fallback emitted %d frames, want 0", rivetFrames.Load())
+	}
+	if got := actor.measurementSnapshot().ReplayFallbackSnapshots; got != 0 {
+		t.Fatalf("fallback snapshots after unframeable Rivet emission = %d, want 0", got)
+	}
+	var failedFrames atomic.Int32
+	failingSocket := &neoSocket{localExtensions: true, writeMessage: func(int, []byte) error {
+		if failedFrames.Add(1) == 3 {
+			return errors.New("recording transport failed")
+		}
+		return nil
+	}}
+	if !actor.sendSnapshot(failingSocket, 899_999) {
+		t.Fatal("failed fallback transport suppressed snapshot attempt")
+	}
+	if failedFrames.Load() <= 3 {
+		t.Fatalf("fallback transport stopped after failed frame: wrote %d frames", failedFrames.Load())
+	}
+	if got := actor.measurementSnapshot().ReplayFallbackSnapshots; got != 0 {
+		t.Fatalf("fallback snapshots after incomplete emission = %d, want 0", got)
+	}
+	filteredSocket := &neoSocket{writeMessage: func(int, []byte) error { return nil }}
+	if !actor.sendSnapshot(filteredSocket, 899_999) {
+		t.Fatal("filtered fallback transport suppressed snapshot attempt")
+	}
+	if got := actor.measurementSnapshot().ReplayFallbackSnapshots; got != 0 {
+		t.Fatalf("fallback snapshots after filtered emission = %d, want 0", got)
+	}
+	var fallbackFrames atomic.Int32
+	hydratedSocket := &neoSocket{localExtensions: true, writeMessage: func(int, []byte) error {
+		fallbackFrames.Add(1)
+		return nil
+	}}
+	actor.sendSnapshot(hydratedSocket, 899_999)
+	if got := actor.measurementSnapshot().ReplayFallbackSnapshots; got != 1 {
+		t.Fatalf("fallback snapshots = %d, want 1", got)
+	}
+	if fallbackFrames.Load() == 0 {
+		t.Fatal("fallback snapshot emitted no frames")
+	}
+	hydratedSocket.markSnapshotSent()
+	if actor.sendSnapshot(hydratedSocket, 899_999) {
+		t.Fatal("hydrated socket emitted duplicate fallback snapshot")
+	}
+	if got := actor.measurementSnapshot().ReplayFallbackSnapshots; got != 1 {
+		t.Fatalf("fallback snapshots after suppressed send = %d, want 1", got)
+	}
+
+	localStarted := make(chan struct{})
+	cloudStarted := make(chan struct{})
+	releaseLocal := make(chan struct{})
+	releaseCloud := make(chan struct{})
+	var localOnce sync.Once
+	var cloudOnce sync.Once
+	var localRevisionsMu sync.Mutex
+	localRevisions := make([]uint64, 0, 2)
+	localSnapshots := make(map[uint64]neoCloudThreadSnapshot)
+	var cloudRevisionsMu sync.Mutex
+	cloudRevisions := make([]uint64, 0, 2)
+	cloudSnapshots := make(map[uint64]neoCloudThreadSnapshot)
+	rt.writeLocalSnapshot = func(snapshot neoCloudThreadSnapshot, dir string) (int64, error) {
+		localRevisionsMu.Lock()
+		localRevisions = append(localRevisions, snapshot.revision)
+		localSnapshots[snapshot.revision] = snapshot
+		call := len(localRevisions)
+		localRevisionsMu.Unlock()
+		if call == 1 {
+			localOnce.Do(func() { close(localStarted) })
+			<-releaseLocal
+		}
+		serializedBytes, _, err := writeNeoLocalThreadSnapshotToDirMeasured(snapshot, dir)
+		return serializedBytes, err
+	}
+	rt.uploadCloudSnapshot = func(snapshot neoCloudThreadSnapshot) (int64, error) {
+		cloudRevisionsMu.Lock()
+		cloudRevisions = append(cloudRevisions, snapshot.revision)
+		cloudSnapshots[snapshot.revision] = snapshot
+		call := len(cloudRevisions)
+		cloudRevisionsMu.Unlock()
+		if call == 1 {
+			cloudOnce.Do(func() { close(cloudStarted) })
+			<-releaseCloud
+		}
+		return uploadNeoCloudThread(snapshot)
+	}
+
+	actor.syncCloudAsync()
+	select {
+	case <-localStarted:
+	case <-time.After(time.Second):
+		t.Fatal("local sink did not start")
+	}
+	select {
+	case <-cloudStarted:
+	case <-time.After(time.Second):
+		t.Fatal("cloud sink did not start")
+	}
+	for index := 0; index < 20; index++ {
+		actor.mu.Lock()
+		actor.title = fmt.Sprintf("revision-%02d", index)
+		actor.mu.Unlock()
+		actor.syncCloudAsync()
+	}
+	blocked := actor.measurementSnapshot()
+	if blocked.Revision != 23 || blocked.LocalRequestedRevision != 23 || blocked.CloudRequestedRevision != 23 {
+		t.Fatalf("blocked requested revisions = actor:%d local:%d cloud:%d, want 23", blocked.Revision, blocked.LocalRequestedRevision, blocked.CloudRequestedRevision)
+	}
+	if blocked.LocalCoalesced != 20 || blocked.CloudCoalesced != 20 {
+		t.Fatalf("blocked coalescing = local:%d cloud:%d, want 20 each", blocked.LocalCoalesced, blocked.CloudCoalesced)
+	}
+	if blocked.RetainedRevisions != 2 || blocked.PeakRetainedRevisions != 2 {
+		t.Fatalf("blocked retained revisions = current:%d peak:%d, want 2", blocked.RetainedRevisions, blocked.PeakRetainedRevisions)
+	}
+	if blocked.RetainedGraphs != 2 || blocked.PeakRetainedGraphs != 2 {
+		t.Fatalf("blocked retained graphs = current:%d peak:%d, want 2", blocked.RetainedGraphs, blocked.PeakRetainedGraphs)
+	}
+	close(releaseLocal)
+	close(releaseCloud)
+	waitForNeoActorSyncIdle(t, actor)
+
+	measured := actor.measurementSnapshot()
+	if measured.LocalStartedRevision != 23 || measured.LocalCompletedRevision != 23 || measured.CloudStartedRevision != 23 || measured.CloudCompletedRevision != 23 {
+		t.Fatalf("completed revisions = local:%d/%d cloud:%d/%d, want 23", measured.LocalStartedRevision, measured.LocalCompletedRevision, measured.CloudStartedRevision, measured.CloudCompletedRevision)
+	}
+	if measured.RetainedRevisions != 1 || measured.RetainedGraphs != 2 || measured.LocalSerializedBytes == 0 || measured.CloudSerializedBytes == 0 {
+		t.Fatalf("completed measurements = revisions:%d graphs:%d localBytes:%d cloudBytes:%d", measured.RetainedRevisions, measured.RetainedGraphs, measured.LocalSerializedBytes, measured.CloudSerializedBytes)
+	}
+	info, err := os.Stat(filepath.Join(rt.threadDir, threadID+".json"))
+	if err != nil {
+		t.Fatalf("stat measured local snapshot: %v", err)
+	}
+	if measured.LocalSerializedBytes != info.Size() {
+		t.Fatalf("local serialized bytes = %d, file size = %d", measured.LocalSerializedBytes, info.Size())
+	}
+	if measured.LocalPersistenceDuration <= 0 || measured.CloudUploadDuration <= 0 {
+		t.Fatalf("sink durations = local:%s cloud:%s", measured.LocalPersistenceDuration, measured.CloudUploadDuration)
+	}
+	localRevisionsMu.Lock()
+	gotLocalRevisions := append([]uint64(nil), localRevisions...)
+	gotLocalSnapshots := make(map[uint64]neoCloudThreadSnapshot, len(localSnapshots))
+	for revision, snapshot := range localSnapshots {
+		gotLocalSnapshots[revision] = snapshot
+	}
+	localRevisionsMu.Unlock()
+	cloudRevisionsMu.Lock()
+	gotCloudRevisions := append([]uint64(nil), cloudRevisions...)
+	gotCloudSnapshots := make(map[uint64]neoCloudThreadSnapshot, len(cloudSnapshots))
+	for revision, snapshot := range cloudSnapshots {
+		gotCloudSnapshots[revision] = snapshot
+	}
+	cloudRevisionsMu.Unlock()
+	if !reflect.DeepEqual(gotLocalRevisions, []uint64{3, 23}) || !reflect.DeepEqual(gotCloudRevisions, []uint64{3, 23}) {
+		t.Fatalf("sink revisions = local:%v cloud:%v, want [3 23]", gotLocalRevisions, gotCloudRevisions)
+	}
+	actor.mu.Lock()
+	actorMessages := actor.messages
+	actor.mu.Unlock()
+	for _, revision := range []uint64{3, 23} {
+		localSnapshot := gotLocalSnapshots[revision]
+		cloudSnapshot := gotCloudSnapshots[revision]
+		if len(localSnapshot.messages) == 0 || len(cloudSnapshot.messages) == 0 || len(actorMessages) == 0 {
+			t.Fatalf("revision %d missing messages", revision)
+		}
+		if &localSnapshot.messages[0] == &actorMessages[0] || &cloudSnapshot.messages[0] == &actorMessages[0] {
+			t.Fatalf("revision %d worker messages share actor outer backing", revision)
+		}
+		if &localSnapshot.messages[0] != &cloudSnapshot.messages[0] || &localSnapshot.messages[0].Content[0] != &cloudSnapshot.messages[0].Content[0] {
+			t.Fatalf("revision %d worker snapshots do not share canonical nested message content", revision)
+		}
+		if &localSnapshot.messages[0].Content[0] == &actorMessages[0].Content[0] {
+			t.Fatalf("revision %d worker snapshot shares mutable actor message content", revision)
+		}
+		if len(localSnapshot.messageJSON) != len(localSnapshot.messages) || cloudSnapshot.messageJSON != nil {
+			t.Fatalf("revision %d message JSON = local:%d cloud:%v", revision, len(localSnapshot.messageJSON), cloudSnapshot.messageJSON)
+		}
+		if localSnapshot.apiKey != "" || localSnapshot.upstreamURL != "" || cloudSnapshot.apiKey != "secret" || cloudSnapshot.upstreamURL != upstream.URL {
+			t.Fatalf("revision %d credentials = local:%q/%q cloud:%q/%q", revision, localSnapshot.upstreamURL, localSnapshot.apiKey, cloudSnapshot.upstreamURL, cloudSnapshot.apiKey)
+		}
+	}
+	loaded, ok := loadNeoThreadFromDir(threadID, rt.threadDir)
+	if !ok {
+		t.Fatal("load persisted worker revision")
+	}
+	if stringValue(loaded["title"]) != "revision-19" || len(arrayValue(loaded["messages"])) != 1 {
+		t.Fatalf("persisted worker revision = title:%q messages:%d", stringValue(loaded["title"]), len(arrayValue(loaded["messages"])))
+	}
+	localRaw, err := os.ReadFile(filepath.Join(rt.threadDir, threadID+".json"))
+	if err != nil {
+		t.Fatalf("read persisted worker revision: %v", err)
+	}
+	if bytes.Contains(localRaw, []byte("secret")) {
+		t.Fatal("persisted worker revision contains cloud credential")
+	}
+	restored := newNeoActor(nil, "actor-measurements-restored", "thread-actor", threadID, threadID, neoActorRecord("actor-measurements-restored", "thread-actor", threadID), nil)
+	if err := restored.importThreadLocalOnly(loaded); err != nil {
+		t.Fatalf("import persisted worker revision: %v", err)
+	}
+	restoredSnapshot, ok := restored.threadSnapshotWithOptions(neoThreadSnapshotOptions{skipLocalMessageJSON: true})
+	if !ok || restoredSnapshot.title != "revision-19" || len(restoredSnapshot.messages) != 1 || textFromBlocks(restoredSnapshot.messages[0].Content) != "measure blocked sinks" {
+		t.Fatalf("restored worker revision = title:%q messages:%d", restoredSnapshot.title, len(restoredSnapshot.messages))
+	}
+	uploadsMu.Lock()
+	gotUploads := append([]capturedCloudUpload(nil), uploads...)
+	uploadsMu.Unlock()
+	if len(gotUploads) != 2 {
+		t.Fatalf("cloud uploads = %d, want 2", len(gotUploads))
+	}
+	latestUpload := gotUploads[len(gotUploads)-1]
+	if latestUpload.authorization != "Bearer secret" || stringValue(latestUpload.payload["method"]) != "uploadThread" || bytes.Contains(latestUpload.body, []byte("secret")) {
+		t.Fatalf("latest cloud upload = authorization:%q method:%q", latestUpload.authorization, stringValue(latestUpload.payload["method"]))
+	}
+	uploadedThread := mapValue(mapValue(latestUpload.payload["params"])["thread"])
+	if stringValue(uploadedThread["title"]) != "revision-19" || len(arrayValue(uploadedThread["messages"])) != 1 {
+		t.Fatalf("uploaded worker revision = title:%q messages:%d", stringValue(uploadedThread["title"]), len(arrayValue(uploadedThread["messages"])))
+	}
+	if _, exists := uploadedThread["apiKey"]; exists {
+		t.Fatal("uploaded thread contains API key field")
+	}
+	if _, exists := uploadedThread["upstreamURL"]; exists {
+		t.Fatal("uploaded thread contains upstream URL field")
+	}
+}
+
+func TestNeoActorMeasurementsTrackConcurrentLocalSnapshots(t *testing.T) {
+	threadID := "T-019f4000-0000-4000-8000-000000000072"
+	actor := newNeoActor(nil, "actor-concurrent-measurements", "thread-actor", threadID, threadID, neoActorRecord("actor-concurrent-measurements", "thread-actor", threadID), nil)
+
+	actor.beginLocalSnapshot(2)
+	actor.beginLocalSnapshot(2)
+	actor.beginLocalSnapshot(3)
+	measured := actor.measurementSnapshot()
+	if measured.LocalStartedRevision != 3 || measured.RetainedRevisions != 3 || measured.RetainedGraphs != 3 || measured.PeakRetainedRevisions != 3 || measured.PeakRetainedGraphs != 3 {
+		t.Fatalf("concurrent local measurements = started:%d revisions:%d/%d graphs:%d/%d", measured.LocalStartedRevision, measured.RetainedRevisions, measured.PeakRetainedRevisions, measured.RetainedGraphs, measured.PeakRetainedGraphs)
+	}
+
+	actor.completeLocalSnapshot(2, 100, time.Millisecond, true)
+	measured = actor.measurementSnapshot()
+	if measured.LocalCompletedRevision != 2 || measured.RetainedRevisions != 3 || measured.RetainedGraphs != 3 {
+		t.Fatalf("first local completion = completed:%d revisions:%d graphs:%d", measured.LocalCompletedRevision, measured.RetainedRevisions, measured.RetainedGraphs)
+	}
+	actor.completeLocalSnapshot(2, 100, time.Millisecond, true)
+	measured = actor.measurementSnapshot()
+	if measured.RetainedRevisions != 2 || measured.RetainedGraphs != 2 {
+		t.Fatalf("second local completion = revisions:%d graphs:%d", measured.RetainedRevisions, measured.RetainedGraphs)
+	}
+	actor.completeLocalSnapshot(3, 200, 2*time.Millisecond, true)
+	measured = actor.measurementSnapshot()
+	if measured.LocalCompletedRevision != 3 || measured.LocalSerializedBytes != 200 || measured.LocalPersistenceDuration != 2*time.Millisecond || measured.RetainedRevisions != 1 || measured.RetainedGraphs != 1 {
+		t.Fatalf("final local completion = completed:%d bytes:%d duration:%s revisions:%d graphs:%d", measured.LocalCompletedRevision, measured.LocalSerializedBytes, measured.LocalPersistenceDuration, measured.RetainedRevisions, measured.RetainedGraphs)
+	}
+}
+
+func TestNeoActorLocalSnapshotThrottleDoesNotBlockClose(t *testing.T) {
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled}}})
+	rt.threadDir = t.TempDir()
+	rt.asyncLocalSnapshots = true
+	rt.localSnapshotMinInterval = 2 * time.Second
+	threadID := "T-019f4000-0000-4000-8000-000000000057"
+	actor := newNeoActor(rt, "actor-test", "thread-actor", threadID, threadID, neoActorRecord("actor-test", "thread-actor", threadID), nil)
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	firstReturned := make(chan struct{})
+	var writes atomic.Int32
+	rt.writeLocalSnapshot = func(neoCloudThreadSnapshot, string) (int64, error) {
+		if writes.Add(1) == 1 {
+			close(firstStarted)
+			<-releaseFirst
+			close(firstReturned)
+		}
+		return 0, nil
+	}
+
+	actor.syncCloudAsync()
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first local snapshot did not start")
+	}
+	actor.syncCloudAsync()
+	close(releaseFirst)
+	select {
+	case <-firstReturned:
+	case <-time.After(time.Second):
+		t.Fatal("first local snapshot did not return")
+	}
+	time.Sleep(20 * time.Millisecond)
+	started := time.Now()
+	actor.closeLocalSnapshotSyncs()
+	if elapsed := time.Since(started); elapsed > 250*time.Millisecond {
+		t.Fatalf("closing local snapshot syncs took %s during throttle interval", elapsed)
+	}
+	if got := writes.Load(); got != 1 {
+		t.Fatalf("local snapshot writes = %d, want 1 before close", got)
+	}
+}
+
+func TestNeoActorSyncCloudAsyncDoesNotCloneWhileCloudSyncRunning(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{UpstreamURL: "http://127.0.0.1:1", UpstreamAPIKey: "secret"}})
+	rt.threadDir = ""
+	rt.asyncLocalSnapshots = true
+	threadID := "T-019f4000-0000-4000-8000-000000000052"
+	actor := newNeoActor(rt, "actor-test", "thread-actor", threadID, threadID, neoActorRecord("actor-test", "thread-actor", threadID), nil)
+	content := make([]any, 2000)
+	for i := range content {
+		content[i] = map[string]any{"type": "text", "text": strings.Repeat("x", 128)}
+	}
+	actor.mu.Lock()
+	actor.messages = []neoMessage{{MessageID: "M-large", ThreadID: threadID, Role: "user", Content: content}}
+	actor.syncRunning = true
+	actor.mu.Unlock()
+
+	allocs := testing.AllocsPerRun(20, actor.syncCloudAsync)
+	actor.mu.Lock()
 	actor.syncRunning = false
 	actor.syncPending = false
 	actor.mu.Unlock()
-
-	actor.syncCloudAsync()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		actor.mu.Lock()
-		running := actor.syncRunning
-		actor.mu.Unlock()
-		if !running {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	actor.mu.Lock()
-	running := actor.syncRunning
-	pending := actor.syncPending
-	actor.mu.Unlock()
-	if running || pending {
-		t.Fatalf("sync state after worker = running:%v pending:%v, want idle", running, pending)
+	t.Logf("coalesced sync allocations = %.1f", allocs)
+	if allocs > 8 {
+		t.Fatalf("sync requests allocated %.1f objects while coalescing, want at most 8", allocs)
 	}
 }
 
@@ -3495,6 +4038,7 @@ func TestNeoWebLocalInferenceSocketRequiresOptInOrigin(t *testing.T) {
 		WebLocalInference: config.AmpWebLocalInference{
 			Enabled:        true,
 			AllowedOrigins: []string{"https://ampcode.com"},
+			BaseURL:        "https://aikinss-macbook-pro.taila39f5b.ts.net",
 		},
 	}})
 	threadID := "T-99999999-9999-4999-8999-999999999999"
@@ -3521,6 +4065,17 @@ func TestNeoWebLocalInferenceSocketRequiresOptInOrigin(t *testing.T) {
 	req.Header.Set(neoInternalClientAPIKeyHeader, "local-key")
 	if !neoWebLocalInferenceSocketRequested(req, actor) {
 		t.Fatal("trusted Origin did not enable web local inference")
+	}
+	req.Header.Set("Origin", "https://aikinss-macbook-pro.taila39f5b.ts.net")
+	if !neoWebLocalInferenceSocketRequested(req, actor) {
+		t.Fatal("configured base URL Origin did not enable web local inference")
+	}
+	req.Header.Set("Origin", "https://example.com")
+	query := req.URL.Query()
+	query.Set("cliproxy-client", "amp-web-local-inference")
+	req.URL.RawQuery = query.Encode()
+	if !neoWebLocalInferenceSocketRequested(req, actor) {
+		t.Fatal("authenticated userscript marker did not enable observer protection")
 	}
 
 	disabledRuntime := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
@@ -4381,7 +4936,7 @@ func TestNeoRuntimeWebLocalInferenceObserverCannotClaimExecutor(t *testing.T) {
 	}
 }
 
-func TestNeoRuntimeWebLocalInferenceOriginSuppressesPluginMessages(t *testing.T) {
+func TestNeoRuntimeWebLocalInferenceOriginForwardsPluginMessages(t *testing.T) {
 	dir := t.TempDir()
 	missingCommand := filepath.Join(dir, "missing-amp")
 	enabled := true
@@ -4417,28 +4972,473 @@ func TestNeoRuntimeWebLocalInferenceOriginSuppressesPluginMessages(t *testing.T)
 	defer conn.Close()
 
 	waitForNeoRivetBareInit(t, conn, 2*time.Second)
-	waitForNeoRivetBareEventType(t, conn, "executor_status", 2*time.Second)
+	waitForNeoRivetBareEventType(t, conn, "executor_status", 5*time.Second)
+	observer := dialNeoActorWebSocket(t, server.URL, threadID)
+	defer observer.Close()
+	waitForNeoMessageType(t, observer, "agent_state", 2*time.Second)
 	actor := rt.store.lookupThreadActor(threadID)
 	if actor == nil {
 		t.Fatal("web local inference bootstrap did not create thread actor")
 	}
+	actor.mu.Lock()
+	existingSockets := make(map[*neoSocket]struct{}, len(actor.sockets))
+	for socket := range actor.sockets {
+		existingSockets[socket] = struct{}{}
+	}
+	actor.mu.Unlock()
+	executorConn := dialNeoActorWebSocketWithoutResume(t, server.URL, threadID, "rvt-skip-ready-wait=true")
+	defer executorConn.Close()
+	var executorSocket *neoSocket
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline) && executorSocket == nil; {
+		actor.mu.Lock()
+		for socket := range actor.sockets {
+			if _, exists := existingSockets[socket]; !exists {
+				executorSocket = socket
+				break
+			}
+		}
+		actor.mu.Unlock()
+		if executorSocket == nil {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	if executorSocket == nil {
+		t.Fatal("executor websocket was not registered")
+	}
+	executorSocket.markExecutor("plugin-ui-test-executor")
+	actor.mu.Lock()
+	actor.executorSocket = executorSocket
+	actor.executorReady = true
+	actor.executorBootstrapComplete = true
+	actor.mu.Unlock()
+	if err := conn.WriteJSON(map[string]any{
+		"type": "plugin_message",
+		"message": map[string]any{
+			"type":   "request",
+			"id":     "client-plugin-request",
+			"method": "ui.select",
+			"params": map[string]any{"options": map[string]any{"title": "Forged"}},
+		},
+	}); err != nil {
+		t.Fatalf("write client plugin request: %v", err)
+	}
+	clientRequest := waitForNeoMessageTypeWhere(t, executorConn, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
+		return stringValue(mapValue(payload["message"])["id"]) == "client-plugin-request"
+	})
+	if stringValue(mapValue(clientRequest["message"])["method"]) != "ui.select" {
+		t.Fatalf("client plugin request = %#v", clientRequest)
+	}
+	actor.mu.Lock()
+	clientRequestCount := len(actor.pluginUIRequests)
+	actor.mu.Unlock()
+	if clientRequestCount != 0 {
+		t.Fatalf("client plugin request created %d pending UI requests", clientRequestCount)
+	}
 	actor.handle(map[string]any{
 		"type": "executor_plugin_message",
 		"message": map[string]any{
-			"type":  "event",
-			"event": "plugins.ready",
+			"type":   "request",
+			"id":     "plugin-request-1",
+			"method": "ui.select",
+			"params": map[string]any{"options": map[string]any{"title": "Choose", "options": []any{"Alpha", "Bravo"}}},
+			"target": map[string]any{"kind": "connection", "connectionId": "web-choice-1"},
 		},
 	})
 
-	deadline := time.Now().Add(200 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		name, args, ok := readNeoRivetBareEvent(t, conn, time.Until(deadline))
-		if !ok {
+	request := waitForNeoRivetBareEventTypeWhere(t, conn, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
+		message := mapValue(payload["message"])
+		return message["type"] == "event" && message["event"] == "plugin.ui.request_added"
+	})
+	requestState := mapValue(mapValue(mapValue(request["message"])["data"])["request"])
+	if requestState["requestId"] != "plugin-request-1" || requestState["method"] != "ui.select" || requestState["status"] != "pending" || stringValue(mapValue(requestState["target"])["connectionId"]) != "web-choice-1" {
+		t.Fatalf("web plugin request = %#v", request)
+	}
+	observerRequest := waitForNeoMessageTypeWhere(t, observer, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
+		return stringValue(mapValue(payload["message"])["event"]) == "plugin.ui.request_added"
+	})
+	if stringValue(mapValue(observerRequest["message"])["event"]) != "plugin.ui.request_added" {
+		t.Fatalf("observer plugin request = %#v", observerRequest)
+	}
+	replayObserver := dialNeoActorWebSocket(t, server.URL, threadID)
+	defer replayObserver.Close()
+	replayed := waitForNeoMessageTypeWhere(t, replayObserver, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
+		return stringValue(mapValue(payload["message"])["event"]) == "plugin.ui.snapshot"
+	})
+	replayedRequests := arrayValue(mapValue(mapValue(replayed["message"])["data"])["requests"])
+	if len(replayedRequests) != 1 || stringValue(mapValue(replayedRequests[0])["requestId"]) != "plugin-request-1" {
+		t.Fatalf("replayed plugin UI requests = %#v", replayed)
+	}
+
+	if err := conn.WriteJSON(map[string]any{
+		"type": "executor_plugin_message",
+		"message": map[string]any{
+			"type":   "request",
+			"id":     "plugin-ui-respond-1",
+			"method": "plugin.ui.respond",
+			"params": map[string]any{"requestId": "plugin-request-1", "result": "Bravo"},
+		},
+	}); err != nil {
+		t.Fatalf("write web executor plugin response: %v", err)
+	}
+	settled := waitForNeoMessageTypeWhere(t, observer, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
+		return stringValue(mapValue(payload["message"])["event"]) == "plugin.ui.request_settled"
+	})
+	settledState := mapValue(mapValue(mapValue(settled["message"])["data"])["request"])
+	if settledState["status"] != "responded" || settledState["response"] != "Bravo" {
+		t.Fatalf("settled plugin UI request = %#v", settled)
+	}
+	actor.mu.Lock()
+	_, settledRequestRetained := actor.pluginUIRequests["plugin-request-1"]
+	actor.mu.Unlock()
+	if settledRequestRetained {
+		t.Fatal("settled plugin UI request remained eligible for cleanup")
+	}
+	executorResponse := waitForNeoMessageTypeWhere(t, executorConn, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
+		message := mapValue(payload["message"])
+		return message["type"] == "response" && message["id"] == "plugin-request-1"
+	})
+	if message := mapValue(executorResponse["message"]); message["type"] != "response" || message["result"] != "Bravo" || message["target"] != nil {
+		t.Fatalf("executor plugin response = %#v", executorResponse)
+	}
+	removed := waitForNeoMessageTypeWhere(t, observer, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
+		return stringValue(mapValue(payload["message"])["event"]) == "plugin.ui.request_removed"
+	})
+	if stringValue(mapValue(mapValue(removed["message"])["data"])["requestId"]) != "plugin-request-1" {
+		t.Fatalf("removed plugin UI request = %#v", removed)
+	}
+
+	actor.handle(map[string]any{
+		"type": "executor_plugin_message",
+		"message": map[string]any{
+			"type":   "request",
+			"id":     "plugin-request-direct",
+			"method": "ui.confirm",
+			"params": map[string]any{"options": map[string]any{"title": "Confirm"}},
+			"target": map[string]any{"kind": "connection", "connectionId": "web-choice-direct"},
+		},
+	})
+	waitForNeoMessageTypeWhere(t, observer, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
+		request := mapValue(mapValue(mapValue(payload["message"])["data"])["request"])
+		return request["requestId"] == "plugin-request-direct"
+	})
+	actor.mu.Lock()
+	actor.executorReady = true
+	actor.executorBootstrapComplete = true
+	actor.queue = append(actor.queue, neoQueuedMessage{
+		MessageID: "M-plugin-queued",
+		Content:   []any{map[string]any{"type": "text", "text": "continue after the choice"}},
+	})
+	actor.mu.Unlock()
+	if err := conn.WriteJSON(map[string]any{
+		"type": "plugin_message",
+		"message": map[string]any{
+			"type":   "response",
+			"id":     "plugin-request-direct",
+			"result": true,
+		},
+	}); err != nil {
+		t.Fatalf("write direct web plugin response: %v", err)
+	}
+	directSettled := waitForNeoMessageTypeWhere(t, observer, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
+		message := mapValue(payload["message"])
+		request := mapValue(mapValue(message["data"])["request"])
+		return message["event"] == "plugin.ui.request_settled" && request["requestId"] == "plugin-request-direct"
+	})
+	if request := mapValue(mapValue(mapValue(directSettled["message"])["data"])["request"]); request["status"] != "responded" || request["response"] != true {
+		t.Fatalf("direct settled plugin UI request = %#v", directSettled)
+	}
+	directResponse := waitForNeoMessageTypeWhere(t, executorConn, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
+		message := mapValue(payload["message"])
+		return message["type"] == "response" && message["id"] == "plugin-request-direct"
+	})
+	if message := mapValue(directResponse["message"]); message["result"] != true || message["target"] != nil {
+		t.Fatalf("direct executor plugin response = %#v", directResponse)
+	}
+	dequeued := waitForNeoMessageTypeWhere(t, observer, "queued_message_dequeued", 2*time.Second, func(payload map[string]any) bool {
+		return payload["queuedMessageId"] == "M-plugin-queued"
+	})
+	if dequeued["queuedMessageId"] != "M-plugin-queued" {
+		t.Fatalf("direct plugin response did not resume queued work: %#v", dequeued)
+	}
+	waitForNeoMessageTypeWhere(t, observer, "agent_state", 2*time.Second, func(payload map[string]any) bool {
+		return payload["state"] == "working"
+	})
+	actor.mu.Lock()
+	actor.generation++
+	actor.currentInference = nil
+	actor.pendingInference = nil
+	actor.agentState = "idle"
+	actor.mu.Unlock()
+	actor.handle(map[string]any{
+		"type": "executor_plugin_message",
+		"message": map[string]any{
+			"type":   "event",
+			"event":  "command.list",
+			"data":   map[string]any{"commands": []any{map[string]any{"id": "plugin-command"}}},
+			"target": map[string]any{"kind": "connection", "connectionId": "web-1"},
+		},
+	})
+	commandList := waitForNeoRivetBareEventTypeWhere(t, conn, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
+		message := mapValue(payload["message"])
+		return message["type"] == "event" && message["event"] == "command.list"
+	})
+	commandMessage := mapValue(commandList["message"])
+	if stringValue(commandMessage["event"]) != "command.list" || stringValue(mapValue(commandMessage["target"])["connectionId"]) != "web-1" {
+		t.Fatalf("web plugin command list = %#v", commandList)
+	}
+
+	actor.handle(map[string]any{
+		"type": "executor_plugin_message",
+		"message": map[string]any{
+			"type":   "request",
+			"id":     "plugin-request-truncate",
+			"method": "ui.confirm",
+			"params": map[string]any{"options": map[string]any{"title": "Confirm"}},
+		},
+	})
+	waitForNeoMessageTypeWhere(t, observer, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
+		request := mapValue(mapValue(mapValue(payload["message"])["data"])["request"])
+		return request["requestId"] == "plugin-request-truncate"
+	})
+	actor.mu.Lock()
+	actor.messages = []neoMessage{{ThreadID: threadID, MessageID: "M-plugin-truncate", Role: "user"}}
+	actor.mu.Unlock()
+	actor.handleBinaryThreadTruncate(map[string]any{"type": "thread:truncate", "fromIndex": 0})
+	truncateResponse := waitForNeoMessageTypeWhere(t, executorConn, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
+		message := mapValue(payload["message"])
+		return message["type"] == "response" && message["id"] == "plugin-request-truncate"
+	})
+	if stringValue(mapValue(truncateResponse["message"])["error"]) == "" {
+		t.Fatalf("thread truncate did not reject plugin UI request = %#v", truncateResponse)
+	}
+	waitForNeoMessageTypeWhere(t, observer, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
+		message := mapValue(payload["message"])
+		return message["event"] == "plugin.ui.request_removed" && mapValue(message["data"])["requestId"] == "plugin-request-truncate"
+	})
+
+	actor.handle(map[string]any{
+		"type": "executor_plugin_message",
+		"message": map[string]any{
+			"target":  "web",
+			"payload": map[string]any{"notification": "plugin-ready"},
+		},
+	})
+	notification := waitForNeoRivetBareEventTypeWhere(t, conn, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
+		message := mapValue(payload["message"])
+		return message["target"] == "web"
+	})
+	if stringValue(mapValue(mapValue(notification["message"])["payload"])["notification"]) != "plugin-ready" {
+		t.Fatalf("non-standard executor plugin message = %#v", notification)
+	}
+
+	actor.handle(map[string]any{
+		"type": "executor_plugin_message",
+		"message": map[string]any{
+			"type":   "request",
+			"id":     "plugin-request-interrupt",
+			"method": "ui.input",
+			"params": map[string]any{"options": map[string]any{"title": "Input"}},
+		},
+	})
+	waitForNeoMessageTypeWhere(t, observer, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
+		request := mapValue(mapValue(mapValue(payload["message"])["data"])["request"])
+		return request["requestId"] == "plugin-request-interrupt"
+	})
+	actor.mu.Lock()
+	actor.currentInference = &neoInferenceInflight{messageID: "M-plugin-interrupt"}
+	actor.agentState = "running_tools"
+	actor.retryScheduled = true
+	actor.mu.Unlock()
+	actor.interruptActiveToolResultsForBinaryUserMessage()
+	interruptResponse := waitForNeoMessageTypeWhere(t, executorConn, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
+		message := mapValue(payload["message"])
+		return message["type"] == "response" && message["id"] == "plugin-request-interrupt"
+	})
+	if stringValue(mapValue(interruptResponse["message"])["error"]) == "" {
+		t.Fatalf("plugin UI interruption did not reject request = %#v", interruptResponse)
+	}
+	waitForNeoMessageTypeWhere(t, observer, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
+		message := mapValue(payload["message"])
+		return message["event"] == "plugin.ui.request_removed" && mapValue(message["data"])["requestId"] == "plugin-request-interrupt"
+	})
+	actor.mu.Lock()
+	interruptedInference := actor.currentInference
+	interruptedState := actor.agentState
+	interruptedRetry := actor.retryScheduled
+	actor.mu.Unlock()
+	if interruptedInference != nil || interruptedState != "idle" || interruptedRetry {
+		t.Fatalf("plugin UI interruption left active work inference=%#v state=%q retry=%v", interruptedInference, interruptedState, interruptedRetry)
+	}
+
+	actor.handle(map[string]any{
+		"type": "executor_plugin_message",
+		"message": map[string]any{
+			"type":   "request",
+			"id":     "plugin-request-disconnect",
+			"method": "ui.input",
+			"params": map[string]any{"options": map[string]any{"title": "Input"}},
+		},
+	})
+	waitForNeoMessageTypeWhere(t, observer, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
+		request := mapValue(mapValue(mapValue(payload["message"])["data"])["request"])
+		return request["requestId"] == "plugin-request-disconnect"
+	})
+	actor.disconnectExecutorForStop()
+	waitForNeoMessageTypeWhere(t, observer, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
+		message := mapValue(payload["message"])
+		return message["event"] == "plugin.ui.request_removed" && mapValue(message["data"])["requestId"] == "plugin-request-disconnect"
+	})
+	cleanObserver := dialNeoActorWebSocket(t, server.URL, threadID)
+	defer cleanObserver.Close()
+	cleanSnapshot := waitForNeoMessageTypeWhere(t, cleanObserver, "plugin_message", 2*time.Second, func(payload map[string]any) bool {
+		return stringValue(mapValue(payload["message"])["event"]) == "plugin.ui.snapshot"
+	})
+	if requests := arrayValue(mapValue(mapValue(cleanSnapshot["message"])["data"])["requests"]); len(requests) != 0 {
+		t.Fatalf("plugin UI requests survived executor cleanup = %#v", cleanSnapshot)
+	}
+}
+
+func TestNeoActorPluginUIRequestCountsAsActiveExecutorWork(t *testing.T) {
+	actor := newNeoActor(newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{ExecutorIdleTimeoutSeconds: 60}}}), "actor", "threadActor", "T-plugin-ui", "T-plugin-ui", nil, nil)
+	actor.mu.Lock()
+	actor.executorID = "cli-headless-plugin-ui"
+	actor.executorReady = true
+	actor.agentState = "idle"
+	actor.spawnedExecutors = map[string]*neoSpawnedExecutor{"spawn": {}}
+	actor.pluginUIRequests["plugin-request"] = map[string]any{"requestId": "plugin-request", "status": "pending"}
+	active := actor.executorWorkActiveLocked()
+	idleEligible := actor.executorIdleStopEligibleLocked()
+	reconnectingRejected := actor.shouldRejectReconnectingExecutorLocked("another-executor")
+	actor.mu.Unlock()
+
+	if !active {
+		t.Fatal("pending plugin UI request was not active executor work")
+	}
+	if idleEligible {
+		t.Fatal("executor with pending plugin UI request was idle-stop eligible")
+	}
+	if !reconnectingRejected {
+		t.Fatal("pending plugin UI request allowed a replacement executor")
+	}
+	stateRequests := arrayValue(actor.stateSnapshotResponse()["pluginUIRequests"])
+	if len(stateRequests) != 1 || stringValue(mapValue(stateRequests[0])["requestId"]) != "plugin-request" {
+		t.Fatalf("state snapshot plugin UI requests = %#v", stateRequests)
+	}
+	actor.respondToPluginUIRequest(nil, map[string]any{
+		"id":     "response-during-reconnect",
+		"params": map[string]any{"requestId": "plugin-request", "result": "choice"},
+	})
+	actor.mu.Lock()
+	reconnectingRequest := cloneNeoJSONMap(actor.pluginUIRequests["plugin-request"])
+	reconnectingResponse := cloneNeoJSONMap(actor.pluginUIResponses["plugin-request"])
+	actor.mu.Unlock()
+	if stringValue(reconnectingRequest["status"]) != "pending" {
+		t.Fatalf("response without executor settled plugin UI request: %#v", reconnectingRequest)
+	}
+	if reconnectingResponse["result"] != "choice" {
+		t.Fatalf("response envelope without executor was not retained: %#v", reconnectingResponse)
+	}
+	actor.handleProtocolPluginMessage(nil, map[string]any{"message": map[string]any{
+		"type": "response", "id": "plugin-request", "result": "direct-choice",
+	}})
+	actor.mu.Lock()
+	directReconnectRequest := cloneNeoJSONMap(actor.pluginUIRequests["plugin-request"])
+	queuedReconnectResponse := cloneNeoJSONMap(actor.pluginUIResponses["plugin-request"])
+	actor.mu.Unlock()
+	if stringValue(directReconnectRequest["status"]) != "pending" {
+		t.Fatalf("direct response without executor settled plugin UI request: %#v", directReconnectRequest)
+	}
+	if queuedReconnectResponse["result"] != "choice" {
+		t.Fatalf("later direct response overwrote retained response envelope: %#v", queuedReconnectResponse)
+	}
+	actor.receiveUserMessage(nil, map[string]any{
+		"type":      "client_append_user_msg",
+		"messageId": "M-0000000000000000000002",
+		"content":   []any{map[string]any{"type": "text", "text": "wait for the choice"}},
+	})
+	actor.mu.Lock()
+	queuedMessages := len(actor.queue)
+	startedMessages := len(actor.messages)
+	actor.mu.Unlock()
+	if queuedMessages != 1 || startedMessages != 0 {
+		t.Fatalf("pending plugin UI request did not gate user message: queued=%d started=%d", queuedMessages, startedMessages)
+	}
+	actor.dequeueQueuedMessage()
+	actor.mu.Lock()
+	queuedAfterDequeue := len(actor.queue)
+	startedAfterDequeue := len(actor.messages)
+	actor.queue = nil
+	actor.mu.Unlock()
+	if queuedAfterDequeue != 1 || startedAfterDequeue != 0 {
+		t.Fatalf("plugin UI blocked dequeue lost work: queued=%d started=%d", queuedAfterDequeue, startedAfterDequeue)
+	}
+
+	actor.mu.Lock()
+	delete(actor.pluginUIRequests, "plugin-request")
+	generation := actor.executorIdleGeneration
+	actor.mu.Unlock()
+	actor.broadcastPluginUIRequestRemovals([]string{"plugin-request"})
+	actor.mu.Lock()
+	rescheduledGeneration := actor.executorIdleGeneration
+	actor.mu.Unlock()
+	if rescheduledGeneration <= generation {
+		t.Fatalf("plugin UI cleanup did not reschedule idle stop: generation=%d want > %d", rescheduledGeneration, generation)
+	}
+}
+
+func TestNeoActorFlushesPluginUIResponseAfterExecutorReconnect(t *testing.T) {
+	connected := make(chan *websocket.Conn, 1)
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := (&websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}).Upgrade(w, r, nil)
+		if err != nil {
 			return
 		}
-		if name == "plugin_message" {
-			t.Fatalf("web local inference socket received plugin message: %#v", args)
-		}
+		connected <- conn
+		<-release
+		_ = conn.Close()
+	}))
+	t.Cleanup(server.Close)
+	client, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	if err != nil {
+		close(release)
+		t.Fatalf("dial plugin reconnect websocket: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = client.Close()
+		close(release)
+	})
+	executorConn := <-connected
+	actor := newNeoActor(newNeoRuntime(&config.Config{}), "actor", "threadActor", "T-plugin-reconnect", "T-plugin-reconnect", nil, nil)
+	actor.pluginUIRequests["plugin-request"] = map[string]any{"requestId": "plugin-request", "status": "pending"}
+	actor.executorSocket = &neoSocket{conn: executorConn}
+	if !actor.settlePluginUIRequestFromResponse(map[string]any{"type": "response", "id": "plugin-request", "result": "choice"}) {
+		t.Fatal("plugin UI response was not handled during executor bootstrap")
+	}
+	if !actor.settlePluginUIRequestFromResponse(map[string]any{"type": "response", "id": "plugin-request", "result": "later-choice"}) {
+		t.Fatal("duplicate plugin UI response was not handled during executor bootstrap")
+	}
+	actor.mu.Lock()
+	actor.executorReady = true
+	actor.executorBootstrapComplete = true
+	actor.mu.Unlock()
+
+	actor.flushPluginUIResponses()
+	var delivered map[string]any
+	if err := client.ReadJSON(&delivered); err != nil {
+		t.Fatalf("read replayed plugin UI response: %v", err)
+	}
+	message := mapValue(delivered["message"])
+	if delivered["type"] != "plugin_message" || message["id"] != "plugin-request" || message["result"] != "choice" {
+		t.Fatalf("replayed plugin UI response = %#v", delivered)
+	}
+
+	actor.mu.Lock()
+	request := cloneNeoJSONMap(actor.pluginUIRequests["plugin-request"])
+	response := cloneNeoJSONMap(actor.pluginUIResponses["plugin-request"])
+	actor.mu.Unlock()
+	if len(request) != 0 || len(response) != 0 {
+		t.Fatalf("reconnected plugin UI work remained pending request=%#v response=%#v", request, response)
 	}
 }
 
@@ -4581,6 +5581,7 @@ func TestNeoRuntimeGatewayWebSocketJSONRPCSkipReadyWaitSubprotocolDefersSnapshot
 		{ThreadID: threadID, MessageID: "M-old", Role: "user", Content: []any{map[string]any{"type": "text", "text": "old"}}, Seq: 1},
 		{ThreadID: threadID, MessageID: "M-new", Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "new"}}, Seq: 2},
 	}
+	actor.replayEvents = []neoReplayEvent{{Seq: 2, Payload: neoMessageAddedPayload(actor.messages[1])}}
 	actor.seq = 3
 	actor.mu.Unlock()
 
@@ -4946,6 +5947,233 @@ func TestNeoRuntimeShutdownPreservesPendingExecutorToolForReconnect(t *testing.T
 	if got := stringValue(resultAfterReconnect["status"]); got != "done" {
 		t.Fatalf("restored review result status = %q, want done", got)
 	}
+	waitForNeoActorSyncIdle(t, restored)
+	waitForNeoActorSyncIdle(t, replacement)
+}
+
+func TestNeoRuntimeRebindPreservesPendingExecutorToolForReconnect(t *testing.T) {
+	useTempNeoThreadStore(t)
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
+		Enabled: &enabled,
+		Host:    "127.0.0.1",
+		Port:    freeTCPPortForTest(t),
+	}}})
+	if err := rt.start(); err != nil {
+		t.Fatalf("start runtime: %v", err)
+	}
+
+	threadID := "T-019f4899-7bfa-78aa-9d42-ca39216d818d"
+	toolCallID := "TU-0000000000000000000003"
+	actor := rt.store.ensureThreadActor(threadID)
+	executorSocket := &neoSocket{}
+	executorSocket.markExecutor("executor-rebind")
+	actor.mu.Lock()
+	actor.executorID = "executor-rebind"
+	actor.executorSocket = executorSocket
+	actor.executorReady = true
+	actor.executorBootstrapComplete = true
+	actor.currentAgentMode = "high"
+	actor.currentReasoningEffort = "xhigh"
+	actor.storeMessageLocked(neoMessage{ThreadID: threadID, MessageID: "M-user", Role: "user", AgentMode: "high", ReasoningEffort: "xhigh", Content: []any{map[string]any{"type": "text", "text": "continue after rebind"}}})
+	actor.storeMessageLocked(neoMessage{ThreadID: threadID, MessageID: "M-assistant", Role: "assistant", AgentMode: "high", ReasoningEffort: "xhigh", State: map[string]any{"type": "complete", "stopReason": "tool_use"}, Content: []any{map[string]any{"type": "tool_use", "id": toolCallID, "name": "shell_command", "input": map[string]any{"command": "go test ./..."}}}})
+	actor.storeMessageLocked(neoMessage{ThreadID: threadID, MessageID: toolResultMessageID(toolCallID), Role: "user", Content: []any{map[string]any{"type": "tool_result", "toolUseID": toolCallID, "run": map[string]any{"status": "in-progress", "progress": "testing"}}}, CompletionStatus: "tool_progress"})
+	actor.pendingTools[toolCallID] = neoPendingTool{ID: toolCallID, Name: "shell_command", AgentMode: "high", ReasoningEffort: "xhigh", MessageID: "M-assistant"}
+	actor.agentState = "running_tools"
+	actor.reconnectGeneration = 7
+	actor.resumeExecutorID = "executor-rebind"
+	actor.executorSocket = nil
+	actor.executorReady = false
+	actor.executorBootstrapComplete = false
+	actor.rebuildHistoryLocked()
+	actor.mu.Unlock()
+	rt.store.preserveExecutorWorkOnClose()
+	actor.finalizeDeferredExecutorDisconnect("executor-rebind", 7)
+	actor.mu.Lock()
+	_, pendingAfterStaleTimer := actor.pendingTools[toolCallID]
+	actor.mu.Unlock()
+	if !pendingAfterStaleTimer {
+		t.Fatal("stale reconnect timer cleared work preserved for rebind")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := rt.rebind(ctx); err != nil {
+		t.Fatalf("rebind runtime: %v", err)
+	}
+
+	stored, ok := loadNeoThreadFromDir(threadID, neoAmpThreadStoreDir())
+	if !ok {
+		t.Fatal("rebind snapshot was not persisted")
+	}
+	if got := stringValue(mapValue(stored["meta"])[neoResumeExecutorIDMetaKey]); got != "executor-rebind" {
+		t.Fatalf("resume executor id = %q, want executor-rebind", got)
+	}
+	restored := newNeoActor(newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled}}}), "actor-restored", "thread-actor", threadID, threadID, neoActorRecord("actor-restored", "thread-actor", threadID), nil)
+	if err := restored.importThreadLocalOnly(stored); err != nil {
+		t.Fatalf("import rebind snapshot: %v", err)
+	}
+	restored.mu.Lock()
+	pending := restored.pendingTools[toolCallID]
+	result := mapValue(mapValue(restored.messages[2].Content[0])["run"])
+	restored.mu.Unlock()
+	if pending.ID != toolCallID || stringValue(result["status"]) != "in-progress" {
+		t.Fatalf("rebind work = pending:%#v run:%#v", pending, result)
+	}
+}
+
+func TestNeoRuntimeRebindConvertsSpawnedExecutorWorkToPendingInference(t *testing.T) {
+	useTempNeoThreadStore(t)
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
+		Enabled: &enabled,
+		Host:    "127.0.0.1",
+		Port:    freeTCPPortForTest(t),
+	}}})
+	if err := rt.start(); err != nil {
+		t.Fatalf("start runtime: %v", err)
+	}
+
+	threadID := "T-019f4899-7bfa-78aa-9d42-ca39216d818f"
+	toolCallID := "TU-0000000000000000000005"
+	actor := rt.store.ensureThreadActor(threadID)
+	actor.mu.Lock()
+	actor.bootstrapExecutorType = "local-client"
+	actor.executorID = "cli-headless-old"
+	actor.executorReady = true
+	actor.executorBootstrapComplete = true
+	actor.spawnedExecutors["spawn-old"] = &neoSpawnedExecutor{spawnID: "spawn-old", threadID: threadID}
+	actor.currentAgentMode = "high"
+	actor.currentReasoningEffort = "xhigh"
+	actor.storeMessageLocked(neoMessage{ThreadID: threadID, MessageID: "M-assistant", Role: "assistant", State: map[string]any{"type": "complete", "stopReason": "tool_use"}, Content: []any{map[string]any{"type": "tool_use", "id": toolCallID, "name": "shell_command", "input": map[string]any{"command": "go test ./..."}}}})
+	actor.storeMessageLocked(neoMessage{ThreadID: threadID, MessageID: toolResultMessageID(toolCallID), Role: "user", Content: []any{map[string]any{"type": "tool_result", "toolUseID": toolCallID, "run": map[string]any{"status": "in-progress"}}}, CompletionStatus: "tool_progress"})
+	actor.pendingTools[toolCallID] = neoPendingTool{ID: toolCallID, Name: "shell_command", AgentMode: "high", ReasoningEffort: "xhigh", MessageID: "M-assistant"}
+	actor.agentState = "running_tools"
+	actor.rebuildHistoryLocked()
+	actor.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := rt.rebind(ctx); err != nil {
+		t.Fatalf("rebind runtime: %v", err)
+	}
+
+	stored, ok := loadNeoThreadFromDir(threadID, neoAmpThreadStoreDir())
+	if !ok {
+		t.Fatal("rebind snapshot was not persisted")
+	}
+	if got := stringValue(mapValue(stored["meta"])[neoResumeExecutorIDMetaKey]); got != "" {
+		t.Fatalf("spawned executor resume id = %q, want empty", got)
+	}
+	if pending := mapValue(stored["pendingInference"]); stringValue(pending["agentMode"]) != "high" || stringValue(pending["reasoningEffort"]) != "xhigh" {
+		t.Fatalf("spawned executor continuation = %#v", pending)
+	}
+
+	disabled := false
+	restarted := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &disabled}}})
+	restored := newNeoActor(restarted, "actor-restored", "thread-actor", threadID, threadID, neoActorRecord("actor-restored", "thread-actor", threadID), nil)
+	if err := restored.importThreadLocalOnly(stored); err != nil {
+		t.Fatalf("import rebind snapshot: %v", err)
+	}
+	restored.mu.Lock()
+	_, stillPending := restored.pendingTools[toolCallID]
+	pendingInference := cloneNeoInferenceInflight(restored.pendingInference)
+	agentState := restored.agentState
+	restored.mu.Unlock()
+	if stillPending || pendingInference == nil || agentState != "idle" {
+		t.Fatalf("restored spawned work = pendingTool:%v pendingInference:%#v state:%q", stillPending, pendingInference, agentState)
+	}
+}
+
+func TestNeoRuntimeStopClearsPendingExecutorWork(t *testing.T) {
+	useTempNeoThreadStore(t)
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
+		Enabled: &enabled,
+		Host:    "127.0.0.1",
+		Port:    freeTCPPortForTest(t),
+	}}})
+	if err := rt.start(); err != nil {
+		t.Fatalf("start runtime: %v", err)
+	}
+
+	threadID := "T-019f4899-7bfa-78aa-9d42-ca39216d818e"
+	toolCallID := "TU-0000000000000000000004"
+	actor := rt.store.ensureThreadActor(threadID)
+	actor.mu.Lock()
+	actor.resumeExecutorID = "executor-disabled"
+	actor.meta[neoResumeExecutorIDMetaKey] = "executor-disabled"
+	actor.currentAgentMode = "high"
+	actor.currentReasoningEffort = "xhigh"
+	actor.currentInference = &neoInferenceInflight{messageID: "M-assistant", agentMode: "high", reasoningEffort: "xhigh"}
+	actor.pendingInference = &neoInferenceInflight{messageID: "M-pending", agentMode: "high", reasoningEffort: "xhigh"}
+	actor.storeMessageLocked(neoMessage{ThreadID: threadID, MessageID: "M-assistant", Role: "assistant", State: map[string]any{"type": "complete", "stopReason": "tool_use"}, Content: []any{map[string]any{"type": "tool_use", "id": toolCallID, "name": "shell_command", "input": map[string]any{"command": "go test ./..."}}}})
+	actor.storeMessageLocked(neoMessage{ThreadID: threadID, MessageID: toolResultMessageID(toolCallID), Role: "user", Content: []any{map[string]any{"type": "tool_result", "toolUseID": toolCallID, "run": map[string]any{"status": "in-progress"}}}, CompletionStatus: "tool_progress"})
+	actor.pendingTools[toolCallID] = neoPendingTool{ID: toolCallID, Name: "shell_command", AgentMode: "high", ReasoningEffort: "xhigh", MessageID: "M-assistant"}
+	actor.agentState = "running_tools"
+	actor.rebuildHistoryLocked()
+	actor.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := rt.stop(ctx); err != nil {
+		t.Fatalf("stop runtime: %v", err)
+	}
+	actor.mu.Lock()
+	currentAfterStop := cloneNeoInferenceInflight(actor.currentInference)
+	pendingAfterStop := cloneNeoInferenceInflight(actor.pendingInference)
+	executorIDAfterStop := actor.executorID
+	resumeExecutorIDAfterStop := actor.resumeExecutorID
+	actor.mu.Unlock()
+	if currentAfterStop != nil || pendingAfterStop != nil || executorIDAfterStop != "" || resumeExecutorIDAfterStop != "" {
+		t.Fatalf("deliberate stop retained executor work: current=%#v pending=%#v executor=%q resume=%q", currentAfterStop, pendingAfterStop, executorIDAfterStop, resumeExecutorIDAfterStop)
+	}
+
+	stored, ok := loadNeoThreadFromDir(threadID, neoAmpThreadStoreDir())
+	if !ok {
+		t.Fatal("stop snapshot was not persisted")
+	}
+	if pending := mapValue(stored["pendingInference"]); len(pending) != 0 {
+		t.Fatalf("deliberate stop persisted pending inference: %#v", pending)
+	}
+	if got := stringValue(mapValue(stored["meta"])[neoResumeExecutorIDMetaKey]); got != "" {
+		t.Fatalf("deliberate stop persisted resume executor id %q", got)
+	}
+	if got := stringValue(stored["agentState"]); got != "idle" {
+		t.Fatalf("deliberate stop agent state = %q, want idle", got)
+	}
+}
+
+func TestNeoRuntimeStopCleansExecutorSpawnedDuringFinalFlush(t *testing.T) {
+	useTempNeoThreadStore(t)
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
+		Enabled: &enabled,
+		Host:    "127.0.0.1",
+		Port:    freeTCPPortForTest(t),
+	}}})
+	if err := rt.start(); err != nil {
+		t.Fatalf("start runtime: %v", err)
+	}
+	actor := rt.store.ensureThreadActor("T-019f4899-7bfa-78aa-9d42-ca39216d8190")
+	rt.writeLocalSnapshot = func(neoCloudThreadSnapshot, string) (int64, error) {
+		actor.mu.Lock()
+		actor.spawnedExecutors["spawn-late"] = &neoSpawnedExecutor{spawnID: "spawn-late", threadID: actor.threadID}
+		actor.mu.Unlock()
+		return 0, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := rt.stop(ctx); err != nil {
+		t.Fatalf("stop runtime: %v", err)
+	}
+	actor.mu.Lock()
+	spawned := len(actor.spawnedExecutors)
+	actor.mu.Unlock()
+	if spawned != 0 {
+		t.Fatalf("late spawned executors after stop = %d, want 0", spawned)
+	}
 }
 
 func TestNeoRuntimeShutdownPersistsLocalReasoningEffortSetting(t *testing.T) {
@@ -5104,23 +6332,1758 @@ func TestWriteNeoLocalThreadFileTightensExistingDirectoryPermissions(t *testing.
 	}
 }
 
-func TestNeoActorLocalSnapshotEpochRejectsPreFlushWriters(t *testing.T) {
-	rt := newNeoRuntime(&config.Config{})
-	actor := newNeoActor(rt, "actor-snapshot-epoch", "thread-actor", "T-snapshot-epoch", "T-snapshot-epoch", neoActorRecord("actor-snapshot-epoch", "thread-actor", "T-snapshot-epoch"), nil)
-	staleEpoch := actor.localSnapshotSyncEpoch()
-
-	actor.closeLocalSnapshotSyncs()
-	actor.reopenLocalSnapshotSyncs()
-
-	if actor.beginLocalSnapshotSync(staleEpoch) {
-		actor.syncWG.Done()
-		t.Fatal("stale pre-flush snapshot writer was allowed after final flush")
+func TestWriteNeoJSONObjectMatchesJSONMarshal(t *testing.T) {
+	value := map[string]any{
+		"z":        neoExplicitNull,
+		"messages": []any{map[string]any{"content": []any{map[string]any{"text": "<>&\u2028", "type": "text"}}, "messageId": "M-1"}, nil, []any{"tail", 3.5}},
+		"empty":    []any{},
+		"typedNil": []any(nil),
+		"meta":     map[string]any{"nested": true, "nil": nil},
 	}
-	freshEpoch := actor.localSnapshotSyncEpoch()
-	if !actor.beginLocalSnapshotSync(freshEpoch) {
-		t.Fatal("fresh post-flush snapshot writer was rejected")
+	want, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("marshal expected object: %v", err)
 	}
-	actor.syncWG.Done()
+	var valueBytes bytes.Buffer
+	if err := writeNeoJSONObjectValue(&valueBytes, value); err != nil {
+		t.Fatalf("write object value: %v", err)
+	}
+	if !bytes.Equal(valueBytes.Bytes(), want) {
+		t.Fatalf("object value bytes = %q, want %q", valueBytes.Bytes(), want)
+	}
+	var got bytes.Buffer
+	if err := writeNeoJSONObject(&got, value); err != nil {
+		t.Fatalf("write object: %v", err)
+	}
+	wantFile := append(append([]byte(nil), want...), '\n')
+	if !bytes.Equal(got.Bytes(), wantFile) {
+		t.Fatalf("object bytes = %q, want %q", got.Bytes(), wantFile)
+	}
+}
+
+func TestWriteNeoCloudUploadPayloadMatchesJSONMarshal(t *testing.T) {
+	thread := map[string]any{
+		"id":       "T-test",
+		"messages": []any{map[string]any{"content": []any{map[string]any{"text": "Amp ☃ <>&\n", "type": "text"}}, "messageId": "M-1"}, nil},
+		"empty":    []any{},
+		"typedNil": []any(nil),
+		"meta":     map[string]any{"nested": true, "nil": nil},
+	}
+	want, err := json.Marshal(map[string]any{
+		"method": "uploadThread",
+		"params": map[string]any{
+			"thread":          thread,
+			"createdOnServer": false,
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal expected upload payload: %v", err)
+	}
+	var got bytes.Buffer
+	if err := writeNeoCloudUploadPayload(&got, thread); err != nil {
+		t.Fatalf("write upload payload: %v", err)
+	}
+	if !bytes.Equal(got.Bytes(), want) {
+		t.Fatalf("upload payload bytes = %q, want %q", got.Bytes(), want)
+	}
+}
+
+func TestNeoCloudUploadBodyThreshold(t *testing.T) {
+	tests := []struct {
+		name       string
+		size       int
+		chunkBytes int
+		compressed bool
+	}{
+		{name: "below", size: neoCloudGzipBytes - 1, chunkBytes: neoCloudGzipBytes - 1},
+		{name: "exact", size: neoCloudGzipBytes, chunkBytes: 64 * 1024, compressed: true},
+		{name: "above", size: neoCloudGzipBytes + 1, chunkBytes: neoCloudGzipBytes + 1, compressed: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			want := bytes.Repeat([]byte("x"), test.size)
+			var body neoCloudUploadBody
+			for offset := 0; offset < len(want); offset += test.chunkBytes {
+				end := min(offset+test.chunkBytes, len(want))
+				written, err := body.Write(want[offset:end])
+				if err != nil || written != end-offset {
+					t.Fatalf("write bytes = %d, %v", written, err)
+				}
+			}
+			if err := body.Close(); err != nil {
+				t.Fatalf("close body: %v", err)
+			}
+			if body.Compressed() != test.compressed {
+				t.Fatalf("compressed = %t, want %t", body.Compressed(), test.compressed)
+			}
+			if body.serializedBytes != int64(len(want)) {
+				t.Fatalf("serialized bytes = %d, want %d", body.serializedBytes, len(want))
+			}
+			got := body.Bytes()
+			if test.compressed {
+				gz, err := gzip.NewReader(bytes.NewReader(got))
+				if err != nil {
+					t.Fatalf("open gzip body: %v", err)
+				}
+				got, err = io.ReadAll(gz)
+				if err != nil {
+					t.Fatalf("read gzip body: %v", err)
+				}
+				if err := gz.Close(); err != nil {
+					t.Fatalf("close gzip body: %v", err)
+				}
+			}
+			if !bytes.Equal(got, want) {
+				t.Fatal("round-trip body differs")
+			}
+		})
+	}
+}
+
+func TestNeoActorLocalSnapshotCachesUnchangedMessageJSON(t *testing.T) {
+	threadID := "T-019f4000-0000-4000-8000-000000000061"
+	actor := newNeoActor(nil, "actor-snapshot-cache", "thread-actor", threadID, threadID, neoActorRecord("actor-snapshot-cache", "thread-actor", threadID), nil)
+	actor.environment = map[string]any{"workingDirectory": t.TempDir()}
+	bytesValue := []byte("bytes")
+	rawValue := json.RawMessage(`{"value":"raw"}`)
+	typedMaps := []map[string]any{{"type": "text", "text": "typed"}}
+	actor.messages = []neoMessage{
+		{ThreadID: threadID, MessageID: "M-1", Role: "user", AgentMode: "smart", Content: []any{map[string]any{"type": "text", "text": "first"}}, Seq: 1},
+		{ThreadID: threadID, MessageID: "M-2", Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "second"}, bytesValue, rawValue, typedMaps}, State: map[string]any{"type": "complete"}, Usage: map[string]any{"inputTokens": 1}, OriginalToolUseInput: map[string]any{"call": map[string]any{"value": "first"}}, Seq: 2},
+	}
+	actor.compactionRecords = []map[string]any{{"cutMessageId": "M-1", "summary": "generated summary"}}
+
+	first, ok := actor.threadSnapshot()
+	if !ok {
+		t.Fatal("first snapshot unavailable")
+	}
+	firstGeneration := actor.localSnapshotMessageCache["M-1\x000"].generation
+	secondGeneration := actor.localSnapshotMessageCache["M-2\x000"].generation
+	second, ok := actor.threadSnapshot()
+	if !ok {
+		t.Fatal("second snapshot unavailable")
+	}
+	if actor.localSnapshotMessageCache["M-1\x000"].generation != firstGeneration || actor.localSnapshotMessageCache["M-2\x000"].generation != secondGeneration {
+		t.Fatalf("unchanged generations = (%d, %d), want (%d, %d)", actor.localSnapshotMessageCache["M-1\x000"].generation, actor.localSnapshotMessageCache["M-2\x000"].generation, firstGeneration, secondGeneration)
+	}
+	if &first.messageJSON[0][0] != &second.messageJSON[0][0] || &first.messageJSON[1][0] != &second.messageJSON[1][0] {
+		t.Fatal("unchanged snapshot message JSON was reallocated")
+	}
+
+	actor.mu.Lock()
+	mapValue(actor.messages[1].Content[0])["text"] = "changed"
+	actor.mu.Unlock()
+	third, ok := actor.threadSnapshot()
+	if !ok {
+		t.Fatal("third snapshot unavailable")
+	}
+	if actor.localSnapshotMessageCache["M-1\x000"].generation != firstGeneration {
+		t.Fatal("unchanged message generation changed")
+	}
+	if actor.localSnapshotMessageCache["M-2\x000"].generation <= secondGeneration {
+		t.Fatal("mutated message generation did not advance")
+	}
+	if &second.messageJSON[0][0] != &third.messageJSON[0][0] {
+		t.Fatal("unchanged message JSON was not reused after another message changed")
+	}
+	if bytes.Equal(second.messageJSON[1], third.messageJSON[1]) {
+		t.Fatal("mutated message JSON was not refreshed")
+	}
+
+	thirdGeneration := actor.localSnapshotMessageCache["M-2\x000"].generation
+	actor.mu.Lock()
+	bytesValue[0] = 'B'
+	rawValue[10] = 'R'
+	typedMaps[0]["text"] = "changed typed"
+	actor.messages[1].State["stopReason"] = "end_turn"
+	actor.messages[1].Usage["outputTokens"] = 2
+	mapValue(actor.messages[1].OriginalToolUseInput["call"])["value"] = "second"
+	actor.mu.Unlock()
+	fourth, ok := actor.threadSnapshot()
+	if !ok {
+		t.Fatal("fourth snapshot unavailable")
+	}
+	if actor.localSnapshotMessageCache["M-2\x000"].generation <= thirdGeneration {
+		t.Fatal("byte-backed or secondary-field mutation did not invalidate cached JSON")
+	}
+	if bytes.Equal(third.messageJSON[1], fourth.messageJSON[1]) {
+		t.Fatal("byte-backed or secondary-field mutation did not refresh JSON")
+	}
+
+	fourthGeneration := actor.localSnapshotMessageCache["M-2\x000"].generation
+	actor.mu.Lock()
+	replacement := actor.messages[1]
+	replacement.CompletionStatus = "complete"
+	actor.messages[1] = replacement
+	actor.mu.Unlock()
+	fifth, ok := actor.threadSnapshot()
+	if !ok {
+		t.Fatal("fifth snapshot unavailable")
+	}
+	if actor.localSnapshotMessageCache["M-2\x000"].generation <= fourthGeneration {
+		t.Fatal("whole-message replacement did not invalidate cached JSON")
+	}
+
+	wantThread := neoCloudThread(fifth)
+	if settings := neoLocalThreadSnapshotSettings(fifth); len(settings) > 0 {
+		wantThread["settings"] = settings
+	}
+	want, err := json.Marshal(wantThread)
+	if err != nil {
+		t.Fatalf("marshal expected thread: %v", err)
+	}
+	want = append(want, '\n')
+	writtenThread, path, err := writeNeoLocalThreadSnapshotFile(fifth, t.TempDir())
+	if err != nil {
+		t.Fatalf("write cached snapshot: %v", err)
+	}
+	if got, want := neoWebLocalProjectFromThread(writtenThread), neoWebLocalProjectFromThread(wantThread); !reflect.DeepEqual(got, want) {
+		t.Fatalf("cached snapshot project = %#v, want %#v", got, want)
+	}
+	remarshaled, err := json.Marshal(writtenThread)
+	if err != nil {
+		t.Fatalf("remarshal cached snapshot: %v", err)
+	}
+	if !bytes.Equal(remarshaled, bytes.TrimSuffix(want, []byte{'\n'})) {
+		t.Fatal("remarshaled cached snapshot differs from complete thread encoding")
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read cached snapshot: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("cached snapshot bytes differ from complete thread encoding")
+	}
+
+	fallback := fifth
+	fallback.messageJSON = append([]neoLocalSnapshotMessageJSON(nil), fifth.messageJSON...)
+	fallback.messageJSON[1] = nil
+	_, fallbackPath, err := writeNeoLocalThreadSnapshotFile(fallback, t.TempDir())
+	if err != nil {
+		t.Fatalf("write fallback snapshot: %v", err)
+	}
+	fallbackBytes, err := os.ReadFile(fallbackPath)
+	if err != nil {
+		t.Fatalf("read fallback snapshot: %v", err)
+	}
+	if !bytes.Equal(fallbackBytes, want) {
+		t.Fatal("fallback snapshot bytes differ from complete thread encoding")
+	}
+
+	for _, snapshotPath := range []struct {
+		name string
+		path string
+	}{
+		{name: "cached", path: path},
+		{name: "fallback", path: fallbackPath},
+	} {
+		t.Run(snapshotPath.name+" restore", func(t *testing.T) {
+			thread, ok := loadNeoThreadFromDir(threadID, filepath.Dir(snapshotPath.path))
+			if !ok {
+				t.Fatal("load persisted snapshot")
+			}
+			restored := newNeoActor(nil, "actor-snapshot-cache-restored", "thread-actor", threadID, threadID, neoActorRecord("actor-snapshot-cache-restored", "thread-actor", threadID), nil)
+			if err := restored.importThreadLocalOnly(thread); err != nil {
+				t.Fatalf("import persisted snapshot: %v", err)
+			}
+			if len(restored.messages) != 2 || restored.messages[0].Role != "user" || restored.messages[1].Role != "assistant" {
+				t.Fatalf("restored messages = %#v", restored.messages)
+			}
+			assistant := restored.messages[1]
+			if textFromBlocks(assistant.Content) != "changed" || assistant.CompletionStatus != "complete" || len(assistant.State) != 0 {
+				t.Fatalf("restored assistant state = %#v", assistant)
+			}
+			if numberFrom(assistant.Usage["inputTokens"]) != 1 || numberFrom(assistant.Usage["outputTokens"]) != 2 || stringValue(mapValue(assistant.OriginalToolUseInput["call"])["value"]) != "second" {
+				t.Fatalf("restored assistant metadata = usage:%#v tool-input:%#v", assistant.Usage, assistant.OriginalToolUseInput)
+			}
+			if len(assistant.Content) != 4 {
+				t.Fatalf("restored assistant content = %#v", assistant.Content)
+			}
+			typedContent := arrayValue(assistant.Content[3])
+			if stringValue(assistant.Content[1]) != "Qnl0ZXM=" || stringValue(mapValue(assistant.Content[2])["value"]) != "Raw" || len(typedContent) != 1 || stringValue(mapValue(typedContent[0])["text"]) != "changed typed" {
+				t.Fatalf("restored assistant content = %#v", assistant.Content)
+			}
+			if stringValue(restored.settings["agentMode"]) != "smart" || len(restored.compactionRecords) != 1 || stringValue(restored.compactionRecords[0]["cutMessageId"]) != "M-1" {
+				t.Fatalf("restored thread state = settings:%#v compaction:%#v", restored.settings, restored.compactionRecords)
+			}
+		})
+	}
+}
+
+func TestNeoActorLocalSnapshotCacheHandlesDuplicateMessageIDs(t *testing.T) {
+	threadID := "T-019f4000-0000-4000-8000-000000000063"
+	actor := newNeoActor(nil, "actor-snapshot-cache-duplicates", "thread-actor", threadID, threadID, neoActorRecord("actor-snapshot-cache-duplicates", "thread-actor", threadID), nil)
+	actor.messages = []neoMessage{
+		{ThreadID: threadID, MessageID: "M-duplicate", Role: "user", Content: []any{map[string]any{"type": "text", "text": "first"}}},
+		{ThreadID: threadID, MessageID: "M-duplicate", Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "second"}}},
+	}
+	first, ok := actor.threadSnapshot()
+	if !ok {
+		t.Fatal("first duplicate snapshot unavailable")
+	}
+	second, ok := actor.threadSnapshot()
+	if !ok {
+		t.Fatal("second duplicate snapshot unavailable")
+	}
+	if len(actor.localSnapshotMessageCache) != 2 {
+		t.Fatalf("duplicate cache entries = %d, want 2", len(actor.localSnapshotMessageCache))
+	}
+	if &first.messageJSON[0][0] != &second.messageJSON[0][0] || &first.messageJSON[1][0] != &second.messageJSON[1][0] {
+		t.Fatal("unchanged duplicate-ID messages were not reused independently")
+	}
+	actor.mu.Lock()
+	mapValue(actor.messages[1].Content[0])["text"] = "changed"
+	actor.mu.Unlock()
+	third, ok := actor.threadSnapshot()
+	if !ok {
+		t.Fatal("third duplicate snapshot unavailable")
+	}
+	if &second.messageJSON[0][0] != &third.messageJSON[0][0] {
+		t.Fatal("first duplicate-ID message was invalidated by second duplicate")
+	}
+	if bytes.Equal(second.messageJSON[1], third.messageJSON[1]) {
+		t.Fatal("mutated duplicate-ID message JSON was not refreshed")
+	}
+}
+
+func TestNeoActorSnapshotCanSkipLocalMessageJSON(t *testing.T) {
+	threadID := "T-019f4000-0000-4000-8000-000000000066"
+	actor := newNeoActor(nil, "actor-snapshot-without-local-json", "thread-actor", threadID, threadID, neoActorRecord("actor-snapshot-without-local-json", "thread-actor", threadID), nil)
+	actor.messages = []neoMessage{
+		{ThreadID: threadID, MessageID: "M-1", Role: "user", Content: []any{map[string]any{"type": "text", "text": "first"}}, Seq: 1},
+		{ThreadID: threadID, MessageID: "M-2", Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "second"}}, State: map[string]any{"type": "complete"}, Usage: map[string]any{"outputTokens": 2}, Seq: 2},
+	}
+	actor.compactionRecords = []map[string]any{{"cutMessageId": "M-1", "summary": "generated summary"}}
+	if _, ok := actor.threadSnapshot(); !ok {
+		t.Fatal("warm snapshot unavailable")
+	}
+	wantGeneration := actor.localSnapshotMessageGen
+	wantCache := make(map[string]neoLocalSnapshotMessageCache, len(actor.localSnapshotMessageCache))
+	for key, cached := range actor.localSnapshotMessageCache {
+		wantCache[key] = cached
+	}
+
+	actor.mu.Lock()
+	mapValue(actor.messages[1].Content[0])["text"] = "changed"
+	actor.mu.Unlock()
+	lean, ok := actor.threadSnapshotWithOptions(neoThreadSnapshotOptions{
+		skipLocalMessageJSON: true,
+	})
+	if !ok {
+		t.Fatal("snapshot without local message JSON unavailable")
+	}
+	if lean.messageJSON != nil {
+		t.Fatalf("snapshot message JSON = %d entries, want nil", len(lean.messageJSON))
+	}
+	if actor.localSnapshotMessageGen != wantGeneration || !reflect.DeepEqual(actor.localSnapshotMessageCache, wantCache) {
+		t.Fatal("snapshot without local message JSON changed the local persistence cache")
+	}
+	full, ok := actor.threadSnapshot()
+	if !ok {
+		t.Fatal("full snapshot unavailable")
+	}
+	if got, want := neoCloudThread(lean), neoCloudThread(full); !reflect.DeepEqual(got, want) {
+		t.Fatalf("cloud thread without local message JSON = %#v, want %#v", got, want)
+	}
+	if &lean.messages[1] == &actor.messages[1] || &full.messages[1] == &actor.messages[1] || &lean.messages[1].Content[0] == &actor.messages[1].Content[0] || &full.messages[1].Content[0] == &actor.messages[1].Content[0] {
+		t.Fatal("general thread snapshot did not deep-clone messages")
+	}
+	written, _, err := writeNeoLocalThreadSnapshotFile(lean, t.TempDir())
+	if err != nil {
+		t.Fatalf("write snapshot without local message JSON: %v", err)
+	}
+	if got, want := written, neoCloudThread(lean); !reflect.DeepEqual(got, want) {
+		t.Fatalf("written snapshot without local message JSON = %#v, want %#v", got, want)
+	}
+
+	actor.mu.Lock()
+	mapValue(actor.messages[1].Content[0])["text"] = "later"
+	actor.mu.Unlock()
+	if got := stringValue(mapValue(lean.messages[1].Content[0])["text"]); got != "changed" {
+		t.Fatalf("isolated snapshot text = %q, want changed", got)
+	}
+}
+
+func TestNeoActorWorkerRevisionToolProcessedCOW(t *testing.T) {
+	threadID := "T-019f4000-0000-4000-8000-000000000074"
+	toolCallID := "TU-0000000000000000000074"
+	actor := newNeoActor(nil, "actor-worker-tool-cow", "thread-actor", threadID, threadID, neoActorRecord("actor-worker-tool-cow", "thread-actor", threadID), nil)
+	actor.messages = []neoMessage{{
+		ThreadID:  threadID,
+		MessageID: "M-tool-cow",
+		Role:      "assistant",
+		Content: []any{map[string]any{
+			"type":  "tool_use",
+			"id":    toolCallID,
+			"name":  "Bash",
+			"input": map[string]any{"command": map[string]any{"text": "original"}},
+		}},
+		OriginalToolUseInput: map[string]any{"existing": map[string]any{"value": "stable"}},
+	}}
+
+	published, ok := actor.workerThreadSnapshot(false)
+	if !ok {
+		t.Fatal("worker revision unavailable")
+	}
+	before, err := json.Marshal(neoCloudThread(published))
+	if err != nil {
+		t.Fatalf("marshal published revision: %v", err)
+	}
+	newArgs := map[string]any{"command": map[string]any{"text": "processed"}}
+	actor.handleBinaryToolProcessed(map[string]any{"toolUseID": toolCallID, "newArgs": newArgs})
+	newArgsCommand := mapValue(newArgs["command"])
+	newArgsCommand["text"] = "inbound mutation"
+
+	after, err := json.Marshal(neoCloudThread(published))
+	if err != nil {
+		t.Fatalf("remarshal published revision: %v", err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatal("published revision changed after tool processing")
+	}
+	if _, exists := published.messages[0].OriginalToolUseInput[toolCallID]; exists {
+		t.Fatal("published OriginalToolUseInput gained processed tool key")
+	}
+
+	actor.mu.Lock()
+	storedOriginal := mapValue(actor.messages[0].OriginalToolUseInput[toolCallID])
+	mapValue(actor.messages[0].OriginalToolUseInput["existing"])["value"] = "actor mutation"
+	currentInput := mapValue(mapValue(actor.messages[0].Content[0])["input"])
+	actor.mu.Unlock()
+	if got := stringValue(mapValue(storedOriginal["command"])["text"]); got != "original" {
+		t.Fatalf("stored original input = %q, want original", got)
+	}
+	mapValue(storedOriginal["command"])["text"] = "stored mutation"
+	if got := stringValue(mapValue(mapValue(mapValue(published.messages[0].Content[0])["input"])["command"])["text"]); got != "original" {
+		t.Fatalf("published tool input = %q, want original", got)
+	}
+	if got := stringValue(mapValue(published.messages[0].OriginalToolUseInput["existing"])["value"]); got != "stable" {
+		t.Fatalf("published existing original input = %q, want stable", got)
+	}
+	if got := stringValue(mapValue(currentInput["command"])["text"]); got != "processed" {
+		t.Fatalf("actor processed input = %q, want processed", got)
+	}
+}
+
+func TestNeoActorWorkerRevisionAppendContentCOW(t *testing.T) {
+	threadID := "T-019f4000-0000-4000-8000-000000000075"
+	actor := newNeoActor(nil, "actor-worker-content-cow", "thread-actor", threadID, threadID, neoActorRecord("actor-worker-content-cow", "thread-actor", threadID), nil)
+	backing := make([]any, 2, 4)
+	backing[0] = map[string]any{"type": "text", "text": "original"}
+	backing[1] = map[string]any{"type": "text", "text": "spare sentinel"}
+	actor.messages = []neoMessage{{ThreadID: threadID, MessageID: "M-content-cow", Role: "user", Content: backing[:1]}}
+
+	published, ok := actor.workerThreadSnapshot(false)
+	if !ok {
+		t.Fatal("worker revision unavailable")
+	}
+	before, err := json.Marshal(neoCloudThread(published))
+	if err != nil {
+		t.Fatalf("marshal published revision: %v", err)
+	}
+	inbound := map[string]any{"type": "text", "text": "appended"}
+	actor.appendUserMessageContent(map[string]any{"messageId": "M-content-cow", "content": []any{inbound}})
+	inbound["text"] = "inbound mutation"
+
+	after, err := json.Marshal(neoCloudThread(published))
+	if err != nil {
+		t.Fatalf("remarshal published revision: %v", err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatal("published revision changed after content append")
+	}
+	if len(published.messages[0].Content) != 1 || stringValue(mapValue(backing[1])["text"]) != "spare sentinel" {
+		t.Fatalf("published or spare content changed: published=%#v spare=%#v", published.messages[0].Content, backing[1])
+	}
+	actor.mu.Lock()
+	actorContent := actor.messages[0].Content
+	actor.mu.Unlock()
+	if len(actorContent) != 2 || stringValue(mapValue(actorContent[1])["text"]) != "appended" {
+		t.Fatalf("actor appended content = %#v", actorContent)
+	}
+	if &actorContent[0] == &published.messages[0].Content[0] {
+		t.Fatal("actor append reused published content backing")
+	}
+}
+
+func TestNeoActorWorkerRevisionRemainsImmutableAcrossMessageMutations(t *testing.T) {
+	threadID := "T-019f4000-0000-4000-8000-000000000076"
+	toolCallID := "TU-0000000000000000000076"
+	newActor := func() *neoActor {
+		actor := newNeoActor(nil, "actor-worker-mutation-cow", "thread-actor", threadID, threadID, neoActorRecord("actor-worker-mutation-cow", "thread-actor", threadID), nil)
+		actor.messages = []neoMessage{
+			{
+				ThreadID:  threadID,
+				MessageID: "M-assistant-cow",
+				Role:      "assistant",
+				Content: []any{
+					map[string]any{"type": "thinking", "thinking": "before", "blockState": "streaming"},
+					map[string]any{"type": "tool_use", "id": toolCallID, "name": "Bash", "input": map[string]any{"command": "pwd"}, "complete": true},
+				},
+				State:                map[string]any{"type": "streaming"},
+				Usage:                map[string]any{"inputTokens": 1},
+				OriginalToolUseInput: map[string]any{"existing": map[string]any{"command": "ls"}},
+				Seq:                  1,
+			},
+			{
+				ThreadID:  threadID,
+				MessageID: "M-user-cow",
+				Role:      "user",
+				Content: []any{map[string]any{
+					"type":      "tool_result",
+					"toolUseID": toolCallID,
+					"run":       map[string]any{"status": "running"},
+				}},
+				Seq: 2,
+			},
+		}
+		actor.seq = 3
+		actor.currentInference = &neoInferenceInflight{messageID: "M-assistant-cow", agentMode: "smart", tools: []string{"Bash"}}
+		return actor
+	}
+	tests := []struct {
+		name   string
+		mutate func(*neoActor)
+	}{
+		{
+			name: "assistant delta",
+			mutate: func(actor *neoActor) {
+				actor.handleProtocolDelta(map[string]any{
+					"type":       "delta",
+					"messageId":  "M-assistant-cow",
+					"role":       "assistant",
+					"state":      "generating",
+					"blockIndex": 0,
+					"blocks":     []any{map[string]any{"type": "thinking", "thinking": " after"}},
+				})
+			},
+		},
+		{
+			name: "user delta",
+			mutate: func(actor *neoActor) {
+				actor.handleProtocolDelta(map[string]any{
+					"type":      "delta",
+					"messageId": "M-user-cow",
+					"role":      "user",
+					"blocks":    []any{map[string]any{"type": "text", "text": "after"}},
+				})
+			},
+		},
+		{
+			name: "tool result update",
+			mutate: func(actor *neoActor) {
+				actor.mu.Lock()
+				actor.storeToolResultEventLocked(neoStoredToolUseRef{MessageIndex: 0, BlockIndex: 1}, map[string]any{
+					"type":      "tool_result",
+					"toolUseID": toolCallID,
+					"run":       map[string]any{"status": "done", "result": "after"},
+				}, "")
+				actor.mu.Unlock()
+			},
+		},
+		{
+			name: "tool result cancellation",
+			mutate: func(actor *neoActor) {
+				actor.mu.Lock()
+				actor.cancelToolResultMessagesLocked([]string{toolCallID}, "user:cancelled")
+				actor.mu.Unlock()
+			},
+		},
+		{
+			name: "assistant cleanup",
+			mutate: func(actor *neoActor) {
+				actor.cleanupPriorAssistantForBinaryDeltaWithReason("user:cancelled")
+			},
+		},
+		{
+			name: "inference usage",
+			mutate: func(actor *neoActor) {
+				actor.handleBinaryInferenceCompleted(map[string]any{"model": "gpt-5", "usage": map[string]any{"outputTokens": 2}})
+			},
+		},
+		{
+			name: "message read",
+			mutate: func(actor *neoActor) {
+				actor.markMessageRead("M-user-cow", true)
+			},
+		},
+		{
+			name: "whole message replacement",
+			mutate: func(actor *neoActor) {
+				actor.storeMessage(neoMessage{
+					ThreadID:  threadID,
+					MessageID: "M-assistant-cow",
+					Role:      "assistant",
+					Content:   []any{map[string]any{"type": "text", "text": "after"}},
+					State:     map[string]any{"type": "complete"},
+				})
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			actor := newActor()
+			published, ok := actor.workerThreadSnapshot(false)
+			if !ok {
+				t.Fatal("worker revision unavailable")
+			}
+			before, err := json.Marshal(neoCloudThread(published))
+			if err != nil {
+				t.Fatalf("marshal published revision: %v", err)
+			}
+			tt.mutate(actor)
+			after, err := json.Marshal(neoCloudThread(published))
+			if err != nil {
+				t.Fatalf("remarshal published revision: %v", err)
+			}
+			if !bytes.Equal(after, before) {
+				t.Fatal("published revision changed after actor mutation")
+			}
+			current, ok := actor.threadSnapshotWithOptions(neoThreadSnapshotOptions{skipLocalMessageJSON: true})
+			if !ok {
+				t.Fatal("current snapshot unavailable")
+			}
+			currentBytes, err := json.Marshal(neoCloudThread(current))
+			if err != nil {
+				t.Fatalf("marshal current snapshot: %v", err)
+			}
+			if bytes.Equal(currentBytes, before) {
+				t.Fatal("mutation did not change current actor state")
+			}
+		})
+	}
+}
+
+func TestCloneNeoJSONValuePreservesByteBackedNilAndEmptyValues(t *testing.T) {
+	tests := []struct {
+		name  string
+		value any
+	}{
+		{name: "nil bytes", value: []byte(nil)},
+		{name: "empty bytes", value: make([]byte, 0)},
+		{name: "nil raw message", value: json.RawMessage(nil)},
+		{name: "empty raw message", value: make(json.RawMessage, 0)},
+		{name: "nil strings", value: []string(nil)},
+		{name: "empty strings", value: make([]string, 0)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			before, beforeErr := json.Marshal(test.value)
+			cloned := cloneNeoJSONValue(test.value)
+			after, afterErr := json.Marshal(cloned)
+			if !bytes.Equal(before, after) || (beforeErr == nil) != (afterErr == nil) {
+				t.Fatalf("clone encoding = (%q, %v), want (%q, %v)", after, afterErr, before, beforeErr)
+			}
+		})
+	}
+}
+
+func TestNeoLocalSnapshotMessageCacheAllowed(t *testing.T) {
+	tests := []struct {
+		name     string
+		messages int
+		bytes    int
+		want     bool
+	}{
+		{name: "maximum messages", messages: neoLocalSnapshotCacheMaxMessages, bytes: 1, want: true},
+		{name: "too many messages", messages: neoLocalSnapshotCacheMaxMessages + 1, bytes: 1},
+		{name: "maximum bytes", messages: 1, bytes: neoLocalSnapshotCacheMaxBytes, want: true},
+		{name: "too many bytes", messages: 1, bytes: neoLocalSnapshotCacheMaxBytes + 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := neoLocalSnapshotMessageCacheAllowed(test.messages, test.bytes); got != test.want {
+				t.Fatalf("allowed = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
+func TestNeoActorLocalSnapshotCacheByteBudgetIsAllOrNothing(t *testing.T) {
+	threadID := "T-019f4000-0000-4000-8000-000000000067"
+	actor := newNeoActor(nil, "actor-snapshot-byte-budget", "thread-actor", threadID, threadID, neoActorRecord("actor-snapshot-byte-budget", "thread-actor", threadID), nil)
+	actor.messages = []neoMessage{
+		{ThreadID: threadID, MessageID: "M-0000000000000000000001", Role: "user", AgentMode: "smart", Content: []any{map[string]any{"type": "text", "text": "first"}}},
+		{ThreadID: threadID, MessageID: "M-0000000000000000000002", Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "second"}}},
+	}
+	actor.compactionRecords = []map[string]any{{"cutMessageId": "M-0000000000000000000001", "summary": "summary"}}
+	first, err := json.Marshal(neoCloudMessage(actor.messages[0]))
+	if err != nil {
+		t.Fatalf("marshal first message: %v", err)
+	}
+	second, err := json.Marshal(neoCloudMessage(actor.messages[1]))
+	if err != nil {
+		t.Fatalf("marshal second message: %v", err)
+	}
+	budget := 2 * (len(first) + len(second))
+
+	overBudgetEncoded := actor.localSnapshotMessageJSONWithByteLimitLocked(actor.messages, budget-1)
+	if len(overBudgetEncoded) != len(actor.messages) || !bytes.Equal(overBudgetEncoded[0], first) || !bytes.Equal(overBudgetEncoded[1], second) {
+		t.Fatalf("over-budget message JSON entries = %d, want one complete encoding", len(overBudgetEncoded))
+	}
+	if actor.localSnapshotMessageCache != nil {
+		t.Fatalf("over-budget cache entries = %d, want nil", len(actor.localSnapshotMessageCache))
+	}
+	if actor.localSnapshotMessageGen != 0 {
+		t.Fatalf("over-budget message generation = %d, want zero", actor.localSnapshotMessageGen)
+	}
+
+	exactBudgetEncoded := actor.localSnapshotMessageJSONWithByteLimitLocked(actor.messages, budget)
+	if len(exactBudgetEncoded) != len(actor.messages) || len(actor.localSnapshotMessageCache) != len(actor.messages) {
+		t.Fatalf("exact-budget cache = encoded:%d retained:%d, want %d", len(exactBudgetEncoded), len(actor.localSnapshotMessageCache), len(actor.messages))
+	}
+	snapshot, ok := actor.threadSnapshotWithOptions(neoThreadSnapshotOptions{skipLocalMessageJSON: true})
+	if !ok {
+		t.Fatal("byte-budget snapshot unavailable")
+	}
+	for _, boundary := range []struct {
+		name    string
+		encoded []neoLocalSnapshotMessageJSON
+	}{
+		{name: "exact budget", encoded: exactBudgetEncoded},
+		{name: "over budget", encoded: overBudgetEncoded},
+	} {
+		t.Run(boundary.name, func(t *testing.T) {
+			persisted := snapshot
+			persisted.messageJSON = boundary.encoded
+			dir := t.TempDir()
+			if _, _, err := writeNeoLocalThreadSnapshotFile(persisted, dir); err != nil {
+				t.Fatalf("write snapshot: %v", err)
+			}
+			thread, ok := loadNeoThreadFromDir(threadID, dir)
+			if !ok {
+				t.Fatal("load snapshot")
+			}
+			restored := newNeoActor(nil, "actor-snapshot-byte-budget-restored", "thread-actor", threadID, threadID, neoActorRecord("actor-snapshot-byte-budget-restored", "thread-actor", threadID), nil)
+			if err := restored.importThreadLocalOnly(thread); err != nil {
+				t.Fatalf("import snapshot: %v", err)
+			}
+			if len(restored.messages) != 2 || restored.messages[0].MessageID != "M-0000000000000000000001" || restored.messages[1].MessageID != "M-0000000000000000000002" || textFromBlocks(restored.messages[0].Content) != "first" || textFromBlocks(restored.messages[1].Content) != "second" {
+				t.Fatalf("restored messages = %#v", restored.messages)
+			}
+			if stringValue(restored.settings["agentMode"]) != "smart" || len(restored.compactionRecords) != 1 || stringValue(restored.compactionRecords[0]["cutMessageId"]) != "M-0000000000000000000001" {
+				t.Fatalf("restored thread state = settings:%#v compaction:%#v", restored.settings, restored.compactionRecords)
+			}
+		})
+	}
+}
+
+func TestNeoActorLocalSnapshotCacheMessageBoundary(t *testing.T) {
+	tests := []struct {
+		name     string
+		messages int
+		want     bool
+	}{
+		{name: "maximum", messages: neoLocalSnapshotCacheMaxMessages, want: true},
+		{name: "maximum plus one", messages: neoLocalSnapshotCacheMaxMessages + 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			actor := newNeoActor(nil, "actor-snapshot-message-boundary", "thread-actor", "T-test", "T-test", neoActorRecord("actor-snapshot-message-boundary", "thread-actor", "T-test"), nil)
+			actor.messages = make([]neoMessage, test.messages)
+			for index := range actor.messages {
+				actor.messages[index] = neoMessage{MessageID: fmt.Sprintf("M-%d", index), Role: "user"}
+			}
+			encoded := actor.localSnapshotMessageJSONLocked(actor.messages)
+			if test.want {
+				if len(encoded) != test.messages || len(actor.localSnapshotMessageCache) != test.messages {
+					t.Fatalf("maximum cache = encoded:%d retained:%d, want %d", len(encoded), len(actor.localSnapshotMessageCache), test.messages)
+				}
+				return
+			}
+			if encoded != nil || actor.localSnapshotMessageCache != nil || actor.localSnapshotMessageGen != 0 {
+				t.Fatalf("over-limit cache = encoded:%d retained:%d generation:%d, want preflight rejection", len(encoded), len(actor.localSnapshotMessageCache), actor.localSnapshotMessageGen)
+			}
+		})
+	}
+}
+
+func TestNormalizedNeoToolNameReusesReplacer(t *testing.T) {
+	if got := normalizedNeoToolName(" Shell_Command-Test "); got != "shellcommandtest" {
+		t.Fatalf("normalized tool name = %q", got)
+	}
+	normalizedNeoToolName("warm-up")
+	var normalized string
+	allocations := testing.AllocsPerRun(100, func() {
+		normalized = normalizedNeoToolName(" Shell_Command-Test ")
+	})
+	runtime.KeepAlive(normalized)
+	if allocations > 2 {
+		t.Fatalf("allocations per normalization = %.1f, want at most 2", allocations)
+	}
+}
+
+func TestNeoLocalSnapshotMessageValues(t *testing.T) {
+	tests := []struct {
+		name     string
+		messages []neoMessage
+		encoded  []neoLocalSnapshotMessageJSON
+		wantOK   bool
+	}{
+		{name: "complete", messages: make([]neoMessage, 2), encoded: []neoLocalSnapshotMessageJSON{[]byte(`{"messageId":"M-1"}`), []byte(`{"messageId":"M-2"}`)}, wantOK: true},
+		{name: "empty thread", messages: []neoMessage{}, encoded: []neoLocalSnapshotMessageJSON{}, wantOK: true},
+		{name: "missing message", messages: make([]neoMessage, 2), encoded: []neoLocalSnapshotMessageJSON{[]byte(`{"messageId":"M-1"}`)}},
+		{name: "failed encoding", messages: make([]neoMessage, 2), encoded: []neoLocalSnapshotMessageJSON{[]byte(`{"messageId":"M-1"}`), nil}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			values, ok := neoLocalSnapshotMessageValues(neoCloudThreadSnapshot{messages: test.messages, messageJSON: test.encoded})
+			if ok != test.wantOK {
+				t.Fatalf("available = %t, want %t", ok, test.wantOK)
+			}
+			if !ok {
+				if values != nil {
+					t.Fatalf("unavailable values = %#v, want nil", values)
+				}
+				return
+			}
+			if len(values) != len(test.messages) {
+				t.Fatalf("values = %d, want %d", len(values), len(test.messages))
+			}
+			for index, value := range values {
+				if _, ok := value.(neoLocalSnapshotMessageJSON); !ok {
+					t.Fatalf("value %d type = %T", index, value)
+				}
+			}
+		})
+	}
+}
+
+func TestNeoActorOverLimitSnapshotWritesCompleteImportableThread(t *testing.T) {
+	threadID := "T-019f4000-0000-4000-8000-000000000064"
+	actor := newNeoActor(nil, "actor-snapshot-cache-limit", "thread-actor", threadID, threadID, neoActorRecord("actor-snapshot-cache-limit", "thread-actor", threadID), nil)
+	actor.messages = make([]neoMessage, neoLocalSnapshotCacheMaxMessages+1)
+	for index := range actor.messages {
+		actor.messages[index] = neoMessage{
+			ThreadID:  threadID,
+			MessageID: fmt.Sprintf("M-%022d", index),
+			Role:      "user",
+			AgentMode: "smart",
+			Content:   []any{map[string]any{"type": "text", "text": "generated"}},
+			Seq:       index + 1,
+		}
+	}
+	actor.compactionRecords = []map[string]any{{"cutMessageId": "M-0000000000000000005000", "summary": "generated summary"}}
+	snapshot, ok := actor.threadSnapshot()
+	if !ok {
+		t.Fatal("over-limit snapshot unavailable")
+	}
+	if snapshot.messageJSON != nil {
+		t.Fatalf("over-limit message JSON entries = %d, want preflight fallback", len(snapshot.messageJSON))
+	}
+	if actor.localSnapshotMessageGen != 0 {
+		t.Fatalf("over-limit message generation = %d, want zero", actor.localSnapshotMessageGen)
+	}
+	if actor.localSnapshotMessageCache != nil {
+		t.Fatalf("over-limit cache entries = %d, want disabled", len(actor.localSnapshotMessageCache))
+	}
+	dir := t.TempDir()
+	if _, _, err := writeNeoLocalThreadSnapshotFile(snapshot, dir); err != nil {
+		t.Fatalf("write over-limit snapshot: %v", err)
+	}
+	thread, ok := loadNeoThreadFromDir(threadID, dir)
+	if !ok {
+		t.Fatal("load over-limit snapshot")
+	}
+	restored := newNeoActor(nil, "actor-snapshot-cache-restored", "thread-actor", threadID, threadID, neoActorRecord("actor-snapshot-cache-restored", "thread-actor", threadID), nil)
+	if err := restored.importThreadLocalOnly(thread); err != nil {
+		t.Fatalf("import over-limit snapshot: %v", err)
+	}
+	if len(restored.messages) != len(actor.messages) {
+		t.Fatalf("restored messages = %d, want %d", len(restored.messages), len(actor.messages))
+	}
+	if restored.messages[0].MessageID != "M-0000000000000000000000" || restored.messages[len(restored.messages)-1].MessageID != fmt.Sprintf("M-%022d", neoLocalSnapshotCacheMaxMessages) {
+		t.Fatalf("restored message boundary IDs = (%q, %q)", restored.messages[0].MessageID, restored.messages[len(restored.messages)-1].MessageID)
+	}
+	if len(restored.compactionRecords) != 1 || stringValue(restored.compactionRecords[0]["cutMessageId"]) != "M-0000000000000000005000" {
+		t.Fatalf("restored compaction records = %#v", restored.compactionRecords)
+	}
+}
+
+func neoMemoryPressureThreadFixture(threadID string, messageCount, payloadBytes int) map[string]any {
+	messages := make([]any, messageCount)
+	payload := strings.Repeat("memory-pressure-payload-", payloadBytes/24+1)[:payloadBytes]
+	thinking := payload[:payloadBytes/3]
+	text := payload[payloadBytes/3 : 2*payloadBytes/3]
+	command := payload[2*payloadBytes/3:]
+	for index := range messages {
+		messageID := fmt.Sprintf("M-%022d", index+1)
+		toolID := fmt.Sprintf("TU-%022d", index/4+1)
+		switch index % 4 {
+		case 0:
+			messages[index] = map[string]any{
+				"messageId":       messageID,
+				"role":            "user",
+				"agentMode":       "deep",
+				"reasoningEffort": "xhigh",
+				"content":         []any{map[string]any{"type": "text", "text": payload}},
+				"userState":       map[string]any{"selection": map[string]any{"path": "internal/api/modules/amp/neo_runtime.go", "line": index + 1}},
+				"fileMentions":    map[string]any{"neo_runtime.go": map[string]any{"path": "internal/api/modules/amp/neo_runtime.go"}},
+				"createdAt":       "2026-07-12T00:00:00Z",
+			}
+		case 1:
+			messages[index] = map[string]any{
+				"messageId": messageID,
+				"role":      "assistant",
+				"content": []any{
+					map[string]any{"type": "thinking", "thinking": thinking, "blockState": "complete"},
+					map[string]any{"type": "text", "text": text},
+					map[string]any{"type": "tool_use", "id": toolID, "name": "shell_command", "input": map[string]any{"command": command}},
+				},
+				"state": map[string]any{"type": "complete", "stopReason": "tool_use"},
+				"usage": map[string]any{"inputTokens": index + 100, "outputTokens": 200},
+			}
+		case 2:
+			messages[index] = map[string]any{
+				"messageId":       messageID,
+				"role":            "user",
+				"parentToolUseId": toolID,
+				"content": []any{map[string]any{
+					"type":      "tool_result",
+					"toolUseID": toolID,
+					"content":   payload,
+					"run":       map[string]any{"status": "done", "result": "command completed"},
+				}},
+			}
+		case 3:
+			content := []any{map[string]any{
+				"type":    "manual_bash_invocation",
+				"args":    map[string]any{"cmd": "git status --short"},
+				"toolRun": map[string]any{"status": "done", "result": payload},
+			}}
+			if index == messageCount-4 {
+				content = append(content, map[string]any{"type": "summary", "summary": map[string]any{"type": "message", "summary": strings.Repeat("compaction summary ", 1024)}})
+			}
+			messages[index] = map[string]any{"messageId": messageID, "role": "info", "content": content}
+		}
+	}
+	lastAssistantIndex := messageCount - 1
+	for lastAssistantIndex > 0 && lastAssistantIndex%4 != 1 {
+		lastAssistantIndex--
+	}
+	lastAssistantID := fmt.Sprintf("M-%022d", lastAssistantIndex+1)
+	return map[string]any{
+		"id":              threadID,
+		"v":               messageCount + 400,
+		"created":         int64(1783814400000),
+		"title":           "Deterministic memory pressure fixture",
+		"agentMode":       "deep",
+		"reasoningEffort": "xhigh",
+		"threadStatus":    "active",
+		"state":           "working",
+		"settings": map[string]any{
+			"agentMode":                           "deep",
+			"reasoning.effort":                    "xhigh",
+			"internal.compactionThresholdPercent": float64(80),
+			"compactionControl":                   map[string]any{"enabled": true, "contextTokenThreshold": float64(120000)},
+		},
+		"meta": map[string]any{
+			"ampcodeConnectorLocalNeo": true,
+			"executorType":             "local-client",
+			"usesThreadActors":         true,
+		},
+		"env":      map[string]any{"workingDirectory": "/workspace/CLIProxyAPI", "platform": "darwin", "shell": "zsh"},
+		"messages": messages,
+		"artifacts": []any{
+			map[string]any{"key": "memory-report", "type": "text", "value": strings.Repeat("artifact ", 2048)},
+		},
+		"actorKV": map[string]any{"plugin-state": map[string]any{"expanded": true, "selectedMessageId": lastAssistantID}},
+		"compactionRecords": []any{
+			map[string]any{"cutMessageId": fmt.Sprintf("M-%022d", messageCount/3), "createdAt": "2026-07-12T00:00:00Z", "summary": strings.Repeat("first summary ", 512)},
+			map[string]any{"cutMessageId": fmt.Sprintf("M-%022d", 2*messageCount/3), "createdAt": "2026-07-12T01:00:00Z", "summary": strings.Repeat("second summary ", 512)},
+		},
+		"relationships": []any{
+			map[string]any{"threadID": "T-019f4000-0000-4000-8000-000000000070", "type": "mention", "role": "parent", "messageId": fmt.Sprintf("M-%022d", messageCount/2)},
+			map[string]any{"threadID": "T-019f4000-0000-4000-8000-000000000071", "type": "handoff", "role": "child", "messageId": lastAssistantID},
+		},
+		"queuedMessages": []any{
+			map[string]any{"id": "Q-memory-1", "steer": true, "queuedMessage": map[string]any{"messageId": "M-queued-1", "role": "user", "content": []any{map[string]any{"type": "text", "text": "inspect retained revisions"}}, "agentMode": "deep", "reasoningEffort": "xhigh"}},
+			map[string]any{"id": "Q-memory-2", "steer": false, "queuedMessage": map[string]any{"messageId": "M-queued-2", "role": "user", "content": []any{map[string]any{"type": "text", "text": "measure serialization"}}, "agentMode": "review", "reasoningEffort": "high"}},
+		},
+		"pendingInference": map[string]any{"messageId": lastAssistantID, "agentMode": "deep", "reasoningEffort": "xhigh", "tools": []any{"shell_command", "apply_patch"}, "parentToolCallId": "TU-parent"},
+		"draft":            []any{map[string]any{"type": "text", "text": "continue memory remediation"}},
+		"autoSubmitDraft":  true,
+		"mainThreadID":     "T-019f4000-0000-4000-8000-000000000070",
+	}
+}
+
+func waitForNeoActorSyncIdleBenchmark(b *testing.B, actor *neoActor) {
+	b.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		actor.mu.Lock()
+		idle := !actor.syncRunning && !actor.localSyncRunning && !actor.syncPending && !actor.localSyncPending
+		actor.mu.Unlock()
+		if idle {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	b.Fatal("timed out waiting for benchmark sinks")
+}
+
+func BenchmarkNeoLargeThreadMemoryPressure(b *testing.B) {
+	const messageCount = 12_235
+	const payloadBytes = 5_200
+	threadID := "T-019f4000-0000-4000-8000-000000000069"
+	dir := b.TempDir()
+	path, err := writeNeoLocalThreadFileInDir(dir, threadID, neoMemoryPressureThreadFixture(threadID, messageCount, payloadBytes))
+	if err != nil {
+		b.Fatalf("write memory pressure fixture: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		b.Fatalf("stat memory pressure fixture: %v", err)
+	}
+	if info.Size() < 60<<20 || info.Size() > 74<<20 {
+		b.Fatalf("memory pressure fixture size = %.2f MiB, want 60-74 MiB", float64(info.Size())/(1<<20))
+	}
+	b.Logf("fixture bytes=%d messages=%d", info.Size(), messageCount)
+	firstCutMessageID := fmt.Sprintf("M-%022d", messageCount/3)
+	secondCutMessageID := fmt.Sprintf("M-%022d", 2*messageCount/3)
+	lastAssistantID := fmt.Sprintf("M-%022d", messageCount-1)
+	expectedPayload := strings.Repeat("memory-pressure-payload-", payloadBytes/24+1)[:payloadBytes]
+	expectedThinking := expectedPayload[:payloadBytes/3]
+	expectedText := expectedPayload[payloadBytes/3 : 2*payloadBytes/3]
+	expectedCommand := expectedPayload[2*payloadBytes/3:]
+	expectedArtifact := strings.Repeat("artifact ", 2048)
+	expectedFirstCompactionSummary := strings.Repeat("first summary ", 512)
+	expectedSecondCompactionSummary := strings.Repeat("second summary ", 512)
+	expectedSummary := strings.Repeat("compaction summary ", 1024)
+
+	loadActor := func(rt *neoRuntime) *neoActor {
+		thread, ok := loadNeoThreadFromDir(threadID, dir)
+		if !ok {
+			b.Fatal("load memory pressure fixture")
+		}
+		rawCompactionRecords := arrayValue(thread["compactionRecords"])
+		rawFixtureComplete := len(rawCompactionRecords) == 2 && stringValue(mapValue(rawCompactionRecords[0])["summary"]) == expectedFirstCompactionSummary && stringValue(mapValue(rawCompactionRecords[1])["summary"]) == expectedSecondCompactionSummary
+		actor := newNeoActor(rt, "actor-memory-pressure", "thread-actor", threadID, threadID, neoActorRecord("actor-memory-pressure", "thread-actor", threadID), nil)
+		if err := actor.importThreadLocalOnly(thread); err != nil {
+			b.Fatalf("import memory pressure fixture: %v", err)
+		}
+		actor.mu.Lock()
+		compactionControl := mapValue(actor.settings["compactionControl"])
+		threadStateComplete := len(actor.messages) == messageCount &&
+			len(actor.compactionRecords) == 2 && len(actor.relationships) == 2 && len(actor.queue) == 2 && actor.pendingInference != nil && len(actor.history) > 0 &&
+			stringValue(actor.settings["agentMode"]) == "deep" && stringValue(actor.settings["reasoning.effort"]) == "xhigh" && stringValue(actor.environment["workingDirectory"]) == "/workspace/CLIProxyAPI" &&
+			numberFrom(actor.settings["internal.compactionThresholdPercent"]) == 80 && boolValue(compactionControl["enabled"]) && numberFrom(compactionControl["contextTokenThreshold"]) == 120000 &&
+			stringValue(actor.environment["platform"]) == "darwin" && stringValue(actor.environment["shell"]) == "zsh" &&
+			textFromBlocks(actor.draft) == "continue memory remediation" && actor.autoSubmitDraft && actor.mainThreadID == "T-019f4000-0000-4000-8000-000000000070"
+		artifact := mapValue(actor.artifacts["memory-report"])
+		pluginState := mapValue(actor.kv["plugin-state"])
+		auxiliaryStateComplete := stringValue(artifact["type"]) == "text" && stringValue(artifact["value"]) == expectedArtifact && boolValue(pluginState["expanded"]) && stringValue(pluginState["selectedMessageId"]) == lastAssistantID
+		compactionStateComplete := len(actor.compactionRecords) == 2 && stringValue(actor.compactionRecords[0]["cutMessageId"]) == firstCutMessageID && stringValue(actor.compactionRecords[0]["createdAt"]) == "2026-07-12T00:00:00Z" && stringValue(actor.compactionRecords[1]["cutMessageId"]) == secondCutMessageID && stringValue(actor.compactionRecords[1]["createdAt"]) == "2026-07-12T01:00:00Z"
+		relationshipStateComplete := len(actor.relationships) == 2 && stringValue(actor.relationships[0]["threadID"]) == "T-019f4000-0000-4000-8000-000000000070" && stringValue(actor.relationships[0]["type"]) == "mention" && stringValue(actor.relationships[0]["role"]) == "parent" && stringValue(actor.relationships[1]["threadID"]) == "T-019f4000-0000-4000-8000-000000000071" && stringValue(actor.relationships[1]["type"]) == "handoff" && stringValue(actor.relationships[1]["role"]) == "child"
+		queueStateComplete := len(actor.queue) == 2 && actor.queue[0].ID == "Q-memory-1" && actor.queue[0].MessageID == "M-queued-1" && actor.queue[0].Steer && textFromBlocks(actor.queue[0].Content) == "inspect retained revisions" && actor.queue[0].AgentMode == "deep" && actor.queue[0].ReasoningEffort == "xhigh" && actor.queue[1].ID == "Q-memory-2" && actor.queue[1].MessageID == "M-queued-2" && !actor.queue[1].Steer && textFromBlocks(actor.queue[1].Content) == "measure serialization" && actor.queue[1].AgentMode == "review" && actor.queue[1].ReasoningEffort == "high"
+		pendingStateComplete := actor.pendingInference != nil && actor.pendingInference.messageID == lastAssistantID && actor.pendingInference.agentMode == "deep" && actor.pendingInference.reasoningEffort == "xhigh" && actor.pendingInference.parentToolCallID == "TU-parent" && slices.Equal(actor.pendingInference.tools, []string{"shell_command", "apply_patch"})
+		historyStateComplete := len(actor.history) == 4 && actor.history[0].Role == "user" && actor.history[0].Text == strings.TrimSpace(expectedSummary) && actor.history[2].Role == "assistant" && actor.history[2].Text == expectedText && len(actor.history[2].ThinkingBlocks) == 1 && actor.history[2].ThinkingBlocks[0].Thinking == expectedThinking && len(actor.history[2].ToolCalls) == 1 && actor.history[2].ToolCalls[0].Name == "shell_command" && stringValue(actor.history[2].ToolCalls[0].Input["command"]) == expectedCommand && actor.history[3].Role == "tool" && actor.history[3].ToolCallID == actor.history[2].ToolCalls[0].ID
+		userStateComplete := false
+		messageShapeComplete := false
+		assistantStateComplete := false
+		toolResultStateComplete := false
+		infoStateComplete := false
+		summaryStateComplete := false
+		if len(actor.messages) == messageCount {
+			user := actor.messages[0]
+			assistant := actor.messages[1]
+			toolResultMessage := actor.messages[2]
+			infoMessage := actor.messages[3]
+			summaryMessage := actor.messages[messageCount-4]
+			messageShapeComplete = len(user.Content) >= 1 && len(assistant.Content) >= 3 && len(toolResultMessage.Content) >= 1 && len(infoMessage.Content) >= 1 && len(summaryMessage.Content) >= 2
+			if messageShapeComplete {
+				userBlock := mapValue(user.Content[0])
+				selection := mapValue(mapValue(user.UserState)["selection"])
+				fileMention := mapValue(user.FileMentions["neo_runtime.go"])
+				thinkingBlock := mapValue(assistant.Content[0])
+				textBlock := mapValue(assistant.Content[1])
+				toolUseBlock := mapValue(assistant.Content[2])
+				toolResultBlock := mapValue(toolResultMessage.Content[0])
+				manualBashBlock := mapValue(infoMessage.Content[0])
+				summaryBlock := mapValue(summaryMessage.Content[1])
+				userStateComplete = user.Role == "user" && user.AgentMode == "deep" && user.ReasoningEffort == "xhigh" && stringValue(userBlock["type"]) == "text" && stringValue(userBlock["text"]) == expectedPayload && stringValue(selection["path"]) == "internal/api/modules/amp/neo_runtime.go" && numberFrom(selection["line"]) == 1 && stringValue(fileMention["path"]) == "internal/api/modules/amp/neo_runtime.go"
+				assistantStateComplete = assistant.Role == "assistant" && stringValue(thinkingBlock["type"]) == "thinking" && stringValue(thinkingBlock["thinking"]) == expectedThinking && stringValue(thinkingBlock["blockState"]) == "complete" && stringValue(textBlock["type"]) == "text" && stringValue(textBlock["text"]) == expectedText &&
+					stringValue(toolUseBlock["type"]) == "tool_use" && stringValue(toolUseBlock["id"]) == "TU-0000000000000000000001" && stringValue(toolUseBlock["name"]) == "shell_command" && stringValue(mapValue(toolUseBlock["input"])["command"]) == expectedCommand
+				toolResultStateComplete = toolResultMessage.Role == "user" && toolResultMessage.ParentToolUseID == "TU-0000000000000000000001" && stringValue(toolResultBlock["type"]) == "tool_result" && stringValue(toolResultBlock["toolUseID"]) == "TU-0000000000000000000001" && stringValue(toolResultBlock["content"]) == expectedPayload && stringValue(mapValue(toolResultBlock["run"])["status"]) == "done" && stringValue(mapValue(toolResultBlock["run"])["result"]) == "command completed"
+				infoStateComplete = infoMessage.Role == "info" && stringValue(manualBashBlock["type"]) == "manual_bash_invocation" && stringValue(mapValue(manualBashBlock["args"])["cmd"]) == "git status --short" && stringValue(mapValue(manualBashBlock["toolRun"])["status"]) == "done" && stringValue(mapValue(manualBashBlock["toolRun"])["result"]) == expectedPayload
+				summaryStateComplete = summaryMessage.Role == "info" && stringValue(summaryBlock["type"]) == "summary" && stringValue(mapValue(summaryBlock["summary"])["type"]) == "message" && stringValue(mapValue(summaryBlock["summary"])["summary"]) == expectedSummary
+			}
+		}
+		actor.mu.Unlock()
+		if !rawFixtureComplete || !threadStateComplete || !auxiliaryStateComplete || !compactionStateComplete || !relationshipStateComplete || !queueStateComplete || !pendingStateComplete || !historyStateComplete || !userStateComplete || !messageShapeComplete || !assistantStateComplete || !toolResultStateComplete || !infoStateComplete || !summaryStateComplete {
+			b.Fatalf("memory pressure fixture state: raw=%t thread=%t auxiliary=%t compaction=%t relationships=%t queue=%t pending=%t history=%t user=%t shape=%t assistant=%t tool-result=%t info=%t summary=%t", rawFixtureComplete, threadStateComplete, auxiliaryStateComplete, compactionStateComplete, relationshipStateComplete, queueStateComplete, pendingStateComplete, historyStateComplete, userStateComplete, messageShapeComplete, assistantStateComplete, toolResultStateComplete, infoStateComplete, summaryStateComplete)
+		}
+		return actor
+	}
+
+	b.Run("cold_import", func(b *testing.B) {
+		b.SetBytes(info.Size())
+		b.ReportAllocs()
+		for b.Loop() {
+			actor := loadActor(nil)
+			runtime.KeepAlive(actor)
+		}
+	})
+	b.Run("replacement_import", func(b *testing.B) {
+		actor := loadActor(nil)
+		b.SetBytes(info.Size())
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			thread, ok := loadNeoThreadFromDir(threadID, dir)
+			if !ok {
+				b.Fatal("load replacement fixture")
+			}
+			if err := actor.importThreadLocalOnly(thread); err != nil {
+				b.Fatalf("replacement import: %v", err)
+			}
+			runtime.KeepAlive(actor)
+		}
+	})
+	b.Run("local_snapshot", func(b *testing.B) {
+		actor := loadActor(nil)
+		outputDir := b.TempDir()
+		b.SetBytes(info.Size())
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			snapshot, ok := actor.threadSnapshot()
+			if !ok {
+				b.Fatal("local snapshot unavailable")
+			}
+			if _, _, err := writeNeoLocalThreadSnapshotFile(snapshot, outputDir); err != nil {
+				b.Fatalf("write local snapshot: %v", err)
+			}
+		}
+	})
+	b.Run("prepared_snapshot_baseline", func(b *testing.B) {
+		actor := loadActor(nil)
+		snapshot, ok := actor.threadSnapshotWithOptions(neoThreadSnapshotOptions{skipLocalMessageJSON: true})
+		if !ok {
+			b.Fatal("prepared snapshot unavailable")
+		}
+		b.SetBytes(info.Size())
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			runtime.KeepAlive(snapshot)
+		}
+	})
+	b.Run("prepared_local_serialization", func(b *testing.B) {
+		actor := loadActor(nil)
+		snapshot, ok := actor.threadSnapshot()
+		if !ok {
+			b.Fatal("prepared local snapshot unavailable")
+		}
+		outputDir := b.TempDir()
+		b.SetBytes(info.Size())
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			if _, _, err := writeNeoLocalThreadSnapshotFile(snapshot, outputDir); err != nil {
+				b.Fatalf("write prepared local snapshot: %v", err)
+			}
+		}
+	})
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reader := io.Reader(r.Body)
+		if r.Header.Get("Content-Encoding") == "gzip" {
+			gz, err := gzip.NewReader(r.Body)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			defer gz.Close()
+			reader = gz
+		}
+		_, _ = io.Copy(io.Discard, reader)
+		writeNeoJSON(w, http.StatusOK, map[string]any{"ok": true})
+	}))
+	b.Cleanup(upstream.Close)
+	b.Run("cloud_upload", func(b *testing.B) {
+		actor := loadActor(nil)
+		b.SetBytes(info.Size())
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			snapshot, ok := actor.threadSnapshotWithOptions(neoThreadSnapshotOptions{skipLocalMessageJSON: true})
+			if !ok {
+				b.Fatal("cloud snapshot unavailable")
+			}
+			snapshot.upstreamURL = upstream.URL
+			snapshot.apiKey = "benchmark"
+			if _, err := uploadNeoCloudThread(snapshot); err != nil {
+				b.Fatalf("upload cloud snapshot: %v", err)
+			}
+		}
+	})
+	b.Run("prepared_cloud_serialization", func(b *testing.B) {
+		actor := loadActor(nil)
+		snapshot, ok := actor.threadSnapshotWithOptions(neoThreadSnapshotOptions{skipLocalMessageJSON: true})
+		if !ok {
+			b.Fatal("prepared cloud snapshot unavailable")
+		}
+		snapshot.upstreamURL = upstream.URL
+		snapshot.apiKey = "benchmark"
+		b.SetBytes(info.Size())
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			if _, err := uploadNeoCloudThread(snapshot); err != nil {
+				b.Fatalf("upload prepared cloud snapshot: %v", err)
+			}
+		}
+	})
+	b.Run("simultaneous_local_cloud_sync", func(b *testing.B) {
+		enabled := true
+		rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+			UpstreamURL:    upstream.URL,
+			UpstreamAPIKey: "benchmark",
+			NeoLocalRuntime: config.AmpNeoLocalRuntime{
+				Enabled: &enabled,
+			},
+		}})
+		rt.threadDir = b.TempDir()
+		rt.asyncLocalSnapshots = true
+		rt.localSnapshotMinInterval = 0
+		actor := loadActor(rt)
+		b.SetBytes(info.Size())
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			actor.syncCloudAsync()
+			waitForNeoActorSyncIdleBenchmark(b, actor)
+		}
+		measured := actor.measurementSnapshot()
+		b.ReportMetric(float64(measured.LocalSerializedBytes), "local-serialized-bytes")
+		b.ReportMetric(float64(measured.CloudSerializedBytes), "cloud-serialized-bytes")
+		b.ReportMetric(float64(measured.LocalPersistenceDuration.Nanoseconds()), "local-persist-ns")
+		b.ReportMetric(float64(measured.CloudUploadDuration.Nanoseconds()), "cloud-upload-ns")
+	})
+	b.Run("blocked_sinks_20_mutations", func(b *testing.B) {
+		enabled := true
+		rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+			UpstreamURL:    upstream.URL,
+			UpstreamAPIKey: "benchmark",
+			NeoLocalRuntime: config.AmpNeoLocalRuntime{
+				Enabled: &enabled,
+			},
+		}})
+		rt.threadDir = b.TempDir()
+		rt.asyncLocalSnapshots = true
+		rt.localSnapshotMinInterval = 0
+		actor := loadActor(rt)
+		b.SetBytes(info.Size())
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			localStarted := make(chan struct{})
+			cloudStarted := make(chan struct{})
+			release := make(chan struct{})
+			var localCalls atomic.Int32
+			var cloudCalls atomic.Int32
+			rt.writeLocalSnapshot = func(snapshot neoCloudThreadSnapshot, outputDir string) (int64, error) {
+				if localCalls.Add(1) == 1 {
+					close(localStarted)
+					<-release
+				}
+				serializedBytes, _, err := writeNeoLocalThreadSnapshotToDirMeasured(snapshot, outputDir)
+				return serializedBytes, err
+			}
+			rt.uploadCloudSnapshot = func(snapshot neoCloudThreadSnapshot) (int64, error) {
+				if cloudCalls.Add(1) == 1 {
+					close(cloudStarted)
+					<-release
+				}
+				return int64(len(snapshot.messages)), nil
+			}
+			actor.syncCloudAsync()
+			<-localStarted
+			<-cloudStarted
+			for index := 0; index < 20; index++ {
+				actor.mu.Lock()
+				actor.title = fmt.Sprintf("blocked-mutation-%d", index)
+				actor.mu.Unlock()
+				actor.syncCloudAsync()
+			}
+			close(release)
+			waitForNeoActorSyncIdleBenchmark(b, actor)
+			measured := actor.measurementSnapshot()
+			b.ReportMetric(float64(measured.PeakRetainedRevisions), "peak-retained-revisions")
+			b.ReportMetric(float64(measured.PeakRetainedGraphs), "peak-retained-graphs")
+		}
+	})
+	b.Run("retained_heap_20_cycles", func(b *testing.B) {
+		enabled := true
+		rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+			UpstreamURL:    upstream.URL,
+			UpstreamAPIKey: "benchmark",
+			NeoLocalRuntime: config.AmpNeoLocalRuntime{
+				Enabled: &enabled,
+			},
+		}})
+		rt.threadDir = b.TempDir()
+		rt.asyncLocalSnapshots = true
+		rt.localSnapshotMinInterval = 0
+		actor := loadActor(rt)
+		for index := 0; index < 3; index++ {
+			actor.mu.Lock()
+			actor.title = fmt.Sprintf("retained-warmup-%d", index)
+			actor.mu.Unlock()
+			actor.syncCloudAsync()
+			waitForNeoActorSyncIdleBenchmark(b, actor)
+		}
+		median := func(samples []uint64) uint64 {
+			values := append([]uint64(nil), samples...)
+			slices.Sort(values)
+			return values[len(values)/2]
+		}
+		var initialLiveBytes uint64
+		var finalLiveBytes uint64
+		b.SetBytes(info.Size() * 20)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			samples := make([]uint64, 20)
+			for index := range samples {
+				actor.mu.Lock()
+				actor.title = fmt.Sprintf("retained-cycle-%d", index)
+				actor.mu.Unlock()
+				actor.syncCloudAsync()
+				waitForNeoActorSyncIdleBenchmark(b, actor)
+				runtime.GC()
+				var stats runtime.MemStats
+				runtime.ReadMemStats(&stats)
+				samples[index] = stats.HeapAlloc
+			}
+			initialLiveBytes = median(samples[:5])
+			finalLiveBytes = median(samples[15:])
+		}
+		growthPercent := 100 * (float64(finalLiveBytes) - float64(initialLiveBytes)) / float64(initialLiveBytes)
+		measured := actor.measurementSnapshot()
+		b.ReportMetric(float64(initialLiveBytes), "initial-live-bytes")
+		b.ReportMetric(float64(finalLiveBytes), "final-live-bytes")
+		b.ReportMetric(growthPercent, "retained-growth-percent")
+		b.ReportMetric(float64(measured.RetainedRevisions), "retained-revisions")
+		b.ReportMetric(float64(measured.RetainedGraphs), "retained-graphs")
+		runtime.KeepAlive(actor)
+	})
+	b.Run("known_replay_reconnect", func(b *testing.B) {
+		actor := loadActor(nil)
+		actor.mu.Lock()
+		actor.replayContinuityKnown = true
+		base := actor.lastSeqLocked() - 1
+		actor.replayEvents = []neoReplayEvent{{Seq: base + 1, Payload: map[string]any{"type": "resume_probe", "seq": base + 1}}}
+		actor.mu.Unlock()
+		var frames atomic.Int64
+		var wireBytes atomic.Int64
+		socket := &neoSocket{localExtensions: true, writeMessage: func(_ int, payload []byte) error {
+			frames.Add(1)
+			wireBytes.Add(int64(len(payload)))
+			return nil
+		}}
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			if !actor.sendSnapshot(socket, base) {
+				b.Fatal("known replay snapshot was not sent")
+			}
+		}
+		if actor.measurementSnapshot().ReplayFallbackSnapshots != 0 {
+			b.Fatal("known replay was counted as fallback")
+		}
+		b.ReportMetric(float64(frames.Load())/float64(b.N), "frames/op")
+		b.ReportMetric(float64(wireBytes.Load())/float64(b.N), "wire-bytes/op")
+	})
+	b.Run("imported_unprovable_replay_reconnect", func(b *testing.B) {
+		actor := loadActor(nil)
+		actor.mu.Lock()
+		base := actor.lastSeqLocked() - 1
+		actor.mu.Unlock()
+		var frames atomic.Int64
+		var wireBytes atomic.Int64
+		socket := &neoSocket{localExtensions: true, writeMessage: func(_ int, payload []byte) error {
+			frames.Add(1)
+			wireBytes.Add(int64(len(payload)))
+			return nil
+		}}
+		b.SetBytes(info.Size())
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			if !actor.sendSnapshot(socket, base) {
+				b.Fatal("fallback replay snapshot was not sent")
+			}
+		}
+		if got := actor.measurementSnapshot().ReplayFallbackSnapshots; got != uint64(b.N) {
+			b.Fatalf("fallback snapshots = %d, want %d", got, b.N)
+		}
+		b.ReportMetric(float64(frames.Load())/float64(b.N), "frames/op")
+		b.ReportMetric(float64(wireBytes.Load())/float64(b.N), "wire-bytes/op")
+	})
+}
+
+func BenchmarkNeoRuntimeColdLocalThreadImport(b *testing.B) {
+	enabled := true
+	threadID := "T-019f4000-0000-4000-8000-000000000066"
+	dir := b.TempDir()
+	messages := make([]any, 2000)
+	for index := range messages {
+		messages[index] = map[string]any{
+			"messageId": fmt.Sprintf("M-%022d", index),
+			"role":      "assistant",
+			"content": []any{
+				map[string]any{"type": "thinking", "thinking": strings.Repeat("r", 512), "blockState": "complete"},
+				map[string]any{"type": "text", "text": strings.Repeat("x", 2048)},
+			},
+			"state": map[string]any{"type": "complete", "stopReason": "end_turn"},
+		}
+	}
+	path, err := writeNeoLocalThreadFileInDir(dir, threadID, map[string]any{
+		"id":        threadID,
+		"v":         len(messages),
+		"agentMode": "deep",
+		"meta":      map[string]any{"ampcodeConnectorLocalNeo": true},
+		"messages":  messages,
+		"compactionRecords": []any{map[string]any{
+			"cutMessageId": "M-0000000000000000001000",
+			"summary":      strings.Repeat("s", 16*1024),
+		}},
+	})
+	if err != nil {
+		b.Fatalf("write benchmark thread: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		b.Fatalf("stat benchmark thread: %v", err)
+	}
+
+	b.Run("load", func(b *testing.B) {
+		b.SetBytes(info.Size())
+		b.ReportAllocs()
+		for b.Loop() {
+			thread, ok := loadNeoThreadFromDir(threadID, dir)
+			if !ok {
+				b.Fatal("load benchmark thread")
+			}
+			runtime.KeepAlive(thread)
+		}
+	})
+	b.Run("load_and_import", func(b *testing.B) {
+		b.SetBytes(info.Size())
+		b.ReportAllocs()
+		for b.Loop() {
+			thread, ok := loadNeoThreadFromDir(threadID, dir)
+			if !ok {
+				b.Fatal("load benchmark thread")
+			}
+			actor := newNeoActor(nil, "actor-import-benchmark", "thread-actor", threadID, threadID, neoActorRecord("actor-import-benchmark", "thread-actor", threadID), nil)
+			if err := actor.importThreadLocalOnly(thread); err != nil {
+				b.Fatalf("import benchmark thread: %v", err)
+			}
+			runtime.KeepAlive(actor)
+		}
+	})
+	b.Run("cold_try_import", func(b *testing.B) {
+		b.SetBytes(info.Size())
+		b.ReportAllocs()
+		for b.Loop() {
+			rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled}}})
+			rt.threadDir = dir
+			if !rt.tryImportNeoLocalThreadActor(threadID) {
+				b.Fatal("cold benchmark import")
+			}
+			runtime.KeepAlive(rt)
+		}
+	})
+}
+
+func BenchmarkNeoActorCachedThreadSnapshot(b *testing.B) {
+	newActor := func() *neoActor {
+		threadID := "T-019f4000-0000-4000-8000-000000000062"
+		actor := newNeoActor(nil, "actor-snapshot-benchmark", "thread-actor", threadID, threadID, neoActorRecord("actor-snapshot-benchmark", "thread-actor", threadID), nil)
+		actor.messages = make([]neoMessage, 2000)
+		for index := range actor.messages {
+			actor.messages[index] = neoMessage{
+				ThreadID:  threadID,
+				MessageID: fmt.Sprintf("M-%d", index),
+				Role:      "assistant",
+				Content:   []any{map[string]any{"type": "text", "text": strings.Repeat("x", 2048)}},
+				Seq:       index + 1,
+			}
+		}
+		return actor
+	}
+	b.Run("cold", func(b *testing.B) {
+		actor := newActor()
+		b.ReportAllocs()
+		for b.Loop() {
+			actor.localSnapshotMessageCache = nil
+			if _, ok := actor.threadSnapshot(); !ok {
+				b.Fatal("cold snapshot unavailable")
+			}
+		}
+	})
+	b.Run("cached", func(b *testing.B) {
+		actor := newActor()
+		if _, ok := actor.threadSnapshot(); !ok {
+			b.Fatal("warm snapshot unavailable")
+		}
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			snapshot, ok := actor.threadSnapshot()
+			if !ok || len(snapshot.messageJSON) != len(actor.messages) {
+				b.Fatal("cached snapshot unavailable")
+			}
+		}
+	})
+	b.Run("without_local_message_json", func(b *testing.B) {
+		actor := newActor()
+		if _, ok := actor.threadSnapshot(); !ok {
+			b.Fatal("warm snapshot unavailable")
+		}
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			snapshot, ok := actor.threadSnapshotWithOptions(neoThreadSnapshotOptions{
+				skipLocalMessageJSON: true,
+			})
+			if !ok || snapshot.messageJSON != nil {
+				b.Fatal("snapshot without local message JSON unavailable")
+			}
+		}
+	})
+}
+
+func BenchmarkNeoActorStreamingDeltaHistory(b *testing.B) {
+	actor := newNeoActor(nil, "actor-streaming-history-benchmark", "thread-actor", "T-test", "T-test", neoActorRecord("actor-streaming-history-benchmark", "thread-actor", "T-test"), nil)
+	actor.messages = make([]neoMessage, 2001)
+	for index := 0; index < 2000; index++ {
+		actor.messages[index] = neoMessage{
+			ThreadID:  "T-test",
+			MessageID: fmt.Sprintf("M-%d", index),
+			Role:      "user",
+			Content:   []any{map[string]any{"type": "text", "text": strings.Repeat("x", 1024)}},
+			Seq:       index + 1,
+		}
+	}
+	actor.messages[2000] = neoMessage{
+		ThreadID:  "T-test",
+		MessageID: "M-streaming",
+		Role:      "assistant",
+		Content:   []any{map[string]any{"type": "text", "text": ""}},
+		State:     map[string]any{"type": "streaming"},
+		Seq:       2001,
+	}
+	actor.seq = 2002
+	actor.rebuildHistoryLocked()
+	actor.currentInference = &neoInferenceInflight{messageID: "M-streaming", agentMode: "smart"}
+	delta := map[string]any{
+		"type":       "delta",
+		"messageId":  "M-streaming",
+		"role":       "assistant",
+		"state":      "generating",
+		"blockIndex": 0,
+		"blocks":     []any{map[string]any{"type": "text", "text": ""}},
+	}
+	historyAddress := &actor.history[0]
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		actor.handleProtocolDelta(delta)
+	}
+	b.StopTimer()
+	if !actor.historyDirty || &actor.history[0] != historyAddress {
+		b.Fatal("streaming benchmark eagerly rebuilt provider history")
+	}
+}
+
+func BenchmarkNeoActorOverLimitLocalSnapshotCachePreflight(b *testing.B) {
+	actor := newNeoActor(nil, "actor-snapshot-preflight-benchmark", "thread-actor", "T-test", "T-test", neoActorRecord("actor-snapshot-preflight-benchmark", "thread-actor", "T-test"), nil)
+	actor.messages = make([]neoMessage, neoLocalSnapshotCacheMaxMessages+1)
+	for index := range actor.messages {
+		actor.messages[index] = neoMessage{MessageID: fmt.Sprintf("M-%d", index), Role: "user"}
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		if encoded := actor.localSnapshotMessageJSONLocked(actor.messages); encoded != nil {
+			b.Fatalf("over-limit message JSON entries = %d, want nil", len(encoded))
+		}
+	}
+	if actor.localSnapshotMessageGen != 0 {
+		b.Fatalf("over-limit message generation = %d, want zero", actor.localSnapshotMessageGen)
+	}
+}
+
+func BenchmarkNeoActorCachedThreadPersistence(b *testing.B) {
+	threadID := "T-019f4000-0000-4000-8000-000000000065"
+	actor := newNeoActor(nil, "actor-persistence-benchmark", "thread-actor", threadID, threadID, neoActorRecord("actor-persistence-benchmark", "thread-actor", threadID), nil)
+	actor.messages = make([]neoMessage, 2000)
+	for index := range actor.messages {
+		actor.messages[index] = neoMessage{
+			ThreadID:  threadID,
+			MessageID: fmt.Sprintf("M-%022d", index),
+			Role:      "assistant",
+			Content:   []any{map[string]any{"type": "text", "text": strings.Repeat("x", 2048)}},
+			Seq:       index + 1,
+		}
+	}
+	if _, ok := actor.threadSnapshot(); !ok {
+		b.Fatal("warm snapshot unavailable")
+	}
+	dir := b.TempDir()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		snapshot, ok := actor.threadSnapshot()
+		if !ok {
+			b.Fatal("cached snapshot unavailable")
+		}
+		if _, _, err := writeNeoLocalThreadSnapshotFile(snapshot, dir); err != nil {
+			b.Fatalf("write cached snapshot: %v", err)
+		}
+	}
+}
+
+func TestNeoActorFinalLocalSnapshotWaitsForAsyncWriter(t *testing.T) {
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled}}})
+	rt.threadDir = t.TempDir()
+	rt.asyncLocalSnapshots = true
+	threadID := "T-019f4000-0000-4000-8000-000000000053"
+	actor := newNeoActor(rt, "actor-snapshot-epoch", "thread-actor", threadID, threadID, neoActorRecord("actor-snapshot-epoch", "thread-actor", threadID), nil)
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var writes atomic.Int32
+	rt.writeLocalSnapshot = func(neoCloudThreadSnapshot, string) (int64, error) {
+		if writes.Add(1) == 1 {
+			close(firstStarted)
+			<-releaseFirst
+		}
+		return 0, nil
+	}
+
+	actor.syncCloudAsync()
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("async local snapshot did not start")
+	}
+	finished := make(chan bool, 1)
+	go func() {
+		finished <- actor.syncLocalThreadSnapshotForShutdownNow()
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		actor.mu.Lock()
+		closing := actor.localSnapshotClosing
+		actor.mu.Unlock()
+		if closing {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("final snapshot did not close async writers")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	actor.syncCloudAsync()
+	select {
+	case <-finished:
+		t.Fatal("final snapshot completed before async writer")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(releaseFirst)
+	select {
+	case ok := <-finished:
+		if !ok {
+			t.Fatal("final local snapshot failed")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("final local snapshot did not complete")
+	}
+	if got := writes.Load(); got != 2 {
+		t.Fatalf("local snapshot writes = %d, want in-flight plus final only", got)
+	}
+}
+
+func TestNeoRuntimeStopWaitsForAsyncLocalSnapshot(t *testing.T) {
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
+		Enabled: &enabled,
+		Host:    "127.0.0.1",
+		Port:    freeTCPPortForTest(t),
+	}}})
+	rt.threadDir = t.TempDir()
+	rt.asyncLocalSnapshots = true
+	if err := rt.start(); err != nil {
+		t.Fatalf("start runtime: %v", err)
+	}
+	threadID := "T-019f4000-0000-4000-8000-000000000054"
+	actor := rt.store.ensureThreadActor(threadID)
+	executorSocket := &neoSocket{}
+	executorSocket.markExecutor("executor-stop")
+	actor.mu.Lock()
+	actor.executorID = "executor-stop"
+	actor.executorSocket = executorSocket
+	actor.executorReady = true
+	actor.executorBootstrapComplete = true
+	actor.pendingTools["TU-stop"] = neoPendingTool{ID: "TU-stop", Name: "shell_command"}
+	actor.agentState = "running_tools"
+	actor.mu.Unlock()
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var writes atomic.Int32
+	rt.writeLocalSnapshot = func(neoCloudThreadSnapshot, string) (int64, error) {
+		if writes.Add(1) == 1 {
+			close(firstStarted)
+			<-releaseFirst
+		}
+		return 0, nil
+	}
+
+	actor.syncCloudAsync()
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("async local snapshot did not start")
+	}
+	stopped := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		stopped <- rt.stop(ctx)
+	}()
+	select {
+	case err := <-stopped:
+		t.Fatalf("runtime stopped before async writer completed: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(releaseFirst)
+	select {
+	case err := <-stopped:
+		if err != nil {
+			t.Fatalf("stop runtime: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runtime stop did not wait for local snapshots")
+	}
+	actor.mu.Lock()
+	closing := actor.localSnapshotClosing
+	running := actor.localSyncRunning
+	executorID := actor.executorID
+	pendingTools := len(actor.pendingTools)
+	agentState := actor.agentState
+	actor.mu.Unlock()
+	if !closing || running || executorID != "" || pendingTools != 0 || agentState != "idle" {
+		t.Fatalf("stopped actor state = closing:%v running:%v executor:%q pending:%d agent:%q", closing, running, executorID, pendingTools, agentState)
+	}
+	writesBefore := writes.Load()
+	actor.syncCloudAsync()
+	if got := writes.Load(); got != writesBefore {
+		t.Fatalf("stopped actor scheduled another local snapshot: writes=%d, want %d", got, writesBefore)
+	}
 }
 
 func TestNeoRuntimeShutdownClosesActorWebSocketsAsTransportFailure(t *testing.T) {
@@ -6108,33 +9071,20 @@ func TestNeoUserActorGetRecentThreadsSeedsMarkedCloudThread(t *testing.T) {
 			if params["limit"] != float64(20) {
 				t.Fatalf("listThreads limit = %#v, want 20", params["limit"])
 			}
-			writeNeoJSON(w, http.StatusOK, map[string]any{"ok": true, "result": map[string]any{"threads": []any{map[string]any{"id": threadID}}}})
+			writeNeoJSON(w, http.StatusOK, map[string]any{"ok": true, "result": map[string]any{"threads": []any{map[string]any{
+				"thread": map[string]any{
+					"data": map[string]any{
+						"id":                   threadID,
+						"title":                "Cloud seeded sidebar",
+						"agentMode":            "deep",
+						"userLastInteractedAt": "2026-06-20T12:00:00Z",
+					},
+					"meta": map[string]any{"executorType": "local-client"},
+				},
+			}}}})
 		case "getThread":
 			getRequests++
-			writeNeoJSON(w, http.StatusOK, map[string]any{
-				"ok": true,
-				"result": map[string]any{
-					"thread": map[string]any{
-						"id":   threadID,
-						"v":    4,
-						"meta": map[string]any{"cliProxyAPILocalNeo": true},
-						"data": map[string]any{
-							"id":        threadID,
-							"title":     "Cloud seeded sidebar",
-							"agentMode": "deep",
-							"messages": []any{
-								map[string]any{
-									"messageId": "M-cloud-sidebar-user",
-									"role":      "user",
-									"createdAt": "2026-06-20T12:00:00Z",
-									"agentMode": "deep",
-									"content":   []any{map[string]any{"type": "text", "text": "restore sidebar after restart"}},
-								},
-							},
-						},
-					},
-				},
-			})
+			t.Fatal("recent thread seeding fetched a full thread")
 		default:
 			t.Fatalf("unexpected upstream request path=%s query=%s", r.URL.Path, r.URL.RawQuery)
 		}
@@ -6167,6 +9117,71 @@ func TestNeoUserActorGetRecentThreadsSeedsMarkedCloudThread(t *testing.T) {
 	}
 	if item["lastUserMessageAt"] != "2026-06-20T12:00:00Z" {
 		t.Fatalf("lastUserMessageAt = %#v", item["lastUserMessageAt"])
+	}
+	if listRequests != 1 || getRequests != 0 {
+		t.Fatalf("upstream requests = list:%d get:%d, want list:1 get:0", listRequests, getRequests)
+	}
+}
+
+func TestNeoUserActorGetRecentThreadsSeedsMarkedCloudThreadFromIDOnlyListItem(t *testing.T) {
+	enabled := true
+	threadID := "T-019e0e6e-f3f1-7078-b5dd-748f66f8c268"
+	listRequests := 0
+	getRequests := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.RawQuery {
+		case "listThreads":
+			listRequests++
+			writeNeoJSON(w, http.StatusOK, map[string]any{"ok": true, "result": map[string]any{"threads": []any{map[string]any{"id": threadID}}}})
+		case "getThread":
+			getRequests++
+			writeNeoJSON(w, http.StatusOK, map[string]any{
+				"ok": true,
+				"result": map[string]any{"thread": map[string]any{
+					"id":   threadID,
+					"v":    4,
+					"meta": map[string]any{"cliProxyAPILocalNeo": true},
+					"data": map[string]any{
+						"id":                   threadID,
+						"title":                "Cloud fallback sidebar",
+						"agentMode":            "deep",
+						"userLastInteractedAt": "2026-06-20T12:30:00Z",
+						"messages": []any{map[string]any{
+							"messageId": "M-cloud-fallback-user",
+							"role":      "user",
+							"createdAt": "2026-06-20T12:30:00Z",
+							"agentMode": "deep",
+							"content":   []any{map[string]any{"type": "text", "text": "restore fallback sidebar"}},
+						}},
+					},
+				}},
+			})
+		default:
+			t.Fatalf("unexpected upstream request path=%s query=%s", r.URL.Path, r.URL.RawQuery)
+		}
+	}))
+	t.Cleanup(upstream.Close)
+
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+		UpstreamURL:    upstream.URL,
+		UpstreamAPIKey: "secret",
+		NeoLocalRuntime: config.AmpNeoLocalRuntime{
+			Enabled: &enabled,
+		},
+	}})
+	userActor, _ := rt.store.upsert(map[string]any{"name": "userActor", "key": "user-local"}, true)
+
+	result := userActor.handleForSocket(nil, map[string]any{
+		"type": "getRecentThreads",
+		"args": []any{map[string]any{"limit": 5}},
+	})
+	items := arrayValue(result)
+	if len(items) != 1 {
+		t.Fatalf("getRecentThreads result = %#v, want one fallback cloud thread", result)
+	}
+	item := mapValue(items[0])
+	if item["threadId"] != threadID || item["title"] != "Cloud fallback sidebar" {
+		t.Fatalf("fallback recent thread summary = %#v", item)
 	}
 	if listRequests != 1 || getRequests != 1 {
 		t.Fatalf("upstream requests = list:%d get:%d, want 1 each", listRequests, getRequests)
@@ -6213,6 +9228,57 @@ func TestNeoUserActorGetRecentThreadsPrefersLiveActorOverCachedSummary(t *testin
 	}
 }
 
+func TestNeoUserActorGetRecentThreadsSeedsCLIProxyAPISummary(t *testing.T) {
+	enabled := true
+	threadID := "T-019e0e6e-f3f1-7078-b5dd-748f66f8c267"
+	getRequests := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.RawQuery {
+		case "listThreads":
+			writeNeoJSON(w, http.StatusOK, map[string]any{"ok": true, "result": map[string]any{"threads": []any{map[string]any{
+				"threadId":          threadID,
+				"title":             "Chained proxy summary",
+				"lastUserMessageAt": "2026-06-20T13:00:00Z",
+				"state":             "idle",
+				"agentState":        "idle",
+				"hasExecutor":       false,
+				"executorConnected": false,
+			}}}})
+		case "getThread":
+			getRequests++
+			t.Fatal("recent thread seeding fetched a full thread")
+		default:
+			t.Fatalf("unexpected upstream request path=%s query=%s", r.URL.Path, r.URL.RawQuery)
+		}
+	}))
+	t.Cleanup(upstream.Close)
+
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+		UpstreamURL:    upstream.URL,
+		UpstreamAPIKey: "secret",
+		NeoLocalRuntime: config.AmpNeoLocalRuntime{
+			Enabled: &enabled,
+		},
+	}})
+	userActor, _ := rt.store.upsert(map[string]any{"name": "userActor", "key": "user-local"}, true)
+
+	result := userActor.handleForSocket(nil, map[string]any{
+		"type": "getRecentThreads",
+		"args": []any{map[string]any{"limit": 5}},
+	})
+	items := arrayValue(result)
+	if len(items) != 1 {
+		t.Fatalf("getRecentThreads result = %#v, want one chained proxy summary", result)
+	}
+	item := mapValue(items[0])
+	if item["threadId"] != threadID || item["title"] != "Chained proxy summary" {
+		t.Fatalf("recent thread summary = %#v", item)
+	}
+	if getRequests != 0 {
+		t.Fatalf("getThread requests = %d, want 0", getRequests)
+	}
+}
+
 func TestNeoUserActorGetRecentThreadsDoesNotSeedUnmarkedCloudThread(t *testing.T) {
 	enabled := true
 	threadID := "T-019e0e6e-f3f1-7078-b5dd-748f66f8c263"
@@ -6227,17 +9293,15 @@ func TestNeoUserActorGetRecentThreadsDoesNotSeedUnmarkedCloudThread(t *testing.T
 			getRequests++
 			writeNeoJSON(w, http.StatusOK, map[string]any{
 				"ok": true,
-				"result": map[string]any{
-					"thread": map[string]any{
-						"id": threadID,
-						"data": map[string]any{
-							"id":        threadID,
-							"title":     "Remote cloud only",
-							"agentMode": "deep",
-							"messages":  []any{map[string]any{"messageId": "M-remote-only-user", "role": "user", "createdAt": "2026-06-20T13:00:00Z", "agentMode": "deep"}},
-						},
+				"result": map[string]any{"thread": map[string]any{
+					"id": threadID,
+					"data": map[string]any{
+						"id":        threadID,
+						"title":     "Remote cloud only",
+						"agentMode": "deep",
+						"messages":  []any{map[string]any{"messageId": "M-remote-only-user", "role": "user", "createdAt": "2026-06-20T13:00:00Z", "agentMode": "deep"}},
 					},
-				},
+				}},
 			})
 		default:
 			t.Fatalf("unexpected upstream request path=%s query=%s", r.URL.Path, r.URL.RawQuery)
@@ -6487,8 +9551,8 @@ func TestNeoUserActorReceivesThreadStatusUpdatedOnExecutorConnectDisconnect(t *t
 	if thread["hasExecutor"] != false || thread["executorConnected"] != false {
 		t.Fatalf("disconnected cloud thread executor state = has:%#v connected:%#v", thread["hasExecutor"], thread["executorConnected"])
 	}
-	if mapValue(thread["meta"])["executorType"] != nil {
-		t.Fatalf("disconnected cloud thread executorType = %#v, want absent", thread["meta"])
+	if meta := mapValue(thread["meta"]); meta["executorType"] != "local-client" || meta["usesThreadActors"] != true {
+		t.Fatalf("disconnected cloud thread identity = %#v", meta)
 	}
 }
 
@@ -6512,8 +9576,8 @@ func TestNeoCloudThreadSnapshotDoesNotReportConnectingExecutor(t *testing.T) {
 	if thread["hasExecutor"] != false || thread["executorConnected"] != false {
 		t.Fatalf("connecting executor should not be reported as connected: has=%#v connected=%#v", thread["hasExecutor"], thread["executorConnected"])
 	}
-	if mapValue(thread["meta"])["executorType"] != nil {
-		t.Fatalf("connecting executorType = %#v, want absent", thread["meta"])
+	if meta := mapValue(thread["meta"]); meta["executorType"] != "local-client" || meta["usesThreadActors"] != true {
+		t.Fatalf("connecting executor identity = %#v", meta)
 	}
 	status, _ := actor.recentThreadStatus()
 	if status["hasExecutor"] != false || status["executorConnected"] != false {
@@ -6587,8 +9651,8 @@ func TestNeoCloudThreadReportsPendingInferenceAsWorking(t *testing.T) {
 	if pending["messageId"] != "M-pending" || pending["agentMode"] != "deep" || pending["reasoningEffort"] != "xhigh" {
 		t.Fatalf("pendingInference = %#v", pending)
 	}
-	if mapValue(thread["meta"])["executorType"] != nil {
-		t.Fatalf("pending disconnected executorType = %#v, want absent", thread["meta"])
+	if meta := mapValue(thread["meta"]); meta["executorType"] != nil || meta["usesThreadActors"] != true {
+		t.Fatalf("pending disconnected actor identity = %#v", meta)
 	}
 }
 
@@ -6901,6 +9965,23 @@ func TestNeoRuntimeThreadActorGatewayImportsMarkedCloudThread(t *testing.T) {
 			Enabled: &enabled,
 		},
 	}})
+	rt.threadDir = t.TempDir()
+	if err := writeNeoLocalThreadSnapshotToDir(neoCloudThreadSnapshot{
+		threadID:  threadID,
+		seq:       1,
+		createdMs: time.Now().Add(-time.Hour).UnixMilli(),
+		title:     "stale disk state",
+		messages: []neoMessage{{
+			ThreadID:  threadID,
+			MessageID: "M-stale",
+			Role:      "user",
+			AgentMode: "deep",
+			Content:   []any{map[string]any{"type": "text", "text": "stale disk message"}},
+			Seq:       1,
+		}},
+	}, rt.threadDir); err != nil {
+		t.Fatalf("write stale local thread: %v", err)
+	}
 	req := httptest.NewRequest(http.MethodGet, "http://localhost:8317/gateway/threadActor/connect?rvt-method=getOrCreate&rvt-key="+url.QueryEscape(threadID), nil)
 	actor := rt.store.actorForGatewayRequest(req)
 	if actor == nil {
@@ -7272,6 +10353,7 @@ func TestNeoRuntimeClientResumeIsSocketScoped(t *testing.T) {
 		{ThreadID: threadID, MessageID: "M-old", Role: "user", Content: []any{map[string]any{"type": "text", "text": "old"}}, Seq: 1},
 		{ThreadID: threadID, MessageID: "M-new", Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "new"}}, Seq: 2},
 	}
+	actor.replayEvents = []neoReplayEvent{{Seq: 2, Payload: neoMessageAddedPayload(actor.messages[1])}}
 	actor.seq = 3
 	actor.mu.Unlock()
 
@@ -7317,6 +10399,830 @@ func TestNeoRuntimeClientResumeIsSocketScoped(t *testing.T) {
 	}
 }
 
+func TestNeoRuntimeWebSocketFullResumePreservesLargeTranscript(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019e0e6e-f3f1-7080-b5dd-748f66f8c26c"
+	actor, _ := rt.store.upsert(map[string]any{"name": "threadActor", "key": threadID, "input": map[string]any{"threadId": threadID}}, true)
+	const messageCount = neoReplayEventLimit + 88
+	messages := make([]neoMessage, 0, messageCount)
+	for i := 0; i < messageCount; i++ {
+		messageID := fmt.Sprintf("M-%022d", i+1)
+		toolUseID := fmt.Sprintf("TU-%04d", i/2)
+		message := neoMessage{ThreadID: threadID, MessageID: messageID, Seq: i + 1}
+		if i%2 == 0 {
+			message.Role = "assistant"
+			message.Content = []any{map[string]any{"type": "tool_use", "id": toolUseID, "name": "shell_command", "input": map[string]any{"command": "pwd"}}}
+		} else {
+			message.Role = "user"
+			message.Content = []any{map[string]any{"type": "tool_result", "toolUseID": toolUseID, "content": "/workspace"}}
+		}
+		if i == 0 {
+			message.Seq = 0
+		}
+		messages = append(messages, message)
+	}
+	cutMessageID := messages[messageCount/2].MessageID
+	actor.mu.Lock()
+	actor.messages = messages
+	actor.compactionRecords = []map[string]any{{"cutMessageId": cutMessageID, "createdAt": "2026-07-12T00:00:00Z"}}
+	actor.seq = messageCount + 1
+	actor.mu.Unlock()
+
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	t.Cleanup(server.Close)
+	conn := dialNeoActorWebSocketWithoutResume(t, server.URL, threadID, "")
+	defer conn.Close()
+	if err := conn.WriteJSON(map[string]any{"type": "client_resume", "version": 0}); err != nil {
+		t.Fatalf("write full client_resume: %v", err)
+	}
+
+	messageIndex := 0
+	toolUses := 0
+	toolResults := 0
+	sawCompactionRecord := false
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		msg, ok := readNeoMessage(t, conn, time.Until(deadline))
+		if !ok {
+			break
+		}
+		switch msg["type"] {
+		case "message_added":
+			if messageIndex >= len(messages) {
+				t.Fatalf("full resume sent too many messages: %#v", msg)
+			}
+			message := mapValue(msg["message"])
+			if got, want := stringValue(message["messageId"]), messages[messageIndex].MessageID; got != want {
+				t.Fatalf("full resume message %d ID = %q, want %q", messageIndex, got, want)
+			}
+			for _, rawBlock := range arrayValue(message["content"]) {
+				switch stringValue(mapValue(rawBlock)["type"]) {
+				case "tool_use":
+					toolUses++
+				case "tool_result":
+					toolResults++
+				}
+			}
+			messageIndex++
+		case "compaction_records":
+			records := arrayValue(msg["records"])
+			sawCompactionRecord = len(records) == 1 && stringValue(mapValue(records[0])["cutMessageId"]) == cutMessageID
+		case "agent_state":
+			if messageIndex != messageCount || toolUses != messageCount/2 || toolResults != messageCount/2 || !sawCompactionRecord {
+				t.Fatalf("full resume completeness messages=%d/%d toolUses=%d toolResults=%d compaction=%v", messageIndex, messageCount, toolUses, toolResults, sawCompactionRecord)
+			}
+			return
+		}
+	}
+	t.Fatal("timed out waiting for full resume snapshot")
+}
+
+func TestNeoRuntimeImportedPositiveResumeFallsBackToCompleteSnapshot(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019e0e6e-f3f1-7080-b5dd-748f66f8c26e"
+	relatedThreadID := "T-019e0e6e-f3f1-7080-b5dd-748f66f8c272"
+	actor, _ := rt.store.upsert(map[string]any{"name": "threadActor", "key": threadID, "input": map[string]any{"threadId": threadID}}, true)
+	if err := actor.importThreadLocalOnly(map[string]any{
+		"id":              threadID,
+		"v":               10_000,
+		"agentMode":       "deep",
+		"reasoningEffort": "xhigh",
+		"messages": []any{
+			map[string]any{"messageId": "M-0000000000000000000001", "role": "user", "content": []any{map[string]any{"type": "text", "text": "preserve everything"}}},
+			map[string]any{"messageId": "M-0000000000000000000002", "role": "assistant", "content": []any{
+				map[string]any{"type": "thinking", "thinking": "reasoning", "blockState": "complete"},
+				map[string]any{"type": "tool_use", "id": "TU-stable", "name": "shell_command", "input": map[string]any{"command": "go test ./..."}},
+			}},
+			map[string]any{"messageId": "M-0000000000000000000003", "role": "user", "content": []any{map[string]any{"type": "tool_result", "toolUseID": "TU-stable", "content": "passed"}}},
+			map[string]any{"messageId": "M-0000000000000000000004", "role": "info", "content": []any{
+				map[string]any{"type": "summary", "summary": map[string]any{"type": "message", "summary": "preserved summary"}},
+				map[string]any{"type": "manual_bash_invocation", "args": map[string]any{"cmd": "git status --short"}, "toolRun": map[string]any{"status": "done", "result": "clean"}},
+			}},
+		},
+		"compactionRecords": []any{map[string]any{"cutMessageId": "M-0000000000000000000001", "createdAt": "2026-07-12T00:00:00Z"}},
+		"relationships":     []any{map[string]any{"threadID": relatedThreadID, "type": "mention", "role": "parent"}},
+	}); err != nil {
+		t.Fatalf("import thread: %v", err)
+	}
+	actor.bumpSeqAndRemember(map[string]any{"type": "resume_probe"})
+	if actor.canReplayFrom(9_000) {
+		t.Fatal("imported actor unexpectedly proved replay continuity")
+	}
+	actor.mu.Lock()
+	retainedSummary := len(actor.messages) == 4 && len(actor.messages[3].Content) == 2 && neoCompactionSummaryText(mapValue(mapValue(actor.messages[3].Content[0])["summary"])) == "preserved summary"
+	actor.mu.Unlock()
+	if !retainedSummary {
+		t.Fatal("imported summary block was not retained")
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	t.Cleanup(server.Close)
+	conn := dialNeoActorWebSocketWithoutResume(t, server.URL, threadID, "")
+	defer conn.Close()
+	if err := conn.WriteJSON(map[string]any{"type": "client_resume", "version": 9_000}); err != nil {
+		t.Fatalf("write positive client_resume: %v", err)
+	}
+
+	wantIDs := []string{"M-0000000000000000000001", "M-0000000000000000000002", "M-0000000000000000000003", "M-0000000000000000000004"}
+	messageIDs := make([]string, 0, len(wantIDs))
+	sawThinking := false
+	sawToolUse := false
+	sawToolResult := false
+	sawManualBash := false
+	sawCompactionRecord := false
+	sawRelationship := false
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		msg, ok := readNeoMessage(t, conn, time.Until(deadline))
+		if !ok {
+			break
+		}
+		switch msg["type"] {
+		case "message_added":
+			message := mapValue(msg["message"])
+			messageIDs = append(messageIDs, stringValue(message["messageId"]))
+			for _, rawBlock := range arrayValue(message["content"]) {
+				switch stringValue(mapValue(rawBlock)["type"]) {
+				case "thinking":
+					sawThinking = true
+				case "tool_use":
+					sawToolUse = stringValue(mapValue(rawBlock)["id"]) == "TU-stable"
+				case "tool_result":
+					sawToolResult = stringValue(mapValue(rawBlock)["toolUseID"]) == "TU-stable" && stringValue(mapValue(rawBlock)["content"]) == "passed"
+				case "manual_bash_invocation":
+					sawManualBash = true
+				}
+			}
+		case "compaction_records":
+			records := arrayValue(msg["records"])
+			sawCompactionRecord = len(records) == 1 && stringValue(mapValue(records[0])["cutMessageId"]) == wantIDs[0]
+		case "thread_relationships":
+			relationships := arrayValue(msg["relationships"])
+			sawRelationship = len(relationships) == 1 && stringValue(mapValue(relationships[0])["threadID"]) == relatedThreadID
+		case "agent_state":
+			if !reflect.DeepEqual(messageIDs, wantIDs) || !sawThinking || !sawToolUse || !sawToolResult || !sawManualBash || !sawCompactionRecord || !sawRelationship {
+				t.Fatalf("fallback completeness ids=%v thinking=%v toolUse=%v toolResult=%v manualBash=%v compaction=%v relationship=%v", messageIDs, sawThinking, sawToolUse, sawToolResult, sawManualBash, sawCompactionRecord, sawRelationship)
+			}
+			return
+		}
+	}
+	t.Fatal("timed out waiting for imported fallback snapshot")
+}
+
+func TestNeoRuntimeImportedPositiveResumePreservesTranscriptBeyondReplayLimit(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019e0e6e-f3f1-7080-b5dd-748f66f8c26f"
+	actor, _ := rt.store.upsert(map[string]any{"name": "threadActor", "key": threadID, "input": map[string]any{"threadId": threadID}}, true)
+	const messageCount = neoReplayEventLimit + 88
+	messages := make([]any, messageCount)
+	for index := range messages {
+		messages[index] = map[string]any{
+			"messageId": fmt.Sprintf("M-%022d", index+1),
+			"role":      "assistant",
+			"content":   []any{map[string]any{"type": "text", "text": fmt.Sprintf("message %d", index+1)}},
+		}
+	}
+	if err := actor.importThreadLocalOnly(map[string]any{"id": threadID, "v": 50_000, "agentMode": "deep", "messages": messages}); err != nil {
+		t.Fatalf("import thread: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	t.Cleanup(server.Close)
+	conn := dialNeoActorWebSocketWithoutResume(t, server.URL, threadID, "")
+	defer conn.Close()
+	if err := conn.WriteJSON(map[string]any{"type": "client_resume", "version": 49_000}); err != nil {
+		t.Fatalf("write positive client_resume: %v", err)
+	}
+
+	messageCountReceived := 0
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		msg, ok := readNeoMessage(t, conn, time.Until(deadline))
+		if !ok {
+			break
+		}
+		switch msg["type"] {
+		case "message_added":
+			messageCountReceived++
+		case "agent_state":
+			if messageCountReceived != messageCount {
+				t.Fatalf("fallback messages = %d, want %d", messageCountReceived, messageCount)
+			}
+			return
+		}
+	}
+	t.Fatal("timed out waiting for large imported fallback snapshot")
+}
+
+func TestNeoRuntimeResumeBeforeReplayFloorFallsBackToCompleteSnapshot(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019e0e6e-f3f1-7080-b5dd-748f66f8c270"
+	actor, _ := rt.store.upsert(map[string]any{"name": "threadActor", "key": threadID, "input": map[string]any{"threadId": threadID}}, true)
+	actor.mu.Lock()
+	actor.messages = []neoMessage{
+		{ThreadID: threadID, MessageID: "M-before-floor", Role: "user", Content: []any{map[string]any{"type": "text", "text": "must survive"}}, Seq: 1},
+		{ThreadID: threadID, MessageID: "M-after-floor", Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "later"}}, Seq: neoReplayEventLimit + 99},
+	}
+	for seq := 1; seq < neoReplayEventLimit+100; seq++ {
+		actor.rememberReplayEventLocked(map[string]any{"type": "resume_probe", "seq": seq})
+	}
+	actor.seq = neoReplayEventLimit + 100
+	actor.mu.Unlock()
+	if actor.canReplayFrom(98) {
+		t.Fatal("base before replay floor unexpectedly accepted")
+	}
+	if !actor.canReplayFrom(99) {
+		t.Fatal("base at replay floor unexpectedly rejected")
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	t.Cleanup(server.Close)
+	conn := dialNeoActorWebSocketWithoutResume(t, server.URL, threadID, "")
+	defer conn.Close()
+	if err := conn.WriteJSON(map[string]any{"type": "client_resume", "version": 98}); err != nil {
+		t.Fatalf("write client_resume: %v", err)
+	}
+	first := waitForNeoMessageType(t, conn, "message_added", 2*time.Second)
+	if got := stringValue(mapValue(first["message"])["messageId"]); got != "M-before-floor" {
+		t.Fatalf("first fallback message = %q, want M-before-floor", got)
+	}
+}
+
+func TestNeoActorCanReplayFromRequiresRetainedContinuity(t *testing.T) {
+	newActor := func(events []neoReplayEvent) *neoActor {
+		actor := newNeoActor(nil, "actor-replay-continuity", "thread-actor", "T-test", "T-test", neoActorRecord("actor-replay-continuity", "thread-actor", "T-test"), nil)
+		actor.replayEvents = events
+		actor.seq = 13
+		return actor
+	}
+	valid := []neoReplayEvent{
+		{Seq: 10, Payload: map[string]any{"type": "resume_probe", "seq": 10}},
+		{Seq: 12, Payload: map[string]any{"type": "resume_probe", "seq": 12}},
+	}
+	tests := []struct {
+		name  string
+		actor *neoActor
+		base  int
+		want  bool
+	}{
+		{name: "nil actor", base: 9},
+		{name: "zero base", actor: newActor(valid), base: 0},
+		{name: "negative base", actor: newActor(valid), base: -1},
+		{name: "no replay events", actor: newActor(nil), base: 9},
+		{name: "base at replay floor", actor: newActor(valid), base: 9, want: true},
+		{name: "base before replay floor", actor: newActor(valid), base: 8},
+		{name: "base ahead of actor", actor: newActor(valid), base: 13},
+		{name: "base at actor high water", actor: newActor(valid), base: 12, want: true},
+		{name: "proven live base", actor: newActor(valid), base: 10, want: true},
+		{name: "duplicate replay sequence", actor: newActor([]neoReplayEvent{{Seq: 10}, {Seq: 10}}), base: 9},
+		{name: "out of order replay sequence", actor: newActor([]neoReplayEvent{{Seq: 10}, {Seq: 9}}), base: 9},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := test.actor.canReplayFrom(test.base); got != test.want {
+				t.Fatalf("canReplayFrom(%d) = %t, want %t", test.base, got, test.want)
+			}
+		})
+	}
+}
+
+func TestNeoRuntimeEagerSnapshotSkipsUnprovablePositiveResume(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019e0e6e-f3f1-7080-b5dd-748f66f8c271"
+	actor, _ := rt.store.upsert(map[string]any{"name": "threadActor", "key": threadID, "input": map[string]any{"threadId": threadID}}, true)
+	if err := actor.importThreadLocalOnly(map[string]any{
+		"id":        threadID,
+		"v":         1_000,
+		"agentMode": "deep",
+		"messages":  []any{map[string]any{"messageId": "M-complete", "role": "user", "content": []any{map[string]any{"type": "text", "text": "once"}}}},
+	}); err != nil {
+		t.Fatalf("import thread: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	t.Cleanup(server.Close)
+	conn := dialNeoActorWebSocket(t, server.URL, threadID)
+	defer conn.Close()
+	waitForNeoMessageType(t, conn, "agent_state", 2*time.Second)
+	waitForNeoMessageType(t, conn, "observers", 2*time.Second)
+	if err := conn.WriteJSON(map[string]any{"type": "client_resume", "version": 900}); err != nil {
+		t.Fatalf("write positive client_resume: %v", err)
+	}
+	if msg, ok := readNeoMessage(t, conn, 150*time.Millisecond); ok {
+		t.Fatalf("unprovable positive resume duplicated eager snapshot: %#v", msg)
+	}
+}
+
+func TestNeoSocketMarshaledTextFrameParity(t *testing.T) {
+	payload := map[string]any{"type": "probe", "value": "<>&\u2028"}
+	tests := []struct {
+		name   string
+		socket neoSocket
+		want   string
+	}{
+		{
+			name: "plain",
+			want: `{"type":"probe","value":"\u003c\u003e\u0026\u2028"}`,
+		},
+		{
+			name:   "json rpc",
+			socket: neoSocket{jsonRPC: true},
+			want:   `{"jsonrpc":"2.0","method":"probe","params":{"value":"\u003c\u003e\u0026\u2028"}}`,
+		},
+		{
+			name:   "rivet observer",
+			socket: neoSocket{rivetAction: true, webLocalObserver: true},
+			want:   `{"body":{"tag":"Event","val":{"args":[{"type":"probe","value":"\u003c\u003e\u0026\u2028"}],"name":"probe"}}}`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var messageType int
+			var frame []byte
+			socket := test.socket
+			socket.writeMessage = func(gotType int, data []byte) error {
+				messageType = gotType
+				frame = append([]byte(nil), data...)
+				return nil
+			}
+			if !socket.sendChecked(payload) {
+				t.Fatal("sendChecked() = false")
+			}
+			if messageType != websocket.TextMessage {
+				t.Fatalf("message type = %d, want %d", messageType, websocket.TextMessage)
+			}
+			if got := string(frame); got != test.want {
+				t.Fatalf("frame = %s, want %s", got, test.want)
+			}
+		})
+	}
+
+	t.Run("string caller", func(t *testing.T) {
+		var frame []byte
+		socket := &neoSocket{writeMessage: func(messageType int, data []byte) error {
+			if messageType != websocket.TextMessage {
+				t.Fatalf("message type = %d, want %d", messageType, websocket.TextMessage)
+			}
+			frame = append([]byte(nil), data...)
+			return nil
+		}}
+		if !socket.sendTextChecked(`{"raw":true}`) {
+			t.Fatal("sendTextChecked() = false")
+		}
+		if got, want := string(frame), `{"raw":true}`; got != want {
+			t.Fatalf("frame = %s, want %s", got, want)
+		}
+	})
+
+	t.Run("writer failure", func(t *testing.T) {
+		socket := &neoSocket{writeMessage: func(int, []byte) error {
+			return errors.New("write failed")
+		}}
+		if socket.sendChecked(payload) {
+			t.Fatal("sendChecked() = true after writer failure")
+		}
+	})
+}
+
+func TestNeoRuntimeWebSocketOutboundJSONNormalization(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019e0e6e-f3f1-7080-b5dd-748f66f8c26b"
+	actor, _ := rt.store.upsert(map[string]any{"name": "threadActor", "key": threadID, "input": map[string]any{"threadId": threadID}}, true)
+	actor.mu.Lock()
+	actor.replayEvents = []neoReplayEvent{{Seq: 2, Payload: map[string]any{
+		"type":       "normalization_probe",
+		"seq":        2,
+		"drop":       nil,
+		"explicit":   neoExplicitNull,
+		"items":      []any{"first", nil, neoExplicitNull, map[string]any{"drop": nil, "keep": "value"}},
+		"typedMap":   map[string]any(nil),
+		"typedSlice": []any(nil),
+	}}}
+	actor.seq = 2
+	actor.mu.Unlock()
+
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	t.Cleanup(server.Close)
+	conn := dialNeoActorWebSocketWithoutResume(t, server.URL, threadID, "")
+	defer conn.Close()
+	if err := conn.WriteJSON(map[string]any{"type": "client_resume", "version": 1}); err != nil {
+		t.Fatalf("write client_resume: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		msg, ok := readNeoMessage(t, conn, time.Until(deadline))
+		if !ok {
+			break
+		}
+		if stringValue(msg["type"]) != "normalization_probe" {
+			continue
+		}
+		if _, ok := msg["drop"]; ok {
+			t.Fatalf("ordinary nil field survived on wire: %#v", msg)
+		}
+		if explicit, ok := msg["explicit"]; !ok || explicit != nil {
+			t.Fatalf("explicit null field = %#v, present=%v", explicit, ok)
+		}
+		items := arrayValue(msg["items"])
+		if len(items) != 3 || stringValue(items[0]) != "first" || items[1] != nil || stringValue(mapValue(items[2])["keep"]) != "value" {
+			t.Fatalf("normalized wire items = %#v", items)
+		}
+		typedMap, mapOK := msg["typedMap"].(map[string]any)
+		typedSlice, sliceOK := msg["typedSlice"].([]any)
+		if !mapOK || !sliceOK || len(typedMap) != 0 || len(typedSlice) != 0 {
+			t.Fatalf("typed nil wire containers = map:%#v slice:%#v", msg["typedMap"], msg["typedSlice"])
+		}
+		return
+	}
+	t.Fatal("timed out waiting for normalized WebSocket frame")
+}
+
+func TestNeoReplayEventMessageIDClassifiesDeduplicatedFamilies(t *testing.T) {
+	messageID := "M-0000000000000000000001"
+	tests := []struct {
+		name    string
+		payload map[string]any
+		want    string
+	}{
+		{name: "delta", payload: map[string]any{"type": "delta", "messageId": messageID}, want: messageID},
+		{name: "message added", payload: map[string]any{"type": "message_added", "message": map[string]any{"messageId": messageID}}, want: messageID},
+		{name: "message updated", payload: map[string]any{"type": "message_updated", "message": map[string]any{"messageId": messageID}}, want: messageID},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := neoReplayEventMessageID(test.payload); got != test.want {
+				t.Fatalf("neoReplayEventMessageID() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestNeoReplayEventRepresentedByMessagesMatrix(t *testing.T) {
+	messageID := "M-0000000000000000000001"
+	toolCallID := "TU-00000000000000000001"
+	messageIDs := map[string]bool{messageID: true}
+	toolCallIDs := map[string]bool{toolCallID: true}
+	tests := []struct {
+		name    string
+		payload map[string]any
+		want    bool
+	}{
+		{name: "matching delta", payload: map[string]any{"type": "delta", "messageId": messageID}, want: true},
+		{name: "different delta", payload: map[string]any{"type": "delta", "messageId": "M-other"}},
+		{name: "empty delta ID", payload: map[string]any{"type": "delta"}},
+		{name: "matching message added", payload: map[string]any{"type": "message_added", "message": map[string]any{"messageId": messageID}}, want: true},
+		{name: "different message added", payload: map[string]any{"type": "message_added", "message": map[string]any{"messageId": "M-other"}}},
+		{name: "empty message added ID", payload: map[string]any{"type": "message_added", "message": map[string]any{}}},
+		{name: "matching message updated", payload: map[string]any{"type": "message_updated", "message": map[string]any{"messageId": messageID}}, want: true},
+		{name: "different message updated", payload: map[string]any{"type": "message_updated", "message": map[string]any{"messageId": "M-other"}}},
+		{name: "empty message updated ID", payload: map[string]any{"type": "message_updated", "message": map[string]any{}}},
+		{name: "matching tool progress", payload: map[string]any{"type": "tool_progress", "toolCallId": toolCallID}, want: true},
+		{name: "different tool progress", payload: map[string]any{"type": "tool_progress", "toolCallId": "TU-other"}},
+		{name: "empty tool progress ID", payload: map[string]any{"type": "tool_progress"}},
+		{name: "unrelated event with matching IDs", payload: map[string]any{"type": "usage", "messageId": messageID, "toolCallId": toolCallID}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := neoReplayEventRepresentedByMessages(test.payload, messageIDs, toolCallIDs); got != test.want {
+				t.Fatalf("neoReplayEventRepresentedByMessages() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestNormalizeNeoOutboundJSONCopyOnWrite(t *testing.T) {
+	clean := map[string]any{
+		"message": map[string]any{
+			"content": []any{map[string]any{"type": "text", "text": "complete"}},
+		},
+		"explicit": neoExplicitNull,
+	}
+	normalizedClean, changed := normalizeNeoOutboundJSONValue(clean)
+	if changed {
+		t.Fatal("clean outbound JSON was copied")
+	}
+	normalizedCleanMap := normalizedClean.(map[string]any)
+	normalizedCleanMap["identityProbe"] = true
+	if clean["identityProbe"] != true {
+		t.Fatal("clean outbound map identity was not preserved")
+	}
+	delete(clean, "identityProbe")
+	cleanSlice := []any{"value"}
+	normalizedCleanSlice, changed := normalizeNeoOutboundJSONValue(cleanSlice)
+	if changed || &normalizedCleanSlice.([]any)[0] != &cleanSlice[0] {
+		t.Fatal("clean outbound slice identity was not preserved")
+	}
+	if allocations := testing.AllocsPerRun(100, func() {
+		normalizeNeoOutboundJSON(clean)
+	}); allocations > 1 {
+		t.Fatalf("clean outbound JSON allocations = %v, want at most 1", allocations)
+	}
+
+	nested := map[string]any{"value": "unchanged"}
+	dirty := map[string]any{
+		"keep":       nested,
+		"drop":       nil,
+		"items":      []any{"first", nil, neoExplicitNull, map[string]any{"drop": nil, "keep": "value"}},
+		"explicit":   neoExplicitNull,
+		"typedMap":   map[string]any(nil),
+		"typedSlice": []any(nil),
+	}
+	normalized, changed := normalizeNeoOutboundJSONValue(dirty)
+	if !changed {
+		t.Fatal("dirty outbound JSON was not normalized")
+	}
+	raw, err := json.Marshal(normalized)
+	if err != nil {
+		t.Fatalf("marshal normalized outbound JSON: %v", err)
+	}
+	if got, want := string(raw), `{"explicit":null,"items":["first",null,{"keep":"value"}],"keep":{"value":"unchanged"},"typedMap":{},"typedSlice":[]}`; got != want {
+		t.Fatalf("normalized outbound JSON = %s, want %s", got, want)
+	}
+	if _, ok := dirty["drop"]; !ok || len(arrayValue(dirty["items"])) != 4 || nested["value"] != "unchanged" {
+		t.Fatalf("normalization mutated input structure")
+	}
+}
+
+func TestNormalizeNeoOutboundJSONChangeMatrix(t *testing.T) {
+	tests := []struct {
+		name        string
+		input       any
+		wantChanged bool
+	}{
+		{name: "clean scalar", input: "value"},
+		{name: "clean nested containers", input: map[string]any{"items": []any{map[string]any{"value": "clean"}}}},
+		{name: "nested nil map value", input: map[string]any{"nested": map[string]any{"drop": nil}}, wantChanged: true},
+		{name: "nested nil slice element", input: map[string]any{"nested": []any{"keep", nil}}, wantChanged: true},
+		{name: "typed nil map", input: map[string]any(nil), wantChanged: true},
+		{name: "typed nil slice", input: []any(nil), wantChanged: true},
+		{name: "explicit null in slice", input: []any{neoExplicitNull}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, changed := normalizeNeoOutboundJSONValue(test.input); changed != test.wantChanged {
+				t.Fatalf("normalizeNeoOutboundJSONValue() changed = %v, want %v", changed, test.wantChanged)
+			}
+		})
+	}
+}
+
+func TestNeoRuntimePositiveResumePreservesLoadedTranscriptAndReplaysOnlySubsequentEvents(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019e0e6e-f3f1-7080-b5dd-748f66f8c26d"
+	actor, _ := rt.store.upsert(map[string]any{"name": "threadActor", "key": threadID, "input": map[string]any{"threadId": threadID}}, true)
+	baseMessages := []neoMessage{
+		{ThreadID: threadID, MessageID: "M-0000000000000000000001", Role: "user", Content: []any{map[string]any{"type": "text", "text": "inspect the repository"}}, Seq: 1},
+		{ThreadID: threadID, MessageID: "M-0000000000000000000002", Role: "assistant", Content: []any{
+			map[string]any{"type": "text", "text": "I will inspect it."},
+			map[string]any{"type": "tool_use", "id": "TU-base", "name": "shell_command", "input": map[string]any{"command": "pwd"}},
+		}, Seq: 2},
+		{ThreadID: threadID, MessageID: "M-0000000000000000000003", Role: "user", Content: []any{
+			map[string]any{"type": "tool_result", "toolUseID": "TU-base", "content": "/workspace"},
+		}, Seq: 3},
+	}
+	preloadedIDs := make(map[string]bool, len(baseMessages))
+	sawToolUse := false
+	sawToolResult := false
+	for _, message := range baseMessages {
+		preloadedIDs[message.MessageID] = true
+		for _, rawBlock := range message.Content {
+			switch stringValue(mapValue(rawBlock)["type"]) {
+			case "tool_use":
+				sawToolUse = true
+			case "tool_result":
+				sawToolResult = true
+			}
+		}
+	}
+	if !sawToolUse || !sawToolResult {
+		t.Fatalf("preloaded transcript missing tool blocks: %#v", baseMessages)
+	}
+
+	actor.mu.Lock()
+	actor.messages = append(append([]neoMessage(nil), baseMessages...),
+		neoMessage{
+			ThreadID: threadID, MessageID: "M-0000000000000000000004", Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "post-base result"}}, Seq: 5,
+		},
+		neoMessage{
+			ThreadID: threadID, MessageID: "legacy-grouped-result", Role: "user", Content: []any{
+				map[string]any{"type": "text", "text": "grouped result"},
+				map[string]any{"type": "tool_result", "toolUseID": "TU-tool-use-ID", "content": "/workspace"},
+				map[string]any{"type": "tool_result", "toolUseId": "TU-tool-use-Id", "content": "/workspace"},
+				map[string]any{"type": "tool_result", "tool_use_id": "TU-tool-use-id", "content": "/workspace"},
+				map[string]any{"type": "tool_result", "toolCallId": "TU-tool-call-Id", "content": "/workspace"},
+			}, Seq: 9,
+		},
+	)
+	actor.replayEvents = []neoReplayEvent{
+		{Seq: 3, Payload: map[string]any{
+			"type": "message_updated",
+			"seq":  3,
+			"message": map[string]any{
+				"threadId":  threadID,
+				"messageId": "M-0000000000000000000001",
+				"role":      "user",
+				"content":   []any{map[string]any{"type": "text", "text": "at-base update must not replay"}},
+			},
+		}},
+		{Seq: 4, Payload: map[string]any{
+			"type": "message_updated",
+			"seq":  4,
+			"message": map[string]any{
+				"threadId":  threadID,
+				"messageId": "M-0000000000000000000002",
+				"role":      "assistant",
+				"content": []any{
+					map[string]any{"type": "text", "text": "I inspected it."},
+					map[string]any{"type": "tool_use", "id": "TU-base", "name": "shell_command", "input": map[string]any{"command": "pwd"}},
+				},
+			},
+		}},
+		{Seq: 6, Payload: map[string]any{
+			"type": "message_updated",
+			"seq":  6,
+			"message": map[string]any{
+				"threadId":  threadID,
+				"messageId": "M-0000000000000000000004",
+				"role":      "assistant",
+				"content":   []any{map[string]any{"type": "text", "text": "duplicate post-base update must not replay"}},
+			},
+		}},
+		{Seq: 7, Payload: map[string]any{
+			"type":      "delta",
+			"seq":       7,
+			"messageId": "M-0000000000000000000004",
+			"role":      "assistant",
+			"blocks":    []any{map[string]any{"type": "text", "text": "duplicate delta must not replay"}},
+		}},
+		{Seq: 8, Payload: map[string]any{
+			"type": "message_added",
+			"seq":  8,
+			"message": map[string]any{
+				"threadId":  threadID,
+				"messageId": "M-0000000000000000000004",
+				"role":      "assistant",
+				"content":   []any{map[string]any{"type": "text", "text": "duplicate add must not replay"}},
+			},
+		}},
+		{Seq: 10, Payload: map[string]any{
+			"type":       "tool_progress",
+			"seq":        10,
+			"toolCallId": "TU-tool-use-ID",
+			"content":    "stale progress must not replay",
+		}},
+		{Seq: 11, Payload: map[string]any{
+			"type":       "tool_progress",
+			"seq":        11,
+			"toolCallId": "TU-tool-use-Id",
+			"content":    "stale progress must not replay",
+		}},
+		{Seq: 12, Payload: map[string]any{
+			"type":       "tool_progress",
+			"seq":        12,
+			"toolCallId": "TU-tool-use-id",
+			"content":    "stale progress must not replay",
+		}},
+		{Seq: 13, Payload: map[string]any{
+			"type":       "tool_progress",
+			"seq":        13,
+			"toolCallId": "TU-tool-call-Id",
+			"content":    "stale progress must not replay",
+		}},
+		{Seq: 14, Payload: map[string]any{
+			"type":       "tool_progress",
+			"seq":        14,
+			"toolCallId": "TU-other",
+			"content":    "unrelated progress",
+		}},
+		{Seq: 15, Payload: map[string]any{
+			"type":      "delta",
+			"seq":       15,
+			"messageId": "resume-delta-near-miss",
+			"role":      "assistant",
+			"blocks":    []any{map[string]any{"type": "text", "text": "unrelated delta"}},
+		}},
+		{Seq: 16, Payload: map[string]any{
+			"type": "message_added",
+			"seq":  16,
+			"message": map[string]any{
+				"threadId":  threadID,
+				"messageId": "resume-added-near-miss",
+				"role":      "assistant",
+				"content":   []any{map[string]any{"type": "text", "text": "unrelated add"}},
+			},
+		}},
+		{Seq: 17, Payload: map[string]any{
+			"type": "message_updated",
+			"seq":  17,
+			"message": map[string]any{
+				"threadId":  threadID,
+				"messageId": "resume-updated-near-miss",
+				"role":      "assistant",
+				"content":   []any{map[string]any{"type": "text", "text": "unrelated update"}},
+			},
+		}},
+	}
+	actor.compactionRecords = []map[string]any{{"cutMessageId": "M-0000000000000000000003", "createdAt": "2026-07-12T00:00:00Z"}}
+	actor.seq = 18
+	actor.mu.Unlock()
+
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	t.Cleanup(server.Close)
+	conn := dialNeoActorWebSocket(t, server.URL, threadID)
+	defer conn.Close()
+	waitForNeoMessageType(t, conn, "agent_state", 2*time.Second)
+
+	if err := conn.WriteJSON(map[string]any{"type": "client_resume", "version": 3}); err != nil {
+		t.Fatalf("write positive client_resume: %v", err)
+	}
+
+	sawUpdate := false
+	sawNewMessage := false
+	sawLegacyToolResult := false
+	sawUnrelatedToolProgress := false
+	sawUnrelatedDelta := false
+	sawUnrelatedAdded := false
+	sawUnrelatedUpdated := false
+	sawCompactionRecord := false
+	replaySeqs := make([]int, 0, 7)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		msg, ok := readNeoMessage(t, conn, time.Until(deadline))
+		if !ok {
+			break
+		}
+		switch msg["type"] {
+		case "message_added":
+			replaySeqs = append(replaySeqs, numberFrom(msg["seq"]))
+			message := mapValue(msg["message"])
+			messageID := stringValue(message["messageId"])
+			if preloadedIDs[messageID] || numberFrom(msg["seq"]) <= 3 {
+				t.Fatalf("positive resume duplicated preloaded message: %#v", msg)
+			}
+			if messageID == "M-0000000000000000000004" {
+				if sawNewMessage {
+					t.Fatalf("positive resume duplicated post-base message: %#v", msg)
+				}
+				sawNewMessage = true
+			}
+			if messageID == "legacy-grouped-result" {
+				if sawLegacyToolResult {
+					t.Fatalf("positive resume duplicated legacy tool-result message: %#v", msg)
+				}
+				sawLegacyToolResult = true
+			}
+			if messageID == "resume-added-near-miss" {
+				sawUnrelatedAdded = true
+			}
+		case "delta":
+			replaySeqs = append(replaySeqs, numberFrom(msg["seq"]))
+			switch stringValue(msg["messageId"]) {
+			case "M-0000000000000000000004":
+				t.Fatalf("positive resume replayed delta already represented by post-base message: %#v", msg)
+			case "resume-delta-near-miss":
+				sawUnrelatedDelta = true
+			}
+		case "tool_progress":
+			replaySeqs = append(replaySeqs, numberFrom(msg["seq"]))
+			switch stringValue(msg["toolCallId"]) {
+			case "TU-tool-use-ID", "TU-tool-use-Id", "TU-tool-use-id", "TU-tool-call-Id":
+				t.Fatalf("positive resume replayed tool progress already represented by post-base result: %#v", msg)
+			case "TU-other":
+				sawUnrelatedToolProgress = true
+			}
+		case "message_updated":
+			replaySeqs = append(replaySeqs, numberFrom(msg["seq"]))
+			if numberFrom(msg["seq"]) <= 3 {
+				t.Fatalf("positive resume replayed event at or before loaded base: %#v", msg)
+			}
+			messageID := stringValue(mapValue(msg["message"])["messageId"])
+			if messageID == "resume-updated-near-miss" {
+				sawUnrelatedUpdated = true
+			} else if !preloadedIDs[messageID] {
+				t.Fatalf("post-base update refers to unknown preloaded message ID: %#v", msg)
+			}
+			if messageID == "M-0000000000000000000002" && numberFrom(msg["seq"]) == 4 {
+				sawUpdate = true
+			}
+		case "compaction_records":
+			records := arrayValue(msg["records"])
+			if len(records) == 1 && stringValue(mapValue(records[0])["cutMessageId"]) == "M-0000000000000000000003" {
+				sawCompactionRecord = true
+			}
+		case "agent_state":
+			if !sawUpdate || !sawNewMessage || !sawLegacyToolResult || !sawUnrelatedToolProgress || !sawUnrelatedDelta || !sawUnrelatedAdded || !sawUnrelatedUpdated || !sawCompactionRecord {
+				t.Fatalf("resume completeness update=%v new=%v legacyToolResult=%v unrelatedToolProgress=%v unrelatedDelta=%v unrelatedAdded=%v unrelatedUpdated=%v compaction=%v", sawUpdate, sawNewMessage, sawLegacyToolResult, sawUnrelatedToolProgress, sawUnrelatedDelta, sawUnrelatedAdded, sawUnrelatedUpdated, sawCompactionRecord)
+			}
+			if want := []int{4, 5, 9, 14, 15, 16, 17}; !reflect.DeepEqual(replaySeqs, want) {
+				t.Fatalf("positive resume replay sequences = %v, want %v", replaySeqs, want)
+			}
+			return
+		}
+	}
+	t.Fatal("timed out waiting for positive resume snapshot")
+}
+
 func TestNeoRuntimeSkipReadyWaitDefersSnapshotUntilClientResume(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	threadID := "T-019e0e6e-f3f1-7081-b5dd-748f66f8c25d"
@@ -7326,7 +11232,8 @@ func TestNeoRuntimeSkipReadyWaitDefersSnapshotUntilClientResume(t *testing.T) {
 		{ThreadID: threadID, MessageID: "M-old", Role: "user", Content: []any{map[string]any{"type": "text", "text": "old"}}, Seq: 1},
 		{ThreadID: threadID, MessageID: "M-seen", Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "seen"}}, Seq: 2},
 	}
-	actor.seq = 3
+	actor.replayEvents = []neoReplayEvent{{Seq: 3, Payload: map[string]any{"type": "resume_probe", "seq": 3}}}
+	actor.seq = 4
 	actor.mu.Unlock()
 
 	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
@@ -7582,6 +11489,95 @@ func TestNeoRuntimeFilesystemBridgeNormalizesBothDirections(t *testing.T) {
 	if result["requestId"] != "fs-1" || result["ok"] != true || result["contentBase64"] != "aGVsbG8=" {
 		t.Fatalf("filesystem result = %#v", result)
 	}
+
+	if err := client.WriteJSON(map[string]any{"type": "client_filesystem_write_file", "requestId": "write-1", "uri": "file:///tmp/a.txt", "contentBase64": "aGVsbG8="}); err != nil {
+		t.Fatalf("write client filesystem write request: %v", err)
+	}
+	writeRequest := waitForNeoMessageType(t, executor, "executor_filesystem_write_file", 2*time.Second)
+	if writeRequest["requestId"] != "write-1" || writeRequest["uri"] != "file:///tmp/a.txt" || writeRequest["contentBase64"] != "aGVsbG8=" {
+		t.Fatalf("filesystem write request = %#v", writeRequest)
+	}
+	if err := executor.WriteJSON(map[string]any{"type": "executor_filesystem_write_file_result", "requestId": "write-1", "ok": true}); err != nil {
+		t.Fatalf("write executor filesystem write result: %v", err)
+	}
+	writeResult := waitForNeoMessageType(t, client, "client_filesystem_write_file_result", 2*time.Second)
+	if writeResult["requestId"] != "write-1" || writeResult["ok"] != true {
+		t.Fatalf("filesystem write result = %#v", writeResult)
+	}
+
+	if err := executor.WriteJSON(map[string]any{"type": "executor_filesystem_write_file", "requestId": "write-2", "uri": "file:///tmp/b.txt", "contentBase64": "d29ybGQ="}); err != nil {
+		t.Fatalf("write executor filesystem write request: %v", err)
+	}
+	reverseWriteRequest := waitForNeoMessageType(t, client, "client_filesystem_write_file", 2*time.Second)
+	if reverseWriteRequest["requestId"] != "write-2" || reverseWriteRequest["contentBase64"] != "d29ybGQ=" {
+		t.Fatalf("reverse filesystem write request = %#v", reverseWriteRequest)
+	}
+	if err := client.WriteJSON(map[string]any{"type": "client_filesystem_write_file_result", "requestId": "write-2", "ok": false, "error": map[string]any{"code": "TOO_LARGE", "message": "too large"}}); err != nil {
+		t.Fatalf("write client filesystem write result: %v", err)
+	}
+	reverseWriteResult := waitForNeoMessageType(t, executor, "executor_filesystem_write_file_result", 2*time.Second)
+	if reverseWriteResult["requestId"] != "write-2" || stringValue(mapValue(reverseWriteResult["error"])["code"]) != "TOO_LARGE" {
+		t.Fatalf("reverse filesystem write result = %#v", reverseWriteResult)
+	}
+
+	oversizedContent := base64.StdEncoding.EncodeToString(make([]byte, neoFilesystemWriteMaxBytes+1))
+	if err := client.WriteJSON(map[string]any{"type": "client_filesystem_write_file", "requestId": "write-3", "uri": "file:///tmp/c.txt", "contentBase64": oversizedContent}); err != nil {
+		t.Fatalf("write oversized client filesystem request: %v", err)
+	}
+	oversizedClientResult := waitForNeoMessageType(t, client, "client_filesystem_write_file_result", 2*time.Second)
+	if oversizedClientResult["requestId"] != "write-3" || stringValue(mapValue(oversizedClientResult["error"])["code"]) != "TOO_LARGE" {
+		t.Fatalf("oversized client filesystem result = %#v", oversizedClientResult)
+	}
+
+	if err := executor.WriteJSON(map[string]any{"type": "executor_filesystem_write_file", "requestId": "write-4", "uri": "file:///tmp/d.txt", "contentBase64": oversizedContent}); err != nil {
+		t.Fatalf("write oversized executor filesystem request: %v", err)
+	}
+	oversizedExecutorResult := waitForNeoMessageType(t, executor, "executor_filesystem_write_file_result", 2*time.Second)
+	if oversizedExecutorResult["requestId"] != "write-4" || stringValue(mapValue(oversizedExecutorResult["error"])["code"]) != "TOO_LARGE" {
+		t.Fatalf("oversized executor filesystem result = %#v", oversizedExecutorResult)
+	}
+
+	if err := client.WriteJSON(map[string]any{"type": "client_orb_services_ensure", "requestId": "orb-1"}); err != nil {
+		t.Fatalf("write client Orb request: %v", err)
+	}
+	orbRequest := waitForNeoMessageType(t, executor, "executor_orb_services_ensure", 2*time.Second)
+	if orbRequest["requestId"] != "orb-1" {
+		t.Fatalf("Orb request = %#v", orbRequest)
+	}
+	orbPayload := map[string]any{
+		"ok":       true,
+		"noConfig": false,
+		"services": []any{map[string]any{
+			"name":         "preview",
+			"ok":           true,
+			"port":         3000,
+			"baseURL":      "http://127.0.0.1:3000",
+			"portals":      []any{map[string]any{"title": "Preview", "url": "http://127.0.0.1:3000"}},
+			"healthStatus": 200,
+		}},
+	}
+	if err := executor.WriteJSON(map[string]any{"type": "executor_orb_services_ensure_result", "requestId": "orb-1", "result": orbPayload}); err != nil {
+		t.Fatalf("write executor Orb result: %v", err)
+	}
+	orbResult := waitForNeoMessageType(t, client, "client_orb_services_ensure_result", 2*time.Second)
+	if orbResult["requestId"] != "orb-1" || mapValue(orbResult["result"])["ok"] != true {
+		t.Fatalf("Orb result = %#v", orbResult)
+	}
+
+	if err := executor.WriteJSON(map[string]any{"type": "executor_orb_services_ensure", "requestId": "orb-2"}); err != nil {
+		t.Fatalf("write executor Orb request: %v", err)
+	}
+	reverseOrbRequest := waitForNeoMessageType(t, client, "client_orb_services_ensure", 2*time.Second)
+	if reverseOrbRequest["requestId"] != "orb-2" {
+		t.Fatalf("reverse Orb request = %#v", reverseOrbRequest)
+	}
+	if err := client.WriteJSON(map[string]any{"type": "client_orb_services_ensure_result", "requestId": "orb-2", "result": orbPayload}); err != nil {
+		t.Fatalf("write client Orb result: %v", err)
+	}
+	reverseOrbResult := waitForNeoMessageType(t, executor, "executor_orb_services_ensure_result", 2*time.Second)
+	if reverseOrbResult["requestId"] != "orb-2" || mapValue(reverseOrbResult["result"])["ok"] != true {
+		t.Fatalf("reverse Orb result = %#v", reverseOrbResult)
+	}
 }
 
 func TestNeoRuntimeTerminalBridgeRetypesBothDirections(t *testing.T) {
@@ -7704,12 +11700,12 @@ func TestNeoRuntimeConcurrentExecutorConnectWithActiveWorkSendsRejected(t *testi
 	if err := newExecutor.WriteJSON(map[string]any{"type": "executor_connect", "clientId": "neo-cli"}); err != nil {
 		t.Fatalf("write concurrent executor_connect: %v", err)
 	}
-	rejected := waitForNeoMessageType(t, newExecutor, "executor_connect_rejected", 2*time.Second)
-	if rejected["clientId"] != "neo-cli" || rejected["reason"] != "executor_already_connected" {
+	rejected := waitForNeoMessageType(t, newExecutor, "executor_error", 2*time.Second)
+	if rejected["code"] != "EXECUTOR_ALREADY_CONNECTED" || stringValue(rejected["message"]) == "" {
 		t.Fatalf("rejected payload = %#v", rejected)
 	}
 	existingInfo := mapValue(rejected["existingExecutorInfo"])
-	if existingInfo["executorId"] != "local-active" || existingInfo["executorType"] != "local-client" {
+	if existingInfo["executorType"] != "local-client" {
 		t.Fatalf("existing executor info = %#v", existingInfo)
 	}
 	assertNoNeoMessageType(t, activeExecutor, "executor_tool_lease_revoked", 150*time.Millisecond)
@@ -7721,7 +11717,7 @@ func TestNeoRuntimeConcurrentExecutorConnectWithActiveWorkSendsRejected(t *testi
 	}
 }
 
-func TestNeoRuntimeHeadlessExecutorConnectDefersUntilIdle(t *testing.T) {
+func TestNeoRuntimeHeadlessExecutorConnectWithActiveWorkSendsRejected(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
 	t.Cleanup(server.Close)
@@ -7749,47 +11745,25 @@ func TestNeoRuntimeHeadlessExecutorConnectDefersUntilIdle(t *testing.T) {
 	newExecutor := dialNeoActorWebSocket(t, server.URL, threadID)
 	defer newExecutor.Close()
 	if err := newExecutor.WriteJSON(map[string]any{"type": "executor_connect", "clientId": "neo-cli"}); err != nil {
-		t.Fatalf("write deferred executor_connect: %v", err)
+		t.Fatalf("write concurrent executor_connect: %v", err)
 	}
-	status := waitForNeoMessageTypeWhere(t, newExecutor, "executor_status", 2*time.Second, func(msg map[string]any) bool {
-		return mapValue(msg["details"])["reasonCode"] == "executor_handoff_deferred"
-	})
-	if details := mapValue(status["details"]); details["reasonCode"] != "executor_handoff_deferred" {
-		t.Fatalf("deferred status = %#v", status)
+	rejected := waitForNeoMessageType(t, newExecutor, "executor_error", 2*time.Second)
+	if rejected["code"] != "EXECUTOR_ALREADY_CONNECTED" {
+		t.Fatalf("rejected payload = %#v", rejected)
 	}
-	actor.mu.Lock()
-	if actor.pendingExecutorHandoff == nil {
-		actor.mu.Unlock()
-		t.Fatal("executor_connect was not held as a pending handoff")
+	if existingInfo := mapValue(rejected["existingExecutorInfo"]); existingInfo["executorType"] != "sandbox" {
+		t.Fatalf("existing executor info = %#v", existingInfo)
 	}
-	actor.mu.Unlock()
-
-	actor.mu.Lock()
-	actor.pendingTools = map[string]neoPendingTool{}
-	actor.mu.Unlock()
-	actor.setAgentState("idle", "", "smart", defaultNeoReasoningEffort("smart"))
-
-	actor.mu.Lock()
-	acceptedID := actor.executorID
-	pendingHandoff := actor.pendingExecutorHandoff
-	_, newSocketRegistered := actor.sockets[actor.executorSocket]
-	acceptedSocketIsExecutor := false
-	if actor.executorSocket != nil {
-		acceptedSocketIsExecutor = actor.executorSocket.isExecutor()
-	}
-	actor.mu.Unlock()
-	if acceptedID != "neo-cli" || pendingHandoff != nil {
-		t.Fatalf("deferred handoff did not accept before frame wait: id=%q pending=%#v registered=%v isExecutor=%v", acceptedID, pendingHandoff, newSocketRegistered, acceptedSocketIsExecutor)
+	actor.broadcast(map[string]any{"type": "thread_title_updated", "title": "Still observing"})
+	observed := waitForNeoMessageType(t, newExecutor, "thread_title_updated", 2*time.Second)
+	if observed["title"] != "Still observing" {
+		t.Fatalf("observer event after rejected connect = %#v", observed)
 	}
 
-	connected := waitForNeoMessageType(t, newExecutor, "executor_connected", 2*time.Second)
-	if connected["executorId"] != "neo-cli" {
-		t.Fatalf("executor_connected = %#v", connected)
-	}
 	actor.mu.Lock()
 	defer actor.mu.Unlock()
-	if actor.executorID != "neo-cli" || actor.executorSocket == nil || actor.executorReady || actor.executorBootstrapComplete || len(actor.spawnedExecutors) != 0 || actor.pendingExecutorHandoff != nil {
-		t.Fatalf("deferred handoff state = id:%q socket:%p ready:%v bootstrap:%v spawned:%d pending:%#v", actor.executorID, actor.executorSocket, actor.executorReady, actor.executorBootstrapComplete, len(actor.spawnedExecutors), actor.pendingExecutorHandoff)
+	if actor.executorID != "cli-headless-active" || actor.executorSocket == nil || !actor.executorReady || !actor.executorBootstrapComplete || len(actor.pendingTools) != 1 || len(actor.spawnedExecutors) != 1 {
+		t.Fatalf("active headless state after rejected connect = id:%q socket:%p ready:%v bootstrap:%v pending:%d spawned:%d", actor.executorID, actor.executorSocket, actor.executorReady, actor.executorBootstrapComplete, len(actor.pendingTools), len(actor.spawnedExecutors))
 	}
 }
 
@@ -7835,6 +11809,35 @@ func TestNeoFilesystemAndGitBridgeMatchesBinarySchema(t *testing.T) {
 	}
 	if _, ok := normalizeNeoFilesystemFileResult("executor_filesystem_read_file_result", map[string]any{"requestId": "fs-file", "ok": true, "content": "legacy"}); ok {
 		t.Fatal("content alias was accepted for filesystem file result")
+	}
+	if _, ok := normalizeNeoFilesystemWriteRequest("executor_filesystem_write_file", map[string]any{"requestId": "fs-write", "uri": "file:///tmp/a.txt", "contentBase64": "not-base64"}); ok {
+		t.Fatal("invalid base64 was accepted for filesystem write request")
+	}
+	if _, ok := normalizeNeoFilesystemWriteRequest("executor_filesystem_write_file", map[string]any{"requestId": "fs-write", "uri": "file:///tmp/a.txt", "contentBase64": "YQ==\n"}); ok {
+		t.Fatal("noncanonical base64 was accepted for filesystem write request")
+	}
+	if _, ok := normalizeNeoFilesystemWriteResult("executor_filesystem_write_file_result", map[string]any{"requestId": "fs-write", "ok": false, "error": map[string]any{"code": "TOO_LARGE", "message": "too large"}}); !ok {
+		t.Fatal("TOO_LARGE filesystem write result was rejected")
+	}
+	if _, ok := normalizeNeoOrbServicesEnsureResult("executor_orb_services_ensure_result", map[string]any{
+		"requestId": "orb-1",
+		"result": map[string]any{
+			"ok":       true,
+			"noConfig": false,
+			"services": []any{map[string]any{"name": "preview", "ok": true}},
+		},
+	}); ok {
+		t.Fatal("Orb service without portals was accepted")
+	}
+	if _, ok := normalizeNeoOrbServicesEnsureResult("executor_orb_services_ensure_result", map[string]any{
+		"requestId": "orb-1",
+		"result": map[string]any{
+			"ok":       true,
+			"noConfig": false,
+			"services": []any{map[string]any{"name": "preview", "ok": true, "port": uint64(3000), "healthStatus": uint64(200), "portals": []any{}}},
+		},
+	}); !ok {
+		t.Fatal("Orb result with CBOR unsigned integers was rejected")
 	}
 
 	gitCommand, ok := normalizeNeoClientGitCommand(map[string]any{"requestId": "git-1", "operation": map[string]any{"type": "file_diff", "path": "main.go", "changeType": "modified", "full": false}})
@@ -8477,8 +12480,8 @@ func waitForNeoActorSyncIdle(t *testing.T, actor *neoActor) {
 	var idleSince time.Time
 	for time.Now().Before(deadline) {
 		actor.mu.Lock()
-		running := actor.syncRunning
-		pending := actor.syncPending
+		running := actor.syncRunning || actor.localSyncRunning
+		pending := actor.syncPending || actor.localSyncPending
 		actor.mu.Unlock()
 		if !running && !pending {
 			if idleSince.IsZero() {
@@ -9000,6 +13003,88 @@ func TestNeoActorProtocolEmptyDeltasDoNotCreateMessages(t *testing.T) {
 	defer actor.mu.Unlock()
 	if len(actor.messages) != 1 || actor.messages[0].MessageID != "M-assistant" || stringValue(mapValue(actor.messages[0].State)["type"]) != "complete" {
 		t.Fatalf("terminal empty assistant delta should create complete message: %#v", actor.messages)
+	}
+}
+
+func TestNeoActorStreamingDeltaLazilyRebuildsProviderHistory(t *testing.T) {
+	actor := newNeoActor(nil, "actor-lazy-history", "threadActor", "T-test", "T-test", neoActorRecord("actor-lazy-history", "threadActor", "T-test"), nil)
+	actor.messages = []neoMessage{{
+		ThreadID:  "T-test",
+		MessageID: "M-user",
+		Role:      "user",
+		Content:   []any{map[string]any{"type": "text", "text": "before"}},
+		Seq:       1,
+	}}
+	actor.seq = 2
+	actor.rebuildHistoryLocked()
+	before := append([]neoHistoryMessage(nil), actor.history...)
+	beforeAddress := &actor.history[0]
+	revision := actor.measurements.revision
+
+	actor.handle(map[string]any{
+		"type":       "delta",
+		"messageId":  "M-assistant",
+		"role":       "assistant",
+		"state":      "generating",
+		"blockIndex": 0,
+		"blocks":     []any{map[string]any{"type": "text", "text": "partial"}},
+	})
+
+	actor.mu.Lock()
+	if !actor.historyDirty {
+		actor.mu.Unlock()
+		t.Fatal("streaming delta did not mark provider history dirty")
+	}
+	if &actor.history[0] != beforeAddress || !reflect.DeepEqual(actor.history, before) {
+		actor.mu.Unlock()
+		t.Fatal("streaming delta eagerly rebuilt provider history")
+	}
+	want := neoHistoryFromStoredMessages(actor.messages, actor.compactionRecords)
+	request := actor.inferenceRequestLocked("smart", "", "")
+	if actor.historyDirty {
+		actor.mu.Unlock()
+		t.Fatal("provider request left history dirty")
+	}
+	if !reflect.DeepEqual(request.History, want) {
+		actor.mu.Unlock()
+		t.Fatalf("provider history = %#v, want %#v", request.History, want)
+	}
+	if actor.measurements.revision != revision {
+		actor.mu.Unlock()
+		t.Fatalf("lazy history rebuild changed snapshot revision from %d to %d", revision, actor.measurements.revision)
+	}
+	actor.mu.Unlock()
+
+	actor.handle(map[string]any{
+		"type":       "delta",
+		"messageId":  "M-assistant",
+		"role":       "assistant",
+		"state":      "generating",
+		"blockIndex": 0,
+		"blocks":     []any{map[string]any{"type": "text", "text": " continued"}},
+	})
+	actor.mu.Lock()
+	actor.storeQueuedUserMessageLocked(neoQueuedMessage{
+		MessageID: "M-follow-up",
+		Content:   []any{map[string]any{"type": "text", "text": "after streaming"}},
+		CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+	}, false)
+	want = neoHistoryFromStoredMessages(actor.messages, actor.compactionRecords)
+	if actor.historyDirty || !reflect.DeepEqual(actor.history, want) {
+		actor.mu.Unlock()
+		t.Fatalf("user boundary history = %#v dirty=%t, want %#v", actor.history, actor.historyDirty, want)
+	}
+	actor.mu.Unlock()
+	actor.handle(map[string]any{"type": "delta", "messageId": "M-assistant", "role": "assistant", "state": "complete"})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.historyDirty {
+		t.Fatal("terminal delta left provider history dirty")
+	}
+	want = neoHistoryFromStoredMessages(actor.messages, actor.compactionRecords)
+	if !reflect.DeepEqual(actor.history, want) {
+		t.Fatalf("terminal provider history = %#v, want %#v", actor.history, want)
 	}
 }
 
@@ -10332,6 +14417,214 @@ func TestNeoActorConcurrentExecutorConnectWithActiveWorkDoesNotReplace(t *testin
 	}
 }
 
+func TestNeoActorTransportClosePreservesPendingToolForReconnect(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019f4000-0000-4000-8000-000000000040"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+	socket := &neoSocket{}
+	socket.markExecutor("executor-1")
+	actor.mu.Lock()
+	actor.sockets[socket] = struct{}{}
+	actor.executorID = "executor-1"
+	actor.resumeExecutorID = "executor-1"
+	actor.executorReady = true
+	actor.executorBootstrapComplete = true
+	actor.executorSocket = socket
+	actor.agentState = "running_tools"
+	actor.pendingTools["tool-1"] = neoPendingTool{ID: "tool-1", AgentMode: "deep", ReasoningEffort: "xhigh"}
+	actor.currentInference = &neoInferenceInflight{messageID: "M-current", agentMode: "deep", reasoningEffort: "xhigh"}
+	actor.mu.Unlock()
+
+	actor.close(socket)
+
+	actor.mu.Lock()
+	if actor.executorID != "executor-1" || actor.executorSocket != nil || actor.executorReady || actor.executorBootstrapComplete {
+		actor.mu.Unlock()
+		t.Fatalf("reconnect grace executor state = id:%q socket:%p ready:%v bootstrap:%v", actor.executorID, actor.executorSocket, actor.executorReady, actor.executorBootstrapComplete)
+	}
+	if _, ok := actor.pendingTools["tool-1"]; !ok || actor.agentState != "running_tools" {
+		actor.mu.Unlock()
+		t.Fatalf("pending tool was disposed during reconnect grace: pending=%#v state=%q", actor.pendingTools, actor.agentState)
+	}
+	actor.mu.Unlock()
+
+	replacement := &neoSocket{}
+	actor.executorConnectForSocket(replacement, map[string]any{"clientId": "executor-1"})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.executorSocket != replacement || !actor.executorResumeBootstrap {
+		t.Fatalf("reconnected executor state = socket:%p resume:%v", actor.executorSocket, actor.executorResumeBootstrap)
+	}
+	if _, ok := actor.pendingTools["tool-1"]; !ok {
+		t.Fatal("matching executor did not reclaim pending tool")
+	}
+	if actor.currentInference == nil || actor.currentInference.messageID != "M-current" {
+		t.Fatalf("matching executor did not reclaim current inference: %#v", actor.currentInference)
+	}
+}
+
+func TestNeoActorTransportCloseRejectsDifferentExecutorDuringReconnectGrace(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019f4000-0000-4000-8000-000000000041"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+	socket := &neoSocket{}
+	socket.markExecutor("executor-1")
+	actor.mu.Lock()
+	actor.sockets[socket] = struct{}{}
+	actor.executorID = "executor-1"
+	actor.resumeExecutorID = "executor-1"
+	actor.executorReady = true
+	actor.executorBootstrapComplete = true
+	actor.executorSocket = socket
+	actor.agentState = "running_tools"
+	actor.pendingTools["tool-1"] = neoPendingTool{ID: "tool-1"}
+	actor.mu.Unlock()
+
+	actor.close(socket)
+	anonymous := &neoSocket{}
+	actor.executorConnectForSocket(anonymous, map[string]any{})
+	actor.mu.Lock()
+	if actor.executorID != "executor-1" || actor.executorSocket != nil {
+		actor.mu.Unlock()
+		t.Fatalf("ID-less executor replaced reconnecting owner: id=%q socket=%p", actor.executorID, actor.executorSocket)
+	}
+	if _, ok := actor.pendingTools["tool-1"]; !ok {
+		actor.mu.Unlock()
+		t.Fatal("ID-less executor disposed pending tool")
+	}
+	actor.mu.Unlock()
+
+	other := &neoSocket{}
+	actor.executorConnectForSocket(other, map[string]any{"clientId": "executor-2"})
+
+	actor.mu.Lock()
+	if actor.executorID != "executor-1" || actor.executorSocket != nil {
+		actor.mu.Unlock()
+		t.Fatalf("different executor replaced reconnecting owner: id=%q socket=%p", actor.executorID, actor.executorSocket)
+	}
+	if _, ok := actor.pendingTools["tool-1"]; !ok {
+		actor.mu.Unlock()
+		t.Fatal("different executor disposed pending tool")
+	}
+	actor.mu.Unlock()
+
+	replacement := &neoSocket{}
+	actor.executorConnectForSocket(replacement, map[string]any{"clientId": "executor-1"})
+}
+
+func TestNeoActorTransportCloseDisposesPendingToolAfterReconnectGrace(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019f4000-0000-4000-8000-000000000042"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+	socket := &neoSocket{}
+	socket.markExecutor("executor-1")
+	actor.mu.Lock()
+	actor.sockets[socket] = struct{}{}
+	actor.executorID = "executor-1"
+	actor.resumeExecutorID = "executor-1"
+	actor.executorReady = true
+	actor.executorBootstrapComplete = true
+	actor.executorSocket = socket
+	actor.agentState = "running_tools"
+	actor.pendingTools["tool-1"] = neoPendingTool{ID: "tool-1"}
+	actor.mu.Unlock()
+
+	actor.close(socket)
+	actor.mu.Lock()
+	generation := actor.reconnectGeneration
+	actor.mu.Unlock()
+	actor.finalizeDeferredExecutorDisconnect("executor-1", generation)
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.executorID != "" || actor.executorSocket != nil || len(actor.pendingTools) != 0 || actor.agentState != "idle" {
+		t.Fatalf("expired reconnect state = id:%q socket:%p pending:%d state:%q", actor.executorID, actor.executorSocket, len(actor.pendingTools), actor.agentState)
+	}
+}
+
+func TestNeoActorStaleReconnectTimeoutDoesNotClearReplacement(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019f4000-0000-4000-8000-000000000047"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+	socket := &neoSocket{}
+	socket.markExecutor("executor-1")
+	actor.mu.Lock()
+	actor.sockets[socket] = struct{}{}
+	actor.executorID = "executor-1"
+	actor.resumeExecutorID = "executor-1"
+	actor.executorReady = true
+	actor.executorBootstrapComplete = true
+	actor.executorSocket = socket
+	actor.agentState = "running_tools"
+	actor.pendingTools["tool-1"] = neoPendingTool{ID: "tool-1"}
+	actor.mu.Unlock()
+
+	actor.close(socket)
+	actor.mu.Lock()
+	generation := actor.reconnectGeneration
+	actor.mu.Unlock()
+	replacement := &neoSocket{}
+	actor.executorConnectForSocket(replacement, map[string]any{"clientId": "executor-1"})
+	actor.executorDisconnectedForSocket(nil, map[string]any{
+		"executorId":                  "executor-1",
+		"cliproxyReconnectGeneration": generation,
+	})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.executorSocket != replacement || actor.executorID != "executor-1" {
+		t.Fatalf("stale reconnect timeout cleared replacement: id=%q socket=%p", actor.executorID, actor.executorSocket)
+	}
+	if _, ok := actor.pendingTools["tool-1"]; !ok {
+		t.Fatal("stale reconnect timeout disposed pending tool")
+	}
+}
+
+func TestNeoSpawnConnectTimeoutStaysDisarmedDuringReconnectGrace(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019f4000-0000-4000-8000-000000000049"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+	spawned := &neoSpawnedExecutor{spawnID: "spawn-1", threadID: threadID}
+	socket := &neoSocket{}
+	socket.markExecutor("executor-1")
+	actor.mu.Lock()
+	actor.spawnedExecutors[spawned.spawnID] = spawned
+	actor.sockets[socket] = struct{}{}
+	actor.pendingTools["tool-1"] = neoPendingTool{ID: "tool-1"}
+	actor.mu.Unlock()
+	actor.executorConnectedForSocket(socket, map[string]any{"executorId": "executor-1"})
+	actor.close(socket)
+	actor.watchSpawnedExecutorConnectTimeout(spawned.spawnID, spawned, time.Millisecond)
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.spawnedExecutors[spawned.spawnID] != spawned || !spawned.connected {
+		t.Fatalf("spawn connect timeout was rearmed during grace: connected=%v spawned=%#v", spawned.connected, actor.spawnedExecutors)
+	}
+}
+
+func TestNeoSpawnConnectTimeoutStaysDisarmedWhenExecutorConnectsBeforeTracking(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019f4000-0000-4000-8000-000000000050"
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+	spawned := &neoSpawnedExecutor{spawnID: "spawn-1", threadID: threadID}
+	actor.mu.Lock()
+	actor.executorID = "cli-headless-1"
+	actor.executorReady = true
+	actor.executorBootstrapComplete = true
+	actor.mu.Unlock()
+
+	actor.trackSpawnedExecutor(spawned.spawnID, spawned)
+	actor.watchSpawnedExecutorConnectTimeout(spawned.spawnID, spawned, time.Millisecond)
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.spawnedExecutors[spawned.spawnID] != spawned || !spawned.connected {
+		t.Fatalf("connected executor was timed out after late tracking: connected=%v spawned=%#v", spawned.connected, actor.spawnedExecutors)
+	}
+}
+
 func TestNeoActorIdleExecutorHandoffClearsSpawnedHeadless(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	threadID := "T-019f4000-0000-4000-8000-000000000031"
@@ -10359,97 +14652,6 @@ func TestNeoActorIdleExecutorHandoffClearsSpawnedHeadless(t *testing.T) {
 	}
 	if len(actor.spawnedExecutors) != 0 {
 		t.Fatalf("spawned executors after idle CLI handoff = %#v, want none", actor.spawnedExecutors)
-	}
-}
-
-func TestNeoActorHeadlessExecutorHandoffCompletesWhenIdle(t *testing.T) {
-	rt := newNeoRuntime(&config.Config{})
-	threadID := "T-019f4000-0000-4000-8000-000000000034"
-	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
-	oldSocket := &neoSocket{}
-	oldSocket.markExecutor("cli-headless-active")
-	newSocket := &neoSocket{}
-	newSocket.markExecutor("neo-cli")
-	actor.mu.Lock()
-	actor.sockets[oldSocket] = struct{}{}
-	actor.sockets[newSocket] = struct{}{}
-	actor.executorID = "cli-headless-active"
-	actor.executorReady = true
-	actor.executorBootstrapComplete = true
-	actor.executorSocket = oldSocket
-	actor.agentState = "running_tools"
-	actor.pendingTools["tool-1"] = neoPendingTool{ID: "tool-1"}
-	actor.spawnedExecutors = map[string]*neoSpawnedExecutor{
-		"spawn-1": {spawnID: "spawn-1", threadID: threadID},
-	}
-	actor.mu.Unlock()
-
-	actor.executorConnectForSocket(newSocket, map[string]any{"clientId": "neo-cli"})
-
-	actor.mu.Lock()
-	if actor.executorID != "cli-headless-active" || actor.executorSocket != oldSocket || actor.pendingExecutorHandoff == nil || newSocket.isExecutor() {
-		actor.mu.Unlock()
-		t.Fatalf("handoff was not deferred: id=%q socket=%p pending=%#v newExecutor=%v", actor.executorID, actor.executorSocket, actor.pendingExecutorHandoff, newSocket.isExecutor())
-	}
-	actor.pendingTools = map[string]neoPendingTool{}
-	actor.agentState = "idle"
-	actor.mu.Unlock()
-
-	if !actor.maybeCompletePendingExecutorHandoff() {
-		t.Fatal("pending handoff did not complete")
-	}
-
-	actor.mu.Lock()
-	defer actor.mu.Unlock()
-	if actor.executorID != "neo-cli" || actor.executorSocket != newSocket || actor.executorReady || actor.executorBootstrapComplete || actor.pendingExecutorHandoff != nil {
-		t.Fatalf("completed handoff state = id:%q socket:%p ready:%v bootstrap:%v pending:%#v", actor.executorID, actor.executorSocket, actor.executorReady, actor.executorBootstrapComplete, actor.pendingExecutorHandoff)
-	}
-	if len(actor.spawnedExecutors) != 0 {
-		t.Fatalf("spawned executors after deferred handoff = %#v, want none", actor.spawnedExecutors)
-	}
-}
-
-func TestNeoActorHeadlessExecutorHandoffCompletesOnProtocolIdle(t *testing.T) {
-	rt := newNeoRuntime(&config.Config{})
-	threadID := "T-019f4000-0000-4000-8000-000000000035"
-	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
-	oldSocket := &neoSocket{}
-	oldSocket.markExecutor("cli-headless-active")
-	newSocket := &neoSocket{}
-	newSocket.markExecutor("neo-cli")
-	actor.mu.Lock()
-	actor.sockets[oldSocket] = struct{}{}
-	actor.sockets[newSocket] = struct{}{}
-	actor.executorID = "cli-headless-active"
-	actor.executorReady = true
-	actor.executorBootstrapComplete = true
-	actor.executorSocket = oldSocket
-	actor.agentState = "running_tools"
-	actor.pendingTools["tool-1"] = neoPendingTool{ID: "tool-1"}
-	actor.spawnedExecutors = map[string]*neoSpawnedExecutor{
-		"spawn-1": {spawnID: "spawn-1", threadID: threadID},
-	}
-	actor.mu.Unlock()
-
-	actor.executorConnectForSocket(newSocket, map[string]any{"clientId": "neo-cli"})
-
-	actor.mu.Lock()
-	if actor.pendingExecutorHandoff == nil {
-		actor.mu.Unlock()
-		t.Fatal("handoff was not deferred")
-	}
-	actor.pendingTools = map[string]neoPendingTool{}
-	actor.mu.Unlock()
-
-	actor.handleProtocolAgentState(map[string]any{"type": "agent_state", "state": "idle"})
-
-	actor.mu.Lock()
-	defer actor.mu.Unlock()
-	if actor.executorID != "neo-cli" || actor.executorSocket != newSocket || actor.executorReady || actor.executorBootstrapComplete || actor.pendingExecutorHandoff != nil {
-		t.Fatalf("protocol idle handoff state = id:%q socket:%p ready:%v bootstrap:%v pending:%#v", actor.executorID, actor.executorSocket, actor.executorReady, actor.executorBootstrapComplete, actor.pendingExecutorHandoff)
-	}
-	if len(actor.spawnedExecutors) != 0 {
-		t.Fatalf("spawned executors after protocol idle handoff = %#v, want none", actor.spawnedExecutors)
 	}
 }
 
@@ -12661,6 +16863,10 @@ func handledNeoInboundTypesForTest() map[string]bool {
 		"client_filesystem_read_directory_result",
 		"client_filesystem_read_file",
 		"client_filesystem_read_file_result",
+		"client_filesystem_write_file",
+		"client_filesystem_write_file_result",
+		"client_orb_services_ensure",
+		"client_orb_services_ensure_result",
 		"client_git_command",
 		"client_git_command_result",
 		"client_git_diff_snapshot",
@@ -12680,6 +16886,7 @@ func handledNeoInboundTypesForTest() map[string]bool {
 		"client_fork_thread",
 		"client_mark_message_read",
 		"client_mark_message_unread",
+		"client_mark_thread_unread",
 		"client_remove_queued_msg",
 		"client_resume",
 		"client_retry",
@@ -12717,6 +16924,10 @@ func handledNeoInboundTypesForTest() map[string]bool {
 		"executor_filesystem_read_directory_result",
 		"executor_filesystem_read_file",
 		"executor_filesystem_read_file_result",
+		"executor_filesystem_write_file",
+		"executor_filesystem_write_file_result",
+		"executor_orb_services_ensure",
+		"executor_orb_services_ensure_result",
 		"executor_git_command",
 		"executor_git_command_result",
 		"executor_guidance_discovery",
@@ -13130,11 +17341,16 @@ func TestHandledNeoInboundTypesCoverLegacyCompatibilityAliases(t *testing.T) {
 		"client_filesystem_read_directory_result",
 		"client_filesystem_read_file",
 		"client_filesystem_read_file_result",
+		"client_filesystem_write_file",
+		"client_filesystem_write_file_result",
 		"client_fork_thread",
 		"client_git_command",
 		"client_git_command_result",
+		"client_orb_services_ensure",
+		"client_orb_services_ensure_result",
 		"client_mark_message_read",
 		"client_mark_message_unread",
+		"client_mark_thread_unread",
 		"client_remove_queued_msg",
 		"client_resume",
 		"client_retry",
@@ -13174,8 +17390,12 @@ func TestHandledNeoInboundTypesCoverLegacyCompatibilityAliases(t *testing.T) {
 		"executor_filesystem_read_directory_result",
 		"executor_filesystem_read_file",
 		"executor_filesystem_read_file_result",
+		"executor_filesystem_write_file",
+		"executor_filesystem_write_file_result",
 		"executor_git_command",
 		"executor_git_command_result",
+		"executor_orb_services_ensure",
+		"executor_orb_services_ensure_result",
 		"executor_guidance_discovery",
 		"executor_guidance_snapshot",
 		"executor_guidance_update",
@@ -13750,8 +17970,8 @@ func TestSelectNeoModelRouteDefaultsVisibleModesToAmpBinaryRoutes(t *testing.T) 
 		model    string
 	}{
 		{mode: "low", provider: "amp", model: "glm-5.2"},
-		{mode: "medium", provider: "openai", model: "gpt-5.5"},
-		{mode: "high", provider: "openai", model: "gpt-5.5"},
+		{mode: "medium", provider: "openai", model: "gpt-5.6-sol"},
+		{mode: "high", provider: "openai", model: "gpt-5.6-sol"},
 		{mode: "ultra", provider: "anthropic", model: "claude-fable-5"},
 	} {
 		t.Run(tc.mode, func(t *testing.T) {
@@ -16847,7 +21067,7 @@ func TestNeoReviewModeExposesServerReviewTools(t *testing.T) {
 		names = append(names, tool.Name)
 		specs[tool.Name] = tool
 	}
-	want := []string{"run_check", "shell_command", "submit_review"}
+	want := []string{"create_thread", "run_check", "shell_command", "submit_review"}
 	if !reflect.DeepEqual(names, want) {
 		t.Fatalf("review mode tools = %#v, want %#v (request order is alphabetical)", names, want)
 	}
@@ -21297,6 +25517,14 @@ func TestNeoActorHandlesMessageReadState(t *testing.T) {
 		t.Fatalf("protocol readAt = %#v, want %q", got, readAt)
 	}
 
+	actor.handle(map[string]any{"type": "client_mark_thread_unread"})
+	actor.mu.Lock()
+	if actor.messages[0].ReadAt != "" {
+		t.Fatalf("thread unread readAt = %q, want cleared", actor.messages[0].ReadAt)
+	}
+	actor.mu.Unlock()
+
+	actor.handle(map[string]any{"type": "client_mark_message_read", "messageId": "M-0000000000000000000001"})
 	actor.handle(map[string]any{"type": "client_mark_message_unread", "messageId": "M-0000000000000000000001"})
 
 	actor.mu.Lock()
@@ -21312,8 +25540,22 @@ func TestNeoActorHandlesMessageReadState(t *testing.T) {
 func TestNeoActorHandlesToolLeaseRevoked(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
-	actor.pendingTools["TU-test"] = neoPendingTool{ID: "TU-test", Name: "Bash", AgentMode: "smart", MessageID: "M-assistant"}
+	actor.messages = []neoMessage{{
+		ThreadID:  "T-test",
+		MessageID: "M-assistant",
+		Role:      "assistant",
+		Content: []any{map[string]any{
+			"type":  "tool_use",
+			"id":    "TU-test",
+			"name":  "Task",
+			"input": map[string]any{"task": "inspect"},
+		}},
+		State: map[string]any{"type": "complete", "stopReason": "tool_use"},
+		Seq:   1,
+	}}
+	actor.pendingTools["TU-test"] = neoPendingTool{ID: "TU-test", Name: "Task", AgentMode: "smart", MessageID: "M-assistant"}
 	actor.agentState = "running_tools"
+	actor.rebuildHistoryLocked()
 
 	actor.handle(map[string]any{"type": "executor_tool_lease_revoked", "toolCallId": "TU-test", "reason": "reassigned"})
 
@@ -21324,6 +25566,17 @@ func TestNeoActorHandlesToolLeaseRevoked(t *testing.T) {
 	}
 	if actor.agentState != "idle" {
 		t.Fatalf("agentState = %q, want idle", actor.agentState)
+	}
+	if len(actor.messages) != 2 {
+		t.Fatalf("messages = %#v, want synthetic cancelled tool result", actor.messages)
+	}
+	result := mapValue(actor.messages[1].Content[0])
+	run := mapValue(result["run"])
+	if result["type"] != "tool_result" || result["toolUseID"] != "TU-test" || run["status"] != "cancelled" || run["reason"] != "system:disposed" {
+		t.Fatalf("cancelled tool result = %#v", result)
+	}
+	if len(actor.history) != 2 || actor.history[1].Role != "tool" || actor.history[1].ToolCallID != "TU-test" {
+		t.Fatalf("history = %#v", actor.history)
 	}
 }
 
@@ -25290,6 +29543,157 @@ func TestNeoActorLocalImportIfEmptyDoesNotReplaceExistingState(t *testing.T) {
 	}
 }
 
+func TestNeoRuntimeColdLocalThreadImportPreservesConversationState(t *testing.T) {
+	enabled := true
+	threadID := "T-019f5464-6bb4-7d2b-8faa-f093660aaab9"
+	dir := t.TempDir()
+	thread := map[string]any{
+		"id":              threadID,
+		"v":               41,
+		"title":           "persisted conversation",
+		"agentMode":       "deep",
+		"reasoningEffort": "xhigh",
+		"meta":            map[string]any{"ampcodeConnectorLocalNeo": true, "projectName": "memory-profile"},
+		"messages": []any{
+			map[string]any{
+				"messageId":       "M-0000000000000000000001",
+				"role":            "user",
+				"agentMode":       "deep",
+				"reasoningEffort": "xhigh",
+				"content":         []any{map[string]any{"type": "text", "text": "preserve the complete conversation"}},
+			},
+			map[string]any{
+				"messageId": "M-0000000000000000000002",
+				"role":      "assistant",
+				"state":     map[string]any{"type": "cancelled"},
+				"content": []any{
+					map[string]any{"type": "thinking", "thinking": "reasoning", "blockState": "complete"},
+					map[string]any{"type": "tool_use", "id": "TU-stable", "name": "shell_command", "input": map[string]any{"command": "go test ./..."}},
+				},
+			},
+			map[string]any{
+				"messageId": "M-0000000000000000000003",
+				"role":      "user",
+				"content": []any{map[string]any{
+					"type":      "tool_result",
+					"toolUseID": "TU-stable",
+					"content":   []any{map[string]any{"type": "text", "text": "all tests passed"}},
+				}},
+			},
+			map[string]any{
+				"messageId": "M-0000000000000000000004",
+				"role":      "info",
+				"content": []any{
+					map[string]any{"type": "summary", "summary": "preserved summary", "content": "preserved summary"},
+					map[string]any{"type": "manual_bash_invocation", "command": "git status --short"},
+				},
+			},
+		},
+		"compactionRecords": []any{map[string]any{
+			"cutMessageId": "M-0000000000000000000001",
+			"summary":      "preserved summary",
+			"createdAt":    "2026-07-12T20:00:00Z",
+		}},
+		"relationships": []any{map[string]any{
+			"threadID": "T-019f5464-6bb4-7d2b-8faa-f093660aaa00",
+			"type":     "mention",
+			"role":     "parent",
+		}},
+	}
+	if _, err := writeNeoLocalThreadFileInDir(dir, threadID, thread); err != nil {
+		t.Fatalf("write local thread: %v", err)
+	}
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled}}})
+	rt.threadDir = dir
+
+	if !rt.tryImportNeoLocalThreadActor(threadID) {
+		t.Fatal("cold local thread import failed")
+	}
+	actor := rt.store.lookupThreadActor(threadID)
+	if actor == nil {
+		t.Fatal("cold local thread actor missing")
+	}
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.title != "persisted conversation" || actor.currentAgentMode != "deep" || actor.currentReasoningEffort != "xhigh" {
+		t.Fatalf("actor state = title:%q mode:%q effort:%q", actor.title, actor.currentAgentMode, actor.currentReasoningEffort)
+	}
+	wantIDs := []string{"M-0000000000000000000001", "M-0000000000000000000002", "M-0000000000000000000003", "M-0000000000000000000004"}
+	if len(actor.messages) != len(wantIDs) {
+		t.Fatalf("messages = %d, want %d", len(actor.messages), len(wantIDs))
+	}
+	for index, wantID := range wantIDs {
+		if actor.messages[index].MessageID != wantID {
+			t.Fatalf("message %d id = %q, want %q", index, actor.messages[index].MessageID, wantID)
+		}
+	}
+	if got := mapValue(actor.messages[1].Content[1]); got["id"] != "TU-stable" || stringValue(mapValue(got["input"])["command"]) != "go test ./..." {
+		t.Fatalf("tool use = %#v", got)
+	}
+	if got := mapValue(actor.messages[2].Content[0]); got["toolUseID"] != "TU-stable" || textFromBlocks(arrayValue(got["content"])) != "all tests passed" {
+		t.Fatalf("tool result = %#v", got)
+	}
+	if len(actor.messages[3].Content) != 2 || stringValue(mapValue(actor.messages[3].Content[0])["type"]) != "summary" || stringValue(mapValue(actor.messages[3].Content[1])["type"]) != "manual_bash_invocation" {
+		t.Fatalf("compaction message = %#v", actor.messages[3].Content)
+	}
+	if len(actor.compactionRecords) != 1 || stringValue(actor.compactionRecords[0]["cutMessageId"]) != "M-0000000000000000000001" {
+		t.Fatalf("compaction records = %#v", actor.compactionRecords)
+	}
+	if len(actor.relationships) != 1 || len(actor.replayEvents) != 0 {
+		t.Fatalf("relationships/replay = %#v/%#v", actor.relationships, actor.replayEvents)
+	}
+}
+
+func TestNeoRuntimeConcurrentColdLocalThreadImportsShareHydratedActor(t *testing.T) {
+	enabled := true
+	threadID := "T-019f5464-6bb4-7d2b-8faa-f093660aaaba"
+	dir := t.TempDir()
+	if _, err := writeNeoLocalThreadFileInDir(dir, threadID, map[string]any{
+		"id":        threadID,
+		"agentMode": "deep",
+		"meta":      map[string]any{"ampcodeConnectorLocalNeo": true},
+		"messages": []any{
+			map[string]any{"messageId": "M-0000000000000000000001", "role": "user", "content": []any{map[string]any{"type": "text", "text": "hydrate once"}}},
+		},
+	}); err != nil {
+		t.Fatalf("write local thread: %v", err)
+	}
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled}}})
+	rt.threadDir = dir
+
+	start := make(chan struct{})
+	results := make(chan bool, 16)
+	var workers sync.WaitGroup
+	for range 16 {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			<-start
+			results <- rt.tryImportNeoLocalThreadActor(threadID)
+		}()
+	}
+	close(start)
+	workers.Wait()
+	close(results)
+	for imported := range results {
+		if !imported {
+			t.Fatal("concurrent local thread import failed")
+		}
+	}
+	rt.store.mu.Lock()
+	actorCount := len(rt.store.actors)
+	rt.store.mu.Unlock()
+	if actorCount != 1 {
+		t.Fatalf("actor count = %d, want 1", actorCount)
+	}
+	actor := rt.store.lookupThreadActor(threadID)
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.messages) != 1 || actor.messages[0].MessageID != "M-0000000000000000000001" || textFromBlocks(actor.messages[0].Content) != "hydrate once" {
+		t.Fatalf("hydrated messages = %#v", actor.messages)
+	}
+}
+
 func TestNeoActorImportRestoresPendingToolForPayloadRequiredStatusOnlyDone(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	threadID := "T-019eb741-4031-702e-a552-6824b09e3aea"
@@ -25374,6 +29778,68 @@ func TestNeoActorImportRestoresPendingToolForPayloadRequiredStatusOnlyDone(t *te
 	}
 	if len(actor.history) != 3 || !strings.Contains(actor.history[2].Text, "review clean") {
 		t.Fatalf("history = %#v, want full shell_command result after completion", actor.history)
+	}
+}
+
+func TestNeoActorImportClassifiesRunTerminalCommandAlias(t *testing.T) {
+	tests := []struct {
+		name            string
+		toolName        string
+		wantPendingName string
+		wantCompletion  string
+		wantAgentState  string
+	}{
+		{name: "exact alias", toolName: "run_terminal_command", wantPendingName: "Bash", wantCompletion: "tool_progress", wantAgentState: "running_tools"},
+		{name: "near miss", toolName: "run_terminal_commands", wantAgentState: "idle"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			threadID := "T-019eb741-4031-702e-a552-6824b09e3aeb"
+			actor := newNeoActor(nil, "actor-terminal-alias", "thread-actor", threadID, threadID, neoActorRecord("actor-terminal-alias", "thread-actor", threadID), nil)
+			thread := map[string]any{
+				"id":        threadID,
+				"agentMode": "deep",
+				"messages": []any{
+					map[string]any{
+						"messageId": "M-0000000000000000000001",
+						"role":      "assistant",
+						"content": []any{map[string]any{
+							"type": "tool_use",
+							"id":   "TU-terminal-alias",
+							"name": test.toolName,
+						}},
+					},
+					map[string]any{
+						"messageId": "M-0000000000000000000002",
+						"role":      "user",
+						"content": []any{map[string]any{
+							"type":      "tool_result",
+							"toolUseID": "TU-terminal-alias",
+							"run":       map[string]any{"status": "done"},
+						}},
+					},
+				},
+			}
+			if err := actor.importThreadLocalOnly(thread); err != nil {
+				t.Fatalf("import thread: %v", err)
+			}
+			if actor.messages[1].CompletionStatus != test.wantCompletion {
+				t.Fatalf("completionStatus = %q, want %q", actor.messages[1].CompletionStatus, test.wantCompletion)
+			}
+			if actor.agentState != test.wantAgentState {
+				t.Fatalf("agentState = %q, want %q", actor.agentState, test.wantAgentState)
+			}
+			pending, ok := actor.pendingTools["TU-terminal-alias"]
+			if test.wantPendingName == "" {
+				if ok {
+					t.Fatalf("pending tool = %#v, want completed near miss", pending)
+				}
+				return
+			}
+			if !ok || pending.Name != test.wantPendingName {
+				t.Fatalf("pending tool = %#v, want %q", pending, test.wantPendingName)
+			}
+		})
 	}
 }
 
@@ -26995,6 +31461,47 @@ func TestNeoRuntimeThreadActorBootstrapDoesNotFetchCloudThread(t *testing.T) {
 	}
 }
 
+func TestUploadNeoCloudThreadKeepsSmallPayloadUncompressed(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	var received []byte
+	var contentLength int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Content-Encoding"); got != "" {
+			t.Errorf("Content-Encoding = %q, want empty", got)
+		}
+		contentLength = r.ContentLength
+		var err error
+		received, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read payload: %v", err)
+		}
+		writeNeoJSON(w, http.StatusOK, map[string]any{"ok": true})
+	}))
+	defer upstream.Close()
+
+	serializedBytes, err := uploadNeoCloudThread(neoCloudThreadSnapshot{
+		upstreamURL: upstream.URL,
+		apiKey:      "secret",
+		threadID:    "T-small-upload",
+		seq:         1,
+		createdMs:   1778170000000,
+		title:       "Small upload",
+	})
+	if err != nil {
+		t.Fatalf("uploadNeoCloudThread error: %v", err)
+	}
+	if contentLength != int64(len(received)) || serializedBytes != int64(len(received)) {
+		t.Fatalf("payload bytes = content-length:%d serialized:%d received:%d", contentLength, serializedBytes, len(received))
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(received, &payload); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	if stringValue(payload["method"]) != "uploadThread" || stringValue(mapValue(mapValue(payload["params"])["thread"])["id"]) != "T-small-upload" {
+		t.Fatalf("payload = %#v", payload)
+	}
+}
+
 func TestUploadNeoCloudThreadUsesAmpInternalClientHeaders(t *testing.T) {
 	dataHome := t.TempDir()
 	t.Setenv("XDG_DATA_HOME", dataHome)
@@ -27007,7 +31514,9 @@ func TestUploadNeoCloudThreadUsesAmpInternalClientHeaders(t *testing.T) {
 	}
 
 	threadID := "T-019e65c0-0310-77a8-b233-4b84d9c0612b"
+	largeText := strings.Repeat("x", neoCloudGzipBytes)
 	var sawRequest bool
+	var receivedBytes atomic.Int64
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		sawRequest = true
 		if r.URL.Path != "/api/internal" || r.URL.RawQuery != "uploadThread" {
@@ -27016,14 +31525,20 @@ func TestUploadNeoCloudThreadUsesAmpInternalClientHeaders(t *testing.T) {
 		if got := r.Header.Get("Authorization"); got != "Bearer secret" {
 			t.Fatalf("Authorization = %q", got)
 		}
+		if got := r.Header.Get("Content-Type"); got != "application/json" {
+			t.Fatalf("Content-Type = %q", got)
+		}
+		if got := r.Header.Get("Content-Encoding"); got != "gzip" {
+			t.Fatalf("Content-Encoding = %q", got)
+		}
 		if got := r.Header.Get("X-Amp-Client-Application"); got != "CLI" {
 			t.Fatalf("X-Amp-Client-Application = %q", got)
 		}
 		if got := r.Header.Get("X-Amp-Client-Type"); got != "cli" {
 			t.Fatalf("X-Amp-Client-Type = %q", got)
 		}
-		if got := r.Header.Get("X-Amp-Client-Version"); strings.TrimSpace(got) == "" {
-			t.Fatalf("X-Amp-Client-Version missing")
+		if got := r.Header.Get("X-Amp-Client-Version"); got != "test-client-version" {
+			t.Fatalf("X-Amp-Client-Version = %q", got)
 		}
 		if got := r.Header.Get("X-Amp-Installation-ID"); got != "upload-install-123" {
 			t.Fatalf("X-Amp-Installation-ID = %q", got)
@@ -27031,8 +31546,18 @@ func TestUploadNeoCloudThreadUsesAmpInternalClientHeaders(t *testing.T) {
 		if got, want := r.Header.Get("X-Amp-Device-Fingerprint"), neoAmpDeviceFingerprint(); got != want {
 			t.Fatalf("X-Amp-Device-Fingerprint = %q, want %q", got, want)
 		}
+		gz, err := gzip.NewReader(r.Body)
+		if err != nil {
+			t.Fatalf("open gzip payload: %v", err)
+		}
+		defer gz.Close()
+		body, err := io.ReadAll(gz)
+		if err != nil {
+			t.Fatalf("read payload: %v", err)
+		}
+		receivedBytes.Store(int64(len(body)))
 		var payload map[string]any
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		if err := json.Unmarshal(body, &payload); err != nil {
 			t.Fatalf("decode payload: %v", err)
 		}
 		if payload["method"] != "uploadThread" {
@@ -27050,15 +31575,16 @@ func TestUploadNeoCloudThreadUsesAmpInternalClientHeaders(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	err := uploadNeoCloudThread(neoCloudThreadSnapshot{
-		upstreamURL: upstream.URL,
-		apiKey:      "secret",
-		threadID:    threadID,
-		seq:         1,
-		createdMs:   1778170000000,
-		title:       "Header parity",
+	serializedBytes, err := uploadNeoCloudThread(neoCloudThreadSnapshot{
+		upstreamURL:   upstream.URL,
+		apiKey:        "secret",
+		clientVersion: "test-client-version",
+		threadID:      threadID,
+		seq:           1,
+		createdMs:     1778170000000,
+		title:         "Header parity",
 		messages: []neoMessage{
-			{ThreadID: threadID, MessageID: "M-user", Role: "user", Content: []any{map[string]any{"type": "text", "text": "hello"}}, Seq: 1},
+			{ThreadID: threadID, MessageID: "M-user", Role: "user", Content: []any{map[string]any{"type": "text", "text": largeText}}, Seq: 1},
 		},
 	})
 	if err != nil {
@@ -27066,6 +31592,9 @@ func TestUploadNeoCloudThreadUsesAmpInternalClientHeaders(t *testing.T) {
 	}
 	if !sawRequest {
 		t.Fatal("upstream did not receive uploadThread request")
+	}
+	if serializedBytes != receivedBytes.Load() {
+		t.Fatalf("serialized bytes = %d, received bytes = %d", serializedBytes, receivedBytes.Load())
 	}
 }
 
@@ -27208,7 +31737,7 @@ func TestNeoCloudThreadIncludesProtocolMessageIDAndCompleteState(t *testing.T) {
 	}
 }
 
-func TestNeoCloudThreadDoesNotAdvertiseDisconnectedThreadActor(t *testing.T) {
+func TestNeoCloudThreadKeepsDisconnectedThreadActorIdentity(t *testing.T) {
 	thread := neoCloudThread(neoCloudThreadSnapshot{
 		threadID:  "T-test",
 		seq:       1,
@@ -27228,8 +31757,8 @@ func TestNeoCloudThreadDoesNotAdvertiseDisconnectedThreadActor(t *testing.T) {
 	if meta["ampcodeConnectorLocalNeo"] != true || meta["cliProxyAPILocalNeo"] != true || meta["ampcodeLocalRuntime"] != true {
 		t.Fatalf("missing local Neo markers in meta: %#v", meta)
 	}
-	if meta["usesDtw"] != nil || meta["usesThreadActors"] != nil || meta["executorType"] != nil {
-		t.Fatalf("disconnected thread actor metadata leaked: %#v", meta)
+	if meta["usesDtw"] != true || meta["usesThreadActors"] != true || meta["executorType"] != "local-client" {
+		t.Fatalf("disconnected thread actor identity = %#v", meta)
 	}
 	if thread["hasExecutor"] != false || thread["executorConnected"] != false {
 		t.Fatalf("executor state = has:%#v connected:%#v", thread["hasExecutor"], thread["executorConnected"])
@@ -27393,6 +31922,82 @@ func TestWriteNeoLocalThreadSnapshotCanonicalizesModeEffortAndExecutorState(t *t
 	}
 	if meta := mapValue(thread["meta"]); meta["executorType"] != "local-client" {
 		t.Fatalf("stored meta = %#v", meta)
+	}
+}
+
+func TestLoadNeoThreadFromDirNormalizesOwnedDataDocument(t *testing.T) {
+	dir := t.TempDir()
+	threadID := "T-019e0e6e-f3f1-7078-b5dd-748f66f8c266"
+	raw, err := json.Marshal(map[string]any{
+		"title": "outer title",
+		"meta": map[string]any{
+			"cliProxyAPILocalNeo": true,
+			"outer":               "preserved",
+			"shared":              "outer",
+		},
+		"data": map[string]any{
+			"id":        threadID,
+			"title":     "inner title",
+			"agentMode": "deep",
+			"messages":  []any{},
+			"meta": map[string]any{
+				"inner":  "preserved",
+				"shared": "inner",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal thread: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, threadID+".json"), raw, 0o600); err != nil {
+		t.Fatalf("write thread: %v", err)
+	}
+
+	thread, ok := loadNeoThreadFromDir(threadID, dir)
+	if !ok {
+		t.Fatal("load data-wrapped thread")
+	}
+	if thread["title"] != "inner title" || thread["data"] != nil {
+		t.Fatalf("normalized thread = %#v", thread)
+	}
+	meta := mapValue(thread["meta"])
+	if meta["cliProxyAPILocalNeo"] != true || meta["outer"] != "preserved" || meta["inner"] != "preserved" || meta["shared"] != "inner" {
+		t.Fatalf("normalized meta = %#v", meta)
+	}
+}
+
+func TestNeoRuntimeProjectIndexUpdateSkipsUnchangedProject(t *testing.T) {
+	threadDir := t.TempDir()
+	rt := newNeoRuntime(&config.Config{})
+	workDir := neoExistingDirectory(t.TempDir())
+	snapshot := neoCloudThreadSnapshot{
+		threadID:  "T-019f53ba-a774-73a1-95a9-1a78fd1638f2",
+		createdMs: time.Now().UnixMilli(),
+		environment: map[string]any{
+			"workingDirectory": workDir,
+		},
+		meta: map[string]any{
+			"projectID":   "75616c3b-f4de-48b7-8b83-c1af6978a035",
+			"projectName": "local-project",
+		},
+	}
+	if _, err := rt.writeThreadSnapshot(snapshot, threadDir); err != nil {
+		t.Fatalf("initial project index update: %v", err)
+	}
+	path := neoWebLocalProjectIndexPath(threadDir)
+	sentinel := time.Unix(1_700_000_000, 0)
+	if err := os.Chtimes(path, sentinel, sentinel); err != nil {
+		t.Fatalf("set project index timestamp: %v", err)
+	}
+	if _, err := rt.writeThreadSnapshot(snapshot, threadDir); err != nil {
+		t.Fatalf("unchanged project index update: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat project index: %v", err)
+	}
+	if !info.ModTime().Equal(sentinel) {
+		t.Fatalf("unchanged project rewrote index mtime=%s want=%s", info.ModTime(), sentinel)
 	}
 }
 

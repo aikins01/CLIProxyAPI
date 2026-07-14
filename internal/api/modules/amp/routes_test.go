@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -390,6 +391,24 @@ func TestWebLocalInferenceOriginAllowlistRequiresOriginOnly(t *testing.T) {
 	}
 }
 
+func TestWebLocalInferenceConfiguredBaseURLOriginIsAllowed(t *testing.T) {
+	settings := config.AmpWebLocalInference{
+		Enabled:        true,
+		AllowedOrigins: []string{"https://ampcode.com"},
+		BaseURL:        "https://aikinss-macbook-pro.taila39f5b.ts.net/",
+	}
+	if !ampWebLocalInferenceRequestOriginAllowed("https://aikinss-macbook-pro.taila39f5b.ts.net", settings) {
+		t.Fatal("configured base URL origin was not allowed")
+	}
+	if ampWebLocalInferenceRequestOriginAllowed("https://example.com", settings) {
+		t.Fatal("unconfigured origin was allowed")
+	}
+	settings.BaseURL = "https://aikinss-macbook-pro.taila39f5b.ts.net/?token=ignored#fragment"
+	if !ampWebLocalInferenceRequestOriginAllowed("https://aikinss-macbook-pro.taila39f5b.ts.net", settings) {
+		t.Fatal("sanitized configured base URL origin was not allowed")
+	}
+}
+
 func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
@@ -418,7 +437,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 	}
 	for _, want := range []string{
 		"// ==UserScript==",
-		"@version 0.1.57",
+		"@version 0.1.64",
 		"@match https://ampcode.com/*",
 		"@updateURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
 		"@downloadURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
@@ -429,11 +448,13 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		ampWebLocalInferenceHeader,
 		"globalThis.JSON.parse",
 		"decodedConfigPatchCount",
+		"decodedGraphPassCount",
+		"decodedGraphVisitCount",
 		"menuIntegrationCount",
 		"commandPaletteIntegrationCount",
 		"localThreadPickerOpenCount",
 		"removedLocalThreadControlCount",
-		`const userscriptVersion = "0.1.57"`,
+		`const userscriptVersion = "0.1.64"`,
 		"userscriptVersion",
 		"lastPatchedThreadActorBaseURL",
 		"lastPatchedThreadID",
@@ -441,6 +462,15 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"threadActorConfig",
 		"plainThreadActorConfigHasBridgeFields",
 		"devalueThreadActorConfigHasBridgeFields",
+		"plainStandaloneThreadActorConfigLike",
+		"devalueStandaloneThreadActorConfigLike",
+		"plainThreadContainerLike",
+		"devalueThreadContainerLike",
+		"plainTranscriptOrToolValueLike",
+		"plainThreadActorConfigValueNeedsLocality",
+		"patchPlainThreadActorConfigValue",
+		"patchDecodedLocalInferenceGraph",
+		"for (const key in value)",
 		"localPlainThreadActorConfig",
 		"localDevalueThreadActorConfig",
 		"plainContainerThreadID",
@@ -480,11 +510,21 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"installLocalProjectPickerSearch",
 		"filterLocalProjectPickerItems",
 		"installLocalProjectNoProjectSelectionHandler",
+		"refreshCreateThreadProjectActivatorsAfterSelection",
+		"setLocalProjectPickerCurrentDirectory",
 		"localProjectPickerLooksLikeProjectPicker",
 		"if (!item || projectPickerItemSelected(item))",
 		"closeLocalProjectPickerViaNoProject",
 		"localProjectFetchCount",
+		"localProjectFetchFailureCount",
+		"lastLocalProjectFetchFailure",
 		"localProjectPickerIntegrationCount",
+		"localProjectIntegrationGeneration",
+		"projectMutationCandidateCount",
+		"projectMutationIgnoredCount",
+		"projectMutationCoalescedCount",
+		"projectMutationFlushCount",
+		"projectMutationPendingRootCount",
 		"lastObservedThreadID",
 		"observedThreadID",
 		"threadID === pathThreadID()",
@@ -521,12 +561,15 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"devalueThreadWorkingDirectory",
 		"rememberPlainThreadRuntime",
 		"rememberDevalueThreadRuntime",
+		"rememberLoadedThreadBase",
+		"loadedThreadBaseVersionLimit",
+		"loadedThreadBaseVersionEntryCount",
+		"rewriteClientResumePayload",
+		"clientResumeRewriteCount",
 		"TextDecoder",
 		`.split(/[\\/]+/)`,
 		"parsedTextLocalInferencePatchOptions",
-		`source.includes("\"id\"")`,
-		`source.includes("workingDirectory")`,
-		`source.includes("workspaceRoot")`,
+		"localInferencePatchFieldPattern",
 		"matches.size === 1",
 		"internalAPIPath",
 		"workingDirectory",
@@ -593,6 +636,25 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 	if selectedLocalProjectIndex < 0 || visibleProjectIndex < 0 || visibleProjectIndex > selectedLocalProjectIndex {
 		t.Fatalf("userscript must prefer visible project before stale selected local project for create-thread working directory")
 	}
+	localWorkingDirectoryIndex := strings.Index(body, "function localWorkingDirectory()")
+	selectedDirectoryIndex := strings.Index(body[localWorkingDirectoryIndex:], "const selectedDirectory = selectedLocalProjectWorkingDirectory();")
+	activeDirectoryIndex := strings.Index(body[localWorkingDirectoryIndex:], "const activeDirectory = activeThreadWorkingDirectory();")
+	if localWorkingDirectoryIndex < 0 || selectedDirectoryIndex < 0 || activeDirectoryIndex < 0 || activeDirectoryIndex > selectedDirectoryIndex {
+		t.Fatalf("userscript must preserve the active thread working directory before a new-thread project selection")
+	}
+	newLocalWorkingDirectoryIndex := strings.Index(body, "function newLocalThreadWorkingDirectory()")
+	if newLocalWorkingDirectoryIndex < 0 {
+		t.Fatal("userscript missing new-thread working directory selection")
+	}
+	newLocalWorkingDirectoryBody := body[newLocalWorkingDirectoryIndex:]
+	newVisibleDirectoryIndex := strings.Index(newLocalWorkingDirectoryBody, "visibleProjectWorkingDirectory(visibleCreateThreadProjectName())")
+	newSelectedDirectoryIndex := strings.Index(newLocalWorkingDirectoryBody, "selectedDirectory ||")
+	if newVisibleDirectoryIndex < 0 || newSelectedDirectoryIndex < 0 || newVisibleDirectoryIndex > newSelectedDirectoryIndex {
+		t.Fatal("userscript must prefer the visible create-thread project before a stale selected project")
+	}
+	if !strings.Contains(newLocalWorkingDirectoryBody, `selectedProject?.name === "~" && selectedDirectory === defaultLocalWorkingDirectory()`) {
+		t.Fatal("userscript must preserve an explicit No Project home selection for local thread creation")
+	}
 	for _, unwanted := range []string{
 		"installLocalThreadKeyboardShortcut();",
 		"installThreadMenuIntegration();",
@@ -632,6 +694,8 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"\n\t\tcreateLocalThread,\n",
 		"\n\t\tpromptLocalThread,\n",
 		"\n\t\topenLocalThreadFromMenu,\n",
+		"patchNestedDevalueThreadActorConfigs",
+		"patchPlainThreadActorConfigs",
 	} {
 		if strings.Contains(body, unwanted) {
 			t.Fatalf("userscript still activates obsolete local thread control %q:\n%s", unwanted, body)
@@ -743,9 +807,11 @@ class NativeWebSocket {
 		this.protocols = protocols;
 		this.readyState = NativeWebSocket.CONNECTING;
 		this.listeners = {};
+		this.sent = [];
 		NativeWebSocket.instances.push(this);
 	}
 	addEventListener(name, callback) { this.listeners[name] = callback; }
+	send(payload) { this.sent.push(payload); }
 	close() { this.readyState = NativeWebSocket.CLOSED; }
 }
 globalThis.location = new URL("https://ampcode.com/threads/" + threadID);
@@ -832,6 +898,13 @@ globalThis.fetch = async (url, init) => {
 globalThis.WebSocket = NativeWebSocket;
 globalThis.prompt = () => "";
 globalThis.history = { state: null, replaceState() {} };
+const nativeResponseJSON = Response.prototype.json;
+let lastNativeResponseJSONPromise = null;
+Response.prototype.json = function(...args) {
+	const promise = nativeResponseJSON.apply(this, args);
+	lastNativeResponseJSONPromise = promise;
+	return promise;
+};
 if (typeof globalThis.atob !== "function") {
 	globalThis.atob = (value) => Buffer.from(value, "base64").toString("binary");
 }
@@ -840,19 +913,52 @@ if (typeof globalThis.btoa !== "function") {
 }
 require(scriptPath);
 const bridge = globalThis.__cliproxyAmpLocalInference;
-	assert(bridge && bridge.userscriptVersion === "0.1.57", "bridge userscript version was not exposed");
+assert(bridge && bridge.userscriptVersion === "0.1.64", "bridge userscript version was not exposed");
+const unrelatedGraphPasses = bridge.diagnostics.decodedGraphPassCount;
+const unrelatedIDPayload = JSON.parse('{"id":"generic-object","payload":[{"value":1}]}');
+assert(unrelatedIDPayload.id === "generic-object", "unrelated id payload changed");
+assert(bridge.diagnostics.decodedGraphPassCount === unrelatedGraphPasses, "unrelated id payload triggered decoded graph traversal");
+const activeThreadPath = globalThis.location.pathname;
+for (let i = 1; i <= 80; i += 1) {
+	const boundedThreadID = "T-00000000-0000-0000-0000-" + i.toString(16).padStart(12, "0");
+	globalThis.location.pathname = "/threads/" + boundedThreadID;
+	JSON.parse(JSON.stringify({ id: boundedThreadID, v: i, messages: [] }));
+}
+globalThis.location.pathname = activeThreadPath;
+assert(bridge.diagnostics.loadedThreadBaseVersionEntryCount === 64, "loaded thread base versions were not bounded");
+const unrelatedResponse = new Response('{"ok":true}');
+Object.defineProperty(unrelatedResponse, "url", { value: "https://ampcode.com/api/unrelated" });
+const unrelatedResponseJSONPromise = unrelatedResponse.json();
+assert(unrelatedResponseJSONPromise === lastNativeResponseJSONPromise, "unrelated response json did not use the native promise fast path");
+assert((await unrelatedResponseJSONPromise).ok === true, "unrelated response json changed decoded data");
+const throwingURLResponse = new Response('{"ok":true}');
+Object.defineProperty(throwingURLResponse, "url", { get() { throw new Error("unexpected url access"); } });
+assert((await throwingURLResponse.json()).ok === true, "response url inspection changed native json behavior");
 	globalThis.localStorage.setItem(bridge.localThreadIDsStorageKey, JSON.stringify([threadID, secondThreadID]));
 	globalThis.localStorage.setItem(bridge.apiKeyStorageKey, "local-key");
 	globalThis.localStorage.setItem(bridge.workingDirectoryStorageKey, createdThreadWorkDir);
+	const encodeGatewayInput = (value) => Buffer.from(JSON.stringify(value)).toString("base64url");
+	new WebSocket("wss://ampcode.com/gateway/threadActor/?rvt-method=get&rvt-input=" + encodeURIComponent(encodeGatewayInput({ input: { threadID } })));
+	const decodedGatewayInputURL = new URL(NativeWebSocket.instances.at(-1).url);
+	assert(decodedGatewayInputURL.searchParams.get("cliproxy-bootstrap-executor") === "true", "decoded rvt-input thread id was not recognized");
+	new WebSocket("wss://ampcode.com/gateway/threadActor/?rvt-method=get&rvt-input=" + encodeURIComponent(encodeGatewayInput({ input: JSON.stringify({ threadId: threadID }) })));
+	const stringGatewayInputURL = new URL(NativeWebSocket.instances.at(-1).url);
+	assert(stringGatewayInputURL.searchParams.get("cliproxy-bootstrap-executor") === "true", "string-wrapped rvt-input thread id was not recognized");
+	new WebSocket("wss://ampcode.com/gateway/threadActor/?rvt-method=get&rvt-input=" + encodeURIComponent(encodeGatewayInput({ input: { payload: { id: secondThreadID }, message: "unrelated " + secondThreadID } })));
+	const unrelatedGatewayInputURL = new URL(NativeWebSocket.instances.at(-1).url);
+	assert(!unrelatedGatewayInputURL.searchParams.has("cliproxy-bootstrap-executor"), "unrelated rvt-input id was treated as a thread id");
 	const strayHigh = new FakeElement("span", "High");
 	const modeLow = new FakeElement("button", "Low");
 	modeLow.setAttribute("aria-haspopup", "menu");
 	documentQueryElements = [strayHigh, modeLow];
-		new WebSocket("wss://ampcode.com/gateway?key=" + encodeURIComponent(threadID));
+		const inheritedModeSocket = new WebSocket("wss://ampcode.com/gateway?key=" + encodeURIComponent(threadID));
 		const inheritedModeURL = new URL(NativeWebSocket.instances.at(-1).url);
 		assert(inheritedModeURL.origin === "ws://127.0.0.1:8317", "gateway websocket was not bridged locally");
 		assert(inheritedModeURL.searchParams.get("cliproxy-agent-mode") === "low", "unrelated High text overrode real mode control");
 		assert(inheritedModeURL.searchParams.get("cliproxy-reasoning-effort") === "medium", "low mode reasoning effort was not inherited");
+		const missingBaseResume = '{"type":"client_resume","version":0}';
+		inheritedModeSocket.send(missingBaseResume);
+		assert(inheritedModeSocket.sent.at(-1) === missingBaseResume, "zero resume changed without a loaded base");
 		const genericAriaModeHigh = new FakeElement("button", "High");
 		genericAriaModeHigh.setAttribute("aria-label", "Agent mode");
 		documentQueryElements = [genericAriaModeHigh];
@@ -875,9 +981,8 @@ assert(metadataFetchAuthorization === "Bearer local-key", "actors metadata fetch
 assert(metadataFetchBridgeHeader === "1", "actors metadata fetch missing bridge header");
 assert(metadataFetchRivetEncoding === "bare", "supported Rivet header was not forwarded");
 assert(metadataFetchUnsupportedHeader === "", "unsupported source header was forwarded to local CORS request");
-const assertPlainConfig = (config, label) => {
+const assertPlainConfig = (config, label, expectedThreadID = label === "created plain" ? createdThreadID : threadID) => {
 	assert(config && typeof config === "object", label + " config missing");
-	const expectedThreadID = label === "created plain" ? createdThreadID : threadID;
 	assert(config.threadId === expectedThreadID, label + " threadId mismatch");
 	assert(config.wsToken === "local-neo", label + " wsToken mismatch");
 	assert(config.ampURL === "http://127.0.0.1:8317", label + " ampURL mismatch");
@@ -888,10 +993,139 @@ const assertPlainConfig = (config, label) => {
 	assert(config.requiresSudoForTerminal === false, label + " requiresSudoForTerminal mismatch");
 	assert(config.threadActorTransport === "json-rpc", label + " threadActorTransport mismatch");
 };
-const plain = JSON.parse(JSON.stringify({ current: { thread: { id: threadID, title: "Local" }, threadActorConfig: null } }));
+const plainThreadSource = {
+	id: threadID,
+	v: 23,
+	title: "Local",
+	messages: [
+		{ messageId: "M-0000000000000000000001", role: "assistant", content: [{ type: "tool_use", id: "TU-plain", name: "shell_command", input: { command: "pwd", request: { id: threadID, threadId: threadID, baseURL: "https://service.example", ampURL: "https://amp.example", wsToken: "tool-token", capability: "write", poolName: "default", threadActorTransport: "json-rpc", hasExecutor: false, executorConnected: false, threadActorConfig: { threadId: threadID, baseURL: "https://service.example" } } } }] },
+		{ messageId: "M-0000000000000000000002", role: "user", content: [{ type: "tool_result", toolUseID: "TU-plain", content: "/workspace" }] },
+	],
+	compactionRecords: [{ cutMessageId: "M-0000000000000000000002", createdAt: "2026-07-12T00:00:00Z" }],
+};
+const preservedPlainTranscript = JSON.stringify({ messages: plainThreadSource.messages, compactionRecords: plainThreadSource.compactionRecords });
+const plain = JSON.parse(JSON.stringify({ current: { thread: plainThreadSource, threadActorConfig: null } }));
 assertPlainConfig(plain.current.threadActorConfig, "plain");
 assert(bridge.diagnostics.lastPatchedThreadID === threadID, "plain patch did not record thread ID");
-const values = JSON.parse(JSON.stringify([{ current: 1 }, { thread: 2 }, { id: 3, title: 4 }, threadID, "Local" ]));
+assert(JSON.stringify({ messages: plain.current.thread.messages, compactionRecords: plain.current.thread.compactionRecords }) === preservedPlainTranscript, "plain route patch changed transcript IDs, tool blocks, or compaction records");
+const referencedPlainConfig = JSON.parse(JSON.stringify({ threadActorConfig: { threadId: threadID, baseURL: "https://ampcode.com" } }));
+assert(referencedPlainConfig.threadActorConfig.baseURL === "http://127.0.0.1:8317", "referenced minimal plain config baseURL was not patched");
+assert(referencedPlainConfig.threadActorConfig.ampURL === "http://127.0.0.1:8317", "referenced minimal plain config ampURL was not patched");
+const standalonePlainConfig = JSON.parse(JSON.stringify({
+	threadId: threadID,
+	baseURL: "https://ampcode.com",
+	wsToken: "remote-token",
+	capability: "write",
+	poolName: "default",
+}));
+assert(standalonePlainConfig.baseURL === "http://127.0.0.1:8317", "standalone plain actor config baseURL was not patched");
+assert(standalonePlainConfig.ampURL === "http://127.0.0.1:8317", "standalone plain actor config ampURL was not patched");
+const devalueShapedToolInput = [
+	{ request: 1 },
+	{ id: 2, threadId: 2, baseURL: 3, ampURL: 4, wsToken: 5, hasExecutor: 6, executorConnected: 6, capability: 7, poolName: 8, threadActorConfig: 9 },
+	threadID,
+	"https://service.example",
+	"https://amp.example",
+	"tool-token",
+	false,
+	"write",
+	"default",
+	{ threadId: 2, baseURL: 3 },
+];
+const preservedDevalueShapedToolInput = JSON.stringify(devalueShapedToolInput);
+const devalueShapedToolEnvelope = JSON.parse(JSON.stringify({ messages: [{ content: [{ type: "tool_use", input: devalueShapedToolInput }] }] }));
+const patchedDevalueShapedToolInput = JSON.stringify(devalueShapedToolEnvelope.messages[0].content[0].input);
+assert(patchedDevalueShapedToolInput === preservedDevalueShapedToolInput, "devalue-shaped tool input was patched as an actor config: " + patchedDevalueShapedToolInput);
+assert(devalueShapedToolEnvelope.messages[0].content[0].input.length === devalueShapedToolInput.length, "devalue-shaped tool input table length changed");
+assert(!patchedDevalueShapedToolInput.includes("http://127.0.0.1:8317"), "devalue-shaped tool input retained the local base URL");
+assert(devalueShapedToolEnvelope.messages[0].content[0].input[1].threadActorConfig === 9, "devalue-shaped tool input threadActorConfig reference changed");
+const devalueTranscriptTable = [
+	{ messages: 1 },
+	[2],
+	{ role: 3, content: 4 },
+	"assistant",
+	[5],
+	{ type: 6, input: 7 },
+	"tool_use",
+	{ threadActorConfig: 8 },
+	{ threadId: 9, baseURL: 10, wsToken: 11, capability: 12, poolName: 13 },
+	threadID,
+	"https://service.example",
+	"tool-token",
+	"write",
+	"default",
+];
+const preservedDevalueTranscriptTable = JSON.stringify(devalueTranscriptTable);
+const patchedDevalueTranscriptTable = JSON.parse(JSON.stringify(devalueTranscriptTable));
+assert(JSON.stringify(patchedDevalueTranscriptTable) === preservedDevalueTranscriptTable, "devalue transcript table actor payload was patched");
+const sharedDevalueConfig = [
+	{ threadActorConfig: 8, messages: 1 },
+	[2],
+	{ role: 3, content: 4 },
+	"assistant",
+	[5],
+	{ type: 6, input: 7 },
+	"tool_use",
+	{ threadActorConfig: 8 },
+	{ threadId: 9, baseURL: 10 },
+	threadID,
+	"https://service.example",
+];
+const preservedSharedTranscriptConfig = JSON.stringify(sharedDevalueConfig[8]);
+const patchedSharedDevalueConfig = JSON.parse(JSON.stringify(sharedDevalueConfig));
+assert(JSON.stringify(patchedSharedDevalueConfig[8]) === preservedSharedTranscriptConfig, "shared transcript actor config was mutated");
+assert(patchedSharedDevalueConfig[7].threadActorConfig === 8, "shared transcript actor config reference changed");
+const externalSharedConfigIndex = patchedSharedDevalueConfig[0].threadActorConfig;
+assert(externalSharedConfigIndex !== 8, "external actor config reference was not isolated from transcript data");
+const externalSharedConfig = patchedSharedDevalueConfig[externalSharedConfigIndex];
+const externalSharedDeref = (value) => Number.isInteger(value) ? patchedSharedDevalueConfig[value] : value;
+assert(externalSharedDeref(externalSharedConfig.baseURL) === "http://127.0.0.1:8317", "isolated external actor config baseURL was not patched");
+assert(externalSharedDeref(externalSharedConfig.ampURL) === "http://127.0.0.1:8317", "isolated external actor config ampURL was not patched");
+const referencedDevalueConfig = JSON.parse(JSON.stringify([
+	{ threadActorConfig: 1 },
+	{ threadId: 2, baseURL: 3 },
+	threadID,
+	"https://ampcode.com",
+]));
+const referencedDevalueDeref = (value) => Number.isInteger(value) ? referencedDevalueConfig[value] : value;
+assert(referencedDevalueDeref(referencedDevalueConfig[1].baseURL) === "http://127.0.0.1:8317", "referenced minimal devalue config baseURL was not patched");
+assert(referencedDevalueDeref(referencedDevalueConfig[1].ampURL) === "http://127.0.0.1:8317", "referenced minimal devalue config ampURL was not patched");
+const standaloneDevalueConfig = JSON.parse(JSON.stringify([
+	{ threadId: 1, baseURL: 2, wsToken: 3, capability: 4, poolName: 5 },
+	threadID,
+	"https://ampcode.com",
+	"remote-token",
+	"write",
+	"default",
+]));
+const standaloneDevalueDeref = (value) => Number.isInteger(value) ? standaloneDevalueConfig[value] : value;
+assert(standaloneDevalueDeref(standaloneDevalueConfig[0].baseURL) === "http://127.0.0.1:8317", "standalone devalue actor config baseURL was not patched");
+assert(standaloneDevalueDeref(standaloneDevalueConfig[0].ampURL) === "http://127.0.0.1:8317", "standalone devalue actor config ampURL was not patched");
+const rawZeroResume = '{ "type": "client_resume", "version": 0 }';
+inheritedModeSocket.send(rawZeroResume);
+const rewrittenRawResume = inheritedModeSocket.sent.at(-1);
+assert(typeof rewrittenRawResume === "string", "raw resume payload type changed");
+assert(JSON.parse(rewrittenRawResume).version === 23, "matching plain loaded base did not rewrite raw zero resume");
+JSON.parse(JSON.stringify({ id: threadID, v: 17, data: { messages: [] } }));
+inheritedModeSocket.send(rawZeroResume);
+assert(JSON.parse(inheritedModeSocket.sent.at(-1)).version === 17, "plain envelope with outer identity and nested transcript did not rewrite zero resume");
+const positiveResume = '{ "type": "client_resume", "version": 11 }';
+inheritedModeSocket.send(positiveResume);
+assert(inheritedModeSocket.sent.at(-1) === positiveResume, "positive resume was changed");
+const unrelatedFrame = '{ "type": "client_set_thread_title", "title": "unchanged" }';
+inheritedModeSocket.send(unrelatedFrame);
+assert(inheritedModeSocket.sent.at(-1) === unrelatedFrame, "unrelated websocket frame was changed");
+const binaryFrame = new Uint8Array([1, 2, 3]);
+inheritedModeSocket.send(binaryFrame);
+assert(inheritedModeSocket.sent.at(-1) === binaryFrame, "binary websocket frame was changed");
+const userActorSocket = new WebSocket("wss://ampcode.com/gateway/userActor/?rvt-method=get&rvt-key=user-local");
+userActorSocket.send(rawZeroResume);
+assert(userActorSocket.sent.at(-1) === rawZeroResume, "user actor resume frame was changed");
+const noBaseSocket = new WebSocket("wss://ampcode.com/gateway/threadActor/?rvt-method=get&rvt-key=" + encodeURIComponent(secondThreadID));
+const noBaseResume = '{"type":"client_resume","version":0}';
+noBaseSocket.send(noBaseResume);
+assert(noBaseSocket.sent.at(-1) === noBaseResume, "mismatched or missing loaded base changed zero resume");
+const values = JSON.parse(JSON.stringify([{ current: 1 }, { thread: 2 }, { id: 3, title: 4, v: 5, messages: 6 }, threadID, "Local", 37, [] ]));
 const configIndex = values[1].threadActorConfig;
 assert(Number.isInteger(configIndex), "devalue threadActorConfig was not a reference");
 const devalueConfig = values[configIndex];
@@ -915,12 +1149,28 @@ const nullDeref = (value) => Number.isInteger(value) ? nullConfigValues[value] :
 assert(nullDeref(nullConfig.threadId) === threadID, "null-ref devalue threadId mismatch");
 assert(nullDeref(nullConfig.wsToken) === "local-neo", "null-ref devalue wsToken mismatch");
 globalThis.location = new URL("https://ampcode.com/threads/" + secondThreadID);
-const secondValues = JSON.parse(JSON.stringify([{ current: 1 }, { thread: 2 }, { id: 3, title: 4 }, secondThreadID, "Second" ]));
+const secondValues = JSON.parse(JSON.stringify([{ current: 1 }, { thread: 2 }, { id: 3, title: 4, v: 5, messages: 6 }, secondThreadID, "Second", 41, [] ]));
 const secondConfigIndex = secondValues[1].threadActorConfig;
 assert(Number.isInteger(secondConfigIndex), "second devalue threadActorConfig was not patched after local navigation");
 const secondConfig = secondValues[secondConfigIndex];
 const secondDeref = (value) => Number.isInteger(value) ? secondValues[value] : value;
 assert(secondDeref(secondConfig.threadId) === secondThreadID, "second devalue threadId mismatch");
+const jsonRPCZeroResume = '{"jsonrpc":"2.0","id":"resume-1","method":"client_resume","params":{"version":0}}';
+noBaseSocket.send(jsonRPCZeroResume);
+const rewrittenJSONRPCResume = noBaseSocket.sent.at(-1);
+assert(typeof rewrittenJSONRPCResume === "string", "JSON-RPC resume payload type changed");
+const parsedJSONRPCResume = JSON.parse(rewrittenJSONRPCResume);
+assert(parsedJSONRPCResume.id === "resume-1", "JSON-RPC resume id changed");
+assert(parsedJSONRPCResume.params.version === 41, "matching devalue loaded base did not rewrite JSON-RPC zero resume");
+assert(bridge.diagnostics.clientResumeRewriteCount === 3, "resume rewrite diagnostics count mismatch");
+assert(bridge.diagnostics.lastClientResumeThreadID === secondThreadID, "resume rewrite diagnostics thread mismatch");
+assert(bridge.diagnostics.lastClientResumeBaseVersion === 41, "resume rewrite diagnostics version mismatch");
+JSON.parse(JSON.stringify([{ thread: 1 }, { id: 2, data: 3 }, secondThreadID, { v: 4, messages: 5 }, 29, []]));
+noBaseSocket.send(jsonRPCZeroResume);
+assert(JSON.parse(noBaseSocket.sent.at(-1)).params.version === 29, "devalue envelope with outer identity and nested transcript did not rewrite zero resume");
+JSON.parse(JSON.stringify([{ thread: 1 }, { id: 2, v: 3, messages: 4 }, secondThreadID, 19, []]));
+noBaseSocket.send(jsonRPCZeroResume);
+assert(JSON.parse(noBaseSocket.sent.at(-1)).params.version === 19, "newly loaded lower thread version did not replace a stale higher base");
 const failedRequestBody = JSON.stringify({
 	payload: encodeDevalue([
 		{ content: 1, agentMode: 5, threadID: 6, reasoningEffort: 7 },
@@ -953,6 +1203,11 @@ const createRequestBody = JSON.stringify({
 	]),
 	refreshes: [],
 });
+globalThis.sessionStorage.setItem(bridge.selectedLocalProjectStorageKey, JSON.stringify({
+	name: "local-project",
+	workingDirectory: createdThreadWorkDir,
+	selectedAt: Date.now(),
+}));
 await fetch("https://ampcode.com/_app/remote/3abror/createProjectThread", {
 	method: "POST",
 	headers: { "Content-Type": "application/json" },
@@ -961,6 +1216,7 @@ await fetch("https://ampcode.com/_app/remote/3abror/createProjectThread", {
 const bridgedCreateURL = new URL(createFetchURL);
 assert(bridgedCreateURL.origin === "http://127.0.0.1:8317", "create fetch was not bridged to local base");
 assert(bridgedCreateURL.searchParams.get("cliproxy-working-directory") === createdThreadWorkDir, "create fetch missing working directory");
+assert(bridgedCreateURL.searchParams.get("cliproxy-local-project") === "1", "create fetch missing local project marker");
 assert(JSON.parse(globalThis.localStorage.getItem(bridge.localThreadIDsStorageKey)).includes(createdThreadID), "created thread was not remembered before route-data parse");
 globalThis.location = new URL("https://ampcode.com/threads/" + createdThreadID);
 const staleSidebarThreadID = "T-019f3586-fb79-7309-a219-4a279ef2900c";
@@ -975,7 +1231,7 @@ assert(!Object.hasOwn(stalePlainSidebar.recentThreads[0], "hasExecutor"), "plain
 assert(!Object.hasOwn(stalePlainSidebar.recentThreads[0], "executorConnected"), "plain local stale executorConnected was not cleared");
 assert(stalePlainSidebar.recentThreads[1].hasExecutor === false, "plain nonlocal hasExecutor was changed");
 assert(stalePlainSidebar.recentThreads[1].executorConnected === false, "plain nonlocal executorConnected was changed");
-const stalePlainAlias = JSON.parse(JSON.stringify({ id: "not-a-thread-id", threadId: createdThreadID, hasExecutor: false, executorConnected: false }));
+const stalePlainAlias = JSON.parse(JSON.stringify({ id: "not-a-thread-id", threadId: createdThreadID, title: "Created", hasExecutor: false, executorConnected: false }));
 assert(!Object.hasOwn(stalePlainAlias, "hasExecutor"), "plain alias stale hasExecutor was not cleared");
 assert(!Object.hasOwn(stalePlainAlias, "executorConnected"), "plain alias stale executorConnected was not cleared");
 const activePlainArray = JSON.parse(JSON.stringify([{ id: createdThreadID, title: "Created", hasExecutor: false, executorConnected: false, threadActorConfig: null }]));
@@ -1005,10 +1261,11 @@ assert(!Object.hasOwn(staleDevalueSidebar[2], "executorConnected"), "devalue loc
 assert(staleDevalueSidebar[7].hasExecutor === 5, "devalue nonlocal hasExecutor was changed");
 assert(staleDevalueSidebar[7].executorConnected === 5, "devalue nonlocal executorConnected was changed");
 const staleDevalueAlias = JSON.parse(JSON.stringify([
-	{ id: 1, threadID: 2, hasExecutor: 3, executorConnected: 3 },
+	{ id: 1, threadID: 2, hasExecutor: 3, executorConnected: 3, title: 4 },
 	"not-a-thread-id",
 	createdThreadID,
 	false,
+	"Created",
 ]));
 assert(!Object.hasOwn(staleDevalueAlias[0], "hasExecutor"), "devalue alias stale hasExecutor was not cleared");
 assert(!Object.hasOwn(staleDevalueAlias[0], "executorConnected"), "devalue alias stale executorConnected was not cleared");
@@ -1128,6 +1385,48 @@ assert(nestedDeref(nestedConfig.threadId) === createdThreadID, "nested route-dat
 assert(nestedDeref(nestedConfig.wsToken) === "local-neo", "nested route-data wsToken mismatch");
 assert(nestedDeref(nestedConfig.ampURL) === "http://127.0.0.1:8317", "nested route-data ampURL mismatch");
 assert(bridge.diagnostics.lastPatchedThreadID === createdThreadID, "nested route-data patch did not record thread ID");
+const discoveredThreadID = "T-019f3586-fb79-7309-a219-4a279ef2900e";
+globalThis.location = new URL("https://ampcode.com/threads/" + discoveredThreadID);
+const mixedLocality = JSON.parse(JSON.stringify({
+	id: discoveredThreadID,
+	hasExecutor: false,
+	executorConnected: false,
+	threadActorConfig: null,
+	nested: [
+		{ threadActorConfig: 1 },
+		{ threadId: 2, baseURL: 3, wsToken: 4 },
+		discoveredThreadID,
+		"https://ampcode.com",
+		"remote-token",
+	],
+}));
+assertPlainConfig(mixedLocality.threadActorConfig, "nested-discovered plain", discoveredThreadID);
+assert(!Object.hasOwn(mixedLocality, "hasExecutor"), "nested-discovered plain stale hasExecutor was not cleared");
+assert(!Object.hasOwn(mixedLocality, "executorConnected"), "nested-discovered plain stale executorConnected was not cleared");
+assert(JSON.parse(globalThis.localStorage.getItem(bridge.localThreadIDsStorageKey)).includes(discoveredThreadID), "nested devalue config did not establish local thread identity");
+const pureDevalueThreadID = "T-019f3586-fb79-7309-a219-4a279ef2900f";
+globalThis.location = new URL("https://ampcode.com/threads/" + pureDevalueThreadID);
+const pureDevalueLocality = JSON.parse(JSON.stringify([
+	{ current: 1, configSource: 6 },
+	{ thread: 2, hasExecutor: 5, executorConnected: 5 },
+	{ id: 3, title: 4 },
+	pureDevalueThreadID,
+	"Pure devalue",
+	false,
+	{ thread: 2, threadActorConfig: 7 },
+	{ threadId: 3, baseURL: 8, wsToken: 9 },
+	"https://ampcode.com",
+	"remote-token",
+]));
+assert(!Object.hasOwn(pureDevalueLocality[1], "hasExecutor"), "later devalue locality did not clear stale hasExecutor");
+assert(!Object.hasOwn(pureDevalueLocality[1], "executorConnected"), "later devalue locality did not clear stale executorConnected");
+const pureDevalueConfigIndex = pureDevalueLocality[1].threadActorConfig;
+assert(Number.isInteger(pureDevalueConfigIndex), "later devalue locality did not add a threadActorConfig");
+const pureDevalueConfig = pureDevalueLocality[pureDevalueConfigIndex];
+const pureDevalueDeref = (value) => Number.isInteger(value) ? pureDevalueLocality[value] : value;
+assert(pureDevalueDeref(pureDevalueConfig.threadId) === pureDevalueThreadID, "later devalue locality config threadId mismatch");
+assert(pureDevalueDeref(pureDevalueConfig.baseURL) === "http://127.0.0.1:8317", "later devalue locality config baseURL mismatch");
+globalThis.location = new URL("https://ampcode.com/threads/" + createdThreadID);
 const socket = new WebSocket("wss://ampcode.com/gateway/threadActor/?rvt-method=get&rvt-key=" + encodeURIComponent(secondThreadID));
 const rewritten = new URL(socket.url);
 assert(rewritten.protocol === "ws:", "websocket protocol was not rewritten");
@@ -1145,7 +1444,9 @@ assert(localHTTPRewritten.protocol === "ws:", "local http websocket protocol was
 assert(localHTTPRewritten.host === "127.0.0.1:8317", "local http websocket host changed");
 assert(localHTTPRewritten.searchParams.get("cliproxy-api-key") === "local-key", "local http websocket localStorage API key was not applied");
 assert(bridge.diagnostics.decodedConfigPatchCount >= 2, "decoded config patches were not recorded");
-assert(bridge.diagnostics.webSocketBootstrapCount === 5, "websocket bootstrap was not recorded");
+assert(bridge.diagnostics.decodedGraphPassCount > 0, "decoded graph passes were not recorded");
+assert(bridge.diagnostics.decodedGraphVisitCount >= bridge.diagnostics.decodedGraphPassCount, "decoded graph visits were not recorded");
+assert(bridge.diagnostics.webSocketBootstrapCount === 8, "websocket bootstrap was not recorded");
 })().catch((error) => {
 	console.error(error && error.stack ? error.stack : error);
 	process.exit(1);
@@ -1334,7 +1635,26 @@ globalThis.HTMLElement = FakeElement;
 globalThis.NodeFilter = { SHOW_TEXT: 4, SHOW_ELEMENT: 1 };
 globalThis.KeyboardEvent = class extends FakeEvent { constructor(type, init) { super(type, init); } };
 globalThis.MouseEvent = class extends FakeEvent { constructor(type, init) { super(type, init); } };
-globalThis.MutationObserver = class { observe() {} disconnect() {} };
+const mutationObservers = [];
+globalThis.MutationObserver = class {
+	constructor(callback) { this.callback = callback; mutationObservers.push(this); }
+	observe() {}
+	disconnect() { this.disconnected = true; }
+};
+const animationFrameCallbacks = new Map();
+let nextAnimationFrameID = 1;
+globalThis.requestAnimationFrame = (callback) => {
+	const id = nextAnimationFrameID++;
+	animationFrameCallbacks.set(id, callback);
+	return id;
+};
+globalThis.cancelAnimationFrame = (id) => animationFrameCallbacks.delete(id);
+const flushAnimationFrames = () => {
+	for (const [id, callback] of Array.from(animationFrameCallbacks)) {
+		animationFrameCallbacks.delete(id);
+		callback(Date.now());
+	}
+};
 globalThis.document = {
 	readyState: "complete",
 	body,
@@ -1370,15 +1690,21 @@ let localProjectsPayload = {
 		{ name: "telemetry.dev", workingDirectory: "/Users/aikins01/Developer/telemetry.dev" },
 	],
 };
-	let lastFetchURL = "";
-	globalThis.fetch = async (url) => {
+	let deferLocalProjectsFetch = false;
+	const deferredLocalProjectsFetches = [];
+		let lastFetchURL = "";
+		globalThis.fetch = async (url) => {
 		lastFetchURL = String(url);
 		if (lastFetchURL.includes("/_app/remote/3abror/createProjectThread")) {
 			return new Response(JSON.stringify({ data: "" }), { status: 200, headers: { "Content-Type": "application/json" } });
 		}
 		assert(lastFetchURL.includes("/ampcode/local-projects.json"), "unexpected fetch " + url);
-		return new Response(JSON.stringify(localProjectsPayload), { status: 200, headers: { "Content-Type": "application/json" } });
-};
+		const responseBody = JSON.stringify(localProjectsPayload);
+			if (deferLocalProjectsFetch) {
+				return new Promise((resolve) => deferredLocalProjectsFetches.push(() => resolve(new Response(responseBody, { status: 200, headers: { "Content-Type": "application/json" } }))));
+			}
+			return new Response(responseBody, { status: 200, headers: { "Content-Type": "application/json" } });
+	};
 globalThis.prompt = () => "";
 globalThis.WebSocket = class {};
 const encodeDevalue = (value) => Buffer.from(JSON.stringify(value)).toString("base64url");
@@ -1402,7 +1728,22 @@ moreActions.textContent = "More Actions";
 headerContainer.append(moreActions, headerProjectLink);
 const picker = new FakeElement("div");
 picker.setAttribute("role", "dialog");
-const input = new FakeElement("input");
+const nearMissPicker = new FakeElement("div");
+	nearMissPicker.setAttribute("role", "dialog");
+	const nearMissInput = new FakeElement("input");
+	const nearMissTitle = new FakeElement("div");
+	nearMissTitle.textContent = "Projects";
+	const nearMissDescription = new FakeElement("div");
+	nearMissDescription.textContent = "No Project is configured";
+	const nearMissList = new FakeElement("div");
+	nearMissList.setAttribute("role", "listbox");
+	const nearMissOption = new FakeElement("button");
+	nearMissOption.setAttribute("role", "option");
+	nearMissOption.textContent = "Open Projects";
+	nearMissList.appendChild(nearMissOption);
+	nearMissPicker.append(nearMissInput, nearMissTitle, nearMissDescription, nearMissList);
+	const input = new FakeElement("input");
+input.textContent = "Choose a project…";
 const title = new FakeElement("div");
 title.textContent = "Projects";
 const popupProjectButton = new FakeElement("button");
@@ -1418,11 +1759,59 @@ list.appendChild(noProject);
 list.appendChild(actions);
 	picker.append(input, title, popupProjectButton, list);
 	body.appendChild(picker);
+	body.appendChild(nearMissPicker);
 	body.appendChild(message);
 	body.appendChild(broadProjectLink);
 	body.appendChild(broadMoreActions);
 	body.appendChild(headerContainer);
 	require(scriptPath);
+	const bridge = globalThis.__cliproxyAmpLocalInference;
+	await new Promise((resolve) => setTimeout(resolve, 25));
+	assert(nearMissList.querySelectorAll("[data-cliproxy-local-project-item]").length === 0, "near-miss project text container was integrated as a picker");
+	const observer = mutationObservers.at(-1);
+	const ignoredBefore = bridge.diagnostics.projectMutationIgnoredCount;
+	const flushBefore = bridge.diagnostics.projectMutationFlushCount;
+	const messageMutations = [];
+	for (let i = 0; i < 40; i += 1) {
+		const content = new FakeElement("span");
+		message.appendChild(content);
+		messageMutations.push({ addedNodes: [content] });
+	}
+	observer.callback(messageMutations);
+	await new Promise((resolve) => setTimeout(resolve, 10));
+	assert(bridge.diagnostics.projectMutationCandidateCount >= 40, "message mutation candidates were not recorded");
+	assert(bridge.diagnostics.projectMutationIgnoredCount >= ignoredBefore + 40, "message mutations were not ignored");
+	assert(bridge.diagnostics.projectMutationFlushCount === flushBefore, "message mutations scheduled project integration");
+	const relevantFlushBefore = bridge.diagnostics.projectMutationFlushCount;
+	const coalescedBefore = bridge.diagnostics.projectMutationCoalescedCount;
+	observer.callback([{ addedNodes: [picker, popupProjectButton, picker] }]);
+	assert(bridge.diagnostics.projectMutationPendingRootCount === 1, "coalesced project root count was not bounded");
+	flushAnimationFrames();
+	await new Promise((resolve) => setTimeout(resolve, 10));
+	assert(bridge.diagnostics.projectMutationFlushCount === relevantFlushBefore + 1, "relevant project mutations were not flushed once");
+	assert(bridge.diagnostics.projectMutationCoalescedCount >= coalescedBefore + 2, "nested project mutations were not coalesced");
+	assert(bridge.diagnostics.projectMutationPendingRootCount === 0, "flushed project roots were retained");
+	const incrementalPicker = new FakeElement("div");
+	incrementalPicker.setAttribute("role", "dialog");
+	body.appendChild(incrementalPicker);
+	observer.callback([{ addedNodes: [incrementalPicker] }]);
+	flushAnimationFrames();
+	const incrementalInput = new FakeElement("input");
+	incrementalInput.textContent = "Choose a project…";
+	const incrementalTitle = new FakeElement("div");
+	incrementalTitle.textContent = "Projects";
+	const incrementalList = new FakeElement("div");
+	incrementalList.setAttribute("role", "listbox");
+	const incrementalNoProject = new FakeElement("button");
+	incrementalNoProject.setAttribute("role", "option");
+	incrementalNoProject.textContent = "No Project";
+	incrementalList.appendChild(incrementalNoProject);
+	incrementalPicker.append(incrementalInput, incrementalTitle, incrementalList);
+	observer.callback([{ addedNodes: [incrementalInput, incrementalTitle, incrementalList] }]);
+	flushAnimationFrames();
+	await new Promise((resolve) => setTimeout(resolve, 25));
+	assert(incrementalList.querySelectorAll("[data-cliproxy-local-project-item]").length === 4, "incrementally mounted project picker was not integrated");
+	incrementalPicker.remove();
 	globalThis.sessionStorage.setItem("cliproxyapi.ampLocalInference.selectedLocalProject", JSON.stringify({
 		name: "on-chain",
 		workingDirectory: "/Users/aikins01/Developer/on-chain",
@@ -1453,13 +1842,51 @@ list.appendChild(actions);
 	headerProjectLink.setAttribute("href", "https://github.com/telemetry-dev/telemetry.dev/tree/6bcbce6911b604cfc8dd8255bc9215a930222dfb");
 	popupProjectButton.textContent = "Project: telemetry.dev";
 	await new Promise((resolve) => setTimeout(resolve, 25));
-	const localItems = list.querySelectorAll("[data-cliproxy-local-project-item]");
+const localItems = list.querySelectorAll("[data-cliproxy-local-project-item]");
 assert(localItems.length === 4, "expected four local project items, got " + localItems.length);
+assert(localItems.every((item) => !item.hidden && item.style.display !== "none"), "empty project search treated placeholder text as a query");
 const selected = localItems.find((item) => item.getAttribute("aria-selected") === "true" || item.dataset.selected === "true");
 assert(selected, "no injected local project item was selected");
 assert(selected.dataset.cliproxyLocalProjectWorkingDirectory === "/Users/aikins01/Developer/telemetry.dev", "visible project was not selected: " + selected.innerText);
-	assert(selected.dataset.cliproxyLocalProjectCurrent === "1", "visible project item was not marked current");
+assert(selected.dataset.cliproxyLocalProjectCurrent === "1", "visible project item was not marked current");
 assert(popupProjectButton.textContent.includes("Project: telemetry.dev"), "popup project button stayed stale: " + popupProjectButton.textContent);
+const unrelatedProjectButton = new FakeElement("button");
+unrelatedProjectButton.textContent = "Project: unrelated";
+body.appendChild(unrelatedProjectButton);
+noProject.addEventListener("click", () => { popupProjectButton.textContent = "No Project"; });
+noProject.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, cancelable: true }));
+noProject.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+await new Promise((resolve) => setTimeout(resolve, 75));
+const homeSelection = JSON.parse(globalThis.sessionStorage.getItem("cliproxyapi.ampLocalInference.selectedLocalProject"));
+assert(homeSelection.name === "~" && homeSelection.workingDirectory === "/Users/aikins01", "No Project did not select home: " + JSON.stringify(homeSelection));
+assert(noProject.getAttribute("aria-selected") === "true" && noProject.dataset.selected === "true", "No Project was not the selected picker item");
+assert(localItems.every((item) => item.dataset.cliproxyLocalProjectCurrent === "0" && !(item.querySelector('[data-slot="project-check"]')?.textContent || "")), "No Project left a local project check selected");
+assert(popupProjectButton.textContent.includes("~"), "No Project did not refresh project button: " + popupProjectButton.textContent);
+assert(unrelatedProjectButton.textContent === "Project: unrelated", "project refresh rewrote unrelated control: " + unrelatedProjectButton.textContent);
+unrelatedProjectButton.remove();
+lastFetchURL = "";
+await globalThis.fetch("https://ampcode.com/_app/remote/3abror/createProjectThread", {
+	method: "POST",
+	headers: { "Content-Type": "application/json" },
+	body: JSON.stringify({ payload: "" }),
+});
+const homeCreateURL = new URL(lastFetchURL);
+assert(homeCreateURL.searchParams.get("cliproxy-working-directory") === "/Users/aikins01", "No Project create did not use home: " + lastFetchURL);
+lastFetchURL = "";
+await globalThis.fetch("https://ampcode.com/_app/remote/3abror/createProjectThread", {
+	method: "POST",
+	headers: { "Content-Type": "application/json" },
+	body: JSON.stringify({ payload: encodeDevalue([{ projectID: 1 }, "75616c3b-f4de-48b7-8b83-c1af6978a034"]) }),
+});
+const homeProjectIDCreateURL = new URL(lastFetchURL);
+assert(homeProjectIDCreateURL.searchParams.get("cliproxy-working-directory") === "/Users/aikins01", "No Project create with projectID did not use home: " + lastFetchURL);
+globalThis.sessionStorage.setItem("cliproxyapi.ampLocalInference.selectedLocalProject", JSON.stringify({
+	name: "telemetry.dev",
+	workingDirectory: "/Users/aikins01/Developer/telemetry.dev",
+	selectedAt: Date.now(),
+}));
+globalThis.localStorage.setItem("cliproxyapi.ampLocalInference.workingDirectory", "/Users/aikins01/Developer/telemetry.dev");
+popupProjectButton.textContent = "Project: telemetry.dev";
 input.value = "Developer/telemetry.dev";
 input.dispatchEvent(new FakeEvent("input", { bubbles: true }));
 await new Promise((resolve) => setTimeout(resolve, 25));
@@ -1575,19 +2002,54 @@ assert(explicitDuplicateURL.searchParams.get("cliproxy-working-directory") === t
 			{ name: "bar service", workingDirectory: "/Users/aikins01/Developer/bar/api" },
 		],
 	};
+	const collisionProjectsPayload = localProjectsPayload;
 	for (const item of list.querySelectorAll("[data-cliproxy-local-project-item]")) item.remove();
 	delete list.dataset.cliproxyCurrentProjectAutoSelected;
 	delete list.dataset.cliproxyLocalProjectLoading;
 	delete list.dataset.cliproxyLocalProjectAttempts;
-	delete require.cache[require.resolve(scriptPath)];
-	require(scriptPath);
-	await new Promise((resolve) => setTimeout(resolve, 25));
+	const cleanupFlushBefore = bridge.diagnostics.projectMutationFlushCount;
+	observer.callback([{ addedNodes: [picker] }]);
+		assert(bridge.diagnostics.projectMutationPendingRootCount === 1, "project root was not pending before observer cleanup");
+		deferLocalProjectsFetch = true;
+		localProjectsPayload = {
+		defaultWorkingDirectory: "/Users/aikins01",
+		projects: [{ name: "stale", workingDirectory: "/Users/aikins01/Developer/stale" }],
+		};
+		delete require.cache[require.resolve(scriptPath)];
+		require(scriptPath);
+		assert(observer.disconnected === true, "replaced project observer was not disconnected");
+		assert(bridge.diagnostics.projectMutationPendingRootCount === 0, "observer cleanup retained pending project roots");
+		flushAnimationFrames();
+		assert(bridge.diagnostics.projectMutationFlushCount === cleanupFlushBefore, "stale project observer flushed after cleanup");
+		assert(deferredLocalProjectsFetches.length === 1, "replacement integration did not start a deferred project fetch");
+		const deferredObserver = mutationObservers.at(-1);
+		localProjectsPayload = collisionProjectsPayload;
+		delete require.cache[require.resolve(scriptPath)];
+		require(scriptPath);
+		assert(deferredObserver.disconnected === true, "observer with an in-flight project fetch was not disconnected");
+		assert(deferredLocalProjectsFetches.length === 2, "current integration did not start its own project fetch");
+		deferredLocalProjectsFetches[0]();
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		assert(list.querySelectorAll("[data-cliproxy-local-project-item]").length === 0, "stale project fetch mutated the reinstalled picker");
+		deferredLocalProjectsFetches[1]();
+		deferLocalProjectsFetch = false;
+		await new Promise((resolve) => setTimeout(resolve, 25));
 	const collisionItems = list.querySelectorAll("[data-cliproxy-local-project-item]");
 	const selectedCollision = collisionItems.find((item) => item.getAttribute("aria-selected") === "true" || item.dataset.selected === "true");
 	const collisionSummary = collisionItems.map((item) => item.dataset.cliproxyLocalProjectWorkingDirectory + ":" + item.dataset.selected + ":" + item.getAttribute("aria-selected") + ":" + item.dataset.cliproxyLocalProjectCurrent).join("|");
 	assert(selectedCollision, "no collision local project item was selected: " + collisionSummary);
 	assert(selectedCollision.dataset.cliproxyLocalProjectWorkingDirectory === "/Users/aikins01/Developer/bar/api", "basename collision selected wrong local project: " + selectedCollision.innerText);
-	})().catch((error) => {
+	for (const item of list.querySelectorAll("[data-cliproxy-local-project-item]")) item.remove();
+		delete list.dataset.cliproxyLocalProjectLoading;
+		delete list.dataset.cliproxyLocalProjectAttempts;
+		localProjectsPayload = null;
+		delete require.cache[require.resolve(scriptPath)];
+		require(scriptPath);
+		const malformedProjectsBridge = globalThis.__cliproxyAmpLocalInference;
+		await new Promise((resolve) => setTimeout(resolve, 25));
+		assert(malformedProjectsBridge.diagnostics.localProjectFetchFailureCount === 1, "malformed project response failure was not recorded");
+		assert(malformedProjectsBridge.diagnostics.lastLocalProjectFetchFailure === "invalid_payload", "malformed project response failure status mismatch");
+		})().catch((error) => {
 	console.error(error && error.stack ? error.stack : error);
 	process.exit(1);
 });
@@ -2221,6 +2683,9 @@ func TestWebLocalInferenceUserscriptMatchesAllowedOrigins(t *testing.T) {
 	if strings.Count(body, "// @match https://ampcode.example.test/*") != 1 {
 		t.Fatalf("userscript did not deduplicate normalized origins:\n%s", body)
 	}
+	if !strings.Contains(body, "// @match http://127.0.0.1:8317/*") {
+		t.Fatalf("userscript missing configured base URL origin match:\n%s", body)
+	}
 }
 
 func TestWebLocalInferenceUserscriptRouteUsesConfiguredBaseURL(t *testing.T) {
@@ -2766,6 +3231,27 @@ func TestWebLocalInferenceLocalProjectsRoute(t *testing.T) {
 	if !foundHistoryProject {
 		t.Fatalf("refreshed projects missing history project id=%q dir=%q: %#v", historyID, historyDir, refreshedProjects)
 	}
+	indexPath := neoWebLocalProjectIndexPath(rt.threadDir)
+	indexInfo, err := os.Stat(indexPath)
+	if err != nil {
+		t.Fatalf("stat refreshed project index: %v", err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	repeatedReq := httptest.NewRequest(http.MethodGet, "/ampcode/local-projects.json?"+ampWebLocalInferenceAPIKeyQuery+"=local-key", nil)
+	repeatedReq.Header.Set("Origin", "https://ampcode.com")
+	repeatedReq.Header.Set(ampWebLocalInferenceHeader, "1")
+	repeatedRec := httptest.NewRecorder()
+	r.ServeHTTP(repeatedRec, repeatedReq)
+	if repeatedRec.Code != http.StatusOK {
+		t.Fatalf("repeated local projects status = %d, body=%s", repeatedRec.Code, repeatedRec.Body.String())
+	}
+	repeatedIndexInfo, err := os.Stat(indexPath)
+	if err != nil {
+		t.Fatalf("stat repeated project index: %v", err)
+	}
+	if !repeatedIndexInfo.ModTime().Equal(indexInfo.ModTime()) {
+		t.Fatalf("unchanged local projects request rewrote index mtime=%s want=%s", repeatedIndexInfo.ModTime(), indexInfo.ModTime())
+	}
 
 	unmarkedReq := httptest.NewRequest(http.MethodGet, "/ampcode/local-projects.json?"+ampWebLocalInferenceAPIKeyQuery+"=local-key", nil)
 	unmarkedReq.Header.Set("Origin", "https://ampcode.com")
@@ -2886,6 +3372,10 @@ func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.
 	if _, ok := createThreadDataThread["messages"].([]any); !ok {
 		t.Fatalf("create threadData thread messages = %#v", createThreadDataThread["messages"])
 	}
+	createThreadDataMeta := mapValue(createThreadDataThread["meta"])
+	if stringValue(createThreadDataMeta["executorType"]) != "local-client" || createThreadDataMeta["usesThreadActors"] != true {
+		t.Fatalf("create threadData runtime identity = %#v", createThreadDataMeta)
+	}
 	if createThreadDataThread["hasExecutor"] == false || createThreadDataThread["executorConnected"] == false {
 		t.Fatalf("create threadData leaked disconnected executor state: %#v", createThreadDataThread)
 	}
@@ -2920,6 +3410,39 @@ func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.
 	}
 	if bootstrapExecutorType != "local-client" || spawnedCount != 1 {
 		t.Fatalf("executor bootstrap = type:%q spawned:%d", bootstrapExecutorType, spawnedCount)
+	}
+
+	localProjectThreadID := "T-019f20b2-5e05-7501-8ddd-994e151ee959"
+	localProjectBody := neoSvelteKitRemoteCommandBodyForTest(t, map[string]any{
+		"content":       []any{map[string]any{"type": "text", "text": "Use injected local project"}},
+		"agentMode":     "medium",
+		"spawnExecutor": true,
+		"threadID":      localProjectThreadID,
+		"projectID":     projectID,
+	})
+	localProjectReq := httptest.NewRequest(http.MethodPost, "/_app/remote/3abror/createProjectThread?"+ampWebLocalInferenceAPIKeyQuery+"=local-key&cliproxy-working-directory="+url.QueryEscape(expectedWorkDir)+"&cliproxy-local-project=1", strings.NewReader(localProjectBody))
+	localProjectReq.Header.Set("Content-Type", "application/json")
+	localProjectReq.Header.Set("Origin", "https://ampcode.com")
+	localProjectReq.Header.Set(ampWebLocalInferenceHeader, "1")
+	localProjectRec := httptest.NewRecorder()
+	r.ServeHTTP(localProjectRec, localProjectReq)
+	if localProjectRec.Code != http.StatusOK {
+		t.Fatalf("local-project create status = %d, body=%s", localProjectRec.Code, localProjectRec.Body.String())
+	}
+	localProjectActor := rt.store.lookupThreadActor(localProjectThreadID)
+	if localProjectActor == nil {
+		t.Fatal("local-project thread actor not found")
+	}
+	localProjectActor.mu.Lock()
+	localProjectMeta := cloneMap(localProjectActor.meta)
+	localProjectEnvironment := cloneMap(localProjectActor.environment)
+	localProjectActor.mu.Unlock()
+	if stringValue(localProjectMeta["projectID"]) != "" {
+		t.Fatalf("local-project create kept stale project ID: %#v", localProjectMeta)
+	}
+	workspace := neoRecentThreadWorkspace(localProjectEnvironment)
+	if stringValue(workspace["uri"]) != (&url.URL{Scheme: "file", Path: expectedWorkDir}).String() {
+		t.Fatalf("local-project workspace = %#v, want %q", workspace, expectedWorkDir)
 	}
 
 	projectOnlyThreadID := "T-019f20b2-5e05-7501-8ddd-994e151ee952"
