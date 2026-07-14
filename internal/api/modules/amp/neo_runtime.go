@@ -133,18 +133,19 @@ var (
 	neoInboundMessageHookMu       sync.RWMutex
 	neoInboundMessageHook         func(actor *neoActor, msg map[string]any)
 	errNeoLocalEmptyStream        = errors.New("local provider stream closed before first payload")
+	neoSharedModeToolOrder        = toolList("get_automation", "create_cron_automation", "create_slack_automation", "create_github_automation", "update_automation", "delete_automation", "slack_write", "slack_read", "github_repo_ci_status")
 	neoModeToolOrder              = map[string][]string{
-		"smart":    toolList("finder", "shell_command", "shell_command_status", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "skill", "load_plugin", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "archive_current_thread", "manage_automation", "slack_write", "slack_read", "send_message_to_agg"),
-		"large":    toolList("finder", "shell_command", "shell_command_status", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "skill", "load_plugin", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "archive_current_thread", "manage_automation", "slack_write", "slack_read", "send_message_to_agg"),
-		"rush":     toolList("finder", "shell_command", "shell_command_status", "apply_patch", "web_search", "read_web_page", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "skill", "load_plugin", "oracle", "librarian", "Task", "view_media", "painter", "archive_current_thread", "manage_automation", "slack_write", "slack_read", "send_message_to_agg"),
-		"agg-man":  toolList("find_thread", "read_thread", "web_search", "read_web_page", "docs_list", "docs_read", "docs_write", "create_project", "list_agent_modes", "list_runners", "create_thread", "archive_thread", "archive_threads", "unarchive_thread", "send_message_to_thread", "sleep", "publish_thread_artifacts", "manage_automation", "slack_write", "slack_read", "github_repo_ci_status", "read_github", "search_github", "commit_search", "list_directory_github", "list_repositories", "glob_github", "diff"),
-		"deep":     toolList("shell_command", "shell_command_status", "apply_patch", "web_search", "read_web_page", "Task", "skill", "load_plugin", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "librarian", "oracle", "finder", "view_media", "painter", "archive_current_thread", "manage_automation", "slack_write", "slack_read", "send_message_to_agg"),
+		"smart":    append(toolList("finder", "shell_command", "shell_command_status", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "send_message_to_thread", "skill", "load_plugin", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "archive_current_thread"), neoSharedModeToolOrder...),
+		"large":    append(toolList("finder", "shell_command", "shell_command_status", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "send_message_to_thread", "skill", "load_plugin", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "archive_current_thread"), neoSharedModeToolOrder...),
+		"rush":     append(toolList("finder", "shell_command", "shell_command_status", "apply_patch", "web_search", "read_web_page", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "send_message_to_thread", "skill", "load_plugin", "oracle", "librarian", "Task", "view_media", "painter", "archive_current_thread"), neoSharedModeToolOrder...),
+		"agg-man":  toolList("find_thread", "read_thread", "web_search", "read_web_page", "docs_list", "docs_read", "docs_write", "create_project", "list_agent_modes", "list_runners", "create_thread", "archive_thread", "archive_threads", "unarchive_thread", "send_message_to_thread", "sleep", "publish_thread_artifacts", "slack_write", "slack_read", "github_repo_ci_status", "read_github", "search_github", "commit_search", "list_directory_github", "list_repositories", "glob_github", "diff"),
+		"deep":     append(toolList("shell_command", "shell_command_status", "apply_patch", "web_search", "read_web_page", "Task", "skill", "load_plugin", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "send_message_to_thread", "librarian", "oracle", "finder", "view_media", "painter", "archive_current_thread"), neoSharedModeToolOrder...),
 		"review":   toolList("shell_command", "run_check", "submit_review", "list_agent_modes", "list_runners", "create_thread"),
-		"nostromo": toolList("finder", "shell_command", "shell_command_status", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "skill", "load_plugin", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "archive_current_thread", "manage_automation", "slack_write", "slack_read", "send_message_to_agg", "apply_patch"),
-		"low":      toolList("finder", "shell_command", "shell_command_status", "apply_patch", "web_search", "read_web_page", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "skill", "load_plugin", "oracle", "librarian", "Task", "view_media", "painter", "archive_current_thread", "manage_automation", "slack_write", "slack_read", "send_message_to_agg"),
-		"medium":   toolList("shell_command", "shell_command_status", "apply_patch", "web_search", "read_web_page", "Task", "skill", "load_plugin", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "librarian", "oracle", "finder", "view_media", "painter", "archive_current_thread", "manage_automation", "slack_write", "slack_read", "send_message_to_agg"),
-		"high":     toolList("shell_command", "shell_command_status", "apply_patch", "web_search", "read_web_page", "Task", "skill", "load_plugin", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "librarian", "oracle", "finder", "view_media", "painter", "archive_current_thread", "manage_automation", "slack_write", "slack_read", "send_message_to_agg"),
-		"ultra":    toolList("finder", "shell_command", "shell_command_status", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "skill", "load_plugin", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "archive_current_thread", "manage_automation", "slack_write", "slack_read", "send_message_to_agg"),
+		"nostromo": append(append(toolList("finder", "shell_command", "shell_command_status", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "send_message_to_thread", "skill", "load_plugin", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "archive_current_thread"), neoSharedModeToolOrder...), "apply_patch"),
+		"low":      append(toolList("finder", "shell_command", "shell_command_status", "apply_patch", "web_search", "read_web_page", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "send_message_to_thread", "skill", "load_plugin", "oracle", "librarian", "Task", "view_media", "painter", "archive_current_thread"), neoSharedModeToolOrder...),
+		"medium":   append(toolList("shell_command", "shell_command_status", "apply_patch", "web_search", "read_web_page", "Task", "skill", "load_plugin", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "send_message_to_thread", "librarian", "oracle", "finder", "view_media", "painter", "archive_current_thread"), neoSharedModeToolOrder...),
+		"high":     append(toolList("shell_command", "shell_command_status", "apply_patch", "web_search", "read_web_page", "Task", "skill", "load_plugin", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "send_message_to_thread", "librarian", "oracle", "finder", "view_media", "painter", "archive_current_thread"), neoSharedModeToolOrder...),
+		"ultra":    append(toolList("finder", "shell_command", "shell_command_status", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "send_message_to_thread", "skill", "load_plugin", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "archive_current_thread"), neoSharedModeToolOrder...),
 	}
 	neoModeToolAllowlist         = orderedToolSets(neoModeToolOrder)
 	neoModeDeferredToolAllowlist = map[string]map[string]bool{
@@ -160,8 +161,9 @@ var (
 		"web_search", "read_web_page", "read_mcp_resource", "read_thread", "find_thread", "skill", "load_plugin", "oracle",
 		"librarian", "Task", "view_media", "painter",
 		"gmail_read", "gmail_write",
-		"shell_command", "shell_command_status", "apply_patch", "archive_current_thread", "send_message_to_agg", "run_check", "submit_review", "docs_list", "docs_read", "docs_write",
-		"create_project", "list_agent_modes", "list_runners", "create_thread", "archive_thread", "archive_threads", "unarchive_thread", "send_message_to_thread", "sleep", "publish_thread_artifacts", "manage_automation",
+		"shell_command", "shell_command_status", "apply_patch", "archive_current_thread", "run_check", "submit_review", "docs_list", "docs_read", "docs_write",
+		"create_project", "list_agent_modes", "list_runners", "create_thread", "archive_thread", "archive_threads", "unarchive_thread", "send_message_to_thread", "sleep", "publish_thread_artifacts",
+		"get_automation", "create_cron_automation", "create_slack_automation", "create_github_automation", "update_automation", "delete_automation",
 		"slack_write", "slack_read", "github_repo_ci_status", "read_github", "search_github", "commit_search",
 		"list_directory_github", "list_repositories", "glob_github", "diff",
 	)
@@ -2461,6 +2463,7 @@ func (s *neoActorStore) pruneIdle(now time.Time, ttl time.Duration) int {
 
 type neoActor struct {
 	mu                          sync.Mutex
+	emissionMu                  sync.Mutex
 	runtime                     *neoRuntime
 	id                          string
 	name                        string
@@ -3166,6 +3169,10 @@ func (a *neoActor) handleForSocket(socket *neoSocket, msg map[string]any) any {
 		if payload, ok := normalizeNeoFilesystemRequest("executor_filesystem_read_file", msg); ok {
 			a.broadcast(payload)
 		}
+	case "client_filesystem_delete":
+		if payload, ok := normalizeNeoFilesystemDeleteRequest("executor_filesystem_delete", msg); ok {
+			a.broadcast(payload)
+		}
 	case "client_filesystem_write_file":
 		a.bridgeFilesystemWriteRequest("executor_filesystem_write_file", "client_filesystem_write_file_result", msg)
 	case "client_orb_services_ensure":
@@ -3182,6 +3189,10 @@ func (a *neoActor) handleForSocket(socket *neoSocket, msg map[string]any) any {
 		}
 	case "executor_filesystem_read_file":
 		if payload, ok := normalizeNeoFilesystemRequest("client_filesystem_read_file", msg); ok {
+			a.broadcast(payload)
+		}
+	case "executor_filesystem_delete":
+		if payload, ok := normalizeNeoFilesystemDeleteRequest("client_filesystem_delete", msg); ok {
 			a.broadcast(payload)
 		}
 	case "executor_filesystem_write_file":
@@ -3202,6 +3213,10 @@ func (a *neoActor) handleForSocket(socket *neoSocket, msg map[string]any) any {
 		if payload, ok := normalizeNeoFilesystemFileResult("client_filesystem_read_file_result", msg); ok {
 			a.broadcast(payload)
 		}
+	case "executor_filesystem_delete_result":
+		if payload, ok := normalizeNeoFilesystemWriteResult("client_filesystem_delete_result", msg); ok {
+			a.broadcast(payload)
+		}
 	case "executor_filesystem_write_file_result":
 		if payload, ok := normalizeNeoFilesystemWriteResult("client_filesystem_write_file_result", msg); ok {
 			a.broadcast(payload)
@@ -3220,6 +3235,10 @@ func (a *neoActor) handleForSocket(socket *neoSocket, msg map[string]any) any {
 		}
 	case "client_filesystem_read_file_result":
 		if payload, ok := normalizeNeoFilesystemFileResult("executor_filesystem_read_file_result", msg); ok {
+			a.broadcast(payload)
+		}
+	case "client_filesystem_delete_result":
+		if payload, ok := normalizeNeoFilesystemWriteResult("executor_filesystem_delete_result", msg); ok {
 			a.broadcast(payload)
 		}
 	case "client_filesystem_write_file_result":
@@ -16826,10 +16845,11 @@ func (a *neoActor) sendSnapshot(socket *neoSocket, sinceSeq int) bool {
 		inflightInference = &clone
 	}
 	agentState = normalizeNeoAgentState(agentState)
-	if activeErrorSeq > sinceSeq {
-		if len(activeError) > 0 {
+	if !fallbackSnapshot {
+		restoreActiveError := len(activeError) > 0 && (activeErrorSeq > sinceSeq || (sinceSeq > 0 && sinceSeq == seq))
+		if restoreActiveError {
 			replayFrames = append(replayFrames, neoSnapshotReplayFrame{seq: activeErrorSeq, messageIndex: -1, payload: map[string]any{"type": "error_set", "seq": activeErrorSeq, "error": activeError}})
-		} else {
+		} else if activeErrorSeq > sinceSeq {
 			replayFrames = append(replayFrames, neoSnapshotReplayFrame{seq: activeErrorSeq, messageIndex: -1, payload: map[string]any{"type": "error_cleared", "seq": activeErrorSeq}})
 		}
 	}
@@ -16904,6 +16924,26 @@ func (a *neoActor) sendSnapshot(socket *neoSocket, sinceSeq int) bool {
 			continue
 		}
 		send(frame.payload)
+	}
+	if fallbackSnapshot {
+		if socket != nil {
+			a.emissionMu.Lock()
+		}
+		a.mu.Lock()
+		fallbackActiveError := cloneMap(a.activeError)
+		fallbackActiveErrorSeq := a.activeErrorSeq
+		a.mu.Unlock()
+		send(map[string]any{"type": "error_cleared", "seq": seq})
+		if len(fallbackActiveError) > 0 {
+			errorSeq := fallbackActiveErrorSeq
+			if errorSeq <= 0 {
+				errorSeq = seq
+			}
+			send(map[string]any{"type": "error_set", "seq": errorSeq, "error": fallbackActiveError})
+		}
+		if socket != nil {
+			a.emissionMu.Unlock()
+		}
 	}
 	send(map[string]any{"type": "thread_relationships", "seq": seq, "relationships": relationships})
 	send(map[string]any{"type": "compaction_records", "records": compactionRecords})
@@ -18559,6 +18599,19 @@ func normalizeNeoFilesystemRequest(outboundType string, msg map[string]any) (map
 		return nil, false
 	}
 	return map[string]any{"type": outboundType, "requestId": requestID, "uri": uri}, true
+}
+
+func normalizeNeoFilesystemDeleteRequest(outboundType string, msg map[string]any) (map[string]any, bool) {
+	request, ok := normalizeNeoFilesystemRequest(outboundType, msg)
+	if !ok {
+		return nil, false
+	}
+	recursive, ok := msg["recursive"].(bool)
+	if !ok {
+		return nil, false
+	}
+	request["recursive"] = recursive
+	return request, true
 }
 
 func normalizeNeoFilesystemWriteRequest(outboundType string, msg map[string]any) (map[string]any, bool) {
@@ -20400,6 +20453,8 @@ func neoObserversPayload(count int, hasExecutor bool) map[string]any {
 
 func (a *neoActor) broadcast(payload any) {
 	a.maybeBroadcastThreadStatusUpdated(payload)
+	a.emissionMu.Lock()
+	defer a.emissionMu.Unlock()
 	for _, socket := range a.socketList() {
 		if socket == nil || !socket.canSend() {
 			continue
@@ -21239,7 +21294,13 @@ func (a *neoActor) canReplayFrom(sinceSeq int) bool {
 }
 
 func (a *neoActor) canReplayFromLocked(sinceSeq, lastSeq int) bool {
-	if !a.replayContinuityKnown || len(a.replayEvents) == 0 || sinceSeq > lastSeq {
+	if sinceSeq > lastSeq {
+		return false
+	}
+	if sinceSeq == lastSeq {
+		return true
+	}
+	if !a.replayContinuityKnown || len(a.replayEvents) == 0 {
 		return false
 	}
 	firstSeq := a.replayEvents[0].Seq
@@ -22204,7 +22265,8 @@ func neoOutboundLocalExtensionOnly(payload any) bool {
 		"draft",
 		"main-thread",
 		"max-tokens",
-		"setPendingNavigation":
+		"setPendingNavigation",
+		"thread_relationships":
 		return true
 	default:
 		return false

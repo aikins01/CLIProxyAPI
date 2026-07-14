@@ -8,19 +8,6 @@ import (
 	"testing"
 )
 
-// The Amp binary parity audit (cmd/amp_binary_audit) deliberately normalizes each
-// agent mode's includeTools reference to the literal "present" because it cannot
-// resolve the rotating minified array variable. That leaves the actual per-mode tool
-// *contents* uncovered: a tool added to or removed from a mode in the binary is
-// invisible to the audit and to the committed baseline. This is exactly the blind
-// spot that let an extra "chart" tool sit in our deep/nostromo lists undetected.
-//
-// These tests close that gap. They derive each mode's tool list straight from the
-// installed Amp binary using only stable anchors (the systemPrompt:"<mode>" key, the
-// includeTools/deferredTools field keys, array literals, and the
-// Array.from(new Set([...a,...b])) derivation), so they survive re-minification, and
-// assert our hardcoded neoModeToolOrder / neoModeDeferredToolAllowlist match.
-
 // neoModeSystemPromptKey maps our internal mode key to the systemPrompt value the Amp
 // binary uses to identify that mode's profile (only agg-man differs: "aggman").
 var neoModeSystemPromptKey = map[string]string{
@@ -144,6 +131,29 @@ func TestNeoModeToolOrderMatchesAmpBinary(t *testing.T) {
 	}
 }
 
+func TestNeoResumeHighWaterEventMatchesAmpDecoder(t *testing.T) {
+	text, path := neoToolParityLoadBinary(t)
+	if !strings.Contains(text, `literal("error_cleared"),seq:`) {
+		t.Fatalf("Amp binary %s does not decode a sequenced error_cleared event", path)
+	}
+	cursorStart := strings.Index(text, "advanceResumeCursor(T){")
+	if cursorStart < 0 {
+		t.Fatalf("Amp binary %s has no advanceResumeCursor implementation", path)
+	}
+	cursor := text[cursorStart:min(cursorStart+500, len(text))]
+	if !strings.Contains(cursor, `"seq"in`) || !strings.Contains(cursor, ".advanceFromSeq(") {
+		t.Fatalf("Amp binary %s resume cursor no longer advances from event seq: %s", path, cursor)
+	}
+	agentStateStart := strings.Index(text, `literal("agent_state")`)
+	if agentStateStart < 0 {
+		t.Fatalf("Amp binary %s has no agent_state decoder", path)
+	}
+	agentStateSchema := text[agentStateStart:min(agentStateStart+220, len(text))]
+	if strings.Contains(agentStateSchema, "seq:") {
+		t.Fatalf("Amp binary %s agent_state decoder unexpectedly accepts seq: %s", path, agentStateSchema)
+	}
+}
+
 func neoToolParityLoadBinary(t *testing.T) (string, string) {
 	t.Helper()
 	path := strings.TrimSpace(os.Getenv("AMP_BINARY"))
@@ -207,22 +217,23 @@ func neoToolParityResolveArray(text, ident string, depth int) ([]string, bool) {
 			return neoToolParityArrayLiteralTools(text, body, depth)
 		}
 	}
-	setNeedle := ident + "=Array.from(new Set(["
-	if at := neoToolParityIndexUnbound(text, setNeedle); at >= 0 {
-		inner := text[at+len(setNeedle):]
-		if end := strings.IndexByte(inner, ']'); end >= 0 {
-			var out []string
+	for _, setNeedle := range []string{ident + "=Array.from(new Set([", ident + "=new Set(["} {
+		if at := neoToolParityIndexUnbound(text, setNeedle); at >= 0 {
+			bracket := at + len(setNeedle) - 1
+			body, ok := neoToolParityScanBracket(text, bracket)
+			if !ok {
+				return nil, false
+			}
+			items, ok := neoToolParityArrayLiteralTools(text, body, depth)
+			if !ok {
+				return nil, false
+			}
+			out := make([]string, 0, len(items))
 			seen := map[string]bool{}
-			for _, spread := range neoToolParitySpreads(inner[:end]) {
-				sub, ok := neoToolParityResolveArray(text, spread, depth+1)
-				if !ok {
-					return nil, false
-				}
-				for _, n := range sub {
-					if !seen[n] {
-						seen[n] = true
-						out = append(out, n)
-					}
+			for _, name := range items {
+				if !seen[name] {
+					seen[name] = true
+					out = append(out, name)
 				}
 			}
 			if len(out) > 0 {
