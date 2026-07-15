@@ -136,17 +136,17 @@ var (
 	errNeoLocalEmptyStream        = errors.New("local provider stream closed before first payload")
 	neoSharedModeToolOrder        = toolList("get_automation", "create_cron_automation", "create_slack_automation", "create_github_automation", "update_automation", "delete_automation", "slack_write", "slack_read", "github_repo_ci_status")
 	neoModeToolOrder              = map[string][]string{
-		"smart":    append(toolList("finder", "shell_command", "shell_command_status", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "send_message_to_thread", "skill", "load_plugin", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "archive_current_thread"), neoSharedModeToolOrder...),
-		"large":    append(toolList("finder", "shell_command", "shell_command_status", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "send_message_to_thread", "skill", "load_plugin", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "archive_current_thread"), neoSharedModeToolOrder...),
-		"rush":     append(toolList("finder", "shell_command", "shell_command_status", "apply_patch", "web_search", "read_web_page", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "send_message_to_thread", "skill", "load_plugin", "oracle", "librarian", "Task", "view_media", "painter", "archive_current_thread"), neoSharedModeToolOrder...),
+		"smart":    append(toolList("finder", "shell_command", "shell_command_status", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "send_message_to_thread", "skill", "load_plugin", "oracle", "librarian", "Task", "view_media", "painter", "public_artifact_url", "read_mcp_resource", "archive_current_thread"), neoSharedModeToolOrder...),
+		"large":    append(toolList("finder", "shell_command", "shell_command_status", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "send_message_to_thread", "skill", "load_plugin", "oracle", "librarian", "Task", "view_media", "painter", "public_artifact_url", "read_mcp_resource", "archive_current_thread"), neoSharedModeToolOrder...),
+		"rush":     append(toolList("finder", "shell_command", "shell_command_status", "apply_patch", "web_search", "read_web_page", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "send_message_to_thread", "skill", "load_plugin", "oracle", "librarian", "Task", "view_media", "painter", "public_artifact_url", "archive_current_thread"), neoSharedModeToolOrder...),
 		"agg-man":  toolList("find_thread", "read_thread", "web_search", "read_web_page", "docs_list", "docs_read", "docs_write", "create_project", "list_agent_modes", "list_runners", "create_thread", "archive_thread", "archive_threads", "unarchive_thread", "send_message_to_thread", "sleep", "publish_thread_artifacts", "slack_write", "slack_read", "github_repo_ci_status", "read_github", "search_github", "commit_search", "list_directory_github", "list_repositories", "glob_github", "diff"),
-		"deep":     append(toolList("shell_command", "shell_command_status", "apply_patch", "web_search", "read_web_page", "Task", "skill", "load_plugin", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "send_message_to_thread", "librarian", "oracle", "finder", "view_media", "painter", "archive_current_thread"), neoSharedModeToolOrder...),
+		"deep":     append(toolList("shell_command", "shell_command_status", "apply_patch", "web_search", "read_web_page", "Task", "skill", "load_plugin", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "send_message_to_thread", "librarian", "oracle", "finder", "view_media", "painter", "public_artifact_url", "archive_current_thread"), neoSharedModeToolOrder...),
 		"review":   toolList("shell_command", "run_check", "submit_review", "list_agent_modes", "list_runners", "create_thread"),
-		"nostromo": append(append(toolList("finder", "shell_command", "shell_command_status", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "send_message_to_thread", "skill", "load_plugin", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "archive_current_thread"), neoSharedModeToolOrder...), "apply_patch"),
-		"low":      append(toolList("finder", "shell_command", "shell_command_status", "apply_patch", "web_search", "read_web_page", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "send_message_to_thread", "skill", "load_plugin", "oracle", "librarian", "Task", "view_media", "painter", "archive_current_thread"), neoSharedModeToolOrder...),
-		"medium":   append(toolList("shell_command", "shell_command_status", "apply_patch", "web_search", "read_web_page", "Task", "skill", "load_plugin", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "send_message_to_thread", "librarian", "oracle", "finder", "view_media", "painter", "archive_current_thread"), neoSharedModeToolOrder...),
-		"high":     append(toolList("shell_command", "shell_command_status", "apply_patch", "web_search", "read_web_page", "Task", "skill", "load_plugin", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "send_message_to_thread", "librarian", "oracle", "finder", "view_media", "painter", "archive_current_thread"), neoSharedModeToolOrder...),
-		"ultra":    append(toolList("finder", "shell_command", "shell_command_status", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "send_message_to_thread", "skill", "load_plugin", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "archive_current_thread"), neoSharedModeToolOrder...),
+		"nostromo": append(append(toolList("finder", "shell_command", "shell_command_status", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "send_message_to_thread", "skill", "load_plugin", "oracle", "librarian", "Task", "view_media", "painter", "public_artifact_url", "read_mcp_resource", "archive_current_thread"), neoSharedModeToolOrder...), "apply_patch"),
+		"low":      append(toolList("finder", "shell_command", "shell_command_status", "apply_patch", "web_search", "read_web_page", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "send_message_to_thread", "skill", "load_plugin", "oracle", "librarian", "Task", "view_media", "painter", "public_artifact_url", "archive_current_thread"), neoSharedModeToolOrder...),
+		"medium":   append(toolList("shell_command", "shell_command_status", "apply_patch", "web_search", "read_web_page", "Task", "skill", "load_plugin", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "send_message_to_thread", "librarian", "oracle", "finder", "view_media", "painter", "public_artifact_url", "archive_current_thread"), neoSharedModeToolOrder...),
+		"high":     append(toolList("shell_command", "shell_command_status", "apply_patch", "web_search", "read_web_page", "Task", "skill", "load_plugin", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "send_message_to_thread", "librarian", "oracle", "finder", "view_media", "painter", "public_artifact_url", "archive_current_thread"), neoSharedModeToolOrder...),
+		"ultra":    append(toolList("finder", "shell_command", "shell_command_status", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "send_message_to_thread", "skill", "load_plugin", "oracle", "librarian", "Task", "view_media", "painter", "public_artifact_url", "read_mcp_resource", "archive_current_thread"), neoSharedModeToolOrder...),
 	}
 	neoModeToolAllowlist         = orderedToolSets(neoModeToolOrder)
 	neoModeDeferredToolAllowlist = map[string]map[string]bool{
@@ -160,7 +160,7 @@ var (
 	neoKnownModeTools = toolSet(
 		"finder", "create_file", "edit_file",
 		"web_search", "read_web_page", "read_mcp_resource", "read_thread", "find_thread", "skill", "load_plugin", "oracle",
-		"librarian", "Task", "view_media", "painter",
+		"librarian", "Task", "view_media", "painter", "public_artifact_url",
 		"gmail_read", "gmail_write",
 		"shell_command", "shell_command_status", "apply_patch", "archive_current_thread", "run_check", "submit_review", "docs_list", "docs_read", "docs_write",
 		"create_project", "list_agent_modes", "list_runners", "create_thread", "archive_thread", "archive_threads", "unarchive_thread", "send_message_to_thread", "sleep", "publish_thread_artifacts",
@@ -2496,6 +2496,7 @@ type neoActor struct {
 	queue                       []neoQueuedMessage
 	queuedIDSeq                 int
 	pendingTools                map[string]neoPendingTool
+	closedNestedToolScopes      map[string]bool
 	subagentWaiters             map[string]chan map[string]any
 	subagentTools               map[string]neoPendingTool
 	approvalQueue               []map[string]any
@@ -2837,6 +2838,7 @@ func newNeoActor(rt *neoRuntime, id, name, key, threadID string, record map[stri
 		tools:                  map[string]neoToolSpec{},
 		skillSnapshot:          map[string]any{},
 		pendingTools:           map[string]neoPendingTool{},
+		closedNestedToolScopes: map[string]bool{},
 		subagentTools:          map[string]neoPendingTool{},
 		sockets:                map[*neoSocket]struct{}{},
 		spawnedExecutors:       map[string]*neoSpawnedExecutor{},
@@ -3153,6 +3155,8 @@ func (a *neoActor) handleForSocket(socket *neoSocket, msg map[string]any) any {
 		a.handleProtocolMessageAdded(msg)
 	case "message_updated":
 		a.handleProtocolMessageUpdated(msg)
+	case "client_truncate_thread":
+		a.handleClientThreadTruncate(msg)
 	case "thread_truncated":
 		a.handleProtocolThreadTruncated(msg)
 	case "thread:truncate":
@@ -3279,6 +3283,11 @@ func (a *neoActor) handleForSocket(socket *neoSocket, msg map[string]any) any {
 		"executor_terminal_open", "executor_terminal_input", "executor_terminal_resize", "executor_terminal_close", "executor_terminal_output", "executor_terminal_exit":
 		if bridgedType, ok := neoTerminalBridgeType(msgType); ok {
 			a.routeTerminalBridge(socket, msg, bridgedType)
+		}
+	case "client_executor_relay_open", "client_executor_relay_data", "client_executor_relay_close",
+		"executor_relay_output", "executor_relay_exit":
+		if bridgedType, ok := neoExecutorRelayBridgeType(msgType); ok {
+			a.routeExecutorRelayBridge(socket, msg, bridgedType)
 		}
 	case "client_upload_assets":
 		a.broadcast(neoRetypedMessage(msg, "executor_upload_assets"))
@@ -6226,6 +6235,10 @@ func (a *neoActor) handleProtocolMessageAdded(msg map[string]any) {
 	}
 
 	a.mu.Lock()
+	if incoming.ParentToolUseID != "" && a.messageIndexLocked(incoming.MessageID) < 0 && a.rejectNewNestedMessageLocked(incoming) {
+		a.mu.Unlock()
+		return
+	}
 	seq := a.protocolSeqLocked(msg)
 	incoming.Seq = seq
 	a.dropSyntheticToolResultMessagesLocked(incoming)
@@ -6261,9 +6274,13 @@ func (a *neoActor) handleProtocolMessageUpdated(msg map[string]any) {
 	}
 
 	a.mu.Lock()
+	index := a.messageIndexLocked(incoming.MessageID)
+	if index < 0 && incoming.ParentToolUseID != "" && a.rejectNewNestedMessageLocked(incoming) {
+		a.mu.Unlock()
+		return
+	}
 	seq := a.protocolSeqLocked(msg)
 	a.dropSyntheticToolResultMessagesLocked(incoming)
-	index := a.messageIndexLocked(incoming.MessageID)
 	if index >= 0 && incoming.ParentToolUseID == "" {
 		incoming.ParentToolUseID = a.messages[index].ParentToolUseID
 	}
@@ -6287,16 +6304,87 @@ func (a *neoActor) handleProtocolMessageUpdated(msg map[string]any) {
 	}
 }
 
+func (a *neoActor) rejectNewNestedMessageLocked(message neoMessage) bool {
+	if !a.nestedToolScopeClosedLocked(message.ParentToolUseID) {
+		return false
+	}
+	if a.closedNestedToolScopes == nil {
+		a.closedNestedToolScopes = map[string]bool{}
+	}
+	for _, rawBlock := range message.Content {
+		block := mapValue(rawBlock)
+		if stringValue(block["type"]) != "tool_use" {
+			continue
+		}
+		if toolCallID := firstNonEmptyString(block["id"], block["toolUseID"], block["toolUseId"], block["tool_use_id"], block["toolCallId"]); toolCallID != "" {
+			a.closedNestedToolScopes[toolCallID] = true
+		}
+	}
+	return true
+}
+
+func (a *neoActor) nestedToolScopeClosedLocked(toolCallID string) bool {
+	if toolCallID == "" {
+		return false
+	}
+	seen := map[string]bool{}
+	for toolCallID != "" && !seen[toolCallID] {
+		seen[toolCallID] = true
+		if a.closedNestedToolScopes[toolCallID] {
+			return true
+		}
+		parentToolCallID := ""
+		for i := len(a.messages) - 1; i >= 0; i-- {
+			message := a.messages[i]
+			for _, rawBlock := range message.Content {
+				block := mapValue(rawBlock)
+				switch stringValue(block["type"]) {
+				case "tool_use":
+					if firstNonEmptyString(block["id"], block["toolUseID"], block["toolUseId"], block["tool_use_id"], block["toolCallId"]) == toolCallID {
+						parentToolCallID = firstNonEmptyString(block["parentToolCallId"], block["parentToolUseId"], message.ParentToolUseID)
+					}
+				case "tool_result":
+					resultToolCallID := firstNonEmptyString(block["toolUseID"], block["toolUseId"], block["tool_use_id"], block["toolCallId"])
+					if resultToolCallID == toolCallID && neoToolRunTerminal(mapValue(block["run"])) {
+						if a.closedNestedToolScopes == nil {
+							a.closedNestedToolScopes = map[string]bool{}
+						}
+						a.closedNestedToolScopes[toolCallID] = true
+						return true
+					}
+				}
+			}
+		}
+		toolCallID = parentToolCallID
+	}
+	return false
+}
+
 func (a *neoActor) handleProtocolThreadTruncated(msg map[string]any) {
 	truncateFromMessage := stringValue(msg["truncateFromMessage"])
 	if truncateFromMessage == "" {
 		a.broadcast(msg)
 		return
 	}
+	a.truncateThreadFromMessage(msg, truncateFromMessage, false)
+}
 
+func (a *neoActor) handleClientThreadTruncate(msg map[string]any) {
+	messageID := stringValue(msg["messageId"])
+	if !neoMessageIDPattern.MatchString(messageID) {
+		return
+	}
+	a.truncateThreadFromMessage(msg, messageID, true)
+}
+
+func (a *neoActor) truncateThreadFromMessage(msg map[string]any, truncateFromMessage string, requireExisting bool) {
 	a.mu.Lock()
-	seq := a.protocolSeqLocked(msg)
 	index := a.messageIndexLocked(truncateFromMessage)
+	if requireExisting && index < 0 {
+		a.mu.Unlock()
+		return
+	}
+	seq := a.protocolSeqLocked(msg)
 	pluginUIRequestIDs := []string(nil)
 	var errorCleared map[string]any
 	if index >= 0 {
@@ -19273,6 +19361,23 @@ func neoTerminalBridgeType(msgType string) (string, bool) {
 	}
 }
 
+func neoExecutorRelayBridgeType(msgType string) (string, bool) {
+	switch msgType {
+	case "client_executor_relay_open":
+		return "executor_relay_open", true
+	case "client_executor_relay_data":
+		return "executor_relay_data", true
+	case "client_executor_relay_close":
+		return "executor_relay_close", true
+	case "executor_relay_output":
+		return "client_executor_relay_output", true
+	case "executor_relay_exit":
+		return "client_executor_relay_exit", true
+	default:
+		return "", false
+	}
+}
+
 func normalizeNeoClientGitCommand(msg map[string]any) (map[string]any, bool) {
 	requestID, ok := neoRequiredString(msg["requestId"])
 	if !ok {
@@ -20710,6 +20815,34 @@ func (a *neoActor) routeTerminalBridge(source *neoSocket, msg map[string]any, br
 		return
 	}
 	if strings.HasPrefix(msgType, "executor_terminal_") {
+		a.mu.Lock()
+		executorSocket := a.executorSocket
+		a.mu.Unlock()
+		if source != nil && executorSocket != nil && source != executorSocket {
+			return
+		}
+		for _, socket := range a.socketList() {
+			if socket == source || socket.isExecutor() {
+				continue
+			}
+			socket.send(payload)
+		}
+	}
+}
+
+func (a *neoActor) routeExecutorRelayBridge(source *neoSocket, msg map[string]any, bridgedType string) {
+	payload := neoRetypedMessage(msg, bridgedType)
+	msgType := stringValue(msg["type"])
+	if strings.HasPrefix(msgType, "client_executor_relay_") {
+		a.mu.Lock()
+		executorSocket := a.executorSocket
+		a.mu.Unlock()
+		if executorSocket != nil {
+			executorSocket.send(payload)
+		}
+		return
+	}
+	if strings.HasPrefix(msgType, "executor_relay_") {
 		a.mu.Lock()
 		executorSocket := a.executorSocket
 		a.mu.Unlock()

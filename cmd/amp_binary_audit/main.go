@@ -52,7 +52,7 @@ var (
 	openAIImagesSDKPattern               = regexp.MustCompile(`\.images\.[a-z]+\(`)
 	googleImageGenerationFeaturePattern  = regexp.MustCompile(`featureHeader:[A-Za-z0-9_$]+\?\?"amp\.image-generation"`)
 	ampHeaderConstantsPattern            = regexp.MustCompile(`Vw="([^"]+)",QRT="([^"]+)",LU="([^"]+)",ART="([^"]+)",RTT="([^"]+)",TTT="([^"]+)"`)
-	anthropicFastModeBetaPattern         = regexp.MustCompile(`VpT="([^"]+)"`)
+	anthropicFastModeBetaPattern         = regexp.MustCompile(`VpT="(fast-mode-[^"]+)"`)
 	anthropicThinkingBetaPattern         = regexp.MustCompile(`if\(\(R\["([^"]+)"\]\?\?!0\)&&R\["([^"]+)"\]&&!FOR\(e\)\)a\.push\("([^"]+)"\)`)
 	anthropicProviderPattern             = regexp.MustCompile(`if\(R\["([^"]+)"\]\)c=R\["([^"]+)"\]`)
 	anthropicSpeedPattern                = regexp.MustCompile(`if\(XpT\(e,R\["([^"]+)"\]\)==="([^"]+)"\)a\.push\(VpT\),c="([^"]+)"`)
@@ -112,6 +112,11 @@ var knownRawThreadDeltaEventValues = map[string]struct{}{
 	"client_cancel":                             {},
 	"client_dismiss_active_error":               {},
 	"client_edit_message":                       {},
+	"client_executor_relay_close":               {},
+	"client_executor_relay_data":                {},
+	"client_executor_relay_exit":                {},
+	"client_executor_relay_open":                {},
+	"client_executor_relay_output":              {},
 	"client_filesystem_delete":                  {},
 	"client_filesystem_delete_result":           {},
 	"client_filesystem_read_directory":          {},
@@ -142,6 +147,7 @@ var knownRawThreadDeltaEventValues = map[string]struct{}{
 	"client_terminal_resize":                    {},
 	"client_steer_queued_msg":                   {},
 	"client_tool_approval_response":             {},
+	"client_truncate_thread":                    {},
 	"client_update_thread_settings":             {},
 	"client_upsert_notification_subscription":   {},
 	"compaction_complete":                       {},
@@ -176,6 +182,11 @@ var knownRawThreadDeltaEventValues = map[string]struct{}{
 	"executor_orb_services_ensure":              {},
 	"executor_orb_services_ensure_result":       {},
 	"executor_plugin_message":                   {},
+	"executor_relay_close":                      {},
+	"executor_relay_data":                       {},
+	"executor_relay_exit":                       {},
+	"executor_relay_open":                       {},
+	"executor_relay_output":                     {},
 	"executor_skill_snapshot":                   {},
 	"executor_status":                           {},
 	"executor_terminal_close":                   {},
@@ -226,6 +237,11 @@ var knownThreadProtocolEvents = []string{
 	"client_cancel",
 	"client_dismiss_active_error",
 	"client_edit_message",
+	"client_executor_relay_close",
+	"client_executor_relay_data",
+	"client_executor_relay_exit",
+	"client_executor_relay_open",
+	"client_executor_relay_output",
 	"client_filesystem_read_directory",
 	"client_filesystem_read_directory_result",
 	"client_filesystem_read_file",
@@ -250,6 +266,7 @@ var knownThreadProtocolEvents = []string{
 	"client_terminal_resize",
 	"client_steer_queued_msg",
 	"client_tool_approval_response",
+	"client_truncate_thread",
 	"client_update_thread_settings",
 	"client_upsert_notification_subscription",
 	"compaction_complete",
@@ -277,6 +294,11 @@ var knownThreadProtocolEvents = []string{
 	"executor_guidance_discovery",
 	"executor_guidance_snapshot",
 	"executor_plugin_message",
+	"executor_relay_close",
+	"executor_relay_data",
+	"executor_relay_exit",
+	"executor_relay_open",
+	"executor_relay_output",
 	"executor_skill_snapshot",
 	"executor_status",
 	"executor_terminal_close",
@@ -572,23 +594,19 @@ var streamJSONMarkers = map[string]string{
 	"is_error":               "result-field",
 	"mcp_servers":            "init-field",
 	"num_turns":              "result-field",
-	"reasoning_effort":       "init-field",
 	"session_id":             "shared-field",
 	"stream-json":            "execute-mode",
 }
 
 var modeSettingMarkers = map[string]string{
-	"agentMode":                 "thread-metadata",
-	"anthropic.speed":           "provider-speed",
-	"draftThreadSettings":       "draft-settings",
-	"explicitEffort":            "session-default",
-	"gemini.thinkingLevel":      "provider-thinking",
-	"internal.model":            "thread-setting",
-	"lastReasoningEffortByMode": "session-default",
-	"lastSpeedByMode":           "session-default",
-	"openai.speed":              "provider-speed",
-	"reasoning.effort":          "thread-setting",
-	"reasoningEffort":           "thread-metadata",
+	"agentMode":            "thread-metadata",
+	"anthropic.speed":      "provider-speed",
+	"draftThreadSettings":  "draft-settings",
+	"gemini.thinkingLevel": "provider-thinking",
+	"internal.model":       "thread-setting",
+	"lastSpeedByMode":      "session-default",
+	"openai.speed":         "provider-speed",
+	"reasoningEffort":      "thread-metadata",
 }
 
 var providerProtocolMarkers = map[string]string{
@@ -662,23 +680,23 @@ var knownPromptTagCountValues = map[string]int{
 	"prompt/compaction":    6,
 	"prompt/guidance":      6,
 	"prompt/painter":       3,
-	"prompt/skills":        10,
+	"prompt/skills":        11,
 	"prompt/system-prompt": 1,
-	"prompt/tools":         37,
+	"prompt/tools":         38,
 	"source/artifacts":     2,
 	"source/code-review":   3,
 	"source/compaction":    18,
 	"source/guidance":      27,
 	"source/painter":       5,
-	"source/settings":      22,
+	"source/settings":      18,
 	"source/skills":        43,
 	"source/system-prompt": 1,
 	"source/tools":         160,
 }
 
 var knownPromptKindCountValues = map[string]int{
-	"prompt": 56,
-	"source": 193,
+	"prompt": 58,
+	"source": 192,
 }
 
 type agentModeMarker struct {
@@ -718,16 +736,16 @@ const knownSharedAgentModeTools = ",get_automation,create_cron_automation,create
 
 var knownAgentModeProfileValues = map[string]struct{}{
 	"agg-man|primary=GPT_5_5|reasoning=none|levels=|include=present|tools=find_thread,read_thread,web_search,read_web_page,docs_list,docs_read,docs_write,create_project,list_agent_modes,list_runners,create_thread,archive_thread,archive_threads,unarchive_thread,send_message_to_thread,sleep,publish_thread_artifacts,slack_write,slack_read,github_repo_ci_status,read_github,search_github,commit_search,list_directory_github,list_repositories,glob_github,diff|deferred=false|visible=false|visibleInV2=false|serverOnly=true": {},
-	"deep|primary=GPT_5_5|reasoning=medium|levels=low,medium,xhigh|include=present|tools=shell_command,shell_command_status,apply_patch,web_search,read_web_page,Task,skill,load_plugin,read_thread,find_thread,list_agent_modes,list_runners,create_thread,send_message_to_thread,librarian,oracle,finder,view_media,painter,archive_current_thread" + knownSharedAgentModeTools + "|deferred=true|visible=false|visibleInV2=false|serverOnly=false":                                                                                    {},
-	"high|primary=GPT_5_6_SOL|reasoning=xhigh|levels=|include=present|tools=shell_command,shell_command_status,apply_patch,web_search,read_web_page,Task,skill,load_plugin,read_thread,find_thread,list_agent_modes,list_runners,create_thread,send_message_to_thread,librarian,oracle,finder,view_media,painter,archive_current_thread" + knownSharedAgentModeTools + "|deferred=true|visible=true|visibleInV2=true|serverOnly=false":                                                                                                   {},
-	"large|primary=CLAUDE_OPUS_4_8|reasoning=|levels=|include=present|tools=finder,shell_command,shell_command_status,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,list_agent_modes,list_runners,create_thread,send_message_to_thread,skill,load_plugin,oracle,librarian,Task,view_media,painter,read_mcp_resource,archive_current_thread" + knownSharedAgentModeTools + "|deferred=true|visible=false|visibleInV2=false|serverOnly=false":                                                                     {},
-	"low|primary=AMP_GLM_5_2|reasoning=medium|levels=|include=present|tools=finder,shell_command,shell_command_status,apply_patch,web_search,read_web_page,read_thread,find_thread,list_agent_modes,list_runners,create_thread,send_message_to_thread,skill,load_plugin,oracle,librarian,Task,view_media,painter,archive_current_thread" + knownSharedAgentModeTools + "|deferred=false|visible=true|visibleInV2=true|serverOnly=false":                                                                                                  {},
-	"medium|primary=GPT_5_6_SOL|reasoning=medium|levels=|include=present|tools=shell_command,shell_command_status,apply_patch,web_search,read_web_page,Task,skill,load_plugin,read_thread,find_thread,list_agent_modes,list_runners,create_thread,send_message_to_thread,librarian,oracle,finder,view_media,painter,archive_current_thread" + knownSharedAgentModeTools + "|deferred=true|visible=true|visibleInV2=true|serverOnly=false":                                                                                                {},
-	"nostromo|primary=AMP_NOSTROMO|reasoning=low|levels=|include=present|tools=finder,shell_command,shell_command_status,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,list_agent_modes,list_runners,create_thread,send_message_to_thread,skill,load_plugin,oracle,librarian,Task,view_media,painter,read_mcp_resource,archive_current_thread" + knownSharedAgentModeTools + ",apply_patch|deferred=false|visible=true|visibleInV2=true|serverOnly=false":                                                       {},
+	"deep|primary=GPT_5_5|reasoning=medium|levels=|include=present|tools=shell_command,shell_command_status,apply_patch,web_search,read_web_page,Task,skill,load_plugin,read_thread,find_thread,list_agent_modes,list_runners,create_thread,send_message_to_thread,librarian,oracle,finder,view_media,painter,public_artifact_url,archive_current_thread" + knownSharedAgentModeTools + "|deferred=true|visible=false|visibleInV2=false|serverOnly=false":                                                                                {},
+	"high|primary=GPT_5_6_SOL|reasoning=xhigh|levels=|include=present|tools=shell_command,shell_command_status,apply_patch,web_search,read_web_page,Task,skill,load_plugin,read_thread,find_thread,list_agent_modes,list_runners,create_thread,send_message_to_thread,librarian,oracle,finder,view_media,painter,public_artifact_url,archive_current_thread" + knownSharedAgentModeTools + "|deferred=true|visible=true|visibleInV2=true|serverOnly=false":                                                                               {},
+	"large|primary=CLAUDE_OPUS_4_8|reasoning=|levels=|include=present|tools=finder,shell_command,shell_command_status,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,list_agent_modes,list_runners,create_thread,send_message_to_thread,skill,load_plugin,oracle,librarian,Task,view_media,painter,public_artifact_url,read_mcp_resource,archive_current_thread" + knownSharedAgentModeTools + "|deferred=true|visible=false|visibleInV2=false|serverOnly=false":                                                 {},
+	"low|primary=AMP_GLM_5_2|reasoning=medium|levels=|include=present|tools=finder,shell_command,shell_command_status,apply_patch,web_search,read_web_page,read_thread,find_thread,list_agent_modes,list_runners,create_thread,send_message_to_thread,skill,load_plugin,oracle,librarian,Task,view_media,painter,public_artifact_url,archive_current_thread" + knownSharedAgentModeTools + "|deferred=false|visible=true|visibleInV2=true|serverOnly=false":                                                                              {},
+	"medium|primary=GPT_5_6_SOL|reasoning=medium|levels=|include=present|tools=shell_command,shell_command_status,apply_patch,web_search,read_web_page,Task,skill,load_plugin,read_thread,find_thread,list_agent_modes,list_runners,create_thread,send_message_to_thread,librarian,oracle,finder,view_media,painter,public_artifact_url,archive_current_thread" + knownSharedAgentModeTools + "|deferred=true|visible=true|visibleInV2=true|serverOnly=false":                                                                            {},
+	"nostromo|primary=AMP_NOSTROMO|reasoning=low|levels=|include=present|tools=finder,shell_command,shell_command_status,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,list_agent_modes,list_runners,create_thread,send_message_to_thread,skill,load_plugin,oracle,librarian,Task,view_media,painter,public_artifact_url,read_mcp_resource,archive_current_thread" + knownSharedAgentModeTools + ",apply_patch|deferred=false|visible=true|visibleInV2=true|serverOnly=false":                                   {},
 	"review|primary=GPT_5_5|reasoning=medium|levels=|include=present|tools=shell_command,run_check,submit_review,list_agent_modes,list_runners,create_thread|deferred=false|visible=false|visibleInV2=false|serverOnly=false":                                                                                                                                                                                                                                                                                                            {},
-	"rush|primary=GPT_5_5|reasoning=none|levels=|include=present|tools=finder,shell_command,shell_command_status,apply_patch,web_search,read_web_page,read_thread,find_thread,list_agent_modes,list_runners,create_thread,send_message_to_thread,skill,load_plugin,oracle,librarian,Task,view_media,painter,archive_current_thread" + knownSharedAgentModeTools + "|deferred=false|visible=false|visibleInV2=false|serverOnly=false":                                                                                                     {},
-	"smart|primary=CLAUDE_OPUS_4_8|reasoning=high|levels=high,max,xhigh|include=present|tools=finder,shell_command,shell_command_status,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,list_agent_modes,list_runners,create_thread,send_message_to_thread,skill,load_plugin,oracle,librarian,Task,view_media,painter,read_mcp_resource,archive_current_thread" + knownSharedAgentModeTools + "|deferred=true|visible=false|visibleInV2=false|serverOnly=false":                                                   {},
-	"ultra|primary=CLAUDE_FABLE_5|reasoning=high|levels=|include=present|tools=finder,shell_command,shell_command_status,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,list_agent_modes,list_runners,create_thread,send_message_to_thread,skill,load_plugin,oracle,librarian,Task,view_media,painter,read_mcp_resource,archive_current_thread" + knownSharedAgentModeTools + "|deferred=true|visible=true|visibleInV2=true|serverOnly=false":                                                                    {},
+	"rush|primary=GPT_5_5|reasoning=none|levels=|include=present|tools=finder,shell_command,shell_command_status,apply_patch,web_search,read_web_page,read_thread,find_thread,list_agent_modes,list_runners,create_thread,send_message_to_thread,skill,load_plugin,oracle,librarian,Task,view_media,painter,public_artifact_url,archive_current_thread" + knownSharedAgentModeTools + "|deferred=false|visible=false|visibleInV2=false|serverOnly=false":                                                                                 {},
+	"smart|primary=CLAUDE_OPUS_4_8|reasoning=high|levels=|include=present|tools=finder,shell_command,shell_command_status,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,list_agent_modes,list_runners,create_thread,send_message_to_thread,skill,load_plugin,oracle,librarian,Task,view_media,painter,public_artifact_url,read_mcp_resource,archive_current_thread" + knownSharedAgentModeTools + "|deferred=true|visible=false|visibleInV2=false|serverOnly=false":                                             {},
+	"ultra|primary=CLAUDE_FABLE_5|reasoning=high|levels=|include=present|tools=finder,shell_command,shell_command_status,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,list_agent_modes,list_runners,create_thread,send_message_to_thread,skill,load_plugin,oracle,librarian,Task,view_media,painter,public_artifact_url,read_mcp_resource,archive_current_thread" + knownSharedAgentModeTools + "|deferred=true|visible=true|visibleInV2=true|serverOnly=false":                                                {},
 }
 
 var knownAgentModeRouteValues = map[string]struct{}{

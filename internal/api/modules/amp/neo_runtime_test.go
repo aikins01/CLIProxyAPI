@@ -11995,6 +11995,69 @@ func TestNeoRuntimeTerminalBridgeUsesActiveExecutor(t *testing.T) {
 	}
 }
 
+func TestNeoRuntimeExecutorRelayBridgeUsesActiveExecutor(t *testing.T) {
+	for _, msgType := range []string{"client_executor_relay_invalid", "executor_relay_data", "client_executor_relay_output"} {
+		if bridged, ok := neoExecutorRelayBridgeType(msgType); ok || bridged != "" {
+			t.Fatalf("invalid executor relay bridge for %s = %q ok=%v", msgType, bridged, ok)
+		}
+	}
+
+	rt := newNeoRuntime(&config.Config{})
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	t.Cleanup(server.Close)
+
+	threadID := "T-019e0e6e-f3f1-7081-b5dd-748f66f8c25e"
+	client := dialNeoActorWebSocket(t, server.URL, threadID)
+	defer client.Close()
+	probeClient := dialNeoActorWebSocket(t, server.URL, threadID)
+	defer probeClient.Close()
+	executor := dialNeoActorWebSocket(t, server.URL, threadID)
+	defer executor.Close()
+	staleExecutor := dialNeoActorWebSocket(t, server.URL, threadID)
+	defer staleExecutor.Close()
+	waitForNeoMessageType(t, client, "agent_state", 2*time.Second)
+	waitForNeoMessageType(t, probeClient, "agent_state", 2*time.Second)
+	waitForNeoMessageType(t, executor, "agent_state", 2*time.Second)
+	waitForNeoMessageType(t, staleExecutor, "agent_state", 2*time.Second)
+
+	if err := executor.WriteJSON(map[string]any{"type": "executor_connected", "executorId": "active-executor"}); err != nil {
+		t.Fatalf("write executor_connected: %v", err)
+	}
+	waitForNeoMessageType(t, client, "executor_connected", 2*time.Second)
+	waitForNeoMessageType(t, probeClient, "executor_connected", 2*time.Second)
+	waitForNeoMessageType(t, staleExecutor, "executor_connected", 2*time.Second)
+
+	if err := client.WriteJSON(map[string]any{"type": "client_executor_relay_open", "channelId": "relay-1", "service": "preview"}); err != nil {
+		t.Fatalf("write client_executor_relay_open: %v", err)
+	}
+	open := waitForNeoMessageType(t, executor, "executor_relay_open", 2*time.Second)
+	if open["channelId"] != "relay-1" || open["service"] != "preview" {
+		t.Fatalf("executor_relay_open = %#v", open)
+	}
+	assertNoNeoMessageType(t, staleExecutor, "executor_relay_open", 100*time.Millisecond)
+
+	if err := client.WriteJSON(map[string]any{"type": "client_executor_relay_data", "channelId": "relay-1", "dataBase64": "b2s=", "binary": false}); err != nil {
+		t.Fatalf("write client_executor_relay_data: %v", err)
+	}
+	data := waitForNeoMessageType(t, executor, "executor_relay_data", 2*time.Second)
+	if data["channelId"] != "relay-1" || data["dataBase64"] != "b2s=" || data["binary"] != false {
+		t.Fatalf("executor_relay_data = %#v", data)
+	}
+
+	if err := staleExecutor.WriteJSON(map[string]any{"type": "executor_relay_exit", "channelId": "relay-1", "error": "stale"}); err != nil {
+		t.Fatalf("write stale executor_relay_exit: %v", err)
+	}
+	assertNoNeoMessageType(t, probeClient, "client_executor_relay_exit", 100*time.Millisecond)
+
+	if err := executor.WriteJSON(map[string]any{"type": "executor_relay_output", "channelId": "relay-1", "dataBase64": "ZG9uZQ==", "binary": true}); err != nil {
+		t.Fatalf("write executor_relay_output: %v", err)
+	}
+	output := waitForNeoMessageType(t, client, "client_executor_relay_output", 2*time.Second)
+	if output["channelId"] != "relay-1" || output["dataBase64"] != "ZG9uZQ==" || output["binary"] != true {
+		t.Fatalf("client_executor_relay_output = %#v", output)
+	}
+}
+
 func TestNeoRuntimeConcurrentExecutorConnectWithActiveWorkSendsRejected(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
@@ -14227,6 +14290,68 @@ func TestNeoActorProtocolMessageUpdatedPreservesParentToolUse(t *testing.T) {
 	}
 	if len(actor.history) != 1 || actor.history[0].ParentToolUseID != "TU-parent" || actor.history[0].Text != "new" {
 		t.Fatalf("history = %#v", actor.history)
+	}
+}
+
+func TestNeoActorProtocolMessagesIgnoreNewChildrenAfterParentTerminates(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "threadActor", "T-test", "T-test", neoActorRecord("actor-test", "threadActor", "T-test"), nil)
+	actor.messages = []neoMessage{
+		{
+			ThreadID:  "T-test",
+			MessageID: "M-parent",
+			Role:      "assistant",
+			Content: []any{map[string]any{
+				"type": "tool_use", "id": "TU-parent", "name": "Task", "input": map[string]any{"prompt": "delegate"}, "complete": true,
+			}},
+		},
+		{
+			ThreadID:  "T-test",
+			MessageID: "M-parent-result",
+			Role:      "user",
+			Content: []any{map[string]any{
+				"type": "tool_result", "toolUseID": "TU-parent", "run": map[string]any{"status": "cancelled", "reason": "user:cancelled"},
+			}},
+		},
+	}
+	actor.rebuildHistoryLocked()
+	initialSeq := actor.seq
+
+	actor.handle(map[string]any{"type": "message_added", "seq": 10, "message": map[string]any{
+		"threadId":        "T-test",
+		"messageId":       "M-late-child",
+		"parentToolUseId": "TU-parent",
+		"role":            "assistant",
+		"content": []any{map[string]any{
+			"type": "tool_use", "id": "TU-late", "name": "finder", "input": map[string]any{"query": "late"}, "complete": true,
+		}},
+		"state": map[string]any{"type": "complete", "stopReason": "tool_use"},
+	}})
+	actor.handle(map[string]any{"type": "message_added", "seq": 11, "message": map[string]any{
+		"threadId":        "T-test",
+		"messageId":       "M-late-grandchild",
+		"parentToolUseId": "TU-late",
+		"role":            "user",
+		"content": []any{map[string]any{
+			"type": "tool_result", "toolUseID": "TU-grandchild", "run": map[string]any{"status": "done", "result": "late"},
+		}},
+	}})
+	actor.handle(map[string]any{"type": "message_updated", "seq": 12, "message": map[string]any{
+		"threadId":        "T-test",
+		"messageId":       "M-unknown-late-child",
+		"parentToolUseId": "TU-late",
+		"role":            "assistant",
+		"content":         []any{map[string]any{"type": "text", "text": "late update"}},
+		"state":           map[string]any{"type": "complete"},
+	}})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.messages) != 2 {
+		t.Fatalf("late child messages were persisted: %#v", actor.messages)
+	}
+	if actor.seq != initialSeq || len(actor.replayEvents) != 0 {
+		t.Fatalf("late child messages advanced replay state: initial=%d seq=%d replay=%#v", initialSeq, actor.seq, actor.replayEvents)
 	}
 }
 
@@ -17560,6 +17685,11 @@ func handledNeoInboundTypesForTest() map[string]bool {
 		"client_create_thread",
 		"client_dismiss_active_error",
 		"client_edit_message",
+		"client_executor_relay_close",
+		"client_executor_relay_data",
+		"client_executor_relay_exit",
+		"client_executor_relay_open",
+		"client_executor_relay_output",
 		"client_filesystem_delete",
 		"client_filesystem_delete_result",
 		"client_filesystem_read_directory",
@@ -17600,6 +17730,7 @@ func handledNeoInboundTypesForTest() map[string]bool {
 		"client_spawn_executor",
 		"client_steer_queued_msg",
 		"client_tool_approval_response",
+		"client_truncate_thread",
 		"client_unarchive_thread",
 		"client_update_thread_settings",
 		"client_upsert_notification_subscription",
@@ -17639,6 +17770,11 @@ func handledNeoInboundTypesForTest() map[string]bool {
 		"executor_guidance_snapshot",
 		"executor_guidance_update",
 		"executor_plugin_message",
+		"executor_relay_close",
+		"executor_relay_data",
+		"executor_relay_exit",
+		"executor_relay_open",
+		"executor_relay_output",
 		"executor_skill_snapshot",
 		"executor_status",
 		"executor_terminal_close",
@@ -21588,7 +21724,7 @@ func TestNeoActorToolsForModeFollowBinaryModeOrder(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
 	binaryNostromoOrder := []string{
-		"finder", "shell_command", "shell_command_status", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "send_message_to_thread", "skill", "load_plugin", "oracle", "librarian", "Task", "view_media", "painter", "read_mcp_resource", "archive_current_thread", "get_automation", "create_cron_automation", "create_slack_automation", "create_github_automation", "update_automation", "delete_automation", "slack_write", "slack_read", "github_repo_ci_status", "apply_patch",
+		"finder", "shell_command", "shell_command_status", "create_file", "edit_file", "web_search", "read_web_page", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "send_message_to_thread", "skill", "load_plugin", "oracle", "librarian", "Task", "view_media", "painter", "public_artifact_url", "read_mcp_resource", "archive_current_thread", "get_automation", "create_cron_automation", "create_slack_automation", "create_github_automation", "update_automation", "delete_automation", "slack_write", "slack_read", "github_repo_ci_status", "apply_patch",
 	}
 	rawTools := []any{map[string]any{"name": "external_tool", "source": map[string]any{"plugin": "test"}}}
 	for i := len(binaryNostromoOrder) - 1; i >= 0; i-- {
@@ -25997,15 +26133,20 @@ func TestNeoActorClientThreadCommandsUseBinarySchema(t *testing.T) {
 	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
 	actor.title = "Old"
 	actor.queue = []neoQueuedMessage{{MessageID: "M-0000000000000000000001", Content: []any{map[string]any{"type": "text", "text": "queued"}}}}
-	actor.messages = []neoMessage{{ThreadID: "T-test", MessageID: "M-0000000000000000000002", Role: "user", Content: []any{map[string]any{"type": "text", "text": "read"}}}}
+	actor.messages = []neoMessage{
+		{ThreadID: "T-test", MessageID: "M-0000000000000000000002", Role: "user", Content: []any{map[string]any{"type": "text", "text": "read"}}},
+		{ThreadID: "T-test", MessageID: "M-0000000000000000000003", Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "answer"}}},
+	}
 
 	actor.handle(map[string]any{"type": "client_set_thread_title", "title": "   "})
 	actor.handle(map[string]any{"type": "client_set_thread_title", "title": strings.Repeat("x", 257)})
 	actor.handle(map[string]any{"type": "client_remove_queued_msg", "queuedMessageId": "queued-1"})
 	actor.handle(map[string]any{"type": "client_mark_message_read", "messageId": "M-user"})
+	actor.handle(map[string]any{"type": "client_truncate_thread", "messageId": "M-0000000000000000000004"})
+	actor.handle(map[string]any{"type": "client_truncate_thread", "messageId": "bad-id"})
 
 	actor.mu.Lock()
-	if actor.title != "Old" || len(actor.queue) != 1 || actor.messages[0].ReadAt != "" {
+	if actor.title != "Old" || len(actor.queue) != 1 || len(actor.messages) != 2 || actor.messages[0].ReadAt != "" {
 		t.Fatalf("invalid client commands mutated state: title=%q queue=%#v messages=%#v", actor.title, actor.queue, actor.messages)
 	}
 	actor.mu.Unlock()
@@ -26013,10 +26154,11 @@ func TestNeoActorClientThreadCommandsUseBinarySchema(t *testing.T) {
 	actor.handle(map[string]any{"type": "client_set_thread_title", "title": "  New title  "})
 	actor.handle(map[string]any{"type": "client_mark_message_read", "messageId": "M-0000000000000000000002"})
 	actor.handle(map[string]any{"type": "client_remove_queued_msg", "queuedMessageId": "M-0000000000000000000001"})
+	actor.handle(map[string]any{"type": "client_truncate_thread", "messageId": "M-0000000000000000000003"})
 
 	actor.mu.Lock()
 	defer actor.mu.Unlock()
-	if actor.title != "New title" || len(actor.queue) != 0 || actor.messages[0].ReadAt == "" {
+	if actor.title != "New title" || len(actor.queue) != 0 || len(actor.messages) != 1 || actor.messages[0].ReadAt == "" {
 		t.Fatalf("valid client commands were not applied: title=%q queue=%#v messages=%#v", actor.title, actor.queue, actor.messages)
 	}
 }

@@ -136,7 +136,20 @@ func TestNeoResumeHighWaterEventMatchesAmpDecoder(t *testing.T) {
 	if !strings.Contains(text, `literal("error_cleared"),seq:`) {
 		t.Fatalf("Amp binary %s does not decode a sequenced error_cleared event", path)
 	}
-	cursorStart := strings.Index(text, "advanceResumeCursor(T){")
+	cursorStart := -1
+	for searchStart := 0; searchStart < len(text); {
+		offset := strings.Index(text[searchStart:], "advanceResumeCursor(")
+		if offset < 0 {
+			break
+		}
+		candidate := searchStart + offset
+		closeOffset := strings.IndexByte(text[candidate:], ')')
+		if closeOffset >= 0 && candidate+closeOffset+1 < len(text) && text[candidate+closeOffset+1] == '{' {
+			cursorStart = candidate
+			break
+		}
+		searchStart = candidate + len("advanceResumeCursor(")
+	}
 	if cursorStart < 0 {
 		t.Fatalf("Amp binary %s has no advanceResumeCursor implementation", path)
 	}

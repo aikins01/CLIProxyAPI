@@ -160,12 +160,12 @@ func TestClassifyStringsExtractsParitySignals(t *testing.T) {
 	assertContains(t, streamJSONCoverageStrings(signals.StreamJSONCoverage), "--stream-json=cli-flag")
 	assertContains(t, streamJSONCoverageStrings(signals.StreamJSONCoverage), "agent_mode=init-field")
 	assertContains(t, streamJSONCoverageStrings(signals.StreamJSONCoverage), "error_during_execution=error-subtype")
-	assertContains(t, signals.ModeSettingMarkers, "reasoning.effort")
+	assertContains(t, signals.ModeSettingMarkers, "reasoningEffort")
 	assertContains(t, signals.ModeSettingMarkers, "draftThreadSettings")
-	assertContains(t, signals.ModeSettingMarkers, "lastReasoningEffortByMode")
-	assertContains(t, modeSettingCoverageStrings(signals.ModeSettingCoverage), "reasoning.effort=thread-setting")
+	assertContains(t, signals.ModeSettingMarkers, "lastSpeedByMode")
+	assertNotContains(t, signals.ModeSettingMarkers, "reasoning.effort")
 	assertContains(t, modeSettingCoverageStrings(signals.ModeSettingCoverage), "draftThreadSettings=draft-settings")
-	assertContains(t, modeSettingCoverageStrings(signals.ModeSettingCoverage), "lastReasoningEffortByMode=session-default")
+	assertContains(t, modeSettingCoverageStrings(signals.ModeSettingCoverage), "lastSpeedByMode=session-default")
 	assertContains(t, signals.ProviderProtocol, "anthropic-beta")
 	assertContains(t, signals.ProviderProtocol, "interleaved-thinking-2025-05-14")
 	assertContains(t, signals.ProviderProtocol, "x-amp-feature")
@@ -575,10 +575,10 @@ var knownPromptTagSetCountValues = map[string]int{
 	"prompt/guidance":                                   6,
 	"prompt/painter":                                    1,
 	"prompt/painter,skills":                             1,
-	"prompt/skills":                                     5,
+	"prompt/skills":                                     6,
 	"prompt/skills,system-prompt,tools":                 1,
 	"prompt/skills,tools":                               2,
-	"prompt/tools":                                      33,
+	"prompt/tools":                                      34,
 	"source/artifacts,compaction,guidance,skills,tools": 1,
 	"source/artifacts,code-review,painter,skills,tools": 1,
 	"source/code-review,guidance,settings":              1,
@@ -596,13 +596,13 @@ var knownPromptTagSetCountValues = map[string]int{
 	"source/painter":                                    1,
 	"source/painter,settings,tools":                     1,
 	"source/painter,tools":                              1,
-	"source/settings":                                   3,
-	"source/settings,skills,tools":                      4,
+	"source/settings":                                   2,
+	"source/settings,skills,tools":                      3,
 	"source/settings,system-prompt,tools":               1,
-	"source/settings,tools":                             9,
+	"source/settings,tools":                             7,
 	"source/skills":                                     12,
-	"source/skills,tools":                               15,
-	"source/tools":                                      101,
+	"source/skills,tools":                               16,
+	"source/tools":                                      103,
 }
 
 func TestLifecycleChecklistKnownPromptTagCountsRunFocusedChecks(t *testing.T) {
@@ -1266,7 +1266,8 @@ func TestBuildSnapshotReadsBinaryLikeFile(t *testing.T) {
 	assertContains(t, toolCatalogCoverageStrings(snapshot.Signals.ToolCatalogCoverage), "builtin:edit_file=file-edit")
 	assertContains(t, snapshot.Signals.StreamJSONMarkers, "--stream-json")
 	assertContains(t, streamJSONCoverageStrings(snapshot.Signals.StreamJSONCoverage), "agent_mode=init-field")
-	assertContains(t, snapshot.Signals.ModeSettingMarkers, "reasoning.effort")
+	assertContains(t, snapshot.Signals.ModeSettingMarkers, "reasoningEffort")
+	assertNotContains(t, snapshot.Signals.ModeSettingMarkers, "reasoning.effort")
 	assertContains(t, modeSettingCoverageStrings(snapshot.Signals.ModeSettingCoverage), "draftThreadSettings=draft-settings")
 	assertContains(t, snapshot.Signals.ProviderProtocol, "anthropic-beta")
 	assertContains(t, providerCoverageStrings(snapshot.Signals.ProviderCoverage), "interleaved-thinking-2025-05-14=anthropic-beta")
