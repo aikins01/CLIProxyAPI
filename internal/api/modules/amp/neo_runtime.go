@@ -47,7 +47,6 @@ import (
 	"github.com/tidwall/gjson"
 	ugorjicodec "github.com/ugorji/go/codec"
 	"golang.org/x/sync/singleflight"
-	"golang.org/x/sys/unix"
 	"gopkg.in/yaml.v3"
 )
 
@@ -68,6 +67,7 @@ const (
 	neoRecentThreadsCloudSeedTTL     = 10 * time.Second
 	neoReplayEventLimit              = 512
 	neoFilesystemWriteMaxBytes       = 4 * 1024 * 1024
+	neoMaxProcessID                  = uint64(1<<31 - 1)
 	neoActorIdleTTL                  = 30 * time.Minute
 	neoActorPruneInterval            = 5 * time.Minute
 	neoLocalSnapshotMinInterval      = 500 * time.Millisecond
@@ -119,6 +119,7 @@ var (
 var (
 	neoThreadIDPattern            = regexp.MustCompile(`T-[0-9A-Za-z][0-9A-Za-z-]*`)
 	neoThreadIDExactPattern       = regexp.MustCompile(`^T-[0-9A-Za-z][0-9A-Za-z-]*$`)
+	neoAmpPIDExactPattern         = regexp.MustCompile(`^[0-9]+$`)
 	neoBinaryThreadIDExactPattern = regexp.MustCompile(`^T-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 	neoBinaryThreadInputTrim      = regexp.MustCompile("^[<(\"'`]+|[>\")'`,.]+$")
 	neoCloudThreadIDPattern       = regexp.MustCompile(`^T-([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$`)
@@ -131,6 +132,8 @@ var (
 	neoAmpDataDir                 = defaultNeoAmpDataDir
 	neoHeadlessPIDDirMu           sync.RWMutex
 	neoHeadlessPIDDir             = defaultNeoHeadlessPIDDir
+	neoAmpHeadlessPIDDirMu        sync.RWMutex
+	neoAmpHeadlessPIDDir          = defaultNeoAmpHeadlessPIDDir
 	neoAmpTaskStoreMu             sync.Mutex
 	neoWebLocalProjectIndexMu     sync.Mutex
 	neoInboundMessageHookMu       sync.RWMutex
@@ -5449,8 +5452,20 @@ func (a *neoActor) spawnExecutorWithProvenance(msg map[string]any, webLocal bool
 	if existing != nil {
 		return a.broadcastExecutorStatus(spawnID, "running", "Headless executor is already starting for this thread.", map[string]any{"reasonCode": "waiting_for_executor_connect", "pid": existing.pid(), "threadId": threadID})
 	}
-
 	cfg := a.runtime.configSnapshot()
+	workDir := neoHeadlessWorkingDirectory(neoHeadlessExecutorSpawnOptions(msg), environment)
+	ampPID, err := prepareNeoAmpHeadlessPIDFile(threadID, workDir)
+	if err != nil {
+		return a.broadcastExecutorStatus(spawnID, "failed", "Cannot prepare Amp headless executor lock: "+err.Error(), map[string]any{"reasonCode": "spawn_failed", "threadId": threadID})
+	}
+	if ampPID > 0 {
+		owned, ownedOK := neoLiveHeadlessPIDRecord(threadID)
+		if ownedOK && owned.PID == ampPID && neoHeadlessProcessOwnedByThread(ampPID, threadID) {
+			return a.broadcastExecutorStatus(spawnID, "running", "Amp headless executor is already starting for this thread.", map[string]any{"reasonCode": "waiting_for_executor_connect", "pid": ampPID, "threadId": threadID})
+		}
+		return a.broadcastExecutorStatus(spawnID, "failed", "Another Amp process already owns this thread.", map[string]any{"reasonCode": "spawn_rejected", "pid": ampPID, "threadId": threadID})
+	}
+
 	command, err := neoAmpExecutorCommand(cfg)
 	if err != nil {
 		return a.broadcastExecutorStatus(spawnID, "failed", err.Error(), map[string]any{"reasonCode": "spawn_failed"})
@@ -5463,7 +5478,6 @@ func (a *neoActor) spawnExecutorWithProvenance(msg map[string]any, webLocal bool
 		}
 	}
 
-	workDir := neoHeadlessWorkingDirectory(neoHeadlessExecutorSpawnOptions(msg), environment)
 	requestedLogPath := neoHeadlessExecutorLogPath(threadID, spawnID)
 	logPath := ""
 	var logFile *os.File
@@ -5616,6 +5630,9 @@ func neoHeadlessExecutorArgs(threadID, agentMode, reasoningEffort, logPath strin
 func (a *neoActor) waitSpawnedExecutor(spawnID string, spawned *neoSpawnedExecutor, logFile *os.File) {
 	err := spawned.cmd.Wait()
 	removeNeoHeadlessPIDFile(spawned.threadID, spawned.pid())
+	if _, cleanupErr := prepareNeoAmpHeadlessPIDFile(spawned.threadID, spawned.cmd.Dir); cleanupErr != nil {
+		log.Debugf("amp neo local runtime failed to clean Amp headless PID file thread=%s pid=%d: %v", spawned.threadID, spawned.pid(), cleanupErr)
+	}
 	if logFile != nil {
 		_ = logFile.Close()
 	}
@@ -12361,21 +12378,6 @@ func neoAmpTimezone() string {
 	return ""
 }
 
-func neoAmpOSRelease() string {
-	var uname unix.Utsname
-	if err := unix.Uname(&uname); err != nil {
-		return ""
-	}
-	var builder strings.Builder
-	for _, value := range uname.Release {
-		if value == 0 {
-			break
-		}
-		builder.WriteByte(byte(value))
-	}
-	return builder.String()
-}
-
 func neoCloudThreadID(threadID string) bool {
 	return neoCloudThreadIDPattern.MatchString(strings.TrimSpace(threadID))
 }
@@ -13085,6 +13087,17 @@ func defaultNeoHeadlessPIDDir() string {
 		return ""
 	}
 	return filepath.Join(home, ".cli-proxy-api", "run", "amp-headless-pids")
+}
+
+func defaultNeoAmpHeadlessPIDDir() string {
+	if cacheDir, ok := os.LookupEnv("XDG_CACHE_HOME"); ok {
+		return filepath.Join(cacheDir, "amp", "pids")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return ""
+	}
+	return filepath.Join(home, ".cache", "amp", "pids")
 }
 
 func neoAmpThreadStoreDir() string {
@@ -26873,13 +26886,74 @@ func writeNeoHeadlessPIDFile(threadID string, pid int, webLocal bool) error {
 	return os.WriteFile(filepath.Join(dir, threadID+".pid"), raw, 0o600)
 }
 
+func prepareNeoAmpHeadlessPIDFile(threadID, workingDirectory string) (int, error) {
+	if !neoThreadIDExactPattern.MatchString(threadID) {
+		return 0, errors.New("invalid Amp headless executor identity")
+	}
+	dir := currentNeoAmpHeadlessPIDDir()
+	if dir == "" {
+		return 0, errors.New("Amp headless executor PID directory unavailable")
+	}
+	if !filepath.IsAbs(dir) && workingDirectory != "" {
+		dir = filepath.Join(workingDirectory, dir)
+	}
+	path := filepath.Join(dir, threadID+".pid")
+	for attempt := 0; attempt < 2; attempt++ {
+		data, err := os.ReadFile(path)
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, nil
+		}
+		if err != nil {
+			return 0, err
+		}
+		pidText := strings.TrimSpace(string(data))
+		if !neoAmpPIDExactPattern.MatchString(pidText) {
+			return 0, nil
+		}
+		pidValue, err := strconv.ParseUint(pidText, 10, 53)
+		if err != nil || pidValue == 0 {
+			return 0, nil
+		}
+		pid := int(pidValue)
+		if pidValue <= neoMaxProcessID && uint64(pid) == pidValue {
+			alive, known := neoProcessStatus(pid)
+			if !known {
+				return 0, nil
+			}
+			if alive {
+				return pid, nil
+			}
+		}
+		current, readErr := os.ReadFile(path)
+		if errors.Is(readErr, os.ErrNotExist) {
+			return 0, nil
+		}
+		if readErr != nil {
+			return 0, readErr
+		}
+		if !bytes.Equal(current, data) {
+			continue
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return 0, err
+		}
+		return 0, nil
+	}
+	return 0, fmt.Errorf("Amp headless executor PID file changed while checking %s", path)
+}
+
+func neoProcessAlive(pid int) bool {
+	alive, known := neoProcessStatus(pid)
+	return known && alive
+}
+
 func neoLiveHeadlessPID(threadID string) int {
 	record, _ := neoLiveHeadlessPIDRecord(threadID)
 	return record.PID
 }
 
 func neoLiveHeadlessPIDRecord(threadID string) (neoHeadlessPIDRecord, bool) {
-	if !neoThreadIDExactPattern.MatchString(threadID) {
+	if !neoRecoveredHeadlessPIDSupported() || !neoThreadIDExactPattern.MatchString(threadID) {
 		return neoHeadlessPIDRecord{}, false
 	}
 	dir := strings.TrimSpace(currentNeoHeadlessPIDDir())
@@ -26897,11 +26971,7 @@ func neoLiveHeadlessPIDRecord(threadID string) (neoHeadlessPIDRecord, bool) {
 	if err != nil || record.PID <= 0 {
 		return neoHeadlessPIDRecord{}, false
 	}
-	process, err := os.FindProcess(record.PID)
-	if err != nil {
-		return neoHeadlessPIDRecord{}, false
-	}
-	if err := process.Signal(syscall.Signal(0)); err != nil && !errors.Is(err, syscall.EPERM) {
+	if !neoProcessAlive(record.PID) {
 		return neoHeadlessPIDRecord{}, false
 	}
 	return record, true
@@ -26909,9 +26979,6 @@ func neoLiveHeadlessPIDRecord(threadID string) (neoHeadlessPIDRecord, bool) {
 
 func stopNeoRecoveredHeadlessPID(threadID string, pid int) {
 	if pid <= 0 {
-		return
-	}
-	if runtime.GOOS == "windows" {
 		return
 	}
 	if neoLiveHeadlessPID(threadID) != pid {
@@ -26969,6 +27036,28 @@ func currentNeoHeadlessPIDDir() string {
 		return ""
 	}
 	return fn()
+}
+
+func currentNeoAmpHeadlessPIDDir() string {
+	neoAmpHeadlessPIDDirMu.RLock()
+	fn := neoAmpHeadlessPIDDir
+	neoAmpHeadlessPIDDirMu.RUnlock()
+	if fn == nil {
+		return ""
+	}
+	return fn()
+}
+
+func replaceNeoAmpHeadlessPIDDir(fn func() string) func() {
+	neoAmpHeadlessPIDDirMu.Lock()
+	old := neoAmpHeadlessPIDDir
+	neoAmpHeadlessPIDDir = fn
+	neoAmpHeadlessPIDDirMu.Unlock()
+	return func() {
+		neoAmpHeadlessPIDDirMu.Lock()
+		neoAmpHeadlessPIDDir = old
+		neoAmpHeadlessPIDDirMu.Unlock()
+	}
 }
 
 func replaceNeoHeadlessPIDDir(fn func() string) func() {
