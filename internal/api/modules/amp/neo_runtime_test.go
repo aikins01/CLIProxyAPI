@@ -6391,6 +6391,90 @@ func TestNeoRuntimeRebindConvertsSpawnedExecutorWorkToPendingInference(t *testin
 	}
 }
 
+func TestNeoActorRebindCleanupStopsRecoveredExecutor(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses POSIX shell command")
+	}
+	pidDir := t.TempDir()
+	t.Cleanup(replaceNeoHeadlessPIDDir(func() string { return pidDir }))
+	threadID := "T-019f4899-7bfa-78aa-9d42-ca39216d8191"
+	childPIDPath := filepath.Join(t.TempDir(), "child.pid")
+	scriptPath := filepath.Join(t.TempDir(), "amp-recovered-rebind")
+	if err := os.WriteFile(scriptPath, []byte("#!/bin/sh\nsleep 30 &\necho $! > \"$CHILD_PID_FILE\"\nwait\n"), 0o700); err != nil {
+		t.Fatalf("write recovered executor script: %v", err)
+	}
+	cmd := exec.Command(scriptPath, "--headless="+threadID)
+	cmd.Env = append(os.Environ(), "CHILD_PID_FILE="+childPIDPath)
+	neoConfigureSpawnedExecutorProcess(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start recovered executor: %v", err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill() })
+	var childPID int
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		body, err := os.ReadFile(childPIDPath)
+		if err == nil {
+			childPID, err = strconv.Atoi(strings.TrimSpace(string(body)))
+			if err != nil {
+				t.Fatalf("parse recovered executor child pid: %v", err)
+			}
+			break
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("read recovered executor child pid: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if childPID <= 0 {
+		t.Fatal("recovered executor child did not start")
+	}
+	if err := writeNeoHeadlessPIDFile(threadID, cmd.Process.Pid, true); err != nil {
+		t.Fatalf("write recovered executor record: %v", err)
+	}
+
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-recovered-rebind", "threadActor", threadID, threadID, neoActorRecord("actor-recovered-rebind", "threadActor", threadID), nil)
+	actor.executorConnectedForSocket(nil, map[string]any{"clientId": "cli-headless-recovered-rebind"})
+	actor.mu.Lock()
+	actor.currentAgentMode = "high"
+	actor.currentReasoningEffort = "xhigh"
+	actor.currentInference = &neoInferenceInflight{messageID: "M-recovered-rebind", agentMode: "high", reasoningEffort: "xhigh"}
+	actor.agentState = "working"
+	actor.meta[neoResumeExecutorIDMetaKey] = "cli-headless-recovered-rebind"
+	actor.mu.Unlock()
+
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- cmd.Wait() }()
+	actor.stopSpawnedExecutorsForRebind()
+	select {
+	case <-waitDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("recovered executor was not stopped for rebind")
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && neoProcessAlive(childPID) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if neoProcessAlive(childPID) {
+		t.Fatalf("recovered executor child %d survived rebind", childPID)
+	}
+	if _, err := os.Stat(filepath.Join(pidDir, threadID+".pid")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("recovered executor record still exists: %v", err)
+	}
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.recoveredExecutorPID != 0 || actor.recoveredExecutorWebLocal || actor.executorID != "" || actor.executorReady {
+		t.Fatalf("rebind recovered executor state = pid:%d web:%v id:%q ready:%v", actor.recoveredExecutorPID, actor.recoveredExecutorWebLocal, actor.executorID, actor.executorReady)
+	}
+	if actor.currentInference != nil || actor.pendingInference == nil || actor.agentState != "idle" {
+		t.Fatalf("rebind recovered work = current:%#v pending:%#v state:%q", actor.currentInference, actor.pendingInference, actor.agentState)
+	}
+	if got := stringValue(actor.meta[neoResumeExecutorIDMetaKey]); got != "" {
+		t.Fatalf("rebind recovered resume executor id = %q, want empty", got)
+	}
+}
+
 func TestNeoRuntimeStopClearsPendingExecutorWork(t *testing.T) {
 	useTempNeoThreadStore(t)
 	enabled := true
@@ -9480,6 +9564,27 @@ func TestNeoUserActorGetRecentThreadsSeedsMarkedCloudThread(t *testing.T) {
 	}
 	if listRequests != 1 || getRequests != 0 {
 		t.Fatalf("upstream requests = list:%d get:%d, want list:1 get:0", listRequests, getRequests)
+	}
+}
+
+func TestNeoRecentThreadStatusesForRequestFiltersCachedCloudSeedBySinceMs(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+		UpstreamURL:    "https://ampcode.com",
+		UpstreamAPIKey: "secret",
+	}})
+	key, err := rt.recentThreadSeedKey(context.Background())
+	if err != nil {
+		t.Fatalf("recent thread seed key: %v", err)
+	}
+	rt.recentThreadSeeds[key] = neoRecentThreadSeed{statuses: []any{
+		map[string]any{"threadId": "T-019e0e6e-f3f1-7078-b5dd-748f66f8c270", "lastUserMessageAt": "2026-06-19T12:00:00Z"},
+		map[string]any{"threadId": "T-019e0e6e-f3f1-7078-b5dd-748f66f8c271", "lastUserMessageAt": "2026-06-20T12:00:00Z"},
+	}}
+
+	sinceMs := int(time.Date(2026, 6, 20, 0, 0, 0, 0, time.UTC).UnixMilli())
+	statuses := rt.recentThreadStatusesForRequest(context.Background(), 10, sinceMs)
+	if len(statuses) != 1 || stringValue(mapValue(statuses[0])["threadId"]) != "T-019e0e6e-f3f1-7078-b5dd-748f66f8c271" {
+		t.Fatalf("filtered cached recent statuses = %#v", statuses)
 	}
 }
 

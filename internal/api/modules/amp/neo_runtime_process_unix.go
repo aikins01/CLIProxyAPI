@@ -23,11 +23,26 @@ func neoCancelSpawnedExecutorProcess(cmd *exec.Cmd) error {
 	if cmd == nil || cmd.Process == nil {
 		return nil
 	}
-	groupErr := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	return neoCancelExecutorProcessGroup(cmd.Process.Pid)
+}
+
+func neoCancelRecoveredExecutorProcess(pid int) error {
+	if pid <= 0 {
+		return nil
+	}
+	return neoCancelExecutorProcessGroup(pid)
+}
+
+func neoCancelExecutorProcessGroup(pid int) error {
+	groupErr := syscall.Kill(-pid, syscall.SIGKILL)
 	if groupErr == nil {
 		return nil
 	}
-	processErr := cmd.Process.Kill()
+	process, findErr := os.FindProcess(pid)
+	if findErr != nil {
+		return errors.Join(groupErr, findErr)
+	}
+	processErr := process.Kill()
 	if processErr == nil || errors.Is(processErr, os.ErrProcessDone) {
 		return nil
 	}

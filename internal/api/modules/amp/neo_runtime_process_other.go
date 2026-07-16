@@ -21,6 +21,21 @@ func neoCancelSpawnedExecutorProcess(cmd *exec.Cmd) error {
 	return err
 }
 
+func neoCancelRecoveredExecutorProcess(pid int) error {
+	if pid <= 0 {
+		return nil
+	}
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return err
+	}
+	err = process.Kill()
+	if errors.Is(err, os.ErrProcessDone) {
+		return nil
+	}
+	return err
+}
+
 func neoSpawnedExecutorDetachedForTest(cmd *exec.Cmd) bool {
 	return true
 }
