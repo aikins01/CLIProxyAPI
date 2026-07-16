@@ -5032,6 +5032,146 @@ func TestNeoRuntimeWebLocalInferenceSkipsSpawnWhenHeadlessPIDAlive(t *testing.T)
 	}
 }
 
+func TestPrepareNeoAmpHeadlessPIDFileRemovesDeadPID(t *testing.T) {
+	dir := t.TempDir()
+	t.Cleanup(replaceNeoAmpHeadlessPIDDir(func() string { return dir }))
+	threadID := "T-33333333-3333-4333-8333-333333333333"
+	path := filepath.Join(dir, threadID+".pid")
+	if err := os.WriteFile(path, []byte("99999999"), 0o600); err != nil {
+		t.Fatalf("write stale Amp PID file: %v", err)
+	}
+
+	pid, err := prepareNeoAmpHeadlessPIDFile(threadID, "")
+	if err != nil {
+		t.Fatalf("prepare stale Amp PID file: %v", err)
+	}
+	if pid != 0 {
+		t.Fatalf("live PID = %d, want 0", pid)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale Amp PID file still exists: %v", err)
+	}
+}
+
+func TestPrepareNeoAmpHeadlessPIDFilePreservesLivePID(t *testing.T) {
+	dir := t.TempDir()
+	t.Cleanup(replaceNeoAmpHeadlessPIDDir(func() string { return dir }))
+	threadID := "T-33333333-3333-4333-8333-333333333333"
+	path := filepath.Join(dir, threadID+".pid")
+	if err := os.WriteFile(path, []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
+		t.Fatalf("write live Amp PID file: %v", err)
+	}
+
+	pid, err := prepareNeoAmpHeadlessPIDFile(threadID, "")
+	if err != nil {
+		t.Fatalf("prepare live Amp PID file: %v", err)
+	}
+	if pid != os.Getpid() {
+		t.Fatalf("live PID = %d, want %d", pid, os.Getpid())
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("live Amp PID file removed: %v", err)
+	}
+}
+
+func TestPrepareNeoAmpHeadlessPIDFileRemovesOutOfRangePID(t *testing.T) {
+	dir := t.TempDir()
+	t.Cleanup(replaceNeoAmpHeadlessPIDDir(func() string { return dir }))
+	threadID := "T-33333333-3333-4333-8333-333333333333"
+	path := filepath.Join(dir, threadID+".pid")
+	if err := os.WriteFile(path, []byte(strconv.FormatUint(neoMaxProcessID+1, 10)), 0o600); err != nil {
+		t.Fatalf("write out-of-range Amp PID file: %v", err)
+	}
+
+	pid, err := prepareNeoAmpHeadlessPIDFile(threadID, "")
+	if err != nil {
+		t.Fatalf("prepare out-of-range Amp PID file: %v", err)
+	}
+	if pid != 0 {
+		t.Fatalf("live PID = %d, want 0", pid)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("out-of-range Amp PID file still exists: %v", err)
+	}
+}
+
+func TestPrepareNeoAmpHeadlessPIDFileDelegatesMalformedPID(t *testing.T) {
+	dir := t.TempDir()
+	t.Cleanup(replaceNeoAmpHeadlessPIDDir(func() string { return dir }))
+	threadID := "T-33333333-3333-4333-8333-333333333333"
+	path := filepath.Join(dir, threadID+".pid")
+	if err := os.WriteFile(path, []byte("starting"), 0o600); err != nil {
+		t.Fatalf("write malformed Amp PID file: %v", err)
+	}
+
+	if pid, err := prepareNeoAmpHeadlessPIDFile(threadID, ""); err != nil || pid != 0 {
+		t.Fatalf("prepare malformed Amp PID file = pid %d, err %v", pid, err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("malformed Amp PID file removed: %v", err)
+	}
+}
+
+func TestPrepareNeoAmpHeadlessPIDFileDelegatesSignedLivePID(t *testing.T) {
+	dir := t.TempDir()
+	t.Cleanup(replaceNeoAmpHeadlessPIDDir(func() string { return dir }))
+	threadID := "T-33333333-3333-4333-8333-333333333333"
+	path := filepath.Join(dir, threadID+".pid")
+	if err := os.WriteFile(path, []byte("+"+strconv.Itoa(os.Getpid())), 0o600); err != nil {
+		t.Fatalf("write signed Amp PID file: %v", err)
+	}
+
+	if pid, err := prepareNeoAmpHeadlessPIDFile(threadID, ""); err != nil || pid != 0 {
+		t.Fatalf("prepare signed Amp PID file = pid %d, err %v", pid, err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("signed Amp PID file removed: %v", err)
+	}
+}
+
+func TestPrepareNeoAmpHeadlessPIDFileUsesRelativeXDGCacheFromExecutorDirectory(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", "")
+	t.Cleanup(replaceNeoAmpHeadlessPIDDir(defaultNeoAmpHeadlessPIDDir))
+	workingDirectory := t.TempDir()
+	threadID := "T-33333333-3333-4333-8333-333333333333"
+	pidDir := filepath.Join(workingDirectory, "amp", "pids")
+	if err := os.MkdirAll(pidDir, 0o700); err != nil {
+		t.Fatalf("create relative Amp PID directory: %v", err)
+	}
+	path := filepath.Join(pidDir, threadID+".pid")
+	if err := os.WriteFile(path, []byte("99999999"), 0o600); err != nil {
+		t.Fatalf("write relative stale Amp PID file: %v", err)
+	}
+
+	if pid, err := prepareNeoAmpHeadlessPIDFile(threadID, workingDirectory); err != nil || pid != 0 {
+		t.Fatalf("prepare relative stale Amp PID file = pid %d, err %v", pid, err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("relative stale Amp PID file still exists: %v", err)
+	}
+}
+
+func TestNeoActorSpawnRejectsExternalAmpPIDLock(t *testing.T) {
+	dir := t.TempDir()
+	t.Cleanup(replaceNeoAmpHeadlessPIDDir(func() string { return dir }))
+	threadID := "T-33333333-3333-4333-8333-333333333333"
+	if err := os.WriteFile(filepath.Join(dir, threadID+".pid"), []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
+		t.Fatalf("write external Amp PID file: %v", err)
+	}
+
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "threadActor", threadID, threadID, neoActorRecord("actor-test", "threadActor", threadID), nil)
+	t.Cleanup(actor.dispose)
+	status := actor.spawnExecutor(map[string]any{"requestId": "spawn-external-lock"})
+	if stringValue(status["status"]) != "failed" {
+		t.Fatalf("spawn status = %#v, want failed", status)
+	}
+	details := mapValue(status["details"])
+	if details["reasonCode"] != "spawn_rejected" || int(numberFrom(details["pid"])) != os.Getpid() {
+		t.Fatalf("spawn details = %#v, want external lock conflict", details)
+	}
+}
+
 func TestNeoRuntimeWebLocalInferenceObserverCannotClaimExecutor(t *testing.T) {
 	dir := t.TempDir()
 	pidDir := filepath.Join(dir, "pids")

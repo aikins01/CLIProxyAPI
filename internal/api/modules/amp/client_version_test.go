@@ -2,7 +2,12 @@ package amp
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"runtime"
 	"slices"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -56,6 +61,124 @@ func TestAmpClientVersionProbeEnvRemovesRemoteControlMode(t *testing.T) {
 	want := []string{"PATH=/usr/bin:/bin", "AMP_SKIP_UPDATE_CHECK=1"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("probe environment = %#v, want %#v", got, want)
+	}
+}
+
+func TestAmpInstalledClientVersionBoundsHungProbe(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell probe fixture is not portable to Windows")
+	}
+	command := filepath.Join(t.TempDir(), "amp")
+	childPIDFile := filepath.Join(t.TempDir(), "child.pid")
+	t.Setenv("TEST_CHILD_PID_FILE", childPIDFile)
+	if err := os.WriteFile(command, []byte("#!/bin/sh\n(trap '' HUP; exec sleep 30) &\necho \"$!\" > \"$TEST_CHILD_PID_FILE\"\nwait\n"), 0o700); err != nil {
+		t.Fatalf("write fake Amp executable: %v", err)
+	}
+	oldTimeout := ampInstalledClientVersionProbeTimeout
+	oldWaitDelay := ampInstalledClientVersionWaitDelay
+	ampInstalledClientVersionProbeTimeout = 5 * time.Second
+	ampInstalledClientVersionWaitDelay = 50 * time.Millisecond
+	t.Cleanup(func() {
+		ampInstalledClientVersionProbeTimeout = oldTimeout
+		ampInstalledClientVersionWaitDelay = oldWaitDelay
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan string, 1)
+	go func() {
+		result <- ampInstalledClientVersion(ctx, command)
+	}()
+
+	var childPIDBytes []byte
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		childPIDBytes, _ = os.ReadFile(childPIDFile)
+		if len(childPIDBytes) > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(childPIDBytes) == 0 {
+		cancel()
+		t.Fatal("fake Amp probe did not start its child")
+	}
+
+	started := time.Now()
+	cancel()
+	select {
+	case got := <-result:
+		if got != "" {
+			t.Fatalf("hung probe version = %q", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("hung probe did not stop within one second")
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("hung probe cancellation elapsed = %s, want less than one second", elapsed)
+	}
+	childPID, err := strconv.Atoi(strings.TrimSpace(string(childPIDBytes)))
+	if err != nil {
+		t.Fatalf("parse child PID: %v", err)
+	}
+	t.Cleanup(func() {
+		if process, err := os.FindProcess(childPID); err == nil {
+			_ = process.Kill()
+		}
+	})
+	deadline = time.Now().Add(time.Second)
+	for neoProcessAlive(childPID) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if neoProcessAlive(childPID) {
+		t.Fatalf("version probe child process %d is still running", childPID)
+	}
+}
+
+func TestAmpInstalledClientVersionKillsChildWhenProbeParentExits(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell probe fixture is not portable to Windows")
+	}
+	command := filepath.Join(t.TempDir(), "amp")
+	childPIDFile := filepath.Join(t.TempDir(), "child.pid")
+	t.Setenv("TEST_CHILD_PID_FILE", childPIDFile)
+	if err := os.WriteFile(command, []byte("#!/bin/sh\n(trap '' HUP; exec sleep 30) &\necho \"$!\" > \"$TEST_CHILD_PID_FILE\"\necho 1.2.3\nexit 0\n"), 0o700); err != nil {
+		t.Fatalf("write fake Amp executable: %v", err)
+	}
+	oldTimeout := ampInstalledClientVersionProbeTimeout
+	oldWaitDelay := ampInstalledClientVersionWaitDelay
+	ampInstalledClientVersionProbeTimeout = 5 * time.Second
+	ampInstalledClientVersionWaitDelay = 50 * time.Millisecond
+	t.Cleanup(func() {
+		ampInstalledClientVersionProbeTimeout = oldTimeout
+		ampInstalledClientVersionWaitDelay = oldWaitDelay
+	})
+
+	started := time.Now()
+	if got := ampInstalledClientVersion(context.Background(), command); got != "" {
+		t.Fatalf("incomplete probe version = %q", got)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("incomplete probe elapsed = %s, want less than one second", elapsed)
+	}
+	childPIDBytes, err := os.ReadFile(childPIDFile)
+	if err != nil {
+		t.Fatalf("read child PID: %v", err)
+	}
+	childPID, err := strconv.Atoi(strings.TrimSpace(string(childPIDBytes)))
+	if err != nil {
+		t.Fatalf("parse child PID: %v", err)
+	}
+	t.Cleanup(func() {
+		if process, err := os.FindProcess(childPID); err == nil {
+			_ = process.Kill()
+		}
+	})
+	deadline := time.Now().Add(time.Second)
+	for neoProcessAlive(childPID) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if neoProcessAlive(childPID) {
+		t.Fatalf("version probe child process %d is still running", childPID)
 	}
 }
 

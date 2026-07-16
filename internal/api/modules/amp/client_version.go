@@ -6,7 +6,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"os/exec"
 	"regexp"
 	"strings"
 	"sync"
@@ -24,8 +23,10 @@ const (
 )
 
 var (
-	ampClientVersionPattern = regexp.MustCompile(`(?:^|[^0-9A-Za-z_.+-])(\d+\.\d+\.\d+(?:-[0-9A-Za-z_-]+(?:\.[0-9A-Za-z_-]+)*)?(?:\+[0-9A-Za-z_-]+(?:\.[0-9A-Za-z_-]+)*)?)(?:$|[^0-9A-Za-z_.+-])`)
-	ampClientVersions       = &ampClientVersionResolver{}
+	ampClientVersionPattern               = regexp.MustCompile(`(?:^|[^0-9A-Za-z_.+-])(\d+\.\d+\.\d+(?:-[0-9A-Za-z_-]+(?:\.[0-9A-Za-z_-]+)*)?(?:\+[0-9A-Za-z_-]+(?:\.[0-9A-Za-z_-]+)*)?)(?:$|[^0-9A-Za-z_.+-])`)
+	ampClientVersions                     = &ampClientVersionResolver{}
+	ampInstalledClientVersionProbeTimeout = 3 * time.Second
+	ampInstalledClientVersionWaitDelay    = 250 * time.Millisecond
 )
 
 type ampClientVersionResolver struct {
@@ -216,9 +217,15 @@ func ampInstalledClientVersion(ctx context.Context, executorCommand string) stri
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	cmd := exec.CommandContext(ctx, command, "--version")
-	cmd.Env = ampClientVersionProbeEnv(os.Environ())
-	out, err := cmd.Output()
+	probeCtx, cancel := context.WithTimeout(ctx, ampInstalledClientVersionProbeTimeout)
+	defer cancel()
+	out, err := ampRunClientVersionProbe(
+		probeCtx,
+		command,
+		[]string{"--version"},
+		ampClientVersionProbeEnv(os.Environ()),
+		ampInstalledClientVersionWaitDelay,
+	)
 	if err != nil {
 		log.Debugf("amp client version: %s --version failed: %v", command, err)
 		return ""
