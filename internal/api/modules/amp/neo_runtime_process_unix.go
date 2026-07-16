@@ -19,6 +19,24 @@ func neoConfigureSpawnedExecutorProcess(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 }
 
+func neoCancelSpawnedExecutorProcess(cmd *exec.Cmd) error {
+	if cmd == nil || cmd.Process == nil {
+		return nil
+	}
+	groupErr := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	if groupErr == nil {
+		return nil
+	}
+	processErr := cmd.Process.Kill()
+	if processErr == nil || errors.Is(processErr, os.ErrProcessDone) {
+		return nil
+	}
+	if errors.Is(groupErr, syscall.ESRCH) {
+		return processErr
+	}
+	return errors.Join(groupErr, processErr)
+}
+
 func neoSpawnedExecutorDetachedForTest(cmd *exec.Cmd) bool {
 	return cmd != nil && cmd.SysProcAttr != nil && cmd.SysProcAttr.Setpgid
 }
