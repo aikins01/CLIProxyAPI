@@ -2,9 +2,24 @@
 
 package amp
 
-import "os/exec"
+import (
+	"errors"
+	"os"
+	"os/exec"
+)
 
 func neoConfigureSpawnedExecutorProcess(cmd *exec.Cmd) {}
+
+func neoCancelSpawnedExecutorProcess(cmd *exec.Cmd) error {
+	if cmd == nil || cmd.Process == nil {
+		return nil
+	}
+	err := cmd.Process.Kill()
+	if errors.Is(err, os.ErrProcessDone) {
+		return nil
+	}
+	return err
+}
 
 func neoSpawnedExecutorDetachedForTest(cmd *exec.Cmd) bool {
 	return true

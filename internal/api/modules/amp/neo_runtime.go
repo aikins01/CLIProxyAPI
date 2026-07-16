@@ -2811,6 +2811,7 @@ type neoSpawnedExecutor struct {
 	command       string
 	logPath       string
 	cmd           *exec.Cmd
+	cancel        context.CancelFunc
 	startedAt     time.Time
 	connected     bool
 	stopping      bool
@@ -2830,10 +2831,16 @@ func (e *neoSpawnedExecutor) waitable() bool {
 }
 
 func (e *neoSpawnedExecutor) stop() {
-	if e == nil || e.cmd == nil || e.cmd.Process == nil {
+	if e == nil {
 		return
 	}
-	_ = e.cmd.Process.Kill()
+	if e.cancel != nil {
+		e.cancel()
+		return
+	}
+	if e.cmd != nil && e.cmd.Process != nil {
+		_ = e.cmd.Process.Kill()
+	}
 }
 
 func (a *neoActor) executorConnectedLocked() bool {
@@ -5494,8 +5501,12 @@ func (a *neoActor) spawnExecutorWithProvenance(msg map[string]any, webLocal bool
 		}
 	}
 	args := neoHeadlessExecutorArgs(threadID, agentMode, reasoningEffort, logPath)
-	cmd := exec.Command(command, args...)
+	executorContext, cancelExecutor := context.WithCancel(context.Background())
+	cmd := exec.CommandContext(executorContext, command, args...)
 	neoConfigureSpawnedExecutorProcess(cmd)
+	cmd.Cancel = func() error {
+		return neoCancelSpawnedExecutorProcess(cmd)
+	}
 	if workDir != "" {
 		cmd.Dir = workDir
 	}
@@ -5511,6 +5522,7 @@ func (a *neoActor) spawnExecutorWithProvenance(msg map[string]any, webLocal bool
 
 	a.broadcastExecutorStatus(spawnID, "starting", "Starting local Amp headless executor.", map[string]any{"reasonCode": "spawn_requested", "threadId": threadID, "command": command, "args": args})
 	if err := cmd.Start(); err != nil {
+		cancelExecutor()
 		if logFile != nil {
 			_ = logFile.Close()
 		}
@@ -5527,6 +5539,7 @@ func (a *neoActor) spawnExecutorWithProvenance(msg map[string]any, webLocal bool
 		command:   command,
 		logPath:   logPath,
 		cmd:       cmd,
+		cancel:    cancelExecutor,
 		startedAt: time.Now(),
 		webLocal:  webLocal,
 	}
