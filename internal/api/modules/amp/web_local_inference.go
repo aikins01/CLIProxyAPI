@@ -300,7 +300,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	return fmt.Sprintf(`// ==UserScript==
 // @name CLIProxyAPI Amp Local Inference
 // @namespace https://github.com/router-for-me/CLIProxyAPI
-// @version 0.1.87
+// @version 0.1.88
 %s
 // @updateURL %s
 // @downloadURL %s
@@ -312,7 +312,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	"use strict";
 
 	const bridgeHeader = %s;
-	const userscriptVersion = "0.1.87";
+	const userscriptVersion = "0.1.88";
 	const apiKeyStorageKey = "cliproxyapi.ampLocalInference.apiKey";
 	const workingDirectoryStorageKey = "cliproxyapi.ampLocalInference.workingDirectory";
 	const selectedLocalProjectStorageKey = "cliproxyapi.ampLocalInference.selectedLocalProject";
@@ -1290,6 +1290,22 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			thread.ownerUserId = userIndex;
 			patched = true;
 		}
+		for (const container of thread === entry ? [thread] : [thread, entry]) {
+			let creator = devalueObjectField(values, container, "creator");
+			if (!isPlainObject(creator)) {
+				creator = { id: userIndex };
+				values.push(creator);
+				container.creator = values.length - 1;
+				patched = true;
+				continue;
+			}
+			if (creator.id !== userIndex) {
+				creator = Object.assign({}, creator, { id: userIndex });
+				values.push(creator);
+				container.creator = values.length - 1;
+				patched = true;
+			}
+		}
 		return patched;
 	}
 
@@ -1849,6 +1865,17 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		if (thread.ownerUserId !== authenticatedAmpUserID) {
 			thread.ownerUserId = authenticatedAmpUserID;
 			patched = true;
+		}
+		for (const container of thread === value ? [thread] : [thread, value]) {
+			if (!isPlainObject(container.creator)) {
+				container.creator = { id: authenticatedAmpUserID };
+				patched = true;
+				continue;
+			}
+			if (container.creator.id !== authenticatedAmpUserID) {
+				container.creator.id = authenticatedAmpUserID;
+				patched = true;
+			}
 		}
 		return patched;
 	}
@@ -2753,6 +2780,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		if (authenticatedAmpUserID) {
 			normalized.creatorUserID = authenticatedAmpUserID;
 			normalized.ownerUserId = authenticatedAmpUserID;
+			normalized.creator = Object.assign({}, isPlainObject(thread.creator) ? thread.creator : {}, { id: authenticatedAmpUserID });
 		}
 		return normalized;
 	}

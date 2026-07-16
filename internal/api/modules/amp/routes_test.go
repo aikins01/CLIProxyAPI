@@ -437,7 +437,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 	}
 	for _, want := range []string{
 		"// ==UserScript==",
-		"@version 0.1.87",
+		"@version 0.1.88",
 		"@match https://ampcode.com/*",
 		"@updateURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
 		"@downloadURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
@@ -454,7 +454,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"commandPaletteIntegrationCount",
 		"localThreadPickerOpenCount",
 		"removedLocalThreadControlCount",
-		`const userscriptVersion = "0.1.87"`,
+		`const userscriptVersion = "0.1.88"`,
 		"discoverLocalThreadID",
 		"normalizeLocalThreadViewPath",
 		`originalFetch(localBaseURLString() + "/api/thread-actors"`,
@@ -889,6 +889,7 @@ globalThis.fetch = async (url, init) => {
 					state: "idle",
 					agentState: "idle",
 					meta: { executorType: "local-client", usesThreadActors: true },
+					creator: { id: "local-user", name: "Local Amp" },
 				},
 				{
 					id: secondThreadID,
@@ -898,6 +899,7 @@ globalThis.fetch = async (url, init) => {
 					state: "idle",
 					agentState: "idle",
 					meta: { executorType: "local-client", usesThreadActors: true },
+					creator: { id: "local-user", name: "Local Amp" },
 				},
 			],
 		}), {
@@ -932,11 +934,13 @@ globalThis.fetch = async (url, init) => {
 				threadId: localThreadID,
 				creatorUserID: "local-user",
 				ownerUserId: "local-user",
+				creator: { id: "local-user", name: "Local Amp" },
 				v: 9,
 				messages: [{ messageId: "M-local-history", protocolMessageID: "M-local-history", role: "user", content: [{ type: "text", text: "local history" }] }],
 				queuedMessages: [],
 			},
 			threadActorConfig: { threadId: localThreadID, wsToken: "local-neo", ampURL: "http://127.0.0.1:8317", baseURL: "http://127.0.0.1:8317" },
+			creator: { id: "local-user", name: "Local Amp" },
 			actorPermissions: { manageThread: true, manageBilling: false },
 		}), {
 			status: 200,
@@ -1023,7 +1027,7 @@ if (typeof globalThis.btoa !== "function") {
 }
 	require(scriptPath);
 	const bridge = globalThis.__cliproxyAmpLocalInference;
-	assert(bridge && bridge.userscriptVersion === "0.1.87", "bridge userscript version was not exposed");
+	assert(bridge && bridge.userscriptVersion === "0.1.88", "bridge userscript version was not exposed");
 		globalThis.localStorage.setItem(bridge.apiKeyStorageKey, "local-key");
 		JSON.parse(JSON.stringify({ user: { id: "U-unrelated", email: "other@example.com" }, workspaces: [] }));
 		assert(bridge.diagnostics.authenticatedAmpUserIDCaptureCount === 0, "unrelated nested user was accepted as the authenticated viewer");
@@ -1087,6 +1091,7 @@ assert((await throwingURLResponse.json()).ok === true, "response url inspection 
 	assert(new URL(localThreadDataFetchURL).searchParams.get("cliproxy-thread-id") === threadID, "local thread resource id was not forwarded");
 	assert(localThreadResource.thread.id === threadID && localThreadResource.thread.v === 9, "local thread resource identity/version mismatch");
 	assert(localThreadResource.thread.creatorUserID === ampViewerUserID && localThreadResource.thread.ownerUserId === ampViewerUserID, "local thread resource was not projected as owned by the authenticated Amp user");
+	assert(localThreadResource.thread.creator.id === ampViewerUserID && localThreadResource.creator.id === ampViewerUserID, "local thread resource creator objects were not projected as the authenticated Amp user");
 		assert(Array.isArray(localThreadResource.thread.messages) && localThreadResource.thread.messages.length === 1, "local thread resource lost transcript messages");
 		assert(localThreadResource.threadActorConfig.threadId === threadID, "local thread resource actor config mismatch");
 		assert(localThreadResource.threadActorConfig.wsToken === "local-key", "local thread resource actor config did not carry the worker token");
@@ -1317,7 +1322,20 @@ assert(userActorSocket.sent.at(-1) === rawZeroResume, "user actor resume frame w
 	const unknownBaseSocket = new WebSocket("wss://ampcode.com/gateway/threadActor/?rvt-method=get&rvt-key=" + encodeURIComponent(cloudThreadID));
 	unknownBaseSocket.send(noBaseResume);
 	assert(unknownBaseSocket.sent.at(-1) === noBaseResume, "mismatched or missing loaded base changed zero resume");
-const values = JSON.parse(JSON.stringify([{ current: 1 }, { thread: 2 }, { id: 3, title: 4, v: 5, messages: 6 }, threadID, "Local", 37, [] ]));
+const values = JSON.parse(JSON.stringify([
+	{ current: 1 },
+	{ thread: 2, creator: 10 },
+	{ id: 3, title: 4, v: 5, messages: 6, creator: 7, creatorUserID: 8, ownerUserId: 8 },
+	threadID,
+	"Local",
+	37,
+	[],
+	{ id: 8, name: 9 },
+	"local-user",
+	"Local Amp",
+	{ id: 8, name: 9 },
+	{ threadCreator: 7, entryCreator: 10 },
+]));
 const configIndex = values[1].threadActorConfig;
 assert(Number.isInteger(configIndex), "devalue threadActorConfig was not a reference");
 const devalueConfig = values[configIndex];
@@ -1331,6 +1349,9 @@ assert(deref(devalueConfig.poolName) === "default", "devalue poolName mismatch")
 assert(deref(devalueConfig.requiresSudoForWrite) === false, "devalue requiresSudoForWrite mismatch");
 assert(deref(devalueConfig.requiresSudoForTerminal) === false, "devalue requiresSudoForTerminal mismatch");
 assert(deref(devalueConfig.threadActorTransport) === "json-rpc", "devalue threadActorTransport mismatch");
+assert(deref(values[2].creatorUserID) === ampViewerUserID && deref(values[2].ownerUserId) === ampViewerUserID, "devalue local thread owner ids were not patched");
+assert(deref(values[values[2].creator].id) === ampViewerUserID && deref(values[values[1].creator].id) === ampViewerUserID, "devalue local thread creator objects were not patched");
+assert(deref(values[values[11].threadCreator].id) === "local-user" && deref(values[values[11].entryCreator].id) === "local-user", "shared devalue creator objects were mutated");
 assert(bridge.diagnostics.lastPatchedThreadID === threadID, "devalue patch did not record thread ID");
 const nullConfigValues = JSON.parse(JSON.stringify([{ current: 1 }, { thread: 2, threadActorConfig: 5 }, { id: 3, title: 4 }, threadID, "Local", null ]));
 const nullConfigIndex = nullConfigValues[1].threadActorConfig;
@@ -1431,9 +1452,14 @@ Object.defineProperty(sidebarResponse, "url", { value: "https://ampcode.com/_app
 	const mergedSidebarRefs = mergedSidebarValues[5].slice(0, 2);
 	const mergedSidebarThreadRefs = mergedSidebarRefs.map((ref) => mergedSidebarValues[ref].thread);
 	const mergedSidebarThreadIDs = mergedSidebarThreadRefs.map((ref) => mergedSidebarValues[mergedSidebarValues[ref].id]);
+	const mergedSidebarCreatorIDs = mergedSidebarThreadRefs.map((ref) => {
+		const creatorRef = mergedSidebarValues[ref].creator;
+		return mergedSidebarValues[mergedSidebarValues[creatorRef].id];
+	});
 	assert(mergedSidebarRefs.every((ref) => Number.isInteger(ref) && Number.isInteger(mergedSidebarValues[ref].thread)), "local sidebar wrappers were not inserted into sidebar response");
 	assert(mergedSidebarRefs.every((ref) => Number.isInteger(mergedSidebarValues[ref].lastActivityTimestamp)), "local sidebar wrappers are missing activity timestamps");
 	assert(JSON.stringify(mergedSidebarThreadIDs) === JSON.stringify([createdThreadID, secondThreadID]), "merged sidebar thread order mismatch");
+	assert(mergedSidebarCreatorIDs.every((id) => id === ampViewerUserID), "merged sidebar creator objects were not projected as the authenticated Amp user");
 	assert(mergedSidebarValues[mergedSidebarValues[mergedSidebarThreadRefs[0]].title] === "Use local project", "merged sidebar thread title mismatch");
 	assert(!Object.hasOwn(mergedSidebarValues[mergedSidebarThreadRefs[1]], "hasExecutor"), "cached local sidebar thread gained hasExecutor before discovery");
 	assert(!Object.hasOwn(mergedSidebarValues[mergedSidebarThreadRefs[1]], "executorConnected"), "cached local sidebar thread gained executorConnected before discovery");

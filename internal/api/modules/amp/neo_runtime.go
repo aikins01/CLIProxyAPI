@@ -2974,11 +2974,15 @@ func (a *neoActor) stopSpawnedExecutors() {
 func (a *neoActor) stopSpawnedExecutorsForRebind() {
 	a.mu.Lock()
 	executors := a.spawnedExecutorListLocked()
-	if len(executors) == 0 {
+	recoveredPID := a.recoveredExecutorPID
+	if len(executors) == 0 && recoveredPID == 0 {
 		a.mu.Unlock()
 		return
 	}
 	a.spawnedExecutors = map[string]*neoSpawnedExecutor{}
+	a.recoveredExecutorPID = 0
+	a.recoveredExecutorWebLocal = false
+	threadID := firstNonEmptyString(a.threadID, a.key)
 	a.touchLocked()
 	a.executorIdleGeneration++
 	a.reconnectGeneration++
@@ -2996,6 +3000,7 @@ func (a *neoActor) stopSpawnedExecutorsForRebind() {
 	for _, executor := range executors {
 		executor.stop()
 	}
+	stopNeoRecoveredHeadlessPID(threadID, recoveredPID)
 	a.broadcastExecutorWorkCleanup(cleanup)
 }
 
@@ -15674,7 +15679,13 @@ func (rt *neoRuntime) recentThreadStatusesForRequest(ctx context.Context, limit,
 	if err == nil {
 		rt.mu.RLock()
 		seed := rt.recentThreadSeeds[key]
-		statuses = append(statuses, cloneArray(seed.statuses)...)
+		for _, rawStatus := range seed.statuses {
+			status := mapValue(rawStatus)
+			updatedMs := neoTimeStringMillis(stringValue(status["lastUserMessageAt"]))
+			if sinceMs <= 0 || updatedMs <= 0 || updatedMs >= sinceMs {
+				statuses = append(statuses, cloneNeoJSONValue(rawStatus))
+			}
+		}
 		rt.mu.RUnlock()
 	}
 	return neoSortRecentThreadStatuses(statuses, limit)
@@ -26998,9 +27009,7 @@ func stopNeoRecoveredHeadlessPID(threadID string, pid int) {
 		return
 	}
 	if neoHeadlessProcessOwnedByThread(pid, threadID) {
-		if process, err := os.FindProcess(pid); err == nil {
-			_ = process.Kill()
-		}
+		_ = neoCancelRecoveredExecutorProcess(pid)
 	}
 	removeNeoHeadlessPIDFile(threadID, pid)
 }
