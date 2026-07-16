@@ -1,0 +1,95 @@
+{
+  "schema": 1,
+  "source_url": "https://ampcode.com/",
+  "routes": [
+    "/(app)/projects",
+    "/(app)/settings/plugins",
+    "/(app)/settings/plugins/manage",
+    "/(app)/threads/[thread=threadID]/(active)",
+    "/(app)/threads/[thread=threadID]/(active)/terminal"
+  ],
+  "contracts": [
+    {
+      "name": "actor-connection-config",
+      "scope": "local-runtime",
+      "required_all": [
+        "threadActorConfig",
+        "actorConnectionPool",
+        "connectActorThread",
+        "wsToken",
+        "ampURL",
+        "baseURL",
+        "threadActorTransport",
+        "json-rpc"
+      ]
+    },
+    {
+      "name": "actor-session-lifecycle",
+      "scope": "local-runtime",
+      "required_all": [
+        "client_resume",
+        "client_append_user_msg",
+        "executor_connected",
+        "observers",
+        "thread_status",
+        "thread_settings"
+      ]
+    },
+    {
+      "name": "headless-executor",
+      "scope": "local-runtime",
+      "required_all": [
+        "client_spawn_executor",
+        "executor_status",
+        "executorType",
+        "hasExecutor",
+        "directTerminalAvailable"
+      ]
+    },
+    {
+      "name": "terminal-relay",
+      "scope": "executor-bridge",
+      "required_all": [
+        "amp-terminal-v1",
+        "openTerminal",
+        "openExecutorRelay",
+        "client_executor_relay_open",
+        "client_executor_relay_data",
+        "client_executor_relay_close",
+        "executor_relay_output",
+        "executor_relay_exit"
+      ]
+    },
+    {
+      "name": "plugin-ui",
+      "scope": "plugin-bridge",
+      "required_all": [
+        "plugin_message",
+        "sendPluginRPCMessage",
+        "plugin.ui.snapshot",
+        "plugin.ui.request_added",
+        "plugin.ui.request_settled",
+        "plugin.ui.request_removed"
+      ]
+    },
+    {
+      "name": "thread-composer",
+      "scope": "local-inference",
+      "required_all": [
+        "actorReady",
+        "connectionCapability",
+        "sendUserMessage"
+      ]
+    },
+    {
+      "name": "projects-and-sidebar",
+      "scope": "userscript",
+      "required_all": [
+        "workingDirectory",
+        "repositoryURL",
+        "projectID",
+        "executorConnected"
+      ]
+    }
+  ]
+}

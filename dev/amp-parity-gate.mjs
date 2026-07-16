@@ -35,6 +35,11 @@ const commands = [
     args: ['run', './cmd/amp_binary_audit', '-strict']
   },
   {
+    name: 'web contract audit',
+    cmd: 'go',
+    args: ['run', './cmd/amp_web_audit', '-strict']
+  },
+  {
     name: 'prompt family audit',
     cmd: 'bun',
     args: ['dev/amp-prompt-family-audit.mjs']

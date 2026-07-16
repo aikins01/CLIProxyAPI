@@ -314,7 +314,7 @@ func TestWebLocalInferenceCORSAllowsOnlyConfiguredActorOriginsAndPaths(t *testin
 		t.Fatalf("enabled web-local-inference internal preflight status = %d, want %d", internalRec.Code, http.StatusNoContent)
 	}
 
-	for _, path := range []string{"/metadata", "/actors/metadata", "/gateway/thread-actor/", "/_app/remote/3abror/createProjectThread", "/ampcode/local-projects.json"} {
+	for _, path := range []string{"/metadata", "/actors/metadata", "/gateway/thread-actor/", "/_app/remote/3abror/createProjectThread", "/ampcode/local-projects.json", "/ampcode/local-thread-data.json"} {
 		t.Run("root preflight "+path, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodOptions, path, nil)
 			req.Header.Set("Origin", "https://ampcode.com")
@@ -437,7 +437,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 	}
 	for _, want := range []string{
 		"// ==UserScript==",
-		"@version 0.1.64",
+		"@version 0.1.87",
 		"@match https://ampcode.com/*",
 		"@updateURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
 		"@downloadURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
@@ -454,7 +454,16 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"commandPaletteIntegrationCount",
 		"localThreadPickerOpenCount",
 		"removedLocalThreadControlCount",
-		`const userscriptVersion = "0.1.64"`,
+		`const userscriptVersion = "0.1.87"`,
+		"discoverLocalThreadID",
+		"normalizeLocalThreadViewPath",
+		`originalFetch(localBaseURLString() + "/api/thread-actors"`,
+		`globalThis.document.body.appendChild(anchor)`,
+		"shouldPatchSidebarResponseJSON",
+		"mergeSidebarResponse",
+		"appendDevalueSidebarValue",
+		`url.searchParams.set("cliproxy-thread-id", threadID)`,
+		"localSidebarThreadMergeCount",
 		"userscriptVersion",
 		"lastPatchedThreadActorBaseURL",
 		"lastPatchedThreadID",
@@ -477,7 +486,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"devalueContainerThreadID",
 		"ensurePlainLocalThreadActorConfig",
 		"ensureDevalueLocalThreadActorConfig",
-		`wsToken: "local-neo"`,
+		`wsToken: storedLocalAPIKey() || "local-neo"`,
 		`threadActorTransport: "json-rpc"`,
 		"local-client",
 		"cliproxyapi.ampLocalInference.apiKey",
@@ -492,6 +501,9 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"cliproxyapi.ampLocalInference.threadSettings",
 		"/ampcode/local-projects.json",
 		"localProjectsEndpointPath",
+		"/ampcode/local-thread-data.json",
+		"localThreadDataEndpointPath",
+		"localThreadResourceDataThreadID",
 		"selectedLocalProjectWorkingDirectory",
 		"currentLocalProjectWorkingDirectory",
 		"rememberSelectedLocalProject",
@@ -518,6 +530,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"localProjectFetchCount",
 		"localProjectFetchFailureCount",
 		"lastLocalProjectFetchFailure",
+		`localProjectsCache = { at: 0, projects: [], threadID, thread: null, threads: [], promise: null }`,
 		"localProjectPickerIntegrationCount",
 		"localProjectIntegrationGeneration",
 		"projectMutationCandidateCount",
@@ -660,7 +673,6 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"installThreadMenuIntegration();",
 		"installCommandPaletteIntegration();",
 		"handleNewThreadIntent();",
-		"mergeSidebarResponse",
 		"seedLocalSidebarProjects",
 		"seedLocalSidebarProjectForWorkingDirectory",
 		"scheduleLocalSidebarProjectsRefresh",
@@ -668,9 +680,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"mergeDevalueSidebarProjects",
 		"cachedLocalSidebarRecentThreads",
 		"cachedLocalSidebarProjects",
-		"sidebarDateFields",
 		"appendDevalueSidebarDateValue",
-		"appendDevalueSidebarValue",
 		"devalueSidebarThreadIDs",
 		"devalueSidebarThreadRef",
 		"patchDevalueSidebarThread",
@@ -686,9 +696,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		`if (!workingDirectory || !response || !response.ok || typeof response.clone !== "function")`,
 		"!projectPickerItemSelected(noProject)",
 		"/_app/remote/cliproxy/listThreadListSidebar",
-		`case "listThreadListSidebar":`,
 		`case "listUserExecutorDaemons":`,
-		`svelteKitRemoteEndpoint(sourceURL.pathname) === "listThreadListSidebar"`,
 		"path.endsWith(\"/listThreadListSidebar\")",
 		"path.endsWith(\"/listUserExecutorDaemons\")",
 		"\n\t\tcreateLocalThread,\n",
@@ -758,8 +766,11 @@ const assert = (condition, message) => {
 const scriptPath = ` + strconv.Quote(scriptPath) + `;
 const threadID = ` + strconv.Quote(threadID) + `;
 const secondThreadID = ` + strconv.Quote(secondThreadID) + `;
+	const pastThreadID = "T-019f324b-2802-7868-b1b1-5f0fa3e87ea7";
+	const cloudThreadID = "T-019f324b-2802-7868-b1b1-5f0fa3e87ea8";
 const createdThreadID = "T-019f20b2-5e05-7501-8ddd-994e151ee951";
 const failedThreadID = "T-019f20b2-5e05-7501-8ddd-994e151ee955";
+const ampViewerUserID = "user_amp_viewer";
 const createdThreadWorkDir = "/Users/aikins01/Developer/CLIProxyAPI";
 class TestStorage {
 	constructor() { this.values = new Map(); }
@@ -841,6 +852,11 @@ const requestPayloadText = (body) => {
 	}
 };
 let createFetchURL = "";
+let localProjectsFetchURL = "";
+let localThreadDataFetchURL = "";
+let localThreadDataFetchCount = 0;
+let localThreadSummaryFetchCount = 0;
+let lastFetchURL = "";
 let metadataFetchURL = "";
 let metadataFetchAuthorization = "";
 let metadataFetchBridgeHeader = "";
@@ -848,7 +864,87 @@ let metadataFetchRivetEncoding = "";
 let metadataFetchUnsupportedHeader = "";
 globalThis.fetch = async (url, init) => {
 	const fetchURL = String(url);
+	lastFetchURL = fetchURL;
 	const parsedURL = new URL(fetchURL, globalThis.location.href);
+	if (parsedURL.pathname === "/ampcode/local-projects.json") {
+		localProjectsFetchURL = fetchURL;
+		return new Response(JSON.stringify({
+			ok: true,
+			projects: [],
+			thread: {
+				id: createdThreadID,
+				threadId: createdThreadID,
+				v: 1,
+				title: "Use local project",
+				state: "idle",
+				agentState: "idle",
+				meta: { executorType: "local-client", usesThreadActors: true },
+			},
+			threads: [
+				{
+					id: createdThreadID,
+					threadId: createdThreadID,
+					v: 1,
+					title: "Use local project",
+					state: "idle",
+					agentState: "idle",
+					meta: { executorType: "local-client", usesThreadActors: true },
+				},
+				{
+					id: secondThreadID,
+					threadId: secondThreadID,
+					v: 1,
+					title: "Second local thread",
+					state: "idle",
+					agentState: "idle",
+					meta: { executorType: "local-client", usesThreadActors: true },
+				},
+			],
+		}), {
+			status: 200,
+			headers: { "Content-Type": "application/json" },
+		});
+	}
+	if (parsedURL.pathname === "/ampcode/local-thread-data.json") {
+		localThreadDataFetchURL = fetchURL;
+		localThreadDataFetchCount += 1;
+		const localThreadID = parsedURL.searchParams.get("cliproxy-thread-id") || "";
+		if (localThreadID === cloudThreadID) {
+			return new Response(JSON.stringify({ message: "thread not found" }), {
+				status: 404,
+				headers: { "Content-Type": "application/json" },
+			});
+		}
+		if (parsedURL.searchParams.get("cliproxy-summary-only") === "1") {
+			localThreadSummaryFetchCount += 1;
+			return new Response(JSON.stringify({
+				type: "result",
+				thread: { id: localThreadID, threadId: localThreadID, v: 9, title: "Local summary" },
+			}), {
+				status: 200,
+				headers: { "Content-Type": "application/json" },
+			});
+		}
+		const response = new Response(JSON.stringify({
+			type: "result",
+			thread: {
+				id: localThreadID,
+				threadId: localThreadID,
+				creatorUserID: "local-user",
+				ownerUserId: "local-user",
+				v: 9,
+				messages: [{ messageId: "M-local-history", protocolMessageID: "M-local-history", role: "user", content: [{ type: "text", text: "local history" }] }],
+				queuedMessages: [],
+			},
+			threadActorConfig: { threadId: localThreadID, wsToken: "local-neo", ampURL: "http://127.0.0.1:8317", baseURL: "http://127.0.0.1:8317" },
+			actorPermissions: { manageThread: true, manageBilling: false },
+		}), {
+			status: 200,
+			headers: { "Content-Type": "application/json" },
+		});
+		Object.defineProperty(response, "url", { value: fetchURL });
+		return response;
+	}
 	if (parsedURL.pathname === "/metadata" || parsedURL.pathname === "/actors/metadata") {
 		metadataFetchURL = fetchURL;
 		const headers = new Headers(init?.headers || {});
@@ -864,6 +960,20 @@ globalThis.fetch = async (url, init) => {
 		}), {
 			status: 200,
 			headers: { "Content-Type": "application/json" },
+		});
+	}
+	if (parsedURL.pathname.endsWith("/listThreadListSidebar")) {
+		const data = JSON.stringify([
+			{ q: 1 },
+			{ "3abror/listThreadListSidebar/": 2 },
+			{ v: 3 },
+			{ projects: 4, recentThreads: 5 },
+			[],
+			[],
+		]);
+		return new Response(JSON.stringify({ type: "result", data }), {
+			status: 200,
+			headers: { "Content-Type": "application/json", "Content-Length": "1" },
 		});
 	}
 	if (parsedURL.pathname.endsWith("/createProjectThread")) {
@@ -911,21 +1021,53 @@ if (typeof globalThis.atob !== "function") {
 if (typeof globalThis.btoa !== "function") {
 	globalThis.btoa = (value) => Buffer.from(value, "binary").toString("base64");
 }
-require(scriptPath);
-const bridge = globalThis.__cliproxyAmpLocalInference;
-assert(bridge && bridge.userscriptVersion === "0.1.64", "bridge userscript version was not exposed");
+	require(scriptPath);
+	const bridge = globalThis.__cliproxyAmpLocalInference;
+	assert(bridge && bridge.userscriptVersion === "0.1.87", "bridge userscript version was not exposed");
+		globalThis.localStorage.setItem(bridge.apiKeyStorageKey, "local-key");
+		JSON.parse(JSON.stringify({ user: { id: "U-unrelated", email: "other@example.com" }, workspaces: [] }));
+		assert(bridge.diagnostics.authenticatedAmpUserIDCaptureCount === 0, "unrelated nested user was accepted as the authenticated viewer");
+		new WebSocket("wss://ampcode.com/gateway/userActor/?rvt-method=get&rvt-key=" + encodeURIComponent(ampViewerUserID));
+	assert(bridge.diagnostics.authenticatedAmpUserIDCaptureCount === 1, "authenticated Amp user id was not captured from the user actor socket");
+	const authenticatedPageDataResponse = new Response(JSON.stringify({
+	type: "data",
+	nodes: [{
+		type: "data",
+		data: [
+			{ user: 1, userWorkspace: 4, userFeatures: 5 },
+			{ id: 2, email: 3 },
+			ampViewerUserID,
+			"viewer@example.com",
+			null,
+			[],
+		],
+	}],
+}));
+	Object.defineProperty(authenticatedPageDataResponse, "url", { value: "https://ampcode.com/__data" });
+	await authenticatedPageDataResponse.json();
+	assert(bridge.diagnostics.authenticatedAmpUserIDCaptureCount === 1, "authenticated Amp user id was not captured from SvelteKit page data");
 const unrelatedGraphPasses = bridge.diagnostics.decodedGraphPassCount;
 const unrelatedIDPayload = JSON.parse('{"id":"generic-object","payload":[{"value":1}]}');
 assert(unrelatedIDPayload.id === "generic-object", "unrelated id payload changed");
 assert(bridge.diagnostics.decodedGraphPassCount === unrelatedGraphPasses, "unrelated id payload triggered decoded graph traversal");
-const activeThreadPath = globalThis.location.pathname;
-for (let i = 1; i <= 80; i += 1) {
-	const boundedThreadID = "T-00000000-0000-0000-0000-" + i.toString(16).padStart(12, "0");
-	globalThis.location.pathname = "/threads/" + boundedThreadID;
-	JSON.parse(JSON.stringify({ id: boundedThreadID, v: i, messages: [] }));
-}
-globalThis.location.pathname = activeThreadPath;
-assert(bridge.diagnostics.loadedThreadBaseVersionEntryCount === 64, "loaded thread base versions were not bounded");
+	const directOpenedThreadSocket = new WebSocket("wss://ampcode.com/gateway/threadActor/?rvt-method=get&rvt-key=" + encodeURIComponent(threadID));
+	JSON.parse(JSON.stringify({ id: threadID, v: 7, messages: [] }));
+	const directOpenedThreadResume = '{"type":"client_resume","version":0}';
+	directOpenedThreadSocket.send(directOpenedThreadResume);
+	assert(JSON.parse(directOpenedThreadSocket.sent.at(-1)).version === 7, "active direct-open thread base did not rewrite zero resume before local id discovery");
+	const activeThreadPath = globalThis.location.pathname;
+	const boundedThreadIDs = [];
+	for (let i = 1; i <= 80; i += 1) {
+		const boundedThreadID = "T-00000000-0000-0000-0000-" + i.toString(16).padStart(12, "0");
+		boundedThreadIDs.push(boundedThreadID);
+	}
+	globalThis.localStorage.setItem(bridge.localThreadIDsStorageKey, JSON.stringify(boundedThreadIDs));
+	for (let i = 0; i < boundedThreadIDs.length; i += 1) {
+		const boundedThreadID = boundedThreadIDs[i];
+		JSON.parse(JSON.stringify({ id: boundedThreadID, v: i + 1, messages: [] }));
+	}
+	globalThis.location.pathname = activeThreadPath;
+	assert(bridge.diagnostics.loadedThreadBaseVersionEntryCount === 64, "loaded thread base versions were not bounded");
 const unrelatedResponse = new Response('{"ok":true}');
 Object.defineProperty(unrelatedResponse, "url", { value: "https://ampcode.com/api/unrelated" });
 const unrelatedResponseJSONPromise = unrelatedResponse.json();
@@ -934,9 +1076,52 @@ assert((await unrelatedResponseJSONPromise).ok === true, "unrelated response jso
 const throwingURLResponse = new Response('{"ok":true}');
 Object.defineProperty(throwingURLResponse, "url", { get() { throw new Error("unexpected url access"); } });
 assert((await throwingURLResponse.json()).ok === true, "response url inspection changed native json behavior");
-	globalThis.localStorage.setItem(bridge.localThreadIDsStorageKey, JSON.stringify([threadID, secondThreadID]));
-	globalThis.localStorage.setItem(bridge.apiKeyStorageKey, "local-key");
-	globalThis.localStorage.setItem(bridge.workingDirectoryStorageKey, createdThreadWorkDir);
+		globalThis.localStorage.setItem(bridge.localThreadIDsStorageKey, JSON.stringify([threadID, secondThreadID]));
+		globalThis.localStorage.setItem(bridge.workingDirectoryStorageKey, createdThreadWorkDir);
+		const destinationThreadResourceResponse = await fetch("https://ampcode.com/threads/" + secondThreadID + "/__data");
+		await destinationThreadResourceResponse.json();
+		assert(bridge.diagnostics.lastLoadedThreadBaseThreadID === secondThreadID && bridge.diagnostics.lastLoadedThreadBaseVersion === 9, "destination thread base was not captured before client navigation committed");
+		const localThreadResourceResponse = await fetch("https://ampcode.com/threads/" + threadID + "/__data");
+	const localThreadResource = await localThreadResourceResponse.json();
+	assert(new URL(localThreadDataFetchURL).pathname === "/ampcode/local-thread-data.json", "local thread resource was not bridged");
+	assert(new URL(localThreadDataFetchURL).searchParams.get("cliproxy-thread-id") === threadID, "local thread resource id was not forwarded");
+	assert(localThreadResource.thread.id === threadID && localThreadResource.thread.v === 9, "local thread resource identity/version mismatch");
+	assert(localThreadResource.thread.creatorUserID === ampViewerUserID && localThreadResource.thread.ownerUserId === ampViewerUserID, "local thread resource was not projected as owned by the authenticated Amp user");
+		assert(Array.isArray(localThreadResource.thread.messages) && localThreadResource.thread.messages.length === 1, "local thread resource lost transcript messages");
+		assert(localThreadResource.threadActorConfig.threadId === threadID, "local thread resource actor config mismatch");
+		assert(localThreadResource.threadActorConfig.wsToken === "local-key", "local thread resource actor config did not carry the worker token");
+	const localThreadViewResourceResponse = await fetch("https://ampcode.com/threads/" + threadID + "/view/__data");
+	const localThreadViewResource = await localThreadViewResourceResponse.json();
+	assert(new URL(localThreadDataFetchURL).pathname === "/ampcode/local-thread-data.json", "local thread view resource was not bridged");
+	assert(new URL(localThreadDataFetchURL).searchParams.get("cliproxy-thread-id") === threadID, "local thread view resource id was not forwarded");
+	assert(localThreadViewResource.thread.id === threadID && localThreadViewResource.threadActorConfig.threadId === threadID, "local thread view resource payload mismatch");
+	localThreadDataFetchURL = "";
+	await fetch("https://ampcode.com/threads/" + threadID + "/__data.json?x-sveltekit-invalidated=0010");
+	assert(new URL(lastFetchURL).pathname === "/threads/" + threadID + "/__data.json", "SvelteKit thread data request was rewritten");
+	assert(localThreadDataFetchURL === "", "SvelteKit thread data request used the plain thread resource bridge");
+	await fetch("https://ampcode.com/threads/" + threadID + "/view/__data.json?x-sveltekit-invalidated=0010");
+	assert(new URL(lastFetchURL).pathname === "/threads/" + threadID + "/view/__data.json", "SvelteKit thread view data request was rewritten");
+	assert(localThreadDataFetchURL === "", "SvelteKit thread view data request used the plain thread resource bridge");
+	let replacedLocationURL = "";
+	globalThis.location = new URL("https://ampcode.com/threads/" + pastThreadID + "/view");
+	globalThis.location.replace = (value) => { replacedLocationURL = String(value); };
+	globalThis.document.readyState = "complete";
+	globalThis.history.replaceState = () => { throw new Error("history fallback used when location.replace was available"); };
+	const discoveryFetchCount = localThreadDataFetchCount;
+	const discoverySummaryFetchCount = localThreadSummaryFetchCount;
+	const discoveredPastThreadResponse = await fetch("https://ampcode.com/threads/" + pastThreadID + "/view/__data");
+	const discoveredPastThread = await discoveredPastThreadResponse.json();
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	assert(discoveredPastThread.thread.id === pastThreadID, "past local thread resource was not bridged after discovery");
+	assert(localThreadDataFetchCount === discoveryFetchCount + 2, "past local thread discovery did not separate summary lookup from thread data");
+	assert(localThreadSummaryFetchCount === discoverySummaryFetchCount + 1, "past local thread discovery did not use a summary-only lookup");
+	assert(JSON.parse(globalThis.localStorage.getItem(bridge.localThreadIDsStorageKey)).includes(pastThreadID), "past local thread was not remembered after discovery");
+	assert(replacedLocationURL === "/threads/" + pastThreadID, "past local thread view route was not normalized");
+	globalThis.location = new URL("https://ampcode.com/threads/" + cloudThreadID);
+	await fetch("https://ampcode.com/threads/" + cloudThreadID + "/__data");
+	assert(new URL(lastFetchURL).pathname === "/threads/" + cloudThreadID + "/__data", "cloud thread resource was bridged after failed local discovery");
+	assert(!JSON.parse(globalThis.localStorage.getItem(bridge.localThreadIDsStorageKey)).includes(cloudThreadID), "cloud thread was remembered as local");
+	globalThis.location = new URL("https://ampcode.com/threads/" + threadID);
 	const encodeGatewayInput = (value) => Buffer.from(JSON.stringify(value)).toString("base64url");
 	new WebSocket("wss://ampcode.com/gateway/threadActor/?rvt-method=get&rvt-input=" + encodeURIComponent(encodeGatewayInput({ input: { threadID } })));
 	const decodedGatewayInputURL = new URL(NativeWebSocket.instances.at(-1).url);
@@ -956,9 +1141,9 @@ assert((await throwingURLResponse.json()).ok === true, "response url inspection 
 		assert(inheritedModeURL.origin === "ws://127.0.0.1:8317", "gateway websocket was not bridged locally");
 		assert(inheritedModeURL.searchParams.get("cliproxy-agent-mode") === "low", "unrelated High text overrode real mode control");
 		assert(inheritedModeURL.searchParams.get("cliproxy-reasoning-effort") === "medium", "low mode reasoning effort was not inherited");
-		const missingBaseResume = '{"type":"client_resume","version":0}';
-		inheritedModeSocket.send(missingBaseResume);
-		assert(inheritedModeSocket.sent.at(-1) === missingBaseResume, "zero resume changed without a loaded base");
+		const localHistoryResume = '{"type":"client_resume","version":0}';
+		inheritedModeSocket.send(localHistoryResume);
+		assert(JSON.parse(inheritedModeSocket.sent.at(-1)).version === 9, "local thread history base did not rewrite zero resume");
 		const genericAriaModeHigh = new FakeElement("button", "High");
 		genericAriaModeHigh.setAttribute("aria-label", "Agent mode");
 		documentQueryElements = [genericAriaModeHigh];
@@ -984,7 +1169,7 @@ assert(metadataFetchUnsupportedHeader === "", "unsupported source header was for
 const assertPlainConfig = (config, label, expectedThreadID = label === "created plain" ? createdThreadID : threadID) => {
 	assert(config && typeof config === "object", label + " config missing");
 	assert(config.threadId === expectedThreadID, label + " threadId mismatch");
-	assert(config.wsToken === "local-neo", label + " wsToken mismatch");
+		assert(config.wsToken === "local-key", label + " wsToken mismatch");
 	assert(config.ampURL === "http://127.0.0.1:8317", label + " ampURL mismatch");
 	assert(config.baseURL === "http://127.0.0.1:8317", label + " baseURL mismatch");
 	assert(config.capability === "write", label + " capability mismatch");
@@ -1109,9 +1294,15 @@ assert(JSON.parse(rewrittenRawResume).version === 23, "matching plain loaded bas
 JSON.parse(JSON.stringify({ id: threadID, v: 17, data: { messages: [] } }));
 inheritedModeSocket.send(rawZeroResume);
 assert(JSON.parse(inheritedModeSocket.sent.at(-1)).version === 17, "plain envelope with outer identity and nested transcript did not rewrite zero resume");
-const positiveResume = '{ "type": "client_resume", "version": 11 }';
-inheritedModeSocket.send(positiveResume);
-assert(inheritedModeSocket.sent.at(-1) === positiveResume, "positive resume was changed");
+const stalePositiveResume = '{ "type": "client_resume", "version": 11 }';
+inheritedModeSocket.send(stalePositiveResume);
+assert(JSON.parse(inheritedModeSocket.sent.at(-1)).version === 17, "stale positive resume did not advance to the loaded base");
+const currentResume = '{ "type": "client_resume", "version": 17 }';
+inheritedModeSocket.send(currentResume);
+assert(inheritedModeSocket.sent.at(-1) === currentResume, "current resume was changed");
+const newerResume = '{ "type": "client_resume", "version": 18 }';
+inheritedModeSocket.send(newerResume);
+assert(inheritedModeSocket.sent.at(-1) === newerResume, "newer resume was changed");
 const unrelatedFrame = '{ "type": "client_set_thread_title", "title": "unchanged" }';
 inheritedModeSocket.send(unrelatedFrame);
 assert(inheritedModeSocket.sent.at(-1) === unrelatedFrame, "unrelated websocket frame was changed");
@@ -1121,17 +1312,18 @@ assert(inheritedModeSocket.sent.at(-1) === binaryFrame, "binary websocket frame 
 const userActorSocket = new WebSocket("wss://ampcode.com/gateway/userActor/?rvt-method=get&rvt-key=user-local");
 userActorSocket.send(rawZeroResume);
 assert(userActorSocket.sent.at(-1) === rawZeroResume, "user actor resume frame was changed");
-const noBaseSocket = new WebSocket("wss://ampcode.com/gateway/threadActor/?rvt-method=get&rvt-key=" + encodeURIComponent(secondThreadID));
-const noBaseResume = '{"type":"client_resume","version":0}';
-noBaseSocket.send(noBaseResume);
-assert(noBaseSocket.sent.at(-1) === noBaseResume, "mismatched or missing loaded base changed zero resume");
+	const noBaseSocket = new WebSocket("wss://ampcode.com/gateway/threadActor/?rvt-method=get&rvt-key=" + encodeURIComponent(secondThreadID));
+	const noBaseResume = '{"type":"client_resume","version":0}';
+	const unknownBaseSocket = new WebSocket("wss://ampcode.com/gateway/threadActor/?rvt-method=get&rvt-key=" + encodeURIComponent(cloudThreadID));
+	unknownBaseSocket.send(noBaseResume);
+	assert(unknownBaseSocket.sent.at(-1) === noBaseResume, "mismatched or missing loaded base changed zero resume");
 const values = JSON.parse(JSON.stringify([{ current: 1 }, { thread: 2 }, { id: 3, title: 4, v: 5, messages: 6 }, threadID, "Local", 37, [] ]));
 const configIndex = values[1].threadActorConfig;
 assert(Number.isInteger(configIndex), "devalue threadActorConfig was not a reference");
 const devalueConfig = values[configIndex];
 const deref = (value) => Number.isInteger(value) ? values[value] : value;
 assert(deref(devalueConfig.threadId) === threadID, "devalue threadId mismatch");
-assert(deref(devalueConfig.wsToken) === "local-neo", "devalue wsToken mismatch");
+assert(deref(devalueConfig.wsToken) === "local-key", "devalue wsToken mismatch");
 assert(deref(devalueConfig.ampURL) === "http://127.0.0.1:8317", "devalue ampURL mismatch");
 assert(deref(devalueConfig.baseURL) === "http://127.0.0.1:8317", "devalue baseURL mismatch");
 assert(deref(devalueConfig.capability) === "write", "devalue capability mismatch");
@@ -1147,7 +1339,7 @@ assert(nullConfigIndex !== 5, "null-ref devalue threadActorConfig still points a
 const nullConfig = nullConfigValues[nullConfigIndex];
 const nullDeref = (value) => Number.isInteger(value) ? nullConfigValues[value] : value;
 assert(nullDeref(nullConfig.threadId) === threadID, "null-ref devalue threadId mismatch");
-assert(nullDeref(nullConfig.wsToken) === "local-neo", "null-ref devalue wsToken mismatch");
+assert(nullDeref(nullConfig.wsToken) === "local-key", "null-ref devalue wsToken mismatch");
 globalThis.location = new URL("https://ampcode.com/threads/" + secondThreadID);
 const secondValues = JSON.parse(JSON.stringify([{ current: 1 }, { thread: 2 }, { id: 3, title: 4, v: 5, messages: 6 }, secondThreadID, "Second", 41, [] ]));
 const secondConfigIndex = secondValues[1].threadActorConfig;
@@ -1162,7 +1354,9 @@ assert(typeof rewrittenJSONRPCResume === "string", "JSON-RPC resume payload type
 const parsedJSONRPCResume = JSON.parse(rewrittenJSONRPCResume);
 assert(parsedJSONRPCResume.id === "resume-1", "JSON-RPC resume id changed");
 assert(parsedJSONRPCResume.params.version === 41, "matching devalue loaded base did not rewrite JSON-RPC zero resume");
-assert(bridge.diagnostics.clientResumeRewriteCount === 3, "resume rewrite diagnostics count mismatch");
+assert(bridge.diagnostics.clientResumeObservedCount === 8, "resume observation diagnostics count mismatch");
+assert(bridge.diagnostics.lastClientResumeObservedVersion === 0, "resume observation diagnostics version mismatch");
+assert(bridge.diagnostics.clientResumeRewriteCount === 6, "resume rewrite diagnostics count mismatch");
 assert(bridge.diagnostics.lastClientResumeThreadID === secondThreadID, "resume rewrite diagnostics thread mismatch");
 assert(bridge.diagnostics.lastClientResumeBaseVersion === 41, "resume rewrite diagnostics version mismatch");
 JSON.parse(JSON.stringify([{ thread: 1 }, { id: 2, data: 3 }, secondThreadID, { v: 4, messages: 5 }, 29, []]));
@@ -1218,6 +1412,62 @@ assert(bridgedCreateURL.origin === "http://127.0.0.1:8317", "create fetch was no
 assert(bridgedCreateURL.searchParams.get("cliproxy-working-directory") === createdThreadWorkDir, "create fetch missing working directory");
 assert(bridgedCreateURL.searchParams.get("cliproxy-local-project") === "1", "create fetch missing local project marker");
 assert(JSON.parse(globalThis.localStorage.getItem(bridge.localThreadIDsStorageKey)).includes(createdThreadID), "created thread was not remembered before route-data parse");
+globalThis.localStorage.setItem(bridge.localThreadIDsStorageKey, JSON.stringify([createdThreadID]));
+const sidebarData = JSON.stringify([
+	{ q: 1 },
+	{ "3abror/listThreadListSidebar/": 2 },
+	{ v: 3 },
+	{ projects: 4, recentThreads: 5 },
+	[],
+	[],
+]);
+const sidebarResponse = new Response(JSON.stringify({ type: "result", data: sidebarData }), {
+	status: 200,
+	headers: { "Content-Type": "application/json" },
+});
+Object.defineProperty(sidebarResponse, "url", { value: "https://ampcode.com/_app/remote/3abror/listThreadListSidebar" });
+	const decodedSidebarResponse = await sidebarResponse.json();
+	const mergedSidebarValues = JSON.parse(decodedSidebarResponse.data);
+	const mergedSidebarRefs = mergedSidebarValues[5].slice(0, 2);
+	const mergedSidebarThreadRefs = mergedSidebarRefs.map((ref) => mergedSidebarValues[ref].thread);
+	const mergedSidebarThreadIDs = mergedSidebarThreadRefs.map((ref) => mergedSidebarValues[mergedSidebarValues[ref].id]);
+	assert(mergedSidebarRefs.every((ref) => Number.isInteger(ref) && Number.isInteger(mergedSidebarValues[ref].thread)), "local sidebar wrappers were not inserted into sidebar response");
+	assert(mergedSidebarRefs.every((ref) => Number.isInteger(mergedSidebarValues[ref].lastActivityTimestamp)), "local sidebar wrappers are missing activity timestamps");
+	assert(JSON.stringify(mergedSidebarThreadIDs) === JSON.stringify([createdThreadID, secondThreadID]), "merged sidebar thread order mismatch");
+	assert(mergedSidebarValues[mergedSidebarValues[mergedSidebarThreadRefs[0]].title] === "Use local project", "merged sidebar thread title mismatch");
+	assert(!Object.hasOwn(mergedSidebarValues[mergedSidebarThreadRefs[1]], "hasExecutor"), "cached local sidebar thread gained hasExecutor before discovery");
+	assert(!Object.hasOwn(mergedSidebarValues[mergedSidebarThreadRefs[1]], "executorConnected"), "cached local sidebar thread gained executorConnected before discovery");
+assert(new URL(localProjectsFetchURL).searchParams.get("cliproxy-thread-id") === createdThreadID, "local summary request used the wrong thread id");
+assert(bridge.diagnostics.localSidebarThreadMergeCount === 2, "sidebar thread merges were not recorded");
+	const canonicalSidebarData = JSON.stringify([
+		{ recentThreads: 1 },
+		[2],
+		{ thread: 3, lastActivityTimestamp: 6, projectName: 7 },
+		{ id: 4, title: 5, hasExecutor: 8, executorConnected: 8 },
+		createdThreadID,
+		"Remote canonical title",
+		1,
+		null,
+		true,
+	]);
+const canonicalSidebarResponse = new Response(JSON.stringify({ type: "result", data: canonicalSidebarData }), {
+	status: 200,
+	headers: { "Content-Type": "application/json" },
+});
+Object.defineProperty(canonicalSidebarResponse, "url", { value: "https://ampcode.com/_app/remote/3abror/listThreadListSidebar" });
+	const decodedCanonicalSidebar = await canonicalSidebarResponse.json();
+	const canonicalSidebarValues = JSON.parse(decodedCanonicalSidebar.data);
+	const canonicalSidebarRefs = canonicalSidebarValues[1];
+	const canonicalSidebarThreadRefs = canonicalSidebarRefs.map((ref) => Number.isInteger(canonicalSidebarValues[ref].thread) ? canonicalSidebarValues[ref].thread : ref);
+	const canonicalSidebarThreadIDs = canonicalSidebarThreadRefs.map((ref) => canonicalSidebarValues[canonicalSidebarValues[ref].id]);
+	const canonicalThreadRef = canonicalSidebarThreadRefs.find((ref) => canonicalSidebarValues[canonicalSidebarValues[ref].id] === createdThreadID);
+	assert(canonicalSidebarValues[canonicalSidebarValues[canonicalThreadRef].title] === "Use local project", "existing remote sidebar shell was not enriched with the local title");
+	assert(canonicalSidebarValues[canonicalSidebarValues[canonicalThreadRef].hasExecutor] === true, "existing local sidebar thread lost hasExecutor");
+	assert(canonicalSidebarValues[canonicalSidebarValues[canonicalThreadRef].executorConnected] === true, "existing local sidebar thread lost executorConnected");
+	assert(canonicalSidebarValues[canonicalSidebarValues[canonicalThreadRef].state] === "idle", "existing remote sidebar shell was not enriched with local state");
+assert(canonicalSidebarThreadIDs.includes(secondThreadID), "missing local sidebar thread was not added");
+assert(bridge.diagnostics.localSidebarThreadMergeCount === 4, "sidebar additions and enrichments were not recorded");
+globalThis.localStorage.setItem(bridge.localThreadIDsStorageKey, JSON.stringify([threadID, secondThreadID, createdThreadID]));
 globalThis.location = new URL("https://ampcode.com/threads/" + createdThreadID);
 const staleSidebarThreadID = "T-019f3586-fb79-7309-a219-4a279ef2900c";
 const sideEffectThreadID = "T-019f3586-fb79-7309-a219-4a279ef2900d";
@@ -1256,8 +1506,8 @@ const staleDevalueSidebar = JSON.parse(JSON.stringify([
 	staleSidebarThreadID,
 	"Remote",
 ]));
-assert(!Object.hasOwn(staleDevalueSidebar[2], "hasExecutor"), "devalue local stale hasExecutor was not cleared");
-assert(!Object.hasOwn(staleDevalueSidebar[2], "executorConnected"), "devalue local stale executorConnected was not cleared");
+assert(!Object.hasOwn(staleDevalueSidebar[2], "hasExecutor"), "devalue local sidebar retained stale hasExecutor");
+assert(!Object.hasOwn(staleDevalueSidebar[2], "executorConnected"), "devalue local sidebar retained stale executorConnected");
 assert(staleDevalueSidebar[7].hasExecutor === 5, "devalue nonlocal hasExecutor was changed");
 assert(staleDevalueSidebar[7].executorConnected === 5, "devalue nonlocal executorConnected was changed");
 const staleDevalueAlias = JSON.parse(JSON.stringify([
@@ -1354,7 +1604,7 @@ assert(jsonConfigIndex !== 5, "json route-data threadActorConfig still points at
 const jsonConfig = jsonValues[jsonConfigIndex];
 const jsonDeref = (value) => Number.isInteger(value) ? jsonValues[value] : value;
 assert(jsonDeref(jsonConfig.threadId) === createdThreadID, "json route-data threadId mismatch");
-assert(jsonDeref(jsonConfig.wsToken) === "local-neo", "json route-data wsToken mismatch");
+assert(jsonDeref(jsonConfig.wsToken) === "local-key", "json route-data wsToken mismatch");
 assert(!Object.hasOwn(jsonValues[2], "hasExecutor"), "json route-data stale hasExecutor was not cleared");
 assert(!Object.hasOwn(jsonValues[2], "executorConnected"), "json route-data stale executorConnected was not cleared");
 assert(bridge.diagnostics.responseJSONPatchCount >= 3, "response json patches were not recorded");
@@ -1382,7 +1632,7 @@ assert(nestedConfigIndex !== 5, "nested route-data threadActorConfig still point
 const nestedConfig = nestedValues[nestedConfigIndex];
 const nestedDeref = (value) => Number.isInteger(value) ? nestedValues[value] : value;
 assert(nestedDeref(nestedConfig.threadId) === createdThreadID, "nested route-data threadId mismatch");
-assert(nestedDeref(nestedConfig.wsToken) === "local-neo", "nested route-data wsToken mismatch");
+assert(nestedDeref(nestedConfig.wsToken) === "local-key", "nested route-data wsToken mismatch");
 assert(nestedDeref(nestedConfig.ampURL) === "http://127.0.0.1:8317", "nested route-data ampURL mismatch");
 assert(bridge.diagnostics.lastPatchedThreadID === createdThreadID, "nested route-data patch did not record thread ID");
 const discoveredThreadID = "T-019f3586-fb79-7309-a219-4a279ef2900e";
@@ -1446,7 +1696,7 @@ assert(localHTTPRewritten.searchParams.get("cliproxy-api-key") === "local-key", 
 assert(bridge.diagnostics.decodedConfigPatchCount >= 2, "decoded config patches were not recorded");
 assert(bridge.diagnostics.decodedGraphPassCount > 0, "decoded graph passes were not recorded");
 assert(bridge.diagnostics.decodedGraphVisitCount >= bridge.diagnostics.decodedGraphPassCount, "decoded graph visits were not recorded");
-assert(bridge.diagnostics.webSocketBootstrapCount === 8, "websocket bootstrap was not recorded");
+assert(bridge.diagnostics.webSocketBootstrapCount === 9, "websocket bootstrap was not recorded");
 })().catch((error) => {
 	console.error(error && error.stack ? error.stack : error);
 	process.exit(1);
@@ -3166,8 +3416,24 @@ func TestWebLocalInferenceLocalProjectsRoute(t *testing.T) {
 	}}); err != nil {
 		t.Fatalf("write project index: %v", err)
 	}
+	threadID := "T-019f6551-9d97-73b2-ab56-d3967bce6e09"
+	actor := rt.store.ensureThreadActor(threadID)
+	actor.mu.Lock()
+	actor.title = "New local web thread"
+	actor.lastUsed = time.Now()
+	actor.environment = map[string]any{"workingDirectory": workDir, "workspaceRoot": workDir}
+	actor.meta = map[string]any{"projectID": projectID, "executorType": "local-client", "usesThreadActors": true}
+	actor.settings = map[string]any{"agentMode": "medium", "reasoning.effort": "medium"}
+	actor.currentAgentMode = "medium"
+	actor.currentReasoningEffort = "medium"
+	actor.messages = []neoMessage{
+		{ThreadID: threadID, MessageID: "M-local-user", Role: "user", Content: []any{map[string]any{"type": "text", "text": "inspect local history"}}, Seq: 1},
+		{ThreadID: threadID, MessageID: "M-local-assistant", Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "history ready"}}, State: map[string]any{"type": "complete", "stopReason": "end_turn"}, Seq: 2},
+	}
+	actor.seq = 3
+	actor.mu.Unlock()
 
-	req := httptest.NewRequest(http.MethodGet, "/ampcode/local-projects.json?"+ampWebLocalInferenceAPIKeyQuery+"=local-key", nil)
+	req := httptest.NewRequest(http.MethodGet, "/ampcode/local-projects.json?"+ampWebLocalInferenceAPIKeyQuery+"=local-key&cliproxy-thread-id="+url.QueryEscape(threadID), nil)
 	req.Header.Set("Origin", "https://ampcode.com")
 	req.Header.Set(ampWebLocalInferenceHeader, "1")
 	rec := httptest.NewRecorder()
@@ -3193,6 +3459,81 @@ func TestWebLocalInferenceLocalProjectsRoute(t *testing.T) {
 	project := mapValue(projects[0])
 	if stringValue(project["id"]) != projectID || stringValue(project["workingDirectory"]) != workDir || stringValue(project["name"]) != "local-app" {
 		t.Fatalf("project = %#v, want id=%q workingDirectory=%q", project, projectID, workDir)
+	}
+	thread := mapValue(response["thread"])
+	if stringValue(thread["id"]) != threadID || stringValue(thread["title"]) != "New local web thread" || numberFrom(thread["v"]) < 1 {
+		t.Fatalf("thread summary = %#v", thread)
+	}
+	if _, exists := thread["messages"]; exists {
+		t.Fatalf("thread summary included transcript messages: %#v", thread)
+	}
+	recentThreads := arrayValue(response["threads"])
+	if len(recentThreads) != 1 || stringValue(mapValue(recentThreads[0])["id"]) != threadID {
+		t.Fatalf("recent thread summaries = %#v, want %q", recentThreads, threadID)
+	}
+	threadMeta := mapValue(thread["meta"])
+	if threadMeta["cliProxyAPILocalNeo"] != true || threadMeta["usesThreadActors"] != true || stringValue(threadMeta["executorType"]) != "local-client" {
+		t.Fatalf("thread summary meta = %#v", threadMeta)
+	}
+
+	threadSummaryReq := httptest.NewRequest(http.MethodGet, "/ampcode/local-thread-data.json?"+ampWebLocalInferenceAPIKeyQuery+"=local-key&"+ampWebLocalThreadSummaryQuery+"=1&cliproxy-thread-id="+url.QueryEscape(threadID), nil)
+	threadSummaryReq.Header.Set("Origin", "https://ampcode.com")
+	threadSummaryReq.Header.Set(ampWebLocalInferenceHeader, "1")
+	threadSummaryRec := httptest.NewRecorder()
+	r.ServeHTTP(threadSummaryRec, threadSummaryReq)
+	if threadSummaryRec.Code != http.StatusOK {
+		t.Fatalf("local thread summary status = %d, body=%s", threadSummaryRec.Code, threadSummaryRec.Body.String())
+	}
+	var threadSummaryData map[string]any
+	if err := json.Unmarshal(threadSummaryRec.Body.Bytes(), &threadSummaryData); err != nil {
+		t.Fatalf("local thread summary JSON error: %v", err)
+	}
+	threadSummary := mapValue(threadSummaryData["thread"])
+	if numberFrom(threadSummary["v"]) != 2 || stringValue(threadSummary["id"]) != threadID {
+		t.Fatalf("local thread summary data = %#v", threadSummaryData)
+	}
+	if _, exists := threadSummary["messages"]; exists {
+		t.Fatalf("local thread summary included messages: %#v", threadSummary)
+	}
+
+	threadDataReq := httptest.NewRequest(http.MethodGet, "/ampcode/local-thread-data.json?"+ampWebLocalInferenceAPIKeyQuery+"=local-key&cliproxy-thread-id="+url.QueryEscape(threadID), nil)
+	threadDataReq.Header.Set("Origin", "https://ampcode.com")
+	threadDataReq.Header.Set(ampWebLocalInferenceHeader, "1")
+	threadDataRec := httptest.NewRecorder()
+	r.ServeHTTP(threadDataRec, threadDataReq)
+	if threadDataRec.Code != http.StatusOK {
+		t.Fatalf("local thread data status = %d, body=%s", threadDataRec.Code, threadDataRec.Body.String())
+	}
+	var threadData map[string]any
+	if err := json.Unmarshal(threadDataRec.Body.Bytes(), &threadData); err != nil {
+		t.Fatalf("local thread data JSON error: %v", err)
+	}
+	threadDataThread := mapValue(threadData["thread"])
+	if stringValue(threadData["type"]) != "result" || stringValue(threadDataThread["id"]) != threadID || numberFrom(threadDataThread["v"]) != 2 {
+		t.Fatalf("local thread data = %#v", threadData)
+	}
+	messages, ok := threadDataThread["messages"].([]any)
+	if !ok || len(messages) != 2 {
+		t.Fatalf("local thread data messages = %#v", threadDataThread["messages"])
+	}
+	if stringValue(mapValue(messages[0])["protocolMessageID"]) != "M-local-user" || stringValue(mapValue(messages[1])["protocolMessageID"]) != "M-local-assistant" {
+		t.Fatalf("local thread data message IDs = %#v", messages)
+	}
+	threadDataMeta := mapValue(threadDataThread["meta"])
+	if stringValue(threadDataMeta["workspaceID"]) != "W-cliproxy-local" || threadData["viewerInThreadWorkspace"] != true {
+		t.Fatalf("local thread data app access = %#v", threadData)
+	}
+	threadDataEnvInitial := mapValue(mapValue(threadDataThread["env"])["initial"])
+	if stringValue(threadDataEnvInitial["workingDirectory"]) != workDir || stringValue(threadDataEnvInitial["workspaceRoot"]) != workDir {
+		t.Fatalf("local thread data environment = %#v", threadDataThread["env"])
+	}
+	threadDataConfig := mapValue(threadData["threadActorConfig"])
+	if stringValue(threadDataConfig["threadId"]) != threadID || stringValue(threadDataConfig["wsToken"]) != "local-key" || stringValue(threadDataConfig["baseURL"]) != neoWebLocalRequestBaseURL(threadDataReq) {
+		t.Fatalf("local thread actor config = %#v", threadDataConfig)
+	}
+	permissions := mapValue(threadData["actorPermissions"])
+	if permissions["manageThread"] != true || permissions["manageBilling"] != false {
+		t.Fatalf("local thread actor permissions = %#v", permissions)
 	}
 
 	historyDir := neoExistingDirectory(t.TempDir())
@@ -4889,6 +5230,29 @@ func TestRegisterManagementRoutesRequiresManagementAuthForWebLocalActorEngineWeb
 		t.Fatalf("upstream path = %q, want actor websocket path", path)
 	} else if strings.Contains(path, ampWebLocalInferenceAPIKeyQuery) {
 		t.Fatalf("upstream path leaked query API key: %q", path)
+	}
+
+	authCalled = false
+	workerReq, err := http.NewRequest(http.MethodGet, server.URL+"/gateway/threadActor/websocket/?rvt-namespace=default&rvt-method=get&rvt-key=T-web&rvt-token=local-key&rvt-skip-ready-wait=true", nil)
+	if err != nil {
+		t.Fatalf("create worker request: %v", err)
+	}
+	workerReq.Header.Set("Origin", "https://ampcode.com")
+	workerReq.Header.Set("Upgrade", "websocket")
+	workerResp, err := http.DefaultClient.Do(workerReq)
+	if err != nil {
+		t.Fatalf("worker request: %v", err)
+	}
+	defer workerResp.Body.Close()
+	if workerResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(workerResp.Body)
+		t.Fatalf("worker status = %d, body=%s", workerResp.StatusCode, body)
+	}
+	if !authCalled {
+		t.Fatal("worker actor websocket token request should call management auth")
+	}
+	if path := <-gotPath; strings.Contains(path, "rvt-token") {
+		t.Fatalf("upstream path leaked worker token: %q", path)
 	}
 
 	metadataReq, err := http.NewRequest(http.MethodGet, server.URL+"/metadata?namespace=default", nil)
