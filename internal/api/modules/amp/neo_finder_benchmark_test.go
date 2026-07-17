@@ -6,11 +6,13 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -33,15 +35,20 @@ type neoFinderBenchmarkCandidate struct {
 }
 
 type neoFinderBenchmarkMetrics struct {
-	Turns          int
-	ToolCalls      int
-	MaxParallel    int
-	ForcedFinals   int
-	InputTokens    int
-	OutputTokens   int
-	TotalInput     int
-	ModelMillis    int64
-	ToolResultByte int
+	Turns                    int
+	ToolCalls                int
+	MaxParallel              int
+	RuntimeAcceptedToolCalls int
+	CapRejectedToolCalls     int
+	ScopeRejectedToolCalls   int
+	MaxRuntimeParallel       int
+	MaxRuntimeInFlight       int
+	ForcedFinals             int
+	InputTokens              int
+	OutputTokens             int
+	TotalInput               int
+	ModelMillis              int64
+	ToolResultByte           int
 }
 
 func TestNeoFinderBenchmarkFixtures(t *testing.T) {
@@ -81,10 +88,10 @@ func TestNeoFinderDefaultBenchmarkCandidates(t *testing.T) {
 		got = append(got, candidate.Route.Provider+"/"+candidate.Route.Model+"@"+firstNonEmptyString(candidate.Effort, "default"))
 	}
 	want := []string{
-		"anthropic/claude-haiku-4-5-20251001@default",
-		"google/gemini-3-flash-preview@high",
+		"openai/gpt-5.6-terra@low",
+		"openai/gpt-5.6-luna@low",
+		"openai/gpt-5.6-sol@low",
 		"google/gemini-3.5-flash@low",
-		"google/gemini-3.5-flash@medium",
 	}
 	if !slices.Equal(got, want) {
 		t.Fatalf("default finder benchmark candidates = %#v, want %#v", got, want)
@@ -108,6 +115,10 @@ func TestNeoFinderBenchmarkScore(t *testing.T) {
 	if !passed || len(missing) != 0 || len(unexpected) != 0 {
 		t.Fatalf("score passed=%v missing=%#v unexpected=%#v", passed, missing, unexpected)
 	}
+	passed, missing, _ = neoFinderBenchmarkScore("Relevant files:\n- internal/auth/middleware.go\n- internal/auth/token.go\n- unrelated.go#L1-L2", tc)
+	if passed || len(missing) == 0 {
+		t.Fatal("score accepted required files without their own line ranges")
+	}
 	passed, missing, unexpected = neoFinderBenchmarkScore(output+"\n- docs/auth.md", tc)
 	if passed || len(missing) != 0 || len(unexpected) == 0 {
 		t.Fatalf("score accepted forbidden file: missing=%#v unexpected=%#v", missing, unexpected)
@@ -115,6 +126,31 @@ func TestNeoFinderBenchmarkScore(t *testing.T) {
 	passed, missing, unexpected = neoFinderBenchmarkScore(output+"\n- internal/auth/cache.go", tc)
 	if passed || len(missing) != 0 || !slices.Contains(unexpected, "internal/auth/cache.go") {
 		t.Fatalf("score accepted file outside allowlist: missing=%#v unexpected=%#v", missing, unexpected)
+	}
+}
+
+func TestNeoFinderBenchmarkRuntimeFanout(t *testing.T) {
+	files := map[string]string{"internal/runtime.go": "type runtime struct{}"}
+	root := neoFinderBenchmarkWorkspace(t, files)
+	calls := make([]neoToolCall, 8)
+	for i := range calls {
+		calls[i] = neoToolCall{ID: "call-" + strconv.Itoa(i), Name: "Grep", Input: map[string]any{"pattern": "runtime"}}
+	}
+	metrics := &neoFinderBenchmarkMetrics{}
+	exchanges := neoFinderBenchmarkExecuteTurn(root, files, calls, metrics)
+	if len(exchanges) != len(calls) {
+		t.Fatalf("benchmark exchanges = %d, want %d", len(exchanges), len(calls))
+	}
+	if metrics.RuntimeAcceptedToolCalls != neoFinderMaxToolCallsPerTurn || metrics.CapRejectedToolCalls != len(calls)-neoFinderMaxToolCallsPerTurn {
+		t.Fatalf("benchmark fanout metrics = %#v", metrics)
+	}
+	if metrics.MaxRuntimeParallel != neoFinderMaxToolCallsPerTurn || metrics.MaxRuntimeInFlight != neoFinderMaxToolCallsPerTurn {
+		t.Fatalf("benchmark parallel metrics = %#v", metrics)
+	}
+	for i, exchange := range exchanges {
+		if !neoRunIsTerminal(exchange.Run) {
+			t.Fatalf("exchange %d is not terminal: %#v", i, exchange.Run)
+		}
 	}
 }
 
@@ -126,6 +162,7 @@ func TestNeoFinderSyntheticModelBenchmark(t *testing.T) {
 	cases := neoFinderSelectedBenchmarkCases(t)
 	repetitions := neoFinderBenchmarkRepetitions(t)
 	strict := neoReadThreadTruthyEnv("AMP_FINDER_MODEL_BENCHMARK_STRICT")
+	results := make([]map[string]any, 0, len(candidates)*len(cases)*repetitions)
 	for caseIndex, tc := range cases {
 		for rep := 1; rep <= repetitions; rep++ {
 			offset := (caseIndex + rep - 1) % len(candidates)
@@ -135,8 +172,12 @@ func TestNeoFinderSyntheticModelBenchmark(t *testing.T) {
 				rep := rep
 				t.Run(fmt.Sprintf("%s/%s/%d", candidate.Name, neoReadThreadBenchmarkSafeName(tc.Name), rep), func(t *testing.T) {
 					result := neoFinderRunSyntheticModelBenchmark(t, candidate, tc, rep)
+					results = append(results, result)
 					raw, _ := json.Marshal(result)
 					t.Log(string(raw))
+					if stringValue(result["error"]) != "" {
+						t.Fatalf("benchmark provider error: %s", string(raw))
+					}
 					if strict && !boolValue(result["passed"]) {
 						t.Fatalf("benchmark miss: %s", string(raw))
 					}
@@ -144,11 +185,15 @@ func TestNeoFinderSyntheticModelBenchmark(t *testing.T) {
 			}
 		}
 	}
+	for _, summary := range neoFinderBenchmarkSummaries(results) {
+		raw, _ := json.Marshal(summary)
+		t.Log("finder benchmark summary: " + string(raw))
+	}
 }
 
 func neoFinderRunSyntheticModelBenchmark(t *testing.T, candidate neoFinderBenchmarkCandidate, tc neoFinderBenchmarkCase, rep int) map[string]any {
 	t.Helper()
-	const root = "/benchmark/repository"
+	root := neoFinderBenchmarkWorkspace(t, tc.Files)
 	rt := newNeoRuntime(neoFinderBenchmarkConfig(t))
 	tools := neoFinderBenchmarkToolSpecs()
 	systemPrompt := strings.NewReplacer(
@@ -164,7 +209,8 @@ func neoFinderRunSyntheticModelBenchmark(t *testing.T, candidate neoFinderBenchm
 	finalText := ""
 	var runErr error
 	started := time.Now()
-	for turn := 0; turn < 6; turn++ {
+	maxTurns := neoSubagentDefs["finder"].MaxTurns
+	for turn := 0; turn < maxTurns; turn++ {
 		route := candidate.Route
 		request := neoInferenceRequest{
 			ActorID:              "actor-finder-benchmark",
@@ -198,16 +244,15 @@ func neoFinderRunSyntheticModelBenchmark(t *testing.T, candidate neoFinderBenchm
 			finalText = inference.Text
 			break
 		}
-		for _, call := range inference.ToolCalls {
-			run := neoFinderBenchmarkExecuteTool(root, tc.Files, call)
-			text := runToText(run)
+		for _, exchange := range neoFinderBenchmarkExecuteTurn(root, tc.Files, inference.ToolCalls, metrics) {
+			text := runToText(exchange.Run)
 			metrics.ToolResultByte += len(text)
 			conversation = append(conversation, neoHistoryMessage{
 				Role:       "tool",
-				ToolCallID: call.ID,
-				ToolName:   call.Name,
+				ToolCallID: exchange.Call.ID,
+				ToolName:   exchange.Call.Name,
 				Text:       text,
-				Content:    neoToolRunHistoryContent(run),
+				Content:    neoToolRunHistoryContent(exchange.Run),
 			})
 		}
 	}
@@ -242,31 +287,205 @@ func neoFinderRunSyntheticModelBenchmark(t *testing.T, candidate neoFinderBenchm
 	}
 	passed, missing, unexpected := neoFinderBenchmarkScore(finalText, tc)
 	result := map[string]any{
-		"candidate":        candidate.Name,
-		"provider":         candidate.Route.Provider,
-		"model":            candidate.Route.Model,
-		"effort":           firstNonEmptyString(candidate.Effort, "default"),
-		"case":             tc.Name,
-		"rep":              rep,
-		"passed":           passed && runErr == nil,
-		"durationMillis":   time.Since(started).Milliseconds(),
-		"modelMillis":      metrics.ModelMillis,
-		"turns":            metrics.Turns,
-		"toolCalls":        metrics.ToolCalls,
-		"maxParallel":      metrics.MaxParallel,
-		"forcedFinals":     metrics.ForcedFinals,
-		"inputTokens":      metrics.InputTokens,
-		"outputTokens":     metrics.OutputTokens,
-		"totalInputTokens": metrics.TotalInput,
-		"toolResultBytes":  metrics.ToolResultByte,
-		"missing":          missing,
-		"unexpected":       unexpected,
-		"output":           neoClipRunes(finalText, 1800),
+		"candidate":                candidate.Name,
+		"provider":                 candidate.Route.Provider,
+		"model":                    candidate.Route.Model,
+		"effort":                   firstNonEmptyString(candidate.Effort, "default"),
+		"case":                     tc.Name,
+		"rep":                      rep,
+		"passed":                   passed && runErr == nil,
+		"durationMillis":           time.Since(started).Milliseconds(),
+		"modelMillis":              metrics.ModelMillis,
+		"turns":                    metrics.Turns,
+		"toolCalls":                metrics.ToolCalls,
+		"maxParallel":              metrics.MaxParallel,
+		"runtimeAcceptedToolCalls": metrics.RuntimeAcceptedToolCalls,
+		"capRejectedToolCalls":     metrics.CapRejectedToolCalls,
+		"scopeRejectedToolCalls":   metrics.ScopeRejectedToolCalls,
+		"maxRuntimeParallel":       metrics.MaxRuntimeParallel,
+		"maxRuntimeInFlight":       metrics.MaxRuntimeInFlight,
+		"forcedFinals":             metrics.ForcedFinals,
+		"inputTokens":              metrics.InputTokens,
+		"outputTokens":             metrics.OutputTokens,
+		"totalInputTokens":         metrics.TotalInput,
+		"toolResultBytes":          metrics.ToolResultByte,
+		"missing":                  missing,
+		"unexpected":               unexpected,
+		"output":                   neoClipRunes(finalText, 1800),
 	}
 	if runErr != nil {
 		result["error"] = runErr.Error()
 	}
 	return result
+}
+
+func neoFinderBenchmarkWorkspace(t *testing.T, files map[string]string) string {
+	t.Helper()
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, ".git"), 0o700); err != nil {
+		t.Fatalf("create benchmark repository: %v", err)
+	}
+	for name, content := range files {
+		target := filepath.Join(root, filepath.FromSlash(name))
+		if !neoFinderPathWithin(root, target) {
+			t.Fatalf("benchmark fixture path escapes repository: %q", name)
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+			t.Fatalf("create benchmark fixture directory: %v", err)
+		}
+		if err := os.WriteFile(target, []byte(content), 0o600); err != nil {
+			t.Fatalf("write benchmark fixture: %v", err)
+		}
+	}
+	canonical, err := neoFinderCanonicalDirectory(root)
+	if err != nil {
+		t.Fatalf("canonicalize benchmark repository: %v", err)
+	}
+	return canonical
+}
+
+func neoFinderBenchmarkExecuteTurn(root string, files map[string]string, calls []neoToolCall, metrics *neoFinderBenchmarkMetrics) []neoSubagentToolExchange {
+	exchanges := make([]neoSubagentToolExchange, 0, len(calls))
+	executable := make([]int, 0, min(len(calls), neoFinderMaxToolCallsPerTurn))
+	acceptedSlots := 0
+	for _, call := range calls {
+		if call.Incomplete {
+			continue
+		}
+		exchange := neoSubagentToolExchange{Call: call}
+		if acceptedSlots >= neoFinderMaxToolCallsPerTurn {
+			exchange.Run = neoFinderToolError(fmt.Sprintf("finder accepts at most %d tool calls per turn; narrow the remaining searches", neoFinderMaxToolCallsPerTurn))
+			metrics.CapRejectedToolCalls++
+			exchanges = append(exchanges, exchange)
+			continue
+		}
+		acceptedSlots++
+		scoped, err := neoScopeFinderToolCall(call, root)
+		if err != nil {
+			exchange.Run = neoFinderToolError(err.Error())
+			metrics.ScopeRejectedToolCalls++
+			exchanges = append(exchanges, exchange)
+			continue
+		}
+		exchange.Call = scoped
+		executable = append(executable, len(exchanges))
+		exchanges = append(exchanges, exchange)
+	}
+	metrics.RuntimeAcceptedToolCalls += len(executable)
+	metrics.MaxRuntimeParallel = max(metrics.MaxRuntimeParallel, len(executable))
+	if len(executable) == 0 {
+		return exchanges
+	}
+
+	var wg sync.WaitGroup
+	var ready sync.WaitGroup
+	var activeMu sync.Mutex
+	active := 0
+	start := make(chan struct{})
+	ready.Add(len(executable))
+	for _, index := range executable {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			activeMu.Lock()
+			active++
+			metrics.MaxRuntimeInFlight = max(metrics.MaxRuntimeInFlight, active)
+			activeMu.Unlock()
+			ready.Done()
+			<-start
+			exchanges[index].Run = neoFinderBenchmarkExecuteTool(root, files, exchanges[index].Call)
+			activeMu.Lock()
+			active--
+			activeMu.Unlock()
+		}(index)
+	}
+	ready.Wait()
+	close(start)
+	wg.Wait()
+	return exchanges
+}
+
+func neoFinderBenchmarkSummaries(results []map[string]any) []map[string]any {
+	grouped := map[string][]map[string]any{}
+	for _, result := range results {
+		grouped[stringValue(result["candidate"])] = append(grouped[stringValue(result["candidate"])], result)
+	}
+	names := make([]string, 0, len(grouped))
+	for name := range grouped {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	summaries := make([]map[string]any, 0, len(names))
+	for _, name := range names {
+		runs := grouped[name]
+		passes := 0
+		errors := 0
+		for _, run := range runs {
+			if boolValue(run["passed"]) {
+				passes++
+			}
+			if stringValue(run["error"]) != "" {
+				errors++
+			}
+		}
+		summaries = append(summaries, map[string]any{
+			"candidate":                    name,
+			"provider":                     stringValue(runs[0]["provider"]),
+			"model":                        stringValue(runs[0]["model"]),
+			"effort":                       stringValue(runs[0]["effort"]),
+			"runs":                         len(runs),
+			"passes":                       passes,
+			"passRate":                     float64(passes) / float64(len(runs)),
+			"providerErrors":               errors,
+			"durationMedianMillis":         neoFinderBenchmarkPercentile(runs, "durationMillis", 50),
+			"durationP95Millis":            neoFinderBenchmarkPercentile(runs, "durationMillis", 95),
+			"modelMedianMillis":            neoFinderBenchmarkPercentile(runs, "modelMillis", 50),
+			"modelP95Millis":               neoFinderBenchmarkPercentile(runs, "modelMillis", 95),
+			"turnsMedian":                  neoFinderBenchmarkPercentile(runs, "turns", 50),
+			"toolCallsMedian":              neoFinderBenchmarkPercentile(runs, "toolCalls", 50),
+			"modelRequestedParallelMedian": neoFinderBenchmarkPercentile(runs, "maxParallel", 50),
+			"runtimeAcceptedCallsMedian":   neoFinderBenchmarkPercentile(runs, "runtimeAcceptedToolCalls", 50),
+			"runtimeParallelMedian":        neoFinderBenchmarkPercentile(runs, "maxRuntimeParallel", 50),
+			"runtimeInFlightMax":           neoFinderBenchmarkMaximum(runs, "maxRuntimeInFlight"),
+			"capRejectedCalls":             neoFinderBenchmarkSum(runs, "capRejectedToolCalls"),
+			"scopeRejectedCalls":           neoFinderBenchmarkSum(runs, "scopeRejectedToolCalls"),
+			"forcedFinals":                 neoFinderBenchmarkSum(runs, "forcedFinals"),
+			"inputTokensMedian":            neoFinderBenchmarkPercentile(runs, "inputTokens", 50),
+			"outputTokensMedian":           neoFinderBenchmarkPercentile(runs, "outputTokens", 50),
+			"totalInputTokensMedian":       neoFinderBenchmarkPercentile(runs, "totalInputTokens", 50),
+			"toolResultBytesMedian":        neoFinderBenchmarkPercentile(runs, "toolResultBytes", 50),
+		})
+	}
+	return summaries
+}
+
+func neoFinderBenchmarkPercentile(results []map[string]any, key string, percentile int) int {
+	values := make([]int, 0, len(results))
+	for _, result := range results {
+		values = append(values, numberFrom(result[key]))
+	}
+	sort.Ints(values)
+	if len(values) == 0 {
+		return 0
+	}
+	index := (percentile*len(values) + 99) / 100
+	return values[max(0, min(index-1, len(values)-1))]
+}
+
+func neoFinderBenchmarkMaximum(results []map[string]any, key string) int {
+	maximum := 0
+	for _, result := range results {
+		maximum = max(maximum, numberFrom(result[key]))
+	}
+	return maximum
+}
+
+func neoFinderBenchmarkSum(results []map[string]any, key string) int {
+	total := 0
+	for _, result := range results {
+		total += numberFrom(result[key])
+	}
+	return total
 }
 
 func neoFinderBenchmarkScore(output string, tc neoFinderBenchmarkCase) (bool, []string, []string) {
@@ -275,7 +494,8 @@ func neoFinderBenchmarkScore(output string, tc neoFinderBenchmarkCase) (bool, []
 	for _, group := range tc.RequiredGroups {
 		found := false
 		for _, file := range group {
-			if strings.Contains(normalized, strings.ToLower(file)) {
+			pattern := regexp.MustCompile(regexp.QuoteMeta(strings.ToLower(file)) + `#l\d+(?:-l\d+)?`)
+			if pattern.MatchString(normalized) {
 				found = true
 				break
 			}
@@ -283,9 +503,6 @@ func neoFinderBenchmarkScore(output string, tc neoFinderBenchmarkCase) (bool, []
 		if !found {
 			missing = append(missing, strings.Join(group, " | "))
 		}
-	}
-	if !strings.Contains(normalized, "#l") {
-		missing = append(missing, "line ranges")
 	}
 	allowed := make(map[string]struct{}, len(tc.AllowedFiles))
 	for _, file := range tc.AllowedFiles {
@@ -389,7 +606,7 @@ func neoFinderBenchmarkGrep(root string, files map[string]string, input map[stri
 		if pathScope != "" && file != pathScope && !strings.HasPrefix(file, strings.TrimSuffix(pathScope, "/")+"/") {
 			continue
 		}
-		if globPattern != "" && !neoFinderBenchmarkGlobMatch(globPattern, file) {
+		if globPattern != "" && !neoFinderBenchmarkGlobMatch(root, globPattern, file) {
 			continue
 		}
 		for index, line := range strings.Split(files[file], "\n") {
@@ -411,7 +628,7 @@ func neoFinderBenchmarkGlob(root string, files map[string]string, input map[stri
 	}
 	result := make([]string, 0)
 	for _, file := range neoFinderBenchmarkSortedPaths(files) {
-		if neoFinderBenchmarkGlobMatch(pattern, file) {
+		if neoFinderBenchmarkGlobMatch(root, pattern, file) {
 			result = append(result, root+"/"+file)
 		}
 	}
@@ -449,8 +666,8 @@ func neoFinderBenchmarkRelativePath(root, value string) string {
 	return strings.TrimPrefix(path.Clean("/"+value), "/")
 }
 
-func neoFinderBenchmarkGlobMatch(pattern, file string) bool {
-	pattern = strings.TrimPrefix(neoFinderBenchmarkRelativePath("/benchmark/repository", pattern), "./")
+func neoFinderBenchmarkGlobMatch(root, pattern, file string) bool {
+	pattern = strings.TrimPrefix(neoFinderBenchmarkRelativePath(root, pattern), "./")
 	if pattern == "" || pattern == "." || pattern == "*" || pattern == "**" || pattern == "**/*" {
 		return true
 	}
@@ -462,7 +679,7 @@ func neoFinderBenchmarkGlobMatch(pattern, file string) bool {
 	if matched || !strings.HasPrefix(pattern, "**/") {
 		return matched
 	}
-	return neoFinderBenchmarkGlobMatch(strings.TrimPrefix(pattern, "**/"), file)
+	return neoFinderBenchmarkGlobMatch(root, strings.TrimPrefix(pattern, "**/"), file)
 }
 
 func neoFinderBenchmarkSortedPaths(files map[string]string) []string {
@@ -479,10 +696,10 @@ func neoFinderBenchmarkCandidates(t *testing.T) []neoFinderBenchmarkCandidate {
 	raw := strings.TrimSpace(os.Getenv("AMP_FINDER_MODEL_BENCHMARK_CANDIDATES"))
 	if raw == "" {
 		return []neoFinderBenchmarkCandidate{
-			{Name: "claude-haiku-4-5-default", Route: neoModelRoute{Provider: "anthropic", Model: "claude-haiku-4-5-20251001"}},
-			{Name: "gemini-3-flash-high", Route: neoModelRoute{Provider: "google", Model: "gemini-3-flash-preview"}, Effort: "high"},
+			{Name: "gpt-5.6-terra-low", Route: neoModelRoute{Provider: "openai", Model: "gpt-5.6-terra"}, Effort: "low"},
+			{Name: "gpt-5.6-luna-low", Route: neoModelRoute{Provider: "openai", Model: "gpt-5.6-luna"}, Effort: "low"},
+			{Name: "gpt-5.6-sol-low", Route: neoModelRoute{Provider: "openai", Model: "gpt-5.6-sol"}, Effort: "low"},
 			{Name: "gemini-3.5-flash-low", Route: neoModelRoute{Provider: "google", Model: "gemini-3.5-flash"}, Effort: "low"},
-			{Name: "gemini-3.5-flash-medium", Route: neoModelRoute{Provider: "google", Model: "gemini-3.5-flash"}, Effort: "medium"},
 		}
 	}
 	candidates := make([]neoFinderBenchmarkCandidate, 0)

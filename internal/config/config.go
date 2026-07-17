@@ -359,7 +359,7 @@ type AmpNeoLocalRuntime struct {
 	TitleModel string `yaml:"title-model,omitempty" json:"title-model,omitempty"`
 
 	// compaction model optionally overrides the model used for local Neo summary
-	// compaction. defaults to gpt-5.4.
+	// compaction. defaults to gpt-5.6-sol.
 	CompactionModel string `yaml:"compaction-model,omitempty" json:"compaction-model,omitempty"`
 
 	// ModeModels optionally overrides the inference model per agent mode
