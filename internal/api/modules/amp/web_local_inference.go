@@ -300,7 +300,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	return fmt.Sprintf(`// ==UserScript==
 // @name CLIProxyAPI Amp Local Inference
 // @namespace https://github.com/router-for-me/CLIProxyAPI
-// @version 0.1.88
+// @version 0.1.91
 %s
 // @updateURL %s
 // @downloadURL %s
@@ -312,13 +312,14 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	"use strict";
 
 	const bridgeHeader = %s;
-	const userscriptVersion = "0.1.88";
+	const userscriptVersion = "0.1.91";
 	const apiKeyStorageKey = "cliproxyapi.ampLocalInference.apiKey";
 	const workingDirectoryStorageKey = "cliproxyapi.ampLocalInference.workingDirectory";
 	const selectedLocalProjectStorageKey = "cliproxyapi.ampLocalInference.selectedLocalProject";
 	const localThreadIDsStorageKey = "cliproxyapi.ampLocalInference.localThreadIDs";
 	const threadWorkingDirectoriesStorageKey = "cliproxyapi.ampLocalInference.threadWorkingDirectories";
 	const threadSettingsStorageKey = "cliproxyapi.ampLocalInference.threadSettings";
+	const localThreadStorageLimit = 100;
 	const localProjectsEndpointPath = "/ampcode/local-projects.json";
 	const localThreadDataEndpointPath = "/ampcode/local-thread-data.json";
 	const localInferencePatchFieldPattern = /"(id|v|messages|threadActorConfig|wsToken|thread_settings|baseURL|ampURL|threadId|threadID|thread_id|hasExecutor|executorConnected|workingDirectory|workspaceRoot|workspace)"\s*:|:\s*"(thread_settings)"/g;
@@ -332,6 +333,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	const NativeWebSocket = globalThis.WebSocket;
 	const loadedThreadBaseVersions = new Map();
 	const localThreadDiscoveryPromises = new Map();
+	const localThreadSockets = new Map();
 	let authenticatedAmpUserID = "";
 	let localThreadViewRedirectTarget = "";
 	const diagnostics = {
@@ -347,6 +349,8 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		webSocketCloseCount: 0,
 		webSocketErrorCount: 0,
 		activeWebSocketCount: 0,
+		trackedLocalThreadSocketCount: 0,
+		staleLocalThreadSocketCloseCount: 0,
 		loadedThreadBaseCaptureCount: 0,
 		loadedThreadBaseVersionEntryCount: 0,
 		clientResumeObservedCount: 0,
@@ -589,6 +593,20 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		}
 	}
 
+	function boundedThreadValues(values, currentThreadID = "") {
+		const ids = localThreadIDs().filter((threadID) => threadID !== currentThreadID);
+		if (currentThreadID && currentThreadID.startsWith("T-")) {
+			ids.unshift(currentThreadID);
+		}
+		const bounded = {};
+		for (const threadID of ids.slice(0, localThreadStorageLimit)) {
+			if (Object.prototype.hasOwnProperty.call(values, threadID)) {
+				bounded[threadID] = values[threadID];
+			}
+		}
+		return bounded;
+	}
+
 	function defaultReasoningEffort(agentMode) {
 		const mode = normalizeAgentMode(agentMode);
 		switch (mode) {
@@ -631,7 +649,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			smart: ["high", "xhigh", "max"],
 			rush: ["none"],
 			deep: ["low", "medium", "xhigh"],
-			review: ["low", "medium", "high"],
+			review: ["none", "low", "medium", "high"],
 			"agg-man": ["none"],
 			nostromo: ["low"],
 		};
@@ -652,7 +670,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			smart: ["high", "xhigh", "max"],
 			rush: ["none"],
 			deep: ["low", "medium", "xhigh"],
-			review: ["low", "medium", "high"],
+			review: ["none", "low", "medium", "high"],
 			"agg-man": ["none"],
 			nostromo: ["low"],
 		};
@@ -683,7 +701,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		}
 		const byThread = threadSettings();
 		byThread[threadID] = Object.assign({}, byThread[threadID] || {}, settings);
-		globalThis.localStorage.setItem(threadSettingsStorageKey, JSON.stringify(byThread));
+		globalThis.localStorage.setItem(threadSettingsStorageKey, JSON.stringify(boundedThreadValues(byThread, threadID)));
 	}
 
 	function activeThreadSettings() {
@@ -738,6 +756,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			"deep:medium": "Deep 2",
 			"deep:xhigh": "Deep 3",
 			"rush:none": "Rush",
+			"review:none": "Review",
 			"review:medium": "Review",
 			"agg-man:none": "Agg-man",
 			"nostromo:low": "Nostromo",
@@ -847,7 +866,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		}
 		const directories = threadWorkingDirectories();
 		directories[threadID] = workingDirectory;
-		globalThis.localStorage.setItem(threadWorkingDirectoriesStorageKey, JSON.stringify(directories));
+		globalThis.localStorage.setItem(threadWorkingDirectoriesStorageKey, JSON.stringify(boundedThreadValues(directories, threadID)));
 		diagnostics.lastInheritedWorkingDirectory = workingDirectory;
 		diagnostics.lastInheritedWorkingDirectoryThreadID = threadID;
 	}
@@ -858,7 +877,9 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		}
 		const ids = localThreadIDs().filter((value) => value !== threadID);
 		ids.unshift(threadID);
-		globalThis.localStorage.setItem(localThreadIDsStorageKey, JSON.stringify(ids.slice(0, 100)));
+		globalThis.localStorage.setItem(localThreadIDsStorageKey, JSON.stringify(ids.slice(0, localThreadStorageLimit)));
+		globalThis.localStorage.setItem(threadWorkingDirectoriesStorageKey, JSON.stringify(boundedThreadValues(threadWorkingDirectories(), threadID)));
+		globalThis.localStorage.setItem(threadSettingsStorageKey, JSON.stringify(boundedThreadValues(threadSettings(), threadID)));
 		normalizeLocalThreadViewPath(threadID);
 	}
 
@@ -4839,6 +4860,88 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		return JSON.stringify(parsed);
 	}
 
+	function updateTrackedLocalThreadSocketCount() {
+		let count = 0;
+		for (const sockets of localThreadSockets.values()) {
+			count += sockets.size;
+		}
+		diagnostics.trackedLocalThreadSocketCount = count;
+	}
+
+	function forgetLocalThreadSocket(threadID, socket) {
+		const sockets = localThreadSockets.get(threadID);
+		if (!sockets) {
+			return;
+		}
+		sockets.delete(socket);
+		if (sockets.size === 0) {
+			localThreadSockets.delete(threadID);
+		}
+		updateTrackedLocalThreadSocketCount();
+	}
+
+	function closeInactiveLocalThreadSockets(activeThreadID = pathThreadID()) {
+		for (const [threadID, sockets] of localThreadSockets) {
+			if (activeThreadID && threadID === activeThreadID) {
+				continue;
+			}
+			for (const socket of sockets) {
+				if (socket.readyState === NativeWebSocket.CONNECTING || socket.readyState === NativeWebSocket.OPEN) {
+					try {
+						socket.close(1000, "thread navigation");
+						diagnostics.staleLocalThreadSocketCloseCount += 1;
+					} catch {
+					}
+				}
+			}
+			localThreadSockets.delete(threadID);
+		}
+		updateTrackedLocalThreadSocketCount();
+	}
+
+	function trackLocalThreadSocket(threadID, socket) {
+		if (!threadID || !socket) {
+			return;
+		}
+		const activeThreadID = pathThreadID();
+		if (!activeThreadID || threadID !== activeThreadID) {
+			if (socket.readyState === NativeWebSocket.CONNECTING || socket.readyState === NativeWebSocket.OPEN) {
+				try {
+					socket.close(1000, "thread navigation");
+					diagnostics.staleLocalThreadSocketCloseCount += 1;
+				} catch {
+				}
+			}
+			return;
+		}
+		closeInactiveLocalThreadSockets(activeThreadID);
+		let sockets = localThreadSockets.get(threadID);
+		if (!sockets) {
+			sockets = new Set();
+			localThreadSockets.set(threadID, sockets);
+		}
+		sockets.add(socket);
+		updateTrackedLocalThreadSocketCount();
+	}
+
+	function installLocalThreadSocketNavigationCleanup() {
+		for (const method of ["pushState", "replaceState"]) {
+			const nativeMethod = globalThis.history?.[method];
+			if (typeof nativeMethod !== "function") {
+				continue;
+			}
+			globalThis.history[method] = function(...args) {
+				const result = Reflect.apply(nativeMethod, this, args);
+				globalThis.queueMicrotask(() => closeInactiveLocalThreadSockets());
+				return result;
+			};
+		}
+		if (typeof globalThis.addEventListener === "function") {
+			globalThis.addEventListener("popstate", () => closeInactiveLocalThreadSockets());
+			globalThis.addEventListener("pagehide", () => closeInactiveLocalThreadSockets(""));
+		}
+	}
+
 	globalThis.JSON.parse = function(text, reviver) {
 		const parsed = originalJSONParse(text, reviver);
 		try {
@@ -4973,6 +5076,9 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			}
 			const socket = Reflect.construct(target, args, newTarget);
 			try {
+				if (resumeThreadID) {
+					trackLocalThreadSocket(resumeThreadID, socket);
+				}
 				if (resumeThreadID && typeof socket.send === "function") {
 					const nativeSend = socket.send.bind(socket);
 					socket.send = (payload) => nativeSend(rewriteClientResumePayload(payload, resumeThreadID));
@@ -4989,6 +5095,9 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 					}
 				});
 				socket.addEventListener("close", (event) => {
+					if (resumeThreadID) {
+						forgetLocalThreadSocket(resumeThreadID, socket);
+					}
 					diagnostics.webSocketCloseCount += 1;
 					diagnostics.activeWebSocketCount = Math.max(0, diagnostics.activeWebSocketCount - 1);
 					diagnostics.lastWebSocketState = "closed";
@@ -5020,10 +5129,14 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		selectedLocalProjectStorageKey,
 		localThreadIDsStorageKey,
 		threadWorkingDirectoriesStorageKey,
+		threadSettingsStorageKey,
+		localThreadStorageLimit,
 		defaultBaseURL,
 		diagnostics,
+		rememberLocalThreadID,
 		removeInjectedLocalThreadControls,
 	};
+	installLocalThreadSocketNavigationCleanup();
 
 	if (/\/view\/?$/.test(globalThis.location.pathname || "")) {
 		discoverLocalThreadID(pathThreadID());

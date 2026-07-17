@@ -24,6 +24,10 @@ var neoModeSystemPromptKey = map[string]string{
 	"ultra":    "ultra",
 }
 
+var neoModeOptionalInAmpBinary = map[string]bool{
+	"agg-man": true,
+}
+
 // TestNeoKnownModeToolsMatchesModeUnion is a pure runtime invariant (no binary
 // needed): neoKnownModeTools must equal the union of every mode's included and
 // deferred tools. It guards against the known-set and the per-mode lists drifting
@@ -62,6 +66,9 @@ func TestNeoModeToolOrderMatchesAuditBaseline(t *testing.T) {
 	for mode, want := range neoModeToolOrder {
 		got, ok := profiles[mode]
 		if !ok {
+			if neoModeOptionalInAmpBinary[mode] {
+				continue
+			}
 			t.Fatalf("mode %q has no tool_names in Amp binary parity baseline", mode)
 		}
 		if !neoToolParityEqualOrdered(got, want) {
@@ -87,6 +94,9 @@ func TestNeoModeToolOrderMatchesAmpBinary(t *testing.T) {
 
 		idents := neoToolParityProfileIdents(text, sp, "includeTools")
 		if len(idents) == 0 {
+			if neoModeOptionalInAmpBinary[mode] {
+				continue
+			}
 			t.Fatalf("mode %q (systemPrompt %q): no includeTools reference found in %s", mode, sp, path)
 		}
 		resolved := make([][]string, 0, len(idents))

@@ -13,7 +13,7 @@ WHEN NOT TO USE THIS TOOL:
 - When you need to create, modify files, or run terminal commands
 
 USAGE GUIDELINES:
-1. Always spawn multiple search agents in parallel to maximise speed.
+1. Use 1-4 diverse, scoped searches per turn. Start with the fewest calls likely to resolve the query and stop as soon as the relevant files and ranges are established.
 2. Formulate your query as a precise engineering request.
    ✓ "Find every place we build an HTTP error response."
    ✗ "error handling search"

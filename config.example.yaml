@@ -340,7 +340,7 @@ nonstream-keepalive-interval: 0
 #     title-generation: true
 #     title-model: "claude-haiku-4-5-20251001"
 #     # optional: summarize old thread context when local Neo history gets large
-#     compaction-model: "gpt-5.4"
+#     compaction-model: "gpt-5.6-sol"
 #   # optional browser bridge for using ampcode.com web UI with local Neo inference.
 #   # Install /ampcode/local-inference.user.js in Tampermonkey, set the local API key
 #   # in browser localStorage, and keep this disabled unless you intentionally use it.

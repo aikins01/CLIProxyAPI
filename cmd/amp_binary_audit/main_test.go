@@ -574,29 +574,29 @@ var knownPromptTagSetCountValues = map[string]int{
 	"prompt/compaction":                                 6,
 	"prompt/guidance":                                   6,
 	"prompt/painter":                                    1,
-	"prompt/painter,skills":                             1,
 	"prompt/skills":                                     6,
 	"prompt/skills,system-prompt,tools":                 1,
 	"prompt/skills,tools":                               2,
 	"prompt/tools":                                      34,
 	"source/artifacts,compaction,guidance,skills,tools": 1,
 	"source/artifacts,code-review,painter,skills,tools": 1,
+	"source/artifacts,compaction,painter,skills,tools":  1,
+	"source/artifacts,painter,settings,tools":           1,
 	"source/code-review,guidance,settings":              1,
 	"source/code-review,guidance,settings,skills,tools": 1,
 	"source/compaction":                                 6,
-	"source/compaction,painter,skills,tools":            1,
 	"source/compaction,skills,tools":                    3,
 	"source/compaction,tools":                           7,
 	"source/guidance":                                   7,
 	"source/guidance,settings":                          1,
 	"source/guidance,settings,skills,tools":             1,
 	"source/guidance,skills":                            2,
-	"source/guidance,skills,tools":                      2,
+	"source/guidance,skills,tools":                      3,
 	"source/guidance,tools":                             11,
 	"source/painter":                                    1,
-	"source/painter,settings,tools":                     1,
+	"source/painter,skills":                             1,
 	"source/painter,tools":                              1,
-	"source/settings":                                   2,
+	"source/settings":                                   3,
 	"source/settings,skills,tools":                      3,
 	"source/settings,system-prompt,tools":               1,
 	"source/settings,tools":                             7,
@@ -661,7 +661,7 @@ func TestKnownModelModeReasoningValuesMatchCommittedBaseline(t *testing.T) {
 	})))
 	assertStringSetsEqual(t, "agent mode profiles", agentModeProfileStrings(baseline.Signals.AgentModeProfiles), sortedKeys(knownAgentModeProfileValues))
 	assertStringSetsEqual(t, "agent mode routes", agentModeRouteStrings(baseline.Signals.AgentModeRoutes), sortedKeys(knownAgentModeRouteValues))
-	assertStringSetsEqual(t, "agent mode coverage", agentModeCoverageStrings(baseline.Signals.AgentModeCoverage), sortedKeys(expectedCoverageValuesFromMap(agentModeScopes)))
+	assertStringSetsEqual(t, "agent mode coverage", agentModeCoverageStrings(baseline.Signals.AgentModeCoverage), sortedKeys(expectedCoverageValuesFromMap(activeAgentModeScopes())))
 
 	expectedModelLimits := make([]string, 0, len(knownModelLimitValues))
 	for name, expectation := range knownModelLimitValues {
@@ -1291,6 +1291,13 @@ func TestBuildSnapshotReadsBinaryLikeFile(t *testing.T) {
 	assertContains(t, modelCoverageStrings(snapshot.Signals.ModelCoverage), "amp-nostromo-v1=amp/amp-nostromo")
 	assertContains(t, snapshot.Signals.ActorRuntime, "threadStatusUpdated")
 	assertContains(t, actorCoverageStrings(snapshot.Signals.ActorCoverage), "threadStatusUpdated=local-runtime")
+}
+
+func TestExtractAgentModeProfilesStopsAtPuckBoundary(t *testing.T) {
+	raw := `REVIEW:{key:"review",primaryModel:Nr("GPT_5_5"),includeTools:NB,reasoningEffort:"medium"},PUCK:{key:"puck",primaryModel:Nr("GPT_5_6_TERRA"),includeTools:BB,reasoningEffort:"none",serverOnly:!0},LOW:{key:"low",primaryModel:Nr("AMP_GLM_5_2"),includeTools:VB,reasoningEffort:"medium"}`
+	profiles := agentModeProfileStrings(extractAgentModeProfiles(raw))
+	assertContains(t, profiles, "review|primary=GPT_5_5|reasoning=medium|levels=|include=present|deferred=false|visible=false|visibleInV2=false|serverOnly=false")
+	assertContains(t, profiles, "puck|primary=GPT_5_6_TERRA|reasoning=none|levels=|include=present|deferred=false|visible=false|visibleInV2=false|serverOnly=true")
 }
 
 func TestLifecycleChecklistMapsChangedSignalsToParityAreas(t *testing.T) {

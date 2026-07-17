@@ -437,7 +437,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 	}
 	for _, want := range []string{
 		"// ==UserScript==",
-		"@version 0.1.88",
+		"@version 0.1.91",
 		"@match https://ampcode.com/*",
 		"@updateURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
 		"@downloadURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
@@ -454,7 +454,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"commandPaletteIntegrationCount",
 		"localThreadPickerOpenCount",
 		"removedLocalThreadControlCount",
-		`const userscriptVersion = "0.1.88"`,
+		`const userscriptVersion = "0.1.91"`,
 		"discoverLocalThreadID",
 		"normalizeLocalThreadViewPath",
 		`originalFetch(localBaseURLString() + "/api/thread-actors"`,
@@ -1027,7 +1027,7 @@ if (typeof globalThis.btoa !== "function") {
 }
 	require(scriptPath);
 	const bridge = globalThis.__cliproxyAmpLocalInference;
-	assert(bridge && bridge.userscriptVersion === "0.1.88", "bridge userscript version was not exposed");
+assert(bridge && bridge.userscriptVersion === "0.1.91", "bridge userscript version was not exposed");
 		globalThis.localStorage.setItem(bridge.apiKeyStorageKey, "local-key");
 		JSON.parse(JSON.stringify({ user: { id: "U-unrelated", email: "other@example.com" }, workspaces: [] }));
 		assert(bridge.diagnostics.authenticatedAmpUserIDCaptureCount === 0, "unrelated nested user was accepted as the authenticated viewer");
@@ -1059,6 +1059,23 @@ assert(bridge.diagnostics.decodedGraphPassCount === unrelatedGraphPasses, "unrel
 	const directOpenedThreadResume = '{"type":"client_resume","version":0}';
 	directOpenedThreadSocket.send(directOpenedThreadResume);
 	assert(JSON.parse(directOpenedThreadSocket.sent.at(-1)).version === 7, "active direct-open thread base did not rewrite zero resume before local id discovery");
+	bridge.rememberLocalThreadID(threadID);
+	globalThis.location = new URL("https://ampcode.com/threads/" + secondThreadID);
+	const navigatedThreadSocket = new WebSocket("wss://ampcode.com/gateway/threadActor/?rvt-method=get&rvt-key=" + encodeURIComponent(secondThreadID));
+	assert(directOpenedThreadSocket.readyState === NativeWebSocket.CLOSED, "previous local thread socket remained open after thread navigation");
+	assert(navigatedThreadSocket.readyState === NativeWebSocket.CONNECTING, "active local thread socket was closed during navigation cleanup");
+	assert(bridge.diagnostics.staleLocalThreadSocketCloseCount === 1, "stale local thread socket close was not recorded");
+	assert(bridge.diagnostics.trackedLocalThreadSocketCount === 1, "tracked local thread sockets were not bounded to the active thread");
+	const staleReconnectSocket = new WebSocket("wss://ampcode.com/gateway/threadActor/?rvt-method=get&rvt-key=" + encodeURIComponent(threadID));
+	assert(staleReconnectSocket.readyState === NativeWebSocket.CLOSED, "stale thread reconnect remained open after navigation");
+	assert(navigatedThreadSocket.readyState === NativeWebSocket.CONNECTING, "stale thread reconnect closed the active thread socket");
+	assert(bridge.diagnostics.staleLocalThreadSocketCloseCount === 2, "stale reconnect socket close was not recorded");
+	assert(bridge.diagnostics.trackedLocalThreadSocketCount === 1, "stale reconnect replaced the active tracked thread socket");
+	globalThis.location = new URL("https://ampcode.com/settings/plugins/manage");
+	const offRouteReconnectSocket = new WebSocket("wss://ampcode.com/gateway/threadActor/?rvt-method=get&rvt-key=" + encodeURIComponent(secondThreadID));
+	assert(offRouteReconnectSocket.readyState === NativeWebSocket.CLOSED, "thread reconnect remained open after leaving the thread route");
+	assert(bridge.diagnostics.staleLocalThreadSocketCloseCount === 3, "off-route reconnect socket close was not recorded");
+	globalThis.location = new URL("https://ampcode.com/threads/" + threadID);
 	const activeThreadPath = globalThis.location.pathname;
 	const boundedThreadIDs = [];
 	for (let i = 1; i <= 80; i += 1) {
@@ -1072,6 +1089,30 @@ assert(bridge.diagnostics.decodedGraphPassCount === unrelatedGraphPasses, "unrel
 	}
 	globalThis.location.pathname = activeThreadPath;
 	assert(bridge.diagnostics.loadedThreadBaseVersionEntryCount === 64, "loaded thread base versions were not bounded");
+	const storedThreadIDs = [];
+	const storedDirectories = {};
+	const storedSettings = {};
+	for (let i = 1; i <= bridge.localThreadStorageLimit + 20; i += 1) {
+		const storedThreadID = "T-10000000-0000-4000-8000-" + i.toString(16).padStart(12, "0");
+		storedThreadIDs.push(storedThreadID);
+		storedDirectories[storedThreadID] = "/tmp/project-" + i;
+		storedSettings[storedThreadID] = { agentMode: "medium", reasoningEffort: "medium" };
+	}
+	storedThreadIDs.unshift(threadID);
+	storedDirectories[threadID] = createdThreadWorkDir;
+	storedSettings[threadID] = { agentMode: "low", reasoningEffort: "medium" };
+	globalThis.localStorage.setItem(bridge.localThreadIDsStorageKey, JSON.stringify(storedThreadIDs));
+	globalThis.localStorage.setItem(bridge.threadWorkingDirectoriesStorageKey, JSON.stringify(storedDirectories));
+	globalThis.localStorage.setItem(bridge.threadSettingsStorageKey, JSON.stringify(storedSettings));
+	bridge.rememberLocalThreadID(threadID);
+	const boundedDirectories = JSON.parse(globalThis.localStorage.getItem(bridge.threadWorkingDirectoriesStorageKey));
+	const boundedSettings = JSON.parse(globalThis.localStorage.getItem(bridge.threadSettingsStorageKey));
+	assert(Object.keys(boundedDirectories).length <= bridge.localThreadStorageLimit, "thread working-directory storage was not bounded");
+	assert(Object.keys(boundedSettings).length <= bridge.localThreadStorageLimit, "thread settings storage was not bounded");
+	assert(boundedDirectories[threadID] === createdThreadWorkDir, "active thread working directory was pruned");
+	assert(boundedSettings[threadID]?.agentMode === "low", "active thread settings were pruned");
+	globalThis.localStorage.removeItem(bridge.threadWorkingDirectoriesStorageKey);
+	globalThis.localStorage.removeItem(bridge.threadSettingsStorageKey);
 const unrelatedResponse = new Response('{"ok":true}');
 Object.defineProperty(unrelatedResponse, "url", { value: "https://ampcode.com/api/unrelated" });
 const unrelatedResponseJSONPromise = unrelatedResponse.json();
@@ -1722,7 +1763,7 @@ assert(localHTTPRewritten.searchParams.get("cliproxy-api-key") === "local-key", 
 assert(bridge.diagnostics.decodedConfigPatchCount >= 2, "decoded config patches were not recorded");
 assert(bridge.diagnostics.decodedGraphPassCount > 0, "decoded graph passes were not recorded");
 assert(bridge.diagnostics.decodedGraphVisitCount >= bridge.diagnostics.decodedGraphPassCount, "decoded graph visits were not recorded");
-assert(bridge.diagnostics.webSocketBootstrapCount === 9, "websocket bootstrap was not recorded");
+assert(bridge.diagnostics.webSocketBootstrapCount === 12, "websocket bootstrap was not recorded");
 })().catch((error) => {
 	console.error(error && error.stack ? error.stack : error);
 	process.exit(1);
@@ -3434,13 +3475,33 @@ func TestWebLocalInferenceLocalProjectsRoute(t *testing.T) {
 
 	workDir := neoExistingDirectory(t.TempDir())
 	projectID := neoDeterministicLocalProjectID("local-app", neoFileURLForDirectory(workDir), workDir)
-	if err := writeNeoWebLocalProjectIndex(rt.threadDir, []any{map[string]any{
-		"id":               projectID,
-		"name":             "local-app",
-		"repositoryURL":    neoFileURLForDirectory(workDir),
-		"workingDirectory": workDir,
-	}}); err != nil {
+	persistedRepositoryURL := "https://github.com/example/persisted-app.git"
+	persistedProjectID := neoDeterministicLocalProjectID("persisted-app", persistedRepositoryURL, "")
+	if err := writeNeoWebLocalProjectIndex(rt.threadDir, []any{
+		map[string]any{
+			"id":               projectID,
+			"name":             "local-app",
+			"repositoryURL":    neoFileURLForDirectory(workDir),
+			"workingDirectory": workDir,
+		},
+		map[string]any{
+			"id":            persistedProjectID,
+			"name":          "persisted-app",
+			"repositoryURL": persistedRepositoryURL,
+		},
+	}); err != nil {
 		t.Fatalf("write project index: %v", err)
+	}
+	persistedThreadID := "T-019f6551-9d97-73b2-ab56-d3967bce6e10"
+	if _, err := writeNeoLocalThreadFileInDir(rt.threadDir, persistedThreadID, map[string]any{
+		"id":    persistedThreadID,
+		"title": "Persisted repository thread",
+		"meta": map[string]any{
+			"cliProxyAPILocalNeo": true,
+			"repositoryURL":       persistedRepositoryURL,
+		},
+	}); err != nil {
+		t.Fatalf("write persisted repository thread: %v", err)
 	}
 	threadID := "T-019f6551-9d97-73b2-ab56-d3967bce6e09"
 	actor := rt.store.ensureThreadActor(threadID)
@@ -3475,15 +3536,22 @@ func TestWebLocalInferenceLocalProjectsRoute(t *testing.T) {
 		t.Fatalf("local projects JSON error: %v", err)
 	}
 	projects := arrayValue(response["projects"])
-	if response["ok"] != true || len(projects) != 1 {
+	if response["ok"] != true || len(projects) != 2 {
 		t.Fatalf("local projects response = %#v", response)
 	}
 	homeDirectory := neoDefaultWebLocalWorkingDirectory()
 	if stringValue(response["defaultWorkingDirectory"]) != homeDirectory {
 		t.Fatalf("defaultWorkingDirectory = %#v, want %q", response["defaultWorkingDirectory"], homeDirectory)
 	}
-	project := mapValue(projects[0])
-	if stringValue(project["id"]) != projectID || stringValue(project["workingDirectory"]) != workDir || stringValue(project["name"]) != "local-app" {
+	var project map[string]any
+	for _, rawProject := range projects {
+		candidate := mapValue(rawProject)
+		if stringValue(candidate["id"]) == projectID {
+			project = candidate
+			break
+		}
+	}
+	if stringValue(project["workingDirectory"]) != workDir || stringValue(project["name"]) != "local-app" {
 		t.Fatalf("project = %#v, want id=%q workingDirectory=%q", project, projectID, workDir)
 	}
 	thread := mapValue(response["thread"])
@@ -3494,8 +3562,26 @@ func TestWebLocalInferenceLocalProjectsRoute(t *testing.T) {
 		t.Fatalf("thread summary included transcript messages: %#v", thread)
 	}
 	recentThreads := arrayValue(response["threads"])
-	if len(recentThreads) != 1 || stringValue(mapValue(recentThreads[0])["id"]) != threadID {
-		t.Fatalf("recent thread summaries = %#v, want %q", recentThreads, threadID)
+	if len(recentThreads) != 2 {
+		t.Fatalf("recent thread summaries = %#v, want live and persisted threads", recentThreads)
+	}
+	foundLiveThread := false
+	foundPersistedThread := false
+	for _, rawRecentThread := range recentThreads {
+		recentThread := mapValue(rawRecentThread)
+		switch stringValue(recentThread["id"]) {
+		case threadID:
+			foundLiveThread = true
+		case persistedThreadID:
+			foundPersistedThread = stringValue(mapValue(recentThread["meta"])["projectID"]) == persistedProjectID
+		}
+	}
+	if !foundLiveThread || !foundPersistedThread {
+		t.Fatalf("recent thread project association = %#v, want live=%v persisted project=%q", recentThreads, foundLiveThread, persistedProjectID)
+	}
+	recentThreadMeta := mapValue(mapValue(recentThreads[0])["meta"])
+	if stringValue(recentThreadMeta["projectID"]) != projectID || recentThreadMeta["usesThreadActors"] != true {
+		t.Fatalf("recent thread summary meta = %#v, want projectID=%q", recentThreadMeta, projectID)
 	}
 	threadMeta := mapValue(thread["meta"])
 	if threadMeta["cliProxyAPILocalNeo"] != true || threadMeta["usesThreadActors"] != true || stringValue(threadMeta["executorType"]) != "local-client" {
@@ -3583,8 +3669,8 @@ func TestWebLocalInferenceLocalProjectsRoute(t *testing.T) {
 		t.Fatalf("refreshed local projects JSON error: %v", err)
 	}
 	refreshedProjects := arrayValue(refreshedResponse["projects"])
-	if len(refreshedProjects) != 2 {
-		t.Fatalf("refreshed projects = %#v, want index and history projects", refreshedResponse)
+	if len(refreshedProjects) != 3 {
+		t.Fatalf("refreshed projects = %#v, want two index and one history projects", refreshedResponse)
 	}
 	historyID := neoDeterministicLocalProjectID(filepath.Base(historyDir), neoFileURLForDirectory(historyDir), historyDir)
 	foundHistoryProject := false
@@ -3661,7 +3747,45 @@ func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.
 	t.Setenv("TEST_STARTED_LOG", startedLog)
 	r := gin.New()
 	enabled := true
+	const (
+		threadID              = "T-019f20b2-5e05-7501-8ddd-994e151ee951"
+		localProjectThreadID  = "T-019f20b2-5e05-7501-8ddd-994e151ee959"
+		projectOnlyThreadID   = "T-019f20b2-5e05-7501-8ddd-994e151ee952"
+		runnerThreadID        = "T-019f20b2-5e05-7501-8ddd-994e151ee955"
+		runnerOptOutThreadID  = "T-019f20b2-5e05-7501-8ddd-994e151ee956"
+		explicitFalseThreadID = "T-019f20b2-5e05-7501-8ddd-994e151ee954"
+		missingDirectoryID    = "T-019f20b2-5e05-7501-8ddd-994e151ee953"
+	)
+	cloudThreadIDs := []string{threadID, localProjectThreadID, projectOnlyThreadID, runnerThreadID, explicitFalseThreadID}
+	cloudThreadCalls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/thread-actors" || cloudThreadCalls >= len(cloudThreadIDs) {
+			t.Fatalf("unexpected cloud shell request %s %s", r.Method, r.URL.Path)
+		}
+		body := readNeoJSON(r.Body)
+		for _, key := range []string{"prompt", "initialPrompt", "message"} {
+			if _, ok := body[key]; ok {
+				t.Fatalf("cloud shell request included %s: %#v", key, body)
+			}
+		}
+		response := map[string]any{
+			"threadId":         cloudThreadIDs[cloudThreadCalls],
+			"wsToken":          "cloud-token",
+			"ownerUserId":      "cloud-user",
+			"threadVersion":    0,
+			"usesDtw":          true,
+			"usesThreadActors": true,
+		}
+		if executorType := stringValue(body["executorType"]); executorType != "" {
+			response["executorType"] = executorType
+		}
+		cloudThreadCalls++
+		writeNeoJSON(w, http.StatusCreated, response)
+	}))
+	t.Cleanup(upstream.Close)
 	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+		UpstreamURL:     upstream.URL,
+		UpstreamAPIKey:  "cloud-key",
 		NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled, ExecutorCommand: command},
 	}})
 	t.Cleanup(func() { rt.store.disposeAll(true, "test done", false) })
@@ -3697,7 +3821,6 @@ func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.
 		t.Fatalf("seed parent status = %d", status)
 	}
 
-	threadID := "T-019f20b2-5e05-7501-8ddd-994e151ee951"
 	requestBody := neoSvelteKitRemoteCommandBodyForTest(t, map[string]any{
 		"content":         []any{map[string]any{"type": "text", "text": "Following @" + parentThreadID}},
 		"agentMode":       "deep",
@@ -3779,7 +3902,6 @@ func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.
 		t.Fatalf("executor bootstrap = type:%q spawned:%d", bootstrapExecutorType, spawnedCount)
 	}
 
-	localProjectThreadID := "T-019f20b2-5e05-7501-8ddd-994e151ee959"
 	localProjectBody := neoSvelteKitRemoteCommandBodyForTest(t, map[string]any{
 		"content":       []any{map[string]any{"type": "text", "text": "Use injected local project"}},
 		"agentMode":     "medium",
@@ -3812,7 +3934,6 @@ func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.
 		t.Fatalf("local-project workspace = %#v, want %q", workspace, expectedWorkDir)
 	}
 
-	projectOnlyThreadID := "T-019f20b2-5e05-7501-8ddd-994e151ee952"
 	projectOnlyBody := neoSvelteKitRemoteCommandBodyForTest(t, map[string]any{
 		"content":         []any{map[string]any{"type": "text", "text": "Use selected project only"}},
 		"agentMode":       "smart",
@@ -3871,7 +3992,6 @@ func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.
 		t.Fatalf("runner registration = %#v", runnerRegistration)
 	}
 
-	runnerThreadID := "T-019f20b2-5e05-7501-8ddd-994e151ee955"
 	runnerBody := neoSvelteKitRemoteCommandBodyForTest(t, map[string]any{
 		"content":         []any{map[string]any{"type": "text", "text": "Use selected runner"}},
 		"agentMode":       "smart",
@@ -3924,7 +4044,6 @@ func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.
 		t.Fatalf("runner heartbeat = %#v", runnerHeartbeat)
 	}
 
-	runnerOptOutThreadID := "T-019f20b2-5e05-7501-8ddd-994e151ee956"
 	runnerOptOutBody := neoSvelteKitRemoteCommandBodyForTest(t, map[string]any{
 		"content":       []any{map[string]any{"type": "text", "text": "Use selected runner without spawning"}},
 		"agentMode":     "smart",
@@ -3950,7 +4069,6 @@ func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.
 		t.Fatalf("unavailable runner created actor %#v", actor)
 	}
 
-	explicitFalseThreadID := "T-019f20b2-5e05-7501-8ddd-994e151ee954"
 	explicitFalseBody := neoSvelteKitRemoteCommandBodyForTest(t, map[string]any{
 		"content":         []any{map[string]any{"type": "text", "text": "Create without spawning"}},
 		"agentMode":       "smart",
@@ -3973,14 +4091,14 @@ func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.
 	if explicitFalseResult["ok"] != true || stringValue(explicitFalseResult["threadID"]) != explicitFalseThreadID {
 		t.Fatalf("explicit-false create result = %#v", explicitFalseResult)
 	}
-	if explicitFalseResult["usesThreadActors"] != false || explicitFalseResult["usesDtw"] != false || stringValue(explicitFalseResult["executorType"]) != "" {
+	if explicitFalseResult["usesThreadActors"] != true || explicitFalseResult["usesDtw"] != true || stringValue(explicitFalseResult["executorType"]) != "" {
 		t.Fatalf("explicit-false local actor response = %#v", explicitFalseResult)
 	}
-	if _, ok := explicitFalseResult["threadActorConfig"]; ok {
-		t.Fatalf("explicit-false returned threadActorConfig: %#v", explicitFalseResult)
+	if stringValue(mapValue(explicitFalseResult["threadActorConfig"])["threadId"]) != explicitFalseThreadID {
+		t.Fatalf("explicit-false actor config = %#v", explicitFalseResult)
 	}
-	if threadData := mapValue(explicitFalseResult["threadData"]); threadData["threadActorConfig"] != nil {
-		t.Fatalf("explicit-false returned threadData actor config: %#v", threadData)
+	if threadData := mapValue(explicitFalseResult["threadData"]); stringValue(mapValue(threadData["threadActorConfig"])["threadId"]) != explicitFalseThreadID {
+		t.Fatalf("explicit-false threadData actor config = %#v", threadData)
 	}
 	if stringValue(explicitFalseResult["workingDirectory"]) != expectedWorkDir || stringValue(explicitFalseResult["workspaceRoot"]) != expectedWorkDir {
 		t.Fatalf("explicit-false working directory response = %#v, want %q", explicitFalseResult, expectedWorkDir)
@@ -3997,11 +4115,10 @@ func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.
 		t.Fatalf("explicit-false executor bootstrap = type:%q spawned:%d", explicitFalseBootstrapExecutorType, explicitFalseSpawnedCount)
 	}
 
-	missingDirectoryThreadID := "T-019f20b2-5e05-7501-8ddd-994e151ee953"
 	missingDirectoryBody := neoSvelteKitRemoteCommandBodyForTest(t, map[string]any{
 		"content":       []any{map[string]any{"type": "text", "text": "No directory source"}},
 		"spawnExecutor": true,
-		"threadID":      missingDirectoryThreadID,
+		"threadID":      missingDirectoryID,
 	})
 	missingDirectoryReq := httptest.NewRequest(http.MethodPost, "/_app/remote/3abror/createProjectThread?"+ampWebLocalInferenceAPIKeyQuery+"=local-key", strings.NewReader(missingDirectoryBody))
 	missingDirectoryReq.Header.Set("Content-Type", "application/json")
@@ -4017,8 +4134,11 @@ func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.
 	if missingDirectoryResult["ok"] != false {
 		t.Fatalf("missing-directory result = %#v, want ok false", missingDirectoryResult)
 	}
-	if actor := rt.store.lookupThreadActor(missingDirectoryThreadID); actor != nil {
+	if actor := rt.store.lookupThreadActor(missingDirectoryID); actor != nil {
 		t.Fatal("missing-directory thread actor was created")
+	}
+	if cloudThreadCalls != len(cloudThreadIDs) {
+		t.Fatalf("cloud shell requests = %d, want %d", cloudThreadCalls, len(cloudThreadIDs))
 	}
 }
 
@@ -5360,7 +5480,7 @@ func TestRegisterManagementRoutesRejectsUnknownNeoRuntimeBridgePathsWithoutProxy
 	}
 }
 
-func TestRegisterManagementRoutesServesNewNeoThreadActorLocallyWithProxy(t *testing.T) {
+func TestRegisterManagementRoutesPassesNewNeoThreadActorUpstreamWithProxy(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	enabled := true
@@ -5393,28 +5513,109 @@ func TestRegisterManagementRoutesServesNewNeoThreadActorLocallyWithProxy(t *test
 	}
 	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, auth)
 
-	body := bytes.NewBufferString(`{"agentMode":"deep","usesThreadActors":true}`)
-	req := httptest.NewRequest(http.MethodPost, "/api/thread-actors", body)
-	req.Header.Set("Authorization", "Bearer local-key")
-	rec := httptest.NewRecorder()
-	r.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	localServer := httptest.NewServer(r)
+	t.Cleanup(localServer.Close)
+	req, err := http.NewRequest(http.MethodPost, localServer.URL+"/api/thread-actors", bytes.NewBufferString(`{"agentMode":"deep","usesThreadActors":true}`))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
 	}
-	if proxyCalled {
-		t.Fatal("new thread actor request should be served locally")
+	req.Header.Set("Authorization", "Bearer local-key")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do request: %v", err)
+	}
+	defer resp.Body.Close()
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+
+	if resp.StatusCode != http.StatusTeapot {
+		t.Fatalf("status = %d, body=%s", resp.StatusCode, string(responseBody))
+	}
+	if !proxyCalled {
+		t.Fatal("new CLI thread actor request did not reach upstream")
+	}
+}
+
+func TestRegisterManagementRoutesPassesNewCLIThreadActorToUpstream(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	enabled := true
+	cloudThreadID := "T-019f6c11-91d7-72cf-ad68-f51a948c2401"
+	requests := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.Method != http.MethodPost || r.URL.Path != "/api/thread-actors" || r.URL.RawQuery != "" {
+			t.Fatalf("upstream request = %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+		}
+		if r.Header.Get("Authorization") != "Bearer upstream-key" {
+			t.Fatalf("upstream Authorization = %q", r.Header.Get("Authorization"))
+		}
+		body := readNeoJSON(r.Body)
+		if body["usesThreadActors"] != true || stringValue(body["agentMode"]) != "deep" {
+			t.Fatalf("upstream body = %#v", body)
+		}
+		writeNeoJSON(w, http.StatusCreated, map[string]any{
+			"threadId":         cloudThreadID,
+			"wsToken":          "cloud-token",
+			"ownerUserId":      "cloud-user",
+			"threadVersion":    0,
+			"poolName":         "cloud-pool",
+			"capability":       "write",
+			"usesDtw":          true,
+			"usesThreadActors": true,
+			"agentMode":        "deep",
+		})
+	}))
+	t.Cleanup(upstream.Close)
+
+	m := &AmpModule{
+		restrictToLocalhost: false,
+		neoRuntime: newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+			UpstreamURL:    upstream.URL,
+			UpstreamAPIKey: "upstream-key",
+			NeoLocalRuntime: config.AmpNeoLocalRuntime{
+				Enabled: &enabled,
+			},
+		}}),
+	}
+	proxy, _ := createReverseProxy(upstream.URL, NewStaticSecretSource("upstream-key"))
+	m.setProxy(proxy)
+	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, nil)
+
+	localServer := httptest.NewServer(r)
+	t.Cleanup(localServer.Close)
+	req, err := http.NewRequest(http.MethodPost, localServer.URL+"/api/thread-actors", bytes.NewBufferString(`{"agentMode":"deep","usesThreadActors":true}`))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do request: %v", err)
+	}
+	defer resp.Body.Close()
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d, body=%s", resp.StatusCode, string(responseBody))
+	}
+	if requests != 1 {
+		t.Fatalf("upstream requests = %d, want 1", requests)
 	}
 	var response map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+	if err := json.Unmarshal(responseBody, &response); err != nil {
 		t.Fatalf("response JSON error: %v", err)
 	}
-	requireNeoBinaryV7ThreadID(t, stringValue(response["threadId"]))
-	if response["agentMode"] != "deep" || response["wsToken"] != "local-key" {
-		t.Fatalf("unexpected local thread actor response: %#v", response)
+	if stringValue(response["threadId"]) != cloudThreadID || stringValue(response["wsToken"]) != "cloud-token" || stringValue(response["ownerUserId"]) != "cloud-user" || stringValue(response["poolName"]) != "cloud-pool" {
+		t.Fatalf("thread actor response = %#v", response)
 	}
-	if response["usesDtw"] != true || response["usesThreadActors"] != true {
-		t.Fatalf("thread actor flags = %#v", response)
+	if m.neoRuntime.store.lookupThreadActor(cloudThreadID) != nil {
+		t.Fatal("CLI thread actor was incorrectly imported into the local runtime")
 	}
 }
 
@@ -5482,48 +5683,106 @@ func TestRegisterManagementRoutesCanForceLocalNeoThreadActorsWithProxy(t *testin
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	enabled := true
-	proxyCalled := false
-	upstreamHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		proxyCalled = true
-		w.WriteHeader(http.StatusTeapot)
-	})
+	cloudThreadID := "T-019f6c11-91d7-72cf-ad68-f51a948c2402"
+	upstreamRequests := 0
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upstreamHandler(w, r)
+		upstreamRequests++
+		if r.Method != http.MethodPost || r.URL.Path != "/api/thread-actors" {
+			t.Fatalf("upstream request = %s %s", r.Method, r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "Bearer upstream-key" {
+			t.Fatalf("upstream Authorization = %q", r.Header.Get("Authorization"))
+		}
+		body := readNeoJSON(r.Body)
+		if stringValue(body["agentMode"]) != "deep" {
+			t.Fatalf("upstream agentMode = %q, want deep", stringValue(body["agentMode"]))
+		}
+		for _, key := range []string{"prompt", "initialPrompt", "message"} {
+			if _, ok := body[key]; ok {
+				t.Fatalf("cloud shell request included %s: %#v", key, body)
+			}
+		}
+		threadMeta := mapValue(body["threadMeta"])
+		if threadMeta["cliProxyAPILocalNeo"] != true || threadMeta["cliProxyAPIWebLocalShell"] != true || threadMeta["ampcodeConnectorLocalNeo"] != true {
+			t.Fatalf("upstream thread meta = %#v", threadMeta)
+		}
+		writeNeoJSON(w, http.StatusCreated, map[string]any{
+			"threadId":         cloudThreadID,
+			"wsToken":          "cloud-token",
+			"ownerUserId":      "cloud-user",
+			"threadVersion":    0,
+			"poolName":         "cloud-pool",
+			"usesDtw":          true,
+			"usesThreadActors": true,
+			"agentMode":        "rush",
+		})
 	}))
 	defer upstream.Close()
 
 	m := &AmpModule{
 		restrictToLocalhost: false,
 		neoRuntime: newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
-			UpstreamURL: upstream.URL,
+			UpstreamURL:    upstream.URL,
+			UpstreamAPIKey: "upstream-key",
 			NeoLocalRuntime: config.AmpNeoLocalRuntime{
 				Enabled:           &enabled,
 				ForceThreadActors: true,
 			},
 		}}),
 	}
-	proxy, _ := createReverseProxy(upstream.URL, NewStaticSecretSource(""))
+	proxy, _ := createReverseProxy(upstream.URL, NewStaticSecretSource("upstream-key"))
 	m.setProxy(proxy)
 
 	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, nil)
 
-	body := bytes.NewBufferString(`{"agentMode":"rush","usesThreadActors":true}`)
+	body := bytes.NewBufferString(`{"prompt":"run this locally","settings":{"agentMode":"deep"}}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/thread-actors", body)
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusOK {
+	if rec.Code != http.StatusCreated {
 		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
 	}
-	if proxyCalled {
-		t.Fatal("thread-actors request should be served locally when force-thread-actors is enabled")
+	if upstreamRequests != 1 {
+		t.Fatalf("upstream requests = %d, want one cloud shell creation", upstreamRequests)
 	}
 	var response map[string]any
 	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
 		t.Fatalf("response JSON error: %v", err)
 	}
-	if response["agentMode"] != "rush" || stringValue(response["wsToken"]) == "" {
+	if response["threadId"] != cloudThreadID || response["agentMode"] != "deep" || response["wsToken"] != "cloud-token" {
 		t.Fatalf("unexpected local thread actor response: %#v", response)
+	}
+	actor := m.neoRuntime.store.lookupThreadActor(cloudThreadID)
+	if actor == nil {
+		t.Fatal("cloud thread ID was not bound to a local actor")
+	}
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.queue) != 1 || textFromBlocks(actor.queue[0].Content) != "run this locally" {
+		t.Fatalf("local actor prompt queue = %#v", actor.queue)
+	}
+}
+
+func TestNeoThreadActorBootstrapBodyRecognizesSupportedCreateShapes(t *testing.T) {
+	for name, body := range map[string]map[string]any{
+		"top-level mode":   {"agentMode": "deep"},
+		"thread meta mode": {"threadMeta": map[string]any{"agentMode": "deep"}},
+		"settings mode":    {"settings": map[string]any{"agentMode": "deep"}},
+		"executor":         {"executorType": "local-client"},
+		"prompt":           {"prompt": "run locally"},
+		"initial prompt":   {"initialPrompt": "run locally"},
+		"message":          {"message": "run locally"},
+		"thread actors":    {"usesThreadActors": true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if !neoThreadActorBootstrapBody(body) {
+				t.Fatalf("bootstrap body was not recognized: %#v", body)
+			}
+		})
+	}
+	if neoThreadActorBootstrapBody(map[string]any{"unrelated": true}) {
+		t.Fatal("unrelated body was recognized as a thread actor bootstrap")
 	}
 }
 
@@ -6421,7 +6680,21 @@ func TestRegisterManagementRoutesServesLocalNeoReviewThreadInternalRPCs(t *testi
 	r := gin.New()
 	enabled := true
 	proxyCalled := false
+	cloudShellRequests := 0
+	cloudThreadID := "T-019f6c50-371f-7d88-8d80-81bb1a97a787"
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/api/thread-actors" {
+			cloudShellRequests++
+			writeNeoJSON(w, http.StatusCreated, map[string]any{
+				"threadId":         cloudThreadID,
+				"wsToken":          "cloud-token",
+				"ownerUserId":      "cloud-user",
+				"threadVersion":    0,
+				"usesDtw":          true,
+				"usesThreadActors": true,
+			})
+			return
+		}
 		proxyCalled = true
 		w.WriteHeader(http.StatusTeapot)
 	}))
@@ -6430,21 +6703,26 @@ func TestRegisterManagementRoutesServesLocalNeoReviewThreadInternalRPCs(t *testi
 	m := &AmpModule{
 		restrictToLocalhost: false,
 		neoRuntime: newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
-			UpstreamURL: upstream.URL,
+			UpstreamURL:    upstream.URL,
+			UpstreamAPIKey: "secret",
 			NeoLocalRuntime: config.AmpNeoLocalRuntime{
-				Enabled: &enabled,
+				Enabled:           &enabled,
+				ForceThreadActors: true,
 			},
 		}}),
 	}
-	proxy, _ := createReverseProxy(upstream.URL, NewStaticSecretSource(""))
+	proxy, _ := createReverseProxy(upstream.URL, NewStaticSecretSource("secret"))
 	m.setProxy(proxy)
 	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, nil)
 
 	createReq := httptest.NewRequest(http.MethodPost, "/api/thread-actors", bytes.NewBufferString(`{"agentMode":"review","usesThreadActors":true}`))
 	createRec := httptest.NewRecorder()
 	r.ServeHTTP(createRec, createReq)
-	if createRec.Code != http.StatusOK {
+	if createRec.Code != http.StatusCreated {
 		t.Fatalf("create status = %d, body=%s", createRec.Code, createRec.Body.String())
+	}
+	if cloudShellRequests != 1 {
+		t.Fatalf("cloud shell requests = %d, want 1", cloudShellRequests)
 	}
 	if proxyCalled {
 		t.Fatal("review thread actor create should be served locally")
