@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	snapshotSchema              = 33
+	snapshotSchema              = 34
 	minSupportedSnapshotSchema  = 28
 	minReleaseBinarySizeBytes   = 1_000_000
 	threadReadSearchTestCommand = `go test -count=1 -run 'TestNeoRuntimeDoesNotServeThreadReadSearchHTTP|TestNeoActorPasses.*ThreadToolResultThrough|TestRegisterManagementRoutesDoesNotServeThreadDiscoveryLocallyWithoutProxy|TestRegisterManagementRoutesPassesInternalRPCsUpstreamWhenProxyExists|TestRegisterManagementRoutesPassesThreadGETsUpstreamWhenProxyExists|TestRegisterManagementRoutesPassesThreadReaderToolsUpstreamWhenProxyExists' ./internal/api/modules/amp`
@@ -36,7 +36,7 @@ var (
 	eventPattern                 = regexp.MustCompile(`\b(?:user|assistant|thread|tool|message|agent|environment|title|max-tokens|main-thread|reasoning-effort)[a-z0-9-]*(?::[a-z][a-z0-9-]*)+\b`)
 	threadProtocolLiteralPattern = regexp.MustCompile(`type:[A-Za-z0-9_$]+\.literal\("([A-Za-z][A-Za-z0-9_:.-]*)"\)`)
 	cancelPattern                = regexp.MustCompile(`\b(?:user|system):[a-z][a-z0-9-]*\b`)
-	modelPattern                 = regexp.MustCompile(`\b(?:gpt|claude|gemini|codex)-[A-Za-z0-9._-]+\b|\bamp-nostromo-[A-Za-z0-9._-]+\b|\bo[1345](?:-[A-Za-z0-9._-]+)+\b`)
+	modelPattern                 = regexp.MustCompile(`\b(?:gpt|claude|gemini|codex)-[A-Za-z0-9._-]+\b|\bamp-nostromo-[A-Za-z0-9._-]+\b|\bo[1345](?:(?:-[A-Za-z][A-Za-z0-9._-]*)+|-[0-9]{4}-[0-9]{2}-[0-9]{2}(?:[-.][A-Za-z0-9][A-Za-z0-9._-]*)?)\b`)
 	// provider namespace is a minified identifier (K, X0, G, ...) that rotates on
 	// every re-minify; match any short ident before the enum member so the model
 	// limit table keeps parsing across releases.
@@ -77,7 +77,104 @@ var (
 	httpMethodPropertyPattern   = regexp.MustCompile(`method\s*:\s*["']?\s*(GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD)\b`)
 	httpQuotedMethodArgPattern  = regexp.MustCompile("[\"'](GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD)[\"']\\s*,\\s*[\"'`]?$")
 	httpMethodCallPrefixPattern = regexp.MustCompile("(?i)\\.(get|post|put|patch|delete|options|head)\\s*\\(\\s*[\"'`]?$")
+	cliCommandLiteralPattern    = regexp.MustCompile(`\.command\(["']([a-z][a-z0-9-]*)(?:\s[^"']*)?["']`)
 )
+
+var knownCLICommandLiteralValues = map[string]struct{}{
+	"add":                      {},
+	"add-chatgpt-sub":          {},
+	"add-chatgpt-subscription": {},
+	"app":                      {},
+	"approve":                  {},
+	"apps":                     {},
+	"archive":                  {},
+	"clone":                    {},
+	"config":                   {},
+	"continue":                 {},
+	"create":                   {},
+	"curl":                     {},
+	"delete":                   {},
+	"docs":                     {},
+	"doctor":                   {},
+	"edit":                     {},
+	"ensure":                   {},
+	"exec":                     {},
+	"export":                   {},
+	"get":                      {},
+	"git-credential-helper":    {},
+	"id-token":                 {},
+	"info":                     {},
+	"internal":                 {},
+	"keyboard-tester":          {},
+	"keymap":                   {},
+	"label":                    {},
+	"last":                     {},
+	"list":                     {},
+	"login":                    {},
+	"logout":                   {},
+	"logs":                     {},
+	"markdown":                 {},
+	"mcp":                      {},
+	"model-providers":          {},
+	"new":                      {},
+	"open":                     {},
+	"orb":                      {},
+	"permissions":              {},
+	"plugins":                  {},
+	"portal":                   {},
+	"projects":                 {},
+	"raw":                      {},
+	"read":                     {},
+	"remove":                   {},
+	"rename":                   {},
+	"report":                   {},
+	"repository":               {},
+	"review":                   {},
+	"search":                   {},
+	"secrets":                  {},
+	"service":                  {},
+	"set":                      {},
+	"share":                    {},
+	"show":                     {},
+	"show-agent-options":       {},
+	"show-docs":                {},
+	"sign-commit":              {},
+	"skill":                    {},
+	"start":                    {},
+	"status":                   {},
+	"stop":                     {},
+	"sync":                     {},
+	"test":                     {},
+	"threads":                  {},
+	"tools":                    {},
+	"top":                      {},
+	"update":                   {},
+	"upload":                   {},
+	"usage":                    {},
+	"version":                  {},
+	"visibility":               {},
+}
+
+var cliControlSurfaceMarkers = map[string]string{
+	"apps":                    `command("apps")`,
+	"orb-secrets":             `command("secrets")`,
+	"remote-control-terminal": `--remote-control-terminal`,
+	"runner-report":           "Generate and send a diagnostic report for the amp --no-tui runner",
+}
+
+var cliControlSurfaceScopes = map[string]string{
+	"apps":                    "amp-owned",
+	"orb-secrets":             "amp-owned",
+	"remote-control-terminal": "local-runtime",
+	"runner-report":           "amp-owned",
+}
+
+var knownCLIControlSurfaceValues = map[string]struct{}{
+	"apps=amp-owned":                        {},
+	"orb-secrets=amp-owned":                 {},
+	"remote-control-terminal=local-runtime": {},
+	"runner-report=amp-owned":               {},
+}
 
 var knownDeltaNames = []string{
 	"agent-mode",
@@ -118,12 +215,17 @@ var knownRawThreadDeltaEventValues = map[string]struct{}{
 	"client_executor_relay_open":                {},
 	"client_executor_relay_output":              {},
 	"client_filesystem_delete":                  {},
+	"client_filesystem_delete_v2":               {},
 	"client_filesystem_delete_result":           {},
 	"client_filesystem_read_directory":          {},
+	"client_filesystem_read_directory_v2":       {},
 	"client_filesystem_read_directory_result":   {},
 	"client_filesystem_read_file":               {},
+	"client_filesystem_read_file_v2":            {},
 	"client_filesystem_read_file_result":        {},
 	"client_filesystem_write_file":              {},
+	"client_filesystem_write_file_v2":           {},
+	"client_filesystem_write_file_v3":           {},
 	"client_filesystem_write_file_result":       {},
 	"client_git_command":                        {},
 	"client_git_command_result":                 {},
@@ -134,6 +236,8 @@ var knownRawThreadDeltaEventValues = map[string]struct{}{
 	"client_mark_thread_unread":                 {},
 	"client_orb_services_ensure":                {},
 	"client_orb_services_ensure_result":         {},
+	"client_request_capture":                    {},
+	"client_request_capture_result":             {},
 	"client_remove_queued_msg":                  {},
 	"client_resume":                             {},
 	"client_retry":                              {},
@@ -166,12 +270,17 @@ var knownRawThreadDeltaEventValues = map[string]struct{}{
 	"executor_environment_update":               {},
 	"executor_error":                            {},
 	"executor_filesystem_delete":                {},
+	"executor_filesystem_delete_v2":             {},
 	"executor_filesystem_delete_result":         {},
 	"executor_filesystem_read_directory":        {},
+	"executor_filesystem_read_directory_v2":     {},
 	"executor_filesystem_read_directory_result": {},
 	"executor_filesystem_read_file":             {},
+	"executor_filesystem_read_file_v2":          {},
 	"executor_filesystem_read_file_result":      {},
 	"executor_filesystem_write_file":            {},
+	"executor_filesystem_write_file_v2":         {},
+	"executor_filesystem_write_file_v3":         {},
 	"executor_filesystem_write_file_result":     {},
 	"executor_git_command":                      {},
 	"executor_git_command_result":               {},
@@ -181,6 +290,8 @@ var knownRawThreadDeltaEventValues = map[string]struct{}{
 	"executor_guidance_snapshot":                {},
 	"executor_orb_services_ensure":              {},
 	"executor_orb_services_ensure_result":       {},
+	"executor_request_capture":                  {},
+	"executor_request_capture_result":           {},
 	"executor_plugin_message":                   {},
 	"executor_relay_close":                      {},
 	"executor_relay_data":                       {},
@@ -243,14 +354,21 @@ var knownThreadProtocolEvents = []string{
 	"client_executor_relay_exit",
 	"client_executor_relay_open",
 	"client_executor_relay_output",
+	"client_filesystem_delete_v2",
 	"client_filesystem_read_directory",
+	"client_filesystem_read_directory_v2",
 	"client_filesystem_read_directory_result",
 	"client_filesystem_read_file",
+	"client_filesystem_read_file_v2",
 	"client_filesystem_read_file_result",
+	"client_filesystem_write_file_v2",
+	"client_filesystem_write_file_v3",
 	"client_git_command",
 	"client_git_command_result",
 	"client_git_diff_snapshot",
 	"client_git_diff_snapshot_result",
+	"client_request_capture",
+	"client_request_capture_result",
 	"client_mark_message_read",
 	"client_mark_message_unread",
 	"client_mark_thread_unread",
@@ -284,14 +402,21 @@ var knownThreadProtocolEvents = []string{
 	"executor_environment_snapshot",
 	"executor_environment_update",
 	"executor_error",
+	"executor_filesystem_delete_v2",
 	"executor_filesystem_read_directory",
+	"executor_filesystem_read_directory_v2",
 	"executor_filesystem_read_directory_result",
 	"executor_filesystem_read_file",
+	"executor_filesystem_read_file_v2",
 	"executor_filesystem_read_file_result",
+	"executor_filesystem_write_file_v2",
+	"executor_filesystem_write_file_v3",
 	"executor_git_command",
 	"executor_git_command_result",
 	"executor_git_diff_snapshot",
 	"executor_git_diff_snapshot_result",
+	"executor_request_capture",
+	"executor_request_capture_result",
 	"executor_guidance_discovery",
 	"executor_guidance_snapshot",
 	"executor_plugin_message",
@@ -371,11 +496,18 @@ var threadDeltaAreas = map[string]string{
 	"assistant:message-update":              "assistant-message",
 	"cancelled":                             "execution-state",
 	"client_filesystem_delete":              "client-command",
+	"client_filesystem_delete_v2":           "client-command",
 	"client_filesystem_delete_result":       "client-command",
+	"client_filesystem_read_directory_v2":   "client-command",
+	"client_filesystem_read_file_v2":        "client-command",
 	"client_filesystem_write_file":          "client-command",
+	"client_filesystem_write_file_v2":       "client-command",
+	"client_filesystem_write_file_v3":       "client-command",
 	"client_filesystem_write_file_result":   "client-command",
 	"client_orb_services_ensure":            "client-command",
 	"client_orb_services_ensure_result":     "client-command",
+	"client_request_capture":                "client-command",
+	"client_request_capture_result":         "client-command",
 	"client_mark_thread_unread":             "client-command",
 	"client_set_thread_open":                "client-command",
 	"compaction_complete":                   "compaction",
@@ -389,11 +521,18 @@ var threadDeltaAreas = map[string]string{
 	"error_cleared":                         "error",
 	"error_set":                             "error",
 	"executor_filesystem_delete":            "executor-bridge",
+	"executor_filesystem_delete_v2":         "executor-bridge",
 	"executor_filesystem_delete_result":     "executor-bridge",
+	"executor_filesystem_read_directory_v2": "executor-bridge",
+	"executor_filesystem_read_file_v2":      "executor-bridge",
 	"executor_filesystem_write_file":        "executor-bridge",
+	"executor_filesystem_write_file_v2":     "executor-bridge",
+	"executor_filesystem_write_file_v3":     "executor-bridge",
 	"executor_filesystem_write_file_result": "executor-bridge",
 	"executor_orb_services_ensure":          "executor-bridge",
 	"executor_orb_services_ensure_result":   "executor-bridge",
+	"executor_request_capture":              "executor-bridge",
+	"executor_request_capture_result":       "executor-bridge",
 	"inference_tools":                       "tool-state",
 	"main-thread":                           "relationship",
 	"max-tokens":                            "settings",
@@ -471,6 +610,8 @@ var toolCatalogMarkers = map[string]string{
 	"browser_take_screenshot":        "browser",
 	"builtin:edit_file":              "file-edit",
 	"experimental.tools":             "tool-filter",
+	"gmail_read":                     "email",
+	"gmail_write":                    "email",
 	"glob":                           "file-search",
 	"mcpServers":                     "mcp",
 	"mcp__server__tool":              "mcp",
@@ -515,6 +656,8 @@ var knownToolCatalogMarkerValues = map[string]struct{}{
 	"browser_take_screenshot":        {},
 	"builtin:edit_file":              {},
 	"experimental.tools":             {},
+	"gmail_read":                     {},
+	"gmail_write":                    {},
 	"glob":                           {},
 	"mcpServers":                     {},
 	"mcp__server__tool":              {},
@@ -682,25 +825,25 @@ var knownCompactionRuleValues = map[string]struct{}{}
 var knownPromptTagCountValues = map[string]int{
 	"prompt/artifacts":     1,
 	"prompt/compaction":    6,
-	"prompt/guidance":      6,
+	"prompt/guidance":      5,
 	"prompt/painter":       2,
-	"prompt/skills":        10,
+	"prompt/skills":        11,
 	"prompt/system-prompt": 1,
-	"prompt/tools":         38,
+	"prompt/tools":         40,
 	"source/artifacts":     4,
 	"source/code-review":   3,
 	"source/compaction":    18,
 	"source/guidance":      28,
 	"source/painter":       6,
-	"source/settings":      19,
+	"source/settings":      17,
 	"source/skills":        45,
 	"source/system-prompt": 1,
-	"source/tools":         161,
+	"source/tools":         163,
 }
 
 var knownPromptKindCountValues = map[string]int{
-	"prompt": 57,
-	"source": 195,
+	"prompt": 59,
+	"source": 197,
 }
 
 type agentModeMarker struct {
@@ -742,20 +885,20 @@ var retiredAgentModeNames = map[string]struct{}{
 	"agg-man": {},
 }
 
-const knownSharedAgentModeTools = ",get_automation,create_cron_automation,update_automation,delete_automation,create_slack_automation,slack_write,slack_read,github_repo_ci_status"
+const knownSharedAgentModeTools = ",get_automation,create_schedule_automation,update_automation,delete_automation,create_slack_automation,slack_write,slack_read,github_repo_ci_status"
 
 var knownAgentModeProfileValues = map[string]struct{}{
-	"deep|primary=GPT_5_5|reasoning=medium|levels=|include=present|tools=shell_command,shell_command_status,apply_patch,web_search,read_web_page,Task,skill,load_plugin,read_thread,find_thread,list_agent_modes,list_runners,create_thread,send_message_to_thread,download_thread_file,librarian,oracle,finder,view_media,painter,public_artifact_url,archive_current_thread" + knownSharedAgentModeTools + "|deferred=true|visible=false|visibleInV2=false|serverOnly=false":                                                                                                                                  {},
-	"high|primary=GPT_5_6_SOL|reasoning=xhigh|levels=|include=present|tools=shell_command,shell_command_status,apply_patch,web_search,read_web_page,Task,skill,load_plugin,read_thread,find_thread,list_agent_modes,list_runners,create_thread,send_message_to_thread,download_thread_file,librarian,oracle,finder,view_media,painter,public_artifact_url,archive_current_thread" + knownSharedAgentModeTools + "|deferred=true|visible=true|visibleInV2=true|serverOnly=false":                                                                                                                                 {},
-	"large|primary=CLAUDE_OPUS_4_8|reasoning=|levels=|include=present|tools=finder,shell_command,shell_command_status,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,list_agent_modes,list_runners,create_thread,send_message_to_thread,download_thread_file,skill,load_plugin,oracle,librarian,Task,view_media,painter,public_artifact_url,read_mcp_resource,archive_current_thread" + knownSharedAgentModeTools + "|deferred=true|visible=false|visibleInV2=false|serverOnly=false":                                                                                                   {},
-	"low|primary=AMP_GLM_5_2|reasoning=medium|levels=|include=present|tools=finder,shell_command,shell_command_status,apply_patch,web_search,read_web_page,read_thread,find_thread,list_agent_modes,list_runners,create_thread,send_message_to_thread,download_thread_file,skill,load_plugin,oracle,librarian,Task,view_media,painter,public_artifact_url,archive_current_thread" + knownSharedAgentModeTools + "|deferred=false|visible=true|visibleInV2=true|serverOnly=false":                                                                                                                                {},
-	"medium|primary=GPT_5_6_SOL|reasoning=medium|levels=|include=present|tools=shell_command,shell_command_status,apply_patch,web_search,read_web_page,Task,skill,load_plugin,read_thread,find_thread,list_agent_modes,list_runners,create_thread,send_message_to_thread,download_thread_file,librarian,oracle,finder,view_media,painter,public_artifact_url,archive_current_thread" + knownSharedAgentModeTools + "|deferred=true|visible=true|visibleInV2=true|serverOnly=false":                                                                                                                              {},
-	"nostromo|primary=AMP_NOSTROMO|reasoning=low|levels=|include=present|tools=finder,shell_command,shell_command_status,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,list_agent_modes,list_runners,create_thread,send_message_to_thread,download_thread_file,skill,load_plugin,oracle,librarian,Task,view_media,painter,public_artifact_url,read_mcp_resource,archive_current_thread" + knownSharedAgentModeTools + ",apply_patch|deferred=false|visible=true|visibleInV2=true|serverOnly=false":                                                                                     {},
-	"puck|primary=GPT_5_6_TERRA|reasoning=none|levels=|include=present|tools=find_thread,read_thread,web_search,read_web_page,docs_list,docs_read,docs_write,create_project,list_agent_modes,list_runners,create_thread,archive_thread,archive_threads,unarchive_thread,send_message_to_thread,publish_thread_artifacts,get_automation,create_cron_automation,update_automation,delete_automation,slack_write,slack_read,github_repo_ci_status,read_github,search_github,commit_search,list_directory_github,list_repositories,glob_github,diff|deferred=false|visible=false|visibleInV2=false|serverOnly=true": {},
-	"review|primary=GPT_5_5|reasoning=medium|levels=|include=present|tools=shell_command,run_check,submit_review,list_agent_modes,list_runners,create_thread|deferred=false|visible=false|visibleInV2=false|serverOnly=false":                                                                                                                                                                                                                                                                                                                                                                                   {},
-	"rush|primary=GPT_5_5|reasoning=none|levels=|include=present|tools=finder,shell_command,shell_command_status,apply_patch,web_search,read_web_page,read_thread,find_thread,list_agent_modes,list_runners,create_thread,send_message_to_thread,download_thread_file,skill,load_plugin,oracle,librarian,Task,view_media,painter,public_artifact_url,archive_current_thread" + knownSharedAgentModeTools + "|deferred=false|visible=false|visibleInV2=false|serverOnly=false":                                                                                                                                   {},
-	"smart|primary=CLAUDE_OPUS_4_8|reasoning=high|levels=|include=present|tools=finder,shell_command,shell_command_status,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,list_agent_modes,list_runners,create_thread,send_message_to_thread,download_thread_file,skill,load_plugin,oracle,librarian,Task,view_media,painter,public_artifact_url,read_mcp_resource,archive_current_thread" + knownSharedAgentModeTools + "|deferred=true|visible=false|visibleInV2=false|serverOnly=false":                                                                                               {},
-	"ultra|primary=CLAUDE_FABLE_5|reasoning=high|levels=|include=present|tools=finder,shell_command,shell_command_status,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,list_agent_modes,list_runners,create_thread,send_message_to_thread,download_thread_file,skill,load_plugin,oracle,librarian,Task,view_media,painter,public_artifact_url,read_mcp_resource,archive_current_thread" + knownSharedAgentModeTools + "|deferred=true|visible=true|visibleInV2=true|serverOnly=false":                                                                                                  {},
+	"deep|primary=GPT_5_5|reasoning=medium|levels=|include=present|tools=shell_command,shell_command_status,apply_patch,web_search,read_web_page,Task,skill,load_plugin,read_thread,find_thread,list_agent_modes,list_runners,create_thread,send_message_to_thread,download_thread_file,upload_thread_file,librarian,oracle,finder,view_media,painter,public_artifact_url,archive_current_thread" + knownSharedAgentModeTools + "|deferred=true|visible=false|visibleInV2=false|serverOnly=false":                                                                                                                   {},
+	"high|primary=GPT_5_6_SOL|reasoning=xhigh|levels=|include=present|tools=shell_command,shell_command_status,apply_patch,web_search,read_web_page,Task,skill,load_plugin,read_thread,find_thread,list_agent_modes,list_runners,create_thread,send_message_to_thread,download_thread_file,upload_thread_file,librarian,oracle,finder,view_media,painter,public_artifact_url,archive_current_thread" + knownSharedAgentModeTools + "|deferred=true|visible=true|visibleInV2=true|serverOnly=false":                                                                                                                  {},
+	"large|primary=CLAUDE_OPUS_4_8|reasoning=|levels=|include=present|tools=finder,shell_command,shell_command_status,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,list_agent_modes,list_runners,create_thread,send_message_to_thread,download_thread_file,upload_thread_file,skill,load_plugin,oracle,librarian,Task,view_media,painter,public_artifact_url,read_mcp_resource,archive_current_thread" + knownSharedAgentModeTools + "|deferred=true|visible=false|visibleInV2=false|serverOnly=false":                                                                                    {},
+	"low|primary=AMP_GLM_5_2|reasoning=medium|levels=|include=present|tools=finder,shell_command,shell_command_status,apply_patch,web_search,read_web_page,read_thread,find_thread,list_agent_modes,list_runners,create_thread,send_message_to_thread,download_thread_file,upload_thread_file,skill,load_plugin,oracle,librarian,Task,view_media,painter,public_artifact_url,archive_current_thread" + knownSharedAgentModeTools + "|deferred=false|visible=true|visibleInV2=true|serverOnly=false":                                                                                                                 {},
+	"medium|primary=GPT_5_6_SOL|reasoning=medium|levels=|include=present|tools=shell_command,shell_command_status,apply_patch,web_search,read_web_page,Task,skill,load_plugin,read_thread,find_thread,list_agent_modes,list_runners,create_thread,send_message_to_thread,download_thread_file,upload_thread_file,librarian,oracle,finder,view_media,painter,public_artifact_url,archive_current_thread" + knownSharedAgentModeTools + "|deferred=true|visible=true|visibleInV2=true|serverOnly=false":                                                                                                               {},
+	"nostromo|primary=AMP_NOSTROMO|reasoning=low|levels=|include=present|tools=finder,shell_command,shell_command_status,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,list_agent_modes,list_runners,create_thread,send_message_to_thread,download_thread_file,upload_thread_file,skill,load_plugin,oracle,librarian,Task,view_media,painter,public_artifact_url,read_mcp_resource,archive_current_thread" + knownSharedAgentModeTools + ",apply_patch|deferred=false|visible=true|visibleInV2=true|serverOnly=false":                                                                      {},
+	"puck|primary=GPT_5_6_TERRA|reasoning=none|levels=|include=present|tools=find_thread,read_thread,web_search,read_web_page,docs_list,docs_read,docs_write,create_project,list_agent_modes,list_runners,create_thread,archive_thread,archive_threads,unarchive_thread,send_message_to_thread,publish_thread_artifacts,get_automation,create_schedule_automation,update_automation,delete_automation,slack_write,slack_read,github_repo_ci_status,read_github,search_github,commit_search,list_directory_github,list_repositories,glob_github,diff|deferred=false|visible=false|visibleInV2=false|serverOnly=true": {},
+	"review|primary=GPT_5_5|reasoning=medium|levels=|include=present|tools=shell_command,run_check,submit_review,list_agent_modes,list_runners,create_thread|deferred=false|visible=false|visibleInV2=false|serverOnly=false":                                                                                                                                                                                                                                                                                                                                                                                       {},
+	"rush|primary=GPT_5_5|reasoning=none|levels=|include=present|tools=finder,shell_command,shell_command_status,apply_patch,web_search,read_web_page,read_thread,find_thread,list_agent_modes,list_runners,create_thread,send_message_to_thread,download_thread_file,upload_thread_file,skill,load_plugin,oracle,librarian,Task,view_media,painter,public_artifact_url,archive_current_thread" + knownSharedAgentModeTools + "|deferred=false|visible=false|visibleInV2=false|serverOnly=false":                                                                                                                    {},
+	"smart|primary=CLAUDE_OPUS_4_8|reasoning=high|levels=|include=present|tools=finder,shell_command,shell_command_status,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,list_agent_modes,list_runners,create_thread,send_message_to_thread,download_thread_file,upload_thread_file,skill,load_plugin,oracle,librarian,Task,view_media,painter,public_artifact_url,read_mcp_resource,archive_current_thread" + knownSharedAgentModeTools + "|deferred=true|visible=false|visibleInV2=false|serverOnly=false":                                                                                {},
+	"ultra|primary=CLAUDE_FABLE_5|reasoning=high|levels=|include=present|tools=finder,shell_command,shell_command_status,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,list_agent_modes,list_runners,create_thread,send_message_to_thread,download_thread_file,upload_thread_file,skill,load_plugin,oracle,librarian,Task,view_media,painter,public_artifact_url,read_mcp_resource,archive_current_thread" + knownSharedAgentModeTools + "|deferred=true|visible=true|visibleInV2=true|serverOnly=false":                                                                                   {},
 }
 
 var knownAgentModeRouteValues = map[string]struct{}{
@@ -1050,6 +1193,7 @@ var knownRouteValues = map[string]struct{}{
 	"/api/telemetry":              {},
 	"/api/thread-actors":          {},
 	"/api/thread-actors/":         {},
+	"/api/threads/":               {},
 	"/api/threads/find?":          {},
 	"/api/user-actor-credentials": {},
 	"/auth":                       {},
@@ -1233,6 +1377,8 @@ type SourceInfo struct {
 }
 
 type Signals struct {
+	CLICommandLiterals   []string                `json:"cli_command_literals"`
+	CLIControlSurfaces   []CLIControlSurface     `json:"cli_control_surfaces"`
 	Routes               []string                `json:"routes"`
 	RouteMethods         []RouteMethods          `json:"route_methods"`
 	RouteCoverage        []RouteCoverage         `json:"route_coverage"`
@@ -1272,6 +1418,11 @@ type Signals struct {
 	ActorCoverage        []ActorCoverage         `json:"actor_runtime_coverage"`
 	PromptFingerprints   []PromptFingerprint     `json:"prompt_fingerprints"`
 	PromptTagCounts      []PromptTagCount        `json:"prompt_tag_counts"`
+}
+
+type CLIControlSurface struct {
+	Name  string `json:"name"`
+	Scope string `json:"scope"`
 }
 
 type routeScopeRule struct {
@@ -1722,6 +1873,8 @@ func extractASCIIStrings(raw []byte, minLen int) []string {
 }
 
 func classifyStrings(strs []string) Signals {
+	cliCommands := map[string]struct{}{}
+	cliControlSurfaces := map[string]CLIControlSurface{}
 	routes := map[string]struct{}{}
 	routeMethods := map[string]map[string]struct{}{}
 	events := map[string]struct{}{}
@@ -1764,6 +1917,16 @@ func classifyStrings(strs []string) Signals {
 	}
 
 	for _, s := range strs {
+		for _, match := range cliCommandLiteralPattern.FindAllStringSubmatch(s, -1) {
+			if len(match) >= 2 {
+				cliCommands[match[1]] = struct{}{}
+			}
+		}
+		for name, marker := range cliControlSurfaceMarkers {
+			if strings.Contains(s, marker) {
+				cliControlSurfaces[name] = CLIControlSurface{Name: name, Scope: cliControlSurfaceScopes[name]}
+			}
+		}
 		for _, loc := range routePattern.FindAllStringIndex(s, -1) {
 			raw := s[loc[0]:loc[1]]
 			if route := normalizeRoute(raw); route != "" {
@@ -1912,6 +2075,8 @@ func classifyStrings(strs []string) Signals {
 	compactionRuleList := sortedCompactionRules(compactionRules)
 
 	return Signals{
+		CLICommandLiterals:   sortedKeys(cliCommands),
+		CLIControlSurfaces:   sortedCLIControlSurfaces(cliControlSurfaces),
 		Routes:               sortedKeys(routes),
 		RouteMethods:         sortedRouteMethods(routeMethods),
 		RouteCoverage:        classifyRouteCoverage(sortedKeys(routes)),
@@ -1952,6 +2117,17 @@ func classifyStrings(strs []string) Signals {
 		PromptFingerprints:   sortedPromptFingerprints(prompts),
 		PromptTagCounts:      promptTagCounts(prompts),
 	}
+}
+
+func sortedCLIControlSurfaces(values map[string]CLIControlSurface) []CLIControlSurface {
+	items := make([]CLIControlSurface, 0, len(values))
+	for _, item := range values {
+		items = append(items, item)
+	}
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].Name < items[j].Name
+	})
+	return items
 }
 
 func deriveAgentModeRoutes(profiles []AgentModeProfile, limits []ModelLimit, largeRules []LargeContextRule) []AgentModeRoute {
@@ -3879,6 +4055,8 @@ func diffSnapshots(old, current Snapshot) auditDiff {
 	return auditDiff{
 		Categories: []categoryDiff{
 			diffStringCategory("binary-source", sourceIdentityStrings(old.Source), sourceIdentityStrings(current.Source)),
+			diffStringCategory("cli-command-literals", old.Signals.CLICommandLiterals, current.Signals.CLICommandLiterals),
+			diffStringCategory("cli-control-surfaces", cliControlSurfaceStrings(old.Signals.CLIControlSurfaces), cliControlSurfaceStrings(current.Signals.CLIControlSurfaces)),
 			diffStringCategory("routes", old.Signals.Routes, current.Signals.Routes),
 			diffStringCategory("route-methods", routeMethodStrings(old.Signals.RouteMethods), routeMethodStrings(current.Signals.RouteMethods)),
 			diffStringCategory("route-coverage", routeCoverageStrings(old.Signals.RouteCoverage), routeCoverageStrings(current.Signals.RouteCoverage)),
@@ -3989,6 +4167,15 @@ func sliceSet(values []string) map[string]struct{} {
 		set[value] = struct{}{}
 	}
 	return set
+}
+
+func cliControlSurfaceStrings(surfaces []CLIControlSurface) []string {
+	values := make([]string, 0, len(surfaces))
+	for _, item := range surfaces {
+		values = append(values, item.Name+"="+item.Scope)
+	}
+	sort.Strings(values)
+	return values
 }
 
 func settingCoverageStrings(coverage []SettingCoverage) []string {
@@ -4470,6 +4657,8 @@ func duplicateSnapshotValues(snapshot Snapshot) []string {
 	var duplicates []string
 	duplicates = append(duplicates, duplicateStrings("source_versions", snapshot.Source.Versions)...)
 	duplicates = append(duplicates, duplicateStrings("source_build_stamps", snapshot.Source.BuildStamps)...)
+	duplicates = append(duplicates, duplicateStrings("cli_command_literals", signals.CLICommandLiterals)...)
+	duplicates = append(duplicates, duplicateStrings("cli_control_surfaces", cliControlSurfaceStrings(signals.CLIControlSurfaces))...)
 	duplicates = append(duplicates, duplicateStrings("routes", signals.Routes)...)
 	duplicates = append(duplicates, duplicateStrings("route_methods", routeMethodStrings(signals.RouteMethods))...)
 	duplicates = append(duplicates, duplicateRouteMethodValues(signals.RouteMethods)...)
@@ -4669,6 +4858,8 @@ func missingExpectedRawReleaseSignals(snapshot Snapshot) []string {
 	}
 	signals := snapshot.Signals
 	var missing []string
+	missing = append(missing, missingStringSet("cli_command_literals", signals.CLICommandLiterals, knownCLICommandLiteralValues)...)
+	missing = append(missing, missingStringSet("cli_control_surfaces", cliControlSurfaceStrings(signals.CLIControlSurfaces), knownCLIControlSurfaceValues)...)
 	missing = append(missing, missingStringSet("routes", signals.Routes, withoutRetired(knownRouteValues, retiredRouteNames))...)
 	missing = append(missing, missingStringSet("route_methods", routeMethodStrings(signals.RouteMethods), withoutRetired(knownRouteMethodValues, retiredRouteMethodValues))...)
 	missing = append(missing, missingStringSet("thread_delta_events", signals.ThreadDeltaEvents, knownRawThreadDeltaEventValues)...)
@@ -4714,6 +4905,16 @@ func unexpectedRawReleaseSignals(snapshot Snapshot) []string {
 	}
 	signals := snapshot.Signals
 	var unexpected []string
+	for _, command := range signals.CLICommandLiterals {
+		if _, ok := knownCLICommandLiteralValues[command]; !ok {
+			unexpected = append(unexpected, "cli_command_literals:"+command)
+		}
+	}
+	for _, surface := range cliControlSurfaceStrings(signals.CLIControlSurfaces) {
+		if _, ok := knownCLIControlSurfaceValues[surface]; !ok {
+			unexpected = append(unexpected, "cli_control_surfaces:"+surface)
+		}
+	}
 	for _, route := range signals.Routes {
 		if !knownRouteValue(route) || routeScope(route) == "" {
 			unexpected = append(unexpected, "routes:"+route)
@@ -4797,6 +4998,8 @@ func missingReleaseSignalCategories(snapshot Snapshot) []string {
 		name    string
 		missing bool
 	}{
+		{name: "cli_command_literals", missing: len(signals.CLICommandLiterals) == 0},
+		{name: "cli_control_surfaces", missing: len(signals.CLIControlSurfaces) == 0},
 		{name: "routes", missing: len(signals.Routes) == 0},
 		{name: "route_methods", missing: len(signals.RouteMethods) == 0},
 		{name: "route_coverage", missing: len(signals.RouteCoverage) == 0},
@@ -5658,7 +5861,9 @@ func printSnapshotCounts(snapshot Snapshot) {
 	modelProviderCounts := modelProviderCounts(snapshot.Signals.ModelCoverage)
 	modelLimitProviderCounts := modelLimitProviderCounts(snapshot.Signals.ModelLimits)
 	actorAreaCounts := actorAreaCounts(snapshot.Signals.ActorCoverage)
-	auditPrintf("counts: routes=%d route_methods=%d events=%d thread_reader_markers=%d tool_cancel_reasons=%d tool_run_statuses=%d tool_catalog_markers=%d stream_json_markers=%d mode_setting_markers=%d provider_protocol_markers=%d review_contract_markers=%d agent_modes=%d agent_mode_routes=%d settings=%d setting_defaults=%d models=%d model_limits=%d large_context_rules=%d adaptive_thinking_rules=%d provider_reasoning_rules=%d provider_header_rules=%d provider_feature_rules=%d compaction_rules=%d actor_markers=%d prompt_fingerprints=%d strings=%d\n",
+	auditPrintf("counts: cli_commands=%d cli_control_surfaces=%d routes=%d route_methods=%d events=%d thread_reader_markers=%d tool_cancel_reasons=%d tool_run_statuses=%d tool_catalog_markers=%d stream_json_markers=%d mode_setting_markers=%d provider_protocol_markers=%d review_contract_markers=%d agent_modes=%d agent_mode_routes=%d settings=%d setting_defaults=%d models=%d model_limits=%d large_context_rules=%d adaptive_thinking_rules=%d provider_reasoning_rules=%d provider_header_rules=%d provider_feature_rules=%d compaction_rules=%d actor_markers=%d prompt_fingerprints=%d strings=%d\n",
+		len(snapshot.Signals.CLICommandLiterals),
+		len(snapshot.Signals.CLIControlSurfaces),
 		len(snapshot.Signals.Routes),
 		len(snapshot.Signals.RouteMethods),
 		len(snapshot.Signals.ThreadDeltaEvents),
@@ -5749,13 +5954,14 @@ func printSnapshotCounts(snapshot Snapshot) {
 		)
 	}
 	if len(toolCatalogAreaCounts) > 0 {
-		auditPrintf("tool catalog areas: file-read=%d file-edit=%d file-search=%d legacy-file-read=%d legacy-file-search=%d browser=%d media=%d mcp=%d skills=%d toolbox=%d tool-filter=%d tool-spec-overrides=%d unknown=%d\n",
+		auditPrintf("tool catalog areas: file-read=%d file-edit=%d file-search=%d legacy-file-read=%d legacy-file-search=%d browser=%d email=%d media=%d mcp=%d skills=%d toolbox=%d tool-filter=%d tool-spec-overrides=%d unknown=%d\n",
 			toolCatalogAreaCounts["file-read"],
 			toolCatalogAreaCounts["file-edit"],
 			toolCatalogAreaCounts["file-search"],
 			toolCatalogAreaCounts["legacy-file-read"],
 			toolCatalogAreaCounts["legacy-file-search"],
 			toolCatalogAreaCounts["browser"],
+			toolCatalogAreaCounts["email"],
 			toolCatalogAreaCounts["media"],
 			toolCatalogAreaCounts["mcp"],
 			toolCatalogAreaCounts["skills"],
@@ -6265,6 +6471,10 @@ func printSuggestions(diff auditDiff) {
 		switch category.Name {
 		case "binary-source":
 			suggestions = append(suggestions, "binary source changed: inspect current audit output, run the lifecycle checklist, then refresh the baseline only after coverage is intentional")
+		case "cli-command-literals":
+			suggestions = append(suggestions, "CLI command literals changed: diff amp --help and relevant subcommand help before refreshing the baseline")
+		case "cli-control-surfaces":
+			suggestions = append(suggestions, "CLI control surfaces changed: verify local-runtime surfaces and Amp-owned /api/internal pass-through before refreshing the baseline")
 		case "routes", "actor-runtime-markers":
 			suggestions = append(suggestions, "actor/route changed: run go test -count=1 -run 'TestRegisterManagementRoutes|TestReverseProxy|TestNeoRuntime' ./internal/api/modules/amp")
 		case "route-methods":
@@ -6454,6 +6664,7 @@ func lifecycleChecklist(snapshot Snapshot, diff auditDiff, full bool) []lifecycl
 	changed := changedCategorySet(diff)
 	sourceOnlyDrift := len(changed) == 1 && changed["binary-source"]
 	full = full || changed["binary-source"]
+	cliSurfaceChanged := changed["cli-command-literals"] || changed["cli-control-surfaces"]
 	routeChanged := changed["routes"] || changed["route-methods"] || changed["route-coverage"]
 	threadReaderChanged := changed["thread-reader-markers"] || changed["thread-reader-coverage"]
 	providerProtocolChanged := changed["provider-protocol-markers"] || changed["provider-protocol-coverage"] || changed["provider-header-rules"] || changed["provider-feature-rules"]
@@ -6510,7 +6721,8 @@ func lifecycleChecklist(snapshot Snapshot, diff auditDiff, full bool) []lifecycl
 		len(unknownActorsFromCoverage(diff)) > 0 ||
 		len(unknownPromptKindCountValuesFromDiff(diff)) > 0 ||
 		len(unknownPromptTagCountValuesFromDiff(diff)) > 0
-	releaseWorkflowChanged := routeChanged ||
+	releaseWorkflowChanged := cliSurfaceChanged ||
+		routeChanged ||
 		threadReaderChanged ||
 		providerProtocolChanged ||
 		reviewContractChanged ||
@@ -6648,6 +6860,20 @@ func lifecycleChecklist(snapshot Snapshot, diff auditDiff, full bool) []lifecycl
 			"dev/amp-binary-parity-baseline.json",
 		},
 	}, changed["stream-json-markers"] || changed["stream-json-coverage"])
+
+	add(lifecycleCheck{
+		Area:    "CLI control plane pass-through",
+		Scope:   "amp-owned",
+		Trigger: "CLI command literals, Apps, orb secrets, runner reports, or remote terminal controls changed",
+		Commands: []string{
+			`go test -count=1 -run 'TestRegisterManagementRoutesPassesInternalRPCsUpstreamWhenProxyExists|TestRegisterManagementRoutesDoesNotSynthesizeAmpControlPlaneRPCs|TestNeoRuntimeGatewayWebSocket|TestNeoRuntimeWebSocket' ./internal/api/modules/amp`,
+		},
+		Files: []string{
+			"cmd/amp_binary_audit/main.go",
+			"internal/api/modules/amp/routes.go",
+			"internal/api/modules/amp/proxy.go",
+		},
+	}, cliSurfaceChanged)
 
 	add(lifecycleCheck{
 		Area:    "provider protocol headers and betas",

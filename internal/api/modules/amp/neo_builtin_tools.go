@@ -12,7 +12,7 @@ func neoSyntheticLocalToolSpec(toolName string) (neoToolSpec, bool) {
 		return neoRunCheckToolSpec(), true
 	case "submit_review":
 		return neoSubmitReviewToolSpec(), true
-	case "create_thread", "archive_thread", "archive_threads", "unarchive_thread", "send_message_to_thread":
+	case "find_thread", "list_agent_modes", "list_runners", "create_thread", "rename_thread", "set_thread_pinned", "add_thread_labels", "remove_thread_labels", "archive_current_thread", "archive_thread", "archive_threads", "unarchive_thread", "send_message_to_thread", "download_thread_file", "upload_thread_file":
 		return neoThreadToolSpec(toolName)
 	case "read_github", "search_github", "commit_search", "diff", "list_directory_github", "list_repositories", "glob_github", "github_repo_ci_status":
 		return neoGitHubToolSpec(toolName)

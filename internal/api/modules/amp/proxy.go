@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -57,6 +58,26 @@ func (rc *readCloser) Read(p []byte) (int, error) { return rc.r.Read(p) }
 func (rc *readCloser) Close() error               { return rc.c.Close() }
 
 type ampProxyInternalMethodContextKey struct{}
+type ampProxyThreadListAugmenterContextKey struct{}
+type ampProxyThreadDeleteContextKey struct{}
+type ampProxyThreadSearchMergeContextKey struct{}
+
+type ampProxyThreadDelete struct {
+	apply   func() error
+	restore func()
+}
+
+type ampProxyThreadListAugmenter struct {
+	limit              int
+	offset             int
+	upstreamOverfetch  int
+	includeEmpty       bool
+	includeArchived    bool
+	threadIDs          map[string]bool
+	excludedLabelNames map[string]bool
+	load               func(int) []any
+	selectedLoad       func(map[string]bool) []any
+}
 
 // createReverseProxy creates a reverse proxy handler for Amp upstream
 // with automatic gzip decompression via ModifyResponse
@@ -97,6 +118,15 @@ func createReverseProxyWithClientVersionProvider(upstreamURL string, secretSourc
 		// Remove proxy, client identity, and browser fingerprint headers
 		misc.ScrubProxyAndFingerprintHeaders(req)
 		req.Header.Del(localNeoInferenceHeader)
+		if _, ok := req.Context().Value(ampProxyThreadListAugmenterContextKey{}).(ampProxyThreadListAugmenter); ok {
+			req.Header.Set("Accept-Encoding", "identity")
+		}
+		if _, ok := req.Context().Value(ampProxyThreadDeleteContextKey{}).(ampProxyThreadDelete); ok {
+			req.Header.Set("Accept-Encoding", "identity")
+		}
+		if _, ok := req.Context().Value(ampProxyThreadSearchMergeContextKey{}).(bool); ok {
+			req.Header.Set("Accept-Encoding", "identity")
+		}
 
 		// Remove query-based credentials if they match the authenticated client API key.
 		// This prevents leaking client auth material to the Amp upstream while avoiding
@@ -140,6 +170,16 @@ func createReverseProxyWithClientVersionProvider(upstreamURL string, secretSourc
 	// Modify incoming responses to handle gzip without Content-Encoding
 	// This addresses the same issue as inline handler gzip handling, but at the proxy level
 	proxy.ModifyResponse = func(resp *http.Response) error {
+		deleteFinalized := false
+		defer func() {
+			if !deleteFinalized && resp != nil {
+				restoreAmpProxyThreadDelete(resp.Request)
+			}
+		}()
+		finalizeDelete := func() error {
+			deleteFinalized = true
+			return applyAmpProxyThreadDelete(resp)
+		}
 		// Skip if already marked as gzip (Content-Encoding set)
 		if resp.Header.Get("Content-Encoding") != "" {
 			return nil
@@ -214,7 +254,7 @@ func createReverseProxyWithClientVersionProvider(upstreamURL string, secretSourc
 					}
 					_ = originalBody.Close()
 					replaceAmpProxyResponseBody(resp, body)
-					return nil
+					return finalizeDelete()
 				}
 			}
 
@@ -226,11 +266,12 @@ func createReverseProxyWithClientVersionProvider(upstreamURL string, secretSourc
 			}
 		}
 
-		return nil
+		return finalizeDelete()
 	}
 
 	// Error handler for proxy failures
 	proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
+		restoreAmpProxyThreadDelete(req)
 		// Client-side cancellations are common during polling; suppress logging in this case
 		if errors.Is(err, context.Canceled) {
 			return
@@ -242,6 +283,101 @@ func createReverseProxyWithClientVersionProvider(upstreamURL string, secretSourc
 	}
 
 	return proxy, nil
+}
+
+func applyAmpProxyThreadDelete(resp *http.Response) error {
+	if resp == nil || resp.Request == nil {
+		return nil
+	}
+	mutation, ok := resp.Request.Context().Value(ampProxyThreadDeleteContextKey{}).(ampProxyThreadDelete)
+	if !ok || mutation.apply == nil {
+		return nil
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 || resp.Body == nil {
+		if mutation.restore != nil {
+			mutation.restore()
+		}
+		return nil
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		if mutation.restore != nil {
+			mutation.restore()
+		}
+		return fmt.Errorf("amp proxy: read delete response: %w", err)
+	}
+	if errClose := resp.Body.Close(); errClose != nil {
+		log.Debugf("amp proxy: delete response close failed: %v", errClose)
+	}
+	replaceAmpProxyResponseBody(resp, body)
+	if !ampProxyThreadDeleteSucceeded(resp.Request, body) {
+		if mutation.restore != nil {
+			mutation.restore()
+		}
+		return nil
+	}
+	if err := mutation.apply(); err != nil {
+		if mutation.restore != nil {
+			mutation.restore()
+		}
+		return fmt.Errorf("amp proxy: purge local thread after upstream deletion: %w", err)
+	}
+	return nil
+}
+
+func restoreAmpProxyThreadDelete(req *http.Request) {
+	if req == nil {
+		return
+	}
+	mutation, ok := req.Context().Value(ampProxyThreadDeleteContextKey{}).(ampProxyThreadDelete)
+	if ok && mutation.restore != nil {
+		mutation.restore()
+	}
+}
+
+func ampProxyThreadDeleteSucceeded(req *http.Request, body []byte) bool {
+	if req == nil || req.URL == nil {
+		return false
+	}
+	if "/"+strings.Trim(req.URL.Path, "/") != "/api/internal" {
+		return ampProxySvelteRemoteCommandSucceeded(body)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return false
+	}
+	if ok, exists := payload["ok"].(bool); exists {
+		if ok {
+			return true
+		}
+		errorPayload := mapValue(payload["error"])
+		return strings.EqualFold(strings.TrimSpace(stringValue(errorPayload["code"])), "thread-not-found")
+	}
+	return false
+}
+
+func ampProxySvelteRemoteCommandSucceeded(body []byte) bool {
+	var envelope map[string]any
+	if err := json.Unmarshal(body, &envelope); err != nil || stringValue(envelope["type"]) != "result" {
+		return false
+	}
+	var values []any
+	if err := json.Unmarshal([]byte(stringValue(envelope["data"])), &values); err != nil {
+		return false
+	}
+	decoded, ok := neoDecodeSvelteKitDevalueIndex(values, 0, map[int]bool{})
+	if !ok {
+		return false
+	}
+	result := mapValue(mapValue(decoded)["_"])
+	if ok, exists := result["ok"].(bool); exists {
+		if ok {
+			return true
+		}
+		errorPayload := mapValue(result["error"])
+		return strings.EqualFold(strings.TrimSpace(stringValue(errorPayload["code"])), "thread-not-found")
+	}
+	return false
 }
 
 func replaceAmpProxyResponseBody(resp *http.Response, body []byte) {
@@ -266,7 +402,43 @@ func normalizeAmpThreadListResponse(resp *http.Response, body []byte) []byte {
 	if err := decoder.Decode(&extra); err != io.EOF {
 		return nil
 	}
-	if !ensureAmpThreadRelationships(payload) {
+	changed := ensureAmpThreadRelationships(payload)
+	if augmenter, ok := resp.Request.Context().Value(ampProxyThreadListAugmenterContextKey{}).(ampProxyThreadListAugmenter); ok && augmenter.load != nil {
+		var loaded []any
+		if len(augmenter.threadIDs) > 0 && augmenter.selectedLoad != nil {
+			loaded = augmenter.selectedLoad(augmenter.threadIDs)
+		} else {
+			loadLimit := augmenter.limit
+			if augmenter.offset > 0 {
+				loadLimit += augmenter.offset
+			}
+			loaded = augmenter.load(loadLimit)
+			if augmenter.selectedLoad != nil {
+				upstreamThreadIDs := ampThreadListResponseIDs(payload)
+				for _, rawThread := range loaded {
+					delete(upstreamThreadIDs, ampThreadListItemID(mapValue(rawThread)))
+				}
+				if len(upstreamThreadIDs) > 0 {
+					loaded = append(loaded, augmenter.selectedLoad(upstreamThreadIDs)...)
+				}
+			}
+		}
+		excludedLocalThreadIDs := ampThreadListExcludedLocalThreadIDs(loaded, augmenter)
+		if filtered, filteredChanged := removeAmpThreadListIDs(payload, excludedLocalThreadIDs); filteredChanged {
+			payload = filtered
+			changed = true
+		}
+		localThreads := filterAmpThreadListLocalThreads(loaded, augmenter)
+		windowLimit := augmenter.limit + augmenter.offset
+		if augmenter.limit > 0 && len(localThreads) > windowLimit {
+			localThreads = localThreads[:windowLimit]
+		}
+		if merged, mergedChanged := mergeAmpThreadListValue(payload, localThreads, augmenter.offset, augmenter.limit); mergedChanged {
+			payload = merged
+			changed = true
+		}
+	}
+	if !changed {
 		return nil
 	}
 	encoded, err := json.Marshal(payload)
@@ -274,6 +446,350 @@ func normalizeAmpThreadListResponse(resp *http.Response, body []byte) []byte {
 		return nil
 	}
 	return encoded
+}
+
+func ampThreadListResponseIDs(value any) map[string]bool {
+	threadIDs := map[string]bool{}
+	var visit func(any)
+	visit = func(current any) {
+		switch typed := current.(type) {
+		case map[string]any:
+			if threadID := ampThreadListItemID(typed); neoThreadIDExactPattern.MatchString(threadID) {
+				threadIDs[threadID] = true
+				return
+			}
+			for _, key := range []string{"result", "threads", "items", "data"} {
+				visit(typed[key])
+			}
+		case []any:
+			for _, item := range typed {
+				visit(item)
+			}
+		}
+	}
+	visit(value)
+	return threadIDs
+}
+
+func ampThreadListExcludedLocalThreadIDs(threads []any, augmenter ampProxyThreadListAugmenter) map[string]bool {
+	excluded := make(map[string]bool)
+	for _, rawThread := range threads {
+		thread := mapValue(rawThread)
+		threadID := ampThreadListItemID(thread)
+		if len(augmenter.threadIDs) > 0 && !augmenter.threadIDs[threadID] {
+			continue
+		}
+		if threadID != "" && ((!augmenter.includeArchived && boolValue(thread["archived"])) || (!augmenter.includeEmpty && numberFrom(thread["messageCount"]) <= 0) || ampThreadListHasExcludedLabel(thread, augmenter.excludedLabelNames)) {
+			excluded[threadID] = true
+		}
+	}
+	return excluded
+}
+
+func removeAmpThreadListIDs(value any, excluded map[string]bool) (any, bool) {
+	if len(excluded) == 0 {
+		return value, false
+	}
+	switch typed := value.(type) {
+	case map[string]any:
+		for _, key := range []string{"threads", "items"} {
+			items, ok := typed[key].([]any)
+			if !ok {
+				continue
+			}
+			filtered := make([]any, 0, len(items))
+			for _, item := range items {
+				if excluded[ampThreadListItemID(mapValue(item))] {
+					continue
+				}
+				filtered = append(filtered, item)
+			}
+			if len(filtered) == len(items) {
+				return typed, false
+			}
+			typed[key] = filtered
+			return typed, true
+		}
+		for _, key := range []string{"result", "data"} {
+			child, exists := typed[key]
+			if !exists {
+				continue
+			}
+			filtered, changed := removeAmpThreadListIDs(child, excluded)
+			if changed {
+				typed[key] = filtered
+				return typed, true
+			}
+		}
+	case []any:
+		filtered := make([]any, 0, len(typed))
+		for _, item := range typed {
+			if excluded[ampThreadListItemID(mapValue(item))] {
+				continue
+			}
+			filtered = append(filtered, item)
+		}
+		if len(filtered) != len(typed) {
+			return filtered, true
+		}
+	}
+	return value, false
+}
+
+func filterAmpThreadListLocalThreads(threads []any, augmenter ampProxyThreadListAugmenter) []any {
+	filtered := make([]any, 0, len(threads))
+	for _, rawThread := range threads {
+		thread := mapValue(rawThread)
+		threadID := ampThreadListItemID(thread)
+		if len(augmenter.threadIDs) > 0 && !augmenter.threadIDs[threadID] {
+			continue
+		}
+		if !augmenter.includeArchived && boolValue(thread["archived"]) {
+			continue
+		}
+		if !augmenter.includeEmpty && numberFrom(thread["messageCount"]) <= 0 {
+			continue
+		}
+		if ampThreadListHasExcludedLabel(thread, augmenter.excludedLabelNames) {
+			continue
+		}
+		filtered = append(filtered, rawThread)
+	}
+	return filtered
+}
+
+func ampThreadListHasExcludedLabel(thread map[string]any, excluded map[string]bool) bool {
+	if len(excluded) == 0 {
+		return false
+	}
+	for _, rawLabel := range arrayValue(thread["labels"]) {
+		label := strings.TrimSpace(firstNonEmptyString(rawLabel, mapValue(rawLabel)["name"]))
+		if excluded[label] {
+			return true
+		}
+	}
+	return false
+}
+
+func mergeAmpThreadListValue(value any, localThreads []any, offset, limit int) (any, bool) {
+	switch typed := value.(type) {
+	case map[string]any:
+		for _, key := range []string{"threads", "items"} {
+			if items, ok := typed[key].([]any); ok {
+				merged, changed := mergeAmpThreadListItems(items, localThreads, offset, limit)
+				if changed {
+					typed[key] = merged
+				}
+				return typed, changed
+			}
+		}
+		for _, key := range []string{"result", "data"} {
+			child, exists := typed[key]
+			if !exists {
+				continue
+			}
+			merged, changed := mergeAmpThreadListValue(child, localThreads, offset, limit)
+			if changed {
+				typed[key] = merged
+				return typed, true
+			}
+		}
+	case []any:
+		return mergeAmpThreadListItems(typed, localThreads, offset, limit)
+	}
+	return value, false
+}
+
+func mergeAmpThreadListItems(items, localThreads []any, offset, limit int) ([]any, bool) {
+	merged := cloneArray(items)
+	byID := make(map[string]int, len(merged)+len(localThreads))
+	var itemShape []string
+	for index, rawItem := range merged {
+		item := mapValue(rawItem)
+		if threadID := ampThreadListItemID(item); threadID != "" {
+			byID[threadID] = index
+			if itemShape == nil {
+				_, itemShape = ampThreadListItemThread(item)
+			}
+		}
+	}
+	changed := false
+	for _, rawLocal := range localThreads {
+		local, _ := ampThreadListItemThread(mapValue(rawLocal))
+		local = cloneMap(local)
+		pinnedOverride, hasPinnedOverride := local[neoLocalPinnedOverrideKey].(bool)
+		delete(local, neoLocalPinnedOverrideKey)
+		threadID := ampThreadListItemID(local)
+		if !neoThreadIDExactPattern.MatchString(threadID) {
+			continue
+		}
+		local["id"] = threadID
+		local["threadId"] = threadID
+		if index, exists := byID[threadID]; exists {
+			existingItem := mapValue(merged[index])
+			existing, shape := ampThreadListItemThread(existingItem)
+			updated := cloneMap(existing)
+			updatedChanged := false
+			if ampThreadListActivityMillis(local) >= ampThreadListActivityMillis(existing) {
+				for key, value := range local {
+					switch key {
+					case "relationships", "pinned", "archived":
+						continue
+					case "title":
+						if ampThreadListPlaceholderTitle(value) {
+							continue
+						}
+					case "creator", "creatorUserID", "ownerUserId":
+						if !ampThreadListMissingValue(existing[key]) {
+							continue
+						}
+					case "meta":
+						value = ampThreadListMergeMissingMap(mapValue(existing[key]), mapValue(value))
+					}
+					updated[key] = cloneNeoJSONValue(value)
+					updatedChanged = true
+				}
+			}
+			if hasPinnedOverride {
+				if existingPinned, exists := updated["pinned"].(bool); !exists || existingPinned != pinnedOverride {
+					updated["pinned"] = pinnedOverride
+					updatedChanged = true
+				}
+			}
+			for _, key := range []string{"archived", "pinned"} {
+				if key == "pinned" && hasPinnedOverride {
+					continue
+				}
+				if _, exists := updated[key]; exists {
+					continue
+				}
+				if value, ok := local[key].(bool); ok {
+					updated[key] = value
+					updatedChanged = true
+				}
+			}
+			if updatedChanged {
+				merged[index] = ampThreadListWrapThread(existingItem, updated, shape)
+				changed = true
+			}
+			continue
+		}
+		if _, ok := local["relationships"].([]any); !ok {
+			local["relationships"] = []any{}
+		}
+		byID[threadID] = len(merged)
+		merged = append(merged, ampThreadListWrapThread(nil, local, itemShape))
+		changed = true
+	}
+	if changed {
+		sort.SliceStable(merged, func(i, j int) bool {
+			left := ampThreadListActivityMillis(mapValue(merged[i]))
+			right := ampThreadListActivityMillis(mapValue(merged[j]))
+			if left != right {
+				return left > right
+			}
+			return ampThreadListItemID(mapValue(merged[i])) < ampThreadListItemID(mapValue(merged[j]))
+		})
+	}
+	start := min(max(0, offset), len(merged))
+	end := len(merged)
+	if limit > 0 {
+		end = min(start+limit, end)
+	}
+	if start > 0 || end < len(merged) {
+		return merged[start:end], true
+	}
+	if !changed {
+		return items, false
+	}
+	return merged, true
+}
+
+func ampThreadListPlaceholderTitle(value any) bool {
+	title := strings.TrimSpace(stringValue(value))
+	return title == "" || strings.EqualFold(title, "Untitled")
+}
+
+func ampThreadListMissingValue(value any) bool {
+	if value == nil {
+		return true
+	}
+	switch typed := value.(type) {
+	case string:
+		return strings.TrimSpace(typed) == ""
+	case map[string]any:
+		return len(typed) == 0
+	default:
+		return false
+	}
+}
+
+func ampThreadListMergeMissingMap(existing, local map[string]any) map[string]any {
+	if len(existing) == 0 {
+		return cloneMap(local)
+	}
+	merged := cloneMap(existing)
+	for key, value := range local {
+		if ampThreadListMissingValue(merged[key]) {
+			merged[key] = cloneNeoJSONValue(value)
+		}
+	}
+	return merged
+}
+
+func ampThreadListItemID(item map[string]any) string {
+	item, _ = ampThreadListItemThread(item)
+	return strings.TrimSpace(firstNonEmptyString(item["id"], item["threadId"], item["threadID"], item["thread_id"]))
+}
+
+func ampThreadListActivityMillis(item map[string]any) int {
+	item, _ = ampThreadListItemThread(item)
+	for _, key := range []string{"lastUserMessageAt", "updatedAt", "userLastInteractedAt", "updated", "createdAt", "created"} {
+		value := item[key]
+		if timestamp := neoTimeStringMillis(stringValue(value)); timestamp > 0 {
+			return timestamp
+		}
+		if timestamp := int(numberFrom(value)); timestamp > 0 {
+			return timestamp
+		}
+	}
+	return 0
+}
+
+func ampThreadListItemThread(item map[string]any) (map[string]any, []string) {
+	current := item
+	shape := make([]string, 0, 2)
+	for {
+		key := ""
+		if len(mapValue(current["thread"])) > 0 {
+			key = "thread"
+		} else if len(mapValue(current["data"])) > 0 {
+			key = "data"
+		}
+		if key == "" {
+			return current, shape
+		}
+		shape = append(shape, key)
+		current = mapValue(current[key])
+	}
+}
+
+func ampThreadListWrapThread(item, thread map[string]any, shape []string) map[string]any {
+	if len(shape) == 0 {
+		return thread
+	}
+	root := cloneMap(item)
+	current := root
+	for index, key := range shape {
+		if index == len(shape)-1 {
+			current[key] = thread
+			break
+		}
+		next := cloneMap(mapValue(current[key]))
+		current[key] = next
+		current = next
+	}
+	return root
 }
 
 func ampThreadListResponse(resp *http.Response) bool {
@@ -321,6 +837,124 @@ func ampProxyInternalRPCMethod(req *http.Request) string {
 		}
 	}
 	return ""
+}
+
+func ampThreadListRequestAugmenter(req *http.Request) (ampProxyThreadListAugmenter, bool) {
+	if req == nil || req.URL == nil {
+		return ampProxyThreadListAugmenter{}, false
+	}
+	augmenter := ampProxyThreadListAugmenter{}
+	query := req.URL.Query()
+	if strings.TrimSpace(query.Get("installationID")) != "" {
+		return ampProxyThreadListAugmenter{}, false
+	}
+	if value, err := strconv.Atoi(strings.TrimSpace(query.Get("limit"))); err == nil && value > 0 {
+		augmenter.limit = value
+	}
+	if offset, err := strconv.Atoi(strings.TrimSpace(query.Get("offset"))); err == nil && offset > 0 {
+		augmenter.offset = offset
+	}
+	if includeArchived, err := strconv.ParseBool(strings.TrimSpace(query.Get("includeArchived"))); err == nil {
+		augmenter.includeArchived = includeArchived
+	}
+	body, err := readAndRestoreNeoJSONBody(req)
+	if err != nil {
+		augmenter.includeEmpty, _ = strconv.ParseBool(strings.TrimSpace(query.Get("includeEmpty")))
+		augmenter.threadIDs = ampThreadListStringSet(query["threadIDs"])
+		augmenter.excludedLabelNames = ampThreadListStringSet(query["excludeLabelNames"])
+		return augmenter, true
+	}
+	params := mapValue(body["params"])
+	if strings.TrimSpace(stringValue(params["installationID"])) != "" {
+		return ampProxyThreadListAugmenter{}, false
+	}
+	if augmenter.limit == 0 {
+		augmenter.limit = max(0, int(numberFrom(params["limit"])))
+	}
+	if !query.Has("offset") {
+		augmenter.offset = max(0, int(numberFrom(params["offset"])))
+	}
+	if augmenter.offset > 0 && augmenter.limit == 0 {
+		return ampProxyThreadListAugmenter{}, false
+	}
+	if !query.Has("includeArchived") {
+		augmenter.includeArchived = boolValue(params["includeArchived"])
+	}
+	augmenter.includeEmpty = boolValue(params["includeEmpty"])
+	if query.Has("includeEmpty") {
+		augmenter.includeEmpty, _ = strconv.ParseBool(strings.TrimSpace(query.Get("includeEmpty")))
+	}
+	augmenter.threadIDs = ampThreadListStringSet(params["threadIDs"])
+	if query.Has("threadIDs") {
+		augmenter.threadIDs = ampThreadListStringSet(query["threadIDs"])
+	}
+	augmenter.excludedLabelNames = ampThreadListStringSet(params["excludeLabelNames"])
+	if query.Has("excludeLabelNames") {
+		augmenter.excludedLabelNames = ampThreadListStringSet(query["excludeLabelNames"])
+	}
+	return augmenter, true
+}
+
+func rewriteAmpThreadListRequestWindow(req *http.Request, augmenter ampProxyThreadListAugmenter) bool {
+	if augmenter.offset <= 0 && augmenter.upstreamOverfetch <= 0 {
+		return true
+	}
+	if req == nil || req.URL == nil || augmenter.limit <= 0 || strings.TrimSpace(req.Header.Get("Content-Encoding")) != "" {
+		return false
+	}
+	upstreamLimit := augmenter.offset + augmenter.limit + augmenter.upstreamOverfetch
+	if upstreamLimit < augmenter.limit || upstreamLimit < augmenter.upstreamOverfetch {
+		return false
+	}
+	body, err := readAndRestoreNeoJSONBody(req)
+	if err != nil {
+		return false
+	}
+	query := req.URL.Query()
+	if query.Has("offset") {
+		query.Set("offset", "0")
+	}
+	if query.Has("limit") {
+		query.Set("limit", strconv.Itoa(upstreamLimit))
+	}
+	params := mapValue(body["params"])
+	if len(params) == 0 {
+		if !query.Has("limit") {
+			return false
+		}
+		query.Set("offset", "0")
+		req.URL.RawQuery = query.Encode()
+		return true
+	}
+	params["offset"] = 0
+	params["limit"] = upstreamLimit
+	body["params"] = params
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		return false
+	}
+	req.URL.RawQuery = query.Encode()
+	req.Body = io.NopCloser(bytes.NewReader(encoded))
+	req.ContentLength = int64(len(encoded))
+	req.Header.Set("Content-Length", strconv.FormatInt(req.ContentLength, 10))
+	return true
+}
+
+func ampThreadListStringSet(raw any) map[string]bool {
+	values := stringArrayValue(raw)
+	if value := strings.TrimSpace(stringValue(raw)); value != "" {
+		values = []any{value}
+	}
+	if len(values) == 0 {
+		return nil
+	}
+	set := make(map[string]bool, len(values))
+	for _, rawValue := range values {
+		if value := strings.TrimSpace(stringValue(rawValue)); value != "" {
+			set[value] = true
+		}
+	}
+	return set
 }
 
 func ensureAmpThreadRelationships(value any) bool {

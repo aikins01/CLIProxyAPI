@@ -1,4 +1,4 @@
-Perform a task (a sub-task of the user's overall task) using a sub-agent that has access to the following tools: Read, Bash, edit_file, create_file, read_web_page, web_search, finder, skill, task_list, view_media.
+Perform a task (a sub-task of the user's overall task) using a sub-agent that has access to the following tools: Read, shell_command, shell_command_status, apply_patch, edit_file, create_file, read_web_page, web_search, finder, skill, view_media.
 
 
 When to use the Task tool:

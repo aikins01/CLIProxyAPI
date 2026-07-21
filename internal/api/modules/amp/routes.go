@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
@@ -292,6 +293,8 @@ func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *ha
 		if m.tryServeNeoLocalThreadSearchFallback(c, proxy) {
 			return
 		}
+		m.attachNeoLocalThreadDelete(c.Request)
+		m.attachNeoLocalThreadListAugmenter(c.Request)
 		proxy.ServeHTTP(c.Writer, c.Request)
 	}
 
@@ -339,6 +342,7 @@ func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *ha
 	}
 	localProjectMiddleware = append(localProjectMiddleware, clientAPIKeyMiddleware())
 	engine.Any("/ampcode/local-projects.json", append(localProjectMiddleware, m.serveWebLocalProjects)...)
+	engine.Any("/ampcode/local-activity.json", append(localProjectMiddleware, m.serveWebLocalActivity)...)
 	engine.Any("/ampcode/local-thread-data.json", append(localProjectMiddleware, m.serveWebLocalThreadData)...)
 	engine.Any("/threads", append(rootMiddleware, proxyHandler)...)
 	engine.Any("/threads/*path", append(rootMiddleware, proxyHandler)...)
@@ -399,6 +403,91 @@ func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *ha
 	})
 }
 
+func (m *AmpModule) attachNeoLocalThreadDelete(req *http.Request) {
+	if m == nil || m.neoRuntime == nil || req == nil || req.URL == nil || req.Method != http.MethodPost {
+		return
+	}
+	threadID := ""
+	if strings.EqualFold(ampProxyInternalRPCMethod(req), "deleteThread") {
+		body, err := readAndRestoreNeoJSONBody(req)
+		if err == nil {
+			threadID = neoInternalRPCThreadID(mapValue(body["params"]))
+		}
+	} else if endpoint, _, ok := neoWebLocalRemoteEndpoint(req.URL.Path); ok && endpoint == "deleteThreadCommand" {
+		body, err := neoSvelteKitRemoteCommandRequest(req)
+		if err == nil {
+			threadID = firstNonEmptyString(body["threadID"], body["threadId"], body["id"])
+		}
+	}
+	if !neoThreadIDExactPattern.MatchString(threadID) {
+		return
+	}
+	rt := m.neoRuntime
+	if rt.neoLocalThreadActorForOwner(req.Context(), threadID, false) == nil {
+		actor := rt.store.lookupThreadActor(threadID)
+		ownerUserID := rt.neoRequestOwnerUserID(req.Context())
+		if actor == nil || !neoRequestOwnerScopeResolved(req.Context(), ownerUserID) || !actor.ownedByUser(ownerUserID) {
+			return
+		}
+	}
+	actors := rt.beginNeoCloudThreadDelete(threadID)
+	var restoreOnce sync.Once
+	mutation := ampProxyThreadDelete{
+		apply: func() error {
+			return rt.purgeNeoLocalThread(threadID)
+		},
+		restore: func() {
+			restoreOnce.Do(func() {
+				rt.cancelNeoCloudThreadDelete(threadID, actors)
+			})
+		},
+	}
+	*req = *req.WithContext(context.WithValue(req.Context(), ampProxyThreadDeleteContextKey{}, mutation))
+}
+
+func (m *AmpModule) attachNeoLocalThreadListAugmenter(req *http.Request) {
+	if m == nil || m.neoRuntime == nil || req == nil || !strings.EqualFold(ampProxyInternalRPCMethod(req), "listThreads") {
+		return
+	}
+	cfg := m.neoThreadConfigSnapshot()
+	if cfg == nil || !neoRuntimeEnabled(cfg) {
+		return
+	}
+	rt := m.neoRuntime
+	augmenter, ok := ampThreadListRequestAugmenter(req)
+	ownerUserID := rt.neoRequestOwnerUserID(req.Context())
+	if !ok || !neoRequestOwnerScopeResolved(req.Context(), ownerUserID) {
+		return
+	}
+	augmenter.upstreamOverfetch = rt.neoLocalThreadListExcludedCountForOwner(augmenter.includeEmpty, augmenter.includeArchived, augmenter.excludedLabelNames, ownerUserID)
+	if !rewriteAmpThreadListRequestWindow(req, augmenter) {
+		return
+	}
+	if len(augmenter.threadIDs) == 0 {
+		loadLimit := augmenter.limit + augmenter.offset
+		loaded := make(chan []any, 1)
+		go func() {
+			loaded <- rt.neoLocalVisibleThreadListSummariesForOwner(loadLimit, augmenter.includeEmpty, augmenter.includeArchived, augmenter.excludedLabelNames, ownerUserID)
+		}()
+		var loadOnce sync.Once
+		var summaries []any
+		augmenter.load = func(int) []any {
+			loadOnce.Do(func() {
+				summaries = <-loaded
+			})
+			return summaries
+		}
+	} else {
+		augmenter.load = func(limit int) []any {
+			return neoFilterThreadsByOwner(rt.neoLocalThreadListSummaries(limit, true), ownerUserID)
+		}
+	}
+	augmenter.selectedLoad = func(threadIDs map[string]bool) []any {
+		return rt.neoLocalThreadSummariesByIDForOwner(threadIDs, ownerUserID)
+	}
+	*req = *req.WithContext(context.WithValue(req.Context(), ampProxyThreadListAugmenterContextKey{}, augmenter))
+}
+
 func (m *AmpModule) tryServeNeoLocalThreadSearchFallback(c *gin.Context, proxy *httputil.ReverseProxy) bool {
 	if m == nil || m.neoRuntime == nil || c == nil || c.Request == nil || c.Request.URL == nil || proxy == nil {
 		return false
@@ -411,6 +500,21 @@ func (m *AmpModule) tryServeNeoLocalThreadSearchFallback(c *gin.Context, proxy *
 	}
 
 	searchQuery := c.Request.URL.Query()
+	ownerUserID := m.neoRuntime.neoRequestOwnerUserID(c.Request.Context())
+	if !neoRequestOwnerScopeResolved(c.Request.Context(), ownerUserID) {
+		return false
+	}
+	offset := neoThreadSearchQueryInt(searchQuery.Get("offset"), 0, 0, 10_000)
+	limit := neoThreadSearchQueryInt(searchQuery.Get("limit"), 20, 1, 75)
+	windowLimit := offset + limit
+	windowQuery := neoCloneURLValues(searchQuery)
+	windowQuery.Set("offset", "0")
+	windowQuery.Set("limit", strconv.Itoa(windowLimit))
+	localSearch, hasLocalSearch := m.neoRuntime.localThreadSearchResponseWithMaxLimitForOwner(windowQuery, windowLimit, ownerUserID)
+	if hasLocalSearch {
+		c.Request.URL.RawQuery = windowQuery.Encode()
+		c.Request = c.Request.WithContext(context.WithValue(c.Request.Context(), ampProxyThreadSearchMergeContextKey{}, true))
+	}
 	threadSearchProxy := *proxy
 	originalModifyResponse := proxy.ModifyResponse
 	threadSearchProxy.ModifyResponse = func(resp *http.Response) error {
@@ -419,7 +523,7 @@ func (m *AmpModule) tryServeNeoLocalThreadSearchFallback(c *gin.Context, proxy *
 				return err
 			}
 		}
-		if resp.StatusCode != http.StatusRequestTimeout || resp.Body == nil {
+		if resp.Body == nil {
 			return nil
 		}
 		body, err := io.ReadAll(resp.Body)
@@ -427,22 +531,15 @@ func (m *AmpModule) tryServeNeoLocalThreadSearchFallback(c *gin.Context, proxy *
 			return err
 		}
 		if closeErr := resp.Body.Close(); closeErr != nil {
-			log.Debugf("amp thread search upstream timeout body close failed: %v", closeErr)
+			log.Debugf("amp thread search upstream body close failed: %v", closeErr)
 		}
-		if neoThreadSearchTimeBudgetExceeded(body) {
-			if response, ok := m.neoRuntime.localThreadSearchResponse(searchQuery); ok {
-				fallbackBody, err := json.Marshal(response)
-				if err != nil {
-					return err
-				}
-				resp.StatusCode = http.StatusOK
-				resp.Status = strconv.Itoa(http.StatusOK) + " " + http.StatusText(http.StatusOK)
-				resp.Body = io.NopCloser(bytes.NewReader(fallbackBody))
-				resp.ContentLength = int64(len(fallbackBody))
-				resp.Header.Del("Content-Encoding")
-				resp.Header.Set("Content-Length", strconv.FormatInt(resp.ContentLength, 10))
-				resp.Header.Set("Content-Type", "application/json")
-				return nil
+		if resp.StatusCode == http.StatusRequestTimeout && neoThreadSearchTimeBudgetExceeded(body) && hasLocalSearch {
+			return replaceNeoThreadSearchResponse(resp, http.StatusOK, mergeNeoThreadSearchResponses(nil, localSearch, offset, limit))
+		}
+		if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices && hasLocalSearch {
+			var upstreamSearch map[string]any
+			if err := json.Unmarshal(body, &upstreamSearch); err == nil {
+				return replaceNeoThreadSearchResponse(resp, resp.StatusCode, mergeNeoThreadSearchResponses(upstreamSearch, localSearch, offset, limit))
 			}
 		}
 		resp.Body = io.NopCloser(bytes.NewReader(body))
@@ -452,6 +549,48 @@ func (m *AmpModule) tryServeNeoLocalThreadSearchFallback(c *gin.Context, proxy *
 	}
 	threadSearchProxy.ServeHTTP(c.Writer, c.Request)
 	return true
+}
+
+func mergeNeoThreadSearchResponses(upstream, local map[string]any, offset, limit int) map[string]any {
+	merged := cloneMap(upstream)
+	threads := make([]any, 0, len(arrayValue(local["threads"]))+len(arrayValue(upstream["threads"])))
+	seen := map[string]bool{}
+	appendThreads := func(values []any) {
+		for _, rawThread := range values {
+			thread := mapValue(rawThread)
+			threadID := firstNonEmptyString(thread["id"], thread["threadId"], thread["threadID"])
+			if !neoThreadIDExactPattern.MatchString(threadID) || seen[threadID] {
+				continue
+			}
+			seen[threadID] = true
+			threads = append(threads, rawThread)
+		}
+	}
+	appendThreads(arrayValue(local["threads"]))
+	appendThreads(arrayValue(upstream["threads"]))
+	if offset > len(threads) {
+		offset = len(threads)
+	}
+	end := min(offset+limit, len(threads))
+	hasMore := boolValue(local["hasMore"]) || boolValue(upstream["hasMore"]) || end < len(threads)
+	merged["threads"] = threads[offset:end]
+	merged["hasMore"] = hasMore
+	return merged
+}
+
+func replaceNeoThreadSearchResponse(resp *http.Response, status int, response map[string]any) error {
+	body, err := json.Marshal(response)
+	if err != nil {
+		return err
+	}
+	resp.StatusCode = status
+	resp.Status = strconv.Itoa(status) + " " + http.StatusText(status)
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	resp.ContentLength = int64(len(body))
+	resp.Header.Del("Content-Encoding")
+	resp.Header.Set("Content-Length", strconv.FormatInt(resp.ContentLength, 10))
+	resp.Header.Set("Content-Type", "application/json")
+	return nil
 }
 
 func neoThreadSearchTimeBudgetExceeded(body []byte) bool {
@@ -479,7 +618,12 @@ func (m *AmpModule) tryServeNeoWebLocalInternalRPC(c *gin.Context) bool {
 	if !matched || m == nil || m.neoRuntime == nil {
 		return false
 	}
-	response, status, ok := m.neoRuntime.neoWebLocalInternalRPCResponse(method, params)
+	actor := m.neoRuntime.neoWebLocalInternalRPCActor(neoInternalRPCThreadID(params))
+	ownerUserID := m.neoRuntime.neoRequestOwnerUserID(c.Request.Context())
+	if actor == nil || !neoRequestOwnerScopeResolved(c.Request.Context(), ownerUserID) || !actor.ownedByUser(ownerUserID) {
+		return false
+	}
+	response, status, ok := actor.neoLocalInternalRPCResponse(method, params)
 	if !ok {
 		return false
 	}
@@ -513,7 +657,8 @@ func (m *AmpModule) canServeNeoWebLocalInternalRPC(c *gin.Context) bool {
 			return false
 		}
 		actor := m.neoRuntime.store.lookupThreadActor(threadID)
-		return actor != nil && actor.hasLocalThreadBootstrapState()
+		ownerUserID := m.neoRuntime.neoRequestOwnerUserID(c.Request.Context())
+		return actor != nil && actor.hasLocalThreadBootstrapState() && neoRequestOwnerScopeResolved(c.Request.Context(), ownerUserID) && actor.ownedByUser(ownerUserID)
 	}
 }
 
@@ -562,7 +707,7 @@ func (m *AmpModule) tryServeNeoLocalInternalRPC(c *gin.Context) bool {
 	if !neoThreadIDExactPattern.MatchString(threadID) {
 		return false
 	}
-	actor := m.neoLocalInternalRPCActor(threadID)
+	actor := m.neoLocalInternalRPCActor(c.Request.Context(), threadID)
 	if actor == nil {
 		return false
 	}
@@ -598,7 +743,7 @@ func neoLocalInternalRPCRequestWithError(r *http.Request) (string, map[string]an
 
 func neoLocalInternalRPCSupported(method string) bool {
 	switch strings.ToLower(strings.TrimSpace(method)) {
-	case "getthreadlabels", "setthreadlabels", "addthreadlabels", "archivethread":
+	case "getthreadtail", "getthreadlabels", "setthreadlabels", "addthreadlabels", "archivethread":
 		return true
 	default:
 		return false
@@ -639,7 +784,7 @@ func neoInternalRPCThreadIDs(params map[string]any) []string {
 	return out
 }
 
-func (m *AmpModule) neoLocalInternalRPCActor(threadID string) *neoActor {
+func (m *AmpModule) neoLocalInternalRPCActor(ctx context.Context, threadID string) *neoActor {
 	if m == nil || m.neoRuntime == nil || m.neoRuntime.store == nil || !neoThreadIDExactPattern.MatchString(threadID) {
 		return nil
 	}
@@ -649,6 +794,13 @@ func (m *AmpModule) neoLocalInternalRPCActor(threadID string) *neoActor {
 	}
 	actor := m.neoRuntime.store.lookupThreadActor(threadID)
 	if actor == nil || !actor.hasLocalThreadBootstrapState() {
+		if !m.neoRuntime.tryImportNeoLocalThreadActor(threadID) {
+			return nil
+		}
+		actor = m.neoRuntime.store.lookupThreadActor(threadID)
+	}
+	ownerUserID := m.neoRuntime.neoRequestOwnerUserID(ctx)
+	if actor == nil || !actor.hasLocalThreadBootstrapState() || !neoRequestOwnerScopeResolved(ctx, ownerUserID) || !actor.ownedByUser(ownerUserID) {
 		return nil
 	}
 	return actor

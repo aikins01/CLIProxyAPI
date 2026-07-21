@@ -15,6 +15,7 @@ var neoModeSystemPromptKey = map[string]string{
 	"large":    "large",
 	"rush":     "rush",
 	"agg-man":  "aggman",
+	"puck":     "puck",
 	"deep":     "deep",
 	"review":   "review",
 	"nostromo": "nostromo",
@@ -26,6 +27,21 @@ var neoModeSystemPromptKey = map[string]string{
 
 var neoModeOptionalInAmpBinary = map[string]bool{
 	"agg-man": true,
+}
+
+var neoModeRuntimeOnlyTools = map[string]map[string]bool{
+	"puck": toolSet("rename_thread", "set_thread_pinned", "add_thread_labels", "remove_thread_labels"),
+}
+
+func neoModeBinaryComparableTools(mode string, names []string) []string {
+	runtimeOnly := neoModeRuntimeOnlyTools[mode]
+	out := make([]string, 0, len(names))
+	for _, name := range names {
+		if !runtimeOnly[name] {
+			out = append(out, name)
+		}
+	}
+	return out
 }
 
 // TestNeoKnownModeToolsMatchesModeUnion is a pure runtime invariant (no binary
@@ -64,6 +80,7 @@ func TestNeoModeToolOrderMatchesAuditBaseline(t *testing.T) {
 		t.Fatal("Amp binary parity baseline has no agent mode tool_names")
 	}
 	for mode, want := range neoModeToolOrder {
+		want = neoModeBinaryComparableTools(mode, want)
 		got, ok := profiles[mode]
 		if !ok {
 			if neoModeOptionalInAmpBinary[mode] {
@@ -87,6 +104,7 @@ func TestNeoModeToolOrderMatchesAmpBinary(t *testing.T) {
 	text, path := neoToolParityLoadBinary(t)
 
 	for mode, want := range neoModeToolOrder {
+		want = neoModeBinaryComparableTools(mode, want)
 		sp, ok := neoModeSystemPromptKey[mode]
 		if !ok {
 			t.Fatalf("mode %q has no systemPrompt mapping; update neoModeSystemPromptKey", mode)

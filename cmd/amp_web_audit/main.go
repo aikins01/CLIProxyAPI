@@ -20,11 +20,12 @@ import (
 )
 
 const (
-	webBaselineSchema = 1
-	maxDocumentBytes  = 5 << 20
-	maxAssetBytes     = 8 << 20
-	maxBundleBytes    = 64 << 20
-	maxAssetCount     = 800
+	webBaselineSchema        = 2
+	minimumWebBaselineSchema = 1
+	maxDocumentBytes         = 5 << 20
+	maxAssetBytes            = 8 << 20
+	maxBundleBytes           = 64 << 20
+	maxAssetCount            = 800
 )
 
 var (
@@ -42,10 +43,11 @@ type webBaseline struct {
 }
 
 type webContract struct {
-	Name        string     `json:"name"`
-	Scope       string     `json:"scope"`
-	RequiredAll []string   `json:"required_all,omitempty"`
-	RequiredAny [][]string `json:"required_any,omitempty"`
+	Name             string     `json:"name"`
+	Scope            string     `json:"scope"`
+	RequiredAll      []string   `json:"required_all,omitempty"`
+	RequiredAny      [][]string `json:"required_any,omitempty"`
+	RequiredTogether [][]string `json:"required_together,omitempty"`
 }
 
 type webAsset struct {
@@ -146,8 +148,8 @@ func readWebBaseline(path string) (webBaseline, error) {
 }
 
 func validateWebBaseline(baseline webBaseline) error {
-	if baseline.Schema != webBaselineSchema {
-		return fmt.Errorf("schema %d is unsupported; want %d", baseline.Schema, webBaselineSchema)
+	if baseline.Schema < minimumWebBaselineSchema || baseline.Schema > webBaselineSchema {
+		return fmt.Errorf("schema %d is unsupported; want %d through %d", baseline.Schema, minimumWebBaselineSchema, webBaselineSchema)
 	}
 	parsed, err := url.Parse(baseline.SourceURL)
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
@@ -178,7 +180,7 @@ func validateWebBaseline(baseline webBaseline) error {
 			return fmt.Errorf("duplicate contract %q", contract.Name)
 		}
 		names[contract.Name] = struct{}{}
-		if len(contract.RequiredAll) == 0 && len(contract.RequiredAny) == 0 {
+		if len(contract.RequiredAll) == 0 && len(contract.RequiredAny) == 0 && len(contract.RequiredTogether) == 0 {
 			return fmt.Errorf("contract %q has no required markers", contract.Name)
 		}
 		for _, marker := range contract.RequiredAll {
@@ -193,6 +195,19 @@ func validateWebBaseline(baseline webBaseline) error {
 			for _, marker := range group {
 				if marker == "" {
 					return fmt.Errorf("contract %q contains an empty required_any marker", contract.Name)
+				}
+			}
+		}
+		for _, group := range contract.RequiredTogether {
+			if baseline.Schema < 2 {
+				return fmt.Errorf("contract %q requires schema 2 for required_together", contract.Name)
+			}
+			if len(group) == 0 {
+				return fmt.Errorf("contract %q contains an empty required_together group", contract.Name)
+			}
+			for _, marker := range group {
+				if marker == "" {
+					return fmt.Errorf("contract %q contains an empty required_together marker", contract.Name)
 				}
 			}
 		}
@@ -261,34 +276,42 @@ func selectedRouteAssetPaths(entry []byte, routes []string) (map[string]struct{}
 	}
 	paths := map[string]struct{}{}
 	for _, route := range routes {
-		pattern := regexp.MustCompile(regexp.QuoteMeta(strconv.Quote(route)) + `\s*:\s*\[\s*(-?[0-9]+)`)
+		pattern := regexp.MustCompile(regexp.QuoteMeta(strconv.Quote(route)) + `\s*:\s*\[\s*(-?[0-9]+)(?:\s*,\s*\[([^\]]*)\])?(?:\s*,\s*\[([^\]]*)\])?`)
 		match := pattern.FindSubmatch(entry)
-		if len(match) != 2 {
+		if len(match) < 2 {
 			return nil, fmt.Errorf("required Amp web route %q is missing", route)
 		}
-		routeNodeIndex, err := strconv.Atoi(string(match[1]))
-		if err != nil {
-			return nil, err
-		}
-		nodeIndex := routeNodeIndex
-		if routeNodeIndex < 0 {
-			nodeIndex = ^routeNodeIndex
-		}
-		nodePath := nodePaths[nodeIndex]
-		if nodePath == "" {
-			if routeNodeIndex >= 0 {
-				return nil, fmt.Errorf("route %q references missing node %d", route, nodeIndex)
+		routeNodeIndexes := []string{string(match[1])}
+		for _, rawIndexes := range match[2:] {
+			for _, rawIndex := range regexp.MustCompile(`-?[0-9]+`).FindAllString(string(rawIndexes), -1) {
+				routeNodeIndexes = append(routeNodeIndexes, rawIndex)
 			}
-			continue
 		}
-		paths[nodePath] = struct{}{}
-		for _, dependencyIndex := range routeDependencyIndexes(entry, nodeIndex) {
-			if dependencyIndex < 0 || dependencyIndex >= len(dependencyPaths) {
-				return nil, fmt.Errorf("route %q references dependency index %d outside map", route, dependencyIndex)
+		for _, rawIndex := range routeNodeIndexes {
+			routeNodeIndex, err := strconv.Atoi(rawIndex)
+			if err != nil {
+				return nil, err
 			}
-			path := dependencyPaths[dependencyIndex]
-			if strings.HasSuffix(path, ".js") {
-				paths[path] = struct{}{}
+			nodeIndex := routeNodeIndex
+			if routeNodeIndex < 0 {
+				nodeIndex = ^routeNodeIndex
+			}
+			nodePath := nodePaths[nodeIndex]
+			if nodePath == "" {
+				if routeNodeIndex >= 0 {
+					return nil, fmt.Errorf("route %q references missing node %d", route, nodeIndex)
+				}
+				continue
+			}
+			paths[nodePath] = struct{}{}
+			for _, dependencyIndex := range routeDependencyIndexes(entry, nodeIndex) {
+				if dependencyIndex < 0 || dependencyIndex >= len(dependencyPaths) {
+					return nil, fmt.Errorf("route %q references dependency index %d outside map", route, dependencyIndex)
+				}
+				path := dependencyPaths[dependencyIndex]
+				if strings.HasSuffix(path, ".js") {
+					paths[path] = struct{}{}
+				}
 			}
 		}
 	}
@@ -524,11 +547,32 @@ func auditWebAssets(source string, assets []webAsset, baseline webBaseline) webR
 				missing = append(missing, strings.Join(group, " | "))
 			}
 		}
+		for _, group := range contract.RequiredTogether {
+			if !assetsContainTogether(assets, group) {
+				missing = append(missing, strings.Join(group, " & "))
+			}
+		}
 		if len(missing) > 0 {
 			report.Findings = append(report.Findings, webFinding{Kind: "contract", Contract: contract.Name, Scope: contract.Scope, Missing: missing})
 		}
 	}
 	return report
+}
+
+func assetsContainTogether(assets []webAsset, markers []string) bool {
+	for _, asset := range assets {
+		found := true
+		for _, marker := range markers {
+			if !bytes.Contains(asset.Body, []byte(marker)) {
+				found = false
+				break
+			}
+		}
+		if found {
+			return true
+		}
+	}
+	return false
 }
 
 func assetsContain(assets []webAsset, marker string) bool {
@@ -543,10 +587,10 @@ func assetsContain(assets []webAsset, marker string) bool {
 
 func printWebReport(output io.Writer, report webReport) {
 	if len(report.Findings) == 0 {
-		fmt.Fprintf(output, "Amp web parity passed: %d assets, %d bytes\n", report.AssetCount, report.Bytes)
+		fmt.Fprintf(output, "Amp upstream web parity passed: %d assets, %d bytes\n", report.AssetCount, report.Bytes)
 		return
 	}
-	fmt.Fprintf(output, "Amp web parity found %d issue(s) across %d assets:\n", len(report.Findings), report.AssetCount)
+	fmt.Fprintf(output, "Amp upstream web parity found %d issue(s) across %d assets:\n", len(report.Findings), report.AssetCount)
 	for _, finding := range report.Findings {
 		if finding.Kind == "route" {
 			fmt.Fprintf(output, "- missing route: %s\n", strings.Join(finding.Missing, ", "))

@@ -86,7 +86,7 @@ var neoSubagentDefs = map[string]neoSubagentDef{
 	"oracle": {
 		Key:             "oracle",
 		DisplayName:     "Oracle",
-		Route:           neoModelRoute{Provider: "anthropic", Model: "claude-fable-5"},
+		Route:           neoModelRoute{Provider: "openai", Model: "gpt-5.6-sol"},
 		IncludeTools:    []string{"Read", "Grep", "glob", "web_search", "read_web_page", "read_thread", "find_thread"},
 		SystemPrompt:    neoOracleSubagentPrompt,
 		ReasoningEffort: "high",
@@ -105,7 +105,7 @@ var neoSubagentDefs = map[string]neoSubagentDef{
 		Key:          "task-subagent",
 		DisplayName:  "Task",
 		Route:        neoModelRoute{}, // inherits the resolved model from config/settings
-		IncludeTools: []string{"Read", "Bash", "edit_file", "create_file", "read_web_page", "web_search", "finder", "skill", "view_media"},
+		IncludeTools: []string{"Read", "shell_command", "shell_command_status", "apply_patch", "edit_file", "create_file", "read_web_page", "web_search", "finder", "skill", "view_media"},
 		SystemPrompt: neoTaskSubagentPrompt,
 		MaxTurns:     30,
 	},
@@ -113,7 +113,7 @@ var neoSubagentDefs = map[string]neoSubagentDef{
 		Key:             "run_check",
 		DisplayName:     "Check",
 		Route:           neoModelRoute{Provider: "openai", Model: "gpt-5.6-terra"},
-		IncludeTools:    []string{"Read", "Grep", "glob", "Bash"},
+		IncludeTools:    []string{"Read", "Grep", "glob", "shell_command", "shell_command_status"},
 		SystemPrompt:    neoRunCheckSubagentPrompt,
 		ReasoningEffort: "low",
 		MaxTurns:        12,
@@ -123,6 +123,13 @@ var neoSubagentDefs = map[string]neoSubagentDef{
 func neoSubagentDefFor(toolName string) (neoSubagentDef, bool) {
 	def, ok := neoSubagentDefs[strings.TrimSpace(toolName)]
 	return def, ok
+}
+
+func neoSubagentRoute(def neoSubagentDef, toolName, agentMode string) neoModelRoute {
+	if strings.TrimSpace(toolName) == "oracle" && strings.EqualFold(strings.TrimSpace(agentMode), "high") {
+		return neoModelRoute{Provider: "anthropic", Model: "claude-fable-5"}
+	}
+	return def.Route
 }
 
 // isNeoLocalSubagentTool reports whether a tool call should be executed locally
@@ -208,10 +215,9 @@ func neoSubagentExposureSpec(toolName string) (neoToolSpec, bool) {
 }
 
 const (
-	neoSubagentToolTimeout       = 5 * time.Minute
-	neoFinderMaxConcurrentRuns   = 2
-	neoFinderMaxToolCallsPerTurn = 4
-	neoFinderGlobWalkEntryLimit  = 4096
+	neoFinderMaxConcurrentRuns      = 2
+	neoFinderMaxConcurrentToolCalls = 4
+	neoFinderGlobWalkEntryLimit     = 4096
 	// neoSubagentMaxDepth bounds nested subagent calls (e.g. Task -> finder) to
 	// prevent runaway recursion.
 	neoSubagentMaxDepth = 3
@@ -255,20 +261,41 @@ func (a *neoActor) executeSubagentRun(name string, input map[string]any, parentT
 	}
 
 	a.mu.Lock()
-	route := def.Route
-	if route.Model == "" {
-		route = selectNeoModelRouteWithConfig(a.runtime, a.currentAgentMode, a.settings)
-	}
 	agentMode := a.currentAgentMode
+	route := neoSubagentRoute(def, name, agentMode)
+	if route.Model == "" {
+		route = selectNeoModelRouteWithConfig(a.runtime, agentMode, a.settings)
+	}
 	tools := a.resolveSubagentToolsLocked(def.IncludeTools)
 	settings := cloneMap(a.settings)
+	if neoLoadScaffoldCustomization(settings, false, nil, nil) != nil {
+		catalog := a.customAgentToolCandidatesLocked()
+		customizedCatalog, customizeErr := neoApplyScaffoldToolCustomization(catalog, settings)
+		if customizeErr != nil {
+			a.mu.Unlock()
+			return "", fmt.Errorf("prepare %s subagent tools: %w", name, customizeErr)
+		}
+		customizedTools := make([]neoToolSpec, 0, len(tools))
+		for _, tool := range tools {
+			if index := neoScaffoldToolIndex(customizedCatalog, tool.Name); index >= 0 {
+				customizedTools = append(customizedTools, customizedCatalog[index])
+			}
+		}
+		tools = customizedTools
+	}
 	if def.ReasoningEffort != "" {
 		settings["reasoning.effort"] = def.ReasoningEffort
 		if (route.Provider == "google" || route.Provider == "vertexai") && validNeoGeminiThinkingLevel(def.ReasoningEffort) {
 			settings["gemini.thinkingLevel"] = def.ReasoningEffort
 		}
 	}
-	environment := cloneMap(a.environment)
+	environment := neoCanonicalizeEnvironmentWorkspace(cloneMap(a.environment))
+	capabilities := cloneMap(a.capabilities)
+	guidance := cloneMap(a.guidanceSnapshot)
+	var scaffoldHistory []neoHistoryMessage
+	if name == "Task" {
+		scaffoldHistory = append([]neoHistoryMessage(nil), a.historyLocked()...)
+	}
 	maxTokens := a.maxTokens
 	a.mu.Unlock()
 	workingDir, workspaceRoot := neoFinderEnvironmentPaths(environment)
@@ -298,6 +325,21 @@ func (a *neoActor) executeSubagentRun(name string, input map[string]any, parentT
 		"{{WORKING_DIR}}", firstNonEmptyString(workingDir, "unknown"),
 		"{{WORKSPACE_ROOT}}", firstNonEmptyString(workspaceRoot, "unknown"),
 	).Replace(def.SystemPrompt)
+	if name == "Task" {
+		scaffoldRequest := neoInferenceRequest{
+			ActorID:      a.id,
+			ThreadID:     a.threadID,
+			AgentMode:    agentMode,
+			MaxTokens:    maxTokens,
+			Settings:     settings,
+			History:      scaffoldHistory,
+			Tools:        tools,
+			Environment:  environment,
+			Capabilities: capabilities,
+			Guidance:     guidance,
+		}
+		systemPrompt = strings.Join(compactStrings([]string{neoSystemPrompt(scaffoldRequest, route), systemPrompt}), "\n\n")
+	}
 
 	inputText := neoSubagentInputText(name, input)
 	conversation := []neoHistoryMessage{{Role: "user", Text: inputText}}
@@ -344,6 +386,8 @@ func (a *neoActor) executeSubagentRun(name string, input map[string]any, parentT
 			History:              append([]neoHistoryMessage(nil), conversation...),
 			Tools:                tools,
 			Environment:          environment,
+			Capabilities:         capabilities,
+			Guidance:             guidance,
 			ModelRouteOverride:   &routeCopy,
 			SystemPromptOverride: systemPrompt,
 		}, func(neoInferenceDelta) {})
@@ -455,6 +499,8 @@ func (a *neoActor) executeSubagentRun(name string, input map[string]any, parentT
 			Settings:             settings,
 			History:              forced,
 			Environment:          environment,
+			Capabilities:         capabilities,
+			Guidance:             guidance,
 			ModelRouteOverride:   &routeCopy,
 			SystemPromptOverride: systemPrompt,
 		}, func(neoInferenceDelta) {})
@@ -533,7 +579,6 @@ func (a *neoActor) execFinderTurnTools(ctx context.Context, calls []neoToolCall,
 
 func (a *neoActor) execPreparedFinderTurnTools(ctx context.Context, calls []neoToolCall, duplicateCallIDs map[string]string, workspaceRoot, executorRoot, parentToolCallID string, generation int) []neoSubagentToolExchange {
 	items := make([]neoFinderTurnTool, 0, len(calls))
-	executable := 0
 	for _, call := range calls {
 		if call.Incomplete {
 			continue
@@ -544,12 +589,6 @@ func (a *neoActor) execPreparedFinderTurnTools(ctx context.Context, calls []neoT
 			items = append(items, item)
 			continue
 		}
-		if executable >= neoFinderMaxToolCallsPerTurn {
-			item.run = neoFinderToolError(fmt.Sprintf("finder accepts at most %d tool calls per turn; narrow the remaining searches", neoFinderMaxToolCallsPerTurn))
-			items = append(items, item)
-			continue
-		}
-		executable++
 		scoped, err := neoScopeFinderToolCallForExecutorContext(ctx, call, workspaceRoot, executorRoot)
 		if err != nil {
 			item.run = neoFinderToolError(err.Error())
@@ -560,23 +599,27 @@ func (a *neoActor) execPreparedFinderTurnTools(ctx context.Context, calls []neoT
 		item.executable = scoped
 		items = append(items, item)
 	}
-	if !a.prepareFinderTurnTools(items, parentToolCallID, generation) {
-		return nil
-	}
-
-	var wg sync.WaitGroup
-	for index := range items {
-		if items[index].run != nil {
-			continue
+	for start := 0; start < len(items); start += neoFinderMaxConcurrentToolCalls {
+		end := min(start+neoFinderMaxConcurrentToolCalls, len(items))
+		batch := items[start:end]
+		if !a.prepareFinderTurnTools(batch, parentToolCallID, generation) {
+			return nil
 		}
-		wg.Add(1)
-		go func(index int) {
-			defer wg.Done()
-			item := &items[index]
-			item.run = a.waitSubagentLeafTool(item.executable, parentToolCallID, item.waiter, generation)
-		}(index)
+
+		var wg sync.WaitGroup
+		for index := range batch {
+			if batch[index].run != nil {
+				continue
+			}
+			wg.Add(1)
+			go func(index int) {
+				defer wg.Done()
+				item := &batch[index]
+				item.run = a.waitSubagentLeafTool(item.waiter)
+			}(index)
+		}
+		wg.Wait()
 	}
-	wg.Wait()
 
 	exchanges := make([]neoSubagentToolExchange, 0, len(items))
 	for _, item := range items {
@@ -691,14 +734,6 @@ func neoFinderWorkspaceScope(workingDir, workspaceRoot string) (string, string, 
 	if !neoFinderPathWithin(root, work) {
 		return "", "", fmt.Errorf("finder working directory %q is outside workspace root %q", work, root)
 	}
-	if neoFinderPathIsRoot(root) {
-		return "", "", fmt.Errorf("finder refuses filesystem-root workspace %q", root)
-	}
-	if home, homeErr := os.UserHomeDir(); homeErr == nil {
-		if canonicalHome, canonicalErr := neoFinderCanonicalDirectory(home); canonicalErr == nil && neoFinderPathEqual(root, canonicalHome) {
-			return "", "", fmt.Errorf("finder refuses home-directory workspace %q; select a repository or narrower workspace", root)
-		}
-	}
 	return work, root, nil
 }
 
@@ -729,66 +764,7 @@ func neoFinderCanonicalDirectory(value string) (string, error) {
 }
 
 func neoFinderEnvironmentPaths(environment map[string]any) (string, string) {
-	initial := mapValue(environment["initial"])
-	workingDir := neoFinderFirstEnvironmentPath(
-		environment["workingDirectory"],
-		environment["working_directory"],
-		environment["cwd"],
-		initial["workingDirectory"],
-		initial["working_directory"],
-		initial["cwd"],
-	)
-	workspaceRoot := neoFinderFirstEnvironmentPath(
-		environment["workspaceRoot"],
-		environment["workspace_root"],
-		initial["workspaceRoot"],
-		initial["workspace_root"],
-	)
-	if workingDir == "" || workspaceRoot == "" {
-		treePath := neoFinderFirstTreePath(environment["trees"], initial["trees"])
-		if workingDir == "" {
-			workingDir = treePath
-		}
-		if workspaceRoot == "" {
-			workspaceRoot = treePath
-		}
-	}
-	if workingDir == "" {
-		workingDir = workspaceRoot
-	}
-	if workspaceRoot == "" {
-		workspaceRoot = workingDir
-	}
-	return workingDir, workspaceRoot
-
-}
-
-func neoFinderFirstEnvironmentPath(values ...any) string {
-	for _, value := range values {
-		candidate := firstNonEmptyString(
-			value,
-			nestedString(value, "uri"),
-			nestedString(value, "path"),
-			nestedString(value, "fsPath"),
-			nestedString(value, "workingDirectory"),
-			nestedString(value, "workspaceRoot"),
-		)
-		if strings.TrimSpace(candidate) != "" {
-			return candidate
-		}
-	}
-	return ""
-}
-
-func neoFinderFirstTreePath(treeSets ...any) string {
-	for _, rawTrees := range treeSets {
-		for _, tree := range arrayValue(rawTrees) {
-			if candidate := neoFinderFirstEnvironmentPath(tree); candidate != "" {
-				return candidate
-			}
-		}
-	}
-	return ""
+	return neoResolvedEnvironmentWorkspacePaths(environment)
 }
 
 func neoFinderPathValue(value string) (string, error) {
@@ -839,10 +815,6 @@ func neoFinderPathIsAbsolute(value string) bool {
 	return strings.HasPrefix(value, "/") || neoFinderWindowsDrivePath(value)
 }
 
-func neoFinderPathIsRoot(value string) bool {
-	return value == "/" || (neoFinderWindowsDrivePath(value) && len(value) == 3)
-}
-
 func neoFinderJoin(root, value string) string {
 	joined, err := neoFinderPathValue(strings.TrimSuffix(root, "/") + "/" + value)
 	if err != nil {
@@ -891,9 +863,6 @@ func neoScopeFinderToolCallForExecutorContext(ctx context.Context, call neoToolC
 	case "Grep":
 		key := neoFinderInputPathKey(call.Input, "path", "directory")
 		patternKey := neoFinderInputPathKey(call.Input, "glob", "filePattern")
-		if key != "" && patternKey != "" {
-			return call, fmt.Errorf("finder Grep path and glob are mutually exclusive")
-		}
 		if key == "" && patternKey == "" {
 			call.Input["path"] = workspaceRoot
 		} else if key != "" {
@@ -904,7 +873,13 @@ func neoScopeFinderToolCallForExecutorContext(ctx context.Context, call neoToolC
 			call.Input[key] = scoped
 		}
 		if patternKey != "" {
-			scoped, err := neoFinderScopedGlobPattern(ctx, workspaceRoot, executorRoot, stringValue(call.Input[patternKey]))
+			var scoped string
+			var err error
+			if key != "" {
+				scoped, err = neoFinderRelativeGlobPattern(ctx, stringValue(call.Input[key]), stringValue(call.Input[patternKey]))
+			} else {
+				scoped, err = neoFinderScopedGlobPattern(ctx, workspaceRoot, executorRoot, stringValue(call.Input[patternKey]))
+			}
 			if err != nil {
 				return call, err
 			}
@@ -1076,6 +1051,11 @@ func neoFinderScopedGlobPattern(ctx context.Context, root, executorRoot, value s
 	}
 	scopedPatterns := make([]string, 0, len(expandedPatterns))
 	for _, expanded := range expandedPatterns {
+		if ctx != nil {
+			if err := ctx.Err(); err != nil {
+				return "", err
+			}
+		}
 		for _, part := range strings.Split(expanded, "/") {
 			if part == ".." {
 				return "", fmt.Errorf("finder glob pattern %q cannot traverse parent directories", parsedValue)
@@ -1110,6 +1090,42 @@ func neoFinderScopedGlobPattern(ctx context.Context, root, executorRoot, value s
 		return neoFinderRestoreGlobEscapes(patternRelativeToRoot, escapes), nil
 	}
 	return neoFinderEscapeGlobLiteralPath(workspacePrefix) + "/" + neoFinderRestoreGlobEscapes(patternRelativeToRoot, escapes), nil
+}
+
+func neoFinderRelativeGlobPattern(ctx context.Context, root, value string) (string, error) {
+	protectedValue, escapes := neoFinderProtectGlobEscapes(value)
+	parsedValue, err := neoFinderPathValue(protectedValue)
+	if err != nil {
+		return "", fmt.Errorf("resolve finder glob pattern %q: %w", value, err)
+	}
+	if parsedValue == "" {
+		return "", fmt.Errorf("finder glob pattern is empty")
+	}
+	expandedPatterns, err := neoFinderBraceExpand(parsedValue, 64)
+	if err != nil {
+		return "", fmt.Errorf("resolve finder glob pattern %q: %w", value, err)
+	}
+	scopedPatterns := make([]string, 0, len(expandedPatterns))
+	for _, expanded := range expandedPatterns {
+		if ctx != nil {
+			if err := ctx.Err(); err != nil {
+				return "", err
+			}
+		}
+		if neoFinderPathIsAbsolute(expanded) {
+			return "", fmt.Errorf("finder glob pattern %q must be relative to the Grep path", value)
+		}
+		for _, part := range strings.Split(expanded, "/") {
+			if part == ".." {
+				return "", fmt.Errorf("finder glob pattern %q cannot traverse parent directories", parsedValue)
+			}
+		}
+		scopedPatterns = append(scopedPatterns, neoFinderRestoreGlobEscapes(expanded, escapes))
+	}
+	if err := neoFinderValidateGlobSymlinks(ctx, root, scopedPatterns); err != nil {
+		return "", err
+	}
+	return neoFinderRestoreGlobEscapes(parsedValue, escapes), nil
 }
 
 type neoFinderGlobEscape struct {
@@ -1437,11 +1453,15 @@ func (a *neoActor) resolveSubagentToolsLocked(names []string) []neoToolSpec {
 	tools := make([]neoToolSpec, 0, len(names))
 	for _, name := range names {
 		if spec, ok := a.tools[name]; ok {
-			tools = append(tools, spec)
+			if neoToolAllowedBySettings(spec, a.settings) {
+				tools = append(tools, spec)
+			} else if synthetic, syntheticOK := neoSyntheticLocalToolSpec(name); syntheticOK && synthetic.Name == spec.Name && neoToolAllowedBySettings(synthetic, a.settings) {
+				tools = append(tools, synthetic)
+			}
 			continue
 		}
 		if a.executorBootstrapComplete {
-			if spec, ok := neoSyntheticLocalToolSpec(name); ok {
+			if spec, ok := neoSyntheticLocalToolSpec(name); ok && neoToolAllowedBySettings(spec, a.settings) {
 				tools = append(tools, spec)
 			}
 		}
@@ -1537,50 +1557,11 @@ func (a *neoActor) execSubagentLeafTool(call neoToolCall, parentToolCallID, chil
 	if !a.registerSubagentLeafTool(call, parentToolCallID, childMessageID, generation, ch) {
 		return map[string]any{"status": "cancelled", "reason": "user:cancelled"}
 	}
-	return a.waitSubagentLeafTool(call, parentToolCallID, ch, generation)
+	return a.waitSubagentLeafTool(ch)
 }
 
-func (a *neoActor) waitSubagentLeafTool(call neoToolCall, parentToolCallID string, ch chan map[string]any, generation int) map[string]any {
-	timer := time.NewTimer(neoSubagentToolTimeout)
-	defer timer.Stop()
-	select {
-	case run := <-ch:
-		return run
-	case <-timer.C:
-		run := map[string]any{"status": "error", "error": map[string]any{"message": "subagent tool " + call.Name + " timed out"}}
-		a.emissionMu.Lock()
-		a.mu.Lock()
-		owner := generation == a.generation && a.subagentWaiters[call.ID] == ch
-		var event map[string]any
-		var sockets []*neoSocket
-		if owner {
-			delete(a.subagentWaiters, call.ID)
-			delete(a.subagentTools, call.ID)
-			event = a.storeSubagentToolResultMessageLocked(call.ID, run, parentToolCallID, "")
-			sockets = a.socketListLocked()
-		}
-		a.mu.Unlock()
-		if owner {
-			for _, socket := range sockets {
-				if socket == nil || !socket.canSend() {
-					continue
-				}
-				socket.send(event)
-				socket.send(map[string]any{"type": "executor_tool_lease_revoked", "toolCallId": call.ID, "reason": "reassigned"})
-			}
-		}
-		a.emissionMu.Unlock()
-		if !owner {
-			select {
-			case run := <-ch:
-				return run
-			default:
-				return map[string]any{"status": "cancelled", "reason": "system:disposed"}
-			}
-		}
-		a.syncCloudAsync()
-		return run
-	}
+func (a *neoActor) waitSubagentLeafTool(ch chan map[string]any) map[string]any {
+	return <-ch
 }
 
 func (a *neoActor) registerSubagentLeafTool(call neoToolCall, parentToolCallID, childMessageID string, generation int, ch chan map[string]any) bool {

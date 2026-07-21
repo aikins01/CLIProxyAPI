@@ -157,6 +157,9 @@ func (a *neoActor) liveReadThreadCorpus(threadID string) (neoReadThreadCorpus, b
 	if target == nil || !target.hasLocalThreadState() {
 		return neoReadThreadCorpus{}, false
 	}
+	if target.threadToolOwnerID() != a.threadToolOwnerID() {
+		return neoReadThreadCorpus{}, false
+	}
 	snapshot, ok := target.threadSnapshotWithOptions(neoThreadSnapshotOptions{
 		skipLocalMessageJSON: true,
 	})
@@ -191,7 +194,7 @@ func (a *neoActor) localReadThreadFileCorpus(threadID string) (neoReadThreadCorp
 		return neoReadThreadCorpus{}, false
 	}
 	thread := neoCloudThreadDocumentForImport(decoded, threadID)
-	if firstNonEmptyString(thread["id"], findThreadID(thread)) != threadID {
+	if firstNonEmptyString(thread["id"], findThreadID(thread)) != threadID || !neoThreadOwnedByUser(thread, a.threadToolOwnerID()) {
 		return neoReadThreadCorpus{}, false
 	}
 	corpus := neoReadThreadCorpusFromThreadMap(threadID, thread, "local-json")

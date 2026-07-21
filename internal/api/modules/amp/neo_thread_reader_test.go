@@ -145,6 +145,39 @@ func TestNeoReadThreadLocalGateRequiresExecutorBootstrap(t *testing.T) {
 	}
 }
 
+func TestNeoReadThreadRejectsForeignOwnedLocalCorpus(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	source := rt.store.ensureThreadActor("T-019f7000-0000-7000-8000-0000000000a1")
+	source.mu.Lock()
+	source.currentAgentMode = "puck"
+	source.meta["ownerUserId"] = "user-a"
+	source.mu.Unlock()
+	liveTarget := rt.store.ensureThreadActor("T-019f7000-0000-7000-8000-0000000000a2")
+	liveTarget.mu.Lock()
+	liveTarget.meta["ownerUserId"] = "user-b"
+	liveTarget.messages = []neoMessage{{MessageID: "M-foreign-live", Role: "user", Content: []any{map[string]any{"type": "text", "text": "foreign live secret"}}}}
+	liveTarget.mu.Unlock()
+	if corpus, ok := source.liveReadThreadCorpus(liveTarget.threadID); ok {
+		t.Fatalf("foreign live corpus = %#v", corpus)
+	}
+
+	persistedThreadID := "T-019f7000-0000-7000-8000-0000000000a3"
+	if err := writeNeoLocalThreadSnapshotToDir(neoCloudThreadSnapshot{
+		threadID: persistedThreadID,
+		meta: map[string]any{
+			"cliProxyAPILocalNeo": true,
+			"ownerUserId":         "user-b",
+		},
+		messages: []neoMessage{{MessageID: "M-foreign-file", Role: "user", Content: []any{map[string]any{"type": "text", "text": "foreign persisted secret"}}}},
+	}, rt.threadDir); err != nil {
+		t.Fatal(err)
+	}
+	if corpus, ok := source.localReadThreadFileCorpus(persistedThreadID); ok {
+		t.Fatalf("foreign persisted corpus = %#v", corpus)
+	}
+}
+
 func TestNeoReadThreadDefaultsToCurrentThread(t *testing.T) {
 	threadID := "T-019e65c0-0310-77a8-b233-4b84d9c06140"
 	var captured []neoInferenceRequest
