@@ -17,7 +17,45 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	log "github.com/sirupsen/logrus"
 )
+
+func TestLogAmpIngressRequestOmitsHeadersAndBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	logger := log.StandardLogger()
+	oldLevel := logger.GetLevel()
+	oldOutput := logger.Out
+	oldFormatter := logger.Formatter
+	t.Cleanup(func() {
+		logger.SetLevel(oldLevel)
+		logger.SetOutput(oldOutput)
+		logger.SetFormatter(oldFormatter)
+	})
+
+	var output bytes.Buffer
+	logger.SetLevel(log.DebugLevel)
+	logger.SetOutput(&output)
+	logger.SetFormatter(&log.JSONFormatter{})
+
+	context, _ := gin.CreateTestContext(httptest.NewRecorder())
+	body := []byte(`{"model":"kimi-k3","messages":[{"role":"user","content":"PRIVATE_BODY_VALUE"}],"tools":[{"type":"function"}],"stream":true}`)
+	context.Request = httptest.NewRequest(http.MethodPost, "/api/provider/moonshotai/v1/chat/completions", bytes.NewReader(body))
+	context.Request.Header.Set("Content-Type", "application/json")
+	context.Request.Header.Set("Authorization", "Bearer PRIVATE_AUTH_VALUE")
+
+	logAmpIngressRequest(context, body)
+	logged := output.String()
+	for _, secret := range []string{"PRIVATE_BODY_VALUE", "PRIVATE_AUTH_VALUE", "Authorization"} {
+		if strings.Contains(logged, secret) {
+			t.Fatalf("sensitive request data %q was logged: %s", secret, logged)
+		}
+	}
+	for _, metadata := range []string{`\"body_len\":`, `\"message_count\":1`, `\"tool_count\":1`, `\"stream\":true`, `\"detected_model\":\"kimi-k3\"`} {
+		if !strings.Contains(logged, metadata) {
+			t.Fatalf("request metadata %q missing from log: %s", metadata, logged)
+		}
+	}
+}
 
 func TestFallbackHandler_ModelMapping_PreservesThinkingSuffixAndRewritesResponse(t *testing.T) {
 	gin.SetMode(gin.TestMode)

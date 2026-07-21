@@ -39,7 +39,6 @@ type neoFinderBenchmarkMetrics struct {
 	ToolCalls                int
 	MaxParallel              int
 	RuntimeAcceptedToolCalls int
-	CapRejectedToolCalls     int
 	ScopeRejectedToolCalls   int
 	MaxRuntimeParallel       int
 	MaxRuntimeInFlight       int
@@ -141,10 +140,10 @@ func TestNeoFinderBenchmarkRuntimeFanout(t *testing.T) {
 	if len(exchanges) != len(calls) {
 		t.Fatalf("benchmark exchanges = %d, want %d", len(exchanges), len(calls))
 	}
-	if metrics.RuntimeAcceptedToolCalls != neoFinderMaxToolCallsPerTurn || metrics.CapRejectedToolCalls != len(calls)-neoFinderMaxToolCallsPerTurn {
+	if metrics.RuntimeAcceptedToolCalls != len(calls) {
 		t.Fatalf("benchmark fanout metrics = %#v", metrics)
 	}
-	if metrics.MaxRuntimeParallel != neoFinderMaxToolCallsPerTurn || metrics.MaxRuntimeInFlight != neoFinderMaxToolCallsPerTurn {
+	if metrics.MaxRuntimeParallel != neoFinderMaxConcurrentToolCalls || metrics.MaxRuntimeInFlight != neoFinderMaxConcurrentToolCalls {
 		t.Fatalf("benchmark parallel metrics = %#v", metrics)
 	}
 	for i, exchange := range exchanges {
@@ -300,7 +299,6 @@ func neoFinderRunSyntheticModelBenchmark(t *testing.T, candidate neoFinderBenchm
 		"toolCalls":                metrics.ToolCalls,
 		"maxParallel":              metrics.MaxParallel,
 		"runtimeAcceptedToolCalls": metrics.RuntimeAcceptedToolCalls,
-		"capRejectedToolCalls":     metrics.CapRejectedToolCalls,
 		"scopeRejectedToolCalls":   metrics.ScopeRejectedToolCalls,
 		"maxRuntimeParallel":       metrics.MaxRuntimeParallel,
 		"maxRuntimeInFlight":       metrics.MaxRuntimeInFlight,
@@ -346,20 +344,12 @@ func neoFinderBenchmarkWorkspace(t *testing.T, files map[string]string) string {
 
 func neoFinderBenchmarkExecuteTurn(root string, files map[string]string, calls []neoToolCall, metrics *neoFinderBenchmarkMetrics) []neoSubagentToolExchange {
 	exchanges := make([]neoSubagentToolExchange, 0, len(calls))
-	executable := make([]int, 0, min(len(calls), neoFinderMaxToolCallsPerTurn))
-	acceptedSlots := 0
+	executable := make([]int, 0, len(calls))
 	for _, call := range calls {
 		if call.Incomplete {
 			continue
 		}
 		exchange := neoSubagentToolExchange{Call: call}
-		if acceptedSlots >= neoFinderMaxToolCallsPerTurn {
-			exchange.Run = neoFinderToolError(fmt.Sprintf("finder accepts at most %d tool calls per turn; narrow the remaining searches", neoFinderMaxToolCallsPerTurn))
-			metrics.CapRejectedToolCalls++
-			exchanges = append(exchanges, exchange)
-			continue
-		}
-		acceptedSlots++
 		scoped, err := neoScopeFinderToolCall(call, root)
 		if err != nil {
 			exchange.Run = neoFinderToolError(err.Error())
@@ -372,36 +362,40 @@ func neoFinderBenchmarkExecuteTurn(root string, files map[string]string, calls [
 		exchanges = append(exchanges, exchange)
 	}
 	metrics.RuntimeAcceptedToolCalls += len(executable)
-	metrics.MaxRuntimeParallel = max(metrics.MaxRuntimeParallel, len(executable))
 	if len(executable) == 0 {
 		return exchanges
 	}
 
-	var wg sync.WaitGroup
-	var ready sync.WaitGroup
-	var activeMu sync.Mutex
-	active := 0
-	start := make(chan struct{})
-	ready.Add(len(executable))
-	for _, index := range executable {
-		wg.Add(1)
-		go func(index int) {
-			defer wg.Done()
-			activeMu.Lock()
-			active++
-			metrics.MaxRuntimeInFlight = max(metrics.MaxRuntimeInFlight, active)
-			activeMu.Unlock()
-			ready.Done()
-			<-start
-			exchanges[index].Run = neoFinderBenchmarkExecuteTool(root, files, exchanges[index].Call)
-			activeMu.Lock()
-			active--
-			activeMu.Unlock()
-		}(index)
+	for startIndex := 0; startIndex < len(executable); startIndex += neoFinderMaxConcurrentToolCalls {
+		endIndex := min(startIndex+neoFinderMaxConcurrentToolCalls, len(executable))
+		batch := executable[startIndex:endIndex]
+		metrics.MaxRuntimeParallel = max(metrics.MaxRuntimeParallel, len(batch))
+		var wg sync.WaitGroup
+		var ready sync.WaitGroup
+		var activeMu sync.Mutex
+		active := 0
+		start := make(chan struct{})
+		ready.Add(len(batch))
+		for _, index := range batch {
+			wg.Add(1)
+			go func(index int) {
+				defer wg.Done()
+				activeMu.Lock()
+				active++
+				metrics.MaxRuntimeInFlight = max(metrics.MaxRuntimeInFlight, active)
+				activeMu.Unlock()
+				ready.Done()
+				<-start
+				exchanges[index].Run = neoFinderBenchmarkExecuteTool(root, files, exchanges[index].Call)
+				activeMu.Lock()
+				active--
+				activeMu.Unlock()
+			}(index)
+		}
+		ready.Wait()
+		close(start)
+		wg.Wait()
 	}
-	ready.Wait()
-	close(start)
-	wg.Wait()
 	return exchanges
 }
 

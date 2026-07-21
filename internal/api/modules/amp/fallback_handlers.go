@@ -53,15 +53,17 @@ func logAmpIngressRequest(c *gin.Context, rawBody []byte) {
 		return
 	}
 	payload := map[string]any{
-		"component":    "amp-ingress",
-		"method":       c.Request.Method,
-		"path":         c.Request.URL.Path,
-		"raw_query":    util.MaskSensitiveQuery(c.Request.URL.RawQuery),
-		"headers":      maskedHeaders(c.Request.Header),
-		"body_len":     len(rawBody),
-		"body":         string(rawBody),
-		"action_param": c.Param("action"),
-		"path_param":   c.Param("path"),
+		"component":     "amp-ingress",
+		"method":        c.Request.Method,
+		"path":          c.Request.URL.Path,
+		"raw_query":     util.MaskSensitiveQuery(c.Request.URL.RawQuery),
+		"content_type":  c.GetHeader("Content-Type"),
+		"body_len":      len(rawBody),
+		"message_count": gjson.GetBytes(rawBody, "messages.#").Int(),
+		"tool_count":    gjson.GetBytes(rawBody, "tools.#").Int(),
+		"stream":        gjson.GetBytes(rawBody, "stream").Bool(),
+		"action_param":  c.Param("action"),
+		"path_param":    c.Param("path"),
 	}
 	if clientModel := extractModelFromRequest(rawBody, c); strings.TrimSpace(clientModel) != "" {
 		payload["detected_model"] = clientModel

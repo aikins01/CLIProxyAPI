@@ -41,6 +41,50 @@ func TestAuditWebAssetsReportsOnlyMissingContracts(t *testing.T) {
 	}
 }
 
+func TestAuditWebAssetsRequiresTogetherMarkersInOneAsset(t *testing.T) {
+	baseline := webBaseline{
+		Schema:    webBaselineSchema,
+		SourceURL: "https://ampcode.com/",
+		Routes:    []string{"/(app)/projects"},
+		Contracts: []webContract{{
+			Name:             "create-thread",
+			Scope:            "upstream-web",
+			RequiredTogether: [][]string{{"createProjectThread", "result.initialThread"}},
+		}},
+	}
+	assets := []webAsset{
+		{Path: "create.js", Body: []byte(`{"/(app)/projects":[]} createProjectThread`)},
+		{Path: "thread.js", Body: []byte("result.initialThread")},
+	}
+	report := auditWebAssets("fixture", assets, baseline)
+	if len(report.Findings) != 1 || strings.Join(report.Findings[0].Missing, ",") != "createProjectThread & result.initialThread" {
+		t.Fatalf("findings = %#v, want one co-location failure", report.Findings)
+	}
+
+	assets[0].Body = append(assets[0].Body, []byte(" result.initialThread")...)
+	report = auditWebAssets("fixture", assets, baseline)
+	if len(report.Findings) != 0 {
+		t.Fatalf("co-located markers were rejected: %#v", report.Findings)
+	}
+}
+
+func TestValidateWebBaselineAcceptsSchema1WithoutRequiredTogether(t *testing.T) {
+	baseline := webBaseline{
+		Schema:    1,
+		SourceURL: "https://ampcode.com/",
+		Routes:    []string{"/(app)/projects"},
+		Contracts: []webContract{{Name: "projects", Scope: "upstream-web", RequiredAll: []string{"createProjectThread"}}},
+	}
+	if err := validateWebBaseline(baseline); err != nil {
+		t.Fatalf("schema 1 baseline was rejected: %v", err)
+	}
+
+	baseline.Contracts[0].RequiredTogether = [][]string{{"createProjectThread", "result.initialThread"}}
+	if err := validateWebBaseline(baseline); err == nil || !strings.Contains(err.Error(), "requires schema 2") {
+		t.Fatalf("schema 1 required_together error = %v", err)
+	}
+}
+
 func TestFetchWebAssetsSelectsRouteDependencies(t *testing.T) {
 	const route = "/(app)/threads/[thread=threadID]/(active)/terminal"
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
@@ -68,6 +112,43 @@ func TestFetchWebAssetsSelectsRouteDependencies(t *testing.T) {
 	}
 	if !assetsContain(assets, "threadActorConfig") || !assetsContain(assets, "amp-terminal-v1") {
 		t.Fatalf("selected assets = %#v", assets)
+	}
+}
+
+func TestFetchWebAssetsIncludesRouteLayoutAndErrorDependencies(t *testing.T) {
+	const route = "/(app)/projects"
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/":
+			_, _ = response.Write([]byte(`<link rel="modulepreload" href="/_app/immutable/entry/app.test.js">`))
+		case "/_app/immutable/entry/app.test.js":
+			_, _ = response.Write([]byte(`const __vite__mapDeps=(i,m=__vite__mapDeps,d=(m.f||(m.f=["/_app/immutable/chunks/route.js","/_app/immutable/chunks/sidebar.js","/_app/immutable/chunks/error.js"])))=>i.map(i=>d[i]);var nodes=[()=>0,()=>0,()=>0,()=>__vitePreload(()=>import("../nodes/3.route.js"),__vite__mapDeps([0]),import.meta.url),()=>__vitePreload(()=>import("../nodes/4.layout.js"),__vite__mapDeps([1]),import.meta.url),()=>__vitePreload(()=>import("../nodes/5.error.js"),__vite__mapDeps([2]),import.meta.url)];const dictionary={"` + route + `":[3,[4],[5]]};`))
+		case "/_app/immutable/nodes/3.route.js":
+			_, _ = response.Write([]byte("projectsRouteNode"))
+		case "/_app/immutable/nodes/4.layout.js":
+			_, _ = response.Write([]byte("appLayoutNode"))
+		case "/_app/immutable/nodes/5.error.js":
+			_, _ = response.Write([]byte("appErrorNode"))
+		case "/_app/immutable/chunks/route.js":
+			_, _ = response.Write([]byte("projectsRouteDependency"))
+		case "/_app/immutable/chunks/sidebar.js":
+			_, _ = response.Write([]byte("listThreadListSidebar createProjectThread"))
+		case "/_app/immutable/chunks/error.js":
+			_, _ = response.Write([]byte("renderRouteError"))
+		default:
+			http.NotFound(response, request)
+		}
+	}))
+	defer server.Close()
+
+	assets, err := fetchWebAssets(server.Client(), server.URL+"/", []string{route})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, marker := range []string{"projectsRouteNode", "appLayoutNode", "appErrorNode", "projectsRouteDependency", "listThreadListSidebar", "createProjectThread", "renderRouteError"} {
+		if !assetsContain(assets, marker) {
+			t.Fatalf("selected assets do not contain %q: %#v", marker, assets)
+		}
 	}
 }
 
@@ -157,7 +238,7 @@ func TestRunStrictWithAssetDirectory(t *testing.T) {
 	if exitCode := run([]string{"-strict", "-baseline", baselinePath, "-asset-dir", assetDir}, &stdout, &stderr); exitCode != 0 {
 		t.Fatalf("exit = %d, stderr = %s", exitCode, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "Amp web parity passed") {
+	if !strings.Contains(stdout.String(), "Amp upstream web parity passed") {
 		t.Fatalf("stdout = %q", stdout.String())
 	}
 

@@ -21,6 +21,8 @@ type ResponseRewriter struct {
 	body             *bytes.Buffer
 	originalModel    string
 	isStreaming      bool
+	sseStreaming     bool
+	streamPending    bytes.Buffer
 	suppressThinking bool
 }
 
@@ -36,6 +38,7 @@ func NewResponseRewriter(w gin.ResponseWriter, originalModel string) *ResponseRe
 const maxBufferedResponseBytes = 2 * 1024 * 1024 // 2MB safety cap
 
 func looksLikeSSEChunk(data []byte) bool {
+	data = normalizeSSELineEndings(data)
 	for _, line := range bytes.Split(data, []byte("\n")) {
 		trimmed := bytes.TrimSpace(line)
 		if bytes.HasPrefix(trimmed, []byte("data:")) ||
@@ -58,11 +61,17 @@ func (rw *ResponseRewriter) enableStreaming(reason string) error {
 		copy(toFlush, buf)
 		rw.body.Reset()
 
-		if _, err := rw.ResponseWriter.Write(rw.rewriteStreamChunk(toFlush)); err != nil {
-			return err
-		}
-		if flusher, ok := rw.ResponseWriter.(http.Flusher); ok {
-			flusher.Flush()
+		if rw.sseStreaming {
+			if err := rw.writeSSEFrames(toFlush); err != nil {
+				return err
+			}
+		} else {
+			if _, err := rw.ResponseWriter.Write(rw.rewriteStreamChunk(toFlush)); err != nil {
+				return err
+			}
+			if flusher, ok := rw.ResponseWriter.(http.Flusher); ok {
+				flusher.Flush()
+			}
 		}
 	}
 
@@ -73,12 +82,14 @@ func (rw *ResponseRewriter) enableStreaming(reason string) error {
 func (rw *ResponseRewriter) Write(data []byte) (int, error) {
 	if !rw.isStreaming && rw.body.Len() == 0 {
 		contentType := rw.Header().Get("Content-Type")
-		rw.isStreaming = strings.Contains(contentType, "text/event-stream") ||
+		rw.sseStreaming = strings.Contains(contentType, "text/event-stream")
+		rw.isStreaming = rw.sseStreaming ||
 			strings.Contains(contentType, "stream")
 	}
 
 	if !rw.isStreaming {
 		if looksLikeSSEChunk(data) {
+			rw.sseStreaming = true
 			if err := rw.enableStreaming("sse heuristic"); err != nil {
 				return 0, err
 			}
@@ -91,16 +102,82 @@ func (rw *ResponseRewriter) Write(data []byte) (int, error) {
 	}
 
 	if rw.isStreaming {
+		if rw.sseStreaming {
+			if err := rw.writeSSEFrames(data); err != nil {
+				return 0, err
+			}
+			return len(data), nil
+		}
 		rewritten := rw.rewriteStreamChunk(data)
-		n, err := rw.ResponseWriter.Write(rewritten)
+		_, err := rw.ResponseWriter.Write(rewritten)
 		if err == nil {
 			if flusher, ok := rw.ResponseWriter.(http.Flusher); ok {
 				flusher.Flush()
 			}
 		}
-		return n, err
+		if err != nil {
+			return 0, err
+		}
+		return len(data), nil
 	}
 	return rw.body.Write(data)
+}
+
+func (rw *ResponseRewriter) writeSSEFrames(data []byte) error {
+	wroteFrame := false
+	for len(data) > 0 {
+		available := maxBufferedResponseBytes - rw.streamPending.Len()
+		if available <= 0 {
+			rw.streamPending.Reset()
+			return fmt.Errorf("SSE frame exceeded %d bytes", maxBufferedResponseBytes)
+		}
+		writeBytes := min(available, len(data))
+		_, _ = rw.streamPending.Write(data[:writeBytes])
+		data = data[writeBytes:]
+		for {
+			frameEnd := sseFrameEnd(rw.streamPending.Bytes())
+			if frameEnd == 0 {
+				break
+			}
+			frame := rw.streamPending.Next(frameEnd)
+			if _, err := rw.ResponseWriter.Write(rw.rewriteStreamChunk(frame)); err != nil {
+				return err
+			}
+			wroteFrame = true
+		}
+		if rw.streamPending.Len() >= maxBufferedResponseBytes {
+			rw.streamPending.Reset()
+			return fmt.Errorf("SSE frame exceeded %d bytes", maxBufferedResponseBytes)
+		}
+	}
+	if wroteFrame {
+		if flusher, ok := rw.ResponseWriter.(http.Flusher); ok {
+			flusher.Flush()
+		}
+	}
+	return nil
+}
+
+func sseFrameEnd(data []byte) int {
+	lineStart := 0
+	for lineStart < len(data) {
+		lineEnd := lineStart
+		for lineEnd < len(data) && data[lineEnd] != '\r' && data[lineEnd] != '\n' {
+			lineEnd++
+		}
+		if lineEnd == len(data) {
+			return 0
+		}
+		nextLine := lineEnd + 1
+		if data[lineEnd] == '\r' && nextLine < len(data) && data[nextLine] == '\n' {
+			nextLine++
+		}
+		if lineEnd == lineStart {
+			return nextLine
+		}
+		lineStart = nextLine
+	}
+	return 0
 }
 
 func (rw *ResponseRewriter) Flush() {
@@ -243,6 +320,7 @@ func (rw *ResponseRewriter) rewriteModelInResponse(data []byte) []byte {
 }
 
 func (rw *ResponseRewriter) rewriteStreamChunk(chunk []byte) []byte {
+	chunk = normalizeSSELineEndings(chunk)
 	lines := bytes.Split(chunk, []byte("\n"))
 	var out [][]byte
 
@@ -316,6 +394,11 @@ func (rw *ResponseRewriter) rewriteStreamChunk(chunk []byte) []byte {
 	return bytes.Join(out, []byte("\n"))
 }
 
+func normalizeSSELineEndings(data []byte) []byte {
+	data = bytes.ReplaceAll(data, []byte("\r\n"), []byte("\n"))
+	return bytes.ReplaceAll(data, []byte("\r"), []byte("\n"))
+}
+
 // rewriteStreamEvent processes a single JSON event in the SSE stream.
 // It rewrites model names and ensures signature fields exist.
 // NOTE: streaming mode does NOT suppress thinking blocks - they are
@@ -324,6 +407,9 @@ func (rw *ResponseRewriter) rewriteStreamChunk(chunk []byte) []byte {
 func (rw *ResponseRewriter) rewriteStreamEvent(data []byte) []byte {
 	// Inject empty signature where needed
 	data = ensureAmpSignature(data)
+	if rw.suppressThinking {
+		data = clearAmpStreamingThinkingSignature(data)
+	}
 
 	// Normalize tool names to canonical casing
 	data = normalizeAmpToolNames(data)
@@ -337,6 +423,16 @@ func (rw *ResponseRewriter) rewriteStreamEvent(data []byte) []byte {
 		}
 	}
 
+	return data
+}
+
+func clearAmpStreamingThinkingSignature(data []byte) []byte {
+	if gjson.GetBytes(data, "content_block.type").String() == "thinking" {
+		data, _ = sjson.SetBytes(data, "content_block.signature", "")
+	}
+	if gjson.GetBytes(data, "delta.type").String() == "signature_delta" {
+		data, _ = sjson.SetBytes(data, "delta.signature", "")
+	}
 	return data
 }
 

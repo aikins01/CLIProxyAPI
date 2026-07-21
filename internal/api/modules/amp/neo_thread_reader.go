@@ -16,10 +16,12 @@ import (
 
 func (a *neoActor) shouldRunLocalActorTool(name string) bool {
 	toolName := strings.TrimSpace(name)
+	a.mu.Lock()
+	serverToolsReady := a.executorBootstrapComplete || strings.EqualFold(a.agentModeLocked(), "puck")
+	_, registered := a.tools[toolName]
+	a.mu.Unlock()
 	if toolName == "read_thread" {
-		a.mu.Lock()
-		defer a.mu.Unlock()
-		return a.executorBootstrapComplete
+		return serverToolsReady
 	}
 	switch {
 	case toolName == "submit_review":
@@ -28,10 +30,7 @@ func (a *neoActor) shouldRunLocalActorTool(name string) bool {
 	default:
 		return false
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	_, registered := a.tools[toolName]
-	return a.executorBootstrapComplete && !registered
+	return serverToolsReady && !registered
 }
 
 func (a *neoActor) runLocalActorTool(pending neoPendingTool, generation int) {

@@ -131,6 +131,19 @@ func TestRewriteStreamChunk_PreservesThinkingWithSignatureInjection(t *testing.T
 	}
 }
 
+func TestRewriteStreamChunkClearsCrossProviderThinkingSignature(t *testing.T) {
+	rw := &ResponseRewriter{suppressThinking: true}
+	chunk := []byte("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"foreign-start\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"plan\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"foreign-delta\"}}\n\n")
+
+	result := rw.rewriteStreamChunk(chunk)
+	if contains(result, []byte("foreign-start")) || contains(result, []byte("foreign-delta")) {
+		t.Fatalf("cross-provider stream retained a replayable signature: %s", result)
+	}
+	if !contains(result, []byte(`"thinking":"plan"`)) || strings.Count(string(result), `"signature":""`) != 2 {
+		t.Fatalf("cross-provider stream did not preserve visible thinking with empty signatures: %s", result)
+	}
+}
+
 func TestLooksLikeSSEChunkDetectsEventStreamFrames(t *testing.T) {
 	tests := []struct {
 		name string
@@ -179,6 +192,72 @@ func TestResponseRewriterWriteDetectsHeaderlessSSEAndRewritesChunk(t *testing.T)
 	}
 	if strings.Contains(rec.Body.String(), "gpt-5.3-codex") {
 		t.Fatalf("SSE chunk leaked mapped model: %s", rec.Body.String())
+	}
+}
+
+func TestResponseRewriterBuffersSplitSSEFramesBeforeRewriting(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	rw := NewResponseRewriter(context.Writer, "")
+	rw.suppressThinking = true
+	rw.Header().Set("Content-Type", "text/event-stream")
+
+	parts := []string{
+		`event: content_block_start` + "\n" + `data: {"type":"content_block_start","content_block":{"type":"thinking","thinking":"plan","sign`,
+		`ature":"foreign-signature"}}` + "\n",
+		"\n",
+	}
+	for _, part := range parts {
+		if n, err := rw.Write([]byte(part)); err != nil || n != len(part) {
+			t.Fatalf("Write() = (%d, %v), want (%d, nil)", n, err, len(part))
+		}
+	}
+
+	body := recorder.Body.String()
+	if strings.Contains(body, "foreign-signature") {
+		t.Fatalf("split SSE frame retained a foreign signature: %s", body)
+	}
+	if !strings.Contains(body, `"signature":""`) {
+		t.Fatalf("split SSE frame did not receive an empty signature: %s", body)
+	}
+}
+
+func TestResponseRewriterRejectsOversizedFragmentedSSEFrame(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	rw := NewResponseRewriter(context.Writer, "")
+	rw.Header().Set("Content-Type", "text/event-stream")
+	first := "data: " + strings.Repeat("x", maxBufferedResponseBytes-7)
+	if n, err := rw.Write([]byte(first)); err != nil || n != len(first) {
+		t.Fatalf("first Write() = (%d, %v), want (%d, nil)", n, err, len(first))
+	}
+	if n, err := rw.Write([]byte("x")); err == nil || n != 0 {
+		t.Fatalf("overflow Write() = (%d, %v), want (0, error)", n, err)
+	}
+	if rw.streamPending.Len() != 0 {
+		t.Fatalf("overflow retained %d buffered bytes", rw.streamPending.Len())
+	}
+}
+
+func TestResponseRewriterParsesAllSSELineEndings(t *testing.T) {
+	for name, frame := range map[string]string{
+		"CR only": "data: {\"response\":{\"model\":\"mapped\"}}\r\r",
+		"mixed":   "event: response.completed\r\ndata: {\"response\":{\"model\":\"mapped\"}}\n\r",
+	} {
+		t.Run(name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			context, _ := gin.CreateTestContext(recorder)
+			rw := NewResponseRewriter(context.Writer, "original")
+			rw.Header().Set("Content-Type", "text/event-stream")
+			if n, err := rw.Write([]byte(frame)); err != nil || n != len(frame) {
+				t.Fatalf("Write() = (%d, %v), want (%d, nil)", n, err, len(frame))
+			}
+			body := recorder.Body.String()
+			if !strings.Contains(body, `"model":"original"`) || strings.Contains(body, `"model":"mapped"`) {
+				t.Fatalf("rewritten frame = %q", body)
+			}
+		})
 	}
 }
 

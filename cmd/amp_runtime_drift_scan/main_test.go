@@ -215,6 +215,72 @@ func TestScanThreadDirIgnoresCancelledAssistantTerminalToolBlock(t *testing.T) {
 	}
 }
 
+func TestScanThreadDirIgnoresCancelledMalformedToolInput(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "T-test.json"), map[string]any{
+		"id": "T-test",
+		"messages": []any{
+			map[string]any{
+				"messageId": "M-assistant",
+				"role":      "assistant",
+				"state":     map[string]any{"type": "cancelled"},
+				"content": []any{map[string]any{
+					"type": "tool_use", "id": "TU-cancelled", "name": "shell_command", "complete": true,
+					"input": map[string]any{"input": `{"`},
+				}},
+			},
+			map[string]any{
+				"messageId": "M-result",
+				"role":      "user",
+				"content": []any{map[string]any{
+					"type": "tool_result", "toolUseID": "TU-cancelled", "run": map[string]any{"status": "cancelled", "reason": "user:cancelled"},
+				}},
+			},
+		},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("findings = %#v, want none for cancelled partial tool input", findings)
+	}
+}
+
+func TestScanThreadDirFlagsCompletedMalformedToolInputFromCancelledMessageWhenToolSucceeded(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "T-test.json"), map[string]any{
+		"id": "T-test",
+		"messages": []any{
+			map[string]any{
+				"messageId": "M-assistant",
+				"role":      "assistant",
+				"state":     map[string]any{"type": "cancelled"},
+				"content": []any{map[string]any{
+					"type": "tool_use", "id": "TU-complete", "name": "shell_command", "complete": true,
+					"input": map[string]any{"input": `{"`},
+				}},
+			},
+			map[string]any{
+				"messageId": "M-result",
+				"role":      "user",
+				"content": []any{map[string]any{
+					"type": "tool_result", "toolUseID": "TU-complete", "run": map[string]any{"status": "done", "result": "ok"},
+				}},
+			},
+		},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 1 || !strings.Contains(findings[0].Detail, "malformed JSON fallback") {
+		t.Fatalf("findings = %#v, want completed malformed tool input finding", findings)
+	}
+}
+
 func TestScanThreadDirIgnoresLiveAssistantStreamingBlocks(t *testing.T) {
 	dir := t.TempDir()
 	writeJSONFile(t, filepath.Join(dir, "T-test.json"), map[string]any{
@@ -1040,6 +1106,83 @@ func TestScanThreadDirAllowsInterleavedNestedToolResultsByParent(t *testing.T) {
 	}
 }
 
+func TestScanThreadDirAllowsParallelFinderSiblingToolUses(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "T-test.json"), map[string]any{
+		"id": "T-test",
+		"messages": []any{
+			map[string]any{
+				"messageId":       "M-grep-a",
+				"parentToolUseId": "TU-finder",
+				"role":            "assistant",
+				"state":           map[string]any{"type": "complete", "stopReason": "tool_use"},
+				"content":         []any{map[string]any{"type": "tool_use", "id": "TU-grep-a", "name": "Grep", "complete": true}},
+			},
+			map[string]any{
+				"messageId":       "M-grep-b",
+				"parentToolUseId": "TU-finder",
+				"role":            "assistant",
+				"state":           map[string]any{"type": "complete", "stopReason": "tool_use"},
+				"content":         []any{map[string]any{"type": "tool_use", "id": "TU-grep-b", "name": "Grep", "complete": true}},
+			},
+			map[string]any{
+				"messageId":       "M-grep-a-result",
+				"parentToolUseId": "TU-finder",
+				"role":            "user",
+				"content":         []any{map[string]any{"type": "tool_result", "toolUseID": "TU-grep-a", "run": map[string]any{"status": "done"}}},
+			},
+			map[string]any{
+				"messageId":       "M-grep-b-result",
+				"parentToolUseId": "TU-finder",
+				"role":            "user",
+				"content":         []any{map[string]any{"type": "tool_result", "toolUseID": "TU-grep-b", "run": map[string]any{"status": "done"}}},
+			},
+		},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("findings = %#v, want none for parallel Finder siblings", findings)
+	}
+}
+
+func TestScanThreadDirFindsDanglingTopLevelToolUseBeforeAnotherToolCall(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "T-test.json"), map[string]any{
+		"id": "T-test",
+		"messages": []any{
+			map[string]any{
+				"messageId": "M-a",
+				"role":      "assistant",
+				"state":     map[string]any{"type": "complete", "stopReason": "tool_use"},
+				"content":   []any{map[string]any{"type": "tool_use", "id": "TU-a", "name": "Grep", "complete": true}},
+			},
+			map[string]any{
+				"messageId": "M-b",
+				"role":      "assistant",
+				"state":     map[string]any{"type": "complete", "stopReason": "tool_use"},
+				"content":   []any{map[string]any{"type": "tool_use", "id": "TU-b", "name": "Grep", "complete": true}},
+			},
+			map[string]any{
+				"messageId": "M-b-result",
+				"role":      "user",
+				"content":   []any{map[string]any{"type": "tool_result", "toolUseID": "TU-b", "run": map[string]any{"status": "done"}}},
+			},
+		},
+	})
+
+	findings, err := scanRuntimeDrift(scanOptions{threadDir: dir, allowMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 1 || findings[0].CallID != "TU-a" {
+		t.Fatalf("findings = %#v, want dangling TU-a", findings)
+	}
+}
+
 func TestScanThreadDirIgnoresReviewModeDanglingToolUse(t *testing.T) {
 	dir := t.TempDir()
 	writeJSONFile(t, filepath.Join(dir, "T-test.json"), map[string]any{
@@ -1807,6 +1950,38 @@ func TestScanCaptureDirFindsDanglingAnthropicToolUseBeforeUserText(t *testing.T)
 	}
 }
 
+func TestScanProviderDanglingToolUseFindsUnresolvedCallBeforeNextAssistant(t *testing.T) {
+	findings := scanProviderDanglingToolUseDrift("capture.json", "T-test", []any{
+		map[string]any{
+			"role": "assistant",
+			"content": []any{map[string]any{
+				"type": "tool_use",
+				"id":   "TU-a",
+				"name": "read_thread",
+			}},
+		},
+		map[string]any{
+			"role": "assistant",
+			"content": []any{map[string]any{
+				"type": "tool_use",
+				"id":   "TU-b",
+				"name": "send_message",
+			}},
+		},
+		map[string]any{
+			"role": "user",
+			"content": []any{
+				map[string]any{"type": "tool_result", "tool_use_id": "TU-a"},
+				map[string]any{"type": "tool_result", "tool_use_id": "TU-b"},
+			},
+		},
+	})
+
+	if len(findings) != 1 || findings[0].CallID != "TU-a" || !strings.Contains(findings[0].Detail, "later assistant message") {
+		t.Fatalf("findings = %#v, want unresolved TU-a before later assistant", findings)
+	}
+}
+
 func TestScanCaptureDirIgnoresPairedProviderToolCalls(t *testing.T) {
 	dir := t.TempDir()
 	writeJSONFile(t, filepath.Join(dir, "capture.json"), map[string]any{
@@ -2304,6 +2479,41 @@ func TestRunSinceHomebrewRuntimeFallsBackToInstalledBinaryModTime(t *testing.T) 
 	}
 	if strings.TrimSpace(stdout.String()) != "[]" {
 		t.Fatalf("stdout = %q, want []", stdout.String())
+	}
+}
+
+func TestRunSinceHomebrewRuntimeUsesNewestInstalledBinaryModTime(t *testing.T) {
+	dir := t.TempDir()
+	realBinary := filepath.Join(dir, "cliproxyapi.real")
+	installedBinary := filepath.Join(dir, "cliproxyapi")
+	for _, path := range []string{realBinary, installedBinary} {
+		if err := os.WriteFile(path, []byte("marker"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	oldTime := time.Date(2026, 6, 1, 18, 0, 0, 0, time.UTC)
+	newTime := time.Date(2026, 6, 1, 20, 0, 0, 0, time.UTC)
+	if err := os.Chtimes(realBinary, oldTime, oldTime); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(installedBinary, newTime, newTime); err != nil {
+		t.Fatal(err)
+	}
+	oldHomebrewRuntimeBinaryPath := homebrewRuntimeBinaryPath
+	oldHomebrewRuntimeFallbackBinaryPath := homebrewRuntimeFallbackBinaryPath
+	homebrewRuntimeBinaryPath = func() string { return realBinary }
+	homebrewRuntimeFallbackBinaryPath = func() string { return installedBinary }
+	t.Cleanup(func() {
+		homebrewRuntimeBinaryPath = oldHomebrewRuntimeBinaryPath
+		homebrewRuntimeFallbackBinaryPath = oldHomebrewRuntimeFallbackBinaryPath
+	})
+
+	cutoff, err := parseSinceCutoff("", "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cutoff.Equal(newTime) {
+		t.Fatalf("cutoff = %s, want %s", cutoff, newTime)
 	}
 }
 

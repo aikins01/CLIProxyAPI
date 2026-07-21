@@ -17,12 +17,13 @@ func TestClassifyStringsExtractsParitySignals(t *testing.T) {
 	strs := []string{
 		`await ja("/api/thread-actors/"+threadId,{method:"POST"}); Ph(R,"GET","/metadata"); api.post("/threads/T-12345678-1234-1234-1234-123456789abc")`,
 		`fetch("/actors/metadata?namespace=default")`,
+		`T.command("apps");T.command("secrets");T.command("report").description("Generate and send a diagnostic report for the amp --no-tui runner");T.option("--remote-control-terminal")`,
 		`["user:message","user:message:interrupt","user:message:append-content","user:message-queue:enqueue","user:message-queue:dequeue","user:message-queue:discard","user:tool-input","tool:data","tool:processed","assistant:message","assistant:message-update","thread:truncate","title","agent-mode","reasoning-effort","environment","max-tokens","main-thread"]`,
 		`J.discriminatedUnion("type",[J.object({type:J.literal("message_added")}),J.object({type:J.literal("message_updated")}),J.object({type:J.literal("delta")}),J.object({type:J.literal("thread_truncated")}),J.object({type:J.literal("queued_messages")}),J.object({type:J.literal("queued_message_added")}),J.object({type:J.literal("queued_message_removed")}),J.object({type:J.literal("queued_message_dequeued")}),J.object({type:J.literal("tool_progress")}),J.object({type:J.literal("tool_approval_queue")}),J.object({type:J.literal("tool_lease")}),J.object({type:J.literal("thread_settings")}),J.object({type:J.literal("thread_title")}),J.object({type:J.literal("thread_status")}),J.object({type:J.literal("thread_relationships")}),J.object({type:J.literal("agent_state")}),J.object({type:J.literal("cancelled")}),J.object({type:J.literal("compaction_started")}),J.object({type:J.literal("compaction_complete")}),J.object({type:J.literal("compaction_records")}),J.object({type:J.literal("retry_scheduled")}),J.object({type:J.literal("retry_started")}),J.object({type:J.literal("retry_cancelled")}),J.object({type:J.literal("error_set")}),J.object({type:J.literal("error_cleared")}),J.object({type:J.literal("error")}),J.object({type:J.literal("edit_rejected")}),J.object({type:J.literal("environment_update")}),J.object({type:J.literal("observers")}),J.object({type:J.literal("plugin_message")}),J.object({type:J.literal("client_append_user_msg")}),J.object({type:J.literal("executor_tool_result")}),J.object({type:J.literal("executor_tools_register")})])`,
 		`type:J.literal("client_terminal_open") type:J.literal("executor_terminal_output")`,
 		`case "user:interrupted": case "system:non-terminal-tool-result": case "system:this": case "user:this":`,
 		`switch(status){case"done":case"error":case"rejected-by-user":case"cancelled":case"in-progress":case"cancellation-requested":case"queued":case"blocked-on-user":} --stream-json --stream-json-thinking agent_mode reasoning_effort mcp_servers session_id duration_ms num_turns error_during_execution is_error`,
-		`tools.disable:{value:["browser_navigate","builtin:edit_file"]}; SFT=new Set(["read_file","ripgrep","Read","Grep","glob","Glob","file_tree","view_media"]); MFT={enableToolSpecs:disableTools}; mcpServers mcp__server__tool skills.disableClaudeCodeSkills skills.path toolbox.path applyPatchFreeform browser_take_screenshot`,
+		`tools.disable:{value:["browser_navigate","builtin:edit_file"]}; SFT=new Set(["read_file","ripgrep","Read","Grep","glob","Glob","file_tree","view_media","gmail_read","gmail_write"]); MFT={enableToolSpecs:disableTools}; mcpServers mcp__server__tool skills.disableClaudeCodeSkills skills.path toolbox.path applyPatchFreeform browser_take_screenshot`,
 		`draftThreadSettings reasoning.effort internal.model agentMode reasoningEffort lastReasoningEffortByMode lastSpeedByMode explicitEffort openai.speed anthropic.speed gemini.thinkingLevel`,
 		`anthropic-beta anthropic-version 2023-06-01 interleaved-thinking-2025-05-14 fast-mode-2026-02-01 x-amp-feature x-amp-thread-id x-amp-message-id x-amp-override-provider X-Amp-Client-Application amp.chat amp.review openai-websocket google-upload-url`,
 		`Vw="x-amp-feature",QRT="x-amp-thread-id",LU="x-amp-message-id",ART="X-Amp-Client-Application",RTT="X-Amp-Client-Type",TTT="X-Amp-Client-Version"; VpT="fast-mode-2026-02-01"`,
@@ -61,6 +62,13 @@ func TestClassifyStringsExtractsParitySignals(t *testing.T) {
 
 	signals := classifyStrings(strs)
 
+	assertContains(t, signals.CLICommandLiterals, "apps")
+	assertContains(t, signals.CLICommandLiterals, "report")
+	assertContains(t, signals.CLICommandLiterals, "secrets")
+	assertContains(t, cliControlSurfaceStrings(signals.CLIControlSurfaces), "apps=amp-owned")
+	assertContains(t, cliControlSurfaceStrings(signals.CLIControlSurfaces), "orb-secrets=amp-owned")
+	assertContains(t, cliControlSurfaceStrings(signals.CLIControlSurfaces), "remote-control-terminal=local-runtime")
+	assertContains(t, cliControlSurfaceStrings(signals.CLIControlSurfaces), "runner-report=amp-owned")
 	assertContains(t, signals.Routes, "/api/thread-actors/")
 	assertContains(t, signals.Routes, "/actors/metadata?namespace=default")
 	assertContains(t, signals.Routes, "/threads/:threadID")
@@ -149,11 +157,15 @@ func TestClassifyStringsExtractsParitySignals(t *testing.T) {
 	assertContains(t, signals.ToolCatalog, "ripgrep")
 	assertContains(t, signals.ToolCatalog, "Glob")
 	assertContains(t, signals.ToolCatalog, "mcp__server__tool")
+	assertContains(t, signals.ToolCatalog, "gmail_read")
+	assertContains(t, signals.ToolCatalog, "gmail_write")
 	assertContains(t, toolCatalogCoverageStrings(signals.ToolCatalogCoverage), "browser_navigate=browser")
 	assertContains(t, toolCatalogCoverageStrings(signals.ToolCatalogCoverage), "builtin:edit_file=file-edit")
 	assertContains(t, toolCatalogCoverageStrings(signals.ToolCatalogCoverage), "read_file=file-read")
 	assertContains(t, toolCatalogCoverageStrings(signals.ToolCatalogCoverage), "Glob=legacy-file-search")
 	assertContains(t, toolCatalogCoverageStrings(signals.ToolCatalogCoverage), "mcp__server__tool=mcp")
+	assertContains(t, toolCatalogCoverageStrings(signals.ToolCatalogCoverage), "gmail_read=email")
+	assertContains(t, toolCatalogCoverageStrings(signals.ToolCatalogCoverage), "gmail_write=email")
 	assertContains(t, signals.StreamJSONMarkers, "--stream-json")
 	assertContains(t, signals.StreamJSONMarkers, "agent_mode")
 	assertContains(t, signals.StreamJSONMarkers, "error_during_execution")
@@ -572,12 +584,12 @@ func TestCommittedBaselineMatchesInstalledAmpBinaryWhenPathMatches(t *testing.T)
 var knownPromptTagSetCountValues = map[string]int{
 	"prompt/artifacts,painter,skills,tools":             1,
 	"prompt/compaction":                                 6,
-	"prompt/guidance":                                   6,
+	"prompt/guidance":                                   5,
 	"prompt/painter":                                    1,
-	"prompt/skills":                                     6,
+	"prompt/skills":                                     7,
 	"prompt/skills,system-prompt,tools":                 1,
 	"prompt/skills,tools":                               2,
-	"prompt/tools":                                      34,
+	"prompt/tools":                                      36,
 	"source/artifacts,compaction,guidance,skills,tools": 1,
 	"source/artifacts,code-review,painter,skills,tools": 1,
 	"source/artifacts,compaction,painter,skills,tools":  1,
@@ -597,12 +609,12 @@ var knownPromptTagSetCountValues = map[string]int{
 	"source/painter,skills":                             1,
 	"source/painter,tools":                              1,
 	"source/settings":                                   3,
-	"source/settings,skills,tools":                      3,
+	"source/settings,skills,tools":                      1,
 	"source/settings,system-prompt,tools":               1,
 	"source/settings,tools":                             7,
 	"source/skills":                                     12,
-	"source/skills,tools":                               16,
-	"source/tools":                                      103,
+	"source/skills,tools":                               18,
+	"source/tools":                                      105,
 }
 
 func TestLifecycleChecklistKnownPromptTagCountsRunFocusedChecks(t *testing.T) {
@@ -1391,6 +1403,8 @@ func TestLifecycleChecklistEveryDiffCategoryHasChecklistPath(t *testing.T) {
 	}}
 	cases := []lifecycleChecklistDiffCase{
 		{name: "binary-source", value: "version=0.0.9999999999-gabcdef"},
+		{name: "cli-command-literals", value: "apps"},
+		{name: "cli-control-surfaces", value: "apps=amp-owned"},
 		{name: "routes", value: "/api/provider/openai/v1"},
 		{name: "route-methods", value: "/metadata=GET=local-runtime"},
 		{name: "route-coverage", value: "/api/provider/openai/v1=local-runtime"},
@@ -1459,6 +1473,8 @@ func TestLifecycleChecklistEveryDiffCategoryHasChecklistPath(t *testing.T) {
 
 func TestDiffSnapshotsCoversEverySignalField(t *testing.T) {
 	signalDiffCategories := map[string][]string{
+		"cli_command_literals":       {"cli-command-literals"},
+		"cli_control_surfaces":       {"cli-control-surfaces"},
 		"routes":                     {"routes"},
 		"route_methods":              {"route-methods"},
 		"route_coverage":             {"route-coverage"},
@@ -1534,6 +1550,8 @@ func TestLifecycleChecklistCommittedBaselineGuardsCoverEveryDiffCategory(t *test
 func committedBaselineChecklistGuardCategoriesForTest() []string {
 	return sortedStrings([]string{
 		"binary-source",
+		"cli-command-literals",
+		"cli-control-surfaces",
 		"routes",
 		"route-methods",
 		"route-coverage",
@@ -1968,6 +1986,20 @@ func TestAuditModelClassifiersRejectAmpNostromoNearMisses(t *testing.T) {
 				t.Fatalf("knownModelLimitNameShape accepted amp near miss %q", model)
 			}
 		})
+	}
+}
+
+func TestAuditModelPatternRejectsNumericOnlyOSeriesSuffixes(t *testing.T) {
+	if got := modelPattern.FindString("o4-1"); got != "" {
+		t.Fatalf("modelPattern matched arithmetic token %q", got)
+	}
+	if got := modelPattern.FindString("o3-mini"); got != "o3-mini" {
+		t.Fatalf("modelPattern matched %q, want o3-mini", got)
+	}
+	for _, model := range []string{"o1-2024-12-17", "o3-2025-04-16", "o3-2025-04-16-preview", "o3-2025-04-16.preview"} {
+		if got := modelPattern.FindString(model); got != model {
+			t.Fatalf("modelPattern matched %q, want %q", got, model)
+		}
 	}
 }
 
@@ -4360,10 +4392,16 @@ func TestBaselineWriteProblemsRejectsMissingReleaseSignalCategories(t *testing.T
 	}
 
 	problems := baselineWriteProblems(snapshot, auditDiff{}, true, false)
-	text := strings.Join(problems, "\n")
+	categoryProblem := ""
+	for _, problem := range problems {
+		if strings.HasPrefix(problem, "missing release signal categories:") {
+			categoryProblem = problem
+			break
+		}
+	}
 
-	assertContainsString(t, text, "missing release signal categories: routes")
-	assertContainsString(t, text, "route_methods")
+	assertContainsString(t, categoryProblem, "routes")
+	assertContainsString(t, categoryProblem, "route_methods")
 	if !strictAuditFailed(snapshot, auditDiff{}) {
 		t.Fatal("strict audit should fail for missing release signal categories")
 	}
@@ -4376,9 +4414,16 @@ func TestBaselineWriteProblemsRejectsMissingReleaseSourceMetadata(t *testing.T) 
 
 	problems := baselineWriteProblems(snapshot, auditDiff{}, true, false)
 	text := strings.Join(problems, "\n")
+	categoryProblem := ""
+	for _, problem := range problems {
+		if strings.HasPrefix(problem, "missing release signal categories:") {
+			categoryProblem = problem
+			break
+		}
+	}
 
 	assertContainsString(t, text, "missing release source metadata: sha256, versions, strings_scanned")
-	assertContainsString(t, text, "missing release signal categories: routes")
+	assertContainsString(t, categoryProblem, "routes")
 	if !strictAuditFailed(snapshot, auditDiff{}) {
 		t.Fatal("strict audit should fail for missing release source metadata")
 	}

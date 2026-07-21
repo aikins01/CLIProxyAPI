@@ -1,7 +1,8 @@
 {
-  "schema": 1,
+  "schema": 2,
   "source_url": "https://ampcode.com/",
   "routes": [
+    "/(app)/feed",
     "/(app)/projects",
     "/(app)/settings/plugins",
     "/(app)/settings/plugins/manage",
@@ -82,13 +83,70 @@
       ]
     },
     {
+      "name": "puck",
+      "scope": "upstream-web",
+      "required_together": [
+        [
+          "openPuckThread",
+          "puckContext",
+          "sendPuckContent"
+        ],
+        [
+          "PUCK_AGENT_MODE",
+          "serverOnly"
+        ]
+      ]
+    },
+    {
+      "name": "activity-and-search",
+      "scope": "upstream-web",
+      "required_all": [
+        "searchFeedRepositories",
+        "searchFeedUsers",
+        "selectedSearchQuery",
+        "selectedRepositoryKey",
+        "selectedStatusKey",
+        "threadSearchRequest"
+      ]
+    },
+    {
+      "name": "create-thread-agent-modes",
+      "scope": "upstream-web",
+      "required_all": [
+        "listServerPluginAgentModes",
+        "createProjectThread",
+        "agentMode",
+        "reasoningEffort"
+      ]
+    },
+    {
+      "name": "create-thread-attachments",
+      "scope": "upstream-web",
+      "required_together": [
+        [
+          "uploadAttachment",
+          "Failed to upload image"
+        ],
+        [
+          "buildCommandPaletteUserMessageContent",
+          "createProjectThread",
+          "result.initialThread"
+        ]
+      ]
+    },
+    {
       "name": "projects-and-sidebar",
-      "scope": "userscript",
+      "scope": "upstream-web",
       "required_all": [
         "workingDirectory",
         "repositoryURL",
         "projectID",
-        "executorConnected"
+        "executorConnected",
+        "listThreadListSidebar",
+        "archiveThreadCommand",
+        "markThreadUnreadCommand",
+        "pinThreadCommand",
+        "createProjectThread"
       ]
     }
   ]

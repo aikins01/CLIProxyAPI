@@ -59,7 +59,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	threadID := flags.String("thread", "", "only scan one Amp thread ID across thread files and provider captures")
 	sinceRaw := flags.String("since", "", "only scan files modified at or after this RFC3339 timestamp")
 	sinceFile := flags.String("since-file", "", "only scan files and timestamped thread messages at or after this file's modification time")
-	sinceHomebrewRuntime := flags.Bool("since-homebrew-runtime", false, "only scan data at or after the Homebrew cliproxyapi.real replacement time")
+	sinceHomebrewRuntime := flags.Bool("since-homebrew-runtime", false, "only scan data at or after the latest Homebrew cliproxyapi runtime replacement time")
 	allowMissing := flags.Bool("allow-missing", true, "treat missing scan directories as empty")
 	jsonOutput := flags.Bool("json", false, "print findings as JSON")
 	summaryOutput := flags.Bool("summary", false, "print grouped finding summary instead of individual findings")
@@ -216,10 +216,7 @@ func parseSinceCutoff(sinceRaw, sinceFile string, sinceHomebrewRuntime bool) (ti
 		}
 	}
 	if sinceHomebrewRuntime {
-		fileTime, err := fileModTime(homebrewRuntimeBinaryPath())
-		if err != nil && errors.Is(err, os.ErrNotExist) {
-			fileTime, err = fileModTime(homebrewRuntimeFallbackBinaryPath())
-		}
+		fileTime, err := newestFileModTime(homebrewRuntimeBinaryPath(), homebrewRuntimeFallbackBinaryPath())
 		if err != nil {
 			return time.Time{}, fmt.Errorf("stat -since-homebrew-runtime: %w", err)
 		}
@@ -228,6 +225,28 @@ func parseSinceCutoff(sinceRaw, sinceFile string, sinceHomebrewRuntime bool) (ti
 		}
 	}
 	return since, nil
+}
+
+func newestFileModTime(paths ...string) (time.Time, error) {
+	var newest time.Time
+	var missingErr error
+	for _, path := range paths {
+		fileTime, err := fileModTime(path)
+		if err == nil {
+			if newest.IsZero() || fileTime.After(newest) {
+				newest = fileTime
+			}
+			continue
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return time.Time{}, err
+		}
+		missingErr = err
+	}
+	if newest.IsZero() {
+		return time.Time{}, missingErr
+	}
+	return newest, nil
 }
 
 func fileModTime(path string) (time.Time, error) {
@@ -402,14 +421,21 @@ func scanThreadDir(dir string, since time.Time, allowMissing bool, threadScope, 
 		}
 		findings = append(findings, scanThreadQueuedMessageDrift(file, threadID, thread, since)...)
 		toolNames := map[string]string{}
+		cancelledToolCalls := map[string]bool{}
 		for _, rawMessage := range messages {
 			for _, rawBlock := range arrayValue(mapValue(rawMessage)["content"]) {
 				block := mapValue(rawBlock)
-				if stringValue(block["type"]) != "tool_use" {
-					continue
-				}
-				if id := firstNonEmptyString(block["id"], block["toolUseID"], block["toolUseId"], block["tool_use_id"], block["toolCallId"]); id != "" {
-					toolNames[id] = stringValue(block["name"])
+				switch stringValue(block["type"]) {
+				case "tool_use":
+					if id := firstNonEmptyString(block["id"], block["toolUseID"], block["toolUseId"], block["tool_use_id"], block["toolCallId"]); id != "" {
+						toolNames[id] = stringValue(block["name"])
+					}
+				case "tool_result":
+					if strings.EqualFold(stringValue(mapValue(block["run"])["status"]), "cancelled") {
+						if id := firstNonEmptyString(block["toolUseID"], block["toolUseId"], block["tool_use_id"], block["toolCallId"], block["id"]); id != "" {
+							cancelledToolCalls[id] = true
+						}
+					}
 				}
 			}
 		}
@@ -425,7 +451,7 @@ func scanThreadDir(dir string, since time.Time, allowMissing bool, threadScope, 
 				case "tool_use":
 					toolID := firstNonEmptyString(block["id"], block["toolUseID"], block["toolUseId"], block["tool_use_id"], block["toolCallId"])
 					toolName := stringValue(block["name"])
-					if preview, ok := completedToolUseMalformedJSONFallback(message, block); ok {
+					if preview, ok := completedToolUseMalformedJSONFallback(message, block, cancelledToolCalls[toolID]); ok {
 						findings = append(findings, driftFinding{
 							Source:    "thread",
 							File:      file,
@@ -670,8 +696,17 @@ func scanThreadDanglingToolUseDrift(file, threadID string, messages []any, since
 			continue
 		}
 		parentToolID := threadMessageParentToolUseID(message)
-		findings = appendDanglingToolUseFindings(findings, file, threadID, pending, message, "later assistant message", since, parentToolID)
-		pending = pendingAfterDanglingBoundary(pending, parentToolID)
+		hasToolUse := false
+		for _, rawBlock := range arrayValue(message["content"]) {
+			if completedToolUseBlock(message, mapValue(rawBlock)) {
+				hasToolUse = true
+				break
+			}
+		}
+		if !hasToolUse || parentToolID == "" {
+			findings = appendDanglingToolUseFindings(findings, file, threadID, pending, message, "later assistant message", since, parentToolID)
+			pending = pendingAfterDanglingBoundary(pending, parentToolID)
+		}
 		for _, rawBlock := range arrayValue(message["content"]) {
 			block := mapValue(rawBlock)
 			if !completedToolUseBlock(message, block) {
@@ -1437,7 +1472,11 @@ func appendProviderToolRunFindings(findings []driftFinding, file, threadID, call
 	return findings
 }
 
-func completedToolUseMalformedJSONFallback(message, block map[string]any) (string, bool) {
+func completedToolUseMalformedJSONFallback(message, block map[string]any, toolCallCancelled bool) (string, bool) {
+	if strings.EqualFold(stringValue(mapValue(message["state"])["type"]), "cancelled") &&
+		(toolCallCancelled || strings.EqualFold(stringValue(block["blockState"]), "cancelled")) {
+		return "", false
+	}
 	if !completedToolUseBlock(message, block) || hasCustomRawInputMetadata(block) {
 		return "", false
 	}

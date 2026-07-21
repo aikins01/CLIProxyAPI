@@ -5,12 +5,17 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
+	"reflect"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 )
@@ -34,6 +39,244 @@ func mkResp(status int, hdr http.Header, body []byte) *http.Response {
 		Header:        hdr,
 		Body:          io.NopCloser(bytes.NewReader(body)),
 		ContentLength: int64(len(body)),
+	}
+}
+
+func TestAmpProxyThreadDeleteSucceededDecodesSvelteCommandResult(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "https://ampcode.com/_app/remote/145jw2/deleteThreadCommand", nil)
+	tests := []struct {
+		name   string
+		result map[string]any
+		want   bool
+	}{
+		{name: "success", result: map[string]any{"ok": true}, want: true},
+		{name: "application failure", result: neoWebLocalRemoteCommandError("permission denied"), want: false},
+		{name: "not found", result: map[string]any{"ok": false, "error": map[string]any{"code": "thread-not-found"}}, want: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			writeNeoSvelteKitRemoteCommand(recorder, http.StatusOK, tc.result)
+			if got := ampProxyThreadDeleteSucceeded(req, recorder.Body.Bytes()); got != tc.want {
+				t.Fatalf("delete success = %v, want %v; body=%s", got, tc.want, recorder.Body.String())
+			}
+		})
+	}
+}
+
+func TestAmpProxyThreadDeleteSucceededRejectsAmbiguousInternalResponses(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "https://ampcode.com/api/internal?deleteThread", nil)
+	for _, body := range []string{
+		`{}`,
+		`{"ok":"false"}`,
+		`{"ok":false}`,
+		`{"ok":false,"error":{"code":"permission-denied"}}`,
+		`not-json`,
+	} {
+		if ampProxyThreadDeleteSucceeded(req, []byte(body)) {
+			t.Fatalf("ambiguous delete response was accepted: %s", body)
+		}
+	}
+	if !ampProxyThreadDeleteSucceeded(req, []byte(`{"ok":true}`)) {
+		t.Fatal("explicit delete success was rejected")
+	}
+	if !ampProxyThreadDeleteSucceeded(req, []byte(`{"ok":false,"error":{"code":"thread-not-found"}}`)) {
+		t.Fatal("thread-not-found delete response was rejected")
+	}
+}
+
+type failingAmpProxyReadCloser struct{}
+
+func (failingAmpProxyReadCloser) Read([]byte) (int, error) {
+	return 0, errors.New("read failed")
+}
+
+func (failingAmpProxyReadCloser) Close() error {
+	return nil
+}
+
+func TestApplyAmpProxyThreadDeletePropagatesBodyReadFailure(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "https://ampcode.com/_app/remote/145jw2/deleteThreadCommand", nil)
+	req = req.WithContext(context.WithValue(req.Context(), ampProxyThreadDeleteContextKey{}, ampProxyThreadDelete{apply: func() error { return nil }}))
+	response := &http.Response{StatusCode: http.StatusOK, Request: req, Body: failingAmpProxyReadCloser{}}
+
+	err := applyAmpProxyThreadDelete(response)
+	if err == nil || !strings.Contains(err.Error(), "read delete response") {
+		t.Fatalf("error = %v, want response read failure", err)
+	}
+}
+
+func TestApplyAmpProxyThreadDeletePropagatesLocalPurgeFailure(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "https://ampcode.com/api/internal?method=deleteThread", nil)
+	req = req.WithContext(context.WithValue(req.Context(), ampProxyThreadDeleteContextKey{}, ampProxyThreadDelete{apply: func() error {
+		return errors.New("snapshot remove failed")
+	}}))
+	response := mkResp(http.StatusOK, http.Header{"Content-Type": []string{"application/json"}}, []byte(`{"ok":true}`))
+	response.Request = req
+
+	err := applyAmpProxyThreadDelete(response)
+	if err == nil || !strings.Contains(err.Error(), "purge local thread") || !strings.Contains(err.Error(), "snapshot remove failed") {
+		t.Fatalf("error = %v, want local purge failure", err)
+	}
+}
+
+func TestAttachNeoLocalThreadDeleteWaitsForCloudUpload(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+		UpstreamURL:    "https://ampcode.com",
+		UpstreamAPIKey: "secret",
+	}})
+	rt.threadDir = t.TempDir()
+	threadID := "T-019f7000-0000-7000-8000-000000000081"
+	actor := rt.store.ensureThreadActor(threadID)
+	actor.mu.Lock()
+	actor.title = "Delete upload race"
+	actor.mu.Unlock()
+	uploadStarted := make(chan struct{}, 2)
+	releaseUpload := make(chan struct{})
+	rt.uploadCloudSnapshot = func(neoCloudThreadSnapshot) (int64, error) {
+		uploadStarted <- struct{}{}
+		<-releaseUpload
+		return 1, nil
+	}
+	actor.syncCloudAsync()
+	select {
+	case <-uploadStarted:
+	case <-time.After(time.Second):
+		t.Fatal("cloud upload did not start")
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "https://ampcode.com/api/internal?deleteThread", bytes.NewBufferString(`{"params":{"thread":"`+threadID+`"}}`))
+	module := &AmpModule{neoRuntime: rt}
+	attached := make(chan struct{})
+	go func() {
+		module.attachNeoLocalThreadDelete(req)
+		close(attached)
+	}()
+	select {
+	case <-attached:
+		t.Fatal("delete was forwarded before the cloud upload finished")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(releaseUpload)
+	select {
+	case <-attached:
+	case <-time.After(time.Second):
+		t.Fatal("delete did not resume after the cloud upload finished")
+	}
+
+	response := mkResp(http.StatusOK, http.Header{"Content-Type": []string{"application/json"}}, []byte(`{"ok":true}`))
+	response.Request = req
+	if err := applyAmpProxyThreadDelete(response); err != nil {
+		t.Fatal(err)
+	}
+	if rt.store.lookupThreadActor(threadID) != nil || !rt.neoThreadDeleted(threadID) {
+		t.Fatal("successful delete did not purge and tombstone the local thread")
+	}
+	actor.syncCloudAsync()
+	select {
+	case <-uploadStarted:
+		t.Fatal("deleted thread scheduled another cloud upload")
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestApplyAmpProxyThreadDeleteRestoresCloudSyncAfterFailure(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+		UpstreamURL:    "https://ampcode.com",
+		UpstreamAPIKey: "secret",
+	}})
+	rt.threadDir = t.TempDir()
+	threadID := "T-019f7000-0000-7000-8000-000000000082"
+	actor := rt.store.ensureThreadActor(threadID)
+	actor.mu.Lock()
+	actor.title = "Failed cloud delete"
+	actor.mu.Unlock()
+	uploaded := make(chan struct{}, 1)
+	rt.uploadCloudSnapshot = func(neoCloudThreadSnapshot) (int64, error) {
+		uploaded <- struct{}{}
+		return 1, nil
+	}
+	req := httptest.NewRequest(http.MethodPost, "https://ampcode.com/api/internal?deleteThread", bytes.NewBufferString(`{"params":{"thread":"`+threadID+`"}}`))
+	module := &AmpModule{neoRuntime: rt}
+	module.attachNeoLocalThreadDelete(req)
+	response := mkResp(http.StatusOK, http.Header{"Content-Type": []string{"application/json"}}, []byte(`{"ok":false,"error":{"code":"permission-denied"}}`))
+	response.Request = req
+	if err := applyAmpProxyThreadDelete(response); err != nil {
+		t.Fatal(err)
+	}
+	actor.syncCloudAsync()
+	select {
+	case <-uploaded:
+	case <-time.After(time.Second):
+		t.Fatal("failed delete did not restore cloud synchronization")
+	}
+	waitForNeoActorSyncIdle(t, actor)
+}
+
+func TestModifyResponseRestoresThreadDeleteWhenResponseIsSkipped(t *testing.T) {
+	proxy, err := createReverseProxy("http://example.com", NewStaticSecretSource("k"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name   string
+		header http.Header
+	}{
+		{name: "encoded", header: http.Header{"Content-Encoding": []string{"gzip"}}},
+		{name: "streaming", header: http.Header{"Content-Type": []string{"text/event-stream"}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			applied := 0
+			restored := 0
+			req := httptest.NewRequest(http.MethodPost, "https://ampcode.com/api/internal?deleteThread", nil)
+			req = req.WithContext(context.WithValue(req.Context(), ampProxyThreadDeleteContextKey{}, ampProxyThreadDelete{
+				apply: func() error {
+					applied++
+					return nil
+				},
+				restore: func() {
+					restored++
+				},
+			}))
+			response := mkResp(http.StatusOK, test.header, []byte(`{"ok":true}`))
+			response.Request = req
+			if err := proxy.ModifyResponse(response); err != nil {
+				t.Fatal(err)
+			}
+			if applied != 0 || restored != 1 {
+				t.Fatalf("apply calls = %d, restore calls = %d", applied, restored)
+			}
+		})
+	}
+}
+
+func TestNeoCloudThreadDeleteStaysBlockedUntilAllAttemptsFinish(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019f7000-0000-7000-8000-000000000083"
+	actor := rt.store.ensureThreadActor(threadID)
+	first := rt.beginNeoCloudThreadDelete(threadID)
+	second := rt.beginNeoCloudThreadDelete(threadID)
+
+	rt.cancelNeoCloudThreadDelete(threadID, first)
+	if !rt.neoCloudThreadSyncBlocked(threadID) {
+		t.Fatal("first failed delete reopened cloud synchronization while another delete was pending")
+	}
+	actor.mu.Lock()
+	closing := actor.cloudSyncClosing
+	actor.mu.Unlock()
+	if !closing {
+		t.Fatal("first failed delete reopened actor cloud synchronization")
+	}
+
+	rt.cancelNeoCloudThreadDelete(threadID, second)
+	if rt.neoCloudThreadSyncBlocked(threadID) {
+		t.Fatal("final failed delete left cloud synchronization blocked")
+	}
+	actor.mu.Lock()
+	closing = actor.cloudSyncClosing
+	actor.mu.Unlock()
+	if closing {
+		t.Fatal("final failed delete did not reopen actor cloud synchronization")
 	}
 }
 
@@ -264,6 +507,640 @@ func TestModifyResponse_NormalizesBodyBasedThreadListRelationships(t *testing.T)
 		t.Fatalf("response JSON error: %v; body=%s", err, got)
 	}
 	assertThreadRelationshipsForTest(t, decoded)
+}
+
+func TestModifyResponse_MergesLocalRuntimeThreadsIntoUpstreamThreadList(t *testing.T) {
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled}}})
+	rt.threadDir = t.TempDir()
+	workingDirectory := t.TempDir()
+	localThreadID := "T-019f70b9-5c65-73a7-8629-3b394bd51d01"
+	if _, err := writeNeoLocalThreadFileInDir(rt.threadDir, localThreadID, map[string]any{
+		"id":    localThreadID,
+		"title": "Local unsynced thread",
+		"meta":  map[string]any{"cliProxyAPILocalNeo": true},
+		"env":   map[string]any{"workingDirectory": workingDirectory},
+		"messages": []any{
+			map[string]any{"messageId": "M-local", "role": "user", "content": []any{map[string]any{"type": "text", "text": "persist locally"}}},
+			map[string]any{"messageId": "M-local-assistant", "role": "assistant", "content": []any{map[string]any{"type": "tool_use", "name": "apply_patch", "input": map[string]any{"patchText": "*** Begin Patch\n*** Update File: example.go\n@@\n-old\n+new\n+extra\n*** End Patch"}}}},
+		},
+	}); err != nil {
+		t.Fatalf("write local thread: %v", err)
+	}
+
+	proxy, err := createReverseProxy("http://example.com", NewStaticSecretSource("k"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "http://proxy.local/api/internal?listThreads", strings.NewReader(`{"method":"listThreads","params":{"limit":20,"excludeLabelNames":["child-thread","review"]}}`))
+	m := &AmpModule{neoRuntime: rt}
+	m.attachNeoLocalThreadListAugmenter(req)
+	proxy.Director(req)
+	remoteThreadID := "T-019f70b9-5c65-73a7-8629-3b394bd51d02"
+	resp := mkResp(http.StatusOK, http.Header{"Content-Type": []string{"application/json"}}, []byte(`{"ok":true,"result":{"threads":[{"id":"`+remoteThreadID+`","threadId":"`+remoteThreadID+`","title":"Upstream thread","lastUserMessageAt":"2020-01-01T00:00:00Z"}]}}`))
+	resp.Request = req
+
+	if err := proxy.ModifyResponse(resp); err != nil {
+		t.Fatalf("ModifyResponse error: %v", err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	var decoded any
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		t.Fatalf("response JSON error: %v; body=%s", err, body)
+	}
+	threads := threadListItemsForTest(decoded)
+	if len(threads) != 2 {
+		t.Fatalf("thread list = %#v, want upstream and local threads", threads)
+	}
+	byID := map[string]map[string]any{}
+	for _, thread := range threads {
+		byID[ampThreadListItemID(thread)] = thread
+	}
+	local := byID[localThreadID]
+	if stringValue(local["title"]) != "Local unsynced thread" {
+		t.Fatalf("local thread = %#v", local)
+	}
+	if stringValue(local["projectName"]) != filepath.Base(workingDirectory) {
+		t.Fatalf("local projectName = %#v, want %q", local["projectName"], filepath.Base(workingDirectory))
+	}
+	if _, ok := local["relationships"].([]any); !ok {
+		t.Fatalf("local relationships = %#v, want array", local["relationships"])
+	}
+	if _, err := time.Parse(time.RFC3339Nano, stringValue(local["userLastInteractedAt"])); err != nil {
+		t.Fatalf("local userLastInteractedAt = %#v: %v", local["userLastInteractedAt"], err)
+	}
+	if numberFrom(local["messageCount"]) != 2 {
+		t.Fatalf("local messageCount = %#v, want 2", local["messageCount"])
+	}
+	summaryStats := mapValue(local["summaryStats"])
+	if numberFrom(summaryStats["messageCount"]) != 2 {
+		t.Fatalf("local summaryStats = %#v, want messageCount 2", local["summaryStats"])
+	}
+	diffStats := mapValue(summaryStats["diffStats"])
+	if numberFrom(diffStats["added"]) != 2 || numberFrom(diffStats["changed"]) != 1 || numberFrom(diffStats["deleted"]) != 1 {
+		t.Fatalf("local diffStats = %#v, want added 2 changed 1 deleted 1", diffStats)
+	}
+	if stringValue(local["executorType"]) != "local-client" {
+		t.Fatalf("local executorType = %#v, want local-client", local["executorType"])
+	}
+	trees := arrayValue(nestedValue(nestedValue(local["env"], "initial"), "trees"))
+	if len(trees) != 1 || stringValue(mapValue(trees[0])["uri"]) == "" {
+		t.Fatalf("local env initial trees = %#v, want workspace", trees)
+	}
+	if numberFrom(local["created"]) <= 0 {
+		t.Fatalf("local created = %#v, want timestamp", local["created"])
+	}
+	if byID[remoteThreadID] == nil {
+		t.Fatalf("upstream thread missing from %#v", threads)
+	}
+}
+
+func TestAttachNeoLocalThreadListAugmenterLoadsRequestedWindow(t *testing.T) {
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled}}})
+	rt.threadDir = t.TempDir()
+	for index := range 3 {
+		threadID := fmt.Sprintf("T-019f70b9-5c65-73a7-8629-%012x", index+1)
+		if err := writeNeoLocalThreadSnapshotToDir(neoCloudThreadSnapshot{
+			threadID:  threadID,
+			createdMs: int64(1778170000000 + index),
+			title:     fmt.Sprintf("Local thread %d", index+1),
+			messages: []neoMessage{{
+				MessageID: fmt.Sprintf("M-local-%d", index+1),
+				Role:      "user",
+				Content:   []any{map[string]any{"type": "text", "text": "persist locally"}},
+			}},
+		}, rt.threadDir); err != nil {
+			t.Fatalf("write local thread %d: %v", index+1, err)
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "http://proxy.local/api/internal?listThreads", strings.NewReader(`{"method":"listThreads","params":{"offset":2,"limit":1}}`))
+	m := &AmpModule{neoRuntime: rt}
+	m.attachNeoLocalThreadListAugmenter(req)
+	augmenter, ok := req.Context().Value(ampProxyThreadListAugmenterContextKey{}).(ampProxyThreadListAugmenter)
+	if !ok || augmenter.load == nil {
+		t.Fatal("thread list augmenter was not attached")
+	}
+	if loaded := augmenter.load(3); len(loaded) != 3 {
+		t.Fatalf("loaded local thread window = %d, want 3", len(loaded))
+	}
+}
+
+func TestRewriteAmpThreadListRequestWindowAddsOmittedQueryOffset(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "http://proxy.local/api/internal?method=listThreads&limit=20", nil)
+	if !rewriteAmpThreadListRequestWindow(req, ampProxyThreadListAugmenter{limit: 20, upstreamOverfetch: 1}) {
+		t.Fatal("query-only listThreads window rewrite was rejected")
+	}
+	query := req.URL.Query()
+	if query.Get("offset") != "0" || query.Get("limit") != "21" {
+		t.Fatalf("rewritten query = %q", req.URL.RawQuery)
+	}
+}
+
+func TestModifyResponse_MergesArchivedLocalRuntimeThreadsWhenRequested(t *testing.T) {
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled}}})
+	rt.threadDir = t.TempDir()
+	threadID := "T-019f70b9-5c65-73a7-8629-3b394bd51d03"
+	if _, err := writeNeoLocalThreadFileInDir(rt.threadDir, threadID, map[string]any{
+		"id":       threadID,
+		"title":    "Archived local thread",
+		"archived": true,
+		"meta":     map[string]any{"cliProxyAPILocalNeo": true},
+		"messages": []any{map[string]any{"messageId": "M-local", "role": "user", "content": []any{map[string]any{"type": "text", "text": "archived locally"}}}},
+	}); err != nil {
+		t.Fatalf("write local thread: %v", err)
+	}
+
+	proxy, err := createReverseProxy("http://example.com", NewStaticSecretSource("k"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defaultReq := httptest.NewRequest(http.MethodPost, "http://proxy.local/api/internal?listThreads", strings.NewReader(`{"method":"listThreads","params":{"limit":20}}`))
+	m := &AmpModule{neoRuntime: rt}
+	m.attachNeoLocalThreadListAugmenter(defaultReq)
+	proxy.Director(defaultReq)
+	defaultResp := mkResp(http.StatusOK, http.Header{"Content-Type": []string{"application/json"}}, []byte(`{"ok":true,"result":{"threads":[{"id":"`+threadID+`","title":"stale upstream copy"}]}}`))
+	defaultResp.Request = defaultReq
+	if err := proxy.ModifyResponse(defaultResp); err != nil {
+		t.Fatalf("default ModifyResponse error: %v", err)
+	}
+	defaultBody, err := io.ReadAll(defaultResp.Body)
+	if err != nil {
+		t.Fatalf("read default response: %v", err)
+	}
+	if threads := threadListItemsForTest(readNeoJSON(bytes.NewReader(defaultBody))); len(threads) != 0 {
+		t.Fatalf("default thread list retained archived upstream copy: %#v", threads)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "http://proxy.local/api/internal?listThreads", strings.NewReader(`{"method":"listThreads","params":{"includeArchived":true,"limit":20}}`))
+	m.attachNeoLocalThreadListAugmenter(req)
+	proxy.Director(req)
+	resp := mkResp(http.StatusOK, http.Header{"Content-Type": []string{"application/json"}}, []byte(`{"ok":true,"result":{"threads":[]}}`))
+	resp.Request = req
+
+	if err := proxy.ModifyResponse(resp); err != nil {
+		t.Fatalf("ModifyResponse error: %v", err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	threads := threadListItemsForTest(readNeoJSON(bytes.NewReader(body)))
+	if len(threads) != 1 || ampThreadListItemID(threads[0]) != threadID || !boolValue(threads[0]["archived"]) {
+		t.Fatalf("archived-inclusive thread list = %#v", threads)
+	}
+}
+
+func TestModifyResponse_RemovesStaleUpstreamCopyOfExcludedLocalThread(t *testing.T) {
+	threadID := "T-019f70b9-5c65-73a7-8629-3b394bd51d09"
+	proxy, err := createReverseProxy("http://example.com", NewStaticSecretSource("k"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "http://proxy.local/api/internal?listThreads", nil)
+	req = req.WithContext(context.WithValue(req.Context(), ampProxyThreadListAugmenterContextKey{}, ampProxyThreadListAugmenter{
+		excludedLabelNames: map[string]bool{"review": true},
+		load: func(int) []any {
+			return []any{map[string]any{"id": threadID, "messageCount": 1, "labels": []any{"review"}}}
+		},
+	}))
+	resp := mkResp(http.StatusOK, http.Header{"Content-Type": []string{"application/json"}}, []byte(`{"ok":true,"result":{"threads":[{"thread":{"data":{"id":"`+threadID+`","title":"stale upstream","labels":[]}}}]}}`))
+	resp.Request = req
+
+	if err := proxy.ModifyResponse(resp); err != nil {
+		t.Fatalf("ModifyResponse error: %v", err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	var decoded any
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		t.Fatalf("response JSON error: %v; body=%s", err, body)
+	}
+	if threads := threadListItemsForTest(decoded); len(threads) != 0 {
+		t.Fatalf("excluded local thread survived as upstream duplicate: %#v", threads)
+	}
+}
+
+func TestNormalizeAmpThreadListResponseUsesSelectedLoaderWithoutFullScan(t *testing.T) {
+	threadID := "T-019f70b9-5c65-73a7-8629-3b394bd51d19"
+	fullLoadCalls := 0
+	selectedLoadCalls := 0
+	req := httptest.NewRequest(http.MethodPost, "http://proxy.local/api/internal?listThreads", nil)
+	req = req.WithContext(context.WithValue(req.Context(), ampProxyThreadListAugmenterContextKey{}, ampProxyThreadListAugmenter{
+		threadIDs: map[string]bool{threadID: true},
+		load: func(int) []any {
+			fullLoadCalls++
+			return nil
+		},
+		selectedLoad: func(threadIDs map[string]bool) []any {
+			selectedLoadCalls++
+			if !threadIDs[threadID] {
+				t.Fatalf("selected thread IDs = %#v", threadIDs)
+			}
+			return []any{map[string]any{"id": threadID, "messageCount": 1}}
+		},
+	}))
+	resp := mkResp(http.StatusOK, http.Header{"Content-Type": []string{"application/json"}}, []byte(`{"ok":true,"result":{"threads":[]}}`))
+	resp.Request = req
+
+	if normalized := normalizeAmpThreadListResponse(resp, []byte(`{"ok":true,"result":{"threads":[]}}`)); normalized == nil {
+		t.Fatal("selected thread was not merged")
+	}
+	if fullLoadCalls != 0 || selectedLoadCalls != 1 {
+		t.Fatalf("loader calls = full:%d selected:%d, want 0/1", fullLoadCalls, selectedLoadCalls)
+	}
+}
+
+func TestNormalizeAmpThreadListResponseBoundsFullLoadAndReconcilesUpstreamIDs(t *testing.T) {
+	localThreadID := "T-019f70b9-5c65-73a7-8629-3b394bd51d33"
+	archivedThreadID := "T-019f70b9-5c65-73a7-8629-3b394bd51d34"
+	fullLoadLimit := 0
+	selectedLoadCalls := 0
+	req := httptest.NewRequest(http.MethodPost, "http://proxy.local/api/internal?listThreads", nil)
+	req = req.WithContext(context.WithValue(req.Context(), ampProxyThreadListAugmenterContextKey{}, ampProxyThreadListAugmenter{
+		limit: 20,
+		load: func(limit int) []any {
+			fullLoadLimit = limit
+			return []any{map[string]any{"id": localThreadID, "threadId": localThreadID, "title": "Local", "messageCount": 1}}
+		},
+		selectedLoad: func(threadIDs map[string]bool) []any {
+			selectedLoadCalls++
+			if len(threadIDs) != 1 || !threadIDs[archivedThreadID] {
+				t.Fatalf("upstream reconciliation IDs = %#v", threadIDs)
+			}
+			return []any{map[string]any{"id": archivedThreadID, "threadId": archivedThreadID, "title": "Archived", "messageCount": 1, "archived": true}}
+		},
+	}))
+	resp := mkResp(http.StatusOK, http.Header{"Content-Type": []string{"application/json"}}, []byte(`{"ok":true,"result":{"threads":[{"id":"`+archivedThreadID+`","threadId":"`+archivedThreadID+`","title":"stale upstream"}]}}`))
+	resp.Request = req
+
+	got := normalizeAmpThreadListResponse(resp, []byte(`{"ok":true,"result":{"threads":[{"id":"`+archivedThreadID+`","threadId":"`+archivedThreadID+`","title":"stale upstream"}]}}`))
+	if fullLoadLimit != 20 || selectedLoadCalls != 1 {
+		t.Fatalf("loader calls = limit:%d selected:%d, want 20/1", fullLoadLimit, selectedLoadCalls)
+	}
+	threads := threadListItemsForTest(readNeoJSON(bytes.NewReader(got)))
+	if len(threads) != 1 || ampThreadListItemID(threads[0]) != localThreadID {
+		t.Fatalf("threads = %#v, want only local visible thread", threads)
+	}
+}
+
+func TestModifyResponse_RemovesStaleUpstreamCopyOfEmptyLocalThread(t *testing.T) {
+	threadID := "T-019f70b9-5c65-73a7-8629-3b394bd51d10"
+	proxy, err := createReverseProxy("http://example.com", NewStaticSecretSource("k"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "http://proxy.local/api/internal?listThreads", nil)
+	req = req.WithContext(context.WithValue(req.Context(), ampProxyThreadListAugmenterContextKey{}, ampProxyThreadListAugmenter{
+		load: func(int) []any {
+			return []any{map[string]any{"id": threadID, "messageCount": 0}}
+		},
+	}))
+	resp := mkResp(http.StatusOK, http.Header{"Content-Type": []string{"application/json"}}, []byte(`{"ok":true,"result":{"threads":[{"id":"`+threadID+`","title":"stale upstream"}]}}`))
+	resp.Request = req
+
+	if err := proxy.ModifyResponse(resp); err != nil {
+		t.Fatalf("ModifyResponse error: %v", err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	if threads := threadListItemsForTest(readNeoJSON(bytes.NewReader(body))); len(threads) != 0 {
+		t.Fatalf("empty local thread survived as upstream duplicate: %#v", threads)
+	}
+}
+
+func TestMergeAmpThreadListItemsHonorsWindow(t *testing.T) {
+	remote1 := "T-019f70b9-5c65-73a7-8629-3b394bd51d11"
+	remote2 := "T-019f70b9-5c65-73a7-8629-3b394bd51d12"
+	local := "T-019f70b9-5c65-73a7-8629-3b394bd51d13"
+	merged, changed := mergeAmpThreadListItems([]any{
+		map[string]any{"id": remote1, "lastUserMessageAt": "2026-07-16T00:00:00Z"},
+		map[string]any{"id": remote2, "lastUserMessageAt": "2026-07-15T00:00:00Z"},
+	}, []any{
+		map[string]any{"id": local, "lastUserMessageAt": "2026-07-17T00:00:00Z"},
+	}, 0, 2)
+	if !changed || len(merged) != 2 {
+		t.Fatalf("merged = %#v changed=%v, want first two rows", merged, changed)
+	}
+	for index, want := range []string{local, remote1} {
+		if got := ampThreadListItemID(mapValue(merged[index])); got != want {
+			t.Fatalf("merged[%d] = %q, want %q", index, got, want)
+		}
+	}
+	secondPage, changed := mergeAmpThreadListItems([]any{
+		map[string]any{"id": remote1, "lastUserMessageAt": "2026-07-16T00:00:00Z"},
+		map[string]any{"id": remote2, "lastUserMessageAt": "2026-07-15T00:00:00Z"},
+	}, []any{
+		map[string]any{"id": local, "lastUserMessageAt": "2026-07-17T00:00:00Z"},
+	}, 2, 2)
+	if !changed || len(secondPage) != 1 || ampThreadListItemID(mapValue(secondPage[0])) != remote2 {
+		t.Fatalf("second page = %#v changed=%v, want displaced upstream row", secondPage, changed)
+	}
+}
+
+func TestMergeAmpThreadListItemsPreservesUpstreamRelationships(t *testing.T) {
+	threadID := "T-019f70b9-5c65-73a7-8629-3b394bd51d21"
+	parentID := "T-019f70b9-5c65-73a7-8629-3b394bd51d22"
+	merged, changed := mergeAmpThreadListItems([]any{
+		map[string]any{
+			"id":                threadID,
+			"lastUserMessageAt": "2026-07-16T00:00:00Z",
+			"relationships":     []any{map[string]any{"threadID": parentID}},
+		},
+	}, []any{
+		map[string]any{"id": threadID, "lastUserMessageAt": "2026-07-17T00:00:00Z", "relationships": []any{}},
+	}, 0, 20)
+	if !changed || len(merged) != 1 {
+		t.Fatalf("merged = %#v changed=%v", merged, changed)
+	}
+	relationships := arrayValue(mapValue(merged[0])["relationships"])
+	if len(relationships) != 1 || stringValue(mapValue(relationships[0])["threadID"]) != parentID {
+		t.Fatalf("relationships = %#v, want upstream relationship", relationships)
+	}
+}
+
+func TestMergeAmpThreadListItemsPreservesAuthoritativeUpstreamMetadata(t *testing.T) {
+	threadID := "T-019f70b9-5c65-73a7-8629-3b394bd51d26"
+	merged, changed := mergeAmpThreadListItems([]any{
+		map[string]any{
+			"id":                threadID,
+			"lastUserMessageAt": "2026-07-18T00:00:00Z",
+			"title":             "Cloud title",
+			"archived":          true,
+			"pinned":            true,
+			"creatorUserID":     "aikins01",
+			"ownerUserId":       "aikins01",
+			"creator":           map[string]any{"id": "aikins01", "name": "Aikins"},
+			"meta":              map[string]any{"repositoryURL": "https://github.com/aikins01/cloud.git"},
+		},
+	}, []any{
+		map[string]any{
+			"id":                threadID,
+			"lastUserMessageAt": "2026-07-19T00:00:00Z",
+			"title":             "Untitled",
+			"archived":          false,
+			"pinned":            false,
+			"creatorUserID":     "local-user",
+			"ownerUserId":       "local-user",
+			"creator":           map[string]any{"id": "local-user", "name": "Local Amp"},
+			"meta":              map[string]any{"repositoryURL": "file:///tmp/local", "ampcodeLocalRuntime": true},
+		},
+	}, 0, 20)
+	if !changed || len(merged) != 1 {
+		t.Fatalf("merged = %#v changed=%v", merged, changed)
+	}
+	thread, _ := ampThreadListItemThread(mapValue(merged[0]))
+	if stringValue(thread["title"]) != "Cloud title" || stringValue(thread["creatorUserID"]) != "aikins01" || stringValue(thread["ownerUserId"]) != "aikins01" {
+		t.Fatalf("cloud identity was replaced: %#v", thread)
+	}
+	if !boolValue(thread["archived"]) || !boolValue(thread["pinned"]) {
+		t.Fatalf("cloud flags were replaced: %#v", thread)
+	}
+	meta := mapValue(thread["meta"])
+	if stringValue(meta["repositoryURL"]) != "https://github.com/aikins01/cloud.git" || !boolValue(meta["ampcodeLocalRuntime"]) {
+		t.Fatalf("merged metadata = %#v", meta)
+	}
+}
+
+func TestMergeAmpThreadListItemsAppliesNewerLocalTitleAndExplicitPinOverride(t *testing.T) {
+	threadID := "T-019f70b9-5c65-73a7-8629-3b394bd51d27"
+	for _, test := range []struct {
+		name        string
+		cloudPinned bool
+		localPinned bool
+	}{
+		{name: "pin", cloudPinned: false, localPinned: true},
+		{name: "unpin", cloudPinned: true, localPinned: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			merged, changed := mergeAmpThreadListItems([]any{
+				map[string]any{
+					"id":                threadID,
+					"lastUserMessageAt": "2026-07-18T00:00:00Z",
+					"title":             "Stale cloud title",
+					"pinned":            test.cloudPinned,
+				},
+			}, []any{
+				map[string]any{
+					"id":                      threadID,
+					"lastUserMessageAt":       "2026-07-19T00:00:00Z",
+					"title":                   "Current local title",
+					"pinned":                  test.localPinned,
+					neoLocalPinnedOverrideKey: test.localPinned,
+				},
+			}, 0, 20)
+			if !changed || len(merged) != 1 {
+				t.Fatalf("merged = %#v changed=%v", merged, changed)
+			}
+			thread, _ := ampThreadListItemThread(mapValue(merged[0]))
+			if stringValue(thread["title"]) != "Current local title" || boolValue(thread["pinned"]) != test.localPinned {
+				t.Fatalf("merged local authority = %#v", thread)
+			}
+			if _, exists := thread[neoLocalPinnedOverrideKey]; exists {
+				t.Fatalf("local pin override leaked into response: %#v", thread)
+			}
+		})
+	}
+}
+
+func TestMergeAmpThreadListItemsPreservesWrappedRowShape(t *testing.T) {
+	existingID := "T-019f70b9-5c65-73a7-8629-3b394bd51d23"
+	localID := "T-019f70b9-5c65-73a7-8629-3b394bd51d24"
+	parentID := "T-019f70b9-5c65-73a7-8629-3b394bd51d25"
+	merged, changed := mergeAmpThreadListItems([]any{
+		map[string]any{"thread": map[string]any{"data": map[string]any{
+			"id": existingID, "title": "remote", "lastUserMessageAt": "2026-07-16T00:00:00Z",
+			"relationships": []any{map[string]any{"threadID": parentID}},
+		}}},
+	}, []any{
+		map[string]any{"id": existingID, "title": "local update", "lastUserMessageAt": "2026-07-17T00:00:00Z"},
+		map[string]any{"id": localID, "title": "local new", "lastUserMessageAt": "2026-07-18T00:00:00Z"},
+	}, 0, 20)
+	if !changed || len(merged) != 2 {
+		t.Fatalf("merged = %#v changed=%v", merged, changed)
+	}
+	byID := map[string]map[string]any{}
+	for _, raw := range merged {
+		item := mapValue(raw)
+		thread, shape := ampThreadListItemThread(item)
+		if !reflect.DeepEqual(shape, []string{"thread", "data"}) {
+			t.Fatalf("row shape = %#v, want wrapped thread/data", shape)
+		}
+		byID[ampThreadListItemID(item)] = thread
+	}
+	if stringValue(byID[existingID]["title"]) != "local update" {
+		t.Fatalf("updated wrapped thread = %#v", byID[existingID])
+	}
+	relationships := arrayValue(byID[existingID]["relationships"])
+	if len(relationships) != 1 || stringValue(mapValue(relationships[0])["threadID"]) != parentID {
+		t.Fatalf("wrapped relationships = %#v", relationships)
+	}
+	if stringValue(byID[localID]["title"]) != "local new" {
+		t.Fatalf("new wrapped thread = %#v", byID[localID])
+	}
+}
+
+func TestNormalizeAmpThreadListResponseFiltersBeforeLocalLimit(t *testing.T) {
+	targetID := "T-019f70b9-5c65-73a7-8629-3b394bd51d31"
+	unrelatedID := "T-019f70b9-5c65-73a7-8629-3b394bd51d32"
+	req := httptest.NewRequest(http.MethodPost, "http://proxy.local/api/internal?listThreads", nil)
+	augmenter := ampProxyThreadListAugmenter{
+		limit:     1,
+		threadIDs: map[string]bool{targetID: true},
+		load: func(limit int) []any {
+			if limit != 0 {
+				t.Fatalf("local summary load limit = %d, want 0 before filtering", limit)
+			}
+			return []any{map[string]any{"id": unrelatedID, "messageCount": 1}}
+		},
+		selectedLoad: func(threadIDs map[string]bool) []any {
+			if !threadIDs[targetID] {
+				t.Fatalf("selected thread IDs = %#v", threadIDs)
+			}
+			return []any{map[string]any{"id": targetID, "messageCount": 1}}
+		},
+	}
+	req = req.WithContext(context.WithValue(req.Context(), ampProxyThreadListAugmenterContextKey{}, augmenter))
+	resp := mkResp(http.StatusOK, http.Header{"Content-Type": []string{"application/json"}}, []byte(`{"ok":true,"result":{"threads":[]}}`))
+	resp.Request = req
+	got := normalizeAmpThreadListResponse(resp, []byte(`{"ok":true,"result":{"threads":[]}}`))
+	threads := threadListItemsForTest(readNeoJSON(bytes.NewReader(got)))
+	if len(threads) != 1 || ampThreadListItemID(threads[0]) != targetID {
+		t.Fatalf("threads = %#v, want selected local thread", threads)
+	}
+}
+
+func TestAmpProxyThreadListAugmenterRequestsIdentityEncoding(t *testing.T) {
+	proxy, err := createReverseProxy("http://example.com", NewStaticSecretSource("k"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "http://proxy.local/api/internal?listThreads", nil)
+	req.Header.Set("Accept-Encoding", "gzip, br")
+	req = req.WithContext(context.WithValue(req.Context(), ampProxyThreadListAugmenterContextKey{}, ampProxyThreadListAugmenter{}))
+	proxy.Director(req)
+	if got := req.Header.Get("Accept-Encoding"); got != "identity" {
+		t.Fatalf("Accept-Encoding = %q, want identity", got)
+	}
+}
+
+func TestAmpThreadListRequestAugmenterHonorsSelectors(t *testing.T) {
+	queryPageReq := httptest.NewRequest(http.MethodPost, "http://proxy.local/api/internal?method=listThreads&offset=20&limit=10", nil)
+	queryPageAugmenter, ok := ampThreadListRequestAugmenter(queryPageReq)
+	if !ok || !rewriteAmpThreadListRequestWindow(queryPageReq, queryPageAugmenter) {
+		t.Fatalf("query-only page augmenter = %#v ok=%v", queryPageAugmenter, ok)
+	}
+	if got := queryPageReq.URL.Query(); got.Get("offset") != "0" || got.Get("limit") != "30" {
+		t.Fatalf("rewritten query-only page = %q", queryPageReq.URL.RawQuery)
+	}
+
+	pageReq := httptest.NewRequest(http.MethodPost, "http://proxy.local/api/internal?listThreads", strings.NewReader(`{"method":"listThreads","params":{"offset":20,"limit":10}}`))
+	pageAugmenter, ok := ampThreadListRequestAugmenter(pageReq)
+	if !ok || pageAugmenter.offset != 20 || pageAugmenter.limit != 10 {
+		t.Fatalf("page augmenter = %#v ok=%v", pageAugmenter, ok)
+	}
+	if !rewriteAmpThreadListRequestWindow(pageReq, pageAugmenter) {
+		t.Fatal("page request was not rewritten")
+	}
+	pageBody, err := readAndRestoreNeoJSONBody(pageReq)
+	if err != nil {
+		t.Fatalf("page body: %v", err)
+	}
+	pageParams := mapValue(pageBody["params"])
+	if numberFrom(pageParams["offset"]) != 0 || numberFrom(pageParams["limit"]) != 30 {
+		t.Fatalf("rewritten page params = %#v", pageParams)
+	}
+
+	installationReq := httptest.NewRequest(http.MethodPost, "http://proxy.local/api/internal?listThreads&installationID=install-other", strings.NewReader(`{"method":"listThreads","params":{"limit":20}}`))
+	if _, ok = ampThreadListRequestAugmenter(installationReq); ok {
+		t.Fatal("query installation ID unexpectedly enabled local augmentation")
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "http://proxy.local/api/internal?listThreads", strings.NewReader(`{"method":"listThreads","params":{"limit":50,"includeEmpty":true,"threadIDs":["T-1"],"excludeLabelNames":["review"]}}`))
+	augmenter, ok := ampThreadListRequestAugmenter(req)
+	if !ok || augmenter.limit != 50 || !augmenter.includeEmpty || !augmenter.threadIDs["T-1"] || !augmenter.excludedLabelNames["review"] {
+		t.Fatalf("augmenter = %#v ok=%v", augmenter, ok)
+	}
+	archivedReq := httptest.NewRequest(http.MethodPost, "http://proxy.local/api/internal?listThreads", strings.NewReader(`{"method":"listThreads","params":{"includeArchived":true,"limit":20}}`))
+	archivedAugmenter, ok := ampThreadListRequestAugmenter(archivedReq)
+	if !ok || !archivedAugmenter.includeArchived {
+		t.Fatalf("archived augmenter = %#v ok=%v", archivedAugmenter, ok)
+	}
+	filtered := filterAmpThreadListLocalThreads([]any{
+		map[string]any{"id": "T-1", "messageCount": 1, "labels": []any{}},
+		map[string]any{"id": "T-2", "messageCount": 1, "labels": []any{}},
+	}, augmenter)
+	if len(filtered) != 1 || ampThreadListItemID(mapValue(filtered[0])) != "T-1" {
+		t.Fatalf("filtered threads = %#v", filtered)
+	}
+	filtered = filterAmpThreadListLocalThreads([]any{
+		map[string]any{"id": "T-1", "messageCount": 1, "labels": []any{"review"}},
+		map[string]any{"id": "T-2", "messageCount": 0, "labels": []any{}},
+		map[string]any{"id": "T-3", "messageCount": 1, "labels": []any{}},
+	}, ampProxyThreadListAugmenter{excludedLabelNames: map[string]bool{"review": true}})
+	if len(filtered) != 1 || ampThreadListItemID(mapValue(filtered[0])) != "T-3" {
+		t.Fatalf("label/empty filtered threads = %#v", filtered)
+	}
+	filtered = filterAmpThreadListLocalThreads([]any{
+		map[string]any{"id": "T-1", "messageCount": 1, "archived": true},
+		map[string]any{"id": "T-2", "messageCount": 1},
+	}, archivedAugmenter)
+	if len(filtered) != 2 {
+		t.Fatalf("archived-inclusive filtered threads = %#v", filtered)
+	}
+}
+
+func TestAmpThreadListPaginationRefillsRowsExcludedByLocalState(t *testing.T) {
+	excludedID := "T-019f70b9-5c65-73a7-8629-3b394bd51d40"
+	visibleIDs := []string{
+		"T-019f70b9-5c65-73a7-8629-3b394bd51d41",
+		"T-019f70b9-5c65-73a7-8629-3b394bd51d42",
+	}
+	upstreamThreads := []any{
+		map[string]any{"id": excludedID, "title": "archived upstream duplicate", "messageCount": 1},
+		map[string]any{"id": visibleIDs[0], "title": "visible first", "messageCount": 1},
+		map[string]any{"id": visibleIDs[1], "title": "visible second", "messageCount": 1},
+	}
+	localThreads := []any{map[string]any{"id": excludedID, "archived": true, "messageCount": 1}}
+
+	for page, wantID := range visibleIDs {
+		offset := page
+		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("http://proxy.local/api/internal?method=listThreads&offset=%d&limit=1", offset), nil)
+		augmenter, ok := ampThreadListRequestAugmenter(req)
+		if !ok {
+			t.Fatalf("page %d request did not produce an augmenter", page)
+		}
+		augmenter.upstreamOverfetch = len(localThreads)
+		augmenter.load = func(int) []any { return localThreads }
+		if !rewriteAmpThreadListRequestWindow(req, augmenter) {
+			t.Fatalf("page %d request was not rewritten", page)
+		}
+		if got, want := req.URL.Query().Get("limit"), strconv.Itoa(offset+2); got != want {
+			t.Fatalf("page %d upstream limit = %q, want %q", page, got, want)
+		}
+		req = req.WithContext(context.WithValue(req.Context(), ampProxyThreadListAugmenterContextKey{}, augmenter))
+		payload := map[string]any{"ok": true, "result": map[string]any{"threads": upstreamThreads[:offset+2]}}
+		body, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp := mkResp(http.StatusOK, http.Header{"Content-Type": []string{"application/json"}}, body)
+		resp.Request = req
+		normalized := normalizeAmpThreadListResponse(resp, body)
+		threads := threadListItemsForTest(readNeoJSON(bytes.NewReader(normalized)))
+		if len(threads) != 1 || ampThreadListItemID(threads[0]) != wantID {
+			t.Fatalf("page %d threads = %#v, want %s", page, threads, wantID)
+		}
+	}
 }
 
 func TestAmpProxyInternalRPCMethodUsesQueryBeforeBody(t *testing.T) {
