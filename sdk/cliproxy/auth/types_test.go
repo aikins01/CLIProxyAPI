@@ -3,10 +3,35 @@ package auth
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
+
+type metadataCloneRecord struct {
+	Values  []string
+	Payload [1][]byte
+	Count   *int
+}
+
+type metadataCloneMap map[string][]byte
+
+type metadataLockedRecord struct {
+	Lock   sync.Mutex
+	Values []string
+}
+
+type metadataOpaqueLeafRecord struct {
+	Channel chan int
+	Values  []string
+}
+
+type metadataPrivateStateRecord struct {
+	private string
+	Values  []string
+}
 
 func TestToolPrefixDisabled(t *testing.T) {
 	var a *Auth
@@ -37,6 +62,121 @@ func TestToolPrefixDisabled(t *testing.T) {
 	a = &Auth{Metadata: map[string]any{"tool_prefix_disabled": false}}
 	if a.ToolPrefixDisabled() {
 		t.Error("should return false when set to false")
+	}
+}
+
+func TestCloneMetadataDetachesReferenceValues(t *testing.T) {
+	count := 3
+	customMap := metadataCloneMap{"key": {1, 2}}
+	record := &metadataCloneRecord{
+		Values:  []string{"first"},
+		Payload: [1][]byte{{3, 4}},
+		Count:   &count,
+	}
+	nested := map[string]any{"items": []any{[]byte{5, 6}}}
+	cycle := map[string]any{}
+	cycle["self"] = cycle
+	original := map[string]any{
+		"bool":       true,
+		"int":        7,
+		"string":     "value",
+		"time":       time.Unix(1_700_000_000, 0),
+		"custom_map": customMap,
+		"record":     record,
+		"nested":     nested,
+		"cycle":      cycle,
+	}
+
+	cloned := cloneMetadata(original)
+	customMap["key"][0] = 9
+	record.Values[0] = "changed"
+	record.Payload[0][0] = 9
+	*record.Count = 9
+	nested["items"].([]any)[0].([]byte)[0] = 9
+	cycle["original-only"] = true
+
+	if cloned["bool"] != true || cloned["int"] != 7 || cloned["string"] != "value" || cloned["time"] != original["time"] {
+		t.Fatalf("immutable clone values = %#v", cloned)
+	}
+	if got := cloned["custom_map"].(metadataCloneMap)["key"][0]; got != 1 {
+		t.Fatalf("custom map clone byte = %d, want 1", got)
+	}
+	clonedRecord := cloned["record"].(*metadataCloneRecord)
+	if clonedRecord == record || clonedRecord.Values[0] != "first" || clonedRecord.Payload[0][0] != 3 || *clonedRecord.Count != 3 {
+		t.Fatalf("record clone = %#v", clonedRecord)
+	}
+	if got := cloned["nested"].(map[string]any)["items"].([]any)[0].([]byte)[0]; got != 5 {
+		t.Fatalf("nested clone byte = %d, want 5", got)
+	}
+	clonedCycle := cloned["cycle"].(map[string]any)
+	if _, ok := clonedCycle["original-only"]; ok {
+		t.Fatal("cycle clone shares mutations with original")
+	}
+	clonedCycle["self"].(map[string]any)["clone-only"] = true
+	if _, ok := clonedCycle["clone-only"]; !ok {
+		t.Fatal("cycle clone did not preserve its self reference")
+	}
+}
+
+func TestCloneMetadataPreservesOpaqueReferenceValues(t *testing.T) {
+	channel := make(chan int)
+	function := func() {}
+	cloned := cloneMetadata(map[string]any{
+		"channel":  channel,
+		"function": function,
+	})
+
+	if cloned["channel"] != channel || reflect.ValueOf(cloned["function"]).Pointer() != reflect.ValueOf(function).Pointer() {
+		t.Fatalf("clone = %#v", cloned)
+	}
+}
+
+func TestCloneMetadataDetachesContainersWithOpaqueLeaves(t *testing.T) {
+	channel := make(chan int)
+	function := func() {}
+	channels := map[string]chan int{"original": channel}
+	functions := []func(){function}
+	record := &metadataOpaqueLeafRecord{Channel: channel, Values: []string{"original"}}
+	cloned := cloneMetadata(map[string]any{
+		"channels":  channels,
+		"functions": functions,
+		"record":    record,
+	})
+
+	channels["added"] = make(chan int)
+	functions[0] = func() {}
+	record.Values[0] = "changed"
+
+	clonedChannels := cloned["channels"].(map[string]chan int)
+	if len(clonedChannels) != 1 || clonedChannels["original"] != channel {
+		t.Fatalf("channel map clone = %#v", clonedChannels)
+	}
+	clonedFunctions := cloned["functions"].([]func())
+	if len(clonedFunctions) != 1 || reflect.ValueOf(clonedFunctions[0]).Pointer() != reflect.ValueOf(function).Pointer() {
+		t.Fatalf("function slice clone = %#v", clonedFunctions)
+	}
+	clonedRecord := cloned["record"].(*metadataOpaqueLeafRecord)
+	if clonedRecord == record || clonedRecord.Channel != channel || clonedRecord.Values[0] != "original" {
+		t.Fatalf("record clone = %#v", clonedRecord)
+	}
+}
+
+func TestCloneMetadataPreservesStructsWithSynchronizationState(t *testing.T) {
+	record := &metadataLockedRecord{Values: []string{"value"}}
+	record.Lock.Lock()
+	defer record.Lock.Unlock()
+	cloned := cloneMetadata(map[string]any{"record": record})
+	if cloned["record"] != record {
+		t.Fatal("clone copied a struct containing synchronization state")
+	}
+}
+
+func TestCloneMetadataDetachesExportedReferencesWithPrivateState(t *testing.T) {
+	record := &metadataPrivateStateRecord{private: "state", Values: []string{"original"}}
+	cloned := cloneMetadata(map[string]any{"record": record})["record"].(*metadataPrivateStateRecord)
+	record.Values[0] = "changed"
+	if cloned == record || cloned.private != "state" || cloned.Values[0] != "original" {
+		t.Fatalf("record clone = %#v", cloned)
 	}
 }
 

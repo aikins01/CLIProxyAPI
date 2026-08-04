@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	. "github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
@@ -227,12 +228,30 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 	// This allows proper cleanup and cancellation of ongoing requests
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 
-	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
+	dataChan, upstreamHeaders, streamMeta, errChan := h.ExecuteStreamWithAuthManagerMeta(cliCtx, h.HandlerType(), modelName, rawJSON, "")
 	setSSEHeaders := func() {
 		c.Header("Content-Type", "text/event-stream")
 		c.Header("Cache-Control", "no-cache")
 		c.Header("Connection", "keep-alive")
 		c.Header("Access-Control-Allow-Origin", "*")
+	}
+	forwardCommitted := func(streamErrs <-chan *interfaces.ErrorMessage) {
+		setSSEHeaders()
+		handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+		flusher.Flush()
+		h.forwardClaudeStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, streamErrs, streamMeta.KeepAliveInterval())
+	}
+	writeInitialError := func(errMsg *interfaces.ErrorMessage) {
+		h.WriteErrorResponse(c, errMsg)
+		if errMsg != nil {
+			cliCancel(errMsg.Error)
+		} else {
+			cliCancel(nil)
+		}
+	}
+	if streamMeta.BootstrapCommitted() {
+		forwardCommitted(errChan)
+		return
 	}
 
 	// Peek at the first chunk to determine success or failure before setting headers
@@ -241,22 +260,32 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 		case <-c.Request.Context().Done():
 			cliCancel(c.Request.Context().Err())
 			return
+		case <-streamMeta.BootstrapCommittedSignal():
+			forwardCommitted(errChan)
+			return
 		case errMsg, ok := <-errChan:
 			if !ok {
 				// Err channel closed cleanly; wait for data channel.
 				errChan = nil
 				continue
 			}
-			// Upstream failed immediately. Return proper error status and JSON.
-			h.WriteErrorResponse(c, errMsg)
-			if errMsg != nil {
-				cliCancel(errMsg.Error)
-			} else {
-				cliCancel(nil)
+			if streamMeta.BootstrapCommitted() {
+				forwardCommitted(handlers.StreamErrorChannel(errMsg))
+				return
 			}
+			// Upstream failed immediately. Return proper error status and JSON.
+			writeInitialError(errMsg)
 			return
 		case chunk, ok := <-dataChan:
 			if !ok {
+				if errMsg, pending := handlers.PendingStreamError(errChan); pending {
+					if streamMeta.BootstrapCommitted() {
+						forwardCommitted(handlers.StreamErrorChannel(errMsg))
+					} else {
+						writeInitialError(errMsg)
+					}
+					return
+				}
 				// Stream closed without data? Send DONE or just headers.
 				setSSEHeaders()
 				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
@@ -276,14 +305,15 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 			}
 
 			// Continue streaming the rest
-			h.forwardClaudeStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan)
+			h.forwardClaudeStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan, streamMeta.KeepAliveInterval())
 			return
 		}
 	}
 }
 
-func (h *ClaudeCodeAPIHandler) forwardClaudeStream(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage) {
+func (h *ClaudeCodeAPIHandler) forwardClaudeStream(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage, keepAliveInterval *time.Duration) {
 	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{
+		KeepAliveInterval: keepAliveInterval,
 		WriteChunk: func(chunk []byte) {
 			if len(chunk) == 0 {
 				return

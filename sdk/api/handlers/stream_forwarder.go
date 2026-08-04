@@ -29,6 +29,25 @@ type StreamForwardOptions struct {
 	WriteKeepAlive func()
 }
 
+func PendingStreamError(errs <-chan *interfaces.ErrorMessage) (*interfaces.ErrorMessage, bool) {
+	if errs == nil {
+		return nil, false
+	}
+	select {
+	case errMsg, ok := <-errs:
+		return errMsg, ok
+	default:
+		return nil, false
+	}
+}
+
+func StreamErrorChannel(errMsg *interfaces.ErrorMessage) <-chan *interfaces.ErrorMessage {
+	errs := make(chan *interfaces.ErrorMessage, 1)
+	errs <- errMsg
+	close(errs)
+	return errs
+}
+
 func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage, opts StreamForwardOptions) {
 	if c == nil {
 		return
@@ -69,14 +88,9 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 			return
 		case chunk, ok := <-data:
 			if !ok {
-				// Prefer surfacing a terminal error if one is pending.
 				if terminalErr == nil {
-					select {
-					case errMsg, ok := <-errs:
-						if ok && errMsg != nil {
-							terminalErr = errMsg
-						}
-					default:
+					if errMsg, okErr := PendingStreamError(errs); okErr && errMsg != nil {
+						terminalErr = errMsg
 					}
 				}
 				if terminalErr != nil {
@@ -98,6 +112,7 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 			flusher.Flush()
 		case errMsg, ok := <-errs:
 			if !ok {
+				errs = nil
 				continue
 			}
 			if errMsg != nil {

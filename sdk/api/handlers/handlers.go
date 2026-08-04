@@ -47,6 +47,70 @@ type ErrorDetail struct {
 	Code string `json:"code,omitempty"`
 }
 
+type StreamMeta struct {
+	mu                   sync.RWMutex
+	commitOnce           sync.Once
+	committed            chan struct{}
+	keepAliveInterval    time.Duration
+	hasKeepAliveInterval bool
+	bootstrapCommitted   bool
+}
+
+func newStreamMeta(keepAliveInterval *time.Duration, bootstrapCommitted bool) *StreamMeta {
+	meta := &StreamMeta{committed: make(chan struct{})}
+	meta.set(keepAliveInterval, bootstrapCommitted)
+	return meta
+}
+
+func (m *StreamMeta) set(keepAliveInterval *time.Duration, bootstrapCommitted bool) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	if keepAliveInterval == nil {
+		m.keepAliveInterval = 0
+		m.hasKeepAliveInterval = false
+	} else {
+		m.keepAliveInterval = *keepAliveInterval
+		m.hasKeepAliveInterval = true
+	}
+	publishCommitted := bootstrapCommitted && !m.bootstrapCommitted
+	m.bootstrapCommitted = m.bootstrapCommitted || bootstrapCommitted
+	m.mu.Unlock()
+	if publishCommitted {
+		m.commitOnce.Do(func() { close(m.committed) })
+	}
+}
+
+func (m *StreamMeta) KeepAliveInterval() *time.Duration {
+	if m == nil {
+		return nil
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if !m.hasKeepAliveInterval {
+		return nil
+	}
+	interval := m.keepAliveInterval
+	return &interval
+}
+
+func (m *StreamMeta) BootstrapCommitted() bool {
+	if m == nil {
+		return false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.bootstrapCommitted
+}
+
+func (m *StreamMeta) BootstrapCommittedSignal() <-chan struct{} {
+	if m == nil {
+		return nil
+	}
+	return m.committed
+}
+
 const idempotencyKeyMetadataKey = "idempotency_key"
 
 const (
@@ -150,6 +214,30 @@ func BuildErrorResponseBody(status int, errText string) []byte {
 		return []byte(fmt.Sprintf(`{"error":{"message":%q,"type":"server_error","code":"internal_server_error"}}`, errText))
 	}
 	return payload
+}
+
+func statusCodeFromError(err error) int {
+	if se, ok := errors.AsType[coreexecutor.StatusError](err); ok && se != nil {
+		if code := se.StatusCode(); code > 0 {
+			return code
+		}
+	}
+	return http.StatusInternalServerError
+}
+
+func headersFromError(err error) http.Header {
+	if err == nil {
+		return nil
+	}
+	var provider interface{ Headers() http.Header }
+	if !errors.As(err, &provider) || provider == nil {
+		return nil
+	}
+	headers := provider.Headers()
+	if headers == nil {
+		return nil
+	}
+	return headers.Clone()
 }
 
 // StreamingKeepAliveInterval returns the SSE keep-alive interval for this server.
@@ -582,18 +670,8 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 	resp, err := h.AuthManager.Execute(ctx, providers, req, opts)
 	if err != nil {
 		err = enrichAuthSelectionError(err, providers, normalizedModel)
-		status := http.StatusInternalServerError
-		if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
-			if code := se.StatusCode(); code > 0 {
-				status = code
-			}
-		}
-		var addon http.Header
-		if he, ok := err.(interface{ Headers() http.Header }); ok && he != nil {
-			if hdr := he.Headers(); hdr != nil {
-				addon = hdr.Clone()
-			}
-		}
+		status := statusCodeFromError(err)
+		addon := headersFromError(err)
 		return nil, nil, &interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: addon}
 	}
 	if !PassthroughHeadersEnabled(h.Cfg) {
@@ -631,18 +709,8 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 	resp, err := h.AuthManager.ExecuteCount(ctx, providers, req, opts)
 	if err != nil {
 		err = enrichAuthSelectionError(err, providers, normalizedModel)
-		status := http.StatusInternalServerError
-		if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
-			if code := se.StatusCode(); code > 0 {
-				status = code
-			}
-		}
-		var addon http.Header
-		if he, ok := err.(interface{ Headers() http.Header }); ok && he != nil {
-			if hdr := he.Headers(); hdr != nil {
-				addon = hdr.Clone()
-			}
-		}
+		status := statusCodeFromError(err)
+		addon := headersFromError(err)
 		return nil, nil, &interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: addon}
 	}
 	if !PassthroughHeadersEnabled(h.Cfg) {
@@ -655,12 +723,18 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 // This path is the only supported execution route.
 // The returned http.Header carries upstream response headers captured before streaming begins.
 func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
+	data, headers, _, errs := h.ExecuteStreamWithAuthManagerMeta(ctx, handlerType, modelName, rawJSON, alt)
+	return data, headers, errs
+}
+
+// ExecuteStreamWithAuthManagerMeta executes a streaming request and exposes synchronized stream metadata.
+func (h *BaseAPIHandler) ExecuteStreamWithAuthManagerMeta(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) (<-chan []byte, http.Header, *StreamMeta, <-chan *interfaces.ErrorMessage) {
 	providers, normalizedModel, errMsg := h.getRequestDetails(modelName)
 	if errMsg != nil {
 		errChan := make(chan *interfaces.ErrorMessage, 1)
 		errChan <- errMsg
 		close(errChan)
-		return nil, nil, errChan
+		return nil, nil, newStreamMeta(nil, false), errChan
 	}
 	logHandlerThinkingConfig("handler auth-manager stream request", handlerType, normalizedModel, rawJSON)
 	reqMeta := requestExecutionMetadata(ctx)
@@ -685,22 +759,14 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 	if err != nil {
 		err = enrichAuthSelectionError(err, providers, normalizedModel)
 		errChan := make(chan *interfaces.ErrorMessage, 1)
-		status := http.StatusInternalServerError
-		if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
-			if code := se.StatusCode(); code > 0 {
-				status = code
-			}
-		}
-		var addon http.Header
-		if he, ok := err.(interface{ Headers() http.Header }); ok && he != nil {
-			if hdr := he.Headers(); hdr != nil {
-				addon = hdr.Clone()
-			}
-		}
+		status := statusCodeFromError(err)
+		addon := headersFromError(err)
 		errChan <- &interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: addon}
 		close(errChan)
-		return nil, nil, errChan
+		return nil, nil, newStreamMeta(nil, false), errChan
 	}
+	streamMeta := newStreamMeta(streamResult.TakeKeepAliveInterval(), streamResult.TakeBootstrapCommitted())
+	bootstrapCommitted := streamMeta.BootstrapCommitted()
 	passthroughHeadersEnabled := PassthroughHeadersEnabled(h.Cfg)
 	// Capture upstream headers from the initial connection synchronously before the goroutine starts.
 	// Keep a mutable map so bootstrap retries can replace it before first payload is sent.
@@ -720,6 +786,14 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 		sentPayload := false
 		bootstrapRetries := 0
 		maxBootstrapRetries := StreamingBootstrapRetries(h.Cfg)
+		var responsesValidator *sseJSONStreamValidator
+		if handlerType == "openai-response" {
+			responsesValidator = &sseJSONStreamValidator{}
+		}
+		var openAIValidator *openAIJSONStreamValidator
+		if handlerType == "openai" || (handlerType == "gemini-cli" && alt == "") {
+			openAIValidator = &openAIJSONStreamValidator{}
+		}
 
 		sendErr := func(msg *interfaces.ErrorMessage) bool {
 			if ctx == nil {
@@ -776,20 +850,51 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 					chunk, ok = <-chunks
 				}
 				if !ok {
+					if responsesValidator != nil {
+						payload, errValidate := responsesValidator.Finish()
+						if errValidate != nil {
+							_ = sendErr(&interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: errValidate})
+							return
+						}
+						if len(payload) > 0 && !sendData(payload) {
+							return
+						}
+					}
+					if openAIValidator != nil {
+						payloads, errValidate := openAIValidator.Finish()
+						if errValidate != nil {
+							_ = sendErr(&interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: errValidate})
+							return
+						}
+						for _, payload := range payloads {
+							if !sendData(payload) {
+								return
+							}
+						}
+					}
 					return
 				}
 				if chunk.Err != nil {
 					streamErr := chunk.Err
 					// Safe bootstrap recovery: if the upstream fails before any payload bytes are sent,
 					// retry a few times (to allow auth rotation / transient recovery) and then attempt model fallback.
-					if !sentPayload {
+					if !sentPayload && !bootstrapCommitted {
 						if bootstrapRetries < maxBootstrapRetries && bootstrapEligible(streamErr) {
 							bootstrapRetries++
 							retryResult, retryErr := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
 							if retryErr == nil {
+								keepAliveInterval := retryResult.TakeKeepAliveInterval()
+								bootstrapCommitted = retryResult.TakeBootstrapCommitted()
 								if passthroughHeadersEnabled {
 									replaceHeader(upstreamHeaders, FilterUpstreamHeaders(retryResult.Headers))
 								}
+								if responsesValidator != nil {
+									responsesValidator = &sseJSONStreamValidator{}
+								}
+								if openAIValidator != nil {
+									openAIValidator = &openAIJSONStreamValidator{}
+								}
+								streamMeta.set(keepAliveInterval, bootstrapCommitted)
 								chunks = retryResult.Chunks
 								continue outer
 							}
@@ -797,73 +902,449 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 						}
 					}
 
-					status := http.StatusInternalServerError
-					if se, ok := streamErr.(interface{ StatusCode() int }); ok && se != nil {
-						if code := se.StatusCode(); code > 0 {
-							status = code
-						}
-					}
-					var addon http.Header
-					if he, ok := streamErr.(interface{ Headers() http.Header }); ok && he != nil {
-						if hdr := he.Headers(); hdr != nil {
-							addon = hdr.Clone()
-						}
-					}
+					status := statusCodeFromError(streamErr)
+					addon := headersFromError(streamErr)
 					_ = sendErr(&interfaces.ErrorMessage{StatusCode: status, Error: streamErr, Addon: addon})
 					return
 				}
 				if len(chunk.Payload) > 0 {
-					if handlerType == "openai-response" {
-						if err := validateSSEDataJSON(chunk.Payload); err != nil {
-							_ = sendErr(&interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: err})
+					payloads := [][]byte{chunk.Payload}
+					if responsesValidator != nil {
+						payload, errValidate := responsesValidator.Add(chunk.Payload)
+						if errValidate != nil {
+							_ = sendErr(&interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: errValidate})
+							return
+						}
+						if len(payload) == 0 {
+							continue
+						}
+						payloads = [][]byte{payload}
+					} else if openAIValidator != nil {
+						var errValidate error
+						payloads, errValidate = openAIValidator.Add(chunk.Payload)
+						if errValidate != nil {
+							_ = sendErr(&interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: errValidate})
 							return
 						}
 					}
-					sentPayload = true
-					if okSendData := sendData(cloneBytes(chunk.Payload)); !okSendData {
-						return
+					for _, payload := range payloads {
+						sentPayload = true
+						if !sendData(cloneBytes(payload)) {
+							return
+						}
 					}
 				}
 			}
 		}
 	}()
-	return dataChan, upstreamHeaders, errChan
+	return dataChan, upstreamHeaders, streamMeta, errChan
 }
 
-func validateSSEDataJSON(chunk []byte) error {
-	for _, line := range bytes.Split(chunk, []byte("\n")) {
-		line = bytes.TrimSpace(line)
-		if len(line) == 0 {
+type openAIJSONStreamValidator struct {
+	pending []byte
+	rawScan jsonValueStreamScanner
+}
+
+func (v *openAIJSONStreamValidator) Add(chunk []byte) ([][]byte, error) {
+	if v == nil || len(chunk) == 0 {
+		return nil, nil
+	}
+	var payloads [][]byte
+	for len(chunk) > 0 {
+		available := maxStreamJSONPendingBytes - len(v.pending)
+		if available == 0 {
+			return nil, fmt.Errorf("OpenAI stream value exceeds %d bytes", maxStreamJSONPendingBytes)
+		}
+		appendLen := min(len(chunk), available)
+		v.pending = append(v.pending, chunk[:appendLen]...)
+		chunk = chunk[appendLen:]
+		complete, err := v.consume(false)
+		if err != nil {
+			return nil, err
+		}
+		payloads = append(payloads, complete...)
+	}
+	return payloads, nil
+}
+
+func (v *openAIJSONStreamValidator) Finish() ([][]byte, error) {
+	if v == nil {
+		return nil, nil
+	}
+	payloads, err := v.consume(true)
+	if err != nil {
+		return nil, err
+	}
+	if len(bytes.TrimSpace(v.pending)) > 0 {
+		return nil, errors.New("incomplete OpenAI stream value")
+	}
+	v.pending = nil
+	return payloads, nil
+}
+
+func (v *openAIJSONStreamValidator) consume(final bool) ([][]byte, error) {
+	var payloads [][]byte
+	for {
+		trimmed := bytes.TrimLeft(v.pending, " \t\r\n")
+		if len(trimmed) != len(v.pending) {
+			v.rawScan.reset()
+		}
+		v.pending = trimmed
+		if len(v.pending) == 0 {
+			return payloads, nil
+		}
+
+		isSSE, partialSSEPrefix := openAIStreamSSEPrefix(v.pending)
+		if partialSSEPrefix {
+			if final {
+				return nil, errors.New("incomplete OpenAI SSE field")
+			}
+			return payloads, nil
+		}
+		if isSSE {
+			frameLen := sseJSONFrameLen(v.pending)
+			if frameLen == 0 {
+				if final {
+					return nil, errors.New("incomplete OpenAI SSE frame")
+				}
+				return payloads, nil
+			}
+			frame := v.pending[:frameLen]
+			payload, found := sseJSONDataPayload(frame)
+			if found && len(payload) > 0 && !bytes.Equal(payload, []byte("[DONE]")) {
+				if !json.Valid(payload) {
+					return nil, errors.New("invalid OpenAI SSE data JSON")
+				}
+				// Joined multi-line data is valid JSON, so newlines are inter-token
+				// whitespace; flatten them so downstream SSE re-framing stays intact.
+				if bytes.IndexByte(payload, '\n') >= 0 {
+					payload = bytes.ReplaceAll(payload, []byte("\n"), []byte(" "))
+				}
+				payloads = append(payloads, cloneBytes(payload))
+			}
+			v.pending = v.pending[frameLen:]
+			v.rawScan.reset()
 			continue
 		}
+
+		doneMarker := []byte("[DONE]")
+		if len(v.pending) < len(doneMarker) && bytes.HasPrefix(doneMarker, v.pending) {
+			if final {
+				return nil, errors.New("incomplete OpenAI stream done marker")
+			}
+			return payloads, nil
+		}
+		if bytes.HasPrefix(v.pending, doneMarker) {
+			v.pending = v.pending[len(doneMarker):]
+			v.rawScan.reset()
+			continue
+		}
+
+		end, complete, err := v.rawScan.valueEnd(v.pending, final)
+		if err != nil {
+			return nil, fmt.Errorf("invalid OpenAI stream JSON: %w", err)
+		}
+		if !complete {
+			if final {
+				return nil, errors.New("incomplete OpenAI stream value")
+			}
+			return payloads, nil
+		}
+		payload := v.pending[:end]
+		if !json.Valid(payload) {
+			return nil, errors.New("invalid OpenAI stream JSON")
+		}
+		payloads = append(payloads, cloneBytes(payload))
+		v.pending = v.pending[end:]
+		v.rawScan.reset()
+	}
+}
+
+func openAIStreamSSEPrefix(data []byte) (bool, bool) {
+	for _, prefix := range [][]byte{[]byte("data:"), []byte("event:"), []byte("id:"), []byte("retry:"), []byte(":")} {
+		if bytes.HasPrefix(data, prefix) {
+			return true, false
+		}
+		if bytes.HasPrefix(prefix, data) {
+			return false, true
+		}
+	}
+	return false, false
+}
+
+type jsonValueStreamScanner struct {
+	offset   int
+	depth    int
+	kind     byte
+	inString bool
+	escaped  bool
+}
+
+func (s *jsonValueStreamScanner) reset() {
+	*s = jsonValueStreamScanner{}
+}
+
+func (s *jsonValueStreamScanner) valueEnd(data []byte, final bool) (int, bool, error) {
+	if len(data) == 0 {
+		return 0, false, nil
+	}
+	if s.kind == 0 {
+		switch data[0] {
+		case '{', '[':
+			s.kind = data[0]
+			s.depth = 1
+			s.offset = 1
+		case '"':
+			s.kind = '"'
+			s.inString = true
+			s.offset = 1
+		case 't', 'f', 'n':
+			s.kind = data[0]
+		case '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
+			s.kind = '#'
+		default:
+			return 0, false, fmt.Errorf("unexpected leading byte %q", data[0])
+		}
+	}
+
+	switch s.kind {
+	case '{', '[', '"':
+		for index := s.offset; index < len(data); index++ {
+			value := data[index]
+			if s.inString {
+				if s.escaped {
+					s.escaped = false
+					continue
+				}
+				switch value {
+				case '\\':
+					s.escaped = true
+				case '"':
+					s.inString = false
+					if s.kind == '"' {
+						return index + 1, true, nil
+					}
+				default:
+					if value < 0x20 {
+						return 0, false, fmt.Errorf("unescaped control byte %q", value)
+					}
+				}
+				continue
+			}
+			switch value {
+			case '"':
+				s.inString = true
+			case '{', '[':
+				s.depth++
+			case '}', ']':
+				s.depth--
+				if s.depth < 0 {
+					return 0, false, errors.New("unexpected closing delimiter")
+				}
+				if s.depth == 0 {
+					return index + 1, true, nil
+				}
+			}
+		}
+		s.offset = len(data)
+		return 0, false, nil
+	case 't', 'f', 'n':
+		target := "true"
+		if s.kind == 'f' {
+			target = "false"
+		} else if s.kind == 'n' {
+			target = "null"
+		}
+		for s.offset < len(data) && s.offset < len(target) {
+			if data[s.offset] != target[s.offset] {
+				return 0, false, fmt.Errorf("invalid literal %q", data[:s.offset+1])
+			}
+			s.offset++
+		}
+		if s.offset == len(target) {
+			// A literal is complete only when followed by a token boundary;
+			// otherwise wait for more bytes so "truee" is not split as
+			// "true" plus a dangling "e".
+			if s.offset < len(data) {
+				switch data[s.offset] {
+				case ' ', '\t', '\r', '\n', '{', '[', '"', 't', 'f', 'n', '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
+				default:
+					return 0, false, fmt.Errorf("invalid byte %q after literal %q", data[s.offset], target)
+				}
+			} else if !final {
+				return 0, false, nil
+			}
+			return s.offset, true, nil
+		}
+		return 0, false, nil
+	case '#':
+		index := s.offset
+		for index < len(data) && jsonNumberStreamByte(data[index]) {
+			index++
+		}
+		s.offset = index
+		if index < len(data) {
+			if !json.Valid(data[:index]) {
+				return 0, false, fmt.Errorf("invalid number %q", data[:index])
+			}
+			return index, true, nil
+		}
+		if final {
+			if !json.Valid(data) {
+				return 0, false, fmt.Errorf("invalid number %q", data)
+			}
+			return len(data), true, nil
+		}
+		return 0, false, nil
+	default:
+		return 0, false, errors.New("invalid JSON scanner state")
+	}
+}
+
+func jsonNumberStreamByte(value byte) bool {
+	return value >= '0' && value <= '9' || value == '-' || value == '+' || value == '.' || value == 'e' || value == 'E'
+}
+
+type sseJSONStreamValidator struct {
+	pending  []byte
+	scanFrom int
+}
+
+const maxStreamJSONPendingBytes = 64 << 20
+
+func (v *sseJSONStreamValidator) Add(chunk []byte) ([]byte, error) {
+	if v == nil || len(chunk) == 0 {
+		return nil, nil
+	}
+
+	var out []byte
+	for len(chunk) > 0 {
+		available := maxStreamJSONPendingBytes - len(v.pending)
+		if available == 0 {
+			return nil, fmt.Errorf("SSE frame exceeds %d bytes", maxStreamJSONPendingBytes)
+		}
+		appendLen := min(len(chunk), available)
+		v.pending = append(v.pending, chunk[:appendLen]...)
+		chunk = chunk[appendLen:]
+
+		consumed := 0
+		scanFrom := v.scanFrom
+		for {
+			frameLen := sseJSONFrameLen(v.pending[scanFrom:])
+			if frameLen == 0 {
+				v.scanFrom = max(0, len(v.pending)-3)
+				break
+			}
+			frameEnd := scanFrom + frameLen
+			frame := v.pending[consumed:frameEnd]
+			if err := validateSSEDataJSON(frame); err != nil {
+				return nil, err
+			}
+			out = append(out, frame...)
+			consumed = frameEnd
+			scanFrom = frameEnd
+		}
+		if consumed > 0 {
+			copy(v.pending, v.pending[consumed:])
+			v.pending = v.pending[:len(v.pending)-consumed]
+			v.scanFrom -= consumed
+			if v.scanFrom < 0 {
+				v.scanFrom = 0
+			}
+		}
+	}
+	return out, nil
+}
+
+func (v *sseJSONStreamValidator) Finish() ([]byte, error) {
+	if v == nil || len(bytes.TrimSpace(v.pending)) == 0 {
+		return nil, nil
+	}
+	return nil, errors.New("incomplete SSE frame")
+}
+
+func sseJSONFrameLen(chunk []byte) int {
+	lineStart := 0
+	for i := 0; i < len(chunk); {
+		switch chunk[i] {
+		case '\n':
+			i++
+			if i-1 == lineStart {
+				return i
+			}
+			lineStart = i
+		case '\r':
+			lineEnd := i
+			i++
+			if lineEnd == lineStart && i == len(chunk) {
+				return 0
+			}
+			if i < len(chunk) && chunk[i] == '\n' {
+				i++
+			}
+			if lineEnd == lineStart {
+				return i
+			}
+			lineStart = i
+		default:
+			i++
+		}
+	}
+	return 0
+}
+
+func sseJSONDataPayload(frame []byte) ([]byte, bool) {
+	var payload []byte
+	found := false
+	for len(frame) > 0 {
+		lineEnd := bytes.IndexAny(frame, "\r\n")
+		line := frame
+		if lineEnd >= 0 {
+			line = frame[:lineEnd]
+			separatorLen := 1
+			if frame[lineEnd] == '\r' && lineEnd+1 < len(frame) && frame[lineEnd+1] == '\n' {
+				separatorLen = 2
+			}
+			frame = frame[lineEnd+separatorLen:]
+		} else {
+			frame = nil
+		}
+		line = bytes.TrimSpace(line)
 		if !bytes.HasPrefix(line, []byte("data:")) {
 			continue
 		}
-		data := bytes.TrimSpace(line[5:])
-		if len(data) == 0 {
-			continue
+		if found {
+			payload = append(payload, '\n')
 		}
-		if bytes.Equal(data, []byte("[DONE]")) {
-			continue
-		}
-		if json.Valid(data) {
-			continue
-		}
-		const max = 512
-		preview := data
-		if len(preview) > max {
-			preview = preview[:max]
-		}
-		return fmt.Errorf("invalid SSE data JSON (len=%d): %q", len(data), preview)
+		payload = append(payload, bytes.TrimSpace(line[len("data:"):])...)
+		found = true
 	}
-	return nil
+	return payload, found
+}
+
+func sseJSONPayloadValid(data []byte) bool {
+	data = bytes.TrimSpace(data)
+	return len(data) == 0 || bytes.Equal(data, []byte("[DONE]")) || json.Valid(data)
+}
+
+func validateSSEDataJSON(frame []byte) error {
+	data, found := sseJSONDataPayload(frame)
+	if !found || sseJSONPayloadValid(data) {
+		return nil
+	}
+	const max = 512
+	preview := data
+	if len(preview) > max {
+		preview = preview[:max]
+	}
+	return fmt.Errorf("invalid SSE data JSON (len=%d): %q", len(data), preview)
 }
 
 func statusFromError(err error) int {
 	if err == nil {
 		return 0
 	}
-	if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
+	if se, ok := errors.AsType[coreexecutor.StatusError](err); ok && se != nil {
 		if code := se.StatusCode(); code > 0 {
 			return code
 		}

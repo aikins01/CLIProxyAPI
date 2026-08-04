@@ -14,6 +14,7 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	. "github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
@@ -485,7 +486,7 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 	// New core execution path
 	modelName := gjson.GetBytes(rawJSON, "model").String()
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
-	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
+	dataChan, upstreamHeaders, streamMeta, errChan := h.ExecuteStreamWithAuthManagerMeta(cliCtx, h.HandlerType(), modelName, rawJSON, "")
 
 	setSSEHeaders := func() {
 		c.Header("Content-Type", "text/event-stream")
@@ -494,6 +495,24 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 		c.Header("Access-Control-Allow-Origin", "*")
 	}
 	framer := &responsesSSEFramer{}
+	forwardCommitted := func(streamErrs <-chan *interfaces.ErrorMessage) {
+		setSSEHeaders()
+		handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+		flusher.Flush()
+		h.forwardResponsesStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, streamErrs, framer, streamMeta.KeepAliveInterval())
+	}
+	writeInitialError := func(errMsg *interfaces.ErrorMessage) {
+		h.WriteErrorResponse(c, errMsg)
+		if errMsg != nil {
+			cliCancel(errMsg.Error)
+		} else {
+			cliCancel(nil)
+		}
+	}
+	if streamMeta.BootstrapCommitted() {
+		forwardCommitted(errChan)
+		return
+	}
 
 	// Peek at the first chunk
 	for {
@@ -501,22 +520,32 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 		case <-c.Request.Context().Done():
 			cliCancel(c.Request.Context().Err())
 			return
+		case <-streamMeta.BootstrapCommittedSignal():
+			forwardCommitted(errChan)
+			return
 		case errMsg, ok := <-errChan:
 			if !ok {
 				// Err channel closed cleanly; wait for data channel.
 				errChan = nil
 				continue
 			}
-			// Upstream failed immediately. Return proper error status and JSON.
-			h.WriteErrorResponse(c, errMsg)
-			if errMsg != nil {
-				cliCancel(errMsg.Error)
-			} else {
-				cliCancel(nil)
+			if streamMeta.BootstrapCommitted() {
+				forwardCommitted(handlers.StreamErrorChannel(errMsg))
+				return
 			}
+			// Upstream failed immediately. Return proper error status and JSON.
+			writeInitialError(errMsg)
 			return
 		case chunk, ok := <-dataChan:
 			if !ok {
+				if errMsg, pending := handlers.PendingStreamError(errChan); pending {
+					if streamMeta.BootstrapCommitted() {
+						forwardCommitted(handlers.StreamErrorChannel(errMsg))
+					} else {
+						writeInitialError(errMsg)
+					}
+					return
+				}
 				// Stream closed without data? Send headers and done.
 				setSSEHeaders()
 				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
@@ -535,17 +564,18 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 			flusher.Flush()
 
 			// Continue
-			h.forwardResponsesStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan, framer)
+			h.forwardResponsesStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan, framer, streamMeta.KeepAliveInterval())
 			return
 		}
 	}
 }
 
-func (h *OpenAIResponsesAPIHandler) forwardResponsesStream(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage, framer *responsesSSEFramer) {
+func (h *OpenAIResponsesAPIHandler) forwardResponsesStream(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage, framer *responsesSSEFramer, keepAliveInterval *time.Duration) {
 	if framer == nil {
 		framer = &responsesSSEFramer{}
 	}
 	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{
+		KeepAliveInterval: keepAliveInterval,
 		WriteChunk: func(chunk []byte) {
 			framer.WriteChunk(c.Writer, chunk)
 		},

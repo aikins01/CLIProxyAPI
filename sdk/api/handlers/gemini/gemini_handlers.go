@@ -188,13 +188,35 @@ func (h *GeminiAPIHandler) handleStreamGenerateContent(c *gin.Context, modelName
 	}
 
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
-	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, alt)
+	dataChan, upstreamHeaders, streamMeta, errChan := h.ExecuteStreamWithAuthManagerMeta(cliCtx, h.HandlerType(), modelName, rawJSON, alt)
 
 	setSSEHeaders := func() {
 		c.Header("Content-Type", "text/event-stream")
 		c.Header("Cache-Control", "no-cache")
 		c.Header("Connection", "keep-alive")
 		c.Header("Access-Control-Allow-Origin", "*")
+	}
+	forwardCommitted := func(streamErrs <-chan *interfaces.ErrorMessage) {
+		setSSEHeaders()
+		handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+		flusher.Flush()
+		h.forwardGeminiStream(c, flusher, alt, func(err error) { cliCancel(err) }, dataChan, streamErrs, streamMeta.KeepAliveInterval())
+	}
+	writeInitialError := func(errMsg *interfaces.ErrorMessage) {
+		h.WriteErrorResponse(c, errMsg)
+		if errMsg != nil {
+			cliCancel(errMsg.Error)
+		} else {
+			cliCancel(nil)
+		}
+	}
+	commitSignal := streamMeta.BootstrapCommittedSignal()
+	if alt != "" {
+		commitSignal = nil
+	}
+	if alt == "" && streamMeta.BootstrapCommitted() {
+		forwardCommitted(errChan)
+		return
 	}
 
 	// Peek at the first chunk
@@ -203,22 +225,32 @@ func (h *GeminiAPIHandler) handleStreamGenerateContent(c *gin.Context, modelName
 		case <-c.Request.Context().Done():
 			cliCancel(c.Request.Context().Err())
 			return
+		case <-commitSignal:
+			forwardCommitted(errChan)
+			return
 		case errMsg, ok := <-errChan:
 			if !ok {
 				// Err channel closed cleanly; wait for data channel.
 				errChan = nil
 				continue
 			}
-			// Upstream failed immediately. Return proper error status and JSON.
-			h.WriteErrorResponse(c, errMsg)
-			if errMsg != nil {
-				cliCancel(errMsg.Error)
-			} else {
-				cliCancel(nil)
+			if alt == "" && streamMeta.BootstrapCommitted() {
+				forwardCommitted(handlers.StreamErrorChannel(errMsg))
+				return
 			}
+			// Upstream failed immediately. Return proper error status and JSON.
+			writeInitialError(errMsg)
 			return
 		case chunk, ok := <-dataChan:
 			if !ok {
+				if errMsg, pending := handlers.PendingStreamError(errChan); pending {
+					if alt == "" && streamMeta.BootstrapCommitted() {
+						forwardCommitted(handlers.StreamErrorChannel(errMsg))
+					} else {
+						writeInitialError(errMsg)
+					}
+					return
+				}
 				// Closed without data
 				if alt == "" {
 					setSSEHeaders()
@@ -246,7 +278,7 @@ func (h *GeminiAPIHandler) handleStreamGenerateContent(c *gin.Context, modelName
 			flusher.Flush()
 
 			// Continue
-			h.forwardGeminiStream(c, flusher, alt, func(err error) { cliCancel(err) }, dataChan, errChan)
+			h.forwardGeminiStream(c, flusher, alt, func(err error) { cliCancel(err) }, dataChan, errChan, streamMeta.KeepAliveInterval())
 			return
 		}
 	}
@@ -301,8 +333,7 @@ func (h *GeminiAPIHandler) handleGenerateContent(c *gin.Context, modelName strin
 	cliCancel()
 }
 
-func (h *GeminiAPIHandler) forwardGeminiStream(c *gin.Context, flusher http.Flusher, alt string, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage) {
-	var keepAliveInterval *time.Duration
+func (h *GeminiAPIHandler) forwardGeminiStream(c *gin.Context, flusher http.Flusher, alt string, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage, keepAliveInterval *time.Duration) {
 	if alt != "" {
 		keepAliveInterval = new(time.Duration(0))
 	}

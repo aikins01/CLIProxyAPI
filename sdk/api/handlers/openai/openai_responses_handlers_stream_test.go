@@ -1,10 +1,13 @@
 package openai
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
@@ -42,7 +45,7 @@ func TestForwardResponsesStreamSeparatesDataOnlySSEChunks(t *testing.T) {
 	close(data)
 	close(errs)
 
-	h.forwardResponsesStream(c, flusher, func(error) {}, data, errs, nil)
+	h.forwardResponsesStream(c, flusher, func(error) {}, data, errs, nil, nil)
 	body := recorder.Body.String()
 	parts := strings.Split(strings.TrimSpace(body), "\n\n")
 	if len(parts) != 2 {
@@ -71,7 +74,7 @@ func TestForwardResponsesStreamRepairsEmptyCompletedOutputFromDoneItems(t *testi
 	close(data)
 	close(errs)
 
-	h.forwardResponsesStream(c, flusher, func(error) {}, data, errs, nil)
+	h.forwardResponsesStream(c, flusher, func(error) {}, data, errs, nil, nil)
 
 	parts := strings.Split(strings.TrimSpace(recorder.Body.String()), "\n\n")
 	if len(parts) != 3 {
@@ -102,7 +105,7 @@ func TestForwardResponsesStreamRepairsMixedIndexedAndUnindexedDoneItems(t *testi
 	close(data)
 	close(errs)
 
-	h.forwardResponsesStream(c, flusher, func(error) {}, data, errs, nil)
+	h.forwardResponsesStream(c, flusher, func(error) {}, data, errs, nil, nil)
 
 	parts := strings.Split(strings.TrimSpace(recorder.Body.String()), "\n\n")
 	if len(parts) != 3 {
@@ -132,7 +135,7 @@ func TestForwardResponsesStreamRepairsMultilineCompletedOutputAsSSEDataLines(t *
 	close(data)
 	close(errs)
 
-	h.forwardResponsesStream(c, flusher, func(error) {}, data, errs, nil)
+	h.forwardResponsesStream(c, flusher, func(error) {}, data, errs, nil, nil)
 
 	parts := strings.Split(strings.TrimSpace(recorder.Body.String()), "\n\n")
 	if len(parts) != 2 {
@@ -167,7 +170,7 @@ func TestForwardResponsesStreamReassemblesSplitSSEEventChunks(t *testing.T) {
 	close(data)
 	close(errs)
 
-	h.forwardResponsesStream(c, flusher, func(error) {}, data, errs, nil)
+	h.forwardResponsesStream(c, flusher, func(error) {}, data, errs, nil, nil)
 
 	got := strings.TrimSuffix(recorder.Body.String(), "\n")
 	want := "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}\n\n"
@@ -186,7 +189,7 @@ func TestForwardResponsesStreamPreservesValidFullSSEEventChunks(t *testing.T) {
 	close(data)
 	close(errs)
 
-	h.forwardResponsesStream(c, flusher, func(error) {}, data, errs, nil)
+	h.forwardResponsesStream(c, flusher, func(error) {}, data, errs, nil, nil)
 
 	got := strings.TrimSuffix(recorder.Body.String(), "\n")
 	if got != string(chunk) {
@@ -204,7 +207,7 @@ func TestForwardResponsesStreamBuffersSplitDataPayloadChunks(t *testing.T) {
 	close(data)
 	close(errs)
 
-	h.forwardResponsesStream(c, flusher, func(error) {}, data, errs, nil)
+	h.forwardResponsesStream(c, flusher, func(error) {}, data, errs, nil, nil)
 
 	got := recorder.Body.String()
 	want := "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}\n\n\n"
@@ -231,9 +234,79 @@ func TestForwardResponsesStreamDropsIncompleteTrailingDataChunkOnFlush(t *testin
 	close(data)
 	close(errs)
 
-	h.forwardResponsesStream(c, flusher, func(error) {}, data, errs, nil)
+	h.forwardResponsesStream(c, flusher, func(error) {}, data, errs, nil, nil)
 
 	if got := recorder.Body.String(); got != "\n" {
 		t.Fatalf("expected incomplete trailing data to be dropped on flush.\nGot: %q", got)
+	}
+}
+
+func TestForwardImagesStreamUsesProviderKeepAlive(t *testing.T) {
+	responsesHandler, recorder, c, flusher := newResponsesStreamTestHandler(t)
+	h := NewOpenAIAPIHandler(responsesHandler.BaseAPIHandler)
+	data := make(chan []byte)
+	errs := make(chan *interfaces.ErrorMessage)
+	go func() {
+		defer close(data)
+		time.Sleep(40 * time.Millisecond)
+		data <- []byte("data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"image_generation_call\",\"result\":\"aGVsbG8=\"}]}}\n\n")
+	}()
+	writeEvent := func(eventName string, payload []byte) {
+		if eventName != "" {
+			_, _ = recorder.WriteString("event: " + eventName + "\n")
+		}
+		_, _ = recorder.WriteString("data: " + string(payload) + "\n\n")
+	}
+	interval := 5 * time.Millisecond
+
+	h.forwardImagesStream(context.Background(), c, flusher, func(error) {}, data, errs, nil, "b64_json", "image_generation", writeEvent, &interval)
+	body := recorder.Body.String()
+	heartbeatIndex := strings.Index(body, ": keep-alive\n\n")
+	dataIndex := strings.Index(body, "data:")
+	if heartbeatIndex < 0 || dataIndex < 0 || heartbeatIndex > dataIndex {
+		t.Fatalf("expected heartbeat before first image event, got %q", body)
+	}
+}
+
+func TestForwardImagesStreamEmitsErrorWhenEOFPrecedesCompletion(t *testing.T) {
+	responsesHandler, recorder, c, flusher := newResponsesStreamTestHandler(t)
+	h := NewOpenAIAPIHandler(responsesHandler.BaseAPIHandler)
+	data := make(chan []byte)
+	errs := make(chan *interfaces.ErrorMessage)
+	close(data)
+	close(errs)
+	var canceled error
+	writeEvent := func(eventName string, payload []byte) {
+		if eventName != "" {
+			_, _ = recorder.WriteString("event: " + eventName + "\n")
+		}
+		_, _ = recorder.WriteString("data: " + string(payload) + "\n\n")
+	}
+
+	h.forwardImagesStream(context.Background(), c, flusher, func(err error) { canceled = err }, data, errs, nil, "b64_json", "image_generation", writeEvent, nil)
+
+	if canceled == nil || !strings.Contains(canceled.Error(), "before response.completed") {
+		t.Fatalf("cancel error = %v", canceled)
+	}
+	body := recorder.Body.String()
+	if !strings.Contains(body, "event: error\n") || !strings.Contains(body, "before response.completed") {
+		t.Fatalf("expected terminal SSE error, got %q", body)
+	}
+}
+
+func TestCollectImagesStreamPrioritizesPendingErrorWhenDataCloses(t *testing.T) {
+	data := make(chan []byte)
+	close(data)
+	wantErr := errors.New("upstream failed")
+	errs := make(chan *interfaces.ErrorMessage, 1)
+	errs <- &interfaces.ErrorMessage{StatusCode: http.StatusServiceUnavailable, Error: wantErr}
+	close(errs)
+
+	out, errMsg := collectImagesFromResponsesStream(context.Background(), data, errs, "b64_json")
+	if out != nil {
+		t.Fatalf("expected no image output, got %q", out)
+	}
+	if errMsg == nil || errMsg.StatusCode != http.StatusServiceUnavailable || !errors.Is(errMsg.Error, wantErr) {
+		t.Fatalf("error = %+v, want status %d and %v", errMsg, http.StatusServiceUnavailable, wantErr)
 	}
 }

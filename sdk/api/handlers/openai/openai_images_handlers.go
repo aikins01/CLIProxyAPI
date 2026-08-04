@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -602,7 +603,7 @@ func (h *OpenAIAPIHandler) collectImagesFromResponses(c *gin.Context, responsesR
 	if mainModel == "" {
 		mainModel = defaultImagesMainModel
 	}
-	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, "openai-response", mainModel, responsesReq, "")
+	dataChan, upstreamHeaders, _, errChan := h.ExecuteStreamWithAuthManagerMeta(cliCtx, "openai-response", mainModel, responsesReq, "")
 
 	out, errMsg := collectImagesFromResponsesStream(cliCtx, dataChan, errChan, responseFormat)
 	stopKeepAlive()
@@ -671,6 +672,12 @@ func collectImagesFromResponsesStream(ctx context.Context, data <-chan []byte, e
 			errs = nil
 		case chunk, ok := <-data:
 			if !ok {
+				if errMsg, pending := handlers.PendingStreamError(errs); pending {
+					if errMsg != nil {
+						return nil, errMsg
+					}
+					return nil, &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: errors.New("stream failed")}
+				}
 				for _, frame := range acc.Flush() {
 					if out, done, errMsg := processFrame(frame); errMsg != nil {
 						return nil, errMsg
@@ -795,7 +802,7 @@ func (h *OpenAIAPIHandler) streamImagesFromResponses(c *gin.Context, responsesRe
 	if mainModel == "" {
 		mainModel = defaultImagesMainModel
 	}
-	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, "openai-response", mainModel, responsesReq, "")
+	dataChan, upstreamHeaders, streamMeta, errChan := h.ExecuteStreamWithAuthManagerMeta(cliCtx, "openai-response", mainModel, responsesReq, "")
 
 	setSSEHeaders := func() {
 		c.Header("Content-Type", "text/event-stream")
@@ -811,6 +818,24 @@ func (h *OpenAIAPIHandler) streamImagesFromResponses(c *gin.Context, responsesRe
 		_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(dataJSON))
 		flusher.Flush()
 	}
+	forwardCommitted := func(streamErrs <-chan *interfaces.ErrorMessage) {
+		setSSEHeaders()
+		handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+		flusher.Flush()
+		h.forwardImagesStream(cliCtx, c, flusher, func(err error) { cliCancel(err) }, dataChan, streamErrs, nil, responseFormat, streamPrefix, writeEvent, streamMeta.KeepAliveInterval())
+	}
+	writeInitialError := func(errMsg *interfaces.ErrorMessage) {
+		h.WriteErrorResponse(c, errMsg)
+		if errMsg != nil {
+			cliCancel(errMsg.Error)
+		} else {
+			cliCancel(nil)
+		}
+	}
+	if streamMeta.BootstrapCommitted() {
+		forwardCommitted(errChan)
+		return
+	}
 
 	// Peek for first chunk/error so we can still return a JSON error body.
 	for {
@@ -818,39 +843,56 @@ func (h *OpenAIAPIHandler) streamImagesFromResponses(c *gin.Context, responsesRe
 		case <-c.Request.Context().Done():
 			cliCancel(c.Request.Context().Err())
 			return
+		case <-streamMeta.BootstrapCommittedSignal():
+			forwardCommitted(errChan)
+			return
 		case errMsg, ok := <-errChan:
 			if !ok {
 				errChan = nil
 				continue
 			}
-			h.WriteErrorResponse(c, errMsg)
-			if errMsg != nil {
-				cliCancel(errMsg.Error)
-			} else {
-				cliCancel(nil)
+			if streamMeta.BootstrapCommitted() {
+				forwardCommitted(handlers.StreamErrorChannel(errMsg))
+				return
 			}
+			writeInitialError(errMsg)
 			return
 		case chunk, ok := <-dataChan:
 			if !ok {
-				setSSEHeaders()
-				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
-				_, _ = c.Writer.Write([]byte("\n"))
-				flusher.Flush()
-				cliCancel(nil)
+				if errMsg, pending := handlers.PendingStreamError(errChan); pending {
+					if streamMeta.BootstrapCommitted() {
+						forwardCommitted(handlers.StreamErrorChannel(errMsg))
+					} else {
+						writeInitialError(errMsg)
+					}
+					return
+				}
+				writeInitialError(&interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: errors.New("stream ended before response.completed")})
 				return
 			}
 
 			setSSEHeaders()
 			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 
-			h.forwardImagesStream(cliCtx, c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan, chunk, responseFormat, streamPrefix, writeEvent)
+			h.forwardImagesStream(cliCtx, c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan, chunk, responseFormat, streamPrefix, writeEvent, streamMeta.KeepAliveInterval())
 			return
 		}
 	}
 }
 
-func (h *OpenAIAPIHandler) forwardImagesStream(ctx context.Context, c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage, firstChunk []byte, responseFormat string, streamPrefix string, writeEvent func(string, []byte)) {
+func (h *OpenAIAPIHandler) forwardImagesStream(ctx context.Context, c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage, firstChunk []byte, responseFormat string, streamPrefix string, writeEvent func(string, []byte), keepAliveInterval *time.Duration) {
 	acc := &sseFrameAccumulator{}
+	interval := handlers.StreamingKeepAliveInterval(h.Cfg)
+	if keepAliveInterval != nil {
+		interval = *keepAliveInterval
+	}
+	var keepAlive *time.Ticker
+	var keepAliveC <-chan time.Time
+	if interval > 0 {
+		keepAlive = time.NewTicker(interval)
+		defer keepAlive.Stop()
+		keepAliveC = keepAlive.C
+	}
 
 	responseFormat = strings.ToLower(strings.TrimSpace(responseFormat))
 	if responseFormat == "" {
@@ -955,13 +997,23 @@ func (h *OpenAIAPIHandler) forwardImagesStream(ctx context.Context, c *gin.Conte
 			errs = nil
 		case chunk, ok := <-data:
 			if !ok {
+				if errMsg, pending := handlers.PendingStreamError(errs); pending {
+					if errMsg == nil {
+						errMsg = &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: errors.New("stream failed")}
+					}
+					emitError(errMsg)
+					cancel(errMsg.Error)
+					return
+				}
 				for _, frame := range acc.Flush() {
 					if processFrame(frame) {
 						cancel(nil)
 						return
 					}
 				}
-				cancel(nil)
+				errStream := errors.New("stream ended before response.completed")
+				emitError(&interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: errStream})
+				cancel(errStream)
 				return
 			}
 			for _, frame := range acc.AddChunk(chunk) {
@@ -970,6 +1022,9 @@ func (h *OpenAIAPIHandler) forwardImagesStream(ctx context.Context, c *gin.Conte
 					return
 				}
 			}
+		case <-keepAliveC:
+			_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
+			flusher.Flush()
 		}
 	}
 }

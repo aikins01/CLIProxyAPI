@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -96,8 +97,12 @@ type Auth struct {
 	Success int64 `json:"-"`
 	Failed  int64 `json:"-"`
 
-	recentRequests recentRequestRing `json:"-"`
-	indexAssigned  bool              `json:"-"`
+	recentRequests       recentRequestRing `json:"-"`
+	indexAssigned        bool              `json:"-"`
+	metadataVersion      uint64            `json:"-"`
+	metadataVersionKnown bool              `json:"-"`
+	metadataSnapshot     map[string]any    `json:"-"`
+	metadataUpdatedAt    time.Time         `json:"-"`
 }
 
 const (
@@ -227,10 +232,27 @@ func (a *Auth) Clone() *Auth {
 			copyAuth.Attributes[key] = value
 		}
 	}
-	if len(a.Metadata) > 0 {
-		copyAuth.Metadata = make(map[string]any, len(a.Metadata))
-		for key, value := range a.Metadata {
-			copyAuth.Metadata[key] = value
+	copyAuth.Metadata = cloneMetadata(a.Metadata)
+	copyAuth.metadataSnapshot = cloneMetadata(a.metadataSnapshot)
+	if len(a.ModelStates) > 0 {
+		copyAuth.ModelStates = make(map[string]*ModelState, len(a.ModelStates))
+		for key, state := range a.ModelStates {
+			copyAuth.ModelStates[key] = state.Clone()
+		}
+	}
+	copyAuth.Runtime = a.Runtime
+	return &copyAuth
+}
+
+func (a *Auth) cloneWithSharedMetadata() *Auth {
+	if a == nil {
+		return nil
+	}
+	copyAuth := *a
+	if len(a.Attributes) > 0 {
+		copyAuth.Attributes = make(map[string]string, len(a.Attributes))
+		for key, value := range a.Attributes {
+			copyAuth.Attributes[key] = value
 		}
 	}
 	if len(a.ModelStates) > 0 {
@@ -241,6 +263,173 @@ func (a *Auth) Clone() *Auth {
 	}
 	copyAuth.Runtime = a.Runtime
 	return &copyAuth
+}
+
+func cloneMetadata(metadata map[string]any) map[string]any {
+	if metadata == nil {
+		return nil
+	}
+	cloned := make(map[string]any, len(metadata))
+	for key, value := range metadata {
+		cloned[key] = cloneMetadataValue(value)
+	}
+	return cloned
+}
+
+func cloneMetadataValue(value any) any {
+	if value == nil {
+		return nil
+	}
+	cloned, ok := cloneMetadataReflectValue(reflect.ValueOf(value), make(map[metadataCloneVisit]reflect.Value))
+	if !ok || !cloned.IsValid() {
+		return nil
+	}
+	return cloned.Interface()
+}
+
+type metadataCloneVisit struct {
+	typeOf  reflect.Type
+	pointer uintptr
+	length  int
+	cap     int
+}
+
+var metadataTimeType = reflect.TypeOf(time.Time{})
+
+func metadataTypeContainsSynchronization(typeOf reflect.Type, visiting map[reflect.Type]bool) bool {
+	if typeOf == metadataTimeType {
+		return false
+	}
+	if visiting[typeOf] {
+		return false
+	}
+	visiting[typeOf] = true
+	defer delete(visiting, typeOf)
+	switch typeOf.Kind() {
+	case reflect.Map:
+		return metadataTypeContainsSynchronization(typeOf.Key(), visiting) || metadataTypeContainsSynchronization(typeOf.Elem(), visiting)
+	case reflect.Slice, reflect.Array, reflect.Pointer:
+		return metadataTypeContainsSynchronization(typeOf.Elem(), visiting)
+	case reflect.Struct:
+		if typeOf.PkgPath() == "sync" || typeOf.PkgPath() == "sync/atomic" {
+			return true
+		}
+		for i := 0; i < typeOf.NumField(); i++ {
+			if metadataTypeContainsSynchronization(typeOf.Field(i).Type, visiting) {
+				return true
+			}
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+func cloneMetadataReflectValue(value reflect.Value, seen map[metadataCloneVisit]reflect.Value) (reflect.Value, bool) {
+	switch value.Kind() {
+	case reflect.Interface:
+		if value.IsNil() {
+			return reflect.Zero(value.Type()), true
+		}
+		cloned, ok := cloneMetadataReflectValue(value.Elem(), seen)
+		if !ok {
+			return reflect.Value{}, false
+		}
+		out := reflect.New(value.Type()).Elem()
+		out.Set(cloned)
+		return out, true
+	case reflect.Map:
+		if value.IsNil() {
+			return reflect.Zero(value.Type()), true
+		}
+		visit := metadataCloneVisit{typeOf: value.Type(), pointer: value.Pointer()}
+		if cloned, ok := seen[visit]; ok {
+			return cloned, true
+		}
+		out := reflect.MakeMapWithSize(value.Type(), value.Len())
+		seen[visit] = out
+		iterator := value.MapRange()
+		for iterator.Next() {
+			key, ok := cloneMetadataReflectValue(iterator.Key(), seen)
+			if !ok {
+				return reflect.Value{}, false
+			}
+			item, ok := cloneMetadataReflectValue(iterator.Value(), seen)
+			if !ok {
+				return reflect.Value{}, false
+			}
+			out.SetMapIndex(key, item)
+		}
+		return out, true
+	case reflect.Slice:
+		if value.IsNil() {
+			return reflect.Zero(value.Type()), true
+		}
+		visit := metadataCloneVisit{typeOf: value.Type(), pointer: value.Pointer(), length: value.Len(), cap: value.Cap()}
+		if cloned, ok := seen[visit]; ok {
+			return cloned, true
+		}
+		out := reflect.MakeSlice(value.Type(), value.Len(), value.Len())
+		seen[visit] = out
+		for i := 0; i < value.Len(); i++ {
+			item, ok := cloneMetadataReflectValue(value.Index(i), seen)
+			if !ok {
+				return reflect.Value{}, false
+			}
+			out.Index(i).Set(item)
+		}
+		return out, true
+	case reflect.Array:
+		out := reflect.New(value.Type()).Elem()
+		for i := 0; i < value.Len(); i++ {
+			item, ok := cloneMetadataReflectValue(value.Index(i), seen)
+			if !ok {
+				return reflect.Value{}, false
+			}
+			out.Index(i).Set(item)
+		}
+		return out, true
+	case reflect.Pointer:
+		if value.IsNil() {
+			return reflect.Zero(value.Type()), true
+		}
+		if metadataTypeContainsSynchronization(value.Type().Elem(), make(map[reflect.Type]bool)) {
+			return value, true
+		}
+		visit := metadataCloneVisit{typeOf: value.Type(), pointer: value.Pointer()}
+		if cloned, ok := seen[visit]; ok {
+			return cloned, true
+		}
+		out := reflect.New(value.Type().Elem())
+		seen[visit] = out
+		item, ok := cloneMetadataReflectValue(value.Elem(), seen)
+		if !ok {
+			return reflect.Value{}, false
+		}
+		out.Elem().Set(item)
+		return out, true
+	case reflect.Struct:
+		if metadataTypeContainsSynchronization(value.Type(), make(map[reflect.Type]bool)) {
+			return value, true
+		}
+		out := reflect.New(value.Type()).Elem()
+		out.Set(value)
+		for i := 0; i < value.NumField(); i++ {
+			if value.Type().Field(i).PkgPath != "" {
+				continue
+			}
+			item, ok := cloneMetadataReflectValue(value.Field(i), seen)
+			if !ok {
+				return reflect.Value{}, false
+			}
+			out.Field(i).Set(item)
+		}
+		return out, true
+	case reflect.Chan, reflect.Func, reflect.UnsafePointer:
+		return value, true
+	default:
+		return value, true
+	}
 }
 
 func stableAuthIndex(seed string) string {

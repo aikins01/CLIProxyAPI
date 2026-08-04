@@ -3,6 +3,10 @@ package executor
 import (
 	"net/http"
 	"net/url"
+	"runtime"
+	"sync"
+	"time"
+	"weak"
 
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 )
@@ -70,7 +74,8 @@ type Response struct {
 
 // StreamChunk represents a single streaming payload unit emitted by provider executors.
 type StreamChunk struct {
-	// Payload is the raw provider chunk payload.
+	// Payload is a raw provider fragment. Framing bytes must be preserved because consumers
+	// concatenate adjacent payloads without inserting separators.
 	Payload []byte
 	// Err reports any terminal error encountered while producing chunks.
 	Err error
@@ -78,11 +83,129 @@ type StreamChunk struct {
 
 // StreamResult wraps the streaming response, providing both the chunk channel
 // and the upstream HTTP response headers captured before streaming begins.
+// Keepalive and bootstrap metadata set through its methods belongs to this
+// pointer and is not preserved by copying the struct. Wrappers must consume
+// that metadata from the original and apply it to the replacement result.
 type StreamResult struct {
 	// Headers carries upstream HTTP response headers from the initial connection.
 	Headers http.Header
 	// Chunks is the channel of streaming payload units.
 	Chunks <-chan StreamChunk
+}
+
+type streamResultMetadata struct {
+	keepAliveInterval    time.Duration
+	hasKeepAliveInterval bool
+	bootstrapCommitted   bool
+}
+
+var streamResultMetadataStore = struct {
+	sync.Mutex
+	values map[weak.Pointer[StreamResult]]streamResultMetadata
+}{values: make(map[weak.Pointer[StreamResult]]streamResultMetadata)}
+
+func removeStreamResultMetadata(key weak.Pointer[StreamResult]) {
+	streamResultMetadataStore.Lock()
+	delete(streamResultMetadataStore.values, key)
+	streamResultMetadataStore.Unlock()
+}
+
+// SetKeepAliveInterval records the executor's preferred downstream keepalive interval.
+func (r *StreamResult) SetKeepAliveInterval(interval time.Duration) {
+	if r == nil {
+		return
+	}
+	key := weak.Make(r)
+	streamResultMetadataStore.Lock()
+	metadata, exists := streamResultMetadataStore.values[key]
+	metadata.keepAliveInterval = interval
+	metadata.hasKeepAliveInterval = true
+	streamResultMetadataStore.values[key] = metadata
+	streamResultMetadataStore.Unlock()
+	if !exists {
+		runtime.AddCleanup(r, removeStreamResultMetadata, key)
+	}
+	runtime.KeepAlive(r)
+}
+
+// TakeKeepAliveInterval returns and removes the executor's downstream keepalive interval.
+func (r *StreamResult) TakeKeepAliveInterval() *time.Duration {
+	if r == nil {
+		return nil
+	}
+	key := weak.Make(r)
+	streamResultMetadataStore.Lock()
+	metadata, exists := streamResultMetadataStore.values[key]
+	hasKeepAliveInterval := exists && metadata.hasKeepAliveInterval
+	interval := metadata.keepAliveInterval
+	if exists {
+		metadata.hasKeepAliveInterval = false
+		if metadata.bootstrapCommitted {
+			streamResultMetadataStore.values[key] = metadata
+		} else {
+			delete(streamResultMetadataStore.values, key)
+		}
+	}
+	streamResultMetadataStore.Unlock()
+	runtime.KeepAlive(r)
+	if !hasKeepAliveInterval {
+		return nil
+	}
+	return &interval
+}
+
+// SetBootstrapCommitted marks an accepted upstream request that must not be retried and whose
+// downstream streaming response may be committed before the first payload is available.
+func (r *StreamResult) SetBootstrapCommitted() {
+	if r == nil {
+		return
+	}
+	key := weak.Make(r)
+	streamResultMetadataStore.Lock()
+	metadata, exists := streamResultMetadataStore.values[key]
+	metadata.bootstrapCommitted = true
+	streamResultMetadataStore.values[key] = metadata
+	streamResultMetadataStore.Unlock()
+	if !exists {
+		runtime.AddCleanup(r, removeStreamResultMetadata, key)
+	}
+	runtime.KeepAlive(r)
+}
+
+// BootstrapCommitted reports whether retrying could duplicate accepted upstream work and the
+// downstream streaming response may be committed before the first payload is available.
+func (r *StreamResult) BootstrapCommitted() bool {
+	if r == nil {
+		return false
+	}
+	key := weak.Make(r)
+	streamResultMetadataStore.Lock()
+	metadata := streamResultMetadataStore.values[key]
+	streamResultMetadataStore.Unlock()
+	runtime.KeepAlive(r)
+	return metadata.bootstrapCommitted
+}
+
+// TakeBootstrapCommitted reports and removes the internal bootstrap commitment marker.
+func (r *StreamResult) TakeBootstrapCommitted() bool {
+	if r == nil {
+		return false
+	}
+	key := weak.Make(r)
+	streamResultMetadataStore.Lock()
+	metadata, exists := streamResultMetadataStore.values[key]
+	committed := exists && metadata.bootstrapCommitted
+	if exists {
+		metadata.bootstrapCommitted = false
+		if metadata.hasKeepAliveInterval {
+			streamResultMetadataStore.values[key] = metadata
+		} else {
+			delete(streamResultMetadataStore.values, key)
+		}
+	}
+	streamResultMetadataStore.Unlock()
+	runtime.KeepAlive(r)
+	return committed
 }
 
 // StatusError represents an error that carries an HTTP-like status code.
