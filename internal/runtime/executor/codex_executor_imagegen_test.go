@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
@@ -25,13 +26,11 @@ func TestCodexExecutorLocalNeoRequestDoesNotInjectImageGeneration(t *testing.T) 
 
 	exec := NewCodexExecutor(&config.Config{})
 	auth := &cliproxyauth.Auth{Attributes: map[string]string{"base_url": server.URL, "api_key": "test"}}
-	headers := http.Header{}
-	headers.Set(localNeoInferenceHeaderName, "1")
-	_, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
+	ctx := util.WithTrustedLocalNeoInference(context.Background())
+	_, err := exec.Execute(ctx, auth, cliproxyexecutor.Request{
 		Model:   "gpt-5.6-sol",
 		Payload: []byte(`{"model":"gpt-5.6-sol","input":"summarize","tools":[]}`),
 	}, cliproxyexecutor.Options{
-		Headers:      headers,
 		SourceFormat: sdktranslator.FromString("openai-response"),
 	})
 	if err != nil {
@@ -45,14 +44,11 @@ func TestCodexExecutorLocalNeoRequestDoesNotInjectImageGeneration(t *testing.T) 
 }
 
 func TestShouldEnsureImageGenerationToolPreservesPublicRequests(t *testing.T) {
-	if !shouldEnsureImageGenerationTool(&config.Config{}, cliproxyexecutor.Options{}) {
+	if !shouldEnsureImageGenerationTool(context.Background(), &config.Config{}) {
 		t.Fatal("public request should retain image generation")
 	}
-	headers := http.Header{}
-	headers.Set(localNeoInferenceHeaderName, "1")
-	if shouldEnsureImageGenerationTool(&config.Config{}, cliproxyexecutor.Options{
-		Headers: headers,
-	}) {
+	ctx := util.WithTrustedLocalNeoInference(context.Background())
+	if shouldEnsureImageGenerationTool(ctx, &config.Config{}) {
 		t.Fatal("local Neo request should not inject image generation")
 	}
 }

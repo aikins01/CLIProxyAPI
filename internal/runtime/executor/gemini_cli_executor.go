@@ -8,9 +8,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -47,7 +49,8 @@ var geminiOAuthScopes = []string{
 
 // GeminiCLIExecutor talks to the Cloud Code Assist endpoint using OAuth credentials from auth metadata.
 type GeminiCLIExecutor struct {
-	cfg *config.Config
+	cfg                *config.Config
+	updateAuthMetadata func(context.Context, *cliproxyauth.Auth, map[string]any) (*cliproxyauth.Auth, error)
 }
 
 // NewGeminiCLIExecutor creates a new Gemini CLI executor instance.
@@ -61,6 +64,10 @@ func NewGeminiCLIExecutor(cfg *config.Config) *GeminiCLIExecutor {
 	return &GeminiCLIExecutor{cfg: cfg}
 }
 
+func (e *GeminiCLIExecutor) SetAuthMetadataUpdater(update func(context.Context, *cliproxyauth.Auth, map[string]any) (*cliproxyauth.Auth, error)) {
+	e.updateAuthMetadata = update
+}
+
 // Identifier returns the executor identifier.
 func (e *GeminiCLIExecutor) Identifier() string { return "gemini-cli" }
 
@@ -69,7 +76,7 @@ func (e *GeminiCLIExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth
 	if req == nil {
 		return nil
 	}
-	tokenSource, _, errSource := prepareGeminiCLITokenSource(req.Context(), e.cfg, auth)
+	tokenSource, baseTokenData, errSource := prepareGeminiCLITokenSource(req.Context(), e.cfg, auth)
 	if errSource != nil {
 		return errSource
 	}
@@ -79,6 +86,9 @@ func (e *GeminiCLIExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth
 	}
 	if strings.TrimSpace(tok.AccessToken) == "" {
 		return statusErr{code: http.StatusUnauthorized, msg: "missing access token"}
+	}
+	if errUpdate := e.updateGeminiCLITokenMetadata(req.Context(), auth, baseTokenData, tok); errUpdate != nil {
+		return fmt.Errorf("persist gemini-cli token metadata: %w", errUpdate)
 	}
 	req.Header.Set("Authorization", "Bearer "+tok.AccessToken)
 	applyGeminiCLIHeaders(req, "unknown")
@@ -181,7 +191,10 @@ func (e *GeminiCLIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 			err = errTok
 			return resp, err
 		}
-		updateGeminiCLITokenMetadata(auth, baseTokenData, tok)
+		err = e.updateGeminiCLITokenMetadata(ctx, auth, baseTokenData, tok)
+		if err != nil {
+			return resp, fmt.Errorf("persist gemini-cli token metadata: %w", err)
+		}
 
 		url := fmt.Sprintf("%s/%s:%s", codeAssistEndpoint, codeAssistVersion, action)
 		if opts.Alt != "" && action != "countTokens" {
@@ -326,7 +339,10 @@ func (e *GeminiCLIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 			err = errTok
 			return nil, err
 		}
-		updateGeminiCLITokenMetadata(auth, baseTokenData, tok)
+		err = e.updateGeminiCLITokenMetadata(ctx, auth, baseTokenData, tok)
+		if err != nil {
+			return nil, fmt.Errorf("persist gemini-cli token metadata: %w", err)
+		}
 
 		url := fmt.Sprintf("%s/%s:%s", codeAssistEndpoint, codeAssistVersion, "streamGenerateContent")
 		if opts.Alt == "" {
@@ -535,7 +551,10 @@ func (e *GeminiCLIExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.
 		if errTok != nil {
 			return cliproxyexecutor.Response{}, errTok
 		}
-		updateGeminiCLITokenMetadata(auth, baseTokenData, tok)
+		err = e.updateGeminiCLITokenMetadata(ctx, auth, baseTokenData, tok)
+		if err != nil {
+			return cliproxyexecutor.Response{}, fmt.Errorf("persist gemini-cli token metadata: %w", err)
+		}
 
 		url := fmt.Sprintf("%s/%s:%s", codeAssistEndpoint, codeAssistVersion, "countTokens")
 		if opts.Alt != "" {
@@ -680,7 +699,6 @@ func prepareGeminiCLITokenSource(ctx context.Context, cfg *config.Config, auth *
 		if token.AccessToken == "" {
 			return nil, nil, fmt.Errorf("gemini-cli access token missing")
 		}
-		updateGeminiCLITokenMetadata(auth, base, &token)
 		return oauth2.StaticTokenSource(&token), base, nil
 	}
 
@@ -689,23 +707,53 @@ func prepareGeminiCLITokenSource(ctx context.Context, cfg *config.Config, auth *
 	if err != nil {
 		return nil, nil, err
 	}
-	updateGeminiCLITokenMetadata(auth, base, currentToken)
 	return oauth2.ReuseTokenSource(currentToken, src), base, nil
 }
 
-func updateGeminiCLITokenMetadata(auth *cliproxyauth.Auth, base map[string]any, tok *oauth2.Token) {
+func (e *GeminiCLIExecutor) updateGeminiCLITokenMetadata(ctx context.Context, auth *cliproxyauth.Auth, base map[string]any, tok *oauth2.Token) error {
 	if auth == nil || tok == nil {
-		return
+		return nil
 	}
 	merged := buildGeminiTokenMap(base, tok)
 	fields := buildGeminiTokenFields(tok, merged)
 	shared := geminicli.ResolveSharedCredential(auth.Runtime)
 	if shared != nil {
-		snapshot := shared.MergeMetadata(fields)
-		if !geminicli.IsVirtual(auth.Runtime) {
+		snapshot, errCommit := shared.CommitMetadata(fields, func(candidate map[string]any) (map[string]any, error) {
+			if e == nil || e.updateAuthMetadata == nil {
+				return candidate, nil
+			}
+			updated, errUpdate := e.updateAuthMetadata(ctx, auth, candidate)
+			if errors.Is(errUpdate, cliproxyauth.ErrStaleAuthMetadata) && updated != nil && geminiMetadataIncludes(updated.Metadata, fields) {
+				errUpdate = nil
+			}
+			if errUpdate != nil || updated == nil {
+				return nil, errUpdate
+			}
+			return updated.Metadata, nil
+		})
+		if errCommit != nil {
+			return errCommit
+		}
+		if (e == nil || e.updateAuthMetadata == nil) && !geminicli.IsVirtual(auth.Runtime) {
 			auth.Metadata = snapshot
 		}
-		return
+		return nil
+	}
+	if geminiMetadataIncludes(auth.Metadata, fields) {
+		return nil
+	}
+	if e != nil && e.updateAuthMetadata != nil {
+		updated, errUpdate := e.updateAuthMetadata(ctx, auth, fields)
+		if errors.Is(errUpdate, cliproxyauth.ErrStaleAuthMetadata) && updated != nil && geminiMetadataIncludes(updated.Metadata, fields) {
+			errUpdate = nil
+		}
+		if errUpdate != nil {
+			return errUpdate
+		}
+		if updated == nil {
+			return errors.New("gemini-cli token metadata update returned no committed state")
+		}
+		return nil
 	}
 	if auth.Metadata == nil {
 		auth.Metadata = make(map[string]any)
@@ -713,6 +761,16 @@ func updateGeminiCLITokenMetadata(auth *cliproxyauth.Auth, base map[string]any, 
 	for k, v := range fields {
 		auth.Metadata[k] = v
 	}
+	return nil
+}
+
+func geminiMetadataIncludes(metadata, fields map[string]any) bool {
+	for key, value := range fields {
+		if !reflect.DeepEqual(metadata[key], value) {
+			return false
+		}
+	}
+	return true
 }
 
 func buildGeminiTokenMap(base map[string]any, tok *oauth2.Token) map[string]any {

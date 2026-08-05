@@ -182,7 +182,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	body, _ = sjson.DeleteBytes(body, "safety_identifier")
 	body, _ = sjson.DeleteBytes(body, "stream_options")
 	body = normalizeCodexInstructions(body)
-	if shouldEnsureImageGenerationTool(e.cfg, opts) {
+	if shouldEnsureImageGenerationTool(ctx, e.cfg) {
 		body = ensureImageGenerationTool(body, baseModel, auth)
 	}
 
@@ -333,7 +333,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body, _ = sjson.DeleteBytes(body, "stream")
 	body = normalizeCodexInstructions(body)
-	if shouldEnsureImageGenerationTool(e.cfg, opts) {
+	if shouldEnsureImageGenerationTool(ctx, e.cfg) {
 		body = ensureImageGenerationTool(body, baseModel, auth)
 	}
 
@@ -431,7 +431,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	body, _ = sjson.DeleteBytes(body, "stream_options")
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body = normalizeCodexInstructions(body)
-	if shouldEnsureImageGenerationTool(e.cfg, opts) {
+	if shouldEnsureImageGenerationTool(ctx, e.cfg) {
 		body = ensureImageGenerationTool(body, baseModel, auth)
 	}
 
@@ -493,6 +493,44 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		var param any
 		outputItemsByIndex := make(map[int64][]byte)
 		var outputItemsFallback [][]byte
+		responsesTarget := from == sdktranslator.FormatOpenAIResponse
+		var responsesEvent []byte
+
+		sendStreamErr := func(err error) {
+			helps.RecordAPIResponseError(ctx, e.cfg, err)
+			reporter.PublishFailure(ctx, err)
+			select {
+			case out <- cliproxyexecutor.StreamChunk{Err: err}:
+			case <-ctx.Done():
+			}
+		}
+
+		sendTranslated := func(raw []byte) bool {
+			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalPayload, body, raw, &param)
+			for i := range chunks {
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
+				case <-ctx.Done():
+					return false
+				}
+			}
+			return true
+		}
+
+		flushResponsesEvent := func() bool {
+			if len(bytes.TrimSpace(responsesEvent)) == 0 {
+				responsesEvent = nil
+				return true
+			}
+			responsesEvent = bytes.TrimRight(responsesEvent, "\r\n")
+			responsesEvent = append(responsesEvent, '\n', '\n')
+			if !sendTranslated(responsesEvent) {
+				return false
+			}
+			responsesEvent = nil
+			return true
+		}
+
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
@@ -513,22 +551,28 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				}
 			}
 
-			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalPayload, body, translatedLine, &param)
-			for i := range chunks {
-				select {
-				case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
-				case <-ctx.Done():
+			if responsesTarget {
+				if len(line) == 0 || string(line) == "\r" {
+					if !flushResponsesEvent() {
+						return
+					}
+					continue
+				}
+				if len(responsesEvent)+len(translatedLine)+1 > 52_428_800 { // 50MB
+					sendStreamErr(fmt.Errorf("codex executor: responses SSE event exceeds 50MB"))
 					return
 				}
+				responsesEvent = append(responsesEvent, translatedLine...)
+				responsesEvent = append(responsesEvent, '\n')
+				continue
+			}
+			if !sendTranslated(translatedLine) {
+				return
 			}
 		}
 		if errScan := scanner.Err(); errScan != nil {
-			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
-			reporter.PublishFailure(ctx, errScan)
-			select {
-			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
-			case <-ctx.Done():
-			}
+			sendStreamErr(errScan)
+			return
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
@@ -906,11 +950,11 @@ func isCodexFreePlanAuth(auth *cliproxyauth.Auth) bool {
 	return strings.EqualFold(strings.TrimSpace(auth.Attributes["plan_type"]), "free")
 }
 
-func shouldEnsureImageGenerationTool(cfg *config.Config, opts cliproxyexecutor.Options) bool {
+func shouldEnsureImageGenerationTool(ctx context.Context, cfg *config.Config) bool {
 	if cfg != nil && cfg.DisableImageGeneration != config.DisableImageGenerationOff {
 		return false
 	}
-	return strings.TrimSpace(opts.Headers.Get(localNeoInferenceHeaderName)) != "1"
+	return !util.IsTrustedLocalNeoInference(ctx)
 }
 
 func ensureImageGenerationTool(body []byte, baseModel string, auth *cliproxyauth.Auth) []byte {

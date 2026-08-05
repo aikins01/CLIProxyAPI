@@ -11,14 +11,7 @@ import (
 // to OpenAI Responses SSE events (response.*).
 
 func ConvertCodexResponseToOpenAIResponses(_ context.Context, _ string, _, _, rawJSON []byte, _ *any) [][]byte {
-	if bytes.HasPrefix(rawJSON, []byte("data:")) {
-		rawJSON = bytes.TrimSpace(rawJSON[5:])
-		out := make([]byte, 0, len(rawJSON)+len("data: "))
-		out = append(out, []byte("data: ")...)
-		out = append(out, rawJSON...)
-		return [][]byte{out}
-	}
-	return [][]byte{rawJSON}
+	return [][]byte{bytes.Clone(rawJSON)}
 }
 
 // ConvertCodexResponseToOpenAIResponsesNonStream builds a single Responses JSON
