@@ -321,6 +321,17 @@ nonstream-keepalive-interval: 0
 #   restrict-management-to-localhost: false
 #   # Force model mappings to run before checking local API keys (default: false)
 #   force-model-mappings: false
+#   # Local Rivet thread-actor proxy: when Amp expects its actor gateway at localhost:6420
+#   # but the Neo local runtime is disabled, forward actor HTTP/WebSocket traffic to the
+#   # cloud actor endpoint. Enabled by default when upstream-url is set and the Neo local
+#   # runtime is disabled. The Neo local runtime, when enabled, owns the endpoint instead.
+#   # thread-actor-proxy-enabled: true
+#   # Local listener address for the actor proxy (default: 127.0.0.1:6420)
+#   # thread-actor-proxy-addr: "127.0.0.1:6420"
+#   # Cloud actor endpoint to proxy to (default: detected from the Amp binary, else https://actors.ampcode.com).
+#   # The Rivet gateway token is only forwarded when the upstream URL carries it as userinfo
+#   # (user:token@host), as the auto-detected endpoint from the Amp binary does.
+#   # thread-actor-proxy-upstream: "https://actors.ampcode.com"
 #   # Optional: write candidate Amp compaction provider requests here for parity debugging.
 #   # Leave empty unless you are intentionally capturing compaction payloads.
 #   compaction-capture-dir: ""
