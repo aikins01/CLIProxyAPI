@@ -2,8 +2,11 @@ package auth
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -109,7 +112,8 @@ func TestManager_ShouldRetryAfterError_UsesOAuthModelAliasForCooldown(t *testing
 }
 
 type credentialRetryLimitExecutor struct {
-	id string
+	id       string
+	countErr error
 
 	mu    sync.Mutex
 	calls int
@@ -135,6 +139,9 @@ func (e *credentialRetryLimitExecutor) Refresh(_ context.Context, auth *Auth) (*
 
 func (e *credentialRetryLimitExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	e.recordCall()
+	if e.countErr != nil {
+		return cliproxyexecutor.Response{}, e.countErr
+	}
 	return cliproxyexecutor.Response{}, &Error{HTTPStatus: 500, Message: "boom"}
 }
 
@@ -152,6 +159,132 @@ func (e *credentialRetryLimitExecutor) Calls() int {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.calls
+}
+
+type authStateNeutralTestError struct{}
+
+func (authStateNeutralTestError) Error() string          { return "auth state neutral" }
+func (authStateNeutralTestError) AuthStateNeutral() bool { return true }
+
+type nonRetryableTestError struct{}
+
+func (nonRetryableTestError) Error() string          { return "non-retryable" }
+func (nonRetryableTestError) AuthStateNeutral() bool { return true }
+func (nonRetryableTestError) Retryable() bool        { return false }
+
+type typedNilMarkerTestError struct {
+	status     int
+	retryAfter time.Duration
+	neutral    bool
+	retryable  bool
+	child      error
+}
+
+func (*typedNilMarkerTestError) Error() string { return "typed nil marker" }
+func (e *typedNilMarkerTestError) StatusCode() int {
+	return e.status
+}
+func (e *typedNilMarkerTestError) RetryAfter() *time.Duration {
+	return &e.retryAfter
+}
+func (e *typedNilMarkerTestError) AuthStateNeutral() bool {
+	return e.neutral
+}
+func (e *typedNilMarkerTestError) Retryable() bool {
+	return e.retryable
+}
+func (e *typedNilMarkerTestError) Unwrap() error {
+	return e.child
+}
+
+var _ = Result{"", "", "", false, nil, nil}
+
+type resultRecordingHook struct {
+	calls   atomic.Int32
+	neutral atomic.Bool
+}
+
+func (*resultRecordingHook) OnAuthRegistered(context.Context, *Auth) {}
+func (*resultRecordingHook) OnAuthUpdated(context.Context, *Auth)    {}
+
+func (h *resultRecordingHook) OnResult(ctx context.Context, _ Result) {
+	h.calls.Add(1)
+	h.neutral.Store(IsAuthStateNeutralResult(ctx))
+}
+
+type reentrantResultHook struct {
+	manager                 *Manager
+	updateReturned          atomic.Bool
+	updatedCallbackDeferred atomic.Bool
+	err                     error
+}
+
+func (*reentrantResultHook) OnAuthRegistered(context.Context, *Auth) {}
+
+func (h *reentrantResultHook) OnAuthUpdated(context.Context, *Auth) {
+	h.updatedCallbackDeferred.Store(h.updateReturned.Load())
+}
+
+func (h *reentrantResultHook) OnResult(ctx context.Context, result Result) {
+	auth, ok := h.manager.GetByID(result.AuthID)
+	if !ok {
+		h.err = errors.New("auth not found")
+		return
+	}
+	auth.Label = "updated-from-result"
+	_, h.err = h.manager.Update(ctx, auth)
+	if h.err == nil {
+		h.updateReturned.Store(true)
+	}
+}
+
+type authStateNeutralExecutor struct {
+	id           string
+	executeErr   error
+	streamErr    error
+	streamChunks []cliproxyexecutor.StreamChunk
+}
+
+type bootstrapCommittedPoolExecutor struct {
+	*openAICompatPoolExecutor
+}
+
+func (e *bootstrapCommittedPoolExecutor) ExecuteStream(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	result, err := e.openAICompatPoolExecutor.ExecuteStream(ctx, auth, req, opts)
+	if result != nil {
+		result.SetBootstrapCommitted()
+	}
+	return result, err
+}
+
+func (e *authStateNeutralExecutor) Identifier() string { return e.id }
+
+func (e *authStateNeutralExecutor) Execute(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, e.executeErr
+}
+
+func (e *authStateNeutralExecutor) ExecuteStream(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	if e.streamErr != nil {
+		return nil, e.streamErr
+	}
+	chunks := make(chan cliproxyexecutor.StreamChunk, len(e.streamChunks))
+	for _, chunk := range e.streamChunks {
+		chunks <- chunk
+	}
+	close(chunks)
+	return &cliproxyexecutor.StreamResult{Chunks: chunks}, nil
+}
+
+func (*authStateNeutralExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, error) {
+	return auth, nil
+}
+
+func (*authStateNeutralExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, nil
+}
+
+func (*authStateNeutralExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
+	return nil, nil
 }
 
 type authFallbackExecutor struct {
@@ -282,6 +415,343 @@ func newCredentialRetryLimitTestManager(t *testing.T, maxRetryCredentials int) (
 	}
 
 	return m, executor
+}
+
+func TestManagerExecuteCountDoesNotMarkAuthStateNeutralFailure(t *testing.T) {
+	hook := &resultRecordingHook{}
+	m := NewManager(nil, nil, hook)
+	m.SetRetryConfig(0, 0, 1)
+	executor := &credentialRetryLimitExecutor{id: "chatgpt-web", countErr: authStateNeutralTestError{}}
+	m.RegisterExecutor(executor)
+	auth := &Auth{ID: uuid.NewString(), Provider: "chatgpt-web"}
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "test-model"}})
+	t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+	if _, err := m.Register(t.Context(), auth); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := m.ExecuteCount(t.Context(), []string{auth.Provider}, cliproxyexecutor.Request{Model: "test-model"}, cliproxyexecutor.Options{}); err == nil {
+		t.Fatal("expected token-count error")
+	}
+	current, ok := m.GetByID(auth.ID)
+	if !ok {
+		t.Fatal("auth not found")
+	}
+	if current.Failed != 0 || current.LastError != nil {
+		t.Fatalf("auth-neutral token-count failure changed auth state: %#v", current)
+	}
+	if hook.calls.Load() != 1 || !hook.neutral.Load() {
+		t.Fatalf("neutral token-count hook calls = %d, neutral = %t", hook.calls.Load(), hook.neutral.Load())
+	}
+}
+
+func TestManagerResultHookReentryIsSerialized(t *testing.T) {
+	hook := &reentrantResultHook{}
+	m := NewManager(nil, nil, hook)
+	hook.manager = m
+	auth, err := m.Register(t.Context(), &Auth{ID: uuid.NewString(), Provider: "chatgpt-web"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	m.MarkResult(WithAuthStateNeutralResult(t.Context()), Result{AuthID: auth.ID})
+	if hook.err != nil {
+		t.Fatal(hook.err)
+	}
+	if !hook.updateReturned.Load() || !hook.updatedCallbackDeferred.Load() {
+		t.Fatal("result hook reentry did not defer the nested callback until the update returned")
+	}
+	updated, ok := m.GetByID(auth.ID)
+	if !ok || updated.Label != "updated-from-result" {
+		t.Fatalf("updated auth = %#v", updated)
+	}
+}
+
+func TestManagerExecuteStreamDoesNotRetryCommittedBootstrap(t *testing.T) {
+	alias := "committed-bootstrap-model"
+	firstErr := &Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota"}
+	baseExecutor := &openAICompatPoolExecutor{
+		id:                "pool",
+		streamFirstErrors: map[string]error{"first-model": firstErr},
+	}
+	executor := &bootstrapCommittedPoolExecutor{openAICompatPoolExecutor: baseExecutor}
+	m := NewManager(nil, nil, nil)
+	m.SetConfig(&internalconfig.Config{
+		OpenAICompatibility: []internalconfig.OpenAICompatibility{{
+			Name: "pool",
+			Models: []internalconfig.OpenAICompatibilityModel{
+				{Name: "first-model", Alias: alias},
+				{Name: "second-model", Alias: alias},
+			},
+		}},
+	})
+	m.RegisterExecutor(executor)
+	auth := &Auth{
+		ID:       "committed-bootstrap-auth-" + uuid.NewString(),
+		Provider: "pool",
+		Status:   StatusActive,
+		Attributes: map[string]string{
+			"api_key":      "test-key",
+			"compat_name":  "pool",
+			"provider_key": "pool",
+		},
+	}
+	if _, err := m.Register(t.Context(), auth); err != nil {
+		t.Fatal(err)
+	}
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: alias}})
+	t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+
+	result, err := m.ExecuteStream(t.Context(), []string{auth.Provider}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.BootstrapCommitted() {
+		t.Fatal("manager stream did not preserve committed bootstrap state")
+	}
+	var streamErr error
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			streamErr = chunk.Err
+		}
+	}
+	if streamErr != firstErr {
+		t.Fatalf("stream error = %v, want %v", streamErr, firstErr)
+	}
+	if models := baseExecutor.StreamModels(); len(models) != 1 || models[0] != "first-model" {
+		t.Fatalf("stream models = %v, want only first-model", models)
+	}
+}
+
+func TestIsAuthStateNeutralError(t *testing.T) {
+	wrapped := fmt.Errorf("wrapped neutral error: %w", authStateNeutralTestError{})
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "nil"},
+		{name: "ordinary", err: errors.New("ordinary")},
+		{name: "direct", err: authStateNeutralTestError{}, want: true},
+		{name: "wrapped", err: wrapped, want: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isAuthStateNeutralError(tc.err); got != tc.want {
+				t.Fatalf("isAuthStateNeutralError() = %t, want %t", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestIsNonRetryableExecutionError(t *testing.T) {
+	if isNonRetryableExecutionError(nil) || isNonRetryableExecutionError(errors.New("ordinary")) {
+		t.Fatal("ordinary errors were non-retryable")
+	}
+	if !isNonRetryableExecutionError(fmt.Errorf("wrapped: %w", nonRetryableTestError{})) {
+		t.Fatal("wrapped non-retryable error was not detected")
+	}
+}
+
+func TestErrorMarkerHelpersIgnoreTypedNil(t *testing.T) {
+	var marker *typedNilMarkerTestError
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "direct", err: marker},
+		{name: "wrapped", err: fmt.Errorf("wrapped: %w", marker)},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if status := statusCodeFromError(tc.err); status != 0 {
+				t.Fatalf("statusCodeFromError() = %d, want 0", status)
+			}
+			if retryAfter := retryAfterFromError(tc.err); retryAfter != nil {
+				t.Fatalf("retryAfterFromError() = %v, want nil", retryAfter)
+			}
+			if isAuthStateNeutralError(tc.err) {
+				t.Fatal("isAuthStateNeutralError() = true, want false")
+			}
+			if isNonRetryableExecutionError(tc.err) {
+				t.Fatal("isNonRetryableExecutionError() = true, want false")
+			}
+		})
+	}
+}
+
+func TestErrorMarkerHelpersSkipTypedNilBeforeValidMarker(t *testing.T) {
+	var typedNil *typedNilMarkerTestError
+	valid := &typedNilMarkerTestError{
+		status:     http.StatusTeapot,
+		retryAfter: 2 * time.Second,
+		neutral:    true,
+		retryable:  false,
+	}
+	err := errors.Join(typedNil, valid)
+	if status := statusCodeFromError(err); status != http.StatusTeapot {
+		t.Fatalf("statusCodeFromError() = %d, want %d", status, http.StatusTeapot)
+	}
+	if retryAfter := retryAfterFromError(err); retryAfter == nil || *retryAfter != 2*time.Second {
+		t.Fatalf("retryAfterFromError() = %v, want 2s", retryAfter)
+	}
+	if !isAuthStateNeutralError(err) {
+		t.Fatal("isAuthStateNeutralError() = false, want true")
+	}
+	if !isNonRetryableExecutionError(err) {
+		t.Fatal("isNonRetryableExecutionError() = false, want true")
+	}
+}
+
+func TestBooleanErrorMarkersAggregateAcrossJoinedErrors(t *testing.T) {
+	retryableStateful := &typedNilMarkerTestError{neutral: false, retryable: true}
+	nonRetryableNeutral := &typedNilMarkerTestError{neutral: true, retryable: false}
+	for _, err := range []error{
+		errors.Join(retryableStateful, nonRetryableNeutral),
+		errors.Join(nonRetryableNeutral, retryableStateful),
+	} {
+		if !isAuthStateNeutralError(err) {
+			t.Fatal("joined error did not preserve auth-state neutrality")
+		}
+		if !isNonRetryableExecutionError(err) {
+			t.Fatal("joined error did not preserve non-retryability")
+		}
+	}
+}
+
+func TestManagerDoesNotReplayNonRetryableExecutions(t *testing.T) {
+	model := "non-retryable-" + uuid.NewString()
+	executor := &authFallbackExecutor{
+		id:                "chatgpt-web",
+		executeErrors:     make(map[string]error),
+		streamFirstErrors: make(map[string]error),
+	}
+	m := NewManager(nil, nil, nil)
+	m.SetRetryConfig(2, time.Second, 2)
+	m.RegisterExecutor(executor)
+	reg := registry.GetGlobalRegistry()
+	for i := 0; i < 2; i++ {
+		auth := &Auth{ID: fmt.Sprintf("non-retryable-auth-%d-%s", i, uuid.NewString()), Provider: executor.id}
+		executor.executeErrors[auth.ID] = nonRetryableTestError{}
+		executor.streamFirstErrors[auth.ID] = nonRetryableTestError{}
+		reg.RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: model}})
+		t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+		if _, err := m.Register(t.Context(), auth); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := m.Execute(t.Context(), []string{executor.id}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{}); !isNonRetryableExecutionError(err) {
+		t.Fatalf("execute error = %v", err)
+	}
+	if got := len(executor.ExecuteCalls()); got != 1 {
+		t.Fatalf("non-retryable execute calls = %d, want 1", got)
+	}
+	if _, err := m.ExecuteStream(t.Context(), []string{executor.id}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{}); !isNonRetryableExecutionError(err) {
+		t.Fatalf("stream error = %v", err)
+	}
+	if got := len(executor.StreamCalls()); got != 1 {
+		t.Fatalf("non-retryable stream calls = %d, want 1", got)
+	}
+}
+
+func TestManagerExecutionPathsDoNotMarkWrappedAuthStateNeutralFailures(t *testing.T) {
+	wrapper := func() error { return fmt.Errorf("wrapped neutral error: %w", authStateNeutralTestError{}) }
+	tests := []struct {
+		name      string
+		configure func(*authStateNeutralExecutor)
+		invoke    func(*Manager, cliproxyexecutor.Request) error
+	}{
+		{
+			name: "execute",
+			configure: func(executor *authStateNeutralExecutor) {
+				executor.executeErr = wrapper()
+			},
+			invoke: func(m *Manager, req cliproxyexecutor.Request) error {
+				_, err := m.Execute(t.Context(), []string{"chatgpt-web"}, req, cliproxyexecutor.Options{})
+				return err
+			},
+		},
+		{
+			name: "immediate_stream",
+			configure: func(executor *authStateNeutralExecutor) {
+				executor.streamErr = wrapper()
+			},
+			invoke: func(m *Manager, req cliproxyexecutor.Request) error {
+				_, err := m.ExecuteStream(t.Context(), []string{"chatgpt-web"}, req, cliproxyexecutor.Options{})
+				return err
+			},
+		},
+		{
+			name: "stream_bootstrap",
+			configure: func(executor *authStateNeutralExecutor) {
+				executor.streamChunks = []cliproxyexecutor.StreamChunk{{Err: wrapper()}}
+			},
+			invoke: func(m *Manager, req cliproxyexecutor.Request) error {
+				result, err := m.ExecuteStream(t.Context(), []string{"chatgpt-web"}, req, cliproxyexecutor.Options{})
+				if err != nil {
+					return err
+				}
+				for chunk := range result.Chunks {
+					if chunk.Err != nil {
+						return chunk.Err
+					}
+				}
+				return nil
+			},
+		},
+		{
+			name: "stream_chunk",
+			configure: func(executor *authStateNeutralExecutor) {
+				executor.streamChunks = []cliproxyexecutor.StreamChunk{{Payload: []byte("started")}, {Err: wrapper()}}
+			},
+			invoke: func(m *Manager, req cliproxyexecutor.Request) error {
+				result, err := m.ExecuteStream(t.Context(), []string{"chatgpt-web"}, req, cliproxyexecutor.Options{})
+				if err != nil {
+					return err
+				}
+				for chunk := range result.Chunks {
+					if chunk.Err != nil {
+						return chunk.Err
+					}
+				}
+				return nil
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			executor := &authStateNeutralExecutor{id: "chatgpt-web"}
+			tc.configure(executor)
+			hook := &resultRecordingHook{}
+			m := NewManager(nil, nil, hook)
+			m.SetRetryConfig(0, 0, 1)
+			m.RegisterExecutor(executor)
+			model := "neutral-" + uuid.NewString()
+			auth := &Auth{ID: uuid.NewString(), Provider: executor.id}
+			reg := registry.GetGlobalRegistry()
+			reg.RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: model}})
+			t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+			if _, err := m.Register(t.Context(), auth); err != nil {
+				t.Fatal(err)
+			}
+			if err := tc.invoke(m, cliproxyexecutor.Request{Model: model}); !isAuthStateNeutralError(err) {
+				t.Fatalf("execution error = %v, want wrapped auth-state-neutral error", err)
+			}
+			current, ok := m.GetByID(auth.ID)
+			if !ok {
+				t.Fatal("auth not found")
+			}
+			if current.Failed != 0 || current.LastError != nil {
+				t.Fatalf("auth-neutral failure changed auth state: %#v", current)
+			}
+			if hook.calls.Load() != 1 || !hook.neutral.Load() {
+				t.Fatalf("neutral result hook calls = %d, neutral = %t", hook.calls.Load(), hook.neutral.Load())
+			}
+		})
+	}
 }
 
 func TestManager_MaxRetryCredentials_LimitsCrossCredentialRetries(t *testing.T) {

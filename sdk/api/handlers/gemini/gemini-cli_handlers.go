@@ -153,13 +153,6 @@ func (h *GeminiCLIAPIHandler) CLIHandler(c *gin.Context) {
 func (h *GeminiCLIAPIHandler) handleInternalStreamGenerateContent(c *gin.Context, rawJSON []byte) {
 	alt := h.GetAlt(c)
 
-	if alt == "" {
-		c.Header("Content-Type", "text/event-stream")
-		c.Header("Cache-Control", "no-cache")
-		c.Header("Connection", "keep-alive")
-		c.Header("Access-Control-Allow-Origin", "*")
-	}
-
 	// Get the http.Flusher interface to manually flush the response.
 	flusher, ok := c.Writer.(http.Flusher)
 	if !ok {
@@ -176,10 +169,84 @@ func (h *GeminiCLIAPIHandler) handleInternalStreamGenerateContent(c *gin.Context
 	modelName := modelResult.String()
 
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
-	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
-	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
-	h.forwardCLIStream(c, flusher, "", func(err error) { cliCancel(err) }, dataChan, errChan)
-	return
+	dataChan, upstreamHeaders, streamMeta, errChan := h.ExecuteStreamWithAuthManagerMeta(cliCtx, h.HandlerType(), modelName, rawJSON, alt)
+	setSSEHeaders := func() {
+		c.Header("Content-Type", "text/event-stream")
+		c.Header("Cache-Control", "no-cache")
+		c.Header("Connection", "keep-alive")
+		c.Header("Access-Control-Allow-Origin", "*")
+	}
+	forwardCommitted := func(streamErrs <-chan *interfaces.ErrorMessage) {
+		setSSEHeaders()
+		handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+		flusher.Flush()
+		h.forwardCLIStream(c, flusher, alt, func(err error) { cliCancel(err) }, dataChan, streamErrs, streamMeta.KeepAliveInterval())
+	}
+	writeInitialError := func(errMsg *interfaces.ErrorMessage) {
+		h.WriteErrorResponse(c, errMsg)
+		if errMsg != nil {
+			cliCancel(errMsg.Error)
+		} else {
+			cliCancel(nil)
+		}
+	}
+	commitSignal := streamMeta.BootstrapCommittedSignal()
+	if alt != "" {
+		commitSignal = nil
+	}
+	if alt == "" && streamMeta.BootstrapCommitted() {
+		forwardCommitted(errChan)
+		return
+	}
+
+	for {
+		select {
+		case <-c.Request.Context().Done():
+			cliCancel(c.Request.Context().Err())
+			return
+		case <-commitSignal:
+			forwardCommitted(errChan)
+			return
+		case errMsg, ok := <-errChan:
+			if !ok {
+				errChan = nil
+				continue
+			}
+			if alt == "" && streamMeta.BootstrapCommitted() {
+				forwardCommitted(handlers.StreamErrorChannel(errMsg))
+				return
+			}
+			writeInitialError(errMsg)
+			return
+		case chunk, ok := <-dataChan:
+			if !ok {
+				if errMsg, pending := handlers.PendingStreamError(errChan); pending {
+					if alt == "" && streamMeta.BootstrapCommitted() {
+						forwardCommitted(handlers.StreamErrorChannel(errMsg))
+					} else {
+						writeInitialError(errMsg)
+					}
+					return
+				}
+				if alt == "" {
+					setSSEHeaders()
+				}
+				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+				flusher.Flush()
+				cliCancel(nil)
+				return
+			}
+
+			if alt == "" {
+				setSSEHeaders()
+			}
+			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+			writeCLIStreamChunk(c, alt, chunk)
+			flusher.Flush()
+			h.forwardCLIStream(c, flusher, alt, func(err error) { cliCancel(err) }, dataChan, errChan, streamMeta.KeepAliveInterval())
+			return
+		}
+	}
 }
 
 // handleInternalGenerateContent handles non-streaming content generation requests.
@@ -201,8 +268,20 @@ func (h *GeminiCLIAPIHandler) handleInternalGenerateContent(c *gin.Context, rawJ
 	cliCancel()
 }
 
-func (h *GeminiCLIAPIHandler) forwardCLIStream(c *gin.Context, flusher http.Flusher, alt string, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage) {
-	var keepAliveInterval *time.Duration
+func writeCLIStreamChunk(c *gin.Context, alt string, chunk []byte) {
+	if alt != "" {
+		_, _ = c.Writer.Write(chunk)
+		return
+	}
+	if len(chunk) == 0 {
+		return
+	}
+	_, _ = c.Writer.Write([]byte("data: "))
+	_, _ = c.Writer.Write(chunk)
+	_, _ = c.Writer.Write([]byte("\n\n"))
+}
+
+func (h *GeminiCLIAPIHandler) forwardCLIStream(c *gin.Context, flusher http.Flusher, alt string, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage, keepAliveInterval *time.Duration) {
 	if alt != "" {
 		keepAliveInterval = new(time.Duration(0))
 	}
@@ -210,20 +289,7 @@ func (h *GeminiCLIAPIHandler) forwardCLIStream(c *gin.Context, flusher http.Flus
 	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{
 		KeepAliveInterval: keepAliveInterval,
 		WriteChunk: func(chunk []byte) {
-			if alt == "" {
-				if bytes.Equal(chunk, []byte("data: [DONE]")) || bytes.Equal(chunk, []byte("[DONE]")) {
-					return
-				}
-
-				if !bytes.HasPrefix(chunk, []byte("data:")) {
-					_, _ = c.Writer.Write([]byte("data: "))
-				}
-
-				_, _ = c.Writer.Write(chunk)
-				_, _ = c.Writer.Write([]byte("\n\n"))
-			} else {
-				_, _ = c.Writer.Write(chunk)
-			}
+			writeCLIStreamChunk(c, alt, chunk)
 		},
 		WriteTerminalError: func(errMsg *interfaces.ErrorMessage) {
 			if errMsg == nil {

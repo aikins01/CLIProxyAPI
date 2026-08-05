@@ -18,8 +18,12 @@ import (
 )
 
 type claudeKeepAliveExecutor struct {
-	calls int
-	delay time.Duration
+	calls           int
+	delay           time.Duration
+	streamDelay     time.Duration
+	streamPayload   []byte
+	streamKeepAlive time.Duration
+	streamCommitted bool
 }
 
 func (e *claudeKeepAliveExecutor) Identifier() string { return "test-claude-provider" }
@@ -36,8 +40,24 @@ func (e *claudeKeepAliveExecutor) Execute(ctx context.Context, auth *coreauth.Au
 	return coreexecutor.Response{Payload: []byte(`{"ok":true}`)}, nil
 }
 
-func (e *claudeKeepAliveExecutor) ExecuteStream(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (*coreexecutor.StreamResult, error) {
-	return nil, errors.New("not implemented")
+func (e *claudeKeepAliveExecutor) ExecuteStream(ctx context.Context, _ *coreauth.Auth, _ coreexecutor.Request, _ coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+	chunks := make(chan coreexecutor.StreamChunk)
+	go func() {
+		defer close(chunks)
+		select {
+		case <-time.After(e.streamDelay):
+			chunks <- coreexecutor.StreamChunk{Payload: e.streamPayload}
+		case <-ctx.Done():
+		}
+	}()
+	result := &coreexecutor.StreamResult{Chunks: chunks}
+	if e.streamKeepAlive != 0 {
+		result.SetKeepAliveInterval(e.streamKeepAlive)
+	}
+	if e.streamCommitted {
+		result.SetBootstrapCommitted()
+	}
+	return result, nil
 }
 
 func (e *claudeKeepAliveExecutor) Refresh(ctx context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
@@ -87,5 +107,38 @@ func TestClaudeMessagesNonStreamingSkipsKeepAliveForAmpJSONClient(t *testing.T) 
 	}
 	if body := resp.Body.String(); body != `{"ok":true}` {
 		t.Fatalf("body = %q, want strict JSON without keepalive bytes", body)
+	}
+}
+
+func TestClaudeCommittedStreamUsesProviderKeepAlive(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	executor := &claudeKeepAliveExecutor{
+		streamDelay:     40 * time.Millisecond,
+		streamPayload:   []byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\"}\n\n"),
+		streamKeepAlive: 5 * time.Millisecond,
+		streamCommitted: true,
+	}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+	auth := &coreauth.Auth{ID: "auth-claude-stream", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("Register auth: %v", err)
+	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "claude-stream-model"}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
+
+	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+	router := gin.New()
+	router.POST("/v1/messages", NewClaudeCodeAPIHandler(base).ClaudeMessages)
+	request := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"claude-stream-model","stream":true,"messages":[{"role":"user","content":"hello"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, request)
+
+	body := recorder.Body.String()
+	heartbeatIndex := strings.Index(body, ": keep-alive\n\n")
+	dataIndex := strings.Index(body, "data:")
+	if heartbeatIndex < 0 || dataIndex < 0 || heartbeatIndex > dataIndex {
+		t.Fatalf("expected heartbeat before first Claude event, got %q", body)
 	}
 }

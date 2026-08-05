@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -26,6 +27,7 @@ import (
 	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
+	"golang.org/x/sync/semaphore"
 )
 
 // ProviderExecutor defines the contract required by Manager to execute provider calls.
@@ -51,6 +53,10 @@ type ExecutionSessionCloser interface {
 	CloseExecutionSession(sessionID string)
 }
 
+type authMetadataUpdaterSetter interface {
+	SetAuthMetadataUpdater(func(context.Context, *Auth, map[string]any) (*Auth, error))
+}
+
 const (
 	homeAuthCountMetadataKey = "__cliproxy_home_auth_count"
 	// CloseAllExecutionSessionsID asks an executor to release all active execution sessions.
@@ -72,12 +78,18 @@ const (
 	// success but the auth still evaluates as needing refresh (e.g. token expiry
 	// wasn't updated). Without this guard, the auto-refresh loop can tight-loop and
 	// burn CPU at idle.
-	refreshIneffectiveBackoff = 30 * time.Second
-	quotaBackoffBase          = time.Second
-	quotaBackoffMax           = 30 * time.Minute
+	refreshIneffectiveBackoff        = 30 * time.Second
+	quotaBackoffBase                 = time.Second
+	quotaBackoffMax                  = 30 * time.Minute
+	persistenceExclusiveWeight int64 = 1<<63 - 1
 )
 
-var quotaCooldownDisabled atomic.Bool
+var (
+	quotaCooldownDisabled atomic.Bool
+)
+
+// ErrStaleAuthMetadata indicates that a runtime metadata update was based on an outdated auth snapshot.
+var ErrStaleAuthMetadata = errors.New("stale auth metadata update")
 
 // SetQuotaCooldownDisabled toggles quota cooldown scheduling globally.
 func SetQuotaCooldownDisabled(disable bool) {
@@ -109,6 +121,25 @@ type Result struct {
 	Error *Error
 }
 
+type authStateNeutralResultContextKey struct{}
+
+// WithAuthStateNeutralResult marks an execution result without changing credential health or availability.
+func WithAuthStateNeutralResult(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, authStateNeutralResultContextKey{}, true)
+}
+
+// IsAuthStateNeutralResult reports whether the context marks an auth-state-neutral execution result.
+func IsAuthStateNeutralResult(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	neutral, _ := ctx.Value(authStateNeutralResultContextKey{}).(bool)
+	return neutral
+}
+
 // Selector chooses an auth candidate for execution.
 type Selector interface {
 	Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error)
@@ -121,7 +152,10 @@ type StoppableSelector interface {
 	Stop()
 }
 
-// Hook captures lifecycle callbacks for observing auth changes.
+// Hook captures lifecycle callbacks for observing auth changes. Synchronous lifecycle calls made
+// from a callback must pass the callback context so the manager can preserve ordered reentrancy.
+// Same-auth reentrant calls commit synchronously but queue their callbacks until the current
+// callback returns.
 type Hook interface {
 	// OnAuthRegistered fires when a new auth is registered.
 	OnAuthRegistered(ctx context.Context, auth *Auth)
@@ -145,13 +179,19 @@ func (NoopHook) OnResult(context.Context, Result) {}
 
 // Manager orchestrates auth lifecycle, selection, execution, and persistence.
 type Manager struct {
-	store     Store
-	executors map[string]ProviderExecutor
-	selector  Selector
-	hook      Hook
-	mu        sync.RWMutex
-	auths     map[string]*Auth
-	scheduler *authScheduler
+	store       Store
+	executors   map[string]ProviderExecutor
+	selector    Selector
+	hook        Hook
+	hookMu      sync.Mutex
+	hookQueue   map[string]*authHookQueue
+	hookWaits   map[string]map[string]int
+	persistGate *semaphore.Weighted
+	persistByMu sync.Mutex
+	persistBy   map[string]*authPersistenceLock
+	mu          sync.RWMutex
+	auths       map[string]*Auth
+	scheduler   *authScheduler
 	// providerOffsets tracks per-model provider rotation state for multi-provider routing.
 	providerOffsets map[string]int
 
@@ -159,6 +199,7 @@ type Manager struct {
 	requestRetry        atomic.Int32
 	maxRetryCredentials atomic.Int32
 	maxRetryInterval    atomic.Int64
+	metadataGeneration  atomic.Uint64
 
 	// oauthModelAlias stores global OAuth model alias mappings (alias -> upstream name) keyed by channel.
 	oauthModelAlias atomic.Value
@@ -182,6 +223,26 @@ type Manager struct {
 	refreshLoop   *authAutoRefreshLoop
 }
 
+type authHookQueue struct {
+	dispatching bool
+	pending     []*authHookTask
+}
+
+type authHookTask struct {
+	notify       func()
+	done         chan struct{}
+	contextState *authHookContextState
+	originAuthID string
+	wait         bool
+	waitEdge     bool
+	panicked     any
+}
+
+type authPersistenceLock struct {
+	ready chan struct{}
+	refs  int
+}
+
 // NewManager constructs a manager with optional custom selector and hook.
 func NewManager(store Store, selector Selector, hook Hook) *Manager {
 	if selector == nil {
@@ -195,6 +256,10 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		executors:        make(map[string]ProviderExecutor),
 		selector:         selector,
 		hook:             hook,
+		hookQueue:        make(map[string]*authHookQueue),
+		hookWaits:        make(map[string]map[string]int),
+		persistBy:        make(map[string]*authPersistenceLock),
+		persistGate:      semaphore.NewWeighted(persistenceExclusiveWeight),
 		auths:            make(map[string]*Auth),
 		providerOffsets:  make(map[string]int),
 		modelPoolOffsets: make(map[string]int),
@@ -227,6 +292,268 @@ func (m *Manager) syncScheduler() {
 		return
 	}
 	m.syncSchedulerFromSnapshot(m.snapshotAuths())
+}
+
+func (m *Manager) lockAuthPersistenceContext(ctx context.Context, authID string) (func(), error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := m.persistGate.Acquire(ctx, 1); err != nil {
+		return nil, err
+	}
+	m.persistByMu.Lock()
+	lock := m.persistBy[authID]
+	if lock == nil {
+		lock = &authPersistenceLock{ready: make(chan struct{}, 1)}
+		lock.ready <- struct{}{}
+		m.persistBy[authID] = lock
+	}
+	lock.refs++
+	m.persistByMu.Unlock()
+	select {
+	case <-ctx.Done():
+		m.persistByMu.Lock()
+		lock.refs--
+		if lock.refs == 0 {
+			delete(m.persistBy, authID)
+		}
+		m.persistByMu.Unlock()
+		m.persistGate.Release(1)
+		return nil, ctx.Err()
+	case <-lock.ready:
+	}
+	return func() {
+		lock.ready <- struct{}{}
+		m.persistByMu.Lock()
+		lock.refs--
+		if lock.refs == 0 {
+			delete(m.persistBy, authID)
+		}
+		m.persistByMu.Unlock()
+		m.persistGate.Release(1)
+	}, nil
+
+}
+
+func (m *Manager) lockAuthPersistence(authID string) func() {
+	unlock, _ := m.lockAuthPersistenceContext(context.Background(), authID)
+	return unlock
+}
+
+type authHookContextKey struct{}
+
+type authHookContext struct {
+	manager *Manager
+	authID  string
+	state   *authHookContextState
+}
+
+type authHookContextState struct{ active atomic.Bool }
+
+func authHookContextID(ctx context.Context, manager *Manager) string {
+	if ctx == nil {
+		return ""
+	}
+	hookContext, _ := ctx.Value(authHookContextKey{}).(authHookContext)
+	if hookContext.manager != manager || hookContext.state == nil || !hookContext.state.active.Load() {
+		return ""
+	}
+	return hookContext.authID
+}
+
+func isReentrantAuthHookCall(ctx context.Context, manager *Manager, authID string) bool {
+	return authHookContextID(ctx, manager) == authID
+}
+
+func mergeMetadataChanges(current, baseline, updated map[string]any) map[string]any {
+	merged := cloneMetadata(current)
+	for key, baselineValue := range baseline {
+		updatedValue, ok := updated[key]
+		if !ok {
+			if currentValue, currentOK := current[key]; currentOK && reflect.DeepEqual(currentValue, baselineValue) {
+				delete(merged, key)
+			}
+			continue
+		}
+		if !reflect.DeepEqual(updatedValue, baselineValue) {
+			if merged == nil {
+				merged = make(map[string]any)
+			}
+			merged[key] = updatedValue
+		}
+	}
+	for key, value := range updated {
+		if _, ok := baseline[key]; ok {
+			continue
+		}
+		if merged == nil {
+			merged = make(map[string]any)
+		}
+		merged[key] = value
+	}
+	return merged
+}
+
+func (m *Manager) nextMetadataVersion() uint64 {
+	return m.metadataGeneration.Add(1)
+}
+
+func metadataUpdatedAtOrNow(updatedAt time.Time) time.Time {
+	if updatedAt.IsZero() {
+		return time.Now()
+	}
+	return updatedAt
+}
+
+func (m *Manager) finalizePersistedMetadata(previous, persisted *Auth) {
+	if previous == nil || persisted == nil {
+		return
+	}
+	if reflect.DeepEqual(persisted.Metadata, previous.Metadata) {
+		persisted.metadataVersion = previous.metadataVersion
+		persisted.metadataUpdatedAt = previous.metadataUpdatedAt
+	} else {
+		persisted.metadataVersion = m.nextMetadataVersion()
+		if !persisted.metadataUpdatedAt.After(previous.metadataUpdatedAt) {
+			persisted.metadataUpdatedAt = time.Now()
+		}
+	}
+	persisted.metadataVersionKnown = true
+	persisted.metadataSnapshot = cloneMetadata(persisted.Metadata)
+}
+
+func authHookWaitPathExists(waits map[string]map[string]int, from, to string) bool {
+	if from == "" || to == "" {
+		return false
+	}
+	pending := []string{from}
+	visited := make(map[string]struct{})
+	for len(pending) > 0 {
+		current := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		if current == to {
+			return true
+		}
+		if _, ok := visited[current]; ok {
+			continue
+		}
+		visited[current] = struct{}{}
+		for next, count := range waits[current] {
+			if count > 0 {
+				pending = append(pending, next)
+			}
+		}
+	}
+	return false
+}
+
+func (m *Manager) enqueueAuthHook(ctx context.Context, authID string, reentrant bool, notify func(context.Context)) (*authHookTask, bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	contextState := &authHookContextState{}
+	hookCtx := context.WithValue(ctx, authHookContextKey{}, authHookContext{manager: m, authID: authID, state: contextState})
+	task := &authHookTask{
+		notify:       func() { notify(hookCtx) },
+		done:         make(chan struct{}),
+		contextState: contextState,
+		originAuthID: authHookContextID(ctx, m),
+		wait:         !reentrant,
+	}
+	m.hookMu.Lock()
+	queue := m.hookQueue[authID]
+	if queue == nil {
+		queue = &authHookQueue{}
+		m.hookQueue[authID] = queue
+	}
+	if task.wait && task.originAuthID != "" && task.originAuthID != authID {
+		if queue.dispatching && authHookWaitPathExists(m.hookWaits, authID, task.originAuthID) {
+			task.wait = false
+		}
+		if task.wait {
+			targets := m.hookWaits[task.originAuthID]
+			if targets == nil {
+				targets = make(map[string]int)
+				m.hookWaits[task.originAuthID] = targets
+			}
+			targets[authID]++
+			task.waitEdge = true
+		}
+	}
+	queue.pending = append(queue.pending, task)
+	if queue.dispatching {
+		m.hookMu.Unlock()
+		return task, false
+	}
+	queue.dispatching = true
+	m.hookMu.Unlock()
+	return task, true
+}
+
+func (m *Manager) drainAuthHooks(authID string) any {
+	var unwaitedPanic any
+	for {
+		m.hookMu.Lock()
+		queue := m.hookQueue[authID]
+		if queue == nil || len(queue.pending) == 0 {
+			delete(m.hookQueue, authID)
+			m.hookMu.Unlock()
+			return unwaitedPanic
+		}
+		task := queue.pending[0]
+		queue.pending[0] = nil
+		queue.pending = queue.pending[1:]
+		m.hookMu.Unlock()
+		func() {
+			task.contextState.active.Store(true)
+			defer func() {
+				task.contextState.active.Store(false)
+				if value := recover(); value != nil {
+					task.panicked = value
+					if !task.wait && unwaitedPanic == nil {
+						unwaitedPanic = value
+					}
+				}
+				close(task.done)
+			}()
+			task.notify()
+		}()
+	}
+}
+
+func (m *Manager) dispatchAuthHook(authID string, task *authHookTask, dispatch bool) {
+	if !task.wait && !dispatch {
+		return
+	}
+	var unwaitedPanic any
+	if dispatch {
+		unwaitedPanic = m.drainAuthHooks(authID)
+	} else {
+		if !task.wait {
+			return
+		}
+		<-task.done
+	}
+	if task.waitEdge {
+		m.hookMu.Lock()
+		if targets := m.hookWaits[task.originAuthID]; targets != nil {
+			if targets[authID] <= 1 {
+				delete(targets, authID)
+			} else {
+				targets[authID]--
+			}
+			if len(targets) == 0 {
+				delete(m.hookWaits, task.originAuthID)
+			}
+		}
+		m.hookMu.Unlock()
+	}
+	if task.panicked != nil {
+		panic(task.panicked)
+	}
+	if unwaitedPanic != nil {
+		panic(unwaitedPanic)
+	}
 }
 
 func (m *Manager) snapshotAuths() []*Auth {
@@ -285,13 +612,20 @@ func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID strin
 	}
 
 	var snapshot *Auth
+	var previous *Auth
 	now := time.Now()
 
-	m.mu.Lock()
+	unlockPersist := m.lockAuthPersistence(authID)
+	m.mu.RLock()
 	auth, ok := m.auths[authID]
 	if ok && auth != nil && len(auth.ModelStates) > 0 {
+		previous = auth.Clone()
+		snapshot = previous.Clone()
+	}
+	m.mu.RUnlock()
+	if snapshot != nil {
 		changed := false
-		for modelKey, state := range auth.ModelStates {
+		for modelKey, state := range snapshot.ModelStates {
 			baseModel := canonicalModelKey(modelKey)
 			if baseModel == "" {
 				baseModel = strings.TrimSpace(modelKey)
@@ -300,7 +634,7 @@ func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID strin
 				// Drop state for models that disappeared from the current registry
 				// snapshot. Keeping them around leaks stale errors into auth-level
 				// status, management output, and websocket fallback checks.
-				delete(auth.ModelStates, modelKey)
+				delete(snapshot.ModelStates, modelKey)
 				changed = true
 				continue
 			}
@@ -313,28 +647,36 @@ func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID strin
 			resetModelState(state, now)
 			changed = true
 		}
-		if len(auth.ModelStates) == 0 {
-			auth.ModelStates = nil
+		if len(snapshot.ModelStates) == 0 {
+			snapshot.ModelStates = nil
 		}
 		if changed {
-			updateAggregatedAvailability(auth, now)
-			if !hasModelError(auth, now) {
-				auth.LastError = nil
-				auth.StatusMessage = ""
-				auth.Status = StatusActive
+			updateAggregatedAvailability(snapshot, now)
+			if !hasModelError(snapshot, now) {
+				snapshot.LastError = nil
+				snapshot.StatusMessage = ""
+				snapshot.Status = StatusActive
 			}
-			auth.UpdatedAt = now
-			if errPersist := m.persist(ctx, auth); errPersist != nil {
-				logEntryWithRequestID(ctx).WithField("auth_id", auth.ID).Warnf("failed to persist auth changes during model state reconciliation: %v", errPersist)
-			}
-			snapshot = auth.Clone()
+			snapshot.UpdatedAt = now
+		} else {
+			snapshot = nil
 		}
 	}
-	m.mu.Unlock()
-
+	if snapshot != nil {
+		if errPersist := m.persistUnlocked(ctx, snapshot); errPersist != nil {
+			logEntryWithRequestID(ctx).WithField("auth_id", snapshot.ID).Warnf("failed to persist auth changes during model state reconciliation: %v", errPersist)
+			snapshot = nil
+		} else {
+			m.finalizePersistedMetadata(previous, snapshot)
+			m.mu.Lock()
+			m.auths[authID] = snapshot.Clone()
+			m.mu.Unlock()
+		}
+	}
 	if m.scheduler != nil && snapshot != nil {
 		m.scheduler.upsertAuth(snapshot)
 	}
+	unlockPersist()
 }
 
 func (m *Manager) SetSelector(selector Selector) {
@@ -355,6 +697,8 @@ func (m *Manager) SetSelector(selector Selector) {
 
 // SetStore swaps the underlying persistence store.
 func (m *Manager) SetStore(store Store) {
+	_ = m.persistGate.Acquire(context.Background(), persistenceExclusiveWeight)
+	defer m.persistGate.Release(persistenceExclusiveWeight)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.store = store
@@ -800,7 +1144,7 @@ func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamC
 	}
 }
 
-func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, resultModel string, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk) *cliproxyexecutor.StreamResult {
+func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, resultModel string, headers http.Header, keepAliveInterval *time.Duration, bootstrapCommitted bool, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk) *cliproxyexecutor.StreamResult {
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		defer close(out)
@@ -813,7 +1157,7 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 				if se, ok := errors.AsType[cliproxyexecutor.StatusError](chunk.Err); ok && se != nil {
 					rerr.HTTPStatus = se.StatusCode()
 				}
-				m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr})
+				m.MarkResult(contextWithAuthStateNeutralResult(ctx, chunk.Err), Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr})
 			}
 			if !forward {
 				return false
@@ -846,7 +1190,14 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 			m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: true})
 		}
 	}()
-	return &cliproxyexecutor.StreamResult{Headers: headers, Chunks: out}
+	result := &cliproxyexecutor.StreamResult{Headers: headers, Chunks: out}
+	if keepAliveInterval != nil {
+		result.SetKeepAliveInterval(*keepAliveInterval)
+	}
+	if bootstrapCommitted {
+		result.SetBootstrapCommitted()
+	}
+	return result
 }
 
 func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor ProviderExecutor, auth *Auth, provider string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, routeModel string, execModels []string, pooled bool) (*cliproxyexecutor.StreamResult, error) {
@@ -870,12 +1221,20 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 			result.RetryAfter = retryAfterFromError(errStream)
-			m.MarkResult(ctx, result)
+			m.MarkResult(contextWithAuthStateNeutralResult(ctx, errStream), result)
+			if isNonRetryableExecutionError(errStream) {
+				return nil, errStream
+			}
 			if isRequestInvalidError(errStream) {
 				return nil, errStream
 			}
 			lastErr = errStream
 			continue
+		}
+		bootstrapCommitted := streamResult.TakeBootstrapCommitted()
+		keepAliveInterval := streamResult.TakeKeepAliveInterval()
+		if bootstrapCommitted {
+			return m.wrapStreamResult(ctx, auth.Clone(), provider, resultModel, streamResult.Headers, keepAliveInterval, true, nil, streamResult.Chunks), nil
 		}
 
 		buffered, closed, bootstrapErr := readStreamBootstrap(ctx, streamResult.Chunks)
@@ -884,6 +1243,16 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				discardStreamChunks(streamResult.Chunks)
 				return nil, errCtx
 			}
+			if isNonRetryableExecutionError(bootstrapErr) {
+				rerr := &Error{Message: bootstrapErr.Error()}
+				if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
+					rerr.HTTPStatus = se.StatusCode()
+				}
+				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
+				m.MarkResult(contextWithAuthStateNeutralResult(ctx, bootstrapErr), result)
+				discardStreamChunks(streamResult.Chunks)
+				return nil, bootstrapErr
+			}
 			if isRequestInvalidError(bootstrapErr) {
 				rerr := &Error{Message: bootstrapErr.Error()}
 				if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
@@ -891,7 +1260,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				}
 				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
-				m.MarkResult(ctx, result)
+				m.MarkResult(contextWithAuthStateNeutralResult(ctx, bootstrapErr), result)
 				discardStreamChunks(streamResult.Chunks)
 				return nil, bootstrapErr
 			}
@@ -902,7 +1271,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				}
 				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
-				m.MarkResult(ctx, result)
+				m.MarkResult(contextWithAuthStateNeutralResult(ctx, bootstrapErr), result)
 				discardStreamChunks(streamResult.Chunks)
 				lastErr = bootstrapErr
 				continue
@@ -913,7 +1282,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 			result.RetryAfter = retryAfterFromError(bootstrapErr)
-			m.MarkResult(ctx, result)
+			m.MarkResult(contextWithAuthStateNeutralResult(ctx, bootstrapErr), result)
 			discardStreamChunks(streamResult.Chunks)
 			return nil, newStreamBootstrapError(bootstrapErr, streamResult.Headers)
 		}
@@ -935,7 +1304,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			close(closedCh)
 			remaining = closedCh
 		}
-		return m.wrapStreamResult(ctx, auth.Clone(), provider, resultModel, streamResult.Headers, buffered, remaining), nil
+		return m.wrapStreamResult(ctx, auth.Clone(), provider, resultModel, streamResult.Headers, keepAliveInterval, false, buffered, remaining), nil
 	}
 	if lastErr == nil {
 		lastErr = &Error{Code: "auth_not_found", Message: "no upstream model available"}
@@ -1093,6 +1462,9 @@ func (m *Manager) RegisterExecutor(executor ProviderExecutor) {
 	if provider == "" {
 		return
 	}
+	if setter, ok := executor.(authMetadataUpdaterSetter); ok {
+		setter.SetAuthMetadataUpdater(m.updateExecutionMetadata)
+	}
 
 	var replaced ProviderExecutor
 	m.mu.Lock()
@@ -1124,22 +1496,48 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	if auth == nil {
 		return nil, nil
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if auth.ID == "" {
 		auth.ID = uuid.NewString()
 	}
+	reentrantHook := isReentrantAuthHookCall(ctx, m, auth.ID)
 	auth.EnsureIndex()
 	authClone := auth.Clone()
+	unlockPersist, errLock := m.lockAuthPersistenceContext(ctx, auth.ID)
+	if errLock != nil {
+		return nil, errLock
+	}
+	if err := ctx.Err(); err != nil {
+		unlockPersist()
+		return nil, err
+	}
+	authClone.metadataVersion = m.nextMetadataVersion()
+	authClone.metadataVersionKnown = true
+	authClone.metadataUpdatedAt = metadataUpdatedAtOrNow(authClone.UpdatedAt)
+	if err := m.persistUnlocked(ctx, authClone); err != nil {
+		unlockPersist()
+		return nil, err
+	}
+	authClone.metadataSnapshot = cloneMetadata(authClone.Metadata)
+	auth.metadataVersion = authClone.metadataVersion
+	auth.metadataVersionKnown = true
+	auth.metadataSnapshot = cloneMetadata(authClone.Metadata)
+	auth.metadataUpdatedAt = authClone.metadataUpdatedAt
 	m.mu.Lock()
-	m.auths[auth.ID] = authClone
+	m.auths[auth.ID] = authClone.Clone()
 	m.mu.Unlock()
 	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 	if m.scheduler != nil {
 		m.scheduler.upsertAuth(authClone)
 	}
 	m.queueRefreshReschedule(auth.ID)
-	_ = m.persist(ctx, auth)
-	m.hook.OnAuthRegistered(ctx, auth.Clone())
-	return auth.Clone(), nil
+	hookAuth := authClone.Clone()
+	hookTask, dispatch := m.enqueueAuthHook(ctx, auth.ID, reentrantHook, func(hookCtx context.Context) { m.hook.OnAuthRegistered(hookCtx, hookAuth) })
+	unlockPersist()
+	m.dispatchAuthHook(auth.ID, hookTask, dispatch)
+	return authClone.Clone(), nil
 }
 
 // Update replaces an existing auth entry and notifies hooks.
@@ -1147,8 +1545,49 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	if auth == nil || auth.ID == "" {
 		return nil, nil
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	reentrantHook := isReentrantAuthHookCall(ctx, m, auth.ID)
+	unlockPersist, errLock := m.lockAuthPersistenceContext(ctx, auth.ID)
+	if errLock != nil {
+		return nil, errLock
+	}
+	if err := ctx.Err(); err != nil {
+		unlockPersist()
+		return nil, err
+	}
+	var existingSnapshot *Auth
 	m.mu.Lock()
 	if existing, ok := m.auths[auth.ID]; ok && existing != nil {
+		existingSnapshot = existing.Clone()
+		staleMetadataVersion := auth.metadataVersionKnown && auth.metadataVersion != existing.metadataVersion
+		staleWatcherMetadata := isWatcherReplay(ctx) &&
+			!auth.metadataVersionKnown &&
+			!reflect.DeepEqual(auth.Metadata, existing.Metadata) &&
+			!auth.UpdatedAt.IsZero() &&
+			!existing.metadataUpdatedAt.IsZero() &&
+			auth.UpdatedAt.Before(existing.metadataUpdatedAt)
+		if staleMetadataVersion {
+			auth.Metadata = mergeMetadataChanges(existingSnapshot.Metadata, auth.metadataSnapshot, auth.Metadata)
+			if reflect.DeepEqual(auth.Metadata, existing.Metadata) {
+				auth.metadataVersion = existing.metadataVersion
+			} else {
+				auth.metadataVersion = existing.metadataVersion + 1
+			}
+			if auth.UpdatedAt.Before(existing.UpdatedAt) {
+				auth.UpdatedAt = existing.UpdatedAt
+			}
+		} else if staleWatcherMetadata {
+			auth.Metadata = existingSnapshot.Metadata
+			auth.metadataVersion = existing.metadataVersion
+			auth.UpdatedAt = existing.UpdatedAt
+		} else if reflect.DeepEqual(auth.Metadata, existing.Metadata) {
+			auth.metadataVersion = existing.metadataVersion
+		} else {
+			auth.metadataVersion = existing.metadataVersion + 1
+		}
+		auth.metadataVersionKnown = true
 		if !auth.indexAssigned && auth.Index == "" {
 			auth.Index = existing.Index
 			auth.indexAssigned = existing.indexAssigned
@@ -1156,28 +1595,153 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 		auth.Success = existing.Success
 		auth.Failed = existing.Failed
 		auth.recentRequests = existing.recentRequests
+		if reflect.DeepEqual(auth.Metadata, existing.Metadata) {
+			auth.metadataUpdatedAt = existing.metadataUpdatedAt
+		} else if isWatcherReplay(ctx) {
+			auth.metadataUpdatedAt = metadataUpdatedAtOrNow(auth.UpdatedAt)
+		} else {
+			auth.metadataUpdatedAt = time.Now()
+		}
 		if !existing.Disabled && existing.Status != StatusDisabled && !auth.Disabled && auth.Status != StatusDisabled {
 			if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
-				auth.ModelStates = existing.ModelStates
+				auth.ModelStates = existingSnapshot.ModelStates
 			}
 		}
+	} else {
+		auth.metadataVersionKnown = true
+		auth.metadataUpdatedAt = metadataUpdatedAtOrNow(auth.UpdatedAt)
 	}
 	auth.EnsureIndex()
 	authClone := auth.Clone()
-	m.auths[auth.ID] = authClone
+	m.mu.Unlock()
+	if err := m.persistUnlocked(ctx, authClone); err != nil {
+		unlockPersist()
+		return nil, err
+	}
+	if existingSnapshot != nil {
+		m.finalizePersistedMetadata(existingSnapshot, authClone)
+	} else {
+		authClone.metadataVersion = m.nextMetadataVersion()
+		authClone.metadataVersionKnown = true
+		authClone.metadataSnapshot = cloneMetadata(authClone.Metadata)
+	}
+	m.mu.Lock()
+	m.auths[auth.ID] = authClone.Clone()
 	m.mu.Unlock()
 	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 	if m.scheduler != nil {
 		m.scheduler.upsertAuth(authClone)
 	}
 	m.queueRefreshReschedule(auth.ID)
-	_ = m.persist(ctx, auth)
-	m.hook.OnAuthUpdated(ctx, auth.Clone())
-	return auth.Clone(), nil
+	hookAuth := authClone.Clone()
+	hookTask, dispatch := m.enqueueAuthHook(ctx, auth.ID, reentrantHook, func(hookCtx context.Context) { m.hook.OnAuthUpdated(hookCtx, hookAuth) })
+	unlockPersist()
+	m.dispatchAuthHook(auth.ID, hookTask, dispatch)
+	return authClone.Clone(), nil
+}
+
+// UpdateMetadata merges runtime credential state when the supplied auth snapshot is current.
+func (m *Manager) UpdateMetadata(ctx context.Context, expected *Auth, updates map[string]any) (*Auth, error) {
+	if m == nil || expected == nil || expected.ID == "" || len(updates) == 0 {
+		return nil, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	reentrantHook := isReentrantAuthHookCall(ctx, m, expected.ID)
+	unlockPersist, errLock := m.lockAuthPersistenceContext(ctx, expected.ID)
+	if errLock != nil {
+		return expected.Clone(), errLock
+	}
+	if err := ctx.Err(); err != nil {
+		unlockPersist()
+		return expected.Clone(), err
+	}
+	m.mu.RLock()
+	existing, ok := m.auths[expected.ID]
+	if !ok || existing == nil {
+		m.mu.RUnlock()
+		unlockPersist()
+		return nil, errors.New("auth not found")
+	}
+	original := existing.Clone()
+	stale := expected.metadataVersionKnown && expected.metadataVersion != original.metadataVersion
+	if !expected.metadataVersionKnown && !reflect.DeepEqual(expected.Metadata, original.Metadata) {
+		stale = true
+	}
+	if stale {
+		m.mu.RUnlock()
+		unlockPersist()
+		return original, ErrStaleAuthMetadata
+	}
+	updated := original.Clone()
+	m.mu.RUnlock()
+	if updated.Metadata == nil {
+		updated.Metadata = make(map[string]any, len(updates))
+	}
+	for key, value := range updates {
+		updated.Metadata[key] = cloneMetadataValue(value)
+	}
+	updated.metadataVersion = m.nextMetadataVersion()
+	updated.metadataVersionKnown = true
+	updated.UpdatedAt = time.Now()
+	updated.metadataUpdatedAt = updated.UpdatedAt
+	if err := m.persistRequiredUnlocked(ctx, updated); err != nil {
+		unlockPersist()
+		return original, err
+	}
+	updated.metadataSnapshot = cloneMetadata(updated.Metadata)
+	m.mu.Lock()
+	m.auths[expected.ID] = updated.Clone()
+	m.mu.Unlock()
+	if m.scheduler != nil {
+		m.scheduler.upsertAuth(updated)
+	}
+	m.queueRefreshReschedule(expected.ID)
+	hookAuth := updated.Clone()
+	hookTask, dispatch := m.enqueueAuthHook(ctx, expected.ID, reentrantHook, func(hookCtx context.Context) { m.hook.OnAuthUpdated(hookCtx, hookAuth) })
+	unlockPersist()
+	m.dispatchAuthHook(expected.ID, hookTask, dispatch)
+	return updated.Clone(), nil
+}
+
+func (m *Manager) updateExecutionMetadata(ctx context.Context, expected *Auth, updates map[string]any) (*Auth, error) {
+	if expected == nil {
+		return nil, nil
+	}
+	parentID := ""
+	if expected.Attributes != nil {
+		parentID = strings.TrimSpace(expected.Attributes["gemini_virtual_parent"])
+	}
+	if parentID == "" {
+		return m.UpdateMetadata(ctx, expected, updates)
+	}
+	parent, ok := m.GetByID(parentID)
+	if !ok {
+		return nil, errors.New("auth not found")
+	}
+	unchanged := true
+	for key, value := range updates {
+		if !reflect.DeepEqual(parent.Metadata[key], value) {
+			unchanged = false
+			break
+		}
+	}
+	if unchanged {
+		return parent, nil
+	}
+	return m.UpdateMetadata(ctx, parent, updates)
 }
 
 // Load resets manager state from the backing store.
 func (m *Manager) Load(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := m.persistGate.Acquire(ctx, persistenceExclusiveWeight); err != nil {
+		return err
+	}
+	defer m.persistGate.Release(persistenceExclusiveWeight)
 	m.mu.Lock()
 	if m.store == nil {
 		m.mu.Unlock()
@@ -1194,7 +1758,12 @@ func (m *Manager) Load(ctx context.Context) error {
 			continue
 		}
 		auth.EnsureIndex()
-		m.auths[auth.ID] = auth.Clone()
+		authClone := auth.Clone()
+		authClone.metadataVersion = m.nextMetadataVersion()
+		authClone.metadataVersionKnown = true
+		authClone.metadataSnapshot = cloneMetadata(authClone.Metadata)
+		authClone.metadataUpdatedAt = metadataUpdatedAtOrNow(authClone.UpdatedAt)
+		m.auths[auth.ID] = authClone
 	}
 	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
 	if cfg == nil {
@@ -1233,8 +1802,8 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 	}
 	if lastErr != nil {
 		if shouldAttemptAntigravityCreditsFallback(m, lastErr, normalized) {
-			if resp, ok := m.tryAntigravityCreditsExecute(ctx, req, opts); ok {
-				return resp, nil
+			if resp, errCredits, handled := m.tryAntigravityCreditsExecute(ctx, req, opts); handled {
+				return resp, errCredits
 			}
 		}
 		return cliproxyexecutor.Response{}, lastErr
@@ -1299,8 +1868,8 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 	}
 	if lastErr != nil {
 		if shouldAttemptAntigravityCreditsFallback(m, lastErr, normalized) {
-			if result, ok := m.tryAntigravityCreditsExecuteStream(ctx, req, opts); ok {
-				return result, nil
+			if result, errCredits, handled := m.tryAntigravityCreditsExecuteStream(ctx, req, opts); handled {
+				return result, errCredits
 			}
 		}
 		var bootstrapErr *streamBootstrapError
@@ -1378,7 +1947,10 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				if ra := retryAfterFromError(errExec); ra != nil {
 					result.RetryAfter = ra
 				}
-				m.MarkResult(execCtx, result)
+				m.MarkResult(contextWithAuthStateNeutralResult(execCtx, errExec), result)
+				if isNonRetryableExecutionError(errExec) {
+					return cliproxyexecutor.Response{}, errExec
+				}
 				if isRequestInvalidError(errExec) {
 					return cliproxyexecutor.Response{}, errExec
 				}
@@ -1467,7 +2039,10 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				if ra := retryAfterFromError(errExec); ra != nil {
 					result.RetryAfter = ra
 				}
-				m.MarkResult(execCtx, result)
+				m.MarkResult(contextWithAuthStateNeutralResult(execCtx, errExec), result)
+				if isNonRetryableExecutionError(errExec) {
+					return cliproxyexecutor.Response{}, errExec
+				}
 				if isRequestInvalidError(errExec) {
 					return cliproxyexecutor.Response{}, errExec
 				}
@@ -1540,7 +2115,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			if errCtx := execCtx.Err(); errCtx != nil {
 				return nil, errCtx
 			}
-			if isRequestInvalidError(errStream) {
+			if isNonRetryableExecutionError(errStream) || isRequestInvalidError(errStream) {
 				return nil, errStream
 			}
 			lastErr = errStream
@@ -2086,6 +2661,9 @@ func (m *Manager) shouldRetryAfterError(err error, attempt int, providers []stri
 	if err == nil {
 		return 0, false
 	}
+	if isNonRetryableExecutionError(err) {
+		return 0, false
+	}
 	if maxWait <= 0 {
 		return 0, false
 	}
@@ -2135,6 +2713,16 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	if result.AuthID == "" {
 		return
 	}
+	reentrantHook := isReentrantAuthHookCall(ctx, m, result.AuthID)
+	if IsAuthStateNeutralResult(ctx) {
+		unlockPersist := m.lockAuthPersistence(result.AuthID)
+		hookTask, dispatch := m.enqueueAuthHook(ctx, result.AuthID, reentrantHook, func(hookCtx context.Context) {
+			m.hook.OnResult(hookCtx, result)
+		})
+		unlockPersist()
+		m.dispatchAuthHook(result.AuthID, hookTask, dispatch)
+		return
+	}
 
 	shouldResumeModel := false
 	shouldSuspendModel := false
@@ -2142,9 +2730,17 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	clearModelQuota := false
 	setModelQuota := false
 	var authSnapshot *Auth
+	var previous *Auth
 
-	m.mu.Lock()
+	unlockPersist := m.lockAuthPersistence(result.AuthID)
+	m.mu.RLock()
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
+		previous = auth
+		authSnapshot = auth.Clone()
+	}
+	m.mu.RUnlock()
+	if authSnapshot != nil {
+		auth := authSnapshot
 		now := time.Now()
 		auth.recordRecentRequest(now, result.Success)
 		if result.Success {
@@ -2265,28 +2861,40 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				applyAuthFailureState(auth, result.Error, result.RetryAfter, now)
 			}
 		}
-
-		_ = m.persist(ctx, auth)
-		authSnapshot = auth.Clone()
 	}
-	m.mu.Unlock()
-	if m.scheduler != nil && authSnapshot != nil {
-		m.scheduler.upsertAuth(authSnapshot)
+	if authSnapshot != nil {
+		// Persistence failure must not discard the observed execution result from
+		// in-memory routing state; only the persisted metadata handoff is gated.
+		if errPersist := m.persistUnlocked(ctx, authSnapshot); errPersist != nil {
+			logEntryWithRequestID(ctx).WithField("auth_id", authSnapshot.ID).Warnf("failed to persist auth execution result: %v", errPersist)
+		} else {
+			m.finalizePersistedMetadata(previous, authSnapshot)
+		}
+		m.mu.Lock()
+		m.auths[result.AuthID] = authSnapshot.cloneWithSharedMetadata()
+		m.mu.Unlock()
 	}
-
-	if clearModelQuota && result.Model != "" {
-		registry.GetGlobalRegistry().ClearModelQuotaExceeded(result.AuthID, result.Model)
+	if authSnapshot != nil {
+		if m.scheduler != nil {
+			m.scheduler.upsertAuth(authSnapshot)
+		}
+		if clearModelQuota && result.Model != "" {
+			registry.GetGlobalRegistry().ClearModelQuotaExceeded(result.AuthID, result.Model)
+		}
+		if setModelQuota && result.Model != "" {
+			registry.GetGlobalRegistry().SetModelQuotaExceeded(result.AuthID, result.Model)
+		}
+		if shouldResumeModel {
+			registry.GetGlobalRegistry().ResumeClientModel(result.AuthID, result.Model)
+		} else if shouldSuspendModel {
+			registry.GetGlobalRegistry().SuspendClientModel(result.AuthID, result.Model, suspendReason)
+		}
 	}
-	if setModelQuota && result.Model != "" {
-		registry.GetGlobalRegistry().SetModelQuotaExceeded(result.AuthID, result.Model)
-	}
-	if shouldResumeModel {
-		registry.GetGlobalRegistry().ResumeClientModel(result.AuthID, result.Model)
-	} else if shouldSuspendModel {
-		registry.GetGlobalRegistry().SuspendClientModel(result.AuthID, result.Model, suspendReason)
-	}
-
-	m.hook.OnResult(ctx, result)
+	hookTask, dispatch := m.enqueueAuthHook(ctx, result.AuthID, reentrantHook, func(hookCtx context.Context) {
+		m.hook.OnResult(hookCtx, result)
+	})
+	unlockPersist()
+	m.dispatchAuthHook(result.AuthID, hookTask, dispatch)
 }
 
 func ensureModelState(auth *Auth, model string) *ModelState {
@@ -2475,11 +3083,99 @@ func statusCodeFromError(err error) int {
 	type statusCoder interface {
 		StatusCode() int
 	}
-	var sc statusCoder
-	if errors.As(err, &sc) && sc != nil {
+	if sc, ok := findErrorMarker[statusCoder](err, nil); ok {
 		return sc.StatusCode()
 	}
 	return 0
+}
+
+func isNilLike(value any) bool {
+	if value == nil {
+		return true
+	}
+	switch reflect.ValueOf(value).Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return reflect.ValueOf(value).IsNil()
+	default:
+		return false
+	}
+}
+
+func findErrorMarker[T any](err error, accept func(T) bool) (T, bool) {
+	var found T
+	ok := visitErrorTree(err, func(candidate error) bool {
+		if marker, matches := any(candidate).(T); matches && !isNilLike(marker) && (accept == nil || accept(marker)) {
+			found = marker
+			return true
+		}
+		if isNilLike(candidate) {
+			return false
+		}
+		adapter, matches := candidate.(interface{ As(any) bool })
+		if !matches {
+			return false
+		}
+		var marker T
+		if !adapter.As(&marker) || isNilLike(marker) || (accept != nil && !accept(marker)) {
+			return false
+		}
+		found = marker
+		return true
+	})
+	return found, ok
+}
+
+func visitErrorTree(err error, visit func(error) bool) bool {
+	if err == nil || visit(err) {
+		return err != nil
+	}
+	if isNilLike(err) {
+		return false
+	}
+	switch wrapped := err.(type) {
+	case interface{ Unwrap() []error }:
+		for _, child := range wrapped.Unwrap() {
+			if visitErrorTree(child, visit) {
+				return true
+			}
+		}
+	case interface{ Unwrap() error }:
+		return visitErrorTree(wrapped.Unwrap(), visit)
+	}
+	return false
+}
+
+func isAuthStateNeutralError(err error) bool {
+	if err == nil {
+		return false
+	}
+	type authStateNeutral interface {
+		AuthStateNeutral() bool
+	}
+	_, ok := findErrorMarker[authStateNeutral](err, func(neutral authStateNeutral) bool {
+		return neutral.AuthStateNeutral()
+	})
+	return ok
+}
+
+func isNonRetryableExecutionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	type retryableMarker interface {
+		Retryable() bool
+	}
+	_, ok := findErrorMarker[retryableMarker](err, func(retryable retryableMarker) bool {
+		return !retryable.Retryable()
+	})
+	return ok
+}
+
+func contextWithAuthStateNeutralResult(ctx context.Context, err error) context.Context {
+	if !isAuthStateNeutralError(err) {
+		return ctx
+	}
+	return WithAuthStateNeutralResult(ctx)
 }
 
 func retryAfterFromError(err error) *time.Duration {
@@ -2489,8 +3185,8 @@ func retryAfterFromError(err error) *time.Duration {
 	type retryAfterProvider interface {
 		RetryAfter() *time.Duration
 	}
-	rap, ok := err.(retryAfterProvider)
-	if !ok || rap == nil {
+	rap, ok := findErrorMarker[retryAfterProvider](err, nil)
+	if !ok {
 		return nil
 	}
 	retryAfter := rap.RetryAfter()
@@ -3387,12 +4083,12 @@ func shouldAttemptAntigravityCreditsFallback(m *Manager, lastErr error, provider
 	}
 }
 
-func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, bool) {
+func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error, bool) {
 	routeModel := req.Model
 	candidates := m.findAllAntigravityCreditsCandidateAuths(routeModel, opts)
 	for _, c := range candidates {
 		if ctx.Err() != nil {
-			return cliproxyexecutor.Response{}, false
+			return cliproxyexecutor.Response{}, nil, false
 		}
 		creditsCtx := WithAntigravityCredits(ctx)
 		if rt := m.roundTripperFor(c.auth); rt != nil {
@@ -3420,22 +4116,25 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 				if ra := retryAfterFromError(errExec); ra != nil {
 					result.RetryAfter = ra
 				}
-				m.MarkResult(creditsCtx, result)
+				m.MarkResult(contextWithAuthStateNeutralResult(creditsCtx, errExec), result)
+				if isNonRetryableExecutionError(errExec) || isRequestInvalidError(errExec) {
+					return cliproxyexecutor.Response{}, errExec, true
+				}
 				continue
 			}
 			m.MarkResult(creditsCtx, result)
-			return resp, true
+			return resp, nil, true
 		}
 	}
-	return cliproxyexecutor.Response{}, false
+	return cliproxyexecutor.Response{}, nil, false
 }
 
-func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, bool) {
+func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error, bool) {
 	routeModel := req.Model
 	candidates := m.findAllAntigravityCreditsCandidateAuths(routeModel, opts)
 	for _, c := range candidates {
 		if ctx.Err() != nil {
-			return nil, false
+			return nil, nil, false
 		}
 		creditsCtx := WithAntigravityCredits(ctx)
 		if rt := m.roundTripperFor(c.auth); rt != nil {
@@ -3450,18 +4149,47 @@ func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cl
 		}
 		result, errStream := m.executeStreamWithModelPool(creditsCtx, c.executor, c.auth, c.provider, req, creditsOpts, routeModel, models, len(models) > 1)
 		if errStream != nil {
+			if isNonRetryableExecutionError(errStream) || isRequestInvalidError(errStream) {
+				return nil, errStream, true
+			}
 			continue
 		}
-		return result, true
+		return result, nil, true
 	}
-	return nil, false
+	return nil, nil, false
 }
 
-func (m *Manager) persist(ctx context.Context, auth *Auth) error {
-	if m.store == nil || auth == nil {
+func (m *Manager) persistCurrent(ctx context.Context, authID string) error {
+	if m == nil || authID == "" {
 		return nil
 	}
+	unlockPersist := m.lockAuthPersistence(authID)
+	defer unlockPersist()
+	return m.persistCurrentUnlocked(ctx, authID)
+}
+
+func (m *Manager) persistCurrentUnlocked(ctx context.Context, authID string) error {
+	m.mu.RLock()
+	auth, ok := m.auths[authID]
+	if ok {
+		auth = auth.Clone()
+	}
+	m.mu.RUnlock()
+	if !ok || auth == nil {
+		return nil
+	}
+	return m.persistUnlocked(ctx, auth)
+}
+
+func (m *Manager) persistUnlocked(ctx context.Context, auth *Auth) error {
 	if shouldSkipPersist(ctx) {
+		return nil
+	}
+	return m.persistRequiredUnlocked(ctx, auth)
+}
+
+func (m *Manager) persistRequiredUnlocked(ctx context.Context, auth *Auth) error {
+	if m.store == nil || auth == nil {
 		return nil
 	}
 	if auth.Attributes != nil {
@@ -3746,19 +4474,23 @@ func lookupMetadataTime(meta map[string]any, keys ...string) (time.Time, bool) {
 }
 
 func (m *Manager) markRefreshPending(id string, now time.Time) bool {
+	unlockPersist := m.lockAuthPersistence(id)
 	m.mu.Lock()
 	auth, ok := m.auths[id]
 	if !ok || auth == nil {
 		m.mu.Unlock()
+		unlockPersist()
 		return false
 	}
 	if !auth.NextRefreshAfter.IsZero() && now.Before(auth.NextRefreshAfter) {
 		m.mu.Unlock()
+		unlockPersist()
 		return false
 	}
 	auth.NextRefreshAfter = now.Add(refreshPendingBackoff)
 	m.auths[id] = auth
 	m.mu.Unlock()
+	unlockPersist()
 
 	m.queueRefreshReschedule(id)
 	return true
@@ -3789,6 +4521,7 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	now := time.Now()
 	if err != nil {
 		shouldReschedule := false
+		unlockPersist := m.lockAuthPersistence(id)
 		m.mu.Lock()
 		if current := m.auths[id]; current != nil {
 			current.NextRefreshAfter = now.Add(refreshFailureBackoff)
@@ -3800,6 +4533,7 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 			}
 		}
 		m.mu.Unlock()
+		unlockPersist()
 		if shouldReschedule {
 			m.queueRefreshReschedule(id)
 		}
