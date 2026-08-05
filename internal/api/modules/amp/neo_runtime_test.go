@@ -26369,6 +26369,173 @@ func TestNeoConfigModeModelRouteOverridesSmartMode(t *testing.T) {
 	}
 }
 
+func TestNeoInferenceModelRoutesResolveMappingsOnce(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+		ForceModelMappings: true,
+		NeoLocalRuntime: config.AmpNeoLocalRuntime{
+			ModeModelRoutes: map[string]config.ModelRouteList{"review": {"openai/gpt-source"}},
+		},
+	}})
+	rt.setModelMapper(staticNeoModelMapper{"gpt-source": "openai/gpt-first"})
+	routes := neoInferenceModelRoutes(rt, neoInferenceRequest{AgentMode: "review"})
+	rt.setModelMapper(staticNeoModelMapper{"gpt-source": "openai/gpt-second", "gpt-first": "openai/gpt-second"})
+
+	if len(routes) != 1 || routes[0].Provider != "openai" || routes[0].Model != "gpt-first" {
+		t.Fatalf("resolved routes after mapper update = %#v, want the original openai/gpt-first snapshot", routes)
+	}
+}
+
+func TestInferNeoLocalRetriesTransientErrorOnSameRoute(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream_%t", stream), func(t *testing.T) {
+			payloads := make([]map[string]any, 0, 2)
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				payloads = append(payloads, readNeoJSON(r.Body))
+				if len(payloads) == 1 {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusInternalServerError)
+					_, _ = w.Write([]byte(`{"error":{"message":"Post https://chatgpt.com/backend-api/codex/responses: read: connection reset by peer","type":"server_error","code":"internal_server_error"}}`))
+					return
+				}
+				if stream {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"retry ok\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":2,\"output_tokens\":1},\"output\":[]}}\n\ndata: [DONE]\n\n"))
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"retry ok"}]}],"usage":{"input_tokens":2,"output_tokens":1}}`))
+			}))
+			defer upstream.Close()
+
+			rt := testNeoRuntimeForServer(t, upstream)
+			cfg := *rt.configSnapshot()
+			cfg.AmpCode.NeoLocalRuntime.ModeModelRoutes = map[string]config.ModelRouteList{"review": {"openai/gpt-5.5"}}
+			if err := rt.updateConfig(&cfg); err != nil {
+				t.Fatalf("update config: %v", err)
+			}
+			request := neoInferenceRequest{Context: context.Background(), ThreadID: "T-transient", MessageID: "M-transient", AgentMode: "review", History: []neoHistoryMessage{{Role: "user", Text: "review"}}}
+			var result neoInferenceResult
+			var err error
+			if stream {
+				result, err = inferNeoLocalStream(rt, request, func(neoInferenceDelta) {})
+			} else {
+				result, err = inferNeoLocal(rt, request)
+			}
+			if err != nil || result.Text != "retry ok" || len(payloads) != 2 {
+				t.Fatalf("transient retry result=%+v err=%v payloads=%d", result, err, len(payloads))
+			}
+			if !reflect.DeepEqual(payloads[0], payloads[1]) {
+				t.Fatalf("transient retry changed request\nfirst=%#v\nretry=%#v", payloads[0], payloads[1])
+			}
+		})
+	}
+}
+
+func TestInferNeoLocalModeModelFallbackSkipsOversizedPrimary(t *testing.T) {
+	primaryModel := "gpt-5.6-sol"
+	fallbackModel := "claude-sonnet-4-5-20250929"
+	primaryMaxInput := neoEffectiveMaxInputTokens("high", primaryModel)
+	fallbackMaxInput := neoEffectiveMaxInputTokens("high", fallbackModel)
+	if primaryMaxInput <= 0 || fallbackMaxInput <= primaryMaxInput {
+		t.Fatalf("route limits primary=%d fallback=%d, want a larger fallback", primaryMaxInput, fallbackMaxInput)
+	}
+	oversizedPrompt := strings.Repeat("x", (primaryMaxInput+4096)*neoCompactionApproxCharsPerToken)
+
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream_%t", stream), func(t *testing.T) {
+			attempts := make([]string, 0, 1)
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				payload := readNeoJSON(r.Body)
+				attempts = append(attempts, stringValue(payload["model"]))
+				if stream {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = w.Write([]byte("event: message_start\n" +
+						`data: {"type":"message_start","message":{"usage":{"input_tokens":3}}}` + "\n\n" +
+						"event: content_block_start\n" +
+						`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}` + "\n\n" +
+						"event: content_block_delta\n" +
+						`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"fallback ok"}}` + "\n\n" +
+						"event: message_stop\n" +
+						`data: {"type":"message_stop"}` + "\n\n"))
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"content":[{"type":"text","text":"fallback ok"}],"usage":{"input_tokens":3,"output_tokens":2}}`))
+			}))
+			defer upstream.Close()
+
+			rt := testNeoRuntimeForServer(t, upstream)
+			cfg := *rt.configSnapshot()
+			cfg.AmpCode.NeoLocalRuntime.ModeModelRoutes = map[string]config.ModelRouteList{"high": {"openai/" + primaryModel, "anthropic/" + fallbackModel}}
+			if err := rt.updateConfig(&cfg); err != nil {
+				t.Fatalf("update config: %v", err)
+			}
+			request := neoInferenceRequest{Context: context.Background(), ThreadID: "T-budget-fallback", AgentMode: "high", SystemPromptOverride: "bounded", History: []neoHistoryMessage{{Role: "user", Text: oversizedPrompt}}}
+			var result neoInferenceResult
+			var err error
+			if stream {
+				result, err = inferNeoLocalStream(rt, request, func(neoInferenceDelta) {})
+			} else {
+				result, err = inferNeoLocal(rt, request)
+			}
+			if err != nil || result.Text != "fallback ok" || !slices.Equal(attempts, []string{fallbackModel}) {
+				t.Fatalf("budget fallback result=%+v err=%v attempts=%#v", result, err, attempts)
+			}
+		})
+	}
+}
+
+func TestInferNeoLocalModeModelBudgetExhaustionPreservesRouteErrors(t *testing.T) {
+	primaryModel := "gpt-5.6-sol"
+	fallbackModel := "claude-sonnet-4-5-20250929"
+	fallbackMaxInput := neoEffectiveMaxInputTokens("high", fallbackModel)
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{
+		ModeModelRoutes: map[string]config.ModelRouteList{"high": {"openai/" + primaryModel, "anthropic/" + fallbackModel}},
+	}}})
+	_, err := inferNeoLocal(rt, neoInferenceRequest{AgentMode: "high", SystemPromptOverride: "bounded", History: []neoHistoryMessage{{Role: "user", Text: strings.Repeat("x", (fallbackMaxInput+4096)*neoCompactionApproxCharsPerToken)}}})
+	if err == nil || !strings.Contains(err.Error(), "openai/"+primaryModel) || !strings.Contains(err.Error(), "anthropic/"+fallbackModel) {
+		t.Fatalf("budget exhaustion error = %v, want both route errors", err)
+	}
+}
+
+func TestInferNeoLocalModelRouteOverrideLeavesRetryToCaller(t *testing.T) {
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		http.Error(w, "provider unavailable", http.StatusServiceUnavailable)
+	}))
+	defer upstream.Close()
+
+	route := neoModelRoute{Provider: "openai", Model: "gpt-5.5"}
+	_, err := inferNeoLocalStream(testNeoRuntimeForServer(t, upstream), neoInferenceRequest{
+		Context:            context.Background(),
+		ThreadID:           "T-route-override",
+		AgentMode:          "review",
+		History:            []neoHistoryMessage{{Role: "user", Text: "review"}},
+		ModelRouteOverride: &route,
+	}, func(neoInferenceDelta) {})
+	if err == nil || calls != 1 || !neoSubagentRetryableInferenceError(err) {
+		t.Fatalf("route override retry error=%v calls=%d", err, calls)
+	}
+}
+
+func TestNeoWaitForInferenceRetryCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- neoWaitForInferenceRetry(ctx, time.Minute)
+	}()
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("retry wait error = %v, want cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("retry wait did not stop after cancellation")
+	}
+}
+
 func TestInferNeoLocalModeModelFallbacksPreserveHistoryAndCache(t *testing.T) {
 	for _, stream := range []bool{false, true} {
 		t.Run(fmt.Sprintf("stream_%t", stream), func(t *testing.T) {
@@ -26436,7 +26603,7 @@ func TestInferNeoLocalModeModelFallbacksPreserveHistoryAndCache(t *testing.T) {
 			if stream && strings.Join(deltas, "") != "fallback ok" {
 				t.Fatalf("fallback deltas = %#v", deltas)
 			}
-			if !slices.Equal(attempts, []string{"openai/gpt-primary", "openai/gpt-fallback"}) {
+			if !slices.Equal(attempts, []string{"openai/gpt-primary", "openai/gpt-primary", "openai/gpt-primary", "openai/gpt-fallback"}) {
 				t.Fatalf("mode fallback attempts = %#v", attempts)
 			}
 			if !reflect.DeepEqual(request.History, wantHistory) {
@@ -26550,11 +26717,11 @@ func TestInferNeoLocalModeModelFallbackAggregatesFailedAnthropicUsage(t *testing
 	if err != nil {
 		t.Fatalf("Anthropic usage fallback error: %v", err)
 	}
-	if result.Text != "fallback ok" || !slices.Equal(attempts, []string{"claude-primary", "gpt-fallback"}) {
+	if result.Text != "fallback ok" || !slices.Equal(attempts, []string{"claude-primary", "claude-primary", "claude-primary", "gpt-fallback"}) {
 		t.Fatalf("Anthropic usage fallback result/attempts = %+v/%#v", result, attempts)
 	}
-	if numberFrom(result.Usage["inputTokens"]) != 7 || numberFrom(result.Usage["outputTokens"]) != 3 {
-		t.Fatalf("Anthropic usage fallback usage = %#v, want input=7 output=3", result.Usage)
+	if numberFrom(result.Usage["inputTokens"]) != 17 || numberFrom(result.Usage["outputTokens"]) != 3 {
+		t.Fatalf("Anthropic usage fallback usage = %#v, want input=17 output=3", result.Usage)
 	}
 }
 
@@ -26596,46 +26763,59 @@ func TestInferNeoLocalModeModelFallbackAppliesTextToolBridgePerRoute(t *testing.
 	if err != nil {
 		t.Fatalf("bridge fallback error: %v", err)
 	}
-	if result.Text != "native fallback" || result.Model != "gpt-fallback" || !slices.Equal(attempts, []string{"gpt-5-6-pro", "gpt-fallback"}) {
+	if result.Text != "native fallback" || result.Model != "gpt-fallback" || !slices.Equal(attempts, []string{"gpt-5-6-pro", "gpt-5-6-pro", "gpt-5-6-pro", "gpt-fallback"}) {
 		t.Fatalf("bridge fallback result/attempts = %+v/%#v", result, attempts)
 	}
 }
 
-func TestInferNeoLocalStreamDoesNotFallbackAfterOutput(t *testing.T) {
-	attempts := make([]string, 0, 2)
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		payload := readNeoJSON(r.Body)
-		model := stringValue(payload["model"])
-		attempts = append(attempts, model)
-		w.Header().Set("Content-Type", "text/event-stream")
-		if model == "gpt-primary" {
-			flusher, _ := w.(http.Flusher)
-			_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"partial\"}\n\n"))
-			if flusher != nil {
-				flusher.Flush()
-			}
-			_, _ = w.Write([]byte("data: not-json\n\n"))
-			return
-		}
-		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"duplicate\"}\n\ndata: [DONE]\n\n"))
-	}))
-	defer upstream.Close()
+func TestInferNeoLocalStreamDoesNotRetryOrFallbackAfterOutput(t *testing.T) {
+	cases := []struct {
+		name     string
+		provider string
+		event    string
+	}{
+		{name: "text", provider: "openai", event: `data: {"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"partial"}` + "\n\n"},
+		{name: "thinking", provider: "openai", event: `data: {"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"partial reasoning"}` + "\n\n"},
+		{name: "thinking signature", provider: "anthropic", event: "event: content_block_start\n" + `data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","signature":"partial-signature"}}` + "\n\n"},
+		{name: "tool call", provider: "openai", event: `data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call-read","name":"Read","arguments":"{}"}}` + "\n\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			attempts := make([]string, 0, 2)
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				payload := readNeoJSON(r.Body)
+				attempts = append(attempts, stringValue(payload["model"]))
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = w.Write([]byte(tc.event))
+				if flusher, ok := w.(http.Flusher); ok {
+					flusher.Flush()
+				}
+				_, _ = w.Write([]byte("data: not-json\n\n"))
+			}))
+			defer upstream.Close()
 
-	rt := testNeoRuntimeForServer(t, upstream)
-	cfg := *rt.configSnapshot()
-	cfg.AmpCode.NeoLocalRuntime.ModeModelRoutes = map[string]config.ModelRouteList{"ultra": {"openai/gpt-primary", "openai/gpt-fallback"}}
-	if err := rt.updateConfig(&cfg); err != nil {
-		t.Fatalf("update config: %v", err)
-	}
-	var output strings.Builder
-	_, err := inferNeoLocalStream(rt, neoInferenceRequest{ThreadID: "T-partial", AgentMode: "ultra", History: []neoHistoryMessage{{Role: "user", Text: "hello"}}}, func(delta neoInferenceDelta) {
-		output.WriteString(delta.Text)
-	})
-	if err == nil {
-		t.Fatal("partial stream error = nil")
-	}
-	if output.String() != "partial" || !slices.Equal(attempts, []string{"gpt-primary"}) {
-		t.Fatalf("partial stream output/attempts = %q/%#v, want no fallback", output.String(), attempts)
+			rt := testNeoRuntimeForServer(t, upstream)
+			cfg := *rt.configSnapshot()
+			cfg.AmpCode.NeoLocalRuntime.ModeModelRoutes = map[string]config.ModelRouteList{"ultra": {tc.provider + "/model-primary", "openai/gpt-fallback"}}
+			if err := rt.updateConfig(&cfg); err != nil {
+				t.Fatalf("update config: %v", err)
+			}
+			delivered := false
+			_, err := inferNeoLocalStream(rt, neoInferenceRequest{
+				ThreadID:  "T-partial",
+				AgentMode: "ultra",
+				History:   []neoHistoryMessage{{Role: "user", Text: "hello"}},
+				Tools:     []neoToolSpec{{Name: "Read", InputSchema: map[string]any{"type": "object"}}},
+			}, func(delta neoInferenceDelta) {
+				delivered = delivered || delta.Text != "" || delta.Thinking != "" || delta.ThinkingSignature != "" || delta.ToolCall != nil
+			})
+			if err == nil {
+				t.Fatal("partial stream error = nil")
+			}
+			if !delivered || !slices.Equal(attempts, []string{"model-primary"}) {
+				t.Fatalf("partial stream delivered/attempts = %t/%#v, want output with no retry or fallback", delivered, attempts)
+			}
+		})
 	}
 }
 
@@ -26930,7 +27110,7 @@ func TestInferNeoLocalModeModelFallbackExhaustionPreservesAttemptErrors(t *testi
 	if err == nil || !strings.Contains(err.Error(), "local Neo mode model routes exhausted") || !strings.Contains(err.Error(), "openai/gpt-primary") || !strings.Contains(err.Error(), "openai/gpt-fallback") {
 		t.Fatalf("exhausted fallback error = %v", err)
 	}
-	if !slices.Equal(attempts, []string{"gpt-primary", "gpt-fallback"}) {
+	if !slices.Equal(attempts, []string{"gpt-primary", "gpt-primary", "gpt-primary", "gpt-fallback", "gpt-fallback", "gpt-fallback"}) {
 		t.Fatalf("exhausted fallback attempts = %#v", attempts)
 	}
 }
@@ -29493,6 +29673,42 @@ func TestInferNeoCompactionAnthropicUsesBinaryHelperHeader(t *testing.T) {
 	}
 }
 
+func TestInferNeoCompactionLocalPropagatesCallerContext(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Context().Err() != nil {
+			w.WriteHeader(http.StatusRequestTimeout)
+			return
+		}
+		_, _ = w.Write([]byte(`{"content":[{"type":"text","text":"<summary>ctx compacted</summary>"}]}`))
+	}))
+	t.Cleanup(upstream.Close)
+
+	summary, err := inferNeoCompactionLocal(context.Background(), testNeoRuntimeForServer(t, upstream), "T-ctx-compaction", neoModelRoute{Provider: "anthropic", Model: "claude-opus-4-7"}, []neoMessage{{
+		ThreadID:  "T-ctx-compaction",
+		MessageID: "M-user",
+		Role:      "user",
+		Content:   []any{map[string]any{"type": "text", "text": "important state"}},
+	}}, "")
+	if err != nil {
+		t.Fatalf("infer compaction with caller context: %v", err)
+	}
+	if summary != "<summary>ctx compacted</summary>" {
+		t.Fatalf("summary = %q", summary)
+	}
+
+	cancelledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := inferNeoCompactionLocal(cancelledCtx, testNeoRuntimeForServer(t, upstream), "T-ctx-compaction", neoModelRoute{Provider: "anthropic", Model: "claude-opus-4-7"}, []neoMessage{{
+		ThreadID:  "T-ctx-compaction",
+		MessageID: "M-user",
+		Role:      "user",
+		Content:   []any{map[string]any{"type": "text", "text": "important state"}},
+	}}, ""); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled caller context err = %v, want context.Canceled", err)
+	}
+}
+
 func TestNeoTitleHelpersSanitizeAndTrimTranscript(t *testing.T) {
 	history := neoTitleHistory([]neoHistoryMessage{
 		{Role: "user", Text: "please fix the local Neo bridge"},
@@ -29679,8 +29895,13 @@ func TestNeoPromptFamilyMatchesBinarySelector(t *testing.T) {
 		{name: "puck mode", agentMode: "puck", route: neoModelRoute{Provider: "openai", Model: "gpt-5.6-sol"}, want: "aggman"},
 		{name: "rush mode", agentMode: "rush", route: neoModelRoute{Provider: "openai", Model: "gpt-5.5"}, want: neoPromptFamilyRush},
 		{name: "low mode", agentMode: "low", route: neoModelRoute{Provider: "amp", Model: "glm-5.2"}, want: neoPromptFamilyGLM52},
+		{name: "low mode mapped inkling", agentMode: "low", route: neoModelRoute{Provider: "baseten", Model: "thinkingmachines/inkling"}, want: neoPromptFamilyGLM52},
 		{name: "low mode gpt fallback", agentMode: "low", route: neoModelRoute{Provider: "openai", Model: "gpt-5.5"}, want: neoPromptFamilyRush},
-		{name: "ultra mode", agentMode: "ultra", route: neoModelRoute{Provider: "anthropic", Model: "claude-fable-5"}, want: neoPromptFamilyFable},
+		{name: "ultra fable", agentMode: "ultra", route: neoModelRoute{Provider: "anthropic", Model: "claude-fable-5"}, want: neoPromptFamilyFable},
+		{name: "ultra anthropic fallback", agentMode: "ultra", route: neoModelRoute{Provider: "anthropic", Model: "claude-opus-4-8"}, want: neoPromptFamilySmart},
+		{name: "ultra gpt fallback", agentMode: "ultra", route: neoModelRoute{Provider: "openai", Model: "gpt-5.6-sol"}, want: neoPromptFamilyGPT},
+		{name: "ultra kimi k3 override", agentMode: "ultra", route: neoModelRoute{Provider: "moonshotai", Model: "kimi-k3"}, want: neoPromptFamilyKimi},
+		{name: "custom kimi k3 mode", agentMode: "kimi-k3", route: neoModelRoute{Provider: "fireworks", Model: "accounts/fireworks/models/kimi-k3"}, want: neoPromptFamilyKimi},
 		{name: "fable model", agentMode: "smart", route: neoModelRoute{Provider: "anthropic", Model: "claude-fable-5"}, want: neoPromptFamilyFable},
 		{name: "deep gpt55", agentMode: "deep", route: neoModelRoute{Provider: "openai", Model: "gpt-5.5"}, want: neoPromptFamilyDeep},
 		{name: "deep fable override", agentMode: "deep", route: neoModelRoute{Provider: "anthropic", Model: "claude-fable-5"}, want: neoPromptFamilyDeep},
@@ -29690,8 +29911,13 @@ func TestNeoPromptFamilyMatchesBinarySelector(t *testing.T) {
 		{name: "high fable override", agentMode: "high", route: neoModelRoute{Provider: "anthropic", Model: "claude-fable-5"}, want: neoPromptFamilyDeep},
 		{name: "review fable override", agentMode: "review", route: neoModelRoute{Provider: "anthropic", Model: "claude-fable-5"}, want: neoPromptFamilyReview},
 		{name: "deep gpt54 fallback", agentMode: "deep", route: neoModelRoute{Provider: "openai", Model: "gpt-5.4"}, want: neoPromptFamilyDeepGPT54},
+		{name: "deep gpt540 near miss", agentMode: "deep", route: neoModelRoute{Provider: "openai", Model: "gpt-5.40"}, want: neoPromptFamilyDeep},
 		{name: "codex model", agentMode: "smart", route: neoModelRoute{Provider: "openai", Model: "gpt-5-codex"}, want: neoPromptFamilyGPT5Codex},
+		{name: "codex near miss", agentMode: "custom-agent", route: neoModelRoute{Provider: "openai", Model: "gpt-5-codex-plus"}, want: neoPromptFamilyGPT},
 		{name: "kimi model", agentMode: "smart", route: neoModelRoute{Provider: "anthropic", Model: "kimi-k2-0905"}, want: neoPromptFamilyKimi},
+		{name: "kimi k3 near miss", agentMode: "custom-agent", route: neoModelRoute{Provider: "openai", Model: "kimi-k30"}, want: neoPromptFamilyGPT},
+		{name: "glm 52 near miss", agentMode: "custom-agent", route: neoModelRoute{Provider: "openai", Model: "glm-5.20"}, want: neoPromptFamilyGPT},
+		{name: "fable near miss", agentMode: "custom-agent", route: neoModelRoute{Provider: "anthropic", Model: "claude-fable-50"}, want: neoPromptFamilyDefault},
 		{name: "generic openai", agentMode: "smart", route: neoModelRoute{Provider: "openai", Model: "o3"}, want: neoPromptFamilyGPT},
 		{name: "xai provider", agentMode: "smart", route: neoModelRoute{Provider: "xai", Model: "grok-code-fast-1"}, want: neoPromptFamilyXAI},
 		{name: "google provider", agentMode: "smart", route: neoModelRoute{Provider: "google", Model: "gemini-3-pro"}, want: neoPromptFamilyGemini},
@@ -29702,6 +29928,54 @@ func TestNeoPromptFamilyMatchesBinarySelector(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := neoPromptFamily(tc.agentMode, tc.route); got != tc.want {
 				t.Fatalf("prompt family = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestNeoPromptFamilyCoversCurrentCustomAgentCatalog(t *testing.T) {
+	for _, tc := range []struct {
+		model      string
+		want       string
+		provenance string
+	}{
+		{model: "amp/glm-5.2", want: neoPromptFamilyGLM52, provenance: "official glm-52-mode"},
+		{model: "anthropic/claude-fable-5", want: neoPromptFamilyFable, provenance: "official fable-mode"},
+		{model: "anthropic/claude-haiku-4-5-20251001", want: neoPromptFamilyDefault, provenance: "amp-classic provider fallback"},
+		{model: "anthropic/claude-opus-4-6", want: neoPromptFamilyDefault, provenance: "amp-classic provider fallback"},
+		{model: "anthropic/claude-opus-4-7", want: neoPromptFamilyDefault, provenance: "amp-classic provider fallback"},
+		{model: "anthropic/claude-opus-4-8", want: neoPromptFamilyDefault, provenance: "amp-classic provider fallback"},
+		{model: "anthropic/claude-opus-5", want: neoPromptFamilyDefault, provenance: "amp-classic provider fallback"},
+		{model: "anthropic/claude-sonnet-4-5-20250929", want: neoPromptFamilyDefault, provenance: "amp-classic provider fallback"},
+		{model: "anthropic/claude-sonnet-4-6", want: neoPromptFamilyDefault, provenance: "amp-classic provider fallback"},
+		{model: "baseten/thinkingmachines/inkling", want: neoPromptFamilyGLM52, provenance: "official inkling-mode matches glm-52 prompt"},
+		{model: "baseten/zai-org/GLM-5.2", want: neoPromptFamilyGLM52, provenance: "official glm-52-mode model family"},
+		{model: "fireworks/accounts/fireworks/models/kimi-k3", want: neoPromptFamilyKimi, provenance: "amp-classic Kimi selector and current Amp catalog"},
+		{model: "openai/gpt-5", want: neoPromptFamilyGPT, provenance: "amp-classic OpenAI provider selector"},
+		{model: "openai/gpt-5-mini", want: neoPromptFamilyGPT, provenance: "amp-classic OpenAI provider selector"},
+		{model: "openai/gpt-5-nano", want: neoPromptFamilyGPT, provenance: "amp-classic OpenAI provider selector"},
+		{model: "openai/gpt-5.1", want: neoPromptFamilyGPT, provenance: "amp-classic OpenAI provider selector"},
+		{model: "openai/gpt-5.2", want: neoPromptFamilyGPT, provenance: "amp-classic OpenAI provider selector"},
+		{model: "openai/gpt-5.2-codex", want: neoPromptFamilyGPT, provenance: "amp-classic exact Codex selector and OpenAI fallback"},
+		{model: "openai/gpt-5.3-codex", want: neoPromptFamilyGPT, provenance: "amp-classic exact Codex selector and OpenAI fallback"},
+		{model: "openai/gpt-5.4", want: neoPromptFamilyGPT, provenance: "amp-classic OpenAI provider selector"},
+		{model: "openai/gpt-5.5", want: neoPromptFamilyGPT, provenance: "amp-classic OpenAI provider selector"},
+		{model: "openai/gpt-5.6-luna", want: neoPromptFamilyGPT, provenance: "amp-classic OpenAI provider selector"},
+		{model: "openai/gpt-5.6-sol", want: neoPromptFamilyGPT, provenance: "amp-classic OpenAI provider selector"},
+		{model: "openai/gpt-5.6-terra", want: neoPromptFamilyGPT, provenance: "amp-classic OpenAI provider selector"},
+		{model: "openai/o3", want: neoPromptFamilyGPT, provenance: "amp-classic OpenAI provider selector"},
+		{model: "vertexai/gemini-3.1-flash-lite", want: neoPromptFamilyGemini, provenance: "amp-classic Vertex AI provider selector"},
+		{model: "vertexai/gemini-3.1-pro-preview", want: neoPromptFamilyGemini, provenance: "amp-classic Vertex AI provider selector"},
+		{model: "vertexai/gemini-3.5-flash", want: neoPromptFamilyGemini, provenance: "amp-classic Vertex AI provider selector"},
+		{model: "vertexai/gemini-3.5-flash-lite", want: neoPromptFamilyGemini, provenance: "amp-classic Vertex AI provider selector"},
+		{model: "vertexai/gemini-3.6-flash", want: neoPromptFamilyGemini, provenance: "amp-classic Vertex AI provider selector"},
+		{model: "xai/grok-4.5", want: neoPromptFamilyXAI, provenance: "official grok-45-mode and amp-classic XAI provider selector"},
+		{model: "xai/grok-build-0.1", want: neoPromptFamilyXAI, provenance: "amp-classic XAI provider selector"},
+	} {
+		t.Run(tc.model, func(t *testing.T) {
+			route := parseNeoModelRoute(tc.model)
+			if got := neoPromptFamily("custom-agent", route); got != tc.want {
+				t.Fatalf("prompt family = %q, want %q (%s)", got, tc.want, tc.provenance)
 			}
 		})
 	}
@@ -29740,6 +30014,18 @@ func TestNeoSystemPromptUsesBinaryPromptFamilies(t *testing.T) {
 			request: neoInferenceRequest{AgentMode: "ultra"},
 			route:   neoModelRoute{Provider: "anthropic", Model: "claude-fable-5"},
 			want:    []string{"You are pair programming with a user to solve their coding task", "# How to act", "# Engineering principles", "# Verification", "# Communication"},
+		},
+		{
+			name:    "ultra gpt fallback",
+			request: neoInferenceRequest{AgentMode: "ultra"},
+			route:   neoModelRoute{Provider: "openai", Model: "gpt-5.6-sol"},
+			want:    []string{"# Fast Context Understanding", "# Parallel Execution Policy", "# Final Status Spec"},
+		},
+		{
+			name:    "ultra kimi k3 override",
+			request: neoInferenceRequest{AgentMode: "ultra"},
+			route:   neoModelRoute{Provider: "moonshotai", Model: "kimi-k3"},
+			want:    []string{"**SPEED FIRST**", "Prefer specialized tools over Bash"},
 		},
 		{
 			name:    "deep gpt54",
@@ -30017,20 +30303,32 @@ func TestNeoSystemPromptIncludesSendMessageWorkflowGuidance(t *testing.T) {
 	if strings.Contains(withoutTool, `workflow: "merge_changes"`) {
 		t.Fatalf("prompt without send_message_to_thread tool should not include workflow guidance:\n%s", withoutTool)
 	}
-	currentThreadPrompt := neoSystemPrompt(neoInferenceRequest{
-		AgentMode: "high",
-		Tools:     []neoToolSpec{{Name: "thread_interact"}, {Name: "shell_command"}},
-	}, neoModelRoute{Provider: "openai", Model: "gpt-5.5"})
-	for _, want := range []string{`thread_interact with action: "message"`, "only for a different target thread", "Never use that action with the current thread ID", "Run Amp review without `--json`", "explicitly requests low-severity findings", "shipping review does not request `--json`", "current Amp uses `--files` to discover checks for those paths", "Never combine `--files` and `--check-scope`", "findings first, ordered by severity with file and line references", "If the review reports no findings, say so explicitly", "report each affected check's count as low-severity findings that Amp omitted", "Do not ask whether to inspect them", "temporary-file statistics alone do not count as reporting the review result", "Divide an oversized review into coherent `--files` scopes"} {
-		if !strings.Contains(currentThreadPrompt, want) {
-			t.Fatalf("prompt missing current-thread review guidance %q:\n%s", want, currentThreadPrompt)
-		}
-	}
-	if strings.Contains(currentThreadPrompt, "run `amp review --json --check-scope .` with shell_command") {
-		t.Fatalf("prompt forces JSON review output:\n%s", currentThreadPrompt)
-	}
-	if strings.Contains(currentThreadPrompt, `workflow: "code_review"`) {
-		t.Fatalf("non-agg-man prompt should not route current review through a message workflow:\n%s", currentThreadPrompt)
+	for _, test := range []struct {
+		name     string
+		tool     string
+		specific []string
+	}{
+		{name: "thread interact", tool: "thread_interact", specific: []string{`thread_interact with action: "message"`, "Never use that action with the current thread ID"}},
+		{name: "send message", tool: "send_message_to_thread", specific: []string{"send_message_to_thread is only for a different target thread", "Never call it with the current thread ID"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			currentThreadPrompt := neoSystemPrompt(neoInferenceRequest{
+				AgentMode: "high",
+				Tools:     []neoToolSpec{{Name: test.tool}, {Name: "shell_command"}},
+			}, neoModelRoute{Provider: "openai", Model: "gpt-5.5"})
+			wants := append(test.specific, "only for a different target thread", "For ordinary ad hoc reviews, run Amp review without `--json`", "explicitly requests low-severity findings", "mandatory exact-final-diff shipping review", "after shipping is authorized", "does not by itself make it that mandatory shipping gate", "Run the mandatory gate with `--json` once per required review scope", "When the complete diff fits in one review, use one invocation and do not duplicate it with a human-readable run", "preserve their reported severity rather than promoting them", "Whenever `--json` is used, summarize the structured output instead of pasting raw JSON", "current Amp uses `--files` to discover checks for those paths", "Never combine `--files` and `--check-scope`", "findings first, ordered by severity with file and line references", "If the review reports no findings, say so explicitly", "report each affected check's count as low-severity findings that Amp omitted", "Do not ask whether to inspect them", "temporary-file statistics alone do not count as reporting the review result", "Divide an oversized review into coherent `--files` scopes")
+			for _, want := range wants {
+				if !strings.Contains(currentThreadPrompt, want) {
+					t.Fatalf("prompt missing current-thread review guidance %q:\n%s", want, currentThreadPrompt)
+				}
+			}
+			if strings.Contains(currentThreadPrompt, "run `amp review --json --check-scope .` with shell_command") {
+				t.Fatalf("prompt forces JSON review output:\n%s", currentThreadPrompt)
+			}
+			if strings.Contains(currentThreadPrompt, `workflow: "code_review"`) {
+				t.Fatalf("non-agg-man prompt should not route current review through a message workflow:\n%s", currentThreadPrompt)
+			}
+		})
 	}
 }
 
@@ -47808,7 +48106,11 @@ func TestNeoRuntimeThreadActorCreationAppliesCustomAgentDefinition(t *testing.T)
 		"ENI_WORKSPACE_GUIDANCE",
 		"Working directory: /workspace/project",
 		"security-review: Review an authorized target",
-		"Run Amp review without `--json`",
+		"For ordinary ad hoc reviews, run Amp review without `--json`",
+		"mandatory exact-final-diff shipping review",
+		"Run the mandatory gate with `--json` once per required review scope",
+		"When the complete diff fits in one review, use one invocation and do not duplicate it with a human-readable run",
+		"preserve their reported severity rather than promoting them",
 		"Never combine `--files` and `--check-scope`",
 		"findings first, ordered by severity with file and line references",
 		"temporary-file statistics alone do not count as reporting the review result",

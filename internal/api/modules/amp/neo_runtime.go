@@ -121,6 +121,8 @@ const (
 	neoKimiSchemaDescriptionByteLimit  = 1024
 	neoENIInitialMaxAttempts           = 4
 	neoENIInitialBufferMaxBytes        = maxBufferedResponseBytes
+	neoTopLevelTransientRetryLimit     = 2
+	neoTopLevelTransientRetryBackoff   = 500 * time.Millisecond
 	neoChangesFileOrderMaxFiles        = 500
 	neoChangesFileOrderPathMaxBytes    = 4096
 	neoSnapshotWorkingDirectoryKey     = "cliProxyAPIWorkingDirectory"
@@ -35505,6 +35507,8 @@ type neoInferenceRequest struct {
 	// ModelRouteOverride forces a specific model/provider regardless of
 	// AgentMode. Used by local subagent runs (finder/oracle/librarian).
 	ModelRouteOverride *neoModelRoute
+	// ModelRouteOverrideResolved indicates that model mapping has already been applied.
+	ModelRouteOverrideResolved bool
 	// SystemPromptOverride replaces the assembled scaffold system prompt. Used
 	// by local subagent runs that carry their own (Amp-owned) prompt.
 	SystemPromptOverride string
@@ -35637,28 +35641,40 @@ func inferNeoLocal(rt *neoRuntime, request neoInferenceRequest) (neoInferenceRes
 	attemptErrors := make([]error, 0, len(routes))
 	var result neoInferenceResult
 	var usage map[string]any
-	for index, configuredRoute := range routes {
-		route := applyNeoModelMapping(rt, configuredRoute)
-		var err error
-		if route.TextToolBridge && len(request.Tools) > 0 {
-			result, err = neoInferTextToolBridge(request, func(wireRequest neoInferenceRequest) (neoInferenceResult, error) {
-				return inferNeoLocalRoute(rt, wireRequest, route)
-			})
-		} else {
-			result, err = inferNeoLocalRoute(rt, request, route)
+	for index, route := range routes {
+		var errInfer error
+		for retry := 0; ; retry++ {
+			if route.TextToolBridge && len(request.Tools) > 0 {
+				result, errInfer = neoInferTextToolBridge(request, func(wireRequest neoInferenceRequest) (neoInferenceResult, error) {
+					return inferNeoLocalRoute(rt, wireRequest, route)
+				})
+			} else {
+				result, errInfer = inferNeoLocalRoute(rt, request, route)
+			}
+			usage = sumNeoInferenceRetryUsage(usage, result.Usage)
+			result.Usage = usage
+			if errInfer == nil {
+				return result, nil
+			}
+			if !neoTopLevelInferenceShouldRetry(request, errInfer, retry, false) {
+				break
+			}
+			delay := neoTopLevelTransientRetryBackoff * time.Duration(1<<retry)
+			log.WithFields(log.Fields{"thread": request.ThreadID, "mode": request.AgentMode, "provider": route.Provider, "model": route.Model, "effort": neoInferenceEffectiveReasoningEffort(request, route), "attempt": retry + 2, "max_attempts": neoTopLevelTransientRetryLimit + 1, "backoff": delay, "error": errInfer}).Warn("amp neo: retrying mode model route after transient inference error")
+			if errWait := neoWaitForInferenceRetry(request.Context, delay); errWait != nil {
+				return result, errWait
+			}
+			if neoInferenceFallbackCancelled(request) {
+				return result, errInfer
+			}
 		}
-		usage = sumNeoInferenceRetryUsage(usage, result.Usage)
-		result.Usage = usage
-		if err == nil {
-			return result, nil
+		if len(routes) == 1 || neoInferenceFallbackCancelled(request) || !neoInferenceFallbackEligible(errInfer) {
+			return result, errInfer
 		}
-		if len(routes) == 1 || neoInferenceFallbackCancelled(request) || !neoSubagentRetryableInferenceError(err) {
-			return result, err
-		}
-		attemptErrors = append(attemptErrors, fmt.Errorf("%s/%s: %w", route.Provider, route.Model, err))
+		attemptErrors = append(attemptErrors, fmt.Errorf("%s/%s: %w", route.Provider, route.Model, errInfer))
 		if index+1 < len(routes) {
 			nextRoute := routes[index+1]
-			log.WithFields(log.Fields{"thread": request.ThreadID, "mode": request.AgentMode, "from_provider": route.Provider, "from_model": route.Model, "to_provider": nextRoute.Provider, "to_model": nextRoute.Model}).Warn("amp neo: falling back to the next mode model route")
+			log.WithFields(log.Fields{"thread": request.ThreadID, "mode": request.AgentMode, "from_provider": route.Provider, "from_model": route.Model, "from_effort": neoInferenceEffectiveReasoningEffort(request, route), "to_provider": nextRoute.Provider, "to_model": nextRoute.Model, "to_effort": neoInferenceEffectiveReasoningEffort(request, nextRoute), "error": errInfer}).Warn("amp neo: falling back to the next mode model route")
 		}
 	}
 	return result, fmt.Errorf("local Neo mode model routes exhausted: %w", errors.Join(attemptErrors...))
@@ -35685,8 +35701,7 @@ func inferNeoLocalRoute(rt *neoRuntime, request neoInferenceRequest, route neoMo
 
 func neoInferenceRoutesInputBudgetError(rt *neoRuntime, request neoInferenceRequest, routes []neoModelRoute) error {
 	errs := make([]error, 0, len(routes))
-	for _, configuredRoute := range routes {
-		route := applyNeoModelMapping(rt, configuredRoute)
+	for _, route := range routes {
 		kimiMessageBytes := 0
 		provider := strings.ToLower(strings.TrimSpace(route.Provider))
 		if provider == "" {
@@ -35720,8 +35735,7 @@ func inferNeoLocalStream(rt *neoRuntime, request neoInferenceRequest, onDelta ne
 	attemptErrors := make([]error, 0, len(routes))
 	var result neoInferenceResult
 	var usage map[string]any
-	for index, configuredRoute := range routes {
-		route := applyNeoModelMapping(rt, configuredRoute)
+	for index, route := range routes {
 		deliveredOutput := false
 		attemptDelta := func(delta neoInferenceDelta) {
 			if onDelta == nil {
@@ -35732,47 +35746,74 @@ func inferNeoLocalStream(rt *neoRuntime, request neoInferenceRequest, onDelta ne
 			}
 			onDelta(delta)
 		}
-		var err error
-		if route.TextToolBridge && len(request.Tools) > 0 {
-			result, err = neoInferTextToolBridge(request, func(wireRequest neoInferenceRequest) (neoInferenceResult, error) {
-				return inferNeoLocalStreamRoute(rt, wireRequest, route, nil)
-			})
-			if err == nil {
-				blockIndex := neoOpenAIThinkingBlockOffset(request.AgentMode, route.Provider)
-				if result.Text != "" {
-					attemptDelta(neoInferenceDelta{Text: result.Text, BlockIndex: blockIndex, Usage: result.Usage})
-					blockIndex++
+		var errInfer error
+		for retry := 0; ; retry++ {
+			if route.TextToolBridge && len(request.Tools) > 0 {
+				result, errInfer = neoInferTextToolBridge(request, func(wireRequest neoInferenceRequest) (neoInferenceResult, error) {
+					return inferNeoLocalStreamRoute(rt, wireRequest, route, nil)
+				})
+				if errInfer == nil {
+					blockIndex := neoOpenAIThinkingBlockOffset(request.AgentMode, route.Provider)
+					if result.Text != "" {
+						attemptDelta(neoInferenceDelta{Text: result.Text, BlockIndex: blockIndex, Usage: result.Usage})
+						blockIndex++
+					}
+					for _, call := range result.ToolCalls {
+						attemptDelta(neoInferenceDelta{ToolCall: &neoToolCallDelta{ID: call.ID, Name: call.Name, Input: call.Input, Complete: true, BlockIndex: blockIndex}, Usage: result.Usage})
+						blockIndex++
+					}
 				}
-				for _, call := range result.ToolCalls {
-					attemptDelta(neoInferenceDelta{ToolCall: &neoToolCallDelta{ID: call.ID, Name: call.Name, Input: call.Input, Complete: true, BlockIndex: blockIndex}, Usage: result.Usage})
-					blockIndex++
-				}
+			} else {
+				result, errInfer = inferNeoLocalStreamRoute(rt, request, route, attemptDelta)
 			}
-		} else {
-			result, err = inferNeoLocalStreamRoute(rt, request, route, attemptDelta)
+			usage = sumNeoInferenceRetryUsage(usage, result.Usage)
+			result.Usage = usage
+			if errInfer == nil {
+				return result, nil
+			}
+			if !neoTopLevelInferenceShouldRetry(request, errInfer, retry, deliveredOutput) {
+				break
+			}
+			delay := neoTopLevelTransientRetryBackoff * time.Duration(1<<retry)
+			log.WithFields(log.Fields{"thread": request.ThreadID, "mode": request.AgentMode, "provider": route.Provider, "model": route.Model, "effort": neoInferenceEffectiveReasoningEffort(request, route), "attempt": retry + 2, "max_attempts": neoTopLevelTransientRetryLimit + 1, "backoff": delay, "error": errInfer}).Warn("amp neo: retrying mode model route after transient inference error")
+			if errWait := neoWaitForInferenceRetry(request.Context, delay); errWait != nil {
+				return result, errWait
+			}
+			if neoInferenceFallbackCancelled(request) {
+				return result, errInfer
+			}
 		}
-		usage = sumNeoInferenceRetryUsage(usage, result.Usage)
-		result.Usage = usage
-		if err == nil {
-			return result, nil
+		if len(routes) == 1 || deliveredOutput || neoInferenceFallbackCancelled(request) || !neoInferenceFallbackEligible(errInfer) {
+			return result, errInfer
 		}
-		if len(routes) == 1 || deliveredOutput || neoInferenceFallbackCancelled(request) || !neoSubagentRetryableInferenceError(err) {
-			return result, err
-		}
-		attemptErrors = append(attemptErrors, fmt.Errorf("%s/%s: %w", route.Provider, route.Model, err))
+		attemptErrors = append(attemptErrors, fmt.Errorf("%s/%s: %w", route.Provider, route.Model, errInfer))
 		if index+1 < len(routes) {
 			nextRoute := routes[index+1]
-			log.WithFields(log.Fields{"thread": request.ThreadID, "mode": request.AgentMode, "from_provider": route.Provider, "from_model": route.Model, "to_provider": nextRoute.Provider, "to_model": nextRoute.Model}).Warn("amp neo: falling back to the next mode model route")
+			log.WithFields(log.Fields{"thread": request.ThreadID, "mode": request.AgentMode, "from_provider": route.Provider, "from_model": route.Model, "from_effort": neoInferenceEffectiveReasoningEffort(request, route), "to_provider": nextRoute.Provider, "to_model": nextRoute.Model, "to_effort": neoInferenceEffectiveReasoningEffort(request, nextRoute), "error": errInfer}).Warn("amp neo: falling back to the next mode model route")
 		}
 	}
 	return result, fmt.Errorf("local Neo mode model routes exhausted: %w", errors.Join(attemptErrors...))
 }
 
 func neoInferenceModelRoutes(rt *neoRuntime, request neoInferenceRequest) []neoModelRoute {
+	var configuredRoutes []neoModelRoute
 	if request.ModelRouteOverride != nil && request.ModelRouteOverride.Model != "" {
-		return []neoModelRoute{*request.ModelRouteOverride}
+		configuredRoutes = []neoModelRoute{*request.ModelRouteOverride}
+	} else {
+		configuredRoutes = selectNeoModelRoutesWithConfig(rt, request.AgentMode, request.Settings)
 	}
-	return selectNeoModelRoutesWithConfig(rt, request.AgentMode, request.Settings)
+	resolvedRoutes := make([]neoModelRoute, len(configuredRoutes))
+	for index, route := range configuredRoutes {
+		resolvedRoutes[index] = neoResolvedInferenceRoute(rt, request, route)
+	}
+	return resolvedRoutes
+}
+
+func neoResolvedInferenceRoute(rt *neoRuntime, request neoInferenceRequest, route neoModelRoute) neoModelRoute {
+	if request.ModelRouteOverrideResolved {
+		return route
+	}
+	return applyNeoModelMapping(rt, route)
 }
 
 func neoInferenceFallbackCancelled(request neoInferenceRequest) bool {
@@ -35780,6 +35821,35 @@ func neoInferenceFallbackCancelled(request neoInferenceRequest) bool {
 		return true
 	}
 	return request.StaleCheck != nil && request.StaleCheck()
+}
+
+func neoInferenceFallbackEligible(err error) bool {
+	var budgetErr *neoInferenceInputBudgetExceededError
+	return errors.As(err, &budgetErr) || neoSubagentRetryableInferenceError(err)
+}
+
+func neoInferenceEffectiveReasoningEffort(request neoInferenceRequest, route neoModelRoute) string {
+	return strings.ToLower(strings.TrimSpace(neoEffectiveThinkingLevel(route, neoRequestReasoningEffort(request))))
+}
+
+func neoTopLevelInferenceShouldRetry(request neoInferenceRequest, err error, retry int, deliveredOutput bool) bool {
+	var identityRetryFailure *neoENIIdentityRetryFailure
+	return request.ModelRouteOverride == nil && !errors.As(err, &identityRetryFailure) && retry < neoTopLevelTransientRetryLimit && !deliveredOutput && !neoInferenceFallbackCancelled(request) && neoSubagentRetryableInferenceError(err)
+}
+
+func neoWaitForInferenceRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	if ctx == nil {
+		<-timer.C
+		return nil
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func inferNeoLocalStreamRoute(rt *neoRuntime, request neoInferenceRequest, route neoModelRoute, onDelta neoStreamCallback) (neoInferenceResult, error) {
@@ -35821,6 +35891,18 @@ func neoENIInitialIdentityRetryEligible(request neoInferenceRequest, route neoMo
 		}
 	}
 	return hasUser
+}
+
+type neoENIIdentityRetryFailure struct {
+	err error
+}
+
+func (e *neoENIIdentityRetryFailure) Error() string {
+	return e.err.Error()
+}
+
+func (e *neoENIIdentityRetryFailure) Unwrap() error {
+	return e.err
 }
 
 func inferNeoENIInitialStream(rt *neoRuntime, request neoInferenceRequest, route neoModelRoute, onDelta neoStreamCallback) (neoInferenceResult, error) {
@@ -35868,7 +35950,7 @@ func inferNeoENIInitialStream(rt *neoRuntime, request neoInferenceRequest, route
 				return result, request.Context.Err()
 			}
 			log.WithFields(log.Fields{"thread": request.ThreadID, "provider": route.Provider, "model": route.Model, "attempt": attempt, "error": err}).Warn("amp neo: initial ENI identity retry failed")
-			return result, fmt.Errorf("initial ENI identity retry attempt %d of %d for %s/%s failed after an identity-contract failure; retry later or select a different model or ENI prompt: %w", attempt, neoENIInitialMaxAttempts, route.Provider, route.Model, err)
+			return result, &neoENIIdentityRetryFailure{err: fmt.Errorf("initial ENI identity retry attempt %d of %d for %s/%s failed after an identity-contract failure; retry later or select a different model or ENI prompt: %w", attempt, neoENIInitialMaxAttempts, route.Provider, route.Model, err)}
 		}
 		if neoENIIdentityAccepted(result) {
 			replayNeoInferenceDeltas(deltas, onDelta)
@@ -36059,6 +36141,14 @@ func neoInferenceInputBudgetError(request neoInferenceRequest, route neoModelRou
 	return neoInferenceInputBudgetErrorWithKimiMessageBytes(request, route, 0)
 }
 
+type neoInferenceInputBudgetExceededError struct {
+	message string
+}
+
+func (e *neoInferenceInputBudgetExceededError) Error() string {
+	return e.message
+}
+
 func neoInferenceInputBudgetErrorWithKimiMessageBytes(request neoInferenceRequest, route neoModelRoute, kimiMessageBytes int) error {
 	provider := strings.ToLower(strings.TrimSpace(route.Provider))
 	if provider == "" {
@@ -36069,7 +36159,7 @@ func neoInferenceInputBudgetErrorWithKimiMessageBytes(request neoInferenceReques
 			kimiMessageBytes = neoKimiChatMessageBytes(request, route)
 		}
 		if kimiMessageBytes > neoKimiMaxMessageBytes {
-			return fmt.Errorf("local Neo inference request too large for moonshotai/%s: message_bytes=%d max_message_bytes=%d; start a new thread or reduce the thread context", route.Model, kimiMessageBytes, neoKimiMaxMessageBytes)
+			return &neoInferenceInputBudgetExceededError{message: fmt.Sprintf("local Neo inference request too large for moonshotai/%s: message_bytes=%d max_message_bytes=%d; start a new thread or reduce the thread context", route.Model, kimiMessageBytes, neoKimiMaxMessageBytes)}
 		}
 	}
 	maxInputTokens := neoEffectiveMaxInputTokens(request.AgentMode, route.Model)
@@ -36087,7 +36177,7 @@ func neoInferenceInputBudgetErrorWithKimiMessageBytes(request neoInferenceReques
 	if !strings.HasPrefix(strings.ToLower(routeName), provider+"/") {
 		routeName = provider + "/" + routeName
 	}
-	return fmt.Errorf("local Neo inference request too large for %s: estimated_input_tokens=%d max_input_tokens=%d; start a new thread or reduce the thread context", routeName, estimatedTokens, maxInputTokens)
+	return &neoInferenceInputBudgetExceededError{message: fmt.Sprintf("local Neo inference request too large for %s: estimated_input_tokens=%d max_input_tokens=%d; start a new thread or reduce the thread context", routeName, estimatedTokens, maxInputTokens)}
 }
 
 // applyNeoModelMapping consults the shared ModelMapper and rewrites the route
@@ -39845,11 +39935,19 @@ func neoPromptFamily(agentMode string, route neoModelRoute) string {
 	agentMode = strings.ToLower(strings.TrimSpace(agentMode))
 	model := strings.ToLower(route.Model)
 	provider := strings.ToLower(route.Provider)
+	modelName := model
+	if index := strings.LastIndex(modelName, "/"); index >= 0 {
+		modelName = modelName[index+1:]
+	}
+	if suffix := thinking.ParseSuffix(modelName); suffix.HasSuffix {
+		modelName = strings.ToLower(suffix.ModelName)
+	}
+	glm52PromptModel := modelName == "glm-5.2" || provider == "baseten" && model == "thinkingmachines/inkling"
 	if agentMode == "agg-man" || agentMode == "puck" || agentMode == neoPromptFamilyAggMan {
 		return neoPromptFamilyAggMan
 	}
 	if agentMode == "low" {
-		if provider == "amp" && strings.Contains(model, "glm-5.2") {
+		if glm52PromptModel {
 			return neoPromptFamilyGLM52
 		}
 		return neoPromptFamilyRush
@@ -39861,18 +39959,20 @@ func neoPromptFamily(agentMode string, route neoModelRoute) string {
 		return neoPromptFamilyReview
 	}
 	if agentMode == "medium" || agentMode == "high" || agentMode == neoPromptFamilyDeep {
-		if strings.Contains(model, "gpt-5.4") {
+		if modelName == "gpt-5.4" {
 			return neoPromptFamilyDeepGPT54
 		}
 		return neoPromptFamilyDeep
 	}
-	if agentMode == "ultra" || strings.Contains(model, "claude-fable-5") {
+	if modelName == "claude-fable-5" {
 		return neoPromptFamilyFable
 	}
 	switch {
-	case strings.Contains(model, "gpt-5-codex"):
+	case glm52PromptModel:
+		return neoPromptFamilyGLM52
+	case modelName == "gpt-5-codex":
 		return neoPromptFamilyGPT5Codex
-	case strings.Contains(model, "kimi-k2"):
+	case strings.Contains(model, "kimi-k2") || modelName == "kimi-k3":
 		return neoPromptFamilyKimi
 	case strings.Contains(model, "gpt") || provider == "openai":
 		return neoPromptFamilyGPT
@@ -39880,6 +39980,8 @@ func neoPromptFamily(agentMode string, route neoModelRoute) string {
 		return neoPromptFamilyXAI
 	case provider == "vertexai" || provider == "google" || provider == "gemini":
 		return neoPromptFamilyGemini
+	case agentMode == "ultra" && provider == "anthropic":
+		return neoPromptFamilySmart
 	case agentMode == "" || agentMode == "smart":
 		return neoPromptFamilySmart
 	default:
@@ -40397,20 +40499,24 @@ func neoOperationalFinalPromptBlocks(request neoInferenceRequest) []string {
 		if mode == "puck" || mode == neoPromptFamilyAggMan {
 			blocks = append(blocks, neoThreadMessageWorkflowGuidance("thread_interact with action: \"message\" and"))
 		} else {
-			blocks = append(blocks, "thread_interact with action: \"message\" is only for a different target thread. Never use that action with the current thread ID. When the user asks to run Amp review for the current thread or workspace and shell_command is available, use shell_command instead of starting a message workflow. Run Amp review without `--json`. Add `--json` only when the user explicitly requests JSON or machine-readable output, explicitly requests low-severity findings, or explicitly asks to debug Amp review's output schema. Describing a review as full, thorough, complete, an audit, everything, or a shipping review does not request `--json`. For a review scoped to specific files, pass `--files` and omit `--check-scope`; current Amp uses `--files` to discover checks for those paths. Use `--check-scope .` only when no `--files` scope is supplied. Never combine `--files` and `--check-scope`. After the command completes, report its important results in the response: findings first, ordered by severity with file and line references, followed by check failures and residual risks or testing gaps. If the review reports no findings, say so explicitly. If it displays no findings but its check footer reports issues, say that Amp's default output had no findings and report each affected check's count as low-severity findings that Amp omitted. Do not ask whether to inspect them, and do not independently recover or rerun them. Command output, raw JSON, an exit status, or temporary-file statistics alone do not count as reporting the review result. When JSON was explicitly requested, summarize it instead of pasting raw JSON. Divide an oversized review into coherent `--files` scopes when the complete diff exceeds the review command's supported size.")
+			blocks = append(blocks, "thread_interact with action: \"message\" is only for a different target thread. Never use that action with the current thread ID. "+neoAmpReviewOperationalGuidance())
 		}
 	} else if neoRequestHasTool(request, "send_message_to_thread") {
 		mode := strings.ToLower(strings.TrimSpace(request.AgentMode))
 		if mode == "agg-man" || mode == "puck" || mode == neoPromptFamilyAggMan {
 			blocks = append(blocks, neoThreadMessageWorkflowGuidance("send_message_to_thread with"))
 		} else {
-			blocks = append(blocks, "send_message_to_thread is only for a different target thread. Never call it with the current thread ID. When the user asks to run Amp review for the current thread or workspace and shell_command is available, use shell_command instead of starting a message workflow. Run Amp review without `--json`. Add `--json` only when the user explicitly requests JSON or machine-readable output, explicitly requests low-severity findings, or explicitly asks to debug Amp review's output schema. Describing a review as full, thorough, complete, an audit, everything, or a shipping review does not request `--json`. For a review scoped to specific files, pass `--files` and omit `--check-scope`; current Amp uses `--files` to discover checks for those paths. Use `--check-scope .` only when no `--files` scope is supplied. Never combine `--files` and `--check-scope`. After the command completes, report its important results in the response: findings first, ordered by severity with file and line references, followed by check failures and residual risks or testing gaps. If the review reports no findings, say so explicitly. If it displays no findings but its check footer reports issues, say that Amp's default output had no findings and report each affected check's count as low-severity findings that Amp omitted. Do not ask whether to inspect them, and do not independently recover or rerun them. Command output, raw JSON, an exit status, or temporary-file statistics alone do not count as reporting the review result. When JSON was explicitly requested, summarize it instead of pasting raw JSON. Divide an oversized review into coherent `--files` scopes when the complete diff exceeds the review command's supported size.")
+			blocks = append(blocks, "send_message_to_thread is only for a different target thread. Never call it with the current thread ID. "+neoAmpReviewOperationalGuidance())
 		}
 	}
 	if boolValue(request.Environment["isLocalClientActorThread"]) || boolValue(request.Settings["isLocalClientActorThread"]) {
 		blocks = append(blocks, "For Amp's own tool connection failures (for example, 'Executor did not acknowledge tool lease' or 'Executor did not reconnect before the tool call expired'), explain that the user's Amp client went offline and they can retry once it reconnects, without repeating the internal error message.")
 	}
 	return blocks
+}
+
+func neoAmpReviewOperationalGuidance() string {
+	return "When the user asks to run Amp review for the current thread or workspace and shell_command is available, use shell_command instead of starting a message workflow. For ordinary ad hoc reviews, run Amp review without `--json`. Add `--json` only when the user explicitly requests JSON or machine-readable output, explicitly requests low-severity findings, explicitly asks to debug Amp review's output schema, or when running the one mandatory exact-final-diff shipping review required by the `shipping-prs` skill after shipping is authorized. Describing a review as full, thorough, complete, an audit, everything, or a shipping review does not by itself make it that mandatory shipping gate. Run the mandatory gate with `--json` once per required review scope so legitimate low-severity findings are available for triage, and preserve their reported severity rather than promoting them for visibility. When the complete diff fits in one review, use one invocation and do not duplicate it with a human-readable run. Whenever `--json` is used, summarize the structured output instead of pasting raw JSON. For a review scoped to specific files, pass `--files` and omit `--check-scope`; current Amp uses `--files` to discover checks for those paths. Use `--check-scope .` only when no `--files` scope is supplied. Never combine `--files` and `--check-scope`. After the command completes, report its important results in the response: findings first, ordered by severity with file and line references, followed by check failures and residual risks or testing gaps. If the review reports no findings, say so explicitly. If ordinary human-readable output displays no findings but its check footer reports issues, say that Amp's default output had no findings and report each affected check's count as low-severity findings that Amp omitted. Do not ask whether to inspect them, and do not independently recover or rerun them. Command output, raw JSON, an exit status, or temporary-file statistics alone do not count as reporting the review result. Divide an oversized review into coherent `--files` scopes when the complete diff exceeds the review command's supported size."
 }
 
 func neoThreadMessageWorkflowGuidance(invocation string) string {
