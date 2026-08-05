@@ -1,6 +1,7 @@
 package amp
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -329,7 +330,7 @@ func neoCompactionRunSyntheticModelBenchmark(t *testing.T, candidate neoCompacti
 	route.ThinkingSuffix = candidate.Effort
 	promptName, prompt := neoCompactionBenchmarkPrompt(t)
 	started := time.Now()
-	summary, err := inferNeoCompactionLocal(rt, tc.ThreadID, route, tc.Messages, prompt)
+	summary, err := inferNeoCompactionLocal(context.Background(), rt, tc.ThreadID, route, tc.Messages, prompt)
 	duration := time.Since(started)
 	normalizedSummary := neoNormalizeCompactionSummary(summary)
 	passed, missing, forbidden := neoCompactionBenchmarkRubric(normalizedSummary, tc)
@@ -373,7 +374,7 @@ func neoCompactionRunRecentThreadModelBenchmark(t *testing.T, candidate neoCompa
 	if tooLarge {
 		err = fmt.Errorf("bounded replay input still exceeds compaction budget: estimated_input_tokens=%d max_input_tokens=%d", estimatedTokens, maxInputTokens)
 	} else {
-		summary, err = inferNeoCompactionLocal(rt, tc.ThreadID, route, messages, prompt)
+		summary, err = inferNeoCompactionLocal(context.Background(), rt, tc.ThreadID, route, messages, prompt)
 	}
 	duration := time.Since(started)
 	summary = neoNormalizeCompactionSummary(summary)

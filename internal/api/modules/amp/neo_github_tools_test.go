@@ -54,7 +54,7 @@ func TestNeoSubagentLocalGitHubToolStoresChildResult(t *testing.T) {
 		Input: map[string]any{"repository": "owner/repo", "path": "cmd/server/main.go"},
 	}
 	childMessageID := actor.storeSubagentToolUseMessage(call, "TU-librarian")
-	run := actor.execSubagentLocalGitHubTool(call, "TU-librarian", childMessageID, "")
+	run := actor.execSubagentLocalGitHubTool(context.Background(), call, "TU-librarian", childMessageID, actor.generation, "")
 
 	if stringValue(run["status"]) != "done" || !strings.Contains(stringValue(run["output"]), "func main") {
 		t.Fatalf("run = %#v", run)
@@ -96,6 +96,65 @@ func TestNeoSubagentLocalGitHubToolStoresChildResult(t *testing.T) {
 	}
 	if len(nestedHistory) != 2 || len(nestedHistory[0].ToolCalls) != 1 || nestedHistory[0].ToolCalls[0].Name != "read_github" || nestedHistory[1].ToolCallID != "leaf-1" {
 		t.Fatalf("nested history = %#v", nestedHistory)
+	}
+}
+
+func TestNeoSubagentLocalGitHubToolHonorsRunCancellation(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	rt := newNeoRuntime(&config.Config{})
+	rt.githubAPIBase = server.URL
+	rt.githubClient = server.Client()
+	actor := newNeoActor(rt, "actor-cancel", "thread-actor", "T-cancel", "T-cancel", neoActorRecord("actor-cancel", "thread-actor", "T-cancel"), nil)
+	call := neoToolCall{ID: "leaf-cancel", Name: "read_github", Input: map[string]any{"repository": "owner/repo", "path": "README.md"}}
+	childMessageID := actor.storeSubagentToolUseMessage(call, "TU-librarian")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	run := actor.execSubagentLocalGitHubTool(ctx, call, "TU-librarian", childMessageID, actor.generation, "")
+	if stringValue(run["status"]) != "error" || requests != 0 {
+		t.Fatalf("cancelled GitHub run = %#v requests=%d", run, requests)
+	}
+}
+
+func TestNeoSubagentLocalGitHubToolDoesNotDeleteReplacementOwner(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(entered)
+		<-release
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"type":"file","encoding":"base64","content":"cGFja2FnZSBtYWluCg=="}`))
+	}))
+	defer server.Close()
+
+	rt := newNeoRuntime(&config.Config{})
+	rt.githubAPIBase = server.URL
+	rt.githubClient = server.Client()
+	actor := newNeoActor(rt, "actor-owner", "thread-actor", "T-owner", "T-owner", neoActorRecord("actor-owner", "thread-actor", "T-owner"), nil)
+	call := neoToolCall{ID: "leaf-owner", Name: "read_github", Input: map[string]any{"repository": "owner/repo", "path": "main.go"}}
+	childMessageID := actor.storeSubagentToolUseMessage(call, "TU-librarian")
+	generation := actor.generation
+	done := make(chan map[string]any, 1)
+	go func() {
+		done <- actor.execSubagentLocalGitHubTool(context.Background(), call, "TU-librarian", childMessageID, generation, "")
+	}()
+	<-entered
+	actor.mu.Lock()
+	actor.advanceGenerationLocked()
+	replacement := neoPendingTool{ID: call.ID, Name: call.Name, MessageID: "M-replacement", ParentToolCallID: "TU-replacement"}
+	actor.subagentTools[call.ID] = replacement
+	actor.mu.Unlock()
+	close(release)
+	<-done
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if current := actor.subagentTools[call.ID]; current.MessageID != replacement.MessageID || current.ParentToolCallID != replacement.ParentToolCallID {
+		t.Fatalf("replacement GitHub tool owner was removed: %#v", current)
 	}
 }
 

@@ -323,6 +323,143 @@ type AmpWebLocalInference struct {
 	BaseURL        string   `yaml:"base-url,omitempty" json:"base-url,omitempty"`
 }
 
+// ModelRouteList is an ordered list of model routes that also accepts a single
+// route in configuration for backward compatibility.
+type ModelRouteList []string
+
+func (routes *ModelRouteList) UnmarshalYAML(value *yaml.Node) error {
+	if value == nil || value.ShortTag() == "!!null" {
+		*routes = nil
+		return nil
+	}
+	var values []string
+	switch value.Kind {
+	case yaml.ScalarNode:
+		if value.ShortTag() != "!!str" {
+			return fmt.Errorf("model route must be a string")
+		}
+		values = []string{value.Value}
+	case yaml.SequenceNode:
+		values = make([]string, len(value.Content))
+		for i, route := range value.Content {
+			if route.Kind != yaml.ScalarNode || route.ShortTag() != "!!str" {
+				return fmt.Errorf("model route at index %d must be a string", i)
+			}
+			values[i] = route.Value
+		}
+	default:
+		return fmt.Errorf("model routes must be a string or sequence")
+	}
+	*routes = ModelRouteList(values)
+	return nil
+}
+
+func (routes *ModelRouteList) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if bytes.Equal(trimmed, []byte("null")) {
+		*routes = nil
+		return nil
+	}
+	if len(trimmed) > 0 && trimmed[0] == '"' {
+		var route string
+		if err := json.Unmarshal(trimmed, &route); err != nil {
+			return fmt.Errorf("decode model route: %w", err)
+		}
+		*routes = ModelRouteList{route}
+		return nil
+	}
+	var values []string
+	if err := json.Unmarshal(trimmed, &values); err != nil {
+		return fmt.Errorf("decode model routes: %w", err)
+	}
+	*routes = ModelRouteList(values)
+	return nil
+}
+
+func (runtime *AmpNeoLocalRuntime) UnmarshalYAML(value *yaml.Node) error {
+	type plain AmpNeoLocalRuntime
+	var decoded plain
+	if err := value.Decode(&decoded); err != nil {
+		return err
+	}
+	*runtime = AmpNeoLocalRuntime(decoded)
+	runtime.syncLegacyModeModels()
+	return nil
+}
+
+func (runtime *AmpNeoLocalRuntime) UnmarshalJSON(data []byte) error {
+	type plain AmpNeoLocalRuntime
+	var decoded plain
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*runtime = AmpNeoLocalRuntime(decoded)
+	runtime.syncLegacyModeModels()
+	return nil
+}
+
+func (runtime AmpNeoLocalRuntime) MarshalYAML() (any, error) {
+	type plain AmpNeoLocalRuntime
+	normalized := plain(runtime)
+	normalized.ModeModelRoutes = runtime.effectiveModeModelRoutes()
+	return normalized, nil
+}
+
+func (runtime AmpNeoLocalRuntime) MarshalJSON() ([]byte, error) {
+	type plain AmpNeoLocalRuntime
+	normalized := plain(runtime)
+	normalized.ModeModelRoutes = runtime.effectiveModeModelRoutes()
+	return json.Marshal(normalized)
+}
+
+func (runtime AmpNeoLocalRuntime) ModeRoutesFor(mode string) ModelRouteList {
+	if routes := runtime.ModeModelRoutes[mode]; len(routes) != 0 {
+		return routes
+	}
+	for configuredMode, routes := range runtime.ModeModelRoutes {
+		if strings.EqualFold(configuredMode, mode) && len(routes) != 0 {
+			return routes
+		}
+	}
+	if route := strings.TrimSpace(runtime.ModeModels[mode]); route != "" {
+		return ModelRouteList{route}
+	}
+	for configuredMode, route := range runtime.ModeModels {
+		if strings.EqualFold(configuredMode, mode) && strings.TrimSpace(route) != "" {
+			return ModelRouteList{route}
+		}
+	}
+	return nil
+}
+
+func (runtime AmpNeoLocalRuntime) effectiveModeModelRoutes() map[string]ModelRouteList {
+	routes := make(map[string]ModelRouteList, len(runtime.ModeModelRoutes)+len(runtime.ModeModels))
+	for mode, configured := range runtime.ModeModelRoutes {
+		routes[mode] = append(ModelRouteList(nil), configured...)
+	}
+	for mode, configured := range runtime.ModeModels {
+		if _, exists := routes[mode]; !exists && strings.TrimSpace(configured) != "" {
+			routes[mode] = ModelRouteList{configured}
+		}
+	}
+	if len(routes) == 0 {
+		return nil
+	}
+	return routes
+}
+
+func (runtime *AmpNeoLocalRuntime) syncLegacyModeModels() {
+	if runtime == nil || len(runtime.ModeModelRoutes) == 0 {
+		return
+	}
+	runtime.ModeModels = make(map[string]string, len(runtime.ModeModelRoutes))
+	for mode, routes := range runtime.ModeModelRoutes {
+		if len(routes) != 0 {
+			runtime.ModeModels[mode] = routes[0]
+		}
+	}
+}
+
 // AmpNeoLocalRuntime controls the local Amp Neo actor/runtime listener.
 type AmpNeoLocalRuntime struct {
 	// Enabled toggles the companion local Neo runtime. Nil means disabled.
@@ -362,12 +499,18 @@ type AmpNeoLocalRuntime struct {
 	// compaction. defaults to gpt-5.6-sol.
 	CompactionModel string `yaml:"compaction-model,omitempty" json:"compaction-model,omitempty"`
 
-	// ModeModels optionally overrides the inference model per agent mode
+	// ModeModels optionally overrides the inference model per agent mode.
+	ModeModels map[string]string `yaml:"-" json:"-"`
+
+	// ModeModelRoutes optionally overrides the ordered inference models per agent mode
 	// (e.g. smart: anthropic/claude-fable-5). the Amp CLI strips the
 	// internal.model thread setting for non-employee accounts, so per-mode
 	// model overrides must be applied server-side. explicit internal.model
 	// thread settings still take precedence when present.
-	ModeModels map[string]string `yaml:"mode-models,omitempty" json:"mode-models,omitempty"`
+	ModeModelRoutes map[string]ModelRouteList `yaml:"mode-models,omitempty" json:"mode-models,omitempty"`
+
+	// SubagentModels defines ordered model routes for local Neo subagents.
+	SubagentModels map[string][]string `yaml:"subagent-models,omitempty" json:"subagent-models,omitempty"`
 }
 
 // AmpUpstreamAPIKeyEntry maps a set of client API keys to a specific upstream API key.

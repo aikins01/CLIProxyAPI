@@ -23,7 +23,7 @@ func TestNeoActorRunsTopLevelThreadToolsLocallyWhenExecutorOmitsThem(t *testing.
 	target := rt.store.ensureThreadActor(targetID)
 	source.executorBootstrapComplete = true
 
-	for _, name := range []string{"find_thread", "list_agent_modes", "list_runners", "create_thread", "rename_thread", "set_thread_pinned", "add_thread_labels", "remove_thread_labels", "archive_current_thread", "archive_thread", "archive_threads", "unarchive_thread", "send_message_to_thread", "download_thread_file", "upload_thread_file"} {
+	for _, name := range []string{"find_thread", "list_agent_modes", "list_runners", "create_thread", "thread_interact", "rename_thread", "set_thread_pinned", "add_thread_labels", "remove_thread_labels", "archive_current_thread", "archive_thread", "archive_threads", "unarchive_thread", "send_message_to_thread", "download_thread_file", "upload_thread_file"} {
 		if !source.shouldRunLocalActorTool(name) {
 			t.Fatalf("%s should run locally when executor omitted it", name)
 		}
@@ -33,7 +33,7 @@ func TestNeoActorRunsTopLevelThreadToolsLocallyWhenExecutorOmitsThem(t *testing.
 	for _, tool := range tools {
 		got[tool.Name] = true
 	}
-	for _, name := range []string{"list_agent_modes", "list_runners", "create_thread", "archive_current_thread", "send_message_to_thread"} {
+	for _, name := range []string{"list_agent_modes", "list_runners", "create_thread", "thread_interact"} {
 		if !got[name] {
 			t.Fatalf("high tools missing synthetic %s: %#v", name, tools)
 		}
@@ -85,12 +85,12 @@ func TestNeoPuckWithoutExecutorExposesOnlyRunnableServerTools(t *testing.T) {
 	for _, tool := range actor.inferenceRequestLocked("puck", "", "").Tools {
 		names[tool.Name] = true
 	}
-	for _, name := range []string{"find_thread", "read_thread", "list_agent_modes", "list_runners", "create_thread", "rename_thread", "set_thread_pinned", "add_thread_labels", "remove_thread_labels", "archive_thread", "archive_threads", "unarchive_thread", "send_message_to_thread", "github_repo_ci_status", "read_github", "search_github", "commit_search", "list_directory_github", "list_repositories", "glob_github", "diff"} {
+	for _, name := range []string{"find_thread", "read_thread", "list_agent_modes", "list_runners", "create_thread", "thread_interact", "update_thread", "archive_threads", "get_schedule", "set_schedule", "update_schedule", "clear_schedule", "github_repo_ci_status", "read_github", "search_github", "commit_search", "list_directory_github", "list_repositories", "glob_github", "diff"} {
 		if !names[name] {
 			t.Fatalf("executor-less Puck missing runnable tool %s: %#v", name, names)
 		}
 	}
-	for _, name := range []string{"web_search", "read_web_page", "docs_list", "docs_read", "docs_write", "create_project", "publish_thread_artifacts", "get_automation", "create_schedule_automation", "update_automation", "delete_automation", "slack_write", "slack_read"} {
+	for _, name := range []string{"web_search", "read_web_page", "docs_list", "docs_read", "docs_write", "create_project", "publish_thread_artifacts", "slack_write", "slack_read", "get_thread_metadata", "archive_thread", "unarchive_thread", "send_message_to_thread", "rename_thread", "set_thread_pinned", "add_thread_labels", "remove_thread_labels"} {
 		if names[name] {
 			t.Fatalf("executor-less Puck exposed unavailable tool %s: %#v", name, names)
 		}
@@ -152,6 +152,14 @@ func TestNeoThreadToolsListAgentModesAndArchiveCurrentThread(t *testing.T) {
 	}
 	if !foundPlugin {
 		t.Fatalf("agent modes missing local plugin modes: %#v", modes)
+	}
+	actor.meta["ownerUserId"] = "user-owner"
+	identity, err := actor.executeLocalThreadTool(neoPendingTool{Name: "get_current_user_identity"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stringValue(identity["id"]) != "user-owner" || stringValue(identity["displayName"]) != "user-owner" {
+		t.Fatalf("current user identity = %#v", identity)
 	}
 
 	archived, err := actor.executeLocalThreadTool(neoPendingTool{Name: "archive_current_thread"})
@@ -219,6 +227,173 @@ func TestNeoThreadToolsMutateOwnedThreadMetadata(t *testing.T) {
 	if _, err := source.executeLocalThreadTool(neoPendingTool{Name: "remove_thread_labels", Input: map[string]any{"labels": []any{}}}); err == nil {
 		t.Fatal("remove_thread_labels accepted empty labels")
 	}
+	updated, err := source.executeLocalThreadTool(neoPendingTool{Name: "update_thread", Input: map[string]any{
+		"threadId": targetID,
+		"title":    "Ready for review",
+		"pinned":   false,
+		"labels":   []any{"reviewed"},
+	}})
+	if err != nil || stringValue(updated["title"]) != "Ready for review" || updated["pinned"] != false || !reflect.DeepEqual(stringArrayValue(updated["labels"]), []any{"reviewed"}) {
+		t.Fatalf("update_thread result=%#v err=%v", updated, err)
+	}
+	target.mu.Lock()
+	target.settings["reasoning.effort"] = "max"
+	target.mu.Unlock()
+	metadata, err := source.executeLocalThreadTool(neoPendingTool{Name: "get_thread_metadata", Input: map[string]any{"threadId": targetID}})
+	if err != nil || stringValue(metadata["threadId"]) != targetID || stringValue(metadata["title"]) != "Ready for review" || metadata["pinned"] != false || stringValue(metadata["reasoningEffort"]) != "max" || !reflect.DeepEqual(stringArrayValue(metadata["labels"]), []any{"reviewed"}) {
+		t.Fatalf("get_thread_metadata result=%#v err=%v", metadata, err)
+	}
+	if _, err := source.executeLocalThreadTool(neoPendingTool{Name: "update_thread", Input: map[string]any{"threadId": targetID}}); err == nil {
+		t.Fatal("update_thread accepted no updates")
+	}
+	if _, err := source.executeLocalThreadTool(neoPendingTool{Name: "update_thread", Input: map[string]any{"threadId": targetID, "labels": []any{"one"}, "addLabels": []any{"two"}}}); err == nil {
+		t.Fatal("update_thread accepted conflicting label updates")
+	}
+	if _, err := source.executeLocalThreadTool(neoPendingTool{Name: "update_thread", Input: map[string]any{"threadId": targetID, "labels": []any{42}}}); err == nil {
+		t.Fatal("update_thread accepted a non-string label")
+	}
+	interacted, err := source.executeLocalThreadTool(neoPendingTool{Name: "thread_interact", Input: map[string]any{"action": "get", "thread": targetID}})
+	if err != nil || stringValue(interacted["threadID"]) != targetID || stringValue(interacted["url"]) != "https://ampcode.com/threads/"+targetID {
+		t.Fatalf("thread_interact get result=%#v err=%v", interacted, err)
+	}
+	interacted, err = source.executeLocalThreadTool(neoPendingTool{Name: "thread_interact", Input: map[string]any{"action": "archive", "thread": targetID}})
+	if err != nil || interacted["archived"] != true {
+		t.Fatalf("thread_interact archive result=%#v err=%v", interacted, err)
+	}
+	interacted, err = source.executeLocalThreadTool(neoPendingTool{Name: "thread_interact", Input: map[string]any{"action": "unarchive", "thread": targetID}})
+	if err != nil || interacted["archived"] != false {
+		t.Fatalf("thread_interact unarchive result=%#v err=%v", interacted, err)
+	}
+	if _, err := source.executeLocalThreadTool(neoPendingTool{Name: "thread_interact", Input: map[string]any{"action": "unknown"}}); err == nil {
+		t.Fatal("thread_interact accepted an unknown action")
+	}
+}
+
+func TestNeoUpdateThreadAppliesMultiFieldMutationsAtomically(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	source := rt.store.ensureThreadActor("T-019f7000-0000-7000-8000-000000000085")
+	targetID := "T-019f7000-0000-7000-8000-000000000086"
+	target := rt.store.ensureThreadActor(targetID)
+	updates := []map[string]any{
+		{"threadId": targetID, "title": "Atomic alpha", "pinned": true, "labels": []any{"alpha"}},
+		{"threadId": targetID, "title": "Atomic beta", "pinned": false, "labels": []any{"beta"}},
+	}
+
+	for range 50 {
+		start := make(chan struct{})
+		results := make([]map[string]any, len(updates))
+		errs := make([]error, len(updates))
+		var group sync.WaitGroup
+		for index, update := range updates {
+			group.Add(1)
+			go func() {
+				defer group.Done()
+				<-start
+				results[index], errs[index] = source.executeLocalUpdateThreadTool(update)
+			}()
+		}
+		close(start)
+		group.Wait()
+		for index, result := range results {
+			if errs[index] != nil || result["title"] != updates[index]["title"] || result["pinned"] != updates[index]["pinned"] || !reflect.DeepEqual(neoThreadLabelsFromAny(result["labels"]), neoThreadLabelsFromAny(updates[index]["labels"])) {
+				t.Fatalf("update %d result=%#v err=%v want=%#v", index, result, errs[index], updates[index])
+			}
+		}
+		target.mu.Lock()
+		final := neoLocalThreadMetadataLocked(target, targetID)
+		target.mu.Unlock()
+		matches := false
+		for _, update := range updates {
+			if final["title"] == update["title"] && final["pinned"] == update["pinned"] && reflect.DeepEqual(neoThreadLabelsFromAny(final["labels"]), neoThreadLabelsFromAny(update["labels"])) {
+				matches = true
+			}
+		}
+		if !matches {
+			t.Fatalf("interleaved final metadata = %#v", final)
+		}
+	}
+}
+
+func TestNeoThreadToolsHydratePersistedMetadata(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	rt.threadDir = t.TempDir()
+	source := rt.store.ensureThreadActor("T-019f7000-0000-7000-8000-000000000091")
+	ownerUserID := "user-primary"
+	source.mu.Lock()
+	source.meta["creatorUserID"] = ownerUserID
+	source.meta["ownerUserId"] = ownerUserID
+	source.mu.Unlock()
+	rt.legacyOwnerMigrationMu.Lock()
+	rt.legacyOwnerMigrationUser = ownerUserID
+	rt.legacyOwnerMigrationMu.Unlock()
+	targetID := "T-019f7000-0000-7000-8000-000000000092"
+	workingDirectory := t.TempDir()
+	_, err := writeNeoLocalThreadFileInDir(rt.threadDir, targetID, map[string]any{
+		"id":        targetID,
+		"title":     "Persisted target",
+		"archived":  true,
+		"agentMode": "deep",
+		"meta": map[string]any{
+			"ownerUserId":         neoLocalOwnerUserID,
+			"labels":              []any{"reviewed"},
+			"projectID":           "project-persisted",
+			"cliProxyAPILocalNeo": true,
+		},
+		"settings": map[string]any{"agentMode": "deep", "reasoning.effort": "medium"},
+		"env":      map[string]any{"workingDirectory": workingDirectory, "workspaceRoot": workingDirectory},
+		"messages": []any{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := source.executeLocalThreadTool(neoPendingTool{Name: "thread_interact", Input: map[string]any{"action": "get", "thread": targetID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result["title"] != "Persisted target" || result["archived"] != true || result["projectID"] != "project-persisted" || result["agentMode"] != "deep" || result["reasoningEffort"] != "medium" {
+		t.Fatalf("persisted metadata = %#v", result)
+	}
+	if labels := neoThreadLabelsFromAny(result["labels"]); !reflect.DeepEqual(labels, []string{"reviewed"}) {
+		t.Fatalf("persisted labels = %#v", labels)
+	}
+	if result["workingDirectory"] != neoExistingDirectory(workingDirectory) {
+		t.Fatalf("persisted working directory = %#v", result["workingDirectory"])
+	}
+	target := rt.store.lookupThreadActor(targetID)
+	if target == nil {
+		t.Fatal("persisted target actor was not hydrated")
+	}
+	if got := target.threadToolOwnerID(); got != ownerUserID {
+		t.Fatalf("persisted target owner = %q, want %q", got, ownerUserID)
+	}
+	persisted, ok := loadNeoThreadFromDir(targetID, rt.threadDir)
+	if !ok || neoThreadOwnerUserID(persisted) != ownerUserID {
+		t.Fatalf("persisted target owner was not durably claimed: %#v", persisted)
+	}
+	target.mu.Lock()
+	target.title = "Current in-memory target"
+	target.mu.Unlock()
+	if _, err := writeNeoLocalThreadFileInDir(rt.threadDir, targetID, map[string]any{
+		"id":        targetID,
+		"title":     "Stale persisted target",
+		"agentMode": "deep",
+		"meta": map[string]any{
+			"ownerUserId":         ownerUserID,
+			"cliProxyAPILocalNeo": true,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	result, err = source.executeLocalThreadTool(neoPendingTool{Name: "thread_interact", Input: map[string]any{"action": "get", "thread": targetID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result["title"] != "Current in-memory target" {
+		t.Fatalf("warm target metadata = %#v", result)
+	}
 }
 
 func TestNeoThreadLabelRelativeUpdatesPreserveConcurrentAdditions(t *testing.T) {
@@ -249,7 +424,7 @@ func TestNeoThreadLabelRelativeUpdatesPreserveConcurrentAdditions(t *testing.T) 
 	}
 }
 
-func TestNeoActorRunsSendMessageToThreadLocallyWhenExecutorOmitsIt(t *testing.T) {
+func TestNeoActorRunsThreadInteractMessageLocallyWhenExecutorOmitsIt(t *testing.T) {
 	useTempNeoThreadStore(t)
 	rt := newNeoRuntime(&config.Config{})
 	sourceID := "T-019e1046-656d-7132-879f-390ded941c42"
@@ -258,7 +433,7 @@ func TestNeoActorRunsSendMessageToThreadLocallyWhenExecutorOmitsIt(t *testing.T)
 	target := rt.store.ensureThreadActor(targetID)
 	source.executorBootstrapComplete = true
 
-	pending := neoPendingTool{ID: "TU-send", Name: "send_message_to_thread", Input: map[string]any{"targetThreadId": targetID, "workflow": "code_review"}, AgentMode: "agg-man", MessageID: "M-assistant"}
+	pending := neoPendingTool{ID: "TU-send", Name: "thread_interact", Input: map[string]any{"action": "message", "thread": targetID, "workflow": "code_review"}, AgentMode: "puck", MessageID: "M-assistant"}
 	source.pendingTools[pending.ID] = pending
 	source.agentState = "running_tools"
 	source.runLocalActorTool(pending, source.generation)
@@ -949,9 +1124,10 @@ func TestNeoCreateThreadPreservesInitialImageContent(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	parent := rt.store.ensureThreadActor("T-019f7000-0000-7000-8000-00000000009e")
 	parent.updateSettings(map[string]any{"agentMode": "puck", "reasoning.effort": "none"})
+	imageData := testNeoPNGBase64(t, 1, 1)
 	content := []any{
 		map[string]any{"type": "text", "text": "Use this reference image."},
-		map[string]any{"type": "image", "source": map[string]any{"type": "url", "url": "https://ampcode.com/attachments/reference.png"}, "sourcePath": "reference.png"},
+		map[string]any{"type": "image", "source": map[string]any{"type": "base64", "mediaType": "image/png", "data": imageData}, "sourcePath": "reference.png"},
 	}
 
 	body, _, _, err := parent.localCreateThreadBody(map[string]any{
@@ -965,7 +1141,8 @@ func TestNeoCreateThreadPreservesInitialImageContent(t *testing.T) {
 		t.Fatalf("image child body also contained prompt: %#v", body)
 	}
 	initialContent := arrayValue(body["content"])
-	if len(initialContent) != 2 || textFromBlocks(initialContent) != "Use this reference image." || stringValue(mapValue(mapValue(initialContent[1])["source"])["url"]) != "https://ampcode.com/attachments/reference.png" {
+	imageSource := mapValue(mapValue(initialContent[1])["source"])
+	if len(initialContent) != 2 || textFromBlocks(initialContent) != "Use this reference image." || stringValue(imageSource["mediaType"]) != "image/png" || stringValue(imageSource["data"]) != imageData {
 		t.Fatalf("image child content = %#v", initialContent)
 	}
 }

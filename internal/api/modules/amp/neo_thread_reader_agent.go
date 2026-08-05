@@ -1,11 +1,13 @@
 package amp
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -19,7 +21,6 @@ const (
 	neoReadThreadAgentProvider      = "openai"
 	neoReadThreadAgentModel         = "gpt-5.6-sol"
 	neoReadThreadAgentEffort        = "medium"
-	neoReadThreadMaxTurns           = 16
 	neoReadThreadSearchLimit        = 12
 	neoReadThreadSearchLimitMax     = 40
 	neoReadThreadReadCount          = 12
@@ -30,15 +31,11 @@ const (
 	neoReadThreadSearchExcerpt      = 1400
 	neoReadThreadReadMessageChars   = 14000
 	neoReadThreadReadTotalChars     = 90000
+	neoReadThreadMaxCallsPerStage   = 64
 	neoReadThreadOverviewTailCount  = neoReadThreadLatestReadCount
 	neoReadThreadHistoryTextChars   = 24000
 	neoReadThreadHistoryTotalChars  = 100000
 	neoReadThreadHistoryNoticeChars = 512
-	neoReadThreadMaxToolCalls       = 24
-	neoReadThreadMaxSearchCalls     = 12
-	neoReadThreadMaxReadCalls       = 12
-	neoReadThreadMaxCallsPerTurn    = 4
-	neoReadThreadForceFinalCalls    = neoReadThreadMaxToolCalls - neoReadThreadMaxCallsPerTurn
 	neoReadThreadStoredHitCount     = 12
 	neoReadThreadStoredMessageCount = 12
 	neoReadThreadStoredExcerptChars = 600
@@ -60,6 +57,8 @@ Rules:
 - Prefer the latest unreverted decision when the thread contains multiple revisions.
 - Do not repeat a search with only a larger limit. Refine the query when more evidence is needed.
 - Use each search hit's recommendedRead range, and do not reread a range already covered by an earlier result.
+- Issue independent searches together in the search stage, then read all relevant ranges together in the read stage.
+- After the read stage, synthesize the answer from the gathered evidence instead of starting another retrieval cycle.
 - For continuation or handoff goals, identify the latest explicit user objective first, then read the assistant and tool outcomes that followed it.
 - Preserve exact technical details: file paths, commands, model names, errors, decisions, and code snippets.
 - When reporting verification or build status, include the complete command string that ran and the latest pass/fail result.
@@ -72,10 +71,11 @@ Rules:
 const neoReadThreadFinalPrompt = `Return the final answer now as JSON only with one key named relevantContent. Include the actual relevant thread content as markdown prose or bullets, not nested JSON. Copy relevant identifiers verbatim. Do not call tools and do not return placeholder or template text.`
 
 type neoReadThreadCorpus struct {
-	ThreadID string
-	Source   string
-	Title    string
-	Messages []neoReadThreadMessage
+	ThreadID  string
+	Source    string
+	Title     string
+	Messages  []neoReadThreadMessage
+	nextIndex int
 }
 
 type neoReadThreadMessage struct {
@@ -116,27 +116,40 @@ type neoReadThreadPositionRange struct {
 	End   int
 }
 
+type neoReadThreadEvidence struct {
+	ToolName    string
+	Run         map[string]any
+	MessageKeys map[int]string
+}
+
 type neoReadThreadAgentState struct {
 	SawOverview bool
 	SawSearch   bool
 	SawRead     bool
 	SawLatest   bool
-	ToolCalls   int
-	SearchCalls int
-	ReadCalls   int
 	SeenCalls   map[string]struct{}
 	ReadRanges  []neoReadThreadPositionRange
 }
 
-func (a *neoActor) readThreadCorpus(threadID, clientAPIKey string) (neoReadThreadCorpus, error) {
-	if corpus, ok := a.liveReadThreadCorpus(threadID); ok {
+func (a *neoActor) readThreadCorpus(ctx context.Context, threadID, clientAPIKey string) (neoReadThreadCorpus, error) {
+	if err := ctx.Err(); err != nil {
+		return neoReadThreadCorpus{}, err
+	}
+	if corpus, ok, err := a.liveReadThreadCorpusContext(ctx, threadID); err != nil {
+		return neoReadThreadCorpus{}, err
+	} else if ok {
 		return corpus, nil
 	}
-	if corpus, ok := a.localReadThreadFileCorpus(threadID); ok {
+	if corpus, ok, err := a.localReadThreadFileCorpusContext(ctx, threadID); err != nil {
+		return neoReadThreadCorpus{}, err
+	} else if ok {
 		return corpus, nil
 	}
-	markdown, err := a.fetchUpstreamThreadMarkdown(threadID, clientAPIKey)
+	markdown, err := a.fetchUpstreamThreadMarkdown(ctx, threadID, clientAPIKey)
 	if err != nil {
+		return neoReadThreadCorpus{}, err
+	}
+	if err := ctx.Err(); err != nil {
 		return neoReadThreadCorpus{}, err
 	}
 	corpus := neoReadThreadCorpusFromMarkdown(threadID, markdown, "upstream-markdown")
@@ -147,32 +160,52 @@ func (a *neoActor) readThreadCorpus(threadID, clientAPIKey string) (neoReadThrea
 }
 
 func (a *neoActor) liveReadThreadCorpus(threadID string) (neoReadThreadCorpus, bool) {
+	corpus, ok, _ := a.liveReadThreadCorpusContext(context.Background(), threadID)
+	return corpus, ok
+}
+
+func (a *neoActor) liveReadThreadCorpusContext(ctx context.Context, threadID string) (neoReadThreadCorpus, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return neoReadThreadCorpus{}, false, err
+	}
 	if a == nil || a.runtime == nil || a.runtime.store == nil || !neoThreadIDExactPattern.MatchString(threadID) {
-		return neoReadThreadCorpus{}, false
+		return neoReadThreadCorpus{}, false, nil
 	}
 	target := a
 	if a.threadID != threadID && a.key != threadID {
 		target = a.runtime.store.lookupThreadActor(threadID)
 	}
 	if target == nil || !target.hasLocalThreadState() {
-		return neoReadThreadCorpus{}, false
+		return neoReadThreadCorpus{}, false, nil
 	}
-	if target.threadToolOwnerID() != a.threadToolOwnerID() {
-		return neoReadThreadCorpus{}, false
+	ownerID := a.threadToolOwnerID()
+	if target.threadToolOwnerID() != ownerID && !a.runtime.claimNeoLegacyThreadActorOwner(target, ownerID) {
+		return neoReadThreadCorpus{}, false, nil
 	}
 	snapshot, ok := target.threadSnapshotWithOptions(neoThreadSnapshotOptions{
 		skipLocalMessageJSON: true,
 	})
 	if !ok {
-		return neoReadThreadCorpus{}, false
+		return neoReadThreadCorpus{}, false, nil
 	}
-	corpus := neoReadThreadCorpusFromThreadMap(threadID, neoCloudThread(snapshot), "local-live")
-	return corpus, len(corpus.Messages) > 0
+	if err := ctx.Err(); err != nil {
+		return neoReadThreadCorpus{}, false, err
+	}
+	corpus, err := neoReadThreadCorpusFromSnapshotContext(ctx, threadID, snapshot, "local-live")
+	return corpus, len(corpus.Messages) > 0, err
 }
 
 func (a *neoActor) localReadThreadFileCorpus(threadID string) (neoReadThreadCorpus, bool) {
+	corpus, ok, _ := a.localReadThreadFileCorpusContext(context.Background(), threadID)
+	return corpus, ok
+}
+
+func (a *neoActor) localReadThreadFileCorpusContext(ctx context.Context, threadID string) (neoReadThreadCorpus, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return neoReadThreadCorpus{}, false, err
+	}
 	if !neoThreadIDExactPattern.MatchString(threadID) {
-		return neoReadThreadCorpus{}, false
+		return neoReadThreadCorpus{}, false, nil
 	}
 	dir := ""
 	if a != nil && a.runtime != nil {
@@ -182,29 +215,127 @@ func (a *neoActor) localReadThreadFileCorpus(threadID string) (neoReadThreadCorp
 		dir = neoAmpThreadStoreDir()
 	}
 	if strings.TrimSpace(dir) == "" {
-		return neoReadThreadCorpus{}, false
+		return neoReadThreadCorpus{}, false, nil
 	}
 	raw, err := os.ReadFile(filepath.Join(dir, threadID+".json"))
 	if err != nil {
-		return neoReadThreadCorpus{}, false
+		return neoReadThreadCorpus{}, false, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return neoReadThreadCorpus{}, false, err
 	}
 	var decoded map[string]any
 	if err := json.Unmarshal(raw, &decoded); err != nil {
 		log.Warnf("amp neo read_thread local corpus read failed thread=%s: %v", threadID, err)
-		return neoReadThreadCorpus{}, false
+		return neoReadThreadCorpus{}, false, nil
 	}
-	thread := neoCloudThreadDocumentForImport(decoded, threadID)
-	if firstNonEmptyString(thread["id"], findThreadID(thread)) != threadID || !neoThreadOwnedByUser(thread, a.threadToolOwnerID()) {
-		return neoReadThreadCorpus{}, false
+	if err := ctx.Err(); err != nil {
+		return neoReadThreadCorpus{}, false, err
 	}
-	corpus := neoReadThreadCorpusFromThreadMap(threadID, thread, "local-json")
-	return corpus, len(corpus.Messages) > 0
+	thread := neoCloudThreadDocumentForImportOwned(decoded, threadID)
+	ownerID := a.threadToolOwnerID()
+	exactOwner := neoThreadOwnedByUser(thread, ownerID)
+	legacyOwner := a.runtime != nil && a.runtime.neoThreadOwnedByRequestUser(thread, ownerID)
+	if firstNonEmptyString(thread["id"], findThreadID(thread)) != threadID || !exactOwner && !legacyOwner {
+		return neoReadThreadCorpus{}, false, nil
+	}
+	if !exactOwner {
+		if a.runtime.store == nil {
+			return neoReadThreadCorpus{}, false, nil
+		}
+		target := a.runtime.store.ensureThreadActor(threadID)
+		if target == nil {
+			return neoReadThreadCorpus{}, false, nil
+		}
+		if err := target.importThreadLocalOnlyIfEmpty(thread); err != nil {
+			log.Warnf("amp neo read_thread local corpus import failed thread=%s: %v", threadID, err)
+			return neoReadThreadCorpus{}, false, nil
+		}
+		if target.threadToolOwnerID() != ownerID && !a.runtime.claimNeoLegacyThreadActorOwner(target, ownerID) {
+			return neoReadThreadCorpus{}, false, nil
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return neoReadThreadCorpus{}, false, err
+	}
+	corpus, err := neoReadThreadCorpusFromThreadMapContext(ctx, threadID, thread, "local-json")
+	return corpus, len(corpus.Messages) > 0, err
+}
+
+func neoReadThreadCorpusFromSnapshot(threadID string, snapshot neoCloudThreadSnapshot, source string) neoReadThreadCorpus {
+	corpus, _ := neoReadThreadCorpusFromSnapshotContext(context.Background(), threadID, snapshot, source)
+	return corpus
+}
+
+func neoReadThreadCorpusFromSnapshotContext(ctx context.Context, threadID string, snapshot neoCloudThreadSnapshot, source string) (neoReadThreadCorpus, error) {
+	corpus := neoReadThreadCorpus{
+		ThreadID: threadID,
+		Source:   source,
+		Title:    strings.TrimSpace(fallbackString(snapshot.title, neoCloudTitle(snapshot.messages))),
+		Messages: make([]neoReadThreadMessage, 0, len(snapshot.messages)+len(snapshot.queuedMessages)),
+	}
+	for sourceIndex, message := range snapshot.messages {
+		if err := ctx.Err(); err != nil {
+			return neoReadThreadCorpus{}, err
+		}
+		messageID := message.MessageID
+		if strings.TrimSpace(messageID) == "" {
+			messageID = ""
+		}
+		createdAt := message.CreatedAt
+		if strings.TrimSpace(createdAt) == "" {
+			createdAt = ""
+		}
+		parentToolUseID := message.ParentToolUseID
+		if strings.TrimSpace(parentToolUseID) == "" {
+			parentToolUseID = ""
+		}
+		if parentToolUseID != "" {
+			continue
+		}
+		if converted, ok := neoReadThreadMessageFromValues(sourceIndex, message.Role, messageID, createdAt, parentToolUseID, message.Content, message.CompletionStatus); ok {
+			corpus.Messages = append(corpus.Messages, converted)
+		}
+	}
+	for queuedIndex, raw := range snapshot.queuedMessages {
+		if err := ctx.Err(); err != nil {
+			return neoReadThreadCorpus{}, err
+		}
+		messageMap := mapValue(raw)
+		if len(messageMap) == 0 {
+			messageMap = map[string]any{"role": "user", "content": raw}
+		}
+		if neoReadThreadMessageIsNested(messageMap) {
+			continue
+		}
+		if message, ok := neoReadThreadMessageFromMap(messageMap, len(snapshot.messages)+queuedIndex); ok {
+			if message.Completion == "" {
+				message.Completion = "queued"
+			}
+			corpus.Messages = append(corpus.Messages, message)
+		}
+	}
+	return corpus, nil
 }
 
 func neoReadThreadCorpusFromThreadMap(threadID string, thread map[string]any, source string) neoReadThreadCorpus {
-	corpus := neoReadThreadCorpus{ThreadID: threadID, Source: source, Title: strings.TrimSpace(stringValue(thread["title"]))}
+	corpus, _ := neoReadThreadCorpusFromThreadMapContext(context.Background(), threadID, thread, source)
+	return corpus
+}
+
+func neoReadThreadCorpusFromThreadMapContext(ctx context.Context, threadID string, thread map[string]any, source string) (neoReadThreadCorpus, error) {
 	rawMessages := arrayValue(thread["messages"])
+	queuedMessages := arrayValue(thread["queuedMessages"])
+	corpus := neoReadThreadCorpus{
+		ThreadID: threadID,
+		Source:   source,
+		Title:    strings.TrimSpace(stringValue(thread["title"])),
+		Messages: make([]neoReadThreadMessage, 0, len(rawMessages)+len(queuedMessages)),
+	}
 	for sourceIndex, raw := range rawMessages {
+		if err := ctx.Err(); err != nil {
+			return neoReadThreadCorpus{}, err
+		}
 		messageMap := mapValue(raw)
 		if neoReadThreadMessageIsNested(messageMap) {
 			continue
@@ -213,7 +344,10 @@ func neoReadThreadCorpusFromThreadMap(threadID string, thread map[string]any, so
 			corpus.Messages = append(corpus.Messages, message)
 		}
 	}
-	for queuedIndex, raw := range arrayValue(thread["queuedMessages"]) {
+	for queuedIndex, raw := range queuedMessages {
+		if err := ctx.Err(); err != nil {
+			return neoReadThreadCorpus{}, err
+		}
 		messageMap := mapValue(raw)
 		if len(messageMap) == 0 {
 			messageMap = map[string]any{"role": "user", "content": raw}
@@ -228,7 +362,7 @@ func neoReadThreadCorpusFromThreadMap(threadID string, thread map[string]any, so
 			corpus.Messages = append(corpus.Messages, message)
 		}
 	}
-	return corpus
+	return corpus, nil
 }
 
 func neoReadThreadMessageIsNested(message map[string]any) bool {
@@ -236,11 +370,23 @@ func neoReadThreadMessageIsNested(message map[string]any) bool {
 }
 
 func neoReadThreadMessageFromMap(message map[string]any, index int) (neoReadThreadMessage, bool) {
-	role := strings.TrimSpace(stringValue(message["role"]))
+	return neoReadThreadMessageFromValues(
+		index,
+		stringValue(message["role"]),
+		firstNonEmptyString(message["messageId"], message["messageID"], message["protocolMessageID"], message["id"]),
+		firstNonEmptyString(message["createdAt"], message["created_at"], message["timestamp"]),
+		firstNonEmptyString(message["parentToolUseId"], message["parentToolUseID"], message["parent_tool_use_id"]),
+		message["content"],
+		stringValue(message["completionStatus"]),
+	)
+}
+
+func neoReadThreadMessageFromValues(index int, role, messageID, createdAt, parentToolUseID string, content any, completionStatus string) (neoReadThreadMessage, bool) {
+	role = strings.TrimSpace(role)
 	if role == "" {
 		role = "unknown"
 	}
-	text, toolUses, toolResults := neoReadThreadContentText(message["content"], stringValue(message["completionStatus"]))
+	text, toolUses, toolResults := neoReadThreadContentText(content, completionStatus)
 	text = strings.TrimSpace(text)
 	if text == "" && len(toolUses) == 0 && len(toolResults) == 0 {
 		return neoReadThreadMessage{}, false
@@ -248,13 +394,13 @@ func neoReadThreadMessageFromMap(message map[string]any, index int) (neoReadThre
 	return neoReadThreadMessage{
 		Index:           index,
 		Role:            role,
-		MessageID:       firstNonEmptyString(message["messageId"], message["messageID"], message["protocolMessageID"], message["id"]),
-		CreatedAt:       firstNonEmptyString(message["createdAt"], message["created_at"], message["timestamp"]),
-		ParentToolUseID: firstNonEmptyString(message["parentToolUseId"], message["parentToolUseID"], message["parent_tool_use_id"]),
+		MessageID:       messageID,
+		CreatedAt:       createdAt,
+		ParentToolUseID: parentToolUseID,
 		Text:            text,
 		ToolUses:        toolUses,
 		ToolResults:     toolResults,
-		Completion:      stringValue(message["completionStatus"]),
+		Completion:      completionStatus,
 	}, true
 }
 
@@ -401,6 +547,15 @@ func (a *neoActor) executeLocalReadThreadAgentWithRoute(pending neoPendingTool, 
 	if len(corpus.Messages) == 0 {
 		return "", errors.New("thread has no readable messages")
 	}
+	runContext, runID, acquired := a.acquireSubagentRun(generation)
+	if !acquired {
+		return "", nil
+	}
+	defer a.releaseSubagentRun(runID)
+	return a.executeLocalReadThreadAgentWithRouteContext(runContext, pending, generation, corpus, goal, route, effort)
+}
+
+func (a *neoActor) executeLocalReadThreadAgentWithRouteContext(runContext context.Context, pending neoPendingTool, generation int, corpus neoReadThreadCorpus, goal string, route neoModelRoute, effort string) (string, error) {
 	if route.Model == "" {
 		route = neoModelRoute{Provider: neoReadThreadAgentProvider, Model: neoReadThreadAgentModel}
 	}
@@ -426,36 +581,50 @@ func (a *neoActor) executeLocalReadThreadAgentWithRoute(pending neoPendingTool, 
 		SawLatest: len(corpus.Messages) <= 1,
 		SeenCalls: map[string]struct{}{},
 	}
-	evidence := make([]string, 0)
-	var lastErr error
+	evidence := make([]neoReadThreadEvidence, 0)
 
-	for turn := 0; turn < neoReadThreadMaxTurns; turn++ {
+	for {
 		if a.subagentGenerationStale(generation) {
 			return "", nil
 		}
 		routeCopy := route
-		result, err := a.runtime.subagentInfer(neoInferenceRequest{
-			ActorID:                  actorID,
-			ThreadID:                 currentThreadID,
-			MessageID:                newNeoMessageID(),
-			AgentMode:                agentMode,
-			ReasoningEffort:          effort,
-			ParentToolCallID:         pending.ID,
-			MaxTokens:                maxTokens,
-			Settings:                 settings,
-			History:                  neoReadThreadRequestHistory(conversation),
-			Tools:                    neoReadThreadInternalToolSpecsForAgentState(state),
-			Environment:              environment,
-			ModelRouteOverride:       &routeCopy,
-			SystemPromptOverride:     neoReadThreadAgentSystemPrompt,
-			ProviderFeature:          "amp.read-thread",
-			DisableParallelToolCalls: true,
-		}, func(neoInferenceDelta) {})
+		requestHistory := neoReadThreadRequestHistory(conversation)
+		result, err := neoReadThreadSubagentInfer(a.runtime, neoInferenceRequest{
+			Context:              runContext,
+			ActorID:              actorID,
+			ThreadID:             currentThreadID,
+			MessageID:            newNeoMessageID(),
+			AgentMode:            agentMode,
+			ReasoningEffort:      effort,
+			ParentToolCallID:     pending.ID,
+			MaxTokens:            maxTokens,
+			Settings:             settings,
+			History:              requestHistory,
+			Tools:                neoReadThreadInternalToolSpecsForAgentState(state),
+			Environment:          environment,
+			ModelRouteOverride:   &routeCopy,
+			SystemPromptOverride: neoReadThreadAgentSystemPrompt,
+			ProviderFeature:      "amp.read-thread",
+		})
 		if err != nil {
 			return "", err
 		}
+		if a.subagentGenerationStale(generation) {
+			return "", nil
+		}
 		conversation = append(conversation, neoHistoryMessage{Role: "assistant", Text: result.Text, ToolCalls: result.ToolCalls, ThinkingBlocks: result.ThinkingBlocks})
 		if len(result.ToolCalls) == 0 {
+			if !state.SawSearch {
+				run := neoReadThreadAutomaticSearch(&state, corpus, goal)
+				neoReadThreadAppendRuntimeEvidence(&conversation, &evidence, "search_thread_messages", run, corpus)
+				continue
+			}
+			if !state.SawRead {
+				run := neoReadThreadAutomaticRead(&state, corpus, goal)
+				neoReadThreadAppendRuntimeEvidence(&conversation, &evidence, "read_thread_messages", run, corpus)
+				neoReadThreadAppendLatestEvidence(&state, corpus, &conversation, &evidence)
+				return a.forceLocalReadThreadFinalWithEvidence(runContext, pending, generation, route, effort, actorID, currentThreadID, agentMode, maxTokens, settings, environment, conversation, corpus, evidence, goal)
+			}
 			if correction := neoReadThreadGateCorrection(state.SawSearch, state.SawRead, state.SawLatest, corpus); correction != "" {
 				conversation = append(conversation, neoHistoryMessage{Role: "user", Text: correction})
 				continue
@@ -464,26 +633,35 @@ func (a *neoActor) executeLocalReadThreadAgentWithRoute(pending neoPendingTool, 
 			if parseErr == nil {
 				return text, nil
 			}
-			lastErr = parseErr
-			forcedText, forcedErr := a.forceLocalReadThreadFinalWithEvidence(pending, generation, route, effort, actorID, currentThreadID, agentMode, maxTokens, settings, environment, conversation, corpus, evidence)
+			forcedText, forcedErr := a.forceLocalReadThreadFinalWithEvidence(runContext, pending, generation, route, effort, actorID, currentThreadID, agentMode, maxTokens, settings, environment, conversation, corpus, evidence, goal)
 			if forcedErr == nil {
 				return forcedText, nil
 			}
-			lastErr = forcedErr
-			conversation = append(conversation, neoHistoryMessage{Role: "user", Text: "Your previous answer was not valid read_thread JSON. Return JSON only with relevantContent."})
-			continue
+			return "", forcedErr
 		}
 		exchanges := make([]neoSubagentToolExchange, 0, len(result.ToolCalls))
+		hadSearchAtTurnStart := state.SawSearch
+		hadReadAtTurnStart := state.SawRead
 		acceptedThisTurn := 0
+		attemptedThisStage := 0
 		for _, call := range result.ToolCalls {
 			if call.Incomplete {
 				continue
 			}
-			run, accepted := neoReadThreadExecuteAgentTool(&state, corpus, call, acceptedThisTurn)
+			run := neoReadThreadRejectedRun("read_thread retrieval stage is complete; use the currently available tool")
+			accepted := false
+			if attemptedThisStage >= neoReadThreadMaxCallsPerStage {
+				run = neoReadThreadRejectedRun(fmt.Sprintf("read_thread accepts at most %d tool calls per retrieval stage", neoReadThreadMaxCallsPerStage))
+			} else if !hadReadAtTurnStart && (!hadSearchAtTurnStart || strings.TrimSpace(call.Name) == "read_thread_messages") {
+				attemptedThisStage++
+				run, accepted = neoReadThreadExecuteAgentTool(&state, corpus, call)
+			}
 			if accepted {
-				acceptedThisTurn++
 				exchanges = append(exchanges, neoSubagentToolExchange{Call: call, Run: neoReadThreadPersistedRun(call.Name, run)})
-				if entry := neoReadThreadEvidenceEntry(call.Name, run); entry != "" {
+				if stringValue(run["status"]) == "done" {
+					acceptedThisTurn++
+				}
+				if entry, ok := neoReadThreadEvidenceEntry(call.Name, run, corpus); ok {
 					evidence = append(evidence, entry)
 				}
 			}
@@ -497,93 +675,275 @@ func (a *neoActor) executeLocalReadThreadAgentWithRoute(pending neoPendingTool, 
 			})
 		}
 		a.storeSubagentToolExchanges(exchanges, pending.ID)
-		if neoReadThreadReadyToForceFinal(state) {
-			return a.forceLocalReadThreadFinalWithEvidence(pending, generation, route, effort, actorID, currentThreadID, agentMode, maxTokens, settings, environment, conversation, corpus, evidence)
+		if state.SawRead {
+			neoReadThreadAppendLatestEvidence(&state, corpus, &conversation, &evidence)
+			return a.forceLocalReadThreadFinalWithEvidence(runContext, pending, generation, route, effort, actorID, currentThreadID, agentMode, maxTokens, settings, environment, conversation, corpus, evidence, goal)
+		}
+		if acceptedThisTurn == 0 {
+			if !state.SawSearch {
+				run := neoReadThreadAutomaticSearch(&state, corpus, goal)
+				neoReadThreadAppendRuntimeEvidence(&conversation, &evidence, "search_thread_messages", run, corpus)
+			} else {
+				run := neoReadThreadAutomaticRead(&state, corpus, goal)
+				neoReadThreadAppendRuntimeEvidence(&conversation, &evidence, "read_thread_messages", run, corpus)
+				neoReadThreadAppendLatestEvidence(&state, corpus, &conversation, &evidence)
+				return a.forceLocalReadThreadFinalWithEvidence(runContext, pending, generation, route, effort, actorID, currentThreadID, agentMode, maxTokens, settings, environment, conversation, corpus, evidence, goal)
+			}
 		}
 	}
+}
 
-	if a.subagentGenerationStale(generation) {
-		return "", nil
+func neoReadThreadAutomaticSearch(state *neoReadThreadAgentState, corpus neoReadThreadCorpus, goal string) map[string]any {
+	query := strings.TrimSpace(goal)
+	if query == "" {
+		query = strings.TrimSpace(corpus.Title)
 	}
-	if state.SawSearch && state.SawRead && !state.SawLatest && len(corpus.Messages) > 1 {
-		latest, readEnd, err := neoReadThreadRead(corpus, map[string]any{"latest": true, "count": neoReadThreadLatestReadCount})
-		if err != nil {
-			return "", fmt.Errorf("read_thread auto latest read failed: %w", err)
+	if query == "" && len(corpus.Messages) > 0 {
+		query = strings.TrimSpace(corpus.Messages[len(corpus.Messages)-1].Text)
+	}
+	if query == "" {
+		query = corpus.ThreadID
+	}
+	call := neoToolCall{ID: newNeoToolCallID(), Name: "search_thread_messages", Input: map[string]any{"query": query}}
+	run, _ := neoReadThreadExecuteAgentTool(state, corpus, call)
+	return run
+}
+
+func neoReadThreadAutomaticRead(state *neoReadThreadAgentState, corpus neoReadThreadCorpus, goal string) map[string]any {
+	input := map[string]any{"latest": true, "count": neoReadThreadLatestReadCount}
+	if search, err := neoReadThreadSearch(corpus, map[string]any{"query": goal, "limit": 1}); err == nil {
+		hits := arrayValue(search["hits"])
+		if len(hits) > 0 {
+			if recommended := cloneMap(mapValue(mapValue(hits[0])["recommendedRead"])); len(recommended) > 0 {
+				input = recommended
+			}
 		}
-		if readEnd >= neoReadThreadLatestMessageIndex(corpus) {
-			state.SawLatest = true
-			conversation = append(conversation, neoHistoryMessage{
-				Role: "user",
-				Text: "The runtime performed the required latest read before finalization because the turn budget was exhausted. Use this latest-read result to check for revisions, superseding decisions, reverts, or contradictions before returning final JSON.\n\n" + runToText(map[string]any{"status": "done", "result": latest}),
-			})
-		}
 	}
-	if correction := neoReadThreadGateCorrection(state.SawSearch, state.SawRead, state.SawLatest, corpus); correction != "" {
-		return "", fmt.Errorf("read_thread subagent did not complete required search/read checks after %d turns: %s", neoReadThreadMaxTurns, correction)
+	call := neoToolCall{ID: newNeoToolCallID(), Name: "read_thread_messages", Input: input}
+	run, _ := neoReadThreadExecuteAgentTool(state, corpus, call)
+	return run
+}
+
+func neoReadThreadAppendLatestEvidence(state *neoReadThreadAgentState, corpus neoReadThreadCorpus, conversation *[]neoHistoryMessage, evidence *[]neoReadThreadEvidence) {
+	if state == nil || state.SawLatest || len(corpus.Messages) <= 1 {
+		return
 	}
-	forcedText, forcedErr := a.forceLocalReadThreadFinalWithEvidence(pending, generation, route, effort, actorID, currentThreadID, agentMode, maxTokens, settings, environment, conversation, corpus, evidence)
-	if forcedErr != nil {
-		if lastErr != nil {
-			return "", lastErr
-		}
-		return "", forcedErr
+	call := neoToolCall{
+		ID:    newNeoToolCallID(),
+		Name:  "read_thread_messages",
+		Input: map[string]any{"latest": true, "count": neoReadThreadLatestReadCount},
 	}
-	return forcedText, nil
+	run, accepted := neoReadThreadExecuteAgentTool(state, corpus, call)
+	if !accepted {
+		state.SawLatest = true
+		return
+	}
+	neoReadThreadAppendRuntimeEvidence(conversation, evidence, call.Name, run, corpus)
+}
+
+func neoReadThreadAppendRuntimeEvidence(conversation *[]neoHistoryMessage, evidence *[]neoReadThreadEvidence, toolName string, run map[string]any, corpus neoReadThreadCorpus) {
+	if conversation == nil {
+		return
+	}
+	text := "Runtime-completed " + toolName + " evidence:\n" + runToText(run)
+	*conversation = append(*conversation, neoHistoryMessage{Role: "user", Text: text})
+	if evidence == nil {
+		return
+	}
+	if entry, ok := neoReadThreadEvidenceEntry(toolName, run, corpus); ok {
+		*evidence = append(*evidence, entry)
+	}
 }
 
 func (a *neoActor) forceLocalReadThreadFinal(pending neoPendingTool, generation int, route neoModelRoute, effort, actorID, currentThreadID, agentMode string, maxTokens any, settings, environment map[string]any, conversation []neoHistoryMessage, corpus neoReadThreadCorpus) (string, error) {
-	return a.forceLocalReadThreadFinalWithEvidence(pending, generation, route, effort, actorID, currentThreadID, agentMode, maxTokens, settings, environment, conversation, corpus, nil)
+	runContext, runID, acquired := a.acquireSubagentRun(generation)
+	if !acquired {
+		return "", nil
+	}
+	defer a.releaseSubagentRun(runID)
+	goal := firstNonEmptyString(pending.Input["goal"], pending.Input["question"], pending.Input["objective"])
+	return a.forceLocalReadThreadFinalWithEvidence(runContext, pending, generation, route, effort, actorID, currentThreadID, agentMode, maxTokens, settings, environment, conversation, corpus, nil, goal)
 }
 
-func (a *neoActor) forceLocalReadThreadFinalWithEvidence(pending neoPendingTool, generation int, route neoModelRoute, effort, actorID, currentThreadID, agentMode string, maxTokens any, settings, environment map[string]any, conversation []neoHistoryMessage, corpus neoReadThreadCorpus, evidence []string) (string, error) {
+func (a *neoActor) forceLocalReadThreadFinalWithEvidence(runContext context.Context, pending neoPendingTool, generation int, route neoModelRoute, effort, actorID, currentThreadID, agentMode string, maxTokens any, settings, environment map[string]any, conversation []neoHistoryMessage, corpus neoReadThreadCorpus, evidence []neoReadThreadEvidence, goal string) (string, error) {
 	if a.subagentGenerationStale(generation) {
 		return "", nil
 	}
-	forced := append([]neoHistoryMessage(nil), conversation...)
-	if evidenceContext := neoReadThreadFinalEvidence(evidence); evidenceContext != "" {
-		forced = append(forced, neoHistoryMessage{Role: "user", Text: evidenceContext})
+	finalCorpus := corpus
+	authoritativeRefresh := corpus.ThreadID != currentThreadID && strings.HasPrefix(corpus.Source, "local-")
+	if authoritativeRefresh {
+		var available bool
+		var err error
+		finalCorpus, _, available, err = a.refreshLocalReadThreadCorpus(runContext, corpus)
+		if err != nil {
+			return "", err
+		}
+		if !available {
+			return "", fmt.Errorf("read_thread target became unavailable during finalization")
+		}
 	}
-	if latestContext := neoReadThreadLatestFinalContext(corpus); latestContext != "" {
-		forced = append(forced, neoHistoryMessage{Role: "user", Text: latestContext})
+	inferFinal := func(activeCorpus neoReadThreadCorpus) (neoInferenceResult, error) {
+		forced := append([]neoHistoryMessage(nil), conversation...)
+		activeEvidence := evidence
+		if authoritativeRefresh {
+			forced = []neoHistoryMessage{{Role: "user", Text: neoReadThreadAgentInput(activeCorpus, goal)}}
+			activeEvidence = neoReadThreadAuthoritativeEvidence(evidence, activeCorpus)
+		} else if len(evidence) > 0 && len(forced) > 1 {
+			forced = forced[:1]
+		}
+		if evidenceContext := neoReadThreadFinalEvidence(activeEvidence); evidenceContext != "" {
+			forced = append(forced, neoHistoryMessage{Role: "user", Text: evidenceContext})
+		}
+		if latestContext := neoReadThreadLatestFinalContext(activeCorpus); latestContext != "" {
+			forced = append(forced, neoHistoryMessage{Role: "user", Text: latestContext})
+		}
+		if len(forced) > 0 && forced[len(forced)-1].Role == "user" {
+			forced[len(forced)-1].Text = strings.TrimSpace(forced[len(forced)-1].Text) + "\n\n" + neoReadThreadFinalPrompt
+		} else {
+			forced = append(forced, neoHistoryMessage{Role: "user", Text: neoReadThreadFinalPrompt})
+		}
+		forced = neoReadThreadFinalHistory(neoReadThreadRequestHistory(forced))
+		routeCopy := route
+		return neoReadThreadSubagentInfer(a.runtime, neoInferenceRequest{
+			Context:              runContext,
+			ActorID:              actorID,
+			ThreadID:             currentThreadID,
+			MessageID:            newNeoMessageID(),
+			AgentMode:            agentMode,
+			ReasoningEffort:      effort,
+			ParentToolCallID:     pending.ID,
+			MaxTokens:            maxTokens,
+			Settings:             settings,
+			History:              forced,
+			Environment:          environment,
+			ModelRouteOverride:   &routeCopy,
+			SystemPromptOverride: neoReadThreadAgentSystemPrompt,
+			ProviderFeature:      "amp.read-thread",
+			ResponseMimeType:     "application/json",
+			ResponseJSONSchema:   neoReadThreadResponseJSONSchema(),
+		})
 	}
-	if len(forced) > 0 && forced[len(forced)-1].Role == "user" {
-		forced[len(forced)-1].Text = strings.TrimSpace(forced[len(forced)-1].Text) + "\n\n" + neoReadThreadFinalPrompt
-	} else {
-		forced = append(forced, neoHistoryMessage{Role: "user", Text: neoReadThreadFinalPrompt})
-	}
-	forced = neoReadThreadFinalHistory(neoReadThreadRequestHistory(forced))
-	routeCopy := route
-	result, err := a.runtime.subagentInfer(neoInferenceRequest{
-		ActorID:              actorID,
-		ThreadID:             currentThreadID,
-		MessageID:            newNeoMessageID(),
-		AgentMode:            agentMode,
-		ReasoningEffort:      effort,
-		ParentToolCallID:     pending.ID,
-		MaxTokens:            maxTokens,
-		Settings:             settings,
-		History:              forced,
-		Environment:          environment,
-		ModelRouteOverride:   &routeCopy,
-		SystemPromptOverride: neoReadThreadAgentSystemPrompt,
-		ProviderFeature:      "amp.read-thread",
-		ResponseMimeType:     "application/json",
-		ResponseJSONSchema:   neoReadThreadResponseJSONSchema(),
-	}, func(neoInferenceDelta) {})
+	result, err := inferFinal(finalCorpus)
 	if err != nil {
 		return "", err
 	}
 	if a.subagentGenerationStale(generation) {
 		return "", nil
 	}
-	text, parseErr := neoReadThreadGroundedRelevantContent(result.Text, corpus)
+	if authoritativeRefresh {
+		refreshed, changed, available, refreshErr := a.refreshLocalReadThreadCorpus(runContext, finalCorpus)
+		if refreshErr != nil {
+			return "", refreshErr
+		}
+		if !available {
+			return "", fmt.Errorf("read_thread target became unavailable during finalization")
+		}
+		if changed {
+			log.Infof("amp neo: refreshing read_thread final after target thread changed target=%s", corpus.ThreadID)
+			finalCorpus = refreshed
+			result, err = inferFinal(finalCorpus)
+			if err != nil {
+				return "", err
+			}
+			if a.subagentGenerationStale(generation) {
+				return "", nil
+			}
+			if _, changedAgain, available, refreshErr := a.refreshLocalReadThreadCorpus(runContext, finalCorpus); refreshErr != nil {
+				return "", refreshErr
+			} else if !available {
+				return "", fmt.Errorf("read_thread target became unavailable during finalization")
+			} else if changedAgain {
+				return "", fmt.Errorf("read_thread target changed repeatedly during finalization")
+			}
+		}
+	}
+	text, parseErr := neoReadThreadGroundedRelevantContent(result.Text, finalCorpus)
 	if parseErr == nil {
 		return text, nil
 	}
-	if fallback := neoReadThreadGroundedMarkdownFallbackContent(result.Text, corpus); fallback != "" {
+	if fallback := neoReadThreadGroundedMarkdownFallbackContent(result.Text, finalCorpus); fallback != "" {
 		return fallback, nil
 	}
 	return "", fmt.Errorf("read_thread forced final did not return valid JSON or markdown fallback: %w", parseErr)
+}
+
+func (a *neoActor) refreshLocalReadThreadCorpus(ctx context.Context, corpus neoReadThreadCorpus) (neoReadThreadCorpus, bool, bool, error) {
+	if a == nil || corpus.ThreadID == "" {
+		return corpus, false, false, nil
+	}
+	refreshed, ok, err := a.liveReadThreadCorpusContext(ctx, corpus.ThreadID)
+	if err != nil {
+		return corpus, false, false, err
+	}
+	if !ok {
+		refreshed, ok, err = a.localReadThreadFileCorpusContext(ctx, corpus.ThreadID)
+		if err != nil {
+			return corpus, false, false, err
+		}
+	}
+	if !ok {
+		return corpus, false, false, nil
+	}
+	merged, changed := neoReadThreadMergeRefreshedCorpus(corpus, refreshed)
+	return merged, changed, true, nil
+}
+
+func neoReadThreadMergeRefreshedCorpus(corpus, refreshed neoReadThreadCorpus) (neoReadThreadCorpus, bool) {
+	merged := corpus
+	merged.Title = refreshed.Title
+	existing := make(map[string][]neoReadThreadMessage, len(corpus.Messages))
+	nextIndex := corpus.nextIndex
+	for _, message := range corpus.Messages {
+		if key := neoReadThreadMessageRefreshKey(message); key != "" {
+			existing[key] = append(existing[key], message)
+		}
+		if message.Index >= nextIndex {
+			nextIndex = message.Index + 1
+		}
+	}
+	merged.Messages = make([]neoReadThreadMessage, 0, len(refreshed.Messages))
+	lastIndex := -1
+	for _, message := range refreshed.Messages {
+		key := neoReadThreadMessageRefreshKey(message)
+		if prior := existing[key]; key != "" && len(prior) > 0 && prior[0].Index > lastIndex {
+			message.Index = prior[0].Index
+			existing[key] = prior[1:]
+		} else {
+			message.Index = nextIndex
+			nextIndex++
+		}
+		lastIndex = message.Index
+		merged.Messages = append(merged.Messages, message)
+	}
+	merged.nextIndex = nextIndex
+	return merged, !reflect.DeepEqual(corpus, merged)
+}
+
+func neoReadThreadMessageRefreshKey(message neoReadThreadMessage) string {
+	if message.MessageID != "" {
+		return "id:" + message.MessageID
+	}
+	payload, err := json.Marshal([]any{message.CreatedAt, message.Role, message.ParentToolUseID, message.Text, message.ToolUses, message.ToolResults, message.Completion})
+	if err != nil {
+		return ""
+	}
+	return "content:" + string(payload)
+}
+
+func neoReadThreadSubagentInfer(rt *neoRuntime, request neoInferenceRequest) (neoInferenceResult, error) {
+	result, err := rt.subagentInfer(request, func(neoInferenceDelta) {})
+	if err == nil || !neoReadThreadTransientProviderError(err) {
+		return result, err
+	}
+	if request.Context != nil && request.Context.Err() != nil {
+		return neoInferenceResult{}, request.Context.Err()
+	}
+	log.Warnf("amp neo: retrying read_thread inference after transient provider error thread=%s: %v", request.ThreadID, err)
+	return rt.subagentInfer(request, func(neoInferenceDelta) {})
+}
+
+func neoReadThreadTransientProviderError(err error) bool {
+	return neoSubagentRetryableInferenceError(err)
 }
 
 func neoReadThreadLatestFinalContext(corpus neoReadThreadCorpus) string {
@@ -601,24 +961,107 @@ func neoReadThreadLatestFinalContext(corpus neoReadThreadCorpus) string {
 	return "Authoritative latest visible target-thread messages before finalization. Prefer this tail over older summaries or earlier search hits when they conflict.\n\n" + runToText(map[string]any{"status": "done", "result": latest})
 }
 
-func neoReadThreadFinalEvidence(entries []string) string {
+func neoReadThreadAuthoritativeEvidence(entries []neoReadThreadEvidence, corpus neoReadThreadCorpus) []neoReadThreadEvidence {
+	refreshed := make([]neoReadThreadEvidence, 0, len(entries))
+	for _, entry := range entries {
+		if entry.ToolName != "read_thread_messages" {
+			continue
+		}
+		result := cloneMap(mapValue(entry.Run["result"]))
+		requestedIndexes := make(map[int]bool)
+		requestedKeys := make(map[string]int)
+		for _, rawMessage := range arrayValue(result["messages"]) {
+			message := mapValue(rawMessage)
+			if index, ok := neoReadThreadInputInt(message, "index"); ok {
+				if key := entry.MessageKeys[index]; key != "" {
+					requestedKeys[key]++
+				} else {
+					requestedIndexes[index] = true
+				}
+			}
+		}
+		messages := make([]any, 0, len(requestedIndexes)+len(requestedKeys))
+		startIndex := -1
+		endIndex := -1
+		for _, message := range corpus.Messages {
+			key := neoReadThreadMessageRefreshKey(message)
+			if requestedKeys[key] > 0 {
+				requestedKeys[key]--
+			} else if !requestedIndexes[message.Index] {
+				continue
+			}
+			if startIndex < 0 {
+				startIndex = message.Index
+			}
+			endIndex = message.Index
+			messages = append(messages, message.detailMap(neoReadThreadReadMessageChars))
+		}
+		if len(messages) == 0 {
+			continue
+		}
+		result["threadID"] = corpus.ThreadID
+		result["source"] = corpus.Source
+		result["messageCount"] = len(corpus.Messages)
+		result["latestMessageIndex"] = neoReadThreadLatestMessageIndex(corpus)
+		result["range"] = map[string]any{"startIndex": startIndex, "endIndex": endIndex}
+		result["messages"] = messages
+		for _, field := range []string{"truncated", "nextStartIndex", "previousEndIndex", "sparseRangeNormalized", "requestedRange"} {
+			delete(result, field)
+		}
+		if evidence, ok := neoReadThreadEvidenceEntry("read_thread_messages", map[string]any{"status": "done", "result": result}, corpus); ok {
+			refreshed = append(refreshed, evidence)
+		}
+	}
+	return refreshed
+}
+
+func neoReadThreadFinalEvidence(entries []neoReadThreadEvidence) string {
+	readEntries := make([]neoReadThreadEvidence, 0, len(entries))
+	for _, entry := range entries {
+		if entry.ToolName == "read_thread_messages" {
+			readEntries = append(readEntries, entry)
+		}
+	}
+	if len(readEntries) > 0 {
+		entries = readEntries
+	}
 	positions := neoReadThreadStoredPositions(len(entries), neoReadThreadEvidenceEntries)
 	if len(positions) == 0 {
 		return ""
 	}
 	selected := make([]string, 0, len(positions))
 	for _, position := range positions {
-		selected = append(selected, entries[position])
+		selected = append(selected, neoReadThreadEvidenceText(entries[position]))
 	}
 	return "Grounded evidence retained from completed read_thread tools. Use these observations and the authoritative latest tail to synthesize the answer; do not resume searching.\n\n" + strings.Join(selected, "\n\n")
 }
 
-func neoReadThreadEvidenceEntry(toolName string, run map[string]any) string {
+func neoReadThreadEvidenceEntry(toolName string, run map[string]any, corpus neoReadThreadCorpus) (neoReadThreadEvidence, bool) {
 	if stringValue(run["status"]) != "done" || (toolName != "search_thread_messages" && toolName != "read_thread_messages") {
-		return ""
+		return neoReadThreadEvidence{}, false
 	}
-	compacted := neoReadThreadPersistedRun(toolName, run)
-	return toolName + " evidence:\n" + neoClipRunes(runToText(compacted), neoReadThreadEvidenceEntryChars)
+	evidence := neoReadThreadEvidence{ToolName: toolName, Run: neoReadThreadPersistedRun(toolName, run)}
+	if toolName == "read_thread_messages" {
+		requested := make(map[int]bool)
+		for _, rawMessage := range arrayValue(mapValue(run["result"])["messages"]) {
+			if index, ok := neoReadThreadInputInt(mapValue(rawMessage), "index"); ok {
+				requested[index] = true
+			}
+		}
+		for _, message := range corpus.Messages {
+			if requested[message.Index] {
+				if evidence.MessageKeys == nil {
+					evidence.MessageKeys = make(map[int]string)
+				}
+				evidence.MessageKeys[message.Index] = neoReadThreadMessageRefreshKey(message)
+			}
+		}
+	}
+	return evidence, true
+}
+
+func neoReadThreadEvidenceText(evidence neoReadThreadEvidence) string {
+	return evidence.ToolName + " evidence:\n" + neoClipRunes(runToText(evidence.Run), neoReadThreadEvidenceEntryChars)
 }
 
 func neoReadThreadRequestHistory(history []neoHistoryMessage) []neoHistoryMessage {
@@ -977,20 +1420,27 @@ func neoReadThreadInternalToolSpecs() []neoToolSpec {
 	}
 }
 
-func neoReadThreadInternalToolSpecsForState(sawOverview, sawSearch bool) []neoToolSpec {
+func neoReadThreadInternalToolSpecsForState(sawOverview, sawSearch, sawRead bool) []neoToolSpec {
 	tools := neoReadThreadInternalToolSpecs()
-	if !sawOverview && !sawSearch {
-		return tools
-	}
 	out := make([]neoToolSpec, 0, len(tools))
 	for _, tool := range tools {
-		switch tool.Name {
-		case "thread_overview":
+		if sawRead {
 			continue
-		case "read_thread_messages":
-			if !sawSearch {
-				continue
+		}
+		if sawSearch {
+			if tool.Name == "read_thread_messages" {
+				out = append(out, tool)
 			}
+			continue
+		}
+		if sawOverview {
+			if tool.Name == "search_thread_messages" {
+				out = append(out, tool)
+			}
+			continue
+		}
+		if tool.Name == "read_thread_messages" {
+			continue
 		}
 		out = append(out, tool)
 	}
@@ -998,42 +1448,11 @@ func neoReadThreadInternalToolSpecsForState(sawOverview, sawSearch bool) []neoTo
 }
 
 func neoReadThreadInternalToolSpecsForAgentState(state neoReadThreadAgentState) []neoToolSpec {
-	if state.ToolCalls >= neoReadThreadMaxToolCalls {
-		return nil
-	}
-	tools := neoReadThreadInternalToolSpecsForState(state.SawOverview, state.SawSearch)
-	out := make([]neoToolSpec, 0, len(tools))
-	for _, tool := range tools {
-		switch tool.Name {
-		case "search_thread_messages":
-			if state.SearchCalls >= neoReadThreadMaxSearchCalls {
-				continue
-			}
-		case "read_thread_messages":
-			if state.ReadCalls >= neoReadThreadMaxReadCalls {
-				continue
-			}
-		}
-		out = append(out, tool)
-	}
-	return out
+	return neoReadThreadInternalToolSpecsForState(state.SawOverview, state.SawSearch, state.SawRead)
 }
 
-func neoReadThreadReadyToForceFinal(state neoReadThreadAgentState) bool {
-	return state.ToolCalls >= neoReadThreadForceFinalCalls && state.SawSearch && state.SawRead
-}
-
-func neoReadThreadExecuteAgentTool(state *neoReadThreadAgentState, corpus neoReadThreadCorpus, call neoToolCall, acceptedThisTurn int) (map[string]any, bool) {
+func neoReadThreadExecuteAgentTool(state *neoReadThreadAgentState, corpus neoReadThreadCorpus, call neoToolCall) (map[string]any, bool) {
 	name := strings.TrimSpace(call.Name)
-	if acceptedThisTurn >= neoReadThreadMaxCallsPerTurn {
-		return neoReadThreadRejectedRun(fmt.Sprintf("read_thread accepts at most %d tool calls per model turn; continue with the completed results", neoReadThreadMaxCallsPerTurn)), false
-	}
-	if state.ToolCalls >= neoReadThreadMaxToolCalls {
-		return neoReadThreadRejectedRun("read_thread tool-call budget is exhausted; synthesize the answer from completed results"), false
-	}
-	if neoReadThreadReadyToForceFinal(*state) {
-		return neoReadThreadRejectedRun("read_thread reserved the remaining tool budget for synthesis from completed results"), false
-	}
 	if state.SeenCalls == nil {
 		state.SeenCalls = map[string]struct{}{}
 	}
@@ -1046,19 +1465,6 @@ func neoReadThreadExecuteAgentTool(state *neoReadThreadAgentState, corpus neoRea
 			return neoReadThreadRejectedRun("read_thread message range was already covered; use the earlier result or read a different range"), false
 		}
 	}
-	switch name {
-	case "search_thread_messages":
-		if state.SearchCalls >= neoReadThreadMaxSearchCalls {
-			return neoReadThreadRejectedRun("read_thread search budget is exhausted; read the strongest existing hits"), false
-		}
-		state.SearchCalls++
-	case "read_thread_messages":
-		if state.ReadCalls >= neoReadThreadMaxReadCalls {
-			return neoReadThreadRejectedRun("read_thread message-read budget is exhausted; synthesize the answer from completed reads"), false
-		}
-		state.ReadCalls++
-	}
-	state.ToolCalls++
 	run, observation := neoReadThreadExecuteInternalToolForState(corpus, call, state.SawOverview, state.SawSearch)
 	if stringValue(run["status"]) == "done" {
 		state.SeenCalls[key] = struct{}{}

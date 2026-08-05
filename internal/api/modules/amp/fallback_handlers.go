@@ -42,7 +42,7 @@ const (
 
 // MappedModelContextKey is the Gin context key for passing mapped model names.
 const MappedModelContextKey = "mapped_model"
-const localNeoInferenceHeader = "X-CLIProxyAPI-Local-Neo-Inference"
+const localNeoInferenceHeader = util.LocalNeoInferenceHeaderName
 
 var (
 	ampCompactionCaptureSafeNamePattern = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
@@ -498,7 +498,7 @@ func (fh *FallbackHandler) WrapHandler(handler gin.HandlerFunc) gin.HandlerFunc 
 				fh.routeFallbackModel(c, handler, modelName, fallbackTarget, requestPath, bodyBytes)
 				return
 			}
-			if c.GetHeader(localNeoInferenceHeader) == "1" && !ampProviderRequest {
+			if util.IsTrustedLocalNeoInference(c.Request.Context()) && !ampProviderRequest {
 				logAmpRouting(RouteTypeNoProvider, modelName, "", "", requestPath)
 				c.AbortWithStatusJSON(http.StatusBadGateway, gin.H{
 					"error":   "local_neo_provider_unavailable",
@@ -579,7 +579,7 @@ func localNeoAmpProviderRequest(c *gin.Context) bool {
 	if c == nil {
 		return false
 	}
-	if c.GetHeader(localNeoInferenceHeader) != "1" {
+	if c.Request == nil || !util.IsTrustedLocalNeoInference(c.Request.Context()) {
 		return false
 	}
 	return strings.EqualFold(strings.TrimSpace(c.Param("provider")), "amp")

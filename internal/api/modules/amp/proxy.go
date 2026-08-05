@@ -77,7 +77,10 @@ type ampProxyThreadListAugmenter struct {
 	excludedLabelNames map[string]bool
 	load               func(int) []any
 	selectedLoad       func(map[string]bool) []any
+	upstreamRebased    bool
 }
+
+const ampThreadListUpstreamMaxLimit = 500
 
 // createReverseProxy creates a reverse proxy handler for Amp upstream
 // with automatic gzip decompression via ModifyResponse
@@ -119,7 +122,7 @@ func createReverseProxyWithClientVersionProvider(upstreamURL string, secretSourc
 		misc.ScrubProxyAndFingerprintHeaders(req)
 		req.Header.Del(localNeoInferenceHeader)
 		if _, ok := req.Context().Value(ampProxyThreadListAugmenterContextKey{}).(ampProxyThreadListAugmenter); ok {
-			req.Header.Set("Accept-Encoding", "identity")
+			req.Header.Set("Accept-Encoding", "gzip")
 		}
 		if _, ok := req.Context().Value(ampProxyThreadDeleteContextKey{}).(ampProxyThreadDelete); ok {
 			req.Header.Set("Accept-Encoding", "identity")
@@ -180,8 +183,8 @@ func createReverseProxyWithClientVersionProvider(upstreamURL string, secretSourc
 			deleteFinalized = true
 			return applyAmpProxyThreadDelete(resp)
 		}
-		// Skip if already marked as gzip (Content-Encoding set)
-		if resp.Header.Get("Content-Encoding") != "" {
+		contentEncoding := strings.TrimSpace(resp.Header.Get("Content-Encoding"))
+		if contentEncoding != "" && !(ampThreadListResponse(resp) && strings.EqualFold(contentEncoding, "gzip")) {
 			return nil
 		}
 
@@ -429,11 +432,17 @@ func normalizeAmpThreadListResponse(resp *http.Response, body []byte) []byte {
 			changed = true
 		}
 		localThreads := filterAmpThreadListLocalThreads(loaded, augmenter)
+		mergeOffset := augmenter.offset
 		windowLimit := augmenter.limit + augmenter.offset
+		if augmenter.offset > 0 && !augmenter.upstreamRebased {
+			mergeOffset = 0
+			windowLimit = augmenter.limit
+			localThreads = ampThreadListNonRebasedWindow(payload, localThreads, augmenter.limit)
+		}
 		if augmenter.limit > 0 && len(localThreads) > windowLimit {
 			localThreads = localThreads[:windowLimit]
 		}
-		if merged, mergedChanged := mergeAmpThreadListValue(payload, localThreads, augmenter.offset, augmenter.limit); mergedChanged {
+		if merged, mergedChanged := mergeAmpThreadListValue(payload, localThreads, mergeOffset, augmenter.limit); mergedChanged {
 			payload = merged
 			changed = true
 		}
@@ -446,6 +455,64 @@ func normalizeAmpThreadListResponse(resp *http.Response, body []byte) []byte {
 		return nil
 	}
 	return encoded
+}
+
+func ampThreadListNonRebasedWindow(payload any, localThreads []any, limit int) []any {
+	upstreamIDs := ampThreadListResponseIDs(payload)
+	minimum, maximum, count := ampThreadListActivityWindow(payload)
+	filtered := make([]any, 0, len(localThreads))
+	for _, rawThread := range localThreads {
+		thread := mapValue(rawThread)
+		if upstreamIDs[ampThreadListItemID(thread)] {
+			filtered = append(filtered, rawThread)
+			continue
+		}
+		activity := ampThreadListActivityMillis(thread)
+		if activity == 0 || count == 0 || activity > maximum {
+			continue
+		}
+		if count >= limit && activity < minimum {
+			continue
+		}
+		filtered = append(filtered, rawThread)
+	}
+	return filtered
+}
+
+func ampThreadListActivityWindow(value any) (int, int, int) {
+	minimum := 0
+	maximum := 0
+	count := 0
+	var visit func(any)
+	visit = func(current any) {
+		switch typed := current.(type) {
+		case map[string]any:
+			if threadID := ampThreadListItemID(typed); neoThreadIDExactPattern.MatchString(threadID) {
+				activity := ampThreadListActivityMillis(typed)
+				if activity > 0 {
+					if minimum == 0 || activity < minimum {
+						minimum = activity
+					}
+					if activity > maximum {
+						maximum = activity
+					}
+				}
+				count++
+				return
+			}
+			for _, key := range []string{"threads", "items", "result", "data"} {
+				if child, ok := typed[key]; ok {
+					visit(child)
+				}
+			}
+		case []any:
+			for _, child := range typed {
+				visit(child)
+			}
+		}
+	}
+	visit(value)
+	return minimum, maximum, count
 }
 
 func ampThreadListResponseIDs(value any) map[string]bool {
@@ -902,8 +969,12 @@ func rewriteAmpThreadListRequestWindow(req *http.Request, augmenter ampProxyThre
 	if req == nil || req.URL == nil || augmenter.limit <= 0 || strings.TrimSpace(req.Header.Get("Content-Encoding")) != "" {
 		return false
 	}
-	upstreamLimit := augmenter.offset + augmenter.limit + augmenter.upstreamOverfetch
-	if upstreamLimit < augmenter.limit || upstreamLimit < augmenter.upstreamOverfetch {
+	upstreamOverfetch := min(augmenter.upstreamOverfetch, max(augmenter.limit, neoRecentThreadsCloudSeedDefault))
+	upstreamLimit := augmenter.offset + augmenter.limit + upstreamOverfetch
+	if upstreamLimit < augmenter.limit || upstreamLimit < upstreamOverfetch {
+		return false
+	}
+	if upstreamLimit > ampThreadListUpstreamMaxLimit {
 		return false
 	}
 	body, err := readAndRestoreNeoJSONBody(req)

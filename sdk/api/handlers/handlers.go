@@ -469,6 +469,9 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 			parentCtx = logging.WithRequestID(parentCtx, requestID)
 		}
 	}
+	if util.IsTrustedLocalNeoInference(requestCtx) {
+		parentCtx = util.WithTrustedLocalNeoInference(parentCtx)
+	}
 	newCtx, cancel := context.WithCancel(parentCtx)
 
 	endpoint := ""
@@ -602,7 +605,7 @@ func isAmpStrictJSONRequest(c *gin.Context) bool {
 		return false
 	}
 	headers := c.Request.Header
-	if strings.TrimSpace(headers.Get("X-CLIProxyAPI-Local-Neo-Inference")) == "1" {
+	if util.IsTrustedLocalNeoInference(c.Request.Context()) {
 		return true
 	}
 	if strings.TrimSpace(headers.Get("X-Amp-Client-Application")) != "" ||
