@@ -5,14 +5,17 @@ package cliproxy
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/api"
+	chatgptweb "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/chatgptweb"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
@@ -25,6 +28,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/sync/singleflight"
 )
 
 // Service wraps the proxy server lifecycle so external programs can embed the CLI proxy.
@@ -96,9 +100,40 @@ type Service struct {
 
 	homeClient *home.Client
 	homeCancel context.CancelFunc
+
+	chatGPTWebCatalogMu sync.Mutex
+	chatGPTWebCatalogs  map[string]chatGPTWebCatalogEntry
+	chatGPTWebRefreshMu sync.Mutex
+	chatGPTWebRefreshCh chan struct{}
+	// Capacity-one trigger channel so repeated config reloads coalesce
+	// onto a single in-flight catalog refresh batch plus one pending rerun.
+	chatGPTWebRefreshTrigger chan struct{}
+	modelRefreshes           singleflight.Group
+	modelRegistrationMu      sync.Mutex
+	modelRegistrations       map[string]*modelRegistrationLock
+	runtimeContextMu         sync.RWMutex
+	runtimeContext           context.Context
 }
 
 var serviceShutdownTimeout = 30 * time.Second
+var chatGPTWebCatalogCacheTTL = 5 * time.Minute
+var chatGPTWebCatalogRetryInterval = 5 * time.Minute
+var chatGPTWebRefreshConcurrency = 4
+
+const chatGPTWebCatalogRefreshInterval = 3 * time.Hour
+
+type chatGPTWebCatalogEntry struct {
+	models        []*ModelInfo
+	fingerprint   [32]byte
+	fetchedAt     time.Time
+	discovered    bool
+	refreshFailed bool
+}
+
+type modelRegistrationLock struct {
+	mu   sync.Mutex
+	refs int
+}
 
 func newServiceShutdownContext() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), serviceShutdownTimeout)
@@ -139,7 +174,7 @@ func (s *Service) ensureAuthUpdateQueue(ctx context.Context) {
 }
 
 func (s *Service) consumeAuthUpdates(ctx context.Context) {
-	ctx = coreauth.WithSkipPersist(ctx)
+	ctx = coreauth.WithWatcherReplay(ctx)
 	for {
 		select {
 		case <-ctx.Done():
@@ -289,6 +324,8 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 		return
 	}
 	auth = auth.Clone()
+	unlockRegistration := s.lockModelRegistration(auth.ID)
+	defer unlockRegistration()
 	s.ensureExecutorsForAuth(auth)
 
 	// IMPORTANT: Update coreManager FIRST, before model registration.
@@ -296,6 +333,7 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 	// immediately for API calls, rather than waiting for model registration to complete.
 	op := "register"
 	var err error
+	var merged *coreauth.Auth
 	if existing, ok := s.coreManager.GetByID(auth.ID); ok {
 		auth.CreatedAt = existing.CreatedAt
 		if !existing.Disabled && existing.Status != coreauth.StatusDisabled && !auth.Disabled && auth.Status != coreauth.StatusDisabled {
@@ -306,9 +344,9 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 			}
 		}
 		op = "update"
-		_, err = s.coreManager.Update(ctx, auth)
+		merged, err = s.coreManager.Update(ctx, auth)
 	} else {
-		_, err = s.coreManager.Register(ctx, auth)
+		merged, err = s.coreManager.Register(ctx, auth)
 	}
 	if err != nil {
 		log.Errorf("failed to %s auth %s: %v", op, auth.ID, err)
@@ -318,11 +356,21 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 			return
 		}
 		auth = current
+	} else if merged != nil {
+		// Update may preserve newer runtime metadata from a concurrent write;
+		// use the manager-returned snapshot so downstream catalog/model state
+		// matches what the manager actually stored.
+		auth = merged
+	}
+	if strings.EqualFold(strings.TrimSpace(auth.Provider), "chatgpt-web") {
+		s.prepareChatGPTWebCatalogForAuth(auth)
+	} else {
+		s.chatGPTWebCatalogMu.Lock()
+		delete(s.chatGPTWebCatalogs, auth.ID)
+		s.chatGPTWebCatalogMu.Unlock()
 	}
 
 	// Register models after auth is updated in coreManager.
-	// This operation may block on network calls, but the auth configuration
-	// is already effective at this point.
 	s.registerModelsForAuth(auth)
 	s.coreManager.ReconcileRegistryModelStates(ctx, auth.ID)
 
@@ -331,6 +379,12 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 	// have an empty supportedModelSet (because Register/Update upserts into the
 	// scheduler before registerModelsForAuth runs) and are invisible to the scheduler.
 	s.coreManager.RefreshSchedulerEntry(auth.ID)
+	if !auth.Disabled && auth.Status != coreauth.StatusDisabled && strings.EqualFold(strings.TrimSpace(auth.Provider), "chatgpt-web") {
+		refreshCtx := s.chatGPTWebRefreshContext(ctx)
+		if refreshCtx != nil {
+			s.queueModelRegistrationRefresh(refreshCtx, auth.Clone())
+		}
+	}
 }
 
 func (s *Service) applyCoreAuthRemoval(ctx context.Context, id string) {
@@ -340,6 +394,11 @@ func (s *Service) applyCoreAuthRemoval(ctx context.Context, id string) {
 	if s.coreManager == nil {
 		return
 	}
+	unlockRegistration := s.lockModelRegistration(id)
+	defer unlockRegistration()
+	s.chatGPTWebCatalogMu.Lock()
+	delete(s.chatGPTWebCatalogs, id)
+	s.chatGPTWebCatalogMu.Unlock()
 	GlobalModelRegistry().UnregisterClient(id)
 	if existing, ok := s.coreManager.GetByID(id); ok && existing != nil {
 		existing.Disabled = true
@@ -351,6 +410,30 @@ func (s *Service) applyCoreAuthRemoval(ctx context.Context, id string) {
 			executor.CloseCodexWebsocketSessionsForAuthID(existing.ID, "auth_removed")
 			s.ensureExecutorsForAuth(existing)
 		}
+	}
+}
+
+func (s *Service) lockModelRegistration(authID string) func() {
+	s.modelRegistrationMu.Lock()
+	if s.modelRegistrations == nil {
+		s.modelRegistrations = make(map[string]*modelRegistrationLock)
+	}
+	lock := s.modelRegistrations[authID]
+	if lock == nil {
+		lock = &modelRegistrationLock{}
+		s.modelRegistrations[authID] = lock
+	}
+	lock.refs++
+	s.modelRegistrationMu.Unlock()
+	lock.mu.Lock()
+	return func() {
+		lock.mu.Unlock()
+		s.modelRegistrationMu.Lock()
+		lock.refs--
+		if lock.refs == 0 {
+			delete(s.modelRegistrations, authID)
+		}
+		s.modelRegistrationMu.Unlock()
 	}
 }
 
@@ -419,7 +502,7 @@ func (s *Service) ensureExecutorsForAuthWithMode(a *coreauth.Auth, forceReplace 
 		s.coreManager.RegisterExecutor(executor.NewOpenAICompatExecutor(compatProviderKey, s.cfg))
 		return
 	}
-	switch strings.ToLower(a.Provider) {
+	switch strings.ToLower(strings.TrimSpace(a.Provider)) {
 	case "gemini":
 		s.coreManager.RegisterExecutor(executor.NewGeminiExecutor(s.cfg))
 	case "vertex":
@@ -437,6 +520,16 @@ func (s *Service) ensureExecutorsForAuthWithMode(a *coreauth.Auth, forceReplace 
 		s.coreManager.RegisterExecutor(executor.NewClaudeExecutor(s.cfg))
 	case "kimi":
 		s.coreManager.RegisterExecutor(executor.NewKimiExecutor(s.cfg))
+	case "chatgpt-web":
+		if !forceReplace {
+			existingExecutor, hasExecutor := s.coreManager.Executor("chatgpt-web")
+			if hasExecutor {
+				if _, isChatGPTWebExecutor := existingExecutor.(*executor.ChatGPTWebExecutor); isChatGPTWebExecutor {
+					return
+				}
+			}
+		}
+		s.coreManager.RegisterExecutor(executor.NewChatGPTWebExecutor(s.cfg, s.coreManager.UpdateMetadata))
 	default:
 		providerKey := strings.ToLower(strings.TrimSpace(a.Provider))
 		if providerKey == "" {
@@ -560,6 +653,64 @@ func (s *Service) applyConfigUpdate(newCfg *config.Config) {
 		s.coreManager.SetOAuthModelAlias(newCfg.OAuthModelAlias)
 	}
 	s.rebindExecutors()
+	s.triggerChatGPTWebCatalogRefresh()
+}
+
+// triggerChatGPTWebCatalogRefresh asks the service-owned refresh coordinator
+// to re-discover ChatGPT web catalogs against the latest config. Triggers
+// coalesce: one batch runs at a time and at most one rerun stays pending, so
+// rapid hot reloads cannot accumulate refresh goroutines or queued upstream
+// work. Each batch snapshots eligible auths when it starts, so a coalesced
+// rerun still observes the newest config.
+func (s *Service) triggerChatGPTWebCatalogRefresh() {
+	if s == nil || s.coreManager == nil {
+		return
+	}
+	refreshCtx := s.chatGPTWebRefreshContext(nil)
+	if refreshCtx == nil {
+		return
+	}
+	s.chatGPTWebRefreshMu.Lock()
+	trigger := s.chatGPTWebRefreshTrigger
+	if trigger == nil {
+		trigger = make(chan struct{}, 1)
+		s.chatGPTWebRefreshTrigger = trigger
+		go func() {
+			s.runChatGPTWebRefreshCoordinator(refreshCtx, trigger)
+			s.chatGPTWebRefreshMu.Lock()
+			if s.chatGPTWebRefreshTrigger == trigger {
+				s.chatGPTWebRefreshTrigger = nil
+			}
+			s.chatGPTWebRefreshMu.Unlock()
+		}()
+	}
+	s.chatGPTWebRefreshMu.Unlock()
+	select {
+	case trigger <- struct{}{}:
+	default:
+	}
+}
+
+// runChatGPTWebRefreshCoordinator drains refresh triggers until the service
+// shuts down. A trigger consumed while a batch is running schedules exactly
+// one rerun against a fresh eligibility snapshot.
+func (s *Service) runChatGPTWebRefreshCoordinator(ctx context.Context, trigger <-chan struct{}) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-trigger:
+		}
+		eligible := make([]*coreauth.Auth, 0)
+		for _, auth := range s.coreManager.List() {
+			if auth == nil || auth.Disabled || auth.Status == coreauth.StatusDisabled || !strings.EqualFold(strings.TrimSpace(auth.Provider), "chatgpt-web") {
+				continue
+			}
+			s.prepareChatGPTWebCatalogForAuth(auth)
+			eligible = append(eligible, auth)
+		}
+		s.runBoundedChatGPTWebRefreshes(ctx, eligible)
+	}
 }
 
 func forceHomeRuntimeConfig(cfg *config.Config) {
@@ -734,6 +885,11 @@ func (s *Service) Run(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	ctx, runCancel := context.WithCancel(ctx)
+	var chatGPTWebCatalogDone <-chan struct{}
+	s.runtimeContextMu.Lock()
+	s.runtimeContext = ctx
+	s.runtimeContextMu.Unlock()
 
 	usage.StartDefault(ctx)
 	homeEnabled := s.cfg != nil && s.cfg.Home.Enabled
@@ -743,6 +899,10 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	defer func() {
+		runCancel()
+		if chatGPTWebCatalogDone != nil {
+			<-chatGPTWebCatalogDone
+		}
 		shutdownCtx, shutdownCancel := newServiceShutdownContext()
 		defer shutdownCancel()
 		if err := s.Shutdown(shutdownCtx); err != nil {
@@ -854,7 +1014,7 @@ func (s *Service) Run(ctx context.Context) error {
 			if !providerSet[provider] {
 				continue
 			}
-			if s.refreshModelRegistrationForAuth(auth) {
+			if s.refreshModelRegistrationForAuth(ctx, auth) {
 				refreshed++
 			}
 		}
@@ -863,6 +1023,12 @@ func (s *Service) Run(ctx context.Context) error {
 			log.Infof("re-registered models for %d auth(s) due to model catalog changes: %v", refreshed, changedProviders)
 		}
 	})
+	catalogDone := make(chan struct{})
+	chatGPTWebCatalogDone = catalogDone
+	go func() {
+		defer close(catalogDone)
+		s.runChatGPTWebCatalogUpdater(ctx)
+	}()
 
 	s.serverErr = make(chan error, 1)
 	go func() {
@@ -1028,12 +1194,391 @@ func (s *Service) ensureAuthDir() error {
 	return nil
 }
 
+func (s *Service) runChatGPTWebCatalogUpdater(ctx context.Context) {
+	refreshTicker := time.NewTicker(chatGPTWebCatalogRefreshInterval)
+	retryTicker := time.NewTicker(chatGPTWebCatalogRetryInterval)
+	defer refreshTicker.Stop()
+	defer retryTicker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-refreshTicker.C:
+			refreshed, discovered := s.refreshChatGPTWebModelRegistrations(ctx)
+			if refreshed > 0 {
+				stale := refreshed - discovered
+				if stale < 0 {
+					stale = 0
+				}
+				log.Infof("refreshed ChatGPT web model catalogs for %d auth(s) (%d discovered, %d stale/fallback)", refreshed, discovered, stale)
+			}
+		case <-retryTicker.C:
+			s.retryFailedChatGPTWebModelRegistrations(ctx)
+		}
+	}
+}
+
+func (s *Service) retryFailedChatGPTWebModelRegistrations(ctx context.Context) int {
+	if s == nil || s.coreManager == nil {
+		return 0
+	}
+	now := time.Now()
+	eligible := make([]*coreauth.Auth, 0)
+	for _, auth := range s.coreManager.List() {
+		if auth == nil || auth.Disabled || auth.Status == coreauth.StatusDisabled || !strings.EqualFold(strings.TrimSpace(auth.Provider), "chatgpt-web") {
+			continue
+		}
+		fingerprint := s.chatGPTWebAuthFingerprint(auth)
+		s.chatGPTWebCatalogMu.Lock()
+		cached, ok := s.chatGPTWebCatalogs[auth.ID]
+		retry := ok && cached.fingerprint == fingerprint && cached.refreshFailed && now.Sub(cached.fetchedAt) >= chatGPTWebCatalogRetryInterval
+		s.chatGPTWebCatalogMu.Unlock()
+		if retry {
+			eligible = append(eligible, auth)
+		}
+	}
+	return s.runBoundedChatGPTWebRefreshes(ctx, eligible)
+}
+
+func (s *Service) refreshChatGPTWebModelRegistrations(ctx context.Context) (refreshed, discovered int) {
+	if s == nil || s.coreManager == nil {
+		return 0, 0
+	}
+	eligible := make([]*coreauth.Auth, 0)
+	for _, auth := range s.coreManager.List() {
+		if auth == nil || auth.Disabled || auth.Status == coreauth.StatusDisabled || !strings.EqualFold(strings.TrimSpace(auth.Provider), "chatgpt-web") {
+			continue
+		}
+		eligible = append(eligible, auth)
+	}
+	refreshed = s.runBoundedChatGPTWebRefreshes(ctx, eligible)
+	for _, auth := range eligible {
+		fingerprint := s.chatGPTWebAuthFingerprint(auth)
+		s.chatGPTWebCatalogMu.Lock()
+		cached, ok := s.chatGPTWebCatalogs[auth.ID]
+		if ok && cached.fingerprint == fingerprint && cached.discovered && !cached.refreshFailed {
+			discovered++
+		}
+		s.chatGPTWebCatalogMu.Unlock()
+	}
+	return refreshed, discovered
+}
+
+// runBoundedChatGPTWebRefreshes refreshes the given auths concurrently
+// through the shared concurrency bound and waits for the batch to finish.
+func (s *Service) runBoundedChatGPTWebRefreshes(ctx context.Context, auths []*coreauth.Auth) int {
+	if len(auths) == 0 {
+		return 0
+	}
+	workers := chatGPTWebRefreshConcurrency
+	if len(auths) < workers {
+		workers = len(auths)
+	}
+	jobs := make(chan *coreauth.Auth)
+	var wg sync.WaitGroup
+	var refreshed atomic.Int64
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for a := range jobs {
+				if ctx.Err() != nil {
+					continue
+				}
+				if s.refreshModelRegistrationForAuth(ctx, a) {
+					refreshed.Add(1)
+				}
+			}
+		}()
+	}
+out:
+	for _, auth := range auths {
+		if ctx.Err() != nil {
+			break
+		}
+		select {
+		case jobs <- auth:
+		case <-ctx.Done():
+			break out
+		}
+	}
+	close(jobs)
+	wg.Wait()
+	return int(refreshed.Load())
+}
+
+func (s *Service) chatGPTWebModelsForAuth(auth *coreauth.Auth) []*ModelInfo {
+	fallback := registry.GetChatGPTWebModels()
+	if s == nil || s.coreManager == nil || auth == nil || auth.ID == "" {
+		return fallback
+	}
+	fingerprint := s.chatGPTWebAuthFingerprint(auth)
+
+	s.chatGPTWebCatalogMu.Lock()
+	cached, cachedOK := s.chatGPTWebCatalogs[auth.ID]
+	if cachedOK && cached.fingerprint == fingerprint && cached.discovered {
+		models := append([]*ModelInfo(nil), cached.models...)
+		s.chatGPTWebCatalogMu.Unlock()
+		return models
+	}
+	s.chatGPTWebCatalogMu.Unlock()
+	return fallback
+}
+
+// chatGPTWebAuthFingerprint hashes the effective credential and proxy inputs
+// for one auth using the service's current config.
+func (s *Service) chatGPTWebAuthFingerprint(auth *coreauth.Auth) [32]byte {
+	return chatGPTWebFingerprint(chatGPTWebCredentialFingerprint(auth), s.chatGPTWebEffectiveProxyURL(auth))
+}
+
+// chatGPTWebEffectiveProxyURL resolves the effective proxy URL for an auth
+// under the service's current config.
+func (s *Service) chatGPTWebEffectiveProxyURL(auth *coreauth.Auth) string {
+	if auth != nil {
+		if proxyURL := strings.TrimSpace(auth.ProxyURL); proxyURL != "" {
+			return proxyURL
+		}
+	}
+	if s == nil {
+		return ""
+	}
+	s.cfgMu.RLock()
+	cfg := s.cfg
+	s.cfgMu.RUnlock()
+	if cfg == nil {
+		return ""
+	}
+	return strings.TrimSpace(cfg.ProxyURL)
+}
+
+func chatGPTWebCredentialFingerprint(auth *coreauth.Auth) [32]byte {
+	if auth == nil {
+		return [32]byte{}
+	}
+	// Mirror chatGPTWebCookie: a present-but-unusable cookie must not
+	// suppress the session_token fallback.
+	cookie := ""
+	if v, ok := auth.Metadata["cookie"].(string); ok && v != "" {
+		if minimized := chatgptweb.MinimizeCookie(v); minimized != "" {
+			cookie = minimized
+		}
+	}
+	if cookie == "" {
+		if v, ok := auth.Metadata["session_token"].(string); ok && v != "" {
+			cookie = chatgptweb.MinimizeCookie(v)
+		}
+	}
+	// Match chatGPTWebUserAgent: default only when the key is absent; a
+	// present-but-invalid value must invalidate the cache with its own
+	// fingerprint instead of silently hashing the default.
+	rawUA, uaExists := auth.Metadata["user_agent"]
+	userAgent := chatgptweb.DefaultUserAgent
+	if uaExists {
+		if value, ok := rawUA.(string); ok {
+			if normalized, err := chatgptweb.NormalizeUserAgent(value); err == nil {
+				userAgent = normalized
+			} else {
+				userAgent = "\x00invalid-ua\x00" + value
+			}
+		} else {
+			userAgent = "\x00invalid-ua\x00non-string"
+		}
+	}
+	return sha256.Sum256([]byte(cookie + "\x00" + userAgent))
+}
+
+func chatGPTWebFingerprint(credential [32]byte, proxyURL string) [32]byte {
+	return sha256.Sum256([]byte(string(credential[:]) + "\x00" + proxyURL))
+}
+
+func (s *Service) prepareChatGPTWebCatalogForAuth(auth *coreauth.Auth) {
+	if s == nil || auth == nil || auth.ID == "" {
+		return
+	}
+	fingerprint := s.chatGPTWebAuthFingerprint(auth)
+	s.chatGPTWebCatalogMu.Lock()
+	defer s.chatGPTWebCatalogMu.Unlock()
+	if s.chatGPTWebCatalogs == nil {
+		s.chatGPTWebCatalogs = make(map[string]chatGPTWebCatalogEntry)
+	}
+	if cached, ok := s.chatGPTWebCatalogs[auth.ID]; !ok || cached.fingerprint != fingerprint {
+		s.chatGPTWebCatalogs[auth.ID] = chatGPTWebCatalogEntry{fingerprint: fingerprint}
+	}
+}
+
+func (s *Service) chatGPTWebAuthMatchesFingerprint(authID string, fingerprint [32]byte) bool {
+	if s == nil || s.coreManager == nil || authID == "" {
+		return false
+	}
+	active, ok := s.coreManager.GetByID(authID)
+	return ok && active != nil && !active.Disabled && active.Status != coreauth.StatusDisabled && strings.EqualFold(strings.TrimSpace(active.Provider), "chatgpt-web") && s.chatGPTWebAuthFingerprint(active) == fingerprint
+}
+
+func (s *Service) chatGPTWebRefreshContext(fallback context.Context) context.Context {
+	if s == nil {
+		return fallback
+	}
+	s.runtimeContextMu.RLock()
+	runtimeCtx := s.runtimeContext
+	s.runtimeContextMu.RUnlock()
+	if runtimeCtx != nil {
+		return runtimeCtx
+	}
+	return fallback
+}
+
+func (s *Service) modelRegistrationRefreshKey(auth *coreauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+	key := auth.ID + "\x00" + provider
+	if provider == "chatgpt-web" {
+		fingerprint := s.chatGPTWebAuthFingerprint(auth)
+		key += "\x00" + string(fingerprint[:])
+	}
+	return key
+}
+
+func (s *Service) queueModelRegistrationRefresh(ctx context.Context, auth *coreauth.Auth) {
+	if s == nil || auth == nil || auth.ID == "" {
+		return
+	}
+	key := s.modelRegistrationRefreshKey(auth)
+	s.modelRefreshes.DoChan(key, func() (any, error) {
+		return s.refreshModelRegistrationForAuthUncoalesced(ctx, auth), nil
+	})
+}
+
+// acquireChatGPTWebRefreshSlot bounds concurrent ChatGPT web catalog
+// discoveries so a config reload cannot fan out one upstream request per
+// account at once.
+func (s *Service) acquireChatGPTWebRefreshSlot(ctx context.Context) (func(), bool) {
+	s.chatGPTWebRefreshMu.Lock()
+	if s.chatGPTWebRefreshCh == nil {
+		s.chatGPTWebRefreshCh = make(chan struct{}, chatGPTWebRefreshConcurrency)
+	}
+	ch := s.chatGPTWebRefreshCh
+	s.chatGPTWebRefreshMu.Unlock()
+	select {
+	case ch <- struct{}{}:
+		return func() { <-ch }, true
+	case <-ctx.Done():
+		return nil, false
+	}
+}
+
+func (s *Service) refreshChatGPTWebModelsForAuth(ctx context.Context, auth *coreauth.Auth) []*ModelInfo {
+	fallback := registry.GetChatGPTWebModels()
+	if s == nil || s.coreManager == nil || auth == nil || auth.ID == "" {
+		return fallback
+	}
+	fingerprint := s.chatGPTWebAuthFingerprint(auth)
+
+	s.chatGPTWebCatalogMu.Lock()
+	cached, cachedOK := s.chatGPTWebCatalogs[auth.ID]
+	if !cachedOK || cached.fingerprint != fingerprint {
+		if s.chatGPTWebCatalogs == nil {
+			s.chatGPTWebCatalogs = make(map[string]chatGPTWebCatalogEntry)
+		}
+		cached = chatGPTWebCatalogEntry{fingerprint: fingerprint}
+		s.chatGPTWebCatalogs[auth.ID] = cached
+		cachedOK = false
+	}
+	if cachedOK && cached.fingerprint == fingerprint && time.Since(cached.fetchedAt) < chatGPTWebCatalogCacheTTL {
+		models := append([]*ModelInfo(nil), cached.models...)
+		s.chatGPTWebCatalogMu.Unlock()
+		return models
+	}
+	s.chatGPTWebCatalogMu.Unlock()
+
+	release, acquired := s.acquireChatGPTWebRefreshSlot(ctx)
+	if !acquired {
+		return fallback
+	}
+	defer release()
+
+	providerExecutor, ok := s.coreManager.Executor("chatgpt-web")
+	webExecutor, okWeb := providerExecutor.(*executor.ChatGPTWebExecutor)
+	if !ok || !okWeb {
+		return fallback
+	}
+	// Capture the credential and proxy fingerprint before the blocking
+	// discovery so a config update that happens mid-fetch cannot let a
+	// stale result publish under the new proxy generation. The proxy comes
+	// from the executor's own config snapshot so the fingerprint matches
+	// the proxy DiscoverModels will actually use.
+	startCredential := chatGPTWebCredentialFingerprint(auth)
+	startProxyURL := webExecutor.EffectiveProxyURL(auth)
+	startFingerprint := chatGPTWebFingerprint(startCredential, startProxyURL)
+	models, discoveredAuth, err := webExecutor.DiscoverModels(ctx, auth)
+	// Reject the result unless the executor's effective proxy still matches
+	// the starting value; a catalog fetched through a stale proxy must not
+	// publish under a new proxy generation.
+	if chatGPTWebFingerprint(startCredential, webExecutor.EffectiveProxyURL(auth)) != startFingerprint {
+		return fallback
+	}
+	discoveredCredential := chatGPTWebCredentialFingerprint(discoveredAuth)
+	discoveredFingerprint := chatGPTWebFingerprint(discoveredCredential, startProxyURL)
+	if err != nil {
+		if !s.chatGPTWebAuthMatchesFingerprint(auth.ID, discoveredFingerprint) {
+			return fallback
+		}
+		s.chatGPTWebCatalogMu.Lock()
+		cached, cachedOK = s.chatGPTWebCatalogs[auth.ID]
+		if !cachedOK || cached.fingerprint != fingerprint && cached.fingerprint != discoveredFingerprint {
+			s.chatGPTWebCatalogMu.Unlock()
+			return fallback
+		}
+		cached.fingerprint = discoveredFingerprint
+		cached.refreshFailed = true
+		if cached.discovered {
+			cached.fetchedAt = time.Now()
+			s.chatGPTWebCatalogs[auth.ID] = cached
+		} else {
+			cached = chatGPTWebCatalogEntry{
+				models:        append([]*ModelInfo(nil), fallback...),
+				fingerprint:   discoveredFingerprint,
+				fetchedAt:     time.Now(),
+				refreshFailed: true,
+			}
+			s.chatGPTWebCatalogs[auth.ID] = cached
+			cachedOK = false
+		}
+		s.chatGPTWebCatalogMu.Unlock()
+		if cachedOK && cached.fingerprint == discoveredFingerprint && cached.discovered {
+			log.WithError(err).WithField("auth_id", auth.ID).Warn("ChatGPT web model catalog refresh failed; keeping the last successful catalog")
+			return append([]*ModelInfo(nil), cached.models...)
+		}
+		log.WithError(err).WithField("auth_id", auth.ID).Warn("ChatGPT web model catalog discovery failed; using built-in models")
+		return fallback
+	}
+
+	if !s.chatGPTWebAuthMatchesFingerprint(auth.ID, discoveredFingerprint) {
+		return fallback
+	}
+	s.chatGPTWebCatalogMu.Lock()
+	cached, cachedOK = s.chatGPTWebCatalogs[auth.ID]
+	if !cachedOK || cached.fingerprint != fingerprint && cached.fingerprint != discoveredFingerprint {
+		s.chatGPTWebCatalogMu.Unlock()
+		return fallback
+	}
+	s.chatGPTWebCatalogs[auth.ID] = chatGPTWebCatalogEntry{
+		models:      append([]*ModelInfo(nil), models...),
+		fingerprint: discoveredFingerprint,
+		fetchedAt:   time.Now(),
+		discovered:  true,
+	}
+	s.chatGPTWebCatalogMu.Unlock()
+	return models
+}
+
 // registerModelsForAuth (re)binds provider models in the global registry using the core auth ID as client identifier.
 func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 	if a == nil || a.ID == "" {
 		return
 	}
-	if a.Disabled {
+	if a.Disabled || a.Status == coreauth.StatusDisabled {
 		GlobalModelRegistry().UnregisterClient(a.ID)
 		return
 	}
@@ -1062,7 +1607,10 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 	if compatDetected {
 		provider = "openai-compatibility"
 	}
-	excluded := s.oauthExcludedModels(provider, authKind)
+	s.cfgMu.RLock()
+	cfg := s.cfg
+	s.cfgMu.RUnlock()
+	excluded := oauthExcludedModels(cfg, provider, authKind)
 	// The synthesizer pre-merges per-account and global exclusions into the "excluded_models" attribute.
 	// If this attribute is present, it represents the complete list of exclusions and overrides the global config.
 	if a.Attributes != nil {
@@ -1074,7 +1622,7 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 	switch provider {
 	case "gemini":
 		models = registry.GetGeminiModels()
-		if entry := s.resolveConfigGeminiKey(a); entry != nil {
+		if entry := resolveConfigGeminiKey(cfg, a); entry != nil {
 			if len(entry.Models) > 0 {
 				models = buildGeminiConfigModels(entry)
 			}
@@ -1086,7 +1634,7 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 	case "vertex":
 		// Vertex AI Gemini supports the same model identifiers as Gemini.
 		models = registry.GetGeminiVertexModels()
-		if entry := s.resolveConfigVertexCompatKey(a); entry != nil {
+		if entry := resolveConfigVertexCompatKey(cfg, a); entry != nil {
 			if len(entry.Models) > 0 {
 				models = buildVertexCompatConfigModels(entry)
 			}
@@ -1106,7 +1654,7 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 		models = applyExcludedModels(models, excluded)
 	case "claude":
 		models = registry.GetClaudeModels()
-		if entry := s.resolveConfigClaudeKey(a); entry != nil {
+		if entry := resolveConfigClaudeKey(cfg, a); entry != nil {
 			if len(entry.Models) > 0 {
 				models = buildClaudeConfigModels(entry)
 			}
@@ -1132,7 +1680,7 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 		default:
 			models = registry.GetCodexProModels()
 		}
-		if entry := s.resolveConfigCodexKey(a); entry != nil {
+		if entry := resolveConfigCodexKey(cfg, a); entry != nil {
 			if len(entry.Models) > 0 {
 				models = buildCodexConfigModels(entry)
 			}
@@ -1144,9 +1692,14 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 	case "kimi":
 		models = registry.GetKimiModels()
 		models = applyExcludedModels(models, excluded)
+	case "chatgpt-web":
+		models = s.chatGPTWebModelsForAuth(a)
+		// Exclusions may name either the namespaced catalog ID
+		// (chatgpt-web/<slug>) or the bare upstream slug; match both.
+		models = applyExcludedModelsMatching(models, excluded, chatGPTWebModelCandidates)
 	default:
 		// Handle OpenAI-compatibility providers by name using config
-		if s.cfg != nil {
+		if cfg != nil {
 			providerKey := provider
 			compatName := strings.TrimSpace(a.Provider)
 			isCompatAuth := false
@@ -1183,8 +1736,8 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 					isCompatAuth = true
 				}
 			}
-			for i := range s.cfg.OpenAICompatibility {
-				compat := &s.cfg.OpenAICompatibility[i]
+			for i := range cfg.OpenAICompatibility {
+				compat := &cfg.OpenAICompatibility[i]
 				if compat.Disabled {
 					continue
 				}
@@ -1219,7 +1772,7 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 						if providerKey == "" {
 							providerKey = "openai-compatibility"
 						}
-						s.registerResolvedModelsForAuth(a, providerKey, applyModelPrefixes(ms, a.Prefix, s.cfg.ForceModelPrefix))
+						s.registerResolvedModelsForAuth(a, providerKey, applyModelPrefixes(ms, a.Prefix, cfg.ForceModelPrefix))
 					} else {
 						// Ensure stale registrations are cleared when model list becomes empty.
 						GlobalModelRegistry().UnregisterClient(a.ID)
@@ -1234,13 +1787,13 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 			}
 		}
 	}
-	models = applyOAuthModelAlias(s.cfg, provider, authKind, models)
+	models = applyOAuthModelAlias(cfg, provider, authKind, models)
 	if len(models) > 0 {
 		key := provider
 		if key == "" {
 			key = strings.ToLower(strings.TrimSpace(a.Provider))
 		}
-		s.registerResolvedModelsForAuth(a, key, applyModelPrefixes(models, a.Prefix, s.cfg != nil && s.cfg.ForceModelPrefix))
+		s.registerResolvedModelsForAuth(a, key, applyModelPrefixes(models, a.Prefix, cfg != nil && cfg.ForceModelPrefix))
 		return
 	}
 
@@ -1254,19 +1807,33 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 // Re-registration is deliberate: registry cooldown/suspension state is treated
 // as part of the previous registration snapshot and is cleared when the auth is
 // rebound to the refreshed model catalog.
-func (s *Service) refreshModelRegistrationForAuth(current *coreauth.Auth) bool {
+func (s *Service) refreshModelRegistrationForAuth(ctx context.Context, current *coreauth.Auth) bool {
+	if s == nil || s.coreManager == nil || current == nil || current.ID == "" {
+		return false
+	}
+	value, _, _ := s.modelRefreshes.Do(s.modelRegistrationRefreshKey(current), func() (any, error) {
+		return s.refreshModelRegistrationForAuthUncoalesced(ctx, current), nil
+	})
+	refreshed, _ := value.(bool)
+	return refreshed
+}
+
+func (s *Service) refreshModelRegistrationForAuthUncoalesced(ctx context.Context, current *coreauth.Auth) bool {
 	if s == nil || s.coreManager == nil || current == nil || current.ID == "" {
 		return false
 	}
 
-	if !current.Disabled {
+	if !current.Disabled && current.Status != coreauth.StatusDisabled {
 		s.ensureExecutorsForAuth(current)
 	}
-	s.registerModelsForAuth(current)
-	s.coreManager.ReconcileRegistryModelStates(context.Background(), current.ID)
+	if !current.Disabled && current.Status != coreauth.StatusDisabled && strings.EqualFold(strings.TrimSpace(current.Provider), "chatgpt-web") {
+		s.refreshChatGPTWebModelsForAuth(ctx, current)
+	}
 
+	unlockRegistration := s.lockModelRegistration(current.ID)
+	defer unlockRegistration()
 	latest, ok := s.latestAuthForModelRegistration(current.ID)
-	if !ok || latest.Disabled {
+	if !ok || latest.Disabled || latest.Status == coreauth.StatusDisabled {
 		GlobalModelRegistry().UnregisterClient(current.ID)
 		s.coreManager.RefreshSchedulerEntry(current.ID)
 		return false
@@ -1296,8 +1863,8 @@ func (s *Service) latestAuthForModelRegistration(authID string) (*coreauth.Auth,
 	return auth, true
 }
 
-func (s *Service) resolveConfigClaudeKey(auth *coreauth.Auth) *config.ClaudeKey {
-	if auth == nil || s.cfg == nil {
+func resolveConfigClaudeKey(cfg *config.Config, auth *coreauth.Auth) *config.ClaudeKey {
+	if auth == nil || cfg == nil {
 		return nil
 	}
 	var attrKey, attrBase string
@@ -1305,8 +1872,8 @@ func (s *Service) resolveConfigClaudeKey(auth *coreauth.Auth) *config.ClaudeKey 
 		attrKey = strings.TrimSpace(auth.Attributes["api_key"])
 		attrBase = strings.TrimSpace(auth.Attributes["base_url"])
 	}
-	for i := range s.cfg.ClaudeKey {
-		entry := &s.cfg.ClaudeKey[i]
+	for i := range cfg.ClaudeKey {
+		entry := &cfg.ClaudeKey[i]
 		cfgKey := strings.TrimSpace(entry.APIKey)
 		cfgBase := strings.TrimSpace(entry.BaseURL)
 		if attrKey != "" && attrBase != "" {
@@ -1325,8 +1892,8 @@ func (s *Service) resolveConfigClaudeKey(auth *coreauth.Auth) *config.ClaudeKey 
 		}
 	}
 	if attrKey != "" {
-		for i := range s.cfg.ClaudeKey {
-			entry := &s.cfg.ClaudeKey[i]
+		for i := range cfg.ClaudeKey {
+			entry := &cfg.ClaudeKey[i]
 			if strings.EqualFold(strings.TrimSpace(entry.APIKey), attrKey) {
 				return entry
 			}
@@ -1335,8 +1902,8 @@ func (s *Service) resolveConfigClaudeKey(auth *coreauth.Auth) *config.ClaudeKey 
 	return nil
 }
 
-func (s *Service) resolveConfigGeminiKey(auth *coreauth.Auth) *config.GeminiKey {
-	if auth == nil || s.cfg == nil {
+func resolveConfigGeminiKey(cfg *config.Config, auth *coreauth.Auth) *config.GeminiKey {
+	if auth == nil || cfg == nil {
 		return nil
 	}
 	var attrKey, attrBase string
@@ -1344,8 +1911,8 @@ func (s *Service) resolveConfigGeminiKey(auth *coreauth.Auth) *config.GeminiKey 
 		attrKey = strings.TrimSpace(auth.Attributes["api_key"])
 		attrBase = strings.TrimSpace(auth.Attributes["base_url"])
 	}
-	for i := range s.cfg.GeminiKey {
-		entry := &s.cfg.GeminiKey[i]
+	for i := range cfg.GeminiKey {
+		entry := &cfg.GeminiKey[i]
 		cfgKey := strings.TrimSpace(entry.APIKey)
 		cfgBase := strings.TrimSpace(entry.BaseURL)
 		if attrKey != "" && strings.EqualFold(cfgKey, attrKey) {
@@ -1361,8 +1928,8 @@ func (s *Service) resolveConfigGeminiKey(auth *coreauth.Auth) *config.GeminiKey 
 	return nil
 }
 
-func (s *Service) resolveConfigVertexCompatKey(auth *coreauth.Auth) *config.VertexCompatKey {
-	if auth == nil || s.cfg == nil {
+func resolveConfigVertexCompatKey(cfg *config.Config, auth *coreauth.Auth) *config.VertexCompatKey {
+	if auth == nil || cfg == nil {
 		return nil
 	}
 	var attrKey, attrBase string
@@ -1370,8 +1937,8 @@ func (s *Service) resolveConfigVertexCompatKey(auth *coreauth.Auth) *config.Vert
 		attrKey = strings.TrimSpace(auth.Attributes["api_key"])
 		attrBase = strings.TrimSpace(auth.Attributes["base_url"])
 	}
-	for i := range s.cfg.VertexCompatAPIKey {
-		entry := &s.cfg.VertexCompatAPIKey[i]
+	for i := range cfg.VertexCompatAPIKey {
+		entry := &cfg.VertexCompatAPIKey[i]
 		cfgKey := strings.TrimSpace(entry.APIKey)
 		cfgBase := strings.TrimSpace(entry.BaseURL)
 		if attrKey != "" && strings.EqualFold(cfgKey, attrKey) {
@@ -1385,8 +1952,8 @@ func (s *Service) resolveConfigVertexCompatKey(auth *coreauth.Auth) *config.Vert
 		}
 	}
 	if attrKey != "" {
-		for i := range s.cfg.VertexCompatAPIKey {
-			entry := &s.cfg.VertexCompatAPIKey[i]
+		for i := range cfg.VertexCompatAPIKey {
+			entry := &cfg.VertexCompatAPIKey[i]
 			if strings.EqualFold(strings.TrimSpace(entry.APIKey), attrKey) {
 				return entry
 			}
@@ -1395,8 +1962,8 @@ func (s *Service) resolveConfigVertexCompatKey(auth *coreauth.Auth) *config.Vert
 	return nil
 }
 
-func (s *Service) resolveConfigCodexKey(auth *coreauth.Auth) *config.CodexKey {
-	if auth == nil || s.cfg == nil {
+func resolveConfigCodexKey(cfg *config.Config, auth *coreauth.Auth) *config.CodexKey {
+	if auth == nil || cfg == nil {
 		return nil
 	}
 	var attrKey, attrBase string
@@ -1404,8 +1971,8 @@ func (s *Service) resolveConfigCodexKey(auth *coreauth.Auth) *config.CodexKey {
 		attrKey = strings.TrimSpace(auth.Attributes["api_key"])
 		attrBase = strings.TrimSpace(auth.Attributes["base_url"])
 	}
-	for i := range s.cfg.CodexKey {
-		entry := &s.cfg.CodexKey[i]
+	for i := range cfg.CodexKey {
+		entry := &cfg.CodexKey[i]
 		cfgKey := strings.TrimSpace(entry.APIKey)
 		cfgBase := strings.TrimSpace(entry.BaseURL)
 		if attrKey != "" && strings.EqualFold(cfgKey, attrKey) {
@@ -1421,8 +1988,7 @@ func (s *Service) resolveConfigCodexKey(auth *coreauth.Auth) *config.CodexKey {
 	return nil
 }
 
-func (s *Service) oauthExcludedModels(provider, authKind string) []string {
-	cfg := s.cfg
+func oauthExcludedModels(cfg *config.Config, provider, authKind string) []string {
 	if cfg == nil {
 		return nil
 	}
@@ -1435,6 +2001,12 @@ func (s *Service) oauthExcludedModels(provider, authKind string) []string {
 }
 
 func applyExcludedModels(models []*ModelInfo, excluded []string) []*ModelInfo {
+	return applyExcludedModelsMatching(models, excluded, func(model *ModelInfo) []string {
+		return []string{model.ID}
+	})
+}
+
+func applyExcludedModelsMatching(models []*ModelInfo, excluded []string, ids func(*ModelInfo) []string) []*ModelInfo {
 	if len(models) == 0 || len(excluded) == 0 {
 		return models
 	}
@@ -1454,11 +2026,16 @@ func applyExcludedModels(models []*ModelInfo, excluded []string) []*ModelInfo {
 		if model == nil {
 			continue
 		}
-		modelID := strings.ToLower(strings.TrimSpace(model.ID))
 		blocked := false
-		for _, pattern := range patterns {
-			if matchWildcard(pattern, modelID) {
-				blocked = true
+		for _, id := range ids(model) {
+			modelID := strings.ToLower(strings.TrimSpace(id))
+			for _, pattern := range patterns {
+				if matchWildcard(pattern, modelID) {
+					blocked = true
+					break
+				}
+			}
+			if blocked {
 				break
 			}
 		}
@@ -1467,6 +2044,20 @@ func applyExcludedModels(models []*ModelInfo, excluded []string) []*ModelInfo {
 		}
 	}
 	return filtered
+}
+
+func chatGPTWebModelCandidates(model *ModelInfo) []string {
+	if model == nil {
+		return nil
+	}
+	ids := []string{model.ID}
+	if slug := strings.TrimSpace(model.Version); slug != "" {
+		ids = append(ids, slug)
+	}
+	if slug := strings.TrimPrefix(model.ID, "chatgpt-web/"); slug != model.ID {
+		ids = append(ids, slug)
+	}
+	return ids
 }
 
 func applyModelPrefixes(models []*ModelInfo, prefix string, forceModelPrefix bool) []*ModelInfo {

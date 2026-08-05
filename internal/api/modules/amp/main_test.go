@@ -11,10 +11,18 @@ func TestMain(m *testing.M) {
 	if err != nil {
 		panic(err)
 	}
+	executor := filepath.Join(root, "amp-test-executor")
+	if err := os.WriteFile(executor, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		panic(err)
+	}
 	neoAmpDataDir = func() string { return filepath.Join(root, "data") }
+	neoHeadlessExecutorLogDir = func() string { return filepath.Join(root, "logs") }
 	neoHeadlessPIDDir = func() string { return filepath.Join(root, "owned-pids") }
 	neoAmpHeadlessPIDDir = func() string { return filepath.Join(root, "cache", "amp", "pids") }
 	if err := os.Setenv("XDG_CACHE_HOME", filepath.Join(root, "cache")); err != nil {
+		panic(err)
+	}
+	if err := os.Setenv("AMP_EXECUTOR_COMMAND", executor); err != nil {
 		panic(err)
 	}
 

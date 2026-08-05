@@ -795,3 +795,7 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(_ context.Co
 
 	return resp
 }
+
+func OpenAIResponsesTokenCount(_ context.Context, count int64) []byte {
+	return []byte(fmt.Sprintf(`{"object":"response.input_tokens","input_tokens":%d}`, count))
+}

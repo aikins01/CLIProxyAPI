@@ -74,7 +74,7 @@ func TestNeoRunCheckDefaultBenchmarkCandidates(t *testing.T) {
 		got = append(got, candidate.Route.Provider+"/"+candidate.Route.Model+"@"+effort)
 	}
 	want := []string{
-		"google/gemini-3.5-flash@high",
+		"openai/gpt-5.6-sol@low",
 		"openai/gpt-5.6-terra@low",
 	}
 	if !slices.Equal(got, want) {
@@ -84,6 +84,8 @@ func TestNeoRunCheckDefaultBenchmarkCandidates(t *testing.T) {
 
 func TestNeoRunCheckBenchmarkScore(t *testing.T) {
 	tc := neoRunCheckBenchmarkCase{
+		Diff:              "diff --git a/internal/router/local.go b/internal/router/local.go\n--- a/internal/router/local.go\n+++ b/internal/router/local.go\n@@ -1 +1 @@\n-old\n+new\n",
+		Files:             []string{"internal/router/local.go"},
 		ExpectedMinIssues: 1,
 		ExpectedMaxIssues: 1,
 		RequiredFile:      "internal/router/local.go",
@@ -93,7 +95,9 @@ func TestNeoRunCheckBenchmarkScore(t *testing.T) {
 		},
 	}
 	result := map[string]any{
-		"status": "completed",
+		"status":       "completed",
+		"coveredFiles": []any{"internal/router/local.go"},
+		"coveredHunks": []any{"internal/router/local.go@@+1,1"},
 		"issues": []any{map[string]any{
 			"file":    "internal/router/local.go",
 			"problem": "blocker: broad matching lacks near-miss coverage",
@@ -159,26 +163,33 @@ func neoRunCheckRunSyntheticModelBenchmark(t *testing.T, candidate neoRunCheckBe
 		"frontmatter":     map[string]any{"name": tc.CheckName},
 		"diffDescription": "synthetic working tree diff",
 		"files":           stringArrayValue(tc.Files),
-		"instructions":    "Evaluate only added or modified lines. The complete diff and all relevant context are embedded below.",
+		"instructions":    "Evaluate only added or modified lines. The immutable review diff snapshot and all relevant context are embedded below.",
 	}
-	inputText := neoSubagentInputText("run_check", input) + "\n\n<complete_diff>\n" + tc.Diff + "\n</complete_diff>"
+	input, err := neoPrepareRunCheckSnapshotInput(input, neoRunCheckBenchmarkSnapshot(tc))
+	if err != nil {
+		t.Fatalf("prepare immutable snapshot: %v", err)
+	}
+	inputText := neoSubagentInputText("run_check", input)
 	systemPrompt := strings.NewReplacer(
 		"{{WORKING_DIR}}", "/benchmark/repository",
 		"{{WORKSPACE_ROOT}}", "/benchmark/repository",
-	).Replace(neoRunCheckSubagentPrompt) + "\n\nFor this benchmark, the complete diff and relevant context are embedded in the user request. Do not call tools."
+	).Replace(neoRunCheckSubagentPrompt) + "\n\nFor this benchmark, the immutable diff snapshot and relevant context are embedded in the user request. Do not call tools."
 	settings := map[string]any{}
 	if candidate.Effort != "" {
 		settings["reasoning.effort"] = candidate.Effort
 	}
 	route := candidate.Route
 	request := neoInferenceRequest{
-		ActorID:              "actor-run-check-benchmark",
-		ThreadID:             "T-019f5000-0000-7000-8000-000000000001",
-		MessageID:            newNeoMessageID(),
-		AgentMode:            "review",
-		ReasoningEffort:      candidate.Effort,
-		Settings:             settings,
-		History:              []neoHistoryMessage{{Role: "user", Text: inputText}},
+		ActorID:         "actor-run-check-benchmark",
+		ThreadID:        "T-019f5000-0000-7000-8000-000000000001",
+		MessageID:       newNeoMessageID(),
+		AgentMode:       "review",
+		ReasoningEffort: candidate.Effort,
+		Settings:        settings,
+		History: []neoHistoryMessage{
+			{Role: "user", Text: stringValue(input[neoReviewSnapshotTextKey])},
+			{Role: "user", Text: inputText},
+		},
 		Environment:          map[string]any{"workingDirectory": "/benchmark/repository", "workspaceRoot": "/benchmark/repository"},
 		ModelRouteOverride:   &route,
 		SystemPromptOverride: systemPrompt,
@@ -210,10 +221,56 @@ func neoRunCheckRunSyntheticModelBenchmark(t *testing.T, candidate neoRunCheckBe
 	return result
 }
 
+func neoRunCheckBenchmarkSnapshot(tc neoRunCheckBenchmarkCase) *neoReviewDiffSnapshot {
+	snapshot := &neoReviewDiffSnapshot{Files: append([]string(nil), tc.Files...), Diffs: map[string]string{}}
+	for _, filename := range tc.Files {
+		startMarker := "diff --git a/" + filename + " b/" + filename
+		start := strings.Index(tc.Diff, startMarker)
+		if start < 0 {
+			continue
+		}
+		end := len(tc.Diff)
+		if next := strings.Index(tc.Diff[start+len(startMarker):], "\ndiff --git "); next >= 0 {
+			end = start + len(startMarker) + next
+		}
+		section := strings.TrimSpace(tc.Diff[start:end])
+		snapshot.Diffs[filename] = section
+		snapshot.Hunks = append(snapshot.Hunks, neoReviewDiffHunks(filename, section)...)
+	}
+	return snapshot
+}
+
+func TestNeoRunCheckBenchmarkSnapshotDoesNotDependOnFileOrder(t *testing.T) {
+	tc := neoRunCheckBenchmarkCase{
+		Diff:  "diff --git a/first.go b/first.go\n--- a/first.go\n+++ b/first.go\n@@ -1 +1 @@\n-old first\n+new first\ndiff --git a/second.go b/second.go\n--- a/second.go\n+++ b/second.go\n@@ -1 +1 @@\n-old second\n+new second\n",
+		Files: []string{"second.go", "first.go"},
+	}
+	snapshot := neoRunCheckBenchmarkSnapshot(tc)
+	if strings.Contains(snapshot.Diffs["first.go"], "second.go") {
+		t.Fatalf("first file snapshot includes second file: %s", snapshot.Diffs["first.go"])
+	}
+	if !strings.Contains(snapshot.Diffs["second.go"], "+new second") {
+		t.Fatalf("second file snapshot = %q", snapshot.Diffs["second.go"])
+	}
+}
+
 func neoRunCheckBenchmarkScore(result map[string]any, tc neoRunCheckBenchmarkCase) (bool, []string) {
 	failures := make([]string, 0)
 	if stringValue(result["status"]) != "completed" {
 		failures = append(failures, "status is not completed")
+	}
+	expectedSnapshot := neoRunCheckBenchmarkSnapshot(tc)
+	coveredFiles, filesOK := neoRunCheckStringSlice(result["coveredFiles"])
+	if !filesOK || !neoReviewSameStringSet(coveredFiles, expectedSnapshot.Files) {
+		failures = append(failures, "coveredFiles does not match the immutable snapshot")
+	}
+	expectedHunks := make([]string, 0, len(expectedSnapshot.Hunks))
+	for _, hunk := range expectedSnapshot.Hunks {
+		expectedHunks = append(expectedHunks, hunk.ID)
+	}
+	coveredHunks, hunksOK := neoRunCheckStringSlice(result["coveredHunks"])
+	if !hunksOK || !neoReviewSameStringSet(coveredHunks, expectedHunks) {
+		failures = append(failures, "coveredHunks does not match the immutable snapshot")
 	}
 	issues := arrayValue(result["issues"])
 	if len(issues) < tc.ExpectedMinIssues || len(issues) > tc.ExpectedMaxIssues {
@@ -273,7 +330,7 @@ func neoRunCheckBenchmarkCandidates(t *testing.T) []neoRunCheckBenchmarkCandidat
 	raw := strings.TrimSpace(os.Getenv("AMP_RUN_CHECK_MODEL_BENCHMARK_CANDIDATES"))
 	if raw == "" {
 		return []neoRunCheckBenchmarkCandidate{
-			{Name: "gemini-3.5-flash-high", Route: neoModelRoute{Provider: "google", Model: "gemini-3.5-flash"}, Effort: "high"},
+			{Name: "gpt-5.6-sol-low", Route: neoModelRoute{Provider: "openai", Model: "gpt-5.6-sol"}, Effort: "low"},
 			{Name: "gpt-5.6-terra-low", Route: neoModelRoute{Provider: "openai", Model: "gpt-5.6-terra"}, Effort: "low"},
 		}
 	}

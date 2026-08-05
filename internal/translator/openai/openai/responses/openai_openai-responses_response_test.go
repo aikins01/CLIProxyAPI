@@ -2,17 +2,23 @@ package responses
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	"github.com/tidwall/gjson"
 )
 
 func parseOpenAIResponsesSSEEvent(t *testing.T, chunk []byte) (string, gjson.Result) {
 	t.Helper()
 
-	lines := strings.Split(string(chunk), "\n")
-	if len(lines) < 2 {
+	frame := strings.TrimSuffix(string(chunk), "\n\n")
+	if frame == string(chunk) {
+		t.Fatalf("SSE chunk is not a complete event: %q", chunk)
+	}
+	lines := strings.Split(frame, "\n")
+	if len(lines) != 2 {
 		t.Fatalf("unexpected SSE chunk: %q", chunk)
 	}
 
@@ -22,6 +28,19 @@ func parseOpenAIResponsesSSEEvent(t *testing.T, chunk []byte) (string, gjson.Res
 		t.Fatalf("invalid SSE data JSON: %q", dataLine)
 	}
 	return event, gjson.Parse(dataLine)
+}
+
+func TestOpenAIResponsesTokenCount(t *testing.T) {
+	result := gjson.ParseBytes(OpenAIResponsesTokenCount(t.Context(), 42))
+	if got := result.Get("object").String(); got != "response.input_tokens" {
+		t.Fatalf("object = %q", got)
+	}
+	if got := result.Get("input_tokens").Int(); got != 42 {
+		t.Fatalf("input_tokens = %d", got)
+	}
+	if result.Get("response").Exists() {
+		t.Fatalf("unexpected response envelope: %s", result.Raw)
+	}
 }
 
 func TestConvertOpenAIChatCompletionsResponseToOpenAIResponses_ResponseCompletedWaitsForDone(t *testing.T) {
@@ -419,5 +438,29 @@ func TestConvertOpenAIChatCompletionsResponseToOpenAIResponses_FunctionCallDoneA
 	}
 	if completedOrder[0] != "call_glob" || completedOrder[1] != "call_read" {
 		t.Fatalf("unexpected completed function_call order: %v", completedOrder)
+	}
+}
+
+func TestOpenAIResponsesTokenCount_RegistryDispatch(t *testing.T) {
+	fallback := []byte(`{"unrelated":true}`)
+
+	got := sdktranslator.TranslateTokenCount(context.Background(), sdktranslator.FormatOpenAI, sdktranslator.FormatOpenAIResponse, 42, fallback)
+	var payload map[string]any
+	if err := json.Unmarshal(got, &payload); err != nil {
+		t.Fatalf("TranslateTokenCount returned invalid JSON: %v", err)
+	}
+	inputTokens, ok := payload["input_tokens"].(float64)
+	if !ok {
+		t.Fatalf("input_tokens missing or wrong type: %v", payload)
+	}
+	if inputTokens != 42 {
+		t.Fatalf("input_tokens = %v, want 42", inputTokens)
+	}
+
+	if got := sdktranslator.TranslateTokenCount(context.Background(), sdktranslator.FormatOpenAIResponse, sdktranslator.FormatOpenAI, 42, fallback); string(got) != string(fallback) {
+		t.Fatalf("reversed format pair = %s, want fallback %s", got, fallback)
+	}
+	if got := sdktranslator.TranslateTokenCount(context.Background(), sdktranslator.FormatOpenAI, sdktranslator.FormatGemini, 42, fallback); string(got) != string(fallback) {
+		t.Fatalf("unrelated format pair = %s, want fallback %s", got, fallback)
 	}
 }

@@ -18,7 +18,7 @@ type neoExclusiveThreadCreationContextKey struct{}
 
 func isNeoThreadTool(name string) bool {
 	switch strings.TrimSpace(name) {
-	case "find_thread", "list_agent_modes", "list_runners", "create_thread", "rename_thread", "set_thread_pinned", "add_thread_labels", "remove_thread_labels", "archive_current_thread", "archive_thread", "archive_threads", "unarchive_thread", "send_message_to_thread", "download_thread_file", "upload_thread_file":
+	case "find_thread", "list_agent_modes", "list_runners", "create_thread", "get_current_user_identity", "thread_interact", "get_thread_metadata", "update_thread", "rename_thread", "set_thread_pinned", "add_thread_labels", "remove_thread_labels", "archive_current_thread", "archive_thread", "archive_threads", "unarchive_thread", "send_message_to_thread", "download_thread_file", "upload_thread_file", "get_schedule", "set_schedule", "update_schedule", "clear_schedule":
 		return true
 	default:
 		return false
@@ -52,6 +52,13 @@ func neoThreadToolSpec(toolName string) (neoToolSpec, bool) {
 		return neoToolSpec{
 			Name:        name,
 			Description: "List Amp runners currently available to start threads, including their IDs, hosts, and working directories.",
+			InputSchema: neoThreadToolSchema(map[string]any{}, nil),
+			Meta:        map[string]any{"source": "server"},
+		}, true
+	case "get_current_user_identity":
+		return neoToolSpec{
+			Name:        name,
+			Description: "Get the signed-in user's Amp identity.",
 			InputSchema: neoThreadToolSchema(map[string]any{}, nil),
 			Meta:        map[string]any{"source": "server"},
 		}, true
@@ -115,6 +122,61 @@ func neoThreadToolSpec(toolName string) (neoToolSpec, bool) {
 				"spawnExecutor": map[string]any{"type": "boolean", "description": "Whether to start the selected executor when work is queued. Default: true."},
 				"agent":         map[string]any{"type": "object", "description": "Optional custom agent definition."},
 				"comment":       map[string]any{"type": "string", "description": "Optional relationship note."},
+			}, nil),
+			Meta: map[string]any{"source": "server"},
+		}, true
+	case "get_thread_metadata":
+		return neoToolSpec{
+			Name:        name,
+			Description: "Get the title, pinned state, labels, archive state, project, agent mode, and workspace metadata for the current Amp thread or another thread owned by the signed-in user.",
+			InputSchema: neoThreadToolSchema(map[string]any{
+				"threadId":       threadID,
+				"threadID":       threadID,
+				"targetThreadId": threadID,
+				"url":            threadID,
+			}, nil),
+			Meta: map[string]any{"source": "server"},
+		}, true
+	case "thread_interact":
+		return neoToolSpec{
+			Name:        name,
+			Description: "Read thread metadata, send a message to another thread, or archive or unarchive a thread.",
+			InputSchema: neoThreadToolSchema(map[string]any{
+				"action":         map[string]any{"type": "string", "enum": []any{"get", "message", "archive", "unarchive"}},
+				"thread":         threadID,
+				"threadId":       threadID,
+				"threadID":       threadID,
+				"targetThreadId": threadID,
+				"url":            threadID,
+				"content":        map[string]any{"type": "array", "items": map[string]any{"type": "object"}, "description": "Message content blocks for the message action."},
+				"message":        map[string]any{"type": "string", "description": "Text to send when content is omitted."},
+				"workflow":       map[string]any{"type": "string", "description": "Optional server workflow such as code_review or merge_changes."},
+				"parentToolCallId": map[string]any{
+					"type":        "string",
+					"description": "Optional parent tool call ID for transcript linkage.",
+				},
+				"sourceThreadId": map[string]any{
+					"type":        "string",
+					"description": "Optional source thread ID; local runtime derives this from the current thread.",
+				},
+				"comment": map[string]any{"type": "string", "description": "Optional relationship note."},
+			}, []any{"action"}),
+			Meta: map[string]any{"source": "server"},
+		}, true
+	case "update_thread":
+		return neoToolSpec{
+			Name:        name,
+			Description: "Update the title, pinned state, or labels of the current Amp thread or another thread owned by the signed-in user. Include only fields the user explicitly asked to change.",
+			InputSchema: neoThreadToolSchema(map[string]any{
+				"threadId":       threadID,
+				"threadID":       threadID,
+				"targetThreadId": threadID,
+				"url":            threadID,
+				"title":          map[string]any{"type": "string", "description": "New thread title, from 1 to 256 characters."},
+				"pinned":         map[string]any{"type": "boolean", "description": "True to pin the thread; false to unpin it."},
+				"labels":         map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Complete replacement label list."},
+				"addLabels":      map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Labels to add while preserving existing labels."},
+				"removeLabels":   map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Labels to remove while preserving all others."},
 			}, nil),
 			Meta: map[string]any{"source": "server"},
 		}, true
@@ -239,6 +301,8 @@ func neoThreadToolSpec(toolName string) (neoToolSpec, bool) {
 			}, []any{"thread", "path"}),
 			Meta: map[string]any{"source": "server"},
 		}, true
+	case "get_schedule", "set_schedule", "update_schedule", "clear_schedule":
+		return neoScheduleToolSpec(name), true
 	default:
 		return neoToolSpec{}, false
 	}
@@ -274,7 +338,7 @@ func (a *neoActor) runLocalThreadActorTool(pending neoPendingTool, generation in
 }
 
 func neoThreadToolProgressText(name string, input map[string]any) string {
-	target := firstNonEmptyString(input["threadId"], input["threadID"], input["targetThreadId"], input["url"])
+	target := firstNonEmptyString(input["thread"], input["threadId"], input["threadID"], input["targetThreadId"], input["url"])
 	switch strings.TrimSpace(name) {
 	case "find_thread":
 		return "Searching threads"
@@ -282,8 +346,36 @@ func neoThreadToolProgressText(name string, input map[string]any) string {
 		return "Listing agent modes"
 	case "list_runners":
 		return "Listing runners"
+	case "get_current_user_identity":
+		return "Reading current user identity"
 	case "create_thread":
 		return "Creating thread"
+	case "thread_interact":
+		switch strings.ToLower(strings.TrimSpace(stringValue(input["action"]))) {
+		case "get":
+			return "Reading thread metadata"
+		case "message":
+			if target != "" {
+				return "Sending message to thread: " + target
+			}
+			return "Sending message to thread"
+		case "archive":
+			if target != "" {
+				return "Archiving thread: " + target
+			}
+			return "Archiving this thread"
+		case "unarchive":
+			if target != "" {
+				return "Unarchiving thread: " + target
+			}
+			return "Unarchiving this thread"
+		default:
+			return "Interacting with thread"
+		}
+	case "get_thread_metadata":
+		return "Reading thread metadata"
+	case "update_thread":
+		return "Updating thread"
 	case "rename_thread":
 		return "Renaming thread"
 	case "set_thread_pinned":
@@ -316,6 +408,14 @@ func neoThreadToolProgressText(name string, input map[string]any) string {
 		return "Downloading file from thread"
 	case "upload_thread_file":
 		return "Uploading file to thread"
+	case "get_schedule":
+		return "Reading schedule"
+	case "set_schedule":
+		return "Setting schedule"
+	case "update_schedule":
+		return "Updating schedule"
+	case "clear_schedule":
+		return "Clearing schedule"
 	default:
 		return strings.TrimSpace(name)
 	}
@@ -329,8 +429,16 @@ func (a *neoActor) executeLocalThreadTool(pending neoPendingTool) (map[string]an
 		return a.executeLocalListAgentModesTool()
 	case "list_runners":
 		return a.executeLocalListRunnersTool()
+	case "get_current_user_identity":
+		return a.executeLocalGetCurrentUserIdentityTool(pending)
 	case "create_thread":
 		return a.executeLocalCreateThreadTool(pending)
+	case "thread_interact":
+		return a.executeLocalThreadInteractTool(pending)
+	case "get_thread_metadata":
+		return a.executeLocalGetThreadMetadataTool(pending.Input)
+	case "update_thread":
+		return a.executeLocalUpdateThreadTool(pending.Input)
 	case "rename_thread":
 		return a.executeLocalRenameThreadTool(pending.Input)
 	case "set_thread_pinned":
@@ -354,9 +462,25 @@ func (a *neoActor) executeLocalThreadTool(pending neoPendingTool) (map[string]an
 		return a.executeLocalDownloadThreadFileTool(pending.Input)
 	case "upload_thread_file":
 		return a.executeLocalUploadThreadFileTool(pending.Input)
+	case "get_schedule", "set_schedule", "update_schedule", "clear_schedule":
+		return a.executeLocalScheduleTool(pending.Name, pending.Input)
 	default:
 		return nil, errors.New("unsupported thread tool")
 	}
+}
+
+func (a *neoActor) executeLocalGetCurrentUserIdentityTool(pending neoPendingTool) (map[string]any, error) {
+	identity := map[string]any{"id": a.threadToolOwnerID()}
+	if a.runtime != nil && strings.TrimSpace(pending.ClientAPIKey) != "" {
+		profile := a.runtime.neoWebLocalCachedUserProfile(neoContextWithClientAPIKey(context.Background(), pending.ClientAPIKey))
+		for _, key := range []string{"id", "username", "firstName", "lastName", "email", "profilePictureUrl"} {
+			if value := strings.TrimSpace(stringValue(profile[key])); value != "" {
+				identity[key] = value
+			}
+		}
+	}
+	identity["displayName"] = neoWebLocalActivityUserDisplayName(identity)
+	return identity, nil
 }
 
 func (a *neoActor) executeLocalFindThreadTool(input map[string]any) (map[string]any, error) {
@@ -863,7 +987,7 @@ func neoCreateThreadOwnedProjectWorkingDirectories(rt *neoRuntime, ownerID strin
 			continue
 		}
 		projectID := neoThreadProjectID(meta)
-		if projectID != "" && neoThreadOwnedByUser(map[string]any{"meta": meta}, ownerID) {
+		if projectID != "" && rt.neoThreadOwnedByRequestUser(map[string]any{"meta": meta}, ownerID) {
 			workingDirectory, workspaceRoot := neoResolvedEnvironmentWorkspacePaths(environment)
 			if projectDirectory := neoWebLocalProjectDirectory(firstNonEmptyString(workspaceRoot, workingDirectory)); projectDirectory != "" {
 				add(projectID, projectDirectory)
@@ -887,7 +1011,7 @@ func neoCreateThreadOwnedProjectWorkingDirectories(rt *neoRuntime, ownerID strin
 		data := mapValue(thread["data"])
 		dataMeta := mapValue(data["meta"])
 		projectID := neoThreadProjectID(meta)
-		if !ok || !neoThreadOwnedByUser(thread, ownerID) || projectID == "" {
+		if !ok || !rt.neoThreadOwnedByRequestUser(thread, ownerID) || projectID == "" {
 			continue
 		}
 		if firstNonEmptyString(thread["runnerId"], thread["runnerID"], meta["runnerId"], meta["runnerID"], data["runnerId"], data["runnerID"], dataMeta["runnerId"], dataMeta["runnerID"]) != "" {
@@ -966,6 +1090,152 @@ func (a *neoActor) executeLocalArchiveThreadTool(input map[string]any, archive b
 	return map[string]any{"threadId": threadID, "archived": archive}, nil
 }
 
+func (a *neoActor) executeLocalGetThreadMetadataTool(input map[string]any) (map[string]any, error) {
+	target, threadID, err := a.threadToolTargetActor(input, true)
+	if err != nil {
+		return nil, err
+	}
+	return neoLocalThreadMetadata(target, threadID), nil
+}
+
+func (a *neoActor) executeLocalUpdateThreadTool(input map[string]any) (map[string]any, error) {
+	target, threadID, err := a.threadToolTargetActor(input, true)
+	if err != nil {
+		return nil, err
+	}
+	titleRaw, titleExists := input["title"]
+	title := ""
+	if titleExists {
+		var ok bool
+		title, ok = normalizeNeoClientThreadTitle(titleRaw)
+		if !ok {
+			return nil, errors.New("update_thread title must contain 1 to 256 characters")
+		}
+	}
+	pinnedRaw, pinnedExists := input["pinned"]
+	pinned, pinnedOK := pinnedRaw.(bool)
+	if pinnedExists && !pinnedOK {
+		return nil, errors.New("update_thread pinned must be a boolean")
+	}
+	labels, labelsExists, err := neoThreadToolOptionalLabels(input, "labels")
+	if err != nil {
+		return nil, err
+	}
+	addLabels, addLabelsExists, err := neoThreadToolOptionalLabels(input, "addLabels")
+	if err != nil {
+		return nil, err
+	}
+	removeLabels, removeLabelsExists, err := neoThreadToolOptionalLabels(input, "removeLabels")
+	if err != nil {
+		return nil, err
+	}
+	if labelsExists && (addLabelsExists || removeLabelsExists) {
+		return nil, errors.New("update_thread labels cannot be combined with addLabels or removeLabels")
+	}
+	if !titleExists && !pinnedExists && !labelsExists && !addLabelsExists && !removeLabelsExists {
+		return nil, errors.New("update_thread requires title, pinned, labels, addLabels, or removeLabels")
+	}
+	target.metadataMutationMu.Lock()
+	defer target.metadataMutationMu.Unlock()
+	target.mu.Lock()
+	titleChanged := titleExists && target.title != title
+	if titleExists {
+		target.title = title
+		target.titleSource = "explicit"
+	}
+	if pinnedExists {
+		target.pinned = pinned
+		value := pinned
+		target.pinnedOverride = &value
+	}
+	if target.meta == nil {
+		target.meta = map[string]any{}
+	}
+	updatedLabels := neoThreadLabelsFromAny(target.meta["labels"])
+	if labelsExists {
+		updatedLabels = neoNormalizeThreadLabels(labels)
+	} else {
+		if addLabelsExists {
+			updatedLabels = neoNormalizeThreadLabels(append(updatedLabels, addLabels...))
+		}
+		if removeLabelsExists {
+			remove := make(map[string]bool, len(removeLabels))
+			for _, label := range removeLabels {
+				remove[strings.ToLower(label)] = true
+			}
+			kept := updatedLabels[:0]
+			for _, label := range updatedLabels {
+				if !remove[strings.ToLower(label)] {
+					kept = append(kept, label)
+				}
+			}
+			updatedLabels = kept
+		}
+	}
+	if labelsExists || addLabelsExists || removeLabelsExists {
+		if len(updatedLabels) == 0 {
+			delete(target.meta, "labels")
+		} else {
+			target.meta["labels"] = updatedLabels
+		}
+	}
+	metadata := neoLocalThreadMetadataLocked(target, threadID)
+	target.mu.Unlock()
+	if titleChanged {
+		target.broadcast(map[string]any{"type": "thread_title", "title": title})
+	}
+	if target.runtime != nil && target.runtime.store != nil {
+		target.runtime.store.broadcastThreadStatusUpdated(target)
+	}
+	target.syncCloudAsync()
+	return metadata, nil
+}
+
+func neoThreadToolOptionalLabels(input map[string]any, key string) ([]string, bool, error) {
+	raw, exists := input[key]
+	if !exists {
+		return nil, false, nil
+	}
+	switch typed := raw.(type) {
+	case []any:
+		for _, label := range typed {
+			if _, ok := label.(string); !ok {
+				return nil, false, fmt.Errorf("update_thread %s must contain only string labels", key)
+			}
+		}
+	case []string:
+	default:
+		return nil, false, fmt.Errorf("update_thread %s must be an array of labels", key)
+	}
+	labels := neoThreadLabelsFromAny(raw)
+	if key != "labels" && len(labels) == 0 {
+		return nil, false, fmt.Errorf("update_thread %s must contain at least one label", key)
+	}
+	return labels, true, nil
+}
+
+func neoLocalThreadMetadata(target *neoActor, threadID string) map[string]any {
+	target.mu.Lock()
+	metadata := neoLocalThreadMetadataLocked(target, threadID)
+	target.mu.Unlock()
+	return metadata
+}
+
+func neoLocalThreadMetadataLocked(target *neoActor, threadID string) map[string]any {
+	return map[string]any{
+		"threadId":         threadID,
+		"title":            target.title,
+		"pinned":           target.pinned,
+		"labels":           neoThreadLabelsFromAny(target.meta["labels"]),
+		"archived":         target.archived,
+		"projectID":        firstNonEmptyString(target.meta["projectID"], target.meta["projectId"], target.meta["project_id"]),
+		"repositoryURL":    firstNonEmptyString(target.meta["repositoryURL"], target.meta["repositoryUrl"], target.meta["repoURL"]),
+		"agentMode":        firstNonEmptyString(target.settings["agentMode"], target.meta["agentMode"]),
+		"reasoningEffort":  firstNonEmptyString(target.settings["reasoning.effort"], target.settings["reasoningEffort"], target.meta["reasoningEffort"]),
+		"workingDirectory": neoWorkingDirectoryFromEnvironment(target.environment),
+	}
+}
+
 func (a *neoActor) executeLocalRenameThreadTool(input map[string]any) (map[string]any, error) {
 	target, threadID, err := a.threadToolTargetActor(input, true)
 	if err != nil {
@@ -1035,6 +1305,37 @@ func (a *neoActor) executeLocalArchiveThreadsTool(input map[string]any) (map[str
 		archived = append(archived, threadIDs[index])
 	}
 	return map[string]any{"archived": archived}, nil
+}
+
+func (a *neoActor) executeLocalThreadInteractTool(pending neoPendingTool) (map[string]any, error) {
+	action := strings.ToLower(strings.TrimSpace(stringValue(pending.Input["action"])))
+	var result map[string]any
+	var err error
+	switch action {
+	case "get":
+		result, err = a.executeLocalGetThreadMetadataTool(pending.Input)
+	case "message":
+		result, err = a.executeLocalSendMessageToThreadTool(pending)
+	case "archive":
+		result, err = a.executeLocalArchiveThreadTool(pending.Input, true)
+	case "unarchive":
+		result, err = a.executeLocalArchiveThreadTool(pending.Input, false)
+	default:
+		return nil, errors.New("thread_interact action must be get, message, archive, or unarchive")
+	}
+	if err != nil {
+		return nil, err
+	}
+	threadID := firstNonEmptyString(result["threadID"], result["threadId"], neoThreadToolInputThreadID(pending.Input))
+	if threadID == "" && action != "message" {
+		threadID = a.threadID
+	}
+	if threadID != "" {
+		result["threadId"] = threadID
+		result["threadID"] = threadID
+		result["url"] = "https://ampcode.com/threads/" + threadID
+	}
+	return result, nil
 }
 
 func (a *neoActor) executeLocalSendMessageToThreadTool(pending neoPendingTool) (map[string]any, error) {
@@ -1457,18 +1758,18 @@ func (a *neoActor) ensureOwnedThreadActor(threadID string) (*neoActor, error) {
 	}
 	ownerID := a.threadToolOwnerID()
 	if target := a.runtime.store.lookupThreadActor(threadID); target != nil {
-		if target.threadToolOwnerID() != ownerID {
+		if target.threadToolOwnerID() != ownerID && !a.runtime.claimNeoLegacyThreadActorOwner(target, ownerID) {
 			return nil, errors.New("thread target is not owned by the current user")
 		}
 		return target, nil
 	}
 	if a.runtime.threadDir != "" {
 		if thread, exists := loadNeoThreadFromDir(threadID, a.runtime.threadDir); exists {
-			if !neoThreadOwnedByUser(thread, ownerID) {
+			if !a.runtime.neoThreadOwnedByRequestUser(thread, ownerID) {
 				return nil, errors.New("thread target is not owned by the current user")
 			}
 			target := a.runtime.store.ensureThreadActor(threadID)
-			if target == nil || target.threadToolOwnerID() != ownerID {
+			if target == nil || target.threadToolOwnerID() != ownerID && !a.runtime.claimNeoLegacyThreadActorOwner(target, ownerID) {
 				return nil, errors.New("thread target is not owned by the current user")
 			}
 			return target, nil
@@ -1509,15 +1810,21 @@ func (a *neoActor) threadToolTargetActor(input map[string]any, allowCurrent bool
 		return nil, "", errors.New("thread tool missing local runtime")
 	}
 	target := a.runtime.store.lookupThreadActor(threadID)
-	if target == nil && a.runtime.threadDir != "" {
-		if _, exists := loadNeoThreadFromDir(threadID, a.runtime.threadDir); exists {
-			target = a.runtime.store.ensureThreadActor(threadID)
+	if (target == nil || !target.hasLocalThreadState()) && a.runtime.threadDir != "" {
+		if thread, exists := loadNeoThreadFromDir(threadID, a.runtime.threadDir); exists {
+			if target == nil {
+				target = a.runtime.store.ensureThreadActorWithLocalImport(threadID, false)
+			}
+			if err := target.importThreadLocalOnlyIfEmpty(thread); err != nil {
+				return nil, "", fmt.Errorf("thread tool could not load target thread: %w", err)
+			}
 		}
 	}
 	if target == nil {
 		return nil, "", errors.New("thread tool could not resolve target thread")
 	}
-	if target.threadToolOwnerID() != a.threadToolOwnerID() {
+	ownerID := a.threadToolOwnerID()
+	if target.threadToolOwnerID() != ownerID && !a.runtime.claimNeoLegacyThreadActorOwner(target, ownerID) {
 		return nil, "", errors.New("thread tool target is not owned by the current user")
 	}
 	return target, threadID, nil

@@ -29,8 +29,12 @@ var neoModeOptionalInAmpBinary = map[string]bool{
 	"agg-man": true,
 }
 
+var neoModeServerOnlyInAmpBinary = map[string]bool{
+	"puck": true,
+}
+
 var neoModeRuntimeOnlyTools = map[string]map[string]bool{
-	"puck": toolSet("rename_thread", "set_thread_pinned", "add_thread_labels", "remove_thread_labels"),
+	"puck": toolSet("rename_thread", "set_thread_pinned", "add_thread_labels", "remove_thread_labels", "set_schedule", "list_workspace_members", "x_read", "x_reply"),
 }
 
 func neoModeBinaryComparableTools(mode string, names []string) []string {
@@ -80,6 +84,9 @@ func TestNeoModeToolOrderMatchesAuditBaseline(t *testing.T) {
 		t.Fatal("Amp binary parity baseline has no agent mode tool_names")
 	}
 	for mode, want := range neoModeToolOrder {
+		if neoModeServerOnlyInAmpBinary[mode] {
+			continue
+		}
 		want = neoModeBinaryComparableTools(mode, want)
 		got, ok := profiles[mode]
 		if !ok {
@@ -104,6 +111,9 @@ func TestNeoModeToolOrderMatchesAmpBinary(t *testing.T) {
 	text, path := neoToolParityLoadBinary(t)
 
 	for mode, want := range neoModeToolOrder {
+		if neoModeServerOnlyInAmpBinary[mode] {
+			continue
+		}
 		want = neoModeBinaryComparableTools(mode, want)
 		sp, ok := neoModeSystemPromptKey[mode]
 		if !ok {

@@ -78,6 +78,27 @@ func GetAntigravityModels() []*ModelInfo {
 	return cloneModelInfos(getModels().Antigravity)
 }
 
+// GetChatGPTWebModels returns model definitions reachable through ChatGPT's
+// web backend. These are hard-coded because remote models.json refreshes do
+// not know about the web-only slugs.
+func GetChatGPTWebModels() []*ModelInfo {
+	return []*ModelInfo{
+		{
+			ID:                  "chatgpt-web/gpt-5-6-pro",
+			Object:              "model",
+			OwnedBy:             "openai",
+			Type:                "chatgpt-web",
+			DisplayName:         "GPT-5.6 Pro (Web)",
+			Description:         "GPT-5.6 Pro via ChatGPT web backend (temporary chat)",
+			ContextLength:       1048576,
+			MaxCompletionTokens: 128000,
+			Thinking: &ThinkingSupport{
+				Levels: []string{"low", "medium", "high"},
+			},
+		},
+	}
+}
+
 // WithCodexBuiltins injects hard-coded Codex-only model definitions that should
 // not depend on remote models.json updates. Built-ins replace any matching IDs
 // already present in the provided slice.
@@ -167,6 +188,7 @@ func cloneModelInfos(models []*ModelInfo) []*ModelInfo {
 //   - codex
 //   - kimi
 //   - antigravity
+//   - chatgpt-web
 func GetStaticModelDefinitionsByChannel(channel string) []*ModelInfo {
 	key := strings.ToLower(strings.TrimSpace(channel))
 	switch key {
@@ -186,6 +208,8 @@ func GetStaticModelDefinitionsByChannel(channel string) []*ModelInfo {
 		return GetKimiModels()
 	case "antigravity":
 		return GetAntigravityModels()
+	case "chatgpt-web":
+		return GetChatGPTWebModels()
 	default:
 		return nil
 	}
@@ -208,6 +232,7 @@ func LookupStaticModelInfo(modelID string) *ModelInfo {
 		data.CodexPro,
 		data.Kimi,
 		data.Antigravity,
+		GetChatGPTWebModels(),
 	}
 	for _, models := range allModels {
 		for _, m := range models {

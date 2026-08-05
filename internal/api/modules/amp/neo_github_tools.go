@@ -167,7 +167,7 @@ func neoGitHubToolSchema(properties map[string]any, required []any) map[string]a
 	return map[string]any{"type": "object", "properties": properties, "required": required}
 }
 
-func (a *neoActor) execSubagentLocalGitHubTool(call neoToolCall, parentToolCallID, parentMessageID, clientAPIKey string) map[string]any {
+func (a *neoActor) execSubagentLocalGitHubTool(ctx context.Context, call neoToolCall, parentToolCallID, parentMessageID string, generation int, clientAPIKey string) map[string]any {
 	pending := neoPendingTool{
 		ID:               call.ID,
 		Name:             call.Name,
@@ -177,21 +177,30 @@ func (a *neoActor) execSubagentLocalGitHubTool(call neoToolCall, parentToolCallI
 		ClientAPIKey:     clientAPIKey,
 	}
 	a.mu.Lock()
+	if generation != a.generation {
+		a.mu.Unlock()
+		return map[string]any{"status": "cancelled", "reason": "user:cancelled"}
+	}
 	if a.subagentTools == nil {
 		a.subagentTools = map[string]neoPendingTool{}
 	}
 	a.subagentTools[call.ID] = pending
 	a.mu.Unlock()
 
-	a.storeSubagentToolResultMessage(call.ID, map[string]any{"status": "in-progress", "progress": map[string]any{"output": neoGitHubProgressText(call.Name, call.Input)}}, parentToolCallID, "tool_progress")
+	if !a.storeSubagentToolResultMessageForGeneration(call.ID, map[string]any{"status": "in-progress", "progress": map[string]any{"output": neoGitHubProgressText(call.Name, call.Input)}}, parentToolCallID, "tool_progress", generation) {
+		return map[string]any{"status": "cancelled", "reason": "user:cancelled"}
+	}
 
-	ctx := neoContextWithClientAPIKey(context.Background(), clientAPIKey)
+	ctx = neoContextWithClientAPIKey(ctx, clientAPIKey)
 	run := a.runLocalGitHubTool(ctx, call.Name, call.Input)
 	a.mu.Lock()
-	delete(a.subagentTools, call.ID)
+	current, owned := a.subagentTools[call.ID]
+	if generation == a.generation && owned && current.MessageID == parentMessageID && current.ParentToolCallID == parentToolCallID {
+		delete(a.subagentTools, call.ID)
+	}
 	a.mu.Unlock()
 
-	a.storeSubagentToolResultMessage(call.ID, run, parentToolCallID, "")
+	a.storeSubagentToolResultMessageForGeneration(call.ID, run, parentToolCallID, "", generation)
 	return run
 }
 

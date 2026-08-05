@@ -13,13 +13,21 @@ import (
 )
 
 type antigravityCreditsFallbackExecutor struct {
-	streamCreditsRequested []bool
+	executeCreditsRequested []bool
+	streamCreditsRequested  []bool
+	creditsError            error
+	streamCreditsError      error
 }
 
 func (e *antigravityCreditsFallbackExecutor) Identifier() string { return "antigravity" }
 
-func (e *antigravityCreditsFallbackExecutor) Execute(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	return cliproxyexecutor.Response{}, &Error{HTTPStatus: http.StatusNotImplemented, Message: "Execute not implemented"}
+func (e *antigravityCreditsFallbackExecutor) Execute(ctx context.Context, _ *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	creditsRequested := AntigravityCreditsRequested(ctx)
+	e.executeCreditsRequested = append(e.executeCreditsRequested, creditsRequested)
+	if !creditsRequested {
+		return cliproxyexecutor.Response{}, &Error{HTTPStatus: http.StatusServiceUnavailable, Message: "quota exhausted"}
+	}
+	return cliproxyexecutor.Response{}, e.creditsError
 }
 
 func (e *antigravityCreditsFallbackExecutor) ExecuteStream(ctx context.Context, _ *Auth, req cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
@@ -31,9 +39,79 @@ func (e *antigravityCreditsFallbackExecutor) ExecuteStream(ctx context.Context, 
 		close(ch)
 		return &cliproxyexecutor.StreamResult{Headers: http.Header{"X-Initial": {req.Model}}, Chunks: ch}, nil
 	}
+	if e.streamCreditsError != nil {
+		ch <- cliproxyexecutor.StreamChunk{Err: e.streamCreditsError}
+		close(ch)
+		return &cliproxyexecutor.StreamResult{Chunks: ch}, nil
+	}
 	ch <- cliproxyexecutor.StreamChunk{Payload: []byte("credits fallback")}
 	close(ch)
 	return &cliproxyexecutor.StreamResult{Headers: http.Header{"X-Credits": {req.Model}}, Chunks: ch}, nil
+}
+
+func TestManagerAntigravityCreditsFallbackDoesNotReplayNonRetryableError(t *testing.T) {
+	const model = "claude-opus-4-6-thinking"
+	tests := []struct {
+		name       string
+		configure  func(*antigravityCreditsFallbackExecutor)
+		invoke     func(*Manager) error
+		creditRuns func(*antigravityCreditsFallbackExecutor) []bool
+	}{
+		{
+			name: "execute",
+			configure: func(executor *antigravityCreditsFallbackExecutor) {
+				executor.creditsError = nonRetryableTestError{}
+			},
+			invoke: func(manager *Manager) error {
+				_, err := manager.Execute(t.Context(), []string{"antigravity"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+				return err
+			},
+			creditRuns: func(executor *antigravityCreditsFallbackExecutor) []bool {
+				return executor.executeCreditsRequested
+			},
+		},
+		{
+			name: "stream",
+			configure: func(executor *antigravityCreditsFallbackExecutor) {
+				executor.streamCreditsError = nonRetryableTestError{}
+			},
+			invoke: func(manager *Manager) error {
+				_, err := manager.ExecuteStream(t.Context(), []string{"antigravity"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+				return err
+			},
+			creditRuns: func(executor *antigravityCreditsFallbackExecutor) []bool {
+				return executor.streamCreditsRequested
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			executor := &antigravityCreditsFallbackExecutor{}
+			tc.configure(executor)
+			manager := NewManager(nil, nil, nil)
+			manager.SetConfig(&internalconfig.Config{QuotaExceeded: internalconfig.QuotaExceeded{AntigravityCredits: true}})
+			manager.SetRetryConfig(0, 0, 1)
+			manager.RegisterExecutor(executor)
+			reg := registry.GetGlobalRegistry()
+			for _, id := range []string{"ag-a", "ag-b"} {
+				reg.RegisterClient(id, "antigravity", []*registry.ModelInfo{{ID: model}})
+				t.Cleanup(func() { reg.UnregisterClient(id) })
+				if _, err := manager.Register(t.Context(), &Auth{ID: id, Provider: "antigravity"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := tc.invoke(manager); !isNonRetryableExecutionError(err) {
+				t.Fatalf("fallback error = %v, want non-retryable", err)
+			}
+			if got := tc.creditRuns(executor); len(got) != 2 || got[0] || !got[1] {
+				t.Fatalf("credits calls = %v, want [false true]", got)
+			}
+			current, ok := manager.GetByID("ag-a")
+			if !ok || current.Failed != 1 {
+				t.Fatalf("first auth failures = %v, want one non-credits failure", current)
+			}
+		})
+	}
 }
 
 func (e *antigravityCreditsFallbackExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, error) {

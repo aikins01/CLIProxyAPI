@@ -261,6 +261,9 @@ func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *ha
 		if m.tryServeNeoLocalAttachment(c) {
 			return
 		}
+		if m.tryServeNeoLocalDiffCapture(c) {
+			return
+		}
 		if m.tryServeNeoWebLocalRemote(c) {
 			return
 		}
@@ -342,7 +345,9 @@ func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *ha
 	}
 	localProjectMiddleware = append(localProjectMiddleware, clientAPIKeyMiddleware())
 	engine.Any("/ampcode/local-projects.json", append(localProjectMiddleware, m.serveWebLocalProjects)...)
+	engine.Any("/ampcode/local-project-details.json", append(localProjectMiddleware, m.serveWebLocalProjectDetails)...)
 	engine.Any("/ampcode/local-activity.json", append(localProjectMiddleware, m.serveWebLocalActivity)...)
+	engine.Any("/ampcode/local-thread-search.json", append(localProjectMiddleware, m.serveWebLocalThreadSearch)...)
 	engine.Any("/ampcode/local-thread-data.json", append(localProjectMiddleware, m.serveWebLocalThreadData)...)
 	engine.Any("/threads", append(rootMiddleware, proxyHandler)...)
 	engine.Any("/threads/*path", append(rootMiddleware, proxyHandler)...)
@@ -459,29 +464,16 @@ func (m *AmpModule) attachNeoLocalThreadListAugmenter(req *http.Request) {
 	if !ok || !neoRequestOwnerScopeResolved(req.Context(), ownerUserID) {
 		return
 	}
-	augmenter.upstreamOverfetch = rt.neoLocalThreadListExcludedCountForOwner(augmenter.includeEmpty, augmenter.includeArchived, augmenter.excludedLabelNames, ownerUserID)
-	if !rewriteAmpThreadListRequestWindow(req, augmenter) {
-		return
-	}
 	if len(augmenter.threadIDs) == 0 {
-		loadLimit := augmenter.limit + augmenter.offset
-		loaded := make(chan []any, 1)
-		go func() {
-			loaded <- rt.neoLocalVisibleThreadListSummariesForOwner(loadLimit, augmenter.includeEmpty, augmenter.includeArchived, augmenter.excludedLabelNames, ownerUserID)
-		}()
-		var loadOnce sync.Once
-		var summaries []any
-		augmenter.load = func(int) []any {
-			loadOnce.Do(func() {
-				summaries = <-loaded
-			})
+		augmenter.upstreamOverfetch = augmenter.limit
+		augmenter.load = func(loadLimit int) []any {
+			summaries, _ := rt.neoLocalThreadListWindowForOwnerContext(req.Context(), loadLimit, augmenter.includeEmpty, augmenter.includeArchived, augmenter.excludedLabelNames, ownerUserID)
 			return summaries
 		}
 	} else {
-		augmenter.load = func(limit int) []any {
-			return neoFilterThreadsByOwner(rt.neoLocalThreadListSummaries(limit, true), ownerUserID)
-		}
+		augmenter.load = func(int) []any { return nil }
 	}
+	augmenter.upstreamRebased = rewriteAmpThreadListRequestWindow(req, augmenter)
 	augmenter.selectedLoad = func(threadIDs map[string]bool) []any {
 		return rt.neoLocalThreadSummariesByIDForOwner(threadIDs, ownerUserID)
 	}
@@ -510,7 +502,7 @@ func (m *AmpModule) tryServeNeoLocalThreadSearchFallback(c *gin.Context, proxy *
 	windowQuery := neoCloneURLValues(searchQuery)
 	windowQuery.Set("offset", "0")
 	windowQuery.Set("limit", strconv.Itoa(windowLimit))
-	localSearch, hasLocalSearch := m.neoRuntime.localThreadSearchResponseWithMaxLimitForOwner(windowQuery, windowLimit, ownerUserID)
+	localSearch, hasLocalSearch := m.neoRuntime.localThreadSearchResponseWithMaxLimitForOwnerContext(c.Request.Context(), windowQuery, windowLimit, ownerUserID)
 	if hasLocalSearch {
 		c.Request.URL.RawQuery = windowQuery.Encode()
 		c.Request = c.Request.WithContext(context.WithValue(c.Request.Context(), ampProxyThreadSearchMergeContextKey{}, true))

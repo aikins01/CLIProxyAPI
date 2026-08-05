@@ -466,8 +466,8 @@ func neoReadThreadSyntheticBenchmarkCases() []neoReadThreadSyntheticCase {
 			MustInclude:     []string{"FINAL_READER_ARCHITECTURE=suffix-tail", "internal/api/modules/amp/neo_thread_reader_agent.go", "latest:true", "backward"},
 			MustNotInclude:  []string{"FINAL_READER_ARCHITECTURE=forward-scan survived"},
 			LatestReadCount: neoReadThreadLatestReadCount,
-			MaxToolCalls:    neoReadThreadMaxTurns,
-			MaxTurns:        neoReadThreadMaxTurns + 1,
+			MaxToolCalls:    16,
+			MaxTurns:        17,
 			MaxNestedBytes:  500000,
 		},
 		{
@@ -577,8 +577,8 @@ func neoReadThreadSyntheticBenchmarkCases() []neoReadThreadSyntheticCase {
 			MustIncludeOneOf: []string{"proposed", "proposal", "not shipped", "not implemented"},
 			MustNotInclude:   []string{"concurrency work is complete"},
 			LatestReadCount:  neoReadThreadLatestReadCount,
-			MaxToolCalls:     neoReadThreadMaxToolCalls,
-			MaxTurns:         neoReadThreadMaxTurns + 1,
+			MaxToolCalls:     24,
+			MaxTurns:         17,
 			MaxNestedBytes:   500000,
 		},
 	}

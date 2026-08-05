@@ -17,8 +17,16 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	log "github.com/sirupsen/logrus"
 )
+
+func trustedLocalNeoMiddlewareForTest() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Request = c.Request.WithContext(util.WithTrustedLocalNeoInference(c.Request.Context()))
+		c.Next()
+	}
+}
 
 func TestLogAmpIngressRequestOmitsHeadersAndBody(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -134,6 +142,7 @@ func TestFallbackHandler_LocalNeoInferenceFailsClosedBeforeAmpProxy(t *testing.T
 	fallback := NewFallbackHandlerWithMapper(func() *httputil.ReverseProxy { return proxy }, nil, nil)
 
 	r := gin.New()
+	r.Use(trustedLocalNeoMiddlewareForTest())
 	r.POST("/api/provider/openai/v1/chat/completions", fallback.WrapHandler(func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"unexpected": true})
 	}))
@@ -146,7 +155,6 @@ func TestFallbackHandler_LocalNeoInferenceFailsClosedBeforeAmpProxy(t *testing.T
 		t.Fatalf("new request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(localNeoInferenceHeader, "1")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("request fallback route: %v", err)
@@ -186,6 +194,7 @@ func TestFallbackHandler_LocalNeoAmpProviderFallsBackToAmpProxy(t *testing.T) {
 	fallback := NewFallbackHandlerWithMapper(func() *httputil.ReverseProxy { return proxy }, nil, nil)
 
 	r := gin.New()
+	r.Use(trustedLocalNeoMiddlewareForTest())
 	r.POST("/api/provider/:provider/v1/chat/completions", fallback.WrapHandler(func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"unexpected": true})
 	}))
@@ -198,7 +207,6 @@ func TestFallbackHandler_LocalNeoAmpProviderFallsBackToAmpProxy(t *testing.T) {
 		t.Fatalf("new request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(localNeoInferenceHeader, "1")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("request fallback route: %v", err)
@@ -244,6 +252,7 @@ func TestFallbackHandler_LocalNeoAmpProviderIgnoresModelFallback(t *testing.T) {
 	fallback.failureBreaker.trip("amp-nostromo-v1")
 
 	r := gin.New()
+	r.Use(trustedLocalNeoMiddlewareForTest())
 	r.POST("/api/provider/:provider/v1/chat/completions", fallback.WrapHandler(func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"unexpected": true})
 	}))
@@ -256,7 +265,6 @@ func TestFallbackHandler_LocalNeoAmpProviderIgnoresModelFallback(t *testing.T) {
 		t.Fatalf("new request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(localNeoInferenceHeader, "1")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("request fallback route: %v", err)
@@ -360,6 +368,7 @@ func TestFallbackHandlerGeminiWildcardActionStripsLeadingSlashBeforeMapping(t *t
 	seenMappedModel := ""
 	seenAction := ""
 	r := gin.New()
+	r.Use(trustedLocalNeoMiddlewareForTest())
 	r.POST("/api/provider/google/v1beta/models/*action", fallback.WrapHandler(withMappedGeminiAction(func(c *gin.Context) {
 		if mapped, ok := c.Get(MappedModelContextKey); ok {
 			seenMappedModel, _ = mapped.(string)
@@ -370,7 +379,6 @@ func TestFallbackHandlerGeminiWildcardActionStripsLeadingSlashBeforeMapping(t *t
 
 	req := httptest.NewRequest(http.MethodPost, "/api/provider/google/v1beta/models/gemini-3-flash-preview:generateContent", bytes.NewReader([]byte(`{"contents":[]}`)))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(localNeoInferenceHeader, "1")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -409,6 +417,7 @@ func TestFallbackHandler_LocalAuthUnavailableDoesNotFallbackToAmpProxy(t *testin
 	fallback := NewFallbackHandlerWithMapper(func() *httputil.ReverseProxy { return proxy }, nil, nil)
 
 	r := gin.New()
+	r.Use(trustedLocalNeoMiddlewareForTest())
 	r.POST("/api/provider/openai/v1/chat/completions", fallback.WrapHandler(func(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": gin.H{
 			"message": "auth_unavailable: no auth available (providers=codex, model=gpt-5.5)",
@@ -425,7 +434,6 @@ func TestFallbackHandler_LocalAuthUnavailableDoesNotFallbackToAmpProxy(t *testin
 		t.Fatalf("new request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(localNeoInferenceHeader, "1")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("request fallback route: %v", err)

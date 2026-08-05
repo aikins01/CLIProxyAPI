@@ -15,22 +15,27 @@ import (
 )
 
 func (a *neoActor) shouldRunLocalActorTool(name string) bool {
-	toolName := strings.TrimSpace(name)
 	a.mu.Lock()
-	serverToolsReady := a.executorBootstrapComplete || strings.EqualFold(a.agentModeLocked(), "puck")
-	_, registered := a.tools[toolName]
-	a.mu.Unlock()
-	if toolName == "read_thread" {
-		return serverToolsReady
-	}
-	switch {
-	case toolName == "submit_review":
-	case isNeoGitHubTool(toolName):
-	case isNeoThreadTool(toolName):
-	default:
+	defer a.mu.Unlock()
+	return a.shouldRunLocalActorToolLocked(name)
+}
+
+func (a *neoActor) shouldRunLocalActorToolLocked(name string) bool {
+	toolName := strings.TrimSpace(name)
+	if !isNeoLocalActorTool(toolName) {
 		return false
 	}
+	serverToolsReady := a.executorBootstrapComplete || strings.EqualFold(a.agentModeLocked(), "puck")
+	_, registered := a.tools[toolName]
+	if toolName == "read_thread" || toolName == "submit_review" {
+		return serverToolsReady
+	}
 	return serverToolsReady && !registered
+}
+
+func isNeoLocalActorTool(name string) bool {
+	toolName := strings.TrimSpace(name)
+	return toolName == "read_thread" || toolName == "submit_review" || isNeoGitHubTool(toolName) || isNeoThreadTool(toolName)
 }
 
 func (a *neoActor) runLocalActorTool(pending neoPendingTool, generation int) {
@@ -65,6 +70,14 @@ func (a *neoActor) runLocalActorTool(pending neoPendingTool, generation int) {
 		a.receiveToolResult(map[string]any{"type": "executor_tool_result", "toolCallId": pending.ID, "run": run})
 	case "submit_review":
 		result, err := executeLocalSubmitReview(pending.Input)
+		if err == nil {
+			snapshot, snapshotErr := a.reviewSnapshotForValidation()
+			if snapshotErr != nil {
+				err = snapshotErr
+			} else {
+				err = neoValidateSubmittedReviewSnapshot(result, snapshot)
+			}
+		}
 		if a.subagentGenerationStale(generation) {
 			return
 		}
@@ -83,6 +96,15 @@ func (a *neoActor) executeLocalReadThread(pending neoPendingTool, generation int
 }
 
 func (a *neoActor) executeLocalReadThreadWithProgress(pending neoPendingTool, generation int, progress func(string)) (string, error) {
+	runContext, runID, acquired := a.acquireSubagentRun(generation)
+	if !acquired {
+		return "", nil
+	}
+	defer a.releaseSubagentRun(runID)
+	return a.executeLocalReadThreadWithProgressContext(runContext, pending, generation, progress)
+}
+
+func (a *neoActor) executeLocalReadThreadWithProgressContext(runContext context.Context, pending neoPendingTool, generation int, progress func(string)) (string, error) {
 	input := pending.Input
 	rawThreadID := firstNonEmptyString(input["threadID"], input["threadId"], input["thread_id"], input["thread"], input["url"])
 	threadID := neoToolInputThreadID(input)
@@ -107,7 +129,7 @@ func (a *neoActor) executeLocalReadThreadWithProgress(pending neoPendingTool, ge
 	if progress != nil && !isCurrentThread {
 		progress("Loading thread...")
 	}
-	corpus, err := a.readThreadCorpus(threadID, pending.ClientAPIKey)
+	corpus, err := a.readThreadCorpus(runContext, threadID, pending.ClientAPIKey)
 	if err != nil {
 		return "", fmt.Errorf("Reading thread failed: %w", err)
 	}
@@ -120,7 +142,7 @@ func (a *neoActor) executeLocalReadThreadWithProgress(pending neoPendingTool, ge
 		}
 		progress("Extracting content from thread...")
 	}
-	return a.executeLocalReadThreadAgent(pending, generation, corpus, goal)
+	return a.executeLocalReadThreadAgentWithRouteContext(runContext, pending, generation, corpus, goal, neoModelRoute{Provider: neoReadThreadAgentProvider, Model: neoReadThreadAgentModel}, neoReadThreadAgentEffort)
 }
 
 func neoReadThreadProgressRun(statusMessage string) map[string]any {
@@ -137,7 +159,7 @@ func neoReadThreadCurrentThreadSentinel(raw string) bool {
 	}
 }
 
-func (a *neoActor) fetchUpstreamThreadMarkdown(threadID, clientAPIKey string) (string, error) {
+func (a *neoActor) fetchUpstreamThreadMarkdown(ctx context.Context, threadID, clientAPIKey string) (string, error) {
 	if a == nil || a.runtime == nil {
 		return "", fmt.Errorf("Thread %s not found locally and cannot fetch from server: API key not configured", threadID)
 	}
@@ -159,7 +181,7 @@ func (a *neoActor) fetchUpstreamThreadMarkdown(threadID, clientAPIKey string) (s
 	base.Path = strings.TrimRight(base.Path, "/") + "/api/threads/" + url.PathEscape(threadID) + ".md"
 	base.RawQuery = "truncate_tool_results=1"
 
-	req, err := http.NewRequest(http.MethodGet, base.String(), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base.String(), nil)
 	if err != nil {
 		return "", err
 	}

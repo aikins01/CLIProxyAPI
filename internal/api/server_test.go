@@ -16,6 +16,7 @@ import (
 	proxyconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
@@ -128,6 +129,49 @@ func TestCORSMiddlewareLetsAmpLocalInferencePreflightReachRoute(t *testing.T) {
 	}
 	if !hit {
 		t.Fatal("route handler was not reached")
+	}
+}
+
+func TestLocalNeoInferenceMiddlewareRejectsForgedMarker(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	tests := []struct {
+		name        string
+		marker      string
+		token       string
+		wantTrusted bool
+	}{
+		{name: "missing"},
+		{name: "public marker", marker: "1"},
+		{name: "wrong token", token: "wrong"},
+		{name: "process capability", marker: "forged", token: util.LocalNeoInferenceCapability(), wantTrusted: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			r := gin.New()
+			r.Use(localNeoInferenceMiddleware())
+			trusted := false
+			tokenPresent := false
+			r.POST("/v1/messages", func(c *gin.Context) {
+				trusted = util.IsTrustedLocalNeoInference(c.Request.Context())
+				tokenPresent = c.GetHeader(util.LocalNeoInferenceTokenHeaderName) != ""
+				if c.GetHeader(util.LocalNeoInferenceHeaderName) != "" {
+					t.Fatal("local Neo inference marker reached application handler")
+				}
+				c.Status(http.StatusNoContent)
+			})
+			req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+			if test.marker != "" {
+				req.Header.Set(util.LocalNeoInferenceHeaderName, test.marker)
+			}
+			if test.token != "" {
+				req.Header.Set(util.LocalNeoInferenceTokenHeaderName, test.token)
+			}
+			rec := httptest.NewRecorder()
+			r.ServeHTTP(rec, req)
+			if rec.Code != http.StatusNoContent || trusted != test.wantTrusted || tokenPresent {
+				t.Fatalf("middleware status=%d trusted=%v token_present=%v", rec.Code, trusted, tokenPresent)
+			}
+		})
 	}
 }
 

@@ -11,8 +11,12 @@ import (
 func parseSSEEvent(t *testing.T, chunk []byte) (string, gjson.Result) {
 	t.Helper()
 
-	lines := strings.Split(string(chunk), "\n")
-	if len(lines) < 2 {
+	frame := strings.TrimSuffix(string(chunk), "\n\n")
+	if frame == string(chunk) {
+		t.Fatalf("SSE chunk is not a complete event: %q", chunk)
+	}
+	lines := strings.Split(frame, "\n")
+	if len(lines) != 2 {
 		t.Fatalf("unexpected SSE chunk: %q", chunk)
 	}
 

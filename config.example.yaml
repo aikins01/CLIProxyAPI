@@ -341,6 +341,20 @@ nonstream-keepalive-interval: 0
 #     title-model: "claude-haiku-4-5-20251001"
 #     # optional: summarize old thread context when local Neo history gets large
 #     compaction-model: "gpt-5.6-sol"
+#     # optional: ordered primary/fallback models used for normal parent inference by mode
+#     # a single model string remains supported
+#     mode-models:
+#       ultra:
+#         - "anthropic/claude-fable-5"
+#         - "chatgpt-web/gpt-5-6-pro"
+#     # optional: ordered per-subagent primary/fallback routes
+#     # supported keys: oracle, finder, librarian, task, run_check
+#     # authenticated ChatGPT Web catalog models use chatgpt-web/<slug>
+#     subagent-models:
+#       oracle:
+#         - "chatgpt-web/gpt-5-6-pro"
+#         - "anthropic/claude-fable-5"
+#         - "openai/gpt-5.6-sol"
 #   # optional browser bridge for using ampcode.com web UI with local Neo inference.
 #   # Install /ampcode/local-inference.user.js in Tampermonkey, set the local API key
 #   # in browser localStorage, and keep this disabled unless you intentionally use it.

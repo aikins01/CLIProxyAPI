@@ -117,6 +117,7 @@ func main() {
 	var oauthCallbackPort int
 	var antigravityLogin bool
 	var kimiLogin bool
+	var chatGPTWebLogin bool
 	var projectID string
 	var vertexImport string
 	var vertexImportPrefix string
@@ -138,6 +139,7 @@ func main() {
 	flag.IntVar(&oauthCallbackPort, "oauth-callback-port", 0, "Override OAuth callback port (defaults to provider-specific port)")
 	flag.BoolVar(&antigravityLogin, "antigravity-login", false, "Login to Antigravity using OAuth")
 	flag.BoolVar(&kimiLogin, "kimi-login", false, "Login to Kimi using OAuth")
+	flag.BoolVar(&chatGPTWebLogin, "chatgpt-web-login", false, "Add a ChatGPT web session by pasting Cookie and User-Agent headers from the same Chromium browser request")
 	flag.StringVar(&projectID, "project_id", "", "Project ID (Gemini only, not required)")
 	flag.StringVar(&configPath, "config", detectDefaultConfigPath(), "Configure File Path")
 	flag.StringVar(&vertexImport, "vertex-import", "", "Import Vertex service account key JSON file")
@@ -608,6 +610,11 @@ func main() {
 		cmd.DoClaudeLogin(cfg, options)
 	} else if kimiLogin {
 		cmd.DoKimiLogin(cfg, options)
+	} else if chatGPTWebLogin {
+		if errLogin := cmd.DoChatGPTWebLogin(cfg, options); errLogin != nil {
+			log.Error(errLogin)
+			os.Exit(1)
+		}
 	} else {
 		// In cloud deploy mode without config file, just wait for shutdown signals
 		if isCloudDeploy && !configFileExists {

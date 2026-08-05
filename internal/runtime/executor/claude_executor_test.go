@@ -20,6 +20,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
@@ -2105,14 +2106,13 @@ func TestApplyCloaking_AmpProviderPreservesForwardedSystem(t *testing.T) {
 }
 
 func TestApplyCloaking_LocalNeoPreservesForwardedSystem(t *testing.T) {
-	headers := http.Header{}
-	headers.Set(localNeoInferenceHeaderName, "1")
 	payload := []byte(`{
 		"system":[{"type":"text","text":"## Skills\n<available_skills><skill><name>code-review</name></skill></available_skills>"}],
 		"messages":[{"role":"user","content":[{"type":"text","text":"do you see skills"}]}]
 	}`)
 
-	out := applyCloaking(newClaudeGinContextWithHeaders(t, headers), &config.Config{}, &cliproxyauth.Auth{}, payload, "claude-opus-4-7", "sk-ant-oat-test")
+	ctx := util.WithTrustedLocalNeoInference(newClaudeGinContextWithHeaders(t, http.Header{}))
+	out := applyCloaking(ctx, &config.Config{}, &cliproxyauth.Auth{}, payload, "claude-opus-4-7", "sk-ant-oat-test")
 
 	systemText := gjson.GetBytes(out, "system.#.text").String()
 	if strings.Contains(systemText, "<available_skills>") {

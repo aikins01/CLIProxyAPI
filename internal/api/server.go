@@ -232,6 +232,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	}
 
 	// Add middleware
+	engine.Use(localNeoInferenceMiddleware())
 	engine.Use(logging.GinLogrusLogger())
 	engine.Use(logging.GinLogrusRecovery())
 	for _, mw := range optionState.extraMiddleware {
@@ -362,6 +363,20 @@ func (s *Server) homeHeartbeatMiddleware() gin.HandlerFunc {
 		if client == nil || !client.HeartbeatOK() {
 			c.AbortWithStatus(http.StatusServiceUnavailable)
 			return
+		}
+		c.Next()
+	}
+}
+
+func localNeoInferenceMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c != nil && c.Request != nil {
+			token := c.Request.Header.Get(util.LocalNeoInferenceTokenHeaderName)
+			c.Request.Header.Del(util.LocalNeoInferenceTokenHeaderName)
+			c.Request.Header.Del(util.LocalNeoInferenceHeaderName)
+			if util.ValidLocalNeoInferenceCapability(token) {
+				c.Request = c.Request.WithContext(util.WithTrustedLocalNeoInference(c.Request.Context()))
+			}
 		}
 		c.Next()
 	}

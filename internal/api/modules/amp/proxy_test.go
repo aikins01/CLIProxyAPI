@@ -510,6 +510,7 @@ func TestModifyResponse_NormalizesBodyBasedThreadListRelationships(t *testing.T)
 }
 
 func TestModifyResponse_MergesLocalRuntimeThreadsIntoUpstreamThreadList(t *testing.T) {
+	allowTestTemporaryProjectDirectories(t)
 	enabled := true
 	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled}}})
 	rt.threadDir = t.TempDir()
@@ -617,6 +618,19 @@ func TestAttachNeoLocalThreadListAugmenterLoadsRequestedWindow(t *testing.T) {
 			t.Fatalf("write local thread %d: %v", index+1, err)
 		}
 	}
+	if err := writeNeoLocalThreadSnapshotToDir(neoCloudThreadSnapshot{
+		threadID:  "T-019f70b9-5c65-73a7-8629-000000000004",
+		createdMs: 1778160000000,
+		title:     "Archived local thread",
+		archived:  true,
+		messages: []neoMessage{{
+			MessageID: "M-local-archived",
+			Role:      "user",
+			Content:   []any{map[string]any{"type": "text", "text": "archived locally"}},
+		}},
+	}, rt.threadDir); err != nil {
+		t.Fatalf("write archived local thread: %v", err)
+	}
 
 	req := httptest.NewRequest(http.MethodPost, "http://proxy.local/api/internal?listThreads", strings.NewReader(`{"method":"listThreads","params":{"offset":2,"limit":1}}`))
 	m := &AmpModule{neoRuntime: rt}
@@ -624,6 +638,20 @@ func TestAttachNeoLocalThreadListAugmenterLoadsRequestedWindow(t *testing.T) {
 	augmenter, ok := req.Context().Value(ampProxyThreadListAugmenterContextKey{}).(ampProxyThreadListAugmenter)
 	if !ok || augmenter.load == nil {
 		t.Fatal("thread list augmenter was not attached")
+	}
+	body, err := readAndRestoreNeoJSONBody(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	params := mapValue(body["params"])
+	if numberFrom(params["offset"]) != 0 || numberFrom(params["limit"]) != 4 {
+		t.Fatalf("rewritten persisted exclusion window = %#v, want offset 0 limit 4", params)
+	}
+	rt.localRecentMu.Lock()
+	fullHistoryLoaded := rt.localRecentLoaded
+	rt.localRecentMu.Unlock()
+	if fullHistoryLoaded {
+		t.Fatal("bounded CLI thread window populated the full-history cache")
 	}
 	if loaded := augmenter.load(3); len(loaded) != 3 {
 		t.Fatalf("loaded local thread window = %d, want 3", len(loaded))
@@ -638,6 +666,78 @@ func TestRewriteAmpThreadListRequestWindowAddsOmittedQueryOffset(t *testing.T) {
 	query := req.URL.Query()
 	if query.Get("offset") != "0" || query.Get("limit") != "21" {
 		t.Fatalf("rewritten query = %q", req.URL.RawQuery)
+	}
+}
+
+func TestRewriteAmpThreadListRequestWindowCapsRefillToOnePage(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "http://proxy.local/api/internal?listThreads", strings.NewReader(`{"method":"listThreads","params":{"limit":50}}`))
+	if !rewriteAmpThreadListRequestWindow(req, ampProxyThreadListAugmenter{limit: 50, upstreamOverfetch: 1000}) {
+		t.Fatal("large thread list refill window was rejected")
+	}
+	body, err := readAndRestoreNeoJSONBody(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := numberFrom(mapValue(body["params"])["limit"]); got != 100 {
+		t.Fatalf("rewritten upstream limit = %d, want 100", got)
+	}
+}
+
+func TestRewriteAmpThreadListRequestWindowRejectsWindowBeyondUpstreamLimit(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "http://proxy.local/api/internal?listThreads", strings.NewReader(`{"method":"listThreads","params":{"offset":1000,"limit":50}}`))
+	if rewriteAmpThreadListRequestWindow(req, ampProxyThreadListAugmenter{offset: 1000, limit: 50, upstreamOverfetch: 1000}) {
+		t.Fatal("thread list window beyond the upstream limit was rewritten")
+	}
+	body, err := readAndRestoreNeoJSONBody(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	params := mapValue(body["params"])
+	if got := numberFrom(params["offset"]); got != 1000 {
+		t.Fatalf("upstream offset = %d, want original 1000", got)
+	}
+	if got := numberFrom(params["limit"]); got != 50 {
+		t.Fatalf("upstream limit = %d, want original 50", got)
+	}
+
+	maximumReq := httptest.NewRequest(http.MethodPost, "http://proxy.local/api/internal?listThreads", strings.NewReader(`{"method":"listThreads","params":{"offset":450,"limit":50}}`))
+	if !rewriteAmpThreadListRequestWindow(maximumReq, ampProxyThreadListAugmenter{offset: 450, limit: 50}) {
+		t.Fatal("thread list window ending at the upstream limit was rejected")
+	}
+
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled}}})
+	rt.threadDir = t.TempDir()
+	deepPageReq := httptest.NewRequest(http.MethodPost, "http://proxy.local/api/internal?listThreads", strings.NewReader(`{"method":"listThreads","params":{"offset":1000,"limit":50}}`))
+	(&AmpModule{neoRuntime: rt}).attachNeoLocalThreadListAugmenter(deepPageReq)
+	augmenter, ok := deepPageReq.Context().Value(ampProxyThreadListAugmenterContextKey{}).(ampProxyThreadListAugmenter)
+	if !ok || augmenter.upstreamRebased {
+		t.Fatalf("deep-page augmenter = %#v, want attached non-rebased augmentation", augmenter)
+	}
+	deepPageBody, err := readAndRestoreNeoJSONBody(deepPageReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if params := mapValue(deepPageBody["params"]); numberFrom(params["offset"]) != 1000 || numberFrom(params["limit"]) != 50 {
+		t.Fatalf("deep-page upstream request was changed: %#v", params)
+	}
+}
+
+func TestAmpThreadListNonRebasedWindowKeepsSelectedAndInRangeLocalThreads(t *testing.T) {
+	payload := map[string]any{"threads": []any{
+		map[string]any{"id": "T-019f7000-0000-7000-8000-000000000101", "updatedAt": "2026-07-20T00:00:00Z"},
+		map[string]any{"id": "T-019f7000-0000-7000-8000-000000000102", "updatedAt": "2026-07-10T00:00:00Z"},
+	}}
+	selectedID := "T-019f7000-0000-7000-8000-000000000101"
+	inRangeID := "T-019f7000-0000-7000-8000-000000000103"
+	filtered := ampThreadListNonRebasedWindow(payload, []any{
+		map[string]any{"id": selectedID},
+		map[string]any{"id": inRangeID, "updatedAt": "2026-07-15T00:00:00Z"},
+		map[string]any{"id": "T-019f7000-0000-7000-8000-000000000104", "updatedAt": "2026-07-25T00:00:00Z"},
+		map[string]any{"id": "T-019f7000-0000-7000-8000-000000000105", "updatedAt": "2026-07-05T00:00:00Z"},
+	}, 2)
+	if len(filtered) != 2 || ampThreadListItemID(mapValue(filtered[0])) != selectedID || ampThreadListItemID(mapValue(filtered[1])) != inRangeID {
+		t.Fatalf("non-rebased local window = %#v", filtered)
 	}
 }
 
@@ -755,6 +855,42 @@ func TestNormalizeAmpThreadListResponseUsesSelectedLoaderWithoutFullScan(t *test
 	}
 	if fullLoadCalls != 0 || selectedLoadCalls != 1 {
 		t.Fatalf("loader calls = full:%d selected:%d, want 0/1", fullLoadCalls, selectedLoadCalls)
+	}
+}
+
+func TestAttachNeoLocalThreadListAugmenterHydratesSelectedLocalThread(t *testing.T) {
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled}}})
+	rt.threadDir = t.TempDir()
+	threadID := "T-019f70b9-5c65-73a7-8629-3b394bd51d20"
+	if _, err := writeNeoLocalThreadFileInDir(rt.threadDir, threadID, map[string]any{
+		"id":    threadID,
+		"title": "Selected local thread",
+		"meta":  map[string]any{"cliProxyAPILocalNeo": true},
+		"messages": []any{map[string]any{
+			"messageId": "M-selected-local",
+			"role":      "user",
+			"content":   []any{map[string]any{"type": "text", "text": "persist locally"}},
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "http://proxy.local/api/internal?listThreads", strings.NewReader(`{"method":"listThreads","params":{"limit":20,"threadIDs":["`+threadID+`"]}}`))
+	m := &AmpModule{neoRuntime: rt}
+	m.attachNeoLocalThreadListAugmenter(req)
+	augmenter, ok := req.Context().Value(ampProxyThreadListAugmenterContextKey{}).(ampProxyThreadListAugmenter)
+	if !ok || augmenter.load == nil || augmenter.selectedLoad == nil {
+		t.Fatalf("selected augmenter = %#v", augmenter)
+	}
+	resp := mkResp(http.StatusOK, http.Header{"Content-Type": []string{"application/json"}}, []byte(`{"ok":true,"result":{"threads":[]}}`))
+	resp.Request = req
+	normalized := normalizeAmpThreadListResponse(resp, []byte(`{"ok":true,"result":{"threads":[]}}`))
+	if normalized == nil {
+		t.Fatal("selected local thread was not merged")
+	}
+	threads := threadListItemsForTest(readNeoJSON(bytes.NewReader(normalized)))
+	if len(threads) != 1 || ampThreadListItemID(threads[0]) != threadID {
+		t.Fatalf("selected local threads = %#v", threads)
 	}
 }
 
@@ -1019,7 +1155,7 @@ func TestNormalizeAmpThreadListResponseFiltersBeforeLocalLimit(t *testing.T) {
 	}
 }
 
-func TestAmpProxyThreadListAugmenterRequestsIdentityEncoding(t *testing.T) {
+func TestAmpProxyThreadListAugmenterRequestsGzipEncoding(t *testing.T) {
 	proxy, err := createReverseProxy("http://example.com", NewStaticSecretSource("k"))
 	if err != nil {
 		t.Fatal(err)
@@ -1028,8 +1164,8 @@ func TestAmpProxyThreadListAugmenterRequestsIdentityEncoding(t *testing.T) {
 	req.Header.Set("Accept-Encoding", "gzip, br")
 	req = req.WithContext(context.WithValue(req.Context(), ampProxyThreadListAugmenterContextKey{}, ampProxyThreadListAugmenter{}))
 	proxy.Director(req)
-	if got := req.Header.Get("Accept-Encoding"); got != "identity" {
-		t.Fatalf("Accept-Encoding = %q, want identity", got)
+	if got := req.Header.Get("Accept-Encoding"); got != "gzip" {
+		t.Fatalf("Accept-Encoding = %q, want gzip", got)
 	}
 }
 
@@ -1121,7 +1257,7 @@ func TestAmpThreadListPaginationRefillsRowsExcludedByLocalState(t *testing.T) {
 		}
 		augmenter.upstreamOverfetch = len(localThreads)
 		augmenter.load = func(int) []any { return localThreads }
-		if !rewriteAmpThreadListRequestWindow(req, augmenter) {
+		if augmenter.upstreamRebased = rewriteAmpThreadListRequestWindow(req, augmenter); !augmenter.upstreamRebased {
 			t.Fatalf("page %d request was not rewritten", page)
 		}
 		if got, want := req.URL.Query().Get("limit"), strconv.Itoa(offset+2); got != want {
@@ -1194,6 +1330,36 @@ func TestModifyResponse_NormalizesGzippedThreadListRelationships(t *testing.T) {
 	got, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("ReadAll error: %v", err)
+	}
+	var decoded any
+	if err := json.Unmarshal(got, &decoded); err != nil {
+		t.Fatalf("response JSON error: %v; body=%s", err, got)
+	}
+	assertThreadRelationshipsForTest(t, decoded)
+}
+
+func TestModifyResponse_NormalizesContentEncodedGzipThreadList(t *testing.T) {
+	proxy, err := createReverseProxy("http://example.com", NewStaticSecretSource("k"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body := []byte(`{"ok":true,"result":{"threads":[{"id":"T-1","title":"missing"}]}}`)
+	resp := mkResp(http.StatusOK, http.Header{
+		"Content-Type":     []string{"application/json"},
+		"Content-Encoding": []string{"gzip"},
+	}, gzipBytes(body))
+	resp.Request = httptest.NewRequest(http.MethodPost, "http://proxy.local/api/internal?listThreads", nil)
+
+	if err := proxy.ModifyResponse(resp); err != nil {
+		t.Fatalf("ModifyResponse error: %v", err)
+	}
+	got, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Header.Get("Content-Encoding") != "" {
+		t.Fatalf("Content-Encoding = %q, want decompressed response", resp.Header.Get("Content-Encoding"))
 	}
 	var decoded any
 	if err := json.Unmarshal(got, &decoded); err != nil {

@@ -13,12 +13,21 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	"github.com/tidwall/gjson"
 )
+
+func TestEncodeCodexWebsocketAsSSEFramesCompleteEvent(t *testing.T) {
+	payload := []byte(`{"type":"response.created"}`)
+	want := []byte("data: {\"type\":\"response.created\"}\n\n")
+	if got := encodeCodexWebsocketAsSSE(payload); !bytes.Equal(got, want) {
+		t.Fatalf("encoded event = %q, want %q", got, want)
+	}
+}
 
 func TestBuildCodexWebsocketRequestBodyPreservesPreviousResponseID(t *testing.T) {
 	body := []byte(`{"model":"gpt-5-codex","previous_response_id":"resp-1","input":[{"type":"message","id":"msg-1"}]}`)
@@ -117,13 +126,11 @@ func TestCodexWebsocketsLocalNeoRequestDoesNotInjectImageGeneration(t *testing.T
 
 	exec := NewCodexWebsocketsExecutor(&config.Config{})
 	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
-	headers := http.Header{}
-	headers.Set(localNeoInferenceHeaderName, "1")
-	_, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
+	ctx := util.WithTrustedLocalNeoInference(context.Background())
+	_, err := exec.Execute(ctx, auth, cliproxyexecutor.Request{
 		Model:   "gpt-5.6-sol",
 		Payload: []byte(`{"model":"gpt-5.6-sol","input":"summarize","tools":[]}`),
 	}, cliproxyexecutor.Options{
-		Headers:      headers,
 		SourceFormat: sdktranslator.FromString("codex"),
 	})
 	if err != nil {

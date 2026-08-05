@@ -210,7 +210,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
 	body, _ = sjson.DeleteBytes(body, "safety_identifier")
 	body = normalizeCodexInstructions(body)
-	if shouldEnsureImageGenerationTool(e.cfg, opts) {
+	if shouldEnsureImageGenerationTool(ctx, e.cfg) {
 		body = ensureImageGenerationTool(body, baseModel, auth)
 	}
 
@@ -410,7 +410,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	requestPath := helps.PayloadRequestPath(opts)
 	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, body, requestedModel, requestPath)
 	body = normalizeCodexInstructions(body)
-	if shouldEnsureImageGenerationTool(e.cfg, opts) {
+	if shouldEnsureImageGenerationTool(ctx, e.cfg) {
 		body = ensureImageGenerationTool(body, baseModel, auth)
 	}
 
@@ -1149,9 +1149,10 @@ func encodeCodexWebsocketAsSSE(payload []byte) []byte {
 	if len(payload) == 0 {
 		return nil
 	}
-	line := make([]byte, 0, len("data: ")+len(payload))
+	line := make([]byte, 0, len("data: ")+len(payload)+2)
 	line = append(line, []byte("data: ")...)
 	line = append(line, payload...)
+	line = append(line, '\n', '\n')
 	return line
 }
 
