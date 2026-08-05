@@ -44,11 +44,13 @@ type ObjectStoreConfig struct {
 // Files are mirrored to a local workspace so existing file-based flows continue to operate.
 type ObjectTokenStore struct {
 	client     *minio.Client
+	httpClient *http.Client
 	cfg        ObjectStoreConfig
 	spoolRoot  string
 	configPath string
 	authDir    string
 	mu         sync.Mutex
+	renameFile func(string, string) error
 }
 
 // NewObjectTokenStore initializes an object storage backed token store.
@@ -94,11 +96,16 @@ func NewObjectTokenStore(cfg ObjectStoreConfig) (*ObjectTokenStore, error) {
 	if err = os.MkdirAll(authDir, 0o700); err != nil {
 		return nil, fmt.Errorf("object store: create auth directory: %w", err)
 	}
+	httpTransport, errTransport := minio.DefaultTransport(cfg.UseSSL)
+	if errTransport != nil {
+		return nil, fmt.Errorf("object store: create HTTP transport: %w", errTransport)
+	}
 
 	options := &minio.Options{
-		Creds:  credentials.NewStaticV4(cfg.AccessKey, cfg.SecretKey, ""),
-		Secure: cfg.UseSSL,
-		Region: cfg.Region,
+		Creds:     credentials.NewStaticV4(cfg.AccessKey, cfg.SecretKey, ""),
+		Secure:    cfg.UseSSL,
+		Region:    cfg.Region,
+		Transport: httpTransport,
 	}
 	if cfg.PathStyle {
 		options.BucketLookup = minio.BucketLookupPath
@@ -111,6 +118,7 @@ func NewObjectTokenStore(cfg ObjectStoreConfig) (*ObjectTokenStore, error) {
 
 	return &ObjectTokenStore{
 		client:     client,
+		httpClient: &http.Client{Transport: httpTransport},
 		cfg:        cfg,
 		spoolRoot:  absRoot,
 		configPath: filepath.Join(configDir, "config.yaml"),
@@ -182,6 +190,16 @@ func (s *ObjectTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (s
 		return "", fmt.Errorf("object store: create auth directory: %w", err)
 	}
 
+	previous, errReadPrevious := os.ReadFile(path)
+	previousExists := errReadPrevious == nil
+	if errReadPrevious != nil && !errors.Is(errReadPrevious, fs.ErrNotExist) {
+		return "", fmt.Errorf("object store: read existing metadata: %w", errReadPrevious)
+	}
+	tmp := path + ".tmp"
+	if errRemoveStale := os.Remove(tmp); errRemoveStale != nil && !errors.Is(errRemoveStale, fs.ErrNotExist) {
+		return "", fmt.Errorf("object store: remove stale temp auth file: %w", errRemoveStale)
+	}
+	defer func() { _ = os.Remove(tmp) }()
 	switch {
 	case auth.Storage != nil:
 		if auth.Metadata == nil {
@@ -191,7 +209,7 @@ func (s *ObjectTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (s
 		if setter, ok := auth.Storage.(interface{ SetMetadata(map[string]any) }); ok {
 			setter.SetMetadata(auth.Metadata)
 		}
-		if err = auth.Storage.SaveTokenToFile(path); err != nil {
+		if err = auth.Storage.SaveTokenToFile(tmp); err != nil {
 			return "", err
 		}
 	case auth.Metadata != nil:
@@ -200,36 +218,78 @@ func (s *ObjectTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (s
 		if errMarshal != nil {
 			return "", fmt.Errorf("object store: marshal metadata: %w", errMarshal)
 		}
-		if existing, errRead := os.ReadFile(path); errRead == nil {
-			if jsonEqual(existing, raw) {
-				return path, nil
-			}
-		} else if errRead != nil && !errors.Is(errRead, fs.ErrNotExist) {
-			return "", fmt.Errorf("object store: read existing metadata: %w", errRead)
-		}
-		tmp := path + ".tmp"
 		if errWrite := os.WriteFile(tmp, raw, 0o600); errWrite != nil {
 			return "", fmt.Errorf("object store: write temp auth file: %w", errWrite)
-		}
-		if errRename := os.Rename(tmp, path); errRename != nil {
-			return "", fmt.Errorf("object store: rename auth file: %w", errRename)
 		}
 	default:
 		return "", fmt.Errorf("object store: nothing to persist for %s", auth.ID)
 	}
-
-	if auth.Attributes == nil {
-		auth.Attributes = make(map[string]string)
-	}
-	auth.Attributes["path"] = path
-
-	if strings.TrimSpace(auth.FileName) == "" {
-		auth.FileName = auth.ID
+	if errChmod := os.Chmod(tmp, 0o600); errChmod != nil && !errors.Is(errChmod, fs.ErrNotExist) {
+		return "", fmt.Errorf("object store: secure temp auth file: %w", errChmod)
 	}
 
-	if err = s.uploadAuth(ctx, path); err != nil {
+	candidate, errReadCandidate := os.ReadFile(tmp)
+	if errors.Is(errReadCandidate, fs.ErrNotExist) && auth.Storage != nil {
+		normalizeSavedAuth(auth, path)
+		return path, nil
+	}
+	if errReadCandidate != nil {
+		return "", fmt.Errorf("object store: read temp auth file: %w", errReadCandidate)
+	}
+	if previousExists && jsonEqual(previous, candidate) {
+		normalizeSavedAuth(auth, path)
+		return path, nil
+	}
+	remoteState, errRemoteState := s.loadAuthObjectState(ctx, path)
+	if errRemoteState != nil {
+		return "", errRemoteState
+	}
+	var uploaded minio.UploadInfo
+	remoteChanged := false
+	switch {
+	case len(candidate) == 0 && remoteState.exists:
+		if strings.TrimSpace(remoteState.etag) == "" {
+			return "", fmt.Errorf("object store: cannot safely delete existing auth object without ETag")
+		}
+		err = s.deleteAuthObjectIfMatch(ctx, path, remoteState.etag)
+		remoteChanged = err == nil
+	case len(candidate) > 0 && remoteState.exists && bytes.Equal(candidate, remoteState.data):
+	case len(candidate) > 0:
+		if remoteState.exists && strings.TrimSpace(remoteState.etag) == "" {
+			return "", fmt.Errorf("object store: cannot safely replace existing auth object without ETag")
+		}
+		uploaded, err = s.uploadAuthDataTracked(ctx, path, candidate, remoteState.etag, !remoteState.exists)
+		remoteChanged = err == nil
+	}
+	if err != nil {
 		return "", err
 	}
+	if errRename := s.renameAuthFile(tmp, path); errRename != nil {
+		if remoteChanged {
+			rollbackCtx := context.WithoutCancel(ctx)
+			var errRollback error
+			switch {
+			case len(candidate) == 0:
+				_, errRollback = s.uploadAuthDataTracked(rollbackCtx, path, remoteState.data, "", true)
+			case remoteState.exists:
+				if strings.TrimSpace(uploaded.ETag) == "" {
+					errRollback = fmt.Errorf("object store: cannot safely restore object without uploaded ETag")
+				} else {
+					_, errRollback = s.uploadAuthDataTracked(rollbackCtx, path, remoteState.data, uploaded.ETag, false)
+				}
+			default:
+				errRollback = s.deleteUploadedAuthObject(rollbackCtx, path, uploaded)
+			}
+			if errRollback != nil {
+				return "", errors.Join(
+					fmt.Errorf("object store: publish auth file: %w", errRename),
+					fmt.Errorf("object store: remote rollback failed: %w", errRollback),
+				)
+			}
+		}
+		return "", fmt.Errorf("object store: publish auth file: %w", errRename)
+	}
+	normalizeSavedAuth(auth, path)
 	return path, nil
 }
 
@@ -449,10 +509,6 @@ func (s *ObjectTokenStore) uploadAuth(ctx context.Context, path string) error {
 	if path == "" {
 		return nil
 	}
-	rel, err := filepath.Rel(s.authDir, path)
-	if err != nil {
-		return fmt.Errorf("object store: resolve auth relative path: %w", err)
-	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -463,35 +519,175 @@ func (s *ObjectTokenStore) uploadAuth(ctx context.Context, path string) error {
 	if len(data) == 0 {
 		return s.deleteAuthObject(ctx, path)
 	}
-	key := objectStoreAuthPrefix + "/" + filepath.ToSlash(rel)
-	return s.putObject(ctx, key, data, "application/json")
+	return s.uploadAuthData(ctx, path, data)
+}
+
+func (s *ObjectTokenStore) renameAuthFile(oldPath, newPath string) error {
+	if s.renameFile != nil {
+		return s.renameFile(oldPath, newPath)
+	}
+	return os.Rename(oldPath, newPath)
+}
+
+func (s *ObjectTokenStore) uploadAuthData(ctx context.Context, path string, data []byte) error {
+	if len(data) == 0 {
+		return s.deleteAuthObject(ctx, path)
+	}
+	_, err := s.uploadAuthDataTracked(ctx, path, data, "", false)
+	return err
+}
+
+type authObjectState struct {
+	exists    bool
+	data      []byte
+	etag      string
+	versionID string
+}
+
+func (s *ObjectTokenStore) loadAuthObjectState(ctx context.Context, path string) (authObjectState, error) {
+	key, err := s.authObjectKey(path)
+	if err != nil {
+		return authObjectState{}, err
+	}
+	fullKey := s.prefixedKey(key)
+	core := minio.Core{Client: s.client}
+	object, info, _, errGet := core.GetObject(ctx, s.cfg.Bucket, fullKey, minio.GetObjectOptions{})
+	if errGet != nil {
+		if isObjectNotFound(errGet) {
+			return authObjectState{}, nil
+		}
+		return authObjectState{}, fmt.Errorf("object store: fetch auth object %s: %w", fullKey, errGet)
+	}
+	data, errRead := io.ReadAll(object)
+	errClose := object.Close()
+	if errRead != nil {
+		return authObjectState{}, fmt.Errorf("object store: read auth object %s: %w", fullKey, errRead)
+	}
+	if errClose != nil {
+		return authObjectState{}, fmt.Errorf("object store: close auth object %s: %w", fullKey, errClose)
+	}
+	return authObjectState{
+		exists:    true,
+		data:      data,
+		etag:      strings.Trim(info.ETag, "\""),
+		versionID: info.VersionID,
+	}, nil
+}
+
+func (s *ObjectTokenStore) authObjectKey(path string) (string, error) {
+	rel, err := filepath.Rel(s.authDir, path)
+	if err != nil {
+		return "", fmt.Errorf("object store: resolve auth relative path: %w", err)
+	}
+	return objectStoreAuthPrefix + "/" + filepath.ToSlash(rel), nil
+}
+
+func (s *ObjectTokenStore) uploadAuthDataTracked(ctx context.Context, path string, data []byte, matchETag string, createOnly bool) (minio.UploadInfo, error) {
+	key, err := s.authObjectKey(path)
+	if err != nil {
+		return minio.UploadInfo{}, err
+	}
+	return s.putObjectTracked(ctx, key, data, "application/json", matchETag, createOnly)
 }
 
 func (s *ObjectTokenStore) deleteAuthObject(ctx context.Context, path string) error {
 	if path == "" {
 		return nil
 	}
-	rel, err := filepath.Rel(s.authDir, path)
+	key, err := s.authObjectKey(path)
 	if err != nil {
-		return fmt.Errorf("object store: resolve auth relative path: %w", err)
+		return err
 	}
-	key := objectStoreAuthPrefix + "/" + filepath.ToSlash(rel)
 	return s.deleteObject(ctx, key)
+}
+
+func (s *ObjectTokenStore) deleteAuthObjectIfMatch(ctx context.Context, path, etag string) error {
+	key, err := s.authObjectKey(path)
+	if err != nil {
+		return err
+	}
+	return s.deleteObjectIfMatch(ctx, key, etag)
+}
+
+func (s *ObjectTokenStore) deleteUploadedAuthObject(ctx context.Context, path string, uploaded minio.UploadInfo) error {
+	key, err := s.authObjectKey(path)
+	if err != nil {
+		return err
+	}
+	fullKey := s.prefixedKey(key)
+	if uploaded.VersionID != "" {
+		if err = s.client.RemoveObject(ctx, s.cfg.Bucket, fullKey, minio.RemoveObjectOptions{VersionID: uploaded.VersionID}); err != nil {
+			return fmt.Errorf("object store: remove uploaded object %s version %s: %w", fullKey, uploaded.VersionID, err)
+		}
+		return nil
+	}
+	if strings.TrimSpace(uploaded.ETag) == "" {
+		return fmt.Errorf("object store: cannot safely rollback new object %s without version ID or ETag", fullKey)
+	}
+	return s.deleteObjectIfMatch(ctx, key, uploaded.ETag)
 }
 
 func (s *ObjectTokenStore) putObject(ctx context.Context, key string, data []byte, contentType string) error {
 	if len(data) == 0 {
 		return s.deleteObject(ctx, key)
 	}
+	_, err := s.putObjectTracked(ctx, key, data, contentType, "", false)
+	return err
+}
+
+func (s *ObjectTokenStore) putObjectTracked(ctx context.Context, key string, data []byte, contentType, matchETag string, createOnly bool) (minio.UploadInfo, error) {
 	fullKey := s.prefixedKey(key)
-	reader := bytes.NewReader(data)
-	_, err := s.client.PutObject(ctx, s.cfg.Bucket, fullKey, reader, int64(len(data)), minio.PutObjectOptions{
-		ContentType: contentType,
-	})
-	if err != nil {
-		return fmt.Errorf("object store: put object %s: %w", fullKey, err)
+	if createOnly {
+		return s.putObjectIfAbsentTracked(ctx, fullKey, data, contentType)
 	}
-	return nil
+	reader := bytes.NewReader(data)
+	options := minio.PutObjectOptions{
+		ContentType: contentType,
+	}
+	if matchETag != "" {
+		options.SetMatchETag(strings.Trim(matchETag, "\""))
+	}
+	info, err := s.client.PutObject(ctx, s.cfg.Bucket, fullKey, reader, int64(len(data)), options)
+	if err != nil {
+		return minio.UploadInfo{}, fmt.Errorf("object store: put object %s: %w", fullKey, err)
+	}
+	return info, nil
+}
+
+func (s *ObjectTokenStore) putObjectIfAbsentTracked(ctx context.Context, fullKey string, data []byte, contentType string) (minio.UploadInfo, error) {
+	headers := http.Header{"If-None-Match": []string{"*"}}
+	u, errPresign := s.client.PresignHeader(ctx, http.MethodPut, s.cfg.Bucket, fullKey, time.Minute, nil, headers)
+	if errPresign != nil {
+		return minio.UploadInfo{}, fmt.Errorf("object store: sign conditional put object %s: %w", fullKey, errPresign)
+	}
+	request, errRequest := http.NewRequestWithContext(ctx, http.MethodPut, u.String(), bytes.NewReader(data))
+	if errRequest != nil {
+		return minio.UploadInfo{}, fmt.Errorf("object store: create conditional put request for %s: %w", fullKey, errRequest)
+	}
+	request.Header.Set("If-None-Match", "*")
+	request.Header.Set("Content-Type", contentType)
+	response, errDo := s.httpClient.Do(request)
+	if errDo != nil {
+		return minio.UploadInfo{}, fmt.Errorf("object store: put object %s: %w", fullKey, errDo)
+	}
+	_, errDrain := io.Copy(io.Discard, response.Body)
+	errClose := response.Body.Close()
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return minio.UploadInfo{}, fmt.Errorf("object store: put object %s: unexpected HTTP status %s", fullKey, response.Status)
+	}
+	if errDrain != nil {
+		return minio.UploadInfo{}, fmt.Errorf("object store: drain put object %s response: %w", fullKey, errDrain)
+	}
+	if errClose != nil {
+		return minio.UploadInfo{}, fmt.Errorf("object store: close put object %s response: %w", fullKey, errClose)
+	}
+	return minio.UploadInfo{
+		Bucket:    s.cfg.Bucket,
+		Key:       fullKey,
+		ETag:      strings.Trim(response.Header.Get("ETag"), "\""),
+		Size:      int64(len(data)),
+		VersionID: response.Header.Get("X-Amz-Version-Id"),
+	}, nil
 }
 
 func (s *ObjectTokenStore) deleteObject(ctx context.Context, key string) error {
@@ -506,12 +702,52 @@ func (s *ObjectTokenStore) deleteObject(ctx context.Context, key string) error {
 	return nil
 }
 
+func (s *ObjectTokenStore) deleteObjectIfMatch(ctx context.Context, key, etag string) error {
+	fullKey := s.prefixedKey(key)
+	headers := http.Header{"If-Match": []string{"\"" + strings.Trim(etag, "\"") + "\""}}
+	u, errPresign := s.client.PresignHeader(ctx, http.MethodDelete, s.cfg.Bucket, fullKey, time.Minute, nil, headers)
+	if errPresign != nil {
+		return fmt.Errorf("object store: sign conditional delete object %s: %w", fullKey, errPresign)
+	}
+	request, errRequest := http.NewRequestWithContext(ctx, http.MethodDelete, u.String(), nil)
+	if errRequest != nil {
+		return fmt.Errorf("object store: create conditional delete request for %s: %w", fullKey, errRequest)
+	}
+	request.Header.Set("If-Match", headers.Get("If-Match"))
+	response, errDo := s.httpClient.Do(request)
+	if errDo != nil {
+		return fmt.Errorf("object store: delete object %s: %w", fullKey, errDo)
+	}
+	_, errDrain := io.Copy(io.Discard, response.Body)
+	errClose := response.Body.Close()
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("object store: delete object %s: unexpected HTTP status %s", fullKey, response.Status)
+	}
+	if errDrain != nil {
+		return fmt.Errorf("object store: drain delete object %s response: %w", fullKey, errDrain)
+	}
+	if errClose != nil {
+		return fmt.Errorf("object store: close delete object %s response: %w", fullKey, errClose)
+	}
+	return nil
+}
+
 func (s *ObjectTokenStore) prefixedKey(key string) string {
 	key = strings.TrimLeft(key, "/")
 	if s.cfg.Prefix == "" {
 		return key
 	}
 	return strings.TrimLeft(s.cfg.Prefix+"/"+key, "/")
+}
+
+func normalizeSavedAuth(auth *cliproxyauth.Auth, path string) {
+	if auth.Attributes == nil {
+		auth.Attributes = make(map[string]string)
+	}
+	auth.Attributes["path"] = path
+	if strings.TrimSpace(auth.FileName) == "" {
+		auth.FileName = auth.ID
+	}
 }
 
 func (s *ObjectTokenStore) resolveAuthPath(auth *cliproxyauth.Auth) (string, error) {

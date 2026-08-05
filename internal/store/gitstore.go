@@ -15,6 +15,8 @@ import (
 	"github.com/go-git/go-git/v6"
 	"github.com/go-git/go-git/v6/config"
 	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/filemode"
+	"github.com/go-git/go-git/v6/plumbing/format/index"
 	"github.com/go-git/go-git/v6/plumbing/object"
 	"github.com/go-git/go-git/v6/plumbing/transport"
 	"github.com/go-git/go-git/v6/plumbing/transport/http"
@@ -26,16 +28,18 @@ const gcInterval = 5 * time.Minute
 
 // GitTokenStore persists token records and auth metadata using git as the backing storage.
 type GitTokenStore struct {
-	mu        sync.Mutex
-	dirLock   sync.RWMutex
-	baseDir   string
-	repoDir   string
-	configDir string
-	remote    string
-	branch    string
-	username  string
-	password  string
-	lastGC    time.Time
+	mu         sync.Mutex
+	dirLock    sync.RWMutex
+	baseDir    string
+	repoDir    string
+	configDir  string
+	remote     string
+	branch     string
+	username   string
+	password   string
+	lastGC     time.Time
+	renameFile func(string, string) error
+	pushRepo   func(context.Context, *git.Repository, *git.PushOptions) error
 }
 
 type resolvedRemoteBranch struct {
@@ -255,7 +259,7 @@ func (s *GitTokenStore) EnsureRepository() error {
 }
 
 // Save persists token storage and metadata to the resolved auth file path.
-func (s *GitTokenStore) Save(_ context.Context, auth *cliproxyauth.Auth) (string, error) {
+func (s *GitTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (string, error) {
 	if auth == nil {
 		return "", fmt.Errorf("auth filestore: auth is nil")
 	}
@@ -285,6 +289,16 @@ func (s *GitTokenStore) Save(_ context.Context, auth *cliproxyauth.Auth) (string
 		return "", fmt.Errorf("auth filestore: create dir failed: %w", err)
 	}
 
+	previous, errReadPrevious := os.ReadFile(path)
+	previousExists := errReadPrevious == nil
+	if errReadPrevious != nil && !errors.Is(errReadPrevious, fs.ErrNotExist) {
+		return "", fmt.Errorf("auth filestore: read existing failed: %w", errReadPrevious)
+	}
+	tmp := path + ".tmp"
+	if errRemoveStale := os.Remove(tmp); errRemoveStale != nil && !errors.Is(errRemoveStale, fs.ErrNotExist) {
+		return "", fmt.Errorf("auth filestore: remove stale temp auth file: %w", errRemoveStale)
+	}
+	defer func() { _ = os.Remove(tmp) }()
 	switch {
 	case auth.Storage != nil:
 		if auth.Metadata == nil {
@@ -294,7 +308,7 @@ func (s *GitTokenStore) Save(_ context.Context, auth *cliproxyauth.Auth) (string
 		if setter, ok := auth.Storage.(interface{ SetMetadata(map[string]any) }); ok {
 			setter.SetMetadata(auth.Metadata)
 		}
-		if err = auth.Storage.SaveTokenToFile(path); err != nil {
+		if err = auth.Storage.SaveTokenToFile(tmp); err != nil {
 			return "", err
 		}
 	case auth.Metadata != nil:
@@ -303,31 +317,27 @@ func (s *GitTokenStore) Save(_ context.Context, auth *cliproxyauth.Auth) (string
 		if errMarshal != nil {
 			return "", fmt.Errorf("auth filestore: marshal metadata failed: %w", errMarshal)
 		}
-		if existing, errRead := os.ReadFile(path); errRead == nil {
-			if jsonEqual(existing, raw) {
-				return path, nil
-			}
-		} else if !os.IsNotExist(errRead) {
-			return "", fmt.Errorf("auth filestore: read existing failed: %w", errRead)
-		}
-		tmp := path + ".tmp"
 		if errWrite := os.WriteFile(tmp, raw, 0o600); errWrite != nil {
 			return "", fmt.Errorf("auth filestore: write temp failed: %w", errWrite)
-		}
-		if errRename := os.Rename(tmp, path); errRename != nil {
-			return "", fmt.Errorf("auth filestore: rename failed: %w", errRename)
 		}
 	default:
 		return "", fmt.Errorf("auth filestore: nothing to persist for %s", auth.ID)
 	}
-
-	if auth.Attributes == nil {
-		auth.Attributes = make(map[string]string)
+	if errChmod := os.Chmod(tmp, 0o600); errChmod != nil && !errors.Is(errChmod, fs.ErrNotExist) {
+		return "", fmt.Errorf("auth filestore: secure temp auth file: %w", errChmod)
 	}
-	auth.Attributes["path"] = path
 
-	if strings.TrimSpace(auth.FileName) == "" {
-		auth.FileName = auth.ID
+	candidate, errReadCandidate := os.ReadFile(tmp)
+	if errors.Is(errReadCandidate, fs.ErrNotExist) && auth.Storage != nil {
+		normalizeSavedAuth(auth, path)
+		return path, nil
+	}
+	if errReadCandidate != nil {
+		return "", fmt.Errorf("auth filestore: read temp failed: %w", errReadCandidate)
+	}
+	if previousExists && jsonEqual(previous, candidate) {
+		normalizeSavedAuth(auth, path)
+		return path, nil
 	}
 
 	relPath, errRel := s.relativeToRepo(path)
@@ -338,11 +348,61 @@ func (s *GitTokenStore) Save(_ context.Context, auth *cliproxyauth.Auth) (string
 	if strings.TrimSpace(messageID) == "" {
 		messageID = filepath.Base(path)
 	}
-	if errCommit := s.commitAndPushLocked(fmt.Sprintf("Update auth %s", strings.TrimSpace(messageID)), relPath); errCommit != nil {
+	repo, errOpen := git.PlainOpen(s.repoDirSnapshot())
+	if errOpen != nil {
+		return "", fmt.Errorf("git token store: open repo: %w", errOpen)
+	}
+	worktree, errWorktree := repo.Worktree()
+	if errWorktree != nil {
+		return "", fmt.Errorf("git token store: worktree: %w", errWorktree)
+	}
+	originalHead, errHead := repo.Head()
+	if errHead != nil {
+		return "", fmt.Errorf("git token store: get head: %w", errHead)
+	}
+	originalIndex, errIndex := repo.Storer.Index()
+	if errIndex != nil {
+		return "", fmt.Errorf("git token store: read index: %w", errIndex)
+	}
+	candidateIndex := cloneGitIndex(originalIndex)
+	if errStage := stageGitAuthData(repo, candidateIndex, relPath, tmp, candidate); errStage != nil {
+		return "", errStage
+	}
+	if errCommit := s.commitStagedAndPushLocked(ctx, repo, worktree, fmt.Sprintf("Update auth %s", strings.TrimSpace(messageID))); errCommit != nil {
+		if errRestore := restoreGitStoreState(repo, originalHead, originalIndex); errRestore != nil {
+			return "", fmt.Errorf("%w (local rollback failed: %v)", errCommit, errRestore)
+		}
 		return "", errCommit
 	}
+	if errRename := s.renameAuthFile(tmp, path); errRename != nil {
+		publishedHead, errPublishedHead := repo.Head()
+		if errPublishedHead != nil {
+			if errRestore := restoreGitStoreState(repo, originalHead, originalIndex); errRestore != nil {
+				return "", fmt.Errorf("git token store: publish auth file: %w (inspect remote rollback state: %v; local rollback failed: %v)", errRename, errPublishedHead, errRestore)
+			}
+			return "", fmt.Errorf("git token store: publish auth file: %w (inspect remote rollback state: %v)", errRename, errPublishedHead)
+		}
+		errRestore := restoreGitStoreState(repo, originalHead, originalIndex)
+		if errRestore != nil {
+			return "", fmt.Errorf("git token store: publish auth file: %w (local rollback failed: %v)", errRename, errRestore)
+		}
+		lease := &git.ForceWithLease{RefName: publishedHead.Name(), Hash: publishedHead.Hash()}
+		if errRollback := s.pushGitRepository(context.WithoutCancel(ctx), repo, lease); errRollback != nil {
+			return "", fmt.Errorf("git token store: publish auth file: %w (remote rollback failed: %v)", errRename, errRollback)
+		}
+		return "", fmt.Errorf("git token store: publish auth file: %w", errRename)
+	}
+	s.maybeRunGC(repo)
 
+	normalizeSavedAuth(auth, path)
 	return path, nil
+}
+
+func (s *GitTokenStore) renameAuthFile(oldPath, newPath string) error {
+	if s.renameFile != nil {
+		return s.renameFile(oldPath, newPath)
+	}
+	return os.Rename(oldPath, newPath)
 }
 
 // List enumerates all auth JSON files under the configured directory.
@@ -829,6 +889,14 @@ func (s *GitTokenStore) commitAndPushLocked(message string, relPaths ...string) 
 	if status.IsClean() {
 		return nil
 	}
+	if err = s.commitStagedAndPushLocked(context.Background(), repo, worktree, message); err != nil {
+		return err
+	}
+	s.maybeRunGC(repo)
+	return nil
+}
+
+func (s *GitTokenStore) commitStagedAndPushLocked(ctx context.Context, repo *git.Repository, worktree *git.Worktree, message string) error {
 	if strings.TrimSpace(message) == "" {
 		message = "Update auth store"
 	}
@@ -854,8 +922,23 @@ func (s *GitTokenStore) commitAndPushLocked(message string, relPaths ...string) 
 	} else if errRewrite := s.rewriteHeadAsSingleCommit(repo, headRef.Name(), commitHash, message, signature); errRewrite != nil {
 		return errRewrite
 	}
-	s.maybeRunGC(repo)
+	// Lease against the last-observed remote head so a concurrent remote writer
+	// surfaces as a push failure instead of being silently overwritten. Fall back
+	// to a plain force push only when no remote-tracking ref exists yet (empty-remote
+	// bootstrap), where there is nothing to clobber.
+	var lease *git.ForceWithLease
+	if headRef != nil {
+		short := strings.TrimPrefix(headRef.Name().String(), "refs/heads/")
+		if remoteTrackingRef, errRT := repo.Reference(plumbing.NewRemoteReferenceName("origin", short), true); errRT == nil {
+			lease = &git.ForceWithLease{RefName: headRef.Name(), Hash: remoteTrackingRef.Hash()}
+		}
+	}
+	return s.pushGitRepository(ctx, repo, lease)
+}
+
+func (s *GitTokenStore) pushGitRepository(ctx context.Context, repo *git.Repository, lease *git.ForceWithLease) error {
 	pushOpts := &git.PushOptions{Auth: s.gitAuth(), Force: true}
+	pushOpts.ForceWithLease = lease
 	if s.branch != "" {
 		pushOpts.RefSpecs = []config.RefSpec{config.RefSpec("refs/heads/" + s.branch + ":refs/heads/" + s.branch)}
 	} else {
@@ -864,11 +947,81 @@ func (s *GitTokenStore) commitAndPushLocked(message string, relPaths ...string) 
 			pushOpts.RefSpecs = []config.RefSpec{config.RefSpec(headRef.Name().String() + ":" + headRef.Name().String())}
 		}
 	}
-	if err = repo.Push(pushOpts); err != nil {
+	var err error
+	if s.pushRepo != nil {
+		err = s.pushRepo(ctx, repo, pushOpts)
+	} else {
+		err = repo.PushContext(ctx, pushOpts)
+	}
+	if err != nil {
 		if errors.Is(err, git.NoErrAlreadyUpToDate) {
 			return nil
 		}
 		return fmt.Errorf("git token store: push: %w", err)
+	}
+	return nil
+}
+
+func cloneGitIndex(source *index.Index) *index.Index {
+	cloned := *source
+	cloned.Entries = make([]*index.Entry, len(source.Entries))
+	for i, entry := range source.Entries {
+		copyEntry := *entry
+		cloned.Entries[i] = &copyEntry
+	}
+	cloned.Cache = nil
+	return &cloned
+}
+
+func stageGitAuthData(repo *git.Repository, candidateIndex *index.Index, relPath, tmpPath string, candidate []byte) error {
+	object := repo.Storer.NewEncodedObject()
+	object.SetType(plumbing.BlobObject)
+	object.SetSize(int64(len(candidate)))
+	writer, errWriter := object.Writer()
+	if errWriter != nil {
+		return fmt.Errorf("git token store: create auth blob writer: %w", errWriter)
+	}
+	if _, errWrite := writer.Write(candidate); errWrite != nil {
+		_ = writer.Close()
+		return fmt.Errorf("git token store: write auth blob: %w", errWrite)
+	}
+	if errClose := writer.Close(); errClose != nil {
+		return fmt.Errorf("git token store: close auth blob: %w", errClose)
+	}
+	hash, errStore := repo.Storer.SetEncodedObject(object)
+	if errStore != nil {
+		return fmt.Errorf("git token store: store auth blob: %w", errStore)
+	}
+	entry, errEntry := candidateIndex.Entry(relPath)
+	if errors.Is(errEntry, index.ErrEntryNotFound) {
+		entry = candidateIndex.Add(relPath)
+	} else if errEntry != nil {
+		return fmt.Errorf("git token store: read auth index entry: %w", errEntry)
+	}
+	info, errStat := os.Stat(tmpPath)
+	if errStat != nil {
+		return fmt.Errorf("git token store: stat temp auth file: %w", errStat)
+	}
+	mode, errMode := filemode.NewFromOSFileMode(info.Mode())
+	if errMode != nil {
+		return fmt.Errorf("git token store: resolve auth file mode: %w", errMode)
+	}
+	entry.Hash = hash
+	entry.ModifiedAt = info.ModTime()
+	entry.Mode = mode
+	entry.Size = uint32(info.Size())
+	if errSetIndex := repo.Storer.SetIndex(candidateIndex); errSetIndex != nil {
+		return fmt.Errorf("git token store: write auth index: %w", errSetIndex)
+	}
+	return nil
+}
+
+func restoreGitStoreState(repo *git.Repository, head *plumbing.Reference, originalIndex *index.Index) error {
+	if err := repo.Storer.SetReference(plumbing.NewHashReference(head.Name(), head.Hash())); err != nil {
+		return fmt.Errorf("restore branch reference: %w", err)
+	}
+	if err := repo.Storer.SetIndex(originalIndex); err != nil {
+		return fmt.Errorf("restore index: %w", err)
 	}
 	return nil
 }

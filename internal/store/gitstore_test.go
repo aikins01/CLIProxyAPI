@@ -1,10 +1,16 @@
 package store
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -12,11 +18,382 @@ import (
 	gitconfig "github.com/go-git/go-git/v6/config"
 	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/plumbing/object"
+	"github.com/go-git/go-git/v6/plumbing/transport"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
+
+type gitStoreTestCommander struct {
+	loader transport.Loader
+}
+
+func (c *gitStoreTestCommander) Command(ctx context.Context, command string, endpoint *transport.Endpoint, _ transport.AuthMethod, params ...string) (transport.Command, error) {
+	service := transport.Service(command)
+	if service != transport.UploadPackService && service != transport.ReceivePackService {
+		return nil, transport.ErrUnsupportedService
+	}
+	return &gitStoreTestCommand{
+		ctx:         ctx,
+		loader:      c.loader,
+		endpoint:    endpoint,
+		service:     service,
+		gitProtocol: strings.Join(params, ":"),
+		done:        make(chan error, 1),
+	}, nil
+}
+
+type gitStoreTestCommand struct {
+	ctx          context.Context
+	loader       transport.Loader
+	endpoint     *transport.Endpoint
+	service      transport.Service
+	gitProtocol  string
+	stdin        *io.PipeReader
+	stdinWriter  *io.PipeWriter
+	stdout       *io.PipeWriter
+	stdoutReader *io.PipeReader
+	done         chan error
+	closeOnce    sync.Once
+}
+
+func (*gitStoreTestCommand) StderrPipe() (io.Reader, error) {
+	return nil, nil
+}
+
+func (c *gitStoreTestCommand) StdinPipe() (io.WriteCloser, error) {
+	c.stdin, c.stdinWriter = io.Pipe()
+	return c.stdinWriter, nil
+}
+
+func (c *gitStoreTestCommand) StdoutPipe() (io.Reader, error) {
+	c.stdoutReader, c.stdout = io.Pipe()
+	return c.stdoutReader, nil
+}
+
+func (c *gitStoreTestCommand) Start() error {
+	storage, err := c.loader.Load(c.endpoint)
+	if err != nil {
+		c.done <- err
+		close(c.done)
+		return err
+	}
+	go func() {
+		var errServe error
+		switch c.service {
+		case transport.UploadPackService:
+			errServe = transport.UploadPack(c.ctx, storage, io.NopCloser(c.stdin), c.stdout, &transport.UploadPackOptions{GitProtocol: c.gitProtocol})
+		case transport.ReceivePackService:
+			errServe = transport.ReceivePack(c.ctx, storage, io.NopCloser(c.stdin), c.stdout, &transport.ReceivePackOptions{GitProtocol: c.gitProtocol})
+		default:
+			errServe = fmt.Errorf("unsupported service: %s", c.service)
+		}
+		if errServe != nil {
+			_ = c.stdout.CloseWithError(errServe)
+		}
+		c.done <- errServe
+		close(c.done)
+	}()
+	return nil
+}
+
+func (c *gitStoreTestCommand) Close() error {
+	c.closeOnce.Do(func() {
+		if c.stdinWriter != nil {
+			_ = c.stdinWriter.Close()
+		}
+		<-c.done
+		if c.stdout != nil {
+			_ = c.stdout.Close()
+		}
+		if c.stdoutReader != nil {
+			_ = c.stdoutReader.Close()
+		}
+		if c.stdin != nil {
+			_ = c.stdin.Close()
+		}
+	})
+	return nil
+}
+
+func init() {
+	transport.Register("file", transport.NewPackTransport(&gitStoreTestCommander{loader: transport.DefaultLoader}))
+}
 
 type testBranchSpec struct {
 	name     string
 	contents string
+}
+
+func TestGitTokenStoreSavePersistsBeforeLocalPublication(t *testing.T) {
+	root := t.TempDir()
+	remoteDir := setupGitRemoteRepository(t, root, "trunk",
+		testBranchSpec{name: "trunk", contents: "remote default branch\n"},
+	)
+	store := NewGitTokenStore(remoteDir, "", "", "trunk")
+	store.SetBaseDir(filepath.Join(root, "workspace", "auths"))
+	path := filepath.Join(root, "workspace", "auths", "credential.json")
+	var durableAtPublish []byte
+	store.renameFile = func(oldPath, newPath string) error {
+		durableAtPublish = readRemoteBranchFile(t, remoteDir, "trunk", "auths/credential.json")
+		if _, err := os.Stat(newPath); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("visible auth exists before publication: %v", err)
+		}
+		return os.Rename(oldPath, newPath)
+	}
+
+	_, err := store.Save(context.Background(), &cliproxyauth.Auth{
+		ID:       "credential.json",
+		Metadata: map[string]any{"value": "candidate"},
+	})
+	if err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	assertJSONField(t, durableAtPublish, "value", "candidate")
+	published, errRead := os.ReadFile(path)
+	if errRead != nil {
+		t.Fatalf("read published auth: %v", errRead)
+	}
+	assertJSONField(t, published, "value", "candidate")
+	assertNoStoreTempFile(t, path)
+
+	remoteRepo, errOpen := git.PlainOpen(remoteDir)
+	if errOpen != nil {
+		t.Fatalf("open remote repo: %v", errOpen)
+	}
+	ref, errRef := remoteRepo.Reference(plumbing.NewBranchReferenceName("trunk"), false)
+	if errRef != nil {
+		t.Fatalf("read remote branch: %v", errRef)
+	}
+	commit, errCommit := remoteRepo.CommitObject(ref.Hash())
+	if errCommit != nil {
+		t.Fatalf("read remote commit: %v", errCommit)
+	}
+	if commit.NumParents() != 0 {
+		t.Fatalf("remote commit parents = %d, want 0", commit.NumParents())
+	}
+}
+
+func TestGitTokenStoreSavePushFailureDoesNotPublishLocalFile(t *testing.T) {
+	root := t.TempDir()
+	remoteDir := setupGitRemoteRepository(t, root, "trunk",
+		testBranchSpec{name: "trunk", contents: "remote default branch\n"},
+	)
+	store := NewGitTokenStore(remoteDir, "", "", "trunk")
+	store.SetBaseDir(filepath.Join(root, "workspace", "auths"))
+	path := filepath.Join(root, "workspace", "auths", "credential.json")
+	if _, err := store.Save(context.Background(), &cliproxyauth.Auth{
+		ID:       "credential.json",
+		Metadata: map[string]any{"value": "previous"},
+	}); err != nil {
+		t.Fatalf("save previous auth: %v", err)
+	}
+	previous, errRead := os.ReadFile(path)
+	if errRead != nil {
+		t.Fatalf("read previous auth: %v", errRead)
+	}
+	repo, errOpen := git.PlainOpen(filepath.Join(root, "workspace"))
+	if errOpen != nil {
+		t.Fatalf("open workspace repo: %v", errOpen)
+	}
+	head, errHead := repo.Head()
+	if errHead != nil {
+		t.Fatalf("read workspace head: %v", errHead)
+	}
+	store.pushRepo = func(context.Context, *git.Repository, *git.PushOptions) error {
+		return errors.New("push rejected")
+	}
+
+	_, errSave := store.Save(context.Background(), &cliproxyauth.Auth{
+		ID:       "credential.json",
+		Metadata: map[string]any{"value": "candidate"},
+	})
+	if errSave == nil {
+		t.Fatal("Save succeeded, want push error")
+	}
+	assertLocalStoreBytes(t, path, previous)
+	assertJSONField(t, readRemoteBranchFile(t, remoteDir, "trunk", "auths/credential.json"), "value", "previous")
+	assertGitStoreState(t, repo, head.Hash())
+	assertNoStoreTempFile(t, path)
+
+	store.pushRepo = nil
+	if _, errRetry := store.Save(context.Background(), &cliproxyauth.Auth{
+		ID:       "credential.json",
+		Metadata: map[string]any{"value": "candidate"},
+	}); errRetry != nil {
+		t.Fatalf("retry Save: %v", errRetry)
+	}
+	assertJSONField(t, readRemoteBranchFile(t, remoteDir, "trunk", "auths/credential.json"), "value", "candidate")
+}
+
+func TestGitTokenStoreSavePublishFailureRollsBackRemote(t *testing.T) {
+	root := t.TempDir()
+	remoteDir := setupGitRemoteRepository(t, root, "trunk",
+		testBranchSpec{name: "trunk", contents: "remote default branch\n"},
+	)
+	store := NewGitTokenStore(remoteDir, "", "", "trunk")
+	store.SetBaseDir(filepath.Join(root, "workspace", "auths"))
+	path := filepath.Join(root, "workspace", "auths", "credential.json")
+	if _, err := store.Save(context.Background(), &cliproxyauth.Auth{
+		ID:       "credential.json",
+		Metadata: map[string]any{"value": "previous"},
+	}); err != nil {
+		t.Fatalf("save previous auth: %v", err)
+	}
+	previous, errRead := os.ReadFile(path)
+	if errRead != nil {
+		t.Fatalf("read previous auth: %v", errRead)
+	}
+	repo, errOpen := git.PlainOpen(filepath.Join(root, "workspace"))
+	if errOpen != nil {
+		t.Fatalf("open workspace repo: %v", errOpen)
+	}
+	head, errHead := repo.Head()
+	if errHead != nil {
+		t.Fatalf("read workspace head: %v", errHead)
+	}
+	store.renameFile = func(string, string) error { return errors.New("publish rejected") }
+
+	_, errSave := store.Save(context.Background(), &cliproxyauth.Auth{
+		ID:       "credential.json",
+		Metadata: map[string]any{"value": "candidate"},
+	})
+	if errSave == nil {
+		t.Fatal("Save succeeded, want publish error")
+	}
+	assertLocalStoreBytes(t, path, previous)
+	assertJSONField(t, readRemoteBranchFile(t, remoteDir, "trunk", "auths/credential.json"), "value", "previous")
+	assertGitStoreState(t, repo, head.Hash())
+	assertNoStoreTempFile(t, path)
+}
+
+func TestGitTokenStoreSaveRollbackLeaseConflictPreservesNewerRemoteHead(t *testing.T) {
+	root := t.TempDir()
+	remoteDir := setupGitRemoteRepository(t, root, "trunk",
+		testBranchSpec{name: "trunk", contents: "remote default branch\n"},
+	)
+	store := NewGitTokenStore(remoteDir, "", "", "trunk")
+	store.SetBaseDir(filepath.Join(root, "workspace", "auths"))
+	path := filepath.Join(root, "workspace", "auths", "credential.json")
+	if _, err := store.Save(context.Background(), &cliproxyauth.Auth{
+		ID:       "credential.json",
+		Metadata: map[string]any{"value": "previous"},
+	}); err != nil {
+		t.Fatalf("save previous auth: %v", err)
+	}
+	previous, errRead := os.ReadFile(path)
+	if errRead != nil {
+		t.Fatalf("read previous auth: %v", errRead)
+	}
+	repo, errOpen := git.PlainOpen(filepath.Join(root, "workspace"))
+	if errOpen != nil {
+		t.Fatalf("open workspace repo: %v", errOpen)
+	}
+	head, errHead := repo.Head()
+	if errHead != nil {
+		t.Fatalf("read workspace head: %v", errHead)
+	}
+	store.renameFile = func(string, string) error { return errors.New("publish rejected") }
+	pushes := 0
+	var newerHead plumbing.Hash
+	store.pushRepo = func(ctx context.Context, repo *git.Repository, opts *git.PushOptions) error {
+		pushes++
+		if pushes == 1 {
+			return repo.PushContext(ctx, opts)
+		}
+		newerHead = advanceRemoteHeadFromCurrentTree(t, remoteDir, "trunk")
+		return repo.PushContext(ctx, opts)
+	}
+
+	_, errSave := store.Save(context.Background(), &cliproxyauth.Auth{
+		ID:       "credential.json",
+		Metadata: map[string]any{"value": "candidate"},
+	})
+	if errSave == nil || !strings.Contains(errSave.Error(), "remote rollback failed") {
+		t.Fatalf("Save error = %v, want lease conflict", errSave)
+	}
+	remoteRepo, errRemote := git.PlainOpen(remoteDir)
+	if errRemote != nil {
+		t.Fatalf("open remote repo: %v", errRemote)
+	}
+	remoteHead, errRemoteHead := remoteRepo.Reference(plumbing.NewBranchReferenceName("trunk"), false)
+	if errRemoteHead != nil {
+		t.Fatalf("read remote head: %v", errRemoteHead)
+	}
+	if remoteHead.Hash() != newerHead {
+		t.Fatalf("remote head = %s, want newer head %s", remoteHead.Hash(), newerHead)
+	}
+	assertLocalStoreBytes(t, path, previous)
+	assertGitStoreState(t, repo, head.Hash())
+	assertNoStoreTempFile(t, path)
+}
+
+func TestGitTokenStoreSaveUsesTemporarySecurePathForTokenStorage(t *testing.T) {
+	root := t.TempDir()
+	remoteDir := setupGitRemoteRepository(t, root, "trunk",
+		testBranchSpec{name: "trunk", contents: "remote default branch\n"},
+	)
+	store := NewGitTokenStore(remoteDir, "", "", "trunk")
+	store.SetBaseDir(filepath.Join(root, "workspace", "auths"))
+	storage := &storeTestTokenStorage{data: []byte(`{"type":"gemini","token":"value"}`), mode: 0o644}
+	store.renameFile = func(oldPath, newPath string) error {
+		assertStoreFileMode(t, oldPath, 0o600)
+		return os.Rename(oldPath, newPath)
+	}
+	auth := &cliproxyauth.Auth{
+		ID:       "credential.json",
+		Metadata: map[string]any{"type": "gemini"},
+		Storage:  storage,
+	}
+	path, err := store.Save(context.Background(), auth)
+	if err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if storage.path != path+".tmp" {
+		t.Fatalf("storage path = %q, want %q", storage.path, path+".tmp")
+	}
+	assertLocalStoreBytes(t, path, storage.data)
+	assertStoreFileMode(t, path, 0o600)
+	assertNoStoreTempFile(t, path)
+}
+
+func TestGitTokenStoreSavePreservesEmptyStorageNoOp(t *testing.T) {
+	root := t.TempDir()
+	remoteDir := setupGitRemoteRepository(t, root, "trunk",
+		testBranchSpec{name: "trunk", contents: "remote default branch\n"},
+	)
+	store := NewGitTokenStore(remoteDir, "", "", "trunk")
+	store.SetBaseDir(filepath.Join(root, "workspace", "auths"))
+	auth := &cliproxyauth.Auth{ID: "credential.json", Storage: &storeTestEmptyStorage{}}
+	path, err := store.Save(context.Background(), auth)
+	if err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if _, errStat := os.Stat(path); !errors.Is(errStat, os.ErrNotExist) {
+		t.Fatalf("stat visible auth error = %v, want not exist", errStat)
+	}
+	assertSavedAuthNormalized(t, auth, path)
+	assertNoStoreTempFile(t, path)
+}
+
+func TestGitTokenStoreSaveSameJSONNormalizesAuth(t *testing.T) {
+	root := t.TempDir()
+	remoteDir := setupGitRemoteRepository(t, root, "trunk",
+		testBranchSpec{name: "trunk", contents: "remote default branch\n"},
+	)
+	store := NewGitTokenStore(remoteDir, "", "", "trunk")
+	store.SetBaseDir(filepath.Join(root, "workspace", "auths"))
+	if _, err := store.Save(context.Background(), &cliproxyauth.Auth{
+		ID:       "credential.json",
+		Metadata: map[string]any{"value": "same"},
+	}); err != nil {
+		t.Fatalf("save initial auth: %v", err)
+	}
+	auth := &cliproxyauth.Auth{ID: "credential.json", Metadata: map[string]any{"value": "same"}}
+	path, err := store.Save(context.Background(), auth)
+	if err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	assertSavedAuthNormalized(t, auth, path)
+	assertNoStoreTempFile(t, path)
 }
 
 func TestEnsureRepositoryUsesRemoteDefaultBranchWhenBranchNotConfigured(t *testing.T) {
@@ -418,6 +795,48 @@ func advanceRemoteBranch(t *testing.T, seedDir, remoteDir, branch, contents, mes
 	}
 }
 
+func advanceRemoteHeadFromCurrentTree(t *testing.T, remoteDir, branch string) plumbing.Hash {
+	t.Helper()
+	remoteRepo, err := git.PlainOpen(remoteDir)
+	if err != nil {
+		t.Fatalf("open remote repo: %v", err)
+	}
+	branchName := plumbing.NewBranchReferenceName(branch)
+	current, err := remoteRepo.Reference(branchName, false)
+	if err != nil {
+		t.Fatalf("read remote branch %s: %v", branch, err)
+	}
+	currentCommit, err := remoteRepo.CommitObject(current.Hash())
+	if err != nil {
+		t.Fatalf("read remote commit: %v", err)
+	}
+	signature := object.Signature{
+		Name:  "Concurrent writer",
+		Email: "concurrent@local",
+		When:  time.Unix(1711929660, 0),
+	}
+	commit := &object.Commit{
+		Author:       signature,
+		Committer:    signature,
+		Message:      "Concurrent update",
+		TreeHash:     currentCommit.TreeHash,
+		ParentHashes: []plumbing.Hash{current.Hash()},
+	}
+	encoded := &plumbing.MemoryObject{}
+	encoded.SetType(plumbing.CommitObject)
+	if err = commit.Encode(encoded); err != nil {
+		t.Fatalf("encode concurrent commit: %v", err)
+	}
+	hash, err := remoteRepo.Storer.SetEncodedObject(encoded)
+	if err != nil {
+		t.Fatalf("store concurrent commit: %v", err)
+	}
+	if err = remoteRepo.Storer.SetReference(plumbing.NewHashReference(branchName, hash)); err != nil {
+		t.Fatalf("advance remote branch %s: %v", branch, err)
+	}
+	return hash
+}
+
 func advanceRemoteBranchFromNewBranch(t *testing.T, seedDir, remoteDir, branch, contents, message string) {
 	t.Helper()
 
@@ -581,5 +1000,56 @@ func assertRemoteBranchContents(t *testing.T, remoteDir, branch, wantContents st
 	}
 	if contents != wantContents {
 		t.Fatalf("remote branch %s contents = %q, want %q", branch, contents, wantContents)
+	}
+}
+
+func readRemoteBranchFile(t *testing.T, remoteDir, branch, path string) []byte {
+	t.Helper()
+	remoteRepo, err := git.PlainOpen(remoteDir)
+	if err != nil {
+		t.Fatalf("open remote repo: %v", err)
+	}
+	ref, err := remoteRepo.Reference(plumbing.NewBranchReferenceName(branch), false)
+	if err != nil {
+		t.Fatalf("read remote branch %s: %v", branch, err)
+	}
+	commit, err := remoteRepo.CommitObject(ref.Hash())
+	if err != nil {
+		t.Fatalf("read remote branch %s commit: %v", branch, err)
+	}
+	tree, err := commit.Tree()
+	if err != nil {
+		t.Fatalf("read remote branch %s tree: %v", branch, err)
+	}
+	file, err := tree.File(path)
+	if err != nil {
+		t.Fatalf("read remote branch %s file %s: %v", branch, path, err)
+	}
+	contents, err := file.Contents()
+	if err != nil {
+		t.Fatalf("read remote branch %s file %s contents: %v", branch, path, err)
+	}
+	return []byte(contents)
+}
+
+func assertGitStoreState(t *testing.T, repo *git.Repository, wantHead plumbing.Hash) {
+	t.Helper()
+	head, err := repo.Head()
+	if err != nil {
+		t.Fatalf("read workspace head: %v", err)
+	}
+	if head.Hash() != wantHead {
+		t.Fatalf("workspace head = %s, want %s", head.Hash(), wantHead)
+	}
+	worktree, err := repo.Worktree()
+	if err != nil {
+		t.Fatalf("open workspace worktree: %v", err)
+	}
+	status, err := worktree.Status()
+	if err != nil {
+		t.Fatalf("workspace status: %v", err)
+	}
+	if !status.IsClean() {
+		t.Fatalf("workspace status is dirty: %s", status.String())
 	}
 }
