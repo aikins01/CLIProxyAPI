@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18616,7 +18617,7 @@ func TestNeoWebLocalGitDiffSnapshotLimitsResponseWithoutChangingHashes(t *testin
 		},
 	}
 
-	limited := neoLimitGitDiffSnapshotResult(original, 1024)
+	limited := neoLimitGitDiffSnapshotResult(original, 1280)
 	limitedSnapshot := mapValue(limited["snapshot"])
 	limitedFiles := arrayValue(limitedSnapshot["files"])
 	large := mapValue(limitedFiles[0])
@@ -18643,7 +18644,7 @@ func TestNeoWebLocalGitDiffSnapshotLimitsResponseWithoutChangingHashes(t *testin
 		t.Fatal("original snapshot was mutated")
 	}
 	raw, err := json.Marshal(limited)
-	if err != nil || len(raw) > 1024 {
+	if err != nil || len(raw) > 1280 {
 		t.Fatalf("limited response bytes = %d, err=%v", len(raw), err)
 	}
 
@@ -18654,7 +18655,7 @@ func TestNeoWebLocalGitDiffSnapshotLimitsResponseWithoutChangingHashes(t *testin
 		"snapshot": map[string]any{
 			"provider":       "git",
 			"available":      true,
-			"repositoryRoot": strings.Repeat("/very-long-path", 256),
+			"repositoryRoot": strings.Repeat("/very-long-path", 128),
 			"diffHash":       "metadata-heavy-hash",
 			"files": []any{map[string]any{
 				"path":      strings.Repeat("long-path/", 256) + "file.go",
@@ -18663,9 +18664,9 @@ func TestNeoWebLocalGitDiffSnapshotLimitsResponseWithoutChangingHashes(t *testin
 			}},
 		},
 	}
-	metadataLimited := neoLimitGitDiffSnapshotResult(metadataHeavy, 512)
+	metadataLimited := neoLimitGitDiffSnapshotResult(metadataHeavy, 4096)
 	metadataRaw, err := json.Marshal(metadataLimited)
-	if err != nil || len(metadataRaw) > 512 {
+	if err != nil || len(metadataRaw) > 4096 {
 		t.Fatalf("metadata-limited response bytes = %d, err=%v", len(metadataRaw), err)
 	}
 	metadataSnapshot := mapValue(metadataLimited["snapshot"])
@@ -18680,6 +18681,87 @@ func TestNeoWebLocalGitDiffSnapshotLimitsResponseWithoutChangingHashes(t *testin
 	}
 	if fallbackLimited["requestId"] != "git-metadata-heavy" || fallbackLimited["ok"] != false || stringValue(fallbackLimited["error"]) == "" {
 		t.Fatalf("fallback-limited response = %#v", fallbackLimited)
+	}
+}
+
+func TestNeoLimitGitDiffSnapshotResultRepairsMissingRequiredFields(t *testing.T) {
+	original := map[string]any{
+		"type":      "client_git_diff_snapshot_result",
+		"requestId": "git-repair",
+		"ok":        true,
+		"snapshot": map[string]any{
+			"provider":       "git",
+			"capturedAt":     float64(1700000000000),
+			"available":      true,
+			"repositoryRoot": "/repo",
+			"repositoryName": "repo",
+			"baseRevision":   "base-sha",
+			"headRevision":   "head-sha",
+			"diffHash":       "hash",
+			"files":          []any{},
+		},
+	}
+	repaired := neoLimitGitDiffSnapshotResult(original, 1<<20)
+	snapshot := mapValue(repaired["snapshot"])
+	for _, key := range []string{"provider", "capturedAt", "repositoryRoot", "repositoryName", "baseRevision", "headRevision", "diffHash"} {
+		if _, exists := snapshot[key]; !exists {
+			t.Fatalf("repaired snapshot missing %s: %#v", key, snapshot)
+		}
+	}
+	for _, key := range []string{"branch", "head"} {
+		value, exists := snapshot[key]
+		if !exists || value != nil {
+			t.Fatalf("repaired snapshot %s = %#v (exists=%v), want explicit nil", key, value, exists)
+		}
+	}
+	if snapshot["includeUntracked"] != false || snapshot["content"] != "renderable" {
+		t.Fatalf("repaired snapshot defaults = %#v", snapshot)
+	}
+	if _, exists := mapValue(original["snapshot"])["branch"]; exists {
+		t.Fatal("original snapshot was mutated")
+	}
+}
+
+func TestNeoLimitGitDiffSnapshotResultOversizedFallbackKeepsRequiredFields(t *testing.T) {
+	largeContent := strings.Repeat("content\n", 4096)
+	original := map[string]any{
+		"type":      "client_git_diff_snapshot_result",
+		"requestId": "git-oversized",
+		"ok":        true,
+		"snapshot": map[string]any{
+			"provider":         "git",
+			"capturedAt":       float64(1700000000000),
+			"available":        true,
+			"repositoryRoot":   "/repo",
+			"repositoryName":   "repo",
+			"branch":           "main",
+			"head":             "head-sha",
+			"baseRevision":     "base-sha",
+			"headRevision":     "head-sha",
+			"includeUntracked": true,
+			"content":          "renderable",
+			"diffHash":         "hash",
+			"files": []any{map[string]any{
+				"path":       "large.go",
+				"changeType": "modified",
+				"created":    false,
+				"diff":       largeContent,
+			}},
+		},
+	}
+	limited := neoLimitGitDiffSnapshotResult(original, 1024)
+	raw, err := json.Marshal(limited)
+	if err != nil || len(raw) > 1024 {
+		t.Fatalf("limited bytes = %d err=%v", len(raw), err)
+	}
+	snapshot := mapValue(limited["snapshot"])
+	if limited["ok"] == false {
+		t.Fatalf("oversized fallback dropped snapshot: %#v", limited)
+	}
+	for _, key := range []string{"provider", "capturedAt", "repositoryRoot", "repositoryName", "branch", "head", "baseRevision", "headRevision", "includeUntracked", "content", "diffHash"} {
+		if _, exists := snapshot[key]; !exists {
+			t.Fatalf("oversized snapshot missing required key %s: %#v", key, snapshot)
+		}
 	}
 }
 
@@ -33616,6 +33698,37 @@ func TestNeoAttachmentCacheBounds(t *testing.T) {
 	}
 }
 
+func TestNeoHydrateAmpAttachmentCacheKeyBoundToCredential(t *testing.T) {
+	imageData, err := base64.StdEncoding.DecodeString(testNeoPNGBase64(t, 1, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const imageURL = "https://ampcode.com/user-content/attachments/private.png"
+	rt := &neoRuntime{attachmentCache: newNeoAttachmentCache()}
+	requests := 0
+	client := &http.Client{Transport: neoRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		requests++
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"image/png"}},
+			Body:       io.NopCloser(bytes.NewReader(imageData)),
+			Request:    req,
+		}, nil
+	})}
+	rt.setSecretSource(NewStaticSecretSource("token-a"))
+
+	if _, _, _, err := neoHydrateInferenceAttachment(rt, t.Context(), imageURL, client, "", neoAttachmentMaxInferenceBytes); err != nil {
+		t.Fatal(err)
+	}
+	scopedKey := "amp-auth:" + hex.EncodeToString(func() []byte { s := sha256.Sum256([]byte("token-a")); return s[:8] }()) + ":" + imageURL
+	if _, _, found := rt.attachmentCache.get(scopedKey); !found {
+		t.Fatalf("authenticated attachment not cached under scoped key; requests=%d", requests)
+	}
+	if _, _, found := rt.attachmentCache.get(imageURL); found {
+		t.Fatal("authenticated attachment cached under bare URL key")
+	}
+}
+
 func TestNeoAttachmentCacheCoalescesConcurrentLoads(t *testing.T) {
 	imageData, err := base64.StdEncoding.DecodeString(testNeoPNGBase64(t, 1, 1))
 	if err != nil {
@@ -34064,6 +34177,98 @@ func TestNeoHydrateInferenceAttachmentsDoesNotAliasRemoteLocalPath(t *testing.T)
 	}
 }
 
+func TestNeoHydrateInferenceAttachmentsAuthenticatesAmpHostedFetch(t *testing.T) {
+	imageData, err := base64.StdEncoding.DecodeString(testNeoPNGBase64(t, 1, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	imageURL := "https://ampcode.com/user-content/attachments/03d33e5405ccd6dc8e25fa77a356ce8cf5d97e980de83c60e5bffbbf19101e4a-file.png"
+	var authorization string
+	client := &http.Client{Transport: neoRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		authorization = req.Header.Get("Authorization")
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"image/png"}},
+			Body:       io.NopCloser(bytes.NewReader(imageData)),
+			Request:    req,
+		}, nil
+	})}
+	rt := &neoRuntime{attachmentCache: newNeoAttachmentCache()}
+	rt.setSecretSource(NewStaticSecretSource("amp-test-key"))
+	history := []neoHistoryMessage{{Role: "user", Content: []any{map[string]any{
+		"type":   "image",
+		"source": map[string]any{"type": "url", "url": imageURL},
+	}}}}
+
+	hydrated, err := neoHydrateInferenceAttachments(rt, t.Context(), history, client, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if authorization != "Bearer amp-test-key" {
+		t.Fatalf("Amp attachment Authorization = %q", authorization)
+	}
+	source := mapValue(mapValue(hydrated[0].Content[0])["source"])
+	if stringValue(source["type"]) != "base64" || stringValue(source["data"]) != base64.StdEncoding.EncodeToString(imageData) {
+		t.Fatalf("hydrated authenticated image = %#v", source)
+	}
+}
+
+func TestNeoFetchAmpAttachmentOmitsAuthorizationWithoutToken(t *testing.T) {
+	imageData, err := base64.StdEncoding.DecodeString(testNeoPNGBase64(t, 1, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var authorization []string
+	authorizationSeen := false
+	client := &http.Client{Transport: neoRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		authorization, authorizationSeen = req.Header["Authorization"], true
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"image/png"}},
+			Body:       io.NopCloser(bytes.NewReader(imageData)),
+			Request:    req,
+		}, nil
+	})}
+
+	if _, _, err := neoFetchAmpAttachment(t.Context(), "https://ampcode.com/user-content/attachments/file.png", client, neoAttachmentMaxInferenceBytes, ""); err != nil {
+		t.Fatal(err)
+	}
+	if authorizationSeen && len(authorization) > 0 {
+		t.Fatalf("unexpected Authorization header = %v", authorization)
+	}
+}
+
+func TestNeoAttachmentRequestPathParsesBinaryURLForms(t *testing.T) {
+	const sha = "03d33e5405ccd6dc8e25fa77a356ce8cf5d97e980de83c60e5bffbbf19101e4a"
+	cases := []struct {
+		path    string
+		id      string
+		matched bool
+	}{
+		{"/api/attachments", "", true},
+		{"/attachments", "", true},
+		{"/api/attachments/AbCdEfGhIjKlMnOp", "AbCdEfGhIjKlMnOp", true},
+		{"/attachments/AbCdEfGhIjKlMnOp", "AbCdEfGhIjKlMnOp", true},
+		{"/api/attachments/" + sha, sha, true},
+		{"/attachments/" + sha, sha, true},
+		{"/attachments/" + sha + "-file.png", sha, true},
+		{"/attachments/" + sha + ".png", sha, true},
+		{"/user-content/attachments/" + sha, sha, true},
+		{"/user-content/attachments/" + sha + "-Screenshot 2026-08-05.png", sha, true},
+		{"/user-content/artifacts/" + sha, "", false},
+		{"/attachments/" + sha + "/extra", "", true},
+		{"/attachments/../secret", "", true},
+		{"/attachments/not-an-id!!!", "", true},
+		{"/unrelated", "", false},
+	}
+	for _, tc := range cases {
+		id, matched := neoAttachmentRequestPath(tc.path)
+		if matched != tc.matched || id != tc.id {
+			t.Errorf("neoAttachmentRequestPath(%q) = %q, %v; want %q, %v", tc.path, id, matched, tc.id, tc.matched)
+		}
+	}
+}
+
 func TestNeoFetchAmpAttachmentRetriesTransientStatus(t *testing.T) {
 	imageData, err := base64.StdEncoding.DecodeString(testNeoPNGBase64(t, 1, 1))
 	if err != nil {
@@ -34083,7 +34288,7 @@ func TestNeoFetchAmpAttachmentRetriesTransientStatus(t *testing.T) {
 		return &http.Response{StatusCode: status, Header: header, Body: io.NopCloser(bytes.NewReader(body)), Request: req}, nil
 	})}
 
-	data, mediaType, err := neoFetchAmpAttachment(t.Context(), "https://ampcode.com/user-content/attachments/file.png", client, neoAttachmentMaxInferenceBytes)
+	data, mediaType, err := neoFetchAmpAttachment(t.Context(), "https://ampcode.com/user-content/attachments/file.png", client, neoAttachmentMaxInferenceBytes, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -34102,8 +34307,99 @@ func TestNeoFetchAmpAttachmentRejectsMalformedImage(t *testing.T) {
 		}, nil
 	})}
 
-	if _, _, err := neoFetchAmpAttachment(t.Context(), "https://ampcode.com/user-content/attachments/file.png", client, neoAttachmentMaxInferenceBytes); err == nil || !strings.Contains(err.Error(), "invalid image attachment data") {
+	if _, _, err := neoFetchAmpAttachment(t.Context(), "https://ampcode.com/user-content/attachments/file.png", client, neoAttachmentMaxInferenceBytes, ""); err == nil || !strings.Contains(err.Error(), "invalid image attachment data") {
 		t.Fatalf("malformed image error = %v", err)
+	}
+}
+
+func TestNeoFetchAmpAttachmentStripsAuthorizationOnCrossHostRedirect(t *testing.T) {
+	imageData, err := base64.StdEncoding.DecodeString(testNeoPNGBase64(t, 1, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const token = "secret-amp-token"
+	var initialAuth, redirectAuth string
+	client := &http.Client{Transport: neoRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if strings.EqualFold(req.URL.Hostname(), "ampcode.com") {
+			initialAuth = req.Header.Get("Authorization")
+			return &http.Response{
+				StatusCode: http.StatusFound,
+				Header: http.Header{
+					"Location": []string{"https://storage.googleapis.com/bucket/object?sig=abc"},
+				},
+				Body:    io.NopCloser(strings.NewReader("")),
+				Request: req,
+			}, nil
+		}
+		redirectAuth = req.Header.Get("Authorization")
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"image/png"}},
+			Body:       io.NopCloser(bytes.NewReader(imageData)),
+			Request:    req,
+		}, nil
+	})}
+
+	data, _, err := neoFetchAmpAttachment(t.Context(), "https://ampcode.com/user-content/attachments/file.png", client, neoAttachmentMaxInferenceBytes, token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(data, imageData) {
+		t.Fatalf("redirected attachment bytes = %d", len(data))
+	}
+	if initialAuth != "Bearer "+token {
+		t.Fatalf("initial request Authorization = %q, want Bearer token", initialAuth)
+	}
+	if redirectAuth != "" {
+		t.Fatalf("redirect request leaked Authorization = %q", redirectAuth)
+	}
+}
+
+func TestNormalizeNeoClientImageBlockAcceptsURLSource(t *testing.T) {
+	block := map[string]any{
+		"type":       "image",
+		"source":     map[string]any{"type": "url", "url": "https://ampcode.com/user-content/attachments/photo.png"},
+		"sourcePath": "photo.png",
+	}
+	normalized, ok := normalizeNeoClientImageBlock(block)
+	if !ok {
+		t.Fatal("url image block rejected")
+	}
+	source := mapValue(normalized["source"])
+	if source["type"] != "url" || source["url"] != "https://ampcode.com/user-content/attachments/photo.png" {
+		t.Fatalf("normalized url source = %#v", source)
+	}
+	if normalized["sourcePath"] != "photo.png" {
+		t.Fatalf("sourcePath = %#v", normalized["sourcePath"])
+	}
+}
+
+func TestNormalizeNeoClientImageBlockURLFallsBackToURLSourcePath(t *testing.T) {
+	const url = "https://ampcode.com/user-content/attachments/photo.png"
+	normalized, ok := normalizeNeoClientImageBlock(map[string]any{
+		"type":   "image",
+		"source": map[string]any{"type": "url", "url": url},
+	})
+	if !ok {
+		t.Fatal("url image block rejected")
+	}
+	if normalized["sourcePath"] != url {
+		t.Fatalf("sourcePath = %#v, want url fallback", normalized["sourcePath"])
+	}
+}
+
+func TestNormalizeNeoClientImageBlockRejectsEmptyURL(t *testing.T) {
+	if _, ok := normalizeNeoClientImageBlock(map[string]any{
+		"type":   "image",
+		"source": map[string]any{"type": "url", "url": ""},
+	}); ok {
+		t.Fatal("empty url image block accepted")
+	}
+	if _, ok := normalizeNeoClientImageBlock(map[string]any{
+		"type":   "image",
+		"source": map[string]any{"type": "url"},
+	}); ok {
+		t.Fatal("missing url image block accepted")
 	}
 }
 
@@ -34225,7 +34521,7 @@ func TestNeoFetchAmpAttachmentCancellation(t *testing.T) {
 	workerDone := make(chan struct{})
 	go func() {
 		defer close(workerDone)
-		_, _, err := neoFetchAmpAttachment(ctx, "https://ampcode.com/user-content/attachments/file.png", client, neoAttachmentMaxInferenceBytes)
+		_, _, err := neoFetchAmpAttachment(ctx, "https://ampcode.com/user-content/attachments/file.png", client, neoAttachmentMaxInferenceBytes, "")
 		done <- err
 	}()
 	t.Cleanup(func() {
@@ -34263,7 +34559,7 @@ func TestNeoFetchAmpAttachmentCancellationDuringRetryBackoff(t *testing.T) {
 	workerDone := make(chan struct{})
 	go func() {
 		defer close(workerDone)
-		_, _, err := neoFetchAmpAttachment(ctx, "https://ampcode.com/user-content/attachments/file.png", client, neoAttachmentMaxInferenceBytes)
+		_, _, err := neoFetchAmpAttachment(ctx, "https://ampcode.com/user-content/attachments/file.png", client, neoAttachmentMaxInferenceBytes, "")
 		done <- err
 	}()
 	t.Cleanup(func() {
@@ -38158,17 +38454,6 @@ func TestNeoActorClientAppendUserMessageRejectsInvalidPayloadLikeBinary(t *testi
 					"type":       "image",
 					"sourcePath": "image.png",
 					"source":     map[string]any{"type": "base64", "data": "AA=="},
-				}},
-			},
-		},
-		{
-			name: "URL image source",
-			msg: map[string]any{
-				"type":      "client_append_user_msg",
-				"messageId": "M-0000000000000000000001",
-				"content": []any{map[string]any{
-					"type":   "image",
-					"source": map[string]any{"type": "url", "url": "https://ampcode.com/user-content/attachments/image.png"},
 				}},
 			},
 		},

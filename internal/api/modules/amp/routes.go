@@ -351,6 +351,16 @@ func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *ha
 	engine.Any("/ampcode/local-thread-data.json", append(localProjectMiddleware, m.serveWebLocalThreadData)...)
 	engine.Any("/threads", append(rootMiddleware, proxyHandler)...)
 	engine.Any("/threads/*path", append(rootMiddleware, proxyHandler)...)
+	// Attachment URL forms recognized by current Amp CLI binaries:
+	// /attachments/<id> and /user-content/attachments/<id> (without /api prefix).
+	// The proxyHandler falls through to the Neo local-attachment serving and
+	// then proxies upstream when not resolvable locally.
+	engine.Any("/attachments", append(rootMiddleware, proxyHandler)...)
+	engine.Any("/attachments/*path", append(rootMiddleware, proxyHandler)...)
+	engine.Any("/user-content/attachments", append(rootMiddleware, proxyHandler)...)
+	engine.Any("/user-content/attachments/*path", append(rootMiddleware, proxyHandler)...)
+	engine.Any("/user-content/artifacts", append(rootMiddleware, proxyHandler)...)
+	engine.Any("/user-content/artifacts/*path", append(rootMiddleware, proxyHandler)...)
 	engine.GET("/docs", append(rootMiddleware, proxyHandler)...)
 	engine.GET("/docs/*path", append(rootMiddleware, proxyHandler)...)
 	engine.GET("/settings", append(rootMiddleware, proxyHandler)...)

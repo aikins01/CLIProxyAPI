@@ -10841,36 +10841,48 @@ func normalizeNeoClientImageBlock(block map[string]any) (map[string]any, bool) {
 	if !ok {
 		return nil, false
 	}
-	if sourceType != "base64" {
-		return nil, false
-	}
-	mediaType := firstNonEmptyString(source["mediaType"], source["media_type"], source["mimeType"], source["mime_type"])
-	if !neoProtocolImageMediaType(mediaType) {
-		return nil, false
-	}
-	data, ok := source["data"].(string)
-	if !ok {
-		return nil, false
-	}
-	if _, err := base64.StdEncoding.Strict().DecodeString(strings.TrimSpace(data)); err != nil {
-		return nil, false
-	}
-	raw, normalizedMediaType, err := decodeNeoAttachmentPayload(data, mediaType)
-	if err != nil {
-		return nil, false
-	}
-	normalizedSource := map[string]any{"type": "base64", "mediaType": normalizedMediaType, "data": base64.StdEncoding.EncodeToString(raw)}
 	sourcePathValue := firstNonNil(block["sourcePath"], block["source_path"])
 	sourcePath := ""
 	if sourcePathValue != nil {
-		var ok bool
-		sourcePath, ok = sourcePathValue.(string)
-		if !ok {
+		var okPath bool
+		sourcePath, okPath = sourcePathValue.(string)
+		if !okPath {
 			return nil, false
 		}
 	}
 	if sourcePath == "" {
 		sourcePath = firstNonEmptyString(block["path"], block["filePath"], block["file_path"], block["filename"], block["name"])
+	}
+	var normalizedSource map[string]any
+	switch sourceType {
+	case "base64":
+		mediaType := firstNonEmptyString(source["mediaType"], source["media_type"], source["mimeType"], source["mime_type"])
+		if !neoProtocolImageMediaType(mediaType) {
+			return nil, false
+		}
+		data, ok := source["data"].(string)
+		if !ok {
+			return nil, false
+		}
+		if _, err := base64.StdEncoding.Strict().DecodeString(strings.TrimSpace(data)); err != nil {
+			return nil, false
+		}
+		raw, normalizedMediaType, err := decodeNeoAttachmentPayload(data, mediaType)
+		if err != nil {
+			return nil, false
+		}
+		normalizedSource = map[string]any{"type": "base64", "mediaType": normalizedMediaType, "data": base64.StdEncoding.EncodeToString(raw)}
+	case "url":
+		url := firstNonEmptyString(source["url"], source["uri"], source["href"])
+		if url == "" {
+			return nil, false
+		}
+		normalizedSource = map[string]any{"type": "url", "url": url}
+		if sourcePath == "" {
+			sourcePath = url
+		}
+	default:
+		return nil, false
 	}
 	out := cloneNeoJSONMap(block)
 	out["type"] = "image"
@@ -17808,6 +17820,51 @@ const (
 
 var neoAttachmentIDPattern = regexp.MustCompile(`^[0-9A-Za-z]{16,64}$`)
 
+// neoAmpSHA256ObjectNamePattern matches Amp-hosted object names: a 64-char
+// lowercase hex SHA256 with an optional "-filename" suffix (e.g.
+// "<hex>-Screenshot 2026-08-05.png"). The canonical ID is the hex part.
+var neoAmpSHA256ObjectNamePattern = regexp.MustCompile(`^([0-9a-f]{64})(?:-.+|\.[a-z0-9]{1,10})?$`)
+
+// neoAttachmentCanonicalID maps an attachment path segment to the canonical
+// local ID used for disk access. Amp-hosted object names may carry a
+// filename suffix after the 64-hex ID; strip it without trusting it.
+func neoAttachmentCanonicalID(segment string) (string, bool) {
+	segment = strings.TrimSpace(segment)
+	if segment == "" || strings.Contains(segment, "/") || strings.Contains(segment, "..") {
+		return "", false
+	}
+	if match := neoAmpSHA256ObjectNamePattern.FindStringSubmatch(segment); match != nil {
+		return match[1], true
+	}
+	if neoAttachmentIDPattern.MatchString(segment) {
+		return segment, true
+	}
+	return "", false
+}
+
+func neoAttachmentRequestPath(path string) (string, bool) {
+	trimmed := "/" + strings.Trim(strings.TrimPrefix(path, "/api"), "/")
+	if trimmed == "/attachments" {
+		return "", true
+	}
+	if strings.HasPrefix(trimmed, "/attachments/") {
+		id, ok := neoAttachmentCanonicalID(strings.TrimPrefix(trimmed, "/attachments/"))
+		if !ok {
+			return "", true
+		}
+		return id, true
+	}
+	const userContentPrefix = "/user-content/attachments/"
+	if strings.HasPrefix(trimmed, userContentPrefix) {
+		id, ok := neoAttachmentCanonicalID(strings.TrimPrefix(trimmed, userContentPrefix))
+		if !ok {
+			return "", true
+		}
+		return id, true
+	}
+	return "", false
+}
+
 type neoAttachmentCacheEntry struct {
 	data      []byte
 	mediaType string
@@ -17984,21 +18041,6 @@ func (m *AmpModule) tryServeNeoLocalAttachment(c *gin.Context) bool {
 		c.JSON(http.StatusMethodNotAllowed, gin.H{"error": "method_not_allowed"})
 		return true
 	}
-}
-
-func neoAttachmentRequestPath(path string) (string, bool) {
-	trimmed := "/" + strings.Trim(strings.TrimPrefix(path, "/api"), "/")
-	if trimmed == "/attachments" {
-		return "", true
-	}
-	if strings.HasPrefix(trimmed, "/attachments/") {
-		id := strings.TrimPrefix(trimmed, "/attachments/")
-		if strings.Contains(id, "/") || !neoAttachmentIDPattern.MatchString(id) {
-			return "", true
-		}
-		return id, true
-	}
-	return "", false
 }
 
 func (m *AmpModule) serveNeoLocalAttachmentUpload(c *gin.Context) {
@@ -18584,14 +18626,29 @@ func neoHydrateInferenceAttachment(rt *neoRuntime, ctx context.Context, rawURL s
 	if client == nil {
 		client = neoAmpAttachmentHTTPClient
 	}
+	var bearerToken string
+	if rt != nil {
+		if source := rt.getSecretSource(); source != nil {
+			if key, errKey := source.Get(ctx); errKey == nil {
+				bearerToken = strings.TrimSpace(key)
+			} else {
+				log.Warnf("amp neo: resolve Amp attachment credential: %v", errKey)
+			}
+		}
+	}
 	loader := func(loadCtx context.Context) ([]byte, string, error) {
-		return neoFetchAmpAttachment(loadCtx, rawURL, client, neoAttachmentMaxImageBytes)
+		return neoFetchAmpAttachment(loadCtx, rawURL, client, neoAttachmentMaxImageBytes, bearerToken)
 	}
 	var raw []byte
 	var mediaType string
 	var err error
+	cacheKey := rawURL
+	if bearerToken != "" {
+		sum := sha256.Sum256([]byte(bearerToken))
+		cacheKey = "amp-auth:" + hex.EncodeToString(sum[:8]) + ":" + rawURL
+	}
 	if rt != nil && rt.attachmentCache != nil {
-		raw, mediaType, err = rt.attachmentCache.load(ctx, rawURL, loader)
+		raw, mediaType, err = rt.attachmentCache.load(ctx, cacheKey, loader)
 	} else {
 		raw, mediaType, err = loader(ctx)
 	}
@@ -18604,12 +18661,34 @@ func neoHydrateInferenceAttachment(rt *neoRuntime, ctx context.Context, rawURL s
 	return raw, mediaType, true, nil
 }
 
-func neoFetchAmpAttachment(ctx context.Context, rawURL string, client *http.Client, maxBytes int) ([]byte, string, error) {
+func neoFetchAmpAttachment(ctx context.Context, rawURL string, client *http.Client, maxBytes int, bearerToken string) ([]byte, string, error) {
+	if bearerToken != "" {
+		original := client.CheckRedirect
+		guarded := *client
+		guarded.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+			if req == nil || req.URL == nil || !strings.EqualFold(req.URL.Hostname(), "ampcode.com") {
+				if req != nil {
+					req.Header.Del("Authorization")
+				}
+			}
+			if original != nil {
+				return original(req, via)
+			}
+			if len(via) >= 10 {
+				return errors.New("stopped after 10 redirects")
+			}
+			return nil
+		}
+		client = &guarded
+	}
 	var lastErr error
 	for attempt := 0; attempt < neoAmpAttachmentFetchAttempts; attempt++ {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 		if err != nil {
 			return nil, "", fmt.Errorf("build Amp attachment request: %w", err)
+		}
+		if bearerToken != "" {
+			req.Header.Set("Authorization", "Bearer "+bearerToken)
 		}
 		resp, err := client.Do(req)
 		if err == nil {
@@ -18818,7 +18897,10 @@ func serveNeoLocalAttachment(c *gin.Context, id string) {
 }
 
 func neoLocalAttachmentURL(r *http.Request, id string) string {
-	return neoLocalAttachmentBaseURL(r) + "/api/attachments/" + url.PathEscape(id)
+	// Current Amp CLI binaries only recognize /attachments/<id> and
+	// /user-content/attachments/<id>; /api/attachments/<id> stays routable
+	// for backward compatibility but is no longer generated.
+	return neoLocalAttachmentBaseURL(r) + "/attachments/" + url.PathEscape(id)
 }
 
 func neoLocalAttachmentBaseURL(r *http.Request) string {
@@ -34454,14 +34536,26 @@ func neoWebLocalObserverPayload(payload any) (any, bool) {
 }
 
 func neoLimitGitDiffSnapshotResult(message map[string]any, maxResponseBytes int) map[string]any {
+	normalized := message
+	cloned := false
+	if boolValue(message["ok"]) {
+		if snapshot := mapValue(message["snapshot"]); len(snapshot) > 0 && neoGitDiffSnapshotNeedsShapeRepair(snapshot) {
+			normalized = mapValue(cloneNeoJSONValue(message))
+			neoNormalizeGitDiffSnapshotShape(mapValue(normalized["snapshot"]))
+			cloned = true
+		}
+	}
 	if maxResponseBytes <= 0 {
-		return message
+		return normalized
 	}
-	raw, err := json.Marshal(message)
+	raw, err := json.Marshal(normalized)
 	if err != nil || len(raw) <= maxResponseBytes {
-		return message
+		return normalized
 	}
-	out := mapValue(cloneNeoJSONValue(message))
+	out := normalized
+	if !cloned {
+		out = mapValue(cloneNeoJSONValue(normalized))
+	}
 	snapshot := mapValue(out["snapshot"])
 	files := arrayValue(snapshot["files"])
 	type candidate struct {
@@ -34511,7 +34605,7 @@ func neoLimitGitDiffSnapshotResult(message map[string]any, maxResponseBytes int)
 		return out
 	}
 	minimalSnapshot := map[string]any{"files": []any{}, "contentOmittedReason": omittedReason}
-	for _, key := range []string{"provider", "capturedAt", "available", "repositoryName", "branch", "head", "diffHash", "baseRef", "baseRefHead", "aheadCount", "behindCount"} {
+	for _, key := range []string{"provider", "capturedAt", "available", "repositoryRoot", "repositoryName", "branch", "head", "baseRevision", "headRevision", "includeUntracked", "content", "diffHash", "baseRef", "baseRefHead", "aheadCount", "behindCount"} {
 		if value, exists := snapshot[key]; exists {
 			minimalSnapshot[key] = value
 		}
@@ -34530,6 +34624,81 @@ func neoLimitGitDiffSnapshotResult(message map[string]any, maxResponseBytes int)
 		"requestId": stringValue(out["requestId"]),
 		"ok":        false,
 		"error":     "Git diff snapshot exceeded the local observer response size limit.",
+	}
+}
+
+func neoGitDiffSnapshotNeedsShapeRepair(snapshot map[string]any) bool {
+	for _, key := range []string{"provider", "capturedAt", "repositoryRoot", "repositoryName", "branch", "head", "includeUntracked", "content", "diffHash"} {
+		if _, exists := snapshot[key]; !exists {
+			return true
+		}
+	}
+	files, ok := snapshot["files"].([]any)
+	if !ok {
+		return true
+	}
+	for _, rawFile := range files {
+		file := mapValue(rawFile)
+		if file == nil {
+			continue
+		}
+		if _, exists := file["changeType"]; !exists {
+			return true
+		}
+		if _, exists := file["created"]; !exists {
+			return true
+		}
+		if _, exists := file["diff"]; !exists {
+			return true
+		}
+	}
+	return false
+}
+
+func neoNormalizeGitDiffSnapshotShape(snapshot map[string]any) {
+	if snapshot == nil {
+		return
+	}
+	if _, exists := snapshot["provider"]; !exists {
+		snapshot["provider"] = "git"
+	}
+	if _, exists := snapshot["capturedAt"]; !exists {
+		snapshot["capturedAt"] = time.Now().UnixMilli()
+	}
+	for _, key := range []string{"repositoryRoot", "repositoryName", "branch", "head"} {
+		if _, exists := snapshot[key]; !exists {
+			snapshot[key] = nil
+		}
+	}
+	if _, exists := snapshot["includeUntracked"]; !exists {
+		snapshot["includeUntracked"] = false
+	}
+	if _, exists := snapshot["content"]; !exists {
+		snapshot["content"] = "renderable"
+	}
+	if _, exists := snapshot["diffHash"]; !exists {
+		snapshot["diffHash"] = ""
+	}
+	files, ok := snapshot["files"].([]any)
+	if !ok {
+		snapshot["files"] = []any{}
+		return
+	}
+	for _, rawFile := range files {
+		file := mapValue(rawFile)
+		if file == nil {
+			continue
+		}
+		if _, exists := file["changeType"]; !exists {
+			file["changeType"] = "modified"
+		}
+		if _, exists := file["created"]; !exists {
+			changeType := stringValue(file["changeType"])
+			file["created"] = changeType == "added" || changeType == "untracked"
+		}
+		if _, exists := file["diff"]; !exists {
+			file["diff"] = ""
+		}
 	}
 }
 
