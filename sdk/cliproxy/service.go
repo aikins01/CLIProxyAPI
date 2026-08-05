@@ -44,6 +44,10 @@ type Service struct {
 	// configUpdateMu serializes config updates across watcher + home.
 	configUpdateMu sync.Mutex
 
+	// shutdownStarted marks that Shutdown has begun, so late-starting subsystems
+	// (e.g. the amp thread actor proxy) can stop themselves instead of leaking.
+	shutdownStarted bool
+
 	// configPath is the path to the configuration file.
 	configPath string
 
@@ -67,6 +71,9 @@ type Service struct {
 
 	// pprofServer manages the optional pprof HTTP debug server.
 	pprofServer *pprofServer
+
+	// ampThreadActorProxy serves Amp's localhost Rivet endpoint when Amp is routed through CLIProxyAPI.
+	ampThreadActorProxy *ampThreadActorProxy
 
 	// serverErr channel for server startup/shutdown errors.
 	serverErr chan error
@@ -1043,6 +1050,7 @@ func (s *Service) Run(ctx context.Context) error {
 	fmt.Printf("API server started successfully on: %s:%d\n", s.cfg.Host, s.cfg.Port)
 
 	s.applyPprofConfig(s.cfg)
+	s.startAmpThreadActorProxy(ctx, s.cfg)
 
 	if s.hooks.OnAfterStart != nil {
 		s.hooks.OnAfterStart(s)
@@ -1106,6 +1114,10 @@ func (s *Service) Shutdown(ctx context.Context) error {
 			ctx = context.Background()
 		}
 
+		s.configUpdateMu.Lock()
+		s.shutdownStarted = true
+		s.configUpdateMu.Unlock()
+
 		if s.server != nil {
 			s.server.ClosePublicListeners()
 			if err := s.server.ShutdownAmpModule(ctx); err != nil {
@@ -1155,6 +1167,19 @@ func (s *Service) Shutdown(ctx context.Context) error {
 			log.Errorf("failed to stop pprof server: %v", errShutdownPprof)
 			if shutdownErr == nil {
 				shutdownErr = errShutdownPprof
+			}
+		}
+
+		s.configUpdateMu.Lock()
+		actorProxy := s.ampThreadActorProxy
+		s.ampThreadActorProxy = nil
+		s.configUpdateMu.Unlock()
+		if actorProxy != nil {
+			if errShutdownActorProxy := actorProxy.Shutdown(ctx); errShutdownActorProxy != nil {
+				log.Errorf("failed to stop amp thread actor proxy: %v", errShutdownActorProxy)
+				if shutdownErr == nil {
+					shutdownErr = errShutdownActorProxy
+				}
 			}
 		}
 

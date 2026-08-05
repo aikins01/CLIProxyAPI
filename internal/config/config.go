@@ -298,6 +298,16 @@ type AmpCode struct {
 	// When false (default), local API keys are used first if available.
 	ForceModelMappings bool `yaml:"force-model-mappings" json:"force-model-mappings"`
 
+	// ThreadActorProxyEnabled controls the local Rivet actor proxy Amp expects when amp.url is localhost.
+	// Defaults to true when ampcode.upstream-url is configured.
+	ThreadActorProxyEnabled *bool `yaml:"thread-actor-proxy-enabled,omitempty" json:"thread-actor-proxy-enabled,omitempty"`
+
+	// ThreadActorProxyAddr is the local listener address for Amp's hardcoded local actor endpoint.
+	ThreadActorProxyAddr string `yaml:"thread-actor-proxy-addr,omitempty" json:"thread-actor-proxy-addr,omitempty"`
+
+	// ThreadActorProxyUpstream is the production actor endpoint proxied by ThreadActorProxyAddr.
+	ThreadActorProxyUpstream string `yaml:"thread-actor-proxy-upstream,omitempty" json:"thread-actor-proxy-upstream,omitempty"`
+
 	// ModelFallbacks defines on-failure model fallbacks for Amp CLI requests. Unlike
 	// ModelMappings (which redirect unconditionally / by availability), these apply only
 	// when the requested model's provider returns a transient quota/unavailable error
