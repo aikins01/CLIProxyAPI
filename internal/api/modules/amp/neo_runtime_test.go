@@ -29888,6 +29888,33 @@ func TestNeoSystemPromptUsesExpandedModeFamilies(t *testing.T) {
 	}
 }
 
+func TestNeoUpstreamPromptKimiIncludesSkillsSection(t *testing.T) {
+	neoUpstreamPromptCache.Delete(neoPromptFamilyKimi)
+	t.Cleanup(func() { neoUpstreamPromptCache.Delete(neoPromptFamilyKimi) })
+
+	prompt := neoUpstreamPrompt(neoPromptFamilyKimi, neoPromptFamilyKimiGzip, neoDefaultPrompt)
+	for _, want := range []string{"# Skills", "call the `skill` tool", "# Tool Usages", "# AGENTS.md file"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("kimi prompt missing %q:\n%s", want, prompt)
+		}
+	}
+	if strings.Count(prompt, neoKimiSkillsPromptSection) != 1 {
+		t.Fatalf("kimi skills section inserted %d times, want 1", strings.Count(prompt, neoKimiSkillsPromptSection))
+	}
+
+	skillsIdx := strings.Index(prompt, "# Skills")
+	toolUsagesIdx := strings.Index(prompt, "# Tool Usages")
+	toolBulletIdx := strings.Index(prompt, "Prefer specialized tools over Bash")
+	if !(skillsIdx >= 0 && toolUsagesIdx > skillsIdx && toolBulletIdx > toolUsagesIdx) {
+		t.Fatalf("expected # Skills before # Tool Usages and tool bullets under # Tool Usages (skills=%d, toolUsages=%d, bullet=%d)", skillsIdx, toolUsagesIdx, toolBulletIdx)
+	}
+
+	again := neoApplyBinaryPromptUpdates(neoPromptFamilyKimi, prompt)
+	if strings.Count(again, neoKimiSkillsPromptSection) != 1 {
+		t.Fatalf("kimi skills section is not idempotent, inserted %d times", strings.Count(again, neoKimiSkillsPromptSection))
+	}
+}
+
 func TestNeoPromptFamilyMatchesBinarySelector(t *testing.T) {
 	for _, tc := range []struct {
 		name      string

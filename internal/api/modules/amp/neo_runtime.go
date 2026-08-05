@@ -39869,6 +39869,7 @@ When calling the oracle with files to review, the ` + "`files`" + ` parameter mu
 - Model: uses oracle tool to analyze the query performance issues and get optimization recommendations
 - Model: implements the suggested improvements`
 	neoGitCommitMultilinePromptLine = "When passing a multi-line body to `git commit -m` in a Bash command, put real line breaks in the quoted argument; do not write literal `\\n` escape sequences."
+	neoKimiSkillsPromptSection      = "# Skills\n\nYour environment exposes specialized skills through the `skill` tool. A skill is a guide for proven techniques, patterns, or tools. Before starting a task, check the available skills and call the `skill` tool to load any whose description matches the task, then follow the loaded instructions. Do not answer from memory when a matching skill exists. Load a skill even when the task seems small."
 )
 
 var neoUpstreamPromptCache sync.Map
@@ -39891,7 +39892,16 @@ func neoUpstreamPrompt(name, encoded string, fallback func() string) string {
 }
 
 func neoApplyBinaryPromptUpdates(name, prompt string) string {
-	if prompt == "" || strings.Contains(prompt, neoGitCommitMultilinePromptLine) {
+	if prompt == "" {
+		return prompt
+	}
+	if name == neoPromptFamilyKimi {
+		if strings.Contains(prompt, neoKimiSkillsPromptSection) {
+			return prompt
+		}
+		return neoInsertPromptLineBefore(prompt, "# Tool Usages", neoKimiSkillsPromptSection)
+	}
+	if strings.Contains(prompt, neoGitCommitMultilinePromptLine) {
 		return prompt
 	}
 	switch name {
@@ -39911,6 +39921,13 @@ func neoInsertPromptLineAfter(prompt, needle, line string) string {
 		return prompt
 	}
 	return strings.Replace(prompt, needle, needle+"\n"+line, 1)
+}
+
+func neoInsertPromptLineBefore(prompt, needle, block string) string {
+	if !strings.Contains(prompt, needle) {
+		return prompt
+	}
+	return strings.Replace(prompt, needle, block+"\n\n"+needle, 1)
 }
 
 func decodeNeoUpstreamPrompt(encoded string) (string, error) {
