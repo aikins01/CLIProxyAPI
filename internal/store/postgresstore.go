@@ -677,12 +677,12 @@ func (s *PostgresStore) rollbackAuthRecord(ctx context.Context, relID string, ca
 		query := fmt.Sprintf("UPDATE %s SET content = $2, updated_at = NOW() WHERE id = $1 AND content = $3", s.fullTableName(s.cfg.AuthTable))
 		result, err = s.db.ExecContext(ctx, query, relID, json.RawMessage(previous), json.RawMessage(candidate))
 	} else {
-		// This save created the record (no prior durable content), so remove it
-		// unconditionally. A content match cannot distinguish our new row from a
-		// concurrent writer's identical new row (ABA), and either way the intended
-		// rolled-back state is "no record".
-		query := fmt.Sprintf("DELETE FROM %s WHERE id = $1", s.fullTableName(s.cfg.AuthTable))
-		result, err = s.db.ExecContext(ctx, query, relID)
+		// This save created the record (no prior durable content), so remove the
+		// row it wrote. Binding the delete to the candidate content avoids deleting
+		// a concurrent writer's newer row committed between our insert and the
+		// failed local publication; a mismatch is reported as a rollback conflict.
+		query := fmt.Sprintf("DELETE FROM %s WHERE id = $1 AND content = $2", s.fullTableName(s.cfg.AuthTable))
+		result, err = s.db.ExecContext(ctx, query, relID, json.RawMessage(candidate))
 	}
 	if err != nil {
 		return fmt.Errorf("postgres store: rollback auth record: %w", err)
