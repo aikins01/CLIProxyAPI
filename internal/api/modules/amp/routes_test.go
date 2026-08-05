@@ -9576,7 +9576,7 @@ func TestRegisterManagementRoutesServesNeoAttachmentsLocally(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse attachment URL %q: %v", attachmentURL, err)
 	}
-	if parsed.Scheme != "http" || parsed.Host != "127.0.0.1:8317" || !strings.HasPrefix(parsed.Path, "/api/attachments/") {
+	if parsed.Scheme != "http" || parsed.Host != "127.0.0.1:8317" || !strings.HasPrefix(parsed.Path, "/attachments/") {
 		t.Fatalf("attachment URL = %q", attachmentURL)
 	}
 
@@ -9599,6 +9599,104 @@ func TestRegisterManagementRoutesServesNeoAttachmentsLocally(t *testing.T) {
 	if headRec.Code != http.StatusOK || headRec.Body.Len() != 0 {
 		t.Fatalf("head response = status %d body %q", headRec.Code, headRec.Body.String())
 	}
+}
+
+func TestRegisterManagementRoutesServesNeoAttachmentsViaBinaryURLForms(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+
+	dir := t.TempDir()
+	oldStoreDir := neoAmpDataDir
+	neoAmpDataDir = func() string { return dir }
+	t.Cleanup(func() { neoAmpDataDir = oldStoreDir })
+
+	enabled := true
+	m := &AmpModule{
+		restrictToLocalhost: false,
+		neoRuntime: newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+			NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled},
+		}}),
+	}
+	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, nil)
+
+	imageBase64 := testNeoPNGBase64(t, 1, 1)
+	imageData, err := base64.StdEncoding.DecodeString(imageBase64)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Upload with current binary fields (threadID, publicArtifact, temporaryFile)
+	// must be tolerated by the local upload handler.
+	uploadBody := fmt.Sprintf(`{"data":%q,"mediaType":"image/png","threadID":"T-019fd27e-8185-77c2-bd71-77a5adbb0d16","publicArtifact":false,"temporaryFile":true}`, imageBase64)
+	req := httptest.NewRequest(http.MethodPost, "/api/attachments", bytes.NewBufferString(uploadBody))
+	req.Host = "127.0.0.1:8317"
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("upload status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	var response map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("upload response JSON error: %v", err)
+	}
+	attachmentURL := stringValue(response["url"])
+	parsed, err := url.Parse(attachmentURL)
+	if err != nil {
+		t.Fatalf("parse attachment URL %q: %v", attachmentURL, err)
+	}
+	// The generated URL must match the current binary's accepted forms
+	// (root /attachments/<id>), not the legacy /api prefix.
+	if !strings.HasPrefix(parsed.Path, "/attachments/") {
+		t.Fatalf("generated attachment URL path = %q", parsed.Path)
+	}
+	id := strings.TrimPrefix(parsed.Path, "/attachments/")
+
+	// GET through the generated root URL.
+	getReq := httptest.NewRequest(http.MethodGet, parsed.RequestURI(), nil)
+	getRec := httptest.NewRecorder()
+	r.ServeHTTP(getRec, getReq)
+	if getRec.Code != http.StatusOK || !bytes.Equal(getRec.Body.Bytes(), imageData) {
+		t.Fatalf("root get = status %d body length %d", getRec.Code, getRec.Body.Len())
+	}
+
+	// GET through the legacy /api alias still works.
+	legacyReq := httptest.NewRequest(http.MethodGet, "/api/attachments/"+id, nil)
+	legacyRec := httptest.NewRecorder()
+	r.ServeHTTP(legacyRec, legacyReq)
+	if legacyRec.Code != http.StatusOK || !bytes.Equal(legacyRec.Body.Bytes(), imageData) {
+		t.Fatalf("legacy get = status %d body length %d", legacyRec.Code, legacyRec.Body.Len())
+	}
+
+	// GET through /user-content/attachments with the same local ID resolves
+	// locally (a sha256-style ID with filename suffix maps to canonical ID).
+	shaID := strings.Repeat("ab", 32)
+	if _, err := writeNeoLocalAttachment(imageData, "image/png"); err != nil {
+		t.Fatal(err)
+	}
+	// Write directly under a sha256-style canonical ID to exercise suffix parsing.
+	if err := writeNeoLocalAttachmentWithID(t, shaID, imageData, "image/png"); err != nil {
+		t.Fatal(err)
+	}
+	ucReq := httptest.NewRequest(http.MethodGet, "/user-content/attachments/"+shaID+"-file.png", nil)
+	ucRec := httptest.NewRecorder()
+	r.ServeHTTP(ucRec, ucReq)
+	if ucRec.Code != http.StatusOK || !bytes.Equal(ucRec.Body.Bytes(), imageData) {
+		t.Fatalf("user-content get = status %d body %q", ucRec.Code, ucRec.Body.String())
+	}
+}
+
+func writeNeoLocalAttachmentWithID(t *testing.T, id string, raw []byte, mediaType string) error {
+	t.Helper()
+	dir := filepath.Join(neoAmpDataDir(), "attachments")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(dir, id+".bin"), raw, 0o600); err != nil {
+		return err
+	}
+	metaRaw, _ := json.Marshal(map[string]any{"mediaType": mediaType})
+	return os.WriteFile(filepath.Join(dir, id+".json"), metaRaw, 0o600)
 }
 
 func TestRegisterManagementRoutesServesNeoAttachmentUploadAliasesLocally(t *testing.T) {
@@ -9693,7 +9791,7 @@ func TestRegisterManagementRoutesNeoAttachmentURLUsesForwardedPublicHost(t *test
 	if err != nil {
 		t.Fatalf("parse attachment URL %q: %v", attachmentURL, err)
 	}
-	if parsed.Scheme != "https" || parsed.Host != "neo.aikins.xyz" || !strings.HasPrefix(parsed.Path, "/api/attachments/") {
+	if parsed.Scheme != "https" || parsed.Host != "neo.aikins.xyz" || !strings.HasPrefix(parsed.Path, "/attachments/") {
 		t.Fatalf("attachment URL = %q", attachmentURL)
 	}
 }
@@ -9708,7 +9806,7 @@ func TestRegisterManagementRoutesNeoAttachmentURLKeepsLoopbackHTTP(t *testing.T)
 	if err != nil {
 		t.Fatalf("parse attachment URL %q: %v", attachmentURL, err)
 	}
-	if parsed.Scheme != "http" || parsed.Host != "127.0.0.1:8317" || parsed.Path != "/api/attachments/AbCdEfGhIjKlMnOp" {
+	if parsed.Scheme != "http" || parsed.Host != "127.0.0.1:8317" || parsed.Path != "/attachments/AbCdEfGhIjKlMnOp" {
 		t.Fatalf("attachment URL = %q", attachmentURL)
 	}
 }
