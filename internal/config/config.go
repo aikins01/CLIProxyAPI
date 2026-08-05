@@ -299,7 +299,7 @@ type AmpCode struct {
 	ForceModelMappings bool `yaml:"force-model-mappings" json:"force-model-mappings"`
 
 	// ThreadActorProxyEnabled controls the local Rivet actor proxy Amp expects when amp.url is localhost.
-	// Defaults to true when ampcode.upstream-url is configured.
+	// Defaults to true when ampcode.upstream-url is configured and the Neo local runtime is disabled.
 	ThreadActorProxyEnabled *bool `yaml:"thread-actor-proxy-enabled,omitempty" json:"thread-actor-proxy-enabled,omitempty"`
 
 	// ThreadActorProxyAddr is the local listener address for Amp's hardcoded local actor endpoint.

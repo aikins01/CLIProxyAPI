@@ -649,6 +649,10 @@ func (s *Service) applyConfigUpdate(newCfg *config.Config) {
 
 	s.applyRetryConfig(newCfg)
 	s.applyPprofConfig(newCfg)
+	s.runtimeContextMu.RLock()
+	runtimeCtx := s.runtimeContext
+	s.runtimeContextMu.RUnlock()
+	s.applyAmpThreadActorProxyConfig(runtimeCtx, newCfg)
 	if s.server != nil {
 		s.server.UpdateClients(newCfg)
 	}

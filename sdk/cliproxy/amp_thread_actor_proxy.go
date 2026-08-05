@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
@@ -28,10 +29,19 @@ const (
 var ampActorEndpointPattern = regexp.MustCompile(`https://[^"\s/@]+@actors\.ampcode\.com(?:[/?#"\s]|$)`)
 
 type ampThreadActorProxy struct {
-	addr     string
-	upstream string
-	hasToken bool
-	server   *http.Server
+	mu         sync.Mutex
+	addr       string
+	configured string
+	upstream   string
+	rivetToken string
+	hasToken   bool
+	server     *http.Server
+	listener   net.Listener
+	runCtx     context.Context
+	stopRun    context.CancelFunc
+	conns      map[net.Conn]struct{}
+	closed     bool
+	done       chan struct{}
 }
 
 func (s *Service) startAmpThreadActorProxy(ctx context.Context, cfg *config.Config) {
@@ -78,6 +88,61 @@ func (s *Service) startAmpThreadActorProxy(ctx context.Context, cfg *config.Conf
 	}
 
 	log.Infof("amp thread actor proxy listening on %s -> %s (rivet token forwarded: %t)", proxy.addr, proxy.upstream, proxy.hasToken)
+}
+
+// applyAmpThreadActorProxyConfig reconciles the actor proxy with runtime config
+// changes. The caller must hold s.configUpdateMu.
+func (s *Service) applyAmpThreadActorProxyConfig(ctx context.Context, cfg *config.Config) {
+	if s == nil || cfg == nil || s.shutdownStarted {
+		return
+	}
+
+	enabled, addr, upstream := ampThreadActorProxySettings(cfg)
+	current := s.ampThreadActorProxy
+	if current != nil && enabled && current.matchesConfig(addr, upstream) {
+		return
+	}
+	s.ampThreadActorProxy = nil
+
+	if current != nil {
+		if errShutdown := current.Shutdown(context.Background()); errShutdown != nil {
+			log.Warnf("amp thread actor proxy stop during config update: %v", errShutdown)
+		}
+	}
+	if !enabled {
+		return
+	}
+
+	proxy, err := newAmpThreadActorProxy(addr, upstream)
+	if err != nil {
+		log.Warnf("amp thread actor proxy disabled: %v", err)
+		return
+	}
+	if err := proxy.Start(ctx); err != nil {
+		log.Warnf("amp thread actor proxy disabled: %v", err)
+		return
+	}
+	if s.shutdownStarted {
+		if errShutdown := proxy.Shutdown(context.Background()); errShutdown != nil {
+			log.Warnf("amp thread actor proxy shutdown after service stop: %v", errShutdown)
+		}
+		return
+	}
+	s.ampThreadActorProxy = proxy
+	log.Infof("amp thread actor proxy listening on %s -> %s (rivet token forwarded: %t)", proxy.addr, proxy.upstream, proxy.hasToken)
+}
+
+func (p *ampThreadActorProxy) matchesConfig(addr, upstream string) bool {
+	if p == nil {
+		return false
+	}
+	parsed, err := url.Parse(strings.TrimSpace(upstream))
+	if err != nil {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.configured == strings.TrimSpace(addr) && p.upstream == redactURL(parsed) && p.rivetToken == rivetTokenFromURL(parsed)
 }
 
 func ampThreadActorProxySettings(cfg *config.Config) (bool, string, string) {
@@ -174,6 +239,9 @@ func newAmpThreadActorProxy(addr string, upstream string) (*ampThreadActorProxy,
 	if addr == "" {
 		return nil, errors.New("local address is empty")
 	}
+	if err := validateLoopbackAddr(addr); err != nil {
+		return nil, err
+	}
 
 	parsed, err := url.Parse(strings.TrimSpace(upstream))
 	if err != nil {
@@ -187,13 +255,13 @@ func newAmpThreadActorProxy(addr string, upstream string) (*ampThreadActorProxy,
 	}
 
 	rivetToken := rivetTokenFromURL(parsed)
+
 	target := *parsed
 	target.User = nil
 
-	localHost, localPort, err := net.SplitHostPort(addr)
+	localHost, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		localHost = addr
-		localPort = ""
 	}
 
 	proxy := httputil.NewSingleHostReverseProxy(&target)
@@ -213,6 +281,8 @@ func newAmpThreadActorProxy(addr string, upstream string) (*ampThreadActorProxy,
 		}
 		// Rewrite Origin only when it names this proxy's own listener, so a page
 		// from an unrelated loopback origin is not silently reattributed upstream.
+		localPort := localListenerPort(incomingHost)
+		requestHostname := localListenerHostname(incomingHost)
 		if origin := strings.TrimSpace(req.Header.Get("Origin")); origin != "" {
 			if originURL, err := url.Parse(origin); err == nil {
 				originHostname, originPort, splitErr := net.SplitHostPort(originURL.Host)
@@ -220,9 +290,8 @@ func newAmpThreadActorProxy(addr string, upstream string) (*ampThreadActorProxy,
 					originHostname = originURL.Host
 					originPort = ""
 				}
-				sameHost := originHostname == localHost ||
-					(originHostname == "localhost" && localHost == "127.0.0.1") ||
-					(originHostname == "127.0.0.1" && localHost == "localhost")
+				sameHost := isLoopbackHostname(originHostname) &&
+					(originHostname == localHost || originHostname == requestHostname)
 				if sameHost && (localPort == "" || originPort == localPort) {
 					req.Header.Set("Origin", target.Scheme+"://"+target.Host)
 				}
@@ -237,17 +306,84 @@ func newAmpThreadActorProxy(addr string, upstream string) (*ampThreadActorProxy,
 		http.Error(rw, "amp thread actor proxy upstream error", http.StatusBadGateway)
 	}
 
+	p := &ampThreadActorProxy{
+		addr:       addr,
+		configured: addr,
+		upstream:   redactURL(parsed),
+		rivetToken: rivetToken,
+		hasToken:   rivetToken != "",
+		conns:      make(map[net.Conn]struct{}),
+		done:       make(chan struct{}),
+	}
+
 	server := &http.Server{
 		Addr:    addr,
 		Handler: proxy,
 	}
+	// Track connections so Shutdown can force-close hijacked WebSocket sessions,
+	// which httputil.ReverseProxy detaches from server.Shutdown.
+	server.ConnState = func(conn net.Conn, state http.ConnState) {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		switch state {
+		case http.StateNew, http.StateActive:
+			p.conns[conn] = struct{}{}
+		case http.StateHijacked:
+		case http.StateClosed, http.StateIdle:
+			delete(p.conns, conn)
+		}
+	}
+	p.server = server
 
-	return &ampThreadActorProxy{
-		addr:     addr,
-		upstream: redactURL(parsed),
-		hasToken: rivetToken != "",
-		server:   server,
-	}, nil
+	return p, nil
+}
+
+func localListenerHostname(host string) string {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return ""
+	}
+	if hostname, _, err := net.SplitHostPort(host); err == nil {
+		return strings.ToLower(hostname)
+	}
+	return strings.ToLower(host)
+}
+
+func localListenerPort(host string) string {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return ""
+	}
+	if _, port, err := net.SplitHostPort(host); err == nil {
+		return port
+	}
+	// A Host without an explicit port means the default port for the scheme;
+	// this proxy is plain HTTP, so treat it as port 80 rather than a wildcard.
+	return "80"
+}
+
+func validateLoopbackAddr(addr string) error {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return fmt.Errorf("actor proxy address %q has no host; the local actor endpoint must bind a loopback address", addr)
+	}
+	if !isLoopbackHostname(host) {
+		return fmt.Errorf("actor proxy address %q is not a loopback address; the local actor endpoint must not listen on non-loopback interfaces", addr)
+	}
+	return nil
+}
+
+func isLoopbackHostname(host string) bool {
+	host = strings.ToLower(strings.TrimSpace(host))
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && ip.IsLoopback()
 }
 
 func rivetTokenFromURL(u *url.URL) string {
@@ -258,8 +394,12 @@ func rivetTokenFromURL(u *url.URL) string {
 	return password
 }
 
+func isRivetGatewayPath(path string) bool {
+	return path == "/gateway" || strings.HasPrefix(path, "/gateway/")
+}
+
 func addRivetGatewayToken(req *http.Request, token string) {
-	if req == nil || req.URL == nil || token == "" || !strings.HasPrefix(req.URL.Path, "/gateway/") {
+	if req == nil || req.URL == nil || token == "" || !isRivetGatewayPath(req.URL.Path) {
 		return
 	}
 
@@ -291,7 +431,7 @@ func isRivetWebSocketRequest(req *http.Request) bool {
 	}
 
 	path := req.URL.Path
-	if path != "/connect" && !strings.HasPrefix(path, "/gateway/") && path != "/websocket" && !strings.HasPrefix(path, "/websocket/") {
+	if path != "/connect" && !isRivetGatewayPath(path) && path != "/websocket" && !strings.HasPrefix(path, "/websocket/") {
 		return false
 	}
 
@@ -350,20 +490,33 @@ func (p *ampThreadActorProxy) Start(ctx context.Context) error {
 		return errors.New("proxy is nil")
 	}
 
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	runCtx, stopRun := context.WithCancel(ctx)
+
 	listener, err := net.Listen("tcp", p.addr)
 	if err != nil {
+		stopRun()
 		return fmt.Errorf("listen %s: %w", p.addr, err)
 	}
+
+	p.mu.Lock()
 	p.addr = listener.Addr().String()
+	p.listener = listener
+	p.runCtx = runCtx
+	p.stopRun = stopRun
+	p.mu.Unlock()
 
 	go func() {
-		<-ctx.Done()
+		<-runCtx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout(ctx))
 		defer cancel()
 		_ = p.Shutdown(shutdownCtx)
 	}()
 
 	go func() {
+		defer close(p.done)
 		if errServe := p.server.Serve(listener); errServe != nil && !errors.Is(errServe, http.ErrServerClosed) {
 			log.Warnf("amp thread actor proxy stopped unexpectedly: %v", errServe)
 		}
@@ -376,7 +529,51 @@ func (p *ampThreadActorProxy) Shutdown(ctx context.Context) error {
 	if p == nil || p.server == nil {
 		return nil
 	}
-	return p.server.Shutdown(ctx)
+
+	p.mu.Lock()
+	if p.closed {
+		done := p.done
+		p.mu.Unlock()
+		if done != nil {
+			<-done
+		}
+		return nil
+	}
+	p.closed = true
+	if p.stopRun != nil {
+		p.stopRun()
+	}
+	server := p.server
+	done := p.done
+	p.mu.Unlock()
+
+	var shutdownErr error
+	shutdownDone := make(chan error, 1)
+	go func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		shutdownDone <- server.Shutdown(shutdownCtx)
+	}()
+
+	p.mu.Lock()
+	conns := make([]net.Conn, 0, len(p.conns))
+	for conn := range p.conns {
+		conns = append(conns, conn)
+	}
+	p.mu.Unlock()
+	for _, conn := range conns {
+		_ = conn.Close()
+	}
+
+	if err := <-shutdownDone; err != nil {
+		log.Warnf("amp thread actor proxy graceful shutdown: %v", err)
+		shutdownErr = err
+	}
+
+	if done != nil {
+		<-done
+	}
+	return shutdownErr
 }
 
 func shutdownTimeout(ctx context.Context) time.Duration {
