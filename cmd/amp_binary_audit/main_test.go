@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -567,6 +569,14 @@ func TestCommittedBaselineMatchesInstalledAmpBinaryWhenPathMatches(t *testing.T)
 	if _, err := os.Stat(defaultAmpBinaryPath); err != nil {
 		t.Skipf("installed Amp binary is not available at %q: %v", defaultAmpBinaryPath, err)
 	}
+	raw, err := os.ReadFile(defaultAmpBinaryPath)
+	if err != nil {
+		t.Fatalf("read installed Amp binary: %v", err)
+	}
+	installedSHA := sha256.Sum256(raw)
+	if installedHex := hex.EncodeToString(installedSHA[:]); installedHex != baseline.Source.SHA256 {
+		t.Skipf("installed Amp binary sha256 %s does not match baseline source sha256 %s; the baseline binary was superseded (likely by Amp auto-update)", installedHex, baseline.Source.SHA256)
+	}
 
 	current, err := BuildSnapshot(defaultAmpBinaryPath)
 	if err != nil {
@@ -582,39 +592,42 @@ func TestCommittedBaselineMatchesInstalledAmpBinaryWhenPathMatches(t *testing.T)
 }
 
 var knownPromptTagSetCountValues = map[string]int{
-	"prompt/artifacts,painter,skills,tools":             1,
-	"prompt/compaction":                                 6,
-	"prompt/guidance":                                   5,
-	"prompt/painter":                                    1,
-	"prompt/skills":                                     7,
-	"prompt/skills,system-prompt,tools":                 1,
-	"prompt/skills,tools":                               2,
-	"prompt/tools":                                      36,
-	"source/artifacts,compaction,guidance,skills,tools": 1,
+	"prompt/artifacts,painter,skills,tools": 1,
+	"prompt/compaction":                     6,
+	"prompt/guidance":                       4,
+	"prompt/painter":                        1,
+	"prompt/skills":                         9,
+	"prompt/skills,system-prompt,tools":     1,
+	"prompt/skills,tools":                   3,
+	"prompt/tools":                          36,
+	"source/artifacts":                      1,
 	"source/artifacts,code-review,painter,skills,tools": 1,
+	"source/artifacts,compaction,guidance,skills,tools": 1,
 	"source/artifacts,compaction,painter,skills,tools":  1,
-	"source/artifacts,painter,settings,tools":           1,
+	"source/artifacts,painter,settings":                 1,
+	"source/artifacts,settings,tools":                   1,
 	"source/code-review,guidance,settings":              1,
 	"source/code-review,guidance,settings,skills,tools": 1,
-	"source/compaction":                                 6,
+	"source/compaction":                                 8,
+	"source/compaction,skills":                          1,
 	"source/compaction,skills,tools":                    3,
-	"source/compaction,tools":                           7,
-	"source/guidance":                                   7,
+	"source/compaction,tools":                           6,
+	"source/guidance":                                   8,
 	"source/guidance,settings":                          1,
 	"source/guidance,settings,skills,tools":             1,
-	"source/guidance,skills":                            2,
-	"source/guidance,skills,tools":                      3,
-	"source/guidance,tools":                             11,
+	"source/guidance,skills":                            3,
+	"source/guidance,skills,tools":                      7,
+	"source/guidance,tools":                             9,
 	"source/painter":                                    1,
 	"source/painter,skills":                             1,
 	"source/painter,tools":                              1,
 	"source/settings":                                   3,
 	"source/settings,skills,tools":                      1,
 	"source/settings,system-prompt,tools":               1,
-	"source/settings,tools":                             7,
-	"source/skills":                                     12,
-	"source/skills,tools":                               18,
-	"source/tools":                                      105,
+	"source/settings,tools":                             5,
+	"source/skills":                                     13,
+	"source/skills,tools":                               20,
+	"source/tools":                                      110,
 }
 
 func TestLifecycleChecklistKnownPromptTagCountsRunFocusedChecks(t *testing.T) {
@@ -665,6 +678,13 @@ func TestKnownModelModeReasoningValuesMatchCommittedBaseline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read committed baseline: %v", err)
 	}
+	if _, ok := knownRawModelValues["claude-opus-5"]; !ok {
+		t.Fatal("claude-opus-5 is missing from known raw models")
+	}
+	wantOpusFive := modelLimitExpectation{Enum: "CLAUDE_OPUS_5", Provider: "anthropic", DisplayName: "Claude Opus 5", ContextWindow: 1000000, MaxOutputTokens: 128000}
+	if got := knownModelLimitValues["claude-opus-5"]; got != wantOpusFive {
+		t.Fatalf("claude-opus-5 limit = %#v, want %#v", got, wantOpusFive)
+	}
 
 	assertStringSetsEqual(t, "models", baseline.Signals.Models, sortedKeys(activeRawModelValues()))
 	assertStringSetsEqual(t, "model coverage", modelCoverageStrings(baseline.Signals.ModelCoverage), sortedKeys(expectedCoverageValuesFromSet(activeRawModelValues(), func(name string) string {
@@ -691,6 +711,12 @@ func TestKnownSettingsValuesMatchCommittedBaseline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read committed baseline: %v", err)
 	}
+	if got := settingScopes["agent.speed"]; got != "local-runtime" {
+		t.Fatalf("agent.speed scope = %q, want local-runtime", got)
+	}
+	if got := knownSettingDefaultValues["agent.speed"]; got != "undefined" {
+		t.Fatalf("agent.speed default = %q, want undefined", got)
+	}
 
 	assertStringSetsEqual(t, "settings", baseline.Signals.Settings, sortedStringMapKeys(activeSettingScopes()))
 	assertStringSetsEqual(t, "setting coverage", settingCoverageStrings(baseline.Signals.SettingCoverage), sortedKeys(expectedCoverageValuesFromMap(activeSettingScopes())))
@@ -703,8 +729,8 @@ func TestKnownSettingsValuesMatchCommittedBaseline(t *testing.T) {
 		expectedDefaults = append(expectedDefaults, name+"="+value+"="+settingScopes[name])
 	}
 	assertStringSetsEqual(t, "setting defaults", settingDefaultStrings(baseline.Signals.SettingDefaults), expectedDefaults)
-	assertStringSetsEqual(t, "mode setting markers", baseline.Signals.ModeSettingMarkers, sortedStringMapKeys(modeSettingMarkers))
-	assertStringSetsEqual(t, "mode setting coverage", modeSettingCoverageStrings(baseline.Signals.ModeSettingCoverage), sortedKeys(expectedCoverageValuesFromMap(modeSettingMarkers)))
+	assertStringSetsEqual(t, "mode setting markers", baseline.Signals.ModeSettingMarkers, sortedStringMapKeys(activeModeSettingMarkers()))
+	assertStringSetsEqual(t, "mode setting coverage", modeSettingCoverageStrings(baseline.Signals.ModeSettingCoverage), sortedKeys(expectedCoverageValuesFromMap(activeModeSettingMarkers())))
 }
 
 // Categories current release binaries no longer carry; the committed baseline
@@ -1306,10 +1332,10 @@ func TestBuildSnapshotReadsBinaryLikeFile(t *testing.T) {
 }
 
 func TestExtractAgentModeProfilesStopsAtPuckBoundary(t *testing.T) {
-	raw := `REVIEW:{key:"review",primaryModel:Nr("GPT_5_5"),includeTools:NB,reasoningEffort:"medium"},PUCK:{key:"puck",primaryModel:Nr("GPT_5_6_TERRA"),includeTools:BB,reasoningEffort:"none",serverOnly:!0},LOW:{key:"low",primaryModel:Nr("AMP_GLM_5_2"),includeTools:VB,reasoningEffort:"medium"}`
+	raw := `REVIEW:{key:"review",primaryModel:Nr("GPT_5_5"),includeTools:NB,reasoningEffort:"medium"},PUCK:{key:"puck",primaryModel:Nr("GPT_5_6_SOL"),includeTools:BB,reasoningEffort:"none",serverOnly:!0},LOW:{key:"low",primaryModel:Nr("AMP_GLM_5_2"),includeTools:VB,reasoningEffort:"medium"}`
 	profiles := agentModeProfileStrings(extractAgentModeProfiles(raw))
 	assertContains(t, profiles, "review|primary=GPT_5_5|reasoning=medium|levels=|include=present|deferred=false|visible=false|visibleInV2=false|serverOnly=false")
-	assertContains(t, profiles, "puck|primary=GPT_5_6_TERRA|reasoning=none|levels=|include=present|deferred=false|visible=false|visibleInV2=false|serverOnly=true")
+	assertContains(t, profiles, "puck|primary=GPT_5_6_SOL|reasoning=none|levels=|include=present|deferred=false|visible=false|visibleInV2=false|serverOnly=true")
 }
 
 func TestLifecycleChecklistMapsChangedSignalsToParityAreas(t *testing.T) {
@@ -1931,6 +1957,15 @@ func TestKnownRouteOwnershipTablesAreInternallyConsistent(t *testing.T) {
 }
 
 func TestKnownLifecycleClassificationTablesAreInternallyConsistent(t *testing.T) {
+	for _, event := range []string{"executor_notepad_operation", "executor_notepad_operation_result"} {
+		if _, ok := knownRawThreadDeltaEventValues[event]; !ok {
+			t.Fatalf("notepad event %q is missing from raw thread deltas", event)
+		}
+		assertContains(t, knownThreadProtocolEvents, event)
+		if area := threadDeltaArea(event); area != "executor-bridge" {
+			t.Fatalf("notepad event %q area = %q, want executor-bridge", event, area)
+		}
+	}
 	for event := range knownRawThreadDeltaEventValues {
 		t.Run("thread-delta/"+event, func(t *testing.T) {
 			if area := threadDeltaArea(event); area == "" {

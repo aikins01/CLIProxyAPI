@@ -179,7 +179,7 @@ func fetchModelsFromRemote(ctx context.Context) (*staticModelsJSON, string) {
 			log.Warnf("models parse failed from %s: %v", url, err)
 			continue
 		}
-		applyAmpBinaryModelOverrides(&parsed)
+		applyModelOverrides(&parsed)
 		if err := validateModelsCatalog(&parsed); err != nil {
 			log.Warnf("models validate failed from %s: %v", url, err)
 			continue
@@ -300,7 +300,7 @@ func loadModelsFromBytes(data []byte, source string) error {
 	if err := json.Unmarshal(data, &parsed); err != nil {
 		return fmt.Errorf("%s: decode models catalog: %w", source, err)
 	}
-	applyAmpBinaryModelOverrides(&parsed)
+	applyModelOverrides(&parsed)
 	if err := validateModelsCatalog(&parsed); err != nil {
 		return fmt.Errorf("%s: validate models catalog: %w", source, err)
 	}
@@ -311,7 +311,7 @@ func loadModelsFromBytes(data []byte, source string) error {
 	return nil
 }
 
-func applyAmpBinaryModelOverrides(data *staticModelsJSON) {
+func applyModelOverrides(data *staticModelsJSON) {
 	if data == nil {
 		return
 	}
@@ -320,6 +320,11 @@ func applyAmpBinaryModelOverrides(data *staticModelsJSON) {
 	setModelLimits(data.Claude, "claude-opus-4-6", 332000, 32000)
 	setModelLimits(data.Claude, "claude-opus-4-7", 332000, 32000)
 	data.Claude = upsertModelInfoPreserveOrder(data.Claude, ampBinaryClaudeOpus48Model())
+	if model := modelInfoByID(data.Claude, "claude-opus-5"); model == nil {
+		data.Claude = append(data.Claude, anthropicClaudeOpus5Model())
+	} else {
+		model.ID = "claude-opus-5"
+	}
 	data.Claude = upsertModelInfoPreserveOrder(data.Claude, claudeFable5Model())
 
 	for _, models := range [][]*ModelInfo{data.CodexFree, data.CodexTeam, data.CodexPlus, data.CodexPro} {
@@ -338,12 +343,17 @@ func setModelLimits(models []*ModelInfo, id string, contextLength, maxCompletion
 }
 
 func modelInfoByID(models []*ModelInfo, id string) *ModelInfo {
+	normalizedID := normalizeModelID(id)
 	for _, model := range models {
-		if model != nil && model.ID == id {
+		if model != nil && normalizeModelID(model.ID) == normalizedID {
 			return model
 		}
 	}
 	return nil
+}
+
+func normalizeModelID(id string) string {
+	return strings.ToLower(strings.TrimSpace(id))
 }
 
 func upsertModelInfoPreserveOrder(models []*ModelInfo, extra *ModelInfo) []*ModelInfo {
@@ -376,6 +386,22 @@ func ampBinaryClaudeOpus48Model() *ModelInfo {
 			ZeroAllowed: true,
 			Levels:      []string{"low", "medium", "high", "xhigh", "max"},
 		},
+	}
+}
+
+// Sources: https://www.anthropic.com/news/claude-opus-5 and https://platform.claude.com/docs/en/about-claude/models/overview
+func anthropicClaudeOpus5Model() *ModelInfo {
+	return &ModelInfo{
+		ID:                  "claude-opus-5",
+		Object:              "model",
+		Created:             1784851200,
+		OwnedBy:             "anthropic",
+		Type:                "claude",
+		DisplayName:         "Claude Opus 5",
+		Description:         "For complex agentic coding and enterprise work",
+		ContextLength:       1000000,
+		MaxCompletionTokens: 128000,
+		Thinking:            &ThinkingSupport{Levels: []string{"low", "medium", "high", "xhigh", "max"}},
 	}
 }
 
@@ -473,10 +499,11 @@ func validateModelSection(section string, models []*ModelInfo) error {
 		if modelID == "" {
 			return fmt.Errorf("%s[%d] has empty id", section, i)
 		}
-		if _, exists := seen[modelID]; exists {
+		normalizedID := normalizeModelID(modelID)
+		if _, exists := seen[normalizedID]; exists {
 			return fmt.Errorf("%s contains duplicate model id %q", section, modelID)
 		}
-		seen[modelID] = struct{}{}
+		seen[normalizedID] = struct{}{}
 	}
 	return nil
 }
