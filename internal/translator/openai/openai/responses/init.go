@@ -12,8 +12,9 @@ func init() {
 		OpenAI,
 		ConvertOpenAIResponsesRequestToOpenAIChatCompletions,
 		interfaces.TranslateResponse{
-			Stream:    ConvertOpenAIChatCompletionsResponseToOpenAIResponses,
-			NonStream: ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream,
+			Stream:     ConvertOpenAIChatCompletionsResponseToOpenAIResponses,
+			NonStream:  ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream,
+			TokenCount: OpenAIResponsesTokenCount,
 		},
 	)
 }

@@ -44,6 +44,7 @@ VisionCoder is also offering our users a limited-time <a href="https://coder.vis
 - OpenAI/Gemini/Claude compatible API endpoints for CLI models
 - OpenAI Codex support (GPT models) via OAuth login
 - Claude Code support via OAuth login
+- ChatGPT web session support (`chatgpt-web/gpt-5-6-pro`, `--chatgpt-web-login`, Temporary Chat enforced)
 - Amp CLI and IDE extensions support with provider routing
 - Streaming, non-streaming, and WebSocket responses where supported
 - Function calling/tools support
