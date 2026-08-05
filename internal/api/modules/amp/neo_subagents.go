@@ -121,13 +121,12 @@ var neoSubagentDefs = map[string]neoSubagentDef{
 		MaxTurns:     30,
 	},
 	"run_check": {
-		Key:             "run_check",
-		DisplayName:     "Check",
-		Route:           neoModelRoute{Provider: "openai", Model: "gpt-5.6-sol"},
-		IncludeTools:    []string{"Read", "Grep", "glob", "shell_command", "shell_command_status"},
-		SystemPrompt:    neoRunCheckSubagentPrompt,
-		ReasoningEffort: "low",
-		MaxTurns:        72,
+		Key:          "run_check",
+		DisplayName:  "Check",
+		Route:        neoModelRoute{Provider: "openai", Model: "gpt-5.5"},
+		IncludeTools: []string{"Read", "Grep", "glob", "shell_command", "shell_command_status"},
+		SystemPrompt: neoRunCheckSubagentPrompt,
+		MaxTurns:     72,
 	},
 }
 
@@ -141,6 +140,22 @@ func neoSubagentRoute(def neoSubagentDef, toolName, agentMode string) neoModelRo
 		return neoModelRoute{Provider: "anthropic", Model: "claude-fable-5"}
 	}
 	return def.Route
+}
+
+func neoSubagentEffectiveReasoningEffort(toolName string, route neoModelRoute, inheritedEffort, configuredEffort string) string {
+	if strings.TrimSpace(toolName) != "run_check" {
+		return configuredEffort
+	}
+	effort := normalizeNeoProtocolReasoningEffort(neoEffectiveThinkingLevel(route, inheritedEffort))
+	if strings.TrimSpace(route.ThinkingSuffix) != "" && effort != "" {
+		return effort
+	}
+	switch effort {
+	case "medium", "high", "xhigh", "max":
+		return effort
+	default:
+		return "medium"
+	}
 }
 
 func neoConfiguredSubagentRoutes(cfg *config.Config, toolName string) []neoModelRoute {
@@ -736,7 +751,14 @@ func (s *neoSubagentCompactionState) prepare(
 	if err != nil {
 		return conversation, neoInferenceRequest{}, err
 	}
-	if !neoCompactionEnabled(settings) || !pressure.shouldCompact(agentMode, settings) {
+	if !neoCompactionEnabled(settings) {
+		if !pressure.fitsHardLimit() {
+			limitErr := neoSubagentIrreducibleContextError(name, effectiveRoute, pressure, s.immutablePrefixLen, nil)
+			return conversation, neoInferenceRequest{}, fmt.Errorf("sub-agent compaction is disabled; enable compaction, reduce the prompt or immutable prefix, or configure a larger route: %w", limitErr)
+		}
+		return conversation, request, nil
+	}
+	if !pressure.shouldCompact(agentMode, settings) {
 		return conversation, request, nil
 	}
 
@@ -899,7 +921,7 @@ func neoSubagentRequestPressureForConversation(
 	history = append(history, conversation...)
 	history = append(history, suffix...)
 	request := buildRequest(history)
-	effectiveRoute := applyNeoModelMapping(rt, route)
+	effectiveRoute := neoResolvedInferenceRoute(rt, request, route)
 	wireRequest := request
 	var err error
 	if effectiveRoute.TextToolBridge && len(request.Tools) > 0 {
@@ -1001,7 +1023,7 @@ func neoSubagentCompactionDropCount(
 	immutablePrefixLen int,
 	buildRequest func([]neoHistoryMessage) neoInferenceRequest,
 ) (int, error) {
-	effectiveRoute := applyNeoModelMapping(rt, route)
+	effectiveRoute := neoResolvedInferenceRoute(rt, buildRequest(nil), route)
 	maxInputTokens := neoEffectiveMaxInputTokens(agentMode, effectiveRoute.Model)
 	if maxInputTokens <= 0 {
 		maxInputTokens = neoEffectiveContextWindow(agentMode, effectiveRoute.Model)
@@ -1102,9 +1124,26 @@ func neoSubagentIrreducibleContextError(name string, route neoModelRoute, pressu
 	routeName := strings.Trim(strings.TrimSpace(provider)+"/"+strings.TrimSpace(route.Model), "/")
 	err := fmt.Errorf("%s sub-agent context cannot be reduced to fit %s: estimated_input_tokens=%d max_input_tokens=%d immutable_initial_messages=%d", name, routeName, pressure.estimatedTokens, pressure.maxInputTokens, immutablePrefixLen)
 	if cause != nil {
-		return fmt.Errorf("%w: %v", err, cause)
+		err = fmt.Errorf("%w: %v", err, cause)
 	}
-	return err
+	return &neoSubagentRouteCapacityError{err: err}
+}
+
+type neoSubagentRouteCapacityError struct {
+	err error
+}
+
+func (e *neoSubagentRouteCapacityError) Error() string {
+	return e.err.Error()
+}
+
+func (e *neoSubagentRouteCapacityError) Unwrap() error {
+	return e.err
+}
+
+func neoSubagentRouteFallbackEligible(err error) bool {
+	var capacityErr *neoSubagentRouteCapacityError
+	return errors.As(err, &capacityErr)
 }
 
 // executeSubagentRun runs a subagent loop and returns its final message text. It
@@ -1145,7 +1184,7 @@ func (a *neoActor) executeSubagentRun(name string, input map[string]any, parentT
 	a.mu.Lock()
 	agentMode := a.currentAgentMode
 	routes := neoSubagentRoutes(cfg, def, name, agentMode, a.settings)
-	route := routes[0]
+	inheritedReasoningEffort := firstNonEmptyString(a.currentReasoningEffort, a.settings["reasoning.effort"])
 	tools := a.resolveSubagentToolsLocked(def.IncludeTools)
 	if name == "run_check" {
 		tools = a.resolveRunCheckToolsLocked(input, def.IncludeTools)
@@ -1166,12 +1205,6 @@ func (a *neoActor) executeSubagentRun(name string, input map[string]any, parentT
 		}
 		tools = customizedTools
 	}
-	if def.ReasoningEffort != "" {
-		settings["reasoning.effort"] = def.ReasoningEffort
-		if (route.Provider == "google" || route.Provider == "vertexai") && validNeoGeminiThinkingLevel(def.ReasoningEffort) {
-			settings["gemini.thinkingLevel"] = def.ReasoningEffort
-		}
-	}
 	environment := neoCanonicalizeEnvironmentWorkspace(cloneMap(a.environment))
 	capabilities := cloneMap(a.capabilities)
 	guidance := cloneMap(a.guidanceSnapshot)
@@ -1184,6 +1217,10 @@ func (a *neoActor) executeSubagentRun(name string, input map[string]any, parentT
 	}
 	maxTokens := a.maxTokens
 	a.mu.Unlock()
+	for index := range routes {
+		routes[index] = applyNeoModelMapping(a.runtime, routes[index])
+	}
+	route := routes[0]
 	workingDir, workspaceRoot := neoFinderEnvironmentPaths(environment)
 	finderExecutorRoot := ""
 	if name == "finder" {
@@ -1254,6 +1291,18 @@ func (a *neoActor) executeSubagentRun(name string, input map[string]any, parentT
 	compactionState := neoSubagentCompactionState{immutablePrefixLen: len(conversation)}
 	buildSubagentRequest := func(route neoModelRoute, messageID string, history []neoHistoryMessage, requestTools []neoToolSpec, requireToolCall bool) neoInferenceRequest {
 		routeCopy := route
+		effectiveReasoningEffort := neoSubagentEffectiveReasoningEffort(name, route, inheritedReasoningEffort, def.ReasoningEffort)
+		requestSettings := cloneMap(settings)
+		if effectiveReasoningEffort != "" {
+			requestSettings["reasoning.effort"] = effectiveReasoningEffort
+			if route.Provider == "google" || route.Provider == "vertexai" {
+				if validNeoGeminiThinkingLevel(effectiveReasoningEffort) {
+					requestSettings["gemini.thinkingLevel"] = effectiveReasoningEffort
+				} else {
+					delete(requestSettings, "gemini.thinkingLevel")
+				}
+			}
+		}
 		attemptSystemPrompt := systemPrompt
 		if name == "Task" {
 			attemptSystemPrompt = strings.Join(compactStrings([]string{neoSystemPrompt(scaffoldRequest, route), systemPrompt}), "\n\n")
@@ -1264,16 +1313,17 @@ func (a *neoActor) executeSubagentRun(name string, input map[string]any, parentT
 			ThreadID:                      a.threadID,
 			MessageID:                     messageID,
 			AgentMode:                     agentMode,
-			ReasoningEffort:               def.ReasoningEffort,
+			ReasoningEffort:               effectiveReasoningEffort,
 			ParentToolCallID:              parentToolCallID,
 			MaxTokens:                     maxTokens,
-			Settings:                      settings,
+			Settings:                      requestSettings,
 			History:                       append([]neoHistoryMessage(nil), history...),
 			Tools:                         requestTools,
 			Environment:                   environment,
 			Capabilities:                  capabilities,
 			Guidance:                      guidance,
 			ModelRouteOverride:            &routeCopy,
+			ModelRouteOverrideResolved:    true,
 			SystemPromptOverride:          attemptSystemPrompt,
 			TextToolBridgeRequireToolCall: requireToolCall,
 		}
@@ -1283,7 +1333,7 @@ func (a *neoActor) executeSubagentRun(name string, input map[string]any, parentT
 	for _, tl := range tools {
 		toolNames = append(toolNames, tl.Name)
 	}
-	log.Debugf("amp neo subagent start tool=%s depth=%d model=%s/%s effort=%s thread=%s call=%s input_len=%d tools=%v", name, depth, route.Provider, route.Model, def.ReasoningEffort, a.threadID, parentToolCallID, len(inputText), toolNames)
+	log.Debugf("amp neo subagent start tool=%s depth=%d model=%s/%s effort=%s thread=%s call=%s input_len=%d tools=%v", name, depth, route.Provider, route.Model, neoSubagentEffectiveReasoningEffort(name, route, inheritedReasoningEffort, def.ReasoningEffort), a.threadID, parentToolCallID, len(inputText), toolNames)
 
 	var finalText string
 	var runErr error
@@ -1319,8 +1369,28 @@ turnLoop:
 				if a.subagentGenerationStale(generation) {
 					return "", nil
 				}
-				runErr = err
-				break turnLoop
+				if runContext.Err() != nil {
+					runErr = err
+					break turnLoop
+				}
+				if !neoSubagentRouteFallbackEligible(err) {
+					runErr = err
+					break turnLoop
+				}
+				attemptErrors = append(attemptErrors, fmt.Errorf("%s/%s: %w", route.Provider, route.Model, err))
+				activeRouteIndex++
+				transientRetries = 0
+				if activeRouteIndex >= len(routes) {
+					if len(routes) == 1 {
+						runErr = err
+					} else {
+						runErr = fmt.Errorf("%s subagent model routes exhausted: %w", name, errors.Join(attemptErrors...))
+					}
+					break turnLoop
+				}
+				nextRoute := routes[activeRouteIndex]
+				log.WithFields(log.Fields{"tool": name, "turn": turn, "from_provider": route.Provider, "from_model": route.Model, "from_effort": neoSubagentEffectiveReasoningEffort(name, route, inheritedReasoningEffort, def.ReasoningEffort), "to_provider": nextRoute.Provider, "to_model": nextRoute.Model, "to_effort": neoSubagentEffectiveReasoningEffort(name, nextRoute, inheritedReasoningEffort, def.ReasoningEffort)}).WithError(err).Warn("amp neo: subagent preflight fallback")
+				continue
 			}
 			result, err = a.runtime.subagentInfer(request, func(neoInferenceDelta) {})
 			if err == nil {
@@ -1340,7 +1410,7 @@ turnLoop:
 			retryable := neoSubagentRetryableInferenceError(err)
 			if retryable && transientRetries < neoSubagentTransientRetryLimit {
 				transientRetries++
-				log.Warnf("amp neo subagent retry tool=%s turn=%d model=%s/%s attempt=%d error=%v", name, turn, route.Provider, route.Model, transientRetries, err)
+				log.WithFields(log.Fields{"tool": name, "turn": turn, "provider": route.Provider, "model": route.Model, "effort": neoSubagentEffectiveReasoningEffort(name, route, inheritedReasoningEffort, def.ReasoningEffort), "attempt": transientRetries}).WithError(err).Warn("amp neo: subagent retry")
 				continue
 			}
 			if !retryable {
@@ -1359,7 +1429,7 @@ turnLoop:
 				break turnLoop
 			}
 			nextRoute := routes[activeRouteIndex]
-			log.Warnf("amp neo subagent fallback tool=%s turn=%d from=%s/%s to=%s/%s", name, turn, route.Provider, route.Model, nextRoute.Provider, nextRoute.Model)
+			log.WithFields(log.Fields{"tool": name, "turn": turn, "from_provider": route.Provider, "from_model": route.Model, "from_effort": neoSubagentEffectiveReasoningEffort(name, route, inheritedReasoningEffort, def.ReasoningEffort), "to_provider": nextRoute.Provider, "to_model": nextRoute.Model, "to_effort": neoSubagentEffectiveReasoningEffort(name, nextRoute, inheritedReasoningEffort, def.ReasoningEffort)}).WithError(err).Warn("amp neo: subagent route fallback")
 		}
 		turnCallNames := make([]string, 0, len(result.ToolCalls))
 		for _, c := range result.ToolCalls {
@@ -1401,7 +1471,7 @@ turnLoop:
 			})
 		}
 		if name == "oracle" {
-			oracleToolCycleCompleted = true
+			oracleToolCycleCompleted = oracleToolCycleCompleted || neoOracleToolCycleCompleted(result.ToolCalls)
 		}
 
 		toolError := neoSubagentCommonToolError(exchanges)
@@ -1427,7 +1497,8 @@ turnLoop:
 		var result neoInferenceResult
 		var err error
 		attemptErrors := make([]error, 0, len(routes)-activeRouteIndex)
-		for {
+	synthesisRoutes:
+		for activeRouteIndex < len(routes) {
 			route = routes[activeRouteIndex]
 			for retry := 0; ; retry++ {
 				messageID := newNeoMessageID()
@@ -1437,33 +1508,45 @@ turnLoop:
 				var request neoInferenceRequest
 				conversation, request, err = compactionState.prepare(runContext, a, generation, name, agentMode, settings, route, conversation, forcedSuffix, requestBuilder)
 				if err != nil {
-					break
+					if a.subagentGenerationStale(generation) || runContext.Err() != nil {
+						break synthesisRoutes
+					}
+					if !neoSubagentRouteFallbackEligible(err) {
+						break synthesisRoutes
+					}
+					attemptErrors = append(attemptErrors, fmt.Errorf("%s/%s: %w", route.Provider, route.Model, err))
+					activeRouteIndex++
+					if activeRouteIndex < len(routes) {
+						nextRoute := routes[activeRouteIndex]
+						log.WithFields(log.Fields{"tool": name, "from_provider": route.Provider, "from_model": route.Model, "from_effort": neoSubagentEffectiveReasoningEffort(name, route, inheritedReasoningEffort, def.ReasoningEffort), "to_provider": nextRoute.Provider, "to_model": nextRoute.Model, "to_effort": neoSubagentEffectiveReasoningEffort(name, nextRoute, inheritedReasoningEffort, def.ReasoningEffort)}).WithError(err).Warn("amp neo: subagent synthesis preflight fallback")
+					}
+					continue synthesisRoutes
 				}
 				result, err = a.runtime.subagentInfer(request, func(neoInferenceDelta) {})
 				if err == nil {
 					err = neoSubagentStopReasonError(result, false)
 				}
-				if err == nil || runContext.Err() != nil || !neoSubagentRetryableInferenceError(err) || retry >= neoSubagentTransientRetryLimit {
-					break
+				if err == nil || runContext.Err() != nil {
+					break synthesisRoutes
 				}
-				log.Warnf("amp neo subagent synthesis retry tool=%s model=%s/%s attempt=%d error=%v", name, route.Provider, route.Model, retry+1, err)
-			}
-			if err == nil || runContext.Err() != nil {
-				break
-			}
-			if !neoSubagentRetryableInferenceError(err) {
-				break
-			}
-			attemptErrors = append(attemptErrors, fmt.Errorf("%s/%s: %w", route.Provider, route.Model, err))
-			activeRouteIndex++
-			if activeRouteIndex >= len(routes) {
-				if len(routes) > 1 {
-					err = fmt.Errorf("%s subagent synthesis routes exhausted: %w", name, errors.Join(attemptErrors...))
+				if !neoSubagentRetryableInferenceError(err) {
+					break synthesisRoutes
 				}
-				break
+				if retry < neoSubagentTransientRetryLimit {
+					log.WithFields(log.Fields{"tool": name, "provider": route.Provider, "model": route.Model, "effort": neoSubagentEffectiveReasoningEffort(name, route, inheritedReasoningEffort, def.ReasoningEffort), "attempt": retry + 1}).WithError(err).Warn("amp neo: subagent synthesis retry")
+					continue
+				}
+				attemptErrors = append(attemptErrors, fmt.Errorf("%s/%s: %w", route.Provider, route.Model, err))
+				activeRouteIndex++
+				if activeRouteIndex < len(routes) {
+					nextRoute := routes[activeRouteIndex]
+					log.WithFields(log.Fields{"tool": name, "from_provider": route.Provider, "from_model": route.Model, "from_effort": neoSubagentEffectiveReasoningEffort(name, route, inheritedReasoningEffort, def.ReasoningEffort), "to_provider": nextRoute.Provider, "to_model": nextRoute.Model, "to_effort": neoSubagentEffectiveReasoningEffort(name, nextRoute, inheritedReasoningEffort, def.ReasoningEffort)}).WithError(err).Warn("amp neo: subagent synthesis route fallback")
+				}
+				continue synthesisRoutes
 			}
-			nextRoute := routes[activeRouteIndex]
-			log.Warnf("amp neo subagent synthesis fallback tool=%s from=%s/%s to=%s/%s", name, route.Provider, route.Model, nextRoute.Provider, nextRoute.Model)
+		}
+		if err != nil && runContext.Err() == nil && activeRouteIndex >= len(routes) && len(routes) > 1 {
+			err = fmt.Errorf("%s subagent synthesis routes exhausted: %w", name, errors.Join(attemptErrors...))
 		}
 		if a.subagentGenerationStale(generation) {
 			return "", nil
@@ -1975,6 +2058,14 @@ func (a *neoActor) execPreparedSubagentTurnTools(ctx context.Context, calls []ne
 		wg.Wait()
 	}
 	return exchanges
+}
+func neoOracleToolCycleCompleted(calls []neoToolCall) bool {
+	for _, call := range calls {
+		if !call.Incomplete {
+			return true
+		}
+	}
+	return false
 }
 
 func neoSubagentUniqueToolCallIDs(calls []neoToolCall) ([]neoToolCall, map[string]string) {

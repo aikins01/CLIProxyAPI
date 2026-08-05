@@ -23,6 +23,7 @@ type neoRunCheckBenchmarkCase struct {
 	ExpectedMinIssues     int
 	ExpectedMaxIssues     int
 	RequiredFile          string
+	ExpectedSeverity      string
 	RequiredKeywordGroups [][]string
 }
 
@@ -34,12 +35,19 @@ type neoRunCheckBenchmarkCandidate struct {
 
 func TestNeoRunCheckBenchmarkFixtures(t *testing.T) {
 	cases := neoRunCheckBenchmarkCases()
-	if len(cases) < 8 {
-		t.Fatalf("run_check benchmark cases = %d, want at least 8", len(cases))
+	if len(cases) < 12 {
+		t.Fatalf("run_check benchmark cases = %d, want at least 12", len(cases))
 	}
 	seenPositive := false
 	seenClean := false
+	requiredCases := map[string]bool{
+		"canonical private state missing invariant comment":    true,
+		"canonical private state documents invariant":          true,
+		"satisfier repeats canonicalization of unchanged term": true,
+		"satisfier normalizes rebound term at method boundary": true,
+	}
 	for _, tc := range cases {
+		delete(requiredCases, tc.Name)
 		t.Run(tc.Name, func(t *testing.T) {
 			if tc.CheckName == "" || strings.TrimSpace(tc.CheckContent) == "" || strings.TrimSpace(tc.Diff) == "" || len(tc.Files) == 0 {
 				t.Fatalf("incomplete fixture: %#v", tc)
@@ -60,6 +68,9 @@ func TestNeoRunCheckBenchmarkFixtures(t *testing.T) {
 	if !seenPositive || !seenClean {
 		t.Fatalf("fixtures positive=%v clean=%v, want both", seenPositive, seenClean)
 	}
+	if len(requiredCases) != 0 {
+		t.Fatalf("run_check benchmark missing PR 4849 fixture cases: %#v", requiredCases)
+	}
 }
 
 func TestNeoRunCheckDefaultBenchmarkCandidates(t *testing.T) {
@@ -74,11 +85,22 @@ func TestNeoRunCheckDefaultBenchmarkCandidates(t *testing.T) {
 		got = append(got, candidate.Route.Provider+"/"+candidate.Route.Model+"@"+effort)
 	}
 	want := []string{
+		"openai/gpt-5.5@medium",
+		"openai/gpt-5.5@high",
 		"openai/gpt-5.6-sol@low",
+		"openai/gpt-5.6-sol@medium",
+		"openai/gpt-5.6-sol@high",
 		"openai/gpt-5.6-terra@low",
 	}
 	if !slices.Equal(got, want) {
 		t.Fatalf("default run_check benchmark candidates = %#v, want %#v", got, want)
+	}
+}
+
+func TestNeoRunCheckBenchmarkDefaultRepetitions(t *testing.T) {
+	t.Setenv("AMP_RUN_CHECK_MODEL_BENCHMARK_REPS", "")
+	if got := neoRunCheckBenchmarkRepetitions(t); got != 3 {
+		t.Fatalf("default run_check benchmark repetitions = %d, want 3", got)
 	}
 }
 
@@ -89,6 +111,7 @@ func TestNeoRunCheckBenchmarkScore(t *testing.T) {
 		ExpectedMinIssues: 1,
 		ExpectedMaxIssues: 1,
 		RequiredFile:      "internal/router/local.go",
+		ExpectedSeverity:  "low",
 		RequiredKeywordGroups: [][]string{
 			{"near-miss", "false positive"},
 			{"test", "coverage"},
@@ -99,16 +122,23 @@ func TestNeoRunCheckBenchmarkScore(t *testing.T) {
 		"coveredFiles": []any{"internal/router/local.go"},
 		"coveredHunks": []any{"internal/router/local.go@@+1,1"},
 		"issues": []any{map[string]any{
-			"file":    "internal/router/local.go",
-			"problem": "blocker: broad matching lacks near-miss coverage",
-			"why":     "A false positive can route the wrong request.",
-			"fix":     "Add a focused test for the boundary.",
+			"severity": "low",
+			"file":     "internal/router/local.go",
+			"problem":  "blocker: broad matching lacks near-miss coverage",
+			"why":      "A false positive can route the wrong request.",
+			"fix":      "Add a focused test for the boundary.",
 		}},
 	}
 	passed, failures := neoRunCheckBenchmarkScore(result, tc)
 	if !passed || len(failures) != 0 {
 		t.Fatalf("score passed=%v failures=%#v", passed, failures)
 	}
+	mapValue(arrayValue(result["issues"])[0])["severity"] = "medium"
+	passed, failures = neoRunCheckBenchmarkScore(result, tc)
+	if passed || len(failures) == 0 {
+		t.Fatalf("score accepted promoted severity")
+	}
+	mapValue(arrayValue(result["issues"])[0])["severity"] = "low"
 	result["issues"] = []any{}
 	passed, failures = neoRunCheckBenchmarkScore(result, tc)
 	if passed || len(failures) == 0 {
@@ -156,11 +186,15 @@ func TestNeoRunCheckSyntheticModelBenchmark(t *testing.T) {
 func neoRunCheckRunSyntheticModelBenchmark(t *testing.T, candidate neoRunCheckBenchmarkCandidate, tc neoRunCheckBenchmarkCase, rep int) map[string]any {
 	t.Helper()
 	rt := newNeoRuntime(neoRunCheckBenchmarkConfig(t))
+	frontmatter := map[string]any{"name": tc.CheckName}
+	if tc.ExpectedSeverity != "" {
+		frontmatter["severity-default"] = tc.ExpectedSeverity
+	}
 	input := map[string]any{
 		"checkName":       tc.CheckName,
 		"checkURI":        "file:///benchmark/checks/" + tc.CheckName + ".md",
 		"checkContent":    tc.CheckContent,
-		"frontmatter":     map[string]any{"name": tc.CheckName},
+		"frontmatter":     frontmatter,
 		"diffDescription": "synthetic working tree diff",
 		"files":           stringArrayValue(tc.Files),
 		"instructions":    "Evaluate only added or modified lines. The immutable review diff snapshot and all relevant context are embedded below.",
@@ -288,16 +322,23 @@ func neoRunCheckBenchmarkScore(result map[string]any, tc neoRunCheckBenchmarkCas
 			failures = append(failures, "missing issue for "+tc.RequiredFile)
 		}
 	}
-	if len(tc.RequiredKeywordGroups) > 0 {
+	if len(tc.RequiredKeywordGroups) > 0 || tc.ExpectedSeverity != "" {
 		matched := false
-		bestMissing := make([]string, 0, len(tc.RequiredKeywordGroups))
+		bestMissing := make([]string, 0, len(tc.RequiredKeywordGroups)+1)
+		if tc.ExpectedSeverity != "" {
+			bestMissing = append(bestMissing, "severity does not match "+tc.ExpectedSeverity)
+		}
 		for _, group := range tc.RequiredKeywordGroups {
 			bestMissing = append(bestMissing, "missing one of: "+strings.Join(group, " | "))
 		}
 		for _, issue := range rubricIssues {
+			issueMap := mapValue(issue)
 			rawIssue, _ := json.Marshal(issue)
 			normalized := strings.ToLower(string(rawIssue))
-			missing := make([]string, 0, len(tc.RequiredKeywordGroups))
+			missing := make([]string, 0, len(tc.RequiredKeywordGroups)+1)
+			if tc.ExpectedSeverity != "" && !strings.EqualFold(stringValue(issueMap["severity"]), tc.ExpectedSeverity) {
+				missing = append(missing, fmt.Sprintf("severity %q, want %q", stringValue(issueMap["severity"]), tc.ExpectedSeverity))
+			}
 			for _, group := range tc.RequiredKeywordGroups {
 				found := false
 				for _, keyword := range group {
@@ -330,7 +371,11 @@ func neoRunCheckBenchmarkCandidates(t *testing.T) []neoRunCheckBenchmarkCandidat
 	raw := strings.TrimSpace(os.Getenv("AMP_RUN_CHECK_MODEL_BENCHMARK_CANDIDATES"))
 	if raw == "" {
 		return []neoRunCheckBenchmarkCandidate{
+			{Name: "gpt-5.5-medium", Route: neoModelRoute{Provider: "openai", Model: "gpt-5.5"}, Effort: "medium"},
+			{Name: "gpt-5.5-high", Route: neoModelRoute{Provider: "openai", Model: "gpt-5.5"}, Effort: "high"},
 			{Name: "gpt-5.6-sol-low", Route: neoModelRoute{Provider: "openai", Model: "gpt-5.6-sol"}, Effort: "low"},
+			{Name: "gpt-5.6-sol-medium", Route: neoModelRoute{Provider: "openai", Model: "gpt-5.6-sol"}, Effort: "medium"},
+			{Name: "gpt-5.6-sol-high", Route: neoModelRoute{Provider: "openai", Model: "gpt-5.6-sol"}, Effort: "high"},
 			{Name: "gpt-5.6-terra-low", Route: neoModelRoute{Provider: "openai", Model: "gpt-5.6-terra"}, Effort: "low"},
 		}
 	}
@@ -439,7 +484,7 @@ func neoRunCheckBenchmarkRepetitions(t *testing.T) int {
 	t.Helper()
 	raw := strings.TrimSpace(os.Getenv("AMP_RUN_CHECK_MODEL_BENCHMARK_REPS"))
 	if raw == "" {
-		return 1
+		return 3
 	}
 	repetitions, err := strconv.Atoi(raw)
 	if err != nil || repetitions <= 0 {
@@ -462,6 +507,8 @@ func neoRunCheckBenchmarkCases() []neoRunCheckBenchmarkCase {
 	regressionCheck := `Only apply this check when the diff changes tests, error handling, credentials, or dependencies. Report new empty or log-only error handling that converts a hard failure into silent success. Do not report unchanged pre-existing code. Start every problem with blocker: or follow-up:.`
 	artifactCheck := `Apply when changed code emits a command or remediation another consumer will act on. Verify the suggestion preserves the original selector, project, scope, path, or resource id, and require a test through the downstream parser or consumer when practical. A string-only assertion is insufficient when it does not prove the command reaches the intended final state. Start every problem with blocker: or follow-up:.`
 	conventionCheck := `Apply when changed code has nearby repository conventions. Compare surrounding code and report concrete divergence in naming, logging, formatting, or scope. Do not report preferences without an established convention. Start every problem with blocker: or follow-up:.`
+	invariantCommentCheck := `Apply when changed code adds or materially repurposes private state used by multiple methods or boundary consumers. Report a missing declaration comment only when the name and type do not expose a correctness-critical invariant such as canonical identity, the diff proves consumers rely on that invariant, and comparable nearby state is documented. Request only the shortest comment stating the invariant. Do not request routine private-field documentation or implementation narration. Start every problem with blocker: or follow-up:.`
+	duplicateNormalizationCheck := `Apply when changed logic repeats normalization, validation, or conversion. Report it only when exact data flow proves the later operation consumes the already-normalized unchanged value without mutation, transformation, or rebinding, and the duplication obscures where the invariant is established. Passing the unchanged value through a call chain does not exempt the repeated operation. Do not report query-time versus storage-time normalization, distinct local copies, or normalization after mutation, transformation, or rebinding. Start every problem with blocker: or follow-up:.`
 	return []neoRunCheckBenchmarkCase{
 		{
 			Name:              "classifier broad route missing near miss",
@@ -480,7 +527,7 @@ func neoRunCheckBenchmarkCases() []neoRunCheckBenchmarkCase {
 index 1111111..2222222 100644
 --- a/internal/router/local.go
 +++ b/internal/router/local.go
-@@ -1,5 +1,9 @@
+@@ -1,4 +1,7 @@
  package router
  
  import "strings"
@@ -492,7 +539,7 @@ diff --git a/internal/router/local_test.go b/internal/router/local_test.go
 index 3333333..4444444 100644
 --- a/internal/router/local_test.go
 +++ b/internal/router/local_test.go
-@@ -4,3 +4,7 @@ func TestShouldBridge(t *testing.T) {
+@@ -4,1 +4,4 @@ func TestShouldBridge(t *testing.T) {
 +    if !shouldBridge("/api/gateway/thread") {
 +        t.Fatal("expected gateway path")
 +    }
@@ -508,7 +555,7 @@ index 3333333..4444444 100644
 index 1111111..2222222 100644
 --- a/internal/router/local.go
 +++ b/internal/router/local.go
-@@ -1,5 +1,9 @@
+@@ -1,4 +1,7 @@
  package router
  
  import "strings"
@@ -520,7 +567,7 @@ diff --git a/internal/router/local_test.go b/internal/router/local_test.go
 index 3333333..4444444 100644
 --- a/internal/router/local_test.go
 +++ b/internal/router/local_test.go
-@@ -4,3 +4,17 @@ func TestShouldBridge(t *testing.T) {
+@@ -4,1 +4,13 @@ func TestShouldBridge(t *testing.T) {
 +    cases := map[string]bool{
 +        "/gateway": true,
 +        "/gateway/": true,
@@ -552,7 +599,7 @@ index 3333333..4444444 100644
 index 1111111..2222222 100644
 --- a/internal/sync/persist.go
 +++ b/internal/sync/persist.go
-@@ -20,7 +20,8 @@ func persistSnapshot(snapshot Snapshot) error {
+@@ -20,5 +20,6 @@ func persistSnapshot(snapshot Snapshot) error {
      if err := store.Save(snapshot); err != nil {
 -        return fmt.Errorf("save snapshot: %w", err)
 +        log.Printf("save snapshot failed: %v", err)
@@ -571,7 +618,7 @@ index 1111111..2222222 100644
 index 1111111..2222222 100644
 --- a/internal/sync/persist.go
 +++ b/internal/sync/persist.go
-@@ -20,7 +20,7 @@ func persistSnapshot(snapshot Snapshot) error {
+@@ -20,5 +20,5 @@ func persistSnapshot(snapshot Snapshot) error {
      if err := store.Save(snapshot); err != nil {
 -        return err
 +        return fmt.Errorf("save snapshot: %w", err)
@@ -596,7 +643,7 @@ index 1111111..2222222 100644
 index 1111111..2222222 100644
 --- a/internal/doctor/remediation.go
 +++ b/internal/doctor/remediation.go
-@@ -12,5 +12,5 @@ func repairHint(project string) string {
+@@ -12,2 +12,2 @@ func repairHint(project string) string {
 -    return fmt.Sprintf("tool repair --project %s", shellquote(project))
 +    return "tool repair"
  }
@@ -604,7 +651,7 @@ diff --git a/internal/doctor/remediation_test.go b/internal/doctor/remediation_t
 index 3333333..4444444 100644
 --- a/internal/doctor/remediation_test.go
 +++ b/internal/doctor/remediation_test.go
-@@ -8,5 +8,5 @@ func TestRepairHint(t *testing.T) {
+@@ -8,2 +8,2 @@ func TestRepairHint(t *testing.T) {
 -    require.Equal(t, "tool repair --project alpha", repairHint("alpha"))
 +    require.Contains(t, repairHint("alpha"), "tool repair")
  }`,
@@ -619,7 +666,7 @@ index 3333333..4444444 100644
 index 1111111..2222222 100644
 --- a/internal/doctor/remediation.go
 +++ b/internal/doctor/remediation.go
-@@ -12,5 +12,5 @@ func repairHint(project string) string {
+@@ -12,2 +12,2 @@ func repairHint(project string) string {
 -    return "tool repair"
 +    return fmt.Sprintf("tool repair --project %s", shellquote(project))
  }
@@ -627,7 +674,7 @@ diff --git a/internal/doctor/remediation_test.go b/internal/doctor/remediation_t
 index 3333333..4444444 100644
 --- a/internal/doctor/remediation_test.go
 +++ b/internal/doctor/remediation_test.go
-@@ -8,3 +8,8 @@ func TestRepairHint(t *testing.T) {
+@@ -8,1 +8,5 @@ func TestRepairHint(t *testing.T) {
 +    args := parseCommand(repairHint("alpha"))
 +    state := runRepair(args)
 +    require.Equal(t, "alpha", state.RepairedProject)
@@ -644,7 +691,7 @@ index 3333333..4444444 100644
 index 1111111..2222222 100644
 --- a/internal/cache/cache.go
 +++ b/internal/cache/cache.go
-@@ -5,8 +5,8 @@ func warmCache() {
+@@ -5,4 +5,4 @@ func warmCache() {
      _ = loadLegacyCache()
 -    const batchSize = 50
 +    const batchSize = 100
@@ -668,10 +715,165 @@ index 1111111..2222222 100644
 index 1111111..2222222 100644
 --- a/internal/api/handler.go
 +++ b/internal/api/handler.go
-@@ -15,6 +15,7 @@ func handleRequest(req Request) error {
+@@ -15,3 +15,4 @@ func handleRequest(req Request) error {
      logrus.WithField("request_id", req.ID).Debug("request received")
 +    fmt.Printf("handling request %s\n", req.ID)
      return dispatch(req)
+ }`,
+		},
+		{
+			Name:              "canonical private state missing invariant comment",
+			CheckName:         "repo-convention-fit",
+			CheckContent:      invariantCommentCheck,
+			Files:             []string{"lib/src/solver/partial_solution.dart"},
+			ExpectedMinIssues: 1,
+			ExpectedMaxIssues: 1,
+			RequiredFile:      "lib/src/solver/partial_solution.dart",
+			ExpectedSeverity:  "low",
+			RequiredKeywordGroups: [][]string{
+				{"canonical", "canonicalized"},
+				{"invariant", "workspace reference", "root reference"},
+				{"comment", "document"},
+			},
+			Diff: `diff --git a/lib/src/solver/partial_solution.dart b/lib/src/solver/partial_solution.dart
+index 1111111..2222222 100644
+--- a/lib/src/solver/partial_solution.dart
++++ b/lib/src/solver/partial_solution.dart
+@@ -25,4 +25,16 @@ class PartialSolution {
+   // Canonical terms retained as the solver's assignment source of truth.
+   final List<Term> _assignments = [];
+
++  final Map<String, PackageRef> _rootRefs = {};
++
++  void rememberRoot(PackageRef ref) {
++    final canonical = ref.canonical();
++    _rootRefs[canonical.workspaceName] = canonical;
++  }
++
++  PackageRef? rootRefFor(String workspaceName) => _rootRefs[workspaceName];
++
++  void forgetRoot(PackageRef ref) {
++    _rootRefs.remove(ref.canonical().workspaceName);
++  }
+ }`,
+		},
+		{
+			Name:              "canonical private state documents invariant",
+			CheckName:         "repo-convention-fit",
+			CheckContent:      invariantCommentCheck,
+			Files:             []string{"lib/src/solver/partial_solution.dart"},
+			ExpectedMaxIssues: 0,
+			Diff: `diff --git a/lib/src/solver/partial_solution.dart b/lib/src/solver/partial_solution.dart
+index 1111111..2222222 100644
+--- a/lib/src/solver/partial_solution.dart
++++ b/lib/src/solver/partial_solution.dart
+@@ -25,4 +25,17 @@ class PartialSolution {
+   // Canonical terms retained as the solver's assignment source of truth.
+   final List<Term> _assignments = [];
+
++  // Canonical package refs keyed by canonical workspace names.
++  final Map<String, PackageRef> _rootRefs = {};
++
++  void rememberRoot(PackageRef ref) {
++    final canonical = ref.canonical();
++    _rootRefs[canonical.workspaceName] = canonical;
++  }
++
++  PackageRef? rootRefFor(String workspaceName) => _rootRefs[workspaceName];
++
++  void forgetRoot(PackageRef ref) {
++    _rootRefs.remove(ref.canonical().workspaceName);
++  }
+ }`,
+		},
+		{
+			Name:              "satisfier repeats canonicalization of unchanged term",
+			CheckName:         "implementation-simplicity-and-cost",
+			CheckContent:      duplicateNormalizationCheck,
+			Files:             []string{"lib/src/solver/partial_solution.dart"},
+			ExpectedMinIssues: 1,
+			ExpectedMaxIssues: 1,
+			RequiredFile:      "lib/src/solver/partial_solution.dart",
+			ExpectedSeverity:  "low",
+			RequiredKeywordGroups: [][]string{
+				{"duplicate", "redundant", "repeated", "repeats", "again"},
+				{"canonical", "normalize"},
+				{"unchanged", "same term", "already"},
+				{"satisfier", "satisfies", "relation"},
+			},
+			Diff: `diff --git a/lib/src/solver/partial_solution.dart b/lib/src/solver/partial_solution.dart
+index 1111111..2222222 100644
+--- a/lib/src/solver/partial_solution.dart
++++ b/lib/src/solver/partial_solution.dart
+@@ -40,1 +40,27 @@ class PartialSolution {
++  Assignment? satisfier(Term term) {
++    term = canonicalizeTerm(term);
++    for (final prefix in _prefixes) {
++      if (prefix.satisfies(term)) return prefix;
++    }
++    return null;
++  }
++
++  void derive(Term term) {
++    term = canonicalizeTerm(term);
++    _assignments.add(term);
++  }
++}
++
++class Assignment {
++  bool satisfies(Term term) => relation(term) == SetRelation.subset;
++
++  SetRelation relation(Term term) {
++    term = canonicalizeTerm(term);
++    return _relationTo(term);
++  }
++}
++
++final class Term {
++  const Term(this.package);
++  final Package package;
+ }`,
+		},
+		{
+			Name:              "satisfier normalizes rebound term at method boundary",
+			CheckName:         "implementation-simplicity-and-cost",
+			CheckContent:      duplicateNormalizationCheck,
+			Files:             []string{"lib/src/solver/partial_solution.dart"},
+			ExpectedMaxIssues: 0,
+			Diff: `diff --git a/lib/src/solver/partial_solution.dart b/lib/src/solver/partial_solution.dart
+index 1111111..2222222 100644
+--- a/lib/src/solver/partial_solution.dart
++++ b/lib/src/solver/partial_solution.dart
+@@ -40,1 +40,30 @@ class PartialSolution {
++  Assignment? satisfier(Term term) {
++    term = canonicalizeTerm(term);
++    for (final prefix in _prefixes) {
++      term = prefix.project(term);
++      if (prefix.satisfies(term)) return prefix;
++    }
++    return null;
++  }
++
++  void derive(Term term) {
++    term = canonicalizeTerm(term);
++    _assignments.add(term);
++  }
++}
++
++class Assignment {
++  Term project(Term term) => term.forPackage(package);
++
++  bool satisfies(Term term) => relation(term) == SetRelation.subset;
++
++  SetRelation relation(Term term) {
++    term = canonicalizeTerm(term);
++    return _relationTo(term);
++  }
++}
++
++final class Term {
++  const Term(this.package);
++  final Package package;
  }`,
 		},
 	}

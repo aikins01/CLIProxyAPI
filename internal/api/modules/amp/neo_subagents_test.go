@@ -41,7 +41,7 @@ func TestNeoSubagentRegistryMatchesLocalContract(t *testing.T) {
 		{"finder", "openai", "gpt-5.6-terra", "low", []string{"Grep", "glob", "Read"}},
 		{"oracle", "openai", "gpt-5.6-sol", "high", []string{"Read", "Grep", "glob", "web_search", "read_web_page", "read_thread", "find_thread"}},
 		{"librarian", "openai", "gpt-5.6-sol", "none", []string{"read_github", "search_github", "commit_search", "diff", "list_directory_github", "list_repositories", "glob_github"}},
-		{"run_check", "openai", "gpt-5.6-sol", "low", []string{"Read", "Grep", "glob", "shell_command", "shell_command_status"}},
+		{"run_check", "openai", "gpt-5.5", "", []string{"Read", "Grep", "glob", "shell_command", "shell_command_status"}},
 		// Task inherits the parent model (empty route) and includes finder (a nested subagent).
 		{"Task", "", "", "", []string{"Read", "shell_command", "shell_command_status", "apply_patch", "edit_file", "create_file", "read_web_page", "web_search", "finder", "skill", "view_media"}},
 	}
@@ -65,6 +65,34 @@ func TestNeoSubagentRegistryMatchesLocalContract(t *testing.T) {
 	}
 }
 
+func TestNeoRunCheckEffectiveReasoningEffortPrecedence(t *testing.T) {
+	cases := []struct {
+		name      string
+		route     neoModelRoute
+		inherited string
+		want      string
+	}{
+		{name: "default floor", route: neoModelRoute{}, inherited: "", want: "medium"},
+		{name: "low parent floor", route: neoModelRoute{}, inherited: "low", want: "medium"},
+		{name: "medium parent", route: neoModelRoute{}, inherited: "medium", want: "medium"},
+		{name: "high parent", route: neoModelRoute{}, inherited: "high", want: "high"},
+		{name: "max parent", route: neoModelRoute{}, inherited: "max", want: "max"},
+		{name: "explicit low suffix", route: neoModelRoute{ThinkingSuffix: "low"}, inherited: "high", want: "low"},
+		{name: "explicit max suffix", route: neoModelRoute{ThinkingSuffix: "max"}, inherited: "medium", want: "max"},
+		{name: "invalid suffix uses floor", route: neoModelRoute{ThinkingSuffix: "invalid"}, inherited: "low", want: "medium"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := neoSubagentEffectiveReasoningEffort("run_check", tc.route, tc.inherited, ""); got != tc.want {
+				t.Fatalf("effective effort = %q, want %q", got, tc.want)
+			}
+		})
+	}
+	if got := neoSubagentEffectiveReasoningEffort("finder", neoModelRoute{ThinkingSuffix: "max"}, "high", "low"); got != "low" {
+		t.Fatalf("finder effective effort = %q, want configured low", got)
+	}
+}
+
 func TestNeoRunCheckToolCandidatesRecognizeAmpAliasesOnly(t *testing.T) {
 	tests := []struct {
 		name string
@@ -85,6 +113,22 @@ func TestNeoRunCheckToolCandidatesRecognizeAmpAliasesOnly(t *testing.T) {
 				t.Fatalf("candidates = %#v, want %#v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestNeoRunCheckPromptRetainsMinorLowSeverityFindings(t *testing.T) {
+	for _, want := range []string{
+		"Real but minor correctness, testing, maintainability, repository-convention, documentation, auditability, or localized efficiency issue",
+		"Do not suppress a valid issue because its correct severity is low",
+		"do not promote it merely to make it visible",
+		"preference-only style, formatter output, cosmetic nits",
+	} {
+		if !strings.Contains(neoRunCheckSubagentPrompt, want) {
+			t.Fatalf("run_check prompt missing low-severity guidance %q", want)
+		}
+	}
+	if strings.Contains(neoRunCheckSubagentPrompt, "low: Style suggestion") {
+		t.Fatalf("run_check prompt still classifies low severity as style-only")
 	}
 }
 
@@ -661,6 +705,101 @@ func TestNeoChatGPTWebOracleCompletesToolCycle(t *testing.T) {
 	}
 }
 
+func TestNeoOracleToolCycleCompletion(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name  string
+		calls []neoToolCall
+		want  bool
+	}{
+		{name: "no calls", calls: nil, want: false},
+		{name: "incomplete only", calls: []neoToolCall{{ID: "TU-1", Name: "Read", Incomplete: true}}, want: false},
+		{name: "single complete call", calls: []neoToolCall{{ID: "TU-2", Name: "Read"}}, want: true},
+		{name: "mixed complete and incomplete", calls: []neoToolCall{
+			{ID: "TU-3", Name: "Read", Incomplete: true},
+			{ID: "TU-4", Name: "Read"},
+		}, want: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := neoOracleToolCycleCompleted(test.calls); got != test.want {
+				t.Fatalf("neoOracleToolCycleCompleted() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestNeoChatGPTWebOracleIncompleteOnlyCycleKeepsToolCallRequired(t *testing.T) {
+	providerCalls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		providerCalls++
+		payload := readNeoJSON(request.Body)
+		if request.URL.Path != "/api/provider/openai/v1/responses" || stringValue(payload["model"]) != "chatgpt-web/gpt-5-5-thinking" {
+			t.Fatalf("provider request path/model = %q/%q", request.URL.Path, stringValue(payload["model"]))
+		}
+		if len(arrayValue(payload["tools"])) != 0 {
+			t.Fatalf("provider payload retained native tools: %#v", payload)
+		}
+		rendered := fmt.Sprint(payload["input"])
+		var responseText string
+		switch providerCalls {
+		case 1:
+			if !strings.Contains(rendered, "This turn requires at least one valid tool call") {
+				t.Fatalf("initial oracle request did not require a tool call: %#v", payload["input"])
+			}
+			responseText = "I will inspect the file.\n" + neoTextToolCallsOpen + `[{"name":"Read","input":{"path":"neo_runtime.go"}}]` + neoTextToolCallsClose
+		case 2:
+			if strings.Contains(rendered, "This turn requires at least one valid tool call") {
+				t.Fatalf("continuation request still required a tool call after a completed cycle: %#v", payload["input"])
+			}
+			responseText = "Oracle completed the inspection."
+		default:
+			t.Fatalf("provider calls = %d, want two", providerCalls)
+		}
+		delta, _ := json.Marshal(map[string]any{"type": "response.output_text.delta", "output_index": 0, "content_index": 0, "delta": responseText})
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprintf(w, "data: %s\n\n", delta)
+		fmt.Fprint(w, "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1},\"output\":[]}}\n\ndata: [DONE]\n\n")
+	}))
+	t.Cleanup(upstream.Close)
+
+	rt := testNeoRuntimeForServer(t, upstream)
+	cfg := *rt.configSnapshot()
+	cfg.AmpCode.NeoLocalRuntime.SubagentModels = map[string][]string{
+		"oracle": {"chatgpt-web/gpt-5-5-thinking"},
+	}
+	if err := rt.updateConfig(&cfg); err != nil {
+		t.Fatalf("update runtime config: %v", err)
+	}
+	actor := newNeoActor(rt, "actor-oracle-incomplete-cycle", "thread-actor", "T-oracle-incomplete-cycle", "T-oracle-incomplete-cycle", neoActorRecord("actor-oracle-incomplete-cycle", "thread-actor", "T-oracle-incomplete-cycle"), nil)
+	actor.currentAgentMode = "high"
+	actor.tools = map[string]neoToolSpec{
+		"Read": {Name: "Read", Description: "Read a file", InputSchema: map[string]any{"type": "object"}},
+	}
+
+	socket := &neoSocket{writeMessage: func(_ int, data []byte) error {
+		var event map[string]any
+		if err := json.Unmarshal(data, &event); err != nil || stringValue(event["type"]) != "tool_lease" {
+			return nil
+		}
+		toolCallID := stringValue(event["toolCallId"])
+		go actor.routeSubagentLeafToolResult(toolCallID, map[string]any{"status": "done", "output": "package amp"})
+		return nil
+	}}
+	actor.sockets[socket] = struct{}{}
+
+	text, err := actor.executeSubagentRun("oracle", map[string]any{"task": "Inspect the runtime"}, "TU-parent-oracle-incomplete", "M-parent", actor.generation, 0, "")
+	if err != nil {
+		t.Fatalf("oracle bridge run failed: %v", err)
+	}
+	if text != "Oracle completed the inspection." {
+		t.Fatalf("oracle bridge result = %q", text)
+	}
+	if providerCalls != 2 {
+		t.Fatalf("provider calls = %d, want two", providerCalls)
+	}
+}
+
 func TestNeoChatGPTWebOracleToolRefusalDoesNotFallback(t *testing.T) {
 	cfg := &config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{SubagentModels: map[string][]string{
 		"oracle": {"chatgpt-web/gpt-5-6-pro", "anthropic/claude-fable-5"},
@@ -994,6 +1133,71 @@ func TestNeoSubagentForcedSynthesisRetriesTransientLocalProviderStreamError(t *t
 	}
 }
 
+func TestNeoSubagentPreflightFailureUsesLargerFallbackRoute(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{SubagentModels: map[string][]string{
+		"Task": {"openai/gpt-5.6-sol", "anthropic/claude-sonnet-4-5-20250929"},
+	}}}})
+	primaryMaxInput := neoEffectiveMaxInputTokens("high", "gpt-5.6-sol")
+	if primaryMaxInput <= 0 {
+		t.Fatalf("primary max input = %d", primaryMaxInput)
+	}
+	fallbackMaxInput := neoEffectiveMaxInputTokens("high", "claude-sonnet-4-5-20250929")
+	if fallbackMaxInput <= primaryMaxInput {
+		t.Fatalf("fallback max input = %d, want larger than primary %d", fallbackMaxInput, primaryMaxInput)
+	}
+	attempts := make([]string, 0, 2)
+	rt.inferStream = func(_ *neoRuntime, request neoInferenceRequest, _ neoStreamCallback) (neoInferenceResult, error) {
+		attempts = append(attempts, request.ModelRouteOverride.Model)
+		return neoInferenceResult{Text: "fallback answer"}, nil
+	}
+	actor := newNeoActor(rt, "actor-preflight-fallback", "thread-actor", "T-preflight-fallback", "T-preflight-fallback", neoActorRecord("actor-preflight-fallback", "thread-actor", "T-preflight-fallback"), nil)
+	actor.currentAgentMode = "high"
+
+	oversizedPrompt := strings.Repeat("x", (primaryMaxInput+4096)*neoCompactionApproxCharsPerToken)
+	text, err := actor.executeSubagentRun("Task", map[string]any{"prompt": oversizedPrompt, "description": "oversized"}, "TU-preflight-fallback", "M-1", actor.generation, 0, "")
+	if err != nil || text != "fallback answer" {
+		t.Fatalf("preflight fallback text=%q err=%v", text, err)
+	}
+	if !slices.Equal(attempts, []string{"claude-sonnet-4-5-20250929"}) {
+		t.Fatalf("inference attempts = %#v, want a single turn on the larger fallback route", attempts)
+	}
+}
+
+func TestNeoSubagentCompactionInvariantErrorsAreNotRouteFallbackEligible(t *testing.T) {
+	cases := []struct {
+		name   string
+		suffix []neoHistoryMessage
+	}{
+		{name: "normal turn"},
+		{name: "forced synthesis", suffix: []neoHistoryMessage{{Role: "user", Text: "write the final answer without tools"}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rt := newNeoRuntime(&config.Config{})
+			actor := newNeoActor(rt, "actor-invalid-compaction", "thread-actor", "T-invalid-compaction", "T-invalid-compaction", neoActorRecord("actor-invalid-compaction", "thread-actor", "T-invalid-compaction"), nil)
+			settings := map[string]any{"internal.compactionThresholdPercent": 0}
+			route := neoModelRoute{Provider: "openai", Model: "gpt-5.6-sol"}
+			conversation := []neoHistoryMessage{
+				{Role: "user", Text: "immutable task"},
+				{Role: "assistant", Text: "invalid summary slot"},
+			}
+			state := neoSubagentCompactionState{immutablePrefixLen: 1, summaryPresent: true}
+			buildRequest := func(history []neoHistoryMessage) neoInferenceRequest {
+				routeCopy := route
+				return neoInferenceRequest{Context: context.Background(), ThreadID: actor.threadID, AgentMode: "high", Settings: settings, History: history, ModelRouteOverride: &routeCopy, SystemPromptOverride: "bounded worker"}
+			}
+
+			_, _, err := state.prepare(context.Background(), actor, actor.generation, "Task", "high", settings, route, conversation, tc.suffix, buildRequest)
+			if err == nil || !strings.Contains(err.Error(), "compaction history is invalid") {
+				t.Fatalf("prepare error = %v, want invalid compaction history", err)
+			}
+			if neoSubagentRouteFallbackEligible(err) {
+				t.Fatalf("invariant error was classified as route-capacity fallback: %v", err)
+			}
+		})
+	}
+}
+
 func TestNeoSubagentForcedSynthesisUsesModelFallback(t *testing.T) {
 	cfg := &config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{SubagentModels: map[string][]string{
 		"Task": {"openai/model-a", "anthropic/model-b"},
@@ -1017,6 +1221,52 @@ func TestNeoSubagentForcedSynthesisUsesModelFallback(t *testing.T) {
 	text, err := actor.executeSubagentRun("Task", map[string]any{"prompt": "continue", "description": "continue"}, "TU-synthesis-fallback", "M-1", actor.generation, 0, "")
 	if err != nil || text != "fallback synthesis" || !slices.Equal(attempts, []string{"model-a", "model-a", "model-a", "model-b"}) {
 		t.Fatalf("forced synthesis fallback text=%q err=%v attempts=%#v", text, err, attempts)
+	}
+}
+
+func TestNeoSubagentForcedSynthesisPreflightFailureUsesLargerFallbackRoute(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{SubagentModels: map[string][]string{
+		"Task": {"openai/gpt-5.6-sol", "anthropic/claude-sonnet-4-5-20250929"},
+	}}}})
+	primaryMaxInput := neoEffectiveMaxInputTokens("high", "gpt-5.6-sol")
+	fallbackMaxInput := neoEffectiveMaxInputTokens("high", "claude-sonnet-4-5-20250929")
+	if primaryMaxInput <= 0 || fallbackMaxInput <= primaryMaxInput {
+		t.Fatalf("route limits primary=%d fallback=%d, want a larger fallback", primaryMaxInput, fallbackMaxInput)
+	}
+	attempts := make([]string, 0, 8)
+	rt.inferStream = func(_ *neoRuntime, request neoInferenceRequest, _ neoStreamCallback) (neoInferenceResult, error) {
+		attempts = append(attempts, request.ModelRouteOverride.Model)
+		if len(request.Tools) == 0 {
+			return neoInferenceResult{Text: "fallback synthesis"}, nil
+		}
+		return neoInferenceResult{ToolCalls: []neoToolCall{{ID: "leaf-preflight", Name: "Read", Input: map[string]any{"path": "file.go"}}}}, nil
+	}
+	actor := newNeoActor(rt, "actor-synthesis-preflight-fallback", "thread-actor", "T-synthesis-preflight-fallback", "T-synthesis-preflight-fallback", neoActorRecord("actor-synthesis-preflight-fallback", "thread-actor", "T-synthesis-preflight-fallback"), nil)
+	actor.currentAgentMode = "high"
+	actor.tools = map[string]neoToolSpec{
+		"Read": {Name: "Read", Description: "Read a file", InputSchema: map[string]any{"type": "object"}},
+	}
+	socket := &neoSocket{writeMessage: func(_ int, data []byte) error {
+		var event map[string]any
+		if err := json.Unmarshal(data, &event); err != nil || stringValue(event["type"]) != "tool_lease" {
+			return nil
+		}
+		leasedID := stringValue(event["toolCallId"])
+		if leasedID == "" {
+			return nil
+		}
+		go actor.routeSubagentLeafToolResult(leasedID, map[string]any{"status": "done", "output": "package amp"})
+		return nil
+	}}
+	actor.sockets[socket] = struct{}{}
+
+	oversizedPrompt := strings.Repeat("x", (primaryMaxInput+1024)*neoCompactionApproxCharsPerToken)
+	text, err := actor.executeSubagentRun("Task", map[string]any{"prompt": oversizedPrompt, "description": "oversized"}, "TU-synthesis-preflight-fallback", "M-1", actor.generation, 0, "")
+	if err != nil || text != "fallback synthesis" {
+		t.Fatalf("synthesis preflight fallback text=%q err=%v", text, err)
+	}
+	if len(attempts) < 2 || attempts[len(attempts)-1] != "claude-sonnet-4-5-20250929" || slices.ContainsFunc(attempts, func(model string) bool { return model != "claude-sonnet-4-5-20250929" }) {
+		t.Fatalf("inference attempts = %#v, want only the fallback route, ending in a synthesis inference", attempts)
 	}
 }
 
@@ -1206,6 +1456,9 @@ func TestNeoSubagentCompactionPreservesImmutablePrefixAndCompleteTail(t *testing
 	if _, err := neoSubagentCompleteExchangeRanges(rebuilt, len(initial)+1); err != nil {
 		t.Fatalf("retained tail split an exchange: %v", err)
 	}
+	if len(rebuilt) < len(initial)+3 || rebuilt[len(rebuilt)-2].Role != "assistant" || rebuilt[len(rebuilt)-2].ToolCalls[0].ID != "TU-check-2" || rebuilt[len(rebuilt)-1].Role != "tool" || rebuilt[len(rebuilt)-1].ToolCallID != "TU-check-2" {
+		t.Fatalf("newest complete exchange was not retained: %#v", rebuilt[len(initial)+1:])
+	}
 	if len(request.History) != len(rebuilt)+1 || request.History[len(request.History)-1].Text != forcedSuffix[0].Text || len(rebuilt) > 0 && rebuilt[len(rebuilt)-1].Text == forcedSuffix[0].Text {
 		t.Fatalf("forced synthesis suffix was not request-local: rebuilt=%#v request=%#v", rebuilt, request.History)
 	}
@@ -1256,7 +1509,7 @@ func TestNeoSubagentCompactionReplacesPreviousSummary(t *testing.T) {
 	for index := 3; index < 7; index++ {
 		first = appendExchange(first, index)
 	}
-	second, _, err := state.prepare(context.Background(), actor, actor.generation, "Task", "high", settings, route, first, nil, buildRequest)
+	second, secondRequest, err := state.prepare(context.Background(), actor, actor.generation, "Task", "high", settings, route, first, nil, buildRequest)
 	if err != nil {
 		t.Fatalf("second compaction: %v", err)
 	}
@@ -1273,6 +1526,9 @@ func TestNeoSubagentCompactionReplacesPreviousSummary(t *testing.T) {
 	}
 	if _, err := neoSubagentCompleteExchangeRanges(second, 2); err != nil {
 		t.Fatalf("second compaction split an exchange: %v", err)
+	}
+	if !reflect.DeepEqual(secondRequest.History, second) {
+		t.Fatalf("second compaction request history diverged from rebuilt history:\n request %#v\n rebuilt %#v", secondRequest.History, second)
 	}
 }
 
@@ -1302,12 +1558,15 @@ func TestNeoSubagentCompactionFailureUsesOneLossyFallback(t *testing.T) {
 		return neoInferenceRequest{Context: context.Background(), ThreadID: actor.threadID, AgentMode: "high", Settings: settings, History: history, ModelRouteOverride: &routeCopy, SystemPromptOverride: "bounded worker"}
 	}
 
-	rebuilt, _, err := state.prepare(context.Background(), actor, actor.generation, "Task", "high", settings, route, conversation, nil, buildRequest)
+	rebuilt, lossyRequest, err := state.prepare(context.Background(), actor, actor.generation, "Task", "high", settings, route, conversation, nil, buildRequest)
 	if err != nil {
 		t.Fatalf("lossy fallback failed: %v", err)
 	}
 	if summaryCalls != 1 || !strings.Contains(rebuilt[1].Text, "exchanges were elided") || state.retryAfterLen <= len(rebuilt) {
 		t.Fatalf("lossy fallback calls=%d state=%#v history=%#v", summaryCalls, state, rebuilt)
+	}
+	if !reflect.DeepEqual(lossyRequest.History, rebuilt) {
+		t.Fatalf("lossy fallback request history diverged from rebuilt history:\n request %#v\n rebuilt %#v", lossyRequest.History, rebuilt)
 	}
 	if _, err := neoSubagentCompleteExchangeRanges(rebuilt, 2); err != nil {
 		t.Fatalf("lossy fallback split an exchange: %v", err)
@@ -1350,6 +1609,56 @@ func TestNeoSubagentCompactionCancellationDoesNotInstallSummary(t *testing.T) {
 	rebuilt, _, err := state.prepare(ctx, actor, actor.generation, "Task", "high", settings, route, conversation, nil, buildRequest)
 	if !errors.Is(err, context.Canceled) || requests != 0 || state.summaryPresent || !reflect.DeepEqual(rebuilt, conversation) {
 		t.Fatalf("cancelled compaction err=%v requests=%d state=%#v history=%#v", err, requests, state, rebuilt)
+	}
+}
+
+func TestNeoSubagentCompactionInflightCancellationDoesNotInstallSummary(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(entered)
+		<-release
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"<summary>must not install</summary>"}}]}`))
+	}))
+	t.Cleanup(upstream.Close)
+
+	rt := testNeoRuntimeForServer(t, upstream)
+	actor := newNeoActor(rt, "actor-inflight-cancel", "thread-actor", "T-inflight-cancel", "T-inflight-cancel", neoActorRecord("actor-inflight-cancel", "thread-actor", "T-inflight-cancel"), nil)
+	settings := map[string]any{"internal.compactionThresholdPercent": 0}
+	route := neoModelRoute{Provider: "openai", Model: "gpt-5.6-sol"}
+	conversation := []neoHistoryMessage{
+		{Role: "user", Text: "immutable task"},
+		{Role: "assistant", ToolCalls: []neoToolCall{{ID: "TU-inflight", Name: "Read"}}},
+		{Role: "tool", ToolCallID: "TU-inflight", ToolName: "Read", Text: "result"},
+	}
+	state := neoSubagentCompactionState{immutablePrefixLen: 1}
+	buildRequest := func(history []neoHistoryMessage) neoInferenceRequest {
+		routeCopy := route
+		return neoInferenceRequest{AgentMode: "high", Settings: settings, History: history, ModelRouteOverride: &routeCopy, SystemPromptOverride: "bounded worker"}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	type outcome struct {
+		rebuilt []neoHistoryMessage
+		err     error
+	}
+	resultCh := make(chan outcome, 1)
+	go func() {
+		rebuilt, _, err := state.prepare(ctx, actor, actor.generation, "Task", "high", settings, route, conversation, nil, buildRequest)
+		resultCh <- outcome{rebuilt: rebuilt, err: err}
+	}()
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("summary inference did not reach the upstream")
+	}
+	cancel()
+	close(release)
+	result := <-resultCh
+	if !errors.Is(result.err, context.Canceled) || state.summaryPresent || !reflect.DeepEqual(result.rebuilt, conversation) {
+		t.Fatalf("in-flight cancelled compaction err=%v state=%#v history_changed=%v", result.err, state, !reflect.DeepEqual(result.rebuilt, conversation))
 	}
 }
 
@@ -1535,6 +1844,62 @@ func TestNeoSubagentCompactionRejectsIrreducibleImmutablePrefix(t *testing.T) {
 	}
 }
 
+func TestNeoSubagentCompactionDisabledStillEnforcesHardLimit(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-disabled-compaction-limit", "thread-actor", "T-disabled-compaction-limit", "T-disabled-compaction-limit", neoActorRecord("actor-disabled-compaction-limit", "thread-actor", "T-disabled-compaction-limit"), nil)
+	route := neoModelRoute{Provider: "openai", Model: "gpt-5.6-sol"}
+	maxInputTokens := neoEffectiveMaxInputTokens("high", route.Model)
+	settings := map[string]any{"compactionControl": map[string]any{"enabled": false}}
+	conversation := []neoHistoryMessage{{Role: "user", Text: strings.Repeat("x", (maxInputTokens+1024)*neoCompactionApproxCharsPerToken)}}
+	state := neoSubagentCompactionState{immutablePrefixLen: 1}
+	buildRequest := func(history []neoHistoryMessage) neoInferenceRequest {
+		routeCopy := route
+		return neoInferenceRequest{AgentMode: "high", History: history, ModelRouteOverride: &routeCopy, SystemPromptOverride: "bounded worker"}
+	}
+
+	rebuilt, _, err := state.prepare(context.Background(), actor, actor.generation, "Task", "high", settings, route, conversation, nil, buildRequest)
+	if err == nil || !strings.Contains(err.Error(), "sub-agent compaction is disabled") || !strings.Contains(err.Error(), "enable compaction") || !strings.Contains(err.Error(), "immutable_initial_messages=1") || !reflect.DeepEqual(rebuilt, conversation) {
+		t.Fatalf("disabled compaction over hard limit err=%v history_changed=%v", err, !reflect.DeepEqual(rebuilt, conversation))
+	}
+
+	fitting := []neoHistoryMessage{{Role: "user", Text: "immutable task"}}
+	kept, request, err := state.prepare(context.Background(), actor, actor.generation, "Task", "high", settings, route, fitting, nil, buildRequest)
+	if err != nil {
+		t.Fatalf("disabled compaction fitting history: %v", err)
+	}
+	if !reflect.DeepEqual(kept, fitting) || !reflect.DeepEqual(request.History, fitting) {
+		t.Fatalf("disabled compaction mutated a fitting history: kept=%#v request=%#v", kept, request.History)
+	}
+}
+
+func TestNeoSubagentCompactionDisabledUsesLargerFallbackRoute(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{SubagentModels: map[string][]string{
+		"Task": {"openai/gpt-5.6-sol", "anthropic/claude-sonnet-4-5-20250929"},
+	}}}})
+	primaryMaxInput := neoEffectiveMaxInputTokens("high", "gpt-5.6-sol")
+	fallbackMaxInput := neoEffectiveMaxInputTokens("high", "claude-sonnet-4-5-20250929")
+	if primaryMaxInput <= 0 || fallbackMaxInput <= primaryMaxInput {
+		t.Fatalf("route limits primary=%d fallback=%d, want a larger fallback", primaryMaxInput, fallbackMaxInput)
+	}
+	attempts := make([]string, 0, 2)
+	rt.inferStream = func(_ *neoRuntime, request neoInferenceRequest, _ neoStreamCallback) (neoInferenceResult, error) {
+		attempts = append(attempts, request.ModelRouteOverride.Model)
+		return neoInferenceResult{Text: "fallback answer"}, nil
+	}
+	actor := newNeoActor(rt, "actor-disabled-fallback", "thread-actor", "T-disabled-fallback", "T-disabled-fallback", neoActorRecord("actor-disabled-fallback", "thread-actor", "T-disabled-fallback"), nil)
+	actor.currentAgentMode = "high"
+	actor.settings["compactionControl"] = map[string]any{"enabled": false}
+
+	oversizedPrompt := strings.Repeat("x", (primaryMaxInput+4096)*neoCompactionApproxCharsPerToken)
+	text, err := actor.executeSubagentRun("Task", map[string]any{"prompt": oversizedPrompt, "description": "oversized"}, "TU-disabled-fallback", "M-1", actor.generation, 0, "")
+	if err != nil || text != "fallback answer" {
+		t.Fatalf("disabled-compaction fallback text=%q err=%v", text, err)
+	}
+	if !slices.Equal(attempts, []string{"claude-sonnet-4-5-20250929"}) {
+		t.Fatalf("inference attempts = %#v, want a single turn on the larger fallback route", attempts)
+	}
+}
+
 func TestNeoSubagentCompactionProviderOverflowFallsBackLossily(t *testing.T) {
 	providerRequests := 0
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -1565,12 +1930,24 @@ func TestNeoSubagentCompactionProviderOverflowFallsBackLossily(t *testing.T) {
 		return neoInferenceRequest{AgentMode: "high", Settings: settings, History: history, ModelRouteOverride: &routeCopy, SystemPromptOverride: "bounded worker"}
 	}
 
-	rebuilt, _, err := state.prepare(context.Background(), actor, actor.generation, "Task", "high", settings, route, conversation, nil, buildRequest)
+	rebuilt, request, err := state.prepare(context.Background(), actor, actor.generation, "Task", "high", settings, route, conversation, nil, buildRequest)
 	if err != nil {
 		t.Fatalf("compaction-provider overflow fallback: %v", err)
 	}
 	if providerRequests != 0 || !strings.Contains(rebuilt[1].Text, "exchanges were elided") {
 		t.Fatalf("compaction-provider overflow requests=%d history_len=%d replacement=%q", providerRequests, len(rebuilt), rebuilt[1].Text)
+	}
+	if len(rebuilt) >= len(conversation) {
+		t.Fatalf("lossy fallback removed no exchanges: before=%d after=%d", len(conversation), len(rebuilt))
+	}
+	rebuiltPressure := neoSubagentRequestPressure{
+		estimatedTokens: neoEstimateInferenceInputTokens(request, route),
+		maxInputTokens:  neoEffectiveMaxInputTokens("high", route.Model),
+		maxInputKnown:   true,
+		provider:        route.Provider,
+	}
+	if !rebuiltPressure.fitsHardLimit() {
+		t.Fatalf("lossy fallback request still exceeds the provider limit: %#v", rebuiltPressure)
 	}
 }
 
@@ -2956,10 +3333,11 @@ func TestNeoLibrarianSubagentUsesGPT56SolNone(t *testing.T) {
 	}
 }
 
-func TestNeoRunCheckSubagentUsesGPT56SolLow(t *testing.T) {
+func TestNeoRunCheckSubagentUsesGPT55InheritedEffort(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	actor := newNeoActor(rt, "actor-run-check", "thread-actor", "T-run-check", "T-run-check", neoActorRecord("actor-run-check", "thread-actor", "T-run-check"), nil)
 	actor.currentAgentMode = "review"
+	actor.currentReasoningEffort = ""
 	actor.settings = map[string]any{"reasoning.effort": "medium"}
 	actor.guidanceSnapshot = map[string]any{"files": []any{map[string]any{"uri": "file:///workspace/AGENTS.md", "content": "RUN_CHECK_PROJECT_GUIDANCE"}}}
 	actor.tools = map[string]neoToolSpec{
@@ -2990,17 +3368,101 @@ func TestNeoRunCheckSubagentUsesGPT56SolLow(t *testing.T) {
 		t.Fatalf("run_check requests = %#v, want exactly one", seen)
 	}
 	route := seen[0].ModelRouteOverride
-	if route == nil || route.Provider != "openai" || route.Model != "gpt-5.6-sol" {
-		t.Fatalf("run_check route = %#v, want openai/gpt-5.6-sol", route)
+	if route == nil || route.Provider != "openai" || route.Model != "gpt-5.5" {
+		t.Fatalf("run_check route = %#v, want openai/gpt-5.5", route)
 	}
-	if seen[0].ReasoningEffort != "low" || stringValue(seen[0].Settings["reasoning.effort"]) != "low" {
-		t.Fatalf("run_check effort request=%q settings=%#v, want low", seen[0].ReasoningEffort, seen[0].Settings)
+	if seen[0].ReasoningEffort != "medium" || stringValue(seen[0].Settings["reasoning.effort"]) != "medium" {
+		t.Fatalf("run_check effort request=%q settings=%#v, want inherited medium", seen[0].ReasoningEffort, seen[0].Settings)
 	}
 	if !neoSubagentHasTools(seen[0].Tools, "Read", "Grep", "glob", "shell_command", "shell_command_status") {
 		t.Fatalf("run_check tools = %#v, want review check tools", seen[0].Tools)
 	}
 	if !strings.Contains(seen[0].SystemPromptOverride, "RUN_CHECK_PROJECT_GUIDANCE") {
 		t.Fatalf("run_check system prompt omitted project guidance: %q", seen[0].SystemPromptOverride)
+	}
+}
+
+func TestNeoRunCheckSubagentRouteSuffixOverridesInheritedEffort(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{SubagentModels: map[string][]string{
+		"run_check": {"google/gemini-3-pro(low)"},
+	}}}})
+	actor := newNeoActor(rt, "actor-run-check-suffix", "thread-actor", "T-run-check-suffix", "T-run-check-suffix", neoActorRecord("actor-run-check-suffix", "thread-actor", "T-run-check-suffix"), nil)
+	actor.currentAgentMode = "review"
+	actor.currentReasoningEffort = "high"
+	actor.settings = map[string]any{"reasoning.effort": "high"}
+	var seen neoInferenceRequest
+	rt.inferStream = func(_ *neoRuntime, req neoInferenceRequest, _ neoStreamCallback) (neoInferenceResult, error) {
+		seen = req
+		return neoInferenceResult{Text: `{"comments":[]}`}, nil
+	}
+	_, err := actor.executeSubagentRun("run_check", map[string]any{
+		"checkName":    "repo-convention-fit",
+		"checkContent": "Prefer repository conventions.",
+	}, "TU-run-check-suffix", "M-1", actor.generation, 0, "")
+	if err != nil {
+		t.Fatalf("run_check subagent failed: %v", err)
+	}
+	if seen.ReasoningEffort != "low" || stringValue(seen.Settings["reasoning.effort"]) != "low" {
+		t.Fatalf("run_check suffix effort request=%q settings=%#v, want explicit low", seen.ReasoningEffort, seen.Settings)
+	}
+	if seen.ModelRouteOverride == nil || seen.ModelRouteOverride.Provider != "google" || stringValue(seen.Settings["gemini.thinkingLevel"]) != "low" || neoProviderReasoningEffort(seen, *seen.ModelRouteOverride) != "low" {
+		t.Fatalf("run_check provider effort route=%#v settings=%#v, want Gemini low", seen.ModelRouteOverride, seen.Settings)
+	}
+}
+
+func TestNeoRunCheckSubagentMappedFallbackRoutesUsePerRouteEffort(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+		ForceModelMappings: true,
+		NeoLocalRuntime: config.AmpNeoLocalRuntime{SubagentModels: map[string][]string{
+			"run_check": {"openai/model-a", "openai/model-b"},
+		}},
+	}})
+	rt.setModelMapper(staticNeoModelMapper{
+		"model-a": "openai/gpt-5.6-sol(max)",
+		"model-b": "google/gemini-3-pro(low)",
+	})
+	actor := newNeoActor(rt, "actor-run-check-mapped-fallback", "thread-actor", "T-run-check-mapped-fallback", "T-run-check-mapped-fallback", neoActorRecord("actor-run-check-mapped-fallback", "thread-actor", "T-run-check-mapped-fallback"), nil)
+	actor.currentAgentMode = "review"
+	actor.currentReasoningEffort = "high"
+	actor.settings = map[string]any{"reasoning.effort": "high", "gemini.thinkingLevel": "high"}
+
+	transientErr := errors.New(`local provider stream error: {"type":"error","error":{"type":"overloaded_error","message":"temporarily unavailable"}}`)
+	requests := make([]neoInferenceRequest, 0, 4)
+	rt.inferStream = func(_ *neoRuntime, request neoInferenceRequest, _ neoStreamCallback) (neoInferenceResult, error) {
+		requests = append(requests, request)
+		if request.ModelRouteOverride != nil && request.ModelRouteOverride.Model == "gpt-5.6-sol" {
+			return neoInferenceResult{}, transientErr
+		}
+		return neoInferenceResult{Text: `{"comments":[]}`}, nil
+	}
+
+	_, err := actor.executeSubagentRun("run_check", map[string]any{
+		"checkName":    "repo-convention-fit",
+		"checkContent": "Prefer repository conventions.",
+	}, "TU-run-check-mapped-fallback", "M-1", actor.generation, 0, "")
+	if err != nil {
+		t.Fatalf("run_check mapped fallback failed: %v", err)
+	}
+	if len(requests) < 2 {
+		t.Fatalf("run_check mapped fallback requests = %#v, want primary and fallback", requests)
+	}
+
+	for index, request := range requests[:len(requests)-1] {
+		route := request.ModelRouteOverride
+		if route == nil || route.Provider != "openai" || route.Model != "gpt-5.6-sol" || route.ThinkingSuffix != "max" || !request.ModelRouteOverrideResolved {
+			t.Fatalf("primary request %d route = %#v resolved=%v, want mapped OpenAI max", index, route, request.ModelRouteOverrideResolved)
+		}
+		if request.ReasoningEffort != "max" || stringValue(request.Settings["reasoning.effort"]) != "max" || neoProviderReasoningEffort(request, *route) != "max" {
+			t.Fatalf("primary request %d effort request=%q settings=%#v, want max", index, request.ReasoningEffort, request.Settings)
+		}
+	}
+	fallback := requests[len(requests)-1]
+	fallbackRoute := fallback.ModelRouteOverride
+	if fallbackRoute == nil || fallbackRoute.Provider != "google" || fallbackRoute.Model != "gemini-3-pro" || fallbackRoute.ThinkingSuffix != "low" || !fallback.ModelRouteOverrideResolved {
+		t.Fatalf("fallback route = %#v resolved=%v, want mapped Gemini low", fallbackRoute, fallback.ModelRouteOverrideResolved)
+	}
+	if fallback.ReasoningEffort != "low" || stringValue(fallback.Settings["reasoning.effort"]) != "low" || stringValue(fallback.Settings["gemini.thinkingLevel"]) != "low" || neoProviderReasoningEffort(fallback, *fallbackRoute) != "low" {
+		t.Fatalf("fallback effort request=%q settings=%#v, want low", fallback.ReasoningEffort, fallback.Settings)
 	}
 }
 

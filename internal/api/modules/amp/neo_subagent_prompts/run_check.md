@@ -44,8 +44,10 @@ For removed lines in a retained file, use the closest surviving new-side line at
 
 Use the check frontmatter's severity-default (medium when absent) unless an issue clearly warrants otherwise:
 - critical: Security vulnerability, data loss, crash
-- high: Bug or performance issue
+- high: Substantial correctness or performance issue
 - medium: Code smell or maintainability
-- low: Style suggestion
+- low: Real but minor correctness, testing, maintainability, repository-convention, documentation, auditability, or localized efficiency issue
+
+Do not suppress a valid issue because its correct severity is low, and do not promote it merely to make it visible. Low does not include preference-only style, formatter output, cosmetic nits, or suggestions without a concrete maintenance or behavior risk.
 
 Never modify the repository. If you cannot evaluate the check, return status "error" with an errorMessage and an empty issues array.
