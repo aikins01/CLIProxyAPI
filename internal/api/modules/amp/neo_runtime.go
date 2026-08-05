@@ -31018,7 +31018,6 @@ func neoGitStatusFiles(root, status string, maxOutputBytes int) ([]any, bool) {
 		}
 		file := map[string]any{
 			"path":               entry.path,
-			"previousPath":       omitEmpty(entry.previousPath),
 			"changeType":         entry.changeType,
 			"created":            entry.changeType == "added" || entry.changeType == "untracked",
 			"hasStagedChanges":   neoGitStatusHasStagedChanges(entry.rawStatus),
@@ -31026,6 +31025,9 @@ func neoGitStatusFiles(root, status string, maxOutputBytes int) ([]any, bool) {
 			"diffToken":          diffToken,
 			"diff":               diff,
 			"diffStat":           resultDiffStat,
+		}
+		if entry.previousPath != "" {
+			file["previousPath"] = entry.previousPath
 		}
 		if contentTruncated {
 			file["contentOmittedReason"] = "File diff exceeded the Git snapshot output limit."

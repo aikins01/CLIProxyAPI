@@ -18533,10 +18533,14 @@ func TestNeoRuntimeGitCommandMatchesCurrentBinaryProtocol(t *testing.T) {
 	if file["path"] != "untracked.txt" || !strings.Contains(diff, "+hello") || numberFrom(diffStat["added"]) != 1 || numberFrom(diffStat["deleted"]) != 0 || file["hasStagedChanges"] != false || file["hasUnstagedChanges"] != true || stringValue(file["diffToken"]) == "" {
 		t.Fatalf("status snapshot file = %#v", file)
 	}
-	for _, key := range []string{"fullFileDiff", "oldContent", "newContent"} {
+	for _, key := range []string{"previousPath", "fullFileDiff", "oldContent", "newContent"} {
 		if _, exists := file[key]; exists {
 			t.Fatalf("status snapshot file unexpectedly contains %s: %#v", key, file)
 		}
+	}
+	renamedFiles, ok := neoGitStatusFiles(repo, "R  renamed.txt\x00original.txt\x00", neoWebLocalGitDiffMaxResponseBytes)
+	if !ok || len(renamedFiles) != 1 || stringValue(mapValue(renamedFiles[0])["previousPath"]) != "original.txt" {
+		t.Fatalf("renamed status snapshot files = %#v ok=%v", renamedFiles, ok)
 	}
 	initialDiffHash := stringValue(snapshot["diffHash"])
 	if err := os.WriteFile(filepath.Join(repo, "untracked.txt"), []byte("updated content\n"), 0o600); err != nil {
