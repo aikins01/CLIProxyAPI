@@ -1,24 +1,31 @@
 package amp
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	log "github.com/sirupsen/logrus"
 )
 
 type neoExclusiveThreadCreationContextKey struct{}
 
+const neoAmpInternalRPCMaxResponseBytes = 1024 * 1024
+
 func isNeoThreadTool(name string) bool {
 	switch strings.TrimSpace(name) {
-	case "find_thread", "list_agent_modes", "list_runners", "create_thread", "get_current_user_identity", "thread_interact", "get_thread_metadata", "update_thread", "rename_thread", "set_thread_pinned", "add_thread_labels", "remove_thread_labels", "archive_current_thread", "archive_thread", "archive_threads", "unarchive_thread", "send_message_to_thread", "download_thread_file", "upload_thread_file", "get_schedule", "set_schedule", "update_schedule", "clear_schedule":
+	case "find_thread", "list_agent_modes", "list_runners", "list_workspace_members", "find_shared_plugins_and_skills", "create_thread", "get_current_user_identity", "thread_interact", "get_thread_metadata", "update_thread", "rename_thread", "set_thread_pinned", "add_thread_labels", "remove_thread_labels", "archive_current_thread", "archive_thread", "archive_threads", "unarchive_thread", "send_message_to_thread", "download_thread_file", "upload_thread_file", "get_schedule", "set_schedule", "update_schedule", "clear_schedule":
 		return true
 	default:
 		return false
@@ -54,6 +61,25 @@ func neoThreadToolSpec(toolName string) (neoToolSpec, bool) {
 			Description: "List Amp runners currently available to start threads, including their IDs, hosts, and working directories.",
 			InputSchema: neoThreadToolSchema(map[string]any{}, nil),
 			Meta:        map[string]any{"source": "server"},
+		}, true
+	case "list_workspace_members":
+		return neoToolSpec{
+			Name:        name,
+			Description: "List the authoritative Amp workspace and ordered member roster for the signed-in account.",
+			InputSchema: neoThreadToolSchema(map[string]any{}, nil),
+			Meta:        map[string]any{"source": "server"},
+		}, true
+	case "find_shared_plugins_and_skills":
+		return neoToolSpec{
+			Name:        name,
+			Description: "Find plugins and skills shared in the signed-in account's authoritative Amp workspace catalog. Results may be partial; hasMore=true means narrow the query or increase limit up to 50 when a lower limit was used.",
+			InputSchema: neoThreadToolSchema(map[string]any{
+				"query":       map[string]any{"type": "string", "maxLength": 200, "description": "Optional name or description search text."},
+				"kind":        map[string]any{"type": "string", "enum": []any{"plugin", "skill"}, "description": "Optional shared item kind."},
+				"ownerUserID": map[string]any{"type": "string", "minLength": 1, "description": "Optional workspace member user ID."},
+				"limit":       map[string]any{"type": "integer", "minimum": 1, "maximum": 50, "description": "Optional maximum number of items to return; when omitted, Amp uses its upstream default."},
+			}, nil),
+			Meta: map[string]any{"source": "server"},
 		}, true
 	case "get_current_user_identity":
 		return neoToolSpec{
@@ -324,7 +350,17 @@ func (a *neoActor) runLocalThreadActorTool(pending neoPendingTool, generation in
 			"progress": map[string]any{"output": neoThreadToolProgressText(pending.Name, pending.Input)},
 		},
 	})
-	result, err := a.executeLocalThreadTool(pending)
+	runContext := context.Background()
+	runID := uint64(0)
+	if isNeoAmpWorkspaceTool(pending.Name) {
+		var acquired bool
+		runContext, runID, acquired = a.acquireSubagentRun(generation)
+		if !acquired {
+			return
+		}
+		defer a.releaseSubagentRun(runID)
+	}
+	result, err := a.executeLocalThreadToolContext(runContext, pending)
 	if a.subagentGenerationStale(generation) {
 		return
 	}
@@ -337,6 +373,15 @@ func (a *neoActor) runLocalThreadActorTool(pending neoPendingTool, generation in
 	a.receiveToolResult(map[string]any{"type": "executor_tool_result", "toolCallId": pending.ID, "run": run})
 }
 
+func isNeoAmpWorkspaceTool(name string) bool {
+	switch strings.TrimSpace(name) {
+	case "list_workspace_members", "find_shared_plugins_and_skills":
+		return true
+	default:
+		return false
+	}
+}
+
 func neoThreadToolProgressText(name string, input map[string]any) string {
 	target := firstNonEmptyString(input["thread"], input["threadId"], input["threadID"], input["targetThreadId"], input["url"])
 	switch strings.TrimSpace(name) {
@@ -346,6 +391,10 @@ func neoThreadToolProgressText(name string, input map[string]any) string {
 		return "Listing agent modes"
 	case "list_runners":
 		return "Listing runners"
+	case "list_workspace_members":
+		return "Listing workspace members"
+	case "find_shared_plugins_and_skills":
+		return "Finding shared plugins and skills"
 	case "get_current_user_identity":
 		return "Reading current user identity"
 	case "create_thread":
@@ -422,6 +471,10 @@ func neoThreadToolProgressText(name string, input map[string]any) string {
 }
 
 func (a *neoActor) executeLocalThreadTool(pending neoPendingTool) (map[string]any, error) {
+	return a.executeLocalThreadToolContext(context.Background(), pending)
+}
+
+func (a *neoActor) executeLocalThreadToolContext(ctx context.Context, pending neoPendingTool) (map[string]any, error) {
 	switch strings.TrimSpace(pending.Name) {
 	case "find_thread":
 		return a.executeLocalFindThreadTool(pending.Input)
@@ -429,6 +482,10 @@ func (a *neoActor) executeLocalThreadTool(pending neoPendingTool) (map[string]an
 		return a.executeLocalListAgentModesTool()
 	case "list_runners":
 		return a.executeLocalListRunnersTool()
+	case "list_workspace_members":
+		return a.executeLocalListWorkspaceMembersTool(ctx, pending)
+	case "find_shared_plugins_and_skills":
+		return a.executeLocalFindSharedPluginsAndSkillsTool(ctx, pending)
 	case "get_current_user_identity":
 		return a.executeLocalGetCurrentUserIdentityTool(pending)
 	case "create_thread":
@@ -481,6 +538,319 @@ func (a *neoActor) executeLocalGetCurrentUserIdentityTool(pending neoPendingTool
 	}
 	identity["displayName"] = neoWebLocalActivityUserDisplayName(identity)
 	return identity, nil
+}
+
+func (a *neoActor) executeLocalListWorkspaceMembersTool(ctx context.Context, pending neoPendingTool) (map[string]any, error) {
+	if a == nil || a.runtime == nil {
+		return nil, errors.New("list_workspace_members is unavailable: missing local runtime")
+	}
+	ctx = neoContextWithClientAPIKey(ctx, pending.ClientAPIKey)
+	result, err := a.runtime.callAmpInternalRPC(ctx, "listWorkspaceMembers", map[string]any{})
+	if err != nil {
+		return nil, fmt.Errorf("list_workspace_members failed: %w", err)
+	}
+	return validateNeoWorkspaceMembersResult(result)
+}
+
+func (a *neoActor) executeLocalFindSharedPluginsAndSkillsTool(ctx context.Context, pending neoPendingTool) (map[string]any, error) {
+	if a == nil || a.runtime == nil {
+		return nil, errors.New("find_shared_plugins_and_skills is unavailable: missing local runtime")
+	}
+	params, err := neoSharedPluginsAndSkillsParams(pending.Input)
+	if err != nil {
+		return nil, err
+	}
+	ctx = neoContextWithClientAPIKey(ctx, pending.ClientAPIKey)
+	result, err := a.runtime.callAmpInternalRPC(ctx, "findSharedPluginsAndSkills", params)
+	if err != nil {
+		return nil, fmt.Errorf("find_shared_plugins_and_skills failed: %w", err)
+	}
+	return validateNeoSharedPluginsAndSkillsResult(result)
+}
+
+func neoSharedPluginsAndSkillsParams(input map[string]any) (map[string]any, error) {
+	params := map[string]any{}
+	if raw, exists := input["query"]; exists {
+		query, ok := raw.(string)
+		if !ok {
+			return nil, errors.New("find_shared_plugins_and_skills query must be a string")
+		}
+		if utf8.RuneCountInString(query) > 200 {
+			return nil, errors.New("find_shared_plugins_and_skills query must be at most 200 characters")
+		}
+		params["query"] = query
+	}
+	if raw, exists := input["kind"]; exists {
+		kind, ok := raw.(string)
+		if !ok || kind != "plugin" && kind != "skill" {
+			return nil, errors.New("find_shared_plugins_and_skills kind must be plugin or skill")
+		}
+		params["kind"] = kind
+	}
+	if raw, exists := input["ownerUserID"]; exists {
+		ownerUserID, ok := raw.(string)
+		if !ok || strings.TrimSpace(ownerUserID) == "" {
+			return nil, errors.New("find_shared_plugins_and_skills ownerUserID must be a non-empty string")
+		}
+		params["ownerUserID"] = ownerUserID
+	}
+	if raw, exists := input["limit"]; exists {
+		limit, ok := neoStrictInteger(raw)
+		if !ok || limit < 1 || limit > 50 {
+			return nil, errors.New("find_shared_plugins_and_skills limit must be an integer from 1 to 50")
+		}
+		params["limit"] = limit
+	}
+	return params, nil
+}
+
+func neoStrictInteger(value any) (int, bool) {
+	switch number := value.(type) {
+	case int:
+		return number, true
+	case int8:
+		return int(number), true
+	case int16:
+		return int(number), true
+	case int32:
+		return int(number), true
+	case int64:
+		return int(number), int64(int(number)) == number
+	case uint:
+		return int(number), uint(int(number)) == number
+	case uint8:
+		return int(number), true
+	case uint16:
+		return int(number), true
+	case uint32:
+		return int(number), uint32(int(number)) == number
+	case uint64:
+		return int(number), uint64(int(number)) == number
+	case float32:
+		value := float64(number)
+		return int(value), !math.IsNaN(value) && !math.IsInf(value, 0) && math.Trunc(value) == value && float64(int(value)) == value
+	case float64:
+		return int(number), !math.IsNaN(number) && !math.IsInf(number, 0) && math.Trunc(number) == number && float64(int(number)) == number
+	case json.Number:
+		parsed, err := strconv.ParseInt(number.String(), 10, 64)
+		return int(parsed), err == nil && int64(int(parsed)) == parsed
+	default:
+		return 0, false
+	}
+}
+
+func (rt *neoRuntime) callAmpInternalRPC(ctx context.Context, method string, params map[string]any) (any, error) {
+	if rt == nil {
+		return nil, errors.New("amp upstream is unavailable: missing local runtime")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	cfg := rt.configSnapshot()
+	if cfg == nil || strings.TrimSpace(cfg.AmpCode.UpstreamURL) == "" {
+		return nil, errors.New("amp upstream is unavailable: URL is not configured")
+	}
+	apiKey, err := rt.upstreamAPIKeyForRequest(ctx, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("amp upstream authentication failed: %w", err)
+	}
+	if apiKey == "" {
+		return nil, errors.New("amp upstream authentication is unavailable: API key is not configured")
+	}
+	payload, err := json.Marshal(map[string]any{"method": method, "params": params})
+	if err != nil {
+		return nil, err
+	}
+	base, err := url.Parse(strings.TrimSpace(cfg.AmpCode.UpstreamURL))
+	if err != nil {
+		return nil, fmt.Errorf("amp upstream is unavailable: invalid URL: %w", err)
+	}
+	base.Path = strings.TrimRight(base.Path, "/") + "/api/internal"
+	base.RawQuery = url.QueryEscape(method)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base.String(), bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	setAmpInternalClientHeaders(req, ampUpstreamClientVersion(&cfg.AmpCode))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("amp upstream is unavailable: %w", err)
+	}
+	defer func() {
+		if errClose := resp.Body.Close(); errClose != nil {
+			log.Errorf("amp neo internal RPC response close failed: %v", errClose)
+		}
+	}()
+	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, neoAmpInternalRPCMaxResponseBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(responseBody) > neoAmpInternalRPCMaxResponseBytes {
+		return nil, fmt.Errorf("%s response exceeded %d bytes", method, neoAmpInternalRPCMaxResponseBytes)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("%s returned HTTP %d: %s", method, resp.StatusCode, clipNeoErrorBody(responseBody))
+	}
+	var decoded map[string]any
+	decoder := json.NewDecoder(bytes.NewReader(responseBody))
+	decoder.UseNumber()
+	if err := decoder.Decode(&decoded); err != nil {
+		return nil, fmt.Errorf("decode %s response: %w", method, err)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return nil, fmt.Errorf("decode %s response: multiple JSON values", method)
+		}
+		return nil, fmt.Errorf("decode %s response: %w", method, err)
+	}
+	rawOK, exists := decoded["ok"]
+	if !exists {
+		return nil, fmt.Errorf("%s response missing ok", method)
+	}
+	ok, valid := rawOK.(bool)
+	if !valid {
+		return nil, fmt.Errorf("%s returned an invalid ok field", method)
+	}
+	if !ok {
+		return nil, fmt.Errorf("%s failed: %s", method, clipNeoErrorBody(responseBody))
+	}
+	result, exists := decoded["result"]
+	if !exists {
+		return nil, fmt.Errorf("%s response missing result", method)
+	}
+	return result, nil
+}
+
+func validateNeoWorkspaceMembersResult(raw any) (map[string]any, error) {
+	result, ok := raw.(map[string]any)
+	if !ok {
+		return nil, errors.New("listWorkspaceMembers returned an invalid result")
+	}
+	workspace, err := validateNeoSharedWorkspace(result, "listWorkspaceMembers")
+	if err != nil {
+		return nil, err
+	}
+	rawMembers, exists := result["members"]
+	if !exists {
+		return nil, errors.New("listWorkspaceMembers result missing members")
+	}
+	members, ok := rawMembers.([]any)
+	if !ok {
+		return nil, errors.New("listWorkspaceMembers result members must be an array")
+	}
+	validated := make([]any, 0, len(members))
+	for index, rawMember := range members {
+		member, ok := rawMember.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("listWorkspaceMembers result member %d must be an object", index)
+		}
+		userID, ok := member["userID"].(string)
+		if !ok {
+			return nil, fmt.Errorf("listWorkspaceMembers result member %d has invalid userID", index)
+		}
+		username, ok := neoRequiredNullableString(member, "username")
+		if !ok {
+			return nil, fmt.Errorf("listWorkspaceMembers result member %d has invalid username", index)
+		}
+		displayName, ok := neoRequiredNullableString(member, "displayName")
+		if !ok {
+			return nil, fmt.Errorf("listWorkspaceMembers result member %d has invalid displayName", index)
+		}
+		validated = append(validated, map[string]any{"userID": userID, "username": username, "displayName": displayName})
+	}
+	return map[string]any{"workspace": workspace, "members": validated}, nil
+}
+
+func validateNeoSharedPluginsAndSkillsResult(raw any) (map[string]any, error) {
+	result, ok := raw.(map[string]any)
+	if !ok {
+		return nil, errors.New("findSharedPluginsAndSkills returned an invalid result")
+	}
+	workspace, err := validateNeoSharedWorkspace(result, "findSharedPluginsAndSkills")
+	if err != nil {
+		return nil, err
+	}
+	rawItems, exists := result["items"]
+	if !exists {
+		return nil, errors.New("findSharedPluginsAndSkills result missing items")
+	}
+	items, ok := rawItems.([]any)
+	if !ok {
+		return nil, errors.New("findSharedPluginsAndSkills result items must be an array")
+	}
+	validated := make([]any, 0, len(items))
+	for index, rawItem := range items {
+		item, ok := rawItem.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("findSharedPluginsAndSkills result item %d must be an object", index)
+		}
+		kind, ok := item["kind"].(string)
+		if !ok || kind != "plugin" && kind != "skill" {
+			return nil, fmt.Errorf("findSharedPluginsAndSkills result item %d has invalid kind", index)
+		}
+		name, nameOK := item["name"].(string)
+		id, idOK := item["id"].(string)
+		description, descriptionOK := neoRequiredNullableString(item, "description")
+		owner, ownerOK := validateNeoSharedItemOwner(item["owner"])
+		if !nameOK || !idOK || !descriptionOK || !ownerOK {
+			return nil, fmt.Errorf("findSharedPluginsAndSkills result item %d has an invalid contract", index)
+		}
+		validated = append(validated, map[string]any{"kind": kind, "name": name, "id": id, "description": description, "owner": owner})
+	}
+	hasMore, ok := result["hasMore"].(bool)
+	if !ok {
+		return nil, errors.New("findSharedPluginsAndSkills result hasMore must be a boolean")
+	}
+	return map[string]any{"workspace": workspace, "items": validated, "hasMore": hasMore}, nil
+}
+
+func validateNeoSharedWorkspace(result map[string]any, method string) (any, error) {
+	rawWorkspace, exists := result["workspace"]
+	if !exists {
+		return nil, fmt.Errorf("%s result missing workspace", method)
+	}
+	if rawWorkspace == nil {
+		return nil, nil
+	}
+	workspace, ok := rawWorkspace.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("%s result workspace must be an object or null", method)
+	}
+	id, idOK := workspace["id"].(string)
+	name, nameOK := workspace["name"].(string)
+	displayName, displayNameOK := neoRequiredNullableString(workspace, "displayName")
+	if !idOK || !nameOK || !displayNameOK {
+		return nil, fmt.Errorf("%s result workspace has an invalid contract", method)
+	}
+	return map[string]any{"id": id, "name": name, "displayName": displayName}, nil
+}
+
+func validateNeoSharedItemOwner(raw any) (map[string]any, bool) {
+	owner, ok := raw.(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	userID, userIDOK := owner["userID"].(string)
+	username, usernameOK := neoRequiredNullableString(owner, "username")
+	displayName, displayNameOK := neoRequiredNullableString(owner, "displayName")
+	if !userIDOK || !usernameOK || !displayNameOK {
+		return nil, false
+	}
+	return map[string]any{"userID": userID, "username": username, "displayName": displayName}, true
+}
+
+func neoRequiredNullableString(object map[string]any, key string) (any, bool) {
+	value, exists := object[key]
+	if !exists {
+		return nil, false
+	}
+	if value == nil {
+		return nil, true
+	}
+	text, ok := value.(string)
+	return text, ok
 }
 
 func (a *neoActor) executeLocalFindThreadTool(input map[string]any) (map[string]any, error) {

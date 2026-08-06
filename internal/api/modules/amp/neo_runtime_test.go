@@ -25511,6 +25511,9 @@ func TestNeoRuntimeActorMarkersCoverAuditBaselineOwnership(t *testing.T) {
 }
 
 type ampBinaryParityBaselineSnapshotForTest struct {
+	Source struct {
+		SHA256 string `json:"sha256"`
+	} `json:"source"`
 	Signals struct {
 		ThreadDeltaEvents   []string `json:"thread_delta_events"`
 		ThreadDeltaCoverage []struct {
@@ -29885,6 +29888,47 @@ func TestNeoSystemPromptUsesExpandedModeFamilies(t *testing.T) {
 		if !strings.Contains(genericOpenAI, want) {
 			t.Fatalf("generic OpenAI prompt missing %q:\n%s", want, genericOpenAI)
 		}
+	}
+}
+
+func TestNeoUpstreamPromptKimiIncludesBehaviorGuidance(t *testing.T) {
+	neoUpstreamPromptCache.Delete(neoPromptFamilyKimi)
+	t.Cleanup(func() { neoUpstreamPromptCache.Delete(neoPromptFamilyKimi) })
+
+	prompt := neoUpstreamPrompt(neoPromptFamilyKimi, neoPromptFamilyKimiGzip, neoDefaultPrompt)
+	for _, want := range []string{"# Skills", "call the `skill` tool", "After compaction or a long gap", "# Engineering Workflow", "# Research and Delegation", "official documentation and primary sources", "# Verification", "never claim a check passed", "# Tool Usages", "# AGENTS.md file"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("kimi prompt missing %q:\n%s", want, prompt)
+		}
+	}
+	if strings.Count(prompt, neoKimiSkillsPromptSection) != 1 {
+		t.Fatalf("kimi skills section inserted %d times, want 1", strings.Count(prompt, neoKimiSkillsPromptSection))
+	}
+	if strings.Count(prompt, neoKimiBehaviorPromptSection) != 1 {
+		t.Fatalf("kimi behavior section inserted %d times, want 1", strings.Count(prompt, neoKimiBehaviorPromptSection))
+	}
+
+	skillsIdx := strings.Index(prompt, "# Skills")
+	workflowIdx := strings.Index(prompt, "# Engineering Workflow")
+	researchIdx := strings.Index(prompt, "# Research and Delegation")
+	verificationIdx := strings.Index(prompt, "# Verification")
+	toolUsagesIdx := strings.Index(prompt, "# Tool Usages")
+	toolBulletIdx := strings.Index(prompt, "Prefer specialized tools over Bash")
+	if !(skillsIdx >= 0 && workflowIdx > skillsIdx && researchIdx > workflowIdx && verificationIdx > researchIdx && toolUsagesIdx > verificationIdx && toolBulletIdx > toolUsagesIdx) {
+		t.Fatalf("unexpected Kimi prompt section order (skills=%d, workflow=%d, research=%d, verification=%d, toolUsages=%d, bullet=%d)", skillsIdx, workflowIdx, researchIdx, verificationIdx, toolUsagesIdx, toolBulletIdx)
+	}
+
+	again := neoApplyBinaryPromptUpdates(neoPromptFamilyKimi, prompt)
+	if strings.Count(again, neoKimiSkillsPromptSection) != 1 {
+		t.Fatalf("kimi skills section is not idempotent, inserted %d times", strings.Count(again, neoKimiSkillsPromptSection))
+	}
+	if strings.Count(again, neoKimiBehaviorPromptSection) != 1 {
+		t.Fatalf("kimi behavior section is not idempotent, inserted %d times", strings.Count(again, neoKimiBehaviorPromptSection))
+	}
+
+	upgraded := neoApplyBinaryPromptUpdates(neoPromptFamilyKimi, neoKimiSkillsPromptSection+"\n\n# Tool Usages")
+	if strings.Count(upgraded, "# Skills") != 1 || strings.Count(upgraded, neoKimiBehaviorPromptSection) != 1 {
+		t.Fatalf("kimi prompt upgrade duplicated or omitted guidance:\n%s", upgraded)
 	}
 }
 
