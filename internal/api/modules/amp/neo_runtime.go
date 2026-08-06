@@ -12936,8 +12936,10 @@ func (a *neoActor) finishAssistantMessageWithOptions(messageID string, result ne
 	usage := normalizeNeoUsage(result.Usage)
 	finalTime := time.Now().UnixMilli()
 	var previousContent []any
+	messageExistedBeforeFinalization := false
 	a.mu.Lock()
 	if index := a.messageIndexLocked(messageID); index >= 0 {
+		messageExistedBeforeFinalization = true
 		previousContent = cloneArray(a.messages[index].Content)
 	}
 	a.mu.Unlock()
@@ -12990,13 +12992,20 @@ func (a *neoActor) finishAssistantMessageWithOptions(messageID string, result ne
 		AgentMode:       agentMode,
 		ParentToolUseID: parentToolCallID,
 	}
-	if index := a.messageIndexLocked(messageID); index >= 0 {
-		if createdAt := a.messages[index].CreatedAt; createdAt != "" {
-			finalMessage.CreatedAt = createdAt
+	var stored neoMessage
+	var messageEvent map[string]any
+	if messageExistedBeforeFinalization {
+		stored, messageEvent = a.storeMessageEventLocked(finalMessage)
+	} else {
+		if index := a.messageIndexLocked(messageID); index >= 0 {
+			if createdAt := a.messages[index].CreatedAt; createdAt != "" {
+				finalMessage.CreatedAt = createdAt
+			}
+			finalMessage.Seq = a.nextSeqLocked()
 		}
-		finalMessage.Seq = a.nextSeqLocked()
+		stored = a.storeMessageLocked(finalMessage)
+		messageEvent = neoMessageAddedPayload(stored)
 	}
-	stored := a.storeMessageLocked(finalMessage)
 	clientAPIKey := ""
 	if a.currentInference != nil && (a.currentInference.messageID == "" || a.currentInference.messageID == messageID) {
 		clientAPIKey = a.currentInference.clientAPIKey
@@ -13014,7 +13023,7 @@ func (a *neoActor) finishAssistantMessageWithOptions(messageID string, result ne
 	providerErrorEvent := a.updateProviderStopReasonErrorLocked(messageID, stopReason, len(toolCalls) == 0)
 	a.mu.Unlock()
 
-	a.broadcast(neoMessageAddedPayload(stored))
+	a.broadcast(messageEvent)
 	if providerErrorEvent != nil {
 		a.broadcast(providerErrorEvent)
 		if providerError := mapValue(providerErrorEvent["error"]); len(providerError) > 0 {

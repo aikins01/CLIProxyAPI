@@ -20670,6 +20670,203 @@ func TestNeoActorProtocolDeltaSequencesAndPersistsStreamingAssistant(t *testing.
 	}
 }
 
+func TestNeoRuntimeStreamedAssistantFinalUpdateMatchesSnapshotAndResume(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-live-final-update"
+	actor, _ := rt.store.upsert(map[string]any{"name": "threadActor", "key": threadID, "input": map[string]any{"threadId": threadID}}, true)
+	defer waitForNeoActorSyncIdle(t, actor)
+
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	t.Cleanup(server.Close)
+	live := dialNeoActorWebSocket(t, server.URL, threadID)
+	defer live.Close()
+	waitForNeoMessageType(t, live, "agent_state", 2*time.Second)
+
+	messageID := "M-streamed-assistant"
+	toolCallID := "TU-streamed-shell"
+	actor.mu.Lock()
+	actor.currentInference = &neoInferenceInflight{messageID: messageID, agentMode: "smart"}
+	actor.mu.Unlock()
+	actor.handleProtocolDelta(map[string]any{
+		"type":       "delta",
+		"messageId":  messageID,
+		"role":       "assistant",
+		"state":      "tool_use",
+		"blockIndex": 0,
+		"blocks": []any{map[string]any{
+			"type":             "tool_use",
+			"id":               toolCallID,
+			"name":             "shell_command",
+			"input":            map[string]any{},
+			"complete":         false,
+			"inputIncomplete":  map[string]any{"cmd": "pwd"},
+			"inputPartialJSON": map[string]any{"json": `{"cmd":"pwd"}`},
+			"blockState":       "streaming",
+		}},
+	})
+	partial := waitForNeoMessageTypeWhere(t, live, "delta", 2*time.Second, func(payload map[string]any) bool {
+		return stringValue(payload["messageId"]) == messageID
+	})
+	if numberFrom(partial["seq"]) <= 0 {
+		t.Fatalf("partial delta missing sequence: %#v", partial)
+	}
+
+	actor.finishAssistantMessageWithOptions(messageID, neoInferenceResult{
+		Provider: "openai",
+		Model:    "gpt-test",
+		ToolCalls: []neoToolCall{{
+			ID:    toolCallID,
+			Name:  "shell_command",
+			Input: map[string]any{"cmd": "pwd"},
+		}},
+	}, "smart", "", true, "")
+
+	completeDelta := waitForNeoMessageTypeWhere(t, live, "delta", 2*time.Second, func(payload map[string]any) bool {
+		if stringValue(payload["messageId"]) != messageID || stringValue(payload["state"]) != "tool_use" {
+			return false
+		}
+		blocks := arrayValue(payload["blocks"])
+		return len(blocks) == 1 && boolValue(mapValue(blocks[0])["complete"])
+	})
+	completeDeltaSeq := numberFrom(completeDelta["seq"])
+	updated := waitForNeoMessageTypeWhere(t, live, "message_updated", 2*time.Second, func(payload map[string]any) bool {
+		return stringValue(mapValue(payload["message"])["messageId"]) == messageID
+	})
+	if numberFrom(updated["seq"]) <= completeDeltaSeq {
+		t.Fatalf("message_updated seq = %d, want > completed delta seq %d: %#v", numberFrom(updated["seq"]), completeDeltaSeq, updated)
+	}
+	updatedMessage := mapValue(updated["message"])
+	updatedBlocks := arrayValue(updatedMessage["content"])
+	if len(updatedBlocks) != 1 {
+		t.Fatalf("message_updated content = %#v, want one tool block", updatedBlocks)
+	}
+	updatedTool := mapValue(updatedBlocks[0])
+	if stringValue(updatedTool["id"]) != toolCallID || stringValue(updatedTool["blockState"]) != "complete" || !boolValue(updatedTool["complete"]) {
+		t.Fatalf("message_updated tool block = %#v", updatedTool)
+	}
+	for _, key := range []string{"inputPartialJSON", "inputPartialJSONDelta", "inputIncomplete"} {
+		if _, exists := updatedTool[key]; exists {
+			t.Fatalf("message_updated tool block retained %s: %#v", key, updatedTool)
+		}
+	}
+
+	actor.receiveToolResult(map[string]any{
+		"type":       "executor_tool_result",
+		"toolCallId": toolCallID,
+		"run":        map[string]any{"status": "done", "result": "/workspace"},
+	})
+	liveResult := waitForNeoMessageTypeWhere(t, live, "message_added", 2*time.Second, func(payload map[string]any) bool {
+		message := mapValue(payload["message"])
+		if stringValue(message["role"]) != "user" {
+			return false
+		}
+		blocks := arrayValue(message["content"])
+		return len(blocks) == 1 && stringValue(mapValue(blocks[0])["toolUseID"]) == toolCallID
+	})
+	resultRun := mapValue(mapValue(arrayValue(mapValue(liveResult["message"])["content"])[0])["run"])
+	if stringValue(resultRun["status"]) != "done" {
+		t.Fatalf("live tool result run = %#v", resultRun)
+	}
+
+	snapshot, ok := actor.threadSnapshot()
+	if !ok || len(snapshot.messages) != 2 {
+		t.Fatalf("snapshot messages = %#v, ok=%t", snapshot.messages, ok)
+	}
+	if snapshot.messages[0].Seq != completeDeltaSeq {
+		t.Fatalf("snapshot assistant seq = %d, want completed delta seq %d", snapshot.messages[0].Seq, completeDeltaSeq)
+	}
+	snapshotMessageJSON, err := json.Marshal(snapshot.messages[0].protocol())
+	if err != nil {
+		t.Fatalf("marshal snapshot assistant: %v", err)
+	}
+	updatedMessageJSON, err := json.Marshal(updatedMessage)
+	if err != nil {
+		t.Fatalf("marshal live assistant update: %v", err)
+	}
+	if !bytes.Equal(snapshotMessageJSON, updatedMessageJSON) {
+		t.Fatalf("snapshot assistant diverged from live update\n snapshot: %#v\n live: %#v", snapshot.messages[0].protocol(), updatedMessage)
+	}
+
+	reload := dialNeoActorWebSocket(t, server.URL, threadID)
+	defer reload.Close()
+	var reloadAssistant map[string]any
+	var reloadResultToolCallID string
+	reloadDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(reloadDeadline) {
+		payload, okRead := readNeoMessage(t, reload, time.Until(reloadDeadline))
+		if !okRead {
+			break
+		}
+		switch payload["type"] {
+		case "message_added":
+			message := mapValue(payload["message"])
+			if stringValue(message["messageId"]) == messageID {
+				reloadAssistant = message
+			}
+			for _, raw := range arrayValue(message["content"]) {
+				if block := mapValue(raw); stringValue(block["type"]) == "tool_result" {
+					reloadResultToolCallID = stringValue(block["toolUseID"])
+				}
+			}
+		case "agent_state":
+			if !reflect.DeepEqual(reloadAssistant, updatedMessage) || reloadResultToolCallID != toolCallID {
+				t.Fatalf("reload diverged from live state assistant=%#v resultToolCallID=%q", reloadAssistant, reloadResultToolCallID)
+			}
+			goto resume
+		}
+	}
+	t.Fatal("timed out waiting for reload snapshot")
+
+resume:
+	resumed := dialNeoActorWebSocketWithoutResume(t, server.URL, threadID, "")
+	defer resumed.Close()
+	if err := resumed.WriteJSON(map[string]any{"type": "client_resume", "version": completeDeltaSeq}); err != nil {
+		t.Fatalf("write incremental client_resume: %v", err)
+	}
+	resumeSawUpdate := false
+	resumeSawResult := false
+	resumeDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(resumeDeadline) {
+		payload, okRead := readNeoMessage(t, resumed, time.Until(resumeDeadline))
+		if !okRead {
+			break
+		}
+		switch payload["type"] {
+		case "message_updated":
+			if stringValue(mapValue(payload["message"])["messageId"]) == messageID {
+				resumeSawUpdate = reflect.DeepEqual(mapValue(payload["message"]), updatedMessage)
+			}
+		case "message_added":
+			message := mapValue(payload["message"])
+			if stringValue(message["messageId"]) == messageID {
+				t.Fatalf("incremental resume replaced final update with message_added: %#v", payload)
+			}
+			for _, raw := range arrayValue(message["content"]) {
+				if stringValue(mapValue(raw)["toolUseID"]) == toolCallID {
+					resumeSawResult = true
+				}
+			}
+		case "agent_state":
+			if !resumeSawUpdate || !resumeSawResult {
+				t.Fatalf("incremental resume update=%t result=%t", resumeSawUpdate, resumeSawResult)
+			}
+			goto fresh
+		}
+	}
+	t.Fatal("timed out waiting for incremental resume")
+
+fresh:
+	freshMessageID := "M-fresh-assistant"
+	actor.finishAssistantMessageWithOptions(freshMessageID, neoInferenceResult{Provider: "openai", Model: "gpt-test", Text: "fresh"}, "smart", "", false, "")
+	freshAdded := waitForNeoMessageTypeWhere(t, live, "message_added", 2*time.Second, func(payload map[string]any) bool {
+		return stringValue(mapValue(payload["message"])["messageId"]) == freshMessageID
+	})
+	if stringValue(mapValue(freshAdded["message"])["role"]) != "assistant" {
+		t.Fatalf("fresh message_added = %#v", freshAdded)
+	}
+}
+
 func TestNeoActorProtocolDeltaAddsInputIncompleteForPartialToolJSON(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	rt := newNeoRuntime(&config.Config{})
@@ -37972,7 +38169,7 @@ func TestNeoRuntimeWebSocketStreamingEventSequenceMatchesAmpActor(t *testing.T) 
 					events = append(events, "delta:tool_use:partial")
 				}
 			}
-		case "message_added":
+		case "message_updated":
 			message := mapValue(msg["message"])
 			if stringValue(message["role"]) != "assistant" {
 				continue
@@ -37984,7 +38181,7 @@ func TestNeoRuntimeWebSocketStreamingEventSequenceMatchesAmpActor(t *testing.T) 
 			if len(blocks) < 3 || stringValue(mapValue(blocks[1])["text"]) != "hello" || stringValue(mapValue(blocks[2])["id"]) != finalToolID {
 				t.Fatalf("assistant message content mismatch: %#v", blocks)
 			}
-			events = append(events, "message_added:assistant")
+			events = append(events, "message_updated:assistant")
 		case "tool_lease":
 			if stringValue(msg["toolCallId"]) != finalToolID {
 				t.Fatalf("tool lease id = %q, want %q: %#v", stringValue(msg["toolCallId"]), finalToolID, msg)
@@ -38002,7 +38199,7 @@ func TestNeoRuntimeWebSocketStreamingEventSequenceMatchesAmpActor(t *testing.T) 
 				"delta:text:lo",
 				"delta:tool_use:partial",
 				"delta:tool_use:complete",
-				"message_added:assistant",
+				"message_updated:assistant",
 				"agent:running_tools",
 				"tool_lease",
 			}
@@ -38241,14 +38438,8 @@ func TestNeoRuntimeWebSocketStreamsAnthropicThinkingAndTextIndexes(t *testing.T)
 			}
 		case "message_added":
 			message := mapValue(msg["message"])
-			if stringValue(message["role"]) != "assistant" || stringValue(mapValue(message["state"])["type"]) != "complete" {
-				continue
-			}
-			content := arrayValue(message["content"])
-			if len(content) >= 2 &&
-				stringValue(mapValue(content[0])["type"]) == "thinking" &&
-				stringValue(mapValue(content[1])["text"]) == "hello" {
-				sawComplete = true
+			if stringValue(message["role"]) == "assistant" && stringValue(mapValue(message["state"])["type"]) == "complete" {
+				t.Fatalf("streamed assistant finalized with message_added: %#v", msg)
 			}
 		case "agent_state":
 			if msg["state"] == "idle" && sawThinking && sawText && sawComplete {
