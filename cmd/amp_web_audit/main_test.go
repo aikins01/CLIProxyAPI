@@ -92,11 +92,23 @@ func TestFetchWebAssetsSelectsRouteDependencies(t *testing.T) {
 		case "/":
 			_, _ = response.Write([]byte(`<link rel="modulepreload" href="/_app/immutable/entry/app.test.js">`))
 		case "/_app/immutable/entry/app.test.js":
-			_, _ = response.Write([]byte(`const __vite__mapDeps=(i,m=__vite__mapDeps,d=(m.f||(m.f=["/_app/immutable/chunks/runtime.js","/_app/immutable/assets/ignored.css"])))=>i.map(i=>d[i]);var nodes=[()=>0,()=>0,()=>0,()=>__vitePreload(()=>import("../nodes/3.route.js"),__vite__mapDeps([0,1]),import.meta.url)];const dictionary={"` + route + `":[3]};`))
+			_, _ = response.Write([]byte(`const __vite__mapDeps=(i,m=__vite__mapDeps,d=(m.f||(m.f=["/_app/immutable/chunks/runtime.js","/_app/immutable/assets/ignored.css","/_app/immutable/chunks/lazy.js","/_app/immutable/chunks/leaf.js","/_app/immutable/chunks/unrelated.js"])))=>i.map(i=>d[i]);var nodes=[()=>0,()=>0,()=>0,()=>__vitePreload(()=>import("../nodes/3.route.js"),__vite__mapDeps([0,1]),import.meta.url),()=>__vitePreload(()=>import("../nodes/4.unrelated.js"),__vite__mapDeps([4]),import.meta.url)];const dictionary={"` + route + `":[3]};`))
 		case "/_app/immutable/nodes/3.route.js":
-			_, _ = response.Write([]byte("threadActorConfig"))
+			_, _ = response.Write([]byte(`threadActorConfig __vite__mapDeps([2]); import{value}from"../chunks/sibling.js"`))
+		case "/_app/immutable/nodes/4.unrelated.js":
+			_, _ = response.Write([]byte("unrelatedRouteNode"))
 		case "/_app/immutable/chunks/runtime.js":
 			_, _ = response.Write([]byte("amp-terminal-v1"))
+		case "/_app/immutable/chunks/lazy.js":
+			_, _ = response.Write([]byte(`const help="./unrelated-string.js"; import("./leaf.js"); client_resume`))
+		case "/_app/immutable/chunks/leaf.js":
+			_, _ = response.Write([]byte("sendUserMessage"))
+		case "/_app/immutable/chunks/sibling.js":
+			_, _ = response.Write([]byte("actorReady"))
+		case "/_app/immutable/chunks/unrelated.js":
+			_, _ = response.Write([]byte("unrelatedRouteAsset"))
+		case "/_app/immutable/chunks/unrelated-string.js":
+			_, _ = response.Write([]byte("unrelatedImportString"))
 		default:
 			http.NotFound(response, request)
 		}
@@ -107,11 +119,140 @@ func TestFetchWebAssetsSelectsRouteDependencies(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(assets) != 3 {
-		t.Fatalf("asset count = %d, want 3", len(assets))
+	if len(assets) != 6 {
+		t.Fatalf("asset count = %d, want 6", len(assets))
 	}
-	if !assetsContain(assets, "threadActorConfig") || !assetsContain(assets, "amp-terminal-v1") {
-		t.Fatalf("selected assets = %#v", assets)
+	for _, marker := range []string{"threadActorConfig", "amp-terminal-v1", "client_resume", "sendUserMessage", "actorReady"} {
+		if !assetsContain(assets, marker) {
+			t.Fatalf("selected assets do not contain %q: %#v", marker, assets)
+		}
+	}
+	if assetsContain(assets, "unrelatedRouteNode") || assetsContain(assets, "unrelatedRouteAsset") || assetsContain(assets, "unrelatedImportString") {
+		t.Fatalf("selected assets include unrelated entry graph: %#v", assets)
+	}
+}
+
+func TestParseDependencyMapRejectsNonAppAssetPaths(t *testing.T) {
+	const entryTemplate = `const __vite__mapDeps=(i,m=__vite__mapDeps,d=(m.f||(m.f=["DEPENDENCY"])))=>i.map(i=>d[i]);`
+	for _, dependencyPath := range []string{
+		"https://example.com/other.js",
+		"//example.com/other.js",
+		"/_app/immutable/../other.js",
+		"/_app/immutable/chunks/runtime.js%3Fignored",
+		"/_app/immutable/chunks/runtime.js%23ignored",
+	} {
+		entry := []byte(strings.Replace(entryTemplate, "DEPENDENCY", dependencyPath, 1))
+		if _, err := parseDependencyMap(entry); err == nil || !strings.Contains(err.Error(), "outside canonical /_app/immutable") {
+			t.Fatalf("parseDependencyMap(%q) error = %v", dependencyPath, err)
+		}
+	}
+}
+
+func TestNestedWebAssetPathsRejectsImportOutsideAppAssets(t *testing.T) {
+	asset := webAsset{
+		Path: "/_app/immutable/nodes/3.route.js",
+		Body: []byte(`import("../../chunks/other.js")`),
+	}
+	if _, err := nestedWebAssetPaths(asset, nil); err == nil || !strings.Contains(err.Error(), "outside canonical /_app/immutable") {
+		t.Fatalf("nestedWebAssetPaths() error = %v", err)
+	}
+}
+
+func TestNestedWebAssetPathsIgnoresImportLikeNonCode(t *testing.T) {
+	asset := webAsset{
+		Path: "/_app/immutable/chunks/lazy.js",
+		Body: []byte("const sample = 'import(\"./missing.js\")'; // import(\"./comment.js\") __vite__mapDeps([0])\n/* from\"./block.js\" */ const template = `import(\"./template.js\")`;"),
+	}
+	paths, err := nestedWebAssetPaths(asset, []string{"/_app/immutable/chunks/dependency.js"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) != 0 {
+		t.Fatalf("nestedWebAssetPaths() = %v, want no paths from non-code text", paths)
+	}
+}
+
+func TestNestedWebAssetPathsIgnoresImportLikeRegex(t *testing.T) {
+	asset := webAsset{
+		Path: "/_app/immutable/chunks/lazy.js",
+		Body: []byte(`const matcher=/from"./leaf.js"/;`),
+	}
+	paths, err := nestedWebAssetPaths(asset, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) != 0 {
+		t.Fatalf("nestedWebAssetPaths() = %v, want no paths from regex literal", paths)
+	}
+}
+
+func TestNestedWebAssetPathsDistinguishesDivisionFromRegex(t *testing.T) {
+	asset := webAsset{
+		Path: "/_app/immutable/chunks/lazy.js",
+		Body: []byte(`const ratio=total/count; import("./leaf.js")`),
+	}
+	paths, err := nestedWebAssetPaths(asset, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := paths["/_app/immutable/chunks/leaf.js"]; !exists {
+		t.Fatalf("nestedWebAssetPaths() = %v, want import after division expression", paths)
+	}
+}
+
+func TestNestedWebAssetPathsPreservesImportAfterPostfixDivision(t *testing.T) {
+	asset := webAsset{
+		Path: "/_app/immutable/chunks/lazy.js",
+		Body: []byte(`i++/2; import("./leaf.js"); const ratio=a/b`),
+	}
+	paths, err := nestedWebAssetPaths(asset, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := paths["/_app/immutable/chunks/leaf.js"]; !exists {
+		t.Fatalf("nestedWebAssetPaths() = %v, want import after postfix division", paths)
+	}
+}
+
+func TestNestedWebAssetPathsIncludesImportAfterCommentTrivia(t *testing.T) {
+	asset := webAsset{
+		Path: "/_app/immutable/chunks/lazy.js",
+		Body: []byte(`import(/* @vite-ignore */ "./leaf.js")`),
+	}
+	paths, err := nestedWebAssetPaths(asset, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := paths["/_app/immutable/chunks/leaf.js"]; !exists {
+		t.Fatalf("nestedWebAssetPaths() = %v, want import after comment trivia", paths)
+	}
+}
+
+func TestNestedWebAssetPathsIgnoresComputedDynamicImport(t *testing.T) {
+	asset := webAsset{
+		Path: "/_app/immutable/chunks/lazy.js",
+		Body: []byte(`import("./leaf.js"+suffix)`),
+	}
+	paths, err := nestedWebAssetPaths(asset, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) != 0 {
+		t.Fatalf("nestedWebAssetPaths() = %v, want no fixed path from computed dynamic import", paths)
+	}
+}
+
+func TestNestedWebAssetPathsIncludesImportInTemplateInterpolation(t *testing.T) {
+	asset := webAsset{
+		Path: "/_app/immutable/chunks/lazy.js",
+		Body: []byte("const x = `${import(\"./leaf.js\")}`"),
+	}
+	paths, err := nestedWebAssetPaths(asset, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := paths["/_app/immutable/chunks/leaf.js"]; !exists {
+		t.Fatalf("nestedWebAssetPaths() = %v, want template interpolation import", paths)
 	}
 }
 

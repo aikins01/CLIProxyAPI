@@ -5,7 +5,6 @@
     "/(app)/feed",
     "/(app)/projects",
     "/(app)/settings/plugins",
-    "/(app)/settings/plugins/manage",
     "/(app)/threads/[thread=threadID]/(active)",
     "/(app)/threads/[thread=threadID]/(active)/terminal"
   ],
@@ -85,14 +84,17 @@
     {
       "name": "puck",
       "scope": "upstream-web",
+      "required_all": [
+        "puckThreadID",
+        "puckContext"
+      ],
       "required_together": [
         [
-          "openPuckThread",
-          "puckContext",
-          "sendPuckContent"
+          "openPuckWithPrompt",
+          "openPuckWithDictation"
         ],
         [
-          "PUCK_AGENT_MODE",
+          "PUCK",
           "serverOnly"
         ]
       ]
@@ -106,7 +108,7 @@
         "selectedSearchQuery",
         "selectedRepositoryKey",
         "selectedStatusKey",
-        "threadSearchRequest"
+        "searchThreads"
       ]
     },
     {
@@ -124,13 +126,14 @@
       "scope": "upstream-web",
       "required_together": [
         [
-          "uploadAttachment",
-          "Failed to upload image"
+          "createPromptAttachmentUpload",
+          "completePromptAttachmentUpload",
+          "Failed to upload attachment"
         ],
         [
-          "buildCommandPaletteUserMessageContent",
-          "createProjectThread",
-          "result.initialThread"
+          "attachFiles",
+          "attachClipboardFiles",
+          "waitForPendingUploads"
         ]
       ]
     },

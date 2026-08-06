@@ -103,7 +103,9 @@ var knownCLICommandLiteralValues = map[string]struct{}{
 	"files":                    {},
 	"get":                      {},
 	"git-credential-helper":    {},
+	"history":                  {},
 	"id-token":                 {},
+	"import":                   {},
 	"info":                     {},
 	"internal":                 {},
 	"keyboard-tester":          {},
@@ -866,26 +868,28 @@ var knownCompactionRuleValues = map[string]struct{}{}
 // refresh them whenever Amp reshapes the embedded tool catalog.
 var knownPromptTagCountValues = map[string]int{
 	"prompt/artifacts":     1,
+	"prompt/code-review":   1,
 	"prompt/compaction":    6,
 	"prompt/guidance":      4,
 	"prompt/painter":       2,
+	"prompt/settings":      2,
 	"prompt/skills":        14,
 	"prompt/system-prompt": 1,
 	"prompt/tools":         41,
 	"source/artifacts":     6,
-	"source/code-review":   3,
+	"source/code-review":   2,
 	"source/compaction":    20,
 	"source/guidance":      32,
 	"source/painter":       6,
-	"source/settings":      16,
-	"source/skills":        54,
+	"source/settings":      14,
+	"source/skills":        60,
 	"source/system-prompt": 1,
-	"source/tools":         169,
+	"source/tools":         168,
 }
 
 var knownPromptKindCountValues = map[string]int{
-	"prompt": 61,
-	"source": 211,
+	"prompt": 63,
+	"source": 215,
 }
 
 type agentModeMarker struct {
@@ -913,7 +917,7 @@ var agentModeScopes = map[string]string{
 	"deep":     "local-runtime",
 	"high":     "local-runtime",
 	"large":    "local-runtime",
-	"low":      "local-runtime",
+	"low":      "local-compatibility",
 	"medium":   "local-runtime",
 	"nostromo": "local-runtime",
 	"puck":     "server-only",
@@ -933,7 +937,7 @@ var knownAgentModeProfileValues = map[string]struct{}{
 	"deep|primary=GPT_5_5|reasoning=medium|levels=|include=present|tools=shell_command,shell_command_status,apply_patch,web_search,read_web_page,Task,skill,load_plugin,reload_plugins,reload_skills,read_thread,find_thread,list_agent_modes,list_runners,create_thread,thread_interact,wait_for_threads,download_thread_file,upload_thread_file,notepad,librarian,oracle,finder,view_media,painter,public_artifact_url,thread_file_url" + knownSharedAgentModeTools + "|deferred=true|visible=false|visibleInV2=false|serverOnly=false":                                                                                                                                      {},
 	"high|primary=GPT_5_6_SOL|reasoning=xhigh|levels=|include=present|tools=shell_command,shell_command_status,apply_patch,web_search,read_web_page,Task,skill,load_plugin,reload_plugins,reload_skills,read_thread,find_thread,list_agent_modes,list_runners,create_thread,thread_interact,wait_for_threads,download_thread_file,upload_thread_file,notepad,librarian,oracle,finder,view_media,painter,public_artifact_url,thread_file_url" + knownSharedAgentModeTools + ",x_read,x_reply|deferred=true|visible=true|visibleInV2=true|serverOnly=false":                                                                                                                      {},
 	"large|primary=CLAUDE_OPUS_4_8|reasoning=|levels=|include=present|tools=finder,shell_command,shell_command_status,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,list_agent_modes,list_runners,create_thread,thread_interact,wait_for_threads,download_thread_file,upload_thread_file,notepad,skill,load_plugin,reload_plugins,reload_skills,oracle,librarian,Task,view_media,painter,public_artifact_url,thread_file_url,read_mcp_resource" + knownSharedAgentModeTools + "|deferred=true|visible=false|visibleInV2=false|serverOnly=false":                                                                                                       {},
-	"low|primary=AMP_GLM_5_2|reasoning=medium|levels=|include=present|tools=finder,shell_command,shell_command_status,apply_patch,web_search,read_web_page,read_thread,find_thread,list_agent_modes,list_runners,create_thread,thread_interact,wait_for_threads,download_thread_file,upload_thread_file,notepad,skill,load_plugin,reload_plugins,reload_skills,oracle,librarian,Task,view_media,painter,public_artifact_url,thread_file_url" + knownSharedAgentModeTools + ",x_read,x_reply|deferred=false|visible=true|visibleInV2=true|serverOnly=false":                                                                                                                     {},
+	"low|primary=GPT_5_6_TERRA|reasoning=medium|levels=|include=present|tools=finder,shell_command,shell_command_status,apply_patch,web_search,read_web_page,read_thread,find_thread,list_agent_modes,list_runners,create_thread,thread_interact,wait_for_threads,download_thread_file,upload_thread_file,notepad,skill,load_plugin,reload_plugins,reload_skills,oracle,librarian,Task,view_media,painter,public_artifact_url,thread_file_url" + knownSharedAgentModeTools + ",x_read,x_reply|deferred=false|visible=true|visibleInV2=true|serverOnly=false":                                                                                                                   {},
 	"medium|primary=GPT_5_6_SOL|reasoning=medium|levels=|include=present|tools=shell_command,shell_command_status,apply_patch,web_search,read_web_page,Task,skill,load_plugin,reload_plugins,reload_skills,read_thread,find_thread,list_agent_modes,list_runners,create_thread,thread_interact,wait_for_threads,download_thread_file,upload_thread_file,notepad,librarian,oracle,finder,view_media,painter,public_artifact_url,thread_file_url" + knownSharedAgentModeTools + ",x_read,x_reply|deferred=true|visible=true|visibleInV2=true|serverOnly=false":                                                                                                                   {},
 	"nostromo|primary=AMP_NOSTROMO|reasoning=low|levels=|include=present|tools=finder,shell_command,shell_command_status,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,list_agent_modes,list_runners,create_thread,thread_interact,wait_for_threads,download_thread_file,upload_thread_file,notepad,skill,load_plugin,reload_plugins,reload_skills,oracle,librarian,Task,view_media,painter,public_artifact_url,thread_file_url,read_mcp_resource" + knownSharedAgentModeTools + ",apply_patch|deferred=false|visible=true|visibleInV2=true|serverOnly=false":                                                                                         {},
 	"puck|primary=GPT_5_6_SOL|reasoning=none|levels=|include=present|tools=find_thread,read_thread,web_search,read_web_page,docs_list,docs_read,docs_write,create_project,update_project,list_agent_modes,list_runners,list_workspace_members,find_shared_plugins_and_skills,create_thread,get_current_time,thread_interact,update_thread,archive_threads,wait_for_threads,thread_file_url,get_schedule,update_schedule,clear_schedule,send_email,slack_write,slack_read,x_read,x_reply,github_repo_ci_status,read_github,search_github,commit_search,list_directory_github,list_repositories,glob_github,diff|deferred=false|visible=false|visibleInV2=false|serverOnly=true": {},
@@ -947,7 +951,7 @@ var knownAgentModeRouteValues = map[string]struct{}{
 	"deep|provider=openai|model=gpt-5.5|primary=GPT_5_5|reasoning=medium|context=400000|max_out=128000":                  {},
 	"high|provider=openai|model=gpt-5.6-sol|primary=GPT_5_6_SOL|reasoning=xhigh|context=400000|max_out=128000":           {},
 	"large|provider=anthropic|model=claude-opus-4-8|primary=CLAUDE_OPUS_4_8|reasoning=|context=332000|max_out=32000":     {},
-	"low|provider=amp|model=glm-5.2|primary=AMP_GLM_5_2|reasoning=medium|context=200000|max_out=32000":                   {},
+	"low|provider=openai|model=gpt-5.6-terra|primary=GPT_5_6_TERRA|reasoning=medium|context=400000|max_out=128000":       {},
 	"medium|provider=openai|model=gpt-5.6-sol|primary=GPT_5_6_SOL|reasoning=medium|context=400000|max_out=128000":        {},
 	"nostromo|provider=amp|model=amp-nostromo-v1|primary=AMP_NOSTROMO|reasoning=low|context=400000|max_out=128000":       {},
 	"puck|provider=openai|model=gpt-5.6-sol|primary=GPT_5_6_SOL|reasoning=none|context=400000|max_out=128000":            {},
@@ -6142,8 +6146,9 @@ func printSnapshotCounts(snapshot Snapshot) {
 		)
 	}
 	if len(agentModeScopeCounts) > 0 {
-		auditPrintf("agent mode scopes: local-runtime=%d server-only=%d unknown=%d\n",
+		auditPrintf("agent mode scopes: local-runtime=%d local-compatibility=%d server-only=%d unknown=%d\n",
 			agentModeScopeCounts["local-runtime"],
+			agentModeScopeCounts["local-compatibility"],
 			agentModeScopeCounts["server-only"],
 			agentModeScopeCounts["unknown"],
 		)

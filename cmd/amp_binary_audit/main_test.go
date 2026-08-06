@@ -592,7 +592,7 @@ func TestKnownPromptTagCountsMatchCommittedBaseline(t *testing.T) {
 	assertStringSetsEqual(t, "prompt tag-set counts", intMapStrings(tagSetCounts), intMapStrings(knownPromptTagSetCountValues))
 }
 
-func TestCommittedBaselineHasCurrentSchemaReleaseSourceAndOnlyPinnedTransitionDrift(t *testing.T) {
+func TestCommittedBaselineHasCurrentSchemaReleaseSourceAndNoAuditProblems(t *testing.T) {
 	root := repoRootForAuditChecklistTest(t)
 	baseline, err := readSnapshotFile(filepath.Join(root, "dev", "amp-binary-parity-baseline.json"))
 	if err != nil {
@@ -611,9 +611,6 @@ func TestCommittedBaselineHasCurrentSchemaReleaseSourceAndOnlyPinnedTransitionDr
 	if !regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(baseline.Source.SHA256) {
 		t.Fatalf("baseline source sha256 = %q, want lowercase hex sha256", baseline.Source.SHA256)
 	}
-	if baseline.Source.SHA256 != unrefreshedBaselineSourceSHA256 {
-		t.Fatalf("baseline source sha256 = %q, transition is pinned to %q", baseline.Source.SHA256, unrefreshedBaselineSourceSHA256)
-	}
 	if len(baseline.Source.Versions) == 0 {
 		t.Fatal("baseline source versions are empty")
 	}
@@ -625,7 +622,7 @@ func TestCommittedBaselineHasCurrentSchemaReleaseSourceAndOnlyPinnedTransitionDr
 	if baseline.Source.StringsScanned == 0 {
 		t.Fatal("baseline source strings_scanned is empty")
 	}
-	assertStringSetsEqual(t, "deferred unrefreshed baseline audit problems", snapshotAuditProblems(baseline), unrefreshedBaselineAuditProblems)
+	assertStringSetsEqual(t, "baseline audit problems", snapshotAuditProblems(baseline), nil)
 }
 
 func TestCommittedBaselineMatchesInstalledAmpBinaryWhenPathMatches(t *testing.T) {
@@ -663,31 +660,32 @@ func TestCommittedBaselineMatchesInstalledAmpBinaryWhenPathMatches(t *testing.T)
 }
 
 var knownPromptTagSetCountValues = map[string]int{
-	"prompt/artifacts,painter,skills,tools": 1,
-	"prompt/compaction":                     6,
-	"prompt/guidance":                       4,
-	"prompt/painter":                        1,
-	"prompt/skills":                         9,
-	"prompt/skills,system-prompt,tools":     1,
-	"prompt/skills,tools":                   3,
-	"prompt/tools":                          36,
-	"source/artifacts":                      1,
+	"prompt/artifacts,painter,skills,tools":             1,
+	"prompt/code-review,settings":                       1,
+	"prompt/compaction":                                 6,
+	"prompt/guidance":                                   4,
+	"prompt/painter":                                    1,
+	"prompt/settings":                                   1,
+	"prompt/skills":                                     9,
+	"prompt/skills,system-prompt,tools":                 1,
+	"prompt/skills,tools":                               3,
+	"prompt/tools":                                      36,
+	"source/artifacts":                                  1,
 	"source/artifacts,code-review,painter,skills,tools": 1,
 	"source/artifacts,compaction,guidance,skills,tools": 1,
 	"source/artifacts,compaction,painter,skills,tools":  1,
+	"source/artifacts,guidance,skills,tools":            1,
 	"source/artifacts,painter,settings":                 1,
-	"source/artifacts,settings,tools":                   1,
-	"source/code-review,guidance,settings":              1,
 	"source/code-review,guidance,settings,skills,tools": 1,
 	"source/compaction":                                 8,
 	"source/compaction,skills":                          1,
 	"source/compaction,skills,tools":                    3,
 	"source/compaction,tools":                           6,
-	"source/guidance":                                   8,
+	"source/guidance":                                   9,
 	"source/guidance,settings":                          1,
 	"source/guidance,settings,skills,tools":             1,
 	"source/guidance,skills":                            3,
-	"source/guidance,skills,tools":                      7,
+	"source/guidance,skills,tools":                      6,
 	"source/guidance,tools":                             9,
 	"source/painter":                                    1,
 	"source/painter,skills":                             1,
@@ -696,17 +694,19 @@ var knownPromptTagSetCountValues = map[string]int{
 	"source/settings,skills,tools":                      1,
 	"source/settings,system-prompt,tools":               1,
 	"source/settings,tools":                             5,
-	"source/skills":                                     13,
-	"source/skills,tools":                               20,
-	"source/tools":                                      110,
+	"source/skills":                                     18,
+	"source/skills,tools":                               21,
+	"source/tools":                                      109,
 }
 
 func TestLifecycleChecklistKnownPromptTagCountsRunFocusedChecks(t *testing.T) {
 	cases := map[string][]string{
 		"prompt/artifacts":     {"remote web control surface"},
+		"prompt/code-review":   {"tools, code review, skills, and images"},
 		"prompt/compaction":    {"compaction and continuation prompts"},
 		"prompt/guidance":      {"compaction and continuation prompts", "streaming assistant and tool edits"},
 		"prompt/painter":       {"tools, code review, skills, and images"},
+		"prompt/settings":      {"model routing, modes, and reasoning", "remote web control surface"},
 		"prompt/skills":        {"tools, code review, skills, and images"},
 		"prompt/system-prompt": {"compaction and continuation prompts", "streaming assistant and tool edits"},
 		"prompt/tools":         {"tools, code review, skills, and images", "streaming assistant and tool edits", "upstream-owned thread read and search", "remote web control surface"},
@@ -762,7 +762,7 @@ func TestKnownModelModeReasoningValuesMatchCommittedBaseline(t *testing.T) {
 		provider, family := modelProviderAndFamily(name)
 		return provider + "/" + family
 	})))
-	assertStringSetsEqual(t, "agent mode profiles", agentModeProfileStrings(baseline.Signals.AgentModeProfiles), unrefreshedBaselineAgentModeProfileValues())
+	assertStringSetsEqual(t, "agent mode profiles", agentModeProfileStrings(baseline.Signals.AgentModeProfiles), sortedKeys(knownAgentModeProfileValues))
 	assertStringSetsEqual(t, "agent mode routes", agentModeRouteStrings(baseline.Signals.AgentModeRoutes), sortedKeys(knownAgentModeRouteValues))
 	assertStringSetsEqual(t, "agent mode coverage", agentModeCoverageStrings(baseline.Signals.AgentModeCoverage), sortedKeys(expectedCoverageValuesFromMap(activeAgentModeScopes())))
 
@@ -774,66 +774,6 @@ func TestKnownModelModeReasoningValuesMatchCommittedBaseline(t *testing.T) {
 	assertStringSetsEqual(t, "large context rules", largeContextRuleStrings(baseline.Signals.LargeContextRules), sortedKeys(knownLargeContextRuleValues))
 	assertStringSetsEqual(t, "adaptive thinking rules", adaptiveThinkingRuleStrings(baseline.Signals.AdaptiveThinking), sortedKeys(knownAdaptiveThinkingRuleValues))
 	assertStringSetsEqual(t, "provider reasoning rules", providerReasoningRuleStrings(baseline.Signals.ProviderReasoning), sortedKeys(knownProviderReasoningRuleValues))
-}
-
-func unrefreshedBaselineAgentModeProfileValues() []string {
-	values := make(map[string]struct{}, len(knownAgentModeProfileValues))
-	for value := range knownAgentModeProfileValues {
-		value = strings.Replace(value, ",find_shared_plugins_and_skills", "", 1)
-		if strings.HasPrefix(value, "puck|") {
-			value = strings.Replace(value, ",list_workspace_members", "", 1)
-		}
-		values[value] = struct{}{}
-	}
-	return sortedKeys(values)
-}
-
-var unrefreshedBaselineReviewContractMarkerValues = map[string]struct{}{
-	"review-cli-deprecation-warning": {},
-}
-
-const unrefreshedBaselineSourceSHA256 = "17bd48287672b7aff113eed9d6eb55ed790285808a03ae54d4199c0d53eff0fc"
-
-var unrefreshedBaselineAuditProblems = []string{
-	"missing expected raw release signals: review_contract_markers:review-cli-deprecation-warning",
-	"missing expected exact release values: agent_mode_profiles:deep profile, agent_mode_profiles:high profile, agent_mode_profiles:large profile, agent_mode_profiles:low profile, agent_mode_profiles:medium profile, agent_mode_profiles:nostromo profile, agent_mode_profiles:puck profile, agent_mode_profiles:rush profile, agent_mode_profiles:smart profile, agent_mode_profiles:ultra profile",
-	"unexpected agent mode profiles: deep profile, high profile, large profile, low profile, medium profile, nostromo profile, puck profile, rush profile, smart profile, ultra profile",
-}
-
-func normalizeUnrefreshedBaselineProfilesForCurrentTaxonomy(t *testing.T, baseline Snapshot) Snapshot {
-	t.Helper()
-	assertStringSetsEqual(t, "unrefreshed agent mode profiles", agentModeProfileStrings(baseline.Signals.AgentModeProfiles), unrefreshedBaselineAgentModeProfileValues())
-
-	baseline.Signals.AgentModeProfiles = append([]AgentModeProfile(nil), baseline.Signals.AgentModeProfiles...)
-	for index := range baseline.Signals.AgentModeProfiles {
-		profile := &baseline.Signals.AgentModeProfiles[index]
-		profile.ReasoningLevels = append([]string(nil), profile.ReasoningLevels...)
-		profile.ToolNames = append([]string(nil), profile.ToolNames...)
-		if profile.Name == "puck" {
-			profile.ToolNames = insertTestToolNamesAfter(t, profile.ToolNames, "list_runners", "list_workspace_members", "find_shared_plugins_and_skills")
-			continue
-		}
-		if profile.Name != "review" {
-			profile.ToolNames = insertTestToolNamesAfter(t, profile.ToolNames, "list_workspace_members", "find_shared_plugins_and_skills")
-		}
-	}
-
-	assertStringSetsEqual(t, "normalized agent mode profiles", agentModeProfileStrings(baseline.Signals.AgentModeProfiles), sortedKeys(knownAgentModeProfileValues))
-	return baseline
-}
-
-func insertTestToolNamesAfter(t *testing.T, values []string, existing string, additions ...string) []string {
-	t.Helper()
-	for index, value := range values {
-		if value == existing {
-			result := make([]string, 0, len(values)+len(additions))
-			result = append(result, values[:index+1]...)
-			result = append(result, additions...)
-			return append(result, values[index+1:]...)
-		}
-	}
-	t.Fatalf("%q is absent from tool names %v", existing, values)
-	return nil
 }
 
 func TestKnownSettingsValuesMatchCommittedBaseline(t *testing.T) {
@@ -918,7 +858,7 @@ func TestKnownRouteProviderActorValuesMatchCommittedBaseline(t *testing.T) {
 	})))
 	assertStringSetsEqual(t, "provider protocol markers", baseline.Signals.ProviderProtocol, sortedStringMapKeys(activeProviderProtocolMarkers()))
 	assertStringSetsEqual(t, "provider protocol coverage", providerCoverageStrings(baseline.Signals.ProviderCoverage), sortedKeys(expectedCoverageValuesFromMap(activeProviderProtocolMarkers())))
-	assertStringSetsEqual(t, "review contract markers", baseline.Signals.ReviewContract, sortedKeys(withoutRetired(withoutRetired(knownReviewContractMarkerValues, retiredReviewContractMarkerValues), unrefreshedBaselineReviewContractMarkerValues)))
+	assertStringSetsEqual(t, "review contract markers", baseline.Signals.ReviewContract, sortedKeys(withoutRetired(knownReviewContractMarkerValues, retiredReviewContractMarkerValues)))
 	assertStringSetsEqual(t, "provider header rules", providerHeaderRuleStrings(baseline.Signals.ProviderHeaders), sortedKeys(knownProviderHeaderRuleValues))
 	assertStringSetsEqual(t, "provider feature rules", providerFeatureRuleStrings(baseline.Signals.ProviderFeatures), sortedKeys(knownProviderFeatureRuleValues))
 	assertStringSetsEqual(t, "compaction rules", compactionRuleStrings(baseline.Signals.CompactionRules), sortedKeys(knownCompactionRuleValues))
@@ -2176,8 +2116,9 @@ func TestKnownModelSettingProviderTablesAreInternallyConsistent(t *testing.T) {
 		"remote-web":    {},
 	}
 	knownAgentModeScopes := map[string]struct{}{
-		"local-runtime": {},
-		"server-only":   {},
+		"local-compatibility": {},
+		"local-runtime":       {},
+		"server-only":         {},
 	}
 	for setting, scope := range settingScopes {
 		t.Run("setting/"+setting, func(t *testing.T) {
@@ -2703,7 +2644,6 @@ func TestLifecycleChecklistCommittedModelModeReasoningRulesMapToFocusedChecks(t 
 	if err != nil {
 		t.Fatalf("read committed baseline: %v", err)
 	}
-	baseline = normalizeUnrefreshedBaselineProfilesForCurrentTaxonomy(t, baseline)
 
 	expected := []struct {
 		category string
@@ -3488,9 +3428,11 @@ func TestLifecycleChecklistCommittedPromptTagCountsMapToFocusedChecks(t *testing
 	}
 	expectedAreas := map[string][]string{
 		"prompt/artifacts":     {"remote web control surface"},
+		"prompt/code-review":   {"tools, code review, skills, and images"},
 		"prompt/compaction":    {"compaction and continuation prompts"},
 		"prompt/guidance":      {"streaming assistant and tool edits", "compaction and continuation prompts"},
 		"prompt/painter":       {"tools, code review, skills, and images"},
+		"prompt/settings":      {"model routing, modes, and reasoning", "remote web control surface"},
 		"prompt/skills":        {"tools, code review, skills, and images"},
 		"prompt/system-prompt": {"streaming assistant and tool edits", "compaction and continuation prompts"},
 		"prompt/tools":         {"streaming assistant and tool edits", "tools, code review, skills, and images"},

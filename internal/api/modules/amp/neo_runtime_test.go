@@ -25510,10 +25510,19 @@ func TestNeoRuntimeActorMarkersCoverAuditBaselineOwnership(t *testing.T) {
 	}
 }
 
+type ampBinaryAgentModeRouteForTest struct {
+	Name                    string `json:"name"`
+	Provider                string `json:"provider"`
+	Model                   string `json:"model"`
+	ReasoningEffort         string `json:"reasoning_effort"`
+	ContextWindow           int    `json:"context_window"`
+	MaxOutputTokens         int    `json:"max_output_tokens"`
+	EffectiveContextWindow  int    `json:"effective_context_window"`
+	EffectiveMaxInputTokens int    `json:"effective_max_input_tokens"`
+	LargeContextAlias       string `json:"large_context_alias"`
+}
+
 type ampBinaryParityBaselineSnapshotForTest struct {
-	Source struct {
-		SHA256 string `json:"sha256"`
-	} `json:"source"`
 	Signals struct {
 		ThreadDeltaEvents   []string `json:"thread_delta_events"`
 		ThreadDeltaCoverage []struct {
@@ -25537,17 +25546,7 @@ type ampBinaryParityBaselineSnapshotForTest struct {
 			Name string `json:"name"`
 			Area string `json:"area"`
 		} `json:"actor_runtime_coverage"`
-		AgentModeRoutes []struct {
-			Name                    string `json:"name"`
-			Provider                string `json:"provider"`
-			Model                   string `json:"model"`
-			ReasoningEffort         string `json:"reasoning_effort"`
-			ContextWindow           int    `json:"context_window"`
-			MaxOutputTokens         int    `json:"max_output_tokens"`
-			EffectiveContextWindow  int    `json:"effective_context_window"`
-			EffectiveMaxInputTokens int    `json:"effective_max_input_tokens"`
-			LargeContextAlias       string `json:"large_context_alias"`
-		} `json:"agent_mode_routes"`
+		AgentModeRoutes   []ampBinaryAgentModeRouteForTest `json:"agent_mode_routes"`
 		AgentModeProfiles []struct {
 			Name            string   `json:"name"`
 			ReasoningEffort string   `json:"reasoning_effort"`
@@ -27157,7 +27156,7 @@ func TestSelectNeoModelRouteDefaultsPuckToGPT56Sol(t *testing.T) {
 	}
 }
 
-func TestSelectNeoModelRouteDefaultsVisibleModesToAmpBinaryRoutes(t *testing.T) {
+func TestSelectNeoModelRouteDefaultsVisibleModesPreserveLocalRouting(t *testing.T) {
 	for _, tc := range []struct {
 		mode     string
 		provider string
@@ -27197,6 +27196,50 @@ func TestSelectNeoModelRouteDefaultsNostromoToAmpNostromo(t *testing.T) {
 	got := selectNeoModelRoute("nostromo", nil)
 	if got.Provider != "amp" || got.Model != "amp-nostromo-v1" {
 		t.Fatalf("route = %+v, want amp/amp-nostromo-v1", got)
+	}
+}
+
+func TestNeoRuntimeLowModeCompatibilityDivergesFromAmpDefault(t *testing.T) {
+	baseline := ampBinaryParityBaselineForTest(t)
+	compatibilityModes := 0
+	for _, mode := range baseline.Signals.AgentModeCoverage {
+		if mode.Scope != "local-compatibility" {
+			continue
+		}
+		compatibilityModes++
+		if mode.Name != "low" {
+			t.Fatalf("agent mode %q has local-compatibility scope, want only low", mode.Name)
+		}
+	}
+	if compatibilityModes != 1 {
+		t.Fatalf("local-compatibility agent modes = %d, want only low", compatibilityModes)
+	}
+
+	var upstream ampBinaryAgentModeRouteForTest
+	found := false
+	for _, route := range baseline.Signals.AgentModeRoutes {
+		if route.Name == "low" {
+			upstream = route
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("Amp binary parity baseline has no low agent mode route")
+	}
+	if upstream.Provider != "openai" || upstream.Model != "gpt-5.6-terra" || upstream.ContextWindow != 400000 || upstream.MaxOutputTokens != 128000 {
+		t.Fatalf("Amp binary low route = %+v, want openai/gpt-5.6-terra with current model limits", upstream)
+	}
+
+	local := selectNeoModelRoute("low", nil)
+	if local.Provider != "amp" || local.Model != "glm-5.2" {
+		t.Fatalf("local low route = %+v, want amp/glm-5.2", local)
+	}
+	if neoModelContextWindow[local.Model] != 200000 || neoModelMaxOutputTokens[local.Model] != 32000 || neoEffectiveMaxInputTokens("low", local.Model) != 168000 {
+		t.Fatalf("local low model limits = context:%d output:%d input:%d", neoModelContextWindow[local.Model], neoModelMaxOutputTokens[local.Model], neoEffectiveMaxInputTokens("low", local.Model))
+	}
+	if neoCompactionObservedUsageTriggerAllowed(local) {
+		t.Fatal("local low route unexpectedly enables Anthropic observed-usage compaction")
 	}
 }
 
@@ -32079,7 +32122,7 @@ func TestNeoAgentModeCoverageHasExplicitOwnership(t *testing.T) {
 		"deep":     "local-runtime",
 		"high":     "local-runtime",
 		"large":    "local-runtime",
-		"low":      "local-runtime",
+		"low":      "local-compatibility",
 		"medium":   "local-runtime",
 		"nostromo": "local-runtime",
 		"puck":     "server-only",

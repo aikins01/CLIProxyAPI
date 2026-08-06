@@ -37,10 +37,6 @@ var neoModeRuntimeOnlyTools = map[string]map[string]bool{
 	"puck": toolSet("rename_thread", "set_thread_pinned", "add_thread_labels", "remove_thread_labels", "set_schedule"),
 }
 
-const neoModeToolOrderTransitionBaselineSHA256 = "17bd48287672b7aff113eed9d6eb55ed790285808a03ae54d4199c0d53eff0fc"
-
-var neoModeToolOrderTransitionModes = toolSet("smart", "large", "rush", "deep", "nostromo", "low", "medium", "high", "ultra")
-
 func neoModeBinaryComparableTools(mode string, names []string) []string {
 	runtimeOnly := neoModeRuntimeOnlyTools[mode]
 	out := make([]string, 0, len(names))
@@ -98,9 +94,6 @@ func TestNeoModeToolOrderMatchesAuditBaseline(t *testing.T) {
 				continue
 			}
 			t.Fatalf("mode %q has no tool_names in Amp binary parity baseline", mode)
-		}
-		if baseline.Source.SHA256 == neoModeToolOrderTransitionBaselineSHA256 && neoModeToolOrderTransitionModes[mode] {
-			want = neoToolParityWithout(want, "find_shared_plugins_and_skills")
 		}
 		if !neoToolParityEqualOrdered(got, want) {
 			t.Errorf("mode %q includeTools differs from Amp binary baseline:\n  baseline: %v\n  runtime : %v\n  baseline-only: %v\n  runtime-only : %v",
