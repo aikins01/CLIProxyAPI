@@ -21115,6 +21115,396 @@ func TestNeoRuntimeStreamedSubmitReviewSupportsHeadlessCompletion(t *testing.T) 
 	}
 }
 
+func TestNeoRuntimeStreamedReviewRunChecksSupportHeadlessCollector(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	rt := newNeoRuntime(&config.Config{})
+	rt.inferStream = func(_ *neoRuntime, request neoInferenceRequest, _ neoStreamCallback) (neoInferenceResult, error) {
+		if strings.HasPrefix(request.ParentToolCallID, "TU-check-") {
+			return neoInferenceResult{Text: `{"issues":[],"filesAnalyzed":0,"coveredFiles":[],"coveredHunks":[]}`}, nil
+		}
+		return neoInferenceResult{}, fmt.Errorf("unexpected inference for parent %q", request.ParentToolCallID)
+	}
+	threadID := "T-headless-review-run-checks"
+	actor, _ := rt.store.upsert(map[string]any{"name": "threadActor", "key": threadID, "input": map[string]any{"threadId": threadID}}, true)
+	defer waitForNeoActorSyncIdle(t, actor)
+
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	t.Cleanup(server.Close)
+	live := dialNeoActorWebSocket(t, server.URL, threadID)
+	defer live.Close()
+	waitForNeoMessageType(t, live, "agent_state", 2*time.Second)
+
+	messageID := "M-review-checks-assistant"
+	userMessageID := "M-review-checks-request"
+	checkNames := []string{"generated-artifact-consumer-contract", "api-and-observability-polish", "implementation-simplicity-and-cost"}
+	toolCallIDs := make([]string, len(checkNames))
+	for index := range checkNames {
+		toolCallIDs[index] = "TU-check-" + strconv.Itoa(index)
+	}
+	actor.mu.Lock()
+	actor.messages = append(actor.messages, neoMessage{
+		ThreadID:  actor.threadID,
+		MessageID: userMessageID,
+		Role:      "user",
+		Content:   []any{map[string]any{"type": "text", "text": "review changes"}},
+	})
+	actor.rebuildHistoryLocked()
+	actor.currentInference = &neoInferenceInflight{messageID: messageID, agentMode: "review"}
+	actor.mu.Unlock()
+	actor.reviewSnapshot = &neoReviewDiffSnapshot{Diffs: map[string]string{}}
+	actor.reviewSnapshotRootMessageID = userMessageID
+
+	actor.handleProtocolDelta(map[string]any{
+		"type":       "delta",
+		"messageId":  messageID,
+		"role":       "assistant",
+		"state":      "tool_use",
+		"blockIndex": 0,
+		"blocks": []any{map[string]any{
+			"type":             "tool_use",
+			"id":               toolCallIDs[0],
+			"name":             "run_check",
+			"input":            map[string]any{},
+			"complete":         false,
+			"inputIncomplete":  map[string]any{"checkName": checkNames[0]},
+			"inputPartialJSON": map[string]any{"json": `{"checkName":"` + checkNames[0] + `"}`},
+			"blockState":       "streaming",
+		}},
+	})
+	waitForNeoMessageTypeWhere(t, live, "delta", 2*time.Second, func(payload map[string]any) bool {
+		return stringValue(payload["messageId"]) == messageID
+	})
+
+	calls := make([]neoToolCall, len(checkNames))
+	for index, checkName := range checkNames {
+		calls[index] = neoToolCall{
+			ID:   toolCallIDs[index],
+			Name: "run_check",
+			Input: map[string]any{
+				"checkName":    checkName,
+				"checkURI":     "file:///checks/" + checkName + ".md",
+				"checkContent": "Return no issues.",
+			},
+		}
+	}
+	actor.finishAssistantMessageWithOptions(messageID, neoInferenceResult{
+		Provider:  "openai",
+		Model:     "gpt-test",
+		Text:      "Running checks.",
+		ToolCalls: calls,
+	}, "review", "medium", true, "")
+
+	completeDelta := waitForNeoMessageTypeWhere(t, live, "delta", 2*time.Second, func(payload map[string]any) bool {
+		if stringValue(payload["messageId"]) != messageID || stringValue(payload["state"]) != "tool_use" {
+			return false
+		}
+		blocks := arrayValue(payload["blocks"])
+		if len(blocks) != len(checkNames) {
+			return false
+		}
+		for _, raw := range blocks {
+			if !boolValue(mapValue(raw)["complete"]) {
+				return false
+			}
+		}
+		return true
+	})
+	synthetic := waitForNeoMessageTypeWhere(t, live, "message_added", 2*time.Second, func(payload map[string]any) bool {
+		return stringValue(mapValue(payload["message"])["role"]) == "assistant"
+	})
+	syntheticMessage := mapValue(synthetic["message"])
+	syntheticID := stringValue(syntheticMessage["messageId"])
+	if syntheticID == "" || syntheticID == messageID {
+		t.Fatalf("synthetic run_check message reused canonical identity: %#v", syntheticMessage)
+	}
+	if _, hasParent := synthetic["parentToolUseId"]; hasParent {
+		t.Fatalf("synthetic run_check compatibility message is nested: %#v", synthetic)
+	}
+	syntheticBlocks := arrayValue(syntheticMessage["content"])
+	if len(syntheticBlocks) != len(checkNames) {
+		t.Fatalf("synthetic run_check content = %#v, want only the %d run_check blocks", syntheticBlocks, len(checkNames))
+	}
+	for index, raw := range syntheticBlocks {
+		block := mapValue(raw)
+		if stringValue(block["type"]) != "tool_use" || stringValue(block["name"]) != "run_check" || !boolValue(block["complete"]) {
+			t.Fatalf("synthetic run_check block = %#v", block)
+		}
+		if stringValue(block["id"]) != toolCallIDs[index] || stringValue(mapValue(block["input"])["checkName"]) != checkNames[index] {
+			t.Fatalf("synthetic run_check block %d lost tool identity or input: %#v", index, block)
+		}
+	}
+	updated := waitForNeoMessageTypeWhere(t, live, "message_updated", 2*time.Second, func(payload map[string]any) bool {
+		return stringValue(mapValue(payload["message"])["messageId"]) == messageID
+	})
+	completeSeq := numberFrom(completeDelta["seq"])
+	syntheticSeq := numberFrom(synthetic["seq"])
+	updatedSeq := numberFrom(updated["seq"])
+	if completeSeq >= syntheticSeq || syntheticSeq >= updatedSeq {
+		t.Fatalf("run_check finalization sequences = delta:%d synthetic:%d updated:%d", completeSeq, syntheticSeq, updatedSeq)
+	}
+	updatedMessage := mapValue(updated["message"])
+	updatedBlocks := arrayValue(updatedMessage["content"])
+	if len(updatedBlocks) != len(checkNames)+1 || stringValue(mapValue(updatedBlocks[0])["type"]) != "text" {
+		t.Fatalf("authoritative review update content = %#v, want text plus %d run_check blocks", updatedBlocks, len(checkNames))
+	}
+
+	headlessSeen := map[string]bool{messageID: true}
+	headlessMessages := []map[string]any{}
+	collect := func(payload map[string]any) {
+		if _, hasParent := payload["parentToolUseId"]; hasParent {
+			return
+		}
+		message := mapValue(payload["message"])
+		id := stringValue(message["messageId"])
+		if headlessSeen[id] {
+			return
+		}
+		headlessSeen[id] = true
+		headlessMessages = append(headlessMessages, message)
+	}
+	collect(synthetic)
+	pendingResults := map[string]bool{}
+	for _, toolCallID := range toolCallIDs {
+		pendingResults[toolCallID] = true
+	}
+	for len(pendingResults) > 0 {
+		resultEvent := waitForNeoMessageTypeWhere(t, live, "message_added", 3*time.Second, func(payload map[string]any) bool {
+			message := mapValue(payload["message"])
+			if stringValue(message["role"]) != "user" {
+				return false
+			}
+			for _, raw := range arrayValue(message["content"]) {
+				if pendingResults[stringValue(mapValue(raw)["toolUseID"])] {
+					return true
+				}
+			}
+			return false
+		})
+		for _, raw := range arrayValue(mapValue(resultEvent["message"])["content"]) {
+			delete(pendingResults, stringValue(mapValue(raw)["toolUseID"]))
+		}
+		collect(resultEvent)
+	}
+	for _, toolCallID := range toolCallIDs {
+		uses := 0
+		results := 0
+		for _, message := range headlessMessages {
+			for _, raw := range arrayValue(message["content"]) {
+				block := mapValue(raw)
+				switch {
+				case stringValue(message["role"]) == "assistant" && stringValue(block["type"]) == "tool_use" && stringValue(block["id"]) == toolCallID:
+					uses++
+				case stringValue(message["role"]) == "user" && stringValue(block["type"]) == "tool_result" && stringValue(block["toolUseID"]) == toolCallID:
+					results++
+					if status := stringValue(mapValue(block["run"])["status"]); status != "done" && status != "error" {
+						t.Fatalf("headless run_check %s terminal status = %q", toolCallID, status)
+					}
+				}
+			}
+		}
+		if uses != 1 || results != 1 {
+			t.Fatalf("headless run_check %s uses/results = %d/%d, want 1/1: %#v", toolCallID, uses, results, headlessMessages)
+		}
+	}
+
+	actor.mu.Lock()
+	replayEvents := cloneNeoReplayEvents(actor.replayEvents)
+	storedMessages := append([]neoMessage(nil), actor.messages...)
+	actor.mu.Unlock()
+	for _, message := range storedMessages {
+		if message.MessageID == syntheticID {
+			t.Fatalf("synthetic run_check message persisted: %#v", message)
+		}
+	}
+	replayedUpdate := false
+	for _, event := range replayEvents {
+		eventMessageID := stringValue(mapValue(event.Payload["message"])["messageId"])
+		if eventMessageID == syntheticID {
+			t.Fatalf("synthetic run_check event entered replay: %#v", event.Payload)
+		}
+		if eventMessageID != messageID {
+			continue
+		}
+		switch event.Payload["type"] {
+		case "message_added":
+			t.Fatalf("canonical run_check finalization replayed as message_added: %#v", event.Payload)
+		case "message_updated":
+			replayedUpdate = true
+		}
+	}
+	if !replayedUpdate {
+		t.Fatal("authoritative run_check update missing from replay")
+	}
+
+	snapshot, ok := actor.threadSnapshot()
+	if !ok {
+		t.Fatal("thread snapshot unavailable")
+	}
+	snapshotCanonical := false
+	for _, message := range snapshot.messages {
+		if message.MessageID == syntheticID {
+			t.Fatalf("synthetic run_check message entered snapshot: %#v", message)
+		}
+		if message.MessageID == messageID && len(message.Content) == len(checkNames)+1 {
+			snapshotCanonical = true
+		}
+	}
+	if !snapshotCanonical {
+		t.Fatalf("snapshot lost canonical review assistant: %#v", snapshot.messages)
+	}
+
+	reload := dialNeoActorWebSocket(t, server.URL, threadID)
+	defer reload.Close()
+	reloadCanonical := false
+	reloadDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(reloadDeadline) {
+		payload, okRead := readNeoMessage(t, reload, time.Until(reloadDeadline))
+		if !okRead {
+			break
+		}
+		if payload["type"] == "agent_state" {
+			break
+		}
+		if payload["type"] != "message_added" {
+			continue
+		}
+		message := mapValue(payload["message"])
+		switch stringValue(message["messageId"]) {
+		case syntheticID:
+			t.Fatalf("synthetic run_check message replayed on reload: %#v", payload)
+		case messageID:
+			reloadCanonical = len(arrayValue(message["content"])) == len(checkNames)+1
+		}
+	}
+	if !reloadCanonical {
+		t.Fatal("reload snapshot lost canonical review assistant")
+	}
+
+	resumed := dialNeoActorWebSocketWithoutResume(t, server.URL, threadID, "")
+	defer resumed.Close()
+	if err := resumed.WriteJSON(map[string]any{"type": "client_resume", "version": completeSeq}); err != nil {
+		t.Fatalf("write incremental client_resume: %v", err)
+	}
+	resumeSawUpdate := false
+	resumeDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(resumeDeadline) {
+		payload, okRead := readNeoMessage(t, resumed, time.Until(resumeDeadline))
+		if !okRead {
+			break
+		}
+		if payload["type"] == "agent_state" {
+			break
+		}
+		message := mapValue(payload["message"])
+		switch payload["type"] {
+		case "message_added":
+			if id := stringValue(message["messageId"]); id == syntheticID || id == messageID {
+				t.Fatalf("incremental resume replayed compatibility addition: %#v", payload)
+			}
+		case "message_updated":
+			if stringValue(message["messageId"]) == messageID {
+				resumeSawUpdate = reflect.DeepEqual(message, updatedMessage)
+			}
+		}
+	}
+	if !resumeSawUpdate {
+		t.Fatal("incremental resume lost authoritative run_check update")
+	}
+}
+
+func TestNeoRuntimeNestedStreamedReviewRunChecksEmitNoSyntheticAddition(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	rt := newNeoRuntime(&config.Config{})
+	rt.inferStream = func(_ *neoRuntime, request neoInferenceRequest, _ neoStreamCallback) (neoInferenceResult, error) {
+		if strings.HasPrefix(request.ParentToolCallID, "TU-check-") {
+			return neoInferenceResult{Text: `{"issues":[],"filesAnalyzed":0,"coveredFiles":[],"coveredHunks":[]}`}, nil
+		}
+		return neoInferenceResult{}, fmt.Errorf("unexpected inference for parent %q", request.ParentToolCallID)
+	}
+	threadID := "T-nested-review-run-checks"
+	actor, _ := rt.store.upsert(map[string]any{"name": "threadActor", "key": threadID, "input": map[string]any{"threadId": threadID}}, true)
+	defer waitForNeoActorSyncIdle(t, actor)
+
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	t.Cleanup(server.Close)
+	live := dialNeoActorWebSocket(t, server.URL, threadID)
+	defer live.Close()
+	waitForNeoMessageType(t, live, "agent_state", 2*time.Second)
+
+	parentToolCallID := "TU-review-parent"
+	messageID := "M-nested-review-assistant"
+	toolCallID := "TU-check-nested"
+	checkName := "generated-artifact-consumer-contract"
+	actor.reviewSnapshot = &neoReviewDiffSnapshot{Diffs: map[string]string{}}
+
+	actor.handleProtocolDelta(map[string]any{
+		"type":             "delta",
+		"messageId":        messageID,
+		"parentToolCallId": parentToolCallID,
+		"role":             "assistant",
+		"state":            "tool_use",
+		"blockIndex":       0,
+		"blocks": []any{map[string]any{
+			"type":             "tool_use",
+			"id":               toolCallID,
+			"name":             "run_check",
+			"input":            map[string]any{},
+			"complete":         false,
+			"inputIncomplete":  map[string]any{"checkName": checkName},
+			"inputPartialJSON": map[string]any{"json": `{"checkName":"` + checkName + `"}`},
+			"blockState":       "streaming",
+		}},
+	})
+	waitForNeoMessageTypeWhere(t, live, "delta", 2*time.Second, func(payload map[string]any) bool {
+		return stringValue(payload["messageId"]) == messageID
+	})
+
+	actor.finishAssistantMessageWithOptions(messageID, neoInferenceResult{
+		Provider: "openai",
+		Model:    "gpt-test",
+		Text:     "Running nested check.",
+		ToolCalls: []neoToolCall{{
+			ID:   toolCallID,
+			Name: "run_check",
+			Input: map[string]any{
+				"checkName":    checkName,
+				"checkURI":     "file:///checks/" + checkName + ".md",
+				"checkContent": "Return no issues.",
+			},
+		}},
+	}, "review", "medium", true, parentToolCallID)
+
+	updated := waitForNeoMessageTypeWhere(t, live, "message_updated", 2*time.Second, func(payload map[string]any) bool {
+		return stringValue(mapValue(payload["message"])["messageId"]) == messageID
+	})
+	if stringValue(mapValue(updated["message"])["parentToolUseId"]) != parentToolCallID {
+		t.Fatalf("nested review finalization lost parent tool linkage: %#v", updated)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		payload, ok := readNeoMessage(t, live, time.Until(deadline))
+		if !ok {
+			break
+		}
+		if payload["type"] != "message_added" {
+			continue
+		}
+		if _, hasParent := payload["parentToolUseId"]; hasParent {
+			continue
+		}
+		message := mapValue(payload["message"])
+		if stringValue(message["role"]) != "assistant" || stringValue(message["parentToolUseId"]) != "" {
+			continue
+		}
+		for _, raw := range arrayValue(message["content"]) {
+			if stringValue(mapValue(raw)["name"]) == "run_check" {
+				t.Fatalf("nested review finalization emitted synthetic top-level run_check addition: %#v", payload)
+			}
+		}
+	}
+}
+
 func TestNeoActorProtocolDeltaAddsInputIncompleteForPartialToolJSON(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	rt := newNeoRuntime(&config.Config{})

@@ -12995,6 +12995,7 @@ func (a *neoActor) finishAssistantMessageWithOptions(messageID string, result ne
 	var stored neoMessage
 	var messageEvent map[string]any
 	var headlessReviewEvent map[string]any
+	var headlessRunCheckEvent map[string]any
 	if messageExistedBeforeFinalization {
 		headlessReviewSeq := 0
 		if agentMode == "review" && len(normalizedCalls) == 0 {
@@ -13007,10 +13008,41 @@ func (a *neoActor) finishAssistantMessageWithOptions(messageID string, result ne
 				}
 			}
 		}
+		var runCheckBlocks []any
+		if agentMode == "review" && parentToolCallID == "" {
+			for _, block := range blocks {
+				blockMap := mapValue(block)
+				if stringValue(blockMap["type"]) == "tool_use" && stringValue(blockMap["name"]) == "run_check" && neoToolUseBlockComplete(blockMap) {
+					runCheckBlocks = append(runCheckBlocks, cloneMap(blockMap))
+				}
+			}
+		}
+		headlessRunCheckSeq := 0
+		if len(runCheckBlocks) > 0 {
+			headlessRunCheckSeq = a.nextSeqLocked()
+		}
 		stored, messageEvent = a.storeMessageEventLocked(finalMessage)
 		if headlessReviewSeq > 0 && messageEvent["type"] == "message_updated" {
 			headlessReviewEvent = neoMessageAddedPayload(stored)
 			headlessReviewEvent["seq"] = headlessReviewSeq
+		}
+		if headlessRunCheckSeq > 0 && messageEvent["type"] == "message_updated" {
+			// Live-only compatibility addition for headless review collectors
+			// that subscribe to message_added and deduplicate by messageId:
+			// they may have already seen the canonical assistant message ID
+			// before its run_check tool blocks were finalized. This synthetic
+			// message is never stored or replayed.
+			synthetic := neoMessage{
+				ThreadID:  a.threadID,
+				MessageID: newNeoMessageID(),
+				Role:      "assistant",
+				Content:   runCheckBlocks,
+				State:     map[string]any{"type": "complete", "stopReason": "tool_use"},
+				CreatedAt: stored.CreatedAt,
+				AgentMode: agentMode,
+				Seq:       headlessRunCheckSeq,
+			}
+			headlessRunCheckEvent = neoMessageAddedPayload(synthetic)
 		}
 	} else {
 		if index := a.messageIndexLocked(messageID); index >= 0 {
@@ -13041,6 +13073,9 @@ func (a *neoActor) finishAssistantMessageWithOptions(messageID string, result ne
 
 	if headlessReviewEvent != nil {
 		a.broadcast(headlessReviewEvent)
+	}
+	if headlessRunCheckEvent != nil {
+		a.broadcast(headlessRunCheckEvent)
 	}
 	a.broadcast(messageEvent)
 	if providerErrorEvent != nil {
