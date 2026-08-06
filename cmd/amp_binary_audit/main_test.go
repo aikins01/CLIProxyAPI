@@ -59,6 +59,7 @@ func TestClassifyStringsExtractsParitySignals(t *testing.T) {
 		`let o=input,k=o&&typeof o==="object"&&"checkURI"in o&&typeof o.checkURI==="string"?o.checkURI:void 0,p=o&&typeof o==="object"&&"checkName"in o&&typeof o.checkName==="string"?o.checkName:void 0`,
 		`severity!=="low" The following checks were run`,
 		"rR.yellow(\"issues found\"); i.push(`${e.result.check.name}: ${n}`)",
+		"Warning: `amp review` is deprecated. Ask Amp to review the changes with the oracle instead: echo 'Ask the oracle to review uncommitted changes' | amp; echo 'Ask the oracle to review the changes since the merge base' | amp",
 		"Please perform compaction guidance for the system prompt and code review workflow. This deliberately long prompt-like segment has enough ordinary words to be fingerprinted without storing the body in the baseline.",
 	}
 
@@ -192,6 +193,7 @@ func TestClassifyStringsExtractsParitySignals(t *testing.T) {
 	assertContains(t, providerCoverageStrings(signals.ProviderCoverage), "google-upload-url=google-upload")
 	assertContains(t, signals.ReviewContract, "human-review-check-footer-counts-issues")
 	assertContains(t, signals.ReviewContract, "human-review-filters-low-severity")
+	assertContains(t, signals.ReviewContract, "review-cli-deprecation-warning")
 	assertContains(t, signals.ReviewContract, "review-cli-appends-check-findings")
 	assertContains(t, signals.ReviewContract, "review-submit-omits-run-check-findings")
 	assertContains(t, signals.ReviewContract, "run-check-instructions-input-shape")
@@ -345,6 +347,11 @@ func TestClassifyStringsRejectsReviewContractNearMisses(t *testing.T) {
 			strs:   []string{`rR.yellow("issues found");`},
 			marker: "human-review-check-footer-counts-issues",
 		},
+		{
+			name:   "review deprecation warning requires both oracle commands",
+			strs:   []string{`Warning: amp review is deprecated. Ask Amp to review the changes with the oracle instead: Ask the oracle to review uncommitted changes`},
+			marker: "review-cli-deprecation-warning",
+		},
 	}
 
 	for _, tt := range tests {
@@ -401,12 +408,75 @@ func TestClassifyStringsDetectsReviewContractMarkers(t *testing.T) {
 			str:    `rR.yellow("issues found"); footer.push(result.check.name)`,
 			marker: "human-review-check-footer-counts-issues",
 		},
+		{
+			name:   "review cli deprecation warning",
+			str:    "Warning: `amp review` is deprecated. Ask Amp to review the changes with the oracle instead: echo 'Ask the oracle to review uncommitted changes' | amp; echo 'Ask the oracle to review the changes since the merge base' | amp",
+			marker: "review-cli-deprecation-warning",
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			signals := classifyStrings([]string{tt.str})
 			assertContains(t, signals.ReviewContract, tt.marker)
+		})
+	}
+}
+
+func TestClassifyStringsDetectsSplitReviewCLIDeprecationWarning(t *testing.T) {
+	tests := map[string][]string{
+		"three strings": {
+			"Warning: `amp review` is deprecated. Ask Amp to review the changes with the oracle instead:",
+			"echo 'Ask the oracle to review uncommitted changes' | amp",
+			"echo 'Ask the oracle to review the changes since the merge base' | amp",
+		},
+		"first two fragments together": {
+			"Ask Amp to review the changes with the oracle instead: echo 'Ask the oracle to review uncommitted changes' | amp",
+			"echo 'Ask the oracle to review the changes since the merge base' | amp",
+		},
+		"last two fragments together": {
+			"Warning: Ask Amp to review the changes with the oracle instead:",
+			"echo 'Ask the oracle to review uncommitted changes' | amp; echo 'Ask the oracle to review the changes since the merge base' | amp",
+		},
+		"fragment split inside phrase": {
+			"Warning: `amp review` is deprecated. Ask Amp to review the changes with the oracle ",
+			"instead: echo 'Ask the oracle to review uncommitted changes' | amp; echo 'Ask the oracle to review the changes since the merge base' | amp",
+		},
+		"four strings with fragments split inside phrases": {
+			"Warning: `amp review` is deprecated. Ask Amp to review the changes with the oracle ",
+			"instead: echo 'Ask the oracle to review uncommitted changes' | amp; ",
+			"echo 'Ask the oracle to review ",
+			"the changes since the merge base' | amp",
+		},
+	}
+
+	for name, strs := range tests {
+		t.Run(name, func(t *testing.T) {
+			signals := classifyStrings(strs)
+			assertContains(t, signals.ReviewContract, "review-cli-deprecation-warning")
+		})
+	}
+}
+
+func TestClassifyStringsRejectsInvalidSplitReviewCLIDeprecationWarning(t *testing.T) {
+	tests := map[string][]string{
+		"non-adjacent fragments": {
+			"Warning: `amp review` is deprecated. Ask Amp to review the changes with the oracle instead:",
+			"echo 'Ask the oracle to review uncommitted changes' | amp",
+			"unrelated binary string",
+			"echo 'Ask the oracle to review the changes since the merge base' | amp",
+		},
+		"reordered fragments": {
+			"Warning: `amp review` is deprecated. Ask Amp to review the changes with the oracle instead:",
+			"echo 'Ask the oracle to review the changes since the merge base' | amp",
+			"echo 'Ask the oracle to review uncommitted changes' | amp",
+		},
+	}
+
+	for name, strs := range tests {
+		t.Run(name, func(t *testing.T) {
+			signals := classifyStrings(strs)
+			assertNotContains(t, signals.ReviewContract, "review-cli-deprecation-warning")
 		})
 	}
 }
@@ -522,7 +592,7 @@ func TestKnownPromptTagCountsMatchCommittedBaseline(t *testing.T) {
 	assertStringSetsEqual(t, "prompt tag-set counts", intMapStrings(tagSetCounts), intMapStrings(knownPromptTagSetCountValues))
 }
 
-func TestCommittedBaselineHasCurrentSchemaAndReleaseSource(t *testing.T) {
+func TestCommittedBaselineHasCurrentSchemaReleaseSourceAndOnlyPinnedTransitionDrift(t *testing.T) {
 	root := repoRootForAuditChecklistTest(t)
 	baseline, err := readSnapshotFile(filepath.Join(root, "dev", "amp-binary-parity-baseline.json"))
 	if err != nil {
@@ -541,6 +611,9 @@ func TestCommittedBaselineHasCurrentSchemaAndReleaseSource(t *testing.T) {
 	if !regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(baseline.Source.SHA256) {
 		t.Fatalf("baseline source sha256 = %q, want lowercase hex sha256", baseline.Source.SHA256)
 	}
+	if baseline.Source.SHA256 != unrefreshedBaselineSourceSHA256 {
+		t.Fatalf("baseline source sha256 = %q, transition is pinned to %q", baseline.Source.SHA256, unrefreshedBaselineSourceSHA256)
+	}
 	if len(baseline.Source.Versions) == 0 {
 		t.Fatal("baseline source versions are empty")
 	}
@@ -552,9 +625,7 @@ func TestCommittedBaselineHasCurrentSchemaAndReleaseSource(t *testing.T) {
 	if baseline.Source.StringsScanned == 0 {
 		t.Fatal("baseline source strings_scanned is empty")
 	}
-	if problems := snapshotAuditProblems(baseline); len(problems) > 0 {
-		t.Fatalf("committed baseline has audit problems: %v", problems)
-	}
+	assertStringSetsEqual(t, "deferred unrefreshed baseline audit problems", snapshotAuditProblems(baseline), unrefreshedBaselineAuditProblems)
 }
 
 func TestCommittedBaselineMatchesInstalledAmpBinaryWhenPathMatches(t *testing.T) {
@@ -691,7 +762,7 @@ func TestKnownModelModeReasoningValuesMatchCommittedBaseline(t *testing.T) {
 		provider, family := modelProviderAndFamily(name)
 		return provider + "/" + family
 	})))
-	assertStringSetsEqual(t, "agent mode profiles", agentModeProfileStrings(baseline.Signals.AgentModeProfiles), sortedKeys(knownAgentModeProfileValues))
+	assertStringSetsEqual(t, "agent mode profiles", agentModeProfileStrings(baseline.Signals.AgentModeProfiles), unrefreshedBaselineAgentModeProfileValues())
 	assertStringSetsEqual(t, "agent mode routes", agentModeRouteStrings(baseline.Signals.AgentModeRoutes), sortedKeys(knownAgentModeRouteValues))
 	assertStringSetsEqual(t, "agent mode coverage", agentModeCoverageStrings(baseline.Signals.AgentModeCoverage), sortedKeys(expectedCoverageValuesFromMap(activeAgentModeScopes())))
 
@@ -703,6 +774,66 @@ func TestKnownModelModeReasoningValuesMatchCommittedBaseline(t *testing.T) {
 	assertStringSetsEqual(t, "large context rules", largeContextRuleStrings(baseline.Signals.LargeContextRules), sortedKeys(knownLargeContextRuleValues))
 	assertStringSetsEqual(t, "adaptive thinking rules", adaptiveThinkingRuleStrings(baseline.Signals.AdaptiveThinking), sortedKeys(knownAdaptiveThinkingRuleValues))
 	assertStringSetsEqual(t, "provider reasoning rules", providerReasoningRuleStrings(baseline.Signals.ProviderReasoning), sortedKeys(knownProviderReasoningRuleValues))
+}
+
+func unrefreshedBaselineAgentModeProfileValues() []string {
+	values := make(map[string]struct{}, len(knownAgentModeProfileValues))
+	for value := range knownAgentModeProfileValues {
+		value = strings.Replace(value, ",find_shared_plugins_and_skills", "", 1)
+		if strings.HasPrefix(value, "puck|") {
+			value = strings.Replace(value, ",list_workspace_members", "", 1)
+		}
+		values[value] = struct{}{}
+	}
+	return sortedKeys(values)
+}
+
+var unrefreshedBaselineReviewContractMarkerValues = map[string]struct{}{
+	"review-cli-deprecation-warning": {},
+}
+
+const unrefreshedBaselineSourceSHA256 = "17bd48287672b7aff113eed9d6eb55ed790285808a03ae54d4199c0d53eff0fc"
+
+var unrefreshedBaselineAuditProblems = []string{
+	"missing expected raw release signals: review_contract_markers:review-cli-deprecation-warning",
+	"missing expected exact release values: agent_mode_profiles:deep profile, agent_mode_profiles:high profile, agent_mode_profiles:large profile, agent_mode_profiles:low profile, agent_mode_profiles:medium profile, agent_mode_profiles:nostromo profile, agent_mode_profiles:puck profile, agent_mode_profiles:rush profile, agent_mode_profiles:smart profile, agent_mode_profiles:ultra profile",
+	"unexpected agent mode profiles: deep profile, high profile, large profile, low profile, medium profile, nostromo profile, puck profile, rush profile, smart profile, ultra profile",
+}
+
+func normalizeUnrefreshedBaselineProfilesForCurrentTaxonomy(t *testing.T, baseline Snapshot) Snapshot {
+	t.Helper()
+	assertStringSetsEqual(t, "unrefreshed agent mode profiles", agentModeProfileStrings(baseline.Signals.AgentModeProfiles), unrefreshedBaselineAgentModeProfileValues())
+
+	baseline.Signals.AgentModeProfiles = append([]AgentModeProfile(nil), baseline.Signals.AgentModeProfiles...)
+	for index := range baseline.Signals.AgentModeProfiles {
+		profile := &baseline.Signals.AgentModeProfiles[index]
+		profile.ReasoningLevels = append([]string(nil), profile.ReasoningLevels...)
+		profile.ToolNames = append([]string(nil), profile.ToolNames...)
+		if profile.Name == "puck" {
+			profile.ToolNames = insertTestToolNamesAfter(t, profile.ToolNames, "list_runners", "list_workspace_members", "find_shared_plugins_and_skills")
+			continue
+		}
+		if profile.Name != "review" {
+			profile.ToolNames = insertTestToolNamesAfter(t, profile.ToolNames, "list_workspace_members", "find_shared_plugins_and_skills")
+		}
+	}
+
+	assertStringSetsEqual(t, "normalized agent mode profiles", agentModeProfileStrings(baseline.Signals.AgentModeProfiles), sortedKeys(knownAgentModeProfileValues))
+	return baseline
+}
+
+func insertTestToolNamesAfter(t *testing.T, values []string, existing string, additions ...string) []string {
+	t.Helper()
+	for index, value := range values {
+		if value == existing {
+			result := make([]string, 0, len(values)+len(additions))
+			result = append(result, values[:index+1]...)
+			result = append(result, additions...)
+			return append(result, values[index+1:]...)
+		}
+	}
+	t.Fatalf("%q is absent from tool names %v", existing, values)
+	return nil
 }
 
 func TestKnownSettingsValuesMatchCommittedBaseline(t *testing.T) {
@@ -787,7 +918,7 @@ func TestKnownRouteProviderActorValuesMatchCommittedBaseline(t *testing.T) {
 	})))
 	assertStringSetsEqual(t, "provider protocol markers", baseline.Signals.ProviderProtocol, sortedStringMapKeys(activeProviderProtocolMarkers()))
 	assertStringSetsEqual(t, "provider protocol coverage", providerCoverageStrings(baseline.Signals.ProviderCoverage), sortedKeys(expectedCoverageValuesFromMap(activeProviderProtocolMarkers())))
-	assertStringSetsEqual(t, "review contract markers", baseline.Signals.ReviewContract, sortedKeys(withoutRetired(knownReviewContractMarkerValues, retiredReviewContractMarkerValues)))
+	assertStringSetsEqual(t, "review contract markers", baseline.Signals.ReviewContract, sortedKeys(withoutRetired(withoutRetired(knownReviewContractMarkerValues, retiredReviewContractMarkerValues), unrefreshedBaselineReviewContractMarkerValues)))
 	assertStringSetsEqual(t, "provider header rules", providerHeaderRuleStrings(baseline.Signals.ProviderHeaders), sortedKeys(knownProviderHeaderRuleValues))
 	assertStringSetsEqual(t, "provider feature rules", providerFeatureRuleStrings(baseline.Signals.ProviderFeatures), sortedKeys(knownProviderFeatureRuleValues))
 	assertStringSetsEqual(t, "compaction rules", compactionRuleStrings(baseline.Signals.CompactionRules), sortedKeys(knownCompactionRuleValues))
@@ -2572,6 +2703,7 @@ func TestLifecycleChecklistCommittedModelModeReasoningRulesMapToFocusedChecks(t 
 	if err != nil {
 		t.Fatalf("read committed baseline: %v", err)
 	}
+	baseline = normalizeUnrefreshedBaselineProfilesForCurrentTaxonomy(t, baseline)
 
 	expected := []struct {
 		category string

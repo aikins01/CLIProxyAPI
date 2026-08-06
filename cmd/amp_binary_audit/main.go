@@ -715,6 +715,7 @@ var retiredToolCatalogMarkerValues = map[string]struct{}{
 var knownReviewContractMarkerValues = map[string]struct{}{
 	"human-review-check-footer-counts-issues": {},
 	"human-review-filters-low-severity":       {},
+	"review-cli-deprecation-warning":          {},
 	"review-cli-appends-check-findings":       {},
 	"review-submit-omits-run-check-findings":  {},
 	"run-check-instructions-input-shape":      {},
@@ -926,16 +927,16 @@ var retiredAgentModeNames = map[string]struct{}{
 	"agg-man": {},
 }
 
-const knownSharedAgentModeTools = ",get_current_user_identity,list_workspace_members,send_email,slack_write,slack_read,get_schedule,set_schedule,update_schedule,clear_schedule,create_slack_trigger"
+const knownSharedAgentModeTools = ",get_current_user_identity,list_workspace_members,find_shared_plugins_and_skills,send_email,slack_write,slack_read,get_schedule,set_schedule,update_schedule,clear_schedule,create_slack_trigger"
 
 var knownAgentModeProfileValues = map[string]struct{}{
-	"deep|primary=GPT_5_5|reasoning=medium|levels=|include=present|tools=shell_command,shell_command_status,apply_patch,web_search,read_web_page,Task,skill,load_plugin,reload_plugins,reload_skills,read_thread,find_thread,list_agent_modes,list_runners,create_thread,thread_interact,wait_for_threads,download_thread_file,upload_thread_file,notepad,librarian,oracle,finder,view_media,painter,public_artifact_url,thread_file_url" + knownSharedAgentModeTools + "|deferred=true|visible=false|visibleInV2=false|serverOnly=false":                                                                                {},
-	"high|primary=GPT_5_6_SOL|reasoning=xhigh|levels=|include=present|tools=shell_command,shell_command_status,apply_patch,web_search,read_web_page,Task,skill,load_plugin,reload_plugins,reload_skills,read_thread,find_thread,list_agent_modes,list_runners,create_thread,thread_interact,wait_for_threads,download_thread_file,upload_thread_file,notepad,librarian,oracle,finder,view_media,painter,public_artifact_url,thread_file_url" + knownSharedAgentModeTools + ",x_read,x_reply|deferred=true|visible=true|visibleInV2=true|serverOnly=false":                                                                {},
-	"large|primary=CLAUDE_OPUS_4_8|reasoning=|levels=|include=present|tools=finder,shell_command,shell_command_status,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,list_agent_modes,list_runners,create_thread,thread_interact,wait_for_threads,download_thread_file,upload_thread_file,notepad,skill,load_plugin,reload_plugins,reload_skills,oracle,librarian,Task,view_media,painter,public_artifact_url,thread_file_url,read_mcp_resource" + knownSharedAgentModeTools + "|deferred=true|visible=false|visibleInV2=false|serverOnly=false":                                                 {},
-	"low|primary=AMP_GLM_5_2|reasoning=medium|levels=|include=present|tools=finder,shell_command,shell_command_status,apply_patch,web_search,read_web_page,read_thread,find_thread,list_agent_modes,list_runners,create_thread,thread_interact,wait_for_threads,download_thread_file,upload_thread_file,notepad,skill,load_plugin,reload_plugins,reload_skills,oracle,librarian,Task,view_media,painter,public_artifact_url,thread_file_url" + knownSharedAgentModeTools + ",x_read,x_reply|deferred=false|visible=true|visibleInV2=true|serverOnly=false":                                                               {},
-	"medium|primary=GPT_5_6_SOL|reasoning=medium|levels=|include=present|tools=shell_command,shell_command_status,apply_patch,web_search,read_web_page,Task,skill,load_plugin,reload_plugins,reload_skills,read_thread,find_thread,list_agent_modes,list_runners,create_thread,thread_interact,wait_for_threads,download_thread_file,upload_thread_file,notepad,librarian,oracle,finder,view_media,painter,public_artifact_url,thread_file_url" + knownSharedAgentModeTools + ",x_read,x_reply|deferred=true|visible=true|visibleInV2=true|serverOnly=false":                                                             {},
-	"nostromo|primary=AMP_NOSTROMO|reasoning=low|levels=|include=present|tools=finder,shell_command,shell_command_status,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,list_agent_modes,list_runners,create_thread,thread_interact,wait_for_threads,download_thread_file,upload_thread_file,notepad,skill,load_plugin,reload_plugins,reload_skills,oracle,librarian,Task,view_media,painter,public_artifact_url,thread_file_url,read_mcp_resource" + knownSharedAgentModeTools + ",apply_patch|deferred=false|visible=true|visibleInV2=true|serverOnly=false":                                   {},
-	"puck|primary=GPT_5_6_SOL|reasoning=none|levels=|include=present|tools=find_thread,read_thread,web_search,read_web_page,docs_list,docs_read,docs_write,create_project,update_project,list_agent_modes,list_runners,create_thread,get_current_time,thread_interact,update_thread,archive_threads,wait_for_threads,thread_file_url,get_schedule,update_schedule,clear_schedule,send_email,slack_write,slack_read,x_read,x_reply,github_repo_ci_status,read_github,search_github,commit_search,list_directory_github,list_repositories,glob_github,diff|deferred=false|visible=false|visibleInV2=false|serverOnly=true": {},
+	"deep|primary=GPT_5_5|reasoning=medium|levels=|include=present|tools=shell_command,shell_command_status,apply_patch,web_search,read_web_page,Task,skill,load_plugin,reload_plugins,reload_skills,read_thread,find_thread,list_agent_modes,list_runners,create_thread,thread_interact,wait_for_threads,download_thread_file,upload_thread_file,notepad,librarian,oracle,finder,view_media,painter,public_artifact_url,thread_file_url" + knownSharedAgentModeTools + "|deferred=true|visible=false|visibleInV2=false|serverOnly=false":                                                                                                                                      {},
+	"high|primary=GPT_5_6_SOL|reasoning=xhigh|levels=|include=present|tools=shell_command,shell_command_status,apply_patch,web_search,read_web_page,Task,skill,load_plugin,reload_plugins,reload_skills,read_thread,find_thread,list_agent_modes,list_runners,create_thread,thread_interact,wait_for_threads,download_thread_file,upload_thread_file,notepad,librarian,oracle,finder,view_media,painter,public_artifact_url,thread_file_url" + knownSharedAgentModeTools + ",x_read,x_reply|deferred=true|visible=true|visibleInV2=true|serverOnly=false":                                                                                                                      {},
+	"large|primary=CLAUDE_OPUS_4_8|reasoning=|levels=|include=present|tools=finder,shell_command,shell_command_status,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,list_agent_modes,list_runners,create_thread,thread_interact,wait_for_threads,download_thread_file,upload_thread_file,notepad,skill,load_plugin,reload_plugins,reload_skills,oracle,librarian,Task,view_media,painter,public_artifact_url,thread_file_url,read_mcp_resource" + knownSharedAgentModeTools + "|deferred=true|visible=false|visibleInV2=false|serverOnly=false":                                                                                                       {},
+	"low|primary=AMP_GLM_5_2|reasoning=medium|levels=|include=present|tools=finder,shell_command,shell_command_status,apply_patch,web_search,read_web_page,read_thread,find_thread,list_agent_modes,list_runners,create_thread,thread_interact,wait_for_threads,download_thread_file,upload_thread_file,notepad,skill,load_plugin,reload_plugins,reload_skills,oracle,librarian,Task,view_media,painter,public_artifact_url,thread_file_url" + knownSharedAgentModeTools + ",x_read,x_reply|deferred=false|visible=true|visibleInV2=true|serverOnly=false":                                                                                                                     {},
+	"medium|primary=GPT_5_6_SOL|reasoning=medium|levels=|include=present|tools=shell_command,shell_command_status,apply_patch,web_search,read_web_page,Task,skill,load_plugin,reload_plugins,reload_skills,read_thread,find_thread,list_agent_modes,list_runners,create_thread,thread_interact,wait_for_threads,download_thread_file,upload_thread_file,notepad,librarian,oracle,finder,view_media,painter,public_artifact_url,thread_file_url" + knownSharedAgentModeTools + ",x_read,x_reply|deferred=true|visible=true|visibleInV2=true|serverOnly=false":                                                                                                                   {},
+	"nostromo|primary=AMP_NOSTROMO|reasoning=low|levels=|include=present|tools=finder,shell_command,shell_command_status,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,list_agent_modes,list_runners,create_thread,thread_interact,wait_for_threads,download_thread_file,upload_thread_file,notepad,skill,load_plugin,reload_plugins,reload_skills,oracle,librarian,Task,view_media,painter,public_artifact_url,thread_file_url,read_mcp_resource" + knownSharedAgentModeTools + ",apply_patch|deferred=false|visible=true|visibleInV2=true|serverOnly=false":                                                                                         {},
+	"puck|primary=GPT_5_6_SOL|reasoning=none|levels=|include=present|tools=find_thread,read_thread,web_search,read_web_page,docs_list,docs_read,docs_write,create_project,update_project,list_agent_modes,list_runners,list_workspace_members,find_shared_plugins_and_skills,create_thread,get_current_time,thread_interact,update_thread,archive_threads,wait_for_threads,thread_file_url,get_schedule,update_schedule,clear_schedule,send_email,slack_write,slack_read,x_read,x_reply,github_repo_ci_status,read_github,search_github,commit_search,list_directory_github,list_repositories,glob_github,diff|deferred=false|visible=false|visibleInV2=false|serverOnly=true": {},
 	"review|primary=GPT_5_5|reasoning=medium|levels=|include=present|tools=shell_command,run_check,submit_review,list_agent_modes,list_runners,create_thread|deferred=false|visible=false|visibleInV2=false|serverOnly=false":                                                                                                                                                                                                                                                                                                                                                            {},
 	"rush|primary=GPT_5_5|reasoning=none|levels=|include=present|tools=finder,shell_command,shell_command_status,apply_patch,web_search,read_web_page,read_thread,find_thread,list_agent_modes,list_runners,create_thread,thread_interact,wait_for_threads,download_thread_file,upload_thread_file,notepad,skill,load_plugin,reload_plugins,reload_skills,oracle,librarian,Task,view_media,painter,public_artifact_url,thread_file_url" + knownSharedAgentModeTools + "|deferred=false|visible=false|visibleInV2=false|serverOnly=false":                                                 {},
 	"smart|primary=CLAUDE_OPUS_4_8|reasoning=high|levels=|include=present|tools=finder,shell_command,shell_command_status,create_file,edit_file,web_search,read_web_page,read_thread,find_thread,list_agent_modes,list_runners,create_thread,thread_interact,wait_for_threads,download_thread_file,upload_thread_file,notepad,skill,load_plugin,reload_plugins,reload_skills,oracle,librarian,Task,view_media,painter,public_artifact_url,thread_file_url,read_mcp_resource" + knownSharedAgentModeTools + "|deferred=true|visible=false|visibleInV2=false|serverOnly=false":             {},
@@ -2112,6 +2113,7 @@ func classifyStrings(strs []string) Signals {
 			}
 		}
 	}
+	addSplitReviewCLIDeprecationWarningMarker(reviewContract, strs)
 	_, hasActionRequest := actors["ActionRequest"]
 	_, hasActionResponse := actors["ActionResponse"]
 	if hasActionRequest && hasActionResponse && seenRivetEncodingPrefix && seenRivetSerializeWithEmbeddedVersion && seenRivetDeserializeWithEmbeddedVersion {
@@ -3309,6 +3311,9 @@ func containsToolCatalogMarker(s, marker string) bool {
 }
 
 func addReviewContractMarkers(found map[string]struct{}, s string) {
+	if containsReviewCLIDeprecationWarning(s) {
+		found["review-cli-deprecation-warning"] = struct{}{}
+	}
 	if strings.Contains(s, "Do not include run_check findings in submit_review") {
 		found["review-submit-omits-run-check-findings"] = struct{}{}
 	}
@@ -3327,6 +3332,69 @@ func addReviewContractMarkers(found map[string]struct{}, s string) {
 	if strings.Contains(s, "yellow") && strings.Contains(s, "issues found") && strings.Contains(s, "result.check.name") {
 		found["human-review-check-footer-counts-issues"] = struct{}{}
 	}
+}
+
+func addSplitReviewCLIDeprecationWarningMarker(found map[string]struct{}, strs []string) {
+	for start := range strs {
+		var candidate strings.Builder
+		progress := 0
+		for index := start; index < len(strs); index++ {
+			if candidate.Len()+len(strs[index]) > reviewCLIDeprecationWarningWindowBytes {
+				break
+			}
+			candidate.WriteString(strs[index])
+			if containsReviewCLIDeprecationWarning(candidate.String()) {
+				found["review-cli-deprecation-warning"] = struct{}{}
+				return
+			}
+			nextProgress := reviewCLIDeprecationWarningProgress(candidate.String())
+			if nextProgress <= progress {
+				break
+			}
+			progress = nextProgress
+		}
+	}
+}
+
+const reviewCLIDeprecationWarningWindowBytes = 1024
+
+var reviewCLIDeprecationWarningFragments = []string{
+	"Ask Amp to review the changes with the oracle instead",
+	"Ask the oracle to review uncommitted changes",
+	"Ask the oracle to review the changes since the merge base",
+}
+
+func containsReviewCLIDeprecationWarning(s string) bool {
+	remaining := s
+	for _, fragment := range reviewCLIDeprecationWarningFragments {
+		index := strings.Index(remaining, fragment)
+		if index < 0 {
+			return false
+		}
+		remaining = remaining[index+len(fragment):]
+	}
+	return true
+}
+
+func reviewCLIDeprecationWarningProgress(s string) int {
+	remaining := s
+	progress := 0
+	for _, fragment := range reviewCLIDeprecationWarningFragments {
+		index := strings.Index(remaining, fragment)
+		if index >= 0 {
+			progress += len(fragment)
+			remaining = remaining[index+len(fragment):]
+			continue
+		}
+		for prefixLength := min(len(fragment)-1, len(remaining)); prefixLength > 0; prefixLength-- {
+			if strings.HasSuffix(remaining, fragment[:prefixLength]) {
+				progress += prefixLength
+				break
+			}
+		}
+		break
+	}
+	return progress
 }
 
 func containsRunCheckURIInputShape(s string) bool {

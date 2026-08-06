@@ -3,6 +3,9 @@ package amp
 import (
 	"context"
 	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -23,7 +26,7 @@ func TestNeoActorRunsTopLevelThreadToolsLocallyWhenExecutorOmitsThem(t *testing.
 	target := rt.store.ensureThreadActor(targetID)
 	source.executorBootstrapComplete = true
 
-	for _, name := range []string{"find_thread", "list_agent_modes", "list_runners", "create_thread", "thread_interact", "rename_thread", "set_thread_pinned", "add_thread_labels", "remove_thread_labels", "archive_current_thread", "archive_thread", "archive_threads", "unarchive_thread", "send_message_to_thread", "download_thread_file", "upload_thread_file"} {
+	for _, name := range []string{"find_thread", "list_agent_modes", "list_runners", "list_workspace_members", "find_shared_plugins_and_skills", "create_thread", "thread_interact", "rename_thread", "set_thread_pinned", "add_thread_labels", "remove_thread_labels", "archive_current_thread", "archive_thread", "archive_threads", "unarchive_thread", "send_message_to_thread", "download_thread_file", "upload_thread_file"} {
 		if !source.shouldRunLocalActorTool(name) {
 			t.Fatalf("%s should run locally when executor omitted it", name)
 		}
@@ -33,7 +36,7 @@ func TestNeoActorRunsTopLevelThreadToolsLocallyWhenExecutorOmitsThem(t *testing.
 	for _, tool := range tools {
 		got[tool.Name] = true
 	}
-	for _, name := range []string{"list_agent_modes", "list_runners", "create_thread", "thread_interact"} {
+	for _, name := range []string{"list_agent_modes", "list_runners", "list_workspace_members", "find_shared_plugins_and_skills", "create_thread", "thread_interact"} {
 		if !got[name] {
 			t.Fatalf("high tools missing synthetic %s: %#v", name, tools)
 		}
@@ -85,7 +88,7 @@ func TestNeoPuckWithoutExecutorExposesOnlyRunnableServerTools(t *testing.T) {
 	for _, tool := range actor.inferenceRequestLocked("puck", "", "").Tools {
 		names[tool.Name] = true
 	}
-	for _, name := range []string{"find_thread", "read_thread", "list_agent_modes", "list_runners", "create_thread", "thread_interact", "update_thread", "archive_threads", "get_schedule", "set_schedule", "update_schedule", "clear_schedule", "github_repo_ci_status", "read_github", "search_github", "commit_search", "list_directory_github", "list_repositories", "glob_github", "diff"} {
+	for _, name := range []string{"find_thread", "read_thread", "list_agent_modes", "list_runners", "list_workspace_members", "find_shared_plugins_and_skills", "create_thread", "thread_interact", "update_thread", "archive_threads", "get_schedule", "set_schedule", "update_schedule", "clear_schedule", "github_repo_ci_status", "read_github", "search_github", "commit_search", "list_directory_github", "list_repositories", "glob_github", "diff"} {
 		if !names[name] {
 			t.Fatalf("executor-less Puck missing runnable tool %s: %#v", name, names)
 		}
@@ -93,6 +96,334 @@ func TestNeoPuckWithoutExecutorExposesOnlyRunnableServerTools(t *testing.T) {
 	for _, name := range []string{"web_search", "read_web_page", "docs_list", "docs_read", "docs_write", "create_project", "publish_thread_artifacts", "slack_write", "slack_read", "get_thread_metadata", "archive_thread", "unarchive_thread", "send_message_to_thread", "rename_thread", "set_thread_pinned", "add_thread_labels", "remove_thread_labels"} {
 		if names[name] {
 			t.Fatalf("executor-less Puck exposed unavailable tool %s: %#v", name, names)
+		}
+	}
+}
+
+func TestNeoWorkspaceToolsUseAuthoritativeInternalRPCs(t *testing.T) {
+	type capturedRequest struct {
+		method      string
+		path        string
+		rawQuery    string
+		body        string
+		authorize   string
+		application string
+		clientType  string
+		version     string
+	}
+	requests := make(chan capturedRequest, 2)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		requests <- capturedRequest{
+			method:      r.Method,
+			path:        r.URL.Path,
+			rawQuery:    r.URL.RawQuery,
+			body:        string(body),
+			authorize:   r.Header.Get("Authorization"),
+			application: r.Header.Get("X-Amp-Client-Application"),
+			clientType:  r.Header.Get("X-Amp-Client-Type"),
+			version:     r.Header.Get("X-Amp-Client-Version"),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.RawQuery {
+		case "listWorkspaceMembers":
+			_, _ = io.WriteString(w, `{"ok":true,"result":{"workspace":{"id":"workspace-1","name":"engineering","displayName":null,"ignored":"value"},"members":[{"userID":"user-2","username":null,"displayName":"Second"},{"userID":"user-1","username":"first","displayName":null}],"ignored":true}}`)
+		case "findSharedPluginsAndSkills":
+			_, _ = io.WriteString(w, `{"ok":true,"result":{"workspace":{"id":"workspace-1","name":"engineering","displayName":"Engineering"},"items":[{"kind":"skill","name":"reviewing","id":"skill-2","description":null,"owner":{"userID":"user-2","username":null,"displayName":"Second"}},{"kind":"plugin","name":"browser","id":"plugin-1","description":"Browser tools","owner":{"userID":"user-1","username":"first","displayName":null}}],"hasMore":true}}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(upstream.Close)
+
+	mapped := NewMappedSecretSource(NewStaticSecretSource(""))
+	mapped.UpdateMappings([]config.AmpUpstreamAPIKeyEntry{{UpstreamAPIKey: "request-upstream-key", APIKeys: []string{"local-client-key"}}})
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+		UpstreamURL:                   upstream.URL,
+		UpstreamAPIKey:                "wrong-default-key",
+		UpstreamClientVersionOverride: "test-client-version",
+	}})
+	rt.setSecretSource(mapped)
+	actor := rt.store.ensureThreadActor("T-019f7000-0000-7000-8000-0000000000c1")
+
+	listed, err := actor.executeLocalThreadTool(neoPendingTool{
+		Name:         "list_workspace_members",
+		Input:        map[string]any{"ignored": true},
+		ClientAPIKey: "local-client-key",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listRequest := <-requests
+	if listRequest.method != http.MethodPost || listRequest.path != "/api/internal" || listRequest.rawQuery != "listWorkspaceMembers" || listRequest.body != `{"method":"listWorkspaceMembers","params":{}}` {
+		t.Fatalf("list request = %#v", listRequest)
+	}
+	if listRequest.authorize != "Bearer request-upstream-key" || listRequest.application != "CLI" || listRequest.clientType != "cli" || listRequest.version != "test-client-version" {
+		t.Fatalf("list headers = %#v", listRequest)
+	}
+	wantListed := map[string]any{
+		"workspace": map[string]any{"id": "workspace-1", "name": "engineering", "displayName": nil},
+		"members": []any{
+			map[string]any{"userID": "user-2", "username": nil, "displayName": "Second"},
+			map[string]any{"userID": "user-1", "username": "first", "displayName": nil},
+		},
+	}
+	if !reflect.DeepEqual(listed, wantListed) {
+		t.Fatalf("list result = %#v, want %#v", listed, wantListed)
+	}
+
+	found, err := actor.executeLocalThreadTool(neoPendingTool{
+		Name: "find_shared_plugins_and_skills",
+		Input: map[string]any{
+			"query":       "review",
+			"kind":        "skill",
+			"ownerUserID": "user-2",
+			"limit":       float64(50),
+		},
+		ClientAPIKey: "local-client-key",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	findRequest := <-requests
+	if findRequest.method != http.MethodPost || findRequest.path != "/api/internal" || findRequest.rawQuery != "findSharedPluginsAndSkills" || findRequest.body != `{"method":"findSharedPluginsAndSkills","params":{"kind":"skill","limit":50,"ownerUserID":"user-2","query":"review"}}` {
+		t.Fatalf("find request = %#v", findRequest)
+	}
+	if findRequest.authorize != "Bearer request-upstream-key" || findRequest.application != "CLI" || findRequest.clientType != "cli" || findRequest.version != "test-client-version" {
+		t.Fatalf("find headers = %#v", findRequest)
+	}
+	wantFound := map[string]any{
+		"workspace": map[string]any{"id": "workspace-1", "name": "engineering", "displayName": "Engineering"},
+		"items": []any{
+			map[string]any{"kind": "skill", "name": "reviewing", "id": "skill-2", "description": nil, "owner": map[string]any{"userID": "user-2", "username": nil, "displayName": "Second"}},
+			map[string]any{"kind": "plugin", "name": "browser", "id": "plugin-1", "description": "Browser tools", "owner": map[string]any{"userID": "user-1", "username": "first", "displayName": nil}},
+		},
+		"hasMore": true,
+	}
+	if !reflect.DeepEqual(found, wantFound) {
+		t.Fatalf("find result = %#v, want %#v", found, wantFound)
+	}
+}
+
+func TestNeoWorkspaceToolsPreserveNullWorkspaceAndEmptyArrays(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.RawQuery == "listWorkspaceMembers" {
+			_, _ = io.WriteString(w, `{"ok":true,"result":{"workspace":null,"members":[]}}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"ok":true,"result":{"workspace":null,"items":[],"hasMore":false}}`)
+	}))
+	t.Cleanup(upstream.Close)
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{UpstreamURL: upstream.URL, UpstreamAPIKey: "upstream-key"}})
+	actor := rt.store.ensureThreadActor("T-019f7000-0000-7000-8000-0000000000c2")
+
+	listed, err := actor.executeLocalThreadTool(neoPendingTool{Name: "list_workspace_members"})
+	if err != nil || listed["workspace"] != nil || !reflect.DeepEqual(listed["members"], []any{}) {
+		t.Fatalf("list result=%#v err=%v", listed, err)
+	}
+	found, err := actor.executeLocalThreadTool(neoPendingTool{Name: "find_shared_plugins_and_skills"})
+	if err != nil || found["workspace"] != nil || !reflect.DeepEqual(found["items"], []any{}) || found["hasMore"] != false {
+		t.Fatalf("find result=%#v err=%v", found, err)
+	}
+}
+
+func TestNeoFindSharedPluginsAndSkillsValidatesOptionalInput(t *testing.T) {
+	valid := []map[string]any{
+		{"query": strings.Repeat("界", 200)},
+		{"kind": "plugin"},
+		{"kind": "skill"},
+		{"ownerUserID": "user-1"},
+		{"limit": 1},
+		{"limit": float64(50)},
+	}
+	for _, input := range valid {
+		if _, err := neoSharedPluginsAndSkillsParams(input); err != nil {
+			t.Errorf("valid input %#v: %v", input, err)
+		}
+	}
+	invalid := []map[string]any{
+		{"query": strings.Repeat("界", 201)},
+		{"query": nil},
+		{"kind": "other"},
+		{"kind": 1},
+		{"ownerUserID": ""},
+		{"ownerUserID": "   "},
+		{"ownerUserID": nil},
+		{"limit": 0},
+		{"limit": 51},
+		{"limit": 1.5},
+		{"limit": "1"},
+	}
+	for _, input := range invalid {
+		if _, err := neoSharedPluginsAndSkillsParams(input); err == nil {
+			t.Errorf("invalid input %#v was accepted", input)
+		}
+	}
+}
+
+func TestNeoWorkspaceToolSpecsAndExposure(t *testing.T) {
+	listSpec, ok := neoSyntheticLocalToolSpec("list_workspace_members")
+	if !ok || !strings.Contains(listSpec.Description, "authoritative") || !reflect.DeepEqual(mapValue(listSpec.InputSchema["properties"]), map[string]any{}) || !reflect.DeepEqual(arrayValue(listSpec.InputSchema["required"]), []any{}) {
+		t.Fatalf("list spec = %#v, ok=%v", listSpec, ok)
+	}
+	findSpec, ok := neoSyntheticLocalToolSpec("find_shared_plugins_and_skills")
+	properties := mapValue(findSpec.InputSchema["properties"])
+	limit := mapValue(properties["limit"])
+	if !ok || !strings.Contains(findSpec.Description, "hasMore=true") || !strings.Contains(findSpec.Description, "up to 50") || numberFrom(mapValue(properties["query"])["maxLength"]) != 200 || !reflect.DeepEqual(arrayValue(mapValue(properties["kind"])["enum"]), []any{"plugin", "skill"}) || numberFrom(mapValue(properties["ownerUserID"])["minLength"]) != 1 || numberFrom(limit["minimum"]) != 1 || numberFrom(limit["maximum"]) != 50 || !strings.Contains(stringValue(limit["description"]), "upstream default") {
+		t.Fatalf("find spec = %#v, ok=%v", findSpec, ok)
+	}
+
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	actor := rt.store.ensureThreadActor("T-019f7000-0000-7000-8000-0000000000c3")
+	actor.mu.Lock()
+	actor.executorBootstrapComplete = true
+	builtinTools := actor.inferenceRequestLocked("high", "", "").Tools
+	customMode := "custom-workspace-tools"
+	actor.settings[neoCustomAgentModeSetting] = customMode
+	actor.settings[neoCustomAgentToolsSetting] = "all"
+	actor.currentAgentMode = customMode
+	customTools := actor.inferenceRequestLocked(customMode, "medium", "").Tools
+	actor.mu.Unlock()
+	for label, tools := range map[string][]neoToolSpec{"builtin": builtinTools, "custom all": customTools} {
+		names := map[string]bool{}
+		for _, tool := range tools {
+			names[tool.Name] = true
+		}
+		for _, name := range []string{"list_workspace_members", "find_shared_plugins_and_skills"} {
+			if !names[name] {
+				t.Errorf("%s tools missing %s", label, name)
+			}
+		}
+	}
+	for _, name := range []string{"list_workspace_members", "find_shared_plugins_and_skills"} {
+		if !actor.shouldRunLocalActorTool(name) {
+			t.Errorf("%s is not owned by local actor dispatch", name)
+		}
+	}
+}
+
+func TestNeoWorkspaceToolsFailExplicitlyWhenUpstreamOrAuthUnavailable(t *testing.T) {
+	noUpstream := newNeoRuntime(&config.Config{}).store.ensureThreadActor("T-019f7000-0000-7000-8000-0000000000c4")
+	if result, err := noUpstream.executeLocalThreadTool(neoPendingTool{Name: "list_workspace_members"}); err == nil || result != nil || !strings.Contains(err.Error(), "upstream is unavailable") {
+		t.Fatalf("unavailable result=%#v err=%v", result, err)
+	}
+
+	noAuthRuntime := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{UpstreamURL: "http://127.0.0.1:1"}})
+	noAuthRuntime.setSecretSource(NewStaticSecretSource(""))
+	noAuth := noAuthRuntime.store.ensureThreadActor("T-019f7000-0000-7000-8000-0000000000c5")
+	if result, err := noAuth.executeLocalThreadTool(neoPendingTool{Name: "find_shared_plugins_and_skills"}); err == nil || result != nil || !strings.Contains(err.Error(), "authentication is unavailable") {
+		t.Fatalf("auth result=%#v err=%v", result, err)
+	}
+
+	for _, test := range []struct {
+		name       string
+		statusCode int
+		body       string
+		tool       string
+		want       string
+	}{
+		{name: "non-2xx", statusCode: http.StatusBadGateway, body: `{"error":"offline"}`, tool: "list_workspace_members", want: "HTTP 502"},
+		{name: "ok false", statusCode: http.StatusOK, body: `{"ok":false,"error":"denied"}`, tool: "find_shared_plugins_and_skills", want: "failed"},
+		{name: "missing ok", statusCode: http.StatusOK, body: `{"result":{"workspace":null,"members":[]}}`, tool: "list_workspace_members", want: "missing ok"},
+		{name: "trailing response data", statusCode: http.StatusOK, body: `{"ok":true,"result":{"workspace":null,"members":[]}} trailing`, tool: "list_workspace_members", want: "decode"},
+		{name: "oversized response", statusCode: http.StatusOK, body: strings.Repeat("x", neoAmpInternalRPCMaxResponseBytes+1), tool: "list_workspace_members", want: "response exceeded"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(test.statusCode)
+				_, _ = io.WriteString(w, test.body)
+			}))
+			defer upstream.Close()
+			rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{UpstreamURL: upstream.URL, UpstreamAPIKey: "key"}})
+			actor := rt.store.ensureThreadActor("T-019f7000-0000-7000-8000-0000000000c6")
+			result, err := actor.executeLocalThreadTool(neoPendingTool{Name: test.tool})
+			if err == nil || result != nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("result=%#v err=%v, want %q", result, err, test.want)
+			}
+		})
+	}
+}
+
+func TestNeoWorkspaceToolRequestIsCancelledWhenGenerationAdvances(t *testing.T) {
+	useTempNeoThreadStore(t)
+	requestStarted := make(chan struct{})
+	requestCancelled := make(chan struct{})
+	releaseRequest := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			return
+		}
+		flusher.Flush()
+		close(requestStarted)
+		select {
+		case <-r.Context().Done():
+			close(requestCancelled)
+		case <-releaseRequest:
+		}
+	}))
+	t.Cleanup(func() {
+		close(releaseRequest)
+		upstream.Close()
+	})
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{UpstreamURL: upstream.URL, UpstreamAPIKey: "key"}})
+	actor := rt.store.ensureThreadActor("T-019f7000-0000-7000-8000-0000000000c8")
+	t.Cleanup(actor.cancel)
+	pending := neoPendingTool{ID: "TU-workspace-cancel", Name: "list_workspace_members", AgentMode: "high", MessageID: "M-assistant"}
+	actor.mu.Lock()
+	actor.pendingTools[pending.ID] = pending
+	actor.agentState = "running_tools"
+	generation := actor.generation
+	actor.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		actor.runLocalThreadActorTool(pending, generation)
+		close(done)
+	}()
+	select {
+	case <-requestStarted:
+	case <-time.After(time.Second):
+		t.Fatal("workspace RPC did not start")
+	}
+	actor.cancel()
+	select {
+	case <-requestCancelled:
+	case <-time.After(time.Second):
+		t.Fatal("generation advance did not cancel workspace RPC")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("workspace tool did not stop after cancellation")
+	}
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.subagentRuns) != 0 {
+		t.Fatalf("cancelled workspace tool retained %d run contexts", len(actor.subagentRuns))
+	}
+	if _, exists := actor.pendingTools[pending.ID]; exists {
+		t.Fatal("cancelled workspace tool remained pending")
+	}
+}
+
+func TestNeoWorkspaceToolsRejectMalformedUpstreamContracts(t *testing.T) {
+	responses := map[string]string{
+		"listWorkspaceMembers":       `{"ok":true,"result":{"workspace":{"id":"workspace-1","name":"engineering"},"members":[]}}`,
+		"findSharedPluginsAndSkills": `{"ok":true,"result":{"workspace":null,"items":[],"hasMore":"false"}}`,
+	}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, responses[r.URL.RawQuery])
+	}))
+	t.Cleanup(upstream.Close)
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{UpstreamURL: upstream.URL, UpstreamAPIKey: "key"}})
+	actor := rt.store.ensureThreadActor("T-019f7000-0000-7000-8000-0000000000c7")
+	for _, name := range []string{"list_workspace_members", "find_shared_plugins_and_skills"} {
+		if result, err := actor.executeLocalThreadTool(neoPendingTool{Name: name}); err == nil || result != nil {
+			t.Errorf("%s accepted malformed result %#v, err=%v", name, result, err)
 		}
 	}
 }
