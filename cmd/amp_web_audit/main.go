@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -29,10 +30,12 @@ const (
 )
 
 var (
-	defaultWebBaselinePath = filepath.Join("dev", "amp-web-parity-baseline.json")
-	appEntryPattern        = regexp.MustCompile(`(?:https?://[^"']+)?(/_app/immutable/entry/app\.[A-Za-z0-9_-]+\.js)`)
-	nodePathPattern        = regexp.MustCompile(`\.\./nodes/([0-9]+)\.[A-Za-z0-9_-]+\.js`)
-	dependencyMapPattern   = regexp.MustCompile(`(?s)m\.f\|\|\(m\.f=\[(.*?)\]\)\)\)=>`)
+	defaultWebBaselinePath    = filepath.Join("dev", "amp-web-parity-baseline.json")
+	appEntryPattern           = regexp.MustCompile(`(?:https?://[^"']+)?(/_app/immutable/entry/app\.[A-Za-z0-9_-]+\.js)`)
+	nodePathPattern           = regexp.MustCompile(`\.\./nodes/([0-9]+)\.[A-Za-z0-9_-]+\.js`)
+	dependencyMapPattern      = regexp.MustCompile(`(?s)m\.f\|\|\(m\.f=\[(.*?)\]\)\)\)=>`)
+	nestedJSImportPathPattern = regexp.MustCompile(`^(\./[A-Za-z0-9_.-]+\.js|(?:\.\./)+(?:chunks|nodes)/[A-Za-z0-9_.-]+\.js)$`)
+	nestedDependencyPattern   = regexp.MustCompile(`__vite__mapDeps\(\[([0-9,\s]*)\]\)`)
 )
 
 type webBaseline struct {
@@ -237,36 +240,62 @@ func fetchWebAssets(client *http.Client, source string, routes []string) ([]webA
 		return nil, err
 	}
 
-	paths, err := selectedRouteAssetPaths(entry, routes)
-	if err != nil {
-		return nil, err
-	}
-	paths[string(entryMatch[1])] = struct{}{}
-	if len(paths) > maxAssetCount {
-		return nil, fmt.Errorf("selected route asset count %d exceeds limit %d", len(paths), maxAssetCount)
-	}
-
-	assets := make([]webAsset, 0, len(paths)+1)
-	assets = append(assets, webAsset{Path: entryURL.Path, Body: entry})
-	delete(paths, string(entryMatch[1]))
-	remainingBundleBytes, err := remainingWebBundleBytes(len(entry), maxBundleBytes)
-	if err != nil {
-		return nil, err
-	}
-	fetched, err := fetchAssetPathsLimited(client, base, paths, remainingBundleBytes)
-	if err != nil {
-		return nil, err
-	}
-	assets = append(assets, fetched...)
-	sort.Slice(assets, func(i, j int) bool { return assets[i].Path < assets[j].Path })
-	return assets, nil
-}
-
-func selectedRouteAssetPaths(entry []byte, routes []string) (map[string]struct{}, error) {
 	dependencyPaths, err := parseDependencyMap(entry)
 	if err != nil {
 		return nil, err
 	}
+	paths, err := selectedRouteAssetPaths(entry, routes, dependencyPaths)
+	if err != nil {
+		return nil, err
+	}
+
+	entryPath := entryURL.Path
+	delete(paths, entryPath)
+	seenPaths := map[string]struct{}{entryPath: {}}
+	for path := range paths {
+		seenPaths[path] = struct{}{}
+	}
+	if len(seenPaths) > maxAssetCount {
+		return nil, fmt.Errorf("selected route asset count %d exceeds limit %d", len(seenPaths), maxAssetCount)
+	}
+
+	assets := make([]webAsset, 0, len(paths)+1)
+	assets = append(assets, webAsset{Path: entryURL.Path, Body: entry})
+	remainingBundleBytes, err := remainingWebBundleBytes(len(entry), maxBundleBytes)
+	if err != nil {
+		return nil, err
+	}
+	for len(paths) > 0 {
+		fetched, err := fetchAssetPathsLimited(client, base, paths, remainingBundleBytes)
+		if err != nil {
+			return nil, err
+		}
+		nextPaths := map[string]struct{}{}
+		for _, asset := range fetched {
+			remainingBundleBytes -= len(asset.Body)
+			nestedPaths, err := nestedWebAssetPaths(asset, dependencyPaths)
+			if err != nil {
+				return nil, err
+			}
+			for path := range nestedPaths {
+				if _, exists := seenPaths[path]; exists {
+					continue
+				}
+				seenPaths[path] = struct{}{}
+				if len(seenPaths) > maxAssetCount {
+					return nil, fmt.Errorf("selected route asset count %d exceeds limit %d", len(seenPaths), maxAssetCount)
+				}
+				nextPaths[path] = struct{}{}
+			}
+		}
+		assets = append(assets, fetched...)
+		paths = nextPaths
+	}
+	sort.Slice(assets, func(i, j int) bool { return assets[i].Path < assets[j].Path })
+	return assets, nil
+}
+
+func selectedRouteAssetPaths(entry []byte, routes, dependencyPaths []string) (map[string]struct{}, error) {
 	nodePaths := map[int]string{}
 	for _, match := range nodePathPattern.FindAllSubmatch(entry, -1) {
 		index, err := strconv.Atoi(string(match[1]))
@@ -318,6 +347,305 @@ func selectedRouteAssetPaths(entry []byte, routes []string) (map[string]struct{}
 	return paths, nil
 }
 
+func nestedWebAssetPaths(asset webAsset, dependencyPaths []string) (map[string]struct{}, error) {
+	assetURL, err := url.Parse(asset.Path)
+	if err != nil {
+		return nil, err
+	}
+	paths := map[string]struct{}{}
+	code := javascriptCodeOnly(asset.Body)
+	for _, specifier := range nestedJSImportSpecifiers(asset.Body, code) {
+		nestedURL, err := assetURL.Parse(specifier)
+		if err != nil {
+			return nil, err
+		}
+		path, err := canonicalWebAssetPath(nestedURL.String())
+		if err != nil {
+			return nil, fmt.Errorf("resolve nested JavaScript import %q from %q: %w", specifier, asset.Path, err)
+		}
+		paths[path] = struct{}{}
+	}
+	for _, match := range nestedDependencyPattern.FindAllSubmatch(code, -1) {
+		for _, rawIndex := range strings.Split(string(match[1]), ",") {
+			rawIndex = strings.TrimSpace(rawIndex)
+			if rawIndex == "" {
+				continue
+			}
+			dependencyIndex, err := strconv.Atoi(rawIndex)
+			if err != nil {
+				return nil, err
+			}
+			if dependencyIndex < 0 || dependencyIndex >= len(dependencyPaths) {
+				return nil, fmt.Errorf("asset %q references dependency index %d outside map", asset.Path, dependencyIndex)
+			}
+			path := dependencyPaths[dependencyIndex]
+			if strings.HasSuffix(path, ".js") {
+				paths[path] = struct{}{}
+			}
+		}
+	}
+	return paths, nil
+}
+
+func nestedJSImportSpecifiers(body, code []byte) []string {
+	var specifiers []string
+	for index := 0; index < len(code); {
+		if !isJavaScriptIdentifierByte(code[index]) {
+			index++
+			continue
+		}
+		start := index
+		for index < len(code) && isJavaScriptIdentifierByte(code[index]) {
+			index++
+		}
+		keyword := string(code[start:index])
+		if keyword != "import" && keyword != "from" || start > 0 && code[start-1] == '.' {
+			continue
+		}
+		next := skipJavaScriptTrivia(body, index)
+		dynamicImport := false
+		if keyword == "import" && next < len(body) && body[next] == '(' {
+			dynamicImport = true
+			next = skipJavaScriptTrivia(body, next+1)
+		}
+		specifier, end, ok := javascriptStringValueAt(body, next)
+		if !ok || !nestedJSImportPathPattern.MatchString(specifier) {
+			continue
+		}
+		if dynamicImport {
+			next = skipJavaScriptTrivia(body, end)
+			if next >= len(body) || body[next] != ')' && body[next] != ',' {
+				continue
+			}
+		}
+		specifiers = append(specifiers, specifier)
+		index = end
+	}
+	return specifiers
+}
+
+func javascriptCodeOnly(body []byte) []byte {
+	code := append([]byte(nil), body...)
+	for index := 0; index < len(body); {
+		if body[index] == '`' {
+			index = maskJavaScriptTemplate(body, code, index)
+			continue
+		}
+		end, ok := skipJavaScriptNonCode(body, index)
+		if !ok {
+			end, ok = skipJavaScriptRegex(body, code, index)
+			if !ok {
+				index++
+				continue
+			}
+		}
+		maskJavaScriptBytes(code, index, end)
+		index = end
+	}
+	return code
+}
+
+func maskJavaScriptTemplate(body, code []byte, index int) int {
+	maskJavaScriptBytes(code, index, index+1)
+	index++
+	for index < len(body) {
+		switch {
+		case body[index] == '\\':
+			end := min(index+2, len(body))
+			maskJavaScriptBytes(code, index, end)
+			index = end
+		case body[index] == '`':
+			maskJavaScriptBytes(code, index, index+1)
+			return index + 1
+		case body[index] == '$' && index+1 < len(body) && body[index+1] == '{':
+			maskJavaScriptBytes(code, index, index+2)
+			index = maskJavaScriptTemplateExpression(body, code, index+2)
+		default:
+			maskJavaScriptBytes(code, index, index+1)
+			index++
+		}
+	}
+	return index
+}
+
+func maskJavaScriptTemplateExpression(body, code []byte, index int) int {
+	depth := 1
+	for index < len(body) {
+		if body[index] == '`' {
+			index = maskJavaScriptTemplate(body, code, index)
+			continue
+		}
+		if end, ok := skipJavaScriptNonCode(body, index); ok {
+			maskJavaScriptBytes(code, index, end)
+			index = end
+			continue
+		}
+		if end, ok := skipJavaScriptRegex(body, code, index); ok {
+			maskJavaScriptBytes(code, index, end)
+			index = end
+			continue
+		}
+		switch body[index] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				maskJavaScriptBytes(code, index, index+1)
+				return index + 1
+			}
+		}
+		index++
+	}
+	return index
+}
+
+func maskJavaScriptBytes(code []byte, start, end int) {
+	for index := start; index < end; index++ {
+		if code[index] != '\n' && code[index] != '\r' {
+			code[index] = ' '
+		}
+	}
+}
+
+func skipJavaScriptNonCode(body []byte, index int) (int, bool) {
+	if index >= len(body) {
+		return index, false
+	}
+	if body[index] == '\'' || body[index] == '"' {
+		return skipJavaScriptQuoted(body, index), true
+	}
+	if body[index] != '/' || index+1 >= len(body) {
+		return index, false
+	}
+	if body[index+1] == '/' {
+		index += 2
+		for index < len(body) && body[index] != '\n' && body[index] != '\r' {
+			index++
+		}
+		return index, true
+	}
+	if body[index+1] == '*' {
+		index += 2
+		for index+1 < len(body) && (body[index] != '*' || body[index+1] != '/') {
+			index++
+		}
+		if index+1 < len(body) {
+			index += 2
+		}
+		return index, true
+	}
+	return index, false
+}
+
+func skipJavaScriptRegex(body, code []byte, index int) (int, bool) {
+	if index >= len(body) || body[index] != '/' || !javascriptRegexCanStart(code, index) {
+		return index, false
+	}
+	inClass := false
+	for end := index + 1; end < len(body); end++ {
+		switch body[end] {
+		case '\\':
+			end++
+		case '[':
+			inClass = true
+		case ']':
+			inClass = false
+		case '/', '\n', '\r':
+			if body[end] != '/' || inClass {
+				if body[end] == '\n' || body[end] == '\r' {
+					return index, false
+				}
+				continue
+			}
+			end++
+			for end < len(body) && isJavaScriptIdentifierByte(body[end]) {
+				end++
+			}
+			return end, true
+		}
+	}
+	return index, false
+}
+
+func javascriptRegexCanStart(code []byte, index int) bool {
+	for index > 0 {
+		index--
+		switch code[index] {
+		case ' ', '\t', '\n', '\r':
+			continue
+		case '+', '-':
+			return index == 0 || code[index-1] != code[index]
+		case '(', '[', '{', '=', ':', ',', ';', '!', '?', '&', '|', '*', '/', '%', '^', '~', '<', '>':
+			return true
+		default:
+			end := index + 1
+			for index > 0 && isJavaScriptIdentifierByte(code[index-1]) {
+				index--
+			}
+			switch string(code[index:end]) {
+			case "await", "case", "delete", "do", "else", "in", "instanceof", "of", "return", "throw", "typeof", "void", "yield":
+				return true
+			default:
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func skipJavaScriptQuoted(body []byte, index int) int {
+	quote := body[index]
+	index++
+	for index < len(body) {
+		if body[index] == '\\' {
+			index += 2
+			continue
+		}
+		index++
+		if body[index-1] == quote {
+			break
+		}
+	}
+	return min(index, len(body))
+}
+
+func skipJavaScriptWhitespace(body []byte, index int) int {
+	for index < len(body) && (body[index] == ' ' || body[index] == '\t' || body[index] == '\n' || body[index] == '\r') {
+		index++
+	}
+	return index
+}
+
+func skipJavaScriptTrivia(body []byte, index int) int {
+	for {
+		index = skipJavaScriptWhitespace(body, index)
+		if index+1 >= len(body) || body[index] != '/' || body[index+1] != '/' && body[index+1] != '*' {
+			return index
+		}
+		index, _ = skipJavaScriptNonCode(body, index)
+	}
+}
+
+func javascriptStringValueAt(body []byte, index int) (string, int, bool) {
+	if index >= len(body) || body[index] != '\'' && body[index] != '"' {
+		return "", index, false
+	}
+	end := skipJavaScriptQuoted(body, index)
+	if end <= index+1 || end > len(body) || body[end-1] != body[index] {
+		return "", end, false
+	}
+	value := body[index+1 : end-1]
+	if bytes.IndexByte(value, '\\') >= 0 {
+		return "", end, false
+	}
+	return string(value), end, true
+}
+
+func isJavaScriptIdentifierByte(value byte) bool {
+	return value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' || value >= '0' && value <= '9' || value == '_' || value == '$'
+}
+
 func parseDependencyMap(entry []byte) ([]string, error) {
 	match := dependencyMapPattern.FindSubmatch(entry)
 	if len(match) != 2 {
@@ -327,7 +655,25 @@ func parseDependencyMap(entry []byte) ([]string, error) {
 	if err := json.Unmarshal(append(append([]byte{'['}, match[1]...), ']'), &paths); err != nil {
 		return nil, fmt.Errorf("decode Vite dependency map: %w", err)
 	}
+	for index, dependencyPath := range paths {
+		path, err := canonicalWebAssetPath(dependencyPath)
+		if err != nil {
+			return nil, fmt.Errorf("Vite dependency map path %q: %w", dependencyPath, err)
+		}
+		paths[index] = path
+	}
 	return paths, nil
+}
+
+func canonicalWebAssetPath(value string) (string, error) {
+	parsed, err := url.Parse(value)
+	if err != nil {
+		return "", err
+	}
+	if value != parsed.Path || !strings.HasPrefix(parsed.Path, "/_app/immutable/") || pathpkg.Clean(parsed.Path) != parsed.Path {
+		return "", errors.New("path is outside canonical /_app/immutable assets")
+	}
+	return parsed.Path, nil
 }
 
 func routeDependencyIndexes(entry []byte, nodeIndex int) []int {
