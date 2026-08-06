@@ -20730,9 +20730,28 @@ func TestNeoRuntimeStreamedAssistantFinalUpdateMatchesSnapshotAndResume(t *testi
 		return len(blocks) == 1 && boolValue(mapValue(blocks[0])["complete"])
 	})
 	completeDeltaSeq := numberFrom(completeDelta["seq"])
-	updated := waitForNeoMessageTypeWhere(t, live, "message_updated", 2*time.Second, func(payload map[string]any) bool {
-		return stringValue(mapValue(payload["message"])["messageId"]) == messageID
-	})
+	var updated map[string]any
+	updateDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(updateDeadline) {
+		payload, okRead := readNeoMessage(t, live, time.Until(updateDeadline))
+		if !okRead {
+			break
+		}
+		message := mapValue(payload["message"])
+		if stringValue(message["messageId"]) != messageID {
+			continue
+		}
+		if payload["type"] == "message_added" {
+			t.Fatalf("ordinary streamed tool finalized with message_added: %#v", payload)
+		}
+		if payload["type"] == "message_updated" {
+			updated = payload
+			break
+		}
+	}
+	if updated == nil {
+		t.Fatal("timed out waiting for ordinary streamed assistant update")
+	}
 	if numberFrom(updated["seq"]) <= completeDeltaSeq {
 		t.Fatalf("message_updated seq = %d, want > completed delta seq %d: %#v", numberFrom(updated["seq"]), completeDeltaSeq, updated)
 	}
@@ -20864,6 +20883,235 @@ fresh:
 	})
 	if stringValue(mapValue(freshAdded["message"])["role"]) != "assistant" {
 		t.Fatalf("fresh message_added = %#v", freshAdded)
+	}
+}
+
+func TestNeoRuntimeStreamedSubmitReviewSupportsHeadlessCompletion(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-headless-review-completion"
+	actor, _ := rt.store.upsert(map[string]any{"name": "threadActor", "key": threadID, "input": map[string]any{"threadId": threadID}}, true)
+	defer waitForNeoActorSyncIdle(t, actor)
+
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	t.Cleanup(server.Close)
+	live := dialNeoActorWebSocket(t, server.URL, threadID)
+	defer live.Close()
+	waitForNeoMessageType(t, live, "agent_state", 2*time.Second)
+
+	messageID := "M-review-assistant"
+	toolCallID := "TU-submit-review"
+	actor.mu.Lock()
+	actor.currentInference = &neoInferenceInflight{messageID: messageID, agentMode: "review"}
+	actor.mu.Unlock()
+	actor.handleProtocolDelta(map[string]any{
+		"type":       "delta",
+		"messageId":  messageID,
+		"role":       "assistant",
+		"state":      "tool_use",
+		"blockIndex": 0,
+		"blocks": []any{map[string]any{
+			"type":             "tool_use",
+			"id":               toolCallID,
+			"name":             "submit_review",
+			"input":            map[string]any{},
+			"complete":         false,
+			"inputIncomplete":  map[string]any{"comments": []any{}},
+			"inputPartialJSON": map[string]any{"json": `{"comments":[]}`},
+			"blockState":       "streaming",
+		}},
+	})
+	waitForNeoMessageTypeWhere(t, live, "delta", 2*time.Second, func(payload map[string]any) bool {
+		return stringValue(payload["messageId"]) == messageID
+	})
+
+	actor.finishAssistantMessageWithOptions(messageID, neoInferenceResult{
+		Provider: "openai",
+		Model:    "gpt-test",
+		ToolCalls: []neoToolCall{{
+			ID:    toolCallID,
+			Name:  "submit_review",
+			Input: map[string]any{"comments": []any{}},
+		}},
+	}, "review", "medium", true, "")
+
+	completeDelta := waitForNeoMessageTypeWhere(t, live, "delta", 2*time.Second, func(payload map[string]any) bool {
+		if stringValue(payload["messageId"]) != messageID || stringValue(payload["state"]) != "tool_use" {
+			return false
+		}
+		blocks := arrayValue(payload["blocks"])
+		return len(blocks) == 1 && boolValue(mapValue(blocks[0])["complete"])
+	})
+	added := waitForNeoMessageTypeWhere(t, live, "message_added", 2*time.Second, func(payload map[string]any) bool {
+		return stringValue(mapValue(payload["message"])["messageId"]) == messageID
+	})
+	updated := waitForNeoMessageTypeWhere(t, live, "message_updated", 2*time.Second, func(payload map[string]any) bool {
+		return stringValue(mapValue(payload["message"])["messageId"]) == messageID
+	})
+	completeSeq := numberFrom(completeDelta["seq"])
+	addedSeq := numberFrom(added["seq"])
+	updatedSeq := numberFrom(updated["seq"])
+	if completeSeq >= addedSeq || addedSeq >= updatedSeq {
+		t.Fatalf("submit_review finalization sequences = delta:%d added:%d updated:%d", completeSeq, addedSeq, updatedSeq)
+	}
+	if !reflect.DeepEqual(mapValue(added["message"]), mapValue(updated["message"])) {
+		t.Fatalf("headless and authoritative review messages differ\n added: %#v\nupdated: %#v", added, updated)
+	}
+	blocks := arrayValue(mapValue(added["message"])["content"])
+	if len(blocks) != 1 {
+		t.Fatalf("headless review message content = %#v", blocks)
+	}
+	toolUse := mapValue(blocks[0])
+	if stringValue(toolUse["type"]) != "tool_use" || stringValue(toolUse["id"]) != toolCallID || stringValue(toolUse["name"]) != "submit_review" || !boolValue(toolUse["complete"]) {
+		t.Fatalf("headless review tool use = %#v", toolUse)
+	}
+
+	actor.mu.Lock()
+	replayEvents := cloneNeoReplayEvents(actor.replayEvents)
+	actor.mu.Unlock()
+	replayedUpdate := false
+	for _, event := range replayEvents {
+		if stringValue(mapValue(event.Payload["message"])["messageId"]) != messageID {
+			continue
+		}
+		switch event.Payload["type"] {
+		case "message_added":
+			t.Fatalf("headless compatibility event entered replay: %#v", event.Payload)
+		case "message_updated":
+			replayedUpdate = true
+		}
+	}
+	if !replayedUpdate {
+		t.Fatal("authoritative submit_review update missing from replay")
+	}
+
+	actor.receiveToolResult(map[string]any{
+		"type":       "executor_tool_result",
+		"toolCallId": toolCallID,
+		"run":        map[string]any{"status": "done", "result": map[string]any{"comments": []any{}}},
+	})
+	resultEvent := waitForNeoMessageTypeWhere(t, live, "message_added", 2*time.Second, func(payload map[string]any) bool {
+		message := mapValue(payload["message"])
+		if stringValue(message["role"]) != "user" {
+			return false
+		}
+		for _, raw := range arrayValue(message["content"]) {
+			if stringValue(mapValue(raw)["toolUseID"]) == toolCallID {
+				return true
+			}
+		}
+		return false
+	})
+
+	headlessMessages := []map[string]any{mapValue(added["message"]), mapValue(resultEvent["message"])}
+	submitReviewIDs := map[string]bool{}
+	for _, message := range headlessMessages {
+		if stringValue(message["role"]) != "assistant" {
+			continue
+		}
+		for _, raw := range arrayValue(message["content"]) {
+			block := mapValue(raw)
+			if stringValue(block["type"]) == "tool_use" && stringValue(block["name"]) == "submit_review" {
+				submitReviewIDs[stringValue(block["id"])] = true
+			}
+		}
+	}
+	completed := false
+	for _, message := range headlessMessages {
+		if stringValue(message["role"]) != "user" {
+			continue
+		}
+		for _, raw := range arrayValue(message["content"]) {
+			block := mapValue(raw)
+			if stringValue(block["type"]) == "tool_result" && submitReviewIDs[stringValue(block["toolUseID"])] && stringValue(mapValue(block["run"])["status"]) == "done" {
+				completed = true
+			}
+		}
+	}
+	if !completed {
+		t.Fatalf("headless message_added collector could not pair submit_review: %#v", headlessMessages)
+	}
+
+	finalMessageID := "M-review-complete"
+	actor.mu.Lock()
+	actor.currentInference = &neoInferenceInflight{messageID: finalMessageID, agentMode: "review"}
+	actor.pendingInference = nil
+	actor.mu.Unlock()
+	actor.handleProtocolDelta(map[string]any{
+		"type":       "delta",
+		"messageId":  finalMessageID,
+		"role":       "assistant",
+		"state":      "generating",
+		"blockIndex": 0,
+		"blocks": []any{map[string]any{
+			"type": "text",
+			"text": "Review submitted.",
+		}},
+	})
+	waitForNeoMessageTypeWhere(t, live, "delta", 2*time.Second, func(payload map[string]any) bool {
+		return stringValue(payload["messageId"]) == finalMessageID
+	})
+	actor.finishAssistantMessageWithOptions(finalMessageID, neoInferenceResult{
+		Provider: "openai",
+		Model:    "gpt-test",
+		Text:     "Review submitted.",
+	}, "review", "medium", true, "")
+	finalDelta := waitForNeoMessageTypeWhere(t, live, "delta", 2*time.Second, func(payload map[string]any) bool {
+		return stringValue(payload["messageId"]) == finalMessageID && stringValue(payload["state"]) == "complete"
+	})
+	finalAdded := waitForNeoMessageTypeWhere(t, live, "message_added", 2*time.Second, func(payload map[string]any) bool {
+		return stringValue(mapValue(payload["message"])["messageId"]) == finalMessageID
+	})
+	finalUpdated := waitForNeoMessageTypeWhere(t, live, "message_updated", 2*time.Second, func(payload map[string]any) bool {
+		return stringValue(mapValue(payload["message"])["messageId"]) == finalMessageID
+	})
+	finalDeltaSeq := numberFrom(finalDelta["seq"])
+	finalAddedSeq := numberFrom(finalAdded["seq"])
+	finalUpdatedSeq := numberFrom(finalUpdated["seq"])
+	if finalDeltaSeq >= finalAddedSeq || finalAddedSeq >= finalUpdatedSeq {
+		t.Fatalf("review completion sequences = delta:%d added:%d updated:%d", finalDeltaSeq, finalAddedSeq, finalUpdatedSeq)
+	}
+	if !reflect.DeepEqual(mapValue(finalAdded["message"]), mapValue(finalUpdated["message"])) {
+		t.Fatalf("headless and authoritative completion messages differ\n added: %#v\nupdated: %#v", finalAdded, finalUpdated)
+	}
+	headlessMessages = append(headlessMessages, mapValue(finalAdded["message"]))
+	headlessCompleted := false
+	for _, message := range headlessMessages {
+		if stringValue(message["role"]) != "assistant" || len(mapValue(message["state"])) == 0 {
+			continue
+		}
+		hasToolUse := false
+		for _, raw := range arrayValue(message["content"]) {
+			if stringValue(mapValue(raw)["type"]) == "tool_use" {
+				hasToolUse = true
+				break
+			}
+		}
+		if !hasToolUse {
+			headlessCompleted = true
+		}
+	}
+	if !headlessCompleted {
+		t.Fatalf("headless message_added collector did not observe review completion: %#v", headlessMessages)
+	}
+
+	actor.mu.Lock()
+	replayEvents = cloneNeoReplayEvents(actor.replayEvents)
+	actor.mu.Unlock()
+	replayedCompletionUpdate := false
+	for _, event := range replayEvents {
+		if stringValue(mapValue(event.Payload["message"])["messageId"]) != finalMessageID {
+			continue
+		}
+		switch event.Payload["type"] {
+		case "message_added":
+			t.Fatalf("headless completion compatibility event entered replay: %#v", event.Payload)
+		case "message_updated":
+			replayedCompletionUpdate = true
+		}
+	}
+	if !replayedCompletionUpdate {
+		t.Fatal("authoritative review completion update missing from replay")
 	}
 }
 

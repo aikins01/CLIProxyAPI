@@ -12994,8 +12994,24 @@ func (a *neoActor) finishAssistantMessageWithOptions(messageID string, result ne
 	}
 	var stored neoMessage
 	var messageEvent map[string]any
+	var headlessReviewEvent map[string]any
 	if messageExistedBeforeFinalization {
+		headlessReviewSeq := 0
+		if agentMode == "review" && len(normalizedCalls) == 0 {
+			headlessReviewSeq = a.nextSeqLocked()
+		} else {
+			for _, call := range normalizedCalls {
+				if call.Name == "submit_review" {
+					headlessReviewSeq = a.nextSeqLocked()
+					break
+				}
+			}
+		}
 		stored, messageEvent = a.storeMessageEventLocked(finalMessage)
+		if headlessReviewSeq > 0 && messageEvent["type"] == "message_updated" {
+			headlessReviewEvent = neoMessageAddedPayload(stored)
+			headlessReviewEvent["seq"] = headlessReviewSeq
+		}
 	} else {
 		if index := a.messageIndexLocked(messageID); index >= 0 {
 			if createdAt := a.messages[index].CreatedAt; createdAt != "" {
@@ -13023,6 +13039,9 @@ func (a *neoActor) finishAssistantMessageWithOptions(messageID string, result ne
 	providerErrorEvent := a.updateProviderStopReasonErrorLocked(messageID, stopReason, len(toolCalls) == 0)
 	a.mu.Unlock()
 
+	if headlessReviewEvent != nil {
+		a.broadcast(headlessReviewEvent)
+	}
 	a.broadcast(messageEvent)
 	if providerErrorEvent != nil {
 		a.broadcast(providerErrorEvent)
