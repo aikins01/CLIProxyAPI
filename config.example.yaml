@@ -326,7 +326,7 @@ nonstream-keepalive-interval: 0
 #   # cloud actor endpoint. Enabled by default when upstream-url is set and the Neo local
 #   # runtime is disabled. The Neo local runtime, when enabled, owns the endpoint instead.
 #   # thread-actor-proxy-enabled: true
-#   # Local listener address for the actor proxy (default: 127.0.0.1:6420)
+#   # Local listener address for the actor proxy (default: 127.0.0.1:6420); loopback only
 #   # thread-actor-proxy-addr: "127.0.0.1:6420"
 #   # Cloud actor endpoint to proxy to (default: detected from the Amp binary, else https://actors.ampcode.com).
 #   # The Rivet gateway token is only forwarded when the upstream URL carries it as userinfo
