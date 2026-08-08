@@ -29302,6 +29302,35 @@ func TestOpenAINeoToolsMoonshotNormalizesToolSchemas(t *testing.T) {
 	}
 }
 
+func TestOpenAINeoToolsMoonshotNormalizesNullableReviewEnums(t *testing.T) {
+	tool := neoSubmitReviewToolSpec()
+	original := cloneNeoJSONMap(tool.InputSchema)
+	tools := openAINeoTools([]neoToolSpec{tool}, "moonshotai")
+	parameters := mapValue(mapValue(tools[0])["function"])
+	properties := mapValue(mapValue(parameters["parameters"])["properties"])
+	commentProperties := mapValue(mapValue(mapValue(properties["comments"])["items"])["properties"])
+
+	for _, name := range []string{"commentType", "severity"} {
+		property := mapValue(commentProperties[name])
+		if property["type"] != "string" {
+			t.Fatalf("%s type = %#v, want string", name, property["type"])
+		}
+		for _, value := range arrayValue(property["enum"]) {
+			if value == nil {
+				t.Fatalf("%s enum retained null: %#v", name, property["enum"])
+			}
+		}
+	}
+	for _, name := range []string{"source", "why", "fix"} {
+		if propertyType := mapValue(commentProperties[name])["type"]; propertyType != "string" {
+			t.Fatalf("%s type = %#v, want string", name, propertyType)
+		}
+	}
+	if !reflect.DeepEqual(tool.InputSchema, original) {
+		t.Fatalf("original review schema mutated: got %#v want %#v", tool.InputSchema, original)
+	}
+}
+
 func TestNeoOpenAIChatMessagesForRequestENIPreservesConversation(t *testing.T) {
 	request := neoInferenceRequest{
 		AgentMode: "custom-eni",

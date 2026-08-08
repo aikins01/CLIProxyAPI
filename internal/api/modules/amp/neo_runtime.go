@@ -43129,7 +43129,10 @@ func neoKimiSchemaHasDefinitionRef(node any, bucket string, skipBucket bool) boo
 func neoNormalizeKimiSchemaProperty(node map[string]any) {
 	if !neoKimiSchemaHasAnyKey(node, neoKimiTypeCompletionSkipKeys) {
 		if explicitType, hasType := node["type"].(string); !hasType || explicitType == "" {
-			if inferredType, ok := neoInferKimiSchemaType(node); ok {
+			if concreteType, ok := neoKimiSingleConcreteSchemaType(node["type"]); ok {
+				node["type"] = concreteType
+				neoRemoveKimiIrrelevantStructureKeys(node, concreteType)
+			} else if inferredType, ok := neoInferKimiSchemaType(node); ok {
 				node["type"] = inferredType
 			}
 		} else if inferredType, ok := neoInferKimiSchemaValueType(node); ok && explicitType != inferredType {
@@ -43137,7 +43140,51 @@ func neoNormalizeKimiSchemaProperty(node map[string]any) {
 			neoRemoveKimiIrrelevantStructureKeys(node, inferredType)
 		}
 	}
+	if concreteType, ok := node["type"].(string); ok && concreteType != "null" {
+		neoRemoveKimiNullSchemaValues(node)
+	}
 	neoVisitKimiChildSchemas(node, neoNormalizeKimiSchemaProperty)
+}
+
+func neoKimiSingleConcreteSchemaType(value any) (string, bool) {
+	types, ok := neoKimiSchemaArray(value)
+	if !ok || len(types) == 0 {
+		return "", false
+	}
+	concrete := ""
+	for _, rawType := range types {
+		typeName, ok := rawType.(string)
+		if !ok || typeName == "" {
+			return "", false
+		}
+		if typeName == "null" {
+			continue
+		}
+		if concrete != "" && concrete != typeName {
+			return "", false
+		}
+		concrete = typeName
+	}
+	return concrete, concrete != ""
+}
+
+func neoRemoveKimiNullSchemaValues(schema map[string]any) {
+	if values, ok := neoKimiSchemaArray(schema["enum"]); ok {
+		filtered := make([]any, 0, len(values))
+		for _, value := range values {
+			if value != nil {
+				filtered = append(filtered, value)
+			}
+		}
+		if len(filtered) == 0 {
+			delete(schema, "enum")
+		} else {
+			schema["enum"] = filtered
+		}
+	}
+	if value, exists := schema["const"]; exists && value == nil {
+		delete(schema, "const")
+	}
 }
 
 func neoInferKimiSchemaType(schema map[string]any) (string, bool) {

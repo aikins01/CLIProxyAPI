@@ -1314,7 +1314,7 @@ func (a *neoActor) executeSubagentRun(name string, input map[string]any, parentT
 		if name == "Task" {
 			attemptSystemPrompt = strings.Join(compactStrings([]string{neoSystemPrompt(scaffoldRequest, route), systemPrompt}), "\n\n")
 		}
-		return neoInferenceRequest{
+		request := neoInferenceRequest{
 			Context:                       runContext,
 			ActorID:                       a.id,
 			ThreadID:                      a.threadID,
@@ -1335,6 +1335,11 @@ func (a *neoActor) executeSubagentRun(name string, input map[string]any, parentT
 			DisableToolCalls:              name == "run_check" && len(requestTools) == 0,
 			TextToolBridgeRequireToolCall: requireToolCall,
 		}
+		if name == "run_check" && len(requestTools) == 0 {
+			request.ResponseMimeType = "application/json"
+			request.ResponseJSONSchema = neoRunCheckResponseJSONSchema()
+		}
+		return request
 	}
 
 	toolNames := make([]string, 0, len(tools))
@@ -1969,7 +1974,7 @@ func (a *neoActor) advanceGenerationLocked() int {
 func neoRunCheckToolNames(input map[string]any, fallback []string) []string {
 	frontmatter := mapValue(input["frontmatter"])
 	raw, exists := frontmatter["tools"]
-	if !exists {
+	if !exists || raw == nil {
 		return fallback
 	}
 	requested := neoStringSlice(raw)
@@ -1991,7 +1996,7 @@ func neoRunCheckToolNames(input map[string]any, fallback []string) []string {
 
 func (a *neoActor) resolveRunCheckToolsLocked(input map[string]any, fallback []string) []neoToolSpec {
 	requested := neoRunCheckToolNames(input, fallback)
-	if _, exists := mapValue(input["frontmatter"])["tools"]; !exists {
+	if raw, exists := mapValue(input["frontmatter"])["tools"]; !exists || raw == nil {
 		return a.resolveSubagentToolsLocked(requested)
 	}
 	tools := make([]neoToolSpec, 0, len(requested))

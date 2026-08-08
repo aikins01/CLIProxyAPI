@@ -12,6 +12,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"slices"
 	"sort"
@@ -58,11 +59,11 @@ type neoReviewDiffSnapshot struct {
 }
 
 func neoReviewPromptBase() string {
-	return "You are an expert senior engineer with deep knowledge of software engineering best practices, security, performance, and maintainability.\n\nYour task is to perform a code review of the provided diff description. The diff description might be a git or bash command that generates the diff or a description of the diff which can then be used to generate the git or bash command to generate the full diff.\n\nReview adversarially: actively try to disprove correctness, safety, compatibility, performance, and maintainability assumptions in the changed code. Only report concrete, actionable issues tied to the current diff; do not invent speculative problems or style nits.\n\nAfter reading the diff, do the following:\n1. Write a high-level summary of the changes in the diff.\n2. Go file-by-file and review each changed hunk.\n3. Comment on what changed in that hunk (including the line range) and how it relates to other\n   changed hunks and code, reading any other relevant files. Also call out bugs, hackiness,\n   unnecessary code, or too much shared mutable state.\n4. Evaluate abstraction fit in both directions: flag unnecessary indirection (over-abstraction)\n   and missing abstractions (duplication or branching complexity). For each finding, cite concrete\n   locations and recommend exactly one action—simplify/inline or introduce/extract a shared\n   concept—only when it improves current code (avoid speculative refactors).\n\nStrongly prefer to restrict your use of git commands to these when getting the diff or determining which files were added/changed/removed:\n<referenceCommands>\n  <command>\n    <description>committed changes on my branch since diverging from the upstream default branch</description>\n    <bash>git diff --merge-base origin/HEAD HEAD</bash>\n  </command>\n  <command>\n    <description>all current checkout changes since diverging from upstream (commits + staged + unstaged tracked)</description>\n    <bash>git diff --merge-base origin/HEAD</bash>\n  </command>\n  <command>\n    <description>changes since diverging from upstream up to and including staged changes</description>\n    <bash>git diff --cached --merge-base origin/HEAD</bash>\n  </command>\n  <command>\n    <description>current checkout tracked changes since divergence, plus a list of newly added untracked files</description>\n    <bash>git diff --merge-base origin/HEAD</bash>\n    <bash>git ls-files --others --exclude-standard</bash>\n  </command>\n  <command>\n    <description>changes on branch foo since divergence from upstream</description>\n    <bash>git diff --merge-base origin/HEAD foo</bash>\n  </command>\n  <command>\n    <description>only filenames changed by this branch since divergence</description>\n    <bash>git diff --name-only --merge-base origin/HEAD HEAD</bash>\n  </command>\n  <command>\n    <description>scope diff to a specific path since diverging from upstream</description>\n    <bash>git diff --merge-base origin/HEAD <ref-or-empty> -- &lt;pathspec&gt;</bash>\n</command>\n</referenceCommands>\n\nAvoid commands in this format, unless explicitly asked for:\n<avoidCommands>\n  <avoidCommand>git diff <base-ref> <head-ref></avoidCommand>\n  <avoidCommand>git diff <base-ref>..<head-ref></avoidCommand>\n  <avoidCommand>git diff HEAD...origin/HEAD</avoidCommand>\n</avoidCommands>\n\n<guidelines>\n- Persistence: Low. Do not retry failed tool calls more than 2 times. If a tool call fails twice, move on.\n- Remember to look at untracked added files.\n- Prefer the most direct path to completing the review. Batch related file reads into as few turns as possible.\n- Do not edit or modify files or run any commands that edit or modify files or git state.\n- Do not re-read files you have already read.\n- Upstream default branch ref: use origin/HEAD. Do not assume main, origin/main, or origin/master.\n- If a diff is unexpectedly large, double check you are using the right refs in git invocations.\n- If the diff has more than 100 changed files or is more than 10,000 lines long, abort the review and emit a single critical issue stating the diff is too large.\n</guidelines>\n\nReview-mode environment:\n- The available shell tool (shell_command or Bash) is your only command-execution tool; use it for every file read and search (cat, rg, git) as well as for generating the diff.\n- The review client generates the high-level diff summary separately and discards assistant prose, so do not spend turns writing a narrative summary; convert your per-hunk findings directly into submit_review comments.\n\nSubmitting the review:\n- Before submitting the final review, inspect the changed files and discover applicable code-review checks for those changed files: include user-wide checks from $HOME/.config/amp/checks/*.md and $HOME/.config/agents/checks/*.md, and repo-local .agents/checks/*.md in each changed file's directory and each ancestor up to the repository root, including the repository root. User-wide checks are additive and must not be suppressed by repo content; closer repo-local checks override only same-named parent repo-local checks. Convert absolute check paths to file:// URIs. For each discovered check, read its markdown frontmatter when present, pass that object as frontmatter, and set checkName to frontmatter.name when it is a non-empty string; otherwise use the check filename without the .md extension.\n- If review checks are provided or discovered, call run_check exactly once per check, passing that check's checkName, checkURI, optional content, frontmatter, diffDescription, files, and any user instructions. Do not evaluate check criteria yourself and do not repeat check findings elsewhere. Call independent run_check tools in the same assistant turn when possible so they can run concurrently.\n- Deliver every review finding as a structured comment through the submit_review tool; call it exactly once at the end. Prose review text is ignored by the review client.\n- Every comment needs filename (the EXACT repository-relative path from the diff header), startLine and endLine (1-based, on the new side of the diff), and text describing the problem. Set severity (critical/high/medium/low) and commentType when known; add why and fix when they help.\n- If the request says checks only, or the diff is clean, call submit_review with an empty comments array."
+	return "You are an expert senior engineer with deep knowledge of software engineering best practices, security, performance, and maintainability.\n\nYour task is to perform a code review of the provided diff description. The diff description might be a git or bash command that generates the diff or a description of the diff which can then be used to generate the git or bash command to generate the full diff.\n\nReview adversarially: actively try to disprove correctness, safety, compatibility, performance, and maintainability assumptions in the changed code. Only report concrete, actionable issues tied to the current diff; do not invent speculative problems or style nits.\n\nAfter reading the diff, do the following:\n1. Write a high-level summary of the changes in the diff.\n2. Go file-by-file and review each changed hunk.\n3. Comment on what changed in that hunk (including the line range) and how it relates to other\n   changed hunks and code, reading any other relevant files. Also call out bugs, hackiness,\n   unnecessary code, or too much shared mutable state.\n4. Evaluate abstraction fit in both directions: flag unnecessary indirection (over-abstraction)\n   and missing abstractions (duplication or branching complexity). For each finding, cite concrete\n   locations and recommend exactly one action—simplify/inline or introduce/extract a shared\n   concept—only when it improves current code (avoid speculative refactors).\n\nStrongly prefer to restrict your use of git commands to these when getting the diff or determining which files were added/changed/removed:\n<referenceCommands>\n  <command>\n    <description>committed changes on my branch since diverging from the upstream default branch</description>\n    <bash>git diff --merge-base origin/HEAD HEAD</bash>\n  </command>\n  <command>\n    <description>all current checkout changes since diverging from upstream (commits + staged + unstaged tracked)</description>\n    <bash>git diff --merge-base origin/HEAD</bash>\n  </command>\n  <command>\n    <description>changes since diverging from upstream up to and including staged changes</description>\n    <bash>git diff --cached --merge-base origin/HEAD</bash>\n  </command>\n  <command>\n    <description>current checkout tracked changes since divergence, plus a list of newly added untracked files</description>\n    <bash>git diff --merge-base origin/HEAD</bash>\n    <bash>git ls-files --others --exclude-standard</bash>\n  </command>\n  <command>\n    <description>changes on branch foo since divergence from upstream</description>\n    <bash>git diff --merge-base origin/HEAD foo</bash>\n  </command>\n  <command>\n    <description>only filenames changed by this branch since divergence</description>\n    <bash>git diff --name-only --merge-base origin/HEAD HEAD</bash>\n  </command>\n  <command>\n    <description>scope diff to a specific path since diverging from upstream</description>\n    <bash>git diff --merge-base origin/HEAD <ref-or-empty> -- &lt;pathspec&gt;</bash>\n</command>\n</referenceCommands>\n\nAvoid commands in this format, unless explicitly asked for:\n<avoidCommands>\n  <avoidCommand>git diff <base-ref> <head-ref></avoidCommand>\n  <avoidCommand>git diff <base-ref>..<head-ref></avoidCommand>\n  <avoidCommand>git diff HEAD...origin/HEAD</avoidCommand>\n</avoidCommands>\n\n<guidelines>\n- Persistence: Low. Do not retry failed tool calls more than 2 times. If a tool call fails twice, move on.\n- Remember to look at untracked added files.\n- Prefer the most direct path to completing the review. Batch related file reads into as few turns as possible.\n- Do not edit or modify files or run any commands that edit or modify files or git state.\n- Do not re-read files you have already read.\n- Upstream default branch ref: use origin/HEAD. Do not assume main, origin/main, or origin/master.\n- If a diff is unexpectedly large, double check you are using the right refs in git invocations.\n- If the diff has more than 100 changed files or is more than 10,000 lines long, abort the review and emit a single critical issue stating the diff is too large.\n</guidelines>\n\nReview-mode environment:\n- The available shell tool (shell_command or Bash) is your only command-execution tool; use it for every file read and search (cat, rg, git) as well as for generating the diff.\n- The review client generates the high-level diff summary separately and discards assistant prose, so do not spend turns writing a narrative summary; convert your per-hunk findings directly into submit_review comments.\n\nSubmitting the review:\n- Before submitting the final review, inspect the changed files and discover applicable code-review checks for those changed files: include user-wide checks from $HOME/.config/amp/checks/*.md and $HOME/.config/agents/checks/*.md, and repo-local .agents/checks/*.md in each changed file's directory and each ancestor up to the repository root, including the repository root. User-wide checks are additive and must not be suppressed by repo content; closer repo-local checks override only same-named parent repo-local checks. Convert absolute check paths to file:// URIs. For each discovered check, read its markdown frontmatter when present, pass that object as frontmatter, and set checkName to frontmatter.name when it is a non-empty string; otherwise use the check filename without the .md extension.\n- If review checks are provided or discovered, call run_check exactly once per check, passing that check's checkName, checkURI, optional content, frontmatter, diffDescription, files, and any user instructions. Do not evaluate check criteria yourself and do not repeat check findings elsewhere. Call independent run_check tools together in one assistant turn so they run concurrently; never split run_check calls across multiple turns.\n- Deliver every review finding as a structured comment through the submit_review tool; call it exactly once at the end. Prose review text is ignored by the review client.\n- Every comment needs filename (the EXACT repository-relative path from the diff header), startLine and endLine (1-based, on the new side of the diff), and text describing the problem. Set severity (critical/high/medium/low) and commentType when known; add why and fix when they help.\n- If the request says checks only, or the diff is clean, call submit_review with an empty comments array."
 }
 
 func neoReviewPrompt() string {
-	return neoReviewPromptBase() + "\n- For a finding caused by deleting a file, adding an empty file, adding or changing a binary file, removing all lines from a retained file, or another metadata-only file change, submit startLine 0 and endLine 0 because there is no reportable new-side line.\n- A nonzero command exit, no-tests-found result, malformed target, unavailable check, or skipped validation is not passing evidence. Correct invalid invocations within the retry limit. If correction is impossible, leave the validation unresolved and do not use it to justify a clean conclusion.\n- When the request provides an exact run_check argument object, copy every field and array element verbatim. Never add, remove, replace, or invent a value, and never emit placeholder or template text.\n- After all run_check calls return, remove every main-review candidate that reports the same root cause as a check issue, even if you discovered it independently or its wording, location, severity, evidence, or fix differs. Check findings are appended mechanically."
+	return neoReviewPromptBase() + "\n- For a finding caused by deleting a file, adding an empty file, adding or changing a binary file, removing all lines from a retained file, or another metadata-only file change, submit startLine 0 and endLine 0 because there is no reportable new-side line.\n- A nonzero command exit, no-tests-found result, malformed target, unavailable check, or skipped validation is not passing evidence. Correct invalid invocations within the retry limit. If correction is impossible, leave the validation unresolved and do not use it to justify a clean conclusion.\n- When the request provides an exact run_check argument object, copy every field and array element verbatim: every field present in the provided object — checkName, checkURI, checkContent, frontmatter, diffDescription, the complete files array, and instructions — must appear in the call identically. Never add, remove, replace, or invent a value, never subset an array, and never emit placeholder or template text.\n- After all run_check calls return, remove every main-review candidate that reports the same root cause as a check issue, even if you discovered it independently or its wording, location, severity, evidence, or fix differs. When you are unsure whether a candidate shares a check issue's root cause, drop the candidate; the check finding is already reported. Check findings are appended mechanically.\n- Do not report that a referenced name, file, or other resource is undefined, unimported, missing, or unresolved when the review scope is a diff, hunk, or file-scoped excerpt; unchanged or unlisted context may provide it. Report an unresolved reference only after verifying the complete changed file, and only when the name is genuinely absent there.\n- Report a main-review finding only when the complete failing sequence is established by the changed code and the review scope in front of you. If the failure additionally requires any assumed caller, later patch, shared or mutated external state, concurrent or in-flight modification, future evolution of the code, or any other behavior outside the diff, it is speculative: do not report it, even when the vulnerable-looking code path is visible.\n- Your first assistant turn must contain the run_check tool calls for every provided or discovered check; do not emit a preamble, plan, or narration turn before calling tools."
 }
 
 func neoCaptureWorkingTreeReviewSnapshot(cwd, diffDescription string, files ...string) (*neoReviewDiffSnapshot, error) {
@@ -1121,19 +1122,90 @@ func neoRunCheckToolSpec() neoToolSpec {
 			"properties": map[string]any{
 				"checkName":       map[string]any{"type": "string", "description": "The name of the check, exactly as provided in the review request."},
 				"checkURI":        map[string]any{"type": "string", "description": "The URI of the check, exactly as provided in the review request."},
-				"checkContent":    map[string]any{"type": "string", "description": "Optional full markdown content of the check when already supplied by a legacy caller."},
-				"frontmatter":     map[string]any{"type": "object", "description": "The check's frontmatter object, verbatim."},
+				"checkContent":    map[string]any{"type": []any{"string", "null"}, "description": "Optional full markdown content of the check when already supplied by a legacy caller."},
+				"frontmatter":     neoRunCheckFrontmatterSchema(),
 				"diffDescription": map[string]any{"type": "string", "description": "The description of the diff under review."},
 				"files":           map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "The files under review."},
 				"instructions":    map[string]any{"type": "string", "description": "Additional user directives for review focus, severity filtering, or scope narrowing that must be honored while evaluating this check."},
 			},
-			"required": []any{"checkName", "checkURI"},
+			"required":             []any{"checkName", "checkURI", "checkContent", "frontmatter", "diffDescription", "files", "instructions"},
+			"additionalProperties": false,
 		},
-		Meta: map[string]any{"source": "server"},
+		Meta:   map[string]any{"source": "server"},
+		Strict: true,
 	}
 }
 
+func neoRunCheckFrontmatterSchema() map[string]any {
+	return map[string]any{
+		"type": []any{"object", "null"},
+		"properties": map[string]any{
+			"name":             map[string]any{"type": []any{"string", "null"}},
+			"description":      map[string]any{"type": []any{"string", "null"}},
+			"severity-default": map[string]any{"type": []any{"string", "null"}},
+			"tools":            map[string]any{"type": []any{"array", "null"}, "items": map[string]any{"type": "string"}},
+		},
+		"required":             []any{"name", "description", "severity-default", "tools"},
+		"additionalProperties": false,
+	}
+}
+
+func neoReviewEmbeddedRunCheckInputs(history []neoHistoryMessage) map[string]map[string]any {
+	var registry map[string]map[string]any
+	const openTag = "<review_check_arguments>"
+	const closeTag = "</review_check_arguments>"
+	for _, message := range history {
+		if !strings.EqualFold(strings.TrimSpace(message.Role), "user") {
+			continue
+		}
+		text := message.Text
+		for {
+			start := strings.Index(text, openTag)
+			if start < 0 {
+				break
+			}
+			text = text[start+len(openTag):]
+			end := strings.Index(text, closeTag)
+			if end < 0 {
+				break
+			}
+			raw := strings.TrimSpace(text[:end])
+			text = text[end+len(closeTag):]
+			var parsed map[string]any
+			if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+				continue
+			}
+			name := stringValue(parsed["checkName"])
+			if name == "" {
+				continue
+			}
+			if registry == nil {
+				registry = make(map[string]map[string]any)
+			}
+			registry[name] = parsed
+		}
+	}
+	return registry
+}
+
+func neoRepairRunCheckInput(registry map[string]map[string]any, name string, input map[string]any) (map[string]any, bool) {
+	if len(registry) == 0 || name != "run_check" || input == nil {
+		return input, false
+	}
+	canonical := registry[stringValue(input["checkName"])]
+	if canonical == nil {
+		return input, false
+	}
+	if reflect.DeepEqual(input, canonical) {
+		return input, false
+	}
+	return cloneMap(canonical), true
+}
+
 func neoSubmitReviewToolSpec() neoToolSpec {
+	nullableString := func(description string) map[string]any {
+		return map[string]any{"type": []any{"string", "null"}, "description": description}
+	}
 	return neoToolSpec{
 		Name:        "submit_review",
 		Description: "Submit the final code review. Call exactly once, after every provided check has been run with run_check, passing all review comments. Do not include run_check findings; they are appended mechanically. Pass an empty comments array when the diff is clean or the request asked for checks only.",
@@ -1149,20 +1221,23 @@ func neoSubmitReviewToolSpec() neoToolSpec {
 							"startLine":   map[string]any{"type": "number", "description": "First line of the commented range (1-based, new side of the diff; use 0 when the changed file has no new-side line)."},
 							"endLine":     map[string]any{"type": "number", "description": "Last line of the commented range (1-based, new side of the diff; use 0 when the changed file has no new-side line)."},
 							"text":        map[string]any{"type": "string", "description": "The review comment describing the problem."},
-							"commentType": map[string]any{"type": "string", "enum": []any{"bug", "suggested_edit", "compliment", "non_actionable", "unknown"}, "description": "The kind of comment."},
-							"severity":    map[string]any{"type": "string", "enum": []any{"critical", "high", "medium", "low"}, "description": "How severe the problem is."},
-							"source":      map[string]any{"type": "string", "description": "What surfaced the comment."},
-							"why":         map[string]any{"type": "string", "description": "Why the problem matters."},
-							"fix":         map[string]any{"type": "string", "description": "Suggested fix."},
+							"commentType": map[string]any{"type": []any{"string", "null"}, "enum": []any{"bug", "suggested_edit", "compliment", "non_actionable", "unknown", nil}, "description": "The kind of comment."},
+							"severity":    map[string]any{"type": []any{"string", "null"}, "enum": []any{"critical", "high", "medium", "low", nil}, "description": "How severe the problem is."},
+							"source":      nullableString("What surfaced the comment."),
+							"why":         nullableString("Why the problem matters."),
+							"fix":         nullableString("Suggested fix."),
 						},
-						"required": []any{"filename", "startLine", "endLine", "text"},
+						"required":             []any{"filename", "startLine", "endLine", "text", "commentType", "severity", "source", "why", "fix"},
+						"additionalProperties": false,
 					},
 					"description": "All review comments. Empty when the diff is clean.",
 				},
 			},
-			"required": []any{"comments"},
+			"required":             []any{"comments"},
+			"additionalProperties": false,
 		},
-		Meta: map[string]any{"source": "server"},
+		Meta:   map[string]any{"source": "server"},
+		Strict: true,
 	}
 }
 
@@ -1303,6 +1378,89 @@ func neoReviewPathValid(value string) bool {
 	}
 	cleaned := path.Clean(value)
 	return cleaned == value && cleaned != "." && cleaned != ".." && !strings.HasPrefix(cleaned, "../")
+}
+
+func neoRunCheckResponseJSONSchema() map[string]any {
+	nullableString := func() map[string]any {
+		return map[string]any{"type": []any{"string", "null"}}
+	}
+	nullableEnum := func(values ...string) map[string]any {
+		enum := make([]any, 0, len(values)+1)
+		for _, value := range values {
+			enum = append(enum, value)
+		}
+		enum = append(enum, nil)
+		return map[string]any{"type": []any{"string", "null"}, "enum": enum}
+	}
+	evidenceProperties := map[string]any{
+		"patternIndex":        map[string]any{"type": "integer"},
+		"observation":         map[string]any{"type": "string"},
+		"sources":             map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+		"outcome":             map[string]any{"type": "string", "enum": []any{"finding", "no-finding", "not-applicable"}},
+		"issueIndexes":        map[string]any{"type": "array", "items": map[string]any{"type": "integer"}},
+		"dependency":          nullableString(),
+		"floorVersion":        nullableString(),
+		"accessPath":          nullableString(),
+		"verification":        nullableEnum("root-runtime-traversal", "root-source-construction", "root-type-declaration", "exact-export-inspection", "exact-behavior-test"),
+		"rootEvidence":        nullableString(),
+		"phaseRelationship":   nullableString(),
+		"budgetOrigin":        nullableEnum("original", "remaining", "independent"),
+		"decisiveSequence":    nullableString(),
+		"implementationOwner": nullableString(),
+		"sourceLifetime":      nullableEnum("mutable", "immutable", "unknown"),
+		"decisionLifetime":    nullableEnum("per-use", "retained", "unknown"),
+		"mutationPath":        nullableString(),
+		"usePath":             nullableString(),
+	}
+	evidenceRequired := make([]any, 0, len(evidenceProperties))
+	for key := range evidenceProperties {
+		evidenceRequired = append(evidenceRequired, key)
+	}
+	issueProperties := map[string]any{
+		"severity": map[string]any{"type": "string", "enum": []any{"low", "medium", "high", "critical"}},
+		"file":     map[string]any{"type": "string"},
+		"line":     map[string]any{"type": "integer"},
+		"endLine":  map[string]any{"type": []any{"integer", "null"}},
+		"problem":  map[string]any{"type": "string"},
+		"why":      map[string]any{"type": "string"},
+		"fix":      map[string]any{"type": "string"},
+	}
+	issueRequired := make([]any, 0, len(issueProperties))
+	for key := range issueProperties {
+		issueRequired = append(issueRequired, key)
+	}
+	properties := map[string]any{
+		"checkName":       map[string]any{"type": "string"},
+		"status":          map[string]any{"type": "string", "enum": []any{"completed", "error"}},
+		"filesAnalyzed":   map[string]any{"type": "integer"},
+		"linesAnalyzed":   map[string]any{"type": "integer"},
+		"patternsChecked": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+		"evidence": map[string]any{"type": "array", "items": map[string]any{
+			"type":                 "object",
+			"properties":           evidenceProperties,
+			"required":             evidenceRequired,
+			"additionalProperties": false,
+		}},
+		"issues": map[string]any{"type": "array", "items": map[string]any{
+			"type":                 "object",
+			"properties":           issueProperties,
+			"required":             issueRequired,
+			"additionalProperties": false,
+		}},
+		"errorMessage": nullableString(),
+		"coveredFiles": map[string]any{"type": []any{"array", "null"}, "items": map[string]any{"type": "string"}},
+		"coveredHunks": map[string]any{"type": []any{"array", "null"}, "items": map[string]any{"type": "string"}},
+	}
+	required := make([]any, 0, len(properties))
+	for key := range properties {
+		required = append(required, key)
+	}
+	return map[string]any{
+		"type":                 "object",
+		"properties":           properties,
+		"required":             required,
+		"additionalProperties": false,
+	}
 }
 
 func neoNormalizeRunCheckResult(input map[string]any, parsed map[string]any) (map[string]any, error) {

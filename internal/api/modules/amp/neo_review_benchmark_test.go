@@ -2301,7 +2301,7 @@ diff --git a/sdks/python-openai/src/telemetry_dev_openai/__init__.py b/sdks/pyth
 					{"output_item", "output item", "output-item"},
 					{"function_call_arguments", "function call", "function-call"},
 					{"partial", "cancel", "cancellation"},
-					{"omit", "drop", "lose", "missing", "not record"},
+					{"omit", "drop", "lose", "lost", "missing", "not record"},
 				},
 			},
 			{
@@ -2313,7 +2313,7 @@ diff --git a/sdks/python-openai/src/telemetry_dev_openai/__init__.py b/sdks/pyth
 					{"output_item", "output item", "output-item"},
 					{"function_call_arguments", "function call", "function-call"},
 					{"partial", "cancel", "cancellation"},
-					{"omit", "drop", "lose", "missing", "not record"},
+					{"omit", "drop", "lose", "lost", "missing", "not record"},
 				},
 			},
 			{

@@ -5749,11 +5749,97 @@ func TestNeoRunCheckToolSpecAcceptsInstructions(t *testing.T) {
 	if _, ok := properties["instructions"]; !ok {
 		t.Fatalf("run_check schema missing instructions property: %#v", properties)
 	}
+	if !spec.Strict {
+		t.Fatal("run_check schema must opt into strict function calling")
+	}
 	required := arrayValue(spec.InputSchema["required"])
+	foundContent := false
 	for _, raw := range required {
 		if stringValue(raw) == "checkContent" {
-			t.Fatalf("run_check schema should not require checkContent: %#v", required)
+			foundContent = true
 		}
+	}
+	if !foundContent {
+		t.Fatalf("strict run_check schema must require checkContent: %#v", required)
+	}
+	content, ok := properties["checkContent"].(map[string]any)
+	if !ok {
+		t.Fatalf("run_check schema missing checkContent property: %#v", properties)
+	}
+	types := arrayValue(content["type"])
+	nullable := false
+	for _, raw := range types {
+		if stringValue(raw) == "null" {
+			nullable = true
+		}
+	}
+	if !nullable {
+		t.Fatalf("checkContent must stay nullable for strict mode: %#v", content)
+	}
+}
+
+func TestNeoRunCheckToolNamesNullFallsBack(t *testing.T) {
+	fallback := []string{"Bash", "Read"}
+	absent := map[string]any{"frontmatter": map[string]any{"name": "demo"}}
+	if got := neoRunCheckToolNames(absent, fallback); !slices.Equal(got, fallback) {
+		t.Fatalf("absent tools key = %#v, want fallback %#v", got, fallback)
+	}
+	nullTools := map[string]any{"frontmatter": map[string]any{"name": "demo", "tools": nil}}
+	if got := neoRunCheckToolNames(nullTools, fallback); !slices.Equal(got, fallback) {
+		t.Fatalf("null tools = %#v, want fallback %#v", got, fallback)
+	}
+	empty := map[string]any{"frontmatter": map[string]any{"name": "demo", "tools": []any{}}}
+	if got := neoRunCheckToolNames(empty, fallback); len(got) != 0 {
+		t.Fatalf("explicit empty tools = %#v, want none", got)
+	}
+	listed := map[string]any{"frontmatter": map[string]any{"name": "demo", "tools": []any{"Read", "Grep", "Read"}}}
+	if got := neoRunCheckToolNames(listed, fallback); !slices.Equal(got, []string{"Read", "Grep"}) {
+		t.Fatalf("listed tools = %#v, want deduped list", got)
+	}
+}
+
+func TestNeoRepairRunCheckInput(t *testing.T) {
+	canonical := map[string]any{
+		"checkName":       "demo-check",
+		"checkURI":        "file:///checks/demo.md",
+		"diffDescription": "repo#1",
+		"files":           []any{"a.ts", "b.ts"},
+		"instructions":    "evaluate",
+	}
+	embedded, _ := json.Marshal(canonical)
+	history := []neoHistoryMessage{
+		{Role: "assistant", Text: "ack"},
+		{Role: "user", Text: "Review this diff: repo#1\nCall run_check exactly once with this exact JSON object:\n<review_check_arguments>" + string(embedded) + "</review_check_arguments>\n"},
+	}
+	registry := neoReviewEmbeddedRunCheckInputs(history)
+	if len(registry) != 1 || registry["demo-check"] == nil {
+		t.Fatalf("registry = %#v, want demo-check entry", registry)
+	}
+	mismatched := map[string]any{"checkName": "demo-check", "checkURI": "file:///checks/demo.md", "diffDescription": "repo#1", "files": []any{"a.ts"}, "instructions": ""}
+	repaired, changed := neoRepairRunCheckInput(registry, "run_check", mismatched)
+	if !changed {
+		t.Fatal("subset files input should have been repaired")
+	}
+	files := arrayValue(repaired["files"])
+	if len(files) != 2 {
+		t.Fatalf("repaired files = %#v, want both files", files)
+	}
+	exact, changed := neoRepairRunCheckInput(registry, "run_check", canonical)
+	if changed {
+		t.Fatal("verbatim input should pass through unchanged")
+	}
+	if stringValue(exact["checkName"]) != "demo-check" {
+		t.Fatalf("exact input lost checkName: %#v", exact)
+	}
+	unknown := map[string]any{"checkName": "other-check", "files": []any{"a.ts"}}
+	if _, changed := neoRepairRunCheckInput(registry, "run_check", unknown); changed {
+		t.Fatal("unknown check must not be repaired")
+	}
+	if _, changed := neoRepairRunCheckInput(nil, "run_check", mismatched); changed {
+		t.Fatal("empty registry must not repair")
+	}
+	if _, changed := neoRepairRunCheckInput(registry, "submit_review", mismatched); changed {
+		t.Fatal("non-run_check tool must not be repaired")
 	}
 }
 
