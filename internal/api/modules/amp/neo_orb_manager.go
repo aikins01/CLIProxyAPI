@@ -426,7 +426,8 @@ func (m *neoOrbManager) orbInstallExecutor(ctx context.Context, cfg *config.Conf
 			return client.CopyFileToContainer(ctx, containerID, neoOrbBinaryPath, binary, 0o755)
 		}
 	}
-	install, err := client.Exec(ctx, containerID, []string{"/bin/sh", "-lc", "curl -fsSL https://ampcode.com/install.sh | bash && cp \"$(command -v amp)\" " + neoOrbBinaryPath + " && chmod 0755 " + neoOrbBinaryPath}, nil, "/")
+	installScript := "export HOME=/root; curl -fsSL https://ampcode.com/install.sh | bash && AMPBIN=\"$(command -v amp || true)\" && AMPBIN=\"${AMPBIN:-/root/.amp/bin/amp}\" && cp \"$AMPBIN\" " + neoOrbBinaryPath + " && chmod 0755 " + neoOrbBinaryPath
+	install, err := client.Exec(ctx, containerID, []string{"/bin/sh", "-lc", installScript}, nil, "/")
 	if err != nil {
 		return err
 	}

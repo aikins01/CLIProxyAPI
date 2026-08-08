@@ -513,6 +513,35 @@ func TestNeoOrbBinaryIsELF(t *testing.T) {
 	}
 }
 
+func TestNeoOrbInstallExecutorUsesInstallerBinaryPath(t *testing.T) {
+	hostAmp := t.TempDir() + "/amp"
+	if err := os.WriteFile(hostAmp, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatalf("write host Amp fixture: %v", err)
+	}
+	t.Setenv("AMP_EXECUTOR_COMMAND", hostAmp)
+	var installCommand string
+	fake := &neoOrbFakeProvider{
+		execHandler: func(cmd []string) neoOrbExecResult {
+			installCommand = strings.Join(cmd, " ")
+			return neoOrbExecResult{ExitCode: 0}
+		},
+	}
+	manager := &neoOrbManager{}
+	if err := manager.orbInstallExecutor(context.Background(), &config.Config{}, fake, "container-fake"); err != nil {
+		t.Fatalf("orbInstallExecutor: %v", err)
+	}
+	for _, required := range []string{
+		"export HOME=/root",
+		"${AMPBIN:-/root/.amp/bin/amp}",
+		`cp "$AMPBIN" /usr/local/bin/amp`,
+		"chmod 0755 /usr/local/bin/amp",
+	} {
+		if !strings.Contains(installCommand, required) {
+			t.Fatalf("install command missing %q: %s", required, installCommand)
+		}
+	}
+}
+
 func TestNeoOrbConcurrentResumeClaimsOnce(t *testing.T) {
 	rt, fake := newNeoOrbTestRuntime(t)
 	threadID := "T-019fdec9-b0cf-745d-8da4-f250184e870e"
