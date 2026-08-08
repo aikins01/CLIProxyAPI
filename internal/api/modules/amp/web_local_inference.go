@@ -317,6 +317,7 @@ func (m *AmpModule) serveWebLocalProjects(c *gin.Context) {
 		"threadTitles":            threadTitles,
 		"archivedThreadIDs":       archivedThreadIDs,
 		"defaultWorkingDirectory": neoDefaultWebLocalWorkingDirectory(),
+		"orbsEnabled":             neoOrbsEnabled(cfg),
 	})
 }
 
@@ -657,6 +658,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	let pendingLocalSidebarThreadID = "";
 	let localSidebarTitleCache = storedLocalSidebarTitles();
 	let localProjectsCache = { at: 0, projects: [], threadID: "", thread: null, threads: [], threadTitles: Object.assign({}, localSidebarTitleCache), sidebarTitleKey: "", promise: null };
+	let localOrbsEnabled = false;
 	let localProjectsCacheGeneration = 0;
 	let localActivityCache = { at: 0, key: "", value: null, promise: null };
 	let localActivityDOMRefreshPending = false;
@@ -4838,6 +4840,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 					(Array.isArray(decoded.archivedThreadIDs) ? decoded.archivedThreadIDs : []).filter(validThreadID),
 				);
 				localProjectsArchiveStateLoaded = true;
+			localOrbsEnabled = decoded.orbsEnabled === true;
 			const threads = normalizeLocalSidebarThreads(decoded.threads, thread);
 			localProjectsCache = {
 				at: Date.now(),
@@ -5932,7 +5935,21 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		});
 	}
 
-	function localThreadPayload(promptText, workingDirectory, modeOptions) {
+	function localProjectRepositoryURLForDirectory(workingDirectory) {
+		const directory = normalizeWorkingDirectory(workingDirectory);
+		if (!directory) {
+			return "";
+		}
+		for (const project of localProjectsCache.projects || []) {
+			const normalized = normalizeLocalProject(project);
+			if (normalized && normalized.workingDirectory === directory) {
+				return firstString(normalized.repositoryURL);
+			}
+		}
+		return "";
+	}
+
+	function localThreadPayload(promptText, workingDirectory, modeOptions, executor) {
 		const mode = localThreadModeOptions(modeOptions);
 		const settings = {
 			agentMode: mode.agentMode,
@@ -5940,10 +5957,11 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		if (mode.reasoningEffort) {
 			settings["reasoning.effort"] = mode.reasoningEffort;
 		}
+		const orbExecutor = executor === "orb";
 		const payload = {
 			agentMode: mode.agentMode,
 			reasoningEffort: mode.reasoningEffort,
-			executorType: "local-client",
+			executorType: orbExecutor ? "sandbox" : "local-client",
 			usesThreadActors: true,
 			settings,
 			threadMeta: {
@@ -5953,8 +5971,16 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 				ampcodeConnectorMode: "local-neo",
 				agentMode: mode.agentMode,
 				reasoningEffort: mode.reasoningEffort,
+				executorType: orbExecutor ? "sandbox" : "local-client",
 			},
 		};
+		if (orbExecutor) {
+			const repositoryURL = localProjectRepositoryURLForDirectory(workingDirectory);
+			if (repositoryURL) {
+				payload.repositoryURL = repositoryURL;
+				payload.threadMeta.repositoryURL = repositoryURL;
+			}
+		}
 		if (workingDirectory) {
 			payload.workingDirectory = workingDirectory;
 			payload.workspaceRoot = workingDirectory;
@@ -5965,10 +5991,10 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		return payload;
 	}
 
-	async function createLocalThread(promptText, workingDirectory, modeOptions) {
+	async function createLocalThread(promptText, workingDirectory, modeOptions, executor) {
 		const headers = localFetchHeaders("application/json");
 		workingDirectory = normalizeWorkingDirectory(workingDirectory) || await ensureDefaultWorkingDirectory(false);
-		const payload = localThreadPayload(promptText, workingDirectory, modeOptions);
+		const payload = localThreadPayload(promptText, workingDirectory, modeOptions, executor);
 		const shellThreadID = await createRemoteThreadShell(payload);
 		payload.threadId = shellThreadID;
 		payload.threadID = shellThreadID;
@@ -6141,8 +6167,12 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			"box-shadow:0 18px 48px rgba(0,0,0,.22)",
 			"font:14px system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif",
 		].join(";");
+		const executorSelection = { value: localOrbsEnabled ? localThreadExecutorChoice() : "local" };
+		if (localOrbsEnabled) {
+			panel.appendChild(buildLocalExecutorToggle(executorSelection));
+		}
 		for (const choice of localThreadModeChoices()) {
-			panel.appendChild(buildLocalThreadChoiceButton(choice, promptText, workingDirectory));
+			panel.appendChild(buildLocalThreadChoiceButton(choice, promptText, workingDirectory, executorSelection));
 		}
 		globalThis.document.body.appendChild(panel);
 		positionLocalThreadPicker(panel, anchor);
@@ -6172,7 +6202,51 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		diagnostics.localThreadPickerOpenCount += 1;
 	}
 
-	function buildLocalThreadChoiceButton(choice, promptText, workingDirectory) {
+	function localThreadExecutorChoice() {
+		try {
+			return globalThis.localStorage.getItem("cliproxyapi.ampLocalInference.executor") === "orb" ? "orb" : "local";
+		} catch {
+			return "local";
+		}
+	}
+
+	function buildLocalExecutorToggle(selection) {
+		const row = globalThis.document.createElement("div");
+		row.style.cssText = "display:flex;gap:4px;padding:2px 2px 8px;margin-bottom:4px;border-bottom:1px solid rgba(128,128,128,.18)";
+		const buttons = [];
+		const paint = () => {
+			for (const entry of buttons) {
+				const active = entry.option.id === selection.value;
+				entry.button.style.background = active ? "rgba(127,127,127,.18)" : "transparent";
+				entry.button.style.opacity = active ? "1" : ".6";
+			}
+		};
+		for (const option of [{ id: "local", label: "Local machine" }, { id: "orb", label: "New Orb" }]) {
+			const button = globalThis.document.createElement("button");
+			button.type = "button";
+			button.textContent = option.label;
+			button.style.cssText = "flex:1;padding:5px 8px;border:0;border-radius:5px;background:transparent;color:inherit;font:inherit;font-size:12px;cursor:default";
+			button.addEventListener("click", (event) => {
+				event.preventDefault();
+				event.stopPropagation();
+				selection.value = option.id;
+				try {
+					globalThis.localStorage.setItem("cliproxyapi.ampLocalInference.executor", option.id);
+				} catch {
+				}
+				paint();
+			}, true);
+			buttons.push({ option, button });
+			if (option.id === "orb") {
+				button.title = "Run in a sandboxed container on this server";
+			}
+			row.appendChild(button);
+		}
+		paint();
+		return row;
+	}
+
+	function buildLocalThreadChoiceButton(choice, promptText, workingDirectory, executorSelection) {
 		const button = globalThis.document.createElement("button");
 		button.type = "button";
 		button.setAttribute("role", "menuitem");
@@ -6207,7 +6281,8 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			event.preventDefault();
 			event.stopPropagation();
 			removeLocalThreadPicker();
-			setTimeout(() => createLocalThread(promptText || "", workingDirectory || "", choice.options).catch((error) => {
+			const executor = executorSelection && executorSelection.value === "orb" ? "orb" : "local";
+			setTimeout(() => createLocalThread(promptText || "", workingDirectory || "", choice.options, executor).catch((error) => {
 				globalThis.alert("Local Amp thread failed: " + (error && error.message ? error.message : String(error)));
 			}), 0);
 		}, true);

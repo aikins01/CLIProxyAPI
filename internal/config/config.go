@@ -329,6 +329,56 @@ type AmpCode struct {
 	NeoLocalRuntime AmpNeoLocalRuntime `yaml:"neo-local-runtime,omitempty" json:"neo-local-runtime,omitempty"`
 
 	WebLocalInference AmpWebLocalInference `yaml:"web-local-inference,omitempty" json:"web-local-inference,omitempty"`
+
+	// Orbs configures remote sandbox executors ("orbs") that run Amp threads in
+	// isolated containers on a configured Docker host instead of the local machine.
+	Orbs AmpOrbs `yaml:"orbs,omitempty" json:"orbs,omitempty"`
+}
+
+// AmpOrbs controls orb executor provisioning for Amp threads. Orbs run in
+// containers on the configured Docker host (the local daemon by default).
+type AmpOrbs struct {
+	// Enabled toggles orb executor support. Nil/false keeps every thread local.
+	Enabled *bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+
+	// Provider selects the orb backend. Only "docker" is supported.
+	Provider string `yaml:"provider,omitempty" json:"provider,omitempty"`
+
+	// DockerHost overrides the Docker Engine API endpoint (default: the
+	// DOCKER_HOST environment variable, then the local unix socket).
+	DockerHost string `yaml:"docker-host,omitempty" json:"docker-host,omitempty"`
+
+	// Image is the container image orbs run. Defaults to debian:12-slim.
+	Image string `yaml:"image,omitempty" json:"image,omitempty"`
+
+	// ExecutorCommand overrides the Amp CLI binary installed into the orb: an
+	// https download URL, or a path on the proxy host to a Linux ELF binary.
+	// Default: the proxy host's own Amp binary on Linux, or the official
+	// installer inside the orb on other host platforms.
+	ExecutorCommand string `yaml:"executor-command,omitempty" json:"executor-command,omitempty"`
+
+	// AutoPauseSeconds pauses an orb after this many seconds without thread
+	// activity (default: 300). A paused orb resumes on the next thread message.
+	AutoPauseSeconds int `yaml:"auto-pause-seconds,omitempty" json:"auto-pause-seconds,omitempty"`
+
+	// SetupTimeoutSeconds bounds orb provisioning work (image preparation,
+	// tooling install, repository clone, and .agents/setup). Default: 600.
+	SetupTimeoutSeconds int `yaml:"setup-timeout-seconds,omitempty" json:"setup-timeout-seconds,omitempty"`
+
+	// NanoCPUs and MemoryMB optionally bound container resources.
+	NanoCPUs int64 `yaml:"nano-cpus,omitempty" json:"nano-cpus,omitempty"`
+	MemoryMB int64 `yaml:"memory-mb,omitempty" json:"memory-mb,omitempty"`
+
+	// Env lists extra environment variables injected into the orb executor
+	// (for example GH_TOKEN for private clones and the gh CLI). Values are
+	// passed only to the orb container and are never logged or included in
+	// status messages.
+	Env map[string]string `yaml:"env,omitempty" json:"env,omitempty"`
+
+	// SyncLocalConfig copies non-secret local Amp configuration into the orb at
+	// provision time: ~/.config/amp/settings.json, ~/.config/agents/checks, and
+	// ~/.config/agents/skills. Auth material is never synced. Default: true.
+	SyncLocalConfig *bool `yaml:"sync-local-config,omitempty" json:"sync-local-config,omitempty"`
 }
 
 type AmpWebLocalInference struct {

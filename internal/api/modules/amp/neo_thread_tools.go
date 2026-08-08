@@ -1026,7 +1026,9 @@ func (a *neoActor) localCreateThreadBody(input map[string]any, threadID string) 
 		case "runner":
 			runnerID = firstNonEmptyString(runnerID, executorMap["id"], executorMap["runnerId"], executorMap["runnerID"])
 		case "orb":
-			return nil, "", false, errors.New("create_thread cannot provision Amp-hosted orbs from the local runtime")
+			if reason := neoOrbsAvailable(a.runtime.configSnapshot()); reason != "" {
+				return nil, "", false, errors.New("create_thread cannot provision an orb: " + reason)
+			}
 		case "", "local":
 		default:
 			return nil, "", false, fmt.Errorf("create_thread received unsupported executor type %q", executorType)
@@ -1034,7 +1036,9 @@ func (a *neoActor) localCreateThreadBody(input map[string]any, threadID string) 
 		executor = executorType
 	}
 	if strings.EqualFold(executor, "orb") {
-		return nil, "", false, errors.New("create_thread cannot provision Amp-hosted orbs from the local runtime")
+		if reason := neoOrbsAvailable(a.runtime.configSnapshot()); reason != "" {
+			return nil, "", false, errors.New("create_thread cannot provision an orb: " + reason)
+		}
 	}
 	if strings.EqualFold(executor, "local") && runnerID != "" {
 		return nil, "", false, errors.New("create_thread executor local conflicts with runnerId")
@@ -1042,7 +1046,10 @@ func (a *neoActor) localCreateThreadBody(input map[string]any, threadID string) 
 	if strings.EqualFold(executor, "runner") && runnerID == "" {
 		return nil, "", false, errors.New("create_thread executor runner requires runnerId")
 	}
-	if executor != "" && !strings.EqualFold(executor, "local") && !strings.EqualFold(executor, "runner") {
+	if strings.EqualFold(executor, "orb") && runnerID != "" {
+		return nil, "", false, errors.New("create_thread executor orb conflicts with runnerId")
+	}
+	if executor != "" && !strings.EqualFold(executor, "local") && !strings.EqualFold(executor, "runner") && !strings.EqualFold(executor, "orb") {
 		if runnerID != "" && runnerID != executor {
 			return nil, "", false, errors.New("create_thread executor conflicts with runnerId")
 		}
@@ -1275,7 +1282,10 @@ func (a *neoActor) localCreateThreadBody(input map[string]any, threadID string) 
 		body["workingDirectory"] = workingDirectory
 		body["workspaceRoot"] = workspaceRoot
 	}
-	if spawnExecutor && (runnerID != "" || workingDirectory != "" || strings.EqualFold(executor, "local")) {
+	if spawnExecutor && strings.EqualFold(executor, "orb") {
+		body["executorType"] = "sandbox"
+		threadMeta["executorType"] = "sandbox"
+	} else if spawnExecutor && (runnerID != "" || workingDirectory != "" || strings.EqualFold(executor, "local")) {
 		body["executorType"] = "local-client"
 		threadMeta["executorType"] = "local-client"
 	}

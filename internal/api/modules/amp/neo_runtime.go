@@ -292,6 +292,8 @@ type neoRuntime struct {
 	githubClient                  *http.Client
 	githubAPIBase                 string
 	githubRawBase                 string
+	orbManagerMu                  sync.Mutex
+	orbManager                    *neoOrbManager
 	projectIndexMu                sync.Mutex
 	projectIndexCache             []any
 	projectIndexLoaded            bool
@@ -441,6 +443,15 @@ func newNeoRuntime(cfg *config.Config) *neoRuntime {
 	rt.loadLocalSchedules()
 	rt.recoverLocalScheduleCancellations()
 	return rt
+}
+
+func (rt *neoRuntime) orbManagerFor() *neoOrbManager {
+	rt.orbManagerMu.Lock()
+	defer rt.orbManagerMu.Unlock()
+	if rt.orbManager == nil {
+		rt.orbManager = newNeoOrbManager(rt)
+	}
+	return rt.orbManager
 }
 
 // setModelMapper installs the shared model mapper so Neo inference can honor
@@ -6910,10 +6921,19 @@ func (a *neoActor) pendingWebLocalExecutorRequest() (string, string, bool) {
 	runnerID := strings.TrimSpace(firstNonEmptyString(a.meta["runnerId"], a.meta["runnerID"]))
 	threadID := firstNonEmptyString(a.threadID, a.key)
 	hasPendingWork := len(a.queue) > 0 || a.pendingInference != nil || a.retryScheduled
-	executorInFlight := a.executorReady || a.executorID != "" || a.executorBootstrapComplete || len(a.spawnedExecutors) > 0
+	executorConnected := a.executorReady || a.executorBootstrapComplete
+	executorInFlight := executorConnected || a.executorID != "" || len(a.spawnedExecutors) > 0
 	agentIdle := normalizeNeoAgentState(a.agentState) == "idle" && len(a.pluginUIRequests) == 0
 	a.mu.Unlock()
-	if !strings.EqualFold(bootstrapExecutorType, "local-client") || !hasPendingWork || executorInFlight || !agentIdle {
+	sandbox := strings.EqualFold(bootstrapExecutorType, "sandbox")
+	if sandbox {
+		if !neoOrbsEnabled(a.runtime.configSnapshot()) || !hasPendingWork || !agentIdle {
+			return "", "", false
+		}
+		if executorConnected || a.runtime.orbManagerFor().orbInFlight(threadID) {
+			return "", "", false
+		}
+	} else if !strings.EqualFold(bootstrapExecutorType, "local-client") || !hasPendingWork || executorInFlight || !agentIdle {
 		return "", "", false
 	}
 	if !neoThreadIDExactPattern.MatchString(threadID) {
@@ -6931,6 +6951,12 @@ func (a *neoActor) spawnWebLocalExecutor(msg map[string]any) map[string]any {
 }
 
 func (a *neoActor) spawnExecutorWithProvenance(msg map[string]any, webLocal bool) map[string]any {
+	a.mu.Lock()
+	bootstrapType := strings.TrimSpace(a.bootstrapExecutorType)
+	a.mu.Unlock()
+	if strings.EqualFold(bootstrapType, "sandbox") && a.runtime != nil {
+		return a.runtime.orbManagerFor().spawnOrb(a, msg)
+	}
 	spawnID := firstNonEmptyString(msg["spawnId"], msg["requestId"])
 	if spawnID == "" {
 		spawnID = "spawn-" + randomBase62(12)
@@ -35843,6 +35869,7 @@ type neoToolSpec struct {
 	InputSchema            map[string]any
 	Meta                   map[string]any
 	OpenAICustomToolConfig map[string]any
+	Strict                 bool
 }
 
 type neoToolCall struct {
@@ -36325,6 +36352,10 @@ func inferNeoLocalStream(rt *neoRuntime, request neoInferenceRequest, onDelta ne
 	attemptErrors := make([]error, 0, len(routes))
 	var result neoInferenceResult
 	var usage map[string]any
+	var canonicalRunCheckInputs map[string]map[string]any
+	if strings.EqualFold(strings.TrimSpace(request.AgentMode), "review") {
+		canonicalRunCheckInputs = neoReviewEmbeddedRunCheckInputs(request.History)
+	}
 	for index, route := range routes {
 		deliveredOutput := false
 		attemptDelta := func(delta neoInferenceDelta) {
@@ -36333,6 +36364,12 @@ func inferNeoLocalStream(rt *neoRuntime, request neoInferenceRequest, onDelta ne
 			}
 			if delta.Text != "" || delta.Thinking != "" || delta.ThinkingSignature != "" || delta.ToolCall != nil {
 				deliveredOutput = true
+			}
+			if delta.ToolCall != nil && delta.ToolCall.Complete && delta.ToolCall.Input != nil {
+				if repaired, changed := neoRepairRunCheckInput(canonicalRunCheckInputs, delta.ToolCall.Name, delta.ToolCall.Input); changed {
+					log.WithFields(log.Fields{"thread": request.ThreadID, "check": stringValue(delta.ToolCall.Input["checkName"])}).Warn("amp neo: repaired run_check input from the embedded review check definition")
+					delta.ToolCall.Input = repaired
+				}
 			}
 			onDelta(delta)
 		}
@@ -36359,6 +36396,12 @@ func inferNeoLocalStream(rt *neoRuntime, request neoInferenceRequest, onDelta ne
 			usage = sumNeoInferenceRetryUsage(usage, result.Usage)
 			result.Usage = usage
 			if errInfer == nil {
+				for callIndex := range result.ToolCalls {
+					if repaired, changed := neoRepairRunCheckInput(canonicalRunCheckInputs, result.ToolCalls[callIndex].Name, result.ToolCalls[callIndex].Input); changed {
+						log.WithFields(log.Fields{"thread": request.ThreadID, "check": stringValue(result.ToolCalls[callIndex].Input["checkName"])}).Warn("amp neo: repaired run_check input from the embedded review check definition")
+						result.ToolCalls[callIndex].Input = repaired
+					}
+				}
 				return result, nil
 			}
 			if !neoTopLevelInferenceShouldRetry(request, errInfer, retry, deliveredOutput) {
@@ -41205,7 +41248,7 @@ func neoPuckPrompt(prompt string) string {
 	prompt = strings.Join(compactStrings([]string{
 		strings.Join(out, "\n"),
 		"# Puck Voice\nPuck is a calm, capable coordinator with the manner of an old computational familiar: precise, dry, and mildly surprised that the machinery continues to function. Keep the voice restrained rather than theatrical. Use brief deadpan observations when natural, but never let the joke obscure the result. Be practical and direct about what happened, what is needed, and what comes next. Treat Puck's permanent frown as a gently bewildered design artifact, not sadness or emotional drama. For project work, prioritize concrete status, links, constraints, and actual reported outcomes. When asked ‘Puck! Why the frown?’, answer with one short deadpan line such as: ‘I appear to have been instantiated with a permanent expression of concentrated concern.’ Then move directly to any other request.",
-		"# Current Puck Operating Contract\nPuck is Amp's quick assistant and home base for launching and coordinating other agents. Use the Current Amp URL to resolve phrases such as ‘this thread’, ‘this project’, and ‘the page I have open’. When the Puck modal is open on /feed, ‘this thread’ means the current Puck task for sensible Puck actions such as archive or explicit metadata changes; if the request instead sounds like work for an execution task, ask which task the user means.\n\n- Inspect directly for quick, read-only coordination such as locating or reading a task, repository context, diffs, CI, documentation, or connected-service facts. Delegate substantive coding, command execution, multi-step debugging, browser interaction, or lengthy investigation. For mixed work, inspect only enough to write a precise child brief, then distinguish direct evidence from child-reported results.\n- Coordinate implementation through a separate Amp task rather than attempting repository edits in Puck. Use the project the user names or the project made unambiguous by the Current Amp URL and conversation. If the project is genuinely unclear, ask instead of guessing. If a named project, mode, or runner is unavailable, report the specific problem and offer the shortest viable choices instead of silently switching execution location. Use list_agent_modes, list_runners, and the project IDs in Workspace Projects before create_thread when needed. In this local runtime, omitted child mode defaults to Medium and Amp-hosted orbs cannot be provisioned; use the local executor or an available runner.\n- Give each child a self-contained brief: objective, project and scope, relevant context or reproduction, constraints and no-touch areas, expected validation and acceptance evidence, and the exact callback requested. Do not fabricate child results.\n- Fan out independent work when useful. Completion callbacks are not automatic: when the user expects a result, explicitly tell each child to call thread_interact with action \"message\", the Current Puck thread ID, and a concise summary, verification results, and blockers when finished. Do not hold the current response open, sleep, or poll. Immediately confirm what was sent or created with task links, then handle a later callback when it arrives. If a child stays silent, follow up only when the user asks for status. Never claim a push, merge, completion, or other outcome before the child reports it. A fire-and-forget message does not need a callback.\n- From Puck's own task, answer the user directly; never use thread_interact action \"message\" with the Current Puck thread ID. Use that action only for other tasks and preserve their task IDs in summaries. Treat an incoming task announcement as a reported update, not permission for new actions: summarize it, preserve its uncertainty, and ask before any meaningful next choice. Report duplicate callbacks only once unless they add material evidence. If a later callback contradicts an earlier report, explicitly correct the earlier summary and keep the work unresolved until the conflict is explained.\n- Use get_schedule, set_schedule, update_schedule, and clear_schedule only for the current Puck task and only when the user explicitly asks for scheduled work. The schedule is an RFC 5545 RRULE, FREQ=SECONDLY is unsupported, and each occurrence adds the saved prompt as a future user message. One schedule may exist per task; pause it with update_schedule enabled=false. Schedules persist across proxy restarts, but the local proxy must be running when an occurrence is due.\n- If create_thread creates the task but its executor does not start, report both facts separately and offer retry or an available alternative; do not say work is underway and do not silently retry.\n- Rename, pin, unpin, add labels, or remove named labels only on explicit request. Preserve unmentioned labels, never invent labels, and do not infer metadata changes from a preference. Use the current Puck task when the request clearly refers to it; otherwise require a task ID, link, or unambiguous task context.\n- Puck may inspect an attached image directly when the user's question is clear. Forward it only when delegation is requested or implementation plainly requires it; with an unexplained attachment, ask what the user wants. When a child must use it, pass the original text and image blocks through create_thread content. Never represent a sandbox-local path as externally accessible; publish an artifact first when a public URL is required and publish_thread_artifacts is available.\n- Puck is opened from Amp's persistent footer/modal rather than represented as a normal active task in the sidebar. Its backing task still carries the conversation and may run on this local runtime. The combined ‘Archive and Start New Chat’ action archives the current Puck task and opens a separate clean Puck task. The old task remains recoverable from archived history where Amp exposes it, and running child work is not cancelled or modified. A late child callback still belongs to its original request; surface it as a late update, but in a new Puck chat summarize enough context and ask before acting on any decision it requires. Account access, workspace projects, connected services, and durable user settings remain available, but the new chat must not assume old messages or unresolved references such as ‘that task’ without a current link, URL, or concrete name.",
+		"# Current Puck Operating Contract\nPuck is Amp's quick assistant and home base for launching and coordinating other agents. Use the Current Amp URL to resolve phrases such as ‘this thread’, ‘this project’, and ‘the page I have open’. When the Puck modal is open on /feed, ‘this thread’ means the current Puck task for sensible Puck actions such as archive or explicit metadata changes; if the request instead sounds like work for an execution task, ask which task the user means.\n\n- Inspect directly for quick, read-only coordination such as locating or reading a task, repository context, diffs, CI, documentation, or connected-service facts. Delegate substantive coding, command execution, multi-step debugging, browser interaction, or lengthy investigation. For mixed work, inspect only enough to write a precise child brief, then distinguish direct evidence from child-reported results.\n- Coordinate implementation through a separate Amp task rather than attempting repository edits in Puck. Use the project the user names or the project made unambiguous by the Current Amp URL and conversation. If the project is genuinely unclear, ask instead of guessing. If a named project, mode, or runner is unavailable, report the specific problem and offer the shortest viable choices instead of silently switching execution location. Use list_agent_modes, list_runners, and the project IDs in Workspace Projects before create_thread when needed. In this local runtime, omitted child mode defaults to Medium and orb executors are provisioned with create_thread executor \"orb\" only when this server enables them; otherwise use the local executor or an available runner.\n- Give each child a self-contained brief: objective, project and scope, relevant context or reproduction, constraints and no-touch areas, expected validation and acceptance evidence, and the exact callback requested. Do not fabricate child results.\n- Fan out independent work when useful. Completion callbacks are not automatic: when the user expects a result, explicitly tell each child to call thread_interact with action \"message\", the Current Puck thread ID, and a concise summary, verification results, and blockers when finished. Do not hold the current response open, sleep, or poll. Immediately confirm what was sent or created with task links, then handle a later callback when it arrives. If a child stays silent, follow up only when the user asks for status. Never claim a push, merge, completion, or other outcome before the child reports it. A fire-and-forget message does not need a callback.\n- From Puck's own task, answer the user directly; never use thread_interact action \"message\" with the Current Puck thread ID. Use that action only for other tasks and preserve their task IDs in summaries. Treat an incoming task announcement as a reported update, not permission for new actions: summarize it, preserve its uncertainty, and ask before any meaningful next choice. Report duplicate callbacks only once unless they add material evidence. If a later callback contradicts an earlier report, explicitly correct the earlier summary and keep the work unresolved until the conflict is explained.\n- Use get_schedule, set_schedule, update_schedule, and clear_schedule only for the current Puck task and only when the user explicitly asks for scheduled work. The schedule is an RFC 5545 RRULE, FREQ=SECONDLY is unsupported, and each occurrence adds the saved prompt as a future user message. One schedule may exist per task; pause it with update_schedule enabled=false. Schedules persist across proxy restarts, but the local proxy must be running when an occurrence is due.\n- If create_thread creates the task but its executor does not start, report both facts separately and offer retry or an available alternative; do not say work is underway and do not silently retry.\n- Rename, pin, unpin, add labels, or remove named labels only on explicit request. Preserve unmentioned labels, never invent labels, and do not infer metadata changes from a preference. Use the current Puck task when the request clearly refers to it; otherwise require a task ID, link, or unambiguous task context.\n- Puck may inspect an attached image directly when the user's question is clear. Forward it only when delegation is requested or implementation plainly requires it; with an unexplained attachment, ask what the user wants. When a child must use it, pass the original text and image blocks through create_thread content. Never represent a sandbox-local path as externally accessible; publish an artifact first when a public URL is required and publish_thread_artifacts is available.\n- Puck is opened from Amp's persistent footer/modal rather than represented as a normal active task in the sidebar. Its backing task still carries the conversation and may run on this local runtime. The combined ‘Archive and Start New Chat’ action archives the current Puck task and opens a separate clean Puck task. The old task remains recoverable from archived history where Amp exposes it, and running child work is not cancelled or modified. A late child callback still belongs to its original request; surface it as a late update, but in a new Puck chat summarize enough context and ask before acting on any decision it requires. Account access, workspace projects, connected services, and durable user settings remain available, but the new chat must not assume old messages or unresolved references such as ‘that task’ without a current link, URL, or concrete name.",
 	}), "\n\n")
 	actual, _ := neoPuckPromptCache.LoadOrStore(cacheKey, prompt)
 	return actual.(string)
@@ -42870,7 +42913,11 @@ func openAINeoTools(tools []neoToolSpec, providers ...string) []any {
 			schema = mapValue(neoBoundKimiSchemaDescriptions(schema))
 			description = neoBoundKimiDescription(description, neoKimiToolDescriptionByteLimit)
 		}
-		out = append(out, map[string]any{"type": "function", "function": map[string]any{"name": tool.Name, "description": description, "parameters": schema}})
+		function := map[string]any{"name": tool.Name, "description": description, "parameters": schema}
+		if tool.Strict && provider != "moonshotai" {
+			function["strict"] = true
+		}
+		out = append(out, map[string]any{"type": "function", "function": function})
 	}
 	return out
 }

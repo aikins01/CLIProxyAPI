@@ -379,6 +379,43 @@ nonstream-keepalive-interval: 0
 #     allowed-origins:
 #       - "https://ampcode.com"
 #       - "https://www.ampcode.com"
+#   # Orb executors: run Amp threads in isolated Docker containers instead of on the
+#   # local machine. The web composer gains a "New Orb" executor choice when this
+#   # is enabled. Containers run the Amp CLI headless executor with the proxy's
+#   # configured API keys; anyone who can create threads effectively gets a shell inside
+#   # the container on the Docker host, so only enable this on a trusted single-user
+#   # deployment. Loopback proxy addresses are rewritten to host.docker.internal so the
+#   # container can reach this server.
+#   orbs:
+#     enabled: false
+#     # provider: docker              # only "docker" is supported
+#     # docker-host: ""               # unix:///var/run/docker.sock by default (or DOCKER_HOST)
+#     # image: "debian:12-slim"       # custom images must be Debian/Ubuntu-based (apt) or
+#     #                               # pre-bake git, curl, and ca-certificates.
+#     #                               # For reproducible provisioning pin a digest, e.g.
+#     #                               # debian:12-slim@sha256:<digest>
+#     # executor-command: ""          # override Amp CLI binary for the orb: an https
+#     #                               # download URL, or a proxy-host path to a Linux ELF.
+#     #                               # Default: the host's own amp binary on Linux, or the
+#     #                               # official ampcode.com installer inside the orb.
+#     #                               # Pin a URL to your own artifact for full control.
+#     # auto-pause-seconds: 300       # pause orbs whose thread is idle with no connected
+#     #                               # executor; archived threads pause immediately.
+#     #                               # A paused orb resumes on the next message
+#     # setup-timeout-seconds: 600    # bounds image pull, tooling install, clone, and
+#     #                               # .agents/setup during provisioning
+#     # nano-cpus: 0                  # optional container CPU limit (1e9 = 1 CPU)
+#     # memory-mb: 0                  # optional container memory limit
+#     # env: {}                       # extra environment for the orb executor, e.g.
+#     #                               # GH_TOKEN for private clones and the gh CLI.
+#     #                               # AMP_*/RIVET_*/RIVETKIT_* keys are reserved
+#     #                               # and ignored.
+#     #                               # A configured GitHub token is usable by processes
+#     #                               # inside the orb (git URL rewrite); prefer a
+#     #                               # fine-grained token scoped to the needed repos.
+#     # sync-local-config: true       # copy ~/.config/amp/settings.json plus
+#     #                               # ~/.config/agents/checks and skills into new orbs.
+#     #                               # Auth/credential-shaped files are never copied.
 #   # Amp Model Mappings
 #   # Route unavailable Amp models to alternative models available in your local proxy.
 #   # Useful when Amp CLI requests models you don't have access to (e.g., Claude Opus 4.5)

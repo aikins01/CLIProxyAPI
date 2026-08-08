@@ -457,6 +457,8 @@ func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *ha
 	engine.Any("/ampcode/local-activity.json", append(localProjectMiddleware, m.serveWebLocalActivity)...)
 	engine.Any("/ampcode/local-thread-search.json", append(localProjectMiddleware, m.serveWebLocalThreadSearch)...)
 	engine.Any("/ampcode/local-thread-data.json", append(localProjectMiddleware, m.serveWebLocalThreadData)...)
+	orbPortalMiddleware := append([]gin.HandlerFunc{}, localProjectMiddleware...)
+	engine.Any("/orb/:threadID/p/:port/*path", append(orbPortalMiddleware, m.serveOrbPortal)...)
 	engine.Any("/threads", append(rootMiddleware, proxyHandler)...)
 	engine.Any("/threads/*path", append(rootMiddleware, proxyHandler)...)
 	// Attachment URL forms recognized by current Amp CLI binaries:
