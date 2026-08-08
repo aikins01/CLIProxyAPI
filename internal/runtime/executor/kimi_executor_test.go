@@ -1,10 +1,25 @@
 package executor
 
 import (
+	"context"
+	"errors"
+	"io"
+	"net/http"
+	"strings"
 	"testing"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	"github.com/tidwall/gjson"
 )
+
+type kimiTestRoundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f kimiTestRoundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
 
 func TestNormalizeKimiToolMessageLinks_UsesCallIDFallback(t *testing.T) {
 	body := []byte(`{
@@ -22,6 +37,105 @@ func TestNormalizeKimiToolMessageLinks_UsesCallIDFallback(t *testing.T) {
 	got := gjson.GetBytes(out, "messages.1.tool_call_id").String()
 	if got != "list_directory:1" {
 		t.Fatalf("messages.1.tool_call_id = %q, want %q", got, "list_directory:1")
+	}
+}
+
+func TestKimiExecutorNativeUpstreamStatusClassification(t *testing.T) {
+	tests := []struct {
+		name        string
+		body        string
+		wantNeutral bool
+	}{
+		{name: "transient", body: `{"error":{"type":"server_error","message":"upstream unavailable"}}`, wantNeutral: true},
+		{name: "authentication", body: `{"error":{"type":"authentication_error","message":"invalid api key"}}`},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.WithValue(t.Context(), "cliproxy.roundtripper", kimiTestRoundTripperFunc(func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusBadGateway,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader(tc.body)),
+				}, nil
+			}))
+			executor := NewKimiExecutor(&config.Config{})
+			auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "test"}}
+			_, err := executor.Execute(ctx, auth, cliproxyexecutor.Request{
+				Model:   "kimi-k2",
+				Payload: []byte(`{"model":"kimi-k2","messages":[{"role":"user","content":"hi"}]}`),
+			}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai")})
+			if err == nil {
+				t.Fatal("Execute() error = nil, want upstream status error")
+			}
+			var status interface{ StatusCode() int }
+			if !errors.As(err, &status) || status.StatusCode() != http.StatusBadGateway {
+				t.Fatalf("upstream status = %v, want %d", err, http.StatusBadGateway)
+			}
+			var neutral interface{ AuthStateNeutral() bool }
+			if !errors.As(err, &neutral) {
+				t.Fatalf("error %T does not expose AuthStateNeutral", err)
+			}
+			if got := neutral.AuthStateNeutral(); got != tc.wantNeutral {
+				t.Fatalf("AuthStateNeutral() for %v = %t, want %t", err, got, tc.wantNeutral)
+			}
+		})
+	}
+}
+
+func TestKimiExecutorNativeTransportFailureIsAuthStateNeutral(t *testing.T) {
+	wantErr := errors.New("upstream transport failed")
+	ctx := context.WithValue(t.Context(), "cliproxy.roundtripper", kimiTestRoundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return nil, wantErr
+	}))
+	executor := NewKimiExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "test"}}
+	_, err := executor.Execute(ctx, auth, cliproxyexecutor.Request{
+		Model:   "kimi-k2",
+		Payload: []byte(`{"model":"kimi-k2","messages":[{"role":"user","content":"hi"}]}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai")})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("Execute() error = %v, want %v", err, wantErr)
+	}
+	var neutral interface{ AuthStateNeutral() bool }
+	if !errors.As(err, &neutral) || !neutral.AuthStateNeutral() {
+		t.Fatalf("transport error is not auth-state-neutral: %v", err)
+	}
+}
+
+func TestKimiExecutorStreamScannerFailureDoesNotEmitCompletion(t *testing.T) {
+	ctx := context.WithValue(t.Context(), "cliproxy.roundtripper", kimiTestRoundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(strings.Repeat("x", 1_048_577))),
+		}, nil
+	}))
+	executor := NewKimiExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "test"}}
+	result, err := executor.ExecuteStream(ctx, auth, cliproxyexecutor.Request{
+		Model:   "kimi-k2",
+		Payload: []byte(`{"model":"kimi-k2","messages":[{"role":"user","content":"hi"}],"stream":true}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai"), Stream: true})
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+
+	var streamErr error
+	for chunk := range result.Chunks {
+		if len(chunk.Payload) > 0 {
+			t.Fatalf("scanner failure emitted completion payload first: %q", chunk.Payload)
+		}
+		if chunk.Err != nil {
+			streamErr = chunk.Err
+		}
+	}
+	if streamErr == nil {
+		t.Fatal("scanner failure did not emit an error")
+	}
+	var neutral interface{ AuthStateNeutral() bool }
+	if !errors.As(streamErr, &neutral) || !neutral.AuthStateNeutral() {
+		t.Fatalf("scanner error is not auth-state-neutral: %v", streamErr)
 	}
 }
 

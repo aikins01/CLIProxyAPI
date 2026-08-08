@@ -27,6 +27,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
 type failingWebLocalThreadResponseWriter struct {
@@ -466,9 +467,15 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 	if got, want := rec.Header().Get("Content-Length"), strconv.Itoa(len(rec.Body.Bytes())); got != want {
 		t.Fatalf("userscript Content-Length = %q, want %q", got, want)
 	}
+	if got := rec.Header().Get("Cache-Control"); got != "no-store, max-age=0" {
+		t.Fatalf("userscript Cache-Control = %q, want no-store revalidation", got)
+	}
+	if got := rec.Header().Get("Pragma"); got != "no-cache" {
+		t.Fatalf("userscript Pragma = %q, want no-cache", got)
+	}
 	for _, want := range []string{
 		"// ==UserScript==",
-		"@version 0.1.195",
+		"@version 0.1.200",
 		"@match https://ampcode.com/*",
 		"@updateURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
 		"@downloadURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
@@ -485,7 +492,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"commandPaletteIntegrationCount",
 		"localThreadPickerOpenCount",
 		"removedLocalThreadControlCount",
-		`const userscriptVersion = "0.1.195"`,
+		`const userscriptVersion = "0.1.200"`,
 		"localThreadSearchEndpointPath",
 		"fetchLocalThreadSearch",
 		"mergeThreadSearchResponse",
@@ -534,9 +541,10 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"local-client",
 		"cliproxyapi.ampLocalInference.apiKey",
 		"storedLocalAPIKey",
-		"globalThis.localStorage.getItem(apiKeyStorageKey)",
+		"persistentLocalAPIKeyStorageKey",
+		"globalThis.localStorage.getItem(persistentStorageKey)",
 		`const promptedAPIKey = (globalThis.prompt("CLIProxyAPI API key") || "").trim()`,
-		"globalThis.sessionStorage.setItem(apiKeyStorageKey, promptedAPIKey)",
+		"rememberLocalAPIKey(promptedAPIKey)",
 		"cliproxyapi.ampLocalInference.workingDirectory",
 		"cliproxyapi.ampLocalInference.selectedLocalProject",
 		"cliproxyapi.ampLocalInference.localThreadIDs",
@@ -869,6 +877,15 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 	if got := headRec.Header().Get("Content-Length"); got == "" {
 		t.Fatalf("userscript HEAD missing Content-Length")
 	}
+	if got, want := headRec.Header().Get("Content-Length"), rec.Header().Get("Content-Length"); got != want {
+		t.Fatalf("userscript HEAD Content-Length = %q, want GET length %q", got, want)
+	}
+	if got := headRec.Header().Get("Cache-Control"); got != "no-store, max-age=0" {
+		t.Fatalf("userscript HEAD Cache-Control = %q, want no-store revalidation", got)
+	}
+	if got := headRec.Header().Get("Pragma"); got != "no-cache" {
+		t.Fatalf("userscript HEAD Pragma = %q, want no-cache", got)
+	}
 }
 
 func TestWebLocalInferenceUserscriptSyntax(t *testing.T) {
@@ -882,6 +899,357 @@ func TestWebLocalInferenceUserscriptSyntax(t *testing.T) {
 	cmd := exec.Command("node", "--check", path)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("userscript syntax check failed: %v\n%s", err, output)
+	}
+}
+
+func TestWebLocalInferenceUserscriptScopesDelayedAPIKeyHydration(t *testing.T) {
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node not installed")
+	}
+	for _, test := range []struct {
+		name     string
+		baseURL  string
+		scenario string
+	}{
+		{name: "after document start", baseURL: "http://127.0.0.1:8317", scenario: "delayed"},
+		{name: "after visual timeout", baseURL: "http://127.0.0.1:8317", scenario: "timeout"},
+		{name: "account scope", baseURL: "http://127.0.0.1:8317", scenario: "account"},
+		{name: "local base scope", baseURL: "http://127.0.0.1:8318", scenario: "base"},
+		{name: "pre-identity persistence consent", baseURL: "http://127.0.0.1:8317", scenario: "pending"},
+		{name: "session key survives refresh before identity", baseURL: "http://127.0.0.1:8317", scenario: "refresh"},
+		{name: "current bootstrap restores refresh identity", baseURL: "http://127.0.0.1:8317", scenario: "bootstrap-object"},
+		{name: "quoted JSON bootstrap restores refresh identity", baseURL: "http://127.0.0.1:8317", scenario: "bootstrap-object-quoted"},
+		{name: "cached sidebar reveals before metadata refresh", baseURL: "http://127.0.0.1:8317", scenario: "cached-sidebar"},
+		{name: "current bootstrap confirms account switch", baseURL: "http://127.0.0.1:8317", scenario: "bootstrap-object-account"},
+		{name: "conflicting bootstrap users cannot confirm identity", baseURL: "http://127.0.0.1:8317", scenario: "bootstrap-object-conflict"},
+		{name: "unrelated object cannot confirm identity", baseURL: "http://127.0.0.1:8317", scenario: "bootstrap-unrelated"},
+		{name: "decoy bootstrap keys cannot confirm identity", baseURL: "http://127.0.0.1:8317", scenario: "bootstrap-decoy-keys"},
+		{name: "stale refresh identity hint cannot cross accounts", baseURL: "http://127.0.0.1:8317", scenario: "refresh-account"},
+		{name: "legacy session key migrates after identity", baseURL: "http://127.0.0.1:8317", scenario: "legacy"},
+		{name: "legacy key cannot overwrite scoped key", baseURL: "http://127.0.0.1:8317", scenario: "legacy-existing"},
+		{name: "corrected credential retries hydration", baseURL: "http://127.0.0.1:8317", scenario: "retry"},
+		{name: "forgotten credential invalidates hydration", baseURL: "http://127.0.0.1:8317", scenario: "forget"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			scriptPath := filepath.Join(dir, "local-inference.user.js")
+			script := ampWebLocalInferenceUserscript(test.baseURL, nil)
+			hydrationTimeout := "5"
+			if test.scenario == "cached-sidebar" {
+				hydrationTimeout = "100"
+			}
+			script = strings.Replace(script, "const localSidebarHydrationTimeout = 2500;", "const localSidebarHydrationTimeout = "+hydrationTimeout+";", 1)
+			exported := strings.Replace(script, "\tglobalThis.__cliproxyAmpLocalInference = {", "\tglobalThis.__cliproxyAmpLocalInferenceAPIKeyTest = { storedLocalAPIKey, localAPIKey, rememberLocalAPIKey, forgetLocalAPIKey, fetchLocalProjects, localSidebarArchivedThreadID, sessionLocalAPIKeyStorageKey, persistentLocalAPIKeyStorageKey, localAPIKeyPromptStorageKey, rememberAuthenticatedAmpUser, renderLocalSidebarMetadata };\n\tglobalThis.__cliproxyAmpLocalInference = {", 1)
+			if exported == script {
+				t.Fatal("userscript missing local inference bridge")
+			}
+			if err := os.WriteFile(scriptPath, []byte(exported), 0o600); err != nil {
+				t.Fatalf("write userscript: %v", err)
+			}
+			runner := `
+(async () => {
+const assert = (condition, message) => { if (!condition) throw new Error(message); };
+const scriptPath = ` + strconv.Quote(scriptPath) + `;
+const scenario = ` + strconv.Quote(test.scenario) + `;
+const configuredBaseURL = ` + strconv.Quote(test.baseURL) + `;
+const viewerA = "viewer-a";
+const viewerB = "viewer-b";
+const viewerC = "viewer-c";
+const legacyKey = "cliproxyapi.ampLocalInference.apiKey";
+const authenticatedUserIDKey = legacyKey + ".authenticatedAmpUserID";
+const normalizedBaseURL = (value) => new URL(value).href.replace(/\/+$/, "");
+const scopeSuffix = (userID, baseURL) => encodeURIComponent(userID) + "." + encodeURIComponent(normalizedBaseURL(baseURL));
+const scopedKey = (userID, baseURL) => "cliproxyapi.ampLocalInference.apiKey.user." + scopeSuffix(userID, baseURL);
+const scopedPromptKey = (userID, baseURL) => "cliproxyapi.ampLocalInference.promptedAPIKey.user." + scopeSuffix(userID, baseURL);
+class TestStorage {
+	constructor() { this.values = new Map(); }
+	getItem(key) { key = String(key); return this.values.has(key) ? this.values.get(key) : null; }
+	setItem(key, value) { this.values.set(String(key), String(value)); }
+	removeItem(key) { this.values.delete(String(key)); }
+}
+class FakeElement {
+	constructor(tagName = "div", text = "") { this.attributes = new Map(); this.children = []; this.dataset = {}; this.style = {}; this.parentElement = null; this.tagName = String(tagName).toUpperCase(); this.textContent = String(text); }
+	appendChild(child) { this.children.push(child); child.parentElement = this; return child; }
+	remove() { if (!this.parentElement) return; this.parentElement.children = this.parentElement.children.filter((child) => child !== this); this.parentElement = null; }
+	setAttribute(name, value) { this.attributes.set(String(name), String(value)); }
+	getAttribute(name) { return this.attributes.has(String(name)) ? this.attributes.get(String(name)) : null; }
+	removeAttribute(name) { this.attributes.delete(String(name)); }
+	hasAttribute(name) { return this.attributes.has(String(name)); }
+	querySelector() { return null; }
+	querySelectorAll(selector) { return selector === "span" ? this.children.filter((child) => child.tagName === "SPAN") : []; }
+	matches() { return false; }
+	closest() { return null; }
+	contains(target) { for (let node = target; node; node = node.parentElement) if (node === this) return true; return false; }
+	addEventListener() {}
+	removeEventListener() {}
+}
+const documentElement = new FakeElement();
+const head = documentElement.appendChild(new FakeElement());
+const body = documentElement.appendChild(new FakeElement());
+const cachedSidebarThreadID = "T-019f324b-2802-7868-b1b1-000000000000";
+const cachedSidebarRow = new FakeElement("a");
+cachedSidebarRow.dataset.sidebarThreadId = cachedSidebarThreadID;
+const cachedSidebarTitle = cachedSidebarRow.appendChild(new FakeElement("span", "Untitled"));
+const bootstrapObjectUserID = scenario === "bootstrap-object-account" ? viewerB : viewerA;
+const inlineScripts = scenario === "bootstrap-object" || scenario === "bootstrap-object-account" || scenario === "cached-sidebar" ? [{
+	textContent: '__sveltekit.data={q:{user:{id:"' + bootstrapObjectUserID + '",email:"viewer@example.test",firstName:"Viewer",lastName:"One",username:"viewer",profilePictureUrl:"https://example.test/avatar"},initialProjects:{projects:[]},userFeatures:[]}};',
+}] : scenario === "bootstrap-object-quoted" ? [{
+	textContent: '__sveltekit.data={"q":{"user":{"id":"' + viewerA + '","email":"viewer@example.test","username":"viewer"},"initialProjects":{"projects":[]},"userFeatures":[]}};',
+}] : scenario === "bootstrap-object-conflict" ? [{
+	textContent: '__sveltekit.data={q:{user:{id:"' + viewerA + '",email:"viewer-a@example.test",username:"viewer-a"},nested:{user:{id:"' + viewerB + '",email:"viewer-b@example.test",username:"viewer-b"}},initialProjects:{projects:[]},userFeatures:[]}};',
+}] : scenario === "bootstrap-unrelated" ? [{
+	textContent: 'const unrelated={user:{id:"' + viewerA + '",email:"viewer@example.test",username:"viewer"},initialProjects:{projects:[]},userFeatures:[]};__sveltekit.data={q:{initialProjects:{projects:[]},userFeatures:[]}};',
+}] : scenario === "bootstrap-decoy-keys" ? [{
+	textContent: '__sveltekit.data={"q":{"user":{"id":"' + viewerA + '","email":"viewer@example.test","username":"viewer"},"notinitialProjects":{},"notuserFeatures":[]}};',
+}] : [];
+globalThis.Element = FakeElement;
+globalThis.HTMLElement = FakeElement;
+globalThis.NodeFilter = { SHOW_TEXT: 4, SHOW_ELEMENT: 1 };
+globalThis.document = {
+	readyState: scenario === "timeout" ? "loading" : "complete",
+	visibilityState: "visible",
+	title: "Amp",
+	documentElement,
+	head,
+	body,
+	createElement() { return new FakeElement(); },
+	createTextNode() { return new FakeElement(); },
+	createTreeWalker() { return { currentNode: null, nextNode() { return null; } }; },
+	getElementById() { return null; },
+	querySelector() { return null; },
+	querySelectorAll(selector) {
+		if (selector === "script:not([src])") return inlineScripts;
+		if (selector === "[data-sidebar-thread-id]" && scenario === "cached-sidebar") return [cachedSidebarRow];
+		return [];
+	},
+	contains(target) { return documentElement.contains(target); },
+	addEventListener() {},
+	removeEventListener() {},
+	dispatchEvent() { return true; },
+};
+globalThis.window = globalThis;
+globalThis.location = new URL("https://ampcode.com/");
+globalThis.history = { state: null, replaceState() {}, pushState() {}, back() {} };
+globalThis.localStorage = new TestStorage();
+globalThis.sessionStorage = new TestStorage();
+globalThis.MutationObserver = class { observe() {} disconnect() {} };
+let pageShowCount = 0;
+globalThis.dispatchEvent = (event) => { if (event?.type === "pageshow") pageShowCount += 1; return true; };
+globalThis.requestAnimationFrame = (callback) => { if (scenario === "cached-sidebar") setTimeout(callback, 0); return 1; };
+globalThis.cancelAnimationFrame = () => {};
+globalThis.WebSocket = class { static CONNECTING = 0; static OPEN = 1; static CLOSING = 2; static CLOSED = 3; addEventListener() {} send() {} close() {} };
+let promptCount = 0;
+globalThis.prompt = () => { promptCount += 1; return scenario === "pending" ? "pending-key" : ""; };
+globalThis.confirm = () => scenario === "pending";
+let localProjectsFetchCount = 0;
+let releaseLocalProjectsFetch;
+const localProjectsFetchGate = scenario === "forget" ? new Promise((resolve) => { releaseLocalProjectsFetch = resolve; }) : null;
+globalThis.fetch = async (input) => {
+	const url = new URL(String(input), globalThis.location.href);
+	if (url.pathname === "/ampcode/local-projects.json") {
+		localProjectsFetchCount += 1;
+		if (scenario === "cached-sidebar") {
+			await new Promise((resolve) => setTimeout(resolve, 10));
+		}
+		if (scenario === "retry" && localProjectsFetchCount === 1) {
+			return new Response(JSON.stringify({ error: "invalid api key" }), { status: 401, headers: { "Content-Type": "application/json" } });
+		}
+		if (scenario === "forget" && localProjectsFetchCount === 1) {
+			await localProjectsFetchGate;
+		}
+		const projects = scenario === "forget" ? [{ id: "stale", name: "Stale", workingDirectory: "/tmp/stale" }] : [];
+		const archivedThreadIDs = scenario === "account" ? ["T-019f324b-2802-7868-b1b1-5f0fa3e87e99"] : [];
+		const threads = scenario === "cached-sidebar" ? Array.from({ length: 100 }, (_, index) => ({
+			id: "T-019f324b-2802-7868-b1b1-" + index.toString(16).padStart(12, "0"),
+			title: index === 0 ? "Cached local title" : "Cached local thread " + index,
+		})) : [];
+		return new Response(JSON.stringify({ ok: true, projects, threads, archivedThreadIDs }), { status: 200, headers: { "Content-Type": "application/json" } });
+	}
+	return new Response("", { status: 404 });
+};
+const previousBaseURL = "http://127.0.0.1:8317";
+if (scenario === "refresh" || scenario === "refresh-account" || scenario === "bootstrap-object" || scenario === "bootstrap-object-quoted" || scenario === "bootstrap-object-account" || scenario === "bootstrap-object-conflict" || scenario === "bootstrap-unrelated" || scenario === "bootstrap-decoy-keys" || scenario === "cached-sidebar") {
+	globalThis.sessionStorage.setItem(scopedKey(viewerA, previousBaseURL), "session-key");
+	globalThis.sessionStorage.setItem(authenticatedUserIDKey, viewerA);
+} else if (scenario === "legacy") {
+	globalThis.sessionStorage.setItem(legacyKey, "legacy-session-key");
+} else if (scenario === "legacy-existing") {
+	globalThis.sessionStorage.setItem(legacyKey, "legacy-session-key");
+	globalThis.sessionStorage.setItem(scopedKey(viewerA, previousBaseURL), "current-session-key");
+} else if (scenario !== "pending") {
+	globalThis.localStorage.setItem(scopedKey(viewerA, previousBaseURL), "persistent-key");
+}
+if (scenario === "cached-sidebar") {
+	globalThis.localStorage.setItem("cliproxyapi.ampLocalInference.sidebarTitles.v3." + scopeSuffix(viewerA, previousBaseURL), JSON.stringify({ [cachedSidebarThreadID]: "Cached local title" }));
+}
+if (scenario === "base") {
+	globalThis.sessionStorage.setItem(scopedPromptKey(viewerA, previousBaseURL), "1");
+}
+await import("file://" + scriptPath);
+const bridge = globalThis.__cliproxyAmpLocalInferenceAPIKeyTest;
+assert(bridge && typeof bridge.rememberAuthenticatedAmpUser === "function", "API-key test bridge was not exposed");
+if (scenario === "timeout") {
+	await new Promise((resolve) => setTimeout(resolve, 15));
+	assert(!documentElement.hasAttribute("data-cliproxy-local-sidebar-hydrating"), "visual hydration gate remained after its timeout");
+}
+if (scenario === "pending") {
+	assert(bridge.localAPIKey(false) === "pending-key", "pre-identity prompt did not return the entered key");
+	assert(bridge.sessionLocalAPIKeyStorageKey() === "" && bridge.persistentLocalAPIKeyStorageKey() === "", "pre-identity key gained an anonymous storage scope");
+	assert(!Array.from(globalThis.sessionStorage.values.values()).includes("pending-key") && !Array.from(globalThis.localStorage.values.values()).includes("pending-key"), "pre-identity key was written to browser storage");
+	bridge.rememberAuthenticatedAmpUser({ id: viewerA });
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	const sessionKey = bridge.sessionLocalAPIKeyStorageKey();
+	const persistentKey = bridge.persistentLocalAPIKeyStorageKey();
+	assert(globalThis.sessionStorage.getItem(sessionKey) === "pending-key", "pre-identity key was not promoted to scoped session storage");
+	assert(globalThis.localStorage.getItem(persistentKey) === "pending-key", "explicit pre-identity persistence consent was not promoted");
+	assert(localProjectsFetchCount === 1 && promptCount === 1, "promoted pre-identity key did not hydrate exactly once without another prompt");
+	return;
+}
+if (scenario === "refresh") {
+	assert(bridge.localAPIKey(false) === "", "refresh used a scoped key before confirming the current account");
+	assert(promptCount === 0, "refresh prompted before delayed identity discovery");
+	bridge.rememberAuthenticatedAmpUser({ id: viewerA });
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	assert(bridge.storedLocalAPIKey() === "session-key", "refresh did not recover its account-scoped session key");
+	assert(promptCount === 0 && localProjectsFetchCount === 1, "refresh did not hydrate exactly once without prompting");
+	return;
+}
+if (scenario === "bootstrap-object" || scenario === "bootstrap-object-quoted") {
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	assert(bridge.storedLocalAPIKey() === "session-key", "current Amp bootstrap did not restore the account-scoped key");
+	assert(promptCount === 0 && localProjectsFetchCount === 1, "current Amp bootstrap did not hydrate exactly once without prompting");
+	return;
+}
+if (scenario === "cached-sidebar") {
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	assert(cachedSidebarTitle.textContent === "Cached local title", "scoped cached sidebar title was not rendered immediately");
+	assert(!documentElement.hasAttribute("data-cliproxy-local-sidebar-hydrating"), "cached visible sidebar waited for the hydration timeout");
+	assert(localProjectsFetchCount === 1, "cached sidebar hydration did not keep one bounded metadata refresh");
+	assert(pageShowCount === 1, "cached sidebar hydration did not rebuild once after background metadata arrived");
+	assert(globalThis.localStorage.getItem("cliproxyapi.ampLocalInference.sidebarTitles.v3." + scopeSuffix(viewerA, previousBaseURL)) !== null, "sidebar title cache was not scoped to the account and local server");
+	cachedSidebarTitle.textContent = "Untitled";
+	bridge.rememberAuthenticatedAmpUser({ id: viewerB });
+	bridge.renderLocalSidebarMetadata();
+	assert(cachedSidebarTitle.textContent === "Untitled", "cached sidebar title leaked across authenticated accounts");
+	return;
+}
+if (scenario === "bootstrap-object-account") {
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	assert(bridge.storedLocalAPIKey() === "", "current Amp bootstrap reused the hinted account's key after an account switch");
+	assert(globalThis.sessionStorage.getItem(authenticatedUserIDKey) === viewerB, "current Amp bootstrap did not replace the stale identity hint");
+	assert(promptCount === 0 && localProjectsFetchCount === 0, "current Amp bootstrap hydrated under the stale hinted account");
+	return;
+}
+if (scenario === "bootstrap-object-conflict") {
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	assert(bridge.storedLocalAPIKey() === "", "conflicting bootstrap users confirmed the stale identity hint");
+	assert(promptCount === 0 && localProjectsFetchCount === 0, "conflicting bootstrap users triggered local hydration");
+	return;
+}
+if (scenario === "bootstrap-unrelated") {
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	assert(bridge.storedLocalAPIKey() === "", "unrelated user object confirmed the stale identity hint");
+	assert(promptCount === 0 && localProjectsFetchCount === 0, "unrelated user object triggered local hydration");
+	return;
+}
+if (scenario === "bootstrap-decoy-keys") {
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	assert(bridge.storedLocalAPIKey() === "", "decoy bootstrap keys confirmed the stale identity hint");
+	assert(promptCount === 0 && localProjectsFetchCount === 0, "decoy bootstrap keys triggered local hydration");
+	return;
+}
+if (scenario === "refresh-account") {
+	assert(bridge.localAPIKey(false) === "", "stale refresh hint used the prior account's scoped key");
+	assert(promptCount === 0, "stale refresh hint prompted before delayed identity discovery");
+	bridge.rememberAuthenticatedAmpUser({ id: viewerB });
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	assert(bridge.storedLocalAPIKey() === "", "confirmed account reused the stale hinted account's key");
+	assert(globalThis.sessionStorage.getItem(scopedKey(viewerA, previousBaseURL)) === "session-key", "account confirmation modified the stale hinted account's key");
+	assert(globalThis.sessionStorage.getItem(authenticatedUserIDKey) === viewerB, "confirmed account did not replace the stale identity hint");
+	assert(promptCount === 0 && localProjectsFetchCount === 0, "stale identity hint triggered local hydration under the wrong account");
+	return;
+}
+if (scenario === "legacy") {
+	assert(bridge.localAPIKey(false) === "", "legacy key was used before confirming the current account");
+	assert(globalThis.sessionStorage.getItem(legacyKey) === "legacy-session-key", "legacy key was removed before identity discovery");
+	assert(promptCount === 0, "legacy key migration prompted before identity discovery");
+	bridge.rememberAuthenticatedAmpUser({ id: viewerA });
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	assert(globalThis.sessionStorage.getItem(scopedKey(viewerA, previousBaseURL)) === "legacy-session-key", "legacy session key was not migrated into the authenticated scope");
+	assert(globalThis.localStorage.getItem(scopedKey(viewerA, previousBaseURL)) === null, "legacy session key became persistent during migration");
+	assert(globalThis.sessionStorage.getItem(legacyKey) === null, "legacy session key remained after migration");
+	assert(bridge.storedLocalAPIKey() === "legacy-session-key" && promptCount === 0 && localProjectsFetchCount === 1, "migrated legacy key did not hydrate exactly once without prompting");
+	return;
+}
+if (scenario === "legacy-existing") {
+	assert(bridge.localAPIKey(false) === "", "legacy key was used before confirming the current account");
+	bridge.rememberAuthenticatedAmpUser({ id: viewerA });
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	assert(bridge.storedLocalAPIKey() === "current-session-key", "legacy migration overwrote the existing scoped key");
+	assert(globalThis.sessionStorage.getItem(legacyKey) === null, "superseded legacy key remained after identity discovery");
+	assert(promptCount === 0 && localProjectsFetchCount === 1, "existing scoped key did not hydrate exactly once after legacy cleanup");
+	return;
+}
+bridge.rememberAuthenticatedAmpUser({ id: viewerA });
+if (scenario === "forget") {
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	assert(localProjectsFetchCount === 1, "passive hydration did not start before the scoped key was forgotten");
+	bridge.forgetLocalAPIKey();
+	releaseLocalProjectsFetch();
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	assert(bridge.storedLocalAPIKey() === "", "forgotten scoped API key remained available");
+	assert((await bridge.fetchLocalProjects(false)).length === 0, "response authorized by a forgotten key repopulated the project cache");
+	return;
+}
+await new Promise((resolve) => setTimeout(resolve, 20));
+if (scenario === "base") {
+	assert(bridge.storedLocalAPIKey() === "", "local-base switch reused another server's key");
+	assert(bridge.persistentLocalAPIKeyStorageKey() !== scopedKey(viewerA, previousBaseURL), "local-base switch retained the prior storage scope");
+	assert(globalThis.sessionStorage.getItem(bridge.localAPIKeyPromptStorageKey("key")) === null, "local-base switch reused prior prompt suppression");
+	bridge.localAPIKey();
+	assert(promptCount === 1 && localProjectsFetchCount === 0, "local-base switch did not prompt independently without hydrating");
+	return;
+}
+assert(bridge.storedLocalAPIKey() === "persistent-key", "delayed identity did not reuse its scoped persistent key");
+assert(promptCount === 0 && localProjectsFetchCount === 1, "delayed identity did not hydrate exactly once without prompting");
+if (scenario === "retry") {
+	bridge.rememberLocalAPIKey("corrected-key");
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	assert(bridge.storedLocalAPIKey() === "corrected-key", "corrected scoped API key was not retained");
+	assert(localProjectsFetchCount === 2, "corrected scoped API key did not retry failed passive hydration");
+	return;
+}
+if (scenario !== "account") return;
+const viewerAArchivedThreadID = "T-019f324b-2802-7868-b1b1-5f0fa3e87e99";
+assert(bridge.localSidebarArchivedThreadID(viewerAArchivedThreadID), "first account archive state was not hydrated");
+const viewerAKey = bridge.sessionLocalAPIKeyStorageKey();
+const viewerAPromptKey = bridge.localAPIKeyPromptStorageKey("key");
+bridge.rememberAuthenticatedAmpUser({ id: viewerB });
+assert(bridge.storedLocalAPIKey() === "", "account switch reused the prior account's key");
+assert(!bridge.localSidebarArchivedThreadID(viewerAArchivedThreadID), "account switch retained the prior account's archived-thread state");
+assert(bridge.sessionLocalAPIKeyStorageKey() !== viewerAKey && bridge.localAPIKeyPromptStorageKey("key") !== viewerAPromptKey, "account switch retained prior scoped state keys");
+bridge.localAPIKey();
+bridge.localAPIKey();
+assert(promptCount === 1, "same-account prompt suppression did not prevent a repeat prompt");
+bridge.rememberAuthenticatedAmpUser({ id: viewerC });
+bridge.localAPIKey();
+assert(promptCount === 2, "prompt suppression crossed authenticated accounts");
+bridge.rememberAuthenticatedAmpUser({ id: viewerB });
+bridge.localAPIKey();
+assert(promptCount === 2, "returning account lost its scoped prompt suppression");
+bridge.rememberAuthenticatedAmpUser({ id: viewerA });
+await new Promise((resolve) => setTimeout(resolve, 20));
+assert(bridge.storedLocalAPIKey() === "persistent-key" && localProjectsFetchCount === 2, "returning keyed account did not rehydrate its invalidated cache exactly once");
+})().catch((error) => { console.error(error && error.stack ? error.stack : error); process.exit(1); });
+`
+			runnerPath := filepath.Join(dir, "runner.mjs")
+			if err := os.WriteFile(runnerPath, []byte(runner), 0o600); err != nil {
+				t.Fatalf("write runner: %v", err)
+			}
+			if output, err := exec.Command("node", runnerPath).CombinedOutput(); err != nil {
+				t.Fatalf("scoped API-key behavior check failed: %v\n%s", err, output)
+			}
+		})
 	}
 }
 
@@ -983,7 +1351,7 @@ func TestWebLocalInferenceUserscriptPatchesLocalThreadActorConfig(t *testing.T) 
 	if hiddenDelay == testDelay {
 		t.Fatal("userscript missing hidden page socket pause delay")
 	}
-	script = strings.Replace(hiddenDelay, "\tglobalThis.__cliproxyAmpLocalInference = {", "\tglobalThis.__cliproxyAmpLocalInferenceTest = { requestLocalSidebarProjectRegroup, localProjectCheckoutIdentity, localSidebarProjectMatches, localProjectNativeMissingPage, fetchLocalProjects, fetchLocalThreadSearch, diffCaptureReadThreadID, invalidateLocalSidebarAfterThreadMutation };\n\tglobalThis.__cliproxyAmpLocalInference = {", 1)
+	script = strings.Replace(hiddenDelay, "\tglobalThis.__cliproxyAmpLocalInference = {", "\tglobalThis.__cliproxyAmpLocalInferenceTest = { requestLocalSidebarProjectRegroup, localProjectCheckoutIdentity, localSidebarProjectMatches, localProjectNativeMissingPage, fetchLocalProjects, fetchLocalThreadSearch, diffCaptureReadThreadID, invalidateLocalSidebarAfterThreadMutation, localSidebarCachedThreadID, localSidebarCachedThreadMetadataComplete, localAPIKey, localProjectLookupAPIKey, storedLocalAPIKey, rememberLocalAPIKey, forgetLocalAPIKey, sessionLocalAPIKeyStorageKey, persistentLocalAPIKeyStorageKey, localAPIKeyPromptStorageKey, rememberAuthenticatedAmpUser, startPassiveLocalSidebarHydration, localSidebarArchivedThreadID, localSidebarMissingMetadataThreadIDs, scheduleLocalSidebarMetadataRefresh };\n\tglobalThis.__cliproxyAmpLocalInference = {", 1)
 	if script == hiddenDelay {
 		t.Fatal("userscript missing local inference bridge")
 	}
@@ -1009,6 +1377,8 @@ const secondThreadID = ` + strconv.Quote(secondThreadID) + `;
 	const hoverSidebarThreadID = "T-019f324b-2802-7868-b1b1-5f0fa3e87ead";
 	const collidingSidebarThreadID = "T-019f324b-2802-7868-b1b1-5f0fa3e87eae";
 	const raceSidebarThreadID = "T-019f324b-2802-7868-b1b1-5f0fa3e87eaf";
+	const incompleteSidebarThreadID = "T-019f324b-2802-7868-b1b1-5f0fa3e87eb3";
+	const unknownSidebarThreadID = "T-019f324b-2802-7868-b1b1-5f0fa3e87eb4";
 	const searchThreadID = "T-019f324b-2802-7868-b1b1-5f0fa3e87eb0";
 	const searchProjectThreadID = "T-019f324b-2802-7868-b1b1-5f0fa3e87eb2";
 	const cloudPuckSessionValues = () => [
@@ -1213,6 +1583,7 @@ let createFetchURL = "";
 			let localProjectsFetchCount = 0;
 			let localProjectsResponseInvalid = false;
 			let localProjectsResponseGate = null;
+			let includeIncompleteCachedThread = false;
 			let localActivityFetchURL = "";
 			let localThreadSearchFetchURL = "";
 let threadSearchRemoteData = "";
@@ -1346,6 +1717,7 @@ globalThis.fetch = async (url, init) => {
 						headers: { "Content-Type": "application/json" },
 					});
 				}
+				const requestedSidebarThreadIDs = parsedURL.searchParams.getAll("cliproxy-sidebar-thread-id");
 			return new Response(JSON.stringify({
 			ok: true,
 			defaultWorkingDirectory: "/Users/aikins01",
@@ -1390,6 +1762,16 @@ globalThis.fetch = async (url, init) => {
 					meta: { executorType: "local-client", usesThreadActors: true, projectID: secondThreadProjectID, projectName: "Second Project", namespace: "aikins01", repositoryURL: "https://github.com/aikins01/second-project.git" },
 					creator: { id: "local-user", name: "Local Amp" },
 				},
+				...(includeIncompleteCachedThread ? [{
+					id: incompleteSidebarThreadID,
+					threadId: incompleteSidebarThreadID,
+					v: 1,
+					title: requestedSidebarThreadIDs.includes(incompleteSidebarThreadID) ? "Hydrated incomplete local thread" : "Untitled",
+					state: "idle",
+					agentState: "idle",
+					meta: { projectID: requestedSidebarThreadIDs.includes(incompleteSidebarThreadID) ? createdThreadProjectID : "unresolved-local-project" },
+					creator: { id: "local-user", name: "Local Amp" },
+				}] : []),
 				...(parsedURL.searchParams.getAll("cliproxy-sidebar-thread-id").includes(collidingSidebarThreadID) ? [{
 					id: collidingSidebarThreadID,
 					threadId: collidingSidebarThreadID,
@@ -1595,7 +1977,7 @@ if (typeof globalThis.btoa !== "function") {
 	require(scriptPath);
 	const bridge = globalThis.__cliproxyAmpLocalInference;
 	const regroupTestBridge = globalThis.__cliproxyAmpLocalInferenceTest;
-assert(bridge && bridge.userscriptVersion === "0.1.195", "bridge userscript version was not exposed");
+assert(bridge && bridge.userscriptVersion === "0.1.200", "bridge userscript version was not exposed");
 	assert(typeof regroupTestBridge?.requestLocalSidebarProjectRegroup === "function", "sidebar regroup test bridge was not exposed");
 	const projectPageTitle = globalThis.document.title;
 	const validProjectHost = new FakeElement("main");
@@ -1612,7 +1994,7 @@ assert(bridge && bridge.userscriptVersion === "0.1.195", "bridge userscript vers
 	assert(!regroupTestBridge.localSidebarProjectMatches(sharedRepositoryCheckout, sharedRepositoryWorktree), "same-repository worktrees matched as one sidebar project");
 	assert(regroupTestBridge.diffCaptureReadThreadID("/api/threads/%E0%A4%A/diff-captures/latest") === "", "malformed diff-capture thread path was not rejected");
 	assert(globalThis.document.documentElement.getAttribute("data-cliproxy-local-sidebar-hydrating") === "1", "sidebar hydration gate was not installed before rendering");
-assert(globalThis.document.documentElement.getAttribute("data-cliproxy-local-inference-version") === "0.1.195", "userscript version was not exposed on the document root");
+assert(globalThis.document.documentElement.getAttribute("data-cliproxy-local-inference-version") === "0.1.200", "userscript version was not exposed on the document root");
 	class InstrumentedWebSocket extends WebSocket {}
 	const instrumentedSocket = new InstrumentedWebSocket("wss://ampcode.com/gateway/userActor/?rvt-method=get&rvt-key=subclass-test");
 	assert(instrumentedSocket instanceof InstrumentedWebSocket, "patched WebSocket discarded a derived constructor prototype");
@@ -1644,7 +2026,8 @@ assert(globalThis.document.documentElement.getAttribute("data-cliproxy-local-inf
 	const cloudPuckSocket = new WebSocket("wss://ampcode.com/gateway/threadActor/?rvt-method=get&rvt-key=" + encodeURIComponent(puckThreadID));
 	assert(new URL(cloudPuckSocket.url).origin === "wss://ampcode.com", "Puck socket without a local key did not remain on Amp Cloud");
 	cloudPuckSocket.close();
-	globalThis.localStorage.setItem(bridge.apiKeyStorageKey, "local-key");
+	regroupTestBridge.rememberLocalAPIKey("local-key");
+	assert(globalThis.sessionStorage.getItem(bridge.apiKeyStorageKey) === null, "pre-identity API key used the obsolete unscoped session key");
 	lastFetchURL = "";
 	const puckSessionResponse = await fetch("https://ampcode.com/_app/remote/14dvguk/openPuckThread", {
 		method: "POST",
@@ -1697,7 +2080,7 @@ assert(globalThis.document.documentElement.getAttribute("data-cliproxy-local-inf
 		userFeatures: [],
 	}));
 	assert(bridge.diagnostics.authenticatedAmpUserIDCaptureCount === 1, "authenticated Amp user id was not captured from initial page data parsing");
-	assert(bridge.sidebarTitlesStorageKey.endsWith("." + encodeURIComponent(ampViewerUserID)), "sidebar title cache was not scoped to the authenticated Amp user");
+	assert(bridge.sidebarTitlesStorageKey.endsWith("." + encodeURIComponent(ampViewerUserID) + "." + encodeURIComponent("http://127.0.0.1:8317")), "sidebar title cache was not scoped to the authenticated Amp user and local server");
 	const authenticatedPageDataResponse = new Response(JSON.stringify({
 	type: "data",
 	nodes: [{
@@ -2099,7 +2482,7 @@ assert(inheritedModeSocket.sent.at(-1) === unrelatedFrame, "unrelated websocket 
 const binaryFrame = new Uint8Array([1, 2, 3]);
 inheritedModeSocket.send(binaryFrame);
 assert(inheritedModeSocket.sent.at(-1) === binaryFrame, "binary websocket frame was changed");
-const userActorSocket = new WebSocket("wss://ampcode.com/gateway/userActor/?rvt-method=get&rvt-key=user-local");
+const userActorSocket = new WebSocket("wss://ampcode.com/gateway/userActor/?rvt-method=get&rvt-key=" + encodeURIComponent(ampViewerUserID));
 userActorSocket.send(rawZeroResume);
 assert(userActorSocket.sent.at(-1) === rawZeroResume, "user actor resume frame was changed");
 	globalThis.location = new URL("https://ampcode.com/feed");
@@ -2741,6 +3124,8 @@ Object.defineProperty(sidebarResponse, "url", { value: "https://ampcode.com/_app
 	assert(mergedSidebarValues[mergedSidebarValues[mergedSidebarThreadRefs[0]].projectName] === "CLIProxyAPI", "inserted direct sidebar thread project name mismatch");
 	assert(mergedSidebarValues[mergedSidebarValues[mergedSidebarThreadRefs[0]].repositoryGroupName] === "CLIProxyAPI", "inserted direct sidebar thread repository group mismatch");
 	assert(mergedSidebarValues[mergedSidebarValues[mergedSidebarThreadRefs[1]].repositoryGroupName] === "second-project", "inserted direct Git sidebar thread repository group mismatch");
+	assert(mergedSidebarValues[mergedSidebarValues[mergedSidebarThreadRefs[0]].automation] === null, "inserted direct sidebar thread did not default automation to null");
+	assert(mergedSidebarValues[mergedSidebarValues[mergedSidebarThreadRefs[1]].automation] === null, "inserted direct Git sidebar thread did not default automation to null");
 	assert(!Object.hasOwn(mergedSidebarValues[mergedSidebarThreadRefs[1]], "hasExecutor"), "cached local sidebar thread gained hasExecutor before discovery");
 	assert(!Object.hasOwn(mergedSidebarValues[mergedSidebarThreadRefs[1]], "executorConnected"), "cached local sidebar thread gained executorConnected before discovery");
 assert(new URL(localProjectsFetchURL).searchParams.get("cliproxy-thread-id") === createdThreadID, "local summary request used the wrong thread id");
@@ -2804,6 +3189,52 @@ assert(new URL(localProjectsFetchURL).searchParams.get("cliproxy-thread-id") ===
 	await regroupTestBridge.fetchLocalProjects(false);
 	assert(localProjectsFetchCount === mutationOnlySidebarFetchCount, "DOM-only sidebar changes bypassed the warm local project cache");
 	documentQueryElements = [];
+	assert(regroupTestBridge.localSidebarCachedThreadID(secondThreadID), "cached local thread was missing before archiving");
+	regroupTestBridge.invalidateLocalSidebarAfterThreadMutation(new URL("https://ampcode.com/_app/remote/145jw2/archiveThreadCommand"), JSON.stringify({ payload: encodeDevalue([{ threadID: 1, archived: 2 }, secondThreadID, true]), refreshes: [] }), { ok: true });
+	assert(!regroupTestBridge.localSidebarCachedThreadID(secondThreadID), "archived local thread remained in the sidebar cache");
+	assert(regroupTestBridge.localSidebarArchivedThreadID(secondThreadID), "archived local thread was not tracked as archived");
+	regroupTestBridge.invalidateLocalSidebarAfterThreadMutation(new URL("https://ampcode.com/_app/remote/145jw2/archiveThreadCommand"), JSON.stringify({ payload: encodeDevalue([{ threadID: 1, archived: 2 }, secondThreadID, false]), refreshes: [] }), { ok: true });
+	assert(!regroupTestBridge.localSidebarArchivedThreadID(secondThreadID), "unarchived local thread was still tracked as archived");
+	await regroupTestBridge.fetchLocalProjects(false);
+	assert(regroupTestBridge.localSidebarCachedThreadID(secondThreadID), "sidebar cache did not recover the unarchived local thread");
+	const previousPromptStub = globalThis.prompt;
+	const previousConfirmStub = globalThis.confirm;
+	let promptReplayValue = "";
+	let confirmReplayValue = false;
+	globalThis.prompt = () => promptReplayValue;
+	globalThis.confirm = () => confirmReplayValue;
+	const sessionAPIKeyStorageKey = regroupTestBridge.sessionLocalAPIKeyStorageKey();
+	const persistentAPIKeyStorageKey = regroupTestBridge.persistentLocalAPIKeyStorageKey();
+	assert(sessionAPIKeyStorageKey === persistentAPIKeyStorageKey, "session and persistent API key storage did not share one account/server scope");
+	assert(persistentAPIKeyStorageKey.includes(encodeURIComponent(ampViewerUserID)), "persistent API key storage was not scoped to the authenticated Amp user");
+	assert(persistentAPIKeyStorageKey.includes(encodeURIComponent("http://127.0.0.1:8317")), "persistent API key storage was not scoped to the local server");
+	assert(globalThis.sessionStorage.getItem(sessionAPIKeyStorageKey) === "local-key", "pre-identity session key was not promoted after authenticated identity arrived");
+	globalThis.sessionStorage.removeItem(sessionAPIKeyStorageKey);
+	globalThis.localStorage.removeItem(bridge.apiKeyStorageKey);
+	globalThis.localStorage.removeItem(persistentAPIKeyStorageKey);
+	promptReplayValue = "test-key-declined";
+	assert(regroupTestBridge.localAPIKey(false) === "test-key-declined", "declined API key prompt did not return the entered key");
+	assert(globalThis.sessionStorage.getItem(sessionAPIKeyStorageKey) === "test-key-declined", "declined API key was not stored for the scoped session");
+	assert(globalThis.localStorage.getItem(persistentAPIKeyStorageKey) === null, "declined API key consent persisted the key to local storage");
+	globalThis.sessionStorage.removeItem(sessionAPIKeyStorageKey);
+	globalThis.localStorage.removeItem(persistentAPIKeyStorageKey);
+	promptReplayValue = "test-key-accepted";
+	confirmReplayValue = true;
+	assert(regroupTestBridge.localAPIKey(false) === "test-key-accepted", "accepted API key prompt did not return the entered key");
+	assert(globalThis.sessionStorage.getItem(sessionAPIKeyStorageKey) === "test-key-accepted", "accepted API key was not stored for the scoped session");
+	assert(globalThis.localStorage.getItem(persistentAPIKeyStorageKey) === "test-key-accepted", "accepted API key consent did not persist the key to local storage");
+	globalThis.sessionStorage.setItem(sessionAPIKeyStorageKey, "stale-key");
+	globalThis.localStorage.setItem(persistentAPIKeyStorageKey, "stale-key");
+	regroupTestBridge.forgetLocalAPIKey();
+	assert(globalThis.sessionStorage.getItem(sessionAPIKeyStorageKey) === null && globalThis.localStorage.getItem(persistentAPIKeyStorageKey) === null, "forgetLocalAPIKey left a scoped API key behind");
+	assert(globalThis.sessionStorage.getItem(bridge.apiKeyStorageKey) === null && globalThis.localStorage.getItem(bridge.apiKeyStorageKey) === null, "obsolete generic API key storage was recreated");
+	globalThis.localStorage.setItem(persistentAPIKeyStorageKey, "local-only-key");
+	assert(regroupTestBridge.storedLocalAPIKey() === "local-only-key", "storedLocalAPIKey did not fall back to local storage");
+	globalThis.localStorage.removeItem(persistentAPIKeyStorageKey);
+	globalThis.prompt = previousPromptStub;
+	globalThis.confirm = previousConfirmStub;
+	globalThis.sessionStorage.setItem(sessionAPIKeyStorageKey, "local-key");
+		await regroupTestBridge.fetchLocalProjects(false);
 	const mergedSidebarMetas = mergedSidebarThreadRefs.map((ref) => mergedSidebarValues[mergedSidebarValues[ref].meta]);
 	assert(mergedSidebarValues[mergedSidebarMetas[0].projectID] === createdThreadProjectID, "merged sidebar project identity mismatch");
 	assert(mergedSidebarValues[mergedSidebarMetas[1].projectName] === "Second Project", "merged sidebar project name mismatch");
@@ -2838,7 +3269,7 @@ assert(new URL(localProjectsFetchURL).searchParams.get("cliproxy-thread-id") ===
 		{ recentThreads: 1 },
 		[2],
 		{ thread: 3, lastActivityTimestamp: 6, projectName: 7, repositoryGroupName: 9 },
-		{ id: 4, title: 5, hasExecutor: 8, executorConnected: 8, pinned: 12, meta: 10 },
+		{ id: 4, title: 5, hasExecutor: 8, executorConnected: 8, pinned: 12, meta: 10, automation: 13 },
 		createdThreadID,
 		"Remote canonical title",
 		1,
@@ -2848,6 +3279,7 @@ assert(new URL(localProjectsFetchURL).searchParams.get("cliproxy-thread-id") ===
 		{ projectID: 11 },
 		"remote-project",
 		false,
+		{ enabled: 8 },
 	]);
 const canonicalSidebarResponse = new Response(JSON.stringify({ type: "result", data: canonicalSidebarData }), {
 	status: 200,
@@ -2869,6 +3301,9 @@ Object.defineProperty(canonicalSidebarResponse, "url", { value: "https://ampcode
 	assert(canonicalSidebarValues[canonicalSidebarValues[canonicalSidebarValues[canonicalThreadRef].meta].projectName] === "CLIProxyAPI", "missing canonical project metadata was not enriched");
 assert(canonicalSidebarValues[canonicalSidebarValues[canonicalThreadRef].hasExecutor] === true, "existing local sidebar thread lost hasExecutor");
 assert(canonicalSidebarValues[canonicalSidebarValues[canonicalThreadRef].executorConnected] === true, "existing local sidebar thread lost executorConnected");
+	assert(canonicalSidebarValues[canonicalSidebarValues[canonicalSidebarValues[canonicalThreadRef].automation].enabled] === true, "existing local sidebar thread lost its automation object");
+	const canonicalInsertedThreadRef = canonicalSidebarThreadRefs.find((ref) => canonicalSidebarValues[canonicalSidebarValues[ref].id] === secondThreadID);
+	assert(canonicalSidebarValues[canonicalSidebarValues[canonicalInsertedThreadRef].automation] === null, "inserted wrapped sidebar thread did not default automation to null");
 	assert(canonicalSidebarValues[canonicalSidebarValues[canonicalThreadRef].pinned] === true, "explicit local pin did not override stale native state");
 	assert(!Object.hasOwn(canonicalSidebarValues[canonicalThreadRef], "cliProxyAPILocalPinnedOverride"), "local pin override marker leaked into sidebar data");
 assert(canonicalSidebarValues[canonicalSidebarValues[canonicalThreadRef].state] === "idle", "existing remote sidebar shell was not enriched with local state");
@@ -2966,6 +3401,87 @@ assert(canonicalSidebarValues[canonicalSidebarValues[canonicalThreadRef].state] 
 	);
 	assert(directFallbackSidebarValues[directFallbackSidebarValues[directFallbackThreadRef].projectName] === "CLIProxyAPI", "direct sidebar row project name retained No project");
 	assert(directFallbackSidebarValues[directFallbackSidebarValues[directFallbackThreadRef].repositoryGroupName] === "CLIProxyAPI", "direct sidebar row repository group retained No project");
+	assert(directFallbackSidebarValues[directFallbackSidebarValues[directFallbackThreadRef].automation] === null, "enriched direct sidebar row did not default automation to null");
+	const directAutomationSidebarResponse = new Response(JSON.stringify({
+		type: "result",
+		data: JSON.stringify([
+			{ recentThreads: 1 },
+			[2],
+			{ id: 3, title: 4, automation: 5 },
+			createdThreadID,
+			"Remote automation title",
+			{ enabled: 6 },
+			true,
+		]),
+	}), { status: 200, headers: { "Content-Type": "application/json" } });
+	Object.defineProperty(directAutomationSidebarResponse, "url", { value: "https://ampcode.com/_app/remote/3abror/listThreadListSidebar" });
+	const directAutomationSidebarValues = JSON.parse((await directAutomationSidebarResponse.json()).data);
+	const directAutomationThreadRef = directAutomationSidebarValues[directAutomationSidebarValues[0].recentThreads].find((ref) =>
+		directAutomationSidebarValues[directAutomationSidebarValues[ref].id] === createdThreadID
+	);
+	assert(directAutomationSidebarValues[directAutomationSidebarValues[directAutomationSidebarValues[directAutomationThreadRef].automation].enabled] === true, "enriched direct sidebar row lost its automation object");
+	includeIncompleteCachedThread = true;
+	regroupTestBridge.invalidateLocalSidebarAfterThreadMutation(new URL("https://ampcode.com/_app/remote/145jw2/pinThreadCommand"), JSON.stringify({ payload: encodeDevalue([{ threadID: 1, pinned: 2 }, secondThreadID, false]), refreshes: [] }), { ok: true });
+	await regroupTestBridge.fetchLocalProjects(false);
+	assert(regroupTestBridge.localSidebarCachedThreadID(incompleteSidebarThreadID), "incomplete sidebar shell was not cached");
+	assert(!regroupTestBridge.localSidebarCachedThreadMetadataComplete(incompleteSidebarThreadID), "Untitled sidebar shell was treated as complete metadata");
+	const incompleteSidebarFetchCount = localProjectsFetchCount;
+	const incompleteSidebarResponse = new Response(JSON.stringify({
+		type: "result",
+		data: JSON.stringify([
+			{ recentThreads: 1 },
+			[2],
+			{ id: 3, title: 4 },
+			incompleteSidebarThreadID,
+			"Untitled",
+		]),
+	}), { status: 200, headers: { "Content-Type": "application/json" } });
+	Object.defineProperty(incompleteSidebarResponse, "url", { value: "https://ampcode.com/_app/remote/3abror/listThreadListSidebar" });
+	const incompleteSidebarValues = JSON.parse((await incompleteSidebarResponse.json()).data);
+	assert(localProjectsFetchCount === incompleteSidebarFetchCount + 1, "incomplete cached sidebar shell did not trigger one targeted metadata lookup");
+	assert(new URL(localProjectsFetchURL).searchParams.getAll("cliproxy-sidebar-thread-id").includes(incompleteSidebarThreadID), "incomplete cached sidebar id was not sent to the metadata endpoint");
+	const incompleteSidebarThreadRef = incompleteSidebarValues[incompleteSidebarValues[0].recentThreads].find((ref) =>
+		incompleteSidebarValues[incompleteSidebarValues[ref].id] === incompleteSidebarThreadID
+	);
+	assert(incompleteSidebarValues[incompleteSidebarValues[incompleteSidebarThreadRef].title] === "Hydrated incomplete local thread", "incomplete sidebar response resolved before local title hydration");
+	assert(regroupTestBridge.localSidebarCachedThreadMetadataComplete(incompleteSidebarThreadID), "targeted sidebar metadata remained incomplete");
+	const completeSidebarFetchCount = localProjectsFetchCount;
+	await regroupTestBridge.fetchLocalProjects(false, [secondThreadID]);
+	assert(localProjectsFetchCount === completeSidebarFetchCount, "complete cached sidebar metadata triggered a redundant request");
+	const unknownSidebarFetchCount = localProjectsFetchCount;
+	await regroupTestBridge.fetchLocalProjects(false, [unknownSidebarThreadID]);
+	await regroupTestBridge.fetchLocalProjects(false, [unknownSidebarThreadID]);
+	assert(localProjectsFetchCount === unknownSidebarFetchCount + 1, "unknown sidebar metadata retried after its completed targeted attempt");
+	await new Promise((resolve) => setTimeout(resolve, 5));
+	const completeMutationRow = new FakeElement("a");
+	completeMutationRow.dataset.sidebarThreadId = secondThreadID;
+	completeMutationRow.appendChild(new FakeElement("span", "Second local thread"));
+	documentQueryElements = [completeMutationRow];
+	assert(regroupTestBridge.localSidebarMissingMetadataThreadIDs().length === 0, "complete sidebar row was classified as missing metadata");
+	const completeMutationFetchCount = localProjectsFetchCount;
+	const nativeDateNow = Date.now;
+	Date.now = () => nativeDateNow() + 20000;
+	regroupTestBridge.scheduleLocalSidebarMetadataRefresh();
+	await new Promise((resolve) => setTimeout(resolve, 5));
+	Date.now = nativeDateNow;
+	assert(localProjectsFetchCount === completeMutationFetchCount, "complete sidebar row mutation restarted TTL metadata polling");
+	const insertedUnknownRow = new FakeElement("a");
+	insertedUnknownRow.dataset.sidebarThreadId = unknownSidebarThreadID;
+	insertedUnknownRow.appendChild(new FakeElement("span", "Remote sidebar title"));
+	documentQueryElements = [insertedUnknownRow];
+	const insertedUnknownFetchCount = localProjectsFetchCount;
+	regroupTestBridge.scheduleLocalSidebarMetadataRefresh();
+	await new Promise((resolve) => setTimeout(resolve, 5));
+	assert(localProjectsFetchCount === insertedUnknownFetchCount, "previously covered unknown sidebar row triggered another metadata lookup");
+	const newlyInsertedUnknownThreadID = "T-019f324b-2802-7868-b1b1-5f0fa3e87eb5";
+	insertedUnknownRow.dataset.sidebarThreadId = newlyInsertedUnknownThreadID;
+	regroupTestBridge.scheduleLocalSidebarMetadataRefresh();
+	await new Promise((resolve) => setTimeout(resolve, 5));
+	regroupTestBridge.scheduleLocalSidebarMetadataRefresh();
+	await new Promise((resolve) => setTimeout(resolve, 5));
+	assert(localProjectsFetchCount === insertedUnknownFetchCount + 1, "new sidebar row did not make exactly one targeted metadata lookup");
+	assert(new URL(localProjectsFetchURL).searchParams.getAll("cliproxy-sidebar-thread-id").includes(newlyInsertedUnknownThreadID), "new sidebar row id was not sent to the metadata endpoint");
+	documentQueryElements = [];
 	const hoverSidebarFetchCount = localProjectsFetchCount;
 	const hoverSidebarResponse = new Response(JSON.stringify({
 		type: "result",
@@ -3305,7 +3821,7 @@ assert(bridge.diagnostics.webSocketBootstrapCount === 13, "websocket bootstrap w
 		assert(event.currentTarget === repeatedSuppressedSocket, "suppressed socket onclose lost current event target");
 		resumedCloseCount += 1;
 	};
-	const hiddenUserActorSocket = new WebSocket("wss://ampcode.com/gateway/userActor/?rvt-method=get&rvt-key=user-local");
+	const hiddenUserActorSocket = new WebSocket("wss://ampcode.com/gateway/userActor/?rvt-method=get&rvt-key=" + encodeURIComponent(ampViewerUserID));
 	const hiddenNonlocalSocket = new WebSocket("wss://example.com/unrelated");
 	assert(NativeWebSocket.instances.length === nativeSocketCountBeforePause + 2, "hidden suppression affected user-actor or nonlocal sockets");
 	assert(new URL(hiddenUserActorSocket.url).origin === "ws://127.0.0.1:8317", "hidden local user-actor socket was not bridged normally");
@@ -3583,13 +4099,16 @@ const flushAnimationFrames = () => {
 		callback(Date.now());
 	}
 };
+const authenticatedBootstrapScript = {
+	textContent: 'globalThis.data=(function(a){a.id="viewer-user";a.username="aikins01";return {initialProjects:[],userFeatures:[]};})({});',
+};
 globalThis.document = {
-	readyState: "complete",
+	readyState: "loading",
 	body,
 	documentElement,
 	createElement(tag) { return new FakeElement(tag); },
 	querySelector(selector) { return documentElement.querySelector(selector); },
-	querySelectorAll(selector) { return documentElement.querySelectorAll(selector); },
+	querySelectorAll(selector) { return selector === "script:not([src])" ? [authenticatedBootstrapScript] : documentElement.querySelectorAll(selector); },
 	getElementById(id) { return documentElement.querySelectorAll("*").find((element) => element.getAttribute("id") === String(id)) || null; },
 	contains(target) { return documentElement.contains(target); },
 	addEventListener(type, callback) { documentElement.addEventListener(type, callback); },
@@ -3606,7 +4125,7 @@ globalThis.history = {
 };
 globalThis.localStorage = new TestStorage();
 globalThis.sessionStorage = new TestStorage();
-globalThis.localStorage.setItem("cliproxyapi.ampLocalInference.apiKey", "local-key");
+globalThis.sessionStorage.setItem("cliproxyapi.ampLocalInference.apiKey.user." + encodeURIComponent("viewer-user") + "." + encodeURIComponent("http://127.0.0.1:8317"), "local-key");
 globalThis.localStorage.setItem("cliproxyapi.ampLocalInference.workingDirectory", "/Users/aikins01/Developer/on-chain");
 globalThis.sessionStorage.setItem("cliproxyapi.ampLocalInference.selectedLocalProject", JSON.stringify({
 	name: "on-chain",
@@ -3727,11 +4246,14 @@ body.appendChild(message);
 	body.appendChild(headerContainer);
 	require(scriptPath);
 	const bridge = globalThis.__cliproxyAmpLocalInference;
-	JSON.parse(JSON.stringify({
+	const captureViewerIdentity = () => JSON.parse(JSON.stringify({
 		userWorkspace: {},
 		userFeatures: {},
 		user: { id: "viewer-user", username: "aikins01", firstName: "Aikins", profilePictureUrl: "https://workoscdn.com/images/aikins" },
 	}));
+	captureViewerIdentity();
+	globalThis.document.readyState = "complete";
+	globalThis.document.dispatchEvent(new FakeEvent("DOMContentLoaded"));
 	await new Promise((resolve) => setTimeout(resolve, 25));
 	assert(Array.prototype.some === nativeArraySome, "userscript replaced Array.prototype.some");
 	assert(nearMissList.querySelectorAll("[data-cliproxy-local-project-item]").length === 0, "near-miss project text container was integrated as a picker");
@@ -4133,6 +4655,7 @@ assert(explicitDuplicateURL.searchParams.get("cliproxy-working-directory") === t
 		};
 		delete require.cache[require.resolve(scriptPath)];
 		require(scriptPath);
+		captureViewerIdentity();
 		assert(observer.disconnected === true, "replaced project observer was not disconnected");
 		assert(bridge.diagnostics.projectMutationPendingRootCount === 0, "observer cleanup retained pending project roots");
 		flushAnimationFrames();
@@ -4142,6 +4665,7 @@ assert(explicitDuplicateURL.searchParams.get("cliproxy-working-directory") === t
 		localProjectsPayload = collisionProjectsPayload;
 		delete require.cache[require.resolve(scriptPath)];
 		require(scriptPath);
+		captureViewerIdentity();
 		assert(deferredObserver.disconnected === true, "observer with an in-flight project fetch was not disconnected");
 		assert(deferredLocalProjectsFetches.length === 2, "current integration did not start its own project fetch");
 		deferredLocalProjectsFetches[0]();
@@ -4174,6 +4698,7 @@ assert(explicitDuplicateURL.searchParams.get("cliproxy-working-directory") === t
 	deferLocalProjectsFetch = true;
 	delete require.cache[require.resolve(scriptPath)];
 	require(scriptPath);
+	captureViewerIdentity();
 	assert(deferredLocalProjectsFetches.length === 3, "project-close race did not start a deferred project lookup");
 	lastFetchURL = "";
 	const projectCloseCreatePromise = globalThis.fetch("https://ampcode.com/_app/remote/3abror/createProjectThread", {
@@ -4194,6 +4719,7 @@ assert(explicitDuplicateURL.searchParams.get("cliproxy-working-directory") === t
 	deferLocalProjectsFetch = true;
 	delete require.cache[require.resolve(scriptPath)];
 	require(scriptPath);
+	captureViewerIdentity();
 	assert(deferredLocalProjectsFetches.length === 4, "empty-body project-close race did not start a deferred project lookup");
 	lastFetchURL = "";
 	const emptyBodyProjectClosePromise = globalThis.fetch("https://ampcode.com/_app/remote/3abror/createProjectThread", {
@@ -4214,6 +4740,7 @@ assert(explicitDuplicateURL.searchParams.get("cliproxy-working-directory") === t
 	deferLocalProjectsFetch = true;
 	delete require.cache[require.resolve(scriptPath)];
 	require(scriptPath);
+	captureViewerIdentity();
 	assert(deferredLocalProjectsFetches.length === 5, "Request-body project-close race did not start a deferred project lookup");
 	lastFetchURL = "";
 	const requestBodyProjectClosePromise = globalThis.fetch(new Request("https://ampcode.com/_app/remote/3abror/createProjectThread", {
@@ -4242,6 +4769,7 @@ assert(explicitDuplicateURL.searchParams.get("cliproxy-working-directory") === t
 		};
 		delete require.cache[require.resolve(scriptPath)];
 		require(scriptPath);
+		captureViewerIdentity();
 		await new Promise((resolve) => setTimeout(resolve, 25));
 		globalThis.location = new URL("https://ampcode.com/projects");
 		const collidingProjectListResponse = new Response(JSON.stringify({
@@ -4281,6 +4809,7 @@ assert(explicitDuplicateURL.searchParams.get("cliproxy-working-directory") === t
 		localProjectsPayload = null;
 		delete require.cache[require.resolve(scriptPath)];
 		require(scriptPath);
+		captureViewerIdentity();
 		const malformedProjectsBridge = globalThis.__cliproxyAmpLocalInference;
 		await new Promise((resolve) => setTimeout(resolve, 25));
 		assert(malformedProjectsBridge.diagnostics.localProjectFetchFailureCount === 1, "malformed project response failure was not recorded");
@@ -11583,6 +12112,135 @@ func TestRegisterProviderAliases_AllProvidersRegistered(t *testing.T) {
 				t.Fatalf("auth middleware header not set for %s", tc.path)
 			}
 		})
+	}
+}
+
+func TestCodexWebsocketsExperimentMiddlewareOnlyMarksResponsesWhenEnabled(t *testing.T) {
+	tests := []struct {
+		name              string
+		enabled           bool
+		path              string
+		attachMiddleware  bool
+		wantWebsocketMark bool
+	}{
+		{name: "disabled responses", path: "/responses", attachMiddleware: true},
+		{name: "enabled responses", enabled: true, path: "/responses", attachMiddleware: true, wantWebsocketMark: true},
+		{name: "enabled compact", enabled: true, path: "/responses/compact"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
+			m := &AmpModule{lastConfig: &config.AmpCode{CodexWebsocketsExperiment: tc.enabled}}
+			router := gin.New()
+			handler := func(c *gin.Context) {
+				if got := cliproxyexecutor.DownstreamWebsocket(c.Request.Context()); got != tc.wantWebsocketMark {
+					t.Fatalf("DownstreamWebsocket() = %t, want %t", got, tc.wantWebsocketMark)
+				}
+				c.Status(http.StatusNoContent)
+			}
+			if tc.attachMiddleware {
+				router.POST(tc.path, m.codexWebsocketsExperimentMiddleware(), handler)
+			} else {
+				router.POST(tc.path, handler)
+			}
+
+			req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(`{"model":"gpt-5-codex"}`))
+			req.Header.Set("X-Amp-Thread-Id", "T-thread")
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, req)
+			if w.Code != http.StatusNoContent {
+				t.Fatalf("status = %d, want %d", w.Code, http.StatusNoContent)
+			}
+		})
+	}
+}
+
+func TestAmpCodexWebsocketSessionIDIsStableBoundedAndIsolated(t *testing.T) {
+	newRequest := func(threadID string, model string, feature string) *http.Request {
+		req := httptest.NewRequest(http.MethodPost, "/api/provider/openai/v1/responses", strings.NewReader(`{"model":"`+model+`","input":[]}`))
+		req.Header.Set("X-Amp-Thread-Id", threadID)
+		req.Header.Set("x-amp-feature", feature)
+		return req
+	}
+
+	base := ampCodexWebsocketSessionID(newRequest("T-thread", "gpt-5-codex", "chat"))
+	if base == "" {
+		t.Fatal("session ID is empty")
+	}
+	if !strings.HasPrefix(base, "amp-codex-ws:") || len(base) != len("amp-codex-ws:")+64 {
+		t.Fatalf("session ID = %q, want bounded SHA-256 identifier", base)
+	}
+	if got := ampCodexWebsocketSessionID(newRequest("T-thread", "gpt-5-codex", "chat")); got != base {
+		t.Fatalf("stable session ID = %q, want %q", got, base)
+	}
+	otherClient := newRequest("T-thread", "gpt-5-codex", "chat")
+	otherClient = otherClient.WithContext(context.WithValue(otherClient.Context(), clientAPIKeyContextKey{}, "client-key"))
+	if got := ampCodexWebsocketSessionID(otherClient); got == base {
+		t.Fatalf("different authenticated client reused session ID %q", got)
+	}
+
+	isolated := []*http.Request{
+		newRequest("T-other", "gpt-5-codex", "chat"),
+		newRequest("T-thread", "gpt-5-codex-mini", "chat"),
+		newRequest("T-thread", "gpt-5-codex", "side-call"),
+	}
+	for i := range isolated {
+		if got := ampCodexWebsocketSessionID(isolated[i]); got == base {
+			t.Fatalf("isolated request %d reused session ID %q", i, got)
+		}
+	}
+
+	fallback := newRequest("", "gpt-5-codex", "chat")
+	fallback.Header.Set("X-Session-ID", "T-thread")
+	if got := ampCodexWebsocketSessionID(fallback); got != base {
+		t.Fatalf("X-Session-ID fallback = %q, want %q", got, base)
+	}
+	if got := ampCodexWebsocketSessionID(httptest.NewRequest(http.MethodPost, "/responses", strings.NewReader(`{"model":"gpt-5-codex"}`))); got != "" {
+		t.Fatalf("session ID without stable thread metadata = %q, want empty", got)
+	}
+}
+
+func TestAmpProviderRequestModelBoundedReadPreservesBody(t *testing.T) {
+	filler := strings.Repeat("x", ampProviderRequestModelPrefixLimit/2)
+	body := `{"input":[{"text":"` + filler + `"}],"model":"gpt-5-codex"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/provider/openai/v1/responses", strings.NewReader(body))
+	if got := ampProviderRequestModel(req); got != "gpt-5-codex" {
+		t.Fatalf("model = %q, want gpt-5-codex", got)
+	}
+	restored, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("read restored body: %v", err)
+	}
+	if string(restored) != body {
+		t.Fatalf("restored body = %d bytes, want the original %d bytes", len(restored), len(body))
+	}
+}
+
+func TestAmpProviderRequestModelSkipsDerivationBeyondPrefix(t *testing.T) {
+	filler := strings.Repeat("x", 2*ampProviderRequestModelPrefixLimit)
+	body := `{"input":[{"text":"` + filler + `"}],"model":"gpt-5-codex"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/provider/openai/v1/responses", strings.NewReader(body))
+	if got := ampProviderRequestModel(req); got != "" {
+		t.Fatalf("model = %q, want empty when model is beyond the bounded prefix", got)
+	}
+	restored, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("read restored body: %v", err)
+	}
+	if string(restored) != body {
+		t.Fatalf("restored body = %d bytes, want the original %d bytes", len(restored), len(body))
+	}
+}
+
+func TestAmpProviderRequestModelRejectsNonObjectPrefix(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/responses", strings.NewReader(`["model"]`))
+	if got := ampProviderRequestModel(req); got != "" {
+		t.Fatalf("model = %q, want empty for non-object payloads", got)
+	}
+	restored, err := io.ReadAll(req.Body)
+	if err != nil || string(restored) != `["model"]` {
+		t.Fatalf("restored body = %q, %v", restored, err)
 	}
 }
 

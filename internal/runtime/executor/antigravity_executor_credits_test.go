@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -154,6 +155,37 @@ func TestParseRetryDelay_HumanReadableDuration(t *testing.T) {
 	want := time.Hour + 43*time.Minute + 56*time.Second
 	if *retryAfter != want {
 		t.Fatalf("parseRetryDelay() = %v, want %v", *retryAfter, want)
+	}
+}
+
+func TestNewAntigravityStatusErrPreservesAuthAndRetryBehavior(t *testing.T) {
+	tests := []struct {
+		name        string
+		statusCode  int
+		body        []byte
+		wantNeutral bool
+	}{
+		{name: "transient upstream", statusCode: http.StatusServiceUnavailable, body: []byte(`{"error":{"status":"UNAVAILABLE"}}`), wantNeutral: true},
+		{name: "authentication", statusCode: http.StatusInternalServerError, body: []byte(`{"error":{"status":"UNAUTHENTICATED"}}`)},
+		{name: "capacity", statusCode: http.StatusServiceUnavailable, body: []byte(`{"error":{"message":"no capacity available"}}`)},
+		{name: "quota", statusCode: http.StatusTooManyRequests, body: []byte(`{"error":{"status":"RESOURCE_EXHAUSTED"}}`)},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := newAntigravityStatusErr(tc.statusCode, tc.body)
+			if got := err.AuthStateNeutral(); got != tc.wantNeutral {
+				t.Fatalf("AuthStateNeutral() = %t, want %t", got, tc.wantNeutral)
+			}
+			if err.StatusCode() != tc.statusCode {
+				t.Fatalf("StatusCode() = %d, want %d", err.StatusCode(), tc.statusCode)
+			}
+		})
+	}
+
+	body := []byte(`{"error":{"status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1.25s"}]}}`)
+	err := newAntigravityStatusErr(http.StatusTooManyRequests, body)
+	if err.RetryAfter() == nil || *err.RetryAfter() != 1250*time.Millisecond {
+		t.Fatalf("RetryAfter() = %v, want 1.25s", err.RetryAfter())
 	}
 }
 
@@ -382,6 +414,139 @@ type roundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
+}
+
+type antigravityErrorReader struct {
+	err error
+}
+
+func (r antigravityErrorReader) Read([]byte) (int, error) {
+	return 0, r.err
+}
+
+func TestAntigravityExecutionTransportFailuresAreAuthStateNeutral(t *testing.T) {
+	wantErr := errors.New("upstream transport failed")
+	auth := &cliproxyauth.Auth{
+		ID:         "auth-transport",
+		Attributes: map[string]string{"base_url": "https://example.com"},
+		Metadata: map[string]any{
+			"access_token": "token",
+			"project_id":   "project-1",
+			"expired":      time.Now().Add(2 * time.Hour).Format(time.RFC3339),
+		},
+	}
+	executor := NewAntigravityExecutor(new(config.Config))
+	ctx := context.WithValue(t.Context(), "cliproxy.roundtripper", roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return nil, wantErr
+	}))
+
+	_, err := executor.Execute(ctx, auth, cliproxyexecutor.Request{
+		Model:   "gemini-2.5-flash",
+		Payload: []byte(`{"request":{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatAntigravity})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("Execute() error = %v, want %v", err, wantErr)
+	}
+	var neutral interface{ AuthStateNeutral() bool }
+	if !errors.As(err, &neutral) || !neutral.AuthStateNeutral() {
+		t.Fatalf("Execute() error is not auth-state-neutral: %v", err)
+	}
+}
+
+func TestAntigravityNon2xxReadFailureIsAuthStateNeutral(t *testing.T) {
+	wantErr := errors.New("response read failed")
+	auth := &cliproxyauth.Auth{
+		ID:         "auth-read",
+		Attributes: map[string]string{"base_url": "https://example.com"},
+		Metadata: map[string]any{
+			"access_token": "token",
+			"project_id":   "project-1",
+			"expired":      time.Now().Add(2 * time.Hour).Format(time.RFC3339),
+		},
+	}
+	executor := NewAntigravityExecutor(new(config.Config))
+	ctx := context.WithValue(t.Context(), "cliproxy.roundtripper", roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusServiceUnavailable,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(io.MultiReader(strings.NewReader(`{"error":`), antigravityErrorReader{err: wantErr})),
+		}, nil
+	}))
+
+	_, err := executor.Execute(ctx, auth, cliproxyexecutor.Request{
+		Model:   "gemini-2.5-flash",
+		Payload: []byte(`{"request":{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatAntigravity})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("Execute() error = %v, want read failure %v", err, wantErr)
+	}
+	var neutral interface{ AuthStateNeutral() bool }
+	if !errors.As(err, &neutral) || !neutral.AuthStateNeutral() {
+		t.Fatalf("Execute() read error is not auth-state-neutral: %v", err)
+	}
+}
+
+func TestAntigravityStreamReadFailureIsAuthStateNeutral(t *testing.T) {
+	wantErr := errors.New("stream read failed")
+	auth := &cliproxyauth.Auth{
+		ID:         "auth-stream-read",
+		Attributes: map[string]string{"base_url": "https://example.com"},
+		Metadata: map[string]any{
+			"access_token": "token",
+			"project_id":   "project-1",
+			"expired":      time.Now().Add(2 * time.Hour).Format(time.RFC3339),
+		},
+	}
+	executor := NewAntigravityExecutor(new(config.Config))
+	ctx := context.WithValue(t.Context(), "cliproxy.roundtripper", roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(antigravityErrorReader{err: wantErr}),
+		}, nil
+	}))
+
+	result, err := executor.ExecuteStream(ctx, auth, cliproxyexecutor.Request{
+		Model:   "gemini-2.5-flash",
+		Payload: []byte(`{"request":{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatAntigravity})
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+	var streamErr error
+	for chunk := range result.Chunks {
+		if len(chunk.Payload) > 0 {
+			t.Fatalf("stream read failure emitted completion payload first: %q", chunk.Payload)
+		}
+		if chunk.Err != nil {
+			streamErr = chunk.Err
+		}
+	}
+	if !errors.Is(streamErr, wantErr) {
+		t.Fatalf("stream error = %v, want %v", streamErr, wantErr)
+	}
+	var neutral interface{ AuthStateNeutral() bool }
+	if !errors.As(streamErr, &neutral) || !neutral.AuthStateNeutral() {
+		t.Fatalf("stream read error is not auth-state-neutral: %v", streamErr)
+	}
+}
+
+func TestAntigravityRefreshTransportFailureIsAuthStateNeutral(t *testing.T) {
+	wantErr := errors.New("refresh transport failed")
+	auth := &cliproxyauth.Auth{Metadata: map[string]any{"refresh_token": "refresh-token"}}
+	executor := NewAntigravityExecutor(new(config.Config))
+	ctx := context.WithValue(t.Context(), "cliproxy.roundtripper", roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return nil, wantErr
+	}))
+
+	_, err := executor.Refresh(ctx, auth)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("Refresh() error = %v, want %v", err, wantErr)
+	}
+	var neutral interface{ AuthStateNeutral() bool }
+	if !errors.As(err, &neutral) || !neutral.AuthStateNeutral() {
+		t.Fatalf("Refresh() error is not auth-state-neutral: %v", err)
+	}
 }
 
 func TestEnsureAccessToken_WarmTokenLoadsCreditsHint(t *testing.T) {

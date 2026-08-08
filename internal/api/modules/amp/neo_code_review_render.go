@@ -15,7 +15,7 @@ func runToTextForTool(toolName string, run any) string {
 		if text, ok := neoCodeReviewRunText(run); ok {
 			return text
 		}
-	case "shellcommand", "bash":
+	case "shellcommand", "runterminalcommand", "bash":
 		if text, ok := neoStructuredToolRunResultText(run); ok {
 			return text
 		}
@@ -100,29 +100,15 @@ func neoCodeReviewResultXML(result map[string]any) (string, bool) {
 	sort.Strings(keys)
 	for _, k := range keys {
 		ck := mapValue(checks[k])
-		res := mapValue(ck["result"])
-		summary := mapValue(res["result"])
-		issues := arrayValue(res["issues"])
-		if issues == nil {
-			issues = arrayValue(ck["issues"])
-		}
-		count := len(issues)
-		if c, ok := summary["issuesFound"]; ok && c != nil {
-			count = int(numberFrom(c))
-		} else if c, ok := res["issuesFound"]; ok && c != nil {
-			count = int(numberFrom(c))
-		}
+		view := neoCodeReviewCheckView(ck, k)
+		issues := view.issues
+		count := view.issuesFound
 		expectedIssues += count
 		b.WriteString("<checkResult>\n")
-		neoXMLText(&b, "checkName", firstNonEmptyString(
-			stringValue(summary["name"]),
-			stringValue(res["name"]),
-			stringValue(mapValue(res["check"])["name"]),
-			stringValue(mapValue(ck["check"])["name"]),
-			neoCheckNameFromKey(k),
-		))
-		neoXMLText(&b, "status", firstNonEmptyString(stringValue(summary["status"]), stringValue(res["status"]), stringValue(ck["status"])))
+		neoXMLText(&b, "checkName", view.name)
+		neoXMLText(&b, "status", view.status)
 		neoXMLText(&b, "issuesFound", strconv.Itoa(count))
+		neoXMLText(&b, "errorMessage", view.errorMessage)
 		if len(issues) > 0 {
 			b.WriteString("<issues>\n")
 			for _, raw := range issues {
@@ -159,6 +145,61 @@ func neoCodeReviewResultXML(result map[string]any) (string, bool) {
 		return "<codeReview>No review findings.</codeReview>", true
 	}
 	return strings.TrimRight(b.String(), "\n"), true
+}
+
+type neoCodeReviewCheckResultView struct {
+	name         string
+	status       string
+	errorMessage string
+	issuesFound  int
+	issues       []any
+}
+
+func neoCodeReviewCheckView(check map[string]any, key string) neoCodeReviewCheckResultView {
+	chain := []map[string]any{check}
+	for len(chain) < 8 {
+		next := mapValue(chain[len(chain)-1]["result"])
+		if len(next) == 0 {
+			break
+		}
+		chain = append(chain, next)
+	}
+	view := neoCodeReviewCheckResultView{name: neoCheckNameFromKey(key)}
+	issuesFoundSet := false
+	for index := len(chain) - 1; index >= 0; index-- {
+		node := chain[index]
+		if view.name == neoCheckNameFromKey(key) {
+			view.name = firstNonEmptyString(
+				stringValue(node["checkName"]),
+				stringValue(node["name"]),
+				stringValue(mapValue(node["check"])["name"]),
+				view.name,
+			)
+		}
+		status := strings.ToLower(strings.TrimSpace(stringValue(node["status"])))
+		if view.status == "" && status != "" {
+			view.status = status
+		}
+		if view.errorMessage == "" {
+			view.errorMessage = firstNonEmptyString(stringValue(node["errorMessage"]), stringValue(mapValue(node["error"])["message"]))
+		}
+		if view.issues == nil {
+			if raw, exists := node["issues"]; exists {
+				view.issues = arrayValue(raw)
+			}
+		}
+		if raw, exists := node["issuesFound"]; !issuesFoundSet && exists && raw != nil {
+			view.issuesFound = int(numberFrom(raw))
+			issuesFoundSet = true
+		}
+	}
+	if view.issues == nil {
+		view.issues = []any{}
+	}
+	if !issuesFoundSet {
+		view.issuesFound = len(view.issues)
+	}
+	return view
 }
 
 func neoCodeReviewMainCommentText(comment map[string]any) string {

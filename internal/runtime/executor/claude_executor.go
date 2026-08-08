@@ -124,7 +124,11 @@ func (e *ClaudeExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Aut
 		return nil, err
 	}
 	httpClient := helps.NewUtlsHTTPClient(e.cfg, auth, 0)
-	return httpClient.Do(httpReq)
+	httpResp, err := httpClient.Do(httpReq)
+	if err != nil {
+		return nil, helps.NewAuthStateNeutralError(err)
+	}
+	return httpResp, nil
 }
 
 func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
@@ -229,7 +233,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		return resp, err
+		return resp, helps.NewAuthStateNeutralError(err)
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
@@ -239,20 +243,21 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		errBody, decErr := decodeResponseBody(httpResp.Body, httpResp.Header.Get("Content-Encoding"))
 		if decErr != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, decErr)
-			msg := fmt.Sprintf("failed to decode error response body: %v", decErr)
-			helps.LogWithRequestID(ctx).Warn(msg)
-			return resp, statusErr{code: httpResp.StatusCode, msg: msg}
+			helps.LogWithRequestID(ctx).Warnf("failed to decode error response body: %v", decErr)
+			return resp, helps.NewAuthStateNeutralStatusError(decErr, httpResp.StatusCode)
 		}
 		b, readErr := io.ReadAll(errBody)
 		if readErr != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, readErr)
-			msg := fmt.Sprintf("failed to read error response body: %v", readErr)
-			helps.LogWithRequestID(ctx).Warn(msg)
-			b = []byte(msg)
+			helps.LogWithRequestID(ctx).Warnf("failed to read error response body: %v", readErr)
+			if errClose := errBody.Close(); errClose != nil {
+				log.Errorf("response body close error: %v", errClose)
+			}
+			return resp, helps.NewAuthStateNeutralStatusError(readErr, httpResp.StatusCode)
 		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
+		err = newOpenAIShapeStatusErr(httpResp.StatusCode, b)
 		if errClose := errBody.Close(); errClose != nil {
 			log.Errorf("response body close error: %v", errClose)
 		}
@@ -264,7 +269,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("response body close error: %v", errClose)
 		}
-		return resp, err
+		return resp, helps.NewAuthStateNeutralError(err)
 	}
 	defer func() {
 		if errClose := decodedBody.Close(); errClose != nil {
@@ -274,7 +279,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	data, err := io.ReadAll(decodedBody)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		return resp, err
+		return resp, helps.NewAuthStateNeutralError(err)
 	}
 	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 	if stream {
@@ -403,7 +408,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		return nil, err
+		return nil, helps.NewAuthStateNeutralError(err)
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
@@ -413,23 +418,24 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		errBody, decErr := decodeResponseBody(httpResp.Body, httpResp.Header.Get("Content-Encoding"))
 		if decErr != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, decErr)
-			msg := fmt.Sprintf("failed to decode error response body: %v", decErr)
-			helps.LogWithRequestID(ctx).Warn(msg)
-			return nil, statusErr{code: httpResp.StatusCode, msg: msg}
+			helps.LogWithRequestID(ctx).Warnf("failed to decode error response body: %v", decErr)
+			return nil, helps.NewAuthStateNeutralStatusError(decErr, httpResp.StatusCode)
 		}
 		b, readErr := io.ReadAll(errBody)
 		if readErr != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, readErr)
-			msg := fmt.Sprintf("failed to read error response body: %v", readErr)
-			helps.LogWithRequestID(ctx).Warn(msg)
-			b = []byte(msg)
+			helps.LogWithRequestID(ctx).Warnf("failed to read error response body: %v", readErr)
+			if errClose := errBody.Close(); errClose != nil {
+				log.Errorf("response body close error: %v", errClose)
+			}
+			return nil, helps.NewAuthStateNeutralStatusError(readErr, httpResp.StatusCode)
 		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
 		if errClose := errBody.Close(); errClose != nil {
 			log.Errorf("response body close error: %v", errClose)
 		}
-		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
+		err = newOpenAIShapeStatusErr(httpResp.StatusCode, b)
 		return nil, err
 	}
 	decodedBody, err := decodeResponseBody(httpResp.Body, httpResp.Header.Get("Content-Encoding"))
@@ -438,7 +444,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("response body close error: %v", errClose)
 		}
-		return nil, err
+		return nil, helps.NewAuthStateNeutralError(err)
 	}
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
@@ -449,18 +455,35 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			}
 		}()
 
-		// If from == to (Claude → Claude), directly forward the SSE stream without translation
-		if from == to {
-			scanner := bufio.NewScanner(decodedBody)
-			scanner.Buffer(nil, 52_428_800) // 50MB
-			for scanner.Scan() {
-				line := scanner.Bytes()
-				helps.AppendAPIResponseChunk(ctx, e.cfg, line)
-				if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
-					reporter.Publish(ctx, detail)
+		scanner := bufio.NewScanner(decodedBody)
+		scanner.Buffer(nil, 52_428_800) // 50MB
+		var param any
+		completed := false
+		sendStreamError := func(streamErr error) {
+			helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
+			reporter.PublishFailure(ctx, streamErr)
+			select {
+			case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
+			case <-ctx.Done():
+			}
+		}
+		for scanner.Scan() {
+			line := scanner.Bytes()
+			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
+			if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
+				reporter.Publish(ctx, detail)
+			}
+			if payload, ok := claudeStreamDataPayload(line); ok && gjson.ValidBytes(payload) {
+				switch gjson.GetBytes(payload, "type").String() {
+				case "error":
+					sendStreamError(newOpenAIShapeStatusErr(http.StatusBadGateway, payload))
+					return
+				case "message_stop":
+					completed = true
 				}
-				line = restoreClaudeOAuthToolNamesFromStreamLine(line, claudeToolPrefix, auth.ToolPrefixDisabled(), oauthToolNamesReverseMap)
-				// Forward the line as-is to preserve SSE format
+			}
+			line = restoreClaudeOAuthToolNamesFromStreamLine(line, claudeToolPrefix, auth.ToolPrefixDisabled(), oauthToolNamesReverseMap)
+			if from == to {
 				cloned := make([]byte, len(line)+1)
 				copy(cloned, line)
 				cloned[len(line)] = '\n'
@@ -469,29 +492,8 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				case <-ctx.Done():
 					return
 				}
+				continue
 			}
-			if errScan := scanner.Err(); errScan != nil {
-				helps.RecordAPIResponseError(ctx, e.cfg, errScan)
-				reporter.PublishFailure(ctx, errScan)
-				select {
-				case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
-				case <-ctx.Done():
-				}
-			}
-			return
-		}
-
-		// For other formats, use translation
-		scanner := bufio.NewScanner(decodedBody)
-		scanner.Buffer(nil, 52_428_800) // 50MB
-		var param any
-		for scanner.Scan() {
-			line := scanner.Bytes()
-			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
-			if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
-				reporter.Publish(ctx, detail)
-			}
-			line = restoreClaudeOAuthToolNamesFromStreamLine(line, claudeToolPrefix, auth.ToolPrefixDisabled(), oauthToolNamesReverseMap)
 			chunks := sdktranslator.TranslateStream(
 				ctx,
 				to,
@@ -511,15 +513,28 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			}
 		}
 		if errScan := scanner.Err(); errScan != nil {
-			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
-			reporter.PublishFailure(ctx, errScan)
-			select {
-			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
-			case <-ctx.Done():
-			}
+			streamErr := helps.NewAuthStateNeutralError(errScan)
+			sendStreamError(streamErr)
+			return
+		}
+		if !completed {
+			streamErr := newUpstreamStatusErr(http.StatusBadGateway, []byte("claude executor: upstream returned incomplete stream: response ended before message_stop"), false)
+			sendStreamError(streamErr)
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
+}
+
+func claudeStreamDataPayload(line []byte) ([]byte, bool) {
+	line = bytes.TrimSpace(line)
+	if len(line) == 0 || !bytes.HasPrefix(line, []byte("data:")) {
+		return nil, false
+	}
+	payload := bytes.TrimSpace(line[len("data:"):])
+	if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
+		return nil, false
+	}
+	return payload, true
 }
 
 func validateClaudeStreamingResponse(data []byte) error {
@@ -531,17 +546,13 @@ func validateClaudeStreamingResponse(data []byte) error {
 	hasMessageDelta := false
 
 	for scanner.Scan() {
-		line := bytes.TrimSpace(scanner.Bytes())
-		if len(line) == 0 || !bytes.HasPrefix(line, []byte("data:")) {
-			continue
-		}
-		payload := bytes.TrimSpace(line[len("data:"):])
-		if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
+		payload, ok := claudeStreamDataPayload(scanner.Bytes())
+		if !ok {
 			continue
 		}
 		hasData = true
 		if !gjson.ValidBytes(payload) {
-			return statusErr{code: http.StatusBadGateway, msg: "claude executor: upstream returned malformed stream data"}
+			return newUpstreamStatusErr(http.StatusBadGateway, []byte("claude executor: upstream returned malformed stream data"), false)
 		}
 
 		root := gjson.ParseBytes(payload)
@@ -554,11 +565,13 @@ func validateClaudeStreamingResponse(data []byte) error {
 			if message == "" {
 				message = "unknown upstream error"
 			}
-			return statusErr{code: http.StatusBadGateway, msg: "claude executor: upstream returned error event: " + message}
+			streamErr := newOpenAIShapeStatusErr(http.StatusBadGateway, payload)
+			streamErr.msg = "claude executor: upstream returned error event: " + message
+			return streamErr
 		case "message_start":
 			message := root.Get("message")
 			if strings.TrimSpace(message.Get("id").String()) == "" || strings.TrimSpace(message.Get("model").String()) == "" {
-				return statusErr{code: http.StatusBadGateway, msg: "claude executor: upstream stream message_start is missing id or model"}
+				return newUpstreamStatusErr(http.StatusBadGateway, []byte("claude executor: upstream stream message_start is missing id or model"), false)
 			}
 			hasMessageStart = true
 		case "message_delta":
@@ -566,16 +579,16 @@ func validateClaudeStreamingResponse(data []byte) error {
 		}
 	}
 	if errScan := scanner.Err(); errScan != nil {
-		return errScan
+		return helps.NewAuthStateNeutralError(errScan)
 	}
 	if !hasData {
-		return statusErr{code: http.StatusBadGateway, msg: "claude executor: upstream returned empty stream response"}
+		return newUpstreamStatusErr(http.StatusBadGateway, []byte("claude executor: upstream returned empty stream response"), false)
 	}
 	if !hasMessageStart {
-		return statusErr{code: http.StatusBadGateway, msg: "claude executor: upstream stream response is missing message_start"}
+		return newUpstreamStatusErr(http.StatusBadGateway, []byte("claude executor: upstream stream response is missing message_start"), false)
 	}
 	if !hasMessageDelta {
-		return statusErr{code: http.StatusBadGateway, msg: "claude executor: upstream stream response ended before message completion"}
+		return newUpstreamStatusErr(http.StatusBadGateway, []byte("claude executor: upstream stream response ended before message completion"), false)
 	}
 	return nil
 }
@@ -638,7 +651,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	resp, err := httpClient.Do(httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		return cliproxyexecutor.Response{}, err
+		return cliproxyexecutor.Response{}, helps.NewAuthStateNeutralError(err)
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, resp.StatusCode, resp.Header.Clone())
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -648,22 +661,23 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 		errBody, decErr := decodeResponseBody(resp.Body, resp.Header.Get("Content-Encoding"))
 		if decErr != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, decErr)
-			msg := fmt.Sprintf("failed to decode error response body: %v", decErr)
-			helps.LogWithRequestID(ctx).Warn(msg)
-			return cliproxyexecutor.Response{}, statusErr{code: resp.StatusCode, msg: msg}
+			helps.LogWithRequestID(ctx).Warnf("failed to decode error response body: %v", decErr)
+			return cliproxyexecutor.Response{}, helps.NewAuthStateNeutralStatusError(decErr, resp.StatusCode)
 		}
 		b, readErr := io.ReadAll(errBody)
 		if readErr != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, readErr)
-			msg := fmt.Sprintf("failed to read error response body: %v", readErr)
-			helps.LogWithRequestID(ctx).Warn(msg)
-			b = []byte(msg)
+			helps.LogWithRequestID(ctx).Warnf("failed to read error response body: %v", readErr)
+			if errClose := errBody.Close(); errClose != nil {
+				log.Errorf("response body close error: %v", errClose)
+			}
+			return cliproxyexecutor.Response{}, helps.NewAuthStateNeutralStatusError(readErr, resp.StatusCode)
 		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		if errClose := errBody.Close(); errClose != nil {
 			log.Errorf("response body close error: %v", errClose)
 		}
-		return cliproxyexecutor.Response{}, statusErr{code: resp.StatusCode, msg: string(b)}
+		return cliproxyexecutor.Response{}, newOpenAIShapeStatusErr(resp.StatusCode, b)
 	}
 	decodedBody, err := decodeResponseBody(resp.Body, resp.Header.Get("Content-Encoding"))
 	if err != nil {
@@ -671,7 +685,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 		if errClose := resp.Body.Close(); errClose != nil {
 			log.Errorf("response body close error: %v", errClose)
 		}
-		return cliproxyexecutor.Response{}, err
+		return cliproxyexecutor.Response{}, helps.NewAuthStateNeutralError(err)
 	}
 	defer func() {
 		if errClose := decodedBody.Close(); errClose != nil {
@@ -681,7 +695,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	data, err := io.ReadAll(decodedBody)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		return cliproxyexecutor.Response{}, err
+		return cliproxyexecutor.Response{}, helps.NewAuthStateNeutralError(err)
 	}
 	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 	count := gjson.GetBytes(data, "input_tokens").Int()

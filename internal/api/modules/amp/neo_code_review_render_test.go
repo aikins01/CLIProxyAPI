@@ -112,6 +112,86 @@ func TestRunToTextForToolRendersCodeReviewAsXML(t *testing.T) {
 	}
 }
 
+func TestRunToTextForToolPreservesStructuredShellResults(t *testing.T) {
+	run := map[string]any{
+		"status": "done",
+		"output": "display only",
+		"result": map[string]any{"exitCode": 1, "output": "No test files found"},
+	}
+	for _, toolName := range []string{"Bash", "shell_command", "run_terminal_command"} {
+		t.Run(toolName, func(t *testing.T) {
+			got := runToTextForTool(toolName, run)
+			if !strings.Contains(got, `"exitCode":1`) || !strings.Contains(got, `"output":"No test files found"`) || strings.Contains(got, "display only") {
+				t.Fatalf("structured %s result = %q", toolName, got)
+			}
+		})
+	}
+}
+
+func TestNeoCodeReviewResultXMLPreservesNestedRunCheckEnvelopes(t *testing.T) {
+	for name, tc := range map[string]struct {
+		check  map[string]any
+		want   []string
+		reject []string
+	}{
+		"structured error": {
+			check: map[string]any{"result": map[string]any{
+				"status":       "error",
+				"issues":       []any{},
+				"errorMessage": "check agent did not return a structured result",
+			}},
+			want:   []string{"<status>error</status>", "<issuesFound>0</issuesFound>", "<errorMessage>check agent did not return a structured result</errorMessage>"},
+			reject: []string{"<status>completed</status>"},
+		},
+		"completed with issue": {
+			check: map[string]any{"result": map[string]any{
+				"status": "done",
+				"result": map[string]any{
+					"checkName": "nested-check",
+					"status":    "completed",
+					"issues": []any{map[string]any{
+						"severity": "medium",
+						"file":     "client.ts",
+						"line":     12,
+						"problem":  "The nested result preserves its issue.",
+					}},
+				},
+			}},
+			want: []string{"<status>completed</status>", "<issuesFound>1</issuesFound>", "The nested result preserves its issue."},
+		},
+		"completed clean": {
+			check: map[string]any{"result": map[string]any{
+				"status": "done",
+				"result": map[string]any{
+					"checkName": "nested-check",
+					"status":    "completed",
+					"issues":    []any{},
+				},
+			}},
+			want: []string{"<status>completed</status>", "<issuesFound>0</issuesFound>"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			xml, ok := neoCodeReviewResultXML(map[string]any{
+				"checks": map[string]any{"file:///checks/nested-check.md": tc.check},
+			})
+			if !ok {
+				t.Fatalf("nested run_check envelope did not render: %#v", tc.check)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(xml, want) {
+					t.Errorf("rendered XML missing %q:\n%s", want, xml)
+				}
+			}
+			for _, reject := range tc.reject {
+				if strings.Contains(xml, reject) {
+					t.Errorf("rendered XML contains %q:\n%s", reject, xml)
+				}
+			}
+		})
+	}
+}
+
 func TestNeoXMLEscaping(t *testing.T) {
 	result := map[string]any{
 		"main": map[string]any{"review": map[string]any{"comments": []any{

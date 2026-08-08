@@ -472,6 +472,12 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 	if util.IsTrustedLocalNeoInference(requestCtx) {
 		parentCtx = util.WithTrustedLocalNeoInference(parentCtx)
 	}
+	if coreexecutor.DownstreamWebsocket(requestCtx) {
+		parentCtx = coreexecutor.WithDownstreamWebsocket(parentCtx)
+	}
+	if executionSessionID := executionSessionIDFromContext(requestCtx); executionSessionID != "" {
+		parentCtx = WithExecutionSessionID(parentCtx, executionSessionID)
+	}
 	newCtx, cancel := context.WithCancel(parentCtx)
 
 	endpoint := ""

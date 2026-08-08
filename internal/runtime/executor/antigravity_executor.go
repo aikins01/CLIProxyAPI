@@ -313,7 +313,11 @@ func (e *AntigravityExecutor) HttpRequest(ctx context.Context, auth *cliproxyaut
 	}
 
 	httpClient := newAntigravityHTTPClient(ctx, e.cfg, auth, 0)
-	return httpClient.Do(httpReq)
+	httpResp, err := httpClient.Do(httpReq)
+	if err != nil {
+		return nil, helps.NewAuthStateNeutralError(err)
+	}
+	return httpResp, nil
 }
 
 func injectEnabledCreditTypes(payload []byte) []byte {
@@ -462,8 +466,11 @@ func antigravityHasExplicitCreditsBalanceExhaustedReason(body []byte) bool {
 	return false
 }
 
-func newAntigravityStatusErr(statusCode int, body []byte) statusErr {
-	err := statusErr{code: statusCode, msg: string(body)}
+func newAntigravityStatusErr(statusCode int, body []byte) upstreamStatusErr {
+	err := newGoogleStatusErr(statusCode, body)
+	if antigravityShouldRetryNoCapacity(statusCode, body) {
+		err.authStateNeutral = false
+	}
 	if statusCode == http.StatusTooManyRequests {
 		if retryAfter, parseErr := parseRetryDelay(body); parseErr == nil && retryAfter != nil {
 			err.retryAfter = retryAfter
@@ -554,17 +561,18 @@ attemptLoop:
 			httpResp, errDo := httpClient.Do(httpReq)
 			if errDo != nil {
 				helps.RecordAPIResponseError(ctx, e.cfg, errDo)
+				neutralErr := helps.NewAuthStateNeutralError(errDo)
 				if errors.Is(errDo, context.Canceled) || errors.Is(errDo, context.DeadlineExceeded) {
-					return resp, errDo
+					return resp, neutralErr
 				}
 				lastStatus = 0
 				lastBody = nil
-				lastErr = errDo
+				lastErr = neutralErr
 				if idx+1 < len(baseURLs) {
 					log.Debugf("antigravity executor: request error on base url %s, retrying with fallback base url: %s", baseURL, baseURLs[idx+1])
 					continue
 				}
-				err = errDo
+				err = neutralErr
 				return resp, err
 			}
 
@@ -575,7 +583,7 @@ attemptLoop:
 			}
 			if errRead != nil {
 				helps.RecordAPIResponseError(ctx, e.cfg, errRead)
-				err = errRead
+				err = helps.NewAuthStateNeutralError(errRead)
 				return resp, err
 			}
 			helps.AppendAPIResponseChunk(ctx, e.cfg, bodyBytes)
@@ -752,17 +760,18 @@ attemptLoop:
 			httpResp, errDo := httpClient.Do(httpReq)
 			if errDo != nil {
 				helps.RecordAPIResponseError(ctx, e.cfg, errDo)
+				neutralErr := helps.NewAuthStateNeutralError(errDo)
 				if errors.Is(errDo, context.Canceled) || errors.Is(errDo, context.DeadlineExceeded) {
-					return resp, errDo
+					return resp, neutralErr
 				}
 				lastStatus = 0
 				lastBody = nil
-				lastErr = errDo
+				lastErr = neutralErr
 				if idx+1 < len(baseURLs) {
 					log.Debugf("antigravity executor: request error on base url %s, retrying with fallback base url: %s", baseURL, baseURLs[idx+1])
 					continue
 				}
-				err = errDo
+				err = neutralErr
 				return resp, err
 			}
 			helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
@@ -773,22 +782,23 @@ attemptLoop:
 				}
 				if errRead != nil {
 					helps.RecordAPIResponseError(ctx, e.cfg, errRead)
+					neutralErr := helps.NewAuthStateNeutralError(errRead)
 					if errors.Is(errRead, context.Canceled) || errors.Is(errRead, context.DeadlineExceeded) {
-						err = errRead
+						err = neutralErr
 						return resp, err
 					}
 					if errCtx := ctx.Err(); errCtx != nil {
-						err = errCtx
+						err = helps.NewAuthStateNeutralError(errCtx)
 						return resp, err
 					}
 					lastStatus = 0
 					lastBody = nil
-					lastErr = errRead
+					lastErr = neutralErr
 					if idx+1 < len(baseURLs) {
 						log.Debugf("antigravity executor: read error on base url %s, retrying with fallback base url: %s", baseURL, baseURLs[idx+1])
 						continue
 					}
-					err = errRead
+					err = neutralErr
 					return resp, err
 				}
 				helps.AppendAPIResponseChunk(ctx, e.cfg, bodyBytes)
@@ -899,7 +909,7 @@ attemptLoop:
 				if errScan := scanner.Err(); errScan != nil {
 					helps.RecordAPIResponseError(ctx, e.cfg, errScan)
 					reporter.PublishFailure(ctx, errScan)
-					out <- cliproxyexecutor.StreamChunk{Err: errScan}
+					out <- cliproxyexecutor.StreamChunk{Err: helps.NewAuthStateNeutralError(errScan)}
 				} else {
 					reporter.EnsurePublished(ctx)
 				}
@@ -1212,17 +1222,18 @@ attemptLoop:
 			httpResp, errDo := httpClient.Do(httpReq)
 			if errDo != nil {
 				helps.RecordAPIResponseError(ctx, e.cfg, errDo)
+				neutralErr := helps.NewAuthStateNeutralError(errDo)
 				if errors.Is(errDo, context.Canceled) || errors.Is(errDo, context.DeadlineExceeded) {
-					return nil, errDo
+					return nil, neutralErr
 				}
 				lastStatus = 0
 				lastBody = nil
-				lastErr = errDo
+				lastErr = neutralErr
 				if idx+1 < len(baseURLs) {
 					log.Debugf("antigravity executor: request error on base url %s, retrying with fallback base url: %s", baseURL, baseURLs[idx+1])
 					continue
 				}
-				err = errDo
+				err = neutralErr
 				return nil, err
 			}
 			helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
@@ -1233,22 +1244,23 @@ attemptLoop:
 				}
 				if errRead != nil {
 					helps.RecordAPIResponseError(ctx, e.cfg, errRead)
+					neutralErr := helps.NewAuthStateNeutralError(errRead)
 					if errors.Is(errRead, context.Canceled) || errors.Is(errRead, context.DeadlineExceeded) {
-						err = errRead
+						err = neutralErr
 						return nil, err
 					}
 					if errCtx := ctx.Err(); errCtx != nil {
-						err = errCtx
+						err = helps.NewAuthStateNeutralError(errCtx)
 						return nil, err
 					}
 					lastStatus = 0
 					lastBody = nil
-					lastErr = errRead
+					lastErr = neutralErr
 					if idx+1 < len(baseURLs) {
 						log.Debugf("antigravity executor: read error on base url %s, retrying with fallback base url: %s", baseURL, baseURLs[idx+1])
 						continue
 					}
-					err = errRead
+					err = neutralErr
 					return nil, err
 				}
 				helps.AppendAPIResponseChunk(ctx, e.cfg, bodyBytes)
@@ -1364,22 +1376,22 @@ attemptLoop:
 						}
 					}
 				}
-				tail := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, []byte("[DONE]"), &param)
-				for i := range tail {
-					select {
-					case out <- cliproxyexecutor.StreamChunk{Payload: tail[i]}:
-					case <-ctx.Done():
-						return
-					}
-				}
 				if errScan := scanner.Err(); errScan != nil {
 					helps.RecordAPIResponseError(ctx, e.cfg, errScan)
 					reporter.PublishFailure(ctx, errScan)
 					select {
-					case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
+					case out <- cliproxyexecutor.StreamChunk{Err: helps.NewAuthStateNeutralError(errScan)}:
 					case <-ctx.Done():
 					}
 				} else {
+					tail := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, []byte("[DONE]"), &param)
+					for i := range tail {
+						select {
+						case out <- cliproxyexecutor.StreamChunk{Payload: tail[i]}:
+						case <-ctx.Done():
+							return
+						}
+					}
 					reporter.EnsurePublished(ctx)
 				}
 			}(httpResp)
@@ -1514,17 +1526,18 @@ func (e *AntigravityExecutor) CountTokens(ctx context.Context, auth *cliproxyaut
 		httpResp, errDo := httpClient.Do(httpReq)
 		if errDo != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, errDo)
+			neutralErr := helps.NewAuthStateNeutralError(errDo)
 			if errors.Is(errDo, context.Canceled) || errors.Is(errDo, context.DeadlineExceeded) {
-				return cliproxyexecutor.Response{}, errDo
+				return cliproxyexecutor.Response{}, neutralErr
 			}
 			lastStatus = 0
 			lastBody = nil
-			lastErr = errDo
+			lastErr = neutralErr
 			if idx+1 < len(baseURLs) {
 				log.Debugf("antigravity executor: request error on base url %s, retrying with fallback base url: %s", baseURL, baseURLs[idx+1])
 				continue
 			}
-			return cliproxyexecutor.Response{}, errDo
+			return cliproxyexecutor.Response{}, neutralErr
 		}
 
 		helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
@@ -1534,7 +1547,7 @@ func (e *AntigravityExecutor) CountTokens(ctx context.Context, auth *cliproxyaut
 		}
 		if errRead != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, errRead)
-			return cliproxyexecutor.Response{}, errRead
+			return cliproxyexecutor.Response{}, helps.NewAuthStateNeutralError(errRead)
 		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, bodyBytes)
 
@@ -1551,24 +1564,12 @@ func (e *AntigravityExecutor) CountTokens(ctx context.Context, auth *cliproxyaut
 			log.Debugf("antigravity executor: rate limited on base url %s, retrying with fallback base url: %s", baseURL, baseURLs[idx+1])
 			continue
 		}
-		sErr := statusErr{code: httpResp.StatusCode, msg: string(bodyBytes)}
-		if httpResp.StatusCode == http.StatusTooManyRequests {
-			if retryAfter, parseErr := parseRetryDelay(bodyBytes); parseErr == nil && retryAfter != nil {
-				sErr.retryAfter = retryAfter
-			}
-		}
-		return cliproxyexecutor.Response{}, sErr
+		return cliproxyexecutor.Response{}, newAntigravityStatusErr(httpResp.StatusCode, bodyBytes)
 	}
 
 	switch {
 	case lastStatus != 0:
-		sErr := statusErr{code: lastStatus, msg: string(lastBody)}
-		if lastStatus == http.StatusTooManyRequests {
-			if retryAfter, parseErr := parseRetryDelay(lastBody); parseErr == nil && retryAfter != nil {
-				sErr.retryAfter = retryAfter
-			}
-		}
-		return cliproxyexecutor.Response{}, sErr
+		return cliproxyexecutor.Response{}, newAntigravityStatusErr(lastStatus, lastBody)
 	case lastErr != nil:
 		return cliproxyexecutor.Response{}, lastErr
 	default:
@@ -1695,7 +1696,7 @@ func (e *AntigravityExecutor) refreshToken(ctx context.Context, auth *cliproxyau
 	httpClient := newAntigravityHTTPClient(ctx, e.cfg, auth, 0)
 	httpResp, errDo := httpClient.Do(httpReq)
 	if errDo != nil {
-		return auth, errDo
+		return auth, helps.NewAuthStateNeutralError(errDo)
 	}
 	defer func() {
 		if errClose := httpResp.Body.Close(); errClose != nil {
@@ -1705,17 +1706,11 @@ func (e *AntigravityExecutor) refreshToken(ctx context.Context, auth *cliproxyau
 
 	bodyBytes, errRead := io.ReadAll(httpResp.Body)
 	if errRead != nil {
-		return auth, errRead
+		return auth, helps.NewAuthStateNeutralError(errRead)
 	}
 
 	if httpResp.StatusCode < http.StatusOK || httpResp.StatusCode >= http.StatusMultipleChoices {
-		sErr := statusErr{code: httpResp.StatusCode, msg: string(bodyBytes)}
-		if httpResp.StatusCode == http.StatusTooManyRequests {
-			if retryAfter, parseErr := parseRetryDelay(bodyBytes); parseErr == nil && retryAfter != nil {
-				sErr.retryAfter = retryAfter
-			}
-		}
-		return auth, sErr
+		return auth, newAntigravityStatusErr(httpResp.StatusCode, bodyBytes)
 	}
 
 	var tokenResp struct {

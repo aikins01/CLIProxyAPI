@@ -132,6 +132,22 @@ func TestNeoRunCheckPromptRetainsMinorLowSeverityFindings(t *testing.T) {
 	}
 }
 
+func TestNeoRunCheckPromptRequiresSupportedEvidence(t *testing.T) {
+	for _, want := range []string{
+		"evidence procedure and finding gates as hard requirements",
+		"exact import, export, resource path, API shape, or behavior",
+		`A nonzero command exit, "no tests found"`,
+		"must contain exactly one entry for each pattern index",
+		`"outcome": "finding" | "no-finding" | "not-applicable"`,
+		`"issueIndexes": [0]`,
+		"Every reported issue must be referenced by at least one `finding` entry",
+	} {
+		if !strings.Contains(neoRunCheckSubagentPrompt, want) {
+			t.Fatalf("run_check prompt missing evidence guidance %q", want)
+		}
+	}
+}
+
 func setNeoFinderWorkspaceForTest(t *testing.T, actor *neoActor) string {
 	t.Helper()
 	root := t.TempDir()
@@ -1377,7 +1393,7 @@ func TestNeoTaskSubagentCompactsLargeToolHistory(t *testing.T) {
 		}
 		toolCallID := stringValue(event["toolCallId"])
 		output := "follow-up result after compaction"
-		if toolCallID == "TU-large-read" {
+		if stringValue(mapValue(event["args"])["path"]) == "neo_runtime.go" {
 			output = "large tool result\n" + strings.Repeat("runtime evidence ", 12000)
 		}
 		go actor.routeSubagentLeafToolResult(toolCallID, map[string]any{"status": "done", "output": output})
@@ -2561,6 +2577,232 @@ func TestNeoFinderConcurrentRunsNamespaceProviderToolCallIDs(t *testing.T) {
 	}
 }
 
+func TestNeoSubagentConcurrentRunsNamespaceProviderToolCallIDs(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-subagent-namespaces", "thread-actor", "T-subagent-namespaces", "T-subagent-namespaces", neoActorRecord("actor-subagent-namespaces", "thread-actor", "T-subagent-namespaces"), nil)
+	call := neoToolCall{ID: "provider-reused-id", Name: "Read", Input: map[string]any{"path": "go.mod"}}
+
+	results := make(chan []neoSubagentToolExchange, 2)
+	for _, parentToolCallID := range []string{"TU-check-a", "TU-check-b"} {
+		go func(parentToolCallID string) {
+			results <- actor.execSubagentTurnTools([]neoToolCall{call}, parentToolCallID, actor.generation, 0, "review", "")
+		}(parentToolCallID)
+	}
+	if !neoWaitFor(time.Second, func() bool {
+		actor.mu.Lock()
+		defer actor.mu.Unlock()
+		return len(actor.subagentWaiters) == 2
+	}) {
+		t.Fatal("concurrent subagent runs did not register distinct leaf tools")
+	}
+	actor.mu.Lock()
+	leasedIDs := make([]string, 0, len(actor.subagentWaiters))
+	for toolCallID := range actor.subagentWaiters {
+		leasedIDs = append(leasedIDs, toolCallID)
+	}
+	actor.mu.Unlock()
+	if leasedIDs[0] == leasedIDs[1] || leasedIDs[0] == call.ID || leasedIDs[1] == call.ID {
+		t.Fatalf("executor tool call IDs were not namespaced: provider=%q leased=%q", call.ID, leasedIDs)
+	}
+	for _, toolCallID := range leasedIDs {
+		if !actor.routeSubagentLeafToolResult(toolCallID, map[string]any{"status": "done", "output": toolCallID}) {
+			t.Fatalf("result for %s was not routed", toolCallID)
+		}
+	}
+	for range 2 {
+		select {
+		case exchanges := <-results:
+			if len(exchanges) != 1 || exchanges[0].Call.ID != call.ID || stringValue(exchanges[0].Run["status"]) != "done" {
+				t.Fatalf("subagent exchange = %#v", exchanges)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("concurrent subagent run did not finish")
+		}
+	}
+
+	pairs := map[string]struct {
+		useID        string
+		resultID     string
+		resultOutput string
+	}{}
+	actor.mu.Lock()
+	for _, message := range actor.messages {
+		if message.ParentToolUseID == "" || len(message.Content) != 1 {
+			continue
+		}
+		pair := pairs[message.ParentToolUseID]
+		block := mapValue(message.Content[0])
+		switch stringValue(block["type"]) {
+		case "tool_use":
+			pair.useID = stringValue(block["id"])
+		case "tool_result":
+			pair.resultID = stringValue(block["toolUseID"])
+			pair.resultOutput = stringValue(mapValue(block["run"])["output"])
+		}
+		pairs[message.ParentToolUseID] = pair
+	}
+	actor.mu.Unlock()
+	for _, parentToolCallID := range []string{"TU-check-a", "TU-check-b"} {
+		pair := pairs[parentToolCallID]
+		if pair.useID == "" || pair.useID != pair.resultID || pair.resultOutput != pair.useID {
+			t.Fatalf("parent %s transcript pair = %#v", parentToolCallID, pair)
+		}
+	}
+}
+
+func TestNeoStoredSubagentExchangesNamespaceProviderToolCallIDs(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-stored-exchange-namespaces", "thread-actor", "T-stored-exchange-namespaces", "T-stored-exchange-namespaces", neoActorRecord("actor-stored-exchange-namespaces", "thread-actor", "T-stored-exchange-namespaces"), nil)
+	exchange := neoSubagentToolExchange{
+		Call: neoToolCall{ID: "provider-reused-stored-id", Name: "Read", Input: map[string]any{"path": "go.mod"}},
+		Run:  map[string]any{"status": "done", "output": "module"},
+	}
+	actor.storeSubagentToolExchanges([]neoSubagentToolExchange{exchange}, "TU-read-thread-a", actor.generation)
+	actor.storeSubagentToolExchanges([]neoSubagentToolExchange{exchange}, "TU-read-thread-b", actor.generation)
+
+	pairs := map[string][2]string{}
+	actor.mu.Lock()
+	for _, message := range actor.messages {
+		if len(message.Content) != 1 {
+			continue
+		}
+		pair := pairs[message.ParentToolUseID]
+		block := mapValue(message.Content[0])
+		switch stringValue(block["type"]) {
+		case "tool_use":
+			pair[0] = stringValue(block["id"])
+		case "tool_result":
+			pair[1] = stringValue(block["toolUseID"])
+		}
+		pairs[message.ParentToolUseID] = pair
+	}
+	actor.mu.Unlock()
+	first := pairs["TU-read-thread-a"]
+	second := pairs["TU-read-thread-b"]
+	if first[0] == "" || second[0] == "" || first[0] != first[1] || second[0] != second[1] || first[0] == second[0] || first[0] == exchange.Call.ID || second[0] == exchange.Call.ID {
+		t.Fatalf("stored exchange transcript pairs = first:%#v second:%#v provider:%q", first, second, exchange.Call.ID)
+	}
+	if exchange.Call.ID != "provider-reused-stored-id" {
+		t.Fatalf("stored exchange mutated provider call ID: %#v", exchange.Call)
+	}
+}
+
+func TestNeoStoredSubagentExchangesRejectStaleGeneration(t *testing.T) {
+	actor := newNeoActor(newNeoRuntime(&config.Config{}), "actor-stale-stored-exchange", "thread-actor", "T-stale-stored-exchange", "T-stale-stored-exchange", neoActorRecord("actor-stale-stored-exchange", "thread-actor", "T-stale-stored-exchange"), nil)
+	generation := actor.generation
+	actor.mu.Lock()
+	actor.advanceGenerationLocked()
+	actor.mu.Unlock()
+	stored := actor.storeSubagentToolExchanges([]neoSubagentToolExchange{{
+		Call: neoToolCall{ID: "provider-stale", Name: "read_thread_messages"},
+		Run:  map[string]any{"status": "done", "result": "stale"},
+	}}, "TU-read-thread", generation)
+	if stored {
+		t.Fatal("stale generation stored read_thread exchanges")
+	}
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.messages) != 0 {
+		t.Fatalf("stale stored exchanges appended messages: %#v", actor.messages)
+	}
+}
+
+func TestNeoRegisterSubagentLeafToolRejectsOwnedID(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-subagent-owned-id", "thread-actor", "T-subagent-owned-id", "T-subagent-owned-id", neoActorRecord("actor-subagent-owned-id", "thread-actor", "T-subagent-owned-id"), nil)
+	call := neoToolCall{ID: "TU-owned", Name: "Read", Input: map[string]any{"path": "go.mod"}}
+	first := make(chan map[string]any, 1)
+	second := make(chan map[string]any, 1)
+	if !actor.registerSubagentLeafTool(call, "TU-parent-a", "M-a", actor.generation, first) {
+		t.Fatal("initial leaf registration failed")
+	}
+	if actor.registerSubagentLeafTool(call, "TU-parent-b", "M-b", actor.generation, second) {
+		t.Fatal("duplicate leaf registration replaced the existing owner")
+	}
+	actor.mu.Lock()
+	owner := actor.subagentWaiters[call.ID]
+	pending := actor.subagentTools[call.ID]
+	actor.mu.Unlock()
+	if owner != first || pending.ParentToolCallID != "TU-parent-a" || pending.MessageID != "M-a" {
+		t.Fatalf("leaf owner changed after duplicate registration: owner=%p pending=%#v", owner, pending)
+	}
+	duplicateRun := actor.execSubagentLeafTool(context.Background(), call, "TU-parent-b", "M-b", actor.generation)
+	if stringValue(duplicateRun["status"]) != "error" || !strings.Contains(runToText(duplicateRun), "already registered") {
+		t.Fatalf("duplicate leaf execution = %#v", duplicateRun)
+	}
+	actor.mu.Lock()
+	owner = actor.subagentWaiters[call.ID]
+	pending = actor.subagentTools[call.ID]
+	messages := len(actor.messages)
+	actor.mu.Unlock()
+	if owner != first || pending.ParentToolCallID != "TU-parent-a" || messages != 0 {
+		t.Fatalf("duplicate leaf execution changed owner state: owner=%p pending=%#v messages=%d", owner, pending, messages)
+	}
+	if !actor.routeSubagentLeafToolResult(call.ID, map[string]any{"status": "done", "output": "module"}) {
+		t.Fatal("owned leaf result was not routed")
+	}
+	select {
+	case run := <-first:
+		if stringValue(run["status"]) != "done" {
+			t.Fatalf("owned leaf result = %#v", run)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("owned leaf waiter was not resolved")
+	}
+	select {
+	case run := <-second:
+		t.Fatalf("replacement waiter received result: %#v", run)
+	default:
+	}
+}
+
+func TestNeoFinderConcurrentScopeErrorsNamespaceProviderToolCallIDs(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-finder-error-namespaces", "thread-actor", "T-finder-error-namespaces", "T-finder-error-namespaces", neoActorRecord("actor-finder-error-namespaces", "thread-actor", "T-finder-error-namespaces"), nil)
+	root := setNeoFinderWorkspaceForTest(t, actor)
+	call := neoToolCall{ID: "provider-reused-error-id", Name: "Read", Input: map[string]any{}}
+
+	results := make(chan []neoSubagentToolExchange, 2)
+	for _, parentToolCallID := range []string{"TU-finder-error-a", "TU-finder-error-b"} {
+		go func(parentToolCallID string) {
+			results <- actor.execFinderTurnTools(context.Background(), []neoToolCall{call}, root, root, parentToolCallID, actor.generation)
+		}(parentToolCallID)
+	}
+	for range 2 {
+		select {
+		case exchanges := <-results:
+			if len(exchanges) != 1 || exchanges[0].Call.ID != call.ID || stringValue(exchanges[0].Run["status"]) != "error" {
+				t.Fatalf("finder scope-error exchange = %#v", exchanges)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("finder scope-error run did not finish")
+		}
+	}
+
+	pairs := map[string][2]string{}
+	actor.mu.Lock()
+	for _, message := range actor.messages {
+		if message.ParentToolUseID == "" || len(message.Content) != 1 {
+			continue
+		}
+		pair := pairs[message.ParentToolUseID]
+		block := mapValue(message.Content[0])
+		switch stringValue(block["type"]) {
+		case "tool_use":
+			pair[0] = stringValue(block["id"])
+		case "tool_result":
+			pair[1] = stringValue(block["toolUseID"])
+		}
+		pairs[message.ParentToolUseID] = pair
+	}
+	actor.mu.Unlock()
+	first := pairs["TU-finder-error-a"]
+	second := pairs["TU-finder-error-b"]
+	if first[0] == "" || second[0] == "" || first[0] != first[1] || second[0] != second[1] || first[0] == second[0] || first[0] == call.ID || second[0] == call.ID {
+		t.Fatalf("finder scope-error transcript pairs = first:%#v second:%#v provider:%q", first, second, call.ID)
+	}
+}
+
 func TestNeoFinderTurnRejectsDuplicateToolCallIDs(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	actor := newNeoActor(rt, "actor-finder-duplicate", "thread-actor", "T-finder-duplicate", "T-finder-duplicate", neoActorRecord("actor-finder-duplicate", "thread-actor", "T-finder-duplicate"), nil)
@@ -2619,6 +2861,10 @@ func TestNeoFinderCancellationWakesLeavesClearsTrackingAndRevokesOnce(t *testing
 
 	rt := newNeoRuntime(&config.Config{})
 	actor := newNeoActor(rt, "actor-finder-cancel", "thread-actor", "T-finder-cancel", "T-finder-cancel", neoActorRecord("actor-finder-cancel", "thread-actor", "T-finder-cancel"), nil)
+	runContext, _, acquired := actor.acquireSubagentRun(actor.generation)
+	if !acquired {
+		t.Fatal("subagent run context was not acquired")
+	}
 	var eventsMu sync.Mutex
 	revocations := map[string]int{}
 	leaseEvents := map[string][]string{}
@@ -2645,7 +2891,7 @@ func TestNeoFinderCancellationWakesLeavesClearsTrackingAndRevokesOnce(t *testing
 	for i := 0; i < leafCount; i++ {
 		call := neoToolCall{ID: "leaf-cancel-" + strconv.Itoa(i), Name: "Grep", Input: map[string]any{"pattern": "x"}}
 		go func(call neoToolCall) {
-			results <- actor.execSubagentLeafTool(call, "TU-finder", "M-leaf", actor.generation)
+			results <- actor.execSubagentLeafTool(runContext, call, "TU-finder", "M-leaf", actor.generation)
 		}(call)
 	}
 	if !neoWaitFor(time.Second, func() bool {
@@ -2697,13 +2943,226 @@ func TestNeoFinderCancellationWakesLeavesClearsTrackingAndRevokesOnce(t *testing
 	}
 }
 
+func TestNeoSubagentCancellationReturnsAuthoritativeReason(t *testing.T) {
+	actor := newNeoActor(newNeoRuntime(&config.Config{}), "actor-cancellation-reason", "thread-actor", "T-cancellation-reason", "T-cancellation-reason", neoActorRecord("actor-cancellation-reason", "thread-actor", "T-cancellation-reason"), nil)
+	toolCallID := "TU-cancellation-reason"
+	waiter := make(chan map[string]any, 1)
+	actor.subagentWaiters = map[string]chan map[string]any{}
+	actor.subagentWaiters[toolCallID] = waiter
+	actor.subagentTools[toolCallID] = neoPendingTool{ID: toolCallID, Name: "Read", ParentToolCallID: "TU-parent"}
+	actor.mu.Lock()
+	cancellation := actor.takeSubagentCancellationLocked()
+	actor.mu.Unlock()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan map[string]any, 1)
+	go func() {
+		done <- actor.waitSubagentLeafTool(ctx, toolCallID, waiter)
+	}()
+	cancel()
+	select {
+	case run := <-done:
+		t.Fatalf("waiter returned before authoritative cancellation: %#v", run)
+	case <-time.After(20 * time.Millisecond):
+	}
+	actor.finishSubagentCancellation(cancellation, "system:disposed", "executor_disconnected")
+	select {
+	case run := <-done:
+		if stringValue(run["status"]) != "cancelled" || stringValue(run["reason"]) != "system:disposed" {
+			t.Fatalf("authoritative cancellation run = %#v", run)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("authoritative cancellation did not wake waiter")
+	}
+}
+
+func TestNeoImportClearsSubagentOwnershipAndRejectsLateResult(t *testing.T) {
+	threadID := "T-019f4000-0000-4000-8000-000000000160"
+	actor := newNeoActor(newNeoRuntime(&config.Config{}), "actor-import-subagent", "thread-actor", threadID, threadID, neoActorRecord("actor-import-subagent", "thread-actor", threadID), nil)
+	toolCallID := "TU-import-leaf"
+	waiter := make(chan map[string]any, 1)
+	actor.subagentWaiters = map[string]chan map[string]any{}
+	events := make(chan map[string]any, 16)
+	socket := &neoSocket{writeMessage: func(_ int, data []byte) error {
+		var event map[string]any
+		if json.Unmarshal(data, &event) == nil {
+			events <- event
+		}
+		return nil
+	}}
+	socket.markExecutor("executor-import")
+	actor.mu.Lock()
+	actor.sockets[socket] = struct{}{}
+	actor.executorSocket = socket
+	actor.executorID = "executor-import"
+	actor.executorReady = true
+	actor.executorBootstrapComplete = true
+	actor.subagentWaiters[toolCallID] = waiter
+	actor.subagentTools[toolCallID] = neoPendingTool{ID: toolCallID, Name: "Read", MessageID: "M-old", ParentToolCallID: "TU-old-parent"}
+	actor.subagentToolLeaseAcks[toolCallID] = true
+	actor.mu.Unlock()
+
+	if err := actor.importThreadLocalOnly(map[string]any{
+		"id": threadID, "agentMode": "smart", "messages": []any{map[string]any{
+			"role": "user", "messageId": "M-imported", "content": []any{map[string]any{"type": "text", "text": "imported"}},
+		}},
+	}); err != nil {
+		t.Fatalf("import thread: %v", err)
+	}
+	actor.replayUnacknowledgedSubagentToolLeases()
+	select {
+	case run := <-waiter:
+		if stringValue(run["status"]) != "cancelled" || stringValue(run["reason"]) != "system:disposed" {
+			t.Fatalf("import cancellation run = %#v", run)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("import did not wake prior subagent waiter")
+	}
+	actor.mu.Lock()
+	waiters := len(actor.subagentWaiters)
+	tools := len(actor.subagentTools)
+	acks := len(actor.subagentToolLeaseAcks)
+	actor.mu.Unlock()
+	if waiters != 0 || tools != 0 || acks != 0 {
+		t.Fatalf("subagent ownership after import = waiters:%d tools:%d acks:%d", waiters, tools, acks)
+	}
+	if actor.routeSubagentLeafToolResult(toolCallID, map[string]any{"status": "done", "output": "late"}) {
+		t.Fatal("late result crossed imported generation")
+	}
+	revocations := 0
+	leases := 0
+	draining := true
+	for draining {
+		select {
+		case event := <-events:
+			switch stringValue(event["type"]) {
+			case "executor_tool_lease_revoked":
+				if stringValue(event["toolCallId"]) == toolCallID {
+					revocations++
+				}
+			case "tool_lease":
+				if stringValue(event["toolCallId"]) == toolCallID {
+					leases++
+				}
+			}
+		default:
+			draining = false
+		}
+	}
+	if revocations != 1 || leases != 0 {
+		t.Fatalf("import lease events = revocations:%d leases:%d", revocations, leases)
+	}
+}
+
+func TestNeoSubagentLeafContextCancellationClearsOwnedRegistration(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-leaf-context-cancel", "thread-actor", "T-leaf-context-cancel", "T-leaf-context-cancel", neoActorRecord("actor-leaf-context-cancel", "thread-actor", "T-leaf-context-cancel"), nil)
+	call := neoToolCall{ID: "TU-context-leaf", Name: "Read", Input: map[string]any{"path": "go.mod"}}
+	childMessageID := actor.storeSubagentToolUseMessage(call, "TU-parent")
+	events := make(chan map[string]any, 4)
+	socket := &neoSocket{writeMessage: func(_ int, data []byte) error {
+		var event map[string]any
+		if json.Unmarshal(data, &event) == nil {
+			events <- event
+		}
+		return nil
+	}}
+	actor.sockets[socket] = struct{}{}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan map[string]any, 1)
+	go func() {
+		done <- actor.execSubagentLeafTool(ctx, call, "TU-parent", childMessageID, actor.generation)
+	}()
+	if !neoWaitFor(time.Second, func() bool {
+		actor.mu.Lock()
+		defer actor.mu.Unlock()
+		return actor.subagentWaiters[call.ID] != nil
+	}) {
+		t.Fatal("leaf tool did not register")
+	}
+	cancel()
+	select {
+	case run := <-done:
+		if stringValue(run["status"]) != "cancelled" || stringValue(run["reason"]) != "user:cancelled" {
+			t.Fatalf("context-cancelled leaf result = %#v", run)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("context cancellation did not wake leaf waiter")
+	}
+	actor.mu.Lock()
+	if len(actor.subagentWaiters) != 0 || len(actor.subagentTools) != 0 {
+		t.Fatalf("context cancellation left tracking: waiters=%d tools=%d", len(actor.subagentWaiters), len(actor.subagentTools))
+	}
+	var terminalResult bool
+	for _, message := range actor.messages {
+		if message.ParentToolUseID != "TU-parent" || len(message.Content) != 1 {
+			continue
+		}
+		block := mapValue(message.Content[0])
+		if stringValue(block["type"]) == "tool_result" && stringValue(block["toolUseID"]) == call.ID && stringValue(mapValue(block["run"])["status"]) == "cancelled" {
+			terminalResult = true
+		}
+	}
+	actor.mu.Unlock()
+	if !terminalResult {
+		t.Fatal("context cancellation did not persist a terminal leaf result")
+	}
+	var leased, revoked bool
+	deadline := time.After(time.Second)
+	for !leased || !revoked {
+		select {
+		case event := <-events:
+			switch stringValue(event["type"]) {
+			case "tool_lease":
+				leased = stringValue(event["toolCallId"]) == call.ID
+			case "executor_tool_lease_revoked":
+				revoked = stringValue(event["toolCallId"]) == call.ID
+			}
+		case <-deadline:
+			t.Fatalf("leaf cancellation events = leased:%v revoked:%v", leased, revoked)
+		}
+	}
+}
+
+func TestNeoFinderTurnContextCancellationWakesLeaf(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-finder-context-cancel", "thread-actor", "T-finder-context-cancel", "T-finder-context-cancel", neoActorRecord("actor-finder-context-cancel", "thread-actor", "T-finder-context-cancel"), nil)
+	root := setNeoFinderWorkspaceForTest(t, actor)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan []neoSubagentToolExchange, 1)
+	go func() {
+		done <- actor.execFinderTurnTools(ctx, []neoToolCall{{ID: "provider-call", Name: "Grep", Input: map[string]any{"pattern": "neoActor"}}}, root, root, "TU-finder", actor.generation)
+	}()
+	if !neoWaitFor(time.Second, func() bool {
+		actor.mu.Lock()
+		defer actor.mu.Unlock()
+		return len(actor.subagentWaiters) == 1
+	}) {
+		t.Fatal("finder leaf did not register")
+	}
+	cancel()
+	select {
+	case exchanges := <-done:
+		if len(exchanges) != 1 || stringValue(exchanges[0].Run["status"]) != "cancelled" {
+			t.Fatalf("cancelled finder exchange = %#v", exchanges)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("finder context cancellation did not wake leaf waiter")
+	}
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.subagentWaiters) != 0 || len(actor.subagentTools) != 0 {
+		t.Fatalf("finder context cancellation left tracking: waiters=%d tools=%d", len(actor.subagentWaiters), len(actor.subagentTools))
+	}
+}
+
 func TestNeoFinderExecutorRevocationWakesLeaf(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	actor := newNeoActor(rt, "actor-finder-revoke", "thread-actor", "T-finder-revoke", "T-finder-revoke", neoActorRecord("actor-finder-revoke", "thread-actor", "T-finder-revoke"), nil)
 	childMessageID := actor.storeSubagentToolUseMessage(neoToolCall{ID: "leaf-revoke", Name: "Grep", Input: map[string]any{"pattern": "x"}}, "TU-finder")
 	done := make(chan map[string]any, 1)
 	go func() {
-		done <- actor.execSubagentLeafTool(neoToolCall{ID: "leaf-revoke", Name: "Grep", Input: map[string]any{"pattern": "x"}}, "TU-finder", childMessageID, actor.generation)
+		done <- actor.execSubagentLeafTool(context.Background(), neoToolCall{ID: "leaf-revoke", Name: "Grep", Input: map[string]any{"pattern": "x"}}, "TU-finder", childMessageID, actor.generation)
 	}()
 	if !neoWaitFor(time.Second, func() bool {
 		actor.mu.Lock()
@@ -2755,7 +3214,7 @@ func TestNeoSubagentLeafLeaseReplaysAfterExecutorReconnect(t *testing.T) {
 
 	result := make(chan map[string]any, 1)
 	go func() {
-		result <- actor.execSubagentLeafTool(neoToolCall{ID: "leaf-reconnect", Name: "Grep", Input: map[string]any{"pattern": "x"}}, "TU-finder", "M-leaf", actor.generation)
+		result <- actor.execSubagentLeafTool(context.Background(), neoToolCall{ID: "leaf-reconnect", Name: "Grep", Input: map[string]any{"pattern": "x"}}, "TU-finder", "M-leaf", actor.generation)
 	}()
 	select {
 	case toolCallID := <-leases:
@@ -2827,7 +3286,7 @@ func TestNeoSubagentAcknowledgedLeafLeaseIsNotReplayed(t *testing.T) {
 
 	result := make(chan map[string]any, 1)
 	go func() {
-		result <- actor.execSubagentLeafTool(neoToolCall{ID: "leaf-ack", Name: "Read", Input: map[string]any{"path": "go.mod"}}, "TU-finder", "M-leaf", actor.generation)
+		result <- actor.execSubagentLeafTool(context.Background(), neoToolCall{ID: "leaf-ack", Name: "Read", Input: map[string]any{"path": "go.mod"}}, "TU-finder", "M-leaf", actor.generation)
 	}()
 	select {
 	case <-leases:
@@ -3351,7 +3810,7 @@ func TestNeoRunCheckSubagentUsesGPT55InheritedEffort(t *testing.T) {
 	var seen []neoInferenceRequest
 	rt.inferStream = func(_ *neoRuntime, req neoInferenceRequest, _ neoStreamCallback) (neoInferenceResult, error) {
 		seen = append(seen, req)
-		return neoInferenceResult{Text: `{"comments":[]}`}, nil
+		return neoInferenceResult{Text: `{"status":"error","errorMessage":"route fixture","issues":[]}`}, nil
 	}
 
 	_, err := actor.executeSubagentRun(" run_check ", map[string]any{
@@ -3393,7 +3852,7 @@ func TestNeoRunCheckSubagentRouteSuffixOverridesInheritedEffort(t *testing.T) {
 	var seen neoInferenceRequest
 	rt.inferStream = func(_ *neoRuntime, req neoInferenceRequest, _ neoStreamCallback) (neoInferenceResult, error) {
 		seen = req
-		return neoInferenceResult{Text: `{"comments":[]}`}, nil
+		return neoInferenceResult{Text: `{"status":"error","errorMessage":"route fixture","issues":[]}`}, nil
 	}
 	_, err := actor.executeSubagentRun("run_check", map[string]any{
 		"checkName":    "repo-convention-fit",
@@ -3433,7 +3892,7 @@ func TestNeoRunCheckSubagentMappedFallbackRoutesUsePerRouteEffort(t *testing.T) 
 		if request.ModelRouteOverride != nil && request.ModelRouteOverride.Model == "gpt-5.6-sol" {
 			return neoInferenceResult{}, transientErr
 		}
-		return neoInferenceResult{Text: `{"comments":[]}`}, nil
+		return neoInferenceResult{Text: `{"status":"error","errorMessage":"route fixture","issues":[]}`}, nil
 	}
 
 	_, err := actor.executeSubagentRun("run_check", map[string]any{
@@ -3718,6 +4177,141 @@ func TestNeoNormalizeRunCheckErrorRequiresMessage(t *testing.T) {
 	normalized, err := neoNormalizeRunCheckResult(input, map[string]any{"status": "error", "issues": []any{}, "errorMessage": "check failed"})
 	if err != nil || stringValue(normalized["errorMessage"]) != "check failed" {
 		t.Fatalf("valid run_check error = %#v, %v", normalized, err)
+	}
+}
+
+func TestNeoNormalizeRunCheckCompletedRequiresEvidence(t *testing.T) {
+	input := map[string]any{"checkName": "evidence-contract"}
+	if _, err := neoNormalizeRunCheckResult(input, map[string]any{"status": "completed", "issues": []any{}}); err == nil || !strings.Contains(err.Error(), "patternsChecked") {
+		t.Fatalf("missing run_check patterns error = %v", err)
+	}
+	if _, err := neoNormalizeRunCheckResult(input, map[string]any{
+		"status":          "completed",
+		"patternsChecked": []any{"dependency floor"},
+		"issues":          []any{},
+	}); err == nil || !strings.Contains(err.Error(), "evidence") {
+		t.Fatalf("missing run_check evidence error = %v", err)
+	}
+	if _, err := neoNormalizeRunCheckResult(input, map[string]any{
+		"status":          "completed",
+		"patternsChecked": []any{"dependency floor"},
+		"evidence": []any{map[string]any{
+			"patternIndex": 0,
+			"observation":  "The floor lacks the direct resource path.",
+			"sources":      []any{"package@1.0.0/client.py"},
+			"outcome":      "finding",
+		}},
+		"issues": []any{},
+	}); err == nil || !strings.Contains(err.Error(), "issueIndexes") {
+		t.Fatalf("unsupported clean run_check evidence error = %v", err)
+	}
+	if _, err := neoNormalizeRunCheckResult(input, map[string]any{
+		"status":          "completed",
+		"patternsChecked": []any{"dependency floor"},
+		"evidence": []any{map[string]any{
+			"patternIndex": 0,
+			"observation":  "The floor exposes beta.responses only.",
+			"sources":      []any{"package.json:24", "package@1.0.0/client.py"},
+			"outcome":      "no-finding",
+			"issueIndexes": []any{0},
+		}},
+		"issues": []any{map[string]any{
+			"severity": "high",
+			"file":     "wrapper.py",
+			"problem":  "The wrapper accesses a resource absent at the published floor.",
+		}},
+	}); err == nil || !strings.Contains(err.Error(), "cannot reference") {
+		t.Fatalf("contradictory run_check evidence error = %v", err)
+	}
+	normalized, err := neoNormalizeRunCheckResult(input, map[string]any{
+		"status":          "completed",
+		"patternsChecked": []any{"dependency floor", "private package exclusion"},
+		"evidence": []any{
+			map[string]any{"patternIndex": 1, "observation": "The package is published.", "sources": []any{"package.json:2"}, "outcome": "not-applicable"},
+			map[string]any{"patternIndex": 0, "observation": "The floor exposes beta.responses only.", "sources": []any{"package.json:24", "package@1.0.0/client.py"}, "outcome": "finding", "issueIndexes": []any{0}},
+		},
+		"issues": []any{map[string]any{
+			"severity": "high",
+			"file":     "wrapper.py",
+			"problem":  "The wrapper accesses a resource absent at the published floor.",
+		}},
+	})
+	if err != nil || len(arrayValue(normalized["evidence"])) != 2 || len(arrayValue(normalized["issues"])) != 1 {
+		t.Fatalf("valid run_check evidence = %#v, %v", normalized, err)
+	}
+}
+
+func TestNeoNormalizePublishedDependencyCapabilityEvidence(t *testing.T) {
+	input := map[string]any{"checkName": "published-dependency-capability-floor"}
+	result := func(patterns []any, evidence []any) map[string]any {
+		return map[string]any{
+			"status":          "completed",
+			"patternsChecked": patterns,
+			"evidence":        evidence,
+			"issues":          []any{},
+		}
+	}
+	entry := func(patternIndex int, dependency, floorVersion, accessPath, verification string) map[string]any {
+		return map[string]any{
+			"patternIndex": patternIndex,
+			"observation":  "The exact floor exposes the complete root-owner capability path.",
+			"sources":      []any{"exact package archive root-client declaration"},
+			"outcome":      "no-finding",
+			"issueIndexes": []any{},
+			"dependency":   dependency,
+			"floorVersion": floorVersion,
+			"accessPath":   accessPath,
+			"verification": verification,
+			"rootEvidence": "exact root client type declaration text",
+		}
+	}
+
+	if _, err := neoNormalizeRunCheckResult(input, result(
+		[]any{"TypeScript root client"},
+		[]any{map[string]any{
+			"patternIndex": 0,
+			"observation":  "An adjacent Responses class exists.",
+			"sources":      []any{"responses.ts"},
+			"outcome":      "no-finding",
+			"issueIndexes": []any{},
+		}},
+	)); err == nil || !strings.Contains(err.Error(), "requires dependency") {
+		t.Fatalf("missing dependency-floor fields error = %v", err)
+	}
+
+	if _, err := neoNormalizeRunCheckResult(input, result(
+		[]any{"TypeScript root client"},
+		[]any{entry(0, "@openrouter/sdk", "1.0.0", "Responses", "exact-export-inspection")},
+	)); err == nil || !strings.Contains(err.Error(), "root owner") {
+		t.Fatalf("adjacent-class access path was accepted: %v", err)
+	}
+
+	if _, err := neoNormalizeRunCheckResult(input, result(
+		[]any{"TypeScript root client"},
+		[]any{entry(0, "@openrouter/sdk", "1.0.0", "OpenRouter.responses", "adjacent-class-inspection")},
+	)); err == nil || !strings.Contains(err.Error(), "invalid verification") {
+		t.Fatalf("invalid dependency-floor verification was accepted: %v", err)
+	}
+
+	normalized, err := neoNormalizeRunCheckResult(input, result(
+		[]any{"TypeScript root client", "Python root client"},
+		[]any{
+			entry(0, "@openrouter/sdk", "1.0.0", "OpenRouter.responses", "root-type-declaration"),
+			entry(1, "openrouter", "1.0.0", "OpenRouter.responses", "root-source-construction"),
+		},
+	))
+	if err != nil || len(arrayValue(normalized["evidence"])) != 2 {
+		t.Fatalf("separate TypeScript/Python owner evidence = %#v, %v", normalized, err)
+	}
+
+	if _, err := neoNormalizeRunCheckResult(input, result(
+		[]any{"first TypeScript root traversal", "duplicate TypeScript root traversal"},
+		[]any{
+			entry(0, "@openrouter/sdk", "1.0.0", "OpenRouter.responses", "root-type-declaration"),
+			entry(1, "@openrouter/sdk", "1.0.0", "OpenRouter.responses", "root-type-declaration"),
+		},
+	)); err == nil || !strings.Contains(err.Error(), "duplicates capability path") {
+		t.Fatalf("duplicate dependency-floor owner evidence was accepted: %v", err)
 	}
 }
 
@@ -4262,7 +4856,7 @@ func TestNeoRunCheckSubagentHonorsFrontmatterTools(t *testing.T) {
 	var seen neoInferenceRequest
 	rt.inferStream = func(_ *neoRuntime, req neoInferenceRequest, _ neoStreamCallback) (neoInferenceResult, error) {
 		seen = req
-		return neoInferenceResult{Text: `{"comments":[]}`}, nil
+		return neoInferenceResult{Text: `{"status":"error","errorMessage":"tool fixture","issues":[]}`}, nil
 	}
 
 	_, err := actor.executeSubagentRun("run_check", map[string]any{
@@ -4281,6 +4875,191 @@ func TestNeoRunCheckSubagentHonorsFrontmatterTools(t *testing.T) {
 	}
 }
 
+func TestNeoRunCheckSubagentPreservesStructuredShellLeafResult(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-run-check-shell-result", "thread-actor", "T-run-check-shell-result", "T-run-check-shell-result", neoActorRecord("actor-run-check-shell-result", "thread-actor", "T-run-check-shell-result"), nil)
+	actor.currentAgentMode = "review"
+	actor.tools = map[string]neoToolSpec{
+		"shell_command": {Name: "shell_command", InputSchema: map[string]any{"type": "object"}},
+	}
+
+	turn := 0
+	rt.inferStream = func(_ *neoRuntime, req neoInferenceRequest, _ neoStreamCallback) (neoInferenceResult, error) {
+		turn++
+		switch turn {
+		case 1:
+			return neoInferenceResult{ToolCalls: []neoToolCall{{ID: "provider-shell-call", Name: "shell_command", Input: map[string]any{"command": "go test ./..."}}}}, nil
+		case 2:
+			if len(req.History) == 0 {
+				t.Fatal("run_check continuation omitted tool history")
+			}
+			leaf := req.History[len(req.History)-1]
+			if leaf.ToolName != "shell_command" || !strings.Contains(leaf.Text, `"exitCode":1`) || !strings.Contains(leaf.Text, `"output":"No test files found"`) || strings.Contains(leaf.Text, "display only") {
+				t.Fatalf("run_check shell evidence = %#v", leaf)
+			}
+			return neoInferenceResult{Text: `{"checkName":"structured-shell","status":"completed","patternsChecked":["shell result"],"evidence":[{"patternIndex":0,"observation":"The command exited nonzero with no tests found.","sources":["shell_command result"],"outcome":"no-finding","issueIndexes":[]}],"issues":[]}`}, nil
+		default:
+			t.Fatalf("run_check inference turns = %d, want two", turn)
+			return neoInferenceResult{}, nil
+		}
+	}
+	socket := &neoSocket{writeMessage: func(_ int, data []byte) error {
+		var event map[string]any
+		if json.Unmarshal(data, &event) == nil && stringValue(event["type"]) == "tool_lease" {
+			toolCallID := stringValue(event["toolCallId"])
+			go actor.routeSubagentLeafToolResult(toolCallID, map[string]any{
+				"status": "done",
+				"output": "display only",
+				"result": map[string]any{"exitCode": 1, "output": "No test files found"},
+			})
+		}
+		return nil
+	}}
+	actor.sockets[socket] = struct{}{}
+
+	text, err := actor.executeSubagentRun("run_check", map[string]any{
+		"checkName":    "structured-shell",
+		"checkURI":     "file:///checks/structured-shell.md",
+		"checkContent": "Inspect shell evidence.",
+	}, "TU-run-check-shell", "M-parent", actor.generation, 0, "")
+	if err != nil {
+		t.Fatalf("run_check subagent failed: %v", err)
+	}
+	if turn != 2 || !strings.Contains(text, `"checkName":"structured-shell"`) {
+		t.Fatalf("run_check result/turns = %q/%d", text, turn)
+	}
+}
+
+func TestNeoRunCheckSubagentRepairsMalformedFinalResultOnce(t *testing.T) {
+	valid := `{"checkName":"repair-check","status":"completed","patternsChecked":["repair contract"],"evidence":[{"patternIndex":0,"observation":"The repaired result satisfies the contract.","sources":["fixture"],"outcome":"no-finding","issueIndexes":[]}],"issues":[]}`
+	for name, initial := range map[string]string{
+		"prose plus JSON":  "Result follows:\n" + valid,
+		"fenced JSON":      "```json\n" + valid + "\n```",
+		"trailing content": valid + "\nDone.",
+		"schema invalid":   `{"checkName":"repair-check","status":"completed","issues":[]}`,
+		"malformed JSON":   `{"checkName":"repair-check","status":"completed","issues":[]`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			rt := newNeoRuntime(&config.Config{})
+			actor := newNeoActor(rt, "actor-run-check-repair", "thread-actor", "T-run-check-repair", "T-run-check-repair", neoActorRecord("actor-run-check-repair", "thread-actor", "T-run-check-repair"), nil)
+			turn := 0
+			rt.inferStream = func(_ *neoRuntime, request neoInferenceRequest, _ neoStreamCallback) (neoInferenceResult, error) {
+				turn++
+				if turn == 1 {
+					return neoInferenceResult{Text: initial}, nil
+				}
+				if turn != 2 {
+					t.Fatalf("repair inference turns = %d, want exactly two", turn)
+				}
+				if len(request.Tools) != 0 {
+					t.Fatalf("repair tools = %#v, want none", request.Tools)
+				}
+				history := neoHistoryTestText(request.History)
+				for _, want := range []string{initial, "Your previous final result was rejected:", "Return exactly one pure JSON object now", "Do not use markdown fences", "patternsChecked", "evidence"} {
+					if !strings.Contains(history, want) {
+						t.Fatalf("repair history missing %q:\n%s", want, history)
+					}
+				}
+				return neoInferenceResult{Text: valid}, nil
+			}
+
+			text, err := actor.executeSubagentRun("run_check", map[string]any{
+				"checkName":    "repair-check",
+				"checkContent": "Verify the repair contract.",
+			}, "TU-run-check-repair", "M-parent", actor.generation, 0, "")
+			if err != nil || turn != 2 {
+				t.Fatalf("repaired run_check = %q, turns=%d, err=%v", text, turn, err)
+			}
+			if result, parseErr := neoParseRunCheckResult(map[string]any{"checkName": "repair-check"}, text); parseErr != nil || stringValue(result["status"]) != "completed" {
+				t.Fatalf("repaired result = %#v, %v", result, parseErr)
+			}
+		})
+	}
+}
+
+func TestNeoRunCheckSubagentRepairsEmptyFinalizationAfterSynthesis(t *testing.T) {
+	valid := `{"checkName":"empty-repair","status":"completed","patternsChecked":["empty finalization"],"evidence":[{"patternIndex":0,"observation":"The continuation returned a structured result.","sources":["fixture"],"outcome":"no-finding","issueIndexes":[]}],"issues":[]}`
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-empty-run-check-repair", "thread-actor", "T-empty-run-check-repair", "T-empty-run-check-repair", neoActorRecord("actor-empty-run-check-repair", "thread-actor", "T-empty-run-check-repair"), nil)
+	turn := 0
+	rt.inferStream = func(_ *neoRuntime, request neoInferenceRequest, _ neoStreamCallback) (neoInferenceResult, error) {
+		turn++
+		switch turn {
+		case 1:
+			return neoInferenceResult{}, nil
+		case 2:
+			if !strings.Contains(neoHistoryTestText(request.History), "Write your complete final answer now") {
+				t.Fatalf("empty finalization did not request synthesis: %#v", request.History)
+			}
+			return neoInferenceResult{Text: "```json\n" + valid + "\n```"}, nil
+		case 3:
+			if len(request.Tools) != 0 || !strings.Contains(neoHistoryTestText(request.History), "Your previous final result was rejected:") {
+				t.Fatalf("structured repair request = tools:%#v history:%#v", request.Tools, request.History)
+			}
+			return neoInferenceResult{Text: valid}, nil
+		default:
+			t.Fatalf("empty repair inference turns = %d, want three", turn)
+			return neoInferenceResult{}, nil
+		}
+	}
+
+	text, err := actor.executeSubagentRun("run_check", map[string]any{"checkName": "empty-repair", "checkContent": "Verify empty finalization recovery."}, "TU-empty-run-check-repair", "M-parent", actor.generation, 0, "")
+	if err != nil || turn != 3 || text != valid {
+		t.Fatalf("empty finalization repair = %q, turns=%d, err=%v", text, turn, err)
+	}
+}
+
+func TestNeoRunCheckSubagentDoesNotRepeatFailedStructuredRepair(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-failed-run-check-repair", "thread-actor", "T-failed-run-check-repair", "T-failed-run-check-repair", neoActorRecord("actor-failed-run-check-repair", "thread-actor", "T-failed-run-check-repair"), nil)
+	turn := 0
+	rt.inferStream = func(_ *neoRuntime, _ neoInferenceRequest, _ neoStreamCallback) (neoInferenceResult, error) {
+		turn++
+		return neoInferenceResult{Text: "not JSON"}, nil
+	}
+
+	_, err := actor.executeSubagentRun("run_check", map[string]any{"checkName": "failed-repair", "checkContent": "Verify bounded repair."}, "TU-failed-run-check-repair", "M-parent", actor.generation, 0, "")
+	if err == nil || turn != 2 || !strings.Contains(err.Error(), "structured-output repair failed") || !strings.Contains(err.Error(), "initial result") || !strings.Contains(err.Error(), "repair result") {
+		t.Fatalf("failed repair = turns:%d err:%v", turn, err)
+	}
+}
+
+func TestNeoRunCheckRepairPromptProvidesValidSnapshotExample(t *testing.T) {
+	input := map[string]any{
+		"checkName":                      "published-dependency-capability-floor",
+		neoReviewSnapshotHashKey:         "snapshot-hash",
+		neoReviewSnapshotFilesKey:        []any{"packages/sdk/src/client.ts", "sdks/python/client.py"},
+		neoReviewSnapshotHunksKey:        []any{"packages/sdk/src/client.ts@@+10,2", "sdks/python/client.py@@+20,2"},
+		neoReviewSnapshotLinesKey:        []any{"packages/sdk/src/client.ts@@+10,2", "sdks/python/client.py@@+20,2"},
+		neoReviewSnapshotDeletedLinesKey: []any{},
+		neoReviewSnapshotDeletedKey:      []any{},
+		neoReviewSnapshotZeroLineKey:     []any{},
+	}
+	prompt := neoRunCheckRepairPrompt(input, errors.New("malformed result"))
+	const startMarker = "Valid completed example:\n"
+	const endMarker = "\n\nFor a failed check instead"
+	start := strings.Index(prompt, startMarker)
+	end := strings.Index(prompt, endMarker)
+	if start < 0 || end < 0 || end <= start {
+		t.Fatalf("repair prompt omitted the completed example:\n%s", prompt)
+	}
+	example := prompt[start+len(startMarker) : end]
+	normalized, err := neoParseRunCheckResult(input, example)
+	if err != nil {
+		t.Fatalf("repair prompt completed example is invalid: %v\n%s", err, example)
+	}
+	if numberFrom(normalized["filesAnalyzed"]) != 2 || len(arrayValue(normalized["coveredFiles"])) != 2 || len(arrayValue(normalized["coveredHunks"])) != 2 {
+		t.Fatalf("repair prompt coverage = %#v", normalized)
+	}
+	evidence := mapValue(arrayValue(normalized["evidence"])[0])
+	if stringValue(evidence["accessPath"]) != "rootOwner.requiredCapability" || stringValue(evidence["verification"]) != "root-type-declaration" {
+		t.Fatalf("repair prompt dependency evidence = %#v", evidence)
+	}
+	if strings.Contains(prompt, "finding|no-finding|not-applicable") || strings.Contains(prompt, `"filesAnalyzed":0`) {
+		t.Fatalf("repair prompt retained an invalid copyable example:\n%s", prompt)
+	}
+}
+
 func TestNeoRunCheckSubagentHonorsExplicitEmptyFrontmatterTools(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	actor := newNeoActor(rt, "actor-run-check-empty-tools", "thread-actor", "T-run-check-empty-tools", "T-run-check-empty-tools", neoActorRecord("actor-run-check-empty-tools", "thread-actor", "T-run-check-empty-tools"), nil)
@@ -4293,7 +5072,7 @@ func TestNeoRunCheckSubagentHonorsExplicitEmptyFrontmatterTools(t *testing.T) {
 	var seen neoInferenceRequest
 	rt.inferStream = func(_ *neoRuntime, req neoInferenceRequest, _ neoStreamCallback) (neoInferenceResult, error) {
 		seen = req
-		return neoInferenceResult{Text: `{"comments":[]}`}, nil
+		return neoInferenceResult{Text: `{"status":"error","errorMessage":"tool fixture","issues":[]}`}, nil
 	}
 
 	repository := t.TempDir()
@@ -4413,7 +5192,7 @@ func TestNeoRunCheckDefinitionErrorIsStructured(t *testing.T) {
 	last := actor.messages[len(actor.messages)-1]
 	run := mapValue(mapValue(last.Content[0])["run"])
 	result := mapValue(run["result"])
-	if stringValue(run["status"]) != "done" || stringValue(result["checkName"]) != "outside" || stringValue(result["status"]) != "error" || len(arrayValue(result["issues"])) != 0 {
+	if stringValue(run["status"]) != "error" || stringValue(mapValue(run["error"])["message"]) == "" || stringValue(result["checkName"]) != "outside" || stringValue(result["status"]) != "error" || len(arrayValue(result["issues"])) != 0 {
 		t.Fatalf("structured run_check definition error = %#v", run)
 	}
 }
@@ -5286,6 +6065,7 @@ func TestNeoSubagentNestedRecursion(t *testing.T) {
 	_, stillPending := actor.pendingTools[parent.ID]
 	var toolText string
 	var nestedFinderResult string
+	var nestedFinderID string
 	for i := len(actor.history) - 1; i >= 0; i-- {
 		if actor.history[i].Role == "tool" && actor.history[i].ToolCallID == parent.ID {
 			toolText = actor.history[i].Text
@@ -5293,7 +6073,16 @@ func TestNeoSubagentNestedRecursion(t *testing.T) {
 		}
 	}
 	for _, message := range actor.messages {
-		if message.ParentToolUseID != parent.ID || message.MessageID != toolResultMessageID("finder-call-1") {
+		if message.ParentToolUseID != parent.ID || message.Role != "assistant" || len(message.Content) != 1 {
+			continue
+		}
+		block := mapValue(message.Content[0])
+		if stringValue(block["type"]) == "tool_use" && stringValue(block["name"]) == "finder" {
+			nestedFinderID = stringValue(block["id"])
+		}
+	}
+	for _, message := range actor.messages {
+		if message.ParentToolUseID != parent.ID || message.MessageID != toolResultMessageID(nestedFinderID) {
 			continue
 		}
 		nestedFinderResult = runToText(mapValue(mapValue(message.Content[0])["run"]))
@@ -5847,6 +6636,7 @@ func TestNeoSubagentRunsSyntheticReadThreadAgentWhenExecutorOmitsIt(t *testing.T
 	var toolText string
 	var childReadResult string
 	var internalReadMessages int
+	var childReadID string
 	for i := len(actor.history) - 1; i >= 0; i-- {
 		if actor.history[i].Role == "tool" && actor.history[i].ToolCallID == parent.ID {
 			toolText = actor.history[i].Text
@@ -5854,10 +6644,19 @@ func TestNeoSubagentRunsSyntheticReadThreadAgentWhenExecutorOmitsIt(t *testing.T
 		}
 	}
 	for _, message := range actor.messages {
-		if message.ParentToolUseID != parent.ID || message.MessageID != toolResultMessageID("read-thread-call-1") {
-			if message.ParentToolUseID == "read-thread-call-1" {
-				internalReadMessages++
-			}
+		if message.ParentToolUseID != parent.ID || message.Role != "assistant" || len(message.Content) != 1 {
+			continue
+		}
+		block := mapValue(message.Content[0])
+		if stringValue(block["type"]) == "tool_use" && stringValue(block["name"]) == "read_thread" {
+			childReadID = stringValue(block["id"])
+		}
+	}
+	for _, message := range actor.messages {
+		if childReadID != "" && message.ParentToolUseID == childReadID {
+			internalReadMessages++
+		}
+		if message.ParentToolUseID != parent.ID || message.MessageID != toolResultMessageID(childReadID) {
 			continue
 		}
 		childReadResult = runToText(mapValue(mapValue(message.Content[0])["run"]))

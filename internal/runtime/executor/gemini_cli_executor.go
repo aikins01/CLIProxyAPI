@@ -113,7 +113,11 @@ func (e *GeminiCLIExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.
 		return nil, err
 	}
 	httpClient := newHTTPClient(ctx, e.cfg, auth, 0)
-	return httpClient.Do(httpReq)
+	httpResp, err := httpClient.Do(httpReq)
+	if err != nil {
+		return nil, helps.NewAuthStateNeutralError(err)
+	}
+	return httpResp, nil
 }
 
 // Execute performs a non-streaming request to the Gemini CLI API.
@@ -226,7 +230,7 @@ func (e *GeminiCLIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 		httpResp, errDo := httpClient.Do(reqHTTP)
 		if errDo != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, errDo)
-			err = errDo
+			err = helps.NewAuthStateNeutralError(errDo)
 			return resp, err
 		}
 
@@ -237,7 +241,7 @@ func (e *GeminiCLIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 		helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 		if errRead != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, errRead)
-			err = errRead
+			err = helps.NewAuthStateNeutralError(errRead)
 			return resp, err
 		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, data)
@@ -376,7 +380,7 @@ func (e *GeminiCLIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 		httpResp, errDo := httpClient.Do(reqHTTP)
 		if errDo != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, errDo)
-			err = errDo
+			err = helps.NewAuthStateNeutralError(errDo)
 			return nil, err
 		}
 		helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
@@ -387,7 +391,7 @@ func (e *GeminiCLIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 			}
 			if errRead != nil {
 				helps.RecordAPIResponseError(ctx, e.cfg, errRead)
-				err = errRead
+				err = helps.NewAuthStateNeutralError(errRead)
 				return nil, err
 			}
 			helps.AppendAPIResponseChunk(ctx, e.cfg, data)
@@ -436,6 +440,15 @@ func (e *GeminiCLIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 					}
 				}
 
+				if errScan := scanner.Err(); errScan != nil {
+					helps.RecordAPIResponseError(ctx, e.cfg, errScan)
+					reporter.PublishFailure(ctx, errScan)
+					select {
+					case out <- cliproxyexecutor.StreamChunk{Err: helps.NewAuthStateNeutralError(errScan)}:
+					case <-ctx.Done():
+					}
+					return
+				}
 				segments := sdktranslator.TranslateStream(respCtx, to, from, attemptModel, opts.OriginalRequest, reqBody, []byte("[DONE]"), &param)
 				for i := range segments {
 					select {
@@ -443,15 +456,6 @@ func (e *GeminiCLIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 					case <-ctx.Done():
 						return
 					}
-				}
-				if errScan := scanner.Err(); errScan != nil {
-					helps.RecordAPIResponseError(ctx, e.cfg, errScan)
-					reporter.PublishFailure(ctx, errScan)
-					select {
-					case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
-					case <-ctx.Done():
-					}
-					return
 				}
 				reporter.EnsurePublished(ctx)
 				return
@@ -462,7 +466,7 @@ func (e *GeminiCLIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 				helps.RecordAPIResponseError(ctx, e.cfg, errRead)
 				reporter.PublishFailure(ctx, errRead)
 				select {
-				case out <- cliproxyexecutor.StreamChunk{Err: errRead}:
+				case out <- cliproxyexecutor.StreamChunk{Err: helps.NewAuthStateNeutralError(errRead)}:
 				case <-ctx.Done():
 				}
 				return
@@ -585,7 +589,7 @@ func (e *GeminiCLIExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.
 		resp, errDo := httpClient.Do(reqHTTP)
 		if errDo != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, errDo)
-			return cliproxyexecutor.Response{}, errDo
+			return cliproxyexecutor.Response{}, helps.NewAuthStateNeutralError(errDo)
 		}
 		data, errRead := io.ReadAll(resp.Body)
 		if errClose := resp.Body.Close(); errClose != nil {
@@ -594,7 +598,7 @@ func (e *GeminiCLIExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.
 		helps.RecordAPIResponseMetadata(ctx, e.cfg, resp.StatusCode, resp.Header.Clone())
 		if errRead != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, errRead)
-			return cliproxyexecutor.Response{}, errRead
+			return cliproxyexecutor.Response{}, helps.NewAuthStateNeutralError(errRead)
 		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
@@ -959,8 +963,8 @@ func fixGeminiCLIImageAspectRatio(modelName string, rawJSON []byte) []byte {
 	return rawJSON
 }
 
-func newGeminiStatusErr(statusCode int, body []byte) statusErr {
-	err := statusErr{code: statusCode, msg: string(body)}
+func newGeminiStatusErr(statusCode int, body []byte) upstreamStatusErr {
+	err := newGoogleStatusErr(statusCode, body)
 	if statusCode == http.StatusTooManyRequests {
 		if retryAfter, parseErr := parseRetryDelay(body); parseErr == nil && retryAfter != nil {
 			err.retryAfter = retryAfter

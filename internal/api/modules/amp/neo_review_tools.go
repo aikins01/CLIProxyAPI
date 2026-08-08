@@ -62,7 +62,7 @@ func neoReviewPromptBase() string {
 }
 
 func neoReviewPrompt() string {
-	return neoReviewPromptBase() + "\n- For a finding caused by deleting a file, adding an empty file, adding or changing a binary file, removing all lines from a retained file, or another metadata-only file change, submit startLine 0 and endLine 0 because there is no reportable new-side line."
+	return neoReviewPromptBase() + "\n- For a finding caused by deleting a file, adding an empty file, adding or changing a binary file, removing all lines from a retained file, or another metadata-only file change, submit startLine 0 and endLine 0 because there is no reportable new-side line.\n- A nonzero command exit, no-tests-found result, malformed target, unavailable check, or skipped validation is not passing evidence. Correct invalid invocations within the retry limit. If correction is impossible, leave the validation unresolved and do not use it to justify a clean conclusion.\n- When the request provides an exact run_check argument object, copy every field and array element verbatim. Never add, remove, replace, or invent a value, and never emit placeholder or template text.\n- After all run_check calls return, remove every main-review candidate that reports the same root cause as a check issue, even if you discovered it independently or its wording, location, severity, evidence, or fix differs. Check findings are appended mechanically."
 }
 
 func neoCaptureWorkingTreeReviewSnapshot(cwd, diffDescription string, files ...string) (*neoReviewDiffSnapshot, error) {
@@ -1074,6 +1074,30 @@ func neoPrepareRunCheckSnapshotInput(input map[string]any, snapshot *neoReviewDi
 		encoded, _ := json.Marshal(hunk)
 		fmt.Fprintf(&packet, "- %s\n", encoded)
 	}
+	packet.WriteString("Changed lines (JSON objects with exact new-side locations):\n")
+	for i, filename := range files {
+		newLine := 0
+		inHunk := false
+		for _, line := range strings.Split(diffs[i], "\n") {
+			if match := neoReviewHunkHeaderPattern.FindStringSubmatch(line); len(match) != 0 {
+				newLine, _ = strconv.Atoi(match[1])
+				inHunk = true
+				continue
+			}
+			if !inHunk || line == "" || strings.HasPrefix(line, "\\") {
+				continue
+			}
+			switch line[0] {
+			case '+':
+				encoded, _ := json.Marshal(map[string]any{"file": filename, "line": newLine, "text": line[1:]})
+				packet.Write(encoded)
+				packet.WriteByte('\n')
+				newLine++
+			case ' ':
+				newLine++
+			}
+		}
+	}
 	packet.WriteString("\n<review_diff_snapshot>\n")
 	packet.WriteString(strings.Join(diffs, "\n"))
 	packet.WriteString("\n</review_diff_snapshot>")
@@ -1091,7 +1115,7 @@ func neoPrepareRunCheckSnapshotInput(input map[string]any, snapshot *neoReviewDi
 func neoRunCheckToolSpec() neoToolSpec {
 	return neoToolSpec{
 		Name:        "run_check",
-		Description: "Run a single discovered review check against the changes under review. Call this once per check provided in the review request, passing the check's name, URI, optional embedded content, frontmatter, diff description, files, and any additional instructions. If content is not embedded, load criteria from the check URI before evaluating it. Returns the structured result of evaluating that check.",
+		Description: "Run a single discovered review check against the changes under review. Call this once per check provided in the review request, passing the check's name, URI, optional embedded content, frontmatter, diff description, files, and any additional instructions. Copy any exact argument object from the request verbatim; never add, remove, replace, or invent values or placeholders. If content is not embedded, load criteria from the check URI before evaluating it. Returns the structured result of evaluating that check.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -1330,7 +1354,13 @@ func neoNormalizeRunCheckResult(input map[string]any, parsed map[string]any) (ma
 	if value, ok := neoReviewNumber(parsed["linesAnalyzed"]); ok {
 		out["linesAnalyzed"] = value
 	}
-	if patterns, ok := neoRunCheckStringArray(parsed["patternsChecked"]); ok {
+	patterns, patternsOK := neoRunCheckStringArray(parsed["patternsChecked"])
+	if patternsOK {
+		for i, raw := range patterns {
+			if strings.TrimSpace(raw.(string)) == "" {
+				return nil, fmt.Errorf("patternsChecked entry %d must not be empty", i)
+			}
+		}
 		out["patternsChecked"] = patterns
 	} else if parsed["patternsChecked"] != nil {
 		return nil, fmt.Errorf("patternsChecked must be a string array")
@@ -1409,6 +1439,169 @@ func neoNormalizeRunCheckResult(input map[string]any, parsed map[string]any) (ma
 		issues = append(issues, normalized)
 	}
 	out["issues"] = issues
+	if status == "completed" {
+		if !patternsOK || len(patterns) == 0 {
+			return nil, fmt.Errorf("completed result requires non-empty patternsChecked")
+		}
+		rawEvidence := arrayValue(parsed["evidence"])
+		if rawEvidence == nil || len(rawEvidence) != len(patterns) {
+			return nil, fmt.Errorf("evidence must contain exactly one entry for each checked pattern")
+		}
+		evidence := make([]any, 0, len(rawEvidence))
+		seen := make(map[int]bool, len(rawEvidence))
+		referencedIssues := make([]bool, len(issues))
+		seenCapabilities := make(map[string]bool, len(rawEvidence))
+		for i, raw := range rawEvidence {
+			entry, ok := asMap(raw)
+			if !ok {
+				return nil, fmt.Errorf("evidence entry %d must be an object", i)
+			}
+			patternIndex, ok := neoReviewNumber(entry["patternIndex"])
+			if !ok || patternIndex < 0 || patternIndex >= len(patterns) || seen[patternIndex] {
+				return nil, fmt.Errorf("evidence entry %d has invalid or duplicate patternIndex", i)
+			}
+			seen[patternIndex] = true
+			observation := strings.TrimSpace(stringValue(entry["observation"]))
+			if observation == "" {
+				return nil, fmt.Errorf("evidence entry %d requires an observation", i)
+			}
+			sources, ok := neoRunCheckStringSlice(entry["sources"])
+			if !ok || len(sources) == 0 {
+				return nil, fmt.Errorf("evidence entry %d requires sources", i)
+			}
+			for _, source := range sources {
+				if strings.TrimSpace(source) == "" {
+					return nil, fmt.Errorf("evidence entry %d contains an empty source", i)
+				}
+			}
+			rawIssueIndexes := arrayValue(entry["issueIndexes"])
+			if entry["issueIndexes"] != nil && rawIssueIndexes == nil {
+				return nil, fmt.Errorf("evidence entry %d issueIndexes must be an array", i)
+			}
+			issueIndexes := make([]any, 0, len(rawIssueIndexes))
+			seenIssueIndexes := make(map[int]bool, len(rawIssueIndexes))
+			for _, rawIssueIndex := range rawIssueIndexes {
+				issueIndex, ok := neoReviewNumber(rawIssueIndex)
+				if !ok || issueIndex < 0 || issueIndex >= len(issues) || seenIssueIndexes[issueIndex] {
+					return nil, fmt.Errorf("evidence entry %d has invalid or duplicate issue index", i)
+				}
+				seenIssueIndexes[issueIndex] = true
+				referencedIssues[issueIndex] = true
+				issueIndexes = append(issueIndexes, issueIndex)
+			}
+			outcome := strings.TrimSpace(stringValue(entry["outcome"]))
+			switch outcome {
+			case "finding":
+				if len(issueIndexes) == 0 {
+					return nil, fmt.Errorf("finding evidence entry %d requires issueIndexes", i)
+				}
+			case "no-finding", "not-applicable":
+				if len(issueIndexes) != 0 {
+					return nil, fmt.Errorf("non-finding evidence entry %d cannot reference issues", i)
+				}
+			default:
+				return nil, fmt.Errorf("evidence entry %d has invalid outcome %q", i, outcome)
+			}
+			normalizedEvidence := map[string]any{
+				"patternIndex": patternIndex,
+				"observation":  observation,
+				"sources":      stringArrayValue(sources),
+				"outcome":      outcome,
+				"issueIndexes": issueIndexes,
+			}
+			if checkName == "published-dependency-capability-floor" && outcome != "not-applicable" {
+				dependency := strings.TrimSpace(stringValue(entry["dependency"]))
+				floorVersion := strings.TrimSpace(stringValue(entry["floorVersion"]))
+				accessPath := strings.TrimSpace(stringValue(entry["accessPath"]))
+				verification := strings.TrimSpace(stringValue(entry["verification"]))
+				rootEvidence := strings.TrimSpace(stringValue(entry["rootEvidence"]))
+				if dependency == "" || floorVersion == "" || accessPath == "" {
+					return nil, fmt.Errorf("dependency-floor evidence entry %d requires dependency, floorVersion, and accessPath", i)
+				}
+				if rootEvidence == "" {
+					return nil, fmt.Errorf("dependency-floor evidence entry %d requires rootEvidence", i)
+				}
+				if !strings.ContainsAny(accessPath, "./:") {
+					return nil, fmt.Errorf("dependency-floor evidence entry %d accessPath %q must include the root owner and required capability", i, accessPath)
+				}
+				switch verification {
+				case "root-runtime-traversal", "root-source-construction", "root-type-declaration", "exact-export-inspection", "exact-behavior-test":
+				default:
+					return nil, fmt.Errorf("dependency-floor evidence entry %d has invalid verification %q", i, verification)
+				}
+				capabilityKey := dependency + "\x00" + floorVersion + "\x00" + accessPath
+				if seenCapabilities[capabilityKey] {
+					return nil, fmt.Errorf("dependency-floor evidence entry %d duplicates capability path %q at %s@%s", i, accessPath, dependency, floorVersion)
+				}
+				seenCapabilities[capabilityKey] = true
+				normalizedEvidence["dependency"] = dependency
+				normalizedEvidence["floorVersion"] = floorVersion
+				normalizedEvidence["accessPath"] = accessPath
+				normalizedEvidence["verification"] = verification
+				normalizedEvidence["rootEvidence"] = rootEvidence
+			}
+			if checkName == "bounded-artifact-state-transitions" && outcome != "not-applicable" {
+				phaseRelationship := strings.TrimSpace(stringValue(entry["phaseRelationship"]))
+				budgetOrigin := strings.TrimSpace(stringValue(entry["budgetOrigin"]))
+				decisiveSequence := strings.TrimSpace(stringValue(entry["decisiveSequence"]))
+				if phaseRelationship == "" || decisiveSequence == "" {
+					return nil, fmt.Errorf("bounded-artifact evidence entry %d requires phaseRelationship and decisiveSequence", i)
+				}
+				switch budgetOrigin {
+				case "original", "remaining", "independent":
+				default:
+					return nil, fmt.Errorf("bounded-artifact evidence entry %d has invalid budgetOrigin %q", i, budgetOrigin)
+				}
+				normalizedEvidence["phaseRelationship"] = phaseRelationship
+				normalizedEvidence["budgetOrigin"] = budgetOrigin
+				normalizedEvidence["decisiveSequence"] = decisiveSequence
+			}
+			if checkName == "generated-artifact-consumer-contract" && outcome == "finding" {
+				implementationOwner := strings.TrimSpace(stringValue(entry["implementationOwner"]))
+				if implementationOwner == "" {
+					return nil, fmt.Errorf("generated-artifact finding evidence entry %d requires implementationOwner", i)
+				}
+				for _, rawIssueIndex := range issueIndexes {
+					issueIndex, _ := neoReviewNumber(rawIssueIndex)
+					issue, _ := asMap(issues[issueIndex])
+					if stringValue(issue["file"]) != implementationOwner {
+						return nil, fmt.Errorf("generated-artifact finding evidence entry %d implementationOwner %q must equal the file of referenced issue %d", i, implementationOwner, issueIndex)
+					}
+				}
+				normalizedEvidence["implementationOwner"] = implementationOwner
+			}
+			if checkName == "classifier-detector-matrix" && outcome != "not-applicable" {
+				sourceLifetime := strings.TrimSpace(stringValue(entry["sourceLifetime"]))
+				decisionLifetime := strings.TrimSpace(stringValue(entry["decisionLifetime"]))
+				mutationPath := strings.TrimSpace(stringValue(entry["mutationPath"]))
+				usePath := strings.TrimSpace(stringValue(entry["usePath"]))
+				switch sourceLifetime {
+				case "mutable", "immutable", "unknown":
+				default:
+					return nil, fmt.Errorf("classifier evidence entry %d has invalid sourceLifetime %q", i, sourceLifetime)
+				}
+				switch decisionLifetime {
+				case "per-use", "retained", "unknown":
+				default:
+					return nil, fmt.Errorf("classifier evidence entry %d has invalid decisionLifetime %q", i, decisionLifetime)
+				}
+				if mutationPath == "" || usePath == "" {
+					return nil, fmt.Errorf("classifier evidence entry %d requires mutationPath and usePath", i)
+				}
+				normalizedEvidence["sourceLifetime"] = sourceLifetime
+				normalizedEvidence["decisionLifetime"] = decisionLifetime
+				normalizedEvidence["mutationPath"] = mutationPath
+				normalizedEvidence["usePath"] = usePath
+			}
+			evidence = append(evidence, normalizedEvidence)
+		}
+		for issueIndex, referenced := range referencedIssues {
+			if !referenced {
+				return nil, fmt.Errorf("reported issue %d is not referenced by finding evidence", issueIndex)
+			}
+		}
+		out["evidence"] = evidence
+	}
 	return out, nil
 }
 
@@ -1574,28 +1767,93 @@ func neoRunCheckErrorResult(input map[string]any, message string) map[string]any
 	}
 }
 
-// neoRunCheckResultFromText parses the run_check subagent's final message
-// into the structured check result the amp review CLI expects. A reply that
-// is not the required JSON object, or that fails normalization, degrades to
-// an error-status result instead of failing the tool call, mirroring how
-// check failures surface upstream.
-func neoRunCheckResultFromText(input map[string]any, text string) map[string]any {
+func neoParseRunCheckResult(input map[string]any, text string) (map[string]any, error) {
 	checkName := stringValue(input["checkName"])
 	trimmed := strings.TrimSpace(text)
 	var parsed map[string]any
 	decoder := json.NewDecoder(strings.NewReader(trimmed))
 	if err := decoder.Decode(&parsed); err != nil {
-		return neoRunCheckErrorResult(input, "check agent did not return a structured result")
+		return nil, fmt.Errorf("decode the final JSON object: %w", err)
 	}
 	if err := decoder.Decode(&struct{}{}); err != io.EOF || parsed == nil {
-		return neoRunCheckErrorResult(input, "check agent did not return a structured result")
+		return nil, fmt.Errorf("the final message must contain exactly one JSON object and no other content")
 	}
 	if stringValue(parsed["checkName"]) == "" {
 		parsed["checkName"] = checkName
 	}
 	normalized, err := neoNormalizeRunCheckResult(input, parsed)
 	if err != nil {
-		return neoRunCheckErrorResult(input, err.Error())
+		return nil, fmt.Errorf("validate the final result: %w", err)
+	}
+	return normalized, nil
+}
+
+func neoRunCheckResultFromText(input map[string]any, text string) map[string]any {
+	normalized, err := neoParseRunCheckResult(input, text)
+	if err != nil {
+		return neoRunCheckErrorResult(input, "check agent did not return a structured result: "+err.Error())
 	}
 	return normalized
+}
+
+func neoRunCheckRepairPrompt(input map[string]any, parseErr error) string {
+	checkName := stringValue(input["checkName"])
+	files := neoStringSlice(input[neoReviewSnapshotFilesKey])
+	hunks := neoStringSlice(input[neoReviewSnapshotHunksKey])
+	completed := map[string]any{
+		"checkName":       checkName,
+		"status":          "completed",
+		"filesAnalyzed":   len(files),
+		"linesAnalyzed":   0,
+		"patternsChecked": []any{"one distinct concrete pattern or capability chain"},
+		"evidence": []any{map[string]any{
+			"patternIndex": 0,
+			"observation":  "concrete fact established by the cited source",
+			"sources":      []any{"exact source"},
+			"outcome":      "no-finding",
+			"issueIndexes": []any{},
+		}},
+		"issues": []any{},
+	}
+	if stringValue(input[neoReviewSnapshotHashKey]) != "" {
+		completed["coveredFiles"] = stringArrayValue(files)
+		completed["coveredHunks"] = stringArrayValue(hunks)
+	}
+	if checkName == "published-dependency-capability-floor" {
+		evidence := mapValue(arrayValue(completed["evidence"])[0])
+		evidence["dependency"] = "exact dependency name"
+		evidence["floorVersion"] = "exact lowest selectable version"
+		evidence["accessPath"] = "rootOwner.requiredCapability"
+		evidence["verification"] = "root-type-declaration"
+		evidence["rootEvidence"] = "exact root traversal output or root declaration text"
+	}
+	if checkName == "bounded-artifact-state-transitions" {
+		evidence := mapValue(arrayValue(completed["evidence"])[0])
+		evidence["phaseRelationship"] = "replacement"
+		evidence["budgetOrigin"] = "original"
+		evidence["decisiveSequence"] = "concrete before-state, later candidate, decision, and final state"
+	}
+	if checkName == "classifier-detector-matrix" {
+		evidence := mapValue(arrayValue(completed["evidence"])[0])
+		evidence["sourceLifetime"] = "immutable"
+		evidence["decisionLifetime"] = "per-use"
+		evidence["mutationPath"] = "none: source is not reassignable"
+		evidence["usePath"] = "operation that consumes the classification"
+	}
+	completedJSON, _ := json.Marshal(completed)
+	errorJSON, _ := json.Marshal(map[string]any{
+		"checkName":    checkName,
+		"status":       "error",
+		"errorMessage": "specific failure",
+		"issues":       []any{},
+	})
+	return fmt.Sprintf(`Your previous final result was rejected: %s
+
+Return exactly one pure JSON object now. Do not use markdown fences, prose before or after the object, or tools.
+
+Valid completed example:
+%s
+
+For a failed check instead return exactly %s.
+Completed results require a non-empty patternsChecked array, exactly one evidence entry for every pattern index, and every issue referenced by finding evidence. Use outcome finding with issueIndexes for a real issue, and include severity, file, line, endLine, problem, why, and fix in that issue. Use no-finding only when the cited evidence supports a clean conclusion. no-finding and not-applicable evidence must not reference issues. Dependency-floor evidence that is not not-applicable additionally requires dependency, floorVersion, accessPath, verification, and rootEvidence. accessPath must name the complete path from the root owner, not an adjacent class or module. verification must be one of root-runtime-traversal, root-source-construction, root-type-declaration, exact-export-inspection, or exact-behavior-test. Bounded-artifact evidence that is not not-applicable requires phaseRelationship, budgetOrigin (original, remaining, or independent), and decisiveSequence. Generated-artifact finding evidence requires implementationOwner equal to the file of every referenced issue. Classifier evidence that is not not-applicable requires sourceLifetime (mutable, immutable, or unknown), decisionLifetime (per-use, retained, or unknown), mutationPath, and usePath.`, parseErr, completedJSON, errorJSON)
 }

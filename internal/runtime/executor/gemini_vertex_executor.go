@@ -230,7 +230,11 @@ func (e *GeminiVertexExecutor) HttpRequest(ctx context.Context, auth *cliproxyau
 		return nil, err
 	}
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
-	return httpClient.Do(httpReq)
+	httpResp, err := httpClient.Do(httpReq)
+	if err != nil {
+		return nil, helps.NewAuthStateNeutralError(err)
+	}
+	return httpResp, nil
 }
 
 // Execute performs a non-streaming request to the Vertex AI API.
@@ -397,7 +401,7 @@ func (e *GeminiVertexExecutor) executeWithServiceAccount(ctx context.Context, au
 	httpResp, errDo := httpClient.Do(httpReq)
 	if errDo != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, errDo)
-		return resp, errDo
+		return resp, helps.NewAuthStateNeutralError(errDo)
 	}
 	defer func() {
 		if errClose := httpResp.Body.Close(); errClose != nil {
@@ -406,16 +410,20 @@ func (e *GeminiVertexExecutor) executeWithServiceAccount(ctx context.Context, au
 	}()
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		b, _ := io.ReadAll(httpResp.Body)
+		b, errRead := io.ReadAll(httpResp.Body)
+		if errRead != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, errRead)
+			return resp, helps.NewAuthStateNeutralError(errRead)
+		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
+		err = newGoogleStatusErr(httpResp.StatusCode, b)
 		return resp, err
 	}
 	data, errRead := io.ReadAll(httpResp.Body)
 	if errRead != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, errRead)
-		return resp, errRead
+		return resp, helps.NewAuthStateNeutralError(errRead)
 	}
 	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 	reporter.Publish(ctx, helps.ParseGeminiUsage(data))
@@ -519,7 +527,7 @@ func (e *GeminiVertexExecutor) executeWithAPIKey(ctx context.Context, auth *clip
 	httpResp, errDo := httpClient.Do(httpReq)
 	if errDo != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, errDo)
-		return resp, errDo
+		return resp, helps.NewAuthStateNeutralError(errDo)
 	}
 	defer func() {
 		if errClose := httpResp.Body.Close(); errClose != nil {
@@ -528,16 +536,20 @@ func (e *GeminiVertexExecutor) executeWithAPIKey(ctx context.Context, auth *clip
 	}()
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		b, _ := io.ReadAll(httpResp.Body)
+		b, errRead := io.ReadAll(httpResp.Body)
+		if errRead != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, errRead)
+			return resp, helps.NewAuthStateNeutralError(errRead)
+		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
+		err = newGoogleStatusErr(httpResp.StatusCode, b)
 		return resp, err
 	}
 	data, errRead := io.ReadAll(httpResp.Body)
 	if errRead != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, errRead)
-		return resp, errRead
+		return resp, helps.NewAuthStateNeutralError(errRead)
 	}
 	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 	reporter.Publish(ctx, helps.ParseGeminiUsage(data))
@@ -630,17 +642,21 @@ func (e *GeminiVertexExecutor) executeStreamWithServiceAccount(ctx context.Conte
 	httpResp, errDo := httpClient.Do(httpReq)
 	if errDo != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, errDo)
-		return nil, errDo
+		return nil, helps.NewAuthStateNeutralError(errDo)
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		b, _ := io.ReadAll(httpResp.Body)
-		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
-		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
+		b, errRead := io.ReadAll(httpResp.Body)
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("vertex executor: close response body error: %v", errClose)
 		}
-		return nil, statusErr{code: httpResp.StatusCode, msg: string(b)}
+		if errRead != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, errRead)
+			return nil, helps.NewAuthStateNeutralError(errRead)
+		}
+		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
+		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
+		return nil, newGoogleStatusErr(httpResp.StatusCode, b)
 	}
 
 	out := make(chan cliproxyexecutor.StreamChunk)
@@ -669,20 +685,22 @@ func (e *GeminiVertexExecutor) executeStreamWithServiceAccount(ctx context.Conte
 				}
 			}
 		}
-		lines := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, body, []byte("[DONE]"), &param)
-		for i := range lines {
-			select {
-			case out <- cliproxyexecutor.StreamChunk{Payload: lines[i]}:
-			case <-ctx.Done():
-				return
-			}
-		}
 		if errScan := scanner.Err(); errScan != nil {
+			errScan = helps.NewAuthStateNeutralError(errScan)
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
 			reporter.PublishFailure(ctx, errScan)
 			select {
 			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
 			case <-ctx.Done():
+			}
+		} else {
+			lines := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, body, []byte("[DONE]"), &param)
+			for i := range lines {
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Payload: lines[i]}:
+				case <-ctx.Done():
+					return
+				}
 			}
 		}
 	}()
@@ -772,17 +790,21 @@ func (e *GeminiVertexExecutor) executeStreamWithAPIKey(ctx context.Context, auth
 	httpResp, errDo := httpClient.Do(httpReq)
 	if errDo != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, errDo)
-		return nil, errDo
+		return nil, helps.NewAuthStateNeutralError(errDo)
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		b, _ := io.ReadAll(httpResp.Body)
-		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
-		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
+		b, errRead := io.ReadAll(httpResp.Body)
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("vertex executor: close response body error: %v", errClose)
 		}
-		return nil, statusErr{code: httpResp.StatusCode, msg: string(b)}
+		if errRead != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, errRead)
+			return nil, helps.NewAuthStateNeutralError(errRead)
+		}
+		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
+		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
+		return nil, newGoogleStatusErr(httpResp.StatusCode, b)
 	}
 
 	out := make(chan cliproxyexecutor.StreamChunk)
@@ -811,20 +833,22 @@ func (e *GeminiVertexExecutor) executeStreamWithAPIKey(ctx context.Context, auth
 				}
 			}
 		}
-		lines := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, body, []byte("[DONE]"), &param)
-		for i := range lines {
-			select {
-			case out <- cliproxyexecutor.StreamChunk{Payload: lines[i]}:
-			case <-ctx.Done():
-				return
-			}
-		}
 		if errScan := scanner.Err(); errScan != nil {
+			errScan = helps.NewAuthStateNeutralError(errScan)
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
 			reporter.PublishFailure(ctx, errScan)
 			select {
 			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
 			case <-ctx.Done():
+			}
+		} else {
+			lines := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, body, []byte("[DONE]"), &param)
+			for i := range lines {
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Payload: lines[i]}:
+				case <-ctx.Done():
+					return
+				}
 			}
 		}
 	}()
@@ -896,7 +920,7 @@ func (e *GeminiVertexExecutor) countTokensWithServiceAccount(ctx context.Context
 	httpResp, errDo := httpClient.Do(httpReq)
 	if errDo != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, errDo)
-		return cliproxyexecutor.Response{}, errDo
+		return cliproxyexecutor.Response{}, helps.NewAuthStateNeutralError(errDo)
 	}
 	defer func() {
 		if errClose := httpResp.Body.Close(); errClose != nil {
@@ -905,15 +929,19 @@ func (e *GeminiVertexExecutor) countTokensWithServiceAccount(ctx context.Context
 	}()
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		b, _ := io.ReadAll(httpResp.Body)
+		b, errRead := io.ReadAll(httpResp.Body)
+		if errRead != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, errRead)
+			return cliproxyexecutor.Response{}, helps.NewAuthStateNeutralError(errRead)
+		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		return cliproxyexecutor.Response{}, statusErr{code: httpResp.StatusCode, msg: string(b)}
+		return cliproxyexecutor.Response{}, newGoogleStatusErr(httpResp.StatusCode, b)
 	}
 	data, errRead := io.ReadAll(httpResp.Body)
 	if errRead != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, errRead)
-		return cliproxyexecutor.Response{}, errRead
+		return cliproxyexecutor.Response{}, helps.NewAuthStateNeutralError(errRead)
 	}
 	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 	count := gjson.GetBytes(data, "totalTokens").Int()
@@ -986,7 +1014,7 @@ func (e *GeminiVertexExecutor) countTokensWithAPIKey(ctx context.Context, auth *
 	httpResp, errDo := httpClient.Do(httpReq)
 	if errDo != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, errDo)
-		return cliproxyexecutor.Response{}, errDo
+		return cliproxyexecutor.Response{}, helps.NewAuthStateNeutralError(errDo)
 	}
 	defer func() {
 		if errClose := httpResp.Body.Close(); errClose != nil {
@@ -995,15 +1023,19 @@ func (e *GeminiVertexExecutor) countTokensWithAPIKey(ctx context.Context, auth *
 	}()
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		b, _ := io.ReadAll(httpResp.Body)
+		b, errRead := io.ReadAll(httpResp.Body)
+		if errRead != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, errRead)
+			return cliproxyexecutor.Response{}, helps.NewAuthStateNeutralError(errRead)
+		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		return cliproxyexecutor.Response{}, statusErr{code: httpResp.StatusCode, msg: string(b)}
+		return cliproxyexecutor.Response{}, newGoogleStatusErr(httpResp.StatusCode, b)
 	}
 	data, errRead := io.ReadAll(httpResp.Body)
 	if errRead != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, errRead)
-		return cliproxyexecutor.Response{}, errRead
+		return cliproxyexecutor.Response{}, helps.NewAuthStateNeutralError(errRead)
 	}
 	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 	count := gjson.GetBytes(data, "totalTokens").Int()

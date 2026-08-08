@@ -68,7 +68,11 @@ func (e *KimiExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth,
 		return nil, err
 	}
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
-	return httpClient.Do(httpReq)
+	httpResp, err := httpClient.Do(httpReq)
+	if err != nil {
+		return nil, helps.NewAuthStateNeutralError(err)
+	}
+	return httpResp, nil
 }
 
 // Execute performs a non-streaming chat completion request to Kimi.
@@ -148,7 +152,7 @@ func (e *KimiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		return resp, err
+		return resp, helps.NewAuthStateNeutralError(err)
 	}
 	defer func() {
 		if errClose := httpResp.Body.Close(); errClose != nil {
@@ -157,16 +161,20 @@ func (e *KimiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	}()
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		b, _ := io.ReadAll(httpResp.Body)
+		b, errRead := io.ReadAll(httpResp.Body)
+		if errRead != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, errRead)
+			return resp, helps.NewAuthStateNeutralError(errRead)
+		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
+		err = newOpenAIShapeStatusErr(httpResp.StatusCode, b)
 		return resp, err
 	}
 	data, err := io.ReadAll(httpResp.Body)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		return resp, err
+		return resp, helps.NewAuthStateNeutralError(err)
 	}
 	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 	reporter.Publish(ctx, helps.ParseOpenAIUsage(data))
@@ -258,17 +266,24 @@ func (e *KimiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		return nil, err
+		return nil, helps.NewAuthStateNeutralError(err)
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		b, _ := io.ReadAll(httpResp.Body)
+		b, errRead := io.ReadAll(httpResp.Body)
+		if errRead != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, errRead)
+			if errClose := httpResp.Body.Close(); errClose != nil {
+				log.Errorf("kimi executor: close response body error: %v", errClose)
+			}
+			return nil, helps.NewAuthStateNeutralError(errRead)
+		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("kimi executor: close response body error: %v", errClose)
 		}
-		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
+		err = newOpenAIShapeStatusErr(httpResp.StatusCode, b)
 		return nil, err
 	}
 	out := make(chan cliproxyexecutor.StreamChunk)
@@ -297,20 +312,22 @@ func (e *KimiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 				}
 			}
 		}
-		doneChunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, body, []byte("[DONE]"), &param)
-		for i := range doneChunks {
-			select {
-			case out <- cliproxyexecutor.StreamChunk{Payload: doneChunks[i]}:
-			case <-ctx.Done():
-				return
-			}
-		}
 		if errScan := scanner.Err(); errScan != nil {
-			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
-			reporter.PublishFailure(ctx, errScan)
+			streamErr := helps.NewAuthStateNeutralError(errScan)
+			helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
+			reporter.PublishFailure(ctx, streamErr)
 			select {
-			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
+			case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
 			case <-ctx.Done():
+			}
+		} else {
+			doneChunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, body, []byte("[DONE]"), &param)
+			for i := range doneChunks {
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Payload: doneChunks[i]}:
+				case <-ctx.Done():
+					return
+				}
 			}
 		}
 	}()

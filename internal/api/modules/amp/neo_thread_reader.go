@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"unicode"
@@ -65,7 +66,8 @@ func (a *neoActor) runLocalActorTool(pending neoPendingTool, generation int) {
 		if err != nil {
 			run = map[string]any{"status": "error", "error": map[string]any{"message": err.Error()}}
 		} else {
-			run = map[string]any{"status": "done", "result": strings.TrimSpace(text)}
+			output := strings.TrimSpace(text)
+			run = map[string]any{"status": "done", "result": output, "output": output}
 		}
 		a.receiveToolResult(map[string]any{"type": "executor_tool_result", "toolCallId": pending.ID, "run": run})
 	case "submit_review":
@@ -78,6 +80,9 @@ func (a *neoActor) runLocalActorTool(pending neoPendingTool, generation int) {
 				err = neoValidateSubmittedReviewSnapshot(result, snapshot)
 			}
 		}
+		if err == nil {
+			err = a.validateRunChecksForSubmission(pending.ID)
+		}
 		if a.subagentGenerationStale(generation) {
 			return
 		}
@@ -89,6 +94,113 @@ func (a *neoActor) runLocalActorTool(pending neoPendingTool, generation int) {
 		}
 		a.receiveToolResult(map[string]any{"type": "executor_tool_result", "toolCallId": pending.ID, "run": run})
 	}
+}
+
+func (a *neoActor) validateRunChecksForSubmission(submitToolCallID string) error {
+	a.reviewSnapshotMu.Lock()
+	rootMessageID := a.reviewSnapshotRootMessageID
+	a.reviewSnapshotMu.Unlock()
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if rootMessageID == "" {
+		rootMessageID = stringValue(mapValue(a.meta[neoReviewSnapshotStateMetaKey])["rootMessageID"])
+	}
+	rootIndex := -1
+	for index, message := range a.messages {
+		if message.MessageID == rootMessageID {
+			rootIndex = index
+			break
+		}
+	}
+	if rootMessageID == "" || rootIndex < 0 {
+		return fmt.Errorf("submit_review blocked: the active review root is unavailable")
+	}
+
+	type checkUse struct {
+		name   string
+		result map[string]any
+	}
+	checks := map[string]*checkUse{}
+	checkNames := map[string]string{}
+	foundSubmit := false
+	for _, message := range a.messages[rootIndex+1:] {
+		if strings.TrimSpace(message.ParentToolUseID) != "" {
+			continue
+		}
+		messageHasSubmit := false
+		messageCheckNames := make([]string, 0)
+		for _, raw := range message.Content {
+			block := mapValue(raw)
+			switch stringValue(block["type"]) {
+			case "tool_use":
+				toolCallID := stringValue(block["id"])
+				toolName := strings.TrimSpace(stringValue(block["name"]))
+				if toolName == "submit_review" && toolCallID == submitToolCallID {
+					foundSubmit = true
+					messageHasSubmit = true
+					continue
+				}
+				if toolName != "run_check" || toolCallID == "" {
+					continue
+				}
+				checkName := firstNonEmptyString(stringValue(mapValue(block["input"])["checkName"]), toolCallID)
+				checks[toolCallID] = &checkUse{name: checkName}
+				checkNames[checkName] = toolCallID
+				messageCheckNames = append(messageCheckNames, checkName)
+			case "tool_result":
+				toolCallID := firstNonEmptyString(stringValue(block["toolUseID"]), stringValue(block["toolUseId"]), stringValue(block["tool_use_id"]), stringValue(block["toolCallId"]))
+				if check := checks[toolCallID]; check != nil {
+					check.result = mapValue(block["run"])
+				}
+			}
+		}
+		if messageHasSubmit {
+			if len(messageCheckNames) != 0 {
+				sort.Strings(messageCheckNames)
+				return fmt.Errorf("submit_review blocked: run_check and submit_review cannot appear in the same assistant message (%s); wait for every structured check result before submitting", strings.Join(messageCheckNames, ", "))
+			}
+			break
+		}
+	}
+	if !foundSubmit {
+		return fmt.Errorf("submit_review blocked: the active submit_review call is not in review history")
+	}
+
+	// A retried check supersedes its earlier attempts: only the latest run_check
+	// call for each check name must complete for submission to proceed.
+	failures := make([]string, 0, len(checkNames))
+	for _, toolCallID := range checkNames {
+		check := checks[toolCallID]
+		if check.result == nil {
+			failures = append(failures, check.name+": missing result")
+			continue
+		}
+		structured := mapValue(check.result["result"])
+		outerStatus := strings.ToLower(strings.TrimSpace(stringValue(check.result["status"])))
+		innerStatus := strings.ToLower(strings.TrimSpace(stringValue(structured["status"])))
+		if outerStatus == "done" && innerStatus == "completed" {
+			if reported := stringValue(structured["checkName"]); reported != check.name {
+				failures = append(failures, check.name+": structured result reported checkName "+firstNonEmptyString(reported, "(missing)"))
+				continue
+			}
+			if _, err := neoNormalizeRunCheckResult(map[string]any{"checkName": check.name}, structured); err != nil {
+				failures = append(failures, check.name+": structured result failed validation: "+err.Error())
+			}
+			continue
+		}
+		message := firstNonEmptyString(
+			stringValue(structured["errorMessage"]),
+			stringValue(mapValue(check.result["error"])["message"]),
+			"status "+firstNonEmptyString(innerStatus, outerStatus, "unknown"),
+		)
+		failures = append(failures, check.name+": "+message)
+	}
+	if len(failures) == 0 {
+		return nil
+	}
+	sort.Strings(failures)
+	return fmt.Errorf("submit_review blocked by unresolved run_check results: %s. Retry or repair the listed run_check calls until they complete, then resubmit; if a check cannot be completed, do not call submit_review and end the review with an explicit final error describing the unresolved checks", strings.Join(failures, "; "))
 }
 
 func (a *neoActor) executeLocalReadThread(pending neoPendingTool, generation int) (string, error) {

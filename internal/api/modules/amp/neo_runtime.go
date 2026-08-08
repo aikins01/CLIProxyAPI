@@ -275,72 +275,78 @@ var (
 )
 
 type neoRuntime struct {
-	mu                           sync.RWMutex
-	cfg                          *config.Config
-	host                         string
-	port                         int
-	server                       *http.Server
-	store                        *neoActorStore
-	started                      bool
-	cleanup                      context.CancelFunc
-	modelMapper                  ModelMapper
-	secretSource                 SecretSource
-	connMu                       sync.Mutex
-	connections                  map[net.Conn]struct{}
-	threadDir                    string
-	attachmentCache              *neoAttachmentCache
-	githubClient                 *http.Client
-	githubAPIBase                string
-	githubRawBase                string
-	projectIndexMu               sync.Mutex
-	projectIndexCache            []any
-	projectIndexLoaded           bool
-	projectIndexStamp            neoWebLocalFileStamp
-	projectHistoryStamp          neoWebLocalFileStamp
-	localRecentMu                sync.Mutex
-	localRecentCache             []any
-	localRecentLoaded            bool
-	localRecentStamp             neoWebLocalFileStamp
-	localRecentSummaryStamp      neoWebLocalFileStamp
-	localRecentScanGroup         singleflight.Group
-	localSummaryIndexMu          sync.Mutex
-	localSummaryIndex            []neoPersistedThreadFile
-	localSummaryIndexLoaded      bool
-	localSummaryIndexStamp       neoWebLocalFileStamp
-	localSummaryIndexLoadedAt    time.Time
-	localSummaryIndexScanGroup   singleflight.Group
-	localThreadSummaryMu         sync.Mutex
-	localThreadSummaryCache      map[string]neoWebLocalThreadSummaryCacheEntry
-	localThreadImportGroup       singleflight.Group
-	localThreadSearchScans       chan struct{}
-	localThreadSearchDecodes     chan struct{}
-	localThreadSearchIndexPrunes bool
-	localThreadSearchRankPrunes  bool
-	localThreadSearchMetrics     neoLocalThreadSearchMetrics
-	scheduleMu                   sync.Mutex
-	scheduleGuards               [64]sync.Mutex
-	schedules                    map[string]neoLocalSchedule
-	scheduleDeletions            map[string]neoLocalScheduleDeletion
-	scheduleCancelling           map[string]string
-	scheduleWake                 chan struct{}
-	schedulePath                 string
-	scheduleStoreErr             error
-	schedulePersistRetryAt       time.Time
-	scheduleDirectorySyncPending bool
-	legacyOwnerMigrationMu       sync.Mutex
-	legacyOwnerMigrationUser     string
-	recentThreadSeeds            map[string]neoRecentThreadSeed
-	webLocalUserProfiles         map[string]neoWebLocalUserProfile
-	deletedThreadIDs             map[string]struct{}
-	deletingThreadIDs            map[string]int
-	writeLocalSnapshot           func(neoCloudThreadSnapshot, string) (int64, error)
-	syncScheduleStoreDir         func(string) error
-	syncScheduleDeletionDir      func(string) error
-	syncScheduledThreadPath      func(string, bool) error
-	uploadCloudSnapshot          func(neoCloudThreadSnapshot) (int64, error)
-	cloudUploadUnsupported       bool
-	asyncLocalSnapshots          bool
-	localSnapshotMinInterval     time.Duration
+	mu                            sync.RWMutex
+	cfg                           *config.Config
+	host                          string
+	port                          int
+	server                        *http.Server
+	store                         *neoActorStore
+	started                       bool
+	cleanup                       context.CancelFunc
+	modelMapper                   ModelMapper
+	secretSource                  SecretSource
+	connMu                        sync.Mutex
+	connections                   map[net.Conn]struct{}
+	threadDir                     string
+	attachmentCache               *neoAttachmentCache
+	githubClient                  *http.Client
+	githubAPIBase                 string
+	githubRawBase                 string
+	projectIndexMu                sync.Mutex
+	projectIndexCache             []any
+	projectIndexLoaded            bool
+	projectIndexStamp             neoWebLocalFileStamp
+	projectHistoryStamp           neoWebLocalFileStamp
+	localRecentMu                 sync.Mutex
+	localRecentCache              []any
+	localRecentLoaded             bool
+	localRecentStamp              neoWebLocalFileStamp
+	localRecentSummaryStamp       neoWebLocalFileStamp
+	localRecentScanGroup          singleflight.Group
+	localSummaryIndexMu           sync.Mutex
+	localSummaryIndex             []neoPersistedThreadFile
+	localSummaryIndexLoaded       bool
+	localSummaryIndexStamp        neoWebLocalFileStamp
+	localSummaryIndexLoadedAt     time.Time
+	localSummaryIndexScanGroup    singleflight.Group
+	localArchivedSummaryMu        sync.Mutex
+	localArchivedSummaryIndex     []neoWebLocalArchivedThreadSummary
+	localArchivedSummaryLoaded    bool
+	localArchivedSummaryStamp     neoWebLocalFileStamp
+	localArchivedSummaryLoadedAt  time.Time
+	localArchivedSummaryScanGroup singleflight.Group
+	localThreadSummaryMu          sync.Mutex
+	localThreadSummaryCache       map[string]neoWebLocalThreadSummaryCacheEntry
+	localThreadImportGroup        singleflight.Group
+	localThreadSearchScans        chan struct{}
+	localThreadSearchDecodes      chan struct{}
+	localThreadSearchIndexPrunes  bool
+	localThreadSearchRankPrunes   bool
+	localThreadSearchMetrics      neoLocalThreadSearchMetrics
+	scheduleMu                    sync.Mutex
+	scheduleGuards                [64]sync.Mutex
+	schedules                     map[string]neoLocalSchedule
+	scheduleDeletions             map[string]neoLocalScheduleDeletion
+	scheduleCancelling            map[string]string
+	scheduleWake                  chan struct{}
+	schedulePath                  string
+	scheduleStoreErr              error
+	schedulePersistRetryAt        time.Time
+	scheduleDirectorySyncPending  bool
+	legacyOwnerMigrationMu        sync.Mutex
+	legacyOwnerMigrationUser      string
+	recentThreadSeeds             map[string]neoRecentThreadSeed
+	webLocalUserProfiles          map[string]neoWebLocalUserProfile
+	deletedThreadIDs              map[string]struct{}
+	deletingThreadIDs             map[string]int
+	writeLocalSnapshot            func(neoCloudThreadSnapshot, string) (int64, error)
+	syncScheduleStoreDir          func(string) error
+	syncScheduleDeletionDir       func(string) error
+	syncScheduledThreadPath       func(string, bool) error
+	uploadCloudSnapshot           func(neoCloudThreadSnapshot) (int64, error)
+	cloudUploadUnsupported        bool
+	asyncLocalSnapshots           bool
+	localSnapshotMinInterval      time.Duration
 	// inferStream overrides the provider inference call used by the local agent
 	// and subagent loops. Defaults to inferNeoLocalStream; tests set it to replay
 	// a scripted session deterministically without a live provider.
@@ -3385,7 +3391,7 @@ func (s *neoActorStore) pruneIdle(now time.Time, ttl time.Duration) int {
 
 type neoActor struct {
 	mu                          sync.Mutex
-	emissionMu                  sync.Mutex
+	emissionMu                  sync.Mutex // acquire before mu when both are held
 	metadataMutationMu          sync.Mutex
 	runtime                     *neoRuntime
 	id                          string
@@ -3486,6 +3492,8 @@ type neoActor struct {
 	threadOpenExpiresAt         int64
 	threadOpenStateSeq          int
 	compacting                  bool
+	compactionOwner             uint64
+	nextCompactionOwner         uint64
 	compactionRecords           []map[string]any
 	compactionRetryAfterLen     int
 	relationships               []map[string]any
@@ -3914,8 +3922,10 @@ func (a *neoActor) dispose() {
 func (a *neoActor) disposeWithOptions(stopExecutors bool, closeReason string, transportClose bool) {
 	a.mu.Lock()
 	a.advanceGenerationLocked()
+	subagentCancellation := a.takeSubagentCancellationLocked()
 	a.currentInference = nil
 	a.mu.Unlock()
+	a.finishSubagentCancellation(subagentCancellation, "system:disposed", "executor_disconnected")
 	if stopExecutors {
 		a.stopSpawnedExecutors()
 	}
@@ -5125,7 +5135,7 @@ func (a *neoActor) addPluginUIRequest(message map[string]any) {
 }
 
 func (a *neoActor) inferenceStartBlockedLocked() bool {
-	return a.agentState != "idle" || len(a.pluginUIRequests) > 0
+	return a.agentState != "idle" || a.compacting || len(a.pluginUIRequests) > 0
 }
 
 func (a *neoActor) respondToPluginUIRequest(source *neoSocket, message map[string]any) {
@@ -5458,7 +5468,6 @@ func (a *neoActor) handleToolProgress(msg map[string]any, sockets ...*neoSocket)
 	}
 	if neoToolRunTerminal(existingRun) {
 		a.mu.Unlock()
-		a.broadcast(payload)
 		return
 	}
 	run, ok := neoToolProgressRun(payload["progress"], existingRun)
@@ -5473,13 +5482,29 @@ func (a *neoActor) handleToolProgress(msg map[string]any, sockets ...*neoSocket)
 
 	a.mu.Lock()
 	existingRun, userInput = a.toolResultRunLocked(toolCallID)
-	if neoToolRunTerminal(existingRun) && !neoToolRunTerminal(run) {
+	if neoToolRunTerminal(existingRun) {
 		a.mu.Unlock()
-		a.broadcast(payload)
 		return
 	}
+	if pendingExists {
+		refreshedPending, ok := a.pendingTools[toolCallID]
+		if !ok {
+			a.mu.Unlock()
+			return
+		}
+		pending = refreshedPending
+	} else if subagentProgress {
+		refreshedPending, ok := a.subagentTools[toolCallID]
+		if !ok {
+			a.mu.Unlock()
+			return
+		}
+		pending = refreshedPending
+	}
 	block := map[string]any{"type": "tool_result", "toolUseID": toolCallID, "run": run}
-	if userInput != nil {
+	if pendingExists && len(pending.ApprovalInput) > 0 {
+		block["userInput"] = cloneMap(pending.ApprovalInput)
+	} else if userInput != nil {
 		block["userInput"] = userInput
 	}
 	completionStatus := ""
@@ -5531,6 +5556,13 @@ type neoStoredToolUseRef struct {
 	ParentToolCallID string
 }
 
+type neoStoredToolResultRef struct {
+	MessageIndex int
+	BlockIndex   int
+	Run          map[string]any
+	UserInput    any
+}
+
 func neoToolCallIDFromMessage(msg map[string]any) string {
 	return firstNonEmptyString(msg["toolUse"], msg["toolUseID"], msg["toolUseId"], msg["tool_use_id"], msg["toolCallId"])
 }
@@ -5565,6 +5597,41 @@ func (a *neoActor) storedToolUseLocked(toolCallID string) (neoStoredToolUseRef, 
 	return neoStoredToolUseRef{}, false
 }
 
+func (a *neoActor) storedToolResultLocked(toolCallID string) (neoStoredToolResultRef, bool) {
+	if toolCallID == "" {
+		return neoStoredToolResultRef{}, false
+	}
+	pending := a.pendingTools[toolCallID]
+	if pending.Name == "" {
+		if toolUse, ok := a.storedToolUseLocked(toolCallID); ok {
+			pending.Name = toolUse.ToolName
+		}
+	}
+	var selected neoStoredToolResultRef
+	selectedTerminal := false
+	found := false
+	for messageIndex, message := range a.messages {
+		if message.Role != "user" {
+			continue
+		}
+		for blockIndex, rawBlock := range message.Content {
+			block := mapValue(rawBlock)
+			if stringValue(block["type"]) != "tool_result" || firstNonEmptyString(block["toolUseID"], block["toolUseId"], block["tool_use_id"], block["toolCallId"]) != toolCallID {
+				continue
+			}
+			run := mapValue(block["run"])
+			terminal := neoToolRunTerminalForPending(pending, run)
+			if found && !neoToolResultSupersedes(stringValue(selected.Run["status"]), stringValue(selected.Run["reason"]), selectedTerminal, stringValue(run["status"]), stringValue(run["reason"]), terminal) {
+				continue
+			}
+			selected = neoStoredToolResultRef{MessageIndex: messageIndex, BlockIndex: blockIndex, Run: run, UserInput: block["userInput"]}
+			selectedTerminal = terminal
+			found = true
+		}
+	}
+	return selected, found
+}
+
 func (a *neoActor) handleBinaryToolData(msg map[string]any) {
 	toolCallID := neoToolCallIDFromMessage(msg)
 	var run map[string]any
@@ -5589,13 +5656,21 @@ func (a *neoActor) handleBinaryToolData(msg map[string]any) {
 		return
 	}
 	existingRun, userInput := a.toolResultRunLocked(toolCallID)
-	if neoToolRunTerminal(existingRun) && !neoToolRunTerminal(run) {
-		a.mu.Unlock()
-		return
-	}
 	pending, pendingExists := a.pendingTools[toolCallID]
+	if neoToolRunTerminal(existingRun) {
+		replaceable := pendingExists && neoToolRunTerminal(run) &&
+			(strings.EqualFold(stringValue(existingRun["status"]), "cancelled") &&
+				strings.EqualFold(stringValue(existingRun["reason"]), "system:disposed") ||
+				neoToolRunProgressForTool(pending.Name, existingRun))
+		if !replaceable {
+			a.mu.Unlock()
+			return
+		}
+	}
 	block := map[string]any{"type": "tool_result", "toolUseID": toolCallID, "run": run}
-	if userInput != nil {
+	if pendingExists && len(pending.ApprovalInput) > 0 {
+		block["userInput"] = cloneMap(pending.ApprovalInput)
+	} else if userInput != nil {
 		block["userInput"] = userInput
 	}
 	completionStatus := ""
@@ -5871,6 +5946,23 @@ func (a *neoActor) handleToolApprovalResponse(msg map[string]any) {
 	toolCallID := firstNonEmptyString(payload["toolCallId"], msg["toolUseId"], msg["id"])
 	a.mu.Lock()
 	removed := a.removeApprovalLocked(toolCallID)
+	var resultEvent map[string]any
+	if removed {
+		if pending, ok := a.pendingTools[toolCallID]; ok {
+			userInput := map[string]any{"accepted": boolValue(payload["accepted"])}
+			if input := mapValue(payload["input"]); len(input) > 0 {
+				if answers := mapValue(input["askAnswers"]); len(answers) > 0 {
+					userInput["askAnswers"] = answers
+				}
+				if feedback := stringValue(input["denyFeedback"]); feedback != "" {
+					userInput["denyFeedback"] = feedback
+				}
+			}
+			pending.ApprovalInput, _ = normalizeNeoProtocolToolResultUserInput(userInput)
+			a.pendingTools[toolCallID] = pending
+			resultEvent = a.storeToolApprovalInputLocked(toolCallID, pending.ApprovalInput)
+		}
+	}
 	approvals := a.approvalQueueListLocked()
 	stateChanged := false
 	state := a.agentState
@@ -5894,11 +5986,38 @@ func (a *neoActor) handleToolApprovalResponse(msg map[string]any) {
 	if removed {
 		a.broadcast(toolApprovalQueuePayload(approvals))
 	}
+	if resultEvent != nil {
+		a.broadcast(resultEvent)
+	}
 	if stateChanged {
 		a.broadcast(map[string]any{"type": "agent_state", "state": state, "agentMode": agentMode, "reasoningEffort": omitEmpty(reasoningEffort)})
-		a.syncCloudAsync()
 		a.scheduleExecutorIdleStopIfNeeded()
 	}
+	if stateChanged || resultEvent != nil {
+		a.syncCloudAsync()
+	}
+}
+
+func (a *neoActor) storeToolApprovalInputLocked(toolCallID string, userInput map[string]any) map[string]any {
+	if len(userInput) == 0 {
+		return nil
+	}
+	ref, ok := a.storedToolResultLocked(toolCallID)
+	if !ok {
+		return nil
+	}
+	message := a.messages[ref.MessageIndex]
+	content := cloneArray(message.Content)
+	block := cloneMap(mapValue(content[ref.BlockIndex]))
+	block["userInput"] = cloneMap(userInput)
+	content[ref.BlockIndex] = block
+	message.Content = content
+	a.messages[ref.MessageIndex] = message
+	a.rebuildHistoryLocked()
+	seq := a.nextSeqLocked()
+	event := map[string]any{"type": "message_updated", "message": message.protocol(), "seq": seq}
+	a.rememberReplayEventLocked(event)
+	return event
 }
 
 func (a *neoActor) executorConnect(msg map[string]any) {
@@ -6011,6 +6130,8 @@ func (a *neoActor) acknowledgeSubagentToolLease(socket *neoSocket, msg map[strin
 }
 
 func (a *neoActor) replayUnacknowledgedSubagentToolLeases() {
+	a.emissionMu.Lock()
+	defer a.emissionMu.Unlock()
 	a.mu.Lock()
 	socket := a.executorSocket
 	if socket == nil || !a.executorConnectedLocked() {
@@ -6040,7 +6161,9 @@ func (a *neoActor) replayUnacknowledgedSubagentToolLeases() {
 	}
 	a.mu.Unlock()
 	for _, payload := range payloads {
-		socket.send(payload)
+		if socket.canSend() {
+			socket.send(payload)
+		}
 	}
 }
 
@@ -8096,6 +8219,10 @@ func (a *neoActor) handleProtocolInferenceTools(msg map[string]any) {
 }
 
 func (a *neoActor) handleProtocolDelta(msg map[string]any) {
+	a.handleProtocolDeltaForGeneration(msg, -1)
+}
+
+func (a *neoActor) handleProtocolDeltaForGeneration(msg map[string]any, generation int) {
 	normalized, ok := normalizeNeoProtocolDelta(msg)
 	if !ok {
 		return
@@ -8109,7 +8236,16 @@ func (a *neoActor) handleProtocolDelta(msg map[string]any) {
 		return
 	}
 
+	generationFenced := generation >= 0
+	if generationFenced {
+		a.emissionMu.Lock()
+	}
 	a.mu.Lock()
+	if generationFenced && generation != a.generation {
+		a.mu.Unlock()
+		a.emissionMu.Unlock()
+		return
+	}
 	seq := a.protocolSeqLocked(msg)
 	original["seq"] = seq
 	index := a.messageIndexLocked(messageID)
@@ -8129,11 +8265,24 @@ func (a *neoActor) handleProtocolDelta(msg map[string]any) {
 		}
 		clearedInference := a.clearCurrentInferenceLocked(messageID)
 		a.rememberReplayEventLocked(msg)
+		var sockets []*neoSocket
+		if generationFenced {
+			sockets = a.socketListLocked()
+		}
 		a.mu.Unlock()
 
-		a.broadcast(msg)
-		if errorCleared != nil {
-			a.broadcast(errorCleared)
+		if generationFenced {
+			emissions := []any{msg}
+			if errorCleared != nil {
+				emissions = append(emissions, errorCleared)
+			}
+			a.sendCapturedUnderEmissionLock(sockets, emissions...)
+			a.emissionMu.Unlock()
+		} else {
+			a.broadcast(msg)
+			if errorCleared != nil {
+				a.broadcast(errorCleared)
+			}
 		}
 		if removedAborted {
 			a.syncCloudAsync()
@@ -8145,8 +8294,17 @@ func (a *neoActor) handleProtocolDelta(msg map[string]any) {
 	}
 	if len(blocks) == 0 && !(role == "assistant" && (state == "complete" || state == "tool_use")) {
 		a.rememberReplayEventLocked(msg)
+		var sockets []*neoSocket
+		if generationFenced {
+			sockets = a.socketListLocked()
+		}
 		a.mu.Unlock()
-		a.broadcast(msg)
+		if generationFenced {
+			a.sendCapturedUnderEmissionLock(sockets, msg)
+			a.emissionMu.Unlock()
+		} else {
+			a.broadcast(msg)
+		}
 		return
 	}
 	var message neoMessage
@@ -8204,11 +8362,24 @@ func (a *neoActor) handleProtocolDelta(msg map[string]any) {
 	if role == "assistant" && (state == "aborted" || state == "complete" || (state == "tool_use" && stringValue(mapValue(stored.State)["type"]) == "complete")) {
 		clearedInference = a.clearCurrentInferenceLocked(messageID)
 	}
+	var sockets []*neoSocket
+	if generationFenced {
+		sockets = a.socketListLocked()
+	}
 	a.mu.Unlock()
 
-	a.broadcast(msg)
-	if errorCleared != nil {
-		a.broadcast(errorCleared)
+	if generationFenced {
+		emissions := []any{msg}
+		if errorCleared != nil {
+			emissions = append(emissions, errorCleared)
+		}
+		a.sendCapturedUnderEmissionLock(sockets, emissions...)
+		a.emissionMu.Unlock()
+	} else {
+		a.broadcast(msg)
+		if errorCleared != nil {
+			a.broadcast(errorCleared)
+		}
 	}
 	a.syncCloudAsync()
 	if clearedInference {
@@ -8469,6 +8640,7 @@ func (a *neoActor) handleProtocolErrorSet(msg map[string]any) {
 	a.activeErrorMessageID = ""
 	a.activeErrorSeq = seq
 	a.compacting = false
+	a.compactionOwner = 0
 	a.mu.Unlock()
 
 	payload := map[string]any{"type": "error_set", "seq": seq, "error": errorPayload}
@@ -12013,6 +12185,7 @@ func (a *neoActor) runInferenceForParentWithOptions(agentMode, reasoningEffort, 
 	if generation != a.generation {
 		a.mu.Unlock()
 		a.clearCurrentInference(assistantID)
+		a.processQueue()
 		return
 	}
 	request := a.inferenceRequestLocked(agentMode, reasoningEffort, parentToolCallID)
@@ -12046,14 +12219,16 @@ func (a *neoActor) runInferenceForParentWithOptions(agentMode, reasoningEffort, 
 		streamed = true
 		if !streamingStateSent {
 			streamingStateSent = true
-			a.setAgentState("streaming", assistantID, agentMode, reasoningEffort)
+			if !a.setAgentStateForGeneration("streaming", assistantID, agentMode, reasoningEffort, generation) {
+				return
+			}
 		}
 		if delta.Text != "" {
 			if textBlockStartTime == 0 {
 				textBlockStartTime = time.Now().UnixMilli()
 			}
 			block := neoMarkStreamingBlock(map[string]any{"type": "text", "text": delta.Text}, textBlockStartTime)
-			a.handleProtocolDelta(withNeoParentToolCallID(neoAssistantDeltaPayload(assistantID, []any{block}, delta.BlockIndex, "generating", delta.Usage), parentToolCallID))
+			a.handleProtocolDeltaForGeneration(withNeoParentToolCallID(neoAssistantDeltaPayload(assistantID, []any{block}, delta.BlockIndex, "generating", delta.Usage), parentToolCallID), generation)
 		}
 		if delta.Thinking != "" || delta.ThinkingSignature != "" {
 			blockIndex := delta.BlockIndex
@@ -12064,7 +12239,7 @@ func (a *neoActor) runInferenceForParentWithOptions(agentMode, reasoningEffort, 
 			}
 			block := map[string]any{"type": "thinking", "thinking": delta.Thinking, "signature": delta.ThinkingSignature}
 			block = neoMarkStreamingBlock(block, thinkingStartTime)
-			a.handleProtocolDelta(withNeoParentToolCallID(neoAssistantDeltaPayload(assistantID, []any{block}, blockIndex, "generating", delta.Usage), parentToolCallID))
+			a.handleProtocolDeltaForGeneration(withNeoParentToolCallID(neoAssistantDeltaPayload(assistantID, []any{block}, blockIndex, "generating", delta.Usage), parentToolCallID), generation)
 		}
 		if delta.ToolCall != nil && delta.ToolCall.Name != "" {
 			input := delta.ToolCall.Input
@@ -12106,7 +12281,7 @@ func (a *neoActor) runInferenceForParentWithOptions(agentMode, reasoningEffort, 
 			} else {
 				block = neoMarkStreamingBlock(block, toolStartTime)
 			}
-			a.handleProtocolDelta(withNeoParentToolCallID(neoAssistantDeltaPayload(assistantID, []any{block}, delta.ToolCall.BlockIndex, "tool_use", delta.Usage), parentToolCallID))
+			a.handleProtocolDeltaForGeneration(withNeoParentToolCallID(neoAssistantDeltaPayload(assistantID, []any{block}, delta.ToolCall.BlockIndex, "tool_use", delta.Usage), parentToolCallID), generation)
 		}
 	})
 	if err != nil {
@@ -12116,9 +12291,11 @@ func (a *neoActor) runInferenceForParentWithOptions(agentMode, reasoningEffort, 
 		// blocks behind diverges and persists a permanently-streaming message
 		// into the snapshot (the load-time normalizer only repairs cancelled
 		// messages, and client_retry never cleans it up).
+		a.emissionMu.Lock()
 		a.mu.Lock()
 		if generation != a.generation || a.currentInference == nil || a.currentInference.messageID != assistantID {
 			a.mu.Unlock()
+			a.emissionMu.Unlock()
 			return
 		}
 		finalizeEvents := a.cleanupPriorAssistantForBinaryDeltaLocked("", nil)
@@ -12135,17 +12312,23 @@ func (a *neoActor) runInferenceForParentWithOptions(agentMode, reasoningEffort, 
 		a.cancelMainInferenceContextLocked()
 		a.currentInference = nil
 		a.executorIdleGeneration++
+		sockets := a.socketListLocked()
 		a.mu.Unlock()
-		log.Errorf("amp neo local actor error: %v", err)
+		emissions := make([]any, 0, len(finalizeEvents)+3)
 		for _, finalizeEvent := range finalizeEvents {
-			a.broadcast(finalizeEvent)
+			emissions = append(emissions, finalizeEvent)
 		}
 		errorEvent := cloneMap(errorPayload)
 		errorEvent["type"] = "error"
-		a.broadcast(errorEvent)
-		a.broadcast(map[string]any{"type": "error_set", "seq": seq, "error": errorPayload})
+		emissions = append(emissions,
+			errorEvent,
+			map[string]any{"type": "error_set", "seq": seq, "error": errorPayload},
+			map[string]any{"type": "agent_state", "state": "idle", "messageId": assistantID, "agentMode": agentMode, "reasoningEffort": omitEmpty(reasoningEffort)},
+		)
+		a.sendCapturedUnderEmissionLock(sockets, emissions...)
+		a.emissionMu.Unlock()
+		log.Errorf("amp neo local actor error: %v", err)
 		a.dispatchNotification("error", "error_set", map[string]any{"seq": seq, "error": errorPayload})
-		a.broadcast(map[string]any{"type": "agent_state", "state": "idle", "messageId": assistantID, "agentMode": agentMode, "reasoningEffort": omitEmpty(reasoningEffort)})
 		if previousState != "idle" {
 			a.dispatchNotification("agent", "agent_idle", map[string]any{"messageId": assistantID, "agentMode": agentMode})
 		}
@@ -12161,7 +12344,7 @@ func (a *neoActor) runInferenceForParentWithOptions(agentMode, reasoningEffort, 
 		return
 	}
 	a.mu.Unlock()
-	hasPendingLocalTools := a.finishAssistantMessageWithOptions(assistantID, result, agentMode, reasoningEffort, streamed, parentToolCallID)
+	hasPendingLocalTools := a.finishAssistantMessageForGeneration(assistantID, result, agentMode, reasoningEffort, streamed, parentToolCallID, generation)
 	a.clearCurrentInference(assistantID)
 	if !hasPendingLocalTools {
 		a.releaseMainInferenceContext(generation)
@@ -12259,6 +12442,20 @@ func (a *neoActor) maybeCompactBeforeInference(agentMode, reasoningEffort, paren
 }
 
 func (a *neoActor) maybeCompactAfterInference(agentMode, reasoningEffort, parentToolCallID, messageID string) bool {
+	if a == nil {
+		return false
+	}
+	a.mu.Lock()
+	if a.currentInference == nil || a.currentInference.messageID != messageID {
+		a.mu.Unlock()
+		return false
+	}
+	generation := a.generation
+	a.mu.Unlock()
+	return a.maybeCompactAfterInferenceForGeneration(agentMode, reasoningEffort, parentToolCallID, messageID, generation)
+}
+
+func (a *neoActor) maybeCompactAfterInferenceForGeneration(agentMode, reasoningEffort, parentToolCallID, messageID string, generation int) bool {
 	if a == nil || a.runtime == nil {
 		return false
 	}
@@ -12268,11 +12465,11 @@ func (a *neoActor) maybeCompactAfterInference(agentMode, reasoningEffort, parent
 	}
 
 	a.mu.Lock()
-	if a.compacting {
+	if generation != a.generation || a.compacting {
 		a.mu.Unlock()
 		return false
 	}
-	if a.currentInference != nil && a.currentInference.messageID != "" && a.currentInference.messageID != messageID {
+	if a.currentInference != nil && a.currentInference.messageID != messageID {
 		a.mu.Unlock()
 		return false
 	}
@@ -12312,7 +12509,7 @@ func (a *neoActor) maybeCompactAfterInference(agentMode, reasoningEffort, parent
 		a.mu.Unlock()
 		return false
 	}
-	plan, ok := a.prepareCompactionPlanLocked(cfg, settings, agentMode, a.generation, sourceMessages, sourceIndexes, compactionMessagesWindow, compactionOffset, finalIndex, true, true)
+	plan, ok := a.prepareCompactionPlanLocked(cfg, settings, agentMode, generation, sourceMessages, sourceIndexes, compactionMessagesWindow, compactionOffset, finalIndex, true, true)
 	if !ok {
 		a.mu.Unlock()
 		return false
@@ -12324,10 +12521,12 @@ func (a *neoActor) maybeCompactAfterInference(agentMode, reasoningEffort, parent
 
 type neoCompactionPlan struct {
 	cfg                           *config.Config
+	context                       context.Context
 	settings                      map[string]any
 	agentMode                     string
 	threadID                      string
 	generation                    int
+	owner                         uint64
 	cutIndex                      int
 	cutMessageID                  string
 	compactionMessages            []neoMessage
@@ -12355,13 +12554,24 @@ func (a *neoActor) prepareCompactionPlanLocked(cfg *config.Config, settings map[
 	if cutScopedIndex < len(sourceMessages) {
 		cutMessageID = sourceMessages[cutScopedIndex].MessageID
 	}
+	planContext := a.mainInferenceContext
+	if planContext == nil {
+		planContext = context.Background()
+	}
+	a.nextCompactionOwner++
+	if a.nextCompactionOwner == 0 {
+		a.nextCompactionOwner++
+	}
 	a.compacting = true
+	a.compactionOwner = a.nextCompactionOwner
 	return neoCompactionPlan{
 		cfg:                           cfg,
+		context:                       planContext,
 		settings:                      settings,
 		agentMode:                     agentMode,
 		threadID:                      a.threadID,
 		generation:                    generation,
+		owner:                         a.compactionOwner,
 		cutIndex:                      cutIndex,
 		cutMessageID:                  cutMessageID,
 		compactionMessages:            neoCompactionInputMessages(sourceMessages, compactionOffset),
@@ -12373,8 +12583,33 @@ func (a *neoActor) prepareCompactionPlanLocked(cfg *config.Config, settings map[
 
 func (a *neoActor) runCompactionPlan(plan neoCompactionPlan) bool {
 	compactionRoute := applyNeoModelMapping(a.runtime, selectNeoCompactionRoute(plan.cfg, plan.agentMode, plan.settings))
-	a.broadcast(map[string]any{"type": "compaction_started"})
+	if !a.publishCompactionStart(plan) {
+		a.mu.Lock()
+		a.releaseCompactionPlanLocked(plan)
+		a.mu.Unlock()
+		return false
+	}
 	return a.runManualCompactionPlan(plan, compactionRoute)
+}
+
+func (a *neoActor) publishCompactionStart(plan neoCompactionPlan) bool {
+	a.emissionMu.Lock()
+	defer a.emissionMu.Unlock()
+	a.mu.Lock()
+	if plan.generation != a.generation || plan.owner != a.compactionOwner || !a.compacting || plan.context == nil || plan.context.Err() != nil {
+		a.mu.Unlock()
+		return false
+	}
+	sockets := a.socketListLocked()
+	a.mu.Unlock()
+	payload := map[string]any{"type": "compaction_started"}
+	a.maybeBroadcastThreadStatusUpdated(payload)
+	for _, socket := range sockets {
+		if socket != nil && socket.canSend() {
+			socket.send(payload)
+		}
+	}
+	return true
 }
 
 func (a *neoActor) runManualCompactionPlan(plan neoCompactionPlan, compactionRoute neoModelRoute) bool {
@@ -12385,37 +12620,42 @@ func (a *neoActor) runManualCompactionPlan(plan neoCompactionPlan, compactionRou
 		if transcriptTokens, transcriptMaxInputTokens, transcriptTooLarge := neoCompactionRequestExceedsInputBudget(plan.agentMode, compactionRoute, transcriptMessages, plan.summaryPrompt); transcriptTooLarge {
 			err = fmt.Errorf("local Neo compaction request too large for %s/%s: estimated_input_tokens=%d compaction_input_budget_tokens=%d safety_tokens=%d transcript_estimated_input_tokens=%d transcript_compaction_input_budget_tokens=%d", compactionRoute.Provider, compactionRoute.Model, estimatedTokens, maxInputTokens, neoCompactionInputSafetyTokens, transcriptTokens, transcriptMaxInputTokens)
 		} else {
-			summary, err = inferNeoCompactionLocal(context.Background(), a.runtime, plan.threadID, compactionRoute, transcriptMessages, plan.summaryPrompt)
+			summary, err = inferNeoCompactionLocal(plan.context, a.runtime, plan.threadID, compactionRoute, transcriptMessages, plan.summaryPrompt)
 		}
 	} else {
-		summary, err = inferNeoCompactionLocal(context.Background(), a.runtime, plan.threadID, compactionRoute, plan.compactionMessages, plan.summaryPrompt)
+		summary, err = inferNeoCompactionLocal(plan.context, a.runtime, plan.threadID, compactionRoute, plan.compactionMessages, plan.summaryPrompt)
 	}
 	if err != nil {
-		log.Warnf("amp neo local runtime compaction failed thread=%s: %v", plan.threadID, err)
-		a.mu.Lock()
-		a.finishFailedCompactionPlanLocked(plan)
-		a.mu.Unlock()
-		a.syncCloudAsync()
-		a.broadcast(neoProtocolCompactionCompletePayload(nil))
+		if !errors.Is(err, context.Canceled) {
+			log.Warnf("amp neo local runtime compaction failed thread=%s: %v", plan.threadID, err)
+		}
+		a.finishFailedCompactionPlan(plan)
 		return false
 	}
 	summary = neoNormalizeCompactionSummary(summary)
 	if summary == "" {
 		log.Warnf("amp neo local runtime compaction returned empty summary thread=%s provider=%s model=%s", plan.threadID, compactionRoute.Provider, compactionRoute.Model)
-		a.mu.Lock()
-		a.finishFailedCompactionPlanLocked(plan)
-		a.mu.Unlock()
-		a.syncCloudAsync()
-		a.broadcast(neoProtocolCompactionCompletePayload(nil))
+		a.finishFailedCompactionPlan(plan)
 		return false
 	}
 
 	summaryMessage := neoCompactionSummaryMessage(plan.threadID, summary)
+	a.emissionMu.Lock()
 	a.mu.Lock()
-	if plan.generation != a.generation || plan.cutIndex > len(a.messages) || (plan.cutMessageID != "" && (plan.cutIndex >= len(a.messages) || a.messages[plan.cutIndex].MessageID != plan.cutMessageID)) {
-		a.compacting = false
+	if plan.generation != a.generation || plan.owner != a.compactionOwner || plan.cutIndex > len(a.messages) || (plan.cutMessageID != "" && (plan.cutIndex >= len(a.messages) || a.messages[plan.cutIndex].MessageID != plan.cutMessageID)) {
+		owned := a.finishFailedCompactionPlanLocked(plan)
+		var sockets []*neoSocket
+		if owned {
+			sockets = a.socketListLocked()
+		}
 		a.mu.Unlock()
-		a.broadcast(neoProtocolCompactionCompletePayload(nil))
+		if owned {
+			a.sendCapturedUnderEmissionLock(sockets, neoProtocolCompactionCompletePayload(nil))
+		}
+		a.emissionMu.Unlock()
+		if owned {
+			a.syncCloudAsync()
+		}
 		return false
 	}
 	summaryMessage.Seq = a.nextSeqLocked()
@@ -12434,24 +12674,52 @@ func (a *neoActor) runManualCompactionPlan(plan neoCompactionPlan, compactionRou
 		recordCutMessageID = summaryMessage.MessageID
 	}
 	record := map[string]any{"cutMessageId": recordCutMessageID, "createdAt": time.Now().UTC().Format(time.RFC3339Nano)}
-	a.compacting = false
+	a.releaseCompactionPlanLocked(plan)
 	a.upsertCompactionRecordLocked(record)
 	records := a.compactionRecordListLocked()
 	addedEvent := neoMessageAddedPayload(summaryMessage)
 	a.rememberReplayEventLocked(addedEvent)
+	sockets := a.socketListLocked()
 	a.mu.Unlock()
 
-	a.broadcast(addedEvent)
-	a.broadcast(neoProtocolCompactionCompletePayload(recordCutMessageID))
-	a.broadcast(map[string]any{"type": "compaction_records", "records": neoProtocolCompactionRecordList(records)})
+	a.sendCapturedUnderEmissionLock(sockets,
+		addedEvent,
+		neoProtocolCompactionCompletePayload(recordCutMessageID),
+		map[string]any{"type": "compaction_records", "records": neoProtocolCompactionRecordList(records)},
+	)
+	a.emissionMu.Unlock()
 	a.dispatchNotification("thread", "compaction_complete", map[string]any{"cutMessageId": recordCutMessageID})
 	a.syncCloudAsync()
 	return true
 }
 
-func (a *neoActor) finishFailedCompactionPlanLocked(plan neoCompactionPlan) {
-	a.compacting = false
-	if plan.markCurrentInferenceAsChecked && plan.generation == a.generation && a.currentInference != nil {
+func (a *neoActor) finishFailedCompactionPlan(plan neoCompactionPlan) bool {
+	a.emissionMu.Lock()
+	a.mu.Lock()
+	owned := a.finishFailedCompactionPlanLocked(plan)
+	var sockets []*neoSocket
+	if owned {
+		sockets = a.socketListLocked()
+	}
+	a.mu.Unlock()
+	if owned {
+		a.sendCapturedUnderEmissionLock(sockets, neoProtocolCompactionCompletePayload(nil))
+	}
+	a.emissionMu.Unlock()
+	if owned {
+		a.syncCloudAsync()
+	}
+	return owned
+}
+
+func (a *neoActor) finishFailedCompactionPlanLocked(plan neoCompactionPlan) bool {
+	if !a.releaseCompactionPlanLocked(plan) {
+		return false
+	}
+	if plan.generation != a.generation {
+		return true
+	}
+	if plan.markCurrentInferenceAsChecked && a.currentInference != nil {
 		a.currentInference.preflightCompactionChecked = true
 	}
 	if plan.sourceLen > 0 {
@@ -12463,6 +12731,16 @@ func (a *neoActor) finishFailedCompactionPlanLocked(plan neoCompactionPlan) {
 			a.compactionRetryAfterLen = retryAfterLen
 		}
 	}
+	return true
+}
+
+func (a *neoActor) releaseCompactionPlanLocked(plan neoCompactionPlan) bool {
+	if plan.owner == 0 || plan.owner != a.compactionOwner {
+		return false
+	}
+	a.compacting = false
+	a.compactionOwner = 0
+	return true
 }
 
 func neoCompactionRequestExceedsInputBudget(agentMode string, route neoModelRoute, messages []neoMessage, summaryPrompt string) (int, int, bool) {
@@ -12873,6 +13151,17 @@ func (a *neoActor) finishAssistantMessage(messageID string, result neoInferenceR
 }
 
 func (a *neoActor) finishAssistantMessageWithOptions(messageID string, result neoInferenceResult, agentMode, reasoningEffort string, streamed bool, parentToolCallID string) bool {
+	return a.finishAssistantMessageForGeneration(messageID, result, agentMode, reasoningEffort, streamed, parentToolCallID, -1)
+}
+
+func (a *neoActor) finishAssistantMessageForGeneration(messageID string, result neoInferenceResult, agentMode, reasoningEffort string, streamed bool, parentToolCallID string, generation int) bool {
+	if generation < 0 {
+		a.mu.Lock()
+		if a.currentInference != nil && a.currentInference.messageID == messageID {
+			generation = a.generation
+		}
+		a.mu.Unlock()
+	}
 	normalizedCalls := normalizeNeoToolCalls(result.ToolCalls)
 	streamBlockOffset := neoOpenAIThinkingBlockOffset(agentMode, result.Provider)
 	blocks := make([]any, 0, 2+len(normalizedCalls)+len(result.ThinkingBlocks))
@@ -12938,6 +13227,11 @@ func (a *neoActor) finishAssistantMessageWithOptions(messageID string, result ne
 	var previousContent []any
 	messageExistedBeforeFinalization := false
 	a.mu.Lock()
+	if generation >= 0 && generation != a.generation {
+		a.mu.Unlock()
+		a.processQueue()
+		return false
+	}
 	if index := a.messageIndexLocked(messageID); index >= 0 {
 		messageExistedBeforeFinalization = true
 		previousContent = cloneArray(a.messages[index].Content)
@@ -12945,8 +13239,9 @@ func (a *neoActor) finishAssistantMessageWithOptions(messageID string, result ne
 	a.mu.Unlock()
 	blocks = neoFinalizeAssistantBlocks(blocks, previousContent, finalTime)
 
-	if !streamed {
-		a.setAgentState("streaming", messageID, agentMode, reasoningEffort)
+	if !streamed && !a.setAgentStateForGeneration("streaming", messageID, agentMode, reasoningEffort, generation) {
+		a.processQueue()
+		return false
 	}
 	state := "generating"
 	stopReason := result.StopReason
@@ -12970,17 +13265,30 @@ func (a *neoActor) finishAssistantMessageWithOptions(messageID string, result ne
 				blockIndex = streamBlockOffset
 			}
 			blockIndex = neoAssistantToolBlockIndex(previousContent, normalizedCalls[0].ID, blockIndex)
-			a.handleProtocolDelta(withNeoParentToolCallID(neoAssistantDeltaPayload(messageID, streamBlocks, blockIndex, state, usage), parentToolCallID))
+			a.handleProtocolDeltaForGeneration(withNeoParentToolCallID(neoAssistantDeltaPayload(messageID, streamBlocks, blockIndex, state, usage), parentToolCallID), generation)
 		}
 	} else {
-		a.handleProtocolDelta(withNeoParentToolCallID(neoAssistantDeltaPayload(messageID, blocks, 0, state, usage), parentToolCallID))
+		a.handleProtocolDeltaForGeneration(withNeoParentToolCallID(neoAssistantDeltaPayload(messageID, blocks, 0, state, usage), parentToolCallID), generation)
 	}
 	if len(normalizedCalls) == 0 {
-		a.setAgentState("streaming", messageID, agentMode, reasoningEffort)
-		a.handleProtocolDelta(withNeoParentToolCallID(neoAssistantDeltaPayload(messageID, []any{}, 0, "complete", usage), parentToolCallID))
+		if !a.setAgentStateForGeneration("streaming", messageID, agentMode, reasoningEffort, generation) {
+			a.processQueue()
+			return false
+		}
+		a.handleProtocolDeltaForGeneration(withNeoParentToolCallID(neoAssistantDeltaPayload(messageID, []any{}, 0, "complete", usage), parentToolCallID), generation)
 	}
 
+	generationFenced := generation >= 0
+	if generationFenced {
+		a.emissionMu.Lock()
+	}
 	a.mu.Lock()
+	if generationFenced && generation != a.generation {
+		a.mu.Unlock()
+		a.emissionMu.Unlock()
+		a.processQueue()
+		return false
+	}
 	finalMessage := neoMessage{
 		ThreadID:        a.threadID,
 		MessageID:       messageID,
@@ -13067,23 +13375,6 @@ func (a *neoActor) finishAssistantMessageWithOptions(messageID string, result ne
 		a.pendingTools[call.ID] = pending
 		toolCalls = append(toolCalls, pending)
 	}
-	a.rebuildHistoryLocked()
-	providerErrorEvent := a.updateProviderStopReasonErrorLocked(messageID, stopReason, len(toolCalls) == 0)
-	a.mu.Unlock()
-
-	if headlessReviewEvent != nil {
-		a.broadcast(headlessReviewEvent)
-	}
-	if headlessRunCheckEvent != nil {
-		a.broadcast(headlessRunCheckEvent)
-	}
-	a.broadcast(messageEvent)
-	if providerErrorEvent != nil {
-		a.broadcast(providerErrorEvent)
-		if providerError := mapValue(providerErrorEvent["error"]); len(providerError) > 0 {
-			a.dispatchNotification("error", "error_set", map[string]any{"seq": providerErrorEvent["seq"], "error": providerError})
-		}
-	}
 	localSubagentToolIDs := map[string]bool{}
 	localActorToolIDs := map[string]bool{}
 	for _, call := range toolCalls {
@@ -13091,12 +13382,11 @@ func (a *neoActor) finishAssistantMessageWithOptions(messageID string, result ne
 			localSubagentToolIDs[call.ID] = true
 			continue
 		}
-		if a.shouldRunLocalActorTool(call.Name) {
+		if a.shouldRunLocalActorToolLocked(call.Name) {
 			localActorToolIDs[call.ID] = true
 		}
 	}
 	if len(localSubagentToolIDs)+len(localActorToolIDs) > 0 {
-		a.mu.Lock()
 		if a.proxyOwnedPendingTools == nil {
 			a.proxyOwnedPendingTools = map[string]bool{}
 		}
@@ -13106,20 +13396,73 @@ func (a *neoActor) finishAssistantMessageWithOptions(messageID string, result ne
 		for toolCallID := range localActorToolIDs {
 			a.proxyOwnedPendingTools[toolCallID] = true
 		}
-		a.mu.Unlock()
+	}
+	a.rebuildHistoryLocked()
+	providerErrorEvent := a.updateProviderStopReasonErrorLocked(messageID, stopReason, len(toolCalls) == 0)
+	var sockets []*neoSocket
+	if generationFenced {
+		sockets = a.socketListLocked()
+	}
+	a.mu.Unlock()
+
+	emissions := make([]any, 0, 4)
+	if headlessReviewEvent != nil {
+		emissions = append(emissions, headlessReviewEvent)
+	}
+	if headlessRunCheckEvent != nil {
+		emissions = append(emissions, headlessRunCheckEvent)
+	}
+	emissions = append(emissions, messageEvent)
+	if providerErrorEvent != nil {
+		emissions = append(emissions, providerErrorEvent)
+	}
+	if generationFenced {
+		a.sendCapturedUnderEmissionLock(sockets, emissions...)
+		a.emissionMu.Unlock()
+	} else {
+		for _, emission := range emissions {
+			a.broadcast(emission)
+		}
+	}
+	if providerErrorEvent != nil {
+		if providerError := mapValue(providerErrorEvent["error"]); len(providerError) > 0 {
+			a.dispatchNotification("error", "error_set", map[string]any{"seq": providerErrorEvent["seq"], "error": providerError})
+		}
 	}
 	a.syncCloudAsync()
-	a.maybeCompactAfterInference(agentMode, reasoningEffort, parentToolCallID, messageID)
+	if generation >= 0 {
+		a.maybeCompactAfterInferenceForGeneration(agentMode, reasoningEffort, parentToolCallID, messageID, generation)
+	} else {
+		a.maybeCompactAfterInference(agentMode, reasoningEffort, parentToolCallID, messageID)
+	}
+	if generation >= 0 {
+		a.mu.Lock()
+		stale := generation != a.generation
+		a.mu.Unlock()
+		if stale {
+			a.processQueue()
+			return false
+		}
+	}
 
 	if len(toolCalls) == 0 {
-		a.setAgentState("idle", messageID, agentMode, reasoningEffort)
+		if !a.setAgentStateForGeneration("idle", messageID, agentMode, reasoningEffort, generation) {
+			a.processQueue()
+			return false
+		}
 		a.processQueue()
 		return false
 	}
 
-	a.setAgentState("running_tools", messageID, agentMode, reasoningEffort)
+	if !a.setAgentStateForGeneration("running_tools", messageID, agentMode, reasoningEffort, generation) {
+		a.processQueue()
+		return false
+	}
 	a.mu.Lock()
-	subagentGeneration := a.generation
+	subagentGeneration := generation
+	if subagentGeneration < 0 {
+		subagentGeneration = a.generation
+	}
 	a.mu.Unlock()
 	for _, call := range toolCalls {
 		// Subagent tools (finder/oracle/librarian) are advertised by the
@@ -13133,7 +13476,10 @@ func (a *neoActor) finishAssistantMessageWithOptions(messageID string, result ne
 			go a.runLocalActorTool(call, subagentGeneration)
 			continue
 		}
-		a.broadcast(withNeoParentToolCallID(map[string]any{"type": "tool_lease", "toolCallId": call.ID, "toolName": call.Name, "args": call.Input, "messageId": stored.MessageID}, call.ParentToolCallID))
+		if !a.broadcastForGeneration(withNeoParentToolCallID(map[string]any{"type": "tool_lease", "toolCallId": call.ID, "toolName": call.Name, "args": call.Input, "messageId": stored.MessageID}, call.ParentToolCallID), generation) {
+			a.processQueue()
+			return false
+		}
 	}
 	return len(localSubagentToolIDs)+len(localActorToolIDs) > 0
 }
@@ -13248,11 +13594,15 @@ func (a *neoActor) receiveToolResult(msg map[string]any, sockets ...*neoSocket) 
 		return
 	}
 	if !neoToolRunTerminalForPending(pending, run) {
+		resultBlock := map[string]any{"type": "tool_result", "toolUseID": toolCallID, "run": run}
+		if len(pending.ApprovalInput) > 0 {
+			resultBlock["userInput"] = cloneMap(pending.ApprovalInput)
+		}
 		_, event := a.storeMessageEventLocked(neoMessage{
 			ThreadID:         a.threadID,
 			Role:             "user",
 			MessageID:        toolResultMessageID(toolCallID),
-			Content:          []any{map[string]any{"type": "tool_result", "toolUseID": toolCallID, "run": run}},
+			Content:          []any{resultBlock},
 			CreatedAt:        time.Now().UTC().Format(time.RFC3339Nano),
 			ParentToolUseID:  pending.ParentToolCallID,
 			CompletionStatus: "tool_progress",
@@ -13294,6 +13644,9 @@ func (a *neoActor) receiveToolResult(msg map[string]any, sockets ...*neoSocket) 
 
 	a.mu.Lock()
 	resultBlock := map[string]any{"type": "tool_result", "toolUseID": toolCallID, "run": run}
+	if len(pending.ApprovalInput) > 0 {
+		resultBlock["userInput"] = cloneMap(pending.ApprovalInput)
+	}
 	storedResult, event := a.storeMessageEventLocked(neoMessage{
 		ThreadID:        a.threadID,
 		Role:            "user",
@@ -20927,6 +21280,19 @@ func (rt *neoRuntime) neoWebLocalSidebarThreadSummaries(ctx context.Context, lim
 	}
 	rt.seedRecentThreadsFromCloudAsync(ctx, limit, 0)
 	statuses := rt.neoFilterThreadsByRequestOwner(rt.recentThreadStatusesForRequest(ctx, 0, 0), ownerUserID)
+	currentStatusIDs := make(map[string]bool, len(statuses))
+	archivedThreadIDs := make([]string, 0)
+	for _, rawStatus := range statuses {
+		status := mapValue(rawStatus)
+		threadID := strings.TrimSpace(firstNonEmptyString(status["id"], status["threadId"], status["threadID"]))
+		if !neoThreadIDExactPattern.MatchString(threadID) || neoSentinelLocalThreadID(threadID) {
+			continue
+		}
+		currentStatusIDs[threadID] = true
+		if boolValue(status["archived"]) && !neoPuckThreadStatus(status) {
+			archivedThreadIDs = append(archivedThreadIDs, threadID)
+		}
+	}
 	scanLimit := limit
 	if scanLimit > 0 {
 		scanLimit *= neoWebLocalSidebarScanFactor
@@ -20934,17 +21300,7 @@ func (rt *neoRuntime) neoWebLocalSidebarThreadSummaries(ctx context.Context, lim
 	allStatuses := rt.neoFilterThreadsByRequestOwner(rt.neoRecentThreadStatusesWithPersisted(statuses, scanLimit, true), ownerUserID)
 	allStatuses = neoWithoutPuckThreadStatuses(allStatuses)
 	allStatuses = neoSortRecentThreadStatuses(allStatuses, scanLimit)
-	archivedThreadIDs := make([]string, 0)
-	for _, rawStatus := range allStatuses {
-		status := mapValue(rawStatus)
-		if boolValue(status["archived"]) {
-			threadID := strings.TrimSpace(firstNonEmptyString(status["id"], status["threadId"], status["threadID"]))
-			if neoThreadIDExactPattern.MatchString(threadID) {
-				archivedThreadIDs = append(archivedThreadIDs, threadID)
-			}
-			continue
-		}
-	}
+	archivedThreadIDs = rt.appendNeoWebLocalPersistedArchivedThreadIDs(ctx, archivedThreadIDs, currentStatusIDs, ownerUserID)
 	seedThreads := rt.neoRecentThreadSummariesFromStatuses(neoWithoutPuckThreadStatuses(allStatuses), 0, false)
 	targetLimit := limit
 	if targetLimit <= 0 {
@@ -20963,6 +21319,42 @@ func (rt *neoRuntime) neoWebLocalSidebarThreadSummaries(ctx context.Context, lim
 	threads = append(seedThreads, threads...)
 	sort.Strings(archivedThreadIDs)
 	return neoSortRecentThreadStatuses(threads, limit), archivedThreadIDs
+}
+
+func (rt *neoRuntime) appendNeoWebLocalPersistedArchivedThreadIDs(ctx context.Context, archivedThreadIDs []string, currentStatusIDs map[string]bool, ownerUserID string) []string {
+	if rt == nil {
+		return archivedThreadIDs
+	}
+	known := make(map[string]bool, len(archivedThreadIDs)+len(currentStatusIDs))
+	for threadID := range currentStatusIDs {
+		known[threadID] = true
+	}
+	unique := make([]string, 0, len(archivedThreadIDs))
+	emitted := make(map[string]bool, len(archivedThreadIDs))
+	for _, threadID := range archivedThreadIDs {
+		if emitted[threadID] || !neoThreadIDExactPattern.MatchString(threadID) || neoSentinelLocalThreadID(threadID) {
+			continue
+		}
+		emitted[threadID] = true
+		known[threadID] = true
+		unique = append(unique, threadID)
+	}
+	archivedThreadIDs = unique
+	for _, summary := range rt.neoWebLocalPersistedArchivedThreadSummaries(ctx) {
+		if ctx.Err() != nil {
+			return archivedThreadIDs
+		}
+		if known[summary.threadID] {
+			continue
+		}
+		if ownerUserID != "" && !rt.neoThreadOwnedByRequestUser(map[string]any{"ownerUserId": summary.ownerUserID}, ownerUserID) {
+			continue
+		}
+		known[summary.threadID] = true
+		archivedThreadIDs = append(archivedThreadIDs, summary.threadID)
+	}
+	sort.Strings(archivedThreadIDs)
+	return archivedThreadIDs
 }
 
 func neoPuckThreadStatus(status map[string]any) bool {
@@ -21504,6 +21896,11 @@ type neoPersistedThreadFile struct {
 	snapshotModified time.Time
 }
 
+type neoWebLocalArchivedThreadSummary struct {
+	threadID    string
+	ownerUserID string
+}
+
 func (rt *neoRuntime) neoWebLocalPersistedThreadSummaries(limit int, skip map[string]bool) []any {
 	return rt.neoWebLocalPersistedThreadSummariesWithArchived(limit, skip, false)
 }
@@ -21756,6 +22153,71 @@ func (rt *neoRuntime) neoWebLocalPersistedThreadSummaryFiles(ctx context.Context
 	}
 	files, _ := value.([]neoPersistedThreadFile)
 	return append([]neoPersistedThreadFile(nil), files...)
+}
+
+func (rt *neoRuntime) neoWebLocalPersistedArchivedThreadSummaries(ctx context.Context) []neoWebLocalArchivedThreadSummary {
+	return rt.neoWebLocalPersistedArchivedThreadSummariesWithReader(ctx, func(file neoPersistedThreadFile) (map[string]any, bool) {
+		return readNeoWebLocalThreadSummary(rt.threadDir, file)
+	})
+}
+
+func (rt *neoRuntime) neoWebLocalPersistedArchivedThreadSummariesWithReader(ctx context.Context, readSummary func(neoPersistedThreadFile) (map[string]any, bool)) []neoWebLocalArchivedThreadSummary {
+	if rt == nil || ctx.Err() != nil {
+		return nil
+	}
+	summaryDir := filepath.Join(rt.threadDir, neoWebLocalThreadSummaryDirName)
+	stamp := neoWebLocalFileSourceStamp(summaryDir)
+	now := time.Now()
+	rt.localArchivedSummaryMu.Lock()
+	if rt.localArchivedSummaryLoaded && stamp == rt.localArchivedSummaryStamp && now.Sub(rt.localArchivedSummaryLoadedAt) < neoWebLocalSummaryIndexTTL {
+		summaries := append([]neoWebLocalArchivedThreadSummary(nil), rt.localArchivedSummaryIndex...)
+		rt.localArchivedSummaryMu.Unlock()
+		return summaries
+	}
+	rt.localArchivedSummaryMu.Unlock()
+	value, _, _ := rt.localArchivedSummaryScanGroup.Do(summaryDir, func() (any, error) {
+		stamp := neoWebLocalFileSourceStamp(summaryDir)
+		now := time.Now()
+		rt.localArchivedSummaryMu.Lock()
+		if rt.localArchivedSummaryLoaded && stamp == rt.localArchivedSummaryStamp && now.Sub(rt.localArchivedSummaryLoadedAt) < neoWebLocalSummaryIndexTTL {
+			summaries := append([]neoWebLocalArchivedThreadSummary(nil), rt.localArchivedSummaryIndex...)
+			rt.localArchivedSummaryMu.Unlock()
+			return summaries, nil
+		}
+		rt.localArchivedSummaryMu.Unlock()
+		files := neoWebLocalPersistedThreadSummaryFilesContext(ctx, rt.threadDir)
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		summaries := make([]neoWebLocalArchivedThreadSummary, 0)
+		for _, file := range files {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			if neoSentinelLocalThreadID(file.threadID) {
+				continue
+			}
+			status, ok := readSummary(file)
+			if !ok || !boolValue(status["archived"]) || neoPuckThreadStatus(status) {
+				continue
+			}
+			summaries = append(summaries, neoWebLocalArchivedThreadSummary{threadID: file.threadID, ownerUserID: neoThreadOwnerUserID(status)})
+		}
+		sort.Slice(summaries, func(i, j int) bool { return summaries[i].threadID < summaries[j].threadID })
+		rt.localArchivedSummaryMu.Lock()
+		rt.localArchivedSummaryIndex = append(rt.localArchivedSummaryIndex[:0], summaries...)
+		rt.localArchivedSummaryLoaded = true
+		rt.localArchivedSummaryStamp = neoWebLocalFileSourceStamp(summaryDir)
+		rt.localArchivedSummaryLoadedAt = time.Now()
+		cached := append([]neoWebLocalArchivedThreadSummary(nil), rt.localArchivedSummaryIndex...)
+		rt.localArchivedSummaryMu.Unlock()
+		return cached, nil
+	})
+	if ctx.Err() != nil {
+		return nil
+	}
+	summaries, _ := value.([]neoWebLocalArchivedThreadSummary)
+	return append([]neoWebLocalArchivedThreadSummary(nil), summaries...)
 }
 
 func scanNeoWebLocalPersistedThreadSummarySidecarsFromFilesContext(ctx context.Context, threadDir string, files []neoPersistedThreadFile, limit int, skip map[string]bool, includeArchived bool) []any {
@@ -26064,17 +26526,41 @@ func (a *neoActor) sendCurrentExecutorState(socket *neoSocket) {
 }
 
 func (a *neoActor) setAgentState(state, messageID, agentMode, reasoningEffort string) {
+	a.setAgentStateForGeneration(state, messageID, agentMode, reasoningEffort, -1)
+}
+
+func (a *neoActor) setAgentStateForGeneration(state, messageID, agentMode, reasoningEffort string, generation int) bool {
 	state = normalizeNeoAgentState(state)
+	generationFenced := generation >= 0
+	if generationFenced {
+		a.emissionMu.Lock()
+	}
 	a.mu.Lock()
+	if generationFenced && generation != a.generation {
+		a.mu.Unlock()
+		a.emissionMu.Unlock()
+		return false
+	}
 	previous := a.agentState
 	a.agentState = state
+	var sockets []*neoSocket
+	if generationFenced {
+		sockets = a.socketListLocked()
+	}
 	a.mu.Unlock()
-	a.broadcast(map[string]any{"type": "agent_state", "state": state, "messageId": omitEmpty(messageID), "agentMode": agentMode, "reasoningEffort": omitEmpty(reasoningEffort)})
+	payload := map[string]any{"type": "agent_state", "state": state, "messageId": omitEmpty(messageID), "agentMode": agentMode, "reasoningEffort": omitEmpty(reasoningEffort)}
+	if generationFenced {
+		a.sendCapturedUnderEmissionLock(sockets, payload)
+		a.emissionMu.Unlock()
+	} else {
+		a.broadcast(payload)
+	}
 	if previous != state && state == "idle" {
 		a.dispatchNotification("agent", "agent_idle", map[string]any{"messageId": omitEmpty(messageID), "agentMode": agentMode})
 	}
 	a.syncCloudAsync()
 	a.scheduleExecutorIdleStopIfNeeded()
+	return true
 }
 
 func (a *neoActor) clearCurrentInference(messageID string) {
@@ -26877,6 +27363,7 @@ func (a *neoActor) importThreadWithSyncOptions(thread map[string]any, syncCloud,
 		return nil
 	}
 	a.advanceGenerationLocked()
+	subagentCancellation := a.takeSubagentCancellationLocked()
 	a.measurements.revision++
 	a.messageRevision++
 	a.workerRevision = nil
@@ -27013,6 +27500,7 @@ func (a *neoActor) importThreadWithSyncOptions(thread map[string]any, syncCloud,
 	a.metadataMutationMu.Unlock()
 	a.reviewSnapshotMu.Unlock()
 
+	a.finishSubagentCancellation(subagentCancellation, "system:disposed", "executor_disconnected")
 	a.sendSnapshot(nil, 0)
 	if readyWork {
 		a.drainReadyWork()
@@ -28058,12 +28546,14 @@ func (a *neoActor) handleCompactionEvent(msg map[string]any) {
 	case "compaction_started":
 		a.mu.Lock()
 		a.compacting = true
+		a.compactionOwner = 0
 		a.mu.Unlock()
 		a.broadcast(map[string]any{"type": "compaction_started"})
 	case "compaction_complete":
 		record, ok := neoCompactionRecord(msg, time.Now().UTC().Format(time.RFC3339Nano))
 		a.mu.Lock()
 		a.compacting = false
+		a.compactionOwner = 0
 		if a.currentInference != nil {
 			a.currentInference.preflightCompactionChecked = true
 		}
@@ -32033,6 +32523,35 @@ func (a *neoActor) broadcast(payload any) {
 	a.broadcastExcept(nil, payload)
 }
 
+func (a *neoActor) broadcastForGeneration(payload any, generation int) bool {
+	if generation < 0 {
+		a.broadcast(payload)
+		return true
+	}
+	a.emissionMu.Lock()
+	defer a.emissionMu.Unlock()
+	a.mu.Lock()
+	if generation != a.generation {
+		a.mu.Unlock()
+		return false
+	}
+	sockets := a.socketListLocked()
+	a.mu.Unlock()
+	a.sendCapturedUnderEmissionLock(sockets, payload)
+	return true
+}
+
+func (a *neoActor) sendCapturedUnderEmissionLock(sockets []*neoSocket, payloads ...any) {
+	for _, payload := range payloads {
+		a.maybeBroadcastThreadStatusUpdated(payload)
+		for _, socket := range sockets {
+			if socket != nil && socket.canSend() {
+				socket.send(payload)
+			}
+		}
+	}
+}
+
 func (a *neoActor) broadcastExcept(excluded *neoSocket, payload any) {
 	a.maybeBroadcastThreadStatusUpdated(payload)
 	a.emissionMu.Lock()
@@ -32464,6 +32983,9 @@ func neoRestoredApprovalQueue(messages []neoMessage) []map[string]any {
 			if toolCallID == "" || !exists || selected.MessageIndex != messageIndex || selected.BlockIndex != blockIndex {
 				continue
 			}
+			if _, answered := normalizeNeoProtocolToolResultUserInput(block["userInput"]); answered {
+				continue
+			}
 			toolUse := toolUses[toolCallID]
 			toolName := firstNonEmptyString(block["toolName"], run["toolName"], toolUse.Name)
 			if toolName == "" {
@@ -32560,6 +33082,7 @@ func neoRestoredPendingTools(messages []neoMessage, agentMode, reasoningEffort s
 	}
 	selectedRuns := map[string]map[string]any{}
 	selectedTerminal := map[string]bool{}
+	selectedApprovalInputs := map[string]map[string]any{}
 	for _, message := range messages {
 		if message.Role != "user" {
 			continue
@@ -32585,11 +33108,22 @@ func neoRestoredPendingTools(messages []neoMessage, agentMode, reasoningEffort s
 			}
 			selectedRuns[toolCallID] = run
 			selectedTerminal[toolCallID] = terminal
+			if userInput, ok := normalizeNeoProtocolToolResultUserInput(block["userInput"]); ok {
+				selectedApprovalInputs[toolCallID] = userInput
+			} else {
+				delete(selectedApprovalInputs, toolCallID)
+			}
 		}
 	}
 	for toolCallID, run := range selectedRuns {
 		if selectedTerminal[toolCallID] || neoToolResultIsStickyStop(stringValue(run["status"]), stringValue(run["reason"])) {
 			delete(pending, toolCallID)
+			continue
+		}
+		if userInput := selectedApprovalInputs[toolCallID]; len(userInput) > 0 {
+			tool := pending[toolCallID]
+			tool.ApprovalInput = cloneMap(userInput)
+			pending[toolCallID] = tool
 		}
 	}
 	return pending
@@ -33141,22 +33675,11 @@ func (a *neoActor) storeMessageEventLocked(message neoMessage) (neoMessage, map[
 }
 
 func (a *neoActor) toolResultRunLocked(toolCallID string) (map[string]any, any) {
-	for _, message := range a.messages {
-		if message.Role != "user" {
-			continue
-		}
-		for _, raw := range message.Content {
-			block := mapValue(raw)
-			if stringValue(block["type"]) != "tool_result" {
-				continue
-			}
-			if firstNonEmptyString(block["toolUseID"], block["tool_use_id"], block["toolCallId"]) != toolCallID {
-				continue
-			}
-			return cloneMap(mapValue(block["run"])), block["userInput"]
-		}
+	result, ok := a.storedToolResultLocked(toolCallID)
+	if !ok {
+		return nil, nil
 	}
-	return nil, nil
+	return cloneMap(result.Run), result.UserInput
 }
 
 func normalizeNeoActivatedSkills(raw any) []neoActivatedSkill {
@@ -35341,6 +35864,7 @@ type neoPendingTool struct {
 	MessageID        string
 	ParentToolCallID string
 	ClientAPIKey     string
+	ApprovalInput    map[string]any
 }
 
 type neoHistoryMessage struct {
@@ -35568,6 +36092,7 @@ type neoInferenceRequest struct {
 	ResponseMimeType              string
 	ResponseJSONSchema            map[string]any
 	DisableParallelToolCalls      bool
+	DisableToolCalls              bool
 	TextToolBridgeRequireToolCall bool
 	// ModelRouteOverride forces a specific model/provider regardless of
 	// AgentMode. Used by local subagent runs (finder/oracle/librarian).
@@ -40585,14 +41110,14 @@ func neoOperationalFinalPromptBlocks(request neoInferenceRequest) []string {
 		if mode == "puck" || mode == neoPromptFamilyAggMan {
 			blocks = append(blocks, neoThreadMessageWorkflowGuidance("thread_interact with action: \"message\" and"))
 		} else {
-			blocks = append(blocks, "thread_interact with action: \"message\" is only for a different target thread. Never use that action with the current thread ID. "+neoAmpReviewOperationalGuidance())
+			blocks = append(blocks, "thread_interact with action: \"message\" is only for a different target thread. Never use that action with the current thread ID. "+neoAmpReviewTimeoutGuidance+" "+neoAmpReviewOperationalGuidance())
 		}
 	} else if neoRequestHasTool(request, "send_message_to_thread") {
 		mode := strings.ToLower(strings.TrimSpace(request.AgentMode))
 		if mode == "agg-man" || mode == "puck" || mode == neoPromptFamilyAggMan {
 			blocks = append(blocks, neoThreadMessageWorkflowGuidance("send_message_to_thread with"))
 		} else {
-			blocks = append(blocks, "send_message_to_thread is only for a different target thread. Never call it with the current thread ID. "+neoAmpReviewOperationalGuidance())
+			blocks = append(blocks, "send_message_to_thread is only for a different target thread. Never call it with the current thread ID. "+neoAmpReviewTimeoutGuidance+" "+neoAmpReviewOperationalGuidance())
 		}
 	}
 	if boolValue(request.Environment["isLocalClientActorThread"]) || boolValue(request.Settings["isLocalClientActorThread"]) {
@@ -40600,6 +41125,8 @@ func neoOperationalFinalPromptBlocks(request neoInferenceRequest) []string {
 	}
 	return blocks
 }
+
+const neoAmpReviewTimeoutGuidance = "For `amp review`, `timeout_ms` is a hard wall-clock deadline. Because reviews may run multiple substantial checks concurrently and take longer than ordinary commands, prefer omitting `timeout_ms`; if the execution environment requires a deadline, allow at least 20 minutes."
 
 func neoAmpReviewOperationalGuidance() string {
 	return "When the user asks to run Amp review for the current thread or workspace and shell_command is available, use shell_command instead of starting a message workflow. For ordinary ad hoc reviews, run Amp review without `--json`. Add `--json` only when the user explicitly requests JSON or machine-readable output, explicitly requests low-severity findings, explicitly asks to debug Amp review's output schema, or when running the one mandatory exact-final-diff shipping review required by the `shipping-prs` skill after shipping is authorized. Describing a review as full, thorough, complete, an audit, everything, or a shipping review does not by itself make it that mandatory shipping gate. Run the mandatory gate with `--json` once per required review scope so legitimate low-severity findings are available for triage, and preserve their reported severity rather than promoting them for visibility. When the complete diff fits in one review, use one invocation and do not duplicate it with a human-readable run. Whenever `--json` is used, summarize the structured output instead of pasting raw JSON. For a review scoped to specific files, pass `--files` and omit `--check-scope`; current Amp uses `--files` to discover checks for those paths. Use `--check-scope .` only when no `--files` scope is supplied. Never combine `--files` and `--check-scope`. After the command completes, report its important results in the response: findings first, ordered by severity with file and line references, followed by check failures and residual risks or testing gaps. If the review reports no findings, say so explicitly. If ordinary human-readable output displays no findings but its check footer reports issues, say that Amp's default output had no findings and report each affected check's count as low-severity findings that Amp omitted. Do not ask whether to inspect them, and do not independently recover or rerun them. Command output, raw JSON, an exit status, or temporary-file statistics alone do not count as reporting the review result. Divide an oversized review into coherent `--files` scopes when the complete diff exceeds the review command's supported size."
@@ -41559,6 +42086,9 @@ func openAIResponsesNeoBody(request neoInferenceRequest, route neoModelRoute, st
 		"prompt_cache_key":    request.ThreadID,
 		"parallel_tool_calls": !request.DisableParallelToolCalls,
 		"tools":               openAIResponsesNeoTools(request.Tools),
+	}
+	if request.DisableToolCalls {
+		body["tool_choice"] = "none"
 	}
 	if stream {
 		body["stream_options"] = map[string]any{"include_obfuscation": false}

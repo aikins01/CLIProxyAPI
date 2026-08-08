@@ -3,6 +3,8 @@ package amp
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -20,6 +22,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers/claude"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers/gemini"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers/openai"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -51,6 +54,111 @@ func getClientAPIKeyFromContext(ctx context.Context) string {
 	if val := ctx.Value(clientAPIKeyContextKey{}); val != nil {
 		if keyStr, ok := val.(string); ok {
 			return keyStr
+		}
+	}
+	return ""
+}
+
+func (m *AmpModule) codexWebsocketsExperimentEnabled() bool {
+	if m == nil {
+		return false
+	}
+	m.configMu.RLock()
+	defer m.configMu.RUnlock()
+	return m.lastConfig != nil && m.lastConfig.CodexWebsocketsExperiment
+}
+
+func (m *AmpModule) codexWebsocketsExperimentMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if !m.codexWebsocketsExperimentEnabled() || c.Request == nil {
+			c.Next()
+			return
+		}
+
+		ctx := cliproxyexecutor.WithDownstreamWebsocket(c.Request.Context())
+		if sessionID := ampCodexWebsocketSessionID(c.Request); sessionID != "" {
+			ctx = handlers.WithExecutionSessionID(ctx, sessionID)
+		}
+		c.Request = c.Request.WithContext(ctx)
+		c.Next()
+	}
+}
+
+func ampCodexWebsocketSessionID(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	threadID := strings.TrimSpace(r.Header.Get("X-Amp-Thread-Id"))
+	if threadID == "" {
+		threadID = strings.TrimSpace(r.Header.Get("X-Session-ID"))
+	}
+	if threadID == "" {
+		return ""
+	}
+
+	model := ampProviderRequestModel(r)
+	if model == "" {
+		return ""
+	}
+
+	hash := sha256.New()
+	_, _ = io.WriteString(hash, strings.TrimSpace(getClientAPIKeyFromContext(r.Context())))
+	_, _ = hash.Write([]byte{0})
+	_, _ = io.WriteString(hash, threadID)
+	_, _ = hash.Write([]byte{0})
+	_, _ = io.WriteString(hash, model)
+	_, _ = hash.Write([]byte{0})
+	_, _ = io.WriteString(hash, strings.TrimSpace(r.Header.Get("x-amp-feature")))
+	return "amp-codex-ws:" + hex.EncodeToString(hash.Sum(nil))
+}
+
+const ampProviderRequestModelPrefixLimit = 1 << 20
+
+func ampProviderRequestModel(r *http.Request) string {
+	if r == nil || r.Body == nil {
+		return ""
+	}
+	prefix, errRead := io.ReadAll(io.LimitReader(r.Body, ampProviderRequestModelPrefixLimit))
+	if len(prefix) > 0 {
+		r.Body = struct {
+			io.Reader
+			io.Closer
+		}{Reader: io.MultiReader(bytes.NewReader(prefix), r.Body), Closer: r.Body}
+	}
+	if errRead != nil || len(prefix) == 0 {
+		return ""
+	}
+	return ampResponsesModelFromPrefix(prefix)
+}
+
+func ampResponsesModelFromPrefix(prefix []byte) string {
+	decoder := json.NewDecoder(bytes.NewReader(prefix))
+	token, err := decoder.Token()
+	if err != nil {
+		return ""
+	}
+	if delim, ok := token.(json.Delim); !ok || delim != '{' {
+		return ""
+	}
+	for decoder.More() {
+		keyToken, errKey := decoder.Token()
+		if errKey != nil {
+			return ""
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return ""
+		}
+		if key == "model" {
+			var model string
+			if errDecode := decoder.Decode(&model); errDecode != nil {
+				return ""
+			}
+			return strings.TrimSpace(model)
+		}
+		var skipped any
+		if errSkip := decoder.Decode(&skipped); errSkip != nil {
+			return ""
 		}
 	}
 	return ""
@@ -1008,7 +1116,7 @@ func (m *AmpModule) registerProviderAliases(engine *gin.Engine, baseHandler *han
 	provider.GET("/models", ampModelsHandler) // Models endpoint doesn't need fallback (no body to check)
 	provider.POST("/chat/completions", fallbackHandler.WrapHandler(openaiHandlers.ChatCompletions))
 	provider.POST("/completions", fallbackHandler.WrapHandler(openaiHandlers.Completions))
-	provider.POST("/responses", fallbackHandler.WrapHandler(openaiResponsesHandlers.Responses))
+	provider.POST("/responses", m.codexWebsocketsExperimentMiddleware(), fallbackHandler.WrapHandler(openaiResponsesHandlers.Responses))
 	provider.POST("/responses/compact", fallbackHandler.WrapHandler(openaiResponsesHandlers.Compact))
 	provider.POST("/images/generations", fallbackHandler.WrapHandler(openaiHandlers.ImagesGenerations))
 	provider.POST("/images/edits", fallbackHandler.WrapHandler(openaiHandlers.ImagesEdits))
@@ -1021,7 +1129,7 @@ func (m *AmpModule) registerProviderAliases(engine *gin.Engine, baseHandler *han
 		// OpenAI-compatible endpoints with fallback
 		v1Amp.POST("/chat/completions", fallbackHandler.WrapHandler(openaiHandlers.ChatCompletions))
 		v1Amp.POST("/completions", fallbackHandler.WrapHandler(openaiHandlers.Completions))
-		v1Amp.POST("/responses", fallbackHandler.WrapHandler(openaiResponsesHandlers.Responses))
+		v1Amp.POST("/responses", m.codexWebsocketsExperimentMiddleware(), fallbackHandler.WrapHandler(openaiResponsesHandlers.Responses))
 		v1Amp.POST("/responses/compact", fallbackHandler.WrapHandler(openaiResponsesHandlers.Compact))
 		v1Amp.POST("/images/generations", fallbackHandler.WrapHandler(openaiHandlers.ImagesGenerations))
 		v1Amp.POST("/images/edits", fallbackHandler.WrapHandler(openaiHandlers.ImagesEdits))

@@ -53,3 +53,23 @@ func TestGetContextWithCancelPreservesLocalNeoTrust(t *testing.T) {
 		t.Fatal("executor context did not preserve trusted local Neo state")
 	}
 }
+
+func TestGetContextWithCancelPreservesWebsocketExecutionSession(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	requestCtx := coreexecutor.WithDownstreamWebsocket(c.Request.Context())
+	requestCtx = WithExecutionSessionID(requestCtx, "session-1")
+	c.Request = c.Request.WithContext(requestCtx)
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, nil)
+
+	executorCtx, cancel := handler.GetContextWithCancel(nil, c, context.Background())
+	defer cancel()
+	if !coreexecutor.DownstreamWebsocket(executorCtx) {
+		t.Fatal("executor context did not preserve downstream websocket state")
+	}
+	meta := requestExecutionMetadata(executorCtx)
+	if got := meta[coreexecutor.ExecutionSessionMetadataKey]; got != "session-1" {
+		t.Fatalf("ExecutionSessionMetadataKey = %v, want session-1", got)
+	}
+}

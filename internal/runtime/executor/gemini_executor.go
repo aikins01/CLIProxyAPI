@@ -87,7 +87,11 @@ func (e *GeminiExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Aut
 		return nil, err
 	}
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
-	return httpClient.Do(httpReq)
+	httpResp, err := httpClient.Do(httpReq)
+	if err != nil {
+		return nil, helps.NewAuthStateNeutralError(err)
+	}
+	return httpResp, nil
 }
 
 // Execute performs a non-streaming request to the Gemini API.
@@ -183,7 +187,7 @@ func (e *GeminiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		return resp, err
+		return resp, helps.NewAuthStateNeutralError(err)
 	}
 	defer func() {
 		if errClose := httpResp.Body.Close(); errClose != nil {
@@ -192,16 +196,20 @@ func (e *GeminiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	}()
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		b, _ := io.ReadAll(httpResp.Body)
+		b, errRead := io.ReadAll(httpResp.Body)
+		if errRead != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, errRead)
+			return resp, helps.NewAuthStateNeutralError(errRead)
+		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
+		err = newGoogleStatusErr(httpResp.StatusCode, b)
 		return resp, err
 	}
 	data, err := io.ReadAll(httpResp.Body)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		return resp, err
+		return resp, helps.NewAuthStateNeutralError(err)
 	}
 	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 	reporter.Publish(ctx, helps.ParseGeminiUsage(data))
@@ -287,17 +295,21 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		return nil, err
+		return nil, helps.NewAuthStateNeutralError(err)
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		b, _ := io.ReadAll(httpResp.Body)
-		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
-		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
+		b, errRead := io.ReadAll(httpResp.Body)
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("gemini executor: close response body error: %v", errClose)
 		}
-		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
+		if errRead != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, errRead)
+			return nil, helps.NewAuthStateNeutralError(errRead)
+		}
+		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
+		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
+		err = newGoogleStatusErr(httpResp.StatusCode, b)
 		return nil, err
 	}
 	out := make(chan cliproxyexecutor.StreamChunk)
@@ -331,20 +343,22 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				}
 			}
 		}
-		lines := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, body, []byte("[DONE]"), &param)
-		for i := range lines {
-			select {
-			case out <- cliproxyexecutor.StreamChunk{Payload: lines[i]}:
-			case <-ctx.Done():
-				return
-			}
-		}
 		if errScan := scanner.Err(); errScan != nil {
+			errScan = helps.NewAuthStateNeutralError(errScan)
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
 			reporter.PublishFailure(ctx, errScan)
 			select {
 			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
 			case <-ctx.Done():
+			}
+		} else {
+			lines := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, body, []byte("[DONE]"), &param)
+			for i := range lines {
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Payload: lines[i]}:
+				case <-ctx.Done():
+					return
+				}
 			}
 		}
 	}()
@@ -411,7 +425,7 @@ func (e *GeminiExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	resp, err := httpClient.Do(httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		return cliproxyexecutor.Response{}, err
+		return cliproxyexecutor.Response{}, helps.NewAuthStateNeutralError(err)
 	}
 	defer func() {
 		if errClose := resp.Body.Close(); errClose != nil {
@@ -423,12 +437,12 @@ func (e *GeminiExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		return cliproxyexecutor.Response{}, err
+		return cliproxyexecutor.Response{}, helps.NewAuthStateNeutralError(err)
 	}
 	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", resp.StatusCode, helps.SummarizeErrorBody(resp.Header.Get("Content-Type"), data))
-		return cliproxyexecutor.Response{}, statusErr{code: resp.StatusCode, msg: string(data)}
+		return cliproxyexecutor.Response{}, newGoogleStatusErr(resp.StatusCode, data)
 	}
 
 	count := gjson.GetBytes(data, "totalTokens").Int()

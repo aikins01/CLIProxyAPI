@@ -35,6 +35,19 @@ type StreamEvent struct {
 	Err     error
 }
 
+type statusError struct {
+	message string
+	status  int
+}
+
+func (e statusError) Error() string {
+	return fmt.Sprintf("%s (status=%d)", e.message, e.status)
+}
+
+func (e statusError) StatusCode() int {
+	return e.status
+}
+
 // NonStream executes a non-streaming HTTP request using the websocket provider.
 func (m *Manager) NonStream(ctx context.Context, provider string, req *HTTPRequest) (*HTTPResponse, error) {
 	if req == nil {
@@ -56,15 +69,6 @@ func (m *Manager) NonStream(ctx context.Context, provider string, req *HTTPReque
 			return nil, ctx.Err()
 		case msg, ok := <-respCh:
 			if !ok {
-				if streamMode {
-					if streamResp == nil {
-						streamResp = &HTTPResponse{Status: http.StatusOK, Headers: make(http.Header)}
-					} else if streamResp.Headers == nil {
-						streamResp.Headers = make(http.Header)
-					}
-					streamResp.Body = append(streamResp.Body[:0], streamBody.Bytes()...)
-					return streamResp, nil
-				}
 				return nil, errors.New("wsrelay: connection closed during response")
 			}
 			switch msg.Type {
@@ -244,5 +248,5 @@ func decodeError(payload map[string]any) error {
 	if message == "" {
 		message = "wsrelay: upstream error"
 	}
-	return fmt.Errorf("%s (status=%d)", message, status)
+	return statusError{message: message, status: status}
 }

@@ -237,6 +237,8 @@ func (m *AmpModule) serveWebLocalInferenceUserscript(c *gin.Context) {
 		return
 	}
 	c.Header("Content-Type", "application/javascript; charset=utf-8")
+	c.Header("Cache-Control", "no-store, max-age=0")
+	c.Header("Pragma", "no-cache")
 	defaultBaseURL := strings.TrimSpace(settings.BaseURL)
 	if defaultBaseURL == "" {
 		defaultBaseURL = ampWebLocalInferenceDefaultBaseURL
@@ -502,7 +504,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	return fmt.Sprintf(`// ==UserScript==
 // @name CLIProxyAPI Amp Local Inference
 // @namespace https://github.com/router-for-me/CLIProxyAPI
-// @version 0.1.195
+// @version 0.1.200
 %s
 // @updateURL %s
 // @downloadURL %s
@@ -514,8 +516,12 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	"use strict";
 
 	const bridgeHeader = %s;
-	const userscriptVersion = "0.1.195";
+	const userscriptVersion = "0.1.200";
 	const apiKeyStorageKey = "cliproxyapi.ampLocalInference.apiKey";
+	const scopedAPIKeyStorageKeyPrefix = apiKeyStorageKey + ".user.";
+	const authenticatedAmpUserIDStorageKey = apiKeyStorageKey + ".authenticatedAmpUserID";
+	const promptedAPIKeyStorageKeyPrefix = "cliproxyapi.ampLocalInference.promptedAPIKey.user.";
+	const promptedProjectsAPIKeyStorageKeyPrefix = "cliproxyapi.ampLocalInference.promptedProjectsAPIKey.user.";
 	const workingDirectoryStorageKey = "cliproxyapi.ampLocalInference.workingDirectory";
 	const selectedLocalProjectStorageKey = "cliproxyapi.ampLocalInference.selectedLocalProject";
 	const localThreadIDsStorageKey = "cliproxyapi.ampLocalInference.localThreadIDs";
@@ -556,6 +562,9 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	const localPinnedOverrides = new Map();
 	let authenticatedAmpUserID = "";
 	let authenticatedAmpUser = {};
+	let pendingLocalAPIKey = "";
+	let pendingLocalAPIKeyRememberConsent = false;
+	const pendingLocalAPIKeyPromptSuppressions = new Set();
 	let localThreadViewRedirectTarget = "";
 	const diagnostics = {
 		authenticatedAmpUserIDCaptureCount: 0,
@@ -655,11 +664,12 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	let localProjectListDecorationPending = false;
 	let localProjectPageGeneration = 0;
 	let localSidebarDOMRefreshPending = false;
+	let localSidebarDOMRefreshRequested = false;
 	const localSidebarProjectRegroupPendingThreadIDs = new Set();
 	const localSidebarProjectRegroupStableSince = new Map();
 	let localSidebarProjectRegroupStableTimer;
 	let localSidebarHydrationRevealScheduled = false;
-	let localSidebarHydrationFetchStarted = false;
+	let localSidebarPassiveHydrationScope = "";
 	let localSidebarHydrationProjectsReady = false;
 	let localSidebarHydrationRefreshRequested = false;
 	let localSidebarHydrationExpectedThreadIDs = new Set();
@@ -715,7 +725,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	}
 
 	function startLocalSidebarHydration() {
-		if (localSidebarHydrationFetchStarted || !globalThis.document?.documentElement?.hasAttribute?.(localSidebarHydrationAttribute)) {
+		if (!globalThis.document?.documentElement?.hasAttribute?.(localSidebarHydrationAttribute)) {
 			return;
 		}
 		captureAuthenticatedAmpUserFromBootstrap();
@@ -723,22 +733,53 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			revealLocalSidebarHydration();
 			return;
 		}
-		localSidebarHydrationFetchStarted = true;
+		startPassiveLocalSidebarHydration();
+	}
+
+	function startPassiveLocalSidebarHydration() {
+		const scope = localAPIKeyScopeSuffix();
+		if (!scope || scope === localSidebarPassiveHydrationScope || !storedLocalAPIKey()) {
+			return;
+		}
+		localSidebarPassiveHydrationScope = scope;
+		renderLocalSidebarMetadata();
+		requestLocalSidebarHydrationRefresh();
+		const failureCount = diagnostics.localProjectFetchFailureCount;
 		fetchLocalProjects(false).then(() => {
+			if (globalThis.__cliproxyAmpLocalInference?.diagnostics !== diagnostics || localAPIKeyScopeSuffix() !== scope) {
+				return;
+			}
+			if (diagnostics.localProjectFetchFailureCount !== failureCount) {
+				localSidebarPassiveHydrationScope = "";
+				revealLocalSidebarHydration();
+				return;
+			}
+			renderLocalSidebarMetadata();
+			requestLocalSidebarProjectRegroup();
+			integrateLocalProjectActivators(globalThis.document);
+			integrateLocalProjectPickers(globalThis.document);
+			scheduleLocalProjectListDecoration();
 			if ((localProjectsCache.threads || []).length === 0 && archivedLocalSidebarThreadIDs.size === 0) {
 				revealLocalSidebarHydration();
 				return;
 			}
 			localSidebarHydrationProjectsReady = true;
 			requestLocalSidebarHydrationRefresh();
-		}, revealLocalSidebarHydration);
+		}, () => {
+			if (globalThis.__cliproxyAmpLocalInference?.diagnostics !== diagnostics || localAPIKeyScopeSuffix() !== scope) {
+				return;
+			}
+			localSidebarPassiveHydrationScope = "";
+			revealLocalSidebarHydration();
+		});
 	}
 
 	function requestLocalSidebarHydrationRefresh() {
 		const rows = globalThis.document?.querySelectorAll?.("[data-sidebar-thread-id]") || [];
-		if (!localSidebarHydrationProjectsReady || localSidebarHydrationRefreshRequested || rows.length === 0) {
+		if (localSidebarHydrationRefreshRequested || rows.length === 0) {
 			return;
 		}
+		renderLocalSidebarMetadata();
 		localSidebarHydrationExpectedThreadIDs = new Set();
 		for (const row of rows) {
 			const threadID = firstString(row?.dataset?.sidebarThreadId, row?.getAttribute?.("data-sidebar-thread-id"));
@@ -746,11 +787,12 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 				localSidebarHydrationExpectedThreadIDs.add(threadID);
 			}
 		}
-		for (const thread of localProjectsCache.threads || []) {
-			const threadID = firstString(thread?.id, thread?.threadId, thread?.threadID);
-			if (validThreadID(threadID)) {
-				localSidebarHydrationExpectedThreadIDs.add(threadID);
-			}
+		if (!localSidebarHydrationProjectsReady && localSidebarPassiveHydrationScope && localSidebarUntitledThreadIDs().length === 0) {
+			scheduleLocalSidebarHydrationReveal();
+			return;
+		}
+		if (!localSidebarHydrationProjectsReady) {
+			return;
 		}
 		localSidebarHydrationRefreshRequested = true;
 		const refresh = () => {
@@ -799,9 +841,9 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		check();
 	}
 
-	function storedLocalSidebarTitles() {
+	function storedLocalSidebarTitles(storageKey = sidebarTitlesStorageKey) {
 		try {
-			const parsed = originalJSONParse(globalThis.localStorage.getItem(sidebarTitlesStorageKey) || "{}");
+			const parsed = originalJSONParse(globalThis.localStorage.getItem(storageKey) || "{}");
 			if (!isPlainObject(parsed)) {
 				return {};
 			}
@@ -822,13 +864,18 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	}
 
 	function activateLocalSidebarTitleOwner(userID) {
-		const nextStorageKey = sidebarTitlesStorageKeyPrefix + "." + encodeURIComponent(firstString(userID) || "anonymous");
+		userID = firstString(userID);
+		const nextStorageKey = userID ? sidebarTitlesStorageKeyPrefix + "." + localAPIKeyScopeSuffixForUser(userID) : sidebarTitlesStorageKeyPrefix + ".anonymous";
 		if (nextStorageKey === sidebarTitlesStorageKey) {
 			return;
 		}
 		sidebarTitlesStorageKey = nextStorageKey;
 		localSidebarTitleCache = storedLocalSidebarTitles();
+		localSidebarPassiveHydrationScope = "";
+		localProjectsCacheGeneration += 1;
 		resetLocalProjectsCache();
+		archivedLocalSidebarThreadIDs = new Set();
+		localProjectsArchiveStateLoaded = false;
 		if (isPlainObject(globalThis.__cliproxyAmpLocalInference)) {
 			globalThis.__cliproxyAmpLocalInference.sidebarTitlesStorageKey = sidebarTitlesStorageKey;
 		}
@@ -886,10 +933,153 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		return localBaseURL().href.replace(/\/+$/, "");
 	}
 
+	function localAPIKeyScopeSuffixForUser(userID) {
+		userID = firstString(userID);
+		if (!userID) {
+			return "";
+		}
+		return encodeURIComponent(userID) + "." + encodeURIComponent(localBaseURLString());
+	}
+
+	function localAPIKeyScopeSuffix() {
+		return localAPIKeyScopeSuffixForUser(authenticatedAmpUserID);
+	}
+
+	function sessionLocalAPIKeyStorageKey() {
+		const scope = localAPIKeyScopeSuffix();
+		return scope ? scopedAPIKeyStorageKeyPrefix + scope : "";
+	}
+
+	function persistentLocalAPIKeyStorageKey() {
+		const scope = localAPIKeyScopeSuffix();
+		return scope ? scopedAPIKeyStorageKeyPrefix + scope : "";
+	}
+
+	function localAPIKeyPromptStorageKey(kind) {
+		const scope = localAPIKeyScopeSuffix();
+		if (!scope) {
+			return "";
+		}
+		return (kind === "projects" ? promptedProjectsAPIKeyStorageKeyPrefix : promptedAPIKeyStorageKeyPrefix) + scope;
+	}
+
+	function localAPIKeyPromptSuppressed(kind) {
+		const storageKey = localAPIKeyPromptStorageKey(kind);
+		return storageKey ? globalThis.sessionStorage.getItem(storageKey) === "1" : pendingLocalAPIKeyPromptSuppressions.has(kind);
+	}
+
+	function suppressLocalAPIKeyPrompt(kind) {
+		const storageKey = localAPIKeyPromptStorageKey(kind);
+		if (storageKey) {
+			globalThis.sessionStorage.setItem(storageKey, "1");
+			return;
+		}
+		pendingLocalAPIKeyPromptSuppressions.add(kind);
+	}
+
+	function clearLocalAPIKeyPromptSuppression(kind) {
+		pendingLocalAPIKeyPromptSuppressions.delete(kind);
+		const storageKey = localAPIKeyPromptStorageKey(kind);
+		if (storageKey) {
+			globalThis.sessionStorage.removeItem(storageKey);
+		}
+	}
+
+	function promotePendingLocalAPIKey() {
+		const sessionStorageKey = sessionLocalAPIKeyStorageKey();
+		const persistentStorageKey = persistentLocalAPIKeyStorageKey();
+		if (!sessionStorageKey || !persistentStorageKey) {
+			return;
+		}
+		const legacySessionAPIKey = globalThis.sessionStorage.getItem(apiKeyStorageKey) || "";
+		const legacyPersistentAPIKey = globalThis.localStorage.getItem(apiKeyStorageKey) || "";
+		if (pendingLocalAPIKey) {
+			globalThis.sessionStorage.setItem(sessionStorageKey, pendingLocalAPIKey);
+			if (pendingLocalAPIKeyRememberConsent) {
+				globalThis.localStorage.setItem(persistentStorageKey, pendingLocalAPIKey);
+			} else {
+				globalThis.localStorage.removeItem(persistentStorageKey);
+			}
+			pendingLocalAPIKey = "";
+			pendingLocalAPIKeyRememberConsent = false;
+		} else if ((legacySessionAPIKey || legacyPersistentAPIKey) && !globalThis.sessionStorage.getItem(sessionStorageKey) && !globalThis.localStorage.getItem(persistentStorageKey)) {
+			globalThis.sessionStorage.setItem(sessionStorageKey, legacySessionAPIKey || legacyPersistentAPIKey);
+			if (legacyPersistentAPIKey) {
+				globalThis.localStorage.setItem(persistentStorageKey, legacyPersistentAPIKey);
+			}
+		}
+		globalThis.sessionStorage.removeItem(apiKeyStorageKey);
+		globalThis.localStorage.removeItem(apiKeyStorageKey);
+		for (const kind of pendingLocalAPIKeyPromptSuppressions) {
+			const storageKey = localAPIKeyPromptStorageKey(kind);
+			if (storageKey) {
+				globalThis.sessionStorage.setItem(storageKey, "1");
+			}
+		}
+		pendingLocalAPIKeyPromptSuppressions.clear();
+	}
+
+	function localAPIKeyAwaitingIdentity() {
+		if (authenticatedAmpUserID) {
+			return false;
+		}
+		const hintedUserID = firstString(globalThis.sessionStorage.getItem(authenticatedAmpUserIDStorageKey));
+		const hintedScope = localAPIKeyScopeSuffixForUser(hintedUserID);
+		const hintedStorageKey = hintedScope ? scopedAPIKeyStorageKeyPrefix + hintedScope : "";
+		if (hintedStorageKey && (globalThis.sessionStorage.getItem(hintedStorageKey) || globalThis.localStorage.getItem(hintedStorageKey))) {
+			return true;
+		}
+		return !!(globalThis.sessionStorage.getItem(apiKeyStorageKey) || globalThis.localStorage.getItem(apiKeyStorageKey));
+	}
+
 	function storedLocalAPIKey() {
-		return globalThis.sessionStorage.getItem(apiKeyStorageKey) ||
-			globalThis.localStorage.getItem(apiKeyStorageKey) ||
-			"";
+		const sessionStorageKey = sessionLocalAPIKeyStorageKey();
+		const apiKey = sessionStorageKey ? globalThis.sessionStorage.getItem(sessionStorageKey) : pendingLocalAPIKey;
+		if (apiKey) {
+			return apiKey;
+		}
+		const persistentStorageKey = persistentLocalAPIKeyStorageKey();
+		return persistentStorageKey ? globalThis.localStorage.getItem(persistentStorageKey) || "" : "";
+	}
+
+	function rememberLocalAPIKey(apiKey) {
+		const remember = typeof globalThis.confirm === "function" && globalThis.confirm("Remember this API key for this Amp account in this browser? It will be stored in localStorage until you clear it.");
+		const sessionStorageKey = sessionLocalAPIKeyStorageKey();
+		const persistentStorageKey = persistentLocalAPIKeyStorageKey();
+		if (!sessionStorageKey || !persistentStorageKey) {
+			pendingLocalAPIKey = apiKey;
+			pendingLocalAPIKeyRememberConsent = remember;
+			return;
+		}
+		globalThis.sessionStorage.setItem(sessionStorageKey, apiKey);
+		globalThis.localStorage.removeItem(apiKeyStorageKey);
+		if (remember) {
+			globalThis.localStorage.setItem(persistentStorageKey, apiKey);
+		} else {
+			globalThis.localStorage.removeItem(persistentStorageKey);
+		}
+		localSidebarPassiveHydrationScope = "";
+		localProjectsCacheGeneration += 1;
+		resetLocalProjectsCache();
+		globalThis.setTimeout(startPassiveLocalSidebarHydration, 0);
+	}
+
+	function forgetLocalAPIKey() {
+		pendingLocalAPIKey = "";
+		pendingLocalAPIKeyRememberConsent = false;
+		globalThis.sessionStorage.removeItem(apiKeyStorageKey);
+		globalThis.localStorage.removeItem(apiKeyStorageKey);
+		const sessionStorageKey = sessionLocalAPIKeyStorageKey();
+		if (sessionStorageKey) {
+			globalThis.sessionStorage.removeItem(sessionStorageKey);
+		}
+		const persistentStorageKey = persistentLocalAPIKeyStorageKey();
+		if (persistentStorageKey) {
+			globalThis.localStorage.removeItem(persistentStorageKey);
+		}
+		localSidebarPassiveHydrationScope = "";
+		localProjectsCacheGeneration += 1;
+		resetLocalProjectsCache();
 	}
 
 	function localAPIKey(rememberCancel = true) {
@@ -897,16 +1087,20 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		if (apiKey) {
 			return apiKey;
 		}
-		const promptedKey = "cliproxyapi.ampLocalInference.promptedAPIKey";
-		if (rememberCancel && globalThis.sessionStorage.getItem(promptedKey) === "1") {
+		if (localAPIKeyAwaitingIdentity()) {
+			return "";
+		}
+		if (rememberCancel && localAPIKeyPromptSuppressed("api")) {
 			return "";
 		}
 		if (rememberCancel) {
-			globalThis.sessionStorage.setItem(promptedKey, "1");
+			suppressLocalAPIKeyPrompt("api");
 		}
 		const promptedAPIKey = (globalThis.prompt("CLIProxyAPI API key") || "").trim();
 		if (promptedAPIKey) {
-			globalThis.sessionStorage.setItem(apiKeyStorageKey, promptedAPIKey);
+			rememberLocalAPIKey(promptedAPIKey);
+		} else {
+			forgetLocalAPIKey();
 		}
 		return promptedAPIKey;
 	}
@@ -916,15 +1110,19 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		if (apiKey) {
 			return apiKey;
 		}
-		const promptedKey = "cliproxyapi.ampLocalInference.promptedProjectsAPIKey";
-		if (globalThis.sessionStorage.getItem(promptedKey) === "1") {
+		if (localAPIKeyAwaitingIdentity()) {
 			return "";
 		}
-		globalThis.sessionStorage.setItem(promptedKey, "1");
+		if (localAPIKeyPromptSuppressed("projects")) {
+			return "";
+		}
+		suppressLocalAPIKeyPrompt("projects");
 		const promptedAPIKey = (globalThis.prompt("CLIProxyAPI API key") || "").trim();
 		if (promptedAPIKey) {
-			globalThis.sessionStorage.setItem(apiKeyStorageKey, promptedAPIKey);
-			globalThis.sessionStorage.removeItem(promptedKey);
+			rememberLocalAPIKey(promptedAPIKey);
+			clearLocalAPIKeyPromptSuppression("projects");
+		} else {
+			forgetLocalAPIKey();
 		}
 		return promptedAPIKey;
 	}
@@ -1705,34 +1903,111 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		return "";
 	}
 
+	function bootstrapObjectLiteral(source, start) {
+		if (source[start] !== "{") {
+			return "";
+		}
+		let depth = 0;
+		let quote = "";
+		let escaped = false;
+		for (let i = start; i < source.length; i += 1) {
+			const character = source[i];
+			if (quote) {
+				if (escaped) {
+					escaped = false;
+				} else if (character === "\\") {
+					escaped = true;
+				} else if (character === quote) {
+					quote = "";
+				}
+				continue;
+			}
+			if (character === '"' || character === "'" || character.charCodeAt(0) === 96) {
+				quote = character;
+				continue;
+			}
+			if (character === "{") {
+				depth += 1;
+			} else if (character === "}" && --depth === 0) {
+				return source.slice(start, i + 1);
+			}
+		}
+		return "";
+	}
+
+	function bootstrapObjectLiteralProfile(source) {
+		const userPattern = /(?:^|[,{])\s*["']?user["']?\s*:\s*\{/g;
+		let matchedProfile = null;
+		for (const match of source.matchAll(userPattern)) {
+			const objectStart = match.index + match[0].lastIndexOf("{");
+			const objectSource = bootstrapObjectLiteral(source, objectStart);
+			if (!objectSource) {
+				continue;
+			}
+			const profile = {};
+			for (const field of ["id", "username", "firstName", "lastName", "email", "profilePictureUrl"]) {
+				const propertyMatch = objectSource.match(new RegExp("(?:^|[,{])\\s*[\"']?" + field + "[\"']?\\s*:\\s*(\\\"(?:\\\\.|[^\\\"\\\\])*\\\")"));
+				if (!propertyMatch) {
+					continue;
+				}
+				try {
+					profile[field] = firstString(originalJSONParse(propertyMatch[1]));
+				} catch {
+				}
+			}
+			const normalizedProfile = ampUserProfile(profile);
+			if (!normalizedProfile || !firstString(normalizedProfile.username, normalizedProfile.email, normalizedProfile.profilePictureUrl)) {
+				continue;
+			}
+			if (matchedProfile && matchedProfile.id !== normalizedProfile.id) {
+				return null;
+			}
+			matchedProfile = normalizedProfile;
+		}
+		return matchedProfile;
+	}
+
 	function captureAuthenticatedAmpUserFromBootstrap() {
 		if (authenticatedAmpUserID) {
 			return authenticatedAmpUserID;
 		}
 		for (const script of globalThis.document?.querySelectorAll?.("script:not([src])") || []) {
 			const source = typeof script?.textContent === "string" ? script.textContent : "";
-			if (!source.includes("initialProjects:") || !source.includes("userFeatures:")) {
+			if (!/(?:^|[,{])\s*["']?initialProjects["']?\s*:/.test(source) || !/(?:^|[,{])\s*["']?userFeatures["']?\s*:/.test(source)) {
 				continue;
 			}
 			const functionMatch = source.match(/\.data\s*=\s*\(function\(([$A-Z_a-z][$\w]*)\)\{/);
-			if (!functionMatch) {
-				continue;
-			}
-			const returnIndex = source.indexOf("return", functionMatch.index);
-			if (returnIndex < 0) {
-				continue;
-			}
-			const prefix = source.slice(functionMatch.index, returnIndex);
-			const objectPrefix = functionMatch[1] + ".";
-			const profile = {};
-			for (const field of ["id", "username", "firstName", "lastName", "profilePictureUrl"]) {
-				const value = bootstrapAssignedJSONString(prefix, objectPrefix + field + "=");
-				if (value) {
-					profile[field] = value;
+			if (functionMatch) {
+				const returnIndex = source.indexOf("return", functionMatch.index);
+				if (returnIndex >= 0) {
+					const prefix = source.slice(functionMatch.index, returnIndex);
+					const objectPrefix = functionMatch[1] + ".";
+					const profile = {};
+					for (const field of ["id", "username", "firstName", "lastName", "profilePictureUrl"]) {
+						const value = bootstrapAssignedJSONString(prefix, objectPrefix + field + "=");
+						if (value) {
+							profile[field] = value;
+						}
+					}
+					if (ampUserProfile(profile)) {
+						return rememberAuthenticatedAmpUser(profile);
+					}
 				}
 			}
-			if (ampUserProfile(profile)) {
-				return rememberAuthenticatedAmpUser(profile);
+			const dataMatch = source.match(/\b__sveltekit[$\w]*\.data\s*=\s*\{/);
+			if (dataMatch) {
+				const keyIndexAfter = (key, from) => {
+					const match = source.slice(from).match(new RegExp("(?:^|[,{])\\s*[\"']?" + key + "[\"']?\\s*:"));
+					return match ? from + match.index : -1;
+				};
+				const initialProjectsIndex = keyIndexAfter("initialProjects", dataMatch.index);
+				const userFeaturesIndex = initialProjectsIndex >= 0 ? keyIndexAfter("userFeatures", initialProjectsIndex) : -1;
+				if (initialProjectsIndex > dataMatch.index && userFeaturesIndex > initialProjectsIndex) {
+					const objectLiteralProfile = bootstrapObjectLiteralProfile(source.slice(dataMatch.index, initialProjectsIndex));
+					if (objectLiteralProfile) {
+						return rememberAuthenticatedAmpUser(objectLiteralProfile);
+					}
+				}
 			}
 		}
 		return authenticatedAmpUserID;
@@ -1740,14 +2015,21 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 
 	function rememberAuthenticatedAmpUser(value) {
 		const profile = ampUserProfile(value);
-		if (!profile || (authenticatedAmpUserID && profile.id !== authenticatedAmpUserID)) {
+		if (!profile) {
 			return authenticatedAmpUserID;
 		}
 		const previousProfile = JSON.stringify([authenticatedAmpUserID, authenticatedAmpUser]);
-		if (!authenticatedAmpUserID) {
+		const identityChanged = profile.id !== authenticatedAmpUserID;
+		if (identityChanged) {
 			authenticatedAmpUserID = profile.id;
+			authenticatedAmpUser = {};
 			diagnostics.authenticatedAmpUserIDCaptureCount += 1;
+			try {
+				globalThis.sessionStorage.setItem(authenticatedAmpUserIDStorageKey, authenticatedAmpUserID);
+			} catch {
+			}
 			activateLocalSidebarTitleOwner(authenticatedAmpUserID);
+			promotePendingLocalAPIKey();
 		}
 		authenticatedAmpUser = Object.assign({}, authenticatedAmpUser, Object.fromEntries(
 			Object.entries(profile).filter(([, item]) => typeof item === "string" && item.trim() !== ""),
@@ -1757,6 +2039,9 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			if (globalThis.location.pathname === "/feed") {
 				scheduleLocalActivityRefresh();
 			}
+		}
+		if (identityChanged) {
+			startPassiveLocalSidebarHydration();
 		}
 		return authenticatedAmpUserID;
 	}
@@ -3648,6 +3933,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 				if (validThreadID(threadID) && typeof decoded.archived === "boolean") {
 					if (decoded.archived) {
 						archivedLocalSidebarThreadIDs.add(threadID);
+						localProjectsCache.threads = (localProjectsCache.threads || []).filter((thread) => firstString(thread?.id, thread?.threadId, thread?.threadID) !== threadID);
 					} else {
 						archivedLocalSidebarThreadIDs.delete(threadID);
 					}
@@ -4333,6 +4619,57 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		return validThreadID(threadID) && Array.isArray(localProjectsCache.threads) && localProjectsCache.threads.some((thread) => isPlainObject(thread) && firstString(thread.id, thread.threadId, thread.threadID) === threadID);
 	}
 
+	function localSidebarCachedThreadMetadataComplete(threadID) {
+		if (!validThreadID(threadID)) {
+			return false;
+		}
+		const thread = [localProjectsCache.thread, ...(localProjectsCache.threads || [])].find((candidate) =>
+			isPlainObject(candidate) && firstString(candidate.id, candidate.threadId, candidate.threadID) === threadID
+		);
+		if (!thread) {
+			return false;
+		}
+		let title = firstString(thread.title);
+		if (!title || title.toLowerCase() === "untitled") {
+			title = firstString(localProjectsCache.threadTitles?.[threadID]);
+		}
+		if (!title || title.toLowerCase() === "untitled") {
+			return false;
+		}
+		const meta = isPlainObject(thread.meta) ? thread.meta : {};
+		const project = isPlainObject(thread.project) ? thread.project : {};
+		const projectID = firstString(thread.projectID, thread.projectId, thread.project_id, meta.projectID, meta.projectId, meta.project_id, project.id, project.projectID, project.projectId);
+		const projectAssociation = projectID || firstString(
+			thread.projectName,
+			thread.repositoryURL,
+			thread.repoURL,
+			thread.workingDirectory,
+			thread.workspaceRoot,
+			meta.projectName,
+			meta.repositoryURL,
+			meta.repoURL,
+			meta.workingDirectory,
+			meta.workspaceRoot,
+			project.name,
+			project.repositoryURL,
+			project.repoURL,
+			project.workingDirectory,
+			project.workspaceRoot,
+		);
+		if (!projectAssociation) {
+			return true;
+		}
+		if (projectID && localProjectByID(localProjectsCache.projects, projectID)) {
+			return true;
+		}
+		const groupName = firstString(localSidebarRepositoryGroupName(thread)).toLowerCase();
+		return !!groupName && groupName !== "no project" && groupName !== "~";
+	}
+
+	function localSidebarArchivedThreadID(threadID) {
+		return validThreadID(threadID) && archivedLocalSidebarThreadIDs.has(threadID);
+	}
+
 	function rememberLocalProjectFetchFailure(reason) {
 		diagnostics.localProjectFetchFailureCount += 1;
 		diagnostics.lastLocalProjectFetchFailure = String(reason || "unknown").slice(0, 32);
@@ -4407,13 +4744,13 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		const additionalSidebarThreadIDSet = new Set((Array.isArray(additionalSidebarThreadIDs) ? additionalSidebarThreadIDs : []).filter(validThreadID));
 		const additionalSidebarMetadataMissing = Array.from(additionalSidebarThreadIDSet).some((sidebarThreadID) =>
 			!coveredSidebarTitleIDs.has(sidebarThreadID) &&
-			!localSidebarCachedThreadID(sidebarThreadID) &&
+			!localSidebarCachedThreadMetadataComplete(sidebarThreadID) &&
 			!archivedLocalSidebarThreadIDs.has(sidebarThreadID)
 		);
 		const visibleLocalSidebarMetadataMissing = requestedSidebarTitleIDs.some((sidebarThreadID) =>
 			rememberedLocalThreadID(sidebarThreadID) &&
 			!coveredSidebarTitleIDs.has(sidebarThreadID) &&
-			!localSidebarCachedThreadID(sidebarThreadID) &&
+			!localSidebarCachedThreadMetadataComplete(sidebarThreadID) &&
 			!archivedLocalSidebarThreadIDs.has(sidebarThreadID)
 		);
 		const sidebarMetadataMissing = additionalSidebarThreadIDSet.size > 0 ? additionalSidebarMetadataMissing : visibleLocalSidebarMetadataMissing;
@@ -4453,8 +4790,8 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			}
 			if (localProjectsCache.promise === requestPromise) {
 				localProjectsCache.promise = null;
+				localProjectsCache.at = 0;
 			}
-			localProjectsCache.at = 0;
 			return fetchLocalProjects(promptForKey, additionalSidebarThreadIDs);
 		};
 		localProjectsCache.threadID = threadID;
@@ -4966,6 +5303,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		if (repositoryGroupName && repositoryGroupName !== "No project") {
 			thread.repositoryGroupName = repositoryGroupName;
 		}
+		thread.automation = isPlainObject(source.automation) ? source.automation : null;
 		const sourceMeta = isPlainObject(source.meta) ? source.meta : {};
 		const meta = {};
 		const metaProjectID = firstString(source.projectID, sourceMeta.projectID, sourceMeta.projectId, sourceMeta.project_id);
@@ -5012,7 +5350,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 					if (typeof value === "undefined") {
 						continue;
 					}
-					if (key === localPinnedOverrideField || key === "title" && (typeof value !== "string" || !value.trim() || value.trim().toLowerCase() === "untitled")) {
+					if (key === localPinnedOverrideField || key === "automation" || key === "title" && (typeof value !== "string" || !value.trim() || value.trim().toLowerCase() === "untitled")) {
 						continue;
 					}
 					if (key === "pinned" && Object.prototype.hasOwnProperty.call(existingThread, key) && typeof pinnedOverride !== "boolean") {
@@ -5025,6 +5363,12 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 						continue;
 					}
 					existingThread[key] = appendDevalueSidebarValue(values, value, key);
+				}
+				const existingAutomation = Number.isInteger(existingThread.automation) ? values[existingThread.automation] : existingThread.automation;
+				if (isPlainObject(source.automation)) {
+					existingThread.automation = appendDevalueSidebarValue(values, source.automation, "automation");
+				} else if (!isPlainObject(existingAutomation)) {
+					existingThread.automation = appendDevalueSidebarValue(values, null, "automation");
 				}
 				if (typeof pinnedOverride === "boolean") {
 					const existingPinned = Number.isInteger(existingThread.pinned) ? values[existingThread.pinned] : existingThread.pinned;
@@ -7979,6 +8323,13 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 
 	function renderLocalSidebarMetadata() {
 		const threadsByID = new Map();
+		if (authenticatedAmpUserID) {
+			for (const [threadID, title] of Object.entries(localSidebarTitleCache)) {
+				if (validThreadID(threadID) && typeof title === "string" && title.trim() && title.trim().toLowerCase() !== "untitled") {
+					threadsByID.set(threadID, title.trim());
+				}
+			}
+		}
 		for (const thread of localProjectsCache.threads || []) {
 			const threadID = firstString(thread?.id, thread?.threadId, thread?.threadID);
 			const title = firstString(thread?.title);
@@ -8093,21 +8444,63 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		return threadIDs.sort();
 	}
 
+	function localSidebarAllVisibleThreadIDs() {
+		const threadIDs = [];
+		const seen = new Set();
+		for (const anchor of globalThis.document.querySelectorAll("[data-sidebar-thread-id]")) {
+			const threadID = firstString(anchor?.dataset?.sidebarThreadId);
+			if (!validThreadID(threadID) || seen.has(threadID)) {
+				continue;
+			}
+			seen.add(threadID);
+			threadIDs.push(threadID);
+		}
+		return threadIDs.sort();
+	}
+
+	function localSidebarMissingMetadataThreadIDs() {
+		const coveredThreadIDs = new Set(String(localProjectsCache.sidebarTitleKey || "").split("\u0000").filter(validThreadID));
+		return localSidebarAllVisibleThreadIDs().filter((threadID) =>
+			!coveredThreadIDs.has(threadID) &&
+			!localSidebarCachedThreadMetadataComplete(threadID) &&
+			!archivedLocalSidebarThreadIDs.has(threadID)
+		);
+	}
+
 	function scheduleLocalSidebarMetadataRefresh() {
 		renderLocalSidebarMetadata();
-		if (localSidebarDOMRefreshPending || localSidebarVisibleThreadIDs().length === 0) {
+		if (localSidebarDOMRefreshPending) {
+			localSidebarDOMRefreshRequested = true;
+			return;
+		}
+		if (localSidebarMissingMetadataThreadIDs().length === 0) {
 			return;
 		}
 		localSidebarDOMRefreshPending = true;
 		globalThis.setTimeout(() => {
-			localSidebarDOMRefreshPending = false;
-			if (localSidebarVisibleThreadIDs().length === 0) {
-				return;
-			}
-			fetchLocalProjects(false).then(() => {
-				renderLocalSidebarMetadata();
-				requestLocalSidebarProjectRegroup();
-			}, () => undefined);
+			const missingThreadIDs = localSidebarMissingMetadataThreadIDs();
+			const finishCycle = () => {
+				localSidebarDOMRefreshPending = false;
+				if (localSidebarDOMRefreshRequested) {
+					localSidebarDOMRefreshRequested = false;
+					scheduleLocalSidebarMetadataRefresh();
+				}
+			};
+			const fetchBatch = (offset) => {
+				if (offset >= missingThreadIDs.length) {
+					finishCycle();
+					return;
+				}
+				fetchLocalProjects(false, missingThreadIDs.slice(offset, offset + 75)).then(() => {
+					renderLocalSidebarMetadata();
+					requestLocalSidebarProjectRegroup();
+					fetchBatch(offset + 75);
+				}, () => {
+					localSidebarDOMRefreshPending = false;
+					localSidebarDOMRefreshRequested = false;
+				});
+			};
+			fetchBatch(0);
 		}, 0);
 	}
 

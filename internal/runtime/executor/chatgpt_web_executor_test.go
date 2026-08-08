@@ -449,6 +449,15 @@ func TestConversationHeadersStableSessionID(t *testing.T) {
 	if got := first.Header.Get("Sec-Fetch-Mode"); got != "cors" {
 		t.Fatalf("Sec-Fetch-Mode = %q, want cors", got)
 	}
+	for header, want := range map[string]string{
+		"OAI-Client-Build-Number": "9052945",
+		"OAI-Client-Version":      "prod-e1d6f2820dd20c3bab36cc42e8668035bf87f7bc",
+		"Priority":                "u=1, i",
+	} {
+		if got := first.Header.Get(header); got != want {
+			t.Fatalf("%s = %q, want %q", header, got, want)
+		}
+	}
 }
 
 func TestConversationHeadersNoEcho(t *testing.T) {

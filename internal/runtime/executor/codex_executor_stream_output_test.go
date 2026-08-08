@@ -105,10 +105,12 @@ func TestCodexExecutorExecuteStream_EmptyStreamCompletionOutputUsesOutputItemDon
 func TestCodexExecutorExecuteStreamOpenAIResponsesAssemblesCompleteSSEEvents(t *testing.T) {
 	first := []byte("event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n")
 	second := []byte("event: response.in_progress\ndata: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"resp_1\"}}\n\n")
+	third := []byte("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\"}}\n\n")
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = w.Write(first)
 		_, _ = w.Write(second)
+		_, _ = w.Write(third)
 	}))
 	defer server.Close()
 
@@ -135,7 +137,7 @@ func TestCodexExecutorExecuteStreamOpenAIResponsesAssemblesCompleteSSEEvents(t *
 		}
 		got = append(got, bytes.Clone(chunk.Payload))
 	}
-	want := [][]byte{first, second}
+	want := [][]byte{first, second, third}
 	if len(got) != len(want) {
 		t.Fatalf("chunk count = %d, want %d: %q", len(got), len(want), got)
 	}
@@ -173,13 +175,22 @@ func TestCodexExecutorExecuteStreamOpenAIResponsesDoesNotEmitPartialFinalSSEEven
 	}
 
 	var got [][]byte
+	var terminalErr error
 	for chunk := range result.Chunks {
 		if chunk.Err != nil {
-			t.Fatalf("stream chunk error: %v", chunk.Err)
+			terminalErr = chunk.Err
+			continue
 		}
 		got = append(got, bytes.Clone(chunk.Payload))
 	}
 	if len(got) != 1 || !bytes.Equal(got[0], complete) {
 		t.Fatalf("chunks = %q, want only complete event %q", got, complete)
+	}
+	if terminalErr == nil {
+		t.Fatal("terminal error = nil, want incomplete-stream failure")
+	}
+	neutral, ok := terminalErr.(interface{ AuthStateNeutral() bool })
+	if !ok || !neutral.AuthStateNeutral() {
+		t.Fatalf("terminal error is not auth-state-neutral: %v", terminalErr)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -959,6 +960,7 @@ func TestClaudeExecutor_ExecuteOpenAINonStreamRejectsEmptyClaudeStream(t *testin
 		t.Fatal("Execute error = nil, want empty stream error")
 	}
 	assertStatusErr(t, err, http.StatusBadGateway)
+	assertAuthStateNeutral(t, err, true)
 	if !strings.Contains(err.Error(), "empty stream response") {
 		t.Fatalf("Execute error = %q, want empty stream response", err.Error())
 	}
@@ -971,9 +973,20 @@ func TestClaudeExecutor_ExecuteOpenAINonStreamRejectsClaudeErrorEvent(t *testing
 		t.Fatal("Execute error = nil, want upstream error event")
 	}
 	assertStatusErr(t, err, http.StatusBadGateway)
+	assertAuthStateNeutral(t, err, true)
 	if !strings.Contains(err.Error(), "upstream overloaded") {
 		t.Fatalf("Execute error = %q, want upstream overloaded", err.Error())
 	}
+}
+
+func TestClaudeExecutor_ExecuteOpenAINonStreamPreservesAuthErrorEvent(t *testing.T) {
+	body := `data: {"type":"error","error":{"type":"authentication_error","message":"invalid api key"}}` + "\n"
+	_, err := executeOpenAIChatCompletionThroughClaude(t, body)
+	if err == nil {
+		t.Fatal("Execute error = nil, want upstream authentication error")
+	}
+	assertStatusErr(t, err, http.StatusBadGateway)
+	assertAuthStateNeutral(t, err, false)
 }
 
 func TestClaudeExecutor_ExecuteOpenAINonStreamRejectsIncompleteClaudeStream(t *testing.T) {
@@ -988,6 +1001,7 @@ func TestClaudeExecutor_ExecuteOpenAINonStreamRejectsIncompleteClaudeStream(t *t
 		t.Fatal("Execute error = nil, want incomplete stream error")
 	}
 	assertStatusErr(t, err, http.StatusBadGateway)
+	assertAuthStateNeutral(t, err, true)
 	if !strings.Contains(err.Error(), "ended before message completion") {
 		t.Fatalf("Execute error = %q, want incomplete stream error", err.Error())
 	}
@@ -1024,6 +1038,106 @@ func TestClaudeExecutor_ExecuteOpenAINonStreamConvertsValidClaudeStream(t *testi
 	}
 }
 
+func TestClaudeExecutor_ExecuteStreamPassthroughClassifiesAuthErrorEvent(t *testing.T) {
+	body := strings.Join([]string{
+		`data: {"type":"message_start","message":{"id":"msg_123","model":"claude-3-5-sonnet-20241022"}}`,
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}`,
+		`data: {"type":"error","error":{"type":"authentication_error","message":"invalid api key"}}`,
+		``,
+	}, "\n")
+
+	payload, streamErr := executeClaudeLiveStream(t, "claude", body)
+	if streamErr == nil {
+		t.Fatal("stream error = nil, want upstream authentication error")
+	}
+	assertStatusErr(t, streamErr, http.StatusBadGateway)
+	assertAuthStateNeutral(t, streamErr, false)
+	if !bytes.Contains(payload, []byte("content_block_delta")) {
+		t.Fatalf("stream payload = %q, want chunks dispatched before error", payload)
+	}
+	if bytes.Contains(payload, []byte(`"type":"error"`)) {
+		t.Fatalf("stream payload = %q, error event must not be forwarded", payload)
+	}
+}
+
+func TestClaudeExecutor_ExecuteStreamTranslatedClassifiesTransientErrorEventNeutral(t *testing.T) {
+	body := `data: {"type":"error","error":{"type":"overloaded_error","message":"upstream overloaded"}}` + "\n"
+
+	payload, streamErr := executeClaudeLiveStream(t, "openai", body)
+	if streamErr == nil {
+		t.Fatal("stream error = nil, want upstream overloaded error")
+	}
+	assertStatusErr(t, streamErr, http.StatusBadGateway)
+	assertAuthStateNeutral(t, streamErr, true)
+	if len(payload) != 0 {
+		t.Fatalf("stream payload = %q, error event must not be translated", payload)
+	}
+}
+
+func TestClaudeExecutor_ExecuteStreamCleanEOFIsIncompleteAndNeutral(t *testing.T) {
+	body := strings.Join([]string{
+		`data: {"type":"message_start","message":{"id":"msg_123","model":"claude-3-5-sonnet-20241022"}}`,
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}`,
+		``,
+	}, "\n")
+
+	for _, sourceFormat := range []string{"claude", "openai"} {
+		t.Run(sourceFormat, func(t *testing.T) {
+			payload, streamErr := executeClaudeLiveStream(t, sourceFormat, body)
+			if streamErr == nil {
+				t.Fatal("stream error = nil, want incomplete stream error")
+			}
+			assertStatusErr(t, streamErr, http.StatusBadGateway)
+			assertAuthStateNeutral(t, streamErr, true)
+			if !strings.Contains(streamErr.Error(), "incomplete stream") {
+				t.Fatalf("stream error = %q, want incomplete stream error", streamErr.Error())
+			}
+			if bytes.Contains(payload, []byte("[DONE]")) {
+				t.Fatalf("stream payload = %q, must not fabricate completion", payload)
+			}
+		})
+	}
+}
+
+func executeClaudeLiveStream(t *testing.T, sourceFormat, upstreamBody string) ([]byte, error) {
+	t.Helper()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(upstreamBody))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "key-123",
+		"base_url": server.URL,
+	}}
+	payload := []byte(`{"model":"claude-3-5-sonnet-20241022","messages":[{"role":"user","content":"hi"}]}`)
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-3-5-sonnet-20241022",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString(sourceFormat),
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+
+	var combined []byte
+	var streamErr error
+	for chunk := range result.Chunks {
+		combined = append(combined, chunk.Payload...)
+		if chunk.Err != nil {
+			if streamErr != nil {
+				t.Fatalf("multiple stream errors: %v and %v", streamErr, chunk.Err)
+			}
+			streamErr = chunk.Err
+		}
+	}
+	return combined, streamErr
+}
+
 func executeOpenAIChatCompletionThroughClaude(t *testing.T, upstreamBody string) (cliproxyexecutor.Response, error) {
 	t.Helper()
 
@@ -1057,6 +1171,18 @@ func assertStatusErr(t *testing.T, err error, want int) {
 	}
 	if got := status.StatusCode(); got != want {
 		t.Fatalf("StatusCode() = %d, want %d", got, want)
+	}
+}
+
+func assertAuthStateNeutral(t *testing.T, err error, want bool) {
+	t.Helper()
+
+	var neutral interface{ AuthStateNeutral() bool }
+	if !errors.As(err, &neutral) {
+		t.Fatalf("error %T does not expose AuthStateNeutral", err)
+	}
+	if got := neutral.AuthStateNeutral(); got != want {
+		t.Fatalf("AuthStateNeutral() = %t, want %t", got, want)
 	}
 }
 
@@ -1319,7 +1445,7 @@ func hasTTLOrderingViolation(payload []byte) bool {
 	return violates
 }
 
-func TestClaudeExecutor_Execute_InvalidGzipErrorBodyReturnsDecodeMessage(t *testing.T) {
+func TestClaudeExecutor_Execute_InvalidGzipErrorBodyIsAuthStateNeutral(t *testing.T) {
 	testClaudeExecutorInvalidCompressedErrorBody(t, func(executor *ClaudeExecutor, auth *cliproxyauth.Auth, payload []byte) error {
 		_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
 			Model:   "claude-3-5-sonnet-20241022",
@@ -1329,7 +1455,7 @@ func TestClaudeExecutor_Execute_InvalidGzipErrorBodyReturnsDecodeMessage(t *test
 	})
 }
 
-func TestClaudeExecutor_ExecuteStream_InvalidGzipErrorBodyReturnsDecodeMessage(t *testing.T) {
+func TestClaudeExecutor_ExecuteStream_InvalidGzipErrorBodyIsAuthStateNeutral(t *testing.T) {
 	testClaudeExecutorInvalidCompressedErrorBody(t, func(executor *ClaudeExecutor, auth *cliproxyauth.Auth, payload []byte) error {
 		_, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
 			Model:   "claude-3-5-sonnet-20241022",
@@ -1339,7 +1465,7 @@ func TestClaudeExecutor_ExecuteStream_InvalidGzipErrorBodyReturnsDecodeMessage(t
 	})
 }
 
-func TestClaudeExecutor_CountTokens_InvalidGzipErrorBodyReturnsDecodeMessage(t *testing.T) {
+func TestClaudeExecutor_CountTokens_InvalidGzipErrorBodyIsAuthStateNeutral(t *testing.T) {
 	testClaudeExecutorInvalidCompressedErrorBody(t, func(executor *ClaudeExecutor, auth *cliproxyauth.Auth, payload []byte) error {
 		_, err := executor.CountTokens(context.Background(), auth, cliproxyexecutor.Request{
 			Model:   "claude-3-5-sonnet-20241022",
@@ -1374,11 +1500,16 @@ func testClaudeExecutorInvalidCompressedErrorBody(
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if !strings.Contains(err.Error(), "failed to decode error response body") {
+	if !strings.Contains(err.Error(), "failed to create gzip reader") {
 		t.Fatalf("expected decode failure message, got: %v", err)
 	}
-	if statusProvider, ok := err.(interface{ StatusCode() int }); !ok || statusProvider.StatusCode() != http.StatusBadRequest {
-		t.Fatalf("expected status code 400, got: %v", err)
+	var neutral interface{ AuthStateNeutral() bool }
+	if !errors.As(err, &neutral) || !neutral.AuthStateNeutral() {
+		t.Fatalf("expected auth-state-neutral error, got: %v", err)
+	}
+	var statusProvider interface{ StatusCode() int }
+	if !errors.As(err, &statusProvider) || statusProvider.StatusCode() != http.StatusBadRequest {
+		t.Fatalf("expected decode error preserving upstream status %d, got: %v", http.StatusBadRequest, err)
 	}
 }
 

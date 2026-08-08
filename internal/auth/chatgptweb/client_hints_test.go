@@ -53,6 +53,15 @@ func TestClientHintsForUA(t *testing.T) {
 	}
 }
 
+func TestClientHintsForChrome151(t *testing.T) {
+	t.Parallel()
+	const userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
+	const want = `"Not=A?Brand";v="99", "Google Chrome";v="151", "Chromium";v="151"`
+	if got := ClientHintsForUA(userAgent).Brands; got != want {
+		t.Fatalf("Sec-CH-UA = %q, want %q", got, want)
+	}
+}
+
 func TestApplyBrowserHeadersXHRShape(t *testing.T) {
 	t.Parallel()
 	req, err := http.NewRequest(http.MethodPost, "https://chatgpt.com/backend-api/f/conversation", nil)
@@ -70,6 +79,7 @@ func TestApplyBrowserHeadersXHRShape(t *testing.T) {
 		t.Errorf("Sec-CH-UA-Platform = %q", got)
 	}
 	for header, want := range map[string]string{
+		"Priority":       "u=1, i",
 		"Sec-Fetch-Dest": "empty",
 		"Sec-Fetch-Mode": "cors",
 		"Sec-Fetch-Site": "same-origin",
@@ -195,5 +205,13 @@ func TestRecordCookieRotationPreservesWebSessionID(t *testing.T) {
 	s = m.RecordCookieRotation(s, []string{"__cf_bm=new; Path=/"}, cookie)
 	if s.WebSessionID != "wsess-1" {
 		t.Fatalf("WebSessionID = %q, want preserved across rotation", s.WebSessionID)
+	}
+}
+
+func TestClientHintsForUAOversizedChromeMajor(t *testing.T) {
+	ua := "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/99999999999999999999999999.0.0.0 Safari/537.36"
+	hints := ClientHintsForUA(ua)
+	if !strings.Contains(hints.Brands, `"Chromium";v="99999999999999999999999999"`) {
+		t.Fatalf("brands = %q, want the oversized engine version preserved", hints.Brands)
 	}
 }

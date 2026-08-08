@@ -163,6 +163,7 @@ func TestNeoRunCheckSyntheticModelBenchmark(t *testing.T) {
 	cases := neoRunCheckSelectedBenchmarkCases(t)
 	repetitions := neoRunCheckBenchmarkRepetitions(t)
 	strict := neoReadThreadTruthyEnv("AMP_RUN_CHECK_MODEL_BENCHMARK_STRICT")
+	failedRuns := 0
 	for caseIndex, tc := range cases {
 		for rep := 1; rep <= repetitions; rep++ {
 			candidateOffset := (caseIndex + rep - 1) % len(candidates)
@@ -174,12 +175,18 @@ func TestNeoRunCheckSyntheticModelBenchmark(t *testing.T) {
 					result := neoRunCheckRunSyntheticModelBenchmark(t, candidate, tc, rep)
 					raw, _ := json.Marshal(result)
 					t.Log(string(raw))
-					if strict && !boolValue(result["passed"]) {
-						t.Fatalf("benchmark miss: %s", string(raw))
+					if !boolValue(result["passed"]) {
+						failedRuns++
+						if strict {
+							t.Fatalf("benchmark miss: %s", string(raw))
+						}
 					}
 				})
 			}
 		}
+	}
+	if failedRuns != 0 {
+		t.Fatalf("%d live run_check benchmark runs failed", failedRuns)
 	}
 }
 
@@ -214,16 +221,13 @@ func neoRunCheckRunSyntheticModelBenchmark(t *testing.T, candidate neoRunCheckBe
 	}
 	route := candidate.Route
 	request := neoInferenceRequest{
-		ActorID:         "actor-run-check-benchmark",
-		ThreadID:        "T-019f5000-0000-7000-8000-000000000001",
-		MessageID:       newNeoMessageID(),
-		AgentMode:       "review",
-		ReasoningEffort: candidate.Effort,
-		Settings:        settings,
-		History: []neoHistoryMessage{
-			{Role: "user", Text: stringValue(input[neoReviewSnapshotTextKey])},
-			{Role: "user", Text: inputText},
-		},
+		ActorID:              "actor-run-check-benchmark",
+		ThreadID:             "T-019f5000-0000-7000-8000-000000000001",
+		MessageID:            newNeoMessageID(),
+		AgentMode:            "review",
+		ReasoningEffort:      candidate.Effort,
+		Settings:             settings,
+		History:              []neoHistoryMessage{{Role: "user", Text: inputText}},
 		Environment:          map[string]any{"workingDirectory": "/benchmark/repository", "workspaceRoot": "/benchmark/repository"},
 		ModelRouteOverride:   &route,
 		SystemPromptOverride: systemPrompt,

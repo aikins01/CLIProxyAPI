@@ -669,12 +669,14 @@ func (a *neoActor) executeLocalReadThreadAgentWithRouteContext(runContext contex
 				Role:            "tool",
 				ToolCallID:      call.ID,
 				ToolName:        call.Name,
-				Text:            runToText(run),
+				Text:            runToTextForTool(call.Name, run),
 				Content:         neoToolRunHistoryContent(run),
 				ParentToolUseID: pending.ID,
 			})
 		}
-		a.storeSubagentToolExchanges(exchanges, pending.ID)
+		if !a.storeSubagentToolExchanges(exchanges, pending.ID, generation) {
+			return "", nil
+		}
 		if state.SawRead {
 			neoReadThreadAppendLatestEvidence(&state, corpus, &conversation, &evidence)
 			return a.forceLocalReadThreadFinalWithEvidence(runContext, pending, generation, route, effort, actorID, currentThreadID, agentMode, maxTokens, settings, environment, conversation, corpus, evidence, goal)
