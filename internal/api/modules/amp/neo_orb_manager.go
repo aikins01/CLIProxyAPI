@@ -490,9 +490,9 @@ func (m *neoOrbManager) orbSyncLocalConfig(ctx context.Context, client neoOrbPro
 			log.Warnf("amp orbs: settings sync failed: %v", errCopy)
 		}
 	}
-	agentsMD := filepath.Join(home, ".config", "agents", "AGENTS.md")
+	agentsMD := filepath.Join(home, ".config", "AGENTS.md")
 	if content, errRead := os.ReadFile(agentsMD); errRead == nil && len(content) <= 4<<20 {
-		if errCopy := client.CopyFileToContainer(ctx, containerID, "/root/.config/agents/AGENTS.md", content, 0o644); errCopy != nil {
+		if errCopy := client.CopyFileToContainer(ctx, containerID, "/root/.config/AGENTS.md", content, 0o644); errCopy != nil {
 			log.Warnf("amp orbs: AGENTS.md sync failed: %v", errCopy)
 		}
 	}

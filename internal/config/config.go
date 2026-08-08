@@ -389,8 +389,8 @@ type AmpOrbs struct {
 	Env map[string]string `yaml:"env,omitempty" json:"env,omitempty"`
 
 	// SyncLocalConfig copies non-secret local Amp configuration into the orb at
-	// provision time: ~/.config/amp/settings.json plus ~/.config/agents
-	// AGENTS.md, checks, and skills. Auth material is never synced.
+	// provision time: ~/.config/amp/settings.json plus ~/.config/AGENTS.md
+	// and ~/.config/agents checks and skills. Auth material is never synced.
 	// Default: true.
 	SyncLocalConfig *bool `yaml:"sync-local-config,omitempty" json:"sync-local-config,omitempty"`
 }

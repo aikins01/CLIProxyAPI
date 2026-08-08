@@ -415,7 +415,7 @@ func TestNeoOrbSyncLocalConfig(t *testing.T) {
 		}
 	}
 	write(".config/amp/settings.json", `{"theme":"dark"}`)
-	write(".config/agents/AGENTS.md", "# global instructions")
+	write(".config/AGENTS.md", "# global instructions")
 	write(".config/agents/checks/orb-check.md", "check")
 	write(".config/agents/skills/demo/SKILL.md", "skill")
 	write(".config/agents/checks/auth-token.json", "secret")
@@ -433,7 +433,7 @@ func TestNeoOrbSyncLocalConfig(t *testing.T) {
 	joined := strings.Join(copies, "\n")
 	for _, want := range []string{
 		"copy:/root/.config/amp/settings.json",
-		"copy:/root/.config/agents/AGENTS.md",
+		"copy:/root/.config/AGENTS.md",
 		"copy-tar:/root/.config/agents/checks:orb-check.md",
 		"copy-tar:/root/.config/agents/skills/demo:SKILL.md",
 	} {

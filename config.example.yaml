@@ -420,10 +420,10 @@ nonstream-keepalive-interval: 0
 #     #                               # A configured GitHub token is usable by processes
 #     #                               # inside the orb (git URL rewrite); prefer a
 #     #                               # fine-grained token scoped to the needed repos.
-#     # sync-local-config: true       # copy ~/.config/amp/settings.json plus
-#     #                               # ~/.config/agents/AGENTS.md, checks, and skills
-#     #                               # into new orbs. Auth/credential-shaped files
-#     #                               # are never copied.
+#     # sync-local-config: true       # copy ~/.config/amp/settings.json,
+#     #                               # ~/.config/AGENTS.md, and ~/.config/agents
+#     #                               # checks + skills into new orbs.
+#     #                               # Auth/credential-shaped files are never copied.
 #   # Amp Model Mappings
 #   # Route unavailable Amp models to alternative models available in your local proxy.
 #   # Useful when Amp CLI requests models you don't have access to (e.g., Claude Opus 4.5)
