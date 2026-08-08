@@ -2,6 +2,7 @@ package amp
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"sort"
@@ -414,6 +415,7 @@ func TestNeoOrbSyncLocalConfig(t *testing.T) {
 		}
 	}
 	write(".config/amp/settings.json", `{"theme":"dark"}`)
+	write(".config/agents/AGENTS.md", "# global instructions")
 	write(".config/agents/checks/orb-check.md", "check")
 	write(".config/agents/skills/demo/SKILL.md", "skill")
 	write(".config/agents/checks/auth-token.json", "secret")
@@ -431,6 +433,7 @@ func TestNeoOrbSyncLocalConfig(t *testing.T) {
 	joined := strings.Join(copies, "\n")
 	for _, want := range []string{
 		"copy:/root/.config/amp/settings.json",
+		"copy:/root/.config/agents/AGENTS.md",
 		"copy-tar:/root/.config/agents/checks:orb-check.md",
 		"copy-tar:/root/.config/agents/skills/demo:SKILL.md",
 	} {
@@ -557,5 +560,60 @@ func TestNeoOrbProvisionFailureRemovesContainer(t *testing.T) {
 	waitNeoOrbState(t, manager, threadID, neoOrbStateFailed)
 	if fake.callCount("remove:container-fake") != 1 {
 		t.Fatalf("failed provisioning did not remove the container: %#v", fake.calls)
+	}
+}
+
+func TestNeoOrbExecutorEnvPublicURLOverride(t *testing.T) {
+	cfg := &config.Config{
+		Host: "127.0.0.1",
+		Port: 8317,
+		AmpCode: config.AmpCode{Orbs: config.AmpOrbs{
+			PublicURL:        "https://amp-proxy.example.test",
+			RuntimePublicURL: "https://amp-runtime.example.test",
+		}},
+	}
+	env := strings.Join(neoOrbExecutorEnv(cfg, "T-019fdec9-b0cf-745d-8da4-f250184e870e", "/work"), "\n")
+	if !strings.Contains(env, "AMP_URL=https://amp-proxy.example.test") {
+		t.Fatalf("public-url override missing:\n%s", env)
+	}
+	if !strings.Contains(env, "RIVET_ENDPOINT=https://amp-runtime.example.test") {
+		t.Fatalf("runtime-public-url override missing:\n%s", env)
+	}
+	if strings.Contains(env, "host.docker.internal") {
+		t.Fatalf("loopback rewrite leaked past the public-url override:\n%s", env)
+	}
+}
+
+func TestNeoOrbContainerSpecNetwork(t *testing.T) {
+	client, calls := newNeoOrbFakeDocker(t, func(call neoOrbFakeDockerCall) (int, any) {
+		if strings.HasPrefix(call.Path, "/containers/create") {
+			var payload map[string]any
+			if err := json.Unmarshal(call.Body, &payload); err != nil {
+				return 400, nil
+			}
+			if mapValue(payload["HostConfig"])["NetworkMode"] != "cliproxy-orbs" {
+				return 400, map[string]any{"message": "missing network mode"}
+			}
+			return 201, map[string]any{"Id": "c1"}
+		}
+		return 500, nil
+	})
+	id, err := client.CreateContainer(context.Background(), neoOrbContainerSpec{Name: "n1", Image: "img", NetworkMode: "cliproxy-orbs"})
+	if err != nil || id != "c1" {
+		t.Fatalf("CreateContainer with network = %q, %v", id, err)
+	}
+	_ = calls
+}
+
+func TestNeoOrbNetworkNameValidation(t *testing.T) {
+	for _, ok := range []string{"", "cliproxy-orbs", "dokploy-network", "orb_net.1", "cliproxy check net"} {
+		if _, err := neoOrbNetworkName(ok); err != nil {
+			t.Fatalf("neoOrbNetworkName(%q) rejected: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"net\nwork", "net\trm", "net\x00"} {
+		if _, err := neoOrbNetworkName(bad); err == nil {
+			t.Fatalf("neoOrbNetworkName(%q) accepted", bad)
+		}
 	}
 }

@@ -27,15 +27,16 @@ type neoOrbDockerClient struct {
 }
 
 type neoOrbContainerSpec struct {
-	Name       string
-	Image      string
-	Env        []string
-	WorkingDir string
-	Cmd        []string
-	NanoCPUs   int64
-	MemoryMB   int64
-	ExtraHosts []string
-	Labels     map[string]string
+	Name        string
+	Image       string
+	Env         []string
+	WorkingDir  string
+	Cmd         []string
+	NanoCPUs    int64
+	MemoryMB    int64
+	ExtraHosts  []string
+	Labels      map[string]string
+	NetworkMode string
 }
 
 type neoOrbContainerState struct {
@@ -180,9 +181,10 @@ func (c *neoOrbDockerClient) EnsureImage(ctx context.Context, image string) erro
 
 func (c *neoOrbDockerClient) CreateContainer(ctx context.Context, spec neoOrbContainerSpec) (string, error) {
 	type hostConfig struct {
-		NanoCPUs   int64    `json:"NanoCPUs,omitempty"`
-		Memory     int64    `json:"Memory,omitempty"`
-		ExtraHosts []string `json:"ExtraHosts,omitempty"`
+		NanoCPUs    int64    `json:"NanoCPUs,omitempty"`
+		Memory      int64    `json:"Memory,omitempty"`
+		ExtraHosts  []string `json:"ExtraHosts,omitempty"`
+		NetworkMode string   `json:"NetworkMode,omitempty"`
 	}
 	type createBody struct {
 		Image      string            `json:"Image"`
@@ -199,9 +201,10 @@ func (c *neoOrbDockerClient) CreateContainer(ctx context.Context, spec neoOrbCon
 		WorkingDir: spec.WorkingDir,
 		Labels:     spec.Labels,
 		HostConfig: hostConfig{
-			NanoCPUs:   spec.NanoCPUs,
-			Memory:     spec.MemoryMB * 1024 * 1024,
-			ExtraHosts: spec.ExtraHosts,
+			NanoCPUs:    spec.NanoCPUs,
+			Memory:      spec.MemoryMB * 1024 * 1024,
+			ExtraHosts:  spec.ExtraHosts,
+			NetworkMode: spec.NetworkMode,
 		},
 	}
 	encoded, err := json.Marshal(payload)

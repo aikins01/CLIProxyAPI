@@ -390,6 +390,13 @@ nonstream-keepalive-interval: 0
 #     enabled: false
 #     # provider: docker              # only "docker" is supported
 #     # docker-host: ""               # unix:///var/run/docker.sock by default (or DOCKER_HOST)
+#     # network: ""                   # docker network for orb containers; when the proxy
+#     #                               # itself runs as a container, create a swarm overlay
+#     #                               # with --attachable, join the proxy service to it,
+#     #                               # and set its name here (portal reachability)
+#     # public-url: ""                # externally reachable AMP_URL for orb executors,
+#     # runtime-public-url: ""        # and for the runtime gateway, when the derived
+#     #                               # loopback URLs would not resolve back to this server
 #     # image: "debian:12-slim"       # custom images must be Debian/Ubuntu-based (apt) or
 #     #                               # pre-bake git, curl, and ca-certificates.
 #     #                               # For reproducible provisioning pin a digest, e.g.
@@ -414,8 +421,9 @@ nonstream-keepalive-interval: 0
 #     #                               # inside the orb (git URL rewrite); prefer a
 #     #                               # fine-grained token scoped to the needed repos.
 #     # sync-local-config: true       # copy ~/.config/amp/settings.json plus
-#     #                               # ~/.config/agents/checks and skills into new orbs.
-#     #                               # Auth/credential-shaped files are never copied.
+#     #                               # ~/.config/agents/AGENTS.md, checks, and skills
+#     #                               # into new orbs. Auth/credential-shaped files
+#     #                               # are never copied.
 #   # Amp Model Mappings
 #   # Route unavailable Amp models to alternative models available in your local proxy.
 #   # Useful when Amp CLI requests models you don't have access to (e.g., Claude Opus 4.5)

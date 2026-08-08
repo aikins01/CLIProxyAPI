@@ -49,8 +49,6 @@ const (
 	// executor reconnect.
 	neoOrbResumeHookSeconds = 10
 
-	// neoOrbSyncMaxBytes bounds the total local-config content uploaded into
-	// one orb directory during provisioning.
 	neoOrbSyncMaxBytes = 32 << 20
 )
 
@@ -101,8 +99,6 @@ func neoOrbsEnabled(cfg *config.Config) bool {
 	return neoOrbsAvailable(cfg) == ""
 }
 
-// neoOrbsAvailable returns "" when orb executors can be provisioned, otherwise
-// the reason they cannot.
 func neoOrbsAvailable(cfg *config.Config) string {
 	orbs := neoOrbsConfig(cfg)
 	if orbs.Enabled == nil || !*orbs.Enabled {
@@ -267,6 +263,19 @@ func (m *neoOrbManager) spawnOrb(a *neoActor, msg map[string]any) map[string]any
 	return map[string]any{"status": "starting", "message": "Provisioning orb container.", "spawnId": spawnID}
 }
 
+func neoOrbNetworkName(raw string) (string, error) {
+	name := strings.TrimSpace(raw)
+	if name == "" {
+		return "", nil
+	}
+	for _, r := range name {
+		if r < 0x20 || r == 0x7f {
+			return "", fmt.Errorf("orbs.network %q is not a valid Docker network name", raw)
+		}
+	}
+	return name, nil
+}
+
 func (m *neoOrbManager) provisionOrb(a *neoActor, record *neoOrbRecord, spawnID, repositoryURL, agentMode, reasoningEffort string) {
 	cfg := m.runtime.configSnapshot()
 	threadID := record.threadID
@@ -311,14 +320,20 @@ func (m *neoOrbManager) provisionOrb(a *neoActor, record *neoOrbRecord, spawnID,
 	}
 
 	orbs := neoOrbsConfig(cfg)
+	network, err := neoOrbNetworkName(orbs.Network)
+	if err != nil {
+		fail("config", "Invalid orb configuration", err)
+		return
+	}
 	containerID, err := client.CreateContainer(setupCtx, neoOrbContainerSpec{
-		Name:       "cliproxy-orb-" + strings.ToLower(threadID),
-		Image:      image,
-		Cmd:        []string{"sleep", "infinity"},
-		NanoCPUs:   orbs.NanoCPUs,
-		MemoryMB:   orbs.MemoryMB,
-		ExtraHosts: []string{"host.docker.internal:host-gateway"},
-		Labels:     map[string]string{"cliproxy.orb": threadID},
+		Name:        "cliproxy-orb-" + strings.ToLower(threadID),
+		Image:       image,
+		Cmd:         []string{"sleep", "infinity"},
+		NanoCPUs:    orbs.NanoCPUs,
+		MemoryMB:    orbs.MemoryMB,
+		ExtraHosts:  []string{"host.docker.internal:host-gateway"},
+		Labels:      map[string]string{"cliproxy.orb": threadID},
+		NetworkMode: network,
 	})
 	if err != nil {
 		fail("create", "Cannot create the orb container", err)
@@ -473,6 +488,12 @@ func (m *neoOrbManager) orbSyncLocalConfig(ctx context.Context, client neoOrbPro
 	if settings, errRead := os.ReadFile(settingsPath); errRead == nil {
 		if errCopy := client.CopyFileToContainer(ctx, containerID, "/root/.config/amp/settings.json", settings, 0o644); errCopy != nil {
 			log.Warnf("amp orbs: settings sync failed: %v", errCopy)
+		}
+	}
+	agentsMD := filepath.Join(home, ".config", "agents", "AGENTS.md")
+	if content, errRead := os.ReadFile(agentsMD); errRead == nil && len(content) <= 4<<20 {
+		if errCopy := client.CopyFileToContainer(ctx, containerID, "/root/.config/agents/AGENTS.md", content, 0o644); errCopy != nil {
+			log.Warnf("amp orbs: AGENTS.md sync failed: %v", errCopy)
 		}
 	}
 	budget := neoOrbSyncMaxBytes
@@ -661,8 +682,6 @@ func (m *neoOrbManager) watchOrbConnect(a *neoActor, record *neoOrbRecord, spawn
 	a.broadcastExecutorStatus(spawnID, "failed", "Orb executor did not connect in time.", map[string]any{"reasonCode": "spawn_failed", "threadId": record.threadID})
 }
 
-// portalAddress returns the orb container's current IP, cached briefly so
-// portal requests do not each cost a Docker inspect.
 func (m *neoOrbManager) portalAddress(ctx context.Context, cfg *config.Config, threadID string) (string, error) {
 	m.mu.Lock()
 	record, ok := m.orbs[threadID]
@@ -806,8 +825,6 @@ func (m *neoOrbManager) reapRecord(record *neoOrbRecord) {
 	log.Infof("amp orbs: paused orb thread=%s idle=%s archived=%v", record.threadID, idleFor.Round(time.Second), archived)
 }
 
-// orbActorIdle reports whether the thread actor currently has no work in
-// flight and no connected executor.
 func (m *neoOrbManager) orbActorIdle(actor *neoActor) bool {
 	actor.mu.Lock()
 	defer actor.mu.Unlock()
@@ -824,6 +841,13 @@ func (m *neoOrbManager) orbActorIdle(actor *neoActor) bool {
 func neoOrbExecutorEnv(cfg *config.Config, threadID, workDir string) []string {
 	proxyBase := neoOrbReachableURL(neoProxyBaseURL(cfg))
 	runtimeBase := neoOrbReachableURL(neoRuntimeBaseURL(cfg))
+	orbs := neoOrbsConfig(cfg)
+	if publicURL := strings.TrimRight(strings.TrimSpace(orbs.PublicURL), "/"); publicURL != "" {
+		proxyBase = publicURL
+	}
+	if runtimeURL := strings.TrimRight(strings.TrimSpace(orbs.RuntimePublicURL), "/"); runtimeURL != "" {
+		runtimeBase = runtimeURL
+	}
 	env := []string{
 		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
 		"HOME=/root",

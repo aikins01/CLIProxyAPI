@@ -348,6 +348,19 @@ type AmpOrbs struct {
 	// DOCKER_HOST environment variable, then the local unix socket).
 	DockerHost string `yaml:"docker-host,omitempty" json:"docker-host,omitempty"`
 
+	// Network optionally names a Docker network orb containers join. Set this
+	// to a swarm-scoped attachable overlay when the proxy itself runs as a
+	// container on that overlay, so the portal proxy can reach orb containers.
+	Network string `yaml:"network,omitempty" json:"network,omitempty"`
+
+	// PublicURL is the base URL orb executors use for AMP_URL (the proxy
+	// listener). RuntimePublicURL is the base for the runtime gateway
+	// (RIVET_*). Set both to externally reachable URLs when the derived
+	// loopback addresses would not resolve back to this server from inside
+	// a container.
+	PublicURL        string `yaml:"public-url,omitempty" json:"public-url,omitempty"`
+	RuntimePublicURL string `yaml:"runtime-public-url,omitempty" json:"runtime-public-url,omitempty"`
+
 	// Image is the container image orbs run. Defaults to debian:12-slim.
 	Image string `yaml:"image,omitempty" json:"image,omitempty"`
 
@@ -376,8 +389,9 @@ type AmpOrbs struct {
 	Env map[string]string `yaml:"env,omitempty" json:"env,omitempty"`
 
 	// SyncLocalConfig copies non-secret local Amp configuration into the orb at
-	// provision time: ~/.config/amp/settings.json, ~/.config/agents/checks, and
-	// ~/.config/agents/skills. Auth material is never synced. Default: true.
+	// provision time: ~/.config/amp/settings.json plus ~/.config/agents
+	// AGENTS.md, checks, and skills. Auth material is never synced.
+	// Default: true.
 	SyncLocalConfig *bool `yaml:"sync-local-config,omitempty" json:"sync-local-config,omitempty"`
 }
 
