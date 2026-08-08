@@ -881,6 +881,65 @@ func TestNeoReadThreadRunLocalActorToolEmitsBinaryProgress(t *testing.T) {
 	}
 }
 
+func TestNeoReadThreadTerminalRunExposesOutputForRenderer(t *testing.T) {
+	threadID := "T-019e65c0-0310-77a8-b233-4b84d9c06142"
+	var captured []neoInferenceRequest
+	rt := newNeoRuntime(&config.Config{})
+	rt.inferStream = neoReadThreadScriptedInfer(t, "[message 0] renderer output result", "renderer output", &captured, nil)
+	actor := newNeoActor(rt, "actor-test", "thread-actor", threadID, threadID, neoActorRecord("actor-test", "thread-actor", threadID), nil)
+	actor.executorBootstrapComplete = true
+	actor.messages = []neoMessage{
+		{ThreadID: threadID, MessageID: "M-assistant", Role: "assistant", Content: []any{map[string]any{"type": "tool_use", "id": "TU-read", "name": "read_thread", "input": map[string]any{"goal": "Extract renderer output."}}}, Seq: 1},
+		{ThreadID: threadID, MessageID: "M-current", Role: "user", Content: []any{map[string]any{"type": "text", "text": "renderer output result"}}, Seq: 2},
+	}
+	pending := neoPendingTool{ID: "TU-read", Name: "read_thread", Input: map[string]any{"goal": "Extract renderer output."}, AgentMode: "deep", MessageID: "M-assistant"}
+	actor.pendingTools[pending.ID] = pending
+
+	actor.runLocalActorTool(pending, actor.generation)
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if _, stillPending := actor.pendingTools["TU-read"]; stillPending {
+		t.Fatalf("pendingTools still contains TU-read after terminal result")
+	}
+	result := actor.messages[actor.messageIndexLocked(toolResultMessageID("TU-read"))]
+	if len(result.Content) != 1 {
+		t.Fatalf("terminal result content = %#v, want single tool_result block", result.Content)
+	}
+	run := mapValue(mapValue(result.Content[0])["run"])
+	if stringValue(run["status"]) != "done" {
+		t.Fatalf("run status = %#v, want done", run["status"])
+	}
+	resultText := stringValue(run["result"])
+	outputText := stringValue(run["output"])
+	if resultText == "" || !strings.Contains(resultText, "renderer output result") {
+		t.Fatalf("run result = %q, want extracted text", resultText)
+	}
+	if outputText != resultText {
+		t.Fatalf("run output = %q, want same string as result %q", outputText, resultText)
+	}
+	var broadcastRun map[string]any
+	for _, replay := range actor.replayEvents {
+		payload := mapValue(replay.Payload)
+		if payload["type"] != "message_added" && payload["type"] != "message_updated" {
+			continue
+		}
+		message := mapValue(payload["message"])
+		if stringValue(message["messageId"]) != toolResultMessageID("TU-read") {
+			continue
+		}
+		for _, raw := range arrayValue(message["content"]) {
+			candidate := mapValue(mapValue(raw)["run"])
+			if stringValue(candidate["status"]) == "done" {
+				broadcastRun = candidate
+			}
+		}
+	}
+	if stringValue(broadcastRun["output"]) != resultText {
+		t.Fatalf("broadcast terminal run = %#v, want output %q", broadcastRun, resultText)
+	}
+}
+
 func TestNeoReadThreadRangeMatrix(t *testing.T) {
 	tests := []struct {
 		name        string

@@ -200,16 +200,21 @@ func (e *typedNilMarkerTestError) Unwrap() error {
 var _ = Result{"", "", "", false, nil, nil}
 
 type resultRecordingHook struct {
-	calls   atomic.Int32
-	neutral atomic.Bool
+	calls      atomic.Int32
+	neutral    atomic.Bool
+	retryAfter atomic.Pointer[time.Duration]
 }
 
 func (*resultRecordingHook) OnAuthRegistered(context.Context, *Auth) {}
 func (*resultRecordingHook) OnAuthUpdated(context.Context, *Auth)    {}
 
-func (h *resultRecordingHook) OnResult(ctx context.Context, _ Result) {
+func (h *resultRecordingHook) OnResult(ctx context.Context, result Result) {
 	h.calls.Add(1)
 	h.neutral.Store(IsAuthStateNeutralResult(ctx))
+	if result.RetryAfter != nil {
+		retryAfter := *result.RetryAfter
+		h.retryAfter.Store(&retryAfter)
+	}
 }
 
 type reentrantResultHook struct {
@@ -751,6 +756,47 @@ func TestManagerExecutionPathsDoNotMarkWrappedAuthStateNeutralFailures(t *testin
 				t.Fatalf("neutral result hook calls = %d, neutral = %t", hook.calls.Load(), hook.neutral.Load())
 			}
 		})
+	}
+}
+
+func TestManagerStreamChunkPreservesRetryAfter(t *testing.T) {
+	wantRetryAfter := 2 * time.Second
+	executor := &authStateNeutralExecutor{
+		id: "stream-retry-after",
+		streamChunks: []cliproxyexecutor.StreamChunk{
+			{Payload: []byte("started")},
+			{Err: &retryAfterStatusError{status: http.StatusTooManyRequests, message: "rate limited", retryAfter: wantRetryAfter}},
+		},
+	}
+	hook := &resultRecordingHook{}
+	m := NewManager(nil, nil, hook)
+	m.SetRetryConfig(0, 0, 1)
+	m.RegisterExecutor(executor)
+	model := "stream-retry-after-" + uuid.NewString()
+	auth := &Auth{ID: uuid.NewString(), Provider: executor.id}
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+	if _, err := m.Register(t.Context(), auth); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := m.ExecuteStream(t.Context(), []string{executor.id}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+	var streamErr error
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			streamErr = chunk.Err
+		}
+	}
+	if streamErr == nil {
+		t.Fatal("stream error was not forwarded")
+	}
+	gotRetryAfter := hook.retryAfter.Load()
+	if gotRetryAfter == nil || *gotRetryAfter != wantRetryAfter {
+		t.Fatalf("result RetryAfter = %v, want %v", gotRetryAfter, wantRetryAfter)
 	}
 }
 

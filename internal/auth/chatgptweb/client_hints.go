@@ -3,6 +3,7 @@ package chatgptweb
 import (
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 )
 
@@ -38,7 +39,7 @@ func ClientHintsForUA(userAgent string) ClientHints {
 		brandMajor = operaMajor
 	}
 	hints := ClientHints{
-		Brands: fmt.Sprintf(`"Chromium";v="%s", "Not=A?Brand";v="24", "%s";v="%s"`, engineMajor, brand, brandMajor),
+		Brands: chromiumBrandList(engineMajor, brand, brandMajor),
 		Mobile: "?0",
 	}
 	switch {
@@ -57,6 +58,33 @@ func ClientHintsForUA(userAgent string) ClientHints {
 		hints.Platform = `"Linux"`
 	}
 	return hints
+}
+
+func chromiumBrandList(engineMajor, productBrand, productMajor string) string {
+	major, err := strconv.Atoi(engineMajor)
+	if err != nil || major < 0 {
+		major = 0
+	}
+	greaseChars := [...]string{" ", "(", ":", "-", ".", "/", ")", ";", "=", "?", "_"}
+	greaseVersions := [...]string{"8", "99", "24"}
+	brands := [...]string{
+		fmt.Sprintf(`"Not%sA%sBrand";v="%s"`, greaseChars[major%len(greaseChars)], greaseChars[(major+1)%len(greaseChars)], greaseVersions[major%len(greaseVersions)]),
+		fmt.Sprintf(`"Chromium";v="%s"`, engineMajor),
+		fmt.Sprintf(`"%s";v="%s"`, productBrand, productMajor),
+	}
+	orders := [...][3]int{
+		{0, 1, 2},
+		{0, 2, 1},
+		{1, 0, 2},
+		{1, 2, 0},
+		{2, 0, 1},
+		{2, 1, 0},
+	}
+	ordered := make([]string, len(brands))
+	for source, destination := range orders[major%len(orders)] {
+		ordered[destination] = brands[source]
+	}
+	return strings.Join(ordered, ", ")
 }
 
 func browserProductMajor(userAgent, prefix string) (string, bool) {
@@ -89,6 +117,7 @@ func (h ClientHints) apply(req *http.Request) {
 // browser sends with the web app's same-origin XHR calls to the backend.
 func ApplyBrowserHeaders(req *http.Request, userAgent string) {
 	ClientHintsForUA(userAgent).apply(req)
+	req.Header.Set("Priority", "u=1, i")
 	req.Header.Set("Sec-Fetch-Dest", "empty")
 	req.Header.Set("Sec-Fetch-Mode", "cors")
 	req.Header.Set("Sec-Fetch-Site", "same-origin")

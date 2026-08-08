@@ -3,9 +3,15 @@ package executor
 import (
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 )
 
 func TestParseCodexRetryAfter(t *testing.T) {
@@ -139,6 +145,131 @@ func TestNewCodexStatusErrPreservesUnclassifiedErrors(t *testing.T) {
 	}
 	if got := err.Error(); got != string(body) {
 		t.Fatalf("error body = %s, want original %s", got, string(body))
+	}
+}
+
+func TestNewCodexStatusErrMarksTransientFailuresAuthStateNeutral(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		body       []byte
+		want       bool
+	}{
+		{name: "request timeout", statusCode: http.StatusRequestTimeout, body: []byte(`{"error":{"type":"server_error"}}`), want: true},
+		{name: "bad gateway", statusCode: http.StatusBadGateway, body: []byte(`{"error":{"type":"server_error"}}`), want: true},
+		{name: "service unavailable", statusCode: http.StatusServiceUnavailable, body: []byte(`{"error":{"message":"upstream connect error or disconnect/reset before headers","type":"server_error"}}`), want: true},
+		{name: "authentication failure", statusCode: http.StatusInternalServerError, body: []byte(`{"error":{"message":"invalid or expired token","type":"authentication_error"}}`), want: false},
+		{name: "rate limit", statusCode: http.StatusTooManyRequests, body: []byte(`{"error":{"type":"usage_limit_reached"}}`), want: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := newCodexStatusErr(tc.statusCode, tc.body)
+			if got := err.AuthStateNeutral(); got != tc.want {
+				t.Fatalf("AuthStateNeutral() = %t, want %t", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCodexExecutorTransportFailureIsAuthStateNeutral(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	baseURL := server.URL
+	server.Close()
+
+	executor := NewCodexExecutor(new(config.Config))
+	auth := new(cliproxyauth.Auth)
+	auth.Attributes = map[string]string{"api_key": "test", "base_url": baseURL}
+	_, err := executor.Execute(t.Context(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-5.6-sol",
+		Payload: []byte(`{"model":"gpt-5.6-sol","input":"test"}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response")})
+	if err == nil {
+		t.Fatal("Execute() error = nil, want transport failure")
+	}
+	neutral, ok := err.(interface{ AuthStateNeutral() bool })
+	if !ok || !neutral.AuthStateNeutral() {
+		t.Fatalf("transport error is not auth-state-neutral: %v", err)
+	}
+}
+
+func TestCodexExecutorIncompleteStreamsAreAuthStateNeutral(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "empty"},
+		{name: "partial", body: "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n"},
+		{name: "truncated completed JSON", body: "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\""},
+		{name: "completed event without delimiter", body: "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}\n"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				if tc.body != "" {
+					_, _ = w.Write([]byte(tc.body))
+				}
+			}))
+			defer server.Close()
+
+			executor := NewCodexExecutor(new(config.Config))
+			auth := new(cliproxyauth.Auth)
+			auth.Attributes = map[string]string{"api_key": "test", "base_url": server.URL}
+			result, err := executor.ExecuteStream(t.Context(), auth, cliproxyexecutor.Request{
+				Model:   "gpt-5.6-sol",
+				Payload: []byte(`{"model":"gpt-5.6-sol","input":"test"}`),
+			}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response")})
+			if err != nil {
+				t.Fatalf("ExecuteStream() error: %v", err)
+			}
+
+			var streamErr error
+			for chunk := range result.Chunks {
+				if chunk.Err != nil {
+					streamErr = chunk.Err
+				}
+			}
+			if streamErr == nil {
+				t.Fatal("stream error = nil, want incomplete-stream failure")
+			}
+			neutral, ok := streamErr.(interface{ AuthStateNeutral() bool })
+			if !ok || !neutral.AuthStateNeutral() {
+				t.Fatalf("incomplete stream error is not auth-state-neutral: %v", streamErr)
+			}
+			statusErr, ok := streamErr.(interface{ StatusCode() int })
+			if !ok || statusErr.StatusCode() != http.StatusRequestTimeout {
+				t.Fatalf("incomplete stream status = %v, want %d", streamErr, http.StatusRequestTimeout)
+			}
+		})
+	}
+}
+
+func TestCodexExecutorTruncatedCompletedEventIsAuthStateNeutral(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\""))
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(new(config.Config))
+	auth := new(cliproxyauth.Auth)
+	auth.Attributes = map[string]string{"api_key": "test", "base_url": server.URL}
+	_, err := executor.Execute(t.Context(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-5.6-sol",
+		Payload: []byte(`{"model":"gpt-5.6-sol","input":"test"}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response")})
+	if err == nil {
+		t.Fatal("Execute() error = nil, want incomplete-stream failure")
+	}
+	neutral, ok := err.(interface{ AuthStateNeutral() bool })
+	if !ok || !neutral.AuthStateNeutral() {
+		t.Fatalf("incomplete stream error is not auth-state-neutral: %v", err)
+	}
+	statusErr, ok := err.(interface{ StatusCode() int })
+	if !ok || statusErr.StatusCode() != http.StatusRequestTimeout {
+		t.Fatalf("incomplete stream status = %v, want %d", err, http.StatusRequestTimeout)
 	}
 }
 

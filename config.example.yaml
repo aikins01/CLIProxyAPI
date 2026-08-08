@@ -321,6 +321,8 @@ nonstream-keepalive-interval: 0
 #   restrict-management-to-localhost: false
 #   # Force model mappings to run before checking local API keys (default: false)
 #   force-model-mappings: false
+#   # Opt in Amp /responses requests to eligible Codex WebSocket credentials (default: false)
+#   codex-websockets-experiment: false
 #   # Local Rivet thread-actor proxy: when Amp expects its actor gateway at localhost:6420
 #   # but the Neo local runtime is disabled, forward actor HTTP/WebSocket traffic to the
 #   # cloud actor endpoint. Enabled by default when upstream-url is set and the Neo local
@@ -367,8 +369,9 @@ nonstream-keepalive-interval: 0
 #         - "anthropic/claude-fable-5"
 #         - "openai/gpt-5.6-sol"
 #   # optional browser bridge for using ampcode.com web UI with local Neo inference.
-#   # Install /ampcode/local-inference.user.js in Tampermonkey, set the local API key
-#   # in browser localStorage, and keep this disabled unless you intentionally use it.
+#   # Install /ampcode/local-inference.user.js in Tampermonkey. The userscript prompts
+#   # once and can remember the key for the authenticated Amp account and local server
+#   # after explicit browser consent. Keep this disabled unless you intentionally use it.
 #   # For Safari and mobile, use a trusted HTTPS URL here, such as Tailscale Serve.
 #   web-local-inference:
 #     enabled: false

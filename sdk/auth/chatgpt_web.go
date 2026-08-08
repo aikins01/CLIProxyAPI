@@ -94,6 +94,24 @@ func (a ChatGPTWebAuthenticator) Login(ctx context.Context, cfg *config.Config, 
 	if cookie == "" {
 		return nil, fmt.Errorf("chatgpt-web: session exchange returned no usable session token")
 	}
+	fmt.Println("If ChatGPT requires Turnstile, the Web executor can submit without a Turnstile token.")
+	fmt.Println("  This opt-in is stored on the credential and applies to future Turnstile challenges;")
+	fmt.Println("  it is unreliable and may increase anti-abuse scrutiny.")
+	rawSubmitWithoutTurnstile, err := opts.Prompt("Submit without Turnstile when challenged? [y/N]: ")
+	if err != nil {
+		// The opt-in is optional: a non-interactive session that cannot answer
+		// keeps the default instead of failing the verified login.
+		fmt.Printf("  Prompt unavailable (%v); keeping the default (no).\n", err)
+		rawSubmitWithoutTurnstile = ""
+	}
+	submitWithoutTurnstile := false
+	switch strings.ToLower(strings.TrimSpace(rawSubmitWithoutTurnstile)) {
+	case "", "n", "no":
+	case "y", "yes":
+		submitWithoutTurnstile = true
+	default:
+		return nil, fmt.Errorf("chatgpt-web: Turnstile compatibility option must be yes or no")
+	}
 
 	email := ""
 	if opts.Metadata != nil {
@@ -121,6 +139,9 @@ func (a ChatGPTWebAuthenticator) Login(ctx context.Context, cfg *config.Config, 
 	}
 	if email != "" {
 		metadata["email"] = email
+	}
+	if submitWithoutTurnstile {
+		metadata["submit_without_turnstile"] = true
 	}
 
 	return &coreauth.Auth{

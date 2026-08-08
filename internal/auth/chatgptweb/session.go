@@ -33,8 +33,8 @@ const (
 
 	DefaultUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
-	clientVersion      = "prod-81e0c5cdf6140e8c5db714d613337f4aeab94029"
-	clientBuildNumber  = "6128297"
+	clientVersion      = "prod-e1d6f2820dd20c3bab36cc42e8668035bf87f7bc"
+	clientBuildNumber  = "9052945"
 	sessionTokenMaxAge = 4 * time.Minute
 	modelsResponseMax  = 4 * 1024 * 1024
 )

@@ -22,6 +22,9 @@ func chatGPTWebLoginPrompt(cookie string) func(string) (string, error) {
 		if strings.HasPrefix(prompt, "User-Agent") {
 			return chatGPTWebTestUserAgent, nil
 		}
+		if strings.HasPrefix(prompt, "Submit without Turnstile") {
+			return "n", nil
+		}
 		return cookie, nil
 	}
 }
@@ -78,6 +81,9 @@ func TestChatGPTWebLoginStoresNormalizedCookieWithoutEcho(t *testing.T) {
 	if auth.Metadata["label"] != auth.Label {
 		t.Fatalf("stored label = %q", auth.Metadata["label"])
 	}
+	if _, ok := auth.Metadata["submit_without_turnstile"]; ok {
+		t.Fatal("default Turnstile choice must remain disabled")
+	}
 	lastRefresh, ok := auth.Metadata["last_refresh"].(int64)
 	if !ok || lastRefresh <= 0 || auth.Metadata["timestamp"] != lastRefresh {
 		t.Fatalf("refresh metadata = %#v", auth.Metadata)
@@ -85,6 +91,28 @@ func TestChatGPTWebLoginStoresNormalizedCookieWithoutEcho(t *testing.T) {
 	credentialID := strings.TrimSuffix(strings.TrimPrefix(auth.FileName, "chatgpt-web-"), ".json")
 	if _, err := uuid.Parse(credentialID); err != nil || auth.ID != auth.FileName {
 		t.Fatalf("credential filename = %q, ID = %q", auth.FileName, auth.ID)
+	}
+}
+
+func TestChatGPTWebLoginStoresSubmitWithoutTurnstileOptIn(t *testing.T) {
+	chatGPTWebSessionServer(t, http.StatusOK)
+	auth, err := (ChatGPTWebAuthenticator{}).Login(context.Background(), &config.Config{}, &LoginOptions{
+		Prompt: func(prompt string) (string, error) {
+			switch {
+			case strings.HasPrefix(prompt, "User-Agent"):
+				return chatGPTWebTestUserAgent, nil
+			case strings.HasPrefix(prompt, "Submit without Turnstile"):
+				return "yes", nil
+			default:
+				return "__Secure-next-auth.session-token=tok123", nil
+			}
+		},
+	})
+	if err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	if enabled, ok := auth.Metadata["submit_without_turnstile"].(bool); !ok || !enabled {
+		t.Fatalf("submit_without_turnstile = %#v, want true", auth.Metadata["submit_without_turnstile"])
 	}
 }
 

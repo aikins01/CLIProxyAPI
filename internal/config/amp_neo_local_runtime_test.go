@@ -9,6 +9,34 @@ import (
 	"testing"
 )
 
+func TestLoadConfigOptional_AmpCodexWebsocketsExperiment(t *testing.T) {
+	tests := []struct {
+		name       string
+		configYAML string
+		want       bool
+	}{
+		{name: "default off", configYAML: "ampcode: {}\n"},
+		{name: "explicitly enabled", configYAML: "ampcode:\n  codex-websockets-experiment: true\n", want: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			configPath := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(configPath, []byte(tc.configYAML), 0o600); err != nil {
+				t.Fatalf("failed to write config: %v", err)
+			}
+
+			cfg, err := LoadConfigOptional(configPath, false)
+			if err != nil {
+				t.Fatalf("LoadConfigOptional() error = %v", err)
+			}
+			if got := cfg.AmpCode.CodexWebsocketsExperiment; got != tc.want {
+				t.Fatalf("CodexWebsocketsExperiment = %t, want %t", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestLoadConfigOptional_AmpNeoModeModelsAcceptsScalarAndSequence(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 	configYAML := []byte(`

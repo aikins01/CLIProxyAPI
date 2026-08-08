@@ -3616,6 +3616,210 @@ func TestNeoWebLocalSidebarThreadSummariesUseBoundedPersistedScan(t *testing.T) 
 	}
 }
 
+func TestNeoWebLocalSidebarThreadSummariesIncludeOutOfRangeArchivedThread(t *testing.T) {
+	useTempNeoThreadStore(t)
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled}}})
+	archivedThreadID := "T-019f4000-0000-4000-8000-000000000150"
+	archivedPath, err := writeNeoLocalThreadFileInDir(rt.threadDir, archivedThreadID, map[string]any{
+		"id":       archivedThreadID,
+		"title":    "Old archived sidebar thread",
+		"archived": true,
+		"messages": []any{
+			map[string]any{"role": "user", "content": []any{map[string]any{"type": "text", "text": "archived long ago"}}},
+		},
+		"meta": map[string]any{"cliProxyAPILocalNeo": true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(archivedPath, stale, stale); err != nil {
+		t.Fatal(err)
+	}
+	puckThreadID := "T-019f4000-0000-4000-8000-000000000151"
+	puckPath, err := writeNeoLocalThreadFileInDir(rt.threadDir, puckThreadID, map[string]any{
+		"id":        puckThreadID,
+		"title":     "Old archived Puck thread",
+		"archived":  true,
+		"agentMode": "puck",
+		"messages": []any{
+			map[string]any{"role": "user", "content": []any{map[string]any{"type": "text", "text": "cloud Puck"}}},
+		},
+		"meta": map[string]any{"cliProxyAPILocalNeo": true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(puckPath, stale, stale); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		threadID := fmt.Sprintf("T-019f4000-0000-4000-8000-00000000016%d", i)
+		if _, err := writeNeoLocalThreadFileInDir(rt.threadDir, threadID, map[string]any{
+			"id":    threadID,
+			"title": fmt.Sprintf("Newer sidebar thread %d", i),
+			"messages": []any{
+				map[string]any{"role": "user", "content": []any{map[string]any{"type": "text", "text": "newer"}}},
+			},
+			"meta": map[string]any{"cliProxyAPILocalNeo": true},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	_, archivedThreadIDs := rt.neoWebLocalSidebarThreadSummaries(context.Background(), 1)
+	if !slices.Contains(archivedThreadIDs, archivedThreadID) {
+		t.Fatalf("archivedThreadIDs = %#v, want out-of-range archived thread %q", archivedThreadIDs, archivedThreadID)
+	}
+	if slices.Contains(archivedThreadIDs, puckThreadID) {
+		t.Fatalf("archivedThreadIDs = %#v, should exclude Puck thread %q", archivedThreadIDs, puckThreadID)
+	}
+	rt.localRecentMu.Lock()
+	fullHistoryLoaded := rt.localRecentLoaded
+	rt.localRecentMu.Unlock()
+	if fullHistoryLoaded {
+		t.Fatal("sidebar archived-id scan populated the full-history cache")
+	}
+}
+
+func TestNeoWebLocalPersistedArchivedThreadIDsFilterOwner(t *testing.T) {
+	useTempNeoThreadStore(t)
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled}}})
+	ownedThreadID := "T-019f4000-0000-4000-8000-000000000152"
+	foreignThreadID := "T-019f4000-0000-4000-8000-000000000153"
+	for _, thread := range []map[string]any{
+		{"id": ownedThreadID, "title": "Owned archived thread", "archived": true, "ownerUserId": neoLocalOwnerUserID, "meta": map[string]any{"cliProxyAPILocalNeo": true}},
+		{"id": foreignThreadID, "title": "Foreign archived thread", "archived": true, "ownerUserId": "user-other", "meta": map[string]any{"cliProxyAPILocalNeo": true}},
+	} {
+		if _, err := writeNeoLocalThreadFileInDir(rt.threadDir, stringValue(thread["id"]), thread); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	archivedThreadIDs := rt.appendNeoWebLocalPersistedArchivedThreadIDs(context.Background(), nil, nil, neoLocalOwnerUserID)
+	if !slices.Contains(archivedThreadIDs, ownedThreadID) || slices.Contains(archivedThreadIDs, foreignThreadID) {
+		t.Fatalf("archivedThreadIDs = %#v, want only owner %q", archivedThreadIDs, neoLocalOwnerUserID)
+	}
+}
+
+func TestNeoWebLocalSidebarThreadSummariesPreferLiveArchiveState(t *testing.T) {
+	useTempNeoThreadStore(t)
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled}}})
+	tests := []struct {
+		threadID string
+		archived bool
+		mode     string
+	}{
+		{threadID: "T-019f4000-0000-4000-8000-000000000154", mode: "smart"},
+		{threadID: "T-019f4000-0000-4000-8000-000000000155", archived: true, mode: "puck"},
+	}
+	for _, test := range tests {
+		if _, err := writeNeoLocalThreadFileInDir(rt.threadDir, test.threadID, map[string]any{
+			"id":        test.threadID,
+			"title":     "Stale archived thread",
+			"archived":  true,
+			"agentMode": "smart",
+			"messages":  []any{map[string]any{"role": "user", "content": []any{map[string]any{"type": "text", "text": "persisted"}}}},
+			"meta":      map[string]any{"cliProxyAPILocalNeo": true},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		actor, _ := rt.store.upsert(map[string]any{"name": "thread-actor", "key": test.threadID, "input": map[string]any{"threadId": test.threadID}}, true)
+		actor.mu.Lock()
+		actor.archived = test.archived
+		actor.currentAgentMode = test.mode
+		actor.settings["agentMode"] = test.mode
+		actor.messages = []neoMessage{{ThreadID: test.threadID, MessageID: newNeoMessageID(), Role: "user", Content: []any{map[string]any{"type": "text", "text": "live"}}, CreatedAt: time.Now().UTC().Format(time.RFC3339Nano), Seq: 1}}
+		actor.rebuildHistoryLocked()
+		actor.mu.Unlock()
+	}
+
+	_, archivedThreadIDs := rt.neoWebLocalSidebarThreadSummaries(context.Background(), 1)
+	for _, test := range tests {
+		if slices.Contains(archivedThreadIDs, test.threadID) {
+			t.Fatalf("archivedThreadIDs = %#v, stale sidecar overrode live state for %s", archivedThreadIDs, test.threadID)
+		}
+	}
+}
+
+func TestNeoWebLocalPersistedArchivedSummaryIndexCachesReads(t *testing.T) {
+	enabled := true
+	threadDir := t.TempDir()
+	archivedA := "T-019f4000-0000-4000-8000-000000000156"
+	archivedB := "T-019f4000-0000-4000-8000-000000000157"
+	activeID := "T-019f4000-0000-4000-8000-000000000158"
+	puckID := "T-019f4000-0000-4000-8000-000000000159"
+	for _, thread := range []map[string]any{
+		{"id": archivedB, "title": "Archived B", "archived": true, "meta": map[string]any{"cliProxyAPILocalNeo": true}},
+		{"id": activeID, "title": "Active", "meta": map[string]any{"cliProxyAPILocalNeo": true}},
+		{"id": puckID, "title": "Puck", "archived": true, "agentMode": "puck", "meta": map[string]any{"cliProxyAPILocalNeo": true}},
+		{"id": archivedA, "title": "Archived A", "archived": true, "meta": map[string]any{"cliProxyAPILocalNeo": true}},
+	} {
+		if _, err := writeNeoLocalThreadFileInDir(threadDir, stringValue(thread["id"]), thread); err != nil {
+			t.Fatal(err)
+		}
+	}
+	summaryDir := filepath.Join(threadDir, neoWebLocalThreadSummaryDirName)
+	if err := writeNeoWebLocalThreadSummaryStatus(filepath.Join(summaryDir, "T-00000000-0000-0000-0000-000000000000.json"), map[string]any{
+		"id": "T-00000000-0000-0000-0000-000000000000", "threadId": "T-00000000-0000-0000-0000-000000000000", "archived": true, "cliProxyAPILocalNeo": true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled}}})
+	rt.threadDir = threadDir
+	reads := 0
+	readSummary := func(file neoPersistedThreadFile) (map[string]any, bool) {
+		reads++
+		return readNeoWebLocalThreadSummary(threadDir, file)
+	}
+
+	first := rt.neoWebLocalPersistedArchivedThreadSummariesWithReader(context.Background(), readSummary)
+	if reads != 4 {
+		t.Fatalf("initial archived summary reads = %d, want 4 non-sentinel sidecars", reads)
+	}
+	if len(first) != 2 || first[0].threadID != archivedA || first[1].threadID != archivedB {
+		t.Fatalf("archived summary index = %#v", first)
+	}
+	second := rt.neoWebLocalPersistedArchivedThreadSummariesWithReader(context.Background(), readSummary)
+	if reads != 4 || !reflect.DeepEqual(second, first) {
+		t.Fatalf("warm archived summary index reread sidecars: reads=%d first=%#v second=%#v", reads, first, second)
+	}
+	if err := writeNeoWebLocalThreadSummaryStatus(neoWebLocalThreadSummaryPath(threadDir, archivedA), map[string]any{
+		"id": archivedA, "threadId": archivedA, "title": "Active A", "cliProxyAPILocalNeo": true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	third := rt.neoWebLocalPersistedArchivedThreadSummariesWithReader(context.Background(), readSummary)
+	if reads != 8 || len(third) != 1 || third[0].threadID != archivedB {
+		t.Fatalf("archived summary index after atomic rewrite = %#v reads=%d", third, reads)
+	}
+	if err := os.Remove(neoWebLocalThreadSummaryPath(threadDir, archivedB)); err != nil {
+		t.Fatal(err)
+	}
+	fourth := rt.neoWebLocalPersistedArchivedThreadSummariesWithReader(context.Background(), readSummary)
+	if reads != 11 || len(fourth) != 0 {
+		t.Fatalf("archived summary index after delete = %#v reads=%d", fourth, reads)
+	}
+	if len(rt.localThreadSummaryCache) != 0 {
+		t.Fatalf("archived summary index churned general summary cache: %#v", rt.localThreadSummaryCache)
+	}
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	fresh := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled}}})
+	fresh.threadDir = threadDir
+	cancelledReads := 0
+	if got := fresh.neoWebLocalPersistedArchivedThreadSummariesWithReader(cancelled, func(file neoPersistedThreadFile) (map[string]any, bool) {
+		cancelledReads++
+		return readNeoWebLocalThreadSummary(threadDir, file)
+	}); len(got) != 0 || cancelledReads != 0 {
+		t.Fatalf("cancelled archived summary scan = %#v reads=%d", got, cancelledReads)
+	}
+}
+
 func TestNeoActorStorePrunesPersistedThreadWithMetadata(t *testing.T) {
 	useTempNeoThreadStore(t)
 	enabled := true
@@ -21120,7 +21324,7 @@ func TestNeoRuntimeStreamedReviewRunChecksSupportHeadlessCollector(t *testing.T)
 	rt := newNeoRuntime(&config.Config{})
 	rt.inferStream = func(_ *neoRuntime, request neoInferenceRequest, _ neoStreamCallback) (neoInferenceResult, error) {
 		if strings.HasPrefix(request.ParentToolCallID, "TU-check-") {
-			return neoInferenceResult{Text: `{"issues":[],"filesAnalyzed":0,"coveredFiles":[],"coveredHunks":[]}`}, nil
+			return neoInferenceResult{Text: `{"issues":[],"filesAnalyzed":0,"coveredFiles":[],"coveredHunks":[],"patternsChecked":["empty snapshot"],"evidence":[{"patternIndex":0,"observation":"No changed lines matched the check.","sources":["immutable snapshot"],"outcome":"no-finding"}]}`}, nil
 		}
 		return neoInferenceResult{}, fmt.Errorf("unexpected inference for parent %q", request.ParentToolCallID)
 	}
@@ -21417,7 +21621,7 @@ func TestNeoRuntimeNestedStreamedReviewRunChecksEmitNoSyntheticAddition(t *testi
 	rt := newNeoRuntime(&config.Config{})
 	rt.inferStream = func(_ *neoRuntime, request neoInferenceRequest, _ neoStreamCallback) (neoInferenceResult, error) {
 		if strings.HasPrefix(request.ParentToolCallID, "TU-check-") {
-			return neoInferenceResult{Text: `{"issues":[],"filesAnalyzed":0,"coveredFiles":[],"coveredHunks":[]}`}, nil
+			return neoInferenceResult{Text: `{"issues":[],"filesAnalyzed":0,"coveredFiles":[],"coveredHunks":[],"patternsChecked":["empty snapshot"],"evidence":[{"patternIndex":0,"observation":"No changed lines matched the check.","sources":["immutable snapshot"],"outcome":"no-finding"}]}`}, nil
 		}
 		return neoInferenceResult{}, fmt.Errorf("unexpected inference for parent %q", request.ParentToolCallID)
 	}
@@ -27741,6 +27945,549 @@ func TestNeoActorCancellationCancelsMainInferenceContext(t *testing.T) {
 	}
 }
 
+func TestNeoActorClientCancelCancelsPreflightCompactionAndDrainsQueuedMessageOnce(t *testing.T) {
+	useTempNeoThreadStore(t)
+	compactionStarted := make(chan struct{}, 1)
+	compactionCancelled := make(chan struct{}, 1)
+	releaseCompaction := make(chan struct{})
+	var releaseCompactionOnce sync.Once
+	upstream := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		select {
+		case compactionStarted <- struct{}{}:
+		default:
+		}
+		select {
+		case <-r.Context().Done():
+			select {
+			case compactionCancelled <- struct{}{}:
+			default:
+			}
+		case <-releaseCompaction:
+		}
+	}))
+	t.Cleanup(func() {
+		releaseCompactionOnce.Do(func() { close(releaseCompaction) })
+		upstream.Close()
+	})
+
+	actor := newNeoCompactionCancellationTestActor(t, upstream, "T-preflight-cancel")
+	events := captureNeoActorEventsForTest(t, actor)
+	var inferenceCalls atomic.Int32
+	var replacementCalls atomic.Int32
+	replacementFinished := make(chan struct{})
+	var replacementFinishedOnce sync.Once
+	actor.runtime.inferStream = func(_ *neoRuntime, request neoInferenceRequest, _ neoStreamCallback) (neoInferenceResult, error) {
+		inferenceCalls.Add(1)
+		if strings.Contains(fmt.Sprint(request.History), "queued replacement") {
+			replacementCalls.Add(1)
+			replacementFinishedOnce.Do(func() { close(replacementFinished) })
+			return neoInferenceResult{Provider: "anthropic", Model: "claude-opus-4-7", Text: "replacement complete"}, nil
+		}
+		return neoInferenceResult{Provider: "anthropic", Model: "claude-opus-4-7", Text: "stale original inference"}, nil
+	}
+	originalFinished := make(chan struct{})
+	go func() {
+		actor.runInference("smart", "medium")
+		close(originalFinished)
+	}()
+
+	select {
+	case <-compactionStarted:
+	case <-time.After(time.Second):
+		t.Fatal("preflight compaction did not start")
+	}
+	queuedMessageID := "M-queued-replacement"
+	actor.receiveNormalizedUserMessage(neoQueuedMessage{
+		MessageID: queuedMessageID,
+		Content:   []any{map[string]any{"type": "text", "text": "queued replacement"}},
+		AgentMode: "smart",
+	})
+	actor.mu.Lock()
+	actor.settings["compactionControl"] = map[string]any{"enabled": false}
+	actor.mu.Unlock()
+	actor.cancel()
+
+	select {
+	case <-compactionCancelled:
+	case <-time.After(time.Second):
+		t.Fatal("client cancel did not cancel the preflight provider request")
+	}
+	select {
+	case <-replacementFinished:
+	case <-time.After(2 * time.Second):
+		t.Fatal("queued replacement did not start after preflight cancellation")
+	}
+	select {
+	case <-originalFinished:
+	case <-time.After(time.Second):
+		t.Fatal("preflight inference did not unwind after cancellation")
+	}
+	waitForNeoCompactionCancellationActorIdle(t, actor)
+	waitForNeoActorSyncIdle(t, actor)
+
+	actor.mu.Lock()
+	queuedMessageCount := 0
+	summaryCount := 0
+	for _, message := range actor.messages {
+		if message.MessageID == queuedMessageID {
+			queuedMessageCount++
+		}
+		if message.Role == "info" {
+			summaryCount++
+		}
+	}
+	queueLen := len(actor.queue)
+	compacting := actor.compacting
+	retryAfterLen := actor.compactionRetryAfterLen
+	recordCount := len(actor.compactionRecords)
+	state := actor.agentState
+	currentInference := actor.currentInference
+	actor.mu.Unlock()
+	if inferenceCalls.Load() != 1 || replacementCalls.Load() != 1 {
+		t.Fatalf("inference calls = total:%d replacement:%d, want 1/1", inferenceCalls.Load(), replacementCalls.Load())
+	}
+	if queuedMessageCount != 1 || queueLen != 0 {
+		t.Fatalf("queued replacement state = stored:%d queued:%d, want 1/0", queuedMessageCount, queueLen)
+	}
+	if compacting || summaryCount != 0 || recordCount != 0 || retryAfterLen != 0 {
+		t.Fatalf("cancelled preflight compaction state = compacting:%t summaries:%d records:%d retryAfterLen:%d", compacting, summaryCount, recordCount, retryAfterLen)
+	}
+	if state != "idle" || currentInference != nil {
+		t.Fatalf("final actor state = %q current:%#v, want idle with no inference", state, currentInference)
+	}
+	assertNeoCancelledCompactionEvents(t, events(), queuedMessageID, "")
+}
+
+func TestNeoActorClientCancelCancelsPostflightCompactionWithoutResurrectingTools(t *testing.T) {
+	useTempNeoThreadStore(t)
+	compactionStarted := make(chan struct{}, 1)
+	compactionCancelled := make(chan struct{}, 1)
+	releaseCompaction := make(chan struct{})
+	var releaseCompactionOnce sync.Once
+	upstream := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		select {
+		case compactionStarted <- struct{}{}:
+		default:
+		}
+		select {
+		case <-r.Context().Done():
+			select {
+			case compactionCancelled <- struct{}{}:
+			default:
+			}
+		case <-releaseCompaction:
+		}
+	}))
+	t.Cleanup(func() {
+		releaseCompactionOnce.Do(func() { close(releaseCompaction) })
+		upstream.Close()
+	})
+
+	actor := newNeoCompactionCancellationTestActor(t, upstream, "T-postflight-cancel")
+	events := captureNeoActorEventsForTest(t, actor)
+	var inferenceCalls atomic.Int32
+	replacementFinished := make(chan struct{})
+	var replacementFinishedOnce sync.Once
+	toolCallID := "TU-stale-postflight"
+	actor.runtime.inferStream = func(_ *neoRuntime, request neoInferenceRequest, _ neoStreamCallback) (neoInferenceResult, error) {
+		call := inferenceCalls.Add(1)
+		if call == 1 {
+			return neoInferenceResult{
+				Provider:   "anthropic",
+				Model:      "claude-opus-4-7",
+				StopReason: "tool_use",
+				ToolCalls: []neoToolCall{{
+					ID:    toolCallID,
+					Name:  "custom_tool",
+					Input: map[string]any{"value": "stale"},
+				}},
+				Usage: map[string]any{"totalInputTokens": 190_000, "outputTokens": 1, "maxInputTokens": 200_000},
+			}, nil
+		}
+		if strings.Contains(fmt.Sprint(request.History), "queued replacement") {
+			replacementFinishedOnce.Do(func() { close(replacementFinished) })
+		}
+		return neoInferenceResult{Provider: "anthropic", Model: "claude-opus-4-7", Text: "replacement complete"}, nil
+	}
+	originalFinished := make(chan struct{})
+	go func() {
+		actor.runInferenceWithOptions("smart", "medium", neoInferenceRunOptions{skipPreflightCompaction: true})
+		close(originalFinished)
+	}()
+
+	select {
+	case <-compactionStarted:
+	case <-time.After(time.Second):
+		actor.mu.Lock()
+		state := actor.agentState
+		current := actor.currentInference
+		messages := cloneNeoMessages(actor.messages)
+		actor.mu.Unlock()
+		t.Fatalf("postflight compaction did not start: calls=%d state=%q current=%#v messages=%#v", inferenceCalls.Load(), state, current, messages)
+	}
+	queuedMessageID := "M-postflight-queued-replacement"
+	actor.receiveNormalizedUserMessage(neoQueuedMessage{
+		MessageID: queuedMessageID,
+		Content:   []any{map[string]any{"type": "text", "text": "queued replacement"}},
+		AgentMode: "smart",
+	})
+	actor.mu.Lock()
+	actor.settings["compactionControl"] = map[string]any{"enabled": false}
+	actor.mu.Unlock()
+	actor.cancel()
+
+	select {
+	case <-compactionCancelled:
+	case <-time.After(time.Second):
+		t.Fatal("client cancel did not cancel the postflight provider request")
+	}
+	select {
+	case <-replacementFinished:
+	case <-time.After(2 * time.Second):
+		t.Fatal("queued replacement did not start after postflight cancellation")
+	}
+	select {
+	case <-originalFinished:
+	case <-time.After(time.Second):
+		t.Fatal("postflight inference did not unwind after cancellation")
+	}
+	waitForNeoCompactionCancellationActorIdle(t, actor)
+	waitForNeoActorSyncIdle(t, actor)
+
+	actor.mu.Lock()
+	queuedMessageCount := 0
+	summaryCount := 0
+	for _, message := range actor.messages {
+		if message.MessageID == queuedMessageID {
+			queuedMessageCount++
+		}
+		if message.Role == "info" {
+			summaryCount++
+		}
+	}
+	_, pendingTool := actor.pendingTools[toolCallID]
+	queueLen := len(actor.queue)
+	compacting := actor.compacting
+	retryAfterLen := actor.compactionRetryAfterLen
+	recordCount := len(actor.compactionRecords)
+	state := actor.agentState
+	currentInference := actor.currentInference
+	actor.mu.Unlock()
+	if inferenceCalls.Load() != 2 {
+		t.Fatalf("inference calls = %d, want original plus replacement", inferenceCalls.Load())
+	}
+	if queuedMessageCount != 1 || queueLen != 0 {
+		t.Fatalf("queued replacement state = stored:%d queued:%d, want 1/0", queuedMessageCount, queueLen)
+	}
+	if pendingTool {
+		t.Fatalf("cancelled postflight tool %q remained pending", toolCallID)
+	}
+	if compacting || summaryCount != 0 || recordCount != 0 || retryAfterLen != 0 {
+		t.Fatalf("cancelled postflight compaction state = compacting:%t summaries:%d records:%d retryAfterLen:%d", compacting, summaryCount, recordCount, retryAfterLen)
+	}
+	if state != "idle" || currentInference != nil {
+		t.Fatalf("final actor state = %q current:%#v, want idle with no inference", state, currentInference)
+	}
+	assertNeoCancelledCompactionEvents(t, events(), queuedMessageID, toolCallID)
+}
+
+func TestNeoActorStalePostflightFinalizationDoesNotResurrectTools(t *testing.T) {
+	actor := newNeoActor(newNeoRuntime(&config.Config{}), "actor-stale-postflight", "threadActor", "T-stale-postflight", "T-stale-postflight", neoActorRecord("actor-stale-postflight", "threadActor", "T-stale-postflight"), nil)
+	events := captureNeoActorEventsForTest(t, actor)
+	messageID := "M-stale-postflight"
+	toolCallID := "TU-stale-postflight"
+	generation := actor.generation
+	actor.emissionMu.Lock()
+	started := make(chan struct{})
+	done := make(chan bool, 1)
+	go func() {
+		close(started)
+		done <- actor.finishAssistantMessageForGeneration(messageID, neoInferenceResult{
+			Provider:   "anthropic",
+			Model:      "claude-opus-4-7",
+			StopReason: "tool_use",
+			ToolCalls: []neoToolCall{{
+				ID:    toolCallID,
+				Name:  "custom_tool",
+				Input: map[string]any{"value": "stale"},
+			}},
+		}, "smart", "medium", false, "", generation)
+	}()
+	<-started
+	select {
+	case <-done:
+		actor.emissionMu.Unlock()
+		t.Fatal("postflight finalization did not wait for emission ownership")
+	case <-time.After(100 * time.Millisecond):
+	}
+	replacementID := "M-replacement"
+	actor.mu.Lock()
+	actor.advanceGenerationLocked()
+	actor.currentInference = &neoInferenceInflight{messageID: replacementID}
+	actor.agentState = "working"
+	actor.mu.Unlock()
+	actor.emissionMu.Unlock()
+	select {
+	case hasPendingLocalTools := <-done:
+		if hasPendingLocalTools {
+			t.Fatal("stale postflight finalization reported pending local tools")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stale postflight finalization did not finish")
+	}
+
+	actor.mu.Lock()
+	messageIndex := actor.messageIndexLocked(messageID)
+	_, pendingTool := actor.pendingTools[toolCallID]
+	state := actor.agentState
+	currentInference := actor.currentInference
+	actor.mu.Unlock()
+	if messageIndex >= 0 || pendingTool || state != "working" || currentInference == nil || currentInference.messageID != replacementID {
+		t.Fatalf("stale postflight state = messageIndex:%d pendingTool:%t state:%q current:%#v", messageIndex, pendingTool, state, currentInference)
+	}
+	if captured := events(); len(captured) != 0 {
+		t.Fatalf("stale postflight finalization emitted events: %#v", captured)
+	}
+}
+
+func TestNeoGenerationFencedDeltaWaitsForEmissionOwnership(t *testing.T) {
+	actor := newNeoActor(newNeoRuntime(&config.Config{}), "actor-fenced-delta", "threadActor", "T-fenced-delta", "T-fenced-delta", neoActorRecord("actor-fenced-delta", "threadActor", "T-fenced-delta"), nil)
+	events := captureNeoActorEventsForTest(t, actor)
+	messageID := "M-fenced-delta"
+	generation := actor.generation
+	actor.emissionMu.Lock()
+	started := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		close(started)
+		actor.handleProtocolDeltaForGeneration(neoAssistantDeltaPayload(messageID, []any{map[string]any{"type": "text", "text": "ready"}}, 0, "generating", nil), generation)
+		close(done)
+	}()
+	<-started
+	select {
+	case <-done:
+		actor.emissionMu.Unlock()
+		t.Fatal("generation-fenced delta did not wait for emission ownership")
+	case <-time.After(100 * time.Millisecond):
+	}
+	actor.mu.Lock()
+	actor.advanceGenerationLocked()
+	actor.mu.Unlock()
+	actor.emissionMu.Unlock()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("generation-fenced delta did not finish")
+	}
+	actor.mu.Lock()
+	messageIndex := actor.messageIndexLocked(messageID)
+	actor.mu.Unlock()
+	if messageIndex >= 0 {
+		t.Fatal("stale generation-fenced delta mutated actor state")
+	}
+	if captured := events(); len(captured) != 0 {
+		t.Fatalf("stale generation-fenced delta events = %#v", captured)
+	}
+}
+
+func TestNeoGenerationFencedAgentStateWaitsForEmissionOwnership(t *testing.T) {
+	actor := newNeoActor(newNeoRuntime(&config.Config{}), "actor-fenced-state", "threadActor", "T-fenced-state", "T-fenced-state", neoActorRecord("actor-fenced-state", "threadActor", "T-fenced-state"), nil)
+	events := captureNeoActorEventsForTest(t, actor)
+	actor.agentState = "working"
+	generation := actor.generation
+	actor.emissionMu.Lock()
+	started := make(chan struct{})
+	done := make(chan bool, 1)
+	go func() {
+		close(started)
+		done <- actor.setAgentStateForGeneration("streaming", "M-fenced-state", "review", "medium", generation)
+	}()
+	<-started
+	select {
+	case <-done:
+		actor.emissionMu.Unlock()
+		t.Fatal("generation-fenced agent state did not wait for emission ownership")
+	case <-time.After(100 * time.Millisecond):
+	}
+	actor.mu.Lock()
+	actor.advanceGenerationLocked()
+	actor.mu.Unlock()
+	actor.emissionMu.Unlock()
+	select {
+	case updated := <-done:
+		if updated {
+			t.Fatal("stale generation-fenced agent state was accepted")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("generation-fenced agent state did not finish")
+	}
+	actor.mu.Lock()
+	state := actor.agentState
+	actor.mu.Unlock()
+	if state != "working" {
+		t.Fatalf("stale generation-fenced agent state mutated actor state to %q", state)
+	}
+	if captured := events(); len(captured) != 0 {
+		t.Fatalf("stale generation-fenced agent state events = %#v", captured)
+	}
+}
+
+func TestNeoCompactionPlanReleaseRequiresOwnership(t *testing.T) {
+	actor := newNeoActor(newNeoRuntime(&config.Config{}), "actor-compaction-owner", "threadActor", "T-compaction-owner", "T-compaction-owner", neoActorRecord("actor-compaction-owner", "threadActor", "T-compaction-owner"), nil)
+	events := captureNeoActorEventsForTest(t, actor)
+	actor.mu.Lock()
+	actor.compacting = true
+	actor.compactionOwner = 2
+	actor.compactionRetryAfterLen = 0
+	generation := actor.generation
+	actor.mu.Unlock()
+	if actor.finishFailedCompactionPlan(neoCompactionPlan{owner: 1, generation: generation, sourceLen: 10}) {
+		t.Fatal("stale compaction owner reported completion")
+	}
+	actor.mu.Lock()
+	if !actor.compacting || actor.compactionOwner != 2 || actor.compactionRetryAfterLen != 0 {
+		actor.mu.Unlock()
+		t.Fatalf("stale plan changed active ownership: compacting=%t owner=%d retryAfterLen=%d", actor.compacting, actor.compactionOwner, actor.compactionRetryAfterLen)
+	}
+	actor.mu.Unlock()
+	if captured := events(); len(captured) != 0 {
+		t.Fatalf("stale compaction owner emitted completion: %#v", captured)
+	}
+	if !actor.finishFailedCompactionPlan(neoCompactionPlan{owner: 2, generation: generation, sourceLen: 10}) {
+		t.Fatal("active compaction owner was not released")
+	}
+	actor.mu.Lock()
+	compacting := actor.compacting
+	owner := actor.compactionOwner
+	actor.mu.Unlock()
+	if compacting || owner != 0 {
+		t.Fatalf("released compaction ownership = compacting:%t owner:%d", compacting, owner)
+	}
+	if captured := events(); len(captured) != 1 || stringValue(captured[0]["type"]) != "compaction_complete" {
+		t.Fatalf("active compaction completion events = %#v", captured)
+	}
+}
+
+func newNeoCompactionCancellationTestActor(t *testing.T, upstream *httptest.Server, threadID string) *neoActor {
+	t.Helper()
+	rt := testNeoRuntimeForServer(t, upstream)
+	enabled := true
+	cfg := *rt.configSnapshot()
+	cfg.AmpCode.NeoLocalRuntime.Enabled = &enabled
+	cfg.AmpCode.NeoLocalRuntime.CompactionModel = "openai/gpt-5.4"
+	if err := rt.updateConfig(&cfg); err != nil {
+		t.Fatalf("update compaction test config: %v", err)
+	}
+	actor := newNeoActor(rt, "actor-"+threadID, "threadActor", threadID, threadID, neoActorRecord("actor-"+threadID, "threadActor", threadID), nil)
+	actor.mu.Lock()
+	actor.executorReady = true
+	actor.title = "Cancellation test"
+	actor.titleSource = "explicit"
+	actor.titleGenerationStarted = true
+	actor.settings["internal.model"] = "anthropic/claude-opus-4-7"
+	actor.settings["internal.compactionThresholdPercent"] = 0
+	for i := 0; i < 15; i++ {
+		role := "user"
+		if i%2 == 1 {
+			role = "assistant"
+		}
+		actor.storeMessageLocked(neoMessage{
+			ThreadID:  threadID,
+			MessageID: fmt.Sprintf("M-%022d", i),
+			Role:      role,
+			Content:   []any{map[string]any{"type": "text", "text": fmt.Sprintf("compaction context %02d %s", i, strings.Repeat("important ", 40))}},
+		})
+	}
+	actor.rebuildHistoryLocked()
+	actor.mu.Unlock()
+	return actor
+}
+
+func captureNeoActorEventsForTest(t *testing.T, actor *neoActor) func() []map[string]any {
+	t.Helper()
+	var mu sync.Mutex
+	var frames [][]byte
+	socket := &neoSocket{writeMessage: func(_ int, data []byte) error {
+		mu.Lock()
+		frames = append(frames, append([]byte(nil), data...))
+		mu.Unlock()
+		return nil
+	}}
+	actor.mu.Lock()
+	actor.sockets[socket] = struct{}{}
+	actor.mu.Unlock()
+	t.Cleanup(func() {
+		actor.mu.Lock()
+		delete(actor.sockets, socket)
+		actor.mu.Unlock()
+	})
+	return func() []map[string]any {
+		mu.Lock()
+		captured := make([][]byte, len(frames))
+		for i := range frames {
+			captured[i] = append([]byte(nil), frames[i]...)
+		}
+		mu.Unlock()
+		events := make([]map[string]any, 0, len(captured))
+		for _, frame := range captured {
+			var event map[string]any
+			if err := json.Unmarshal(frame, &event); err != nil {
+				t.Fatalf("decode captured Neo event: %v", err)
+			}
+			events = append(events, event)
+		}
+		return events
+	}
+}
+
+func waitForNeoCompactionCancellationActorIdle(t *testing.T, actor *neoActor) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		actor.mu.Lock()
+		idle := actor.agentState == "idle" && actor.currentInference == nil && !actor.compacting && len(actor.queue) == 0
+		actor.mu.Unlock()
+		if idle {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	t.Fatalf("actor did not become idle: state=%q current=%#v compacting=%t queue=%d", actor.agentState, actor.currentInference, actor.compacting, len(actor.queue))
+}
+
+func assertNeoCancelledCompactionEvents(t *testing.T, events []map[string]any, queuedMessageID, forbiddenToolCallID string) {
+	t.Helper()
+	started := 0
+	completed := 0
+	dequeued := 0
+	for _, event := range events {
+		switch stringValue(event["type"]) {
+		case "compaction_started":
+			started++
+		case "compaction_complete":
+			completed++
+			if stringValue(event["cutMessageId"]) != "" {
+				t.Fatalf("cancelled compaction completion included cutMessageId: %#v", event)
+			}
+		case "queued_message_dequeued":
+			if stringValue(event["queuedMessageId"]) == queuedMessageID {
+				dequeued++
+			}
+		case "tool_lease":
+			if forbiddenToolCallID != "" && stringValue(event["toolCallId"]) == forbiddenToolCallID {
+				t.Fatalf("stale postflight tool lease was emitted: %#v", event)
+			}
+		}
+	}
+	if started != 1 || completed != 1 || dequeued != 1 {
+		t.Fatalf("cancelled compaction lifecycle = started:%d completed:%d dequeued:%d, want 1/1/1", started, completed, dequeued)
+	}
+}
+
 func TestNeoActorDisposeCancelsInferenceContexts(t *testing.T) {
 	actor := newNeoActor(newNeoRuntime(&config.Config{}), "actor-dispose-contexts", "thread-actor", "T-dispose-contexts", "T-dispose-contexts", neoActorRecord("actor-dispose-contexts", "thread-actor", "T-dispose-contexts"), nil)
 	mainContext, cancelMain := context.WithCancel(context.Background())
@@ -27893,6 +28640,7 @@ func TestNeoActorStaleErrorDoesNotFinalizeReplacementInference(t *testing.T) {
 		return neoInferenceResult{}, errors.New("stale provider error")
 	}
 	actor := newNeoActor(rt, "actor-stale-finalize", "thread-actor", "T-stale-finalize", "T-stale-finalize", neoActorRecord("actor-stale-finalize", "thread-actor", "T-stale-finalize"), nil)
+	events := captureNeoActorEventsForTest(t, actor)
 	actor.messages = []neoMessage{{ThreadID: actor.threadID, MessageID: "M-user", Role: "user", Content: []any{map[string]any{"type": "text", "text": "start"}}}}
 	actor.rebuildHistoryLocked()
 	done := make(chan struct{})
@@ -27907,11 +28655,21 @@ func TestNeoActorStaleErrorDoesNotFinalizeReplacementInference(t *testing.T) {
 		case <-time.After(time.Second):
 			t.Errorf("stale inference goroutine did not stop during cleanup")
 		}
+		actor.cancel()
 	})
 	select {
 	case <-entered:
 	case <-time.After(time.Second):
 		t.Fatal("main inference did not start")
+	}
+	actor.emissionMu.Lock()
+	eventsBeforeError := events()
+	releaseInference()
+	select {
+	case <-done:
+		actor.emissionMu.Unlock()
+		t.Fatal("inference error finalization did not wait for emission ownership")
+	case <-time.After(100 * time.Millisecond):
 	}
 	actor.mu.Lock()
 	actor.advanceGenerationLocked()
@@ -27919,16 +28677,22 @@ func TestNeoActorStaleErrorDoesNotFinalizeReplacementInference(t *testing.T) {
 	actor.currentInference = &neoInferenceInflight{messageID: replacementID, agentMode: "ultra", reasoningEffort: "high"}
 	actor.agentState = "working"
 	actor.mu.Unlock()
-	releaseInference()
+	actor.emissionMu.Unlock()
 	select {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("stale inference did not return")
 	}
 	actor.mu.Lock()
-	defer actor.mu.Unlock()
-	if actor.currentInference == nil || actor.currentInference.messageID != replacementID || actor.agentState != "working" || actor.activeError != nil {
-		t.Fatalf("replacement inference was overwritten: current=%#v state=%q error=%#v", actor.currentInference, actor.agentState, actor.activeError)
+	currentInference := actor.currentInference
+	state := actor.agentState
+	activeError := actor.activeError
+	actor.mu.Unlock()
+	if currentInference == nil || currentInference.messageID != replacementID || state != "working" || activeError != nil {
+		t.Fatalf("replacement inference was overwritten: current=%#v state=%q error=%#v", currentInference, state, activeError)
+	}
+	if captured := events(); len(captured) != len(eventsBeforeError) {
+		t.Fatalf("stale inference error emitted events: before=%#v after=%#v", eventsBeforeError, captured)
 	}
 }
 
@@ -31258,6 +32022,32 @@ func TestNeoSystemPromptIncludesSendMessageWorkflowGuidance(t *testing.T) {
 	}
 }
 
+func TestNeoSystemPromptIncludesAmpReviewTimeoutGuidance(t *testing.T) {
+	for _, tool := range []string{"thread_interact", "send_message_to_thread"} {
+		t.Run(tool, func(t *testing.T) {
+			prompt := neoSystemPrompt(neoInferenceRequest{
+				AgentMode: "high",
+				Tools:     []neoToolSpec{{Name: tool}, {Name: "shell_command"}},
+			}, neoModelRoute{Provider: "openai", Model: "gpt-5.5"})
+			for _, want := range []string{
+				"`timeout_ms` is a hard wall-clock deadline",
+				"reviews may run multiple substantial checks concurrently and take longer than ordinary commands",
+				"prefer omitting `timeout_ms`",
+				"allow at least 20 minutes",
+				"For ordinary ad hoc reviews, run Amp review without `--json`",
+				"Add `--json` only when the user explicitly requests JSON or machine-readable output",
+			} {
+				if !strings.Contains(prompt, want) {
+					t.Fatalf("prompt missing Amp review guidance %q:\n%s", want, prompt)
+				}
+			}
+			if strings.Contains(prompt, "inactivity timeout") {
+				t.Fatalf("prompt restored obsolete inactivity-timeout semantics:\n%s", prompt)
+			}
+		})
+	}
+}
+
 func TestNeoSystemPromptMatchesBinaryEnvironmentThreadContext(t *testing.T) {
 	prompt := neoSystemPrompt(neoInferenceRequest{
 		ThreadID:  "T-019e1055-055c-705b-ae36-73d934ec6a89",
@@ -33441,7 +34231,12 @@ func TestNeoReviewModeRouteAndPrompt(t *testing.T) {
 		"repo-local checks override only same-named parent repo-local checks",
 		"set checkName to frontmatter.name",
 		"deleting a file, adding an empty file, adding or changing a binary file, removing all lines from a retained file, or another metadata-only file change, submit startLine 0 and endLine 0",
+		"no-tests-found result",
+		"do not use it to justify a clean conclusion",
 		"run_check exactly once per check",
+		"copy every field and array element verbatim",
+		"never emit placeholder or template text",
+		"same root cause as a check issue",
 		"submit_review tool; call it exactly once",
 		"empty comments array",
 	} {
@@ -33466,7 +34261,7 @@ func TestNeoReviewSevenChecksCompleteBeforeSingleSubmit(t *testing.T) {
 			entered <- request.ParentToolCallID
 			select {
 			case <-release:
-				return neoInferenceResult{Text: `{"issues":[],"filesAnalyzed":0,"coveredFiles":[],"coveredHunks":[]}`}, nil
+				return neoInferenceResult{Text: `{"issues":[],"filesAnalyzed":0,"coveredFiles":[],"coveredHunks":[],"patternsChecked":["empty snapshot"],"evidence":[{"patternIndex":0,"observation":"No changed lines matched the check.","sources":["immutable snapshot"],"outcome":"no-finding"}]}`}, nil
 			case <-request.Context.Done():
 				return neoInferenceResult{}, request.Context.Err()
 			}
@@ -33575,6 +34370,208 @@ func TestNeoReviewSevenChecksCompleteBeforeSingleSubmit(t *testing.T) {
 	}
 	if submitUses != 1 || submitResults != 1 {
 		t.Fatalf("submit_review uses/results = %d/%d, want 1/1", submitUses, submitResults)
+	}
+}
+
+func TestNeoReviewFailedCheckCannotCompleteThroughSubmitReview(t *testing.T) {
+	useTempNeoThreadStore(t)
+	var mainCalls atomic.Int32
+	rt := newNeoRuntime(&config.Config{})
+	rt.inferStream = func(_ *neoRuntime, request neoInferenceRequest, _ neoStreamCallback) (neoInferenceResult, error) {
+		if request.ParentToolCallID == "TU-review-failed-check" {
+			return neoInferenceResult{Text: `{"checkName":"published-dependency-capability-floor","status":"error","errorMessage":"exact floor evidence is unavailable","issues":[]}`}, nil
+		}
+		switch mainCalls.Add(1) {
+		case 1:
+			return neoInferenceResult{ToolCalls: []neoToolCall{{
+				ID:   "TU-review-failed-check",
+				Name: "run_check",
+				Input: map[string]any{
+					"checkName":    "published-dependency-capability-floor",
+					"checkContent": "Verify exact dependency floors.",
+				},
+			}}}, nil
+		case 2:
+			return neoInferenceResult{ToolCalls: []neoToolCall{{ID: "TU-review-blocked-submit", Name: "submit_review", Input: map[string]any{"comments": []any{}}}}}, nil
+		case 3:
+			if !strings.Contains(neoHistoryTestText(request.History), "submit_review blocked by unresolved run_check results") {
+				t.Fatalf("review continuation did not receive the submit gate error: %#v", request.History)
+			}
+			return neoInferenceResult{Text: "Review failed because a required check could not complete."}, nil
+		default:
+			return neoInferenceResult{}, fmt.Errorf("unexpected review inference")
+		}
+	}
+
+	actor := newNeoActor(rt, "actor-review-failed-check", "thread-actor", "T-review-failed-check", "T-review-failed-check", neoActorRecord("actor-review-failed-check", "thread-actor", "T-review-failed-check"), nil)
+	actor.executorReady = true
+	actor.executorBootstrapComplete = true
+	actor.messages = []neoMessage{{ThreadID: actor.threadID, MessageID: "M-review-failed-check-root", Role: "user", Content: []any{map[string]any{"type": "text", "text": "review changes"}}}}
+	actor.reviewSnapshot = &neoReviewDiffSnapshot{Diffs: map[string]string{}}
+	actor.reviewSnapshotRootMessageID = "M-review-failed-check-root"
+	actor.rebuildHistoryLocked()
+	t.Cleanup(func() { actor.cancel() })
+
+	actor.runInference("review", "medium")
+	if !neoWaitFor(3*time.Second, func() bool {
+		actor.mu.Lock()
+		defer actor.mu.Unlock()
+		return mainCalls.Load() == 3 && len(actor.pendingTools) == 0 && len(actor.subagentRuns) == 0 && actor.agentState == "idle"
+	}) {
+		actor.mu.Lock()
+		defer actor.mu.Unlock()
+		t.Fatalf("failed-check review did not finish explicitly: calls=%d pending=%d subagents=%d state=%q", mainCalls.Load(), len(actor.pendingTools), len(actor.subagentRuns), actor.agentState)
+	}
+
+	actor.mu.Lock()
+	messages := append([]neoMessage(nil), actor.messages...)
+	actor.mu.Unlock()
+	var checkRun, submitRun map[string]any
+	for _, message := range messages {
+		for _, raw := range message.Content {
+			block := mapValue(raw)
+			if stringValue(block["type"]) != "tool_result" {
+				continue
+			}
+			switch stringValue(block["toolUseID"]) {
+			case "TU-review-failed-check":
+				checkRun = mapValue(block["run"])
+			case "TU-review-blocked-submit":
+				submitRun = mapValue(block["run"])
+			}
+		}
+	}
+	if stringValue(checkRun["status"]) != "error" || stringValue(mapValue(checkRun["result"])["status"]) != "error" {
+		t.Fatalf("failed run_check was not preserved as a tool error: %#v", checkRun)
+	}
+	if stringValue(submitRun["status"]) != "error" || !strings.Contains(stringValue(mapValue(submitRun["error"])["message"]), "published-dependency-capability-floor") {
+		t.Fatalf("submit_review accepted or obscured the failed check: %#v", submitRun)
+	}
+}
+
+func TestNeoSubmitReviewGateScopesChecksToActiveReviewRoot(t *testing.T) {
+	completedRun := func(checkName string) map[string]any {
+		return map[string]any{"status": "done", "result": map[string]any{
+			"checkName":       checkName,
+			"status":          "completed",
+			"issues":          []any{},
+			"patternsChecked": []any{"submit gate contract"},
+			"evidence": []any{map[string]any{
+				"patternIndex": 0,
+				"observation":  "The submit gate preserved the completed check.",
+				"sources":      []any{"active review history"},
+				"outcome":      "no-finding",
+				"issueIndexes": []any{},
+			}},
+		}}
+	}
+	failedRun := func(checkName, message string) map[string]any {
+		return map[string]any{"status": "error", "error": map[string]any{"message": message}, "result": map[string]any{"checkName": checkName, "status": "error", "errorMessage": message, "issues": []any{}}}
+	}
+	toolUse := func(messageID, toolCallID, name, checkName string) neoMessage {
+		input := map[string]any{}
+		if checkName != "" {
+			input["checkName"] = checkName
+		} else {
+			input["comments"] = []any{}
+		}
+		return neoMessage{MessageID: messageID, Role: "assistant", Content: []any{map[string]any{"type": "tool_use", "id": toolCallID, "name": name, "input": input}}}
+	}
+	toolResult := func(messageID, toolCallID string, run map[string]any) neoMessage {
+		return neoMessage{MessageID: messageID, Role: "user", Content: []any{map[string]any{"type": "tool_result", "toolUseID": toolCallID, "run": run}}}
+	}
+
+	actor := newNeoActor(newNeoRuntime(&config.Config{}), "actor-submit-gate", "thread-actor", "T-submit-gate", "T-submit-gate", neoActorRecord("actor-submit-gate", "thread-actor", "T-submit-gate"), nil)
+	actor.reviewSnapshotRootMessageID = "M-current-root"
+	actor.messages = []neoMessage{
+		{MessageID: "M-stale-root", Role: "user"},
+		toolUse("M-stale-use", "TU-stale-check", "run_check", "stale-check"),
+		toolResult("M-stale-result", "TU-stale-check", failedRun("stale-check", "stale failure")),
+		{MessageID: "M-current-root", Role: "user"},
+		toolUse("M-current-use", "TU-current-check", "run_check", "current-check"),
+		toolResult("M-current-result", "TU-current-check", completedRun("current-check")),
+		toolUse("M-current-submit", "TU-current-submit", "submit_review", ""),
+	}
+	if err := actor.validateRunChecksForSubmission("TU-current-submit"); err != nil {
+		t.Fatalf("stale failed check contaminated the active review: %v", err)
+	}
+
+	actor.messages[5] = toolResult("M-current-result", "TU-current-check", failedRun("current-check", "current failure"))
+	if err := actor.validateRunChecksForSubmission("TU-current-submit"); err == nil || !strings.Contains(err.Error(), "current-check") || strings.Contains(err.Error(), "stale-check") {
+		t.Fatalf("active failed-check gate error = %v", err)
+	}
+
+	actor.messages = slices.Delete(actor.messages, 5, 6)
+	if err := actor.validateRunChecksForSubmission("TU-current-submit"); err == nil || !strings.Contains(err.Error(), "missing result") {
+		t.Fatalf("missing active check result was accepted: %v", err)
+	}
+
+	for name, content := range map[string][]any{
+		"check before submit": {
+			map[string]any{"type": "tool_use", "id": "TU-same-check", "name": "run_check", "input": map[string]any{"checkName": "same-message-check"}},
+			map[string]any{"type": "tool_use", "id": "TU-same-submit", "name": "submit_review", "input": map[string]any{"comments": []any{}}},
+		},
+		"submit before check": {
+			map[string]any{"type": "tool_use", "id": "TU-same-submit", "name": "submit_review", "input": map[string]any{"comments": []any{}}},
+			map[string]any{"type": "tool_use", "id": "TU-same-check", "name": "run_check", "input": map[string]any{"checkName": "same-message-check"}},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			actor.messages = []neoMessage{
+				{MessageID: "M-current-root", Role: "user"},
+				{MessageID: "M-same-message", Role: "assistant", Content: content},
+			}
+			err := actor.validateRunChecksForSubmission("TU-same-submit")
+			if err == nil || !strings.Contains(err.Error(), "same assistant message") || !strings.Contains(err.Error(), "same-message-check") {
+				t.Fatalf("same-message submission error = %v", err)
+			}
+		})
+	}
+
+	actor.messages = []neoMessage{
+		{MessageID: "M-current-root", Role: "user"},
+		toolUse("M-duplicate-use-1", "TU-duplicate-check-1", "run_check", "duplicate-check"),
+		toolResult("M-duplicate-result-1", "TU-duplicate-check-1", completedRun("duplicate-check")),
+		toolUse("M-duplicate-use-2", "TU-duplicate-check-2", "run_check", "duplicate-check"),
+		toolResult("M-duplicate-result-2", "TU-duplicate-check-2", completedRun("duplicate-check")),
+		toolUse("M-duplicate-submit", "TU-duplicate-submit", "submit_review", ""),
+	}
+	if err := actor.validateRunChecksForSubmission("TU-duplicate-submit"); err != nil {
+		t.Fatalf("latest completed check attempt was rejected: %v", err)
+	}
+
+	actor.messages = []neoMessage{
+		{MessageID: "M-current-root", Role: "user"},
+		toolUse("M-retry-use-1", "TU-retry-check-1", "run_check", "retried-check"),
+		toolResult("M-retry-result-1", "TU-retry-check-1", failedRun("retried-check", "first attempt failed")),
+		toolUse("M-retry-use-2", "TU-retry-check-2", "run_check", "retried-check"),
+		toolResult("M-retry-result-2", "TU-retry-check-2", completedRun("retried-check")),
+		toolUse("M-retry-submit", "TU-retry-submit", "submit_review", ""),
+	}
+	if err := actor.validateRunChecksForSubmission("TU-retry-submit"); err != nil {
+		t.Fatalf("recovered check retry was rejected: %v", err)
+	}
+
+	actor.messages = []neoMessage{
+		{MessageID: "M-current-root", Role: "user"},
+		toolUse("M-regress-use-1", "TU-regress-check-1", "run_check", "regressed-check"),
+		toolResult("M-regress-result-1", "TU-regress-check-1", completedRun("regressed-check")),
+		toolUse("M-regress-use-2", "TU-regress-check-2", "run_check", "regressed-check"),
+		toolResult("M-regress-result-2", "TU-regress-check-2", failedRun("regressed-check", "later attempt failed")),
+		toolUse("M-regress-submit", "TU-regress-submit", "submit_review", ""),
+	}
+	if err := actor.validateRunChecksForSubmission("TU-regress-submit"); err == nil || !strings.Contains(err.Error(), "regressed-check") {
+		t.Fatalf("failed latest check attempt was accepted: %v", err)
+	}
+
+	actor.messages = []neoMessage{
+		{MessageID: "M-current-root", Role: "user"},
+		toolUse("M-alias-use", "TU-alias-check", "run_check", "alias-check"),
+		{MessageID: "M-alias-result", Role: "user", Content: []any{map[string]any{"type": "tool_result", "toolCallId": "TU-alias-check", "run": completedRun("alias-check")}}},
+		toolUse("M-alias-submit", "TU-alias-submit", "submit_review", ""),
+	}
+	if err := actor.validateRunChecksForSubmission("TU-alias-submit"); err != nil {
+		t.Fatalf("aliased tool-result ID was classified as missing: %v", err)
 	}
 }
 
@@ -33866,13 +34863,44 @@ func TestNeoReviewDeletedFileRangesValidateAgainstSnapshot(t *testing.T) {
 	if got := neoStringSlice(prepared[neoReviewSnapshotDeletedLinesKey]); !reflect.DeepEqual(got, []string{"deleted.go@@+0,0", "kept.go@@+1,1"}) {
 		t.Fatalf("deleted snapshot lines = %#v, want deleted-file and replacement anchors", got)
 	}
-	checkResult := neoRunCheckResultFromText(prepared, `{"checkName":"deleted-files","status":"completed","filesAnalyzed":2,"coveredFiles":["deleted.go","kept.go"],"coveredHunks":["deleted.go@@+0,0","kept.go@@+1,1"],"issues":[{"severity":"high","file":"deleted.go","line":0,"endLine":0,"problem":"required file was removed"}]}`)
+	checkResult := neoRunCheckResultFromText(prepared, `{"checkName":"deleted-files","status":"completed","filesAnalyzed":2,"coveredFiles":["deleted.go","kept.go"],"coveredHunks":["deleted.go@@+0,0","kept.go@@+1,1"],"patternsChecked":["required file retention"],"evidence":[{"patternIndex":0,"observation":"The required file was deleted.","sources":["deleted.go@@+0,0"],"outcome":"finding","issueIndexes":[0]}],"issues":[{"severity":"high","file":"deleted.go","line":0,"endLine":0,"problem":"required file was removed"}]}`)
 	if stringValue(checkResult["status"]) != "completed" {
 		t.Fatalf("deleted-file run_check result = %#v", checkResult)
 	}
 	addedContentDiff := "diff --git a/kept.go b/kept.go\n--- a/kept.go\n+++ b/kept.go\n@@ -1 +1,2 @@\n old\n+++ /dev/null"
 	if neoReviewDiffDeletesFile(addedContentDiff) {
 		t.Fatal("added source text resembling a diff header was classified as a deleted file")
+	}
+}
+
+func TestNeoPrepareRunCheckSnapshotInputIndexesExactChangedLines(t *testing.T) {
+	firstDiff := "diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -10,4 +10,5 @@\n context ten\n-old eleven\n+new eleven\n context twelve\n+added thirteen\n context fourteen\n@@ -30,2 +31,3 @@\n context thirty one\n+added thirty two\n context thirty three"
+	secondDiff := "diff --git a/b.go b/b.go\n--- a/b.go\n+++ b/b.go\n@@ -1,2 +1,2 @@\n-old one\n+new one\n stay two"
+	metadataDiff := "diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755"
+	snapshot := new(neoReviewDiffSnapshot)
+	snapshot.Files = []string{"a.go", "b.go", "mode.sh"}
+	snapshot.Diffs = map[string]string{"a.go": firstDiff, "b.go": secondDiff, "mode.sh": metadataDiff}
+	snapshot.Hunks = append(neoReviewDiffHunks("a.go", firstDiff), neoReviewDiffHunks("b.go", secondDiff)...)
+	prepared, err := neoPrepareRunCheckSnapshotInput(map[string]any{"checkName": "locations"}, snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := stringValue(prepared[neoReviewSnapshotTextKey])
+	locationIndex := strings.SplitN(text, "\n\n"+string(rune(60))+"review_diff_snapshot"+string(rune(62)), 2)[0]
+	for _, want := range []string{
+		`{"file":"a.go","line":11,"text":"new eleven"}`,
+		`{"file":"a.go","line":13,"text":"added thirteen"}`,
+		`{"file":"a.go","line":32,"text":"added thirty two"}`,
+		`{"file":"b.go","line":1,"text":"new one"}`,
+	} {
+		if !strings.Contains(locationIndex, want) {
+			t.Errorf("changed-line index missing %s:\n%s", want, locationIndex)
+		}
+	}
+	for _, unwanted := range []string{`"text":"old eleven"`, `"text":"context ten"`, `"file":"mode.sh"`} {
+		if strings.Contains(locationIndex, unwanted) {
+			t.Errorf("changed-line index invented location %s:\n%s", unwanted, locationIndex)
+		}
 	}
 }
 
@@ -33936,7 +34964,7 @@ func TestNeoReviewEmptyRetainedFileAcceptsZeroRange(t *testing.T) {
 	if len(alternateHunks) != 1 || !reflect.DeepEqual(alternateHunks[0].Deleted, []string{"empty.go@@+0,0"}) {
 		t.Fatalf("empty retained alternate-header lines = %#v, want zero range", alternateHunks)
 	}
-	checkResult := neoRunCheckResultFromText(prepared, `{"checkName":"empty-file","status":"completed","filesAnalyzed":1,"coveredFiles":["empty.go"],"coveredHunks":["empty.go@@+0,0"],"issues":[{"severity":"high","file":"empty.go","line":0,"endLine":0,"problem":"required implementation was removed"}]}`)
+	checkResult := neoRunCheckResultFromText(prepared, `{"checkName":"empty-file","status":"completed","filesAnalyzed":1,"coveredFiles":["empty.go"],"coveredHunks":["empty.go@@+0,0"],"patternsChecked":["required implementation retention"],"evidence":[{"patternIndex":0,"observation":"All implementation lines were removed.","sources":["empty.go@@+0,0"],"outcome":"finding","issueIndexes":[0]}],"issues":[{"severity":"high","file":"empty.go","line":0,"endLine":0,"problem":"required implementation was removed"}]}`)
 	if stringValue(checkResult["status"]) != "completed" {
 		t.Fatalf("empty retained run_check result = %#v", checkResult)
 	}
@@ -34017,7 +35045,7 @@ func TestNeoReviewEmptyRetainedFileAcceptsZeroRange(t *testing.T) {
 func TestNeoRunCheckResultFromText(t *testing.T) {
 	input := map[string]any{"checkName": "repo-fit"}
 
-	parsed := neoRunCheckResultFromText(input, "{\"status\":\"completed\",\"issues\":[{\"severity\":\"high\",\"file\":\"a.go\",\"problem\":\"x\"}]}")
+	parsed := neoRunCheckResultFromText(input, "{\"status\":\"completed\",\"patternsChecked\":[\"contract\"],\"evidence\":[{\"patternIndex\":0,\"observation\":\"The changed contract is broken.\",\"sources\":[\"a.go\"],\"outcome\":\"finding\",\"issueIndexes\":[0]}],\"issues\":[{\"severity\":\"high\",\"file\":\"a.go\",\"problem\":\"x\"}]}")
 	if stringValue(parsed["checkName"]) != "repo-fit" || stringValue(parsed["status"]) != "completed" {
 		t.Fatalf("run_check result = %#v", parsed)
 	}
@@ -34085,6 +35113,7 @@ func TestNeoRunCheckResultValidatesImmutableSnapshotCoverage(t *testing.T) {
 		"coveredFiles":["pkg/b.go","a.go"],
 		"coveredHunks":["pkg/b.go@@+20,2","a.go@@+10,4"],
 		"patternsChecked":["repository fit"],
+		"evidence":[{"patternIndex":0,"observation":"The changed lines violate the repository contract.","sources":["a.go:11-12"],"outcome":"finding","issueIndexes":[0]}],
 		"issues":[{"severity":"medium","file":"a.go","line":11,"endLine":12,"problem":"broken contract"}]
 	}`
 	result := neoRunCheckResultFromText(input, valid)
@@ -36661,6 +37690,17 @@ func TestOpenAIResponsesNeoBodyCanDisableParallelToolCalls(t *testing.T) {
 	}, neoModelRoute{Provider: "openai", Model: "gpt-5.6-sol"}, true)
 	if body["parallel_tool_calls"] != false {
 		t.Fatalf("parallel_tool_calls = %#v, want false", body["parallel_tool_calls"])
+	}
+}
+
+func TestOpenAIResponsesNeoBodyCanDisableAllToolCalls(t *testing.T) {
+	body := openAIResponsesNeoBody(neoInferenceRequest{
+		ThreadID:         "T-run-check",
+		History:          []neoHistoryMessage{{Role: "user", Text: "review the snapshot"}},
+		DisableToolCalls: true,
+	}, neoModelRoute{Provider: "openai", Model: "gpt-5.5"}, true)
+	if body["tool_choice"] != "none" {
+		t.Fatalf("tool_choice = %#v, want none", body["tool_choice"])
 	}
 }
 
@@ -40164,6 +41204,338 @@ func TestNeoActorToolResultAfterTerminalProgressSnapshotKeepsResultText(t *testi
 	}
 	if toolEntries[0].Text != "User selected option 2: Sushi" {
 		t.Fatalf("history text = %q, want the executor result text, not the bare snapshot run", toolEntries[0].Text)
+	}
+}
+
+func TestNeoActorToolApprovalResponseStoresUserInputOnToolResult(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	actor.messages = []neoMessage{{
+		ThreadID:  "T-test",
+		MessageID: "M-assistant",
+		Role:      "assistant",
+		Content:   []any{map[string]any{"type": "tool_use", "id": "TU-ML2SuGcK3aVnyv80kmWmuP", "name": "ask_user_choice", "input": map[string]any{"question": "pick one"}}},
+		Seq:       1,
+	}}
+	actor.rebuildHistoryLocked()
+	actor.pendingTools["TU-ML2SuGcK3aVnyv80kmWmuP"] = neoPendingTool{ID: "TU-ML2SuGcK3aVnyv80kmWmuP", Name: "ask_user_choice", MessageID: "M-assistant"}
+	actor.upsertApprovalLocked(map[string]any{"id": "TU-ML2SuGcK3aVnyv80kmWmuP", "toolCallId": "TU-ML2SuGcK3aVnyv80kmWmuP", "toolName": "ask_user_choice"})
+
+	payload, ok := normalizeNeoClientToolApprovalResponse(map[string]any{
+		"type":       "client_tool_approval_response",
+		"toolCallId": "TU-ML2SuGcK3aVnyv80kmWmuP",
+		"accepted":   true,
+		"input":      map[string]any{"askAnswers": map[string]any{"q": "a"}},
+	})
+	if !ok {
+		t.Fatal("client tool approval response was not normalized")
+	}
+	actor.handleToolApprovalResponse(payload)
+	actor.receiveToolResult(map[string]any{
+		"type":       "executor_tool_result",
+		"toolCallId": "TU-ML2SuGcK3aVnyv80kmWmuP",
+		"run":        map[string]any{"status": "done", "result": "picked"},
+		"userInput":  map[string]any{"accepted": false, "denyFeedback": "executor override"},
+	})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if _, pending := actor.pendingTools["TU-ML2SuGcK3aVnyv80kmWmuP"]; pending {
+		t.Fatal("TU-ML2SuGcK3aVnyv80kmWmuP remained pending after the terminal tool result")
+	}
+	stored := make([]neoMessage, 0, 1)
+	for _, message := range actor.messages {
+		if message.MessageID == toolResultMessageID("TU-ML2SuGcK3aVnyv80kmWmuP") {
+			stored = append(stored, message)
+		}
+	}
+	if len(stored) != 1 {
+		t.Fatalf("tool result messages for TU-ML2SuGcK3aVnyv80kmWmuP = %#v, want exactly one", stored)
+	}
+	if len(stored[0].Content) != 1 {
+		t.Fatalf("tool result content = %#v", stored[0].Content)
+	}
+	block := mapValue(stored[0].Content[0])
+	userInput := mapValue(block["userInput"])
+	if !boolValue(userInput["accepted"]) || stringValue(mapValue(userInput["askAnswers"])["q"]) != "a" {
+		t.Fatalf("stored tool_result userInput = %#v", block["userInput"])
+	}
+	protocolContent := arrayValue(stored[0].protocol()["content"])
+	if len(protocolContent) != 1 {
+		t.Fatalf("protocol content = %#v", protocolContent)
+	}
+	protocolInput := mapValue(mapValue(protocolContent[0])["userInput"])
+	if !boolValue(protocolInput["accepted"]) || stringValue(mapValue(protocolInput["askAnswers"])["q"]) != "a" {
+		t.Fatalf("protocol tool_result userInput = %#v", mapValue(protocolContent[0])["userInput"])
+	}
+}
+
+func TestNeoActorToolApprovalResponseUpdatesAuthoritativeToolResult(t *testing.T) {
+	actor := newNeoActor(newNeoRuntime(&config.Config{}), "actor-approval-authority", "thread-actor", "T-test", "T-test", neoActorRecord("actor-approval-authority", "thread-actor", "T-test"), nil)
+	toolCallID := "TU-approval-authority"
+	actor.messages = []neoMessage{
+		{ThreadID: "T-test", MessageID: "M-tool", Role: "assistant", Content: []any{map[string]any{"type": "tool_use", "id": toolCallID, "name": "shell_command", "input": map[string]any{"command": "pwd"}}}, Seq: 1},
+		{ThreadID: "T-test", MessageID: "M-result-old", Role: "user", Content: []any{map[string]any{"type": "tool_result", "toolUseId": toolCallID, "run": map[string]any{"status": "blocked-on-user"}}}, CompletionStatus: "tool_progress", Seq: 2},
+		{ThreadID: "T-test", MessageID: "M-result-current", Role: "user", Content: []any{map[string]any{"type": "tool_result", "toolCallId": toolCallID, "run": map[string]any{"status": "in-progress", "output": "waiting"}}}, CompletionStatus: "tool_progress", Seq: 3},
+	}
+	actor.pendingTools[toolCallID] = neoPendingTool{ID: toolCallID, Name: "shell_command", MessageID: "M-tool"}
+	actor.approvalQueue = []map[string]any{{"id": toolCallID, "toolCallId": toolCallID, "toolName": "shell_command"}}
+	actor.agentState = "awaiting_approval"
+	actor.rebuildHistoryLocked()
+
+	actor.handleToolApprovalResponse(map[string]any{"type": "client_tool_approval_response", "toolCallId": toolCallID, "accepted": false, "input": "use a safer command"})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	oldInput := mapValue(mapValue(actor.messages[1].Content[0])["userInput"])
+	currentInput := mapValue(mapValue(actor.messages[2].Content[0])["userInput"])
+	run, selectedInput := actor.toolResultRunLocked(toolCallID)
+	if len(oldInput) != 0 {
+		t.Fatalf("superseded tool result received approval input: %#v", oldInput)
+	}
+	if boolValue(currentInput["accepted"]) || stringValue(currentInput["denyFeedback"]) != "use a safer command" {
+		t.Fatalf("authoritative tool result approval input = %#v", currentInput)
+	}
+	if stringValue(run["status"]) != "in-progress" || !reflect.DeepEqual(mapValue(selectedInput), currentInput) {
+		t.Fatalf("selected tool result = run:%#v input:%#v", run, selectedInput)
+	}
+}
+
+func TestNeoActorToolApprovalResponseSurvivesSnapshotImport(t *testing.T) {
+	disabled := false
+	threadID := "T-019f9533-01aa-755d-af04-74a4b502df08"
+	toolCallID := "TU-approval-restart"
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &disabled}}})
+	actor := newNeoActor(rt, "actor-approval-restart", "thread-actor", threadID, threadID, neoActorRecord("actor-approval-restart", "thread-actor", threadID), nil)
+	actor.currentAgentMode = "smart"
+	actor.settings["agentMode"] = "smart"
+	actor.messages = []neoMessage{
+		{
+			ThreadID: threadID, MessageID: "M-approval-tool", Role: "assistant", Seq: 1,
+			Content: []any{map[string]any{"type": "tool_use", "id": toolCallID, "name": "shell_command", "input": map[string]any{"command": "rm example"}, "complete": true, "blockState": "complete"}},
+			State:   map[string]any{"type": "complete", "stopReason": "tool_use"},
+		},
+		{
+			ThreadID: threadID, MessageID: toolResultMessageID(toolCallID), Role: "user", Seq: 2, CompletionStatus: "tool_progress",
+			Content: []any{map[string]any{"type": "tool_result", "toolUseID": toolCallID, "run": map[string]any{"status": "blocked-on-user", "reason": "approval needed"}}},
+		},
+	}
+	actor.pendingTools[toolCallID] = neoPendingTool{ID: toolCallID, Name: "shell_command", Input: map[string]any{"command": "rm example"}, MessageID: "M-approval-tool", AgentMode: "smart"}
+	actor.approvalQueue = []map[string]any{{"id": toolCallID, "toolCallId": toolCallID, "toolName": "shell_command"}}
+	actor.agentState = "awaiting_approval"
+	actor.rebuildHistoryLocked()
+
+	actor.handleToolApprovalResponse(map[string]any{"type": "client_tool_approval_response", "toolCallId": toolCallID, "accepted": false, "input": "use a safer command"})
+	snapshot, ok := actor.threadSnapshot()
+	if !ok {
+		t.Fatal("approval snapshot missing")
+	}
+	persisted := marshalNeoThreadForTest(t, neoCloudThread(snapshot))
+	restored := newNeoActor(rt, "actor-approval-restored", "thread-actor", threadID, threadID, neoActorRecord("actor-approval-restored", "thread-actor", threadID), nil)
+	if err := restored.importThreadLocalOnlyIfEmptyWithReadyWork(persisted, false); err != nil {
+		t.Fatalf("import approval snapshot: %v", err)
+	}
+	restored.mu.Lock()
+	pending, pendingExists := restored.pendingTools[toolCallID]
+	approvalCount := len(restored.approvalQueue)
+	restored.mu.Unlock()
+	if !pendingExists || approvalCount != 0 {
+		t.Fatalf("restored approval state = pending:%#v approvals:%d", pending, approvalCount)
+	}
+	if boolValue(pending.ApprovalInput["accepted"]) || stringValue(pending.ApprovalInput["denyFeedback"]) != "use a safer command" {
+		t.Fatalf("restored approval input = %#v", pending.ApprovalInput)
+	}
+
+	restored.handleToolProgress(map[string]any{"type": "tool_progress", "toolCallId": toolCallID, "progress": map[string]any{"type": "snapshot", "value": map[string]any{"status": "in-progress", "output": "denial received"}}})
+	progressSnapshot, ok := restored.threadSnapshot()
+	if !ok {
+		t.Fatal("approval progress snapshot missing")
+	}
+	progressed := newNeoActor(rt, "actor-approval-progressed", "thread-actor", threadID, threadID, neoActorRecord("actor-approval-progressed", "thread-actor", threadID), nil)
+	if err := progressed.importThreadLocalOnlyIfEmptyWithReadyWork(marshalNeoThreadForTest(t, neoCloudThread(progressSnapshot)), false); err != nil {
+		t.Fatalf("import approval progress snapshot: %v", err)
+	}
+	progressed.receiveToolResult(map[string]any{"type": "executor_tool_result", "toolCallId": toolCallID, "run": map[string]any{"status": "rejected-by-user", "result": "denied"}})
+	progressed.mu.Lock()
+	result := progressed.messages[progressed.messageIndexLocked(toolResultMessageID(toolCallID))]
+	progressed.mu.Unlock()
+	userInput := mapValue(mapValue(result.Content[0])["userInput"])
+	if boolValue(userInput["accepted"]) || stringValue(userInput["denyFeedback"]) != "use a safer command" {
+		t.Fatalf("final restored approval input = %#v", userInput)
+	}
+}
+
+func TestNeoActorToolResultIgnoresUnapprovedUserInput(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+	toolCallID := "TU-ML2SuGcK3aVnyv80kmWmuP"
+	actor.messages = []neoMessage{{
+		ThreadID:  "T-test",
+		MessageID: "M-assistant",
+		Role:      "assistant",
+		Content:   []any{map[string]any{"type": "tool_use", "id": toolCallID, "name": "ask_user_choice", "input": map[string]any{"question": "pick one"}}},
+		Seq:       1,
+	}}
+	actor.rebuildHistoryLocked()
+	actor.pendingTools[toolCallID] = neoPendingTool{
+		ID:        toolCallID,
+		Name:      "ask_user_choice",
+		MessageID: "M-assistant",
+	}
+	payload, ok := normalizeNeoClientToolApprovalResponse(map[string]any{
+		"type":       "client_tool_approval_response",
+		"toolCallId": toolCallID,
+		"accepted":   true,
+		"input":      map[string]any{"askAnswers": map[string]any{"q": "unrequested"}},
+	})
+	if !ok {
+		t.Fatal("client tool approval response was not normalized")
+	}
+	actor.handleToolApprovalResponse(payload)
+
+	actor.receiveToolResult(map[string]any{
+		"type":       "executor_tool_result",
+		"toolCallId": toolCallID,
+		"run":        map[string]any{"status": "done", "result": "denied"},
+		"userInput":  map[string]any{"accepted": false, "denyFeedback": "not now"},
+	})
+
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	result := actor.messages[actor.messageIndexLocked(toolResultMessageID(toolCallID))]
+	if userInput := mapValue(result.Content[0])["userInput"]; userInput != nil {
+		t.Fatalf("stored tool_result userInput = %#v, want unapproved values omitted", userInput)
+	}
+}
+
+func TestNeoActorAlternativeToolResultProducersStoreApprovalInput(t *testing.T) {
+	newActor := func() *neoActor {
+		rt := newNeoRuntime(&config.Config{})
+		actor := newNeoActor(rt, "actor-test", "thread-actor", "T-test", "T-test", neoActorRecord("actor-test", "thread-actor", "T-test"), nil)
+		actor.messages = []neoMessage{{
+			ThreadID:  "T-test",
+			MessageID: "M-assistant",
+			Role:      "assistant",
+			Content:   []any{map[string]any{"type": "tool_use", "id": "TU-choice", "name": "ask_user_choice", "input": map[string]any{"question": "pick one"}}},
+			Seq:       1,
+		}}
+		actor.rebuildHistoryLocked()
+		actor.pendingTools["TU-choice"] = neoPendingTool{
+			ID:            "TU-choice",
+			Name:          "ask_user_choice",
+			MessageID:     "M-assistant",
+			ApprovalInput: map[string]any{"accepted": false, "denyFeedback": "not now"},
+		}
+		return actor
+	}
+	assertApproval := func(t *testing.T, actor *neoActor) {
+		t.Helper()
+		actor.mu.Lock()
+		defer actor.mu.Unlock()
+		result := actor.messages[actor.messageIndexLocked(toolResultMessageID("TU-choice"))]
+		userInput := mapValue(mapValue(result.Content[0])["userInput"])
+		if boolValue(userInput["accepted"]) || stringValue(userInput["denyFeedback"]) != "not now" {
+			t.Fatalf("stored tool_result userInput = %#v", userInput)
+		}
+	}
+
+	t.Run("terminal progress", func(t *testing.T) {
+		actor := newActor()
+		actor.handleToolProgress(map[string]any{"type": "tool_progress", "toolCallId": "TU-choice", "progress": map[string]any{"type": "snapshot", "value": map[string]any{"status": "done", "result": "picked"}}})
+		assertApproval(t, actor)
+	})
+
+	t.Run("binary result", func(t *testing.T) {
+		actor := newActor()
+		actor.handleBinaryToolData(map[string]any{"toolCallId": "TU-choice", "data": map[string]any{"status": "done", "result": "picked"}})
+		assertApproval(t, actor)
+	})
+
+	t.Run("nonterminal result", func(t *testing.T) {
+		actor := newActor()
+		actor.receiveToolResult(map[string]any{"type": "executor_tool_result", "toolCallId": "TU-choice", "run": map[string]any{"status": "in-progress", "output": "waiting"}})
+		assertApproval(t, actor)
+	})
+
+	t.Run("terminal result", func(t *testing.T) {
+		actor := newActor()
+		actor.receiveToolResult(map[string]any{"type": "executor_tool_result", "toolCallId": "TU-choice", "run": map[string]any{"status": "rejected-by-user", "result": "denied"}})
+		assertApproval(t, actor)
+	})
+}
+
+func TestNeoActorDelayedTerminalBinaryDataDoesNotRewriteCompletedTool(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		complete   func(*neoActor)
+		wantStatus string
+		wantResult string
+	}{
+		{
+			name: "terminal result",
+			complete: func(actor *neoActor) {
+				actor.receiveToolResult(map[string]any{"type": "executor_tool_result", "toolCallId": "TU-delayed", "run": map[string]any{"status": "done", "result": "authoritative"}})
+			},
+			wantStatus: "done",
+			wantResult: "authoritative",
+		},
+		{
+			name: "terminal progress",
+			complete: func(actor *neoActor) {
+				actor.handleToolProgress(map[string]any{"type": "tool_progress", "toolCallId": "TU-delayed", "progress": map[string]any{"type": "snapshot", "value": map[string]any{"status": "done", "result": "authoritative"}}})
+			},
+			wantStatus: "done",
+			wantResult: "authoritative",
+		},
+		{
+			name:       "cancellation",
+			complete:   func(actor *neoActor) { actor.cancel() },
+			wantStatus: "cancelled",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			actor := newNeoActor(newNeoRuntime(&config.Config{}), "actor-delayed-binary", "thread-actor", "T-test", "T-test", neoActorRecord("actor-delayed-binary", "thread-actor", "T-test"), nil)
+			actor.messages = []neoMessage{{ThreadID: "T-test", MessageID: "M-delayed", Role: "assistant", Content: []any{map[string]any{"type": "tool_use", "id": "TU-delayed", "name": "shell_command", "input": map[string]any{"command": "pwd"}}}, Seq: 1}}
+			actor.pendingTools["TU-delayed"] = neoPendingTool{ID: "TU-delayed", Name: "shell_command", Input: map[string]any{"command": "pwd"}, MessageID: "M-delayed"}
+			actor.rebuildHistoryLocked()
+			test.complete(actor)
+			actor.handleBinaryToolData(map[string]any{"toolCallId": "TU-delayed", "data": map[string]any{"status": "error", "error": map[string]any{"message": "late"}}})
+
+			actor.mu.Lock()
+			run, _ := actor.toolResultRunLocked("TU-delayed")
+			actor.mu.Unlock()
+			if stringValue(run["status"]) != test.wantStatus || test.wantResult != "" && stringValue(run["result"]) != test.wantResult {
+				t.Fatalf("tool run after delayed binary data = %#v", run)
+			}
+		})
+	}
+}
+
+func TestNeoActorDropsProgressAfterTerminalToolResult(t *testing.T) {
+	actor := newNeoActor(newNeoRuntime(&config.Config{}), "actor-stale-progress", "thread-actor", "T-test", "T-test", neoActorRecord("actor-stale-progress", "thread-actor", "T-test"), nil)
+	toolCallID := "TU-terminal-progress"
+	actor.messages = []neoMessage{
+		{ThreadID: "T-test", MessageID: "M-tool", Role: "assistant", Content: []any{map[string]any{"type": "tool_use", "id": toolCallID, "name": "shell_command", "input": map[string]any{"command": "pwd"}}}, Seq: 1},
+		{ThreadID: "T-test", MessageID: toolResultMessageID(toolCallID), Role: "user", Content: []any{map[string]any{"type": "tool_result", "toolUseID": toolCallID, "run": map[string]any{"status": "done", "output": "authoritative"}}}, Seq: 2},
+	}
+	frames := 0
+	socket := &neoSocket{writeMessage: func(_ int, _ []byte) error {
+		frames++
+		return nil
+	}}
+	actor.sockets[socket] = struct{}{}
+	actor.rebuildHistoryLocked()
+
+	actor.handleToolProgress(map[string]any{"type": "tool_progress", "toolCallId": toolCallID, "progress": map[string]any{"output": "stale"}})
+
+	actor.mu.Lock()
+	run, _ := actor.toolResultRunLocked(toolCallID)
+	actor.mu.Unlock()
+	if frames != 0 {
+		t.Fatalf("stale progress frames = %d, want 0", frames)
+	}
+	if stringValue(run["status"]) != "done" || stringValue(run["output"]) != "authoritative" {
+		t.Fatalf("terminal tool result after stale progress = %#v", run)
 	}
 }
 

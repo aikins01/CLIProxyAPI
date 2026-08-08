@@ -18,6 +18,7 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
@@ -67,7 +68,11 @@ func (e *OpenAICompatExecutor) HttpRequest(ctx context.Context, auth *cliproxyau
 		return nil, err
 	}
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
-	return httpClient.Do(httpReq)
+	httpResp, err := httpClient.Do(httpReq)
+	if err != nil {
+		return nil, helps.NewAuthStateNeutralError(err)
+	}
+	return httpResp, nil
 }
 
 func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
@@ -149,7 +154,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		return resp, err
+		return resp, helps.NewAuthStateNeutralError(err)
 	}
 	defer func() {
 		if errClose := httpResp.Body.Close(); errClose != nil {
@@ -158,16 +163,20 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	}()
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		b, _ := io.ReadAll(httpResp.Body)
+		b, errRead := io.ReadAll(httpResp.Body)
+		if errRead != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, errRead)
+			return resp, helps.NewAuthStateNeutralError(errRead)
+		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
+		err = newOpenAIShapeStatusErr(httpResp.StatusCode, b)
 		return resp, err
 	}
 	body, err := io.ReadAll(httpResp.Body)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		return resp, err
+		return resp, helps.NewAuthStateNeutralError(err)
 	}
 	helps.AppendAPIResponseChunk(ctx, e.cfg, body)
 	reporter.Publish(ctx, helps.ParseOpenAIUsage(body))
@@ -255,17 +264,24 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		return nil, err
+		return nil, helps.NewAuthStateNeutralError(err)
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		b, _ := io.ReadAll(httpResp.Body)
+		b, errRead := io.ReadAll(httpResp.Body)
+		if errRead != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, errRead)
+			if errClose := httpResp.Body.Close(); errClose != nil {
+				log.Errorf("openai compat executor: close response body error: %v", errClose)
+			}
+			return nil, helps.NewAuthStateNeutralError(errRead)
+		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("openai compat executor: close response body error: %v", errClose)
 		}
-		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
+		err = newOpenAIShapeStatusErr(httpResp.StatusCode, b)
 		return nil, err
 	}
 	out := make(chan cliproxyexecutor.StreamChunk)
@@ -296,7 +312,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 					continue
 				}
 				if bytes.HasPrefix(trimmedLine, []byte("{")) || bytes.HasPrefix(trimmedLine, []byte("[")) {
-					streamErr := statusErr{code: http.StatusBadGateway, msg: string(trimmedLine)}
+					streamErr := newOpenAIShapeStatusErr(http.StatusBadGateway, trimmedLine)
 					helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
 					reporter.PublishFailure(ctx, streamErr)
 					select {
@@ -319,10 +335,11 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			}
 		}
 		if errScan := scanner.Err(); errScan != nil {
-			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
-			reporter.PublishFailure(ctx, errScan)
+			streamErr := helps.NewAuthStateNeutralError(errScan)
+			helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
+			reporter.PublishFailure(ctx, streamErr)
 			select {
-			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
+			case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
 			case <-ctx.Done():
 			}
 		} else {
@@ -448,6 +465,89 @@ type statusErr struct {
 	retryAfter *time.Duration
 }
 
+type upstreamStatusErr struct {
+	statusErr
+	authStateNeutral bool
+}
+
+func newUpstreamStatusErr(statusCode int, body []byte, credentialStateAffecting bool) upstreamStatusErr {
+	return upstreamStatusErr{
+		statusErr:        statusErr{code: statusCode, msg: string(body)},
+		authStateNeutral: (statusCode == http.StatusRequestTimeout || statusCode/100 == 5) && !credentialStateAffecting,
+	}
+}
+
+func newGoogleStatusErr(statusCode int, body []byte) upstreamStatusErr {
+	return newUpstreamStatusErr(statusCode, body, googleErrorAffectsCredentialState(body))
+}
+
+func googleErrorAffectsCredentialState(body []byte) bool {
+	status := strings.ToUpper(strings.TrimSpace(gjson.GetBytes(body, "error.status").String()))
+	switch status {
+	case "UNAUTHENTICATED", "PERMISSION_DENIED", "RESOURCE_EXHAUSTED":
+		return true
+	}
+	code := int(gjson.GetBytes(body, "error.code").Int())
+	if code == http.StatusUnauthorized || code == http.StatusForbidden || code == http.StatusTooManyRequests {
+		return true
+	}
+	message := strings.ToLower(gjson.GetBytes(body, "error.message").String())
+	signals := []string{
+		"api key not valid",
+		"invalid api key",
+		"api key expired",
+		"invalid authentication credentials",
+		"invalid access token",
+		"access token has expired",
+		"permission denied",
+		"quota exceeded",
+		"resource exhausted",
+		"usage limit",
+		"billing",
+		"payment required",
+	}
+	return containsAny(message, signals...) || containsAny(strings.ToLower(string(body)), signals...)
+}
+
+func newOpenAIShapeStatusErr(statusCode int, body []byte) upstreamStatusErr {
+	return newUpstreamStatusErr(statusCode, body, openAIShapeErrorAffectsCredentialState(body))
+}
+
+func openAIShapeErrorAffectsCredentialState(body []byte) bool {
+	errType := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.type").String()))
+	switch errType {
+	case "authentication_error", "permission_error", "billing_error":
+		return true
+	}
+	code := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.code").String()))
+	switch code {
+	case "invalid_api_key", "invalid_token", "insufficient_quota", "billing_hard_limit_reached", "payment_required":
+		return true
+	}
+	message := strings.ToLower(gjson.GetBytes(body, "error.message").String())
+	signals := []string{
+		"invalid api key",
+		"incorrect api key",
+		"invalid or expired token",
+		"token has expired",
+		"permission denied",
+		"quota exceeded",
+		"usage limit",
+		"billing",
+		"payment required",
+	}
+	return containsAny(message, signals...) || containsAny(strings.ToLower(string(body)), signals...)
+}
+
+func containsAny(value string, candidates ...string) bool {
+	for _, candidate := range candidates {
+		if strings.Contains(value, candidate) {
+			return true
+		}
+	}
+	return false
+}
+
 func (e statusErr) Error() string {
 	if e.msg != "" {
 		return e.msg
@@ -456,3 +556,7 @@ func (e statusErr) Error() string {
 }
 func (e statusErr) StatusCode() int            { return e.code }
 func (e statusErr) RetryAfter() *time.Duration { return e.retryAfter }
+
+func (e upstreamStatusErr) AuthStateNeutral() bool {
+	return e.authStateNeutral
+}

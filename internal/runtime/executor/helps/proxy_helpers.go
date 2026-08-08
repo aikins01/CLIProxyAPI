@@ -2,6 +2,7 @@ package helps
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -11,6 +12,57 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
 )
+
+type authStateNeutralError struct {
+	err error
+}
+
+func NewAuthStateNeutralError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return authStateNeutralError{err: err}
+}
+
+func (e authStateNeutralError) Error() string {
+	return e.err.Error()
+}
+
+func (e authStateNeutralError) Unwrap() error {
+	return e.err
+}
+
+func (e authStateNeutralError) AuthStateNeutral() bool {
+	return true
+}
+
+type authStateNeutralStatusError struct {
+	err    error
+	status int
+}
+
+func NewAuthStateNeutralStatusError(err error, status int) error {
+	if err == nil {
+		return nil
+	}
+	return authStateNeutralStatusError{err: err, status: status}
+}
+
+func (e authStateNeutralStatusError) Error() string {
+	return fmt.Sprintf("%s (status=%d)", e.err.Error(), e.status)
+}
+
+func (e authStateNeutralStatusError) Unwrap() error {
+	return e.err
+}
+
+func (e authStateNeutralStatusError) AuthStateNeutral() bool {
+	return true
+}
+
+func (e authStateNeutralStatusError) StatusCode() int {
+	return e.status
+}
 
 func EffectiveProxyURL(cfg *config.Config, auth *cliproxyauth.Auth) string {
 	if auth != nil {

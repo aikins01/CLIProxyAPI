@@ -532,6 +532,7 @@ var neoSubagentRunObserverForTest atomic.Pointer[neoSubagentRunObserver]
 
 type neoSubagentRunObserver struct {
 	completed func(string)
+	prepared  func(string, map[string]any)
 }
 
 // runSubagent executes a top-level subagent tool call locally and delivers the
@@ -553,8 +554,11 @@ func (a *neoActor) runSubagent(parent neoPendingTool, generation int) {
 		}
 		input, err = a.prepareRunCheckInputContext(ctx, parent.Input)
 		if err != nil {
-			a.deliverSubagentRun(parent, map[string]any{"status": "done", "result": neoRunCheckErrorResult(parent.Input, err.Error())})
+			a.deliverSubagentRun(parent, neoRunCheckToolRun(neoRunCheckErrorResult(parent.Input, err.Error())))
 			return
+		}
+		if observer := neoSubagentRunObserverForTest.Load(); observer != nil && observer.prepared != nil {
+			observer.prepared(parent.ID, input)
 		}
 	}
 	text, err := a.executeSubagentRun(parent.Name, input, parent.ID, parent.MessageID, generation, 0, parent.ClientAPIKey)
@@ -563,10 +567,18 @@ func (a *neoActor) runSubagent(parent neoPendingTool, generation int) {
 		if err != nil {
 			result = neoRunCheckErrorResult(input, err.Error())
 		}
-		a.deliverSubagentRun(parent, map[string]any{"status": "done", "result": result})
+		a.deliverSubagentRun(parent, neoRunCheckToolRun(result))
 		return
 	}
 	a.deliverSubagentResult(parent, text, err)
+}
+
+func neoRunCheckToolRun(result map[string]any) map[string]any {
+	if stringValue(result["status"]) == "error" {
+		message := firstNonEmptyString(stringValue(result["errorMessage"]), "run_check failed")
+		return map[string]any{"status": "error", "error": map[string]any{"message": message}, "result": result}
+	}
+	return map[string]any{"status": "done", "result": result}
 }
 
 func (a *neoActor) prepareRunCheckInput(input map[string]any) (map[string]any, error) {
@@ -634,7 +646,8 @@ func (a *neoActor) ensureReviewSnapshotWithScopeContextLocked(ctx context.Contex
 	a.mu.Unlock()
 	scope := neoReviewSnapshotScope(diffDescription, files)
 	rootIdentityMatches := a.reviewSnapshotRootMessageID == rootMessageID
-	if rootIdentityMatches && a.reviewSnapshot != nil && (useEstablishedScope || a.reviewSnapshotDescription == diffDescription && slices.Equal(a.reviewSnapshotScope, scope)) {
+	cachedScopeMatches := slices.Equal(neoNormalizedReviewSnapshotScope(a.reviewSnapshotScope), scope)
+	if rootIdentityMatches && a.reviewSnapshot != nil && (useEstablishedScope || a.reviewSnapshotDescription == diffDescription && cachedScopeMatches) {
 		return a.reviewSnapshot, nil
 	}
 	persistedScope := scope
@@ -1272,13 +1285,7 @@ func (a *neoActor) executeSubagentRun(name string, input map[string]any, parentT
 	if name == "oracle" && a.threadID != "" {
 		inputText += "\n\nParent thread: " + a.threadID + "\nYou can use the read_thread tool with this ID to read the full conversation that invoked you if you need more context."
 	}
-	conversation := make([]neoHistoryMessage, 0, 2)
-	if name == "run_check" {
-		if snapshotText := stringValue(input[neoReviewSnapshotTextKey]); snapshotText != "" {
-			conversation = append(conversation, neoHistoryMessage{Role: "user", Text: snapshotText})
-		}
-	}
-	conversation = append(conversation, neoHistoryMessage{Role: "user", Text: inputText})
+	conversation := []neoHistoryMessage{{Role: "user", Text: inputText}}
 
 	if files := neoStringSlice(input["files"]); len(files) > 0 && name == "oracle" {
 		attached := a.readSubagentFiles(runContext, files, firstNonEmptyString(workingDir, workspaceRoot), stringValue(environment["ampURL"]), parentToolCallID, parentMessageID, generation)
@@ -1325,6 +1332,7 @@ func (a *neoActor) executeSubagentRun(name string, input map[string]any, parentT
 			ModelRouteOverride:            &routeCopy,
 			ModelRouteOverrideResolved:    true,
 			SystemPromptOverride:          attemptSystemPrompt,
+			DisableToolCalls:              name == "run_check" && len(requestTools) == 0,
 			TextToolBridgeRequireToolCall: requireToolCall,
 		}
 	}
@@ -1465,7 +1473,7 @@ turnLoop:
 				Role:            "tool",
 				ToolCallID:      exchange.Call.ID,
 				ToolName:        exchange.Call.Name,
-				Text:            runToText(exchange.Run),
+				Text:            runToTextForTool(exchange.Call.Name, exchange.Run),
 				Content:         neoToolRunHistoryContent(exchange.Run),
 				ParentToolUseID: parentToolCallID,
 			})
@@ -1557,6 +1565,51 @@ turnLoop:
 			finalText = strings.TrimSpace(result.Text)
 		}
 		log.Debugf("amp neo subagent force-synthesis tool=%s text_len=%d err=%v", name, len(finalText), err)
+	}
+	if runErr == nil && name == "run_check" && !a.subagentGenerationStale(generation) {
+		if _, parseErr := neoParseRunCheckResult(input, finalText); parseErr != nil {
+			if len(conversation) == 0 || conversation[len(conversation)-1].Role != "assistant" || strings.TrimSpace(conversation[len(conversation)-1].Text) != finalText {
+				conversation = append(conversation, neoHistoryMessage{Role: "assistant", Text: finalText})
+			}
+			repairSuffix := []neoHistoryMessage{{Role: "user", Text: neoRunCheckRepairPrompt(input, parseErr)}}
+			if activeRouteIndex >= len(routes) {
+				runErr = fmt.Errorf("run_check structured-output repair unavailable after initial failure: %w", parseErr)
+			} else {
+				route = routes[activeRouteIndex]
+				messageID := newNeoMessageID()
+				requestBuilder := func(history []neoHistoryMessage) neoInferenceRequest {
+					return buildSubagentRequest(route, messageID, history, nil, false)
+				}
+				var request neoInferenceRequest
+				var repairErr error
+				conversation, request, repairErr = compactionState.prepare(runContext, a, generation, name, agentMode, settings, route, conversation, repairSuffix, requestBuilder)
+				var repaired neoInferenceResult
+				if repairErr == nil {
+					repaired, repairErr = a.runtime.subagentInfer(request, func(neoInferenceDelta) {})
+				}
+				if repairErr == nil {
+					repairErr = neoSubagentStopReasonError(repaired, false)
+				}
+				if repairErr == nil && len(repaired.ToolCalls) != 0 {
+					repairErr = fmt.Errorf("repair returned tool calls")
+				}
+				repairedText := strings.TrimSpace(repaired.Text)
+				if repairErr == nil {
+					if _, repairedParseErr := neoParseRunCheckResult(input, repairedText); repairedParseErr != nil {
+						repairErr = repairedParseErr
+					}
+				}
+				if a.subagentGenerationStale(generation) {
+					return "", nil
+				}
+				if repairErr != nil {
+					runErr = fmt.Errorf("run_check structured-output repair failed; initial result: %v; repair result: %w", parseErr, repairErr)
+				} else {
+					finalText = repairedText
+				}
+				log.Debugf("amp neo run_check structured-output repair initial_error=%v repaired_len=%d err=%v", parseErr, len(repairedText), repairErr)
+			}
+		}
 	}
 	if runErr == nil && finalText == "" {
 		if turnLimitReached {
@@ -1980,47 +2033,41 @@ func (a *neoActor) execSubagentTurnTools(calls []neoToolCall, parentToolCallID s
 }
 
 func (a *neoActor) execPreparedSubagentTurnTools(ctx context.Context, calls []neoToolCall, duplicateCallIDs map[string]string, parentToolCallID string, generation, depth int, agentMode, clientAPIKey string) []neoSubagentToolExchange {
-	exchanges := make([]neoSubagentToolExchange, 0, len(calls))
-	childMessageIDs := make([]string, 0, len(calls))
+	items := make([]neoSubagentTurnTool, 0, len(calls))
 	nestedRuns := make(chan struct{}, neoSubagentMaxConcurrentNestedRuns)
 	for _, call := range calls {
 		if call.Incomplete {
 			continue
 		}
-		exchanges = append(exchanges, neoSubagentToolExchange{Call: call})
-		childMessageIDs = append(childMessageIDs, "")
+		item := neoSubagentTurnTool{original: call, executable: call}
+		item.executable.ID = newNeoToolCallID()
+		item.localReadThread = call.Name == "read_thread" && a.shouldRunLocalActorTool(call.Name)
+		item.lease = !isNeoLocalSubagentTool(call.Name) && !item.localReadThread && !isNeoGitHubTool(call.Name)
+		if duplicateID, duplicate := duplicateCallIDs[call.ID]; duplicate {
+			item.run = neoFinderToolError(fmt.Sprintf("subagent received duplicate tool call id %q", duplicateID))
+		}
+		items = append(items, item)
 	}
 
-	for start := 0; start < len(exchanges); start += neoSubagentMaxConcurrentToolCalls {
-		end := min(start+neoSubagentMaxConcurrentToolCalls, len(exchanges))
-		for index := start; index < end; index++ {
-			call := exchanges[index].Call
-			childMessageID, stored := a.storeSubagentToolUseMessageForGeneration(call, parentToolCallID, generation)
-			if !stored {
-				return nil
-			}
-			childMessageIDs[index] = childMessageID
-			if duplicateID, duplicate := duplicateCallIDs[call.ID]; duplicate {
-				exchanges[index].Run = neoFinderToolError(fmt.Sprintf("subagent received duplicate tool call id %q", duplicateID))
-				if !a.storeSubagentToolResultMessageForGeneration(call.ID, exchanges[index].Run, parentToolCallID, "", generation) {
-					return nil
-				}
-			}
+	for start := 0; start < len(items); start += neoSubagentMaxConcurrentToolCalls {
+		end := min(start+neoSubagentMaxConcurrentToolCalls, len(items))
+		batch := items[start:end]
+		if !a.prepareSubagentTurnTools(batch, parentToolCallID, generation) {
+			return nil
 		}
 		var wg sync.WaitGroup
-		for index := start; index < end; index++ {
-			if exchanges[index].Run != nil {
+		for index := range batch {
+			if batch[index].run != nil {
 				continue
 			}
 			wg.Add(1)
 			go func(index int) {
 				defer wg.Done()
-				call := exchanges[index].Call
-				childMessageID := childMessageIDs[index]
+				item := &batch[index]
+				call := item.executable
 				var run map[string]any
 				localSubagent := isNeoLocalSubagentTool(call.Name)
-				localReadThread := call.Name == "read_thread" && a.shouldRunLocalActorTool(call.Name)
-				if localSubagent || localReadThread {
+				if localSubagent || item.localReadThread {
 					nestedRuns <- struct{}{}
 					defer func() { <-nestedRuns }()
 				}
@@ -2028,7 +2075,7 @@ func (a *neoActor) execPreparedSubagentTurnTools(ctx context.Context, calls []ne
 					if depth >= neoSubagentMaxDepth {
 						run = neoFinderToolError(fmt.Sprintf("subagent nesting exceeds maximum depth %d", neoSubagentMaxDepth))
 					} else {
-						nestedText, nestedErr := a.executeSubagentRun(call.Name, call.Input, call.ID, childMessageID, generation, depth+1, clientAPIKey)
+						nestedText, nestedErr := a.executeSubagentRun(call.Name, call.Input, call.ID, item.childMessageID, generation, depth+1, clientAPIKey)
 						if nestedErr != nil {
 							run = map[string]any{"status": "error", "error": map[string]any{"message": nestedErr.Error()}}
 						} else {
@@ -2036,26 +2083,31 @@ func (a *neoActor) execPreparedSubagentTurnTools(ctx context.Context, calls []ne
 						}
 					}
 					a.storeSubagentToolResultMessageForGeneration(call.ID, run, parentToolCallID, "", generation)
-				} else if localReadThread {
-					readPending := neoPendingTool{ID: call.ID, Name: call.Name, Input: call.Input, AgentMode: agentMode, ParentToolCallID: parentToolCallID, MessageID: childMessageID, ClientAPIKey: clientAPIKey}
+				} else if item.localReadThread {
+					readPending := neoPendingTool{ID: call.ID, Name: call.Name, Input: call.Input, AgentMode: agentMode, ParentToolCallID: parentToolCallID, MessageID: item.childMessageID, ClientAPIKey: clientAPIKey}
 					text, err := a.executeLocalReadThreadWithProgress(readPending, generation, func(statusMessage string) {
 						a.storeSubagentToolResultMessageForGeneration(call.ID, neoReadThreadProgressRun(statusMessage), parentToolCallID, "tool_progress", generation)
 					})
 					if err != nil {
 						run = map[string]any{"status": "error", "error": map[string]any{"message": err.Error()}}
 					} else {
-						run = map[string]any{"status": "done", "result": strings.TrimSpace(text)}
+						output := strings.TrimSpace(text)
+						run = map[string]any{"status": "done", "result": output, "output": output}
 					}
 					a.storeSubagentToolResultMessageForGeneration(call.ID, run, parentToolCallID, "", generation)
 				} else if isNeoGitHubTool(call.Name) {
-					run = a.execSubagentLocalGitHubTool(ctx, call, parentToolCallID, childMessageID, generation, clientAPIKey)
+					run = a.execSubagentLocalGitHubTool(ctx, call, parentToolCallID, item.childMessageID, generation, clientAPIKey)
 				} else {
-					run = a.execSubagentLeafTool(call, parentToolCallID, childMessageID, generation)
+					run = a.waitSubagentLeafTool(ctx, call.ID, item.waiter)
 				}
-				exchanges[index].Run = run
+				item.run = run
 			}(index)
 		}
 		wg.Wait()
+	}
+	exchanges := make([]neoSubagentToolExchange, 0, len(items))
+	for _, item := range items {
+		exchanges = append(exchanges, neoSubagentToolExchange{Call: item.original, Run: item.run})
 	}
 	return exchanges
 }
@@ -2098,7 +2150,7 @@ func neoSubagentCommonToolError(exchanges []neoSubagentToolExchange) string {
 		if !strings.EqualFold(strings.TrimSpace(stringValue(exchange.Run["status"])), "error") {
 			return ""
 		}
-		message := runToText(exchange.Run)
+		message := runToTextForTool(exchange.Call.Name, exchange.Run)
 		if message == "" {
 			return ""
 		}
@@ -2111,74 +2163,17 @@ func neoSubagentCommonToolError(exchanges []neoSubagentToolExchange) string {
 	return common
 }
 
-type neoFinderTurnTool struct {
-	original       neoToolCall
-	executable     neoToolCall
-	childMessageID string
-	run            map[string]any
-	waiter         chan map[string]any
+type neoSubagentTurnTool struct {
+	original        neoToolCall
+	executable      neoToolCall
+	childMessageID  string
+	run             map[string]any
+	waiter          chan map[string]any
+	localReadThread bool
+	lease           bool
 }
 
-func (a *neoActor) execFinderTurnTools(ctx context.Context, calls []neoToolCall, workspaceRoot, executorRoot, parentToolCallID string, generation int) []neoSubagentToolExchange {
-	calls, duplicateCallIDs := neoFinderUniqueToolCallIDs(calls)
-	return a.execPreparedFinderTurnTools(ctx, calls, duplicateCallIDs, workspaceRoot, executorRoot, parentToolCallID, generation)
-}
-func (a *neoActor) execPreparedFinderTurnTools(ctx context.Context, calls []neoToolCall, duplicateCallIDs map[string]string, workspaceRoot, executorRoot, parentToolCallID string, generation int) []neoSubagentToolExchange {
-	items := make([]neoFinderTurnTool, 0, len(calls))
-	for _, call := range calls {
-		if call.Incomplete {
-			continue
-		}
-		item := neoFinderTurnTool{original: call, executable: call}
-		if duplicateID, duplicate := duplicateCallIDs[call.ID]; duplicate {
-			item.run = neoFinderToolError(fmt.Sprintf("finder received duplicate tool call id %q", duplicateID))
-			items = append(items, item)
-			continue
-		}
-		scoped, err := neoScopeFinderToolCallForExecutorContext(ctx, call, workspaceRoot, executorRoot)
-		if err != nil {
-			item.run = neoFinderToolError(err.Error())
-			items = append(items, item)
-			continue
-		}
-		scoped.ID = newNeoToolCallID()
-		item.executable = scoped
-		items = append(items, item)
-	}
-	for start := 0; start < len(items); start += neoFinderMaxConcurrentToolCalls {
-		end := min(start+neoFinderMaxConcurrentToolCalls, len(items))
-		batch := items[start:end]
-		if !a.prepareFinderTurnTools(batch, parentToolCallID, generation) {
-			return nil
-		}
-
-		var wg sync.WaitGroup
-		for index := range batch {
-			if batch[index].run != nil {
-				continue
-			}
-			wg.Add(1)
-			go func(index int) {
-				defer wg.Done()
-				item := &batch[index]
-				item.run = a.waitSubagentLeafTool(item.waiter)
-			}(index)
-		}
-		wg.Wait()
-	}
-
-	exchanges := make([]neoSubagentToolExchange, 0, len(items))
-	for _, item := range items {
-		exchanges = append(exchanges, neoSubagentToolExchange{Call: item.original, Run: item.run})
-	}
-	return exchanges
-}
-
-func neoFinderUniqueToolCallIDs(calls []neoToolCall) ([]neoToolCall, map[string]string) {
-	return neoSubagentUniqueToolCallIDs(calls)
-}
-
-func (a *neoActor) prepareFinderTurnTools(items []neoFinderTurnTool, parentToolCallID string, generation int) bool {
+func (a *neoActor) prepareSubagentTurnTools(items []neoSubagentTurnTool, parentToolCallID string, generation int) bool {
 	a.emissionMu.Lock()
 	a.mu.Lock()
 	if generation != a.generation {
@@ -2208,7 +2203,138 @@ func (a *neoActor) prepareFinderTurnTools(items []neoFinderTurnTool, parentToolC
 		})
 		emissions = append(emissions, useEvent)
 		if item.run != nil {
-			emissions = append(emissions, a.storeSubagentToolResultMessageLocked(item.original.ID, item.run, parentToolCallID, ""))
+			emissions = append(emissions, a.storeSubagentToolResultMessageLocked(item.executable.ID, item.run, parentToolCallID, ""))
+			continue
+		}
+		a.subagentTools[item.executable.ID] = neoPendingTool{
+			ID:               item.executable.ID,
+			Name:             item.executable.Name,
+			Input:            item.executable.Input,
+			MessageID:        item.childMessageID,
+			ParentToolCallID: parentToolCallID,
+		}
+		if !item.lease {
+			continue
+		}
+		item.waiter = make(chan map[string]any, 1)
+		a.subagentWaiters[item.executable.ID] = item.waiter
+		delete(a.subagentToolLeaseAcks, item.executable.ID)
+		emissions = append(emissions, withNeoParentToolCallID(map[string]any{
+			"type":       "tool_lease",
+			"toolCallId": item.executable.ID,
+			"toolName":   item.executable.Name,
+			"args":       item.executable.Input,
+			"messageId":  item.childMessageID,
+		}, parentToolCallID))
+	}
+	a.mu.Unlock()
+	for _, payload := range emissions {
+		for _, socket := range sockets {
+			if socket == nil || !socket.canSend() {
+				continue
+			}
+			socket.send(payload)
+		}
+	}
+	a.emissionMu.Unlock()
+	if len(emissions) > 0 {
+		a.syncCloudAsync()
+	}
+	return true
+}
+
+func (a *neoActor) execFinderTurnTools(ctx context.Context, calls []neoToolCall, workspaceRoot, executorRoot, parentToolCallID string, generation int) []neoSubagentToolExchange {
+	calls, duplicateCallIDs := neoFinderUniqueToolCallIDs(calls)
+	return a.execPreparedFinderTurnTools(ctx, calls, duplicateCallIDs, workspaceRoot, executorRoot, parentToolCallID, generation)
+}
+func (a *neoActor) execPreparedFinderTurnTools(ctx context.Context, calls []neoToolCall, duplicateCallIDs map[string]string, workspaceRoot, executorRoot, parentToolCallID string, generation int) []neoSubagentToolExchange {
+	items := make([]neoSubagentTurnTool, 0, len(calls))
+	for _, call := range calls {
+		if call.Incomplete {
+			continue
+		}
+		item := neoSubagentTurnTool{original: call, executable: call}
+		item.executable.ID = newNeoToolCallID()
+		item.lease = true
+		if duplicateID, duplicate := duplicateCallIDs[call.ID]; duplicate {
+			item.run = neoFinderToolError(fmt.Sprintf("finder received duplicate tool call id %q", duplicateID))
+			items = append(items, item)
+			continue
+		}
+		scoped, err := neoScopeFinderToolCallForExecutorContext(ctx, call, workspaceRoot, executorRoot)
+		if err != nil {
+			item.run = neoFinderToolError(err.Error())
+			items = append(items, item)
+			continue
+		}
+		scoped.ID = item.executable.ID
+		item.executable = scoped
+		items = append(items, item)
+	}
+	for start := 0; start < len(items); start += neoFinderMaxConcurrentToolCalls {
+		end := min(start+neoFinderMaxConcurrentToolCalls, len(items))
+		batch := items[start:end]
+		if !a.prepareFinderTurnTools(batch, parentToolCallID, generation) {
+			return nil
+		}
+
+		var wg sync.WaitGroup
+		for index := range batch {
+			if batch[index].run != nil {
+				continue
+			}
+			wg.Add(1)
+			go func(index int) {
+				defer wg.Done()
+				item := &batch[index]
+				item.run = a.waitSubagentLeafTool(ctx, item.executable.ID, item.waiter)
+			}(index)
+		}
+		wg.Wait()
+	}
+
+	exchanges := make([]neoSubagentToolExchange, 0, len(items))
+	for _, item := range items {
+		exchanges = append(exchanges, neoSubagentToolExchange{Call: item.original, Run: item.run})
+	}
+	return exchanges
+}
+
+func neoFinderUniqueToolCallIDs(calls []neoToolCall) ([]neoToolCall, map[string]string) {
+	return neoSubagentUniqueToolCallIDs(calls)
+}
+
+func (a *neoActor) prepareFinderTurnTools(items []neoSubagentTurnTool, parentToolCallID string, generation int) bool {
+	a.emissionMu.Lock()
+	a.mu.Lock()
+	if generation != a.generation {
+		a.mu.Unlock()
+		a.emissionMu.Unlock()
+		return false
+	}
+	if a.subagentWaiters == nil {
+		a.subagentWaiters = map[string]chan map[string]any{}
+	}
+	if a.subagentTools == nil {
+		a.subagentTools = map[string]neoPendingTool{}
+	}
+	sockets := a.socketListLocked()
+	emissions := make([]map[string]any, 0, len(items)*2)
+	for index := range items {
+		item := &items[index]
+		item.childMessageID = newNeoMessageID()
+		_, useEvent := a.storeMessageEventLocked(neoMessage{
+			ThreadID:        a.threadID,
+			Role:            "assistant",
+			MessageID:       item.childMessageID,
+			Content:         []any{neoToolUseBlock(item.executable, true)},
+			State:           map[string]any{"type": "complete", "stopReason": "tool_use"},
+			CreatedAt:       time.Now().UTC().Format(time.RFC3339Nano),
+			ParentToolUseID: parentToolCallID,
+		})
+		emissions = append(emissions, useEvent)
+		if item.run != nil {
+			emissions = append(emissions, a.storeSubagentToolResultMessageLocked(item.executable.ID, item.run, parentToolCallID, ""))
 			continue
 		}
 		item.waiter = make(chan map[string]any, 1)
@@ -3121,6 +3247,11 @@ func (a *neoActor) storeSubagentToolResultMessageForGeneration(toolCallID string
 		return false
 	}
 	event := a.storeSubagentToolResultMessageLocked(toolCallID, run, parentToolCallID, completionStatus)
+	if pending, ok := a.subagentTools[toolCallID]; ok && neoToolRunTerminalForPending(pending, run) {
+		delete(a.subagentWaiters, toolCallID)
+		delete(a.subagentTools, toolCallID)
+		delete(a.subagentToolLeaseAcks, toolCallID)
+	}
 	sockets := a.socketListLocked()
 	a.mu.Unlock()
 	for _, socket := range sockets {
@@ -3152,18 +3283,26 @@ type neoSubagentToolExchange struct {
 	Run  map[string]any
 }
 
-func (a *neoActor) storeSubagentToolExchanges(exchanges []neoSubagentToolExchange, parentToolCallID string) {
+func (a *neoActor) storeSubagentToolExchanges(exchanges []neoSubagentToolExchange, parentToolCallID string, generation int) bool {
 	if len(exchanges) == 0 {
-		return
+		return true
 	}
 	events := make([]map[string]any, 0, len(exchanges)*2)
+	a.emissionMu.Lock()
 	a.mu.Lock()
+	if generation != a.generation {
+		a.mu.Unlock()
+		a.emissionMu.Unlock()
+		return false
+	}
 	for _, exchange := range exchanges {
+		executable := exchange.Call
+		executable.ID = newNeoToolCallID()
 		_, useEvent := a.storeMessageEventLocked(neoMessage{
 			ThreadID:        a.threadID,
 			Role:            "assistant",
 			MessageID:       newNeoMessageID(),
-			Content:         []any{neoToolUseBlock(exchange.Call, true)},
+			Content:         []any{neoToolUseBlock(executable, true)},
 			State:           map[string]any{"type": "complete", "stopReason": "tool_use"},
 			CreatedAt:       time.Now().UTC().Format(time.RFC3339Nano),
 			ParentToolUseID: parentToolCallID,
@@ -3172,33 +3311,86 @@ func (a *neoActor) storeSubagentToolExchanges(exchanges []neoSubagentToolExchang
 		_, resultEvent := a.storeMessageEventLocked(neoMessage{
 			ThreadID:        a.threadID,
 			Role:            "user",
-			MessageID:       toolResultMessageID(exchange.Call.ID),
-			Content:         []any{map[string]any{"type": "tool_result", "toolUseID": exchange.Call.ID, "run": exchange.Run}},
+			MessageID:       toolResultMessageID(executable.ID),
+			Content:         []any{map[string]any{"type": "tool_result", "toolUseID": executable.ID, "run": exchange.Run}},
 			CreatedAt:       time.Now().UTC().Format(time.RFC3339Nano),
 			ParentToolUseID: parentToolCallID,
 		})
 		events = append(events, resultEvent)
 	}
+	sockets := a.socketListLocked()
 	a.mu.Unlock()
 
 	for _, event := range events {
-		a.broadcast(event)
+		for _, socket := range sockets {
+			if socket == nil || !socket.canSend() {
+				continue
+			}
+			socket.send(event)
+		}
 	}
+	a.emissionMu.Unlock()
 	a.syncCloudAsync()
+	return true
 }
 
 // execSubagentLeafTool leases a subagent's leaf-tool call to the executor and
 // blocks until the executor returns a terminal run, routed back via a waiter.
-func (a *neoActor) execSubagentLeafTool(call neoToolCall, parentToolCallID, childMessageID string, generation int) map[string]any {
+func (a *neoActor) execSubagentLeafTool(ctx context.Context, call neoToolCall, parentToolCallID, childMessageID string, generation int) map[string]any {
+	cancelled := map[string]any{"status": "cancelled", "reason": "user:cancelled"}
+	if ctx.Err() != nil {
+		a.storeSubagentToolResultMessageForGeneration(call.ID, cloneMap(cancelled), parentToolCallID, "", generation)
+		return cancelled
+	}
 	ch := make(chan map[string]any, 1)
 	if !a.registerSubagentLeafTool(call, parentToolCallID, childMessageID, generation, ch) {
-		return map[string]any{"status": "cancelled", "reason": "user:cancelled"}
+		if a.subagentGenerationStale(generation) {
+			return cancelled
+		}
+		return map[string]any{"status": "error", "error": map[string]any{"message": "subagent leaf tool ID is already registered"}}
 	}
-	return a.waitSubagentLeafTool(ch)
+	return a.waitSubagentLeafTool(ctx, call.ID, ch)
 }
 
-func (a *neoActor) waitSubagentLeafTool(ch chan map[string]any) map[string]any {
-	return <-ch
+func (a *neoActor) waitSubagentLeafTool(ctx context.Context, toolCallID string, ch chan map[string]any) map[string]any {
+	select {
+	case run := <-ch:
+		return run
+	case <-ctx.Done():
+		run := map[string]any{"status": "cancelled", "reason": "user:cancelled"}
+		if a.cancelSubagentLeafToolWaiter(toolCallID, ch, run) {
+			return run
+		}
+		return <-ch
+	}
+}
+
+func (a *neoActor) cancelSubagentLeafToolWaiter(toolCallID string, ch chan map[string]any, run map[string]any) bool {
+	a.emissionMu.Lock()
+	a.mu.Lock()
+	if a.subagentWaiters[toolCallID] != ch {
+		a.mu.Unlock()
+		a.emissionMu.Unlock()
+		return false
+	}
+	pending := a.subagentTools[toolCallID]
+	delete(a.subagentWaiters, toolCallID)
+	delete(a.subagentTools, toolCallID)
+	delete(a.subagentToolLeaseAcks, toolCallID)
+	event := a.storeSubagentToolResultMessageLocked(toolCallID, run, pending.ParentToolCallID, "")
+	sockets := a.socketListLocked()
+	a.mu.Unlock()
+	revoked := map[string]any{"type": "executor_tool_lease_revoked", "toolCallId": toolCallID, "reason": "user_canceled"}
+	for _, socket := range sockets {
+		if socket == nil || !socket.canSend() {
+			continue
+		}
+		socket.send(event)
+		socket.send(revoked)
+	}
+	a.emissionMu.Unlock()
+	a.syncCloudAsync()
+	return true
 }
 
 func (a *neoActor) registerSubagentLeafTool(call neoToolCall, parentToolCallID, childMessageID string, generation int, ch chan map[string]any) bool {
@@ -3214,6 +3406,14 @@ func (a *neoActor) registerSubagentLeafTool(call neoToolCall, parentToolCallID, 
 	}
 	if a.subagentTools == nil {
 		a.subagentTools = map[string]neoPendingTool{}
+	}
+	if a.subagentWaiters[call.ID] != nil {
+		a.mu.Unlock()
+		return false
+	}
+	if _, exists := a.subagentTools[call.ID]; exists {
+		a.mu.Unlock()
+		return false
 	}
 	a.subagentWaiters[call.ID] = ch
 	a.subagentTools[call.ID] = neoPendingTool{
@@ -3342,7 +3542,12 @@ func (a *neoActor) takeSubagentCancellationLocked() neoSubagentCancellation {
 }
 
 func (a *neoActor) finishSubagentCancellation(cancellation neoSubagentCancellation, runReason, leaseReason string) {
+	if len(cancellation.IDs) == 0 {
+		return
+	}
 	run := map[string]any{"status": "cancelled", "reason": runReason}
+	a.emissionMu.Lock()
+	sockets := a.socketList()
 	for _, id := range cancellation.IDs {
 		if ch := cancellation.Waiters[id]; ch != nil {
 			select {
@@ -3350,8 +3555,15 @@ func (a *neoActor) finishSubagentCancellation(cancellation neoSubagentCancellati
 			default:
 			}
 		}
-		a.broadcast(map[string]any{"type": "executor_tool_lease_revoked", "toolCallId": id, "reason": leaseReason})
+		revoked := map[string]any{"type": "executor_tool_lease_revoked", "toolCallId": id, "reason": leaseReason}
+		for _, socket := range sockets {
+			if socket == nil || !socket.canSend() {
+				continue
+			}
+			socket.send(revoked)
+		}
 	}
+	a.emissionMu.Unlock()
 }
 
 func neoToolIDsExcluding(ids, excluded []string) []string {
@@ -3416,7 +3628,7 @@ func (a *neoActor) deliverSubagentRun(parent neoPendingTool, run map[string]any)
 		Role:            "tool",
 		ToolCallID:      parent.ID,
 		ToolName:        parent.Name,
-		Text:            runToText(run),
+		Text:            runToTextForTool(parent.Name, run),
 		Content:         neoToolRunHistoryContent(run),
 		ParentToolUseID: parent.ParentToolCallID,
 	})
@@ -3468,6 +3680,12 @@ func neoSubagentInputText(toolName string, input map[string]any) string {
 	case "run_check":
 		var b strings.Builder
 		b.WriteString("Run this review check against the changes under review.\n\n")
+		snapshotText := stringValue(input[neoReviewSnapshotTextKey])
+		if snapshotText != "" {
+			b.WriteString("AUTHORITATIVE INPUT: The immutable review snapshot below is the complete patch under review. Read every listed file and hunk before evaluating the check. Do not claim the patch is absent when the snapshot delimiters are present.\n\n")
+			b.WriteString(snapshotText)
+			b.WriteString("\n\n")
+		}
 		frontmatter, _ := json.Marshal(mapValue(input["frontmatter"]))
 		checkURI := stringValue(input["checkURI"])
 		checkContent := stringValue(input["checkContent"])
@@ -3503,6 +3721,9 @@ func neoSubagentInputText(toolName string, input map[string]any) string {
 				b.WriteString("\n")
 			}
 		}
+		if snapshotText != "" {
+			b.WriteString("\nEvaluate the check against the immutable snapshot above. Populate coveredFiles and coveredHunks from its manifest, and report only findings supported by changed lines in that snapshot.\n")
+		}
 		return strings.TrimSpace(b.String())
 	default: // finder and any other query-shaped subagent
 		return firstNonEmptyString(input["query"], input["task"], input["prompt"], input["description"])
@@ -3525,7 +3746,7 @@ func (a *neoActor) readSubagentFiles(ctx context.Context, files []string, workin
 		}
 		resolvedPath := neoSubagentAttachmentPath(requestedPath, workingDirectory)
 		call := neoToolCall{ID: newNeoToolCallID(), Name: "Read", Input: map[string]any{"path": resolvedPath}}
-		run := a.execSubagentLeafTool(call, parentToolCallID, parentMessageID, generation)
+		run := a.execSubagentLeafTool(ctx, call, parentToolCallID, parentMessageID, generation)
 		var mention, image map[string]any
 		if readImage, ok := neoReadImageResultBlock(mapValue(run["result"])); ok && stringValue(readImage["data"]) == "" {
 			imageURL := stringValue(readImage["url"])

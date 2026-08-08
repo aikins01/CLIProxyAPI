@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -48,6 +49,17 @@ func NewAIStudioExecutor(cfg *config.Config, provider string, relay *wsrelay.Man
 // Identifier returns the executor identifier.
 func (e *AIStudioExecutor) Identifier() string { return "aistudio" }
 
+func newAIStudioRelayError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var statusError interface{ StatusCode() int }
+	if errors.As(err, &statusError) && statusError.StatusCode() > 0 {
+		return newGoogleStatusErr(statusError.StatusCode(), []byte(err.Error()))
+	}
+	return helps.NewAuthStateNeutralError(err)
+}
+
 // PrepareRequest prepares the HTTP request for execution.
 func (e *AIStudioExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth) error {
 	if req == nil {
@@ -87,7 +99,7 @@ func (e *AIStudioExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.A
 	if httpReq.Body != nil {
 		b, errRead := io.ReadAll(httpReq.Body)
 		if errRead != nil {
-			return nil, errRead
+			return nil, helps.NewAuthStateNeutralError(errRead)
 		}
 		body = b
 		httpReq.Body = io.NopCloser(bytes.NewReader(b))
@@ -101,7 +113,7 @@ func (e *AIStudioExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.A
 	}
 	wsResp, errRelay := e.relay.NonStream(ctx, auth.ID, wsReq)
 	if errRelay != nil {
-		return nil, errRelay
+		return nil, newAIStudioRelayError(errRelay)
 	}
 	if wsResp == nil {
 		return nil, fmt.Errorf("aistudio executor: ws response is nil")
@@ -170,14 +182,14 @@ func (e *AIStudioExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth,
 	wsResp, err := e.relay.NonStream(ctx, authID, wsReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		return resp, err
+		return resp, newAIStudioRelayError(err)
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, wsResp.Status, wsResp.Headers.Clone())
 	if len(wsResp.Body) > 0 {
 		helps.AppendAPIResponseChunk(ctx, e.cfg, wsResp.Body)
 	}
 	if wsResp.Status < 200 || wsResp.Status >= 300 {
-		return resp, statusErr{code: wsResp.Status, msg: string(wsResp.Body)}
+		return resp, newGoogleStatusErr(wsResp.Status, wsResp.Body)
 	}
 	reporter.Publish(ctx, helps.ParseGeminiUsage(wsResp.Body))
 	var param any
@@ -232,11 +244,11 @@ func (e *AIStudioExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth
 	wsStream, err := e.relay.Stream(ctx, authID, wsReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		return nil, err
+		return nil, newAIStudioRelayError(err)
 	}
 	firstEvent, ok := <-wsStream
 	if !ok {
-		err = fmt.Errorf("wsrelay: stream closed before start")
+		err = helps.NewAuthStateNeutralError(fmt.Errorf("wsrelay: stream closed before start"))
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return nil, err
 	}
@@ -252,7 +264,7 @@ func (e *AIStudioExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth
 			body.Write(firstEvent.Payload)
 		}
 		if firstEvent.Type == wsrelay.MessageTypeStreamEnd {
-			return nil, statusErr{code: firstEvent.Status, msg: body.String()}
+			return nil, newGoogleStatusErr(firstEvent.Status, body.Bytes())
 		}
 		for event := range wsStream {
 			if event.Err != nil {
@@ -274,7 +286,7 @@ func (e *AIStudioExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth
 				break
 			}
 		}
-		return nil, statusErr{code: firstEvent.Status, msg: body.String()}
+		return nil, newGoogleStatusErr(firstEvent.Status, body.Bytes())
 	}
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func(first wsrelay.StreamEvent) {
@@ -285,8 +297,9 @@ func (e *AIStudioExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth
 			if event.Err != nil {
 				helps.RecordAPIResponseError(ctx, e.cfg, event.Err)
 				reporter.PublishFailure(ctx, event.Err)
+				streamErr := newAIStudioRelayError(fmt.Errorf("wsrelay: %w", event.Err))
 				select {
-				case out <- cliproxyexecutor.StreamChunk{Err: fmt.Errorf("wsrelay: %v", event.Err)}:
+				case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
 				case <-ctx.Done():
 				}
 				return false
@@ -324,6 +337,15 @@ func (e *AIStudioExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth
 				if len(event.Payload) > 0 {
 					helps.AppendAPIResponseChunk(ctx, e.cfg, event.Payload)
 				}
+				if event.Status > 0 && event.Status != http.StatusOK {
+					statusError := newGoogleStatusErr(event.Status, event.Payload)
+					reporter.PublishFailure(ctx, statusError)
+					select {
+					case out <- cliproxyexecutor.StreamChunk{Err: statusError}:
+					case <-ctx.Done():
+					}
+					return false
+				}
 				lines := sdktranslator.TranslateStream(ctx, body.toFormat, opts.SourceFormat, req.Model, opts.OriginalRequest, translatedReq, event.Payload, &param)
 				for i := range lines {
 					select {
@@ -337,8 +359,9 @@ func (e *AIStudioExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth
 			case wsrelay.MessageTypeError:
 				helps.RecordAPIResponseError(ctx, e.cfg, event.Err)
 				reporter.PublishFailure(ctx, event.Err)
+				streamErr := newAIStudioRelayError(fmt.Errorf("wsrelay: %w", event.Err))
 				select {
-				case out <- cliproxyexecutor.StreamChunk{Err: fmt.Errorf("wsrelay: %v", event.Err)}:
+				case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
 				case <-ctx.Done():
 				}
 				return false
@@ -396,14 +419,14 @@ func (e *AIStudioExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.A
 	resp, err := e.relay.NonStream(ctx, authID, wsReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		return cliproxyexecutor.Response{}, err
+		return cliproxyexecutor.Response{}, newAIStudioRelayError(err)
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, resp.Status, resp.Headers.Clone())
 	if len(resp.Body) > 0 {
 		helps.AppendAPIResponseChunk(ctx, e.cfg, resp.Body)
 	}
 	if resp.Status < 200 || resp.Status >= 300 {
-		return cliproxyexecutor.Response{}, statusErr{code: resp.Status, msg: string(resp.Body)}
+		return cliproxyexecutor.Response{}, newGoogleStatusErr(resp.Status, resp.Body)
 	}
 	totalTokens := gjson.GetBytes(resp.Body, "totalTokens").Int()
 	if totalTokens <= 0 {

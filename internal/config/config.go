@@ -298,6 +298,10 @@ type AmpCode struct {
 	// When false (default), local API keys are used first if available.
 	ForceModelMappings bool `yaml:"force-model-mappings" json:"force-model-mappings"`
 
+	// CodexWebsocketsExperiment opts Amp /responses requests into eligible Codex
+	// WebSocket credentials (default: false).
+	CodexWebsocketsExperiment bool `yaml:"codex-websockets-experiment,omitempty" json:"codex-websockets-experiment,omitempty"`
+
 	// ThreadActorProxyEnabled controls the local Rivet actor proxy Amp expects when amp.url is localhost.
 	// Defaults to true when ampcode.upstream-url is configured and the Neo local runtime is disabled.
 	ThreadActorProxyEnabled *bool `yaml:"thread-actor-proxy-enabled,omitempty" json:"thread-actor-proxy-enabled,omitempty"`

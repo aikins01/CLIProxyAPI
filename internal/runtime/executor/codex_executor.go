@@ -33,6 +33,8 @@ const (
 	codexUserAgent             = "codex_cli_rs/0.118.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9"
 	codexOriginator            = "codex_cli_rs"
 	codexDefaultImageToolModel = "gpt-image-2"
+	codexIncompleteStreamError = "stream error: stream disconnected before completion: stream closed before response.completed"
+	codexMalformedSSEDataError = "stream error: malformed SSE event JSON"
 )
 
 var dataTag = []byte("data:")
@@ -140,7 +142,11 @@ func (e *CodexExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 		return nil, err
 	}
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
-	return httpClient.Do(httpReq)
+	httpResp, err := httpClient.Do(httpReq)
+	if err != nil {
+		return nil, helps.NewAuthStateNeutralError(err)
+	}
+	return httpResp, nil
 }
 
 func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
@@ -213,7 +219,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		return resp, err
+		return resp, helps.NewAuthStateNeutralError(err)
 	}
 	defer func() {
 		if errClose := httpResp.Body.Close(); errClose != nil {
@@ -222,7 +228,11 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	}()
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		b, _ := io.ReadAll(httpResp.Body)
+		b, errRead := io.ReadAll(httpResp.Body)
+		if errRead != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, errRead)
+			return resp, helps.NewAuthStateNeutralError(errRead)
+		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
 		err = newCodexStatusErr(httpResp.StatusCode, b)
@@ -231,19 +241,35 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	data, err := io.ReadAll(httpResp.Body)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		return resp, err
+		return resp, helps.NewAuthStateNeutralError(err)
 	}
 	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 
 	lines := bytes.Split(data, []byte("\n"))
 	outputItemsByIndex := make(map[int64][]byte)
 	var outputItemsFallback [][]byte
-	for _, line := range lines {
+	for lineIndex, line := range lines {
 		if !bytes.HasPrefix(line, dataTag) {
 			continue
 		}
 
 		eventData := bytes.TrimSpace(line[5:])
+		if len(eventData) != 0 && !gjson.ValidBytes(eventData) {
+			if bytes.Equal(eventData, []byte("[DONE]")) {
+				continue
+			}
+			truncated := true
+			for _, later := range lines[lineIndex+1:] {
+				if bytes.HasPrefix(later, dataTag) {
+					truncated = false
+					break
+				}
+			}
+			if truncated {
+				return resp, newCodexStatusErr(http.StatusRequestTimeout, []byte(codexIncompleteStreamError))
+			}
+			return resp, newCodexStatusErr(http.StatusBadGateway, []byte(codexMalformedSSEDataError))
+		}
 		eventType := gjson.GetBytes(eventData, "type").String()
 
 		if eventType == "response.output_item.done" {
@@ -297,7 +323,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
 		return resp, nil
 	}
-	err = statusErr{code: 408, msg: "stream error: stream disconnected before completion: stream closed before response.completed"}
+	err = newCodexStatusErr(http.StatusRequestTimeout, []byte(codexIncompleteStreamError))
 	return resp, err
 }
 
@@ -364,7 +390,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		return resp, err
+		return resp, helps.NewAuthStateNeutralError(err)
 	}
 	defer func() {
 		if errClose := httpResp.Body.Close(); errClose != nil {
@@ -373,7 +399,11 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	}()
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		b, _ := io.ReadAll(httpResp.Body)
+		b, errRead := io.ReadAll(httpResp.Body)
+		if errRead != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, errRead)
+			return resp, helps.NewAuthStateNeutralError(errRead)
+		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
 		err = newCodexStatusErr(httpResp.StatusCode, b)
@@ -382,7 +412,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	data, err := io.ReadAll(httpResp.Body)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		return resp, err
+		return resp, helps.NewAuthStateNeutralError(err)
 	}
 	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 	reporter.Publish(ctx, helps.ParseOpenAIUsage(data))
@@ -463,7 +493,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		return nil, err
+		return nil, helps.NewAuthStateNeutralError(err)
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
@@ -473,7 +503,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		}
 		if readErr != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, readErr)
-			return nil, readErr
+			return nil, helps.NewAuthStateNeutralError(readErr)
 		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
@@ -495,6 +525,8 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		var outputItemsFallback [][]byte
 		responsesTarget := from == sdktranslator.FormatOpenAIResponse
 		var responsesEvent []byte
+		responseCompleted := false
+		pendingResponseCompleted := false
 
 		sendStreamErr := func(err error) {
 			helps.RecordAPIResponseError(ctx, e.cfg, err)
@@ -520,6 +552,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		flushResponsesEvent := func() bool {
 			if len(bytes.TrimSpace(responsesEvent)) == 0 {
 				responsesEvent = nil
+				pendingResponseCompleted = false
 				return true
 			}
 			responsesEvent = bytes.TrimRight(responsesEvent, "\r\n")
@@ -527,7 +560,11 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			if !sendTranslated(responsesEvent) {
 				return false
 			}
+			if pendingResponseCompleted {
+				responseCompleted = true
+			}
 			responsesEvent = nil
+			pendingResponseCompleted = false
 			return true
 		}
 
@@ -535,13 +572,26 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			line := scanner.Bytes()
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 			translatedLine := bytes.Clone(line)
+			completedLine := false
 
 			if bytes.HasPrefix(line, dataTag) {
 				data := bytes.TrimSpace(line[5:])
+				if len(data) != 0 && bytes.Equal(data, []byte("[DONE]")) {
+					continue
+				}
+				if len(data) != 0 && !gjson.ValidBytes(data) {
+					if scanner.Scan() {
+						sendStreamErr(newCodexStatusErr(http.StatusBadGateway, []byte(codexMalformedSSEDataError)))
+						return
+					}
+					sendStreamErr(newCodexStatusErr(http.StatusRequestTimeout, []byte(codexIncompleteStreamError)))
+					return
+				}
 				switch gjson.GetBytes(data, "type").String() {
 				case "response.output_item.done":
 					collectCodexOutputItemDone(data, outputItemsByIndex, &outputItemsFallback)
 				case "response.completed":
+					completedLine = true
 					if detail, ok := helps.ParseCodexUsage(data); ok {
 						reporter.Publish(ctx, detail)
 					}
@@ -562,6 +612,9 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 					sendStreamErr(fmt.Errorf("codex executor: responses SSE event exceeds 50MB"))
 					return
 				}
+				if completedLine {
+					pendingResponseCompleted = true
+				}
 				responsesEvent = append(responsesEvent, translatedLine...)
 				responsesEvent = append(responsesEvent, '\n')
 				continue
@@ -569,10 +622,16 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			if !sendTranslated(translatedLine) {
 				return
 			}
+			if completedLine {
+				responseCompleted = true
+			}
 		}
 		if errScan := scanner.Err(); errScan != nil {
-			sendStreamErr(errScan)
+			sendStreamErr(helps.NewAuthStateNeutralError(errScan))
 			return
+		}
+		if !responseCompleted {
+			sendStreamErr(newCodexStatusErr(http.StatusRequestTimeout, []byte(codexIncompleteStreamError)))
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
@@ -870,17 +929,23 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 	util.ApplyCustomHeadersFromAttrs(r, attrs)
 }
 
-func newCodexStatusErr(statusCode int, body []byte) statusErr {
+func newCodexStatusErr(statusCode int, body []byte) upstreamStatusErr {
 	errCode := statusCode
 	if isCodexModelCapacityError(body) {
 		errCode = http.StatusTooManyRequests
+	}
+	authStateNeutral := errCode == http.StatusRequestTimeout || errCode/100 == 5
+	if code, _, ok := codexStatusErrorClassification(errCode, body); ok {
+		if code == "auth_unavailable" {
+			authStateNeutral = false
+		}
 	}
 	body = classifyCodexStatusError(errCode, body)
 	err := statusErr{code: errCode, msg: string(body)}
 	if retryAfter := parseCodexRetryAfter(errCode, body, time.Now()); retryAfter != nil {
 		err.retryAfter = retryAfter
 	}
-	return err
+	return upstreamStatusErr{statusErr: err, authStateNeutral: authStateNeutral}
 }
 
 func classifyCodexStatusError(statusCode int, body []byte) []byte {

@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -226,5 +227,113 @@ func TestOpenAICompatExecutorStreamSkipsKeepAliveUntilDataLine(t *testing.T) {
 	}
 	if gjson.Get(got.String(), "choices.0.delta.content").String() != "hello" {
 		t.Fatalf("stream payload = %s", got.String())
+	}
+}
+
+func TestNewOpenAIShapeStatusErrPreservesCredentialFailureClassification(t *testing.T) {
+	tests := []struct {
+		name        string
+		statusCode  int
+		body        string
+		wantNeutral bool
+	}{
+		{name: "transient server error", statusCode: http.StatusBadGateway, body: `{"error":{"type":"server_error"}}`, wantNeutral: true},
+		{name: "authentication error in 5xx", statusCode: http.StatusInternalServerError, body: `{"error":{"type":"authentication_error"}}`},
+		{name: "string authentication error in 5xx", statusCode: http.StatusInternalServerError, body: `{"error":"invalid api key"}`},
+		{name: "plain authentication error in 5xx", statusCode: http.StatusInternalServerError, body: `invalid api key`},
+		{name: "permission error in 5xx", statusCode: http.StatusBadGateway, body: `{"error":{"type":"permission_error"}}`},
+		{name: "payment error in 5xx", statusCode: http.StatusServiceUnavailable, body: `{"error":{"code":"payment_required"}}`},
+		{name: "quota error in 5xx", statusCode: http.StatusInternalServerError, body: `{"error":{"code":"insufficient_quota"}}`},
+		{name: "rate limit status", statusCode: http.StatusTooManyRequests, body: `{"error":{"type":"server_error"}}`},
+		{name: "provider capacity in 5xx", statusCode: http.StatusServiceUnavailable, body: `{"error":{"type":"server_error","message":"no capacity available"}}`, wantNeutral: true},
+		{name: "at capacity message in 5xx", statusCode: http.StatusBadGateway, body: `{"error":{"type":"server_error","message":"model is at capacity"}}`, wantNeutral: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := newOpenAIShapeStatusErr(tc.statusCode, []byte(tc.body))
+			if got := err.StatusCode(); got != tc.statusCode {
+				t.Fatalf("StatusCode() = %d, want %d", got, tc.statusCode)
+			}
+			if got := err.AuthStateNeutral(); got != tc.wantNeutral {
+				t.Fatalf("AuthStateNeutral() = %t, want %t", got, tc.wantNeutral)
+			}
+		})
+	}
+}
+
+func TestOpenAICompatExecutorTransportFailureIsAuthStateNeutral(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	baseURL := server.URL
+	server.Close()
+
+	executor := NewOpenAICompatExecutor("openai-compatibility", &config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": baseURL,
+		"api_key":  "test",
+	}}
+	_, err := executor.Execute(t.Context(), auth, cliproxyexecutor.Request{
+		Model:   "openai-model",
+		Payload: []byte(`{"model":"openai-model","messages":[{"role":"user","content":"hi"}]}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai")})
+	if err == nil {
+		t.Fatal("Execute() error = nil, want transport failure")
+	}
+	var neutral interface{ AuthStateNeutral() bool }
+	if !errors.As(err, &neutral) || !neutral.AuthStateNeutral() {
+		t.Fatalf("transport error is not auth-state-neutral: %v", err)
+	}
+}
+
+type aiStudioRelayStatusTestError struct {
+	status  int
+	message string
+}
+
+func (e aiStudioRelayStatusTestError) Error() string   { return e.message }
+func (e aiStudioRelayStatusTestError) StatusCode() int { return e.status }
+
+func TestNewAIStudioRelayErrorPreservesStatusClassification(t *testing.T) {
+	tests := []struct {
+		name        string
+		err         error
+		wantStatus  int
+		wantNeutral bool
+	}{
+		{name: "transport", err: errors.New("relay disconnected"), wantNeutral: true},
+		{name: "transient status", err: aiStudioRelayStatusTestError{status: http.StatusServiceUnavailable, message: "temporarily unavailable"}, wantStatus: http.StatusServiceUnavailable, wantNeutral: true},
+		{name: "authentication status", err: aiStudioRelayStatusTestError{status: http.StatusUnauthorized, message: "invalid api key"}, wantStatus: http.StatusUnauthorized},
+		{name: "mislabeled authentication status", err: aiStudioRelayStatusTestError{status: http.StatusInternalServerError, message: "invalid api key"}, wantStatus: http.StatusInternalServerError},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := newAIStudioRelayError(tc.err)
+			var neutral interface{ AuthStateNeutral() bool }
+			if !errors.As(err, &neutral) || neutral.AuthStateNeutral() != tc.wantNeutral {
+				t.Fatalf("AuthStateNeutral() for %v = %v, want %t", err, neutral, tc.wantNeutral)
+			}
+			if tc.wantStatus > 0 {
+				var status interface{ StatusCode() int }
+				if !errors.As(err, &status) || status.StatusCode() != tc.wantStatus {
+					t.Fatalf("StatusCode() for %v = %v, want %d", err, status, tc.wantStatus)
+				}
+			}
+		})
+	}
+}
+
+func TestNewGoogleStatusErrKeepsProviderCapacityAuthStateNeutral(t *testing.T) {
+	for _, body := range []string{
+		`{"error":{"code":503,"status":"UNAVAILABLE","message":"no capacity available"}}`,
+		`{"error":{"code":502,"status":"UNAVAILABLE","message":"model is at capacity"}}`,
+	} {
+		err := newGoogleStatusErr(http.StatusServiceUnavailable, []byte(body))
+		if !err.AuthStateNeutral() {
+			t.Fatalf("AuthStateNeutral() for %s = false, want true", body)
+		}
+	}
+	credential := newGoogleStatusErr(http.StatusInternalServerError, []byte(`{"error":{"code":500,"message":"api key not valid"}}`))
+	if credential.AuthStateNeutral() {
+		t.Fatal("credential failure was classified auth-state-neutral")
 	}
 }
