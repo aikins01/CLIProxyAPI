@@ -178,6 +178,50 @@ func TestNeoRuntimeMetadataIncludesClientEndpoint(t *testing.T) {
 	}
 }
 
+func TestNeoRuntimeLoopbackHost(t *testing.T) {
+	tests := []struct {
+		host string
+		want bool
+	}{
+		{host: "localhost", want: true},
+		{host: "LOCALHOST", want: true},
+		{host: "127.0.0.1", want: true},
+		{host: "127.42.0.1", want: true},
+		{host: "::1", want: true},
+		{host: "0.0.0.0"},
+		{host: "::"},
+		{host: "192.168.1.10"},
+		{host: "203.0.113.10"},
+		{host: "runner.example"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.host, func(t *testing.T) {
+			if got := neoRuntimeLoopbackHost(tc.host); got != tc.want {
+				t.Fatalf("neoRuntimeLoopbackHost(%q) = %t, want %t", tc.host, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestNeoRuntimeStartRejectsNonLoopbackBeforeListen(t *testing.T) {
+	previousListen := neoRuntimeListen
+	listenCalled := false
+	neoRuntimeListen = func(string, string) (net.Listener, error) {
+		listenCalled = true
+		return nil, errors.New("unexpected listen")
+	}
+	t.Cleanup(func() { neoRuntimeListen = previousListen })
+
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{NeoLocalRuntime: config.AmpNeoLocalRuntime{Host: "0.0.0.0"}}})
+	err := rt.start()
+	if err == nil || !strings.Contains(err.Error(), "must be loopback") {
+		t.Fatalf("start error = %v, want loopback rejection", err)
+	}
+	if listenCalled {
+		t.Fatal("non-loopback runtime invoked listener")
+	}
+}
+
 func TestNeoRuntimeStartRetriesUntilPortIsReleased(t *testing.T) {
 	held, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -3484,6 +3528,64 @@ func TestNeoActorStorePrunesIdleActors(t *testing.T) {
 	}
 	if got := rt.store.findActors(url.Values{"name": []string{"thread-actor"}, "key": []string{"T-prune-active"}}); len(got) != 1 {
 		t.Fatalf("protected actor missing: %#v", got)
+	}
+}
+
+func TestNeoActorStoreClaimsThreadIDAtomically(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	threadID := "T-019f4000-0000-4000-8000-000000000139"
+	claimedActor, claim := rt.store.reserveThreadActor(threadID)
+	if claimedActor == nil || claim == nil {
+		t.Fatalf("initial reservation actor=%#v claim=%#v", claimedActor, claim)
+	}
+	if actor := rt.store.lookupThreadActor(threadID); actor != nil {
+		t.Fatalf("provisional actor was visible before commit: %#v", actor)
+	}
+
+	const workers = 32
+	start := make(chan struct{})
+	actors := make(chan *neoActor, workers)
+	claims := make(chan *neoThreadActorClaim, workers)
+	var group sync.WaitGroup
+	for range workers {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			<-start
+			actor, claim := rt.store.reserveThreadActor(threadID)
+			actors <- actor
+			claims <- claim
+		}()
+	}
+	close(start)
+	if !claim.commit() {
+		t.Fatal("provisional claim commit failed")
+	}
+	group.Wait()
+	close(actors)
+	close(claims)
+	for actor := range actors {
+		if actor != claimedActor {
+			t.Fatalf("concurrent reservation actor = %p, want %p", actor, claimedActor)
+		}
+	}
+	for concurrentClaim := range claims {
+		if concurrentClaim != nil {
+			t.Fatalf("concurrent reservation created a second claim: %#v", concurrentClaim)
+		}
+	}
+	if stored := rt.store.lookupThreadActor(threadID); stored != claimedActor {
+		t.Fatalf("stored actor = %p, want %p", stored, claimedActor)
+	}
+
+	retryThreadID := "T-019f4000-0000-4000-8000-00000000013a"
+	abortedActor, abortedClaim := rt.store.reserveThreadActor(retryThreadID)
+	if abortedActor == nil || abortedClaim == nil || !abortedClaim.abort() {
+		t.Fatalf("abort setup actor=%#v claim=%#v", abortedActor, abortedClaim)
+	}
+	retryActor, retryClaim := rt.store.reserveThreadActor(retryThreadID)
+	if retryActor == nil || retryClaim == nil || retryActor == abortedActor || !retryClaim.commit() {
+		t.Fatalf("reservation after abort actor=%#v claim=%#v", retryActor, retryClaim)
 	}
 }
 
@@ -14552,6 +14654,101 @@ func TestNeoCloudThreadSnapshotExecutorTypePrecedence(t *testing.T) {
 	}
 }
 
+func TestNeoSandboxThreadClassificationSurvivesSnapshotImportAndRetry(t *testing.T) {
+	useTempNeoThreadStore(t)
+	enabled := true
+	newRuntime := func() *neoRuntime {
+		return newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+			NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled},
+			WebLocalInference: config.AmpWebLocalInference{
+				Enabled:        true,
+				AllowedOrigins: []string{"https://ampcode.com"},
+			},
+			Orbs: config.AmpOrbs{Enabled: &enabled, Provider: "docker"},
+		}})
+	}
+	rt := newRuntime()
+	threadID := "T-019f4000-0000-4000-8000-000000000031"
+	response, status := rt.localThreadActorManagementResponse(context.Background(), map[string]any{
+		"agentMode":        "smart",
+		"executorType":     "sandbox",
+		"usesThreadActors": true,
+		"threadMeta": map[string]any{
+			"cliProxyAPILocalNeo": true,
+			"executorType":        "local-client",
+		},
+	}, threadID)
+	if status != http.StatusOK || stringValue(response["executorType"]) != "sandbox" {
+		t.Fatalf("sandbox actor creation status=%d response=%#v", status, response)
+	}
+	actor := rt.store.lookupThreadActor(threadID)
+	if actor == nil {
+		t.Fatal("sandbox actor was not created")
+	}
+	actor.mu.Lock()
+	bootstrapExecutorType := actor.bootstrapExecutorType
+	metaExecutorType := stringValue(actor.meta["executorType"])
+	actor.mu.Unlock()
+	if bootstrapExecutorType != "sandbox" || metaExecutorType != "sandbox" {
+		t.Fatalf("created sandbox classification = bootstrap:%q meta:%q", bootstrapExecutorType, metaExecutorType)
+	}
+	nestedThreadID := "T-019f4000-0000-4000-8000-000000000032"
+	nestedResponse, nestedStatus := rt.localThreadActorManagementResponse(context.Background(), map[string]any{
+		"agentMode":        "smart",
+		"usesThreadActors": true,
+		"threadMeta":       map[string]any{"executorType": "sandbox"},
+	}, nestedThreadID)
+	nestedActor := rt.store.lookupThreadActor(nestedThreadID)
+	if nestedStatus != http.StatusOK || stringValue(nestedResponse["executorType"]) != "sandbox" || nestedActor == nil {
+		t.Fatalf("nested sandbox actor creation status=%d response=%#v actor=%p", nestedStatus, nestedResponse, nestedActor)
+	}
+	nestedActor.mu.Lock()
+	nestedExecutorType := nestedActor.bootstrapExecutorType
+	nestedMetaExecutorType := stringValue(nestedActor.meta["executorType"])
+	nestedActor.mu.Unlock()
+	if nestedExecutorType != "sandbox" || nestedMetaExecutorType != "sandbox" {
+		t.Fatalf("nested sandbox classification = bootstrap:%q meta:%q", nestedExecutorType, nestedMetaExecutorType)
+	}
+
+	snapshot, ok := actor.threadSnapshot()
+	if !ok {
+		t.Fatal("sandbox thread snapshot failed")
+	}
+	if snapshot.executorType != "sandbox" || stringValue(snapshot.meta["executorType"]) != "sandbox" {
+		t.Fatalf("sandbox snapshot classification = executor:%q meta:%#v", snapshot.executorType, snapshot.meta)
+	}
+	if err := writeNeoLocalThreadSnapshotToDir(snapshot, rt.threadDir); err != nil {
+		t.Fatalf("persist sandbox snapshot: %v", err)
+	}
+	persisted, ok := loadNeoThreadFromDir(threadID, rt.threadDir)
+	if !ok || stringValue(mapValue(persisted["meta"])["executorType"]) != "sandbox" {
+		t.Fatalf("persisted sandbox thread = %#v", persisted)
+	}
+
+	restarted := newRuntime()
+	restored := restarted.store.ensureThreadActor(threadID)
+	if err := restored.importThreadLocalOnly(persisted); err != nil {
+		t.Fatalf("import sandbox snapshot: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/gateway/threadActor/websocket/?rvt-method=get&rvt-key="+threadID+"&cliproxy-bootstrap-executor=true", nil)
+	req.Header.Set("Origin", "https://ampcode.com")
+	req.Header.Set(neoInternalClientAPIKeyHeader, "local-key")
+	neoApplyWebLocalInferenceBootstrapQuery(req, restored)
+	restored.mu.Lock()
+	restoredExecutorType := restored.bootstrapExecutorType
+	restoredMetaExecutorType := stringValue(restored.meta["executorType"])
+	restored.retryScheduled = true
+	restored.agentState = "idle"
+	restored.mu.Unlock()
+	if restoredExecutorType != "sandbox" || restoredMetaExecutorType != "sandbox" {
+		t.Fatalf("restored sandbox classification = bootstrap:%q meta:%q", restoredExecutorType, restoredMetaExecutorType)
+	}
+	_, retryThreadID, retryPending := restored.pendingWebLocalExecutorRequest()
+	if !retryPending || retryThreadID != threadID {
+		t.Fatalf("sandbox retry classification = pending:%v thread:%q", retryPending, retryThreadID)
+	}
+}
+
 func TestNeoCloudThreadReportsPendingInferenceAsWorking(t *testing.T) {
 	thread := neoCloudThread(neoCloudThreadSnapshot{
 		threadID:         "T-test",
@@ -14727,8 +14924,18 @@ func TestNeoUserActorRunnerLifecycle(t *testing.T) {
 		"args": []any{map[string]any{"sessionId": "session-local", "runningThreads": []any{}}},
 	}))
 	intents := arrayValue(heartbeat["intents"])
-	if heartbeat["ok"] != true || len(intents) != 1 || mapValue(intents[0])["threadId"] != threadID || mapValue(intents[0])["desired"] != "running" {
+	if heartbeat["ok"] != true || len(intents) != 1 || mapValue(intents[0])["threadId"] != threadID || mapValue(intents[0])["desired"] != "stopped" {
 		t.Fatalf("runnerHeartbeat result = %#v", heartbeat)
+	}
+	heartbeat = mapValue(userActor.handleForSocket(socket, map[string]any{
+		"type": "runnerHeartbeat",
+		"args": []any{map[string]any{"sessionId": "session-local", "runningThreads": []any{}}},
+	}))
+	if intents = arrayValue(heartbeat["intents"]); heartbeat["ok"] != true || len(intents) != 0 {
+		t.Fatalf("acknowledged runnerHeartbeat result = %#v", heartbeat)
+	}
+	if desired, ok := neoUserRunnerIntentForTest(userActor, "runner-local", threadID); ok {
+		t.Fatalf("acknowledged missing-thread intent remains desired=%q", desired)
 	}
 	unregistered := mapValue(userActor.handleForSocket(socket, map[string]any{
 		"type": "unregisterRunner",
@@ -14736,6 +14943,355 @@ func TestNeoUserActorRunnerLifecycle(t *testing.T) {
 	}))
 	if unregistered["ok"] != true || len(userActor.userExecutorRunners()) != 0 {
 		t.Fatalf("unregisterRunner result = %#v runners=%#v", unregistered, userActor.userExecutorRunners())
+	}
+}
+
+func TestNeoStockRunnerHeartbeatIgnoresBrokerSessionCollision(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	userActor, _ := rt.store.upsert(map[string]any{"name": "userActor", "key": "user-session-collision"}, true)
+	if _, err := userActor.syncLocalBrokerHeartbeat(neoLocalBrokerHeartbeatForTest("broker-session-collision", "shared-session", 1, "broker-runner", t.TempDir(), nil)); err != nil {
+		t.Fatalf("register broker runner: %v", err)
+	}
+	registered := mapValue(userActor.handleForSocket(&neoSocket{runnerID: "stock-runner"}, map[string]any{
+		"type": "registerRunner",
+		"args": []any{map[string]any{
+			"sessionId":        "shared-session",
+			"workingDirectory": neoExistingDirectory(t.TempDir()),
+			"runningThreads":   []any{},
+		}},
+	}))
+	if registered["ok"] != true {
+		t.Fatalf("register stock runner = %#v", registered)
+	}
+	for iteration := 0; iteration < 32; iteration++ {
+		heartbeat := mapValue(userActor.handleForSocket(&neoSocket{}, map[string]any{
+			"type": "runnerHeartbeat",
+			"args": []any{map[string]any{"sessionId": "shared-session", "runningThreads": []any{}}},
+		}))
+		if heartbeat["ok"] != true {
+			t.Fatalf("empty-key stock heartbeat %d = %#v", iteration, heartbeat)
+		}
+	}
+}
+
+func TestNeoRunnerIntentCapacityHasDistinctCreationError(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	ownerUserID := "user-runner-capacity"
+	runnerID := "runner-capacity"
+	userActor, _, allowed := rt.store.upsertForOwner(map[string]any{"name": "userActor", "key": ownerUserID}, true, ownerUserID)
+	if !allowed || userActor == nil {
+		t.Fatal("owner user actor was not created")
+	}
+	workingDirectory := t.TempDir()
+	if _, err := userActor.syncLocalBrokerHeartbeat(neoLocalBrokerHeartbeatForTest("broker-capacity", "session-1", 1, runnerID, workingDirectory, nil)); err != nil {
+		t.Fatalf("register capacity runner: %v", err)
+	}
+	userActor.mu.Lock()
+	runner := userActor.userRunners[runnerID]
+	for index := range neoLocalBrokerThreadLimit {
+		threadID := fmt.Sprintf("T-019f5000-0000-4000-8000-%012x", index)
+		runner.intents[threadID] = "running"
+	}
+	userActor.userRunners[runnerID] = runner
+	userActor.mu.Unlock()
+
+	threadID := "T-019f5000-0000-4000-8000-000000001000"
+	response, status := rt.localThreadActorManagementResponseForOwner(context.Background(), map[string]any{
+		"runnerId":         runnerID,
+		"executorType":     "local-client",
+		"usesThreadActors": true,
+	}, threadID, ownerUserID)
+	if status != http.StatusTooManyRequests || stringValue(response["error"]) != "runner_capacity_exceeded" || stringValue(response["message"]) != "local runner thread capacity is exhausted" {
+		t.Fatalf("capacity response=%#v status=%d", response, status)
+	}
+	if actor := rt.store.lookupThreadActor(threadID); actor != nil {
+		t.Fatalf("capacity failure retained thread actor %#v", actor)
+	}
+	if desired, ok := neoUserRunnerIntentForTest(userActor, runnerID, threadID); ok {
+		t.Fatalf("capacity failure retained runner intent desired=%q", desired)
+	}
+}
+
+func TestNeoRunnerIntentCapacityIgnoresExpiredRunners(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	userActor, _ := rt.store.upsert(map[string]any{"name": "userActor", "key": "user-expired-capacity"}, true)
+	if _, err := userActor.syncLocalBrokerHeartbeat(neoLocalBrokerHeartbeatForTest("broker-expired-capacity", "session-1", 1, "runner-expired-capacity", t.TempDir(), nil)); err != nil {
+		t.Fatalf("register expired runner: %v", err)
+	}
+	if _, err := userActor.syncLocalBrokerHeartbeat(neoLocalBrokerHeartbeatForTest("broker-live-capacity", "session-1", 1, "runner-live-capacity", t.TempDir(), nil)); err != nil {
+		t.Fatalf("register live runner: %v", err)
+	}
+	userActor.mu.Lock()
+	expiredRunner := userActor.userRunners["runner-expired-capacity"]
+	for index := range neoLocalBrokerThreadLimit {
+		threadID := fmt.Sprintf("T-019f5000-0000-4000-8002-%012x", index)
+		expiredRunner.intents[threadID] = "running"
+	}
+	expiredRunner.updatedAt = time.Now().Add(-neoLocalBrokerHeartbeatTTL - time.Second)
+	userActor.userRunners[expiredRunner.runnerID] = expiredRunner
+	userActor.mu.Unlock()
+
+	threadID := "T-019f5000-0000-4000-8000-000000001001"
+	if result := userActor.requestUserExecutorRunnerThreadResult("runner-live-capacity", threadID); result != neoUserExecutorRunnerAccepted {
+		t.Fatalf("live runner request result = %d", result)
+	}
+	userActor.mu.Lock()
+	_, expiredPresent := userActor.userRunners[expiredRunner.runnerID]
+	userActor.mu.Unlock()
+	if expiredPresent {
+		t.Fatal("expired runner remained after capacity check")
+	}
+}
+
+func TestNeoRunnerTerminalStopSurvivesIntentCapacity(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	userActor, _ := rt.store.upsert(map[string]any{"name": "userActor", "key": "user-terminal-stop-capacity"}, true)
+	runnerID := "runner-terminal-stop-capacity"
+	threadID := "T-019f5000-0000-4000-8000-000000002000"
+	if _, err := userActor.syncLocalBrokerHeartbeat(neoLocalBrokerHeartbeatForTest("broker-terminal-stop-capacity", "session-1", 1, runnerID, t.TempDir(), []string{threadID})); err != nil {
+		t.Fatalf("register runner: %v", err)
+	}
+	userActor.mu.Lock()
+	runner := userActor.userRunners[runnerID]
+	for index := range neoLocalBrokerThreadLimit {
+		unrelatedThreadID := fmt.Sprintf("T-019f5000-0000-4000-8001-%012x", index)
+		runner.intents[unrelatedThreadID] = "running"
+	}
+	userActor.userRunners[runnerID] = runner
+	userActor.mu.Unlock()
+
+	if !userActor.stopUserExecutorRunnerThread(runnerID, threadID) {
+		t.Fatal("terminal stop for a reported running thread was rejected at intent capacity")
+	}
+	if desired, ok := neoUserRunnerIntentForTest(userActor, runnerID, threadID); !ok || desired != "stopped" {
+		t.Fatalf("terminal stop intent desired=%q present=%v", desired, ok)
+	}
+	userActor.mu.Lock()
+	intentCount := userActor.userExecutorRunnerIntentCountLocked()
+	userActor.mu.Unlock()
+	if intentCount != neoLocalBrokerThreadLimit+1 || intentCount > neoLocalBrokerThreadLimit*2 {
+		t.Fatalf("intent count = %d", intentCount)
+	}
+	if userActor.stopUserExecutorRunnerThread(runnerID, "T-019f5000-0000-4000-8000-000000002001") {
+		t.Fatal("arbitrary terminal stop exceeded the normal intent capacity")
+	}
+}
+
+func TestNeoRunnerIntentReassertionSurvivesStoppedReportReconciliation(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	userActor, _ := rt.store.upsert(map[string]any{"name": "userActor", "key": "user-reassert"}, true)
+	socket := &neoSocket{runnerID: "runner-reassert"}
+	registered := mapValue(userActor.handleForSocket(socket, map[string]any{
+		"type": "registerRunner",
+		"args": []any{map[string]any{
+			"sessionId":        "session-reassert",
+			"hostname":         "Local Machine",
+			"workingDirectory": neoExistingDirectory(t.TempDir()),
+			"runningThreads":   []any{},
+		}},
+	}))
+	if registered["ok"] != true {
+		t.Fatalf("registerRunner result = %#v", registered)
+	}
+
+	threadID := "T-019f4000-0000-4000-8000-000000000032"
+	if !userActor.requestUserExecutorRunnerThread("runner-reassert", threadID) {
+		t.Fatal("initial runner intent was rejected")
+	}
+	firstHeartbeat := mapValue(userActor.handleForSocket(socket, map[string]any{
+		"type": "runnerHeartbeat",
+		"args": []any{map[string]any{"sessionId": "session-reassert", "runningThreads": []any{}}},
+	}))
+	firstIntents := arrayValue(firstHeartbeat["intents"])
+	if len(firstIntents) != 1 || stringValue(mapValue(firstIntents[0])["desired"]) != "stopped" {
+		t.Fatalf("first runnerHeartbeat result = %#v", firstHeartbeat)
+	}
+	userActor.mu.Lock()
+	staleRunner := cloneNeoUserExecutorRunner(userActor.userRunners["runner-reassert"])
+	staleRevision := staleRunner.intentRevisions[threadID]
+	userActor.mu.Unlock()
+
+	if !userActor.requestUserExecutorRunnerThread("runner-reassert", threadID) {
+		t.Fatal("reasserted runner intent was rejected")
+	}
+	userActor.userExecutorRunnerIntentValues(staleRunner)
+	userActor.mu.Lock()
+	currentRunner := cloneNeoUserExecutorRunner(userActor.userRunners["runner-reassert"])
+	userActor.mu.Unlock()
+	if currentRunner.intents[threadID] != "running" || currentRunner.intentRevisions[threadID] == staleRevision {
+		t.Fatalf("reasserted intent was lost: %#v", currentRunner)
+	}
+
+	threadActor := rt.store.ensureThreadActor(threadID)
+	threadActor.mu.Lock()
+	threadActor.currentAgentMode = "low"
+	threadActor.currentReasoningEffort = "medium"
+	threadActor.mu.Unlock()
+	heartbeat := mapValue(userActor.handleForSocket(socket, map[string]any{
+		"type": "runnerHeartbeat",
+		"args": []any{map[string]any{"sessionId": "session-reassert", "runningThreads": []any{}}},
+	}))
+	intents := arrayValue(heartbeat["intents"])
+	if len(intents) != 1 {
+		t.Fatalf("reasserted runnerHeartbeat result = %#v", heartbeat)
+	}
+	intent := mapValue(intents[0])
+	if intent["threadId"] != threadID || intent["desired"] != "running" || intent["agentMode"] != "low" || intent["reasoningEffort"] != "medium" {
+		t.Fatalf("reasserted intent = %#v", intent)
+	}
+}
+
+func TestNeoLocalBrokerHeartbeatValidation(t *testing.T) {
+	threadID := "T-019f4000-0000-4000-8000-000000000031"
+	valid := `{"brokerId":"mac-broker","sessionId":"session-1","sessionGeneration":1,"hostname":"Mac","pid":1234,"runners":[{"runnerId":"local-runner-a","workingDirectory":"/Users/test/Developer/app","repositoryURL":"https://github.com/example/app.git","runningThreads":["` + threadID + `"]}]}`
+	if _, err := decodeNeoLocalBrokerHeartbeat([]byte(valid)); err != nil {
+		t.Fatalf("valid heartbeat: %v", err)
+	}
+	broadThreadID := strings.Replace(valid, threadID, "T-not-a-native-uuid", 1)
+	if _, err := decodeNeoLocalBrokerHeartbeat([]byte(broadThreadID)); err != nil {
+		t.Fatalf("broad valid thread ID heartbeat: %v", err)
+	}
+	tests := map[string]string{
+		"unknown field":            strings.Replace(valid, `"pid":1234`, `"pid":1234,"extra":true`, 1),
+		"duplicate field":          strings.Replace(valid, `"pid":1234`, `"pid":1234,"pid":1235`, 1),
+		"case-folded duplicate":    strings.Replace(valid, `"pid":1234`, `"pid":1234,"PID":1235`, 1),
+		"trailing JSON":            valid + `{}`,
+		"missing generation":       strings.Replace(valid, `,"sessionGeneration":1`, ``, 1),
+		"missing runners":          `{"brokerId":"mac-broker","sessionId":"session-1","sessionGeneration":1,"hostname":"Mac","pid":1234}`,
+		"null runners":             `{"brokerId":"mac-broker","sessionId":"session-1","sessionGeneration":1,"hostname":"Mac","pid":1234,"runners":null}`,
+		"unsafe broker ID":         strings.Replace(valid, `"mac-broker"`, `"../mac-broker"`, 1),
+		"control hostname":         strings.Replace(valid, `"Mac"`, `"Mac\nBook"`, 1),
+		"noncanonical path":        strings.Replace(valid, `/Users/test/Developer/app`, `/Users/test/Developer/../Developer/app`, 1),
+		"relative path":            strings.Replace(valid, `/Users/test/Developer/app`, `Developer/app`, 1),
+		"duplicate runner ID":      strings.Replace(valid, `]}`, `,{"runnerId":"local-runner-a","workingDirectory":"/Users/test/Developer/other","repositoryURL":"","runningThreads":[]}]}`, 1),
+		"duplicate directory":      strings.Replace(valid, `]}`, `,{"runnerId":"local-runner-b","workingDirectory":"/Users/test/Developer/app","repositoryURL":"","runningThreads":[]}]}`, 1),
+		"duplicate running thread": strings.Replace(valid, `]}`, `,{"runnerId":"local-runner-b","workingDirectory":"/Users/test/Developer/other","repositoryURL":"","runningThreads":["`+threadID+`"]}]}`, 1),
+		"missing runningThreads":   strings.Replace(valid, `,"runningThreads":["`+threadID+`"]`, ``, 1),
+	}
+	for name, payload := range tests {
+		t.Run(name, func(t *testing.T) {
+			if _, err := decodeNeoLocalBrokerHeartbeat([]byte(payload)); err == nil {
+				t.Fatalf("heartbeat unexpectedly accepted: %s", payload)
+			}
+		})
+	}
+}
+
+func TestNeoLocalBrokerMissingRunnerIntentAcknowledgement(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	ownerUserID := "user-broker-ack"
+	userActor, _, allowed := rt.store.upsertForOwner(map[string]any{"name": "userActor", "key": ownerUserID}, true, ownerUserID)
+	if !allowed || userActor == nil {
+		t.Fatal("owner user actor was not created")
+	}
+	runnerID := "runner-broker-ack"
+	threadID := "T-019f4000-0000-4000-8000-000000000033"
+	heartbeat := neoLocalBrokerHeartbeatForTest("broker-ack", "session-1", 1, runnerID, t.TempDir(), nil)
+	if _, err := userActor.syncLocalBrokerHeartbeat(heartbeat); err != nil {
+		t.Fatalf("initial heartbeat: %v", err)
+	}
+	if !userActor.requestUserExecutorRunnerThread(runnerID, threadID) {
+		t.Fatal("runner intent was rejected")
+	}
+
+	reported, err := userActor.syncLocalBrokerHeartbeat(heartbeat)
+	if err != nil || len(reported) != 1 {
+		t.Fatalf("reported heartbeat runners=%#v err=%v", reported, err)
+	}
+	intents := userActor.userExecutorRunnerIntentValues(reported[0])
+	if len(intents) != 1 || mapValue(intents[0])["threadId"] != threadID || mapValue(intents[0])["desired"] != "stopped" {
+		t.Fatalf("reported intents = %#v", intents)
+	}
+
+	acknowledged, err := userActor.syncLocalBrokerHeartbeat(heartbeat)
+	if err != nil || len(acknowledged) != 1 {
+		t.Fatalf("acknowledged heartbeat runners=%#v err=%v", acknowledged, err)
+	}
+	if intents = userActor.userExecutorRunnerIntentValues(acknowledged[0]); len(intents) != 0 {
+		t.Fatalf("acknowledged intents = %#v", intents)
+	}
+	if desired, ok := neoUserRunnerIntentForTest(userActor, runnerID, threadID); ok {
+		t.Fatalf("acknowledged broker intent remains desired=%q", desired)
+	}
+}
+
+func TestNeoLocalBrokerHeartbeatSessionReplacementAndOmission(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	ownerUserID := "user_a"
+	userActor, _, allowed := rt.store.upsertForOwner(map[string]any{"name": "userActor", "key": ownerUserID}, true, ownerUserID)
+	if !allowed || userActor == nil {
+		t.Fatal("owner user actor was not created")
+	}
+	threadID := "T-019f4000-0000-4000-8000-000000000031"
+	threadActor := rt.store.ensureThreadActor(threadID)
+	threadActor.mu.Lock()
+	threadActor.meta["ownerUserId"] = ownerUserID
+	threadActor.meta["creatorUserID"] = ownerUserID
+	threadActor.currentAgentMode = "deep"
+	threadActor.currentReasoningEffort = "xhigh"
+	threadActor.mu.Unlock()
+	request := func(sessionID string, runners []neoLocalBrokerHeartbeatRunner) neoLocalBrokerHeartbeatRequest {
+		return neoLocalBrokerHeartbeatRequest{
+			BrokerID:          "mac-broker",
+			SessionID:         sessionID,
+			SessionGeneration: 1,
+			Hostname:          "Mac",
+			PID:               1234,
+			Runners:           &runners,
+		}
+	}
+	runningThreads := []string{}
+	runner := neoLocalBrokerHeartbeatRunner{
+		RunnerID:         "local-runner-a",
+		WorkingDirectory: "/Users/test/Developer/app",
+		RepositoryURL:    "https://github.com/example/app.git",
+		RunningThreads:   &runningThreads,
+	}
+	if _, err := userActor.syncLocalBrokerHeartbeat(request("session-1", []neoLocalBrokerHeartbeatRunner{runner})); err != nil {
+		t.Fatalf("initial heartbeat: %v", err)
+	}
+	if !userActor.requestUserExecutorRunnerThread(runner.RunnerID, threadID) {
+		t.Fatal("runner intent was not accepted")
+	}
+	replacement := request("session-2", []neoLocalBrokerHeartbeatRunner{runner})
+	replacement.SessionGeneration = 2
+	replaced, err := userActor.syncLocalBrokerHeartbeat(replacement)
+	if err != nil {
+		t.Fatalf("replacement heartbeat: %v", err)
+	}
+	if len(replaced) != 1 {
+		t.Fatalf("replacement runners = %#v", replaced)
+	}
+	intents := userActor.userExecutorRunnerIntentValues(replaced[0])
+	if len(intents) != 1 {
+		t.Fatalf("replacement intents = %#v", intents)
+	}
+	intent := mapValue(intents[0])
+	if intent["threadId"] != threadID || intent["desired"] != "running" || intent["agentMode"] != "deep" || intent["reasoningEffort"] != "xhigh" {
+		t.Fatalf("replacement intent = %#v", intent)
+	}
+	if _, err := userActor.syncLocalBrokerHeartbeat(request("session-1", []neoLocalBrokerHeartbeatRunner{runner})); !errors.Is(err, errNeoLocalBrokerStaleSession) {
+		t.Fatalf("stale session error = %v", err)
+	}
+	userActor.mu.Lock()
+	activeSessionID := userActor.userBrokerSessions["mac-broker"].sessionID
+	userActor.mu.Unlock()
+	if activeSessionID != "session-2" {
+		t.Fatalf("active session = %q, want session-2", activeSessionID)
+	}
+	omission := request("session-2", []neoLocalBrokerHeartbeatRunner{})
+	omission.SessionGeneration = 2
+	if _, err := userActor.syncLocalBrokerHeartbeat(omission); err != nil {
+		t.Fatalf("omission heartbeat: %v", err)
+	}
+	if runners := userActor.userExecutorRunners(); len(runners) != 0 {
+		t.Fatalf("omitted runners remain registered: %#v", runners)
 	}
 }
 
@@ -18329,6 +18885,8 @@ func TestNeoRuntimeHeadlessExecutorConnectWithActiveWorkSendsRejected(t *testing
 		t.Fatal("missing thread actor")
 	}
 	actor.mu.Lock()
+	actor.bootstrapExecutorType = "sandbox"
+	actor.meta["executorType"] = "sandbox"
 	actor.agentState = "running_tools"
 	actor.pendingTools["tool-1"] = neoPendingTool{ID: "tool-1"}
 	actor.spawnedExecutors = map[string]*neoSpawnedExecutor{
@@ -19528,9 +20086,19 @@ func TestNeoWebLocalObserverPayloadFiltersExecutorConnected(t *testing.T) {
 }
 
 func TestNeoObserversPayloadSelectsRelayTerminalForHeadlessExecutor(t *testing.T) {
-	headless := neoObserversPayload(2, true, "cli-headless-test", "local-client")
-	if headless["directTerminalAvailable"] != false || headless["executorType"] != "sandbox" {
-		t.Fatalf("headless observers = %#v, want sandbox actor relay", headless)
+	localHeadless := neoObserversPayload(2, true, "cli-headless-local", "local-client")
+	if localHeadless["directTerminalAvailable"] != false || localHeadless["executorType"] != "local-client" {
+		t.Fatalf("local headless observers = %#v, want durable local-client classification", localHeadless)
+	}
+
+	sandboxHeadless := neoObserversPayload(2, true, "cli-headless-sandbox", "sandbox")
+	if sandboxHeadless["directTerminalAvailable"] != false || sandboxHeadless["executorType"] != "sandbox" {
+		t.Fatalf("sandbox headless observers = %#v, want durable sandbox classification", sandboxHeadless)
+	}
+
+	fallbackHeadless := neoObserversPayload(2, true, "cli-headless-fallback", "")
+	if fallbackHeadless["directTerminalAvailable"] != false || fallbackHeadless["executorType"] != "sandbox" {
+		t.Fatalf("fallback headless observers = %#v, want prefix sandbox fallback", fallbackHeadless)
 	}
 
 	interactive := neoObserversPayload(2, true, "cli-interactive", "local-client")
@@ -25239,7 +25807,7 @@ func TestNeoDiscoverHeadlessLoginShellPath(t *testing.T) {
 	}
 	dir := t.TempDir()
 	shell := filepath.Join(dir, "shell")
-	if err := os.WriteFile(shell, []byte("#!/bin/sh\nPATH=/login/bin:/usr/bin\nexport PATH\nprintf 'startup noise\\n'\neval \"$2\"\n"), 0o755); err != nil {
+	if err := os.WriteFile(shell, []byte("#!/bin/sh\n[ \"$1\" = \"-lc\" ] || exit 1\nPATH=/login/bin:/usr/bin\nexport PATH\nprintf 'startup noise\\n'\neval \"$2\"\n"), 0o755); err != nil {
 		t.Fatalf("WriteFile shell error: %v", err)
 	}
 
@@ -33985,7 +34553,7 @@ func TestNeoActorFiltersAmpBuiltInToolsByMode(t *testing.T) {
 
 	puckNames := requestNames("puck")
 	assertMode("puck", puckNames,
-		[]string{"find_thread", "read_thread", "web_search", "docs_read", "list_agent_modes", "list_runners", "create_thread", "thread_interact", "update_thread", "archive_threads", "get_schedule", "set_schedule", "update_schedule", "clear_schedule", "slack_write", "slack_read", "github_repo_ci_status", "read_github", "search_github", "commit_search", "list_directory_github", "list_repositories", "glob_github", "diff"},
+		[]string{"find_thread", "read_thread", "web_search", "docs_read", "list_agent_modes", "list_runners", "create_thread", "thread_interact", "update_thread", "archive_threads", "get_schedule", "set_schedule", "update_schedule", "clear_schedule", "slack_write", "slack_read", "painter", "github_repo_ci_status", "read_github", "search_github", "commit_search", "list_directory_github", "list_repositories", "glob_github", "diff"},
 		[]string{"Read", "Grep", "glob", "Glob", "Task", "shell_command", "sleep", "load_plugin", "view_media", "create_slack_automation", "rename_thread", "set_thread_pinned", "add_thread_labels", "remove_thread_labels", "get_current_time", "thread_file_url", "send_email"})
 
 	nostromoNames := requestNames("nostromo")
@@ -54784,5 +55352,973 @@ func TestReadAndRestoreNeoJSONBodyRejectsGzipEncodingMismatch(t *testing.T) {
 	}
 	if len(body) != 0 {
 		t.Fatalf("body = %#v, want empty map", body)
+	}
+}
+
+type neoLocalBrokerStateSnapshotForTest struct {
+	runners     map[string]neoUserExecutorRunner
+	sessions    map[string]neoUserExecutorBrokerSession
+	actorFences map[string]neoUserExecutorBrokerFence
+	durable     map[string]neoUserExecutorBrokerFence
+}
+
+func neoLocalBrokerStateForTest(actor *neoActor) neoLocalBrokerStateSnapshotForTest {
+	actor.mu.Lock()
+	runners := make(map[string]neoUserExecutorRunner, len(actor.userRunners))
+	for runnerID, runner := range actor.userRunners {
+		runners[runnerID] = cloneNeoUserExecutorRunner(runner)
+	}
+	sessions := make(map[string]neoUserExecutorBrokerSession, len(actor.userBrokerSessions))
+	for brokerID, session := range actor.userBrokerSessions {
+		sessions[brokerID] = session
+	}
+	actorFences := make(map[string]neoUserExecutorBrokerFence, len(actor.userBrokerFences))
+	for brokerID, fence := range actor.userBrokerFences {
+		actorFences[brokerID] = fence
+	}
+	ownerUserID := actor.key
+	actor.mu.Unlock()
+
+	durable := map[string]neoUserExecutorBrokerFence{}
+	if actor.runtime != nil {
+		actor.runtime.brokerFenceMu.Lock()
+		for brokerID, fence := range actor.runtime.brokerFences[ownerUserID] {
+			durable[brokerID] = fence
+		}
+		actor.runtime.brokerFenceMu.Unlock()
+	}
+	return neoLocalBrokerStateSnapshotForTest{
+		runners:     runners,
+		sessions:    sessions,
+		actorFences: actorFences,
+		durable:     durable,
+	}
+}
+
+func neoLocalBrokerHeartbeatForTest(brokerID, sessionID string, generation uint64, runnerID, workingDirectory string, runningThreads []string) neoLocalBrokerHeartbeatRequest {
+	runners := []neoLocalBrokerHeartbeatRunner{}
+	if runnerID != "" {
+		running := append([]string(nil), runningThreads...)
+		runners = append(runners, neoLocalBrokerHeartbeatRunner{
+			RunnerID:         runnerID,
+			WorkingDirectory: workingDirectory,
+			RepositoryURL:    "",
+			RunningThreads:   &running,
+		})
+	}
+	return neoLocalBrokerHeartbeatRequest{
+		BrokerID:          brokerID,
+		SessionID:         sessionID,
+		SessionGeneration: generation,
+		Hostname:          "Test Host",
+		PID:               1234,
+		Runners:           &runners,
+	}
+}
+
+func neoUserRunnerIntentForTest(actor *neoActor, runnerID, threadID string) (string, bool) {
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	runner, ok := actor.userRunners[runnerID]
+	if !ok {
+		return "", false
+	}
+	desired, ok := runner.intents[threadID]
+	return desired, ok
+}
+
+func TestNeoLocalBrokerGenerationFencesPersistAcrossRotationExpiryAndRestart(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	ownerUserID := "user-generation-fence"
+	userActor, _, allowed := rt.store.upsertForOwner(map[string]any{"name": "userActor", "key": ownerUserID}, true, ownerUserID)
+	if !allowed || userActor == nil {
+		t.Fatal("owner user actor was not created")
+	}
+	runnerID := "runner-authoritative"
+	request := neoLocalBrokerHeartbeatForTest("broker-main", "session-1", 1, runnerID, "/tmp/runner-generation-1", nil)
+	if runners, err := userActor.syncLocalBrokerHeartbeat(request); err != nil || len(runners) != 1 {
+		t.Fatalf("generation 1 heartbeat runners=%#v err=%v", runners, err)
+	}
+	for generation := uint64(2); generation <= 20; generation++ {
+		request = neoLocalBrokerHeartbeatForTest(
+			"broker-main",
+			fmt.Sprintf("session-%d", generation),
+			generation,
+			runnerID,
+			fmt.Sprintf("/tmp/runner-generation-%d", generation),
+			nil,
+		)
+		if runners, err := userActor.syncLocalBrokerHeartbeat(request); err != nil || len(runners) != 1 {
+			t.Fatalf("generation %d rotation runners=%#v err=%v", generation, runners, err)
+		}
+	}
+	userActor.mu.Lock()
+	rotatedRunner := userActor.userRunners[runnerID]
+	userActor.mu.Unlock()
+	if rotatedRunner.runnerID != runnerID || rotatedRunner.sessionID != "session-20" || rotatedRunner.workingDirectory != "/tmp/runner-generation-20" {
+		t.Fatalf("runnerId-authoritative rotation = %#v", rotatedRunner)
+	}
+
+	beforeRejected := neoLocalBrokerStateForTest(userActor)
+	for _, rejected := range []neoLocalBrokerHeartbeatRequest{
+		neoLocalBrokerHeartbeatForTest("broker-main", "session-19", 19, runnerID, "/tmp/rejected-lower", nil),
+		neoLocalBrokerHeartbeatForTest("broker-main", "session-20-different", 20, runnerID, "/tmp/rejected-equal", nil),
+	} {
+		if _, err := userActor.syncLocalBrokerHeartbeat(rejected); !errors.Is(err, errNeoLocalBrokerStaleSession) {
+			t.Fatalf("rejected generation error = %v, want stale session", err)
+		}
+		if after := neoLocalBrokerStateForTest(userActor); !reflect.DeepEqual(after, beforeRejected) {
+			t.Fatalf("rejected heartbeat mutated runners, intents, sessions, fences, or timestamps:\nbefore=%#v\nafter=%#v", beforeRejected, after)
+		}
+	}
+	if _, err := decodeNeoLocalBrokerHeartbeat([]byte(`{"brokerId":"broker-main","sessionGeneration":`)); err == nil {
+		t.Fatal("invalid broker payload was accepted")
+	}
+	if after := neoLocalBrokerStateForTest(userActor); !reflect.DeepEqual(after, beforeRejected) {
+		t.Fatalf("invalid payload mutated broker state:\nbefore=%#v\nafter=%#v", beforeRejected, after)
+	}
+
+	for brokerIndex := 1; brokerIndex < neoLocalBrokerSessionLimit; brokerIndex++ {
+		brokerID := fmt.Sprintf("broker-%03d", brokerIndex)
+		if _, err := userActor.syncLocalBrokerHeartbeat(neoLocalBrokerHeartbeatForTest(brokerID, "session-1", 1, "", "", nil)); err != nil {
+			t.Fatalf("register broker %d: %v", brokerIndex, err)
+		}
+	}
+	userActor.mu.Lock()
+	brokerCount := len(userActor.userBrokerSessions)
+	userActor.mu.Unlock()
+	if brokerCount != neoLocalBrokerSessionLimit {
+		t.Fatalf("broker count = %d, want %d", brokerCount, neoLocalBrokerSessionLimit)
+	}
+	if _, err := userActor.syncLocalBrokerHeartbeat(neoLocalBrokerHeartbeatForTest("broker-over-limit", "session-1", 1, "", "", nil)); err == nil {
+		t.Fatal("129th broker was accepted")
+	}
+
+	staleAt := time.Now().Add(-neoLocalBrokerHeartbeatTTL - time.Second)
+	userActor.mu.Lock()
+	staleRunner := userActor.userRunners[runnerID]
+	staleRunner.updatedAt = staleAt
+	userActor.userRunners[runnerID] = staleRunner
+	staleSession := userActor.userBrokerSessions["broker-main"]
+	staleSession.updatedAt = staleAt
+	userActor.userBrokerSessions["broker-main"] = staleSession
+	userActor.mu.Unlock()
+	if runners := userActor.userExecutorRunners(); len(runners) != 0 {
+		t.Fatalf("expired runner list = %#v, want empty", runners)
+	}
+	userActor.mu.Lock()
+	_, sessionPresent := userActor.userBrokerSessions["broker-main"]
+	_, fencePresent := userActor.userBrokerFences["broker-main"]
+	userActor.mu.Unlock()
+	if sessionPresent || !fencePresent {
+		t.Fatalf("expiry sessionPresent=%v fencePresent=%v", sessionPresent, fencePresent)
+	}
+
+	stockSocket := &neoSocket{runnerID: runnerID}
+	stockRegistration := mapValue(userActor.handleForSocket(stockSocket, map[string]any{
+		"type": "registerRunner",
+		"args": []any{map[string]any{
+			"sessionId":        "stock-session",
+			"workingDirectory": t.TempDir(),
+			"runningThreads":   []any{},
+		}},
+	}))
+	if stockRegistration["ok"] != true {
+		t.Fatalf("stock runner registration = %#v", stockRegistration)
+	}
+	if _, err := userActor.syncLocalBrokerHeartbeat(neoLocalBrokerHeartbeatForTest("broker-main", "session-19", 19, "", "", nil)); !errors.Is(err, errNeoLocalBrokerStaleSession) {
+		t.Fatalf("durable fence after stock registration error = %v", err)
+	}
+
+	fencePath := filepath.Join(filepath.Dir(rt.threadDir), neoLocalBrokerFenceStoreFileName)
+	if rt.brokerFencePath != fencePath {
+		t.Fatalf("broker fence path = %q, want %q", rt.brokerFencePath, fencePath)
+	}
+	if _, err := os.Stat(fencePath); err != nil {
+		t.Fatalf("durable broker fence stat: %v", err)
+	}
+	restarted := newNeoRuntime(&config.Config{})
+	restartedUserActor, _, allowed := restarted.store.upsertForOwner(map[string]any{"name": "userActor", "key": ownerUserID}, true, ownerUserID)
+	if !allowed || restartedUserActor == nil {
+		t.Fatal("restarted owner user actor was not created")
+	}
+	if _, err := restartedUserActor.syncLocalBrokerHeartbeat(neoLocalBrokerHeartbeatForTest("broker-main", "session-19", 19, "", "", nil)); !errors.Is(err, errNeoLocalBrokerStaleSession) {
+		t.Fatalf("restarted runtime accepted old generation: %v", err)
+	}
+}
+
+func TestNeoLocalBrokerFenceDirectorySyncFailureRetriesPersistence(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	ownerUserID := "user-fence-retry"
+	userActor, _, allowed := rt.store.upsertForOwner(map[string]any{"name": "userActor", "key": ownerUserID}, true, ownerUserID)
+	if !allowed || userActor == nil {
+		t.Fatal("owner user actor was not created")
+	}
+	syncCalls := 0
+	rt.syncBrokerFenceDir = func(string) error {
+		syncCalls++
+		if syncCalls == 1 {
+			return errors.New("injected directory sync failure")
+		}
+		return nil
+	}
+	heartbeat := neoLocalBrokerHeartbeatForTest("broker-retry", "session-1", 1, "runner-retry", t.TempDir(), nil)
+	if _, err := userActor.syncLocalBrokerHeartbeat(heartbeat); !errors.Is(err, errNeoLocalBrokerFenceUnavailable) {
+		t.Fatalf("first heartbeat error = %v, want fence unavailable", err)
+	}
+	rt.brokerFenceMu.Lock()
+	_, retainedAfterFailure := rt.brokerFences[ownerUserID]
+	rt.brokerFenceMu.Unlock()
+	if retainedAfterFailure {
+		t.Fatal("failed fence persistence remained accepted in memory")
+	}
+	if _, err := userActor.syncLocalBrokerHeartbeat(heartbeat); err != nil {
+		t.Fatalf("identical heartbeat retry: %v", err)
+	}
+	if syncCalls != 2 {
+		t.Fatalf("directory sync calls = %d, want 2", syncCalls)
+	}
+	rt.brokerFenceMu.Lock()
+	fence := rt.brokerFences[ownerUserID]["broker-retry"]
+	rt.brokerFenceMu.Unlock()
+	if fence.sessionID != "session-1" || fence.sessionGeneration != 1 {
+		t.Fatalf("persisted retry fence = %#v", fence)
+	}
+}
+
+func TestNeoUserRunnerOperationsAreConcurrentRaceSafe(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	userActor, _ := rt.store.upsert(map[string]any{"name": "userActor", "key": neoLocalOwnerUserID}, true)
+	workingDirectory := t.TempDir()
+	heartbeat := neoLocalBrokerHeartbeatForTest("broker-concurrent", "session-concurrent", 1, "runner-concurrent", workingDirectory, nil)
+	if _, err := userActor.syncLocalBrokerHeartbeat(heartbeat); err != nil {
+		t.Fatalf("initial heartbeat: %v", err)
+	}
+
+	start := make(chan struct{})
+	errorsFound := make(chan error, 32)
+	var workers sync.WaitGroup
+	for worker := 0; worker < 8; worker++ {
+		worker := worker
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			<-start
+			for iteration := 0; iteration < 200; iteration++ {
+				threadID := fmt.Sprintf("T-019f4000-0000-4000-8000-%012d", worker*200+iteration)
+				switch worker % 4 {
+				case 0:
+					if _, err := userActor.syncLocalBrokerHeartbeat(heartbeat); err != nil {
+						errorsFound <- err
+						return
+					}
+				case 1:
+					userActor.requestUserExecutorRunnerThread("runner-concurrent", threadID)
+				case 2:
+					userActor.stopUserExecutorRunnerThread("runner-concurrent", threadID)
+				case 3:
+					userActor.userExecutorRunners()
+				}
+			}
+		}()
+	}
+	close(start)
+	workers.Wait()
+	close(errorsFound)
+	for err := range errorsFound {
+		t.Fatalf("concurrent runner operation: %v", err)
+	}
+	if runners := userActor.userExecutorRunners(); len(runners) != 1 || stringValue(mapValue(runners[0])["runnerId"]) != "runner-concurrent" {
+		t.Fatalf("concurrent runner list = %#v", runners)
+	}
+}
+
+func TestNeoRunnerIntentStartsAfterAuthoritativeCloudThread(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		handler http.HandlerFunc
+		code    string
+	}{
+		{
+			name: "cloud shell error",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				http.Error(w, "unavailable", http.StatusServiceUnavailable)
+			},
+			code: "cloud_thread_shell_failed",
+		},
+		{
+			name: "empty response",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				writeNeoJSON(w, http.StatusCreated, map[string]any{})
+			},
+			code: "cloud_thread_shell_failed",
+		},
+		{
+			name: "owner mismatch",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				threadID := stringValue(mapValue(readNeoJSON(r.Body)["threadMeta"])["requestedThreadID"])
+				writeNeoJSON(w, http.StatusCreated, map[string]any{
+					"threadId":      threadID,
+					"wsToken":       "cloud-token",
+					"ownerUserId":   "user-other",
+					"threadVersion": 1,
+				})
+			},
+			code: "cloud_thread_owner_mismatch",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			useTempNeoThreadStore(t)
+			deleteCalls := 0
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/api/internal" && r.URL.RawQuery == "deleteThread" {
+					deleteCalls++
+				}
+				tc.handler(w, r)
+			}))
+			t.Cleanup(upstream.Close)
+			rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{UpstreamURL: upstream.URL, UpstreamAPIKey: "secret"}})
+			ownerUserID := "user-compensation"
+			userActor, _, _ := rt.store.upsertForOwner(map[string]any{"name": "userActor", "key": ownerUserID}, true, ownerUserID)
+			runnerID := "runner-compensation"
+			workingDirectory := t.TempDir()
+			if _, err := userActor.syncLocalBrokerHeartbeat(neoLocalBrokerHeartbeatForTest("broker-compensation", "session-1", 1, runnerID, workingDirectory, nil)); err != nil {
+				t.Fatal(err)
+			}
+			threadID := "T-019f9000-0000-7000-8000-000000000001"
+			ctx := context.WithValue(context.Background(), clientAPIKeyContextKey{}, "client-key")
+			response, status := rt.localThreadActorManagementResponseForOwner(ctx, map[string]any{
+				"runnerId":         runnerID,
+				"executorType":     "local-client",
+				"usesThreadActors": true,
+				"threadMeta": map[string]any{
+					"cliProxyAPIWebLocalShell": true,
+					"requestedThreadID":        threadID,
+				},
+			}, threadID, ownerUserID)
+			if status != http.StatusBadGateway || stringValue(response["error"]) != tc.code {
+				t.Fatalf("compensation response=%#v status=%d", response, status)
+			}
+			if desired, ok := neoUserRunnerIntentForTest(userActor, runnerID, threadID); ok {
+				t.Fatalf("failed cloud thread created intent desired=%q", desired)
+			}
+			if tc.name == "owner mismatch" && deleteCalls != 0 {
+				t.Fatalf("owner-mismatched cloud thread received %d delete requests", deleteCalls)
+			}
+		})
+	}
+
+	t.Run("changed cloud thread ID", func(t *testing.T) {
+		useTempNeoThreadStore(t)
+		requestedThreadID := "T-019f9000-0000-7000-8000-000000000002"
+		cloudThreadID := "T-019f9000-0000-7000-8000-000000000003"
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			writeNeoJSON(w, http.StatusCreated, map[string]any{
+				"threadId":      cloudThreadID,
+				"wsToken":       "cloud-token",
+				"ownerUserId":   "user-compensation",
+				"threadVersion": 1,
+			})
+		}))
+		t.Cleanup(upstream.Close)
+		rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{UpstreamURL: upstream.URL, UpstreamAPIKey: "secret"}})
+		ownerUserID := "user-compensation"
+		userActor, _, _ := rt.store.upsertForOwner(map[string]any{"name": "userActor", "key": ownerUserID}, true, ownerUserID)
+		runnerID := "runner-compensation"
+		workingDirectory := t.TempDir()
+		if _, err := userActor.syncLocalBrokerHeartbeat(neoLocalBrokerHeartbeatForTest("broker-compensation", "session-1", 1, runnerID, workingDirectory, nil)); err != nil {
+			t.Fatal(err)
+		}
+		ctx := context.WithValue(context.Background(), clientAPIKeyContextKey{}, "client-key")
+		response, status := rt.localThreadActorManagementResponseForOwner(ctx, map[string]any{
+			"runnerId":         runnerID,
+			"executorType":     "local-client",
+			"usesThreadActors": true,
+			"threadMeta":       map[string]any{"cliProxyAPIWebLocalShell": true},
+		}, requestedThreadID, ownerUserID)
+		if status < 200 || status >= 300 || stringValue(response["threadId"]) != cloudThreadID {
+			t.Fatalf("changed thread response=%#v status=%d", response, status)
+		}
+		if desired, ok := neoUserRunnerIntentForTest(userActor, runnerID, requestedThreadID); ok {
+			t.Fatalf("provisional thread intent desired=%q", desired)
+		}
+		if desired, ok := neoUserRunnerIntentForTest(userActor, runnerID, cloudThreadID); !ok || desired != "running" {
+			t.Fatalf("cloud thread intent desired=%q present=%v", desired, ok)
+		}
+	})
+
+	t.Run("invalid owned cloud shell is deleted", func(t *testing.T) {
+		for _, omittedField := range []string{"wsToken", "threadVersion"} {
+			t.Run(omittedField, func(t *testing.T) {
+				useTempNeoThreadStore(t)
+				threadID := "T-019f9000-0000-7000-8000-000000000006"
+				ownerUserID := "user-invalid-cloud"
+				runnerID := "runner-invalid-cloud"
+				deleteCalls := 0
+				upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					switch {
+					case r.URL.Path == "/api/thread-actors":
+						response := map[string]any{
+							"threadId":      threadID,
+							"wsToken":       "cloud-token",
+							"ownerUserId":   ownerUserID,
+							"threadVersion": 1,
+						}
+						delete(response, omittedField)
+						writeNeoJSON(w, http.StatusCreated, response)
+					case r.URL.Path == "/api/internal" && r.URL.RawQuery == "deleteThread":
+						deleteCalls++
+						if nestedString(readNeoJSON(r.Body)["params"], "thread") != threadID {
+							t.Error("invalid cloud shell cleanup used the wrong thread ID")
+						}
+						writeNeoJSON(w, http.StatusOK, map[string]any{"ok": true})
+					default:
+						t.Errorf("unexpected upstream request path=%s query=%s", r.URL.Path, r.URL.RawQuery)
+						http.Error(w, "unexpected request", http.StatusBadRequest)
+					}
+				}))
+				t.Cleanup(upstream.Close)
+				rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{UpstreamURL: upstream.URL, UpstreamAPIKey: "secret"}})
+				userActor, _, _ := rt.store.upsertForOwner(map[string]any{"name": "userActor", "key": ownerUserID}, true, ownerUserID)
+				if _, err := userActor.syncLocalBrokerHeartbeat(neoLocalBrokerHeartbeatForTest("broker-invalid-cloud", "session-1", 1, runnerID, t.TempDir(), nil)); err != nil {
+					t.Fatal(err)
+				}
+				response, status := rt.localThreadActorManagementResponseForOwner(context.Background(), map[string]any{
+					"runnerId":         runnerID,
+					"executorType":     "local-client",
+					"usesThreadActors": true,
+					"threadMeta":       map[string]any{"cliProxyAPIWebLocalShell": true},
+				}, threadID, ownerUserID)
+				if status != http.StatusBadGateway || stringValue(response["error"]) != "cloud_thread_shell_failed" {
+					t.Fatalf("invalid cloud response=%#v status=%d", response, status)
+				}
+				if deleteCalls != 1 {
+					t.Fatalf("invalid cloud shell delete calls = %d", deleteCalls)
+				}
+				if rt.store.lookupThreadActor(threadID) != nil {
+					t.Fatal("invalid cloud shell created a local actor")
+				}
+				if desired, ok := neoUserRunnerIntentForTest(userActor, runnerID, threadID); ok {
+					t.Fatalf("invalid cloud shell created intent desired=%q", desired)
+				}
+			})
+		}
+	})
+
+	t.Run("changed cloud thread ID collision", func(t *testing.T) {
+		useTempNeoThreadStore(t)
+		requestedThreadID := "T-019f9000-0000-7000-8000-000000000007"
+		cloudThreadID := "T-019f9000-0000-7000-8000-000000000008"
+		ownerUserID := "user-cloud-collision"
+		runnerID := "runner-cloud-collision"
+		deleteCalls := 0
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.Method == http.MethodPost && r.URL.Path == "/api/thread-actors" && r.URL.RawQuery == "":
+				writeNeoJSON(w, http.StatusCreated, map[string]any{
+					"threadId":      cloudThreadID,
+					"wsToken":       "cloud-token",
+					"ownerUserId":   ownerUserID,
+					"threadVersion": 1,
+				})
+			case r.Method == http.MethodPost && r.URL.Path == "/api/internal" && r.URL.RawQuery == "deleteThread":
+				deleteCalls++
+				if r.Header.Get("Authorization") != "Bearer secret" || r.Header.Get("Content-Type") != "application/json" {
+					t.Errorf("delete headers authorization=%q content-type=%q", r.Header.Get("Authorization"), r.Header.Get("Content-Type"))
+				}
+				payload := readNeoJSON(r.Body)
+				if payload["method"] != "deleteThread" || nestedString(payload["params"], "thread") != cloudThreadID {
+					t.Errorf("delete payload = %#v", payload)
+				}
+				writeNeoJSON(w, http.StatusOK, map[string]any{"ok": true})
+			default:
+				t.Errorf("unexpected upstream request method=%s path=%s query=%s", r.Method, r.URL.Path, r.URL.RawQuery)
+				http.Error(w, "unexpected request", http.StatusBadRequest)
+			}
+		}))
+		t.Cleanup(upstream.Close)
+		rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{UpstreamURL: upstream.URL, UpstreamAPIKey: "secret"}})
+		userActor, _, _ := rt.store.upsertForOwner(map[string]any{"name": "userActor", "key": ownerUserID}, true, ownerUserID)
+		if _, err := userActor.syncLocalBrokerHeartbeat(neoLocalBrokerHeartbeatForTest("broker-cloud-collision", "session-1", 1, runnerID, t.TempDir(), nil)); err != nil {
+			t.Fatal(err)
+		}
+		existingActor := rt.store.ensureThreadActor(cloudThreadID)
+		existingActor.mu.Lock()
+		existingActor.meta["ownerUserId"] = "user-existing"
+		existingActor.title = "Existing thread"
+		existingActor.mu.Unlock()
+
+		response, status := rt.localThreadActorManagementResponseForOwner(context.Background(), map[string]any{
+			"runnerId":         runnerID,
+			"executorType":     "local-client",
+			"usesThreadActors": true,
+			"threadMeta":       map[string]any{"cliProxyAPIWebLocalShell": true},
+		}, requestedThreadID, ownerUserID)
+		if status != http.StatusConflict || stringValue(response["error"]) != "cloud_thread_id_conflict" || stringValue(response["threadId"]) != cloudThreadID {
+			t.Fatalf("collision response=%#v status=%d", response, status)
+		}
+		existingActor.mu.Lock()
+		existingOwner := stringValue(existingActor.meta["ownerUserId"])
+		existingTitle := existingActor.title
+		existingActor.mu.Unlock()
+		if existingOwner != "user-existing" || existingTitle != "Existing thread" {
+			t.Fatalf("existing actor changed owner=%q title=%q", existingOwner, existingTitle)
+		}
+		if deleteCalls != 1 {
+			t.Fatalf("colliding cloud thread received %d delete requests", deleteCalls)
+		}
+		if desired, ok := neoUserRunnerIntentForTest(userActor, runnerID, cloudThreadID); ok {
+			t.Fatalf("colliding cloud thread created intent desired=%q", desired)
+		}
+	})
+
+	t.Run("runner expires after cloud shell creation", func(t *testing.T) {
+		useTempNeoThreadStore(t)
+		requestedThreadID := "T-019f9000-0000-7000-8000-000000000004"
+		cloudThreadID := "T-019f9000-0000-7000-8000-000000000005"
+		ownerUserID := "user-expired-runner"
+		runnerID := "runner-expired-after-cloud"
+		createCalls := 0
+		deleteCalls := 0
+		var userActor *neoActor
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.Method == http.MethodPost && r.URL.Path == "/api/thread-actors" && r.URL.RawQuery == "":
+				createCalls++
+				userActor.mu.Lock()
+				runner := userActor.userRunners[runnerID]
+				runner.updatedAt = time.Now().Add(-neoLocalBrokerHeartbeatTTL - time.Second)
+				userActor.userRunners[runnerID] = runner
+				userActor.mu.Unlock()
+				writeNeoJSON(w, http.StatusCreated, map[string]any{
+					"threadId":      cloudThreadID,
+					"wsToken":       "cloud-token",
+					"ownerUserId":   ownerUserID,
+					"threadVersion": 1,
+				})
+			case r.Method == http.MethodPost && r.URL.Path == "/api/internal" && r.URL.RawQuery == "deleteThread":
+				deleteCalls++
+				if r.Header.Get("Authorization") != "Bearer secret" || r.Header.Get("Content-Type") != "application/json" {
+					t.Errorf("delete headers authorization=%q content-type=%q", r.Header.Get("Authorization"), r.Header.Get("Content-Type"))
+				}
+				payload := readNeoJSON(r.Body)
+				if payload["method"] != "deleteThread" || nestedString(payload["params"], "thread") != cloudThreadID {
+					t.Errorf("delete payload = %#v", payload)
+				}
+				writeNeoJSON(w, http.StatusOK, map[string]any{"ok": true})
+			default:
+				t.Errorf("unexpected upstream request method=%s path=%s query=%s", r.Method, r.URL.Path, r.URL.RawQuery)
+				http.Error(w, "unexpected request", http.StatusBadRequest)
+			}
+		}))
+		t.Cleanup(upstream.Close)
+		rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{UpstreamURL: upstream.URL, UpstreamAPIKey: "secret"}})
+		userActor, _, _ = rt.store.upsertForOwner(map[string]any{"name": "userActor", "key": ownerUserID}, true, ownerUserID)
+		if _, err := userActor.syncLocalBrokerHeartbeat(neoLocalBrokerHeartbeatForTest("broker-expired-after-cloud", "session-1", 1, runnerID, t.TempDir(), nil)); err != nil {
+			t.Fatal(err)
+		}
+		ctx := context.WithValue(context.Background(), clientAPIKeyContextKey{}, "client-key")
+		response, status := rt.localThreadActorManagementResponseForOwner(ctx, map[string]any{
+			"runnerId":         runnerID,
+			"executorType":     "local-client",
+			"usesThreadActors": true,
+			"threadMeta":       map[string]any{"cliProxyAPIWebLocalShell": true},
+		}, requestedThreadID, ownerUserID)
+		if status != http.StatusBadRequest || stringValue(response["error"]) != "runner_not_found" || stringValue(response["threadId"]) != cloudThreadID {
+			t.Fatalf("expired runner response=%#v status=%d", response, status)
+		}
+		if createCalls != 1 || deleteCalls != 1 {
+			t.Fatalf("upstream create calls=%d delete calls=%d", createCalls, deleteCalls)
+		}
+		if rt.store.lookupThreadActor(requestedThreadID) != nil || rt.store.lookupThreadActor(cloudThreadID) != nil {
+			t.Fatal("failed runner reservation created a local thread actor")
+		}
+		if desired, ok := neoUserRunnerIntentForTest(userActor, runnerID, requestedThreadID); ok {
+			t.Fatalf("requested thread intent remains desired=%q", desired)
+		}
+		if desired, ok := neoUserRunnerIntentForTest(userActor, runnerID, cloudThreadID); ok {
+			t.Fatalf("cloud thread intent remains desired=%q", desired)
+		}
+	})
+
+	t.Run("canceled cleanup", func(t *testing.T) {
+		useTempNeoThreadStore(t)
+		threadID := "T-019f9000-0000-7000-8000-000000000009"
+		ownerUserID := "user-canceled-cleanup"
+		runnerID := "runner-canceled-cleanup"
+		deleteStarted := make(chan struct{})
+		releaseDelete := make(chan struct{})
+		var userActor *neoActor
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.Method == http.MethodPost && r.URL.Path == "/api/thread-actors" && r.URL.RawQuery == "":
+				userActor.mu.Lock()
+				runner := userActor.userRunners[runnerID]
+				runner.updatedAt = time.Now().Add(-neoLocalBrokerHeartbeatTTL - time.Second)
+				userActor.userRunners[runnerID] = runner
+				userActor.mu.Unlock()
+				writeNeoJSON(w, http.StatusCreated, map[string]any{
+					"threadId":      threadID,
+					"wsToken":       "cloud-token",
+					"ownerUserId":   ownerUserID,
+					"threadVersion": 1,
+				})
+			case r.Method == http.MethodPost && r.URL.Path == "/api/internal" && r.URL.RawQuery == "deleteThread":
+				close(deleteStarted)
+				select {
+				case <-r.Context().Done():
+				case <-releaseDelete:
+				}
+			default:
+				http.Error(w, "unexpected request", http.StatusBadRequest)
+			}
+		}))
+		t.Cleanup(upstream.Close)
+		t.Cleanup(func() { close(releaseDelete) })
+		rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{UpstreamURL: upstream.URL, UpstreamAPIKey: "secret"}})
+		userActor, _, _ = rt.store.upsertForOwner(map[string]any{"name": "userActor", "key": ownerUserID}, true, ownerUserID)
+		if _, err := userActor.syncLocalBrokerHeartbeat(neoLocalBrokerHeartbeatForTest("broker-canceled-cleanup", "session-1", 1, runnerID, t.TempDir(), nil)); err != nil {
+			t.Fatal(err)
+		}
+		baseCtx := context.WithValue(context.Background(), clientAPIKeyContextKey{}, "client-key")
+		ctx, cancel := context.WithCancel(baseCtx)
+		defer cancel()
+		result := make(chan struct {
+			response map[string]any
+			status   int
+		}, 1)
+		go func() {
+			response, status := rt.localThreadActorManagementResponseForOwner(ctx, map[string]any{
+				"runnerId":         runnerID,
+				"executorType":     "local-client",
+				"usesThreadActors": true,
+				"threadMeta":       map[string]any{"cliProxyAPIWebLocalShell": true},
+			}, threadID, ownerUserID)
+			result <- struct {
+				response map[string]any
+				status   int
+			}{response: response, status: status}
+		}()
+		select {
+		case <-deleteStarted:
+		case <-time.After(2 * time.Second):
+			t.Fatal("compensating delete did not start")
+		}
+		cancel()
+		select {
+		case got := <-result:
+			if got.status != http.StatusBadGateway || stringValue(got.response["error"]) != "cloud_thread_cleanup_failed" || stringValue(got.response["threadId"]) != threadID {
+				t.Fatalf("canceled cleanup response=%#v status=%d", got.response, got.status)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("canceled compensating delete blocked thread creation")
+		}
+	})
+}
+
+func TestNeoRunnerIntentArchiveAndPurgeLifecycle(t *testing.T) {
+	createTopLevelRunnerThread := func(t *testing.T, rt *neoRuntime, ownerUserID, runnerID, threadID string) (*neoActor, *neoActor) {
+		t.Helper()
+		userActor, _, _ := rt.store.upsertForOwner(map[string]any{"name": "userActor", "key": ownerUserID}, true, ownerUserID)
+		if _, err := userActor.syncLocalBrokerHeartbeat(neoLocalBrokerHeartbeatForTest("broker-top-level", "session-1", 1, runnerID, t.TempDir(), nil)); err != nil {
+			t.Fatal(err)
+		}
+		response, status := rt.localThreadActorManagementResponseForOwner(context.Background(), map[string]any{
+			"runnerId":         runnerID,
+			"executorType":     "local-client",
+			"usesThreadActors": true,
+		}, threadID, ownerUserID)
+		if status < 200 || status >= 300 {
+			t.Fatalf("top-level runner thread response=%#v status=%d", response, status)
+		}
+		actor := rt.store.lookupThreadActor(threadID)
+		if actor == nil {
+			t.Fatal("top-level runner thread actor was not created")
+		}
+		actor.mu.Lock()
+		storedRunnerID := stringValue(actor.meta["runnerId"])
+		actor.mu.Unlock()
+		if storedRunnerID != runnerID {
+			t.Fatalf("stored top-level runnerId = %q, want %q", storedRunnerID, runnerID)
+		}
+		if desired, ok := neoUserRunnerIntentForTest(userActor, runnerID, threadID); !ok || desired != "running" {
+			t.Fatalf("initial top-level runner intent desired=%q present=%v", desired, ok)
+		}
+		return actor, userActor
+	}
+
+	t.Run("top-level runner binding archive", func(t *testing.T) {
+		useTempNeoThreadStore(t)
+		rt := newNeoRuntime(&config.Config{})
+		ownerUserID := "user-top-level-archive"
+		runnerID := "runner-top-level-archive"
+		threadID := "T-019f9000-0000-7000-8000-000000000013"
+		actor, userActor := createTopLevelRunnerThread(t, rt, ownerUserID, runnerID, threadID)
+		actor.archiveThread(true, nil)
+		if desired, ok := neoUserRunnerIntentForTest(userActor, runnerID, threadID); !ok || desired != "stopped" {
+			t.Fatalf("archived top-level runner intent desired=%q present=%v", desired, ok)
+		}
+	})
+
+	t.Run("top-level runner binding purge", func(t *testing.T) {
+		useTempNeoThreadStore(t)
+		rt := newNeoRuntime(&config.Config{})
+		ownerUserID := "user-top-level-purge"
+		runnerID := "runner-top-level-purge"
+		threadID := "T-019f9000-0000-7000-8000-000000000014"
+		_, userActor := createTopLevelRunnerThread(t, rt, ownerUserID, runnerID, threadID)
+		if err := rt.purgeNeoLocalThread(threadID); err != nil {
+			t.Fatalf("purge top-level runner thread: %v", err)
+		}
+		if desired, ok := neoUserRunnerIntentForTest(userActor, runnerID, threadID); !ok || desired != "stopped" {
+			t.Fatalf("purged top-level runner intent desired=%q present=%v", desired, ok)
+		}
+	})
+
+	t.Run("archive and unarchive", func(t *testing.T) {
+		useTempNeoThreadStore(t)
+		rt := newNeoRuntime(&config.Config{})
+		ownerUserID := "user-archive-runner"
+		runnerID := "runner-archive"
+		threadID := "T-019f9000-0000-7000-8000-000000000010"
+		userActor, _, _ := rt.store.upsertForOwner(map[string]any{"name": "userActor", "key": ownerUserID}, true, ownerUserID)
+		if _, err := userActor.syncLocalBrokerHeartbeat(neoLocalBrokerHeartbeatForTest("broker-archive", "session-1", 1, runnerID, t.TempDir(), []string{threadID})); err != nil {
+			t.Fatal(err)
+		}
+		if !userActor.requestUserExecutorRunnerThread(runnerID, threadID) {
+			t.Fatal("initial running intent was rejected")
+		}
+		actor := rt.store.ensureThreadActor(threadID)
+		actor.mu.Lock()
+		actor.meta["ownerUserId"] = ownerUserID
+		actor.meta["runnerId"] = runnerID
+		actor.mu.Unlock()
+		actor.archiveThread(true, nil)
+		if desired, ok := neoUserRunnerIntentForTest(userActor, runnerID, threadID); !ok || desired != "stopped" {
+			t.Fatalf("archived intent desired=%q present=%v", desired, ok)
+		}
+		actor.archiveThread(false, nil)
+		if desired, ok := neoUserRunnerIntentForTest(userActor, runnerID, threadID); !ok || desired != "stopped" {
+			t.Fatalf("unarchived intent desired=%q present=%v, want stopped", desired, ok)
+		}
+	})
+
+	t.Run("failed early purge", func(t *testing.T) {
+		useTempNeoThreadStore(t)
+		rt := newNeoRuntime(&config.Config{})
+		ownerUserID := "user-failed-purge-runner"
+		runnerID := "runner-failed-purge"
+		threadID := "T-019f9000-0000-7000-8000-000000000011"
+		userActor, _, _ := rt.store.upsertForOwner(map[string]any{"name": "userActor", "key": ownerUserID}, true, ownerUserID)
+		if _, err := userActor.syncLocalBrokerHeartbeat(neoLocalBrokerHeartbeatForTest("broker-failed-purge", "session-1", 1, runnerID, t.TempDir(), nil)); err != nil {
+			t.Fatal(err)
+		}
+		if !userActor.requestUserExecutorRunnerThread(runnerID, threadID) {
+			t.Fatal("initial running intent was rejected")
+		}
+		actor := rt.store.ensureThreadActor(threadID)
+		actor.mu.Lock()
+		actor.meta["ownerUserId"] = ownerUserID
+		actor.meta["runnerId"] = runnerID
+		actor.mu.Unlock()
+		badStore := filepath.Join(t.TempDir(), "not-a-directory")
+		if err := os.WriteFile(badStore, []byte("blocked"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		rt.threadDir = badStore
+		if err := rt.purgeNeoLocalThread(threadID); err == nil {
+			t.Fatal("purge unexpectedly succeeded")
+		}
+		if desired, ok := neoUserRunnerIntentForTest(userActor, runnerID, threadID); !ok || desired != "running" {
+			t.Fatalf("failed purge intent desired=%q present=%v, want running", desired, ok)
+		}
+	})
+
+	t.Run("successful purge", func(t *testing.T) {
+		useTempNeoThreadStore(t)
+		rt := newNeoRuntime(&config.Config{})
+		ownerUserID := "user-successful-purge-runner"
+		runnerID := "runner-successful-purge"
+		threadID := "T-019f9000-0000-7000-8000-000000000012"
+		workingDirectory := t.TempDir()
+		userActor, _, _ := rt.store.upsertForOwner(map[string]any{"name": "userActor", "key": ownerUserID}, true, ownerUserID)
+		if _, err := userActor.syncLocalBrokerHeartbeat(neoLocalBrokerHeartbeatForTest("broker-successful-purge", "session-1", 1, runnerID, workingDirectory, []string{threadID})); err != nil {
+			t.Fatal(err)
+		}
+		if !userActor.requestUserExecutorRunnerThread(runnerID, threadID) {
+			t.Fatal("initial running intent was rejected")
+		}
+		actor := rt.store.ensureThreadActor(threadID)
+		actor.mu.Lock()
+		actor.meta["ownerUserId"] = ownerUserID
+		actor.meta["runnerId"] = runnerID
+		actor.mu.Unlock()
+		if err := rt.purgeNeoLocalThread(threadID); err != nil {
+			t.Fatalf("purge: %v", err)
+		}
+		if desired, ok := neoUserRunnerIntentForTest(userActor, runnerID, threadID); !ok || desired != "stopped" {
+			t.Fatalf("purged intent desired=%q present=%v", desired, ok)
+		}
+		if _, err := userActor.syncLocalBrokerHeartbeat(neoLocalBrokerHeartbeatForTest("broker-successful-purge", "session-1", 1, runnerID, workingDirectory, []string{threadID})); err != nil {
+			t.Fatal(err)
+		}
+		if desired, ok := neoUserRunnerIntentForTest(userActor, runnerID, threadID); !ok || desired != "stopped" {
+			t.Fatalf("unacknowledged purge intent desired=%q present=%v", desired, ok)
+		}
+		if _, err := userActor.syncLocalBrokerHeartbeat(neoLocalBrokerHeartbeatForTest("broker-successful-purge", "session-1", 1, runnerID, workingDirectory, nil)); err != nil {
+			t.Fatal(err)
+		}
+		if desired, ok := neoUserRunnerIntentForTest(userActor, runnerID, threadID); ok {
+			t.Fatalf("acknowledged purge intent remains desired=%q", desired)
+		}
+	})
+}
+
+func TestNeoRunnerBackedSpawnsFailClosedBeforeLocalExecutorSideEffects(t *testing.T) {
+	useTempNeoThreadStore(t)
+	enabled := true
+	root := t.TempDir()
+	ownedPIDDir := filepath.Join(root, "owned-pids")
+	ampPIDDir := filepath.Join(root, "amp-pids")
+	for _, dir := range []string{ownedPIDDir, ampPIDDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "sentinel"), []byte("unchanged"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(replaceNeoHeadlessPIDDir(func() string { return ownedPIDDir }))
+	t.Cleanup(replaceNeoAmpHeadlessPIDDir(func() string { return ampPIDDir }))
+	invalidCommand := filepath.Join(root, "must-not-resolve", "amp")
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+		NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled, ExecutorCommand: invalidCommand},
+		WebLocalInference: config.AmpWebLocalInference{
+			Enabled:        true,
+			AllowedOrigins: []string{"https://ampcode.com"},
+		},
+		Orbs: config.AmpOrbs{Enabled: &enabled, Provider: "docker"},
+	}})
+	ownerUserID := neoLocalOwnerUserID
+	runnerID := "runner-fail-closed"
+	workingDirectory := t.TempDir()
+	userActor, _, _ := rt.store.upsertForOwner(map[string]any{"name": "userActor", "key": ownerUserID}, true, ownerUserID)
+	if _, err := userActor.syncLocalBrokerHeartbeat(neoLocalBrokerHeartbeatForTest("broker-fail-closed", "session-1", 1, runnerID, workingDirectory, nil)); err != nil {
+		t.Fatal(err)
+	}
+	threadIDs := []string{
+		"T-019f9000-0000-7000-8000-000000000020",
+		"T-019f9000-0000-7000-8000-000000000021",
+		"T-019f9000-0000-7000-8000-000000000022",
+	}
+	for _, dir := range []string{ownedPIDDir, ampPIDDir} {
+		for _, threadID := range threadIDs {
+			if err := os.WriteFile(filepath.Join(dir, threadID+".pid"), []byte("sentinel-"+threadID), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	snapshotPIDFiles := func() map[string]string {
+		t.Helper()
+		files := map[string]string{}
+		for _, dir := range []string{ownedPIDDir, ampPIDDir} {
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, entry := range entries {
+				raw, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+				if err != nil {
+					t.Fatal(err)
+				}
+				files[dir+"/"+entry.Name()] = string(raw)
+			}
+		}
+		return files
+	}
+	beforePIDFiles := snapshotPIDFiles()
+
+	directActor := rt.store.ensureThreadActor(threadIDs[0])
+	directActor.mu.Lock()
+	directActor.bootstrapExecutorType = "sandbox"
+	directActor.agentState = "idle"
+	directActor.meta["ownerUserId"] = ownerUserID
+	directActor.meta["runnerId"] = runnerID
+	directActor.environment = map[string]any{"workingDirectory": workingDirectory}
+	directActor.mu.Unlock()
+	directStatus := directActor.spawnExecutor(map[string]any{"requestId": "runner-direct"})
+	if directStatus["status"] != "running" || stringValue(mapValue(directStatus["details"])["reasonCode"]) != "waiting_for_runner" {
+		t.Fatalf("runner-backed contradictory sandbox spawn = %#v", directStatus)
+	}
+
+	unavailableActor := rt.store.ensureThreadActor(threadIDs[1])
+	unavailableActor.mu.Lock()
+	unavailableActor.bootstrapExecutorType = "local-client"
+	unavailableActor.meta["ownerUserId"] = ownerUserID
+	unavailableActor.meta["runnerId"] = "runner-missing"
+	unavailableActor.environment = map[string]any{"workingDirectory": workingDirectory}
+	unavailableActor.mu.Unlock()
+	unavailableStatus := unavailableActor.spawnExecutor(map[string]any{"requestId": "runner-unavailable"})
+	if unavailableStatus["status"] != "failed" || stringValue(mapValue(unavailableStatus["details"])["reasonCode"]) != "runner_unavailable" {
+		t.Fatalf("unavailable runner spawn = %#v", unavailableStatus)
+	}
+
+	pendingActor := rt.store.ensureThreadActor(threadIDs[1])
+	pendingActor.mu.Lock()
+	pendingActor.bootstrapExecutorType = "sandbox"
+	pendingActor.agentState = "idle"
+	pendingActor.meta["ownerUserId"] = ownerUserID
+	pendingActor.meta["runnerId"] = runnerID
+	pendingActor.environment = map[string]any{"workingDirectory": workingDirectory}
+	pendingActor.queue = []neoQueuedMessage{{MessageID: "M-0000000000000000000021", Content: []any{map[string]any{"type": "text", "text": "retry on runner"}}}}
+	pendingActor.mu.Unlock()
+	pendingStatus := pendingActor.maybeSpawnWebLocalExecutorForPendingWork()
+	if pendingStatus["status"] != "running" || !strings.Contains(stringValue(pendingStatus["message"]), "selected runner") {
+		t.Fatalf("runner-backed pending retry = %#v", pendingStatus)
+	}
+	if desired, ok := neoUserRunnerIntentForTest(userActor, runnerID, threadIDs[1]); !ok || desired != "running" {
+		t.Fatalf("pending retry intent desired=%q present=%v", desired, ok)
+	}
+
+	webSocketActor := rt.store.ensureThreadActor(threadIDs[2])
+	webSocketActor.mu.Lock()
+	webSocketActor.bootstrapExecutorType = "sandbox"
+	webSocketActor.agentState = "idle"
+	webSocketActor.meta["ownerUserId"] = ownerUserID
+	webSocketActor.meta["runnerId"] = runnerID
+	webSocketActor.environment = map[string]any{"workingDirectory": workingDirectory}
+	webSocketActor.mu.Unlock()
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	t.Cleanup(server.Close)
+	header := http.Header{}
+	header.Set(neoInternalClientAPIKeyHeader, "local-key")
+	header.Set("Origin", "https://ampcode.com")
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/gateway/threadActor/websocket/?rvt-method=get&rvt-key=" + threadIDs[2] + "&cliproxy-bootstrap-executor=true&cliproxy-client=amp-web-local-inference"
+	conn, response, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err != nil {
+		status := 0
+		if response != nil {
+			status = response.StatusCode
+		}
+		t.Fatalf("runner-backed websocket dial status=%d err=%v", status, err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	webSocketStatus := waitForNeoMessageType(t, conn, "executor_status", 2*time.Second)
+	if webSocketStatus["status"] != "running" || stringValue(mapValue(webSocketStatus["details"])["reasonCode"]) != "waiting_for_runner" {
+		t.Fatalf("runner-backed websocket bootstrap = %#v", webSocketStatus)
+	}
+	if afterPIDFiles := snapshotPIDFiles(); !reflect.DeepEqual(afterPIDFiles, beforePIDFiles) {
+		t.Fatalf("runner-backed spawn touched owned/Amp PID sentinels:\nbefore=%#v\nafter=%#v", beforePIDFiles, afterPIDFiles)
+	}
+	for _, actor := range []*neoActor{directActor, unavailableActor, pendingActor, webSocketActor} {
+		actor.mu.Lock()
+		spawned := len(actor.spawnedExecutors)
+		actor.mu.Unlock()
+		if spawned != 0 {
+			t.Fatalf("runner-backed actor spawned %d proxy executors", spawned)
+		}
 	}
 }

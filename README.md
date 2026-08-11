@@ -93,6 +93,54 @@ CLIProxyAPI includes integrated support for [Amp CLI](https://ampcode.com) and A
 - **Model mapping** to route unavailable models to alternatives (e.g., `claude-opus-4.5` → `claude-sonnet-4`)
 - Security-first design with localhost-only management endpoints
 
+### Self-hosted Amp threads
+
+The optional Neo runtime can make CLIProxyAPI the authoritative thread gateway for two executor classes:
+
+- **Sandbox Orbs** run one headless Amp executor per thread in an isolated Docker container. Browser-created Orb threads persist `executorType: "sandbox"`, connect through the configured public runtime URL, run executable `.agents/setup` and bounded `.agents/resume` hooks, expose authenticated HTTP/WebSocket portals, and pause when archived or idle. On proxy restart, the Orb manager reconciles containers labelled `cliproxy.orb=<thread-id>` with persisted sandbox thread state. It preserves running and paused containers without creating a replacement; ambiguous, stopped, or incomplete records fail closed. This is container rediscovery, not Amp snapshot reuse.
+- **Mac local threads** use `cmd/amp_local_broker` on the owner-authenticated Mac. The browser must select exactly one live catalogued runner and submit its `runnerId`. The server treats browser paths as untrusted display data and never executes them. The broker maps the runner to one explicitly approved Git checkout, starts native `amp --headless=<thread-id>` with that checkout as both `cmd.Dir` and `AMP_PWD`, and supervises one child per active thread. Broker or runner loss fails clearly; runner-backed threads never fall back to finding or spawning Amp in the proxy container.
+
+The direct Neo runtime listener is local control-plane infrastructure and accepts only loopback hosts such as `127.0.0.1`, `localhost`, or `::1`. Do not bind `neo-local-runtime.host` to `0.0.0.0`, a LAN address, or a public interface. Remote executors must connect through the authenticated public runtime gateway configured by `orbs.runtime-public-url` or the broker's `runtimeURL`, not directly to port 6420.
+
+Orb provisioning starts from Debian 12 and installs a common development toolset plus pinned Node.js 24.19.0, pnpm 11.20.0, Bun 1.3.14, and `agent-browser` 0.33.2. AMD64 uses pinned Chrome for Testing 151.0.7922.77; ARM64 uses Debian Chromium because Chrome for Testing has no Linux ARM64 build. Every Orb gets a separate browser home, namespace, and socket directory, and provisioning must pass an offline `data:` URL browser smoke test. Open Browser Use remains laptop-local: its extension, native host, skill, browser profiles, cookies, state, CDP sessions, and auto-connect configuration are not copied into Orbs. Pin the configured Debian image by digest if the base image must also be reproducible.
+
+Local config sync is intentionally narrow. It copies guidance, review checks, compatible skills, and an allowlisted non-secret subset of Amp settings. It skips non-regular files, credential-shaped names, endpoints, MCP definitions (including skill-local `mcp.json`), permissions, per-thread state, plugins, and laptop-only browser/desktop-control skills. Plugin sync is unsupported because executable plugin source and plugin configuration cannot be made safe through filename filtering alone.
+
+`creating-charts` is a version-matched built-in skill embedded in the native Amp executable, and the Amp web UI renders its fenced Flint output. `view_media` and Painter are also embedded Amp tools, backed by remote vision and image-generation models rather than Debian packages; they are therefore not listed by `amp tools list` inside an official Orb. CLIProxyAPI advertises and normalizes their tool and artifact protocol, but execution through the self-hosted gateway remains unverified. Deterministic PDF or image annotation utilities are not installed by default.
+
+The Mac broker uses a private JSON config and a separate private API-key file. A minimal configuration is:
+
+```json
+{
+  "version": 1,
+  "brokerId": "owner-mac",
+  "apiURL": "https://amp.example.com",
+  "runtimeURL": "https://amp-runtime.example.com",
+  "apiKeyFile": "/private/path/amp-api-key",
+  "ampBinary": "/absolute/path/to/amp",
+  "stateDirectory": "/private/path/amp-local-broker-state",
+  "logDirectory": "/private/path/amp-local-broker-logs",
+  "heartbeatSeconds": 15,
+  "workspaces": [
+    {
+      "id": "project-checkout",
+      "path": "/absolute/path/to/one/git/checkout",
+      "repositoryURL": "https://github.com/example/project.git"
+    }
+  ]
+}
+```
+
+Validate it with `go run ./cmd/amp_local_broker -config /private/path/broker.json -check`, then run the same command without `-check` under the Mac user's process supervisor. Config, key, state, and log paths must be owned by that user and private. Broad roots such as a home directory, a general development directory, or `~/.config` are rejected unless individually and explicitly overridden. The API key is intentionally available to the trusted native Amp child through its environment; it is excluded from argv and broker messages, but the checkout is not an OS filesystem sandbox and an arbitrary child can print its own environment to its private log.
+
+Broker heartbeats use a durable, monotonically increasing `sessionGeneration`. The server stores the highest accepted generation per owner and broker in `.cliproxyapi-local-broker-fences.json` beside the thread directory. Older or conflicting sessions are rejected and stop their children. The broker generation directory and the server fence file must both be persistent; deploy protocol-compatible server and broker versions together.
+
+The Mac broker preserves safe built-in and plugin/custom agent mode keys when it starts native Amp. Custom modes must be installed and configured consistently for the server and the Mac Amp installation; the broker does not copy plugin source or configuration.
+
+For persistent self-hosted history, mount the parent Amp data directory that contains `threads/`, `.cliproxyapi-local-broker-fences.json`, and schedule/search sidecars. Reconcile any existing Mac history into that mount before making the server authoritative, verify the sidebar and restored threads, and retire transitional one-way sync only after the reconciliation is audited. Avoid editing the same thread through both stores during migration.
+
+This integration does not claim full Amp-managed Orb parity. Unsupported or unverified features include OIDC, webhooks, commit signing, the official `amp orb service`/systemd supervisor and complete hairpin model, terminal pane, file browser, `amp sync`, retention deletion, official snapshot reuse, plugin sync, and Amp-managed media/Painter/Flint rendering through self-hosted executors. Container rediscovery preserves an existing Docker container, not an official Orb snapshot. A deployment still requires live end-to-end verification of fresh/restored Orb answers, pause/resume, portals, and isolated `agent-browser` on its actual Docker host and architecture.
+
 When you need the request/response shape of a specific backend family, use the provider-specific paths instead of the merged `/v1/...` endpoints:
 
 - Use `/api/provider/{provider}/v1/messages` for messages-style backends.

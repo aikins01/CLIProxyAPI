@@ -66,6 +66,10 @@ func (m *AmpModule) serveOrbPortal(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
 		return
 	}
+	if err := manager.ensureRecovered(cfg); err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "orb recovery failed: " + err.Error()})
+		return
+	}
 	record, ok := manager.snapshot(threadID)
 	if !ok {
 		c.JSON(http.StatusNotFound, gin.H{"error": "no orb for thread"})
@@ -77,7 +81,14 @@ func (m *AmpModule) serveOrbPortal(c *gin.Context) {
 		return
 	}
 	if record.state != neoOrbStateRunning || record.containerID == "" {
-		c.JSON(http.StatusConflict, gin.H{"error": "orb is not ready", "state": record.state})
+		body := gin.H{"error": "orb is not ready", "state": record.state}
+		if record.state == neoOrbStateConflict {
+			if reason := strings.TrimSpace(record.failReason); reason != "" {
+				body["error"] = "orb is not ready: " + reason
+				body["recoveryBlocker"] = reason
+			}
+		}
+		c.JSON(http.StatusConflict, body)
 		return
 	}
 	inspectCtx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)

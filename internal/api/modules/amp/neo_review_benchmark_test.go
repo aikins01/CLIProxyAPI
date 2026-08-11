@@ -13,6 +13,7 @@ import (
 	"os"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -47,6 +48,55 @@ type neoReviewBenchmarkExpectedFinding struct {
 	Locations             []neoReviewBenchmarkLocation
 	Severity              string
 	RequiredKeywordGroups [][]string
+}
+
+func TestNeoRunCheckExportStatusPredicateAcceptsDirectOwnershipChecks(t *testing.T) {
+	accessPath, err := neoParseDependencyAccessPath("@example/sdk/subpath.js#Owner.call")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, source := range map[string]string{
+		"available":             `console.log(Object.hasOwn(pkg.exports, "./subpath.js") ? "AVAILABLE" : "MISSING")`,
+		"missing":               `console.log(!Object.hasOwn(pkg.exports, "./subpath.js") ? "MISSING" : "AVAILABLE")`,
+		"parenthesized missing": `console.log(!(Object.hasOwn(pkg.exports, "./subpath.js")) ? "MISSING" : "AVAILABLE")`,
+		"assigned available":    `const available = Object.hasOwn(pkg.exports, "./subpath.js"); console.log(available ? "AVAILABLE" : "MISSING")`,
+		"assigned missing":      `const missing = !Object.hasOwn(pkg.exports, "./subpath.js"); console.log(missing ? "MISSING" : "AVAILABLE")`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			executable := neoRunCheckASCIIFold(neoRunCheckDeclarationLexicalMask(source))
+			for _, status := range []string{"AVAILABLE", "MISSING"} {
+				if !neoRunCheckExportStatusPredicate(source, executable, status, accessPath) {
+					t.Fatalf("direct ownership predicate rejected status %s", status)
+				}
+			}
+		})
+	}
+	unrelated := `console.log(Object.hasOwn(cache, "./subpath.js") ? "AVAILABLE" : "MISSING")`
+	if neoRunCheckExportStatusPredicate(unrelated, neoRunCheckASCIIFold(neoRunCheckDeclarationLexicalMask(unrelated)), "AVAILABLE", accessPath) {
+		t.Fatal("unrelated ownership predicate was accepted as package export evidence")
+	}
+	unrelated = `console.log(Object.hasOwn(otherPkg.exports, "./subpath.js") ? "AVAILABLE" : "MISSING")`
+	if neoRunCheckExportStatusPredicate(unrelated, neoRunCheckASCIIFold(neoRunCheckDeclarationLexicalMask(unrelated)), "AVAILABLE", accessPath) {
+		t.Fatal("unrelated package ownership predicate was accepted as exact-floor export evidence")
+	}
+}
+
+func TestNeoRunCheckExactExportStatusRequiresFloorBoundProvenance(t *testing.T) {
+	accessPath, err := neoParseDependencyAccessPath("@example/sdk/subpath.js#Owner.call")
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := `set -e; load-exact-floor @example/sdk@1.0.0 @example/sdk/subpath.js#Owner.call; console.log(Object.hasOwn(pkg.exports, "./subpath.js") ? "AVAILABLE" : "MISSING")`
+	evidence := map[string]any{"tool": "shell_command", "input": `{"command":` + strconv.Quote(command) + `}`}
+	if reason := neoRunCheckUnsafeStatusAssertion(evidence, "@example/sdk/subpath.js#Owner.call=AVAILABLE", accessPath, "AVAILABLE", "exact-export-inspection"); !strings.Contains(reason, "bound to the exact-floor package export map") {
+		t.Fatalf("unbound exact-export assertion reason = %q", reason)
+	}
+	command = `set -e; load-exact-floor @example/sdk@1.0.0 @example/sdk/subpath.js#Owner.call; console.log('CLIPROXY_PACKAGE_EXPORTS=' + JSON.stringify(pkg.exports)); console.log(Object.hasOwn(pkg.exports, "./subpath.js") ? "AVAILABLE" : "MISSING")`
+	evidence["input"] = `{"command":` + strconv.Quote(command) + `}`
+	output := "CLIPROXY_PACKAGE_EXPORTS={\"./subpath.js\":\"./subpath.js\"}\n@example/sdk/subpath.js#Owner.call=AVAILABLE"
+	if reason := neoRunCheckUnsafeStatusAssertion(evidence, output, accessPath, "AVAILABLE", "exact-export-inspection"); reason != "" {
+		t.Fatalf("bound exact-export assertion reason = %q", reason)
+	}
 }
 
 type neoReviewBenchmarkCase struct {
@@ -1861,8 +1911,9 @@ func TestNeoReviewPR148LargeSnapshotSurvivesActorRunCheckLifecycle(t *testing.T)
 			evidence["dependency"] = "@openrouter/sdk"
 			evidence["floorVersion"] = "1.0.0"
 			evidence["accessPath"] = "client.beta.responses"
+			evidence["floorStatus"] = "compatible"
 			evidence["verification"] = "root-type-declaration"
-			evidence["rootEvidence"] = "root client type declares beta.responses"
+			evidence["rootEvidence"] = []any{"root client type declares beta.responses"}
 		}
 		if checkName == "bounded-artifact-state-transitions" {
 			evidence["phaseRelationship"] = "addition"
@@ -1875,17 +1926,28 @@ func TestNeoReviewPR148LargeSnapshotSurvivesActorRunCheckLifecycle(t *testing.T)
 			evidence["mutationPath"] = "none: snapshot text is not reassignable"
 			evidence["usePath"] = "check evaluation consumes the snapshot"
 		}
-		resultJSON, err := json.Marshal(map[string]any{
+		patternsChecked := []any{"actor snapshot delivery"}
+		if checkName == "published-dependency-capability-floor" {
+			patternsChecked = []any{neoDependencyPatternKey("@openrouter/sdk", "1.0.0", "client.beta.responses")}
+		}
+		result := map[string]any{
 			"checkName":       checkName,
 			"status":          "completed",
 			"filesAnalyzed":   len(neoStringSlice(prepared[neoReviewSnapshotFilesKey])),
 			"linesAnalyzed":   0,
 			"coveredFiles":    stringArrayValue(neoStringSlice(prepared[neoReviewSnapshotFilesKey])),
 			"coveredHunks":    stringArrayValue(neoStringSlice(prepared[neoReviewSnapshotHunksKey])),
-			"patternsChecked": []any{"actor snapshot delivery"},
+			"patternsChecked": patternsChecked,
 			"evidence":        []any{evidence},
 			"issues":          []any{},
-		})
+		}
+		if checkName == "published-dependency-capability-floor" {
+			result["status"] = "error"
+			result["patternsChecked"] = []any{}
+			result["evidence"] = []any{}
+			result["errorMessage"] = "required validation tool evidence is unavailable in the snapshot lifecycle fixture"
+		}
+		resultJSON, err := json.Marshal(result)
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -119,6 +119,44 @@ func TestNeoOrbPortalProxiesToContainer(t *testing.T) {
 	}
 }
 
+func TestNeoOrbPortalRecoversContainerOnFirstRequest(t *testing.T) {
+	module, fake, threadID := newNeoOrbPortalTestModule(t)
+	manager := module.neoRuntime.orbManagerFor()
+	manager.mu.Lock()
+	manager.orbs = map[string]*neoOrbRecord{}
+	manager.recovered = false
+	manager.recoveredKey = ""
+	manager.mu.Unlock()
+	writeNeoOrbPersistedThread(t, module.neoRuntime, threadID, "sandbox", "recovered-container")
+	fake.containers = []neoOrbContainerSummary{{ID: "recovered-container", Labels: map[string]string{"cliproxy.orb": threadID}}}
+	fake.inspectState = neoOrbContainerState{Exists: true, Running: true, IPAddress: "172.17.0.10"}
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("recovered portal"))
+	}))
+	defer upstream.Close()
+	original := neoOrbPortalTargetURL
+	neoOrbPortalTargetURL = func(containerIP string, port int) (string, error) {
+		if containerIP != "172.17.0.10" || port != 3000 {
+			t.Fatalf("portal target = %q:%d", containerIP, port)
+		}
+		return upstream.URL, nil
+	}
+	t.Cleanup(func() { neoOrbPortalTargetURL = original })
+
+	recorder := neoOrbPortalRequest(t, module, "/orb/"+threadID+"/p/3000/", nil)
+	if recorder.status != http.StatusOK || recorder.body != "recovered portal" {
+		t.Fatalf("recovered portal response = %d %q", recorder.status, recorder.body)
+	}
+	if record, ok := manager.snapshot(threadID); !ok || record.containerID != "recovered-container" {
+		t.Fatalf("recovered portal record = %#v, %t", record, ok)
+	}
+	if fake.callCount("list-orbs") != 1 {
+		t.Fatalf("portal recovery calls = %#v", fake.calls)
+	}
+}
+
 func TestNeoOrbPortalDisabledOrbs(t *testing.T) {
 	useTempNeoThreadStore(t)
 	rt := newNeoRuntime(&config.Config{})

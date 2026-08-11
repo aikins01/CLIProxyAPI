@@ -37,6 +37,10 @@ var neoModeRuntimeOnlyTools = map[string]map[string]bool{
 	"puck": toolSet("rename_thread", "set_thread_pinned", "add_thread_labels", "remove_thread_labels", "set_schedule"),
 }
 
+var neoModeAuditBaselineClientRegisteredTools = toolSet("portal_observe", "portal_control")
+
+var neoModeAuditBaselineClientRegisteredModes = toolSet("smart", "large", "rush", "deep", "nostromo", "low", "medium", "high", "ultra")
+
 func neoModeBinaryComparableTools(mode string, names []string) []string {
 	runtimeOnly := neoModeRuntimeOnlyTools[mode]
 	out := make([]string, 0, len(names))
@@ -46,6 +50,34 @@ func neoModeBinaryComparableTools(mode string, names []string) []string {
 		}
 	}
 	return out
+}
+
+func neoModeAuditBaselineComparableTools(mode string, names []string) ([]string, bool) {
+	if !neoModeAuditBaselineClientRegisteredModes[mode] {
+		return names, true
+	}
+	out := make([]string, 0, len(names))
+	portalState := 0
+	for _, name := range names {
+		switch name {
+		case "portal_observe":
+			if portalState != 0 || len(out) == 0 || out[len(out)-1] != "read_web_page" {
+				return nil, false
+			}
+			portalState = 1
+		case "portal_control":
+			if portalState != 1 {
+				return nil, false
+			}
+			portalState = 2
+		default:
+			if portalState == 1 {
+				return nil, false
+			}
+			out = append(out, name)
+		}
+	}
+	return out, portalState == 2
 }
 
 // TestNeoKnownModeToolsMatchesModeUnion is a pure runtime invariant (no binary
@@ -88,6 +120,10 @@ func TestNeoModeToolOrderMatchesAuditBaseline(t *testing.T) {
 			continue
 		}
 		want = neoModeBinaryComparableTools(mode, want)
+		want, comparable := neoModeAuditBaselineComparableTools(mode, want)
+		if !comparable {
+			t.Fatalf("mode %q runtime tools do not contain the client-registered portal pair immediately after read_web_page", mode)
+		}
 		got, ok := profiles[mode]
 		if !ok {
 			if neoModeOptionalInAmpBinary[mode] {

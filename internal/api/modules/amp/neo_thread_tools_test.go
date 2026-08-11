@@ -1088,8 +1088,13 @@ func TestNeoCreateThreadDispatchesToSelectedRunner(t *testing.T) {
 		"type": "runnerHeartbeat",
 		"args": []any{map[string]any{"sessionId": "session-build-runner", "runningThreads": []any{}}},
 	}))
-	if heartbeat["ok"] != true || len(arrayValue(heartbeat["intents"])) != 0 {
-		t.Fatalf("runner should be idle before child receives work: %#v", heartbeat)
+	intents := arrayValue(heartbeat["intents"])
+	if heartbeat["ok"] != true || len(intents) != 1 {
+		t.Fatalf("runner should receive child intent: %#v", heartbeat)
+	}
+	intent := mapValue(intents[0])
+	if intent["threadId"] != childID || intent["desired"] != "running" || intent["agentMode"] != "low" || intent["reasoningEffort"] != "medium" {
+		t.Fatalf("runner child intent = %#v", intent)
 	}
 	if _, err := parent.executeLocalSendMessageToThreadTool(neoPendingTool{ID: "TU-start-runner-child", Input: map[string]any{
 		"thread":  childID,
@@ -1108,7 +1113,7 @@ func TestNeoCreateThreadDispatchesToSelectedRunner(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	intents := arrayValue(heartbeat["intents"])
+	intents = arrayValue(heartbeat["intents"])
 	if heartbeat["ok"] != true || len(intents) != 1 || stringValue(mapValue(intents[0])["threadId"]) != childID || stringValue(mapValue(intents[0])["desired"]) != "running" {
 		t.Fatalf("runner heartbeat = %#v", heartbeat)
 	}

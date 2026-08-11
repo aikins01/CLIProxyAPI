@@ -5,9 +5,11 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"reflect"
 	"strings"
 	"testing"
 
+	kimiauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/kimi"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -19,6 +21,95 @@ type kimiTestRoundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (f kimiTestRoundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
+}
+
+func TestKimiClaudeRequestAuthIsRequestLocal(t *testing.T) {
+	tests := []struct {
+		name string
+		auth *cliproxyauth.Auth
+	}{
+		{name: "nil auth"},
+		{name: "nil attributes", auth: &cliproxyauth.Auth{Metadata: map[string]any{"access_token": "test-token"}}},
+		{name: "empty attributes", auth: &cliproxyauth.Auth{Attributes: map[string]string{}}},
+		{name: "existing attributes", auth: &cliproxyauth.Auth{Attributes: map[string]string{"base_url": "https://original.example", "custom": "value"}}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var originalAttributes map[string]string
+			if tc.auth != nil && tc.auth.Attributes != nil {
+				originalAttributes = make(map[string]string, len(tc.auth.Attributes))
+				for key, value := range tc.auth.Attributes {
+					originalAttributes[key] = value
+				}
+			}
+			requestAuth := kimiClaudeRequestAuth(tc.auth)
+			if requestAuth == nil || requestAuth.Attributes["base_url"] != kimiauth.KimiAPIBaseURL {
+				t.Fatalf("request auth = %#v", requestAuth)
+			}
+			if tc.auth == nil {
+				return
+			}
+			if requestAuth == tc.auth {
+				t.Fatal("request auth reused shared auth pointer")
+			}
+			if !reflect.DeepEqual(tc.auth.Attributes, originalAttributes) {
+				t.Fatalf("shared attributes changed to %#v", tc.auth.Attributes)
+			}
+			requestAuth.Attributes["custom"] = "request-value"
+			if !reflect.DeepEqual(tc.auth.Attributes, originalAttributes) {
+				t.Fatalf("request mutation reached shared attributes: %#v", tc.auth.Attributes)
+			}
+		})
+	}
+}
+
+func TestKimiExecutorClaudePathsHandleNilAuthState(t *testing.T) {
+	executor := NewKimiExecutor(&config.Config{})
+	request := cliproxyexecutor.Request{
+		Model:   "kimi-k2",
+		Payload: []byte(`{"model":"kimi-k2","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`),
+	}
+	options := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")}
+	operations := []struct {
+		name string
+		run  func(context.Context, *cliproxyauth.Auth) error
+	}{
+		{name: "execute", run: func(ctx context.Context, auth *cliproxyauth.Auth) error {
+			_, err := executor.Execute(ctx, auth, request, options)
+			return err
+		}},
+		{name: "execute stream", run: func(ctx context.Context, auth *cliproxyauth.Auth) error {
+			_, err := executor.ExecuteStream(ctx, auth, request, options)
+			return err
+		}},
+		{name: "count tokens", run: func(ctx context.Context, auth *cliproxyauth.Auth) error {
+			_, err := executor.CountTokens(ctx, auth, request, options)
+			return err
+		}},
+	}
+	for _, authCase := range []struct {
+		name string
+		auth func() *cliproxyauth.Auth
+	}{
+		{name: "nil auth", auth: func() *cliproxyauth.Auth { return nil }},
+		{name: "nil attributes", auth: func() *cliproxyauth.Auth {
+			return &cliproxyauth.Auth{Metadata: map[string]any{"access_token": "test-token"}}
+		}},
+	} {
+		for _, operation := range operations {
+			t.Run(authCase.name+"/"+operation.name, func(t *testing.T) {
+				auth := authCase.auth()
+				ctx, cancel := context.WithCancel(t.Context())
+				cancel()
+				if err := operation.run(ctx, auth); err == nil {
+					t.Fatal("operation unexpectedly succeeded with canceled context")
+				}
+				if auth != nil && auth.Attributes != nil {
+					t.Fatalf("shared auth attributes changed to %#v", auth.Attributes)
+				}
+			})
+		}
+	}
 }
 
 func TestNormalizeKimiToolMessageLinks_UsesCallIDFallback(t *testing.T) {
@@ -37,6 +128,136 @@ func TestNormalizeKimiToolMessageLinks_UsesCallIDFallback(t *testing.T) {
 	got := gjson.GetBytes(out, "messages.1.tool_call_id").String()
 	if got != "list_directory:1" {
 		t.Fatalf("messages.1.tool_call_id = %q, want %q", got, "list_directory:1")
+	}
+}
+
+func TestKimiNormalizeRequestSchemasPreservesNullability(t *testing.T) {
+	body := []byte(`{
+		"model":"kimi-k3",
+		"tools":[{"type":"function","function":{"name":"submit_review","parameters":{
+			"type":"object",
+			"properties":{
+				"comments":{"type":"array","items":{"type":"object","properties":{
+					"commentType":{"type":["string","null"],"enum":["bug","unknown",null]},
+					"severity":{"type":"string","enum":["high","low",null]},
+					"source":{"type":["string","null"]},
+					"description":{"type":"object","properties":{"value":{"type":"string"}}}
+				},"required":["commentType","severity","source"]}}
+			},"required":["comments"]
+		}}}],
+		"response_format":{"type":"json_schema","json_schema":{"name":"run_check","schema":{
+			"type":"object","properties":{
+				"endLine":{"type":["integer","null"]},
+				"verification":{"type":["string","null"],"enum":["root-runtime-traversal",null]}
+			},"required":["endLine","verification"]
+		}}}
+	}`)
+
+	out, err := normalizeKimiRequestSchemas(body)
+	if err != nil {
+		t.Fatalf("normalizeKimiRequestSchemas() error = %v", err)
+	}
+	for _, path := range []string{
+		"tools.0.function.parameters.properties.comments.items.properties.commentType",
+		"tools.0.function.parameters.properties.comments.items.properties.source",
+	} {
+		if got := gjson.GetBytes(out, path+".anyOf.0.type").String(); got != "string" {
+			t.Fatalf("%s.anyOf.0.type = %q, want string", path, got)
+		}
+		if got := gjson.GetBytes(out, path+".anyOf.1.type").String(); got != "null" {
+			t.Fatalf("%s.anyOf.1.type = %q, want null", path, got)
+		}
+	}
+	commentType := "tools.0.function.parameters.properties.comments.items.properties.commentType"
+	if got := gjson.GetBytes(out, commentType+".anyOf.0.enum").Raw; got != `["bug","unknown"]` {
+		t.Fatalf("commentType non-null enum = %s", got)
+	}
+	severity := "tools.0.function.parameters.properties.comments.items.properties.severity"
+	if got := gjson.GetBytes(out, severity+".type").String(); got != "string" {
+		t.Fatalf("severity type = %q, want string", got)
+	}
+	if got := gjson.GetBytes(out, severity+".enum").Raw; got != `["high","low"]` {
+		t.Fatalf("severity enum = %s, want non-null values", got)
+	}
+	if gjson.GetBytes(out, severity+".anyOf").Exists() {
+		t.Fatal("null enum value widened a non-null string schema")
+	}
+	if got := gjson.GetBytes(out, "tools.0.function.parameters.properties.comments.items.properties.description.type").String(); got != "object" {
+		t.Fatalf("parameter named description type = %q, want object", got)
+	}
+	if got := gjson.GetBytes(out, "tools.0.function.parameters.properties.comments.items.properties.description.properties.value.type").String(); got != "string" {
+		t.Fatalf("nested description value type = %q, want string", got)
+	}
+	endLine := "response_format.json_schema.schema.properties.endLine"
+	if got := gjson.GetBytes(out, endLine+".anyOf.0.type").String(); got != "integer" {
+		t.Fatalf("structured-output endLine type = %q, want integer", got)
+	}
+	if got := gjson.GetBytes(out, endLine+".anyOf.1.type").String(); got != "null" {
+		t.Fatalf("structured-output endLine nullable type = %q, want null", got)
+	}
+	verification := "response_format.json_schema.schema.properties.verification"
+	if got := gjson.GetBytes(out, verification+".anyOf.0.type").String(); got != "string" {
+		t.Fatalf("structured-output verification type = %q, want string", got)
+	}
+	if got := gjson.GetBytes(out, verification+".anyOf.0.enum").Raw; got != `["root-runtime-traversal"]` {
+		t.Fatalf("structured-output verification enum = %s, want non-null values", got)
+	}
+	if got := gjson.GetBytes(out, verification+".anyOf.1.type").String(); got != "null" {
+		t.Fatalf("structured-output verification nullable type = %q, want null", got)
+	}
+}
+
+func TestKimiNormalizeRequestSchemasPreservesNullOnlyConstraints(t *testing.T) {
+	body := []byte(`{
+		"tools":[{"type":"function","function":{"name":"null_constraints","parameters":{
+			"type":"object","properties":{
+				"constOnly":{"type":["string","null"],"const":null},
+				"enumOnly":{"type":["string","null"],"enum":[null]},
+				"nullable":{"type":["string","null"]}
+			}
+		}}}]
+	}`)
+
+	out, err := normalizeKimiRequestSchemas(body)
+	if err != nil {
+		t.Fatalf("normalizeKimiRequestSchemas() error = %v", err)
+	}
+	constOnly := "tools.0.function.parameters.properties.constOnly"
+	if got := gjson.GetBytes(out, constOnly+".type").String(); got != "null" {
+		t.Fatalf("const-only type = %s", got)
+	}
+	enumOnly := "tools.0.function.parameters.properties.enumOnly"
+	if got := gjson.GetBytes(out, enumOnly+".type").String(); got != "null" {
+		t.Fatalf("enum-only type = %s", got)
+	}
+	nullable := "tools.0.function.parameters.properties.nullable"
+	if got := gjson.GetBytes(out, nullable+".anyOf.0.type").String(); got != "string" {
+		t.Fatalf("ordinary nullable concrete type = %q, want string", got)
+	}
+	if got := gjson.GetBytes(out, nullable+".anyOf.1.type").String(); got != "null" {
+		t.Fatalf("ordinary nullable second type = %q, want null", got)
+	}
+}
+
+func TestKimiNormalizeRequestSchemasRejectsUnrepresentableNullableSchemas(t *testing.T) {
+	for name, body := range map[string]string{
+		"existing anyOf":    `{"tools":[{"type":"function","function":{"parameters":{"type":"object","properties":{"value":{"type":["string","null"],"anyOf":[{"minLength":1}]}}}}}]}`,
+		"MFJS boolean enum": `{"response_format":{"type":"json_schema","json_schema":{"schema":{"type":"object","properties":{"value":{"type":["boolean","null"],"enum":[true,null]}}}}}}`,
+		"empty types":       `{"tools":[{"type":"function","function":{"parameters":{"type":"object","properties":{"value":{"type":[]}}}}}]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := normalizeKimiRequestSchemas([]byte(body))
+			if err == nil || !strings.Contains(err.Error(), "unsupported") {
+				t.Fatalf("normalizeKimiRequestSchemas() error = %v", err)
+			}
+			status, ok := err.(interface{ StatusCode() int })
+			if !ok || status.StatusCode() != http.StatusBadRequest {
+				t.Fatalf("normalizeKimiRequestSchemas() status = %v, want %d", err, http.StatusBadRequest)
+			}
+			if !strings.Contains(err.Error(), "properties.value") {
+				t.Fatalf("normalizeKimiRequestSchemas() error lacks schema path: %v", err)
+			}
+		})
 	}
 }
 

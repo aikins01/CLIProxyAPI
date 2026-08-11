@@ -47,6 +47,11 @@ type neoOrbContainerState struct {
 	Exists    bool
 }
 
+type neoOrbContainerSummary struct {
+	ID     string
+	Labels map[string]string
+}
+
 type neoOrbExecResult struct {
 	ExitCode int
 	Stdout   string
@@ -223,6 +228,32 @@ func (c *neoOrbDockerClient) CreateContainer(ctx context.Context, spec neoOrbCon
 		return "", fmt.Errorf("docker create container: unexpected response %s", clipNeoErrorBody(respBody))
 	}
 	return created.ID, nil
+}
+
+func (c *neoOrbDockerClient) ListOrbContainers(ctx context.Context) ([]neoOrbContainerSummary, error) {
+	filters, err := json.Marshal(map[string][]string{"label": {"cliproxy.orb"}})
+	if err != nil {
+		return nil, err
+	}
+	respBody, _, err := c.request(ctx, http.MethodGet, "/containers/json?all=true&filters="+url.QueryEscape(string(filters)), nil, "")
+	if err != nil {
+		return nil, err
+	}
+	var listed []struct {
+		ID     string            `json:"Id"`
+		Labels map[string]string `json:"Labels"`
+	}
+	if err := json.Unmarshal(respBody, &listed); err != nil {
+		return nil, fmt.Errorf("docker list orb containers: %w", err)
+	}
+	containers := make([]neoOrbContainerSummary, 0, len(listed))
+	for _, container := range listed {
+		if strings.TrimSpace(container.ID) == "" {
+			continue
+		}
+		containers = append(containers, neoOrbContainerSummary{ID: container.ID, Labels: container.Labels})
+	}
+	return containers, nil
 }
 
 func (c *neoOrbDockerClient) StartContainer(ctx context.Context, id string) error {

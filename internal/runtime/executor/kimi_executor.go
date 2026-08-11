@@ -4,12 +4,16 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"time"
 
@@ -79,8 +83,7 @@ func (e *KimiExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth,
 func (e *KimiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
 	from := opts.SourceFormat
 	if from.String() == "claude" {
-		auth.Attributes["base_url"] = kimiauth.KimiAPIBaseURL
-		return e.ClaudeExecutor.Execute(ctx, auth, req, opts)
+		return e.ClaudeExecutor.Execute(ctx, kimiClaudeRequestAuth(auth), req, opts)
 	}
 
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
@@ -114,6 +117,10 @@ func (e *KimiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel, requestPath)
+	body, err = normalizeKimiRequestSchemas(body)
+	if err != nil {
+		return resp, err
+	}
 	body, err = normalizeKimiToolMessageLinks(body)
 	if err != nil {
 		return resp, err
@@ -190,8 +197,7 @@ func (e *KimiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 func (e *KimiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
 	from := opts.SourceFormat
 	if from.String() == "claude" {
-		auth.Attributes["base_url"] = kimiauth.KimiAPIBaseURL
-		return e.ClaudeExecutor.ExecuteStream(ctx, auth, req, opts)
+		return e.ClaudeExecutor.ExecuteStream(ctx, kimiClaudeRequestAuth(auth), req, opts)
 	}
 
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
@@ -228,6 +234,10 @@ func (e *KimiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel, requestPath)
+	body, err = normalizeKimiRequestSchemas(body)
+	if err != nil {
+		return nil, err
+	}
 	body, err = normalizeKimiToolMessageLinks(body)
 	if err != nil {
 		return nil, err
@@ -336,8 +346,283 @@ func (e *KimiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 
 // CountTokens estimates token count for Kimi requests.
 func (e *KimiExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	auth.Attributes["base_url"] = kimiauth.KimiAPIBaseURL
-	return e.ClaudeExecutor.CountTokens(ctx, auth, req, opts)
+	return e.ClaudeExecutor.CountTokens(ctx, kimiClaudeRequestAuth(auth), req, opts)
+}
+
+func kimiClaudeRequestAuth(auth *cliproxyauth.Auth) *cliproxyauth.Auth {
+	requestAuth := auth.Clone()
+	if requestAuth == nil {
+		requestAuth = &cliproxyauth.Auth{}
+	}
+	attributes := make(map[string]string, len(requestAuth.Attributes)+1)
+	for key, value := range requestAuth.Attributes {
+		attributes[key] = value
+	}
+	attributes["base_url"] = kimiauth.KimiAPIBaseURL
+	requestAuth.Attributes = attributes
+	return requestAuth
+}
+
+func normalizeKimiRequestSchemas(body []byte) ([]byte, error) {
+	if len(body) == 0 {
+		return body, nil
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	var payload map[string]any
+	if err := decoder.Decode(&payload); err != nil {
+		var syntaxError *json.SyntaxError
+		if errors.Is(err, io.EOF) || errors.As(err, &syntaxError) {
+			return body, nil
+		}
+		return body, fmt.Errorf("kimi executor: failed to decode request schemas: %w", err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return body, nil
+	}
+
+	changed := false
+	if tools, ok := payload["tools"].([]any); ok {
+		for _, rawTool := range tools {
+			tool, ok := rawTool.(map[string]any)
+			if !ok {
+				continue
+			}
+			function, ok := tool["function"].(map[string]any)
+			if !ok {
+				continue
+			}
+			if parameters, ok := function["parameters"].(map[string]any); ok {
+				if err := normalizeKimiRequestSchemaNode(parameters, &changed); err != nil {
+					return body, statusErr{code: http.StatusBadRequest, msg: fmt.Sprintf("kimi executor: unsupported tool schema: %v", err)}
+				}
+			}
+		}
+	}
+	if responseFormat, ok := payload["response_format"].(map[string]any); ok {
+		if jsonSchema, ok := responseFormat["json_schema"].(map[string]any); ok {
+			if schema, ok := jsonSchema["schema"].(map[string]any); ok {
+				if err := normalizeKimiRequestSchemaNode(schema, &changed); err != nil {
+					return body, statusErr{code: http.StatusBadRequest, msg: fmt.Sprintf("kimi executor: unsupported structured-output schema: %v", err)}
+				}
+			}
+		}
+	}
+	if !changed {
+		return body, nil
+	}
+	normalized, err := json.Marshal(payload)
+	if err != nil {
+		return body, fmt.Errorf("kimi executor: failed to encode request schemas: %w", err)
+	}
+	return normalized, nil
+}
+
+func normalizeKimiRequestSchemaNode(schema map[string]any, changed *bool) error {
+	if err := normalizeKimiRequestSchemaConstraints(schema, changed); err != nil {
+		return err
+	}
+
+	for _, key := range []string{"$defs", "definitions", "dependentSchemas", "patternProperties", "properties"} {
+		children, ok := schema[key].(map[string]any)
+		if !ok {
+			continue
+		}
+		for name, rawChild := range children {
+			if child, ok := rawChild.(map[string]any); ok {
+				if err := normalizeKimiRequestSchemaNode(child, changed); err != nil {
+					return fmt.Errorf("%s.%s: %w", key, name, err)
+				}
+			}
+		}
+	}
+	for _, key := range []string{"additionalItems", "additionalProperties", "contains", "contentSchema", "else", "if", "items", "not", "propertyNames", "then", "unevaluatedItems", "unevaluatedProperties"} {
+		if child, ok := schema[key].(map[string]any); ok {
+			if err := normalizeKimiRequestSchemaNode(child, changed); err != nil {
+				return fmt.Errorf("%s: %w", key, err)
+			}
+		}
+	}
+	for _, key := range []string{"allOf", "anyOf", "items", "oneOf", "prefixItems"} {
+		children, ok := schema[key].([]any)
+		if !ok {
+			continue
+		}
+		for index, rawChild := range children {
+			if child, ok := rawChild.(map[string]any); ok {
+				if err := normalizeKimiRequestSchemaNode(child, changed); err != nil {
+					return fmt.Errorf("%s[%d]: %w", key, index, err)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func normalizeKimiRequestSchemaConstraints(schema map[string]any, changed *bool) error {
+	typeNames, hasTypeArray, err := kimiSchemaTypeNames(schema["type"])
+	if err != nil {
+		return err
+	}
+	if hasTypeArray && len(typeNames) == 0 {
+		return fmt.Errorf("schema type arrays must not be empty")
+	}
+	enumValues, hasEnum := schema["enum"].([]any)
+	enumHasNull := false
+	for _, value := range enumValues {
+		if value == nil {
+			enumHasNull = true
+			break
+		}
+	}
+	if !hasTypeArray && !enumHasNull {
+		return nil
+	}
+	if _, ok := schema["anyOf"]; ok {
+		return fmt.Errorf("nullable type or enum cannot be combined with an existing anyOf without changing its meaning")
+	}
+
+	constValue, hasConst := schema["const"]
+	typeAllowsNull := len(typeNames) == 0 || slices.Contains(typeNames, "null")
+	nullAllowed := typeAllowsNull && (!hasEnum || enumHasNull) && (!hasConst || constValue == nil)
+	nonNullEnum := make([]any, 0, len(enumValues))
+	for _, value := range enumValues {
+		if value != nil {
+			nonNullEnum = append(nonNullEnum, value)
+		}
+	}
+	for _, value := range nonNullEnum {
+		matchesType := len(typeNames) == 0
+		for _, typeName := range typeNames {
+			if kimiSchemaEnumValueMatchesType(value, typeName) {
+				matchesType = true
+				break
+			}
+		}
+		if !matchesType {
+			return fmt.Errorf("nullable enum contains a non-null value that MFJS cannot represent for its declared type")
+		}
+	}
+
+	branches := make([]any, 0, len(typeNames)+1)
+	if !hasConst || constValue != nil {
+		if len(typeNames) == 0 && len(nonNullEnum) > 0 {
+			if !kimiSchemaEnumValuesHaveOneType(nonNullEnum) {
+				return fmt.Errorf("nullable enums without a type must use one non-null value type")
+			}
+			branches = append(branches, map[string]any{"enum": nonNullEnum})
+		}
+		for _, typeName := range typeNames {
+			if typeName == "null" {
+				continue
+			}
+			branch := map[string]any{"type": typeName}
+			if hasConst {
+				branch["const"] = constValue
+			}
+			if hasEnum {
+				filtered := make([]any, 0, len(nonNullEnum))
+				for _, value := range nonNullEnum {
+					if kimiSchemaEnumValueMatchesType(value, typeName) {
+						filtered = append(filtered, value)
+					}
+				}
+				if len(filtered) == 0 {
+					continue
+				}
+				branch["enum"] = filtered
+			}
+			branches = append(branches, branch)
+		}
+	}
+	if nullAllowed {
+		branches = append(branches, map[string]any{"type": "null"})
+	}
+	if len(branches) == 0 {
+		return fmt.Errorf("nullable schema has no representable MFJS branch")
+	}
+
+	delete(schema, "type")
+	delete(schema, "enum")
+	if hasConst && constValue == nil {
+		delete(schema, "const")
+	}
+	if len(branches) == 1 {
+		for key, value := range branches[0].(map[string]any) {
+			schema[key] = value
+		}
+	} else {
+		schema["anyOf"] = branches
+	}
+	*changed = true
+	return nil
+}
+
+func kimiSchemaTypeNames(raw any) ([]string, bool, error) {
+	if typeName, ok := raw.(string); ok {
+		if typeName == "" {
+			return nil, false, nil
+		}
+		return []string{typeName}, false, nil
+	}
+	rawTypes, ok := raw.([]any)
+	if !ok {
+		return nil, false, nil
+	}
+	typeNames := make([]string, 0, len(rawTypes))
+	seen := map[string]bool{}
+	for _, rawType := range rawTypes {
+		typeName, ok := rawType.(string)
+		if !ok || typeName == "" {
+			return nil, true, fmt.Errorf("schema type arrays must contain non-empty strings")
+		}
+		if !seen[typeName] {
+			typeNames = append(typeNames, typeName)
+			seen[typeName] = true
+		}
+	}
+	return typeNames, true, nil
+}
+
+func kimiSchemaEnumValueMatchesType(value any, typeName string) bool {
+	switch typeName {
+	case "string":
+		_, ok := value.(string)
+		return ok
+	case "number":
+		_, ok := value.(json.Number)
+		return ok
+	case "integer":
+		number, ok := value.(json.Number)
+		if !ok {
+			return false
+		}
+		parsed, ok := new(big.Rat).SetString(number.String())
+		return ok && parsed.IsInt()
+	default:
+		return false
+	}
+}
+
+func kimiSchemaEnumValuesHaveOneType(values []any) bool {
+	typeName := ""
+	for _, value := range values {
+		current := ""
+		switch value.(type) {
+		case string:
+			current = "string"
+		case json.Number:
+			current = "number"
+		default:
+			return false
+		}
+		if typeName != "" && typeName != current {
+			return false
+		}
+		typeName = current
+	}
+	return typeName != ""
 }
 
 func normalizeKimiToolMessageLinks(body []byte) ([]byte, error) {

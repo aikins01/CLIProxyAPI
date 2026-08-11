@@ -34,12 +34,23 @@ const (
 	neoReviewSnapshotZeroLineKey     = "internal.reviewSnapshotZeroLineFiles"
 	neoReviewSnapshotTextKey         = "internal.reviewSnapshotText"
 	neoReviewSnapshotStateMetaKey    = "internal.reviewSnapshot"
+	neoRunCheckToolEvidenceKey       = "internal.runCheckToolEvidence"
+	neoRunCheckToolEvidenceRequired  = "internal.runCheckToolEvidenceRequired"
 )
 
 var (
 	neoReviewHunkHeaderPattern        = regexp.MustCompile(`^@@ -[0-9]+(?:,[0-9]+)? \+([0-9]+)(?:,([0-9]+))? @@`)
 	neoReviewEmptyRetainedHunkPattern = regexp.MustCompile(`^@@ -1(?:,[0-9]+)? \+(?:0|1),0 @@`)
+	neoRunCheckExportIndexPattern     = regexp.MustCompile(`(?is)(?:\bexports\b|\bexportsmap\b|\.exports)\s*(?:\?\.)?\s*\[[^]]+\]`)
+	neoRunCheckWildcardExportPattern  = regexp.MustCompile(`(?m)["'][^"'\r\n]*\*[^"'\r\n]*["']\s*:`)
+	neoRunCheckExportPacketPattern    = regexp.MustCompile(`(?is)["']CLIPROXY_PACKAGE_EXPORTS=["']\s*\+\s*JSON\.stringify\(\s*pkg\.exports\s*\)`)
 )
+
+type neoDependencyAccessPath struct {
+	raw     string
+	module  string
+	members []string
+}
 
 type neoReviewDiffHunk struct {
 	ID        string
@@ -1384,6 +1395,9 @@ func neoRunCheckResponseJSONSchema() map[string]any {
 	nullableString := func() map[string]any {
 		return map[string]any{"type": []any{"string", "null"}}
 	}
+	nullableStringArray := func() map[string]any {
+		return map[string]any{"type": []any{"array", "null"}, "items": map[string]any{"type": "string"}}
+	}
 	nullableEnum := func(values ...string) map[string]any {
 		enum := make([]any, 0, len(values)+1)
 		for _, value := range values {
@@ -1401,8 +1415,9 @@ func neoRunCheckResponseJSONSchema() map[string]any {
 		"dependency":          nullableString(),
 		"floorVersion":        nullableString(),
 		"accessPath":          nullableString(),
+		"floorStatus":         nullableEnum("compatible", "incompatible", "unverified"),
 		"verification":        nullableEnum("root-runtime-traversal", "root-source-construction", "root-type-declaration", "exact-export-inspection", "exact-behavior-test"),
-		"rootEvidence":        nullableString(),
+		"rootEvidence":        nullableStringArray(),
 		"phaseRelationship":   nullableString(),
 		"budgetOrigin":        nullableEnum("original", "remaining", "independent"),
 		"decisiveSequence":    nullableString(),
@@ -1671,16 +1686,34 @@ func neoNormalizeRunCheckResult(input map[string]any, parsed map[string]any) (ma
 				dependency := strings.TrimSpace(stringValue(entry["dependency"]))
 				floorVersion := strings.TrimSpace(stringValue(entry["floorVersion"]))
 				accessPath := strings.TrimSpace(stringValue(entry["accessPath"]))
+				floorStatus := strings.TrimSpace(stringValue(entry["floorStatus"]))
 				verification := strings.TrimSpace(stringValue(entry["verification"]))
-				rootEvidence := strings.TrimSpace(stringValue(entry["rootEvidence"]))
+				rootEvidence, rootEvidenceOK := neoRunCheckStringSlice(entry["rootEvidence"])
 				if dependency == "" || floorVersion == "" || accessPath == "" {
 					return nil, fmt.Errorf("dependency-floor evidence entry %d requires dependency, floorVersion, and accessPath", i)
 				}
-				if rootEvidence == "" {
-					return nil, fmt.Errorf("dependency-floor evidence entry %d requires rootEvidence", i)
+				parsedAccessPath, accessPathErr := neoParseDependencyAccessPath(accessPath)
+				if accessPathErr != nil {
+					return nil, fmt.Errorf("dependency-floor evidence entry %d has invalid accessPath: %w", i, accessPathErr)
 				}
-				if !strings.ContainsAny(accessPath, "./:") {
-					return nil, fmt.Errorf("dependency-floor evidence entry %d accessPath %q must include the root owner and required capability", i, accessPath)
+				expectedPattern := neoDependencyPatternKey(dependency, floorVersion, accessPath)
+				if pattern := patterns[patternIndex].(string); pattern != expectedPattern {
+					return nil, fmt.Errorf("dependency-floor evidence entry %d pattern must be %q for accessPath %q", i, expectedPattern, accessPath)
+				}
+				if !rootEvidenceOK || len(rootEvidence) == 0 {
+					return nil, fmt.Errorf("dependency-floor evidence entry %d requires rootEvidence as a non-empty array of exact excerpts", i)
+				}
+				switch floorStatus {
+				case "compatible":
+					if outcome != "no-finding" {
+						return nil, fmt.Errorf("dependency-floor evidence entry %d compatible floorStatus requires no-finding outcome", i)
+					}
+				case "incompatible", "unverified":
+					if outcome != "finding" {
+						return nil, fmt.Errorf("dependency-floor evidence entry %d %s floorStatus requires finding outcome", i, floorStatus)
+					}
+				default:
+					return nil, fmt.Errorf("dependency-floor evidence entry %d has invalid floorStatus %q", i, floorStatus)
 				}
 				switch verification {
 				case "root-runtime-traversal", "root-source-construction", "root-type-declaration", "exact-export-inspection", "exact-behavior-test":
@@ -1691,12 +1724,22 @@ func neoNormalizeRunCheckResult(input map[string]any, parsed map[string]any) (ma
 				if seenCapabilities[capabilityKey] {
 					return nil, fmt.Errorf("dependency-floor evidence entry %d duplicates capability path %q at %s@%s", i, accessPath, dependency, floorVersion)
 				}
+				rootEvidence = neoNonEmptyRunCheckEvidence(rootEvidence)
+				if len(rootEvidence) == 0 {
+					return nil, fmt.Errorf("dependency-floor evidence entry %d requires non-empty rootEvidence excerpts", i)
+				}
+				if boolValue(input[neoRunCheckToolEvidenceRequired]) {
+					if err := neoValidateDependencyToolEvidence(input, i, dependency, floorVersion, floorStatus, verification, parsedAccessPath, rootEvidence); err != nil {
+						return nil, err
+					}
+				}
 				seenCapabilities[capabilityKey] = true
 				normalizedEvidence["dependency"] = dependency
 				normalizedEvidence["floorVersion"] = floorVersion
 				normalizedEvidence["accessPath"] = accessPath
+				normalizedEvidence["floorStatus"] = floorStatus
 				normalizedEvidence["verification"] = verification
-				normalizedEvidence["rootEvidence"] = rootEvidence
+				normalizedEvidence["rootEvidence"] = stringArrayValue(rootEvidence)
 			}
 			if checkName == "bounded-artifact-state-transitions" && outcome != "not-applicable" {
 				phaseRelationship := strings.TrimSpace(stringValue(entry["phaseRelationship"]))
@@ -1761,6 +1804,2218 @@ func neoNormalizeRunCheckResult(input map[string]any, parsed map[string]any) (ma
 		out["evidence"] = evidence
 	}
 	return out, nil
+}
+
+func neoNonEmptyRunCheckEvidence(fragments []string) []string {
+	nonEmpty := make([]string, 0, len(fragments))
+	for _, fragment := range fragments {
+		if strings.TrimSpace(fragment) != "" {
+			nonEmpty = append(nonEmpty, fragment)
+		}
+	}
+	return nonEmpty
+}
+
+func neoValidateDependencyToolEvidence(input map[string]any, entryIndex int, dependency, floorVersion, floorStatus, verification string, accessPath neoDependencyAccessPath, fragments []string) error {
+	toolEvidence := arrayValue(input[neoRunCheckToolEvidenceKey])
+	if len(toolEvidence) == 0 {
+		return fmt.Errorf("dependency-floor evidence entry %d requires exact rootEvidence excerpts from successful tool results", entryIndex)
+	}
+	edgeOwners := append([]string(nil), accessPath.members[:len(accessPath.members)-1]...)
+	for edgeIndex := range edgeOwners {
+		for _, fragment := range fragments {
+			if declaredOwner := neoRunCheckDeclaredMemberOwner(fragment, edgeOwners[edgeIndex], accessPath.members[edgeIndex+1]); declaredOwner != "" {
+				if edgeIndex+1 < len(edgeOwners) {
+					edgeOwners[edgeIndex+1] = declaredOwner
+				}
+				break
+			}
+		}
+	}
+	coveredEdges := make([]bool, len(accessPath.members)-1)
+	moduleEdgeCovered := accessPath.module == ""
+	assertionStatus := map[string]string{
+		"compatible":   "AVAILABLE",
+		"incompatible": "MISSING",
+		"unverified":   "UNVERIFIED",
+	}[floorStatus]
+	assertion := accessPath.raw + "=" + assertionStatus
+	if latestStatus, ok := neoRunCheckLatestDependencyStatus(toolEvidence, dependency, floorVersion, verification, accessPath); ok && latestStatus != assertionStatus {
+		return fmt.Errorf("dependency-floor evidence entry %d status assertion %q was superseded by later successful exact-floor output %q", entryIndex, assertion, accessPath.raw+"="+latestStatus)
+	}
+	assertionFound := false
+	absentEdge := -1
+	moduleMissing := false
+	fragmentPresentEdges := make([][]int, len(fragments))
+	for fragmentIndex, fragment := range fragments {
+		if !utf8.ValidString(fragment) || len(fragment) > 2048 {
+			return fmt.Errorf("dependency-floor evidence entry %d rootEvidence excerpt %d must contain at most 2048 valid UTF-8 bytes", entryIndex, fragmentIndex)
+		}
+		matched := false
+		matchedOutput := ""
+		matchedCallText := ""
+		unsafeReason := ""
+		for _, raw := range toolEvidence {
+			evidence := mapValue(raw)
+			callText := neoRunCheckToolEvidenceCallText(evidence)
+			output, outputMatched := neoRunCheckToolEvidenceOutput(evidence, fragment)
+			if outputMatched && neoRunCheckExactFloorEvidenceTarget(callText, dependency, floorVersion, verification) {
+				if neoRunCheckEvidenceLine(fragment, assertion) {
+					if reason := neoRunCheckUnsafeStatusAssertion(evidence, output, accessPath, assertionStatus, verification); reason != "" {
+						unsafeReason = reason
+						continue
+					}
+				}
+				if strings.Contains(callText, fragment) {
+					continue
+				}
+				matched = true
+				matchedOutput = output
+				matchedCallText = callText
+				break
+			}
+		}
+		if !matched {
+			if unsafeReason != "" {
+				return fmt.Errorf("dependency-floor evidence entry %d rootEvidence excerpt %d uses an unsafe status assertion: %s", entryIndex, fragmentIndex, unsafeReason)
+			}
+			return fmt.Errorf("dependency-floor evidence entry %d rootEvidence excerpt %d was not found verbatim in a successful tool result whose call identifies %s@%s", entryIndex, fragmentIndex, dependency, floorVersion)
+		}
+		meaningful := false
+		for _, status := range []string{"AVAILABLE", "MISSING", "UNVERIFIED"} {
+			candidate := accessPath.raw + "=" + status
+			if status != assertionStatus && neoRunCheckEvidenceLine(fragment, candidate) {
+				return fmt.Errorf("dependency-floor evidence entry %d rootEvidence excerpt %d contradicts floorStatus %q with %q", entryIndex, fragmentIndex, floorStatus, candidate)
+			}
+		}
+		if neoRunCheckEvidenceLine(fragment, assertion) {
+			assertionFound = true
+			meaningful = true
+			if verification == "root-runtime-traversal" || verification == "exact-behavior-test" {
+				moduleEdgeCovered = true
+				for edgeIndex := range coveredEdges {
+					coveredEdges[edgeIndex] = true
+				}
+			} else if verification == "exact-export-inspection" {
+				moduleEdgeCovered = true
+				moduleMissing = assertionStatus == "MISSING"
+			}
+		}
+		if accessPath.module != "" && (neoRunCheckModuleExportBinding(fragment, accessPath.module, accessPath.members[0]) ||
+			neoRunCheckExactModuleTarget(matchedCallText, accessPath.module) && neoRunCheckDirectModuleExport(fragment, accessPath.members[0])) {
+			moduleEdgeCovered = true
+			meaningful = true
+		}
+		for edgeIndex := 0; edgeIndex < len(accessPath.members)-1; edgeIndex++ {
+			allowMethod := edgeIndex == len(accessPath.members)-2
+			memberPresent, memberAbsent := neoRunCheckScopedMemberDeclaration(fragment, edgeOwners[edgeIndex], accessPath.members[edgeIndex+1], allowMethod)
+			if verification == "root-source-construction" {
+				if scopedPresent, scopedAbsent, scoped := neoRunCheckMatchedPythonConstruction(matchedOutput, fragment, edgeOwners[edgeIndex], accessPath.members[edgeIndex+1]); scoped {
+					memberPresent, memberAbsent = scopedPresent, scopedAbsent
+				}
+			}
+			if memberPresent {
+				coveredEdges[edgeIndex] = true
+				fragmentPresentEdges[fragmentIndex] = append(fragmentPresentEdges[fragmentIndex], edgeIndex)
+				meaningful = true
+			}
+			if floorStatus == "incompatible" && memberAbsent && (absentEdge < 0 || edgeIndex < absentEdge) {
+				absentEdge = edgeIndex
+				meaningful = true
+			}
+		}
+		if !meaningful {
+			expected := make([]string, 0, len(coveredEdges)+2)
+			if accessPath.module != "" {
+				expected = append(expected, fmt.Sprintf("complete owner scope for module %q -> export %q", accessPath.module, accessPath.members[0]))
+			}
+			for edgeIndex := 0; edgeIndex < len(accessPath.members)-1; edgeIndex++ {
+				expected = append(expected, fmt.Sprintf("complete owner scope for %q -> %q", accessPath.members[edgeIndex], accessPath.members[edgeIndex+1]))
+			}
+			expected = append(expected, fmt.Sprintf("exact assertion %q", assertion))
+			return fmt.Errorf("dependency-floor evidence entry %d rootEvidence excerpt %d does not prove any edge or exact status for accessPath %q; replace it with %s", entryIndex, fragmentIndex, accessPath.raw, strings.Join(expected, ", "))
+		}
+	}
+	if floorStatus != "compatible" && !assertionFound {
+		return fmt.Errorf("dependency-floor evidence entry %d with %s floorStatus requires exact successful-tool assertion %q", entryIndex, floorStatus, assertion)
+	}
+	if floorStatus == "incompatible" && (verification == "root-source-construction" || verification == "root-type-declaration") && absentEdge < 0 {
+		return fmt.Errorf("dependency-floor evidence entry %d requires a complete exact owner declaration or construction excerpt proving which accessPath edge is missing", entryIndex)
+	}
+	if absentEdge >= 0 {
+		for fragmentIndex, presentEdges := range fragmentPresentEdges {
+			for _, edgeIndex := range presentEdges {
+				if edgeIndex >= absentEdge {
+					return fmt.Errorf("dependency-floor evidence entry %d rootEvidence excerpt %d proves an irrelevant later edge after accessPath edge %q -> %q is already missing", entryIndex, fragmentIndex, accessPath.members[absentEdge], accessPath.members[absentEdge+1])
+				}
+			}
+		}
+	}
+	if !moduleEdgeCovered {
+		return fmt.Errorf("dependency-floor evidence entry %d rootEvidence does not connect module %q to export %q", entryIndex, accessPath.module, accessPath.members[0])
+	}
+	if moduleMissing {
+		return nil
+	}
+	for edgeIndex, covered := range coveredEdges {
+		if absentEdge >= 0 && edgeIndex >= absentEdge {
+			break
+		}
+		if !covered {
+			return fmt.Errorf("dependency-floor evidence entry %d rootEvidence does not connect accessPath segments %q and %q in one exact excerpt", entryIndex, accessPath.members[edgeIndex], accessPath.members[edgeIndex+1])
+		}
+	}
+	return nil
+}
+
+func neoRunCheckLatestDependencyStatus(toolEvidence []any, dependency, floorVersion, verification string, accessPath neoDependencyAccessPath) (string, bool) {
+	latest := ""
+	for _, raw := range toolEvidence {
+		evidence := mapValue(raw)
+		callText := neoRunCheckToolEvidenceCallText(evidence)
+		if !neoRunCheckExactFloorEvidenceTarget(callText, dependency, floorVersion, verification) {
+			continue
+		}
+		for _, output := range neoStringSlice(evidence["outputs"]) {
+			for _, line := range strings.Split(strings.ReplaceAll(output, "\r\n", "\n"), "\n") {
+				line = strings.TrimSpace(line)
+				if strings.Contains(callText, line) {
+					continue
+				}
+				for _, status := range []string{"AVAILABLE", "MISSING", "UNVERIFIED"} {
+					if line != accessPath.raw+"="+status || neoRunCheckUnsafeStatusAssertion(evidence, output, accessPath, status, verification) != "" {
+						continue
+					}
+					latest = status
+					break
+				}
+			}
+		}
+	}
+	return latest, latest != ""
+}
+
+func neoRunCheckToolEvidenceOutput(evidence map[string]any, fragment string) (string, bool) {
+	outputs := neoStringSlice(evidence["outputs"])
+	for index := len(outputs) - 1; index >= 0; index-- {
+		output := outputs[index]
+		if strings.Contains(output, fragment) {
+			return output, true
+		}
+	}
+	return "", false
+}
+
+func neoParseDependencyAccessPath(value string) (neoDependencyAccessPath, error) {
+	if value == "" || len(value) > 512 || !utf8.ValidString(value) || strings.IndexFunc(value, func(r rune) bool { return r <= ' ' || r == 0x7f }) >= 0 {
+		return neoDependencyAccessPath{}, fmt.Errorf("%q must be valid UTF-8 without whitespace or control characters and at most 512 bytes", value)
+	}
+	parsed := neoDependencyAccessPath{raw: value}
+	memberChain := value
+	if hash := strings.IndexByte(value, '#'); hash >= 0 {
+		if hash == 0 || hash == len(value)-1 || strings.Contains(value[hash+1:], "#") {
+			return neoDependencyAccessPath{}, fmt.Errorf("%q must use module-specifier#Export.member for an imported owner", value)
+		}
+		parsed.module = value[:hash]
+		memberChain = value[hash+1:]
+	}
+	parsed.members = strings.Split(memberChain, ".")
+	if len(parsed.members) < 2 {
+		return neoDependencyAccessPath{}, fmt.Errorf("%q must include an owner and terminal capability", value)
+	}
+	for _, member := range parsed.members {
+		if !neoDependencyIdentifier(member) {
+			return neoDependencyAccessPath{}, fmt.Errorf("%q contains invalid owner or capability segment %q", value, member)
+		}
+	}
+	return parsed, nil
+}
+
+func neoDependencyPatternKey(dependency, floorVersion, accessPath string) string {
+	return dependency + "@" + floorVersion + " " + accessPath
+}
+
+func neoDependencyIdentifier(value string) bool {
+	if value == "" || !neoDependencyIdentifierStart(value[0]) {
+		return false
+	}
+	for index := 1; index < len(value); index++ {
+		if !neoDependencyIdentifierStart(value[index]) && (value[index] < '0' || value[index] > '9') {
+			return false
+		}
+	}
+	return true
+}
+
+func neoDependencyIdentifierStart(value byte) bool {
+	return value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' || value == '_' || value == '$'
+}
+
+func neoRunCheckEvidenceTerm(text, term string) bool {
+	text = strings.ToLower(text)
+	term = strings.ToLower(strings.TrimSpace(term))
+	if text == "" || term == "" {
+		return false
+	}
+	for offset := 0; offset <= len(text)-len(term); {
+		index := strings.Index(text[offset:], term)
+		if index < 0 {
+			return false
+		}
+		index += offset
+		beforeOK := index == 0 || !neoRunCheckEvidenceIdentifierByte(text[index-1])
+		after := index + len(term)
+		afterOK := after == len(text) || !neoRunCheckEvidenceIdentifierByte(text[after])
+		if beforeOK && afterOK {
+			return true
+		}
+		offset = index + 1
+	}
+	return false
+}
+
+func neoRunCheckExactIdentifierTerm(text, term string) bool {
+	term = strings.TrimSpace(term)
+	if text == "" || term == "" {
+		return false
+	}
+	for offset := 0; offset <= len(text)-len(term); {
+		index := strings.Index(text[offset:], term)
+		if index < 0 {
+			return false
+		}
+		index += offset
+		beforeOK := index == 0 || !neoRunCheckEvidenceIdentifierByte(text[index-1])
+		after := index + len(term)
+		afterOK := after == len(text) || !neoRunCheckEvidenceIdentifierByte(text[after])
+		if beforeOK && afterOK {
+			return true
+		}
+		offset = index + 1
+	}
+	return false
+}
+
+func neoRunCheckExactModuleTarget(text, module string) bool {
+	module = strings.TrimSpace(module)
+	if text == "" || module == "" {
+		return false
+	}
+	for offset := 0; offset <= len(text)-len(module); {
+		index := strings.Index(text[offset:], module)
+		if index < 0 {
+			return false
+		}
+		index += offset
+		beforeOK := index == 0 || !neoDependencyEvidenceByte(text[index-1])
+		after := index + len(module)
+		afterOK := after == len(text) || !neoDependencyEvidenceByte(text[after])
+		if beforeOK && afterOK {
+			return true
+		}
+		offset = index + 1
+	}
+	return false
+}
+
+func neoRunCheckEvidenceIdentifierByte(value byte) bool {
+	return value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' || value >= '0' && value <= '9' || value == '_' || value == '$'
+}
+
+func neoRunCheckEvidenceDelimitedTerm(text, term string, tokenByte func(byte) bool) bool {
+	text = strings.ToLower(text)
+	term = strings.ToLower(strings.TrimSpace(term))
+	for offset := 0; term != "" && offset <= len(text)-len(term); {
+		index := strings.Index(text[offset:], term)
+		if index < 0 {
+			return false
+		}
+		index += offset
+		beforeOK := index == 0 || !tokenByte(text[index-1])
+		after := index + len(term)
+		if beforeOK && (after == len(text) || !tokenByte(text[after])) {
+			return true
+		}
+		offset = index + 1
+	}
+	return false
+}
+
+func neoRunCheckDependencyTerm(text, term string) bool {
+	text = strings.ToLower(text)
+	term = strings.ToLower(strings.TrimSpace(term))
+	for offset := 0; term != "" && offset <= len(text)-len(term); {
+		index := strings.Index(text[offset:], term)
+		if index < 0 {
+			return false
+		}
+		index += offset
+		beforeOK := index == 0 || !neoDependencyEvidenceByte(text[index-1])
+		after := index + len(term)
+		afterOK := after == len(text) || !neoDependencyEvidenceByte(text[after]) || text[after] == '@'
+		if beforeOK && afterOK {
+			return true
+		}
+		offset = index + 1
+	}
+	return false
+}
+
+func neoRunCheckExactFloorTarget(text, dependency, floorVersion string) bool {
+	return neoRunCheckExactFloorTargetWithCommands(text, dependency, floorVersion, [][]string{
+		{"npm", "pack"}, {"npm", "view"}, {"pnpm", "pack"}, {"pip", "download"}, {"python", "-m", "pip", "download"},
+		{"python3", "-m", "pip", "download"}, {"inspect"}, {"inspect-literal"}, {"load-exact-floor"}, {"resolve.exports"}, {"resolve-exports"},
+	})
+}
+
+func neoRunCheckExactFloorTargetWithCommands(text, dependency, floorVersion string, commands [][]string) bool {
+	dependency = strings.ToLower(strings.TrimSpace(dependency))
+	floorVersion = strings.ToLower(strings.TrimSpace(floorVersion))
+	for _, source := range neoRunCheckExecutableSources(text) {
+		for _, separator := range []string{"@", "=="} {
+			target := dependency + separator + floorVersion
+			for _, command := range neoRunCheckShellStatements(source) {
+				if neoRunCheckCommandTargetsFloorWithCommands(command, target, commands) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func neoRunCheckExactFloorEvidenceTarget(text, dependency, floorVersion, verification string) bool {
+	switch verification {
+	case "root-runtime-traversal", "exact-behavior-test":
+		return neoRunCheckExactFloorTargetWithCommands(text, dependency, floorVersion, [][]string{{"load-exact-floor"}})
+	case "exact-export-inspection":
+		return neoRunCheckExactFloorTargetWithCommands(text, dependency, floorVersion, [][]string{{"resolve.exports"}, {"resolve-exports"}, {"load-exact-floor"}})
+	}
+	executableSources := neoRunCheckExecutableSources(text)
+	shellText := ""
+	if len(executableSources) > 0 {
+		shellText = executableSources[0]
+	}
+	safeArchiveWorkflow := neoRunCheckShellExitsOnError(shellText) && !neoRunCheckShellDisablesErrexit(shellText) && !neoRunCheckShellHasOrOperator(shellText) && !neoRunCheckShellHasBackgroundOperator(shellText) &&
+		(!neoRunCheckShellHasPipeline(shellText) || neoRunCheckShellEnablesPipefail(shellText))
+	dependency = strings.ToLower(strings.TrimSpace(dependency))
+	floorVersion = strings.ToLower(strings.TrimSpace(floorVersion))
+	statements := neoRunCheckShellStatements(shellText)
+	for _, separator := range []string{"@", "=="} {
+		target := dependency + separator + floorVersion
+		if neoRunCheckBoundInspectTarget(shellText, target) {
+			return true
+		}
+		var artifact neoRunCheckFloorArtifact
+		for _, words := range statements {
+			if neoRunCheckCommandTargetsFloor(words, target) {
+				artifact = neoRunCheckExpectedFloorArtifact(words, dependency, floorVersion)
+				continue
+			}
+			if artifact.kind == "" || len(words) == 0 {
+				continue
+			}
+			switch strings.ToLower(words[0]) {
+			case "tar", "bsdtar", "unzip":
+				artifact.root = neoRunCheckExtractedFloorRoot(words, artifact)
+			case "cat", "sed", "awk", "grep", "rg", "head", "tail":
+				if safeArchiveWorkflow && artifact.root != "" && neoRunCheckCommandReadsFloorRoot(words, artifact.root) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func neoRunCheckBoundInspectTarget(text, target string) bool {
+	var statement []string
+	for _, source := range neoRunCheckExecutableSources(text) {
+		for _, words := range neoRunCheckShellStatements(source) {
+			if statement != nil {
+				return false
+			}
+			statement = words
+		}
+	}
+	return len(statement) > 1 && (strings.EqualFold(statement[0], "inspect") || strings.EqualFold(statement[0], "inspect-literal")) && strings.EqualFold(statement[1], target)
+}
+
+type neoRunCheckFloorArtifact struct {
+	kind       string
+	dependency string
+	version    string
+	root       string
+}
+
+func neoRunCheckExpectedFloorArtifact(words []string, dependency, floorVersion string) neoRunCheckFloorArtifact {
+	if len(words) >= 3 && (strings.EqualFold(words[0], "npm") || strings.EqualFold(words[0], "pnpm")) && strings.EqualFold(words[1], "pack") {
+		return neoRunCheckFloorArtifact{kind: "npm", dependency: dependency, version: floorVersion}
+	}
+	for _, prefix := range [][]string{{"pip", "download"}, {"python", "-m", "pip", "download"}, {"python3", "-m", "pip", "download"}} {
+		if len(words) <= len(prefix) {
+			continue
+		}
+		matched := true
+		for index, part := range prefix {
+			if !strings.EqualFold(words[index], part) {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return neoRunCheckFloorArtifact{kind: "python", dependency: dependency, version: floorVersion}
+		}
+	}
+	return neoRunCheckFloorArtifact{}
+}
+
+func neoRunCheckExtractedFloorRoot(words []string, artifact neoRunCheckFloorArtifact) string {
+	archive := ""
+	destination := "."
+	for index := 1; index < len(words); index++ {
+		word := strings.TrimSpace(words[index])
+		if neoRunCheckFloorArchive(artifact, filepath.Base(word)) {
+			archive = filepath.Base(word)
+			continue
+		}
+		unzip := strings.EqualFold(words[0], "unzip")
+		if (unzip && word == "-d" || !unzip && word == "-C") && index+1 < len(words) {
+			destination = filepath.Clean(words[index+1])
+			index++
+		}
+	}
+	if archive == "" {
+		return ""
+	}
+	if artifact.kind == "npm" {
+		return filepath.Join(destination, "package")
+	}
+	if strings.HasSuffix(strings.ToLower(archive), ".whl") {
+		return destination
+	}
+	return filepath.Join(destination, neoRunCheckArchiveStem(archive))
+}
+
+func neoRunCheckFloorArchive(artifact neoRunCheckFloorArtifact, archive string) bool {
+	archive = strings.ToLower(strings.TrimSpace(archive))
+	name := strings.ToLower(strings.TrimPrefix(artifact.dependency, "@"))
+	name = strings.ReplaceAll(name, "/", "-")
+	if artifact.kind == "npm" {
+		name = strings.ReplaceAll(name, "_", "-")
+		return archive == name+"-"+artifact.version+".tgz"
+	}
+	for _, candidate := range []string{
+		strings.NewReplacer("-", "_", ".", "_").Replace(name),
+		strings.NewReplacer("_", "-", ".", "-").Replace(name),
+	} {
+		prefix := candidate + "-" + artifact.version
+		if archive == prefix+".tar.gz" || archive == prefix+".tgz" || archive == prefix+".zip" || strings.HasPrefix(archive, prefix+"-") && strings.HasSuffix(archive, ".whl") {
+			return true
+		}
+	}
+	return false
+}
+
+func neoRunCheckArchiveStem(archive string) string {
+	lower := strings.ToLower(archive)
+	for _, suffix := range []string{".tar.gz", ".tgz", ".zip"} {
+		if strings.HasSuffix(lower, suffix) {
+			return archive[:len(archive)-len(suffix)]
+		}
+	}
+	return archive
+}
+
+func neoRunCheckCommandReadsFloorRoot(words []string, root string) bool {
+	root = filepath.Clean(root)
+	for _, word := range words[1:] {
+		candidate := filepath.Clean(strings.TrimSpace(word))
+		if candidate == root || strings.HasPrefix(candidate, root+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
+}
+
+func neoRunCheckCommandTargetsFloor(words []string, target string) bool {
+	return neoRunCheckCommandTargetsFloorWithCommands(words, target, [][]string{
+		{"npm", "pack"}, {"npm", "view"}, {"pnpm", "pack"}, {"pip", "download"}, {"python", "-m", "pip", "download"},
+		{"python3", "-m", "pip", "download"}, {"inspect"}, {"inspect-literal"}, {"load-exact-floor"}, {"resolve.exports"}, {"resolve-exports"},
+	})
+}
+
+func neoRunCheckCommandTargetsFloorWithCommands(words []string, target string, commands [][]string) bool {
+	for _, command := range commands {
+		if len(words) <= len(command) {
+			continue
+		}
+		matched := true
+		for index, commandWord := range command {
+			if !strings.EqualFold(words[index], commandWord) {
+				matched = false
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+		for index := len(command); index < len(words); index++ {
+			word := strings.ToLower(words[index])
+			if word == target {
+				return true
+			}
+			if !strings.HasPrefix(word, "-") {
+				continue
+			}
+			if strings.Contains(word, "=") || neoRunCheckFloorBooleanOption(word) {
+				continue
+			}
+			if !neoRunCheckFloorValueOption(word) || index+1 >= len(words) {
+				break
+			}
+			index++
+		}
+	}
+	return false
+}
+
+func neoRunCheckFloorBooleanOption(option string) bool {
+	switch option {
+	case "--json", "--dry-run", "--ignore-scripts", "--no-deps", "--no-binary", "--only-binary", "--pre", "--no-build-isolation":
+		return true
+	default:
+		return false
+	}
+}
+
+func neoRunCheckFloorValueOption(option string) bool {
+	switch option {
+	case "--pack-destination", "-d", "--dest", "--platform", "--python-version", "--implementation", "--abi", "--index-url", "--extra-index-url", "--find-links", "--proxy", "--timeout", "--retries", "--cache-dir", "--cert", "--client-cert", "--progress-bar", "--config-settings":
+		return true
+	default:
+		return false
+	}
+}
+
+func neoRunCheckShellStatements(text string) [][]string {
+	statements := make([][]string, 0)
+	words := make([]string, 0)
+	var word strings.Builder
+	flushWord := func() {
+		if word.Len() > 0 {
+			words = append(words, word.String())
+			word.Reset()
+		}
+	}
+	flushStatement := func() {
+		flushWord()
+		if len(words) > 0 {
+			statements = append(statements, words)
+			words = nil
+		}
+	}
+	var quote byte
+	escaped := false
+	comment := false
+	for index := 0; index < len(text); index++ {
+		current := text[index]
+		if comment {
+			if current == '\n' {
+				comment = false
+				flushStatement()
+			}
+			continue
+		}
+		if escaped {
+			word.WriteByte(current)
+			escaped = false
+			continue
+		}
+		if quote != 0 {
+			if current == '\\' && quote == '"' {
+				escaped = true
+				continue
+			}
+			if current == quote {
+				quote = 0
+				continue
+			}
+			word.WriteByte(current)
+			continue
+		}
+		switch current {
+		case '\\':
+			escaped = true
+		case '\'', '"':
+			quote = current
+		case ' ', '\t', '\r':
+			flushWord()
+		case '\n', ';', '|', '&', '(', ')':
+			flushStatement()
+			if (current == '|' || current == '&') && index+1 < len(text) && text[index+1] == current {
+				index++
+			}
+		case '#':
+			if word.Len() == 0 {
+				comment = true
+			} else {
+				word.WriteByte(current)
+			}
+		default:
+			word.WriteByte(current)
+		}
+	}
+	flushStatement()
+	return statements
+}
+
+func neoDependencyEvidenceByte(value byte) bool {
+	return neoRunCheckEvidenceIdentifierByte(value) || strings.ContainsRune("@/.-+", rune(value))
+}
+
+func neoVersionEvidenceByte(value byte) bool {
+	return neoRunCheckEvidenceIdentifierByte(value) || strings.ContainsRune(".-+", rune(value))
+}
+
+func neoRunCheckEvidenceLine(text, line string) bool {
+	for _, candidate := range strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n") {
+		if strings.TrimSpace(candidate) == line {
+			return true
+		}
+	}
+	return false
+}
+
+func neoRunCheckModuleExportBinding(fragment, module, exportName string) bool {
+	mask := neoRunCheckDeclarationLexicalMask(fragment)
+	pattern := regexp.MustCompile(`(?s)\bexport\s+(?:type\s+)?\{([^}]*)\}\s*from\s*["']` + regexp.QuoteMeta(module) + `["']`)
+	for _, match := range pattern.FindAllStringSubmatchIndex(fragment, -1) {
+		if match[0] < 0 || match[1] > len(mask) || !neoRunCheckEvidenceTerm(mask[match[0]:match[1]], "export") {
+			continue
+		}
+		for _, binding := range strings.Split(fragment[match[2]:match[3]], ",") {
+			fields := strings.Fields(strings.TrimSpace(binding))
+			if len(fields) > 0 && fields[0] == "type" {
+				fields = fields[1:]
+			}
+			boundName := ""
+			if len(fields) == 1 {
+				boundName = fields[0]
+			} else if len(fields) == 3 && fields[1] == "as" {
+				boundName = fields[2]
+			}
+			if boundName == exportName {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func neoRunCheckDirectModuleExport(fragment, exportName string) bool {
+	mask := neoRunCheckDeclarationLexicalMask(fragment)
+	declaration := regexp.MustCompile(`\bexport\s+(?:declare\s+)?(?:abstract\s+)?(?:class|interface|type|enum|function|namespace|const|let|var)\s+` + regexp.QuoteMeta(exportName) + `\b`)
+	if declaration.MatchString(mask) {
+		return true
+	}
+	bindings := regexp.MustCompile(`(?s)\bexport\s+(?:type\s+)?\{([^}]*)\}\s*;?`).FindAllStringSubmatch(mask, -1)
+	for _, bindingList := range bindings {
+		if len(bindingList) != 2 {
+			continue
+		}
+		for _, binding := range strings.Split(bindingList[1], ",") {
+			fields := strings.Fields(strings.TrimSpace(binding))
+			if len(fields) > 0 && fields[0] == "type" {
+				fields = fields[1:]
+			}
+			if len(fields) == 1 && fields[0] == exportName || len(fields) == 3 && fields[1] == "as" && fields[2] == exportName {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func neoRunCheckScopedMember(fragment, owner, member string) (bool, bool) {
+	return neoRunCheckScopedMemberDeclaration(fragment, owner, member, true)
+}
+
+func neoRunCheckDeclaredMemberOwner(fragment, owner, member string) string {
+	masked := neoRunCheckDeclarationLexicalMask(fragment)
+	for _, scope := range neoRunCheckOwnerScopes(masked, owner) {
+		body := scope
+		if open := strings.IndexByte(scope, '{'); open >= 0 {
+			body = scope[open+1:]
+		} else if lineEnd := strings.IndexByte(scope, '\n'); lineEnd >= 0 {
+			body = scope[lineEnd+1:]
+		}
+		declaration := regexp.MustCompile(`(?:^|[;\n{}])\s*(?:(?:public|private|protected|readonly|static|abstract|declare|override|get)\s+)*` + regexp.QuoteMeta(member) + `\s*[?!]?\s*(?:\(\s*\))?\s*:\s*([A-Za-z_$][A-Za-z0-9_$]*)`)
+		if match := declaration.FindStringSubmatch(body); len(match) == 2 {
+			return match[1]
+		}
+	}
+	for _, scope := range neoRunCheckPythonOwnerScopes(fragment, owner) {
+		if mapBody, ok := neoRunCheckPythonSubSDKMap(scope); ok {
+			mapping := regexp.MustCompile(`["']` + regexp.QuoteMeta(member) + `["']\s*:\s*([A-Za-z_$][A-Za-z0-9_$]*)`)
+			if match := mapping.FindStringSubmatch(mapBody); len(match) == 2 {
+				return match[1]
+			}
+		}
+	}
+	return ""
+}
+
+func neoRunCheckScopedMemberDeclaration(fragment, owner, member string, allowMethod bool) (bool, bool) {
+	scopes := neoRunCheckOwnerScopes(neoRunCheckDeclarationLexicalMask(fragment), owner)
+	if len(scopes) == 0 {
+		return false, false
+	}
+	ambiguous := false
+	for _, scope := range scopes {
+		body := scope
+		if open := strings.IndexByte(scope, '{'); open >= 0 {
+			body = scope[open+1:]
+		} else if lineEnd := strings.IndexByte(scope, '\n'); lineEnd >= 0 {
+			body = scope[lineEnd+1:]
+		}
+		if neoRunCheckDirectMemberDeclaration(body, member, allowMethod) {
+			return true, false
+		}
+		ambiguous = ambiguous || neoRunCheckExactIdentifierTerm(body, member)
+	}
+	for _, scope := range scopes {
+		if neoRunCheckScopeHasInheritance(scope, owner) {
+			return false, false
+		}
+	}
+	if ambiguous {
+		return false, false
+	}
+	return false, true
+}
+
+func neoRunCheckDirectMemberDeclaration(body, member string, allowMethod bool) bool {
+	folded := body
+	member = strings.TrimSpace(member)
+	braceDepth, parenDepth, bracketDepth := 0, 0, 0
+	for offset := 0; member != "" && offset <= len(folded)-len(member); offset++ {
+		switch folded[offset] {
+		case '{':
+			braceDepth++
+			continue
+		case '}':
+			if braceDepth > 0 {
+				braceDepth--
+			}
+			continue
+		case '(':
+			parenDepth++
+			continue
+		case ')':
+			if parenDepth > 0 {
+				parenDepth--
+			}
+			continue
+		case '[':
+			bracketDepth++
+			continue
+		case ']':
+			if bracketDepth > 0 {
+				bracketDepth--
+			}
+			continue
+		}
+		if braceDepth != 0 || parenDepth != 0 || bracketDepth != 0 || !strings.HasPrefix(folded[offset:], member) {
+			continue
+		}
+		beforeOK := offset == 0 || !neoRunCheckEvidenceIdentifierByte(folded[offset-1])
+		after := offset + len(member)
+		if !beforeOK || after < len(folded) && neoRunCheckEvidenceIdentifierByte(folded[after]) {
+			continue
+		}
+		prefixStart := strings.LastIndexAny(folded[:offset], "\n;{}") + 1
+		prefix := strings.TrimSpace(folded[prefixStart:offset])
+		if !neoRunCheckMemberDeclarationPrefix(prefix) {
+			continue
+		}
+		for after < len(folded) && (folded[after] == ' ' || folded[after] == '\t') {
+			after++
+		}
+		if after < len(folded) && (folded[after] == '?' || folded[after] == '!') {
+			after++
+			for after < len(folded) && (folded[after] == ' ' || folded[after] == '\t') {
+				after++
+			}
+		}
+		if after == len(folded) || strings.ContainsRune(":=;", rune(folded[after])) || (allowMethod || neoRunCheckGetterDeclarationPrefix(prefix)) && folded[after] == '(' {
+			return true
+		}
+	}
+	return false
+}
+
+func neoRunCheckGetterDeclarationPrefix(prefix string) bool {
+	for _, field := range strings.Fields(prefix) {
+		if field == "get" {
+			return true
+		}
+	}
+	return false
+}
+
+func neoRunCheckMemberDeclarationPrefix(prefix string) bool {
+	if prefix == "" {
+		return true
+	}
+	allowed := map[string]bool{
+		"abstract": true, "async": true, "declare": true, "def": true, "get": true, "override": true,
+		"private": true, "protected": true, "public": true, "readonly": true, "set": true, "static": true,
+	}
+	for _, field := range strings.Fields(prefix) {
+		if !allowed[field] {
+			return false
+		}
+	}
+	return true
+}
+
+func neoRunCheckDeclarationLexicalMask(fragment string) string {
+	masked := []byte(fragment)
+	for offset := 0; offset < len(masked); {
+		switch {
+		case offset+1 < len(masked) && masked[offset] == '/' && masked[offset+1] == '/':
+			for offset < len(masked) && masked[offset] != '\n' {
+				masked[offset] = ' '
+				offset++
+			}
+		case offset+1 < len(masked) && masked[offset] == '/' && masked[offset+1] == '*':
+			masked[offset], masked[offset+1] = ' ', ' '
+			offset += 2
+			for offset < len(masked) {
+				if offset+1 < len(masked) && masked[offset] == '*' && masked[offset+1] == '/' {
+					masked[offset], masked[offset+1] = ' ', ' '
+					offset += 2
+					break
+				}
+				if masked[offset] != '\n' {
+					masked[offset] = ' '
+				}
+				offset++
+			}
+		case masked[offset] == '#' && (offset == 0 || masked[offset-1] == ' ' || masked[offset-1] == '\t' || masked[offset-1] == '\n'):
+			for offset < len(masked) && masked[offset] != '\n' {
+				masked[offset] = ' '
+				offset++
+			}
+		case masked[offset] == '\'' || masked[offset] == '"' || masked[offset] == '`':
+			quote := masked[offset]
+			width := 1
+			if quote != '`' && offset+2 < len(masked) && masked[offset+1] == quote && masked[offset+2] == quote {
+				width = 3
+			}
+			for index := 0; index < width; index++ {
+				masked[offset+index] = ' '
+			}
+			offset += width
+			escaped := false
+			for offset < len(masked) {
+				if !escaped && width == 3 && offset+2 < len(masked) && masked[offset] == quote && masked[offset+1] == quote && masked[offset+2] == quote {
+					masked[offset], masked[offset+1], masked[offset+2] = ' ', ' ', ' '
+					offset += 3
+					break
+				}
+				current := masked[offset]
+				if !escaped && width == 1 && current == quote {
+					masked[offset] = ' '
+					offset++
+					break
+				}
+				if current != '\n' {
+					masked[offset] = ' '
+				}
+				if escaped {
+					escaped = false
+				} else if current == '\\' && quote != '\'' {
+					escaped = true
+				}
+				offset++
+			}
+		default:
+			offset++
+		}
+	}
+	return string(masked)
+}
+
+func neoRunCheckScopeHasInheritance(scope, owner string) bool {
+	header := scope
+	if lineEnd := strings.IndexByte(header, '\n'); lineEnd >= 0 {
+		header = header[:lineEnd]
+	}
+	if brace := strings.IndexByte(header, '{'); brace >= 0 {
+		header = header[:brace]
+	}
+	folded := neoRunCheckASCIIFold(header)
+	if neoRunCheckEvidenceTerm(folded, "extends") {
+		return true
+	}
+	classPrefix := "class "
+	trimmed := strings.TrimSpace(header)
+	foldedTrimmed := neoRunCheckASCIIFold(trimmed)
+	if !strings.HasPrefix(foldedTrimmed, classPrefix) {
+		return false
+	}
+	declaration := strings.TrimSpace(trimmed[len(classPrefix):])
+	if len(declaration) < len(owner) || !strings.EqualFold(declaration[:len(owner)], owner) {
+		return false
+	}
+	remainder := strings.TrimSpace(declaration[len(owner):])
+	if !strings.HasPrefix(remainder, "(") {
+		return false
+	}
+	close := strings.IndexByte(remainder, ')')
+	return close > 1 && strings.TrimSpace(remainder[1:close]) != ""
+}
+
+func neoRunCheckMatchedPythonConstruction(_ string, fragment, owner, member string) (bool, bool, bool) {
+	if !strings.Contains(fragment, "_sub_sdk_map") {
+		return false, false, false
+	}
+	for _, scope := range neoRunCheckPythonOwnerScopes(fragment, owner) {
+		if mapBody, ok := neoRunCheckPythonSubSDKMap(scope); ok {
+			present := neoRunCheckExactIdentifierTerm(mapBody, member)
+			return present, !present, true
+		}
+	}
+	return false, false, false
+}
+
+func neoRunCheckPythonSubSDKMap(scope string) (string, bool) {
+	masked := neoRunCheckDeclarationLexicalMask(scope)
+	mapIndex := strings.Index(masked, "_sub_sdk_map")
+	if mapIndex < 0 {
+		return "", false
+	}
+	openOffset := strings.IndexByte(masked[mapIndex:], '{')
+	if openOffset < 0 {
+		return "", false
+	}
+	open := mapIndex + openOffset
+	close := neoRunCheckClosingBrace(masked, open)
+	if close <= open {
+		return "", false
+	}
+	return scope[open : close+1], true
+}
+
+func neoRunCheckBalancedBraces(text string) bool {
+	open := strings.IndexByte(text, '{')
+	return open >= 0 && neoRunCheckClosingBrace(text, open) == len(strings.TrimSpace(text))-1
+}
+
+func neoRunCheckOwnerScopes(fragment, owner string) []string {
+	scopes := make([]string, 0)
+	lower := neoRunCheckASCIIFold(fragment)
+	for _, keyword := range []string{"class", "interface"} {
+		for offset := 0; offset < len(lower); {
+			index := strings.Index(lower[offset:], keyword)
+			if index < 0 {
+				break
+			}
+			index += offset
+			nameStart := index + len(keyword)
+			if index > 0 && neoRunCheckEvidenceIdentifierByte(lower[index-1]) || nameStart >= len(fragment) || fragment[nameStart] != ' ' && fragment[nameStart] != '\t' && fragment[nameStart] != '\n' && fragment[nameStart] != '\r' {
+				offset = index + 1
+				continue
+			}
+			for nameStart < len(fragment) && (fragment[nameStart] == ' ' || fragment[nameStart] == '\t') {
+				nameStart++
+			}
+			nameEnd := nameStart
+			for nameEnd < len(fragment) && neoRunCheckEvidenceIdentifierByte(lower[nameEnd]) {
+				nameEnd++
+			}
+			if fragment[nameStart:nameEnd] != owner {
+				offset = index + 1
+				continue
+			}
+			braceOffset := strings.IndexByte(fragment[nameEnd:], '{')
+			if braceOffset < 0 {
+				offset = nameEnd
+				continue
+			}
+			open := nameEnd + braceOffset
+			if close := neoRunCheckClosingBrace(fragment, open); close > open {
+				scopes = append(scopes, fragment[index:close+1])
+				offset = close + 1
+				continue
+			}
+			offset = open + 1
+		}
+	}
+	lines := strings.Split(strings.ReplaceAll(fragment, "\r\n", "\n"), "\n")
+	for index, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(strings.ToLower(trimmed), "class ") {
+			continue
+		}
+		name := strings.TrimSpace(trimmed[len("class "):])
+		if stop := strings.IndexAny(name, "(: \t"); stop >= 0 {
+			name = name[:stop]
+		}
+		if name != owner {
+			continue
+		}
+		indent := len(line) - len(strings.TrimLeft(line, " \t"))
+		end := index + 1
+		for end < len(lines) {
+			if strings.TrimSpace(lines[end]) == "" {
+				end++
+				continue
+			}
+			bodyIndent := len(lines[end]) - len(strings.TrimLeft(lines[end], " \t"))
+			if bodyIndent <= indent {
+				break
+			}
+			end++
+		}
+		scopes = append(scopes, strings.Join(lines[index:end], "\n"))
+	}
+	return scopes
+}
+
+func neoRunCheckPythonOwnerScopes(fragment, owner string) []string {
+	fragment = strings.ReplaceAll(strings.ReplaceAll(fragment, "\r\n", "\n"), "\r", "\n")
+	originalLines := strings.Split(fragment, "\n")
+	maskedLines := strings.Split(neoRunCheckDeclarationLexicalMask(fragment), "\n")
+	scopes := make([]string, 0)
+	for index, maskedLine := range maskedLines {
+		trimmed := strings.TrimSpace(maskedLine)
+		if !strings.HasPrefix(strings.ToLower(trimmed), "class ") {
+			continue
+		}
+		name := strings.TrimSpace(trimmed[len("class "):])
+		if stop := strings.IndexAny(name, "(: \t"); stop >= 0 {
+			name = name[:stop]
+		}
+		if name != owner {
+			continue
+		}
+		indent := len(maskedLine) - len(strings.TrimLeft(maskedLine, " \t"))
+		end := index + 1
+		for end < len(maskedLines) {
+			if strings.TrimSpace(maskedLines[end]) == "" {
+				end++
+				continue
+			}
+			bodyIndent := len(maskedLines[end]) - len(strings.TrimLeft(maskedLines[end], " \t"))
+			if bodyIndent <= indent {
+				break
+			}
+			end++
+		}
+		scopes = append(scopes, strings.Join(originalLines[index:end], "\n"))
+	}
+	return scopes
+}
+
+func neoRunCheckASCIIFold(value string) string {
+	folded := []byte(value)
+	for index, current := range folded {
+		if current >= 'A' && current <= 'Z' {
+			folded[index] = current + ('a' - 'A')
+		}
+	}
+	return string(folded)
+}
+
+func neoRunCheckUnsafeStatusAssertion(evidence map[string]any, output string, accessPath neoDependencyAccessPath, status, verification string) string {
+	callText := neoRunCheckToolEvidenceCallText(evidence)
+	if status != "UNVERIFIED" && neoRunCheckHasCaughtFailure(callText, accessPath) {
+		return "caught load, import, dependency, extraction, or harness failures must produce UNVERIFIED or a nonzero result, never AVAILABLE or MISSING"
+	}
+	lower := strings.ToLower(neoRunCheckExecutableText(callText))
+	if status != "UNVERIFIED" && neoRunCheckShellTool(stringValue(evidence["tool"])) {
+		if neoRunCheckShellDisablesErrexit(callText) || neoRunCheckShellHasOrOperator(callText) {
+			return "shell failure suppression cannot support an AVAILABLE or MISSING assertion"
+		}
+		if neoRunCheckShellHasBackgroundOperator(callText) {
+			return "background shell commands cannot support an AVAILABLE or MISSING assertion"
+		}
+		if neoRunCheckShellHasAndOperator(callText) && !neoRunCheckShellExitsOnError(callText) {
+			return "shell && chains must enable exit-on-error before emitting AVAILABLE or MISSING"
+		}
+		if neoRunCheckShellHasPipeline(callText) && !neoRunCheckShellEnablesPipefail(callText) {
+			return "shell pipelines must enable pipefail before emitting AVAILABLE or MISSING"
+		}
+		if (strings.Contains(callText, "\n") || strings.Contains(callText, ";")) && !neoRunCheckShellExitsOnError(callText) {
+			return "multi-stage shell measurement must enable exit-on-error before emitting AVAILABLE or MISSING"
+		}
+	}
+	exactExportLookup := strings.Contains(lower, "exports") &&
+		(strings.Contains(lower, "hasownproperty") || strings.Contains(lower, "object.hasown") || neoRunCheckExportIndexPattern.MatchString(lower) ||
+			neoRunCheckExactExportInExpression(callText)) || neoRunCheckStringExportIndex(callText)
+	standardsAwareExportResolver := neoRunCheckStandardsAwareExportResolver(callText)
+	if exactExportLookup && !standardsAwareExportResolver {
+		available, missing, bound := neoRunCheckExportMapStatus(callText, output, accessPath)
+		if status == "AVAILABLE" && (!bound || !available) {
+			return "exact-key package export availability must be bound to the exact-floor package export map or a standards-aware resolver"
+		}
+		if status == "MISSING" && (!bound || !missing) {
+			return "exact-key package export lookup does not establish absence unless wildcard export patterns are resolved"
+		}
+	}
+	if status == "MISSING" && accessPath.module != "" && neoRunCheckWildcardExportPattern.MatchString(output) && !standardsAwareExportResolver {
+		return "package export output contains wildcard export patterns that must be resolved with a standards-aware resolver before declaring a module path missing"
+	}
+	if verification == "root-runtime-traversal" || verification == "exact-behavior-test" || verification == "exact-export-inspection" {
+		if !strings.Contains(strings.ToLower(callText), strings.ToLower(accessPath.raw)) {
+			return "runtime, behavior, and export status assertions must measure the exact accessPath"
+		}
+		if !neoRunCheckHasStatusPredicate(callText, accessPath, verification, status) {
+			return status + " status must be derived from a capability predicate, not assembled unconditionally"
+		}
+	}
+	return ""
+}
+
+func neoRunCheckHasStatusPredicate(callText string, accessPath neoDependencyAccessPath, verification, status string) bool {
+	sources := neoRunCheckExecutableSources(callText)
+	for _, source := range sources {
+		executable := neoRunCheckDeclarationLexicalMask(source)
+		if verification != "exact-export-inspection" {
+			for _, pathPattern := range neoRunCheckRuntimePathPatterns(source, accessPath) {
+				predicate := regexp.MustCompile(`\b(?:typeof\s+` + pathPattern + `\s*(?:===?|!==?)\s*["'](?:function|undefined|object|string|number|boolean|symbol|bigint)["']|callable\(\s*` + pathPattern + `\b)`)
+				for _, match := range predicate.FindAllStringIndex(source, -1) {
+					if !neoRunCheckEvidenceTerm(executable[match[0]:match[1]], "typeof") && !neoRunCheckEvidenceTerm(executable[match[0]:match[1]], "callable") {
+						continue
+					}
+					if neoRunCheckConditionalStatusStatement(source, match[0], match[1], status) {
+						return true
+					}
+				}
+			}
+			continue
+		}
+		if neoRunCheckExportStatusPredicate(source, neoRunCheckASCIIFold(executable), status, accessPath) {
+			return true
+		}
+	}
+	return false
+}
+
+func neoRunCheckRuntimePathPatterns(source string, accessPath neoDependencyAccessPath) []string {
+	parts := make([]string, 0, len(accessPath.members))
+	for _, member := range accessPath.members {
+		parts = append(parts, regexp.QuoteMeta(member))
+	}
+	patterns := []string{strings.Join(parts, `(?:\.|\?\.)`)}
+	if len(accessPath.members) < 2 {
+		return patterns
+	}
+	owner := regexp.QuoteMeta(accessPath.members[0])
+	aliases := make([]string, 0)
+	executable := neoRunCheckDeclarationLexicalMask(source)
+	javascript := regexp.MustCompile(`\b(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*new\s+` + owner + `\b`)
+	for _, match := range javascript.FindAllStringSubmatch(executable, -1) {
+		if len(match) == 2 {
+			aliases = append(aliases, match[1])
+		}
+	}
+	python := regexp.MustCompile(`(?m)^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*` + owner + `\s*\(`)
+	for _, match := range python.FindAllStringSubmatch(executable, -1) {
+		if len(match) == 2 {
+			aliases = append(aliases, match[1])
+		}
+	}
+	suffix := make([]string, 0, len(accessPath.members)-1)
+	for _, member := range accessPath.members[1:] {
+		suffix = append(suffix, regexp.QuoteMeta(member))
+	}
+	for _, alias := range aliases {
+		patterns = append(patterns, regexp.QuoteMeta(alias)+`(?:\.|\?\.)`+strings.Join(suffix, `(?:\.|\?\.)`))
+	}
+	return patterns
+}
+
+func neoRunCheckConditionalStatusStatement(source string, start, end int, status string) bool {
+	statementStart := start
+	for statementStart > 0 && source[statementStart-1] != ';' && source[statementStart-1] != '\n' {
+		statementStart--
+	}
+	statementEnd := end
+	for statementEnd < len(source) && source[statementEnd] != ';' && source[statementEnd] != '\n' {
+		statementEnd++
+	}
+	statement := strings.ToLower(source[statementStart:statementEnd])
+	prefix := strings.TrimSpace(source[statementStart:start])
+	predicate := strings.ToLower(source[start:end])
+	trueStatus, falseStatus, validPredicate := neoRunCheckPredicateStatuses(predicate)
+	if !validPredicate {
+		return false
+	}
+	jsBranches := regexp.MustCompile(`\?\s*["']?` + trueStatus + `["']?\s*:\s*["']?` + falseStatus + `["']?`).FindStringIndex(statement)
+	pythonBranches := regexp.MustCompile(`["']?` + trueStatus + `["']?\s+if\s+[^\n;]+\s+else\s+["']?` + falseStatus + `["']?`).FindStringIndex(statement)
+	if jsBranches == nil && pythonBranches == nil {
+		return false
+	}
+	emitsStatus := neoRunCheckConditionalDirectlyEmitted(source[statementStart:statementEnd], start-statementStart, end-statementStart)
+	if !emitsStatus {
+		assignment := regexp.MustCompile(`(?i)(?:const|let|var)\s+([a-z_$][a-z0-9_$]*)\s*=\s*$`).FindStringSubmatch(prefix)
+		if len(assignment) == 2 {
+			remainder := source[statementEnd:]
+			emitter := regexp.MustCompile(`(?i)(?:console\.log|print|printf|emit)\s*\([^;\n]*\b` + regexp.QuoteMeta(assignment[1]) + `\b`)
+			emitsStatus = emitter.MatchString(remainder)
+		}
+	}
+	return strings.Contains(statement, strings.ToLower(status)) && emitsStatus
+}
+
+func neoRunCheckPredicateStatuses(predicate string) (string, string, bool) {
+	if neoRunCheckEvidenceTerm(predicate, "callable") {
+		return "available", "missing", true
+	}
+	lower := strings.ToLower(strings.TrimSpace(predicate))
+	for _, marker := range []string{"hasownproperty", "object.hasown", " in ", "resolve.exports", "resolve-exports", "import.meta.resolve", "require.resolve"} {
+		index := strings.Index(lower, marker)
+		if index < 0 {
+			continue
+		}
+		prefix := strings.TrimSpace(lower[:index])
+		for strings.HasSuffix(prefix, "(") {
+			prefix = strings.TrimSpace(strings.TrimSuffix(prefix, "("))
+		}
+		if strings.HasSuffix(prefix, "!") {
+			return "missing", "available", true
+		}
+		return "available", "missing", true
+	}
+	comparison := regexp.MustCompile(`(===|==|!==|!=)\s*["'](function|undefined|object|string|number|boolean|symbol|bigint)["']`).FindStringSubmatch(predicate)
+	if len(comparison) != 3 {
+		return "", "", false
+	}
+	equality := comparison[1] == "==" || comparison[1] == "==="
+	switch comparison[2] {
+	case "undefined":
+		if equality {
+			return "missing", "available", true
+		}
+		return "available", "missing", true
+	case "function":
+		if equality {
+			return "available", "missing", true
+		}
+		return "missing", "available", true
+	default:
+		if equality {
+			return "available", "missing", true
+		}
+		return "", "", false
+	}
+}
+
+func neoRunCheckConditionalDirectlyEmitted(statement string, predicateStart, predicateEnd int) bool {
+	masked := strings.ToLower(neoRunCheckDeclarationLexicalMask(statement))
+	emitter := regexp.MustCompile(`(?:console\.log|print|printf|emit)\s*\(`)
+	for _, match := range emitter.FindAllStringIndex(masked, -1) {
+		open := match[1] - 1
+		if open >= predicateStart {
+			continue
+		}
+		depth := 0
+		for index := open; index < len(masked); index++ {
+			switch masked[index] {
+			case '(':
+				depth++
+			case ')':
+				depth--
+				if depth == 0 {
+					if predicateEnd <= index {
+						return true
+					}
+					index = len(masked)
+				}
+			}
+		}
+	}
+	return false
+}
+
+func neoRunCheckExportStatusPredicate(source, executable, status string, accessPath neoDependencyAccessPath) bool {
+	directPredicates := []string{"hasownproperty", "object.hasown", " in "}
+	for _, predicate := range directPredicates {
+		for offset := 0; ; {
+			index := strings.Index(executable[offset:], predicate)
+			if index < 0 {
+				break
+			}
+			index += offset
+			predicateStart := index
+			for previous := index - 1; previous >= 0; previous-- {
+				if source[previous] == ' ' || source[previous] == '\t' || source[previous] == '(' {
+					continue
+				}
+				if source[previous] == '!' {
+					predicateStart = previous
+				}
+				break
+			}
+			predicateEnd := index + len(predicate)
+			for predicateEnd < len(source) && source[predicateEnd] != '?' && source[predicateEnd] != ';' && source[predicateEnd] != '\n' {
+				predicateEnd++
+			}
+			if neoRunCheckExportPredicateTargetsModule(source, index, index+len(predicate), accessPath) && neoRunCheckConditionalStatusStatement(source, predicateStart, predicateEnd, status) {
+				return true
+			}
+			offset = index + 1
+		}
+	}
+	assignment := regexp.MustCompile(`\b(?:const|let|var)\s+([a-z_$][a-z0-9_$]*)\s*=\s*[^;\n]*(?:hasownproperty|object\.hasown|\sin\s+[^;\n]*exports|exports(?:\?\.)?\[[^]]+\]|resolve\.exports|resolve-exports|import\.meta\.resolve|require\.resolve)`)
+	for _, match := range assignment.FindAllStringSubmatchIndex(executable, -1) {
+		if len(match) < 4 {
+			continue
+		}
+		name := executable[match[2]:match[3]]
+		if !neoRunCheckExportPredicateTargetsModule(source, match[0], match[1], accessPath) {
+			continue
+		}
+		trueStatus, falseStatus, validPredicate := neoRunCheckPredicateStatuses(source[match[0]:match[1]])
+		if !validPredicate {
+			continue
+		}
+		conditional := regexp.MustCompile(`(?:console\.log|print|printf|emit)\s*\([^;\n]*\b` + regexp.QuoteMeta(name) + `\b[^;\n]*\?[^;\n]*` + trueStatus + `[^;\n]*:[^;\n]*` + falseStatus)
+		if conditional.MatchString(strings.ToLower(source[match[1]:])) {
+			return true
+		}
+	}
+	return false
+}
+
+func neoRunCheckExportPredicateTargetsModule(source string, start, end int, accessPath neoDependencyAccessPath) bool {
+	if accessPath.module == "" {
+		return true
+	}
+	exportKey := neoRunCheckModuleExportKey(accessPath.module)
+	if exportKey == "" {
+		return false
+	}
+	statementStart := start
+	for statementStart > 0 && source[statementStart-1] != ';' && source[statementStart-1] != '\n' {
+		statementStart--
+	}
+	statementEnd := end
+	for statementEnd < len(source) && source[statementEnd] != ';' && source[statementEnd] != '\n' {
+		statementEnd++
+	}
+	statement := source[statementStart:statementEnd]
+	statementMask := strings.ToLower(neoRunCheckDeclarationLexicalMask(statement))
+	exportTarget := regexp.MustCompile(`(?:\bpkg(?:\?\.|\.)exports\b|resolve\.exports|resolve-exports|import\.meta\.resolve|require\.resolve)`)
+	if !exportTarget.MatchString(statementMask) {
+		return false
+	}
+	quotedKey := regexp.MustCompile(`["']` + regexp.QuoteMeta(exportKey) + `["']`)
+	if quotedKey.MatchString(statement) {
+		return true
+	}
+	assignment := regexp.MustCompile(`(?m)\b(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*["']` + regexp.QuoteMeta(exportKey) + `["']`)
+	for _, match := range assignment.FindAllStringSubmatch(source[:statementEnd], -1) {
+		if len(match) == 2 && neoRunCheckEvidenceTerm(statement, match[1]) {
+			return true
+		}
+	}
+	return false
+}
+
+func neoRunCheckStandardsAwareExportResolver(callInput string) bool {
+	executable := strings.ToLower(neoRunCheckExecutableText(callInput))
+	for _, term := range []string{"resolve.exports", "resolve-exports", "import.meta.resolve(", "require.resolve("} {
+		if neoRunCheckExecutableToken(executable, term) {
+			return true
+		}
+	}
+	return false
+}
+
+func neoRunCheckExecutableToken(text, term string) bool {
+	for offset := 0; offset <= len(text)-len(term); {
+		index := strings.Index(text[offset:], term)
+		if index < 0 {
+			return false
+		}
+		index += offset
+		beforeOK := index == 0 || !neoDependencyEvidenceByte(text[index-1])
+		after := index + len(term)
+		afterOK := strings.HasSuffix(term, "(") || after == len(text) || !neoDependencyEvidenceByte(text[after])
+		if beforeOK && afterOK {
+			return true
+		}
+		offset = index + 1
+	}
+	return false
+}
+
+func neoRunCheckStringExportIndex(callInput string) bool {
+	sources := neoRunCheckExecutableSources(callInput)
+	for _, source := range sources {
+		masked := neoRunCheckDeclarationLexicalMask(source)
+		for open := 0; open < len(masked); open++ {
+			if masked[open] != '[' {
+				continue
+			}
+			closeOffset := strings.IndexByte(masked[open+1:], ']')
+			if closeOffset < 0 {
+				break
+			}
+			close := open + 1 + closeOffset
+			property := strings.TrimSpace(source[open+1 : close])
+			if property != `"exports"` && property != `'exports'` {
+				continue
+			}
+			after := strings.TrimSpace(masked[close+1:])
+			if strings.HasPrefix(after, "?.") {
+				after = strings.TrimSpace(after[2:])
+			}
+			if strings.HasPrefix(after, "[") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func neoRunCheckCompleteExportMap(callInput, output string, accessPath neoDependencyAccessPath) bool {
+	_, missing, ok := neoRunCheckExportMapStatus(callInput, output, accessPath)
+	return ok && missing
+}
+
+func neoRunCheckExportMapStatus(callInput, output string, accessPath neoDependencyAccessPath) (bool, bool, bool) {
+	const marker = "CLIPROXY_PACKAGE_EXPORTS="
+	exportKey := neoRunCheckModuleExportKey(accessPath.module)
+	if exportKey == "" || !neoRunCheckExportPacketPattern.MatchString(callInput) {
+		return false, false, false
+	}
+	for _, line := range strings.Split(strings.ReplaceAll(output, "\r\n", "\n"), "\n") {
+		packet := strings.TrimSpace(line)
+		if !strings.HasPrefix(packet, marker) {
+			continue
+		}
+		var exports any
+		if json.Unmarshal([]byte(strings.TrimSpace(strings.TrimPrefix(packet, marker))), &exports) != nil || !neoRunCheckValidExportTarget(exports) || neoRunCheckExportValueHasWildcard(exports) {
+			continue
+		}
+		switch typed := exports.(type) {
+		case nil, string, []any:
+			if exportKey == "." {
+				return exports != nil, exports == nil, true
+			}
+			return false, true, true
+		case map[string]any:
+			subpathMap := false
+			conditionMap := false
+			for key := range typed {
+				if strings.HasPrefix(key, ".") {
+					subpathMap = true
+				} else {
+					conditionMap = true
+				}
+			}
+			if subpathMap && conditionMap {
+				continue
+			}
+			if !subpathMap {
+				if exportKey == "." {
+					return true, false, true
+				}
+				return false, true, true
+			}
+			target, exported := typed[exportKey]
+			if !exported || target == nil {
+				return false, true, true
+			}
+			return true, false, true
+		}
+	}
+	return false, false, false
+}
+
+func neoRunCheckModuleExportKey(module string) string {
+	parts := strings.Split(strings.TrimSpace(module), "/")
+	prefix := 1
+	if len(parts) > 0 && strings.HasPrefix(parts[0], "@") {
+		prefix = 2
+	}
+	if len(parts) <= prefix {
+		return "."
+	}
+	return "./" + strings.Join(parts[prefix:], "/")
+}
+
+func neoRunCheckExportValueHasWildcard(value any) bool {
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, child := range typed {
+			if strings.Contains(key, "*") || neoRunCheckExportValueHasWildcard(child) {
+				return true
+			}
+		}
+	case []any:
+		for _, child := range typed {
+			if neoRunCheckExportValueHasWildcard(child) {
+				return true
+			}
+		}
+	case string:
+		return strings.Contains(typed, "*")
+	}
+	return false
+}
+
+func neoRunCheckValidExportTarget(value any) bool {
+	switch typed := value.(type) {
+	case nil, string:
+		return true
+	case []any:
+		for _, child := range typed {
+			if !neoRunCheckValidExportTarget(child) {
+				return false
+			}
+		}
+		return true
+	case map[string]any:
+		for _, child := range typed {
+			if !neoRunCheckValidExportTarget(child) {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+func neoRunCheckHasCaughtFailure(callInput string, accessPath neoDependencyAccessPath) bool {
+	for _, source := range neoRunCheckExecutableSources(callInput) {
+		executable := strings.ToLower(neoRunCheckDeclarationLexicalMask(source))
+		for offset := 0; ; {
+			index := strings.Index(executable[offset:], ".catch(")
+			if index < 0 {
+				break
+			}
+			index += offset
+			start := strings.LastIndexAny(executable[:index], ";\n") + 1
+			end := index + len(".catch(")
+			if tail := strings.IndexAny(executable[end:], ";\n"); tail >= 0 {
+				end += tail
+			} else {
+				end = len(executable)
+			}
+			if neoRunCheckCaughtFailureRelevant(source[start:end], accessPath) {
+				return true
+			}
+			offset = index + len(".catch(")
+		}
+		for offset := 0; ; {
+			index := strings.Index(executable[offset:], "catch")
+			if index < 0 {
+				break
+			}
+			index += offset
+			beforeOK := index == 0 || !neoRunCheckEvidenceIdentifierByte(executable[index-1])
+			after := index + len("catch")
+			if beforeOK && (after == len(executable) || !neoRunCheckEvidenceIdentifierByte(executable[after])) {
+				tryIndex := strings.LastIndex(executable[:index], "try")
+				if tryIndex >= 0 && neoRunCheckCaughtFailureRelevant(source[tryIndex:after], accessPath) {
+					return true
+				}
+			}
+			offset = index + len("catch")
+		}
+		lines := strings.Split(strings.ReplaceAll(executable, "\r\n", "\n"), "\n")
+		rawLines := strings.Split(strings.ReplaceAll(source, "\r\n", "\n"), "\n")
+		for index, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if !strings.HasPrefix(trimmed, "except:") && !strings.HasPrefix(trimmed, "except ") {
+				continue
+			}
+			for tryIndex := index - 1; tryIndex >= 0; tryIndex-- {
+				if strings.TrimSpace(lines[tryIndex]) != "try:" {
+					continue
+				}
+				if neoRunCheckCaughtFailureRelevant(strings.Join(rawLines[tryIndex:index+1], "\n"), accessPath) {
+					return true
+				}
+				break
+			}
+		}
+	}
+	return false
+}
+
+func neoRunCheckCaughtFailureRelevant(scope string, accessPath neoDependencyAccessPath) bool {
+	lower := strings.ToLower(scope)
+	if accessPath.raw != "" && strings.Contains(lower, strings.ToLower(accessPath.raw)) {
+		return true
+	}
+	for _, term := range []string{"loadfloor", "load_floor", "loadexactfloor", "load_exact_floor", "import", "require(", "resolve.exports", "resolve-exports", "npm pack", "pnpm pack", "pip download", "tar ", "unzip ", "traverse", "=available", "=missing", "=unverified"} {
+		if strings.Contains(lower, term) {
+			return true
+		}
+	}
+	return false
+}
+
+func neoRunCheckExecutableText(callInput string) string {
+	sources := neoRunCheckExecutableSources(callInput)
+	for index := range sources {
+		sources[index] = neoRunCheckDeclarationLexicalMask(sources[index])
+	}
+	return strings.Join(sources, "\n")
+}
+
+type neoRunCheckHeredoc struct {
+	delimiter  string
+	stripTabs  bool
+	executable bool
+	body       strings.Builder
+}
+
+func neoRunCheckExecutableSources(callInput string) []string {
+	input := strings.ReplaceAll(strings.ReplaceAll(callInput, "\r\n", "\n"), "\r", "\n")
+	outer := []byte(input)
+	scripts := make([]string, 0)
+	pending := make([]*neoRunCheckHeredoc, 0)
+	for offset := 0; offset <= len(input); {
+		end := strings.IndexByte(input[offset:], '\n')
+		if end < 0 {
+			end = len(input)
+		} else {
+			end += offset
+		}
+		line := input[offset:end]
+		if len(pending) > 0 {
+			candidate := line
+			if pending[0].stripTabs {
+				candidate = strings.TrimLeft(candidate, "\t")
+			}
+			if candidate == pending[0].delimiter {
+				if pending[0].executable {
+					scripts = append(scripts, pending[0].body.String())
+				}
+				pending = pending[1:]
+			} else if pending[0].executable {
+				pending[0].body.WriteString(line)
+				pending[0].body.WriteByte('\n')
+			}
+			for index := offset; index < end; index++ {
+				outer[index] = ' '
+			}
+		} else {
+			pending = append(pending, neoRunCheckLineHeredocs(line)...)
+		}
+		if end == len(input) {
+			break
+		}
+		offset = end + 1
+	}
+	outerText := string(outer)
+	sources := []string{outerText}
+	sources = append(sources, neoRunCheckInlineScriptBodies(callInput, neoRunCheckDeclarationLexicalMask(outerText))...)
+	sources = append(sources, scripts...)
+	return sources
+}
+
+func neoRunCheckLineHeredocs(line string) []*neoRunCheckHeredoc {
+	heredocs := make([]*neoRunCheckHeredoc, 0)
+	var quote byte
+	escaped := false
+	for index := 0; index+1 < len(line); index++ {
+		current := line[index]
+		if escaped {
+			escaped = false
+			continue
+		}
+		if quote != 0 {
+			if current == '\\' && quote == '"' {
+				escaped = true
+			} else if current == quote {
+				quote = 0
+			}
+			continue
+		}
+		if current == '\\' {
+			escaped = true
+			continue
+		}
+		if current == '\'' || current == '"' {
+			quote = current
+			continue
+		}
+		if current == '#' && (index == 0 || line[index-1] == ' ' || line[index-1] == '\t') {
+			break
+		}
+		if current != '<' || line[index+1] != '<' {
+			continue
+		}
+		cursor := index + 2
+		stripTabs := false
+		if cursor < len(line) && line[cursor] == '-' {
+			stripTabs = true
+			cursor++
+		}
+		for cursor < len(line) && (line[cursor] == ' ' || line[cursor] == '\t') {
+			cursor++
+		}
+		delimiterQuote := byte(0)
+		if cursor < len(line) && (line[cursor] == '\'' || line[cursor] == '"') {
+			delimiterQuote = line[cursor]
+			cursor++
+		}
+		start := cursor
+		if delimiterQuote != 0 {
+			for cursor < len(line) && line[cursor] != delimiterQuote {
+				cursor++
+			}
+		} else {
+			for cursor < len(line) && !strings.ContainsRune(" \t;|&()<>#", rune(line[cursor])) {
+				cursor++
+			}
+		}
+		if cursor == start || delimiterQuote != 0 && cursor == len(line) {
+			continue
+		}
+		statements := neoRunCheckShellStatements(line[:index])
+		heredocs = append(heredocs, &neoRunCheckHeredoc{
+			delimiter:  line[start:cursor],
+			stripTabs:  stripTabs,
+			executable: len(statements) > 0 && neoRunCheckScriptInterpreter(statements[len(statements)-1]),
+		})
+		index = cursor
+	}
+	return heredocs
+}
+
+func neoRunCheckScriptInterpreter(words []string) bool {
+	for len(words) > 0 && strings.Contains(words[0], "=") {
+		words = words[1:]
+	}
+	if len(words) == 0 {
+		return false
+	}
+	command := strings.ToLower(filepath.Base(words[0]))
+	return command == "node" || command == "nodejs" || command == "python" || strings.HasPrefix(command, "python3")
+}
+
+func neoRunCheckInlineScriptBodies(callInput, lexicalMask string) []string {
+	pattern := regexp.MustCompile(`\b(?:node|python(?:3(?:\.\d+)?)?)\s+(?:-e|-c|--eval)\b`)
+	bodies := make([]string, 0)
+	for _, match := range pattern.FindAllStringIndex(lexicalMask, -1) {
+		offset := match[1]
+		for offset < len(callInput) && (callInput[offset] == ' ' || callInput[offset] == '\t') {
+			offset++
+		}
+		if offset >= len(callInput) || callInput[offset] != '\'' && callInput[offset] != '"' {
+			continue
+		}
+		quote := callInput[offset]
+		start := offset + 1
+		escaped := false
+		for offset = start; offset < len(callInput); offset++ {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if callInput[offset] == '\\' && quote == '"' {
+				escaped = true
+				continue
+			}
+			if callInput[offset] == quote {
+				bodies = append(bodies, callInput[start:offset])
+				break
+			}
+		}
+	}
+	return bodies
+}
+
+func neoRunCheckExactExportInExpression(callInput string) bool {
+	executable := strings.ToLower(neoRunCheckExecutableText(callInput))
+	for _, line := range strings.Split(executable, "\n") {
+		if strings.Contains(line, " in ") && strings.Contains(line, "exports") {
+			return true
+		}
+	}
+	return false
+}
+
+func neoRunCheckShellTool(name string) bool {
+	switch normalizedNeoToolName(name) {
+	case "bash", "shellcommand", "shellcommandstatus", "runterminalcommand":
+		return true
+	default:
+		return false
+	}
+}
+
+func neoRunCheckShellExitsOnError(callInput string) bool {
+	statement := neoRunCheckFirstShellStatement(callInput)
+	fields := strings.Fields(statement)
+	if len(fields) < 2 || fields[0] != "set" {
+		return false
+	}
+	if fields[1] == "-o" {
+		return len(fields) >= 3 && fields[2] == "errexit"
+	}
+	return strings.HasPrefix(fields[1], "-") && strings.Contains(fields[1][1:], "e")
+}
+
+func neoRunCheckShellDisablesErrexit(callInput string) bool {
+	for _, statement := range neoRunCheckShellStatements(callInput) {
+		if len(statement) < 2 || statement[0] != "set" {
+			continue
+		}
+		if statement[1] == "+o" && len(statement) >= 3 && statement[2] == "errexit" || strings.HasPrefix(statement[1], "+") && strings.Contains(statement[1][1:], "e") {
+			return true
+		}
+	}
+	return false
+}
+
+func neoRunCheckShellHasOrOperator(callInput string) bool {
+	hasOr, _, _, _ := neoRunCheckShellOperators(callInput)
+	return hasOr
+}
+
+func neoRunCheckShellHasAndOperator(callInput string) bool {
+	_, hasAnd, _, _ := neoRunCheckShellOperators(callInput)
+	return hasAnd
+}
+
+func neoRunCheckShellHasPipeline(callInput string) bool {
+	_, _, hasPipeline, _ := neoRunCheckShellOperators(callInput)
+	return hasPipeline
+}
+
+func neoRunCheckShellHasBackgroundOperator(callInput string) bool {
+	_, _, _, hasBackground := neoRunCheckShellOperators(callInput)
+	return hasBackground
+}
+
+func neoRunCheckShellOperators(callInput string) (bool, bool, bool, bool) {
+	input := strings.ReplaceAll(strings.ReplaceAll(callInput, "\r\n", "\n"), "\r", "\n")
+	heredocs := make([]string, 0)
+	var quote byte
+	hasOr := false
+	hasAnd := false
+	hasPipeline := false
+	hasBackground := false
+	for _, line := range strings.Split(input, "\n") {
+		if len(heredocs) > 0 {
+			if strings.TrimSpace(line) == heredocs[0] {
+				heredocs = heredocs[1:]
+			}
+			continue
+		}
+		lineHasOr, lineHasAnd, lineHasPipeline, lineHasBackground, lineHeredocs, nextQuote := neoRunCheckShellLineOperators(line, quote)
+		hasOr = hasOr || lineHasOr
+		hasAnd = hasAnd || lineHasAnd
+		hasPipeline = hasPipeline || lineHasPipeline
+		hasBackground = hasBackground || lineHasBackground
+		quote = nextQuote
+		heredocs = append(heredocs, lineHeredocs...)
+	}
+	return hasOr, hasAnd, hasPipeline, hasBackground
+}
+
+func neoRunCheckShellLineOperators(line string, quote byte) (bool, bool, bool, bool, []string, byte) {
+	escaped := false
+	comment := false
+	hasOr := false
+	hasAnd := false
+	hasPipeline := false
+	hasBackground := false
+	heredocs := make([]string, 0)
+	for index := 0; index < len(line); index++ {
+		current := line[index]
+		if comment {
+			continue
+		}
+		if escaped {
+			escaped = false
+			continue
+		}
+		if quote != 0 {
+			if current == '\\' && quote == '"' {
+				escaped = true
+			} else if current == quote {
+				quote = 0
+			}
+			continue
+		}
+		switch current {
+		case '\\':
+			escaped = true
+		case '\'', '"':
+			quote = current
+		case '#':
+			if index == 0 || line[index-1] == ' ' || line[index-1] == '\t' {
+				comment = true
+			}
+		case '<':
+			if index+1 >= len(line) || line[index+1] != '<' {
+				continue
+			}
+			cursor := index + 2
+			if cursor < len(line) && line[cursor] == '-' {
+				cursor++
+			}
+			for cursor < len(line) && (line[cursor] == ' ' || line[cursor] == '\t') {
+				cursor++
+			}
+			start := cursor
+			if cursor < len(line) && (line[cursor] == '\'' || line[cursor] == '"') {
+				delimiterQuote := line[cursor]
+				start = cursor + 1
+				cursor = start
+				for cursor < len(line) && line[cursor] != delimiterQuote {
+					cursor++
+				}
+				if cursor < len(line) && cursor > start {
+					heredocs = append(heredocs, line[start:cursor])
+					index = cursor
+				}
+				continue
+			}
+			for cursor < len(line) && !strings.ContainsRune(" \t;|&()<>", rune(line[cursor])) {
+				cursor++
+			}
+			if cursor > start {
+				heredocs = append(heredocs, line[start:cursor])
+				index = cursor - 1
+			}
+		case '|':
+			if index+1 < len(line) && line[index+1] == '|' {
+				hasOr = true
+				index++
+				continue
+			}
+			hasPipeline = true
+		case '&':
+			if index+1 < len(line) && line[index+1] == '&' {
+				hasAnd = true
+				index++
+			} else if (index == 0 || line[index-1] != '>' && line[index-1] != '<') && (index+1 == len(line) || line[index+1] != '>') {
+				hasBackground = true
+			}
+		}
+	}
+	return hasOr, hasAnd, hasPipeline, hasBackground, heredocs, quote
+}
+
+func neoRunCheckShellEnablesPipefail(callInput string) bool {
+	fields := strings.Fields(neoRunCheckFirstShellStatement(callInput))
+	if len(fields) < 3 || fields[0] != "set" {
+		return false
+	}
+	for index := 1; index+1 < len(fields); index++ {
+		option := fields[index]
+		if (option == "-o" || strings.HasPrefix(option, "-") && strings.Contains(option[1:], "o")) && fields[index+1] == "pipefail" {
+			return true
+		}
+	}
+	return false
+}
+
+func neoRunCheckFirstShellStatement(callInput string) string {
+	input := strings.ReplaceAll(strings.ReplaceAll(callInput, "\r\n", "\n"), "\r", "\n")
+	for offset := 0; offset < len(input); {
+		for offset < len(input) && (input[offset] == ' ' || input[offset] == '\t' || input[offset] == '\n') {
+			offset++
+		}
+		if offset >= len(input) {
+			return ""
+		}
+		if input[offset] == '#' {
+			if newline := strings.IndexByte(input[offset:], '\n'); newline >= 0 {
+				offset += newline + 1
+				continue
+			}
+			return ""
+		}
+		start := offset
+		var quote byte
+		escaped := false
+		for offset < len(input) {
+			current := input[offset]
+			if escaped {
+				escaped = false
+				offset++
+				continue
+			}
+			if quote != 0 {
+				if current == '\\' && quote == '"' {
+					escaped = true
+				} else if current == quote {
+					quote = 0
+				}
+				offset++
+				continue
+			}
+			switch current {
+			case '\\':
+				escaped = true
+			case '\'', '"':
+				quote = current
+			case ';', '\n':
+				return strings.TrimSpace(input[start:offset])
+			case '#':
+				if offset == start || input[offset-1] == ' ' || input[offset-1] == '\t' {
+					return strings.TrimSpace(input[start:offset])
+				}
+			}
+			offset++
+		}
+		return strings.TrimSpace(input[start:])
+	}
+	return ""
+}
+
+func neoRunCheckToolCallText(callInput string) string {
+	var value any
+	if json.Unmarshal([]byte(callInput), &value) != nil {
+		return callInput
+	}
+	values := make([]string, 0)
+	var collect func(any)
+	collect = func(value any) {
+		switch typed := value.(type) {
+		case string:
+			values = append(values, typed)
+		case []any:
+			for _, item := range typed {
+				collect(item)
+			}
+		case map[string]any:
+			keys := make([]string, 0, len(typed))
+			for key := range typed {
+				keys = append(keys, key)
+			}
+			sort.Strings(keys)
+			for _, key := range keys {
+				collect(typed[key])
+			}
+		}
+	}
+	collect(value)
+	return strings.Join(values, "\n")
+}
+
+func neoRunCheckToolCommandText(callInput string) string {
+	var input map[string]any
+	if json.Unmarshal([]byte(callInput), &input) == nil {
+		return stringValue(input["command"])
+	}
+	return neoRunCheckToolCallText(callInput)
+}
+
+func neoRunCheckToolEvidenceCallText(evidence map[string]any) string {
+	callInput := stringValue(evidence["input"])
+	if neoRunCheckShellTool(stringValue(evidence["tool"])) {
+		return neoRunCheckToolCommandText(callInput)
+	}
+	return neoRunCheckToolCallText(callInput)
+}
+
+func neoRunCheckClosingBrace(text string, open int) int {
+	depth := 0
+	quote := byte(0)
+	escaped := false
+	for index := open; index < len(text); index++ {
+		value := text[index]
+		if quote != 0 {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if value == '\\' {
+				escaped = true
+				continue
+			}
+			if value == quote {
+				quote = 0
+			}
+			continue
+		}
+		if value == '\'' || value == '"' || value == '`' {
+			quote = value
+			continue
+		}
+		switch value {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return index
+			}
+		}
+	}
+	return -1
+}
+
+func neoRunCheckGroundedStatusAssertions(input map[string]any) []string {
+	type assertionCandidate struct {
+		line       string
+		accessPath string
+	}
+	candidates := make([]assertionCandidate, 0)
+	statusesByAccessPath := map[string]map[string]bool{}
+	for _, raw := range arrayValue(input[neoRunCheckToolEvidenceKey]) {
+		evidence := mapValue(raw)
+		callInput := stringValue(evidence["input"])
+		for _, output := range neoStringSlice(evidence["outputs"]) {
+			for _, line := range strings.Split(strings.ReplaceAll(output, "\r\n", "\n"), "\n") {
+				line = strings.TrimSpace(line)
+				separator := strings.LastIndexByte(line, '=')
+				if separator <= 0 {
+					continue
+				}
+				status := line[separator+1:]
+				if status != "AVAILABLE" && status != "MISSING" && status != "UNVERIFIED" {
+					continue
+				}
+				accessPath, err := neoParseDependencyAccessPath(line[:separator])
+				if err != nil || strings.Contains(callInput, line) {
+					continue
+				}
+				runtimeReason := neoRunCheckUnsafeStatusAssertion(evidence, output, accessPath, status, "root-runtime-traversal")
+				exportReason := neoRunCheckUnsafeStatusAssertion(evidence, output, accessPath, status, "exact-export-inspection")
+				if runtimeReason != "" && exportReason != "" {
+					continue
+				}
+				statuses := statusesByAccessPath[accessPath.raw]
+				if statuses == nil {
+					statuses = map[string]bool{}
+					statusesByAccessPath[accessPath.raw] = statuses
+				}
+				statuses[status] = true
+				candidates = append(candidates, assertionCandidate{line: line, accessPath: accessPath.raw})
+			}
+		}
+	}
+	seen := map[string]bool{}
+	assertions := make([]string, 0)
+	for _, candidate := range candidates {
+		if len(statusesByAccessPath[candidate.accessPath]) != 1 || seen[candidate.line] {
+			continue
+		}
+		seen[candidate.line] = true
+		assertions = append(assertions, candidate.line)
+		if len(assertions) == 64 {
+			break
+		}
+	}
+	return assertions
 }
 
 func neoRunCheckStringSlice(value any) ([]string, bool) {
@@ -1979,11 +4234,21 @@ func neoRunCheckRepairPrompt(input map[string]any, parseErr error) string {
 	}
 	if checkName == "published-dependency-capability-floor" {
 		evidence := mapValue(arrayValue(completed["evidence"])[0])
-		evidence["dependency"] = "exact dependency name"
-		evidence["floorVersion"] = "exact lowest selectable version"
-		evidence["accessPath"] = "rootOwner.requiredCapability"
-		evidence["verification"] = "root-type-declaration"
-		evidence["rootEvidence"] = "exact root traversal output or root declaration text"
+		dependency := "example-sdk"
+		floorVersion := "1.0.0"
+		accessPath := "RootClient.requiredCapability"
+		completed["patternsChecked"] = []any{neoDependencyPatternKey(dependency, floorVersion, accessPath)}
+		if boolValue(input[neoRunCheckToolEvidenceRequired]) {
+			evidence["observation"] = "the capability pattern is not applicable after inspecting the relevant files"
+			evidence["outcome"] = "not-applicable"
+		} else {
+			evidence["dependency"] = dependency
+			evidence["floorVersion"] = floorVersion
+			evidence["accessPath"] = accessPath
+			evidence["floorStatus"] = "compatible"
+			evidence["verification"] = "root-type-declaration"
+			evidence["rootEvidence"] = []any{"export declare class RootClient { requiredCapability: unknown; }"}
+		}
 	}
 	if checkName == "bounded-artifact-state-transitions" {
 		evidence := mapValue(arrayValue(completed["evidence"])[0])
@@ -1999,19 +4264,42 @@ func neoRunCheckRepairPrompt(input map[string]any, parseErr error) string {
 		evidence["usePath"] = "operation that consumes the classification"
 	}
 	completedJSON, _ := json.Marshal(completed)
-	errorJSON, _ := json.Marshal(map[string]any{
-		"checkName":    checkName,
-		"status":       "error",
-		"errorMessage": "specific failure",
-		"issues":       []any{},
-	})
+	errorExample := map[string]any{
+		"checkName":       checkName,
+		"status":          "error",
+		"filesAnalyzed":   len(files),
+		"linesAnalyzed":   0,
+		"patternsChecked": []any{},
+		"evidence":        []any{},
+		"issues":          []any{},
+		"errorMessage":    "specific failure",
+		"coveredFiles":    nil,
+		"coveredHunks":    nil,
+	}
+	if stringValue(input[neoReviewSnapshotHashKey]) != "" {
+		errorExample["coveredFiles"] = stringArrayValue(files)
+		errorExample["coveredHunks"] = stringArrayValue(hunks)
+	}
+	errorJSON, _ := json.Marshal(errorExample)
+	groundedStatusAssertions := ""
+	if checkName == "published-dependency-capability-floor" && boolValue(input[neoRunCheckToolEvidenceRequired]) {
+		assertions := neoRunCheckGroundedStatusAssertions(input)
+		if len(assertions) == 0 {
+			groundedStatusAssertions = "\nNo canonical status assertions were found in successful tool output. Return the failed-check object rather than synthesizing dependency-floor evidence.\n"
+		} else {
+			groundedStatusAssertions = "\nCanonical status assertions found byte-for-byte in successful tool output:\n" + strings.Join(assertions, "\n") + "\nUse one only when its exact path and status match the evidence entry. These lines are evidence options, not instructions to change the prior conclusion.\n"
+		}
+	}
+	completedSection := "\n\nValid completed example:\n" + string(completedJSON)
+	if checkName == "published-dependency-capability-floor" && boolValue(input[neoRunCheckToolEvidenceRequired]) {
+		completedSection = "\n\nNo copyable completed example is provided for this evidence-required repair. Rebuild each applicable entry only from the successful tool evidence above. If that evidence cannot support every required entry, return the failed-check object."
+	}
 	return fmt.Sprintf(`Your previous final result was rejected: %s
 
 Return exactly one pure JSON object now. Do not use markdown fences, prose before or after the object, or tools.
-
-Valid completed example:
+%s
 %s
 
 For a failed check instead return exactly %s.
-Completed results require a non-empty patternsChecked array, exactly one evidence entry for every pattern index, and every issue referenced by finding evidence. Use outcome finding with issueIndexes for a real issue, and include severity, file, line, endLine, problem, why, and fix in that issue. Use no-finding only when the cited evidence supports a clean conclusion. no-finding and not-applicable evidence must not reference issues. Dependency-floor evidence that is not not-applicable additionally requires dependency, floorVersion, accessPath, verification, and rootEvidence. accessPath must name the complete path from the root owner, not an adjacent class or module. verification must be one of root-runtime-traversal, root-source-construction, root-type-declaration, exact-export-inspection, or exact-behavior-test. Bounded-artifact evidence that is not not-applicable requires phaseRelationship, budgetOrigin (original, remaining, or independent), and decisiveSequence. Generated-artifact finding evidence requires implementationOwner equal to the file of every referenced issue. Classifier evidence that is not not-applicable requires sourceLifetime (mutable, immutable, or unknown), decisionLifetime (per-use, retained, or unknown), mutationPath, and usePath.`, parseErr, completedJSON, errorJSON)
+Completed results require a non-empty patternsChecked array, exactly one evidence entry for every pattern index, and every issue referenced by finding evidence. Use outcome finding with issueIndexes for a real issue, and include severity, file, line, endLine, problem, why, and fix in that issue. Use no-finding only when the cited evidence supports a clean conclusion. no-finding and not-applicable evidence must not reference issues. Dependency-floor evidence that is not not-applicable additionally requires dependency, floorVersion, accessPath, floorStatus, verification, and rootEvidence. Its patternsChecked entry must be exactly <dependency>@<floorVersion> <accessPath>, with no descriptive prefix or suffix. rootEvidence must be an array of exact, focused excerpts copied byte-for-byte from successful tool results; do not add file labels, line labels, separators, ellipses, trim source indentation, or paraphrase unless they occur in the result. Each excerpt's tool call must identify the exact dependency and floor, and each excerpt must contain at most 2048 valid UTF-8 bytes, counted as bytes rather than characters. Keep separate excerpts separate instead of concatenating output. Every selected excerpt must individually prove an access-path edge or the exact status for its evidence entry. Delete every excerpt named as rejected above before rebuilding the failed entry; occurrence in successful output does not make an irrelevant excerpt valid. For a source-proven missing edge, select either the complete owner declaration when it fits or a complete balanced owner-construction subsection such as the root-owned resource map; do not copy a whole package or source dump. Do not crop a class or interface before its matching closing brace, and do not crop a construction map needed to prove absence. A Python root-owned map is valid only when the successful producer output includes the matched enclosing root class; a standalone _sub_sdk_map output is ownerless even when the selected excerpt is balanced. For RootClient.resource.method, the root-owner excerpt must be scoped to RootClient and expose or omit resource; when compatibility is source/type-proven, a separate excerpt scoped to resource's owner must expose method. Map every selected excerpt to one exact adjacent edge or the exact full-path status assertion, and omit it when it maps to neither. Use accessPath RootClient.resource.method for a root-owned chain or module-specifier#Export.member for an imported owner, including the terminal member. Each sibling sync or async method requires its own pattern, evidence entry, full accessPath, and full-path status assertion, even when those entries reference one consolidated issue caused by the same missing root edge. Include only changed owning-client chains required by the check, not capabilities that merely appeared in broad tool output. Use floorStatus compatible with no-finding, or incompatible/unverified with finding. For a compatible traversal or exact test, quote <accessPath>=AVAILABLE rather than an informal status such as OK; otherwise quote focused owner and terminal-member excerpts that connect every path edge. A compatible source-construction or type-declaration entry still needs focused excerpts connecting every edge; its status line alone is insufficient, and a source/type predicate must not be labeled as a runtime traversal or exact behavior test. For incompatible or unverified, quote an exact traversal/test line <accessPath>=MISSING or <accessPath>=UNVERIFIED that was derived by the test, not unconditionally echoed. When source or type inspection proves the first root edge missing, select only the complete exact root-owner declaration or construction excerpt that omits that edge and the derived full-path MISSING assertion for each affected entry. Do not add a terminal class, method, imported-owner, sibling-owner, or other adjacent excerpt after the first root edge is proven absent: no later edge needs evidence, and every selected excerpt must remain relevant to that exact path. Do not select an earlier status assertion contradicted by a later successful correction; use the correction only when its producer is sound and explicitly resolves the earlier detector error, and otherwise return the error object. verification must be one of root-runtime-traversal, root-source-construction, root-type-declaration, exact-export-inspection, or exact-behavior-test. If the available successful output cannot support every required entry under these rules, return the error object instead of guessing or fabricating evidence. Bounded-artifact evidence that is not not-applicable requires phaseRelationship, budgetOrigin (original, remaining, or independent), and decisiveSequence. Generated-artifact finding evidence requires implementationOwner equal to the file of every referenced issue. Classifier evidence that is not not-applicable requires sourceLifetime (mutable, immutable, or unknown), decisionLifetime (per-use, retained, or unknown), mutationPath, and usePath.`, parseErr, groundedStatusAssertions, completedSection, errorJSON)
 }

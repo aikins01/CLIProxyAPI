@@ -10,6 +10,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -144,6 +146,27 @@ func TestNeoOrbDockerClientInspect(t *testing.T) {
 	state, err = client.InspectContainer(context.Background(), "gone")
 	if err != nil || state.Exists {
 		t.Fatalf("InspectContainer missing = %#v, %v", state, err)
+	}
+}
+
+func TestNeoOrbDockerClientListsLabelledContainers(t *testing.T) {
+	client, _ := newNeoOrbFakeDocker(t, func(call neoOrbFakeDockerCall) (int, any) {
+		parsed, err := url.Parse(call.Path)
+		if err != nil || call.Method != http.MethodGet || parsed.Path != "/containers/json" || parsed.Query().Get("all") != "true" {
+			return 400, map[string]any{"message": "bad list request"}
+		}
+		var filters map[string][]string
+		if err := json.Unmarshal([]byte(parsed.Query().Get("filters")), &filters); err != nil || !reflect.DeepEqual(filters, map[string][]string{"label": {"cliproxy.orb"}}) {
+			return 400, map[string]any{"message": "bad filters"}
+		}
+		return 200, []any{
+			map[string]any{"Id": "container-one", "Labels": map[string]string{"cliproxy.orb": "T-019fdec9-b0cf-745d-8da4-f250184e870e"}},
+			map[string]any{"Id": "container-two", "Labels": map[string]string{"other": "value"}},
+		}
+	})
+	containers, err := client.ListOrbContainers(context.Background())
+	if err != nil || len(containers) != 2 || containers[0].ID != "container-one" || containers[0].Labels["cliproxy.orb"] == "" {
+		t.Fatalf("ListOrbContainers = %#v, %v", containers, err)
 	}
 }
 
