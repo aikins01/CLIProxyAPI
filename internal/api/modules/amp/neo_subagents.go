@@ -22,6 +22,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
@@ -526,6 +527,8 @@ const (
 	neoSubagentAttachmentMaxTextLines  = 500
 	neoSubagentAttachmentMaxLineBytes  = 2048
 	neoRunCheckDefinitionMaxBytes      = 1024 * 1024
+	neoRunCheckToolEvidenceMaxBytes    = 4 * 1024 * 1024
+	neoRunCheckToolOutputMaxBytes      = 1024 * 1024
 )
 
 var neoSubagentRunObserverForTest atomic.Pointer[neoSubagentRunObserver]
@@ -1165,12 +1168,17 @@ func neoSubagentRouteFallbackEligible(err error) bool {
 // subagent tools, which run as nested subagents.
 func (a *neoActor) executeSubagentRun(name string, input map[string]any, parentToolCallID, parentMessageID string, generation, depth int, clientAPIKey string) (string, error) {
 	name = strings.TrimSpace(name)
+	dependencyFloorCheck := false
 	def, ok := neoSubagentDefFor(name)
 	if !ok {
 		return "", fmt.Errorf("unknown subagent %q", name)
 	}
 	if name == "run_check" {
+		input = cloneNeoJSONMap(input)
 		var err error
+		delete(input, neoRunCheckToolEvidenceKey)
+		delete(input, neoRunCheckToolEvidenceRequired)
+		dependencyFloorCheck = stringValue(input["checkName"]) == "published-dependency-capability-floor"
 		a.mu.Lock()
 		workingDirectory := neoWorkingDirectoryFromEnvironment(a.environment)
 		a.mu.Unlock()
@@ -1178,6 +1186,8 @@ func (a *neoActor) executeSubagentRun(name string, input map[string]any, parentT
 		if err != nil {
 			return "", err
 		}
+		delete(input, neoRunCheckToolEvidenceKey)
+		delete(input, neoRunCheckToolEvidenceRequired)
 	}
 	runContext, subagentRunID, acquired := a.acquireSubagentRun(generation)
 	if !acquired {
@@ -1199,7 +1209,9 @@ func (a *neoActor) executeSubagentRun(name string, input map[string]any, parentT
 	routes := neoSubagentRoutes(cfg, def, name, agentMode, a.settings)
 	inheritedReasoningEffort := firstNonEmptyString(a.currentReasoningEffort, a.settings["reasoning.effort"])
 	tools := a.resolveSubagentToolsLocked(def.IncludeTools)
+	requireDependencyToolEvidence := false
 	if name == "run_check" {
+		requireDependencyToolEvidence = dependencyFloorCheck
 		tools = a.resolveRunCheckToolsLocked(input, def.IncludeTools)
 	}
 	settings := cloneMap(a.settings)
@@ -1314,7 +1326,7 @@ func (a *neoActor) executeSubagentRun(name string, input map[string]any, parentT
 		if name == "Task" {
 			attemptSystemPrompt = strings.Join(compactStrings([]string{neoSystemPrompt(scaffoldRequest, route), systemPrompt}), "\n\n")
 		}
-		return neoInferenceRequest{
+		request := neoInferenceRequest{
 			Context:                       runContext,
 			ActorID:                       a.id,
 			ThreadID:                      a.threadID,
@@ -1335,6 +1347,11 @@ func (a *neoActor) executeSubagentRun(name string, input map[string]any, parentT
 			DisableToolCalls:              name == "run_check" && len(requestTools) == 0,
 			TextToolBridgeRequireToolCall: requireToolCall,
 		}
+		if name == "run_check" && len(requestTools) == 0 {
+			request.ResponseMimeType = "application/json"
+			request.ResponseJSONSchema = neoRunCheckResponseJSONSchema()
+		}
+		return request
 	}
 
 	toolNames := make([]string, 0, len(tools))
@@ -1350,6 +1367,8 @@ func (a *neoActor) executeSubagentRun(name string, input map[string]any, parentT
 	activeRouteIndex := 0
 	oracleToolCycleCompleted := false
 	turnLimitReached := false
+	runCheckToolEvidence := make([]any, 0)
+	runCheckEvidenceCollector := neoRunCheckToolEvidenceCollector{backgroundShell: map[int]*neoRunCheckBackgroundShell{}}
 
 turnLoop:
 	for turn := 0; ; turn++ {
@@ -1469,14 +1488,20 @@ turnLoop:
 			return "", nil
 		}
 		for _, exchange := range exchanges {
+			toolText := runToTextForTool(exchange.Call.Name, exchange.Run)
 			conversation = append(conversation, neoHistoryMessage{
 				Role:            "tool",
 				ToolCallID:      exchange.Call.ID,
 				ToolName:        exchange.Call.Name,
-				Text:            runToTextForTool(exchange.Call.Name, exchange.Run),
+				Text:            toolText,
 				Content:         neoToolRunHistoryContent(exchange.Run),
 				ParentToolUseID: parentToolCallID,
 			})
+			if dependencyFloorCheck {
+				if evidence, ok := runCheckEvidenceCollector.collect(exchange.Call, exchange.Run, toolText); ok {
+					runCheckToolEvidence = append(runCheckToolEvidence, evidence)
+				}
+			}
 		}
 		if name == "oracle" {
 			oracleToolCycleCompleted = oracleToolCycleCompleted || neoOracleToolCycleCompleted(result.ToolCalls)
@@ -1566,6 +1591,10 @@ turnLoop:
 		}
 		log.Debugf("amp neo subagent force-synthesis tool=%s text_len=%d err=%v", name, len(finalText), err)
 	}
+	if dependencyFloorCheck {
+		input[neoRunCheckToolEvidenceKey] = runCheckToolEvidence
+		input[neoRunCheckToolEvidenceRequired] = requireDependencyToolEvidence
+	}
 	if runErr == nil && name == "run_check" && !a.subagentGenerationStale(generation) {
 		if _, parseErr := neoParseRunCheckResult(input, finalText); parseErr != nil {
 			if len(conversation) == 0 || conversation[len(conversation)-1].Role != "assistant" || strings.TrimSpace(conversation[len(conversation)-1].Text) != finalText {
@@ -1621,6 +1650,223 @@ turnLoop:
 
 	log.Debugf("amp neo subagent done tool=%s depth=%d thread=%s call=%s result_len=%d err=%v", name, depth, a.threadID, parentToolCallID, len(strings.TrimSpace(finalText)), runErr)
 	return finalText, runErr
+}
+
+func neoRunCheckSuccessfulToolResult(toolName string, run map[string]any) bool {
+	status := strings.ToLower(strings.TrimSpace(stringValue(run["status"])))
+	if status != "done" && status != "completed" && status != "success" {
+		return false
+	}
+	if result, ok := asMap(run["result"]); ok {
+		if strings.EqualFold(strings.TrimSpace(stringValue(result["status"])), "error") || boolValue(result["running"]) {
+			return false
+		}
+	}
+	switch normalizedNeoToolName(toolName) {
+	case "shellcommand", "shellcommandstatus", "runterminalcommand", "bash":
+		result, ok := asMap(run["result"])
+		if !ok {
+			return false
+		}
+		exitCode, exists := result["exitCode"]
+		if !exists {
+			exitCode, exists = result["exit_code"]
+		}
+		if !exists {
+			return false
+		}
+		value, numeric := neoReviewNumber(exitCode)
+		return numeric && value == 0
+	default:
+		return true
+	}
+}
+
+type neoRunCheckBackgroundShell struct {
+	input  string
+	output string
+}
+
+type neoRunCheckToolEvidenceCollector struct {
+	backgroundShell map[int]*neoRunCheckBackgroundShell
+	retainedBytes   int
+	pendingBytes    int
+}
+
+func (c *neoRunCheckToolEvidenceCollector) collect(call neoToolCall, run map[string]any, toolText string) (map[string]any, bool) {
+	toolName := normalizedNeoToolName(call.Name)
+	if toolName == "shellcommandstatus" {
+		pid := neoRunCheckShellStatusPID(call.Input)
+		background := c.backgroundShell[pid]
+		if background == nil {
+			return nil, false
+		}
+		terminal := !boolValue(nestedValue(run["result"], "running"))
+		c.appendBackgroundOutput(background, neoRunCheckShellEvidenceOutputs(toolText, run), terminal)
+		if !neoRunCheckSuccessfulToolResult(call.Name, run) {
+			if !boolValue(nestedValue(run["result"], "running")) {
+				c.pendingBytes -= len(background.output)
+				delete(c.backgroundShell, pid)
+			}
+			return nil, false
+		}
+		c.pendingBytes -= len(background.output)
+		delete(c.backgroundShell, pid)
+		outputs := c.retainOutputs([]string{background.output})
+		if len(outputs) == 0 {
+			return nil, false
+		}
+		return map[string]any{"tool": "shell_command", "input": background.input, "outputs": stringArrayValue(outputs)}, true
+	}
+
+	callInput, _ := json.Marshal(call.Input)
+	if toolName == "shellcommand" && boolValue(nestedValue(run["result"], "running")) {
+		if pid := neoRunCheckShellLaunchPID(run); pid > 0 {
+			background := &neoRunCheckBackgroundShell{input: string(callInput)}
+			c.appendBackgroundOutput(background, neoRunCheckShellEvidenceOutputs(toolText, run), false)
+			c.backgroundShell[pid] = background
+		}
+		return nil, false
+	}
+	if !neoRunCheckSuccessfulToolResult(call.Name, run) || strings.TrimSpace(toolText) == "" {
+		return nil, false
+	}
+	return map[string]any{
+		"tool":    call.Name,
+		"input":   string(callInput),
+		"outputs": stringArrayValue(c.retainOutputs(neoRunCheckToolEvidenceOutputs(toolText, run))),
+	}, true
+}
+
+func (c *neoRunCheckToolEvidenceCollector) appendBackgroundOutput(background *neoRunCheckBackgroundShell, outputs []string, terminal bool) {
+	previousBytes := len(background.output)
+	reserve := neoRunCheckToolOutputMaxBytes
+	if terminal {
+		reserve = 0
+	}
+	limit := min(neoRunCheckToolOutputMaxBytes, neoRunCheckToolEvidenceMaxBytes-reserve-c.retainedBytes-(c.pendingBytes-previousBytes))
+	for _, output := range outputs {
+		bounded := neoRunCheckBoundToolEvidence(output, limit)
+		background.output = neoRunCheckAppendBoundToolEvidence(background.output, bounded, limit)
+	}
+	c.pendingBytes += len(background.output) - previousBytes
+}
+
+func (c *neoRunCheckToolEvidenceCollector) retainOutputs(outputs []string) []string {
+	retained := make([]string, 0, len(outputs))
+	for _, output := range outputs {
+		remaining := neoRunCheckToolEvidenceMaxBytes - c.retainedBytes - c.pendingBytes
+		if remaining <= 0 {
+			break
+		}
+		bounded := neoRunCheckBoundToolEvidence(output, min(remaining, neoRunCheckToolOutputMaxBytes))
+		if bounded == "" {
+			continue
+		}
+		retained = append(retained, bounded)
+		c.retainedBytes += len(bounded)
+	}
+	return retained
+}
+
+func neoRunCheckBoundToolEvidence(output string, limit int) string {
+	if limit <= 0 || output == "" {
+		return ""
+	}
+	if len(output) <= limit {
+		return output
+	}
+	const marker = "\n... [run_check tool evidence truncated] ...\n"
+	if limit <= len(marker) {
+		return neoRunCheckUTF8Prefix(output, limit)
+	}
+	head := (limit - len(marker)) / 2
+	tail := limit - len(marker) - head
+	headOutput := neoRunCheckUTF8Prefix(output, head)
+	tailStart := len(output) - tail
+	for tailStart < len(output) && !utf8.RuneStart(output[tailStart]) {
+		tailStart++
+	}
+	return headOutput + marker + output[tailStart:]
+}
+
+func neoRunCheckAppendBoundToolEvidence(existing, appended string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	if len(existing)+len(appended) <= limit {
+		return existing + appended
+	}
+	const marker = "\n... [run_check tool evidence truncated] ...\n"
+	if limit <= len(marker) {
+		if len(existing) >= limit {
+			return neoRunCheckUTF8Prefix(existing, limit)
+		}
+		return existing + neoRunCheckUTF8Prefix(appended, limit-len(existing))
+	}
+	headLimit := (limit - len(marker)) / 2
+	tailLimit := limit - len(marker) - headLimit
+	head := neoRunCheckUTF8Prefix(existing, headLimit)
+	if len(head) < headLimit {
+		head += neoRunCheckUTF8Prefix(appended, headLimit-len(head))
+	}
+	tail := neoRunCheckUTF8Suffix(appended, tailLimit)
+	if len(tail) < tailLimit {
+		tail = neoRunCheckUTF8Suffix(existing, tailLimit-len(tail)) + tail
+	}
+	return head + marker + tail
+}
+
+func neoRunCheckUTF8Prefix(output string, limit int) string {
+	end := min(len(output), limit)
+	for end > 0 && !utf8.ValidString(output[:end]) {
+		end--
+	}
+	return output[:end]
+}
+
+func neoRunCheckUTF8Suffix(output string, limit int) string {
+	start := max(0, len(output)-limit)
+	for start < len(output) && !utf8.RuneStart(output[start]) {
+		start++
+	}
+	return output[start:]
+}
+
+func neoRunCheckShellLaunchPID(run map[string]any) int {
+	result := mapValue(run["result"])
+	return numberFrom(result["pid"], result["processId"], result["process_id"])
+}
+
+func neoRunCheckShellStatusPID(input map[string]any) int {
+	return numberFrom(input["pid"], input["processId"], input["process_id"])
+}
+
+func neoRunCheckShellEvidenceOutputs(toolText string, run map[string]any) []string {
+	outputs := make([]string, 0, 2)
+	if value := stringValue(run["output"]); value != "" {
+		outputs = append(outputs, value)
+	}
+	if result, ok := asMap(run["result"]); ok {
+		for _, key := range []string{"output", "stdout"} {
+			if value := stringValue(result[key]); value != "" && !slices.Contains(outputs, value) {
+				outputs = append(outputs, value)
+			}
+		}
+	}
+	return outputs
+}
+
+func neoRunCheckToolEvidenceOutputs(toolText string, run map[string]any) []string {
+	outputs := []string{toolText}
+	if result, ok := asMap(run["result"]); ok {
+		for _, key := range []string{"output", "stdout"} {
+			if value := stringValue(result[key]); value != "" && value != toolText {
+				outputs = append(outputs, value)
+			}
+		}
+	}
+	return outputs
 }
 
 func neoSubagentStopReasonError(result neoInferenceResult, allowToolUse bool) error {
@@ -1969,7 +2215,7 @@ func (a *neoActor) advanceGenerationLocked() int {
 func neoRunCheckToolNames(input map[string]any, fallback []string) []string {
 	frontmatter := mapValue(input["frontmatter"])
 	raw, exists := frontmatter["tools"]
-	if !exists {
+	if !exists || raw == nil {
 		return fallback
 	}
 	requested := neoStringSlice(raw)
@@ -1991,7 +2237,7 @@ func neoRunCheckToolNames(input map[string]any, fallback []string) []string {
 
 func (a *neoActor) resolveRunCheckToolsLocked(input map[string]any, fallback []string) []neoToolSpec {
 	requested := neoRunCheckToolNames(input, fallback)
-	if _, exists := mapValue(input["frontmatter"])["tools"]; !exists {
+	if raw, exists := mapValue(input["frontmatter"])["tools"]; !exists || raw == nil {
 		return a.resolveSubagentToolsLocked(requested)
 	}
 	tools := make([]neoToolSpec, 0, len(requested))

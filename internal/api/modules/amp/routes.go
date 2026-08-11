@@ -218,10 +218,10 @@ func noCORSMiddleware() gin.HandlerFunc {
 		}
 
 		// Remove CORS headers to prevent cross-origin access from browsers
-		c.Header("Access-Control-Allow-Origin", "")
-		c.Header("Access-Control-Allow-Methods", "")
-		c.Header("Access-Control-Allow-Headers", "")
-		c.Header("Access-Control-Allow-Credentials", "")
+		c.Writer.Header().Del("Access-Control-Allow-Origin")
+		c.Writer.Header().Del("Access-Control-Allow-Methods")
+		c.Writer.Header().Del("Access-Control-Allow-Headers")
+		c.Writer.Header().Del("Access-Control-Allow-Credentials")
 
 		// For OPTIONS preflight, deny with 403
 		if c.Request.Method == "OPTIONS" {
@@ -452,11 +452,19 @@ func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *ha
 		localProjectMiddleware = append(localProjectMiddleware, auth)
 	}
 	localProjectMiddleware = append(localProjectMiddleware, clientAPIKeyMiddleware())
+	localBrokerMiddleware := []gin.HandlerFunc{noCORSMiddleware()}
+	if auth != nil {
+		localBrokerMiddleware = append(localBrokerMiddleware, auth)
+	}
+	localBrokerMiddleware = append(localBrokerMiddleware, clientAPIKeyMiddleware())
+	engine.Any("/ampcode/local-broker/heartbeat.json", append(localBrokerMiddleware, m.serveLocalBrokerHeartbeat)...)
 	engine.Any("/ampcode/local-projects.json", append(localProjectMiddleware, m.serveWebLocalProjects)...)
 	engine.Any("/ampcode/local-project-details.json", append(localProjectMiddleware, m.serveWebLocalProjectDetails)...)
 	engine.Any("/ampcode/local-activity.json", append(localProjectMiddleware, m.serveWebLocalActivity)...)
 	engine.Any("/ampcode/local-thread-search.json", append(localProjectMiddleware, m.serveWebLocalThreadSearch)...)
 	engine.Any("/ampcode/local-thread-data.json", append(localProjectMiddleware, m.serveWebLocalThreadData)...)
+	orbPortalMiddleware := append([]gin.HandlerFunc{}, localProjectMiddleware...)
+	engine.Any("/orb/:threadID/p/:port/*path", append(orbPortalMiddleware, m.serveOrbPortal)...)
 	engine.Any("/threads", append(rootMiddleware, proxyHandler)...)
 	engine.Any("/threads/*path", append(rootMiddleware, proxyHandler)...)
 	// Attachment URL forms recognized by current Amp CLI binaries:

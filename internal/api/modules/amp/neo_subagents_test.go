@@ -26,6 +26,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 )
@@ -141,6 +142,20 @@ func TestNeoRunCheckPromptRequiresSupportedEvidence(t *testing.T) {
 		`"outcome": "finding" | "no-finding" | "not-applicable"`,
 		`"issueIndexes": [0]`,
 		"Every reported issue must be referenced by at least one `finding` entry",
+		"first inventory every changed owning-client access chain from the diff",
+		"do not return a completed result while any changed chain is absent",
+		"Set the corresponding pattern to exactly `<dependency>@<floorVersion> <accessPath>`",
+		"Each sibling method still requires its own exact dependency pattern",
+		"Every excerpt must contain at most 2048 valid UTF-8 bytes",
+		"emit and quote `<accessPath>=AVAILABLE`, not an informal status such as `OK`",
+		"Do not crop a class or interface before its matching closing brace",
+		"printing a standalone `_sub_sdk_map` loses root ownership",
+		"map each selected excerpt to one exact adjacent edge or to the exact full-path status assertion",
+		"never omit the chain because its evidence packet is incomplete",
+		"On a repair turn, delete every rejected excerpt",
+		"do not add capabilities merely because a broad harness printed them",
+		"`decisionLifetime` describes when the derived classification is computed",
+		"source read, wrapper argument or capture site, supported mutation, and consuming operation",
 	} {
 		if !strings.Contains(neoRunCheckSubagentPrompt, want) {
 			t.Fatalf("run_check prompt missing evidence guidance %q", want)
@@ -4261,8 +4276,9 @@ func TestNeoNormalizePublishedDependencyCapabilityEvidence(t *testing.T) {
 			"dependency":   dependency,
 			"floorVersion": floorVersion,
 			"accessPath":   accessPath,
+			"floorStatus":  "compatible",
 			"verification": verification,
-			"rootEvidence": "exact root client type declaration text",
+			"rootEvidence": []any{"exact root client type declaration text"},
 		}
 	}
 
@@ -4280,24 +4296,48 @@ func TestNeoNormalizePublishedDependencyCapabilityEvidence(t *testing.T) {
 	}
 
 	if _, err := neoNormalizeRunCheckResult(input, result(
-		[]any{"TypeScript root client"},
+		[]any{neoDependencyPatternKey("@openrouter/sdk", "1.0.0", "Responses")},
 		[]any{entry(0, "@openrouter/sdk", "1.0.0", "Responses", "exact-export-inspection")},
-	)); err == nil || !strings.Contains(err.Error(), "root owner") {
+	)); err == nil || !strings.Contains(err.Error(), "owner and terminal capability") {
 		t.Fatalf("adjacent-class access path was accepted: %v", err)
 	}
 
 	if _, err := neoNormalizeRunCheckResult(input, result(
-		[]any{"TypeScript root client"},
+		[]any{neoDependencyPatternKey("@openrouter/sdk", "1.0.0", "@openrouter/sdk/sdk/embeddings.js.Embeddings.generate")},
+		[]any{entry(0, "@openrouter/sdk", "1.0.0", "@openrouter/sdk/sdk/embeddings.js.Embeddings.generate", "exact-export-inspection")},
+	)); err == nil || !strings.Contains(err.Error(), "invalid owner or capability segment") {
+		t.Fatalf("ambiguous module access path was accepted: %v", err)
+	}
+
+	if _, err := neoNormalizeRunCheckResult(input, result(
+		[]any{neoDependencyPatternKey("@openrouter/sdk", "1.0.0", "OpenRouter.responses")},
 		[]any{entry(0, "@openrouter/sdk", "1.0.0", "OpenRouter.responses", "adjacent-class-inspection")},
 	)); err == nil || !strings.Contains(err.Error(), "invalid verification") {
 		t.Fatalf("invalid dependency-floor verification was accepted: %v", err)
 	}
 
+	if _, err := neoNormalizeRunCheckResult(input, result(
+		[]any{neoDependencyPatternKey("@openrouter/sdk", "1.0.0", "OpenRouter.responses.send")},
+		[]any{entry(0, "@openrouter/sdk", "1.0.0", "OpenRouter.responses", "root-type-declaration")},
+	)); err == nil || !strings.Contains(err.Error(), "pattern must be") {
+		t.Fatalf("shortened dependency access path was accepted for a changed method pattern: %v", err)
+	}
+
+	if _, err := neoNormalizeRunCheckResult(input, result(
+		[]any{neoDependencyPatternKey("openai", "6.0.0", "OpenAI.baseURL")},
+		[]any{entry(0, "openai", "6.0.0", "OpenAI.baseURL", "root-type-declaration")},
+	)); err != nil {
+		t.Fatalf("two-segment property capability was rejected: %v", err)
+	}
+
 	normalized, err := neoNormalizeRunCheckResult(input, result(
-		[]any{"TypeScript root client", "Python root client"},
 		[]any{
-			entry(0, "@openrouter/sdk", "1.0.0", "OpenRouter.responses", "root-type-declaration"),
-			entry(1, "openrouter", "1.0.0", "OpenRouter.responses", "root-source-construction"),
+			neoDependencyPatternKey("@openrouter/sdk", "1.0.0", "OpenRouter.responses.send"),
+			neoDependencyPatternKey("openrouter", "1.0.0", "OpenRouter.responses.send"),
+		},
+		[]any{
+			entry(0, "@openrouter/sdk", "1.0.0", "OpenRouter.responses.send", "root-type-declaration"),
+			entry(1, "openrouter", "1.0.0", "OpenRouter.responses.send", "root-source-construction"),
 		},
 	))
 	if err != nil || len(arrayValue(normalized["evidence"])) != 2 {
@@ -4305,13 +4345,1305 @@ func TestNeoNormalizePublishedDependencyCapabilityEvidence(t *testing.T) {
 	}
 
 	if _, err := neoNormalizeRunCheckResult(input, result(
-		[]any{"first TypeScript root traversal", "duplicate TypeScript root traversal"},
 		[]any{
-			entry(0, "@openrouter/sdk", "1.0.0", "OpenRouter.responses", "root-type-declaration"),
-			entry(1, "@openrouter/sdk", "1.0.0", "OpenRouter.responses", "root-type-declaration"),
+			neoDependencyPatternKey("@openrouter/sdk", "1.0.0", "OpenRouter.responses.send"),
+			neoDependencyPatternKey("@openrouter/sdk", "1.0.0", "OpenRouter.responses.send"),
+		},
+		[]any{
+			entry(0, "@openrouter/sdk", "1.0.0", "OpenRouter.responses.send", "root-type-declaration"),
+			entry(1, "@openrouter/sdk", "1.0.0", "OpenRouter.responses.send", "root-type-declaration"),
 		},
 	)); err == nil || !strings.Contains(err.Error(), "duplicates capability path") {
 		t.Fatalf("duplicate dependency-floor owner evidence was accepted: %v", err)
+	}
+}
+
+func TestNeoNormalizePublishedDependencyCapabilityToolProvenance(t *testing.T) {
+	toolEvidence := func(input, output string) []any {
+		return []any{map[string]any{"tool": "shell_command", "input": input, "outputs": []any{output}}}
+	}
+	input := func(evidence []any) map[string]any {
+		return map[string]any{
+			"checkName":                     "published-dependency-capability-floor",
+			neoRunCheckToolEvidenceRequired: true,
+			neoRunCheckToolEvidenceKey:      evidence,
+		}
+	}
+	result := func(accessPath string, fragments ...string) map[string]any {
+		rootEvidence := make([]any, 0, len(fragments))
+		for _, fragment := range fragments {
+			rootEvidence = append(rootEvidence, fragment)
+		}
+		return map[string]any{
+			"status":          "completed",
+			"patternsChecked": []any{neoDependencyPatternKey("@example/sdk", "1.0.0", accessPath)},
+			"evidence": []any{map[string]any{
+				"patternIndex": 0,
+				"observation":  "The exact floor exposes the root capability path.",
+				"sources":      []any{"exact package archive"},
+				"outcome":      "no-finding",
+				"issueIndexes": []any{},
+				"dependency":   "@example/sdk",
+				"floorVersion": "1.0.0",
+				"accessPath":   accessPath,
+				"floorStatus":  "compatible",
+				"verification": "root-type-declaration",
+				"rootEvidence": rootEvidence,
+			}},
+			"issues": []any{},
+		}
+	}
+	root := "export declare class RootClient { get responses(): Responses; }"
+	method := "export declare class Responses { send(): Promise<Response>; }"
+
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(
+		`{"command":"inspect @example/sdk@1.0.0 exact declarations"}`,
+		root+"\n"+method,
+	)), result("RootClient.responses.send", "export declare class RootClient { get responses(): Fabricated; }", method)); err == nil || !strings.Contains(err.Error(), "not found verbatim") {
+		t.Fatalf("fabricated exact-floor evidence was accepted: %v", err)
+	}
+
+	normalized, err := neoNormalizeRunCheckResult(input(toolEvidence(
+		`{"command":"inspect @example/sdk@1.0.0 exact declarations"}`,
+		root+"\n"+method,
+	)), result("RootClient.responses.send", root, method))
+	if err != nil || len(arrayValue(normalized["evidence"])) != 1 {
+		t.Fatalf("exact tool-grounded root evidence = %#v, %v", normalized, err)
+	}
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(
+		`{"command":"inspect @example/sdk@1.0.0; cat fabricated-output.txt"}`,
+		root+"\n"+method,
+	)), result("RootClient.responses.send", root, method)); err == nil || !strings.Contains(err.Error(), "call identifies") {
+		t.Fatalf("unbound inspect output producer established exact-floor evidence: %v", err)
+	}
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(
+		`{"command":"set -e; printf '@example/sdk@1.0.0' >/dev/null; inspect unrelated-package@1.0.0"}`,
+		root+"\n"+method,
+	)), result("RootClient.responses.send", root, method)); err == nil || !strings.Contains(err.Error(), "call identifies") {
+		t.Fatalf("non-acquisition exact-floor mention established provenance: %v", err)
+	}
+	quotedFloorResult := result("RootClient.responses.send", root, method)
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(
+		`{"command":"inspect '@example/sdk@1.0.0' exact declarations"}`,
+		root+"\n"+method,
+	)), quotedFloorResult); err != nil {
+		t.Fatalf("quoted exact-floor command operand was rejected: %v", err)
+	}
+	for name, command := range map[string]string{
+		"npm options": `npm pack --pack-destination "$tmp" @example/sdk@1.0.0`,
+		"pip options": `python -m pip download --no-deps @example/sdk==1.0.0 -d "$tmp"`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if !neoRunCheckExactFloorTarget(command, "@example/sdk", "1.0.0") {
+				t.Fatalf("option-bearing exact-floor command was rejected: %q", command)
+			}
+		})
+	}
+	if neoRunCheckExactFloorTarget("cat <<'DATA'\ninspect @example/sdk@1.0.0\nDATA", "@example/sdk", "1.0.0") {
+		t.Fatal("inert heredoc data established exact-floor provenance")
+	}
+	if neoRunCheckExactFloorEvidenceTarget("inspect @example/sdk@1.0.0; console.log(typeof RootClient.responses.send === 'function' ? AVAILABLE : MISSING)", "@example/sdk", "1.0.0", "root-runtime-traversal") {
+		t.Fatal("exact-floor mention without a runtime loader established runtime provenance")
+	}
+	if !neoRunCheckExactFloorEvidenceTarget("load-exact-floor @example/sdk@1.0.0; console.log(typeof RootClient.responses.send === 'function' ? AVAILABLE : MISSING)", "@example/sdk", "1.0.0", "root-runtime-traversal") {
+		t.Fatal("executed exact-floor runtime loader was rejected")
+	}
+	if !neoRunCheckExactFloorEvidenceTarget(neoRunCheckToolCommandText(`{"command":"inspect @example/sdk@1.0.0 root declarations","workdir":"/tmp/worktree"}`), "@example/sdk", "1.0.0", "root-type-declaration") {
+		t.Fatal("producer-bound exact-floor inspection was rejected")
+	}
+	if neoRunCheckExactFloorEvidenceTarget(neoRunCheckToolCommandText(`{"command":"inspect @example/sdk@1.0.0; cat fabricated-output.txt","workdir":"/tmp/worktree"}`), "@example/sdk", "1.0.0", "root-type-declaration") {
+		t.Fatal("mixed exact-floor inspection and unrelated output producer established source provenance")
+	}
+	if neoRunCheckExactFloorEvidenceTarget(neoRunCheckToolCommandText(`{"command":"cat fabricated-output.txt","workdir":"inspect @example/sdk@1.0.0"}`), "@example/sdk", "1.0.0", "root-type-declaration") {
+		t.Fatal("unrelated tool-input field established exact-floor source provenance")
+	}
+	inertArchiveWorkflow := "set -e; cat <<'DATA'\nnpm pack @example/sdk@1.0.0\ntar -xzf example-sdk-1.0.0.tgz\nsed -n '1,120p' package/index.d.ts\nDATA"
+	if neoRunCheckExactFloorEvidenceTarget(inertArchiveWorkflow, "@example/sdk", "1.0.0", "root-type-declaration") {
+		t.Fatal("inert heredoc archive commands established exact-floor source provenance")
+	}
+	for name, command := range map[string]string{
+		"and chain":        `inspect @example/sdk@1.0.0 && cat fabricated-output.txt`,
+		"leading producer": `cat fabricated-output.txt; inspect @example/sdk@1.0.0`,
+		"pipeline":         `inspect @example/sdk@1.0.0 | cat`,
+		"wrapped command":  `sh -c 'inspect @example/sdk@1.0.0'`,
+	} {
+		t.Run("rejects unbound "+name, func(t *testing.T) {
+			if neoRunCheckExactFloorEvidenceTarget(command, "@example/sdk", "1.0.0", "root-type-declaration") {
+				t.Fatalf("unbound inspection command was accepted: %q", command)
+			}
+		})
+	}
+	archiveWorkflow := `set -e; npm pack @example/sdk@1.0.0; tar -xzf example-sdk-1.0.0.tgz; sed -n '1,120p' package/index.d.ts`
+	if !neoRunCheckExactFloorEvidenceTarget(archiveWorkflow, "@example/sdk", "1.0.0", "root-type-declaration") {
+		t.Fatal("exact-floor archive extraction and source inspection was rejected")
+	}
+	if neoRunCheckExactFloorEvidenceTarget(`npm pack @example/sdk@1.0.0; printf 'unrelated'`, "@example/sdk", "1.0.0", "root-type-declaration") {
+		t.Fatal("exact-floor acquisition without artifact inspection established source provenance")
+	}
+	if neoRunCheckExactFloorEvidenceTarget(`set -e; npm pack @example/sdk@1.0.0; tar -xzf unrelated-1.0.0.tgz; sed -n '1,120p' package/index.d.ts`, "@example/sdk", "1.0.0", "root-type-declaration") {
+		t.Fatal("unrelated archive extraction established source provenance")
+	}
+	if neoRunCheckExactFloorEvidenceTarget(`set -e; npm pack @example/sdk@1.0.0; tar -xzf example-sdk-1.0.0.tgz; sed -n '1,120p' unrelated/index.d.ts`, "@example/sdk", "1.0.0", "root-type-declaration") {
+		t.Fatal("unrelated source inspection established source provenance")
+	}
+	if neoRunCheckExactFloorEvidenceTarget(`npm pack @example/sdk@1.0.0; tar -xzf example-sdk-1.0.0.tgz; sed -n '1,120p' package/index.d.ts`, "@example/sdk", "1.0.0", "root-type-declaration") {
+		t.Fatal("non-fail-fast archive workflow established source provenance")
+	}
+	if !neoRunCheckExactFloorEvidenceTarget(`set -e; npm pack @example/sdk@1.0.0; mkdir extracted; tar -xzf example-sdk-1.0.0.tgz -C extracted; rg 'class RootClient' extracted/package/index.d.ts`, "@example/sdk", "1.0.0", "root-source-construction") {
+		t.Fatal("destination-scoped exact-floor source inspection was rejected")
+	}
+	if !neoRunCheckExactFloorEvidenceTarget(`set -e; pnpm pack @example/sdk@1.0.0; tar -xzf example-sdk-1.0.0.tgz; cat package/index.d.ts`, "@example/sdk", "1.0.0", "root-type-declaration") {
+		t.Fatal("pnpm exact-floor source inspection was rejected")
+	}
+	if !neoRunCheckExactFloorEvidenceTarget(`set -e; python -m pip download --no-deps example-sdk==1.0.0; mkdir extracted; tar -xzf example_sdk-1.0.0.tar.gz -C extracted; sed -n '1,120p' extracted/example_sdk-1.0.0/example_sdk/client.py`, "example-sdk", "1.0.0", "root-source-construction") {
+		t.Fatal("Python sdist exact-floor source inspection was rejected")
+	}
+	if !neoRunCheckExactFloorEvidenceTarget(`set -e; pip download example-sdk==1.0.0; unzip example_sdk-1.0.0-py3-none-any.whl -d extracted; rg 'class RootClient' extracted/example_sdk/client.py`, "example-sdk", "1.0.0", "root-source-construction") {
+		t.Fatal("Python wheel exact-floor source inspection was rejected")
+	}
+	if neoRunCheckExactFloorEvidenceTarget(`set -e; pip download example-sdk==1.0.0; unzip other_sdk-1.0.0-py3-none-any.whl -d extracted; rg 'class RootClient' extracted/example_sdk/client.py`, "example-sdk", "1.0.0", "root-source-construction") {
+		t.Fatal("unrelated Python wheel established source provenance")
+	}
+	intermediateMethod := "export declare class RootClient { responses(): Responses; }"
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(
+		`{"command":"inspect @example/sdk@1.0.0 exact declarations"}`,
+		intermediateMethod+"\n"+method,
+	)), result("RootClient.responses.send", intermediateMethod, method)); err == nil || !strings.Contains(err.Error(), "does not prove any edge") {
+		t.Fatalf("intermediate method established a property access edge: %v", err)
+	}
+
+	adjacent := "export declare class Beta { get responses(): Responses; }"
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(
+		`{"command":"inspect @example/sdk@1.0.0 exact declarations"}`,
+		adjacent+"\n"+method,
+	)), result("RootClient.responses.send", adjacent, method)); err == nil || !strings.Contains(err.Error(), `does not prove any edge or exact status`) || !strings.Contains(err.Error(), `complete owner scope for "RootClient" -> "responses"`) || !strings.Contains(err.Error(), `exact assertion "RootClient.responses.send=AVAILABLE"`) {
+		t.Fatalf("adjacent-resource evidence validated a different root path: %v", err)
+	}
+
+	if _, err := neoNormalizeRunCheckResult(input(nil), result("RootClient.responses.send", root, method)); err == nil || !strings.Contains(err.Error(), "successful tool results") {
+		t.Fatalf("unavailable tool provenance was accepted: %v", err)
+	}
+
+	compact := "A.b=AVAILABLE"
+	compactResult := result("A.b", compact)
+	mapValue(arrayValue(compactResult["evidence"])[0])["verification"] = "root-runtime-traversal"
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(
+		`{"command":"set -e; load-exact-floor @example/sdk@1.0.0 A.b; console.log(typeof A.b === 'function' ? AVAILABLE : MISSING)"}`,
+		compact,
+	)), compactResult); err != nil {
+		t.Fatalf("compact exact traversal assertion was rejected: %v", err)
+	}
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(
+		`{"command":"load-exact-floor @example/sdk@1.0.0 A.b=AVAILABLE"}`,
+		compact,
+	)), compactResult); err == nil || !strings.Contains(err.Error(), "assembled unconditionally") {
+		t.Fatalf("command-literal traversal assertion was accepted: %v", err)
+	}
+
+	modulePath := "@example/sdk/sdk/embeddings.js#Embeddings.generate"
+	moduleBinding := `export { Embeddings } from "@example/sdk/sdk/embeddings.js";`
+	moduleMethod := "export declare class Embeddings { generate(): Promise<Response>; }"
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(
+		`{"command":"inspect @example/sdk@1.0.0 module exports"}`,
+		moduleBinding+"\n"+moduleMethod,
+	)), result(modulePath, moduleBinding, moduleMethod)); err != nil {
+		t.Fatalf("module file suffix was treated as an ownership segment: %v", err)
+	}
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(
+		`{"command":"inspect @example/sdk@1.0.0 @example/sdk/sdk/embeddings.js module exports"}`,
+		moduleMethod,
+	)), result(modulePath, moduleMethod)); err != nil {
+		t.Fatalf("direct resolved-module export evidence was rejected: %v", err)
+	}
+	nonExportedModuleMethod := "declare class Embeddings { generate(): Promise<Response>; }"
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(
+		`{"command":"inspect @example/sdk@1.0.0 @example/sdk/sdk/embeddings.js module exports"}`,
+		nonExportedModuleMethod,
+	)), result(modulePath, nonExportedModuleMethod)); err == nil || !strings.Contains(err.Error(), "does not connect module") {
+		t.Fatalf("non-exported resolved-module owner established module ownership: %v", err)
+	}
+	for name, evidence := range map[string][]string{
+		"export": {"export declare class embeddings { generate(): Promise<Response>; }"},
+		"owner":  {moduleBinding, "declare class embeddings { generate(): Promise<Response>; }"},
+		"member": {"export declare class Embeddings { Generate(): Promise<Response>; }"},
+	} {
+		t.Run("case-mismatched "+name, func(t *testing.T) {
+			if _, err := neoNormalizeRunCheckResult(input(toolEvidence(
+				`{"command":"inspect @example/sdk@1.0.0 @example/sdk/sdk/embeddings.js module exports"}`,
+				strings.Join(evidence, "\n"),
+			)), result(modulePath, evidence...)); err == nil {
+				t.Fatalf("case-mismatched %s established exact access-path ownership", name)
+			}
+		})
+	}
+	moduleAliasPath := "@example/sdk/sdk/embeddings.js#VectorEmbeddings.generate"
+	moduleAliasBinding := `export { Embeddings as VectorEmbeddings } from "@example/sdk/sdk/embeddings.js";`
+	moduleAliasMethod := "export declare class VectorEmbeddings { generate(): Promise<Response>; }"
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(
+		`{"command":"inspect @example/sdk@1.0.0 module exports"}`,
+		moduleAliasBinding+"\n"+moduleAliasMethod,
+	)), result(moduleAliasPath, moduleAliasBinding, moduleAliasMethod)); err != nil {
+		t.Fatalf("named module re-export alias was rejected: %v", err)
+	}
+	moduleImport := `import { VectorEmbeddings } from "@example/sdk/sdk/embeddings.js";`
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(
+		`{"command":"inspect @example/sdk@1.0.0 module exports"}`,
+		moduleImport+"\n"+moduleAliasMethod,
+	)), result(moduleAliasPath, moduleImport, moduleAliasMethod)); err == nil || !strings.Contains(err.Error(), "does not prove any edge") {
+		t.Fatalf("module import established exported ownership: %v", err)
+	}
+	moduleMention := `const description = "@example/sdk/sdk/embeddings.js Embeddings";`
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(
+		`{"command":"inspect @example/sdk@1.0.0 module exports"}`,
+		moduleMention+"\n"+moduleMethod,
+	)), result(modulePath, moduleMention, moduleMethod)); err == nil || !strings.Contains(err.Error(), "does not prove any edge") {
+		t.Fatalf("raw module and export mentions established ownership: %v", err)
+	}
+
+	indentedRoot := "class RootClient(BaseSDK):\n    _sub_sdk_map = {\n        \"chat\": Chat,\n        \"embeddings\": Embeddings,\n    }"
+	indentedMethod := "class Embeddings(BaseSDK):\n    def generate(self): ..."
+	pythonResult := result("RootClient.embeddings.generate", indentedRoot, indentedMethod)
+	mapValue(arrayValue(pythonResult["evidence"])[0])["verification"] = "root-source-construction"
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(
+		`{"command":"inspect @example/sdk@1.0.0 root map"}`,
+		indentedRoot+"\n"+indentedMethod,
+	)), pythonResult); err != nil {
+		t.Fatalf("raw source evidence with indentation, quotes, and newlines was rejected: %v", err)
+	}
+	inactivePythonRoot := `fixture = """
+class RootClient(BaseSDK):
+    _sub_sdk_map = {"embeddings": Embeddings}
+"""`
+	if present, absent, scoped := neoRunCheckMatchedPythonConstruction("", inactivePythonRoot, "RootClient", "embeddings"); present || absent || scoped {
+		t.Fatalf("inactive Python construction = %t/%t/%t", present, absent, scoped)
+	}
+	inactivePythonMap := `class RootClient(BaseSDK):
+    """
+    _sub_sdk_map = {"embeddings": Embeddings}
+    """`
+	if present, absent, scoped := neoRunCheckMatchedPythonConstruction("", inactivePythonMap, "RootClient", "embeddings"); present || absent || scoped {
+		t.Fatalf("inactive Python map = %t/%t/%t", present, absent, scoped)
+	}
+
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(
+		`{"command":"inspect @example/sdk@1.0.0 root map"}`,
+		root,
+	)), result("RootClient.responses.send", root)); err == nil || !strings.Contains(err.Error(), `segments "responses" and "send"`) {
+		t.Fatalf("incomplete terminal method evidence was accepted: %v", err)
+	}
+
+	pythonAdjacent := "class Beta(BaseSDK):\n    _sub_sdk_map = {\"responses\": Responses}"
+	pythonMethod := "class Responses(BaseSDK):\n    def send(self): ..."
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(
+		`{"command":"inspect @example/sdk@1.0.0 Python root map"}`,
+		pythonAdjacent+"\n"+pythonMethod,
+	)), result("OpenRouter.responses.send", pythonAdjacent, pythonMethod)); err == nil || !strings.Contains(err.Error(), `does not prove any edge or exact status`) {
+		t.Fatalf("Python Beta root map validated OpenRouter owner: %v", err)
+	}
+
+	pythonRootMap := "_sub_sdk_map = {\n        \"beta\": Beta,\n        \"chat\": Chat,\n        \"embeddings\": Embeddings,\n    }"
+	pythonRoot := "class OpenRouter(BaseSDK):\n    " + pythonRootMap
+	pythonMissingAssertion := "OpenRouter.responses.send=MISSING"
+	pythonMissing := result("OpenRouter.responses.send", pythonRoot, pythonMissingAssertion)
+	pythonMissingEntry := mapValue(arrayValue(pythonMissing["evidence"])[0])
+	pythonMissingEntry["outcome"] = "finding"
+	pythonMissingEntry["issueIndexes"] = []any{0}
+	pythonMissingEntry["floorStatus"] = "incompatible"
+	pythonMissingEntry["verification"] = "root-source-construction"
+	pythonMissing["issues"] = []any{map[string]any{
+		"severity": "high", "file": "wrapper.py", "line": 1,
+		"problem": "The root capability is missing.", "why": "The access can fail at runtime.", "fix": "Raise the floor.",
+	}}
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(
+		`{"command":"inspect @example/sdk@1.0.0 Python root construction"}`,
+		pythonRoot+"\n"+pythonAdjacent+"\n"+pythonMissingAssertion,
+	)), pythonMissing); err != nil {
+		t.Fatalf("exact Python root construction absence was rejected: %v", err)
+	}
+	pythonRootWithUnrelatedMember := "class OpenRouter(BaseSDK):\n    responses = Responses\n    " + pythonRootMap
+	pythonMissingEntry["rootEvidence"] = []any{pythonRootWithUnrelatedMember, pythonMissingAssertion}
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(
+		`{"command":"inspect @example/sdk@1.0.0 Python root construction"}`,
+		pythonRootWithUnrelatedMember+"\n"+pythonMissingAssertion,
+	)), pythonMissing); err != nil {
+		t.Fatalf("member outside the Python root map changed map absence: %v", err)
+	}
+	pythonRootWithLaterMethod := pythonRoot + "\n\n    def close(self):\n        pass"
+	pythonMissingEntry["rootEvidence"] = []any{pythonRootWithLaterMethod, pythonMissingAssertion}
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(
+		`{"command":"inspect @example/sdk@1.0.0 Python root construction"}`,
+		pythonRootWithLaterMethod+"\n"+pythonMissingAssertion,
+	)), pythonMissing); err != nil {
+		t.Fatalf("complete Python root owner with code after its map was rejected: %v", err)
+	}
+	pythonMissingEntry["rootEvidence"] = []any{pythonRootMap, pythonMissingAssertion}
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(
+		`{"command":"inspect @example/sdk@1.0.0 Python root construction"}`,
+		pythonRoot+"\n"+pythonMissingAssertion,
+	)), pythonMissing); err == nil || !strings.Contains(err.Error(), "does not prove any edge or exact status") {
+		t.Fatalf("standalone Python root map established ownership: %v", err)
+	}
+	pythonMissingEntry["rootEvidence"] = []any{pythonAdjacent, pythonMissingAssertion}
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(
+		`{"command":"inspect @example/sdk@1.0.0 Python adjacent construction"}`,
+		pythonAdjacent+"\n"+pythonMissingAssertion,
+	)), pythonMissing); err == nil || !strings.Contains(err.Error(), "does not prove any edge or exact status") {
+		t.Fatalf("adjacent Python construction established root absence: %v", err)
+	}
+
+	missing := result("RootClient.responses.send", root, method)
+	missingEntry := mapValue(arrayValue(missing["evidence"])[0])
+	missingEntry["outcome"] = "finding"
+	missingEntry["issueIndexes"] = []any{0}
+	missingEntry["floorStatus"] = "incompatible"
+	missingEntry["verification"] = "root-runtime-traversal"
+	missing["issues"] = []any{map[string]any{
+		"severity": "high", "file": "wrapper.ts", "line": 1,
+		"problem": "The root capability is missing.", "why": "The access can fail at runtime.", "fix": "Raise the floor.",
+	}}
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(
+		`{"command":"load-exact-floor @example/sdk@1.0.0 root map"}`,
+		root+"\n"+method,
+	)), missing); err == nil || !strings.Contains(err.Error(), "requires exact successful-tool assertion") {
+		t.Fatalf("source declarations established a missing capability: %v", err)
+	}
+	missingAssertion := "RootClient.responses.send=MISSING"
+	missingEntry["rootEvidence"] = []any{missingAssertion}
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(
+		`{"command":"set -e; load-exact-floor @example/sdk@1.0.0 RootClient.responses.send; console.log(typeof RootClient.responses.send === 'function' ? AVAILABLE : MISSING)"}`,
+		missingAssertion,
+	)), missing); err != nil {
+		t.Fatalf("exact missing traversal assertion was rejected: %v", err)
+	}
+	availableAssertion := "RootClient.responses.send=AVAILABLE"
+	correctedEvidence := append(toolEvidence(
+		`{"command":"set -e; load-exact-floor @example/sdk@1.0.0 RootClient.responses.send; console.log(typeof RootClient.responses.send === 'function' ? AVAILABLE : MISSING)"}`,
+		missingAssertion,
+	), toolEvidence(
+		`{"command":"set -e; load-exact-floor @example/sdk@1.0.0 RootClient.responses.send; console.log(typeof RootClient.responses.send === 'function' ? AVAILABLE : MISSING)"}`,
+		availableAssertion,
+	)...)
+	if _, err := neoNormalizeRunCheckResult(input(correctedEvidence), cloneNeoJSONMap(missing)); err == nil || !strings.Contains(err.Error(), "superseded by later successful exact-floor output") {
+		t.Fatalf("stale missing assertion survived a later available correction: %v", err)
+	}
+	synthesizedStatusHarness := `{"command":"set -e; load-exact-floor @example/sdk@1.0.0 >/dev/null; access=RootClient.responses.send; echo \"$access=MISSING\""}`
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(synthesizedStatusHarness, missingAssertion)), missing); err == nil || !strings.Contains(err.Error(), "assembled unconditionally") {
+		t.Fatalf("variable-built status assertion established a traversal: %v", err)
+	}
+	suffixPredicateHarness := `{"command":"set -e; load-exact-floor @example/sdk@1.0.0 RootClient.responses.send; typeof OtherClient.responses.send ? AVAILABLE : MISSING"}`
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(suffixPredicateHarness, missingAssertion)), missing); err == nil || !strings.Contains(err.Error(), "capability predicate") {
+		t.Fatalf("suffix-only predicate established a root traversal: %v", err)
+	}
+	unusedPredicateHarness := `{"command":"set -e; load-exact-floor @example/sdk@1.0.0 RootClient.responses.send; typeof RootClient.responses.send; echo RootClient.responses.send=MISSING"}`
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(unusedPredicateHarness, missingAssertion)), missing); err == nil || !strings.Contains(err.Error(), "capability predicate") {
+		t.Fatalf("unused predicate established a status assertion: %v", err)
+	}
+	bareTypeofHarness := `{"command":"set -e; load-exact-floor @example/sdk@1.0.0 RootClient.responses.send; typeof RootClient.responses.send ? AVAILABLE : MISSING"}`
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(bareTypeofHarness, missingAssertion)), missing); err == nil || !strings.Contains(err.Error(), "capability predicate") {
+		t.Fatalf("bare typeof truthiness established a status assertion: %v", err)
+	}
+	discardedConditionalHarness := `{"command":"set -e; load-exact-floor @example/sdk@1.0.0 RootClient.responses.send; typeof RootClient.responses.send === 'function' ? AVAILABLE : MISSING; echo RootClient.responses.send=MISSING"}`
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(discardedConditionalHarness, missingAssertion)), missing); err == nil || !strings.Contains(err.Error(), "capability predicate") {
+		t.Fatalf("discarded status conditional established a status assertion: %v", err)
+	}
+	nonFunctionInequalityHarness := `{"command":"set -e; load-exact-floor @example/sdk@1.0.0 RootClient.responses.send; console.log(typeof RootClient.responses.send !== 'object' ? AVAILABLE : MISSING)"}`
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(nonFunctionInequalityHarness, missingAssertion)), missing); err == nil || !strings.Contains(err.Error(), "capability predicate") {
+		t.Fatalf("non-function inequality established a status assertion: %v", err)
+	}
+	unusedConditionalHarness := `{"command":"set -e; load-exact-floor @example/sdk@1.0.0 RootClient.responses.send; const status = typeof RootClient.responses.send === 'function' ? AVAILABLE : MISSING; echo RootClient.responses.send=MISSING"}`
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(unusedConditionalHarness, missingAssertion)), missing); err == nil || !strings.Contains(err.Error(), "capability predicate") {
+		t.Fatalf("unused status conditional established a status assertion: %v", err)
+	}
+	emittedConditionalHarness := `{"command":"set -e; load-exact-floor @example/sdk@1.0.0 RootClient.responses.send; const status = typeof RootClient.responses.send === 'function' ? AVAILABLE : MISSING; console.log('RootClient.responses.send=' + status)"}`
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(emittedConditionalHarness, missingAssertion)), missing); err != nil {
+		t.Fatalf("emitted predicate-derived status variable was rejected: %v", err)
+	}
+	aliasedRootHarness := `{"command":"set -e; load-exact-floor @example/sdk@1.0.0 RootClient.responses.send; const client = new RootClient(); const status = typeof client.responses.send === 'function' ? AVAILABLE : MISSING; console.log('RootClient.responses.send=' + status)"}`
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(aliasedRootHarness, missingAssertion)), missing); err != nil {
+		t.Fatalf("instantiated root-client alias was rejected: %v", err)
+	}
+	for name, harness := range map[string]string{
+		"quoted alias":    `{"command":"set -e; load-exact-floor @example/sdk@1.0.0 RootClient.responses.send; const note = 'const client = new RootClient()'; const status = typeof client.responses.send === 'function' ? AVAILABLE : MISSING; console.log('RootClient.responses.send=' + status)"}`,
+		"commented alias": `{"command":"set -e; load-exact-floor @example/sdk@1.0.0 RootClient.responses.send; /* const client = new RootClient(); */ const status = typeof client.responses.send === 'function' ? AVAILABLE : MISSING; console.log('RootClient.responses.send=' + status)"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := neoNormalizeRunCheckResult(input(toolEvidence(harness, missingAssertion)), cloneNeoJSONMap(missing)); err == nil || !strings.Contains(err.Error(), "capability predicate") {
+				t.Fatalf("inactive root-client alias established a traversal: %v", err)
+			}
+		})
+	}
+	unrelatedAliasHarness := `{"command":"set -e; load-exact-floor @example/sdk@1.0.0 RootClient.responses.send; const client = new OtherClient(); const status = typeof client.responses.send === 'function' ? AVAILABLE : MISSING; console.log('RootClient.responses.send=' + status)"}`
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(unrelatedAliasHarness, missingAssertion)), missing); err == nil || !strings.Contains(err.Error(), "capability predicate") {
+		t.Fatalf("unrelated client alias established root traversal: %v", err)
+	}
+	invertedConditionalHarness := `{"command":"set -e; load-exact-floor @example/sdk@1.0.0 RootClient.responses.send; const status = typeof RootClient.responses.send === 'function' ? MISSING : AVAILABLE; console.log('RootClient.responses.send=' + status)"}`
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(invertedConditionalHarness, missingAssertion)), missing); err == nil || !strings.Contains(err.Error(), "capability predicate") {
+		t.Fatalf("inverted status branches established a status assertion: %v", err)
+	}
+	unrelatedEmitterHarness := `{"command":"set -e; load-exact-floor @example/sdk@1.0.0 RootClient.responses.send; const status = typeof RootClient.responses.send === 'function' ? AVAILABLE : MISSING; console.log(other)"}`
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(unrelatedEmitterHarness, missingAssertion)), missing); err == nil || !strings.Contains(err.Error(), "capability predicate") {
+		t.Fatalf("unemitted predicate result established a status assertion: %v", err)
+	}
+
+	jsCatchHarness := `{"command":"load-exact-floor @example/sdk@1.0.0; node <<'JS'\nconst access = 'RootClient.responses.send';\ntry { const client = loadExactFloor(); console.log(access + '=' + (typeof client.responses?.send === 'function' ? 'AVAILABLE' : 'MISSING')); } catch (error) { console.log(access + '=MISSING'); }\nJS"}`
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(jsCatchHarness, missingAssertion)), missing); err == nil || !strings.Contains(err.Error(), "caught load") {
+		t.Fatalf("JavaScript caught import failure established absence: %v", err)
+	}
+
+	pythonCatchHarness := `{"command":"load-exact-floor @example/sdk@1.0.0; python3 - <<'PY'\naccess = 'RootClient.responses.send'\ntry:\n    client = load_exact_floor()\n    print(f'{access}=' + ('AVAILABLE' if callable(client.responses.send) else 'MISSING'))\nexcept Exception:\n    print(f'{access}=MISSING')\nPY"}`
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(pythonCatchHarness, missingAssertion)), missing); err == nil || !strings.Contains(err.Error(), "caught load") {
+		t.Fatalf("Python caught import failure established absence: %v", err)
+	}
+	jsVariableCatchHarness := `{"command":"load-exact-floor @example/sdk@1.0.0; const status = 'MISSING'; import('./floor.js').catch(() => console.log([access, status].join('=')))"}`
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(jsVariableCatchHarness, missingAssertion)), missing); err == nil || !strings.Contains(err.Error(), "caught load") {
+		t.Fatalf("variable-derived JavaScript caught failure established absence: %v", err)
+	}
+	pythonVariableCatchHarness := "load-exact-floor @example/sdk@1.0.0\nstatus = 'MISSING'\ntry:\n    import broken_floor\nexcept ImportError:\n    print('='.join((access, status)))"
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(pythonVariableCatchHarness, missingAssertion)), missing); err == nil || !strings.Contains(err.Error(), "caught load") {
+		t.Fatalf("variable-derived Python caught failure established absence: %v", err)
+	}
+	swallowedShellHarness := `{"command":"set +e; load-exact-floor @example/sdk@1.0.0 || failed=1; printf '%s=%s\\n' \"$access\" MISSING"}`
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(swallowedShellHarness, missingAssertion)), missing); err == nil || !strings.Contains(err.Error(), "shell failure suppression") {
+		t.Fatalf("swallowed shell failure established absence: %v", err)
+	}
+
+	exactExportHarness := `{"command":"set -e; load-exact-floor @example/sdk@1.0.0 RootClient.responses.send; const exported = Object.prototype.hasOwnProperty.call(pkg.exports, key); console.log('RootClient.responses.send=' + (exported ? 'AVAILABLE' : 'MISSING'))"}`
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(exactExportHarness, missingAssertion)), missing); err == nil || !strings.Contains(err.Error(), "wildcard export patterns") {
+		t.Fatalf("exact-key-only package export lookup established absence: %v", err)
+	}
+	completeExportMap := "CLIPROXY_PACKAGE_EXPORTS={\".\":\"./index.js\",\"./chat.js\":\"./chat.js\"}\n" + missingAssertion
+	completeExportHarness := `{"command":"set -e; load-exact-floor @example/sdk@1.0.0; console.log('CLIPROXY_PACKAGE_EXPORTS=' + JSON.stringify(pkg.exports)); const exported = Object.prototype.hasOwnProperty.call(pkg.exports, key); console.log('RootClient.responses.send=' + (exported ? 'AVAILABLE' : 'MISSING'))"}`
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(completeExportHarness, completeExportMap)), missing); err == nil || !strings.Contains(err.Error(), "wildcard export patterns") {
+		t.Fatalf("package export map established root-member absence: %v", err)
+	}
+	rootExportPath := neoDependencyAccessPath{module: "@example/sdk", members: []string{"RootClient", "responses", "send"}}
+	for _, packet := range []string{
+		`CLIPROXY_PACKAGE_EXPORTS="./index.js"`,
+		`CLIPROXY_PACKAGE_EXPORTS=["./index.js","./fallback.js"]`,
+		`CLIPROXY_PACKAGE_EXPORTS={"import":"./index.mjs","require":"./index.cjs"}`,
+	} {
+		if neoRunCheckCompleteExportMap(completeExportHarness, packet, rootExportPath) {
+			t.Fatalf("root export shape established root-module absence: %s", packet)
+		}
+	}
+	if !neoRunCheckCompleteExportMap(completeExportHarness, `CLIPROXY_PACKAGE_EXPORTS={".":null}`, rootExportPath) {
+		t.Fatal("explicitly blocked root export was not recognized")
+	}
+	unrelatedJSON := "{\".\":\"./index.js\"}\n" + missingAssertion
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(exactExportHarness, unrelatedJSON)), missing); err == nil || !strings.Contains(err.Error(), "wildcard export patterns") {
+		t.Fatalf("unrelated JSON established export-map absence: %v", err)
+	}
+	wildcardPacket := "CLIPROXY_PACKAGE_EXPORTS={\"./*.js\":\"./esm/*.js\"}\n" + missingAssertion
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(completeExportHarness, wildcardPacket)), missing); err == nil || !strings.Contains(err.Error(), "wildcard export patterns") {
+		t.Fatalf("explicit wildcard export map established absence: %v", err)
+	}
+	unusedWildcardHarness := `{"command":"set -e; load-exact-floor @example/sdk@1.0.0 RootClient.responses.send; const keys = Object.keys(pkg.exports); const wildcard = keys.some(k => k.includes('*')); const exported = Object.hasOwn(pkg.exports, key); console.log(access + '=' + (exported ? 'AVAILABLE' : 'MISSING'))"}`
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(unusedWildcardHarness, missingAssertion)), missing); err == nil || !strings.Contains(err.Error(), "wildcard export patterns") {
+		t.Fatalf("unrelated wildcard scan legitimized exact-key export absence: %v", err)
+	}
+	for name, harness := range map[string]string{
+		"in expression":     `{"command":"set -e; load-exact-floor @example/sdk@1.0.0 RootClient.responses.send; const exported = key in pkg.exports; emit(status)"}`,
+		"optional indexing": `{"command":"set -e; load-exact-floor @example/sdk@1.0.0 RootClient.responses.send; const exported = pkg.exports?.[key]; emit(status)"}`,
+		"bracket indexing":  `{"command":"set -e; load-exact-floor @example/sdk@1.0.0 RootClient.responses.send; const exported = pkg[\"exports\"][key]; emit(status)"}`,
+	} {
+		if _, err := neoNormalizeRunCheckResult(input(toolEvidence(harness, missingAssertion)), missing); err == nil || !strings.Contains(err.Error(), "wildcard export patterns") {
+			t.Fatalf("%s established exact-key export absence: %v", name, err)
+		}
+	}
+	inactiveBracketHarness := `{"command":"set -e; printf '%s\\n' 'pkg[\"exports\"][key]'; emit(status)"}`
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(inactiveBracketHarness, missingAssertion)), missing); err == nil || strings.Contains(err.Error(), "wildcard export patterns") {
+		t.Fatalf("inactive bracket indexing was classified as an exact export lookup: %v", err)
+	}
+	missingEntry["verification"] = "exact-export-inspection"
+	moduleMissingAssertion := "@example/sdk/sdk/responses.js#Responses.send=MISSING"
+	moduleMissing := result("@example/sdk/sdk/responses.js#Responses.send", moduleMissingAssertion)
+	moduleMissingEntry := mapValue(arrayValue(moduleMissing["evidence"])[0])
+	moduleMissingEntry["outcome"] = "finding"
+	moduleMissingEntry["issueIndexes"] = []any{0}
+	moduleMissingEntry["floorStatus"] = "incompatible"
+	moduleMissingEntry["verification"] = "exact-export-inspection"
+	moduleMissing["issues"] = []any{map[string]any{
+		"severity": "high", "file": "wrapper.ts", "line": 1,
+		"problem": "The imported capability is missing.", "why": "The import can fail at runtime.", "fix": "Raise the floor.",
+	}}
+	moduleCompleteExportMap := "CLIPROXY_PACKAGE_EXPORTS={\".\":\"./index.js\",\"./chat.js\":\"./chat.js\"}\n" + moduleMissingAssertion
+	moduleCompleteExportHarness := `{"command":"set -e; load-exact-floor @example/sdk@1.0.0; console.log('CLIPROXY_PACKAGE_EXPORTS=' + JSON.stringify(pkg.exports)); const key = './sdk/responses.js'; const exported = Object.prototype.hasOwnProperty.call(pkg.exports, key); console.log('@example/sdk/sdk/responses.js#Responses.send=' + (exported ? 'AVAILABLE' : 'MISSING'))"}`
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(moduleCompleteExportHarness, moduleCompleteExportMap)), moduleMissing); err != nil {
+		t.Fatalf("complete wildcard-free package export map was rejected: %v", err)
+	}
+	for name, packet := range map[string]string{
+		"string":      `"./index.js"`,
+		"array":       `["./index.js",{"import":"./index.mjs"}]`,
+		"conditional": `{"import":"./index.mjs","require":"./index.cjs"}`,
+		"null":        `null`,
+	} {
+		t.Run("root-only "+name+" exports", func(t *testing.T) {
+			output := "CLIPROXY_PACKAGE_EXPORTS=" + packet + "\n" + moduleMissingAssertion
+			if _, err := neoNormalizeRunCheckResult(input(toolEvidence(moduleCompleteExportHarness, output)), cloneNeoJSONMap(moduleMissing)); err != nil {
+				t.Fatalf("valid root-only exports packet was rejected: %v", err)
+			}
+		})
+	}
+	wrongPacketSource := `{"command":"set -e; load-exact-floor @example/sdk@1.0.0; console.log('CLIPROXY_PACKAGE_EXPORTS=' + JSON.stringify(other)); JSON.stringify(pkg.exports); const exported = Object.hasOwn(pkg.exports, key); console.log('@example/sdk/sdk/responses.js#Responses.send=MISSING')"}`
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(wrongPacketSource, moduleCompleteExportMap)), moduleMissing); err == nil || !strings.Contains(err.Error(), "wildcard export patterns") {
+		t.Fatalf("unbound export-map packet established absence: %v", err)
+	}
+	presentExportMap := "CLIPROXY_PACKAGE_EXPORTS={\"./sdk/responses.js\":\"./responses.js\"}\n" + moduleMissingAssertion
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(moduleCompleteExportHarness, presentExportMap)), moduleMissing); err == nil || !strings.Contains(err.Error(), "wildcard export patterns") {
+		t.Fatalf("present package export key established absence: %v", err)
+	}
+	blockedExportMap := "CLIPROXY_PACKAGE_EXPORTS={\"./sdk/responses.js\":null}\n" + moduleMissingAssertion
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(moduleCompleteExportHarness, blockedExportMap)), cloneNeoJSONMap(moduleMissing)); err != nil {
+		t.Fatalf("null-blocked package export key did not establish absence: %v", err)
+	}
+	wildcardExportOutput := "{\n  \"./*.js\": {\n    \"default\": \"./esm/*.js\"\n  }\n}\n" + moduleMissingAssertion
+	directFileHarness := `{"command":"set -euo pipefail\nload-exact-floor @example/sdk@1.0.0 @example/sdk/sdk/responses.js#Responses.send exports\nnode -e \"const access = '@example/sdk/sdk/responses.js#Responses.send'; const resolved = fs.existsSync(js) || fs.existsSync(dts); emit(access + '=' + (resolved ? 'AVAILABLE' : 'MISSING'))\""}`
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(directFileHarness, wildcardExportOutput)), moduleMissing); err == nil || !strings.Contains(err.Error(), "wildcard export patterns") {
+		t.Fatalf("direct package-file lookup ignored wildcard export resolution: %v", err)
+	}
+	unrelatedFileHarness := `{"command":"set -e; load-exact-floor @example/sdk@1.0.0 @example/sdk/sdk/responses.js#Responses.send; node -e \"const access = '@example/sdk/sdk/responses.js#Responses.send'; const unrelated = fs.existsSync('/tmp/other'); emit(access + '=' + (unrelated ? 'AVAILABLE' : 'MISSING'))\""}`
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(unrelatedFileHarness, moduleMissingAssertion)), cloneNeoJSONMap(moduleMissing)); err == nil || !strings.Contains(err.Error(), "capability predicate") {
+		t.Fatalf("unrelated file existence established runtime capability: %v", err)
+	}
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(
+		`{"command":"set -e; resolve.exports @example/sdk@1.0.0 ./sdk/responses.js; node -e \"const resolved = require.resolve('./sdk/responses.js'); const access = '@example/sdk/sdk/responses.js#Responses.send'; emit(access + '=' + (resolved ? 'AVAILABLE' : 'MISSING'))\""}`,
+		wildcardExportOutput,
+	)), moduleMissing); err != nil {
+		t.Fatalf("standards-aware package export resolution was rejected: %v", err)
+	}
+	moduleAvailableAssertion := "@example/sdk/sdk/responses.js#Responses.send=AVAILABLE"
+	moduleAvailable := result("@example/sdk/sdk/responses.js#Responses.send", moduleAvailableAssertion)
+	mapValue(arrayValue(moduleAvailable["evidence"])[0])["verification"] = "exact-export-inspection"
+	availableExportHarness := `{"command":"set -e; resolve.exports @example/sdk@1.0.0 ./sdk/responses.js; node -e \"const resolved = require.resolve('./sdk/responses.js'); const access = '@example/sdk/sdk/responses.js#Responses.send'; emit(access + '=' + (resolved ? 'AVAILABLE' : 'MISSING'))\""}`
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(availableExportHarness, moduleAvailableAssertion)), moduleAvailable); err == nil || !strings.Contains(err.Error(), `segments "Responses" and "send"`) {
+		t.Fatalf("module availability established an unverified terminal member: %v", err)
+	}
+	wrongResolvedModuleHarness := `{"command":"set -e; resolve.exports @example/sdk@1.0.0 ./other.js; node -e \"const resolved = require.resolve('./other.js'); const access = '@example/sdk/sdk/responses.js#Responses.send'; emit(access + '=' + (resolved ? 'AVAILABLE' : 'MISSING'))\""}`
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(wrongResolvedModuleHarness, moduleMissingAssertion)), cloneNeoJSONMap(moduleMissing)); err == nil || !strings.Contains(err.Error(), "capability predicate") {
+		t.Fatalf("unrelated resolved module established exact export status: %v", err)
+	}
+	missingEntry["verification"] = "root-runtime-traversal"
+
+	sourceAfterImportFailure := `{"command":"inspect @example/sdk@1.0.0 exact root types after transitive import failure"}`
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(sourceAfterImportFailure, root+"\n"+method)), result("RootClient.responses.send", root, method)); err != nil {
+		t.Fatalf("exact source and type evidence after a transitive import failure was rejected: %v", err)
+	}
+
+	rootWithoutResponses := "export declare class RootClient { get beta(): Beta; }"
+	betaWithResponses := "export declare class Beta { get responses(): Responses; }"
+	derivedRootHarness := `{"command":"inspect @example/sdk@1.0.0 exact root declaration and derived RootClient.responses.send status"}`
+	missingEntry["verification"] = "root-type-declaration"
+	missingEntry["rootEvidence"] = []any{rootWithoutResponses, missingAssertion}
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(
+		derivedRootHarness,
+		rootWithoutResponses+"\n"+betaWithResponses+"\n"+method+"\n"+missingAssertion,
+	)), missing); err != nil {
+		t.Fatalf("exact root-source absence was rejected because an adjacent owner exposes the resource: %v", err)
+	}
+	missingEntry["rootEvidence"] = []any{rootWithoutResponses, method, missingAssertion}
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(
+		derivedRootHarness,
+		rootWithoutResponses+"\n"+method+"\n"+missingAssertion,
+	)), missing); err == nil {
+		t.Fatalf("terminal owner evidence was retained after the root edge was missing: %v", err)
+	}
+	missingEntry["rootEvidence"] = []any{rootWithoutResponses, missingAssertion}
+	combinedAdjacent := rootWithoutResponses + "\n" + betaWithResponses + "\n" + method
+	if _, err := neoNormalizeRunCheckResult(input(toolEvidence(
+		`{"command":"inspect @example/sdk@1.0.0 exact declarations"}`,
+		combinedAdjacent,
+	)), result("RootClient.responses.send", combinedAdjacent)); err == nil {
+		t.Fatalf("adjacent declarations in one excerpt established root ownership: %v", err)
+	}
+
+	wrongFloorInput := input(toolEvidence(`{"command":"set -e; load-exact-floor @example/sdk@1.0.0 A.b; typeof A.b === 'function' ? AVAILABLE : MISSING"}`, compact))
+	wrongFloorEntry := mapValue(arrayValue(compactResult["evidence"])[0])
+	wrongFloorEntry["floorVersion"] = "1.0"
+	compactResult["patternsChecked"] = []any{neoDependencyPatternKey("@example/sdk", "1.0", "A.b")}
+	if _, err := neoNormalizeRunCheckResult(wrongFloorInput, compactResult); err == nil || !strings.Contains(err.Error(), "call identifies") {
+		t.Fatalf("longer floor version qualified a shorter claimed floor: %v", err)
+	}
+
+	siblingResult := func() map[string]any {
+		rootMap := "class OpenRouter(BaseSDK):\n    _sub_sdk_map = {\n        \"beta\": Beta,\n        \"chat\": Chat,\n        \"embeddings\": Embeddings,\n    }"
+		return map[string]any{
+			"status": "completed",
+			"patternsChecked": []any{
+				neoDependencyPatternKey("openrouter", "1.0.0", "OpenRouter.responses.send"),
+				neoDependencyPatternKey("openrouter", "1.0.0", "OpenRouter.responses.send_async"),
+			},
+			"evidence": []any{
+				map[string]any{
+					"patternIndex": 0, "observation": "The root responses edge required by send is missing.", "sources": []any{"exact package source"},
+					"outcome": "finding", "issueIndexes": []any{0}, "dependency": "openrouter", "floorVersion": "1.0.0",
+					"accessPath": "OpenRouter.responses.send", "floorStatus": "incompatible", "verification": "root-source-construction",
+					"rootEvidence": []any{rootMap, "OpenRouter.responses.send=MISSING"},
+				},
+				map[string]any{
+					"patternIndex": 1, "observation": "The same missing root edge also blocks send_async.", "sources": []any{"exact package source"},
+					"outcome": "finding", "issueIndexes": []any{0}, "dependency": "openrouter", "floorVersion": "1.0.0",
+					"accessPath": "OpenRouter.responses.send_async", "floorStatus": "incompatible", "verification": "root-source-construction",
+					"rootEvidence": []any{rootMap, "OpenRouter.responses.send_async=MISSING"},
+				},
+			},
+			"issues": []any{map[string]any{
+				"severity": "high", "file": "wrapper.py", "line": 1,
+				"problem": "The root responses resource required by send and send_async is missing.",
+				"why":     "Both changed accesses can fail at runtime.", "fix": "Raise the dependency floor.",
+			}},
+		}
+	}
+	siblingOutput := "class OpenRouter(BaseSDK):\n    _sub_sdk_map = {\n        \"beta\": Beta,\n        \"chat\": Chat,\n        \"embeddings\": Embeddings,\n    }\nOpenRouter.responses.send=MISSING\nOpenRouter.responses.send_async=MISSING"
+	siblingInput := map[string]any{
+		"checkName":                     "published-dependency-capability-floor",
+		neoRunCheckToolEvidenceRequired: true,
+		neoRunCheckToolEvidenceKey: toolEvidence(
+			`{"command":"inspect openrouter==1.0.0 root construction and exact send and send_async statuses"}`,
+			siblingOutput,
+		),
+	}
+	normalizedSiblings, err := neoNormalizeRunCheckResult(siblingInput, siblingResult())
+	if err != nil {
+		t.Fatalf("sibling methods could not share one consolidated issue: %v", err)
+	}
+	siblingEvidence := arrayValue(normalizedSiblings["evidence"])
+	if len(siblingEvidence) != 2 || stringValue(mapValue(siblingEvidence[0])["accessPath"]) != "OpenRouter.responses.send" || stringValue(mapValue(siblingEvidence[1])["accessPath"]) != "OpenRouter.responses.send_async" || !reflect.DeepEqual(mapValue(siblingEvidence[0])["issueIndexes"], []any{0}) || !reflect.DeepEqual(mapValue(siblingEvidence[1])["issueIndexes"], []any{0}) {
+		t.Fatalf("sibling method evidence was not distinct and consolidated: %#v", siblingEvidence)
+	}
+	missingAsyncAssertion := siblingResult()
+	mapValue(arrayValue(missingAsyncAssertion["evidence"])[1])["rootEvidence"] = []any{
+		"_sub_sdk_map = {\n        \"beta\": Beta,\n        \"chat\": Chat,\n        \"embeddings\": Embeddings,\n    }",
+		"OpenRouter.responses.send=MISSING",
+	}
+	if _, err := neoNormalizeRunCheckResult(siblingInput, missingAsyncAssertion); err == nil || !strings.Contains(err.Error(), "OpenRouter.responses.send_async") {
+		t.Fatalf("send evidence covered send_async without its full-path assertion: %v", err)
+	}
+}
+
+func TestNeoRunCheckOwnerScopesPreserveUnicodeOffsets(t *testing.T) {
+	declaration := "class RootClient { responses: Responses }"
+	for name, prefix := range map[string]string{
+		"expanding lowercase":   strings.Repeat("Ⱥ", 32) + " ",
+		"contracting lowercase": strings.Repeat("K", 32) + " ",
+	} {
+		t.Run(name, func(t *testing.T) {
+			scopes := neoRunCheckOwnerScopes(prefix+declaration, "RootClient")
+			if !reflect.DeepEqual(scopes, []string{declaration}) {
+				t.Fatalf("owner scopes = %#v, want %#v", scopes, []string{declaration})
+			}
+			present, absent := neoRunCheckScopedMember(prefix+declaration, "RootClient", "responses")
+			if !present || absent {
+				t.Fatalf("scoped member = %v, %v, want present", present, absent)
+			}
+		})
+	}
+}
+
+func TestNeoRunCheckOwnerScopesRequireDeclarationBoundaries(t *testing.T) {
+	for name, declaration := range map[string]string{
+		"identifier prefix": "const classRootClient = { responses: Responses }",
+		"keyword suffix":    "classRootClient { responses: Responses }",
+		"interface suffix":  "interfaceRootClient { responses: Responses }",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if scopes := neoRunCheckOwnerScopes(declaration, "RootClient"); len(scopes) != 0 {
+				t.Fatalf("non-declaration owner scopes = %#v", scopes)
+			}
+			if present, absent := neoRunCheckScopedMember(declaration, "RootClient", "responses"); present || absent {
+				t.Fatalf("non-declaration scoped member = %v, %v", present, absent)
+			}
+		})
+	}
+}
+
+func TestNeoRunCheckScopedMemberTreatsInheritanceAsUnknown(t *testing.T) {
+	tests := []struct {
+		name        string
+		declaration string
+		wantPresent bool
+		wantAbsent  bool
+	}{
+		{name: "flat missing class", declaration: "class RootClient {}", wantAbsent: true},
+		{name: "direct member", declaration: "class RootClient { responses: Responses }", wantPresent: true},
+		{name: "getter member", declaration: "class RootClient { get responses(): Responses }", wantPresent: true},
+		{name: "method member", declaration: "class RootClient { public responses(): Responses }", wantPresent: true},
+		{name: "TypeScript class inheritance", declaration: "class RootClient extends BaseClient {}"},
+		{name: "TypeScript interface inheritance", declaration: "interface RootClient extends BaseClient {}"},
+		{name: "inherited class matches member", declaration: "class RootClient extends responses {}"},
+		{name: "Python inheritance", declaration: "class RootClient(BaseClient):\n    pass"},
+		{name: "line comment member", declaration: "class RootClient { // responses: Responses\n}", wantAbsent: true},
+		{name: "block comment member", declaration: "class RootClient { /* responses: Responses */ }", wantAbsent: true},
+		{name: "string member", declaration: `class RootClient { label = "responses: Responses" }`, wantAbsent: true},
+		{name: "template member", declaration: "class RootClient { label = `responses: Responses` }", wantAbsent: true},
+		{name: "nested member use", declaration: "class RootClient { inspect() { return this.responses } }"},
+		{name: "initializer member use", declaration: "class RootClient { fallback = responses || beta }"},
+		{name: "comment declaration", declaration: "// class RootClient {}"},
+		{name: "string declaration", declaration: `const fixture = "class RootClient {}"`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			present, absent := neoRunCheckScopedMember(test.declaration, "RootClient", "responses")
+			if present != test.wantPresent || absent != test.wantAbsent {
+				t.Fatalf("neoRunCheckScopedMember() = %v, %v, want %v, %v", present, absent, test.wantPresent, test.wantAbsent)
+			}
+		})
+	}
+}
+
+func TestNeoRunCheckInheritedOwnerCannotProveMissingCapability(t *testing.T) {
+	assertion := "RootClient.responses.send=MISSING"
+	result := func(declaration string) map[string]any {
+		return map[string]any{
+			"status":          "completed",
+			"patternsChecked": []any{neoDependencyPatternKey("@example/sdk", "1.0.0", "RootClient.responses.send")},
+			"evidence": []any{map[string]any{
+				"patternIndex": 0, "observation": "The root capability is missing.", "sources": []any{"exact package types"},
+				"outcome": "finding", "issueIndexes": []any{0}, "dependency": "@example/sdk", "floorVersion": "1.0.0",
+				"accessPath": "RootClient.responses.send", "floorStatus": "incompatible", "verification": "root-type-declaration",
+				"rootEvidence": []any{declaration, assertion},
+			}},
+			"issues": []any{map[string]any{
+				"severity": "high", "file": "wrapper.ts", "line": 1,
+				"problem": "The root capability is missing.", "why": "The call can fail.", "fix": "Raise the floor.",
+			}},
+		}
+	}
+	input := func(declaration string) map[string]any {
+		return map[string]any{
+			"checkName":                     "published-dependency-capability-floor",
+			neoRunCheckToolEvidenceRequired: true,
+			neoRunCheckToolEvidenceKey: []any{map[string]any{
+				"tool":    "shell_command",
+				"input":   `{"command":"inspect @example/sdk@1.0.0 RootClient.responses.send declaration and status"}`,
+				"outputs": []any{declaration + "\n" + assertion},
+			}},
+		}
+	}
+	flat := "class RootClient {}"
+	if _, err := neoNormalizeRunCheckResult(input(flat), result(flat)); err != nil {
+		t.Fatalf("flat owner absence was rejected: %v", err)
+	}
+	inherited := "class RootClient extends BaseClient {}"
+	if _, err := neoNormalizeRunCheckResult(input(inherited), result(inherited)); err == nil || !strings.Contains(err.Error(), "does not prove any edge") {
+		t.Fatalf("inherited owner established absence: %v", err)
+	}
+	for name, declaration := range map[string]string{
+		"comment declaration": "// class RootClient {}",
+		"string declaration":  `const fixture = "class RootClient {}"`,
+		"nested member use":   "class RootClient { inspect() { return this.responses } }",
+		"initializer use":     "class RootClient { fallback = responses || beta }",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := neoNormalizeRunCheckResult(input(declaration), result(declaration)); err == nil || !strings.Contains(err.Error(), "does not prove any edge") {
+				t.Fatalf("inactive owner declaration established absence: %v", err)
+			}
+		})
+	}
+}
+
+func TestNeoRunCheckBackgroundShellEvidenceUsesLaunchProvenance(t *testing.T) {
+	collector := neoRunCheckToolEvidenceCollector{backgroundShell: map[int]*neoRunCheckBackgroundShell{}}
+	launch := neoToolCall{ID: "TU-launch", Name: "shell_command", Input: map[string]any{"command": "set -e; load-exact-floor @example/sdk@1.0.0 RootClient.responses.send; typeof RootClient.responses?.send === 'function' ? AVAILABLE : MISSING"}}
+	if evidence, ok := collector.collect(launch, map[string]any{
+		"status": "done", "result": map[string]any{"running": true, "pid": 42, "output": "RootClient.responses."},
+	}, "launch"); ok || evidence != nil {
+		t.Fatalf("background launch emitted terminal evidence: %#v", evidence)
+	}
+	poll := neoToolCall{ID: "TU-poll", Name: "shell_command_status", Input: map[string]any{"pid": 42}}
+	if evidence, ok := collector.collect(poll, map[string]any{
+		"status": "done", "result": map[string]any{"running": true, "output": "send=MISS"},
+	}, "poll"); ok || evidence != nil {
+		t.Fatalf("running poll emitted terminal evidence: %#v", evidence)
+	}
+	evidence, ok := collector.collect(poll, map[string]any{
+		"status": "done", "result": map[string]any{"running": false, "exitCode": 0, "output": "ING\n"},
+	}, "terminal")
+	if !ok || stringValue(evidence["tool"]) != "shell_command" || !strings.Contains(stringValue(evidence["input"]), "@example/sdk@1.0.0") {
+		t.Fatalf("terminal evidence = %#v", evidence)
+	}
+	if outputs := neoStringSlice(evidence["outputs"]); !slices.Contains(outputs, "RootClient.responses.send=MISSING\n") {
+		t.Fatalf("accumulated outputs = %#v", outputs)
+	}
+}
+
+func TestNeoRunCheckToolEvidenceCollectorBoundsRetainedOutput(t *testing.T) {
+	collector := neoRunCheckToolEvidenceCollector{backgroundShell: map[int]*neoRunCheckBackgroundShell{}}
+	foreground := neoToolCall{Name: "Read", Input: map[string]any{"path": "fixture"}}
+	evidence, ok := collector.collect(foreground, map[string]any{"status": "done", "result": map[string]any{"output": strings.Repeat("x", neoRunCheckToolOutputMaxBytes+100)}}, strings.Repeat("y", neoRunCheckToolOutputMaxBytes+100))
+	if !ok {
+		t.Fatal("bounded foreground output was not retained")
+	}
+	for _, output := range neoStringSlice(evidence["outputs"]) {
+		if len(output) > neoRunCheckToolOutputMaxBytes {
+			t.Fatalf("foreground output retained %d bytes", len(output))
+		}
+	}
+	launch := neoToolCall{Name: "shell_command", Input: map[string]any{"command": "inspect package"}}
+	collector.collect(launch, map[string]any{"status": "done", "result": map[string]any{"running": true, "pid": 88, "output": strings.Repeat("z", neoRunCheckToolOutputMaxBytes+100)}}, "launch")
+	background := collector.backgroundShell[88]
+	if background == nil || len(background.output) > neoRunCheckToolOutputMaxBytes {
+		t.Fatalf("background output bytes = %d", len(background.output))
+	}
+	if collector.retainedBytes+collector.pendingBytes > neoRunCheckToolEvidenceMaxBytes {
+		t.Fatalf("collector retained %d bytes", collector.retainedBytes+collector.pendingBytes)
+	}
+	status := neoToolCall{Name: "shell_command_status", Input: map[string]any{"pid": 88}}
+	evidence, ok = collector.collect(status, map[string]any{"status": "done", "result": map[string]any{"running": false, "exitCode": 0, "output": "\nTerminal.capability=MISSING\n"}}, "terminal")
+	if !ok || !strings.Contains(strings.Join(neoStringSlice(evidence["outputs"]), ""), "Terminal.capability=MISSING") {
+		t.Fatalf("bounded terminal evidence = %#v", evidence)
+	}
+	for limit := 1; limit < 32; limit++ {
+		bounded := neoRunCheckBoundToolEvidence(strings.Repeat("🙂", 32), limit)
+		if !utf8.ValidString(bounded) || len(bounded) > limit {
+			t.Fatalf("UTF-8 bounded output at %d bytes = %q (%d bytes)", limit, bounded, len(bounded))
+		}
+	}
+	reserved := neoRunCheckToolEvidenceCollector{backgroundShell: map[int]*neoRunCheckBackgroundShell{}}
+	for pid := 1; pid <= 4; pid++ {
+		call := neoToolCall{Name: "shell_command", Input: map[string]any{"command": "inspect package " + strconv.Itoa(pid)}}
+		reserved.collect(call, map[string]any{"status": "done", "result": map[string]any{"running": true, "pid": pid, "output": strings.Repeat("p", neoRunCheckToolOutputMaxBytes)}}, "launch")
+	}
+	completed := neoToolCall{Name: "Read", Input: map[string]any{"path": "completed"}}
+	evidence, ok = reserved.collect(completed, map[string]any{"status": "done", "result": map[string]any{"output": "independent completed evidence"}}, "independent completed evidence")
+	if !ok || !strings.Contains(strings.Join(neoStringSlice(evidence["outputs"]), ""), "independent completed evidence") {
+		t.Fatalf("pending background output suppressed completed evidence: %#v", evidence)
+	}
+	if reserved.retainedBytes+reserved.pendingBytes > neoRunCheckToolEvidenceMaxBytes {
+		t.Fatalf("reserved collector retained %d bytes", reserved.retainedBytes+reserved.pendingBytes)
+	}
+}
+
+func TestNeoRunCheckShellExitsOnErrorRequiresExecutablePrologue(t *testing.T) {
+	for name, command := range map[string]string{
+		"short option":           "set -e; inspect package",
+		"combined options":       "set -euo pipefail\ninspect package",
+		"long option":            "set -o errexit; inspect package",
+		"after shebang comments": "#!/bin/sh\n# setup\nset -eu\ninspect package",
+	} {
+		t.Run("accepts "+name, func(t *testing.T) {
+			if !neoRunCheckShellExitsOnError(command) {
+				t.Fatalf("executable exit-on-error prologue was rejected: %q", command)
+			}
+		})
+	}
+	for name, command := range map[string]string{
+		"comment only":     "# set -e\ninspect package; emit status",
+		"echoed text":      "echo 'set -e'; inspect package; emit status",
+		"quoted command":   "'set -e'; inspect package; emit status",
+		"late option":      "inspect package; set -e; emit status",
+		"different option": "set -u; inspect package; emit status",
+	} {
+		t.Run("rejects "+name, func(t *testing.T) {
+			if neoRunCheckShellExitsOnError(command) {
+				t.Fatalf("inactive or late exit-on-error text was accepted: %q", command)
+			}
+		})
+	}
+}
+
+func TestNeoRunCheckShellPipelineRequiresPipefail(t *testing.T) {
+	assertion := "RootClient.responses.send=MISSING"
+	result := map[string]any{
+		"status":          "completed",
+		"patternsChecked": []any{neoDependencyPatternKey("@example/sdk", "1.0.0", "RootClient.responses.send")},
+		"evidence": []any{map[string]any{
+			"patternIndex": 0, "observation": "The capability is missing.", "sources": []any{"exact runtime traversal"},
+			"outcome": "finding", "issueIndexes": []any{0}, "dependency": "@example/sdk", "floorVersion": "1.0.0",
+			"accessPath": "RootClient.responses.send", "floorStatus": "incompatible", "verification": "root-runtime-traversal",
+			"rootEvidence": []any{assertion},
+		}},
+		"issues": []any{map[string]any{
+			"severity": "high", "file": "wrapper.ts", "line": 1,
+			"problem": "The capability is missing.", "why": "The call can fail.", "fix": "Raise the floor.",
+		}},
+	}
+	input := func(command string) map[string]any {
+		return map[string]any{
+			"checkName":                     "published-dependency-capability-floor",
+			neoRunCheckToolEvidenceRequired: true,
+			neoRunCheckToolEvidenceKey: []any{map[string]any{
+				"tool": "shell_command", "input": `{"command":` + strconv.Quote(command) + `}`, "outputs": []any{assertion},
+			}},
+		}
+	}
+	if _, err := neoNormalizeRunCheckResult(input(`set -e; load-exact-floor @example/sdk@1.0.0 RootClient.responses.send | cat; node -e "const access='RootClient.responses.send'; console.log(access + '=' + (typeof RootClient.responses?.send === 'function' ? 'AVAILABLE' : 'MISSING'))"`), cloneNeoJSONMap(result)); err == nil || !strings.Contains(err.Error(), "pipefail") {
+		t.Fatalf("pipeline without pipefail established absence: %v", err)
+	}
+	if _, err := neoNormalizeRunCheckResult(input(`set -e pipefail; load-exact-floor @example/sdk@1.0.0 RootClient.responses.send | cat; node -e "const access='RootClient.responses.send'; console.log(access + '=' + (typeof RootClient.responses?.send === 'function' ? 'AVAILABLE' : 'MISSING'))"`), cloneNeoJSONMap(result)); err == nil || !strings.Contains(err.Error(), "pipefail") {
+		t.Fatalf("invalid set syntax established pipefail: %v", err)
+	}
+	if _, err := neoNormalizeRunCheckResult(input(`set -euo pipefail; load-exact-floor @example/sdk@1.0.0 RootClient.responses.send | cat; node -e "const access='RootClient.responses.send'; console.log(access + '=' + (typeof RootClient.responses?.send === 'function' ? 'AVAILABLE' : 'MISSING'))"`), cloneNeoJSONMap(result)); err != nil {
+		t.Fatalf("pipeline with pipefail was rejected: %v", err)
+	}
+}
+
+func TestNeoRunCheckCaughtFailureIgnoresInactiveText(t *testing.T) {
+	accessPath := neoDependencyAccessPath{raw: "RootClient.responses.send", members: []string{"RootClient", "responses", "send"}}
+	for name, input := range map[string]string{
+		"single quoted":      `printf '%s\n' 'catch (error)'`,
+		"double quoted":      `printf "%s\n" ".catch(() => fallback)"`,
+		"JavaScript comment": "inspect package // catch (error)",
+		"Python comment":     "inspect package # except Exception:",
+		"heredoc data":       "cat <<'EOF'\ntry { loadFloor() } catch (error) { fail(error) }\nEOF",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if neoRunCheckHasCaughtFailure(input, accessPath) {
+				t.Fatalf("inactive caught failure was accepted: %q", input)
+			}
+		})
+	}
+	if neoRunCheckHasCaughtFailure("load-exact-floor @example/sdk@1.0.0; try { cleanupCache() } catch (error) { log(error) }; console.log(typeof RootClient.responses.send === 'function' ? AVAILABLE : MISSING)", accessPath) {
+		t.Fatal("unrelated active catch handler was treated as a caught dependency-floor failure")
+	}
+	for name, input := range map[string]string{
+		"promise catch":    "loadFloor().catch(handleFailure)",
+		"JavaScript catch": "try { loadFloor() } catch (error) { fail(error) }",
+		"node eval catch":  `node -e "try { loadFloor() } catch (error) { fail(error) }"`,
+		"node heredoc":     "node <<'JS'\ntry { loadFloor() } catch (error) { fail(error) }\nJS",
+		"Python except":    "try:\n    load_floor()\nexcept Exception:\n    fail()",
+		"Python command":   "python3 -c \"try:\n    load_floor()\nexcept Exception:\n    fail()\"",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if !neoRunCheckHasCaughtFailure(input, accessPath) {
+				t.Fatalf("active caught failure was missed: %q", input)
+			}
+		})
+	}
+}
+
+func TestNeoRunCheckStatusPredicateIgnoresInertHeredocPayload(t *testing.T) {
+	accessPath := neoDependencyAccessPath{raw: "RootClient.responses.send", members: []string{"RootClient", "responses", "send"}}
+	predicate := "console.log(typeof RootClient.responses.send === 'function' ? 'AVAILABLE' : 'MISSING')"
+	if neoRunCheckHasStatusPredicate("cat <<'EOF'\n"+predicate+"\nEOF", accessPath, "root-runtime-traversal", "AVAILABLE") {
+		t.Fatal("inert heredoc payload was accepted as a status predicate")
+	}
+	if !neoRunCheckHasStatusPredicate("node <<'JS'\n"+predicate+"\nJS", accessPath, "root-runtime-traversal", "AVAILABLE") {
+		t.Fatal("executable heredoc script was rejected as a status predicate")
+	}
+}
+
+func TestNeoRunCheckStandardsAwareExportResolverIgnoresInactiveText(t *testing.T) {
+	for name, input := range map[string]string{
+		"single quoted": `printf '%s\n' 'require.resolve(target)'`,
+		"double quoted": `printf "%s\n" "import.meta.resolve(target)"`,
+		"comment":       "inspect package // resolve.exports target",
+		"identifier":    "unrelatedresolve.exports target",
+		"method suffix": "fake.require.resolve(target)",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if neoRunCheckStandardsAwareExportResolver(input) {
+				t.Fatalf("inactive export resolver was accepted: %q", input)
+			}
+		})
+	}
+	for name, input := range map[string]string{
+		"direct":    "resolve.exports package target",
+		"node eval": `node -e "require.resolve(target)"`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if !neoRunCheckStandardsAwareExportResolver(input) {
+				t.Fatalf("active export resolver was missed: %q", input)
+			}
+		})
+	}
+}
+
+func TestNeoRunCheckShellPipelineIgnoresInactiveText(t *testing.T) {
+	for name, command := range map[string]string{
+		"single quoted":  "set -e; printf '%s\\n' 'left | right'",
+		"double quoted":  `set -e; printf "%s\n" "left | right"`,
+		"comment":        "set -e # left | right\ninspect package",
+		"escaped":        `set -e; printf left\|right`,
+		"quoted heredoc": "set -e\nnode <<'JS'\nconst value = left | right\nJS\ninspect package",
+		"plain heredoc":  "set -e\ncat <<EOF\nleft | right\nEOF\ninspect package",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if neoRunCheckShellHasPipeline(command) {
+				t.Fatalf("inactive pipeline was treated as an operator: %q", command)
+			}
+		})
+	}
+	command := "set -e; inspect package | cat; verify package || true"
+	if !neoRunCheckShellHasPipeline(command) || !neoRunCheckShellHasOrOperator(command) {
+		t.Fatalf("pipeline followed by fallback was not fully detected: %q", command)
+	}
+}
+
+func TestNeoRunCheckShellOrOperatorIgnoresInactiveText(t *testing.T) {
+	for name, command := range map[string]string{
+		"single quoted":  "set -e; printf '%s\n' 'left || right'",
+		"double quoted":  `set -e; printf "%s\n" "left || right"`,
+		"comment":        "set -e # || true\ninspect package",
+		"escaped":        `set -e; printf left\|\|right`,
+		"quoted heredoc": "set -e\nnode <<'JS'\nconst value = left || right\nJS\ninspect package",
+		"plain heredoc":  "set -e\ncat <<EOF\nleft || right\nEOF\ninspect package",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if neoRunCheckShellHasOrOperator(command) {
+				t.Fatalf("inactive || was treated as an operator: %q", command)
+			}
+		})
+	}
+	for name, command := range map[string]string{
+		"fallback":                 "set -e; inspect package || true",
+		"failure assignment":       "set -e; inspect package || failed=1",
+		"heredoc command fallback": "set -e\nnode <<'JS' || true\nrun()\nJS",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if !neoRunCheckShellHasOrOperator(command) {
+				t.Fatalf("executable || was not detected: %q", command)
+			}
+		})
+	}
+}
+
+func TestNeoRunCheckShellAndOperatorRequiresErrexit(t *testing.T) {
+	for name, command := range map[string]string{
+		"single quoted": "printf '%s\n' 'left && right'",
+		"comment":       "# left && right\ninspect package",
+		"escaped":       `printf left\&\&right`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if neoRunCheckShellHasAndOperator(command) {
+				t.Fatalf("inactive && was treated as an operator: %q", command)
+			}
+		})
+	}
+	if !neoRunCheckShellHasAndOperator("inspect package && verify package") {
+		t.Fatal("executable && was not detected")
+	}
+}
+
+func TestNeoRunCheckShellBackgroundOperatorIgnoresInactiveText(t *testing.T) {
+	for name, command := range map[string]string{
+		"single quoted": `printf '%s\n' 'inspect package &'`,
+		"comment":       "inspect package # &\nverify package",
+		"escaped":       `printf inspect\&verify`,
+		"redirect":      `inspect package 2>&1`,
+		"heredoc data":  "cat <<'EOF'\ninspect package &\nEOF",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if neoRunCheckShellHasBackgroundOperator(command) {
+				t.Fatalf("inactive background operator was detected: %q", command)
+			}
+		})
+	}
+	if !neoRunCheckShellHasBackgroundOperator("inspect package & verify package") {
+		t.Fatal("active background operator was not detected")
+	}
+}
+
+func TestNeoRunCheckBackgroundShellEvidencePreservesSafetyChecks(t *testing.T) {
+	assertion := "RootClient.responses.send=MISSING"
+	result := map[string]any{
+		"status":          "completed",
+		"patternsChecked": []any{neoDependencyPatternKey("@example/sdk", "1.0.0", "RootClient.responses.send")},
+		"evidence": []any{map[string]any{
+			"patternIndex": 0, "observation": "The exact traversal is missing.", "sources": []any{"runtime traversal"},
+			"outcome": "finding", "issueIndexes": []any{0}, "dependency": "@example/sdk", "floorVersion": "1.0.0",
+			"accessPath": "RootClient.responses.send", "floorStatus": "incompatible", "verification": "root-runtime-traversal",
+			"rootEvidence": []any{assertion},
+		}},
+		"issues": []any{map[string]any{
+			"severity": "high", "file": "wrapper.ts", "line": 1,
+			"problem": "The traversal is missing.", "why": "The call can fail.", "fix": "Raise the floor.",
+		}},
+	}
+	for name, command := range map[string]string{
+		"set plus e":              "set +e; load-exact-floor @example/sdk@1.0.0; echo " + assertion,
+		"later set plus e":        "set -e; load-exact-floor @example/sdk@1.0.0; set +e; echo " + assertion,
+		"later named set plus e":  "set -e; load-exact-floor @example/sdk@1.0.0; set +o errexit; echo " + assertion,
+		"or suppression":          "load-exact-floor @example/sdk@1.0.0 || true; echo " + assertion,
+		"background acquisition":  "set -e; load-exact-floor @example/sdk@1.0.0 & echo " + assertion,
+		"multi-stage no errexit":  "load-exact-floor @example/sdk@1.0.0; echo " + assertion,
+		"commented exit on error": "# set -e\nload-exact-floor @example/sdk@1.0.0; echo " + assertion,
+		"echoed exit on error":    "echo 'set -e'; load-exact-floor @example/sdk@1.0.0; echo " + assertion,
+	} {
+		t.Run(name, func(t *testing.T) {
+			collector := neoRunCheckToolEvidenceCollector{backgroundShell: map[int]*neoRunCheckBackgroundShell{}}
+			launch := neoToolCall{Name: "shell_command", Input: map[string]any{"command": command}}
+			collector.collect(launch, map[string]any{
+				"status": "done", "result": map[string]any{"running": true, "pid": 77},
+			}, "launch")
+			status := neoToolCall{Name: "shell_command_status", Input: map[string]any{"pid": 77}}
+			evidence, ok := collector.collect(status, map[string]any{
+				"status": "done", "result": map[string]any{"running": false, "exitCode": 0, "output": assertion},
+			}, "terminal")
+			if !ok {
+				t.Fatal("terminal background result did not produce evidence")
+			}
+			checkInput := map[string]any{
+				"checkName":                     "published-dependency-capability-floor",
+				neoRunCheckToolEvidenceRequired: true,
+				neoRunCheckToolEvidenceKey:      []any{evidence},
+			}
+			if _, err := neoNormalizeRunCheckResult(checkInput, cloneMap(result)); err == nil || !strings.Contains(err.Error(), "unsafe status assertion") {
+				t.Fatalf("unsafe background launch was accepted: %v", err)
+			}
+		})
+	}
+
+	collector := neoRunCheckToolEvidenceCollector{backgroundShell: map[int]*neoRunCheckBackgroundShell{}}
+	launch := neoToolCall{Name: "shell_command", Input: map[string]any{"command": "set -e; load-exact-floor @example/sdk@1.0.0"}}
+	collector.collect(launch, map[string]any{"status": "done", "result": map[string]any{"running": true, "pid": 99}}, "launch")
+	status := neoToolCall{Name: "shell_command_status", Input: map[string]any{"pid": 99}}
+	if evidence, ok := collector.collect(status, map[string]any{
+		"status": "done", "result": map[string]any{"running": false, "exitCode": 1, "output": assertion},
+	}, "terminal"); ok || evidence != nil || collector.backgroundShell[99] != nil {
+		t.Fatalf("nonzero background result was retained: %#v", evidence)
+	}
+}
+
+func TestNeoRunCheckSubagentUsesBackgroundShellEvidence(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-background-shell", "thread-actor", "T-background-shell", "T-background-shell", neoActorRecord("actor-background-shell", "thread-actor", "T-background-shell"), nil)
+	actor.currentAgentMode = "review"
+	actor.tools = map[string]neoToolSpec{
+		"shell_command":        {Name: "shell_command", InputSchema: map[string]any{"type": "object"}},
+		"shell_command_status": {Name: "shell_command_status", InputSchema: map[string]any{"type": "object"}},
+	}
+
+	const assertion = "RootClient.responses.send=MISSING"
+	completed := `{"checkName":"published-dependency-capability-floor","status":"completed","patternsChecked":["@example/sdk@1.0.0 RootClient.responses.send"],"evidence":[{"patternIndex":0,"observation":"The exact traversal is missing.","sources":["runtime traversal"],"outcome":"finding","issueIndexes":[0],"dependency":"@example/sdk","floorVersion":"1.0.0","accessPath":"RootClient.responses.send","floorStatus":"incompatible","verification":"root-runtime-traversal","rootEvidence":["RootClient.responses.send=MISSING"]}],"issues":[{"severity":"high","file":"wrapper.ts","line":1,"problem":"The exact traversal is missing.","why":"The call can fail.","fix":"Raise the floor."}]}`
+	turn := 0
+	rt.inferStream = func(_ *neoRuntime, _ neoInferenceRequest, _ neoStreamCallback) (neoInferenceResult, error) {
+		turn++
+		switch turn {
+		case 1:
+			return neoInferenceResult{ToolCalls: []neoToolCall{{
+				ID: "TU-background-launch", Name: "shell_command",
+				Input: map[string]any{"command": "set -e; load-exact-floor @example/sdk@1.0.0 RootClient.responses.send; node -e \"const access='RootClient.responses.send'; console.log(access + '=' + (typeof RootClient.responses?.send === 'function' ? 'AVAILABLE' : 'MISSING'))\""},
+			}}}, nil
+		case 2, 3:
+			return neoInferenceResult{ToolCalls: []neoToolCall{{
+				ID: fmt.Sprintf("TU-background-poll-%d", turn), Name: "shell_command_status",
+				Input: map[string]any{"pid": 42},
+			}}}, nil
+		case 4:
+			return neoInferenceResult{Text: completed}, nil
+		default:
+			t.Fatalf("background evidence inference turns = %d, want four", turn)
+			return neoInferenceResult{}, nil
+		}
+	}
+
+	lease := 0
+	socket := &neoSocket{writeMessage: func(_ int, data []byte) error {
+		var event map[string]any
+		if json.Unmarshal(data, &event) != nil || stringValue(event["type"]) != "tool_lease" {
+			return nil
+		}
+		lease++
+		toolCallID := stringValue(event["toolCallId"])
+		var run map[string]any
+		switch lease {
+		case 1:
+			run = map[string]any{"status": "done", "result": map[string]any{"running": true, "pid": 42, "output": "RootClient.responses."}}
+		case 2:
+			run = map[string]any{"status": "done", "result": map[string]any{"running": true, "output": "send=MISS"}}
+		case 3:
+			run = map[string]any{"status": "done", "result": map[string]any{"running": false, "exitCode": 0, "output": "ING"}}
+		default:
+			t.Fatalf("background evidence leases = %d, want three", lease)
+		}
+		go actor.routeSubagentLeafToolResult(toolCallID, run)
+		return nil
+	}}
+	actor.sockets[socket] = struct{}{}
+
+	text, err := actor.executeSubagentRun("run_check", map[string]any{
+		"checkName":    "published-dependency-capability-floor",
+		"checkContent": "Verify the exact published dependency floor.",
+	}, "TU-background-check", "M-parent", actor.generation, 0, "")
+	if err != nil || turn != 4 || text != completed {
+		t.Fatalf("background evidence result = %q, turns=%d, err=%v", text, turn, err)
+	}
+	if normalized, parseErr := neoParseRunCheckResult(map[string]any{
+		"checkName":                     "published-dependency-capability-floor",
+		neoRunCheckToolEvidenceRequired: true,
+		neoRunCheckToolEvidenceKey: []any{map[string]any{
+			"tool": "shell_command", "input": `{"command":"set -e; load-exact-floor @example/sdk@1.0.0 RootClient.responses.send; node -e \"const access='RootClient.responses.send'; console.log(access + '=' + (typeof RootClient.responses?.send === 'function' ? 'AVAILABLE' : 'MISSING'))\""}`, "outputs": []any{assertion},
+		}},
+	}, text); parseErr != nil || len(arrayValue(normalized["issues"])) != 1 {
+		t.Fatalf("background evidence normalized result = %#v, %v", normalized, parseErr)
+	}
+}
+
+func TestNeoRunCheckSuccessfulToolResultRejectsFailedShellEvidence(t *testing.T) {
+	for name, run := range map[string]map[string]any{
+		"outer error":    {"status": "error", "result": map[string]any{"exitCode": 0, "output": "evidence"}},
+		"nonzero":        {"status": "done", "result": map[string]any{"exitCode": 1, "output": "evidence"}},
+		"still running":  {"status": "done", "result": map[string]any{"running": true, "exitCode": 0, "output": "evidence"}},
+		"missing result": {"status": "done", "output": "evidence"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if neoRunCheckSuccessfulToolResult("shell_command", run) {
+				t.Fatalf("failed shell result was accepted: %#v", run)
+			}
+		})
+	}
+	if !neoRunCheckSuccessfulToolResult("shell_command", map[string]any{"status": "done", "result": map[string]any{"exitCode": 0, "output": "evidence"}}) {
+		t.Fatal("successful shell result was rejected")
+	}
+	outputs := neoRunCheckToolEvidenceOutputs(`{"exitCode":0,"output":"\"responses\": true"}`, map[string]any{
+		"result": map[string]any{"exitCode": 0, "output": `"responses": true`},
+	})
+	if len(outputs) != 2 || outputs[1] != `"responses": true` {
+		t.Fatalf("raw structured shell evidence = %#v", outputs)
+	}
+}
+
+func TestNeoRunCheckGroundedStatusAssertions(t *testing.T) {
+	input := map[string]any{
+		neoRunCheckToolEvidenceKey: []any{
+			map[string]any{
+				"input": `{"command":"set -e; inspect @example/sdk@1.0.0 A.b @example/sdk/mod.js#Owner.call; node -e \"const a='A.b'; const m='@example/sdk/mod.js#Owner.call'; console.log(a + '=' + (typeof A.b === 'function' ? 'AVAILABLE' : 'MISSING')); console.log(m + '=' + (typeof Owner.call === 'function' ? 'AVAILABLE' : 'MISSING'))\""}`,
+				"outputs": []any{
+					"A.b=AVAILABLE\n@example/sdk/mod.js#Owner.call=MISSING\nnot an assertion",
+					"A.b=AVAILABLE",
+				},
+			},
+			map[string]any{
+				"input":   `{"command":"inspect @example/sdk@1.0.0; echo C.d=UNVERIFIED"}`,
+				"outputs": []any{"C.d=UNVERIFIED"},
+			},
+			map[string]any{
+				"input":   `{"command":"inspect @example/sdk@1.0.0; try { traverse() } catch (error) { console.log(access + '=MISSING') }"}`,
+				"outputs": []any{"D.e=MISSING"},
+			},
+			map[string]any{
+				"input":   "inspect @example/sdk@1.0.0\ntry:\n    traverse()\nexcept Exception:\n    print(f'{access}=MISSING')",
+				"outputs": []any{"E.f=MISSING"},
+			},
+			map[string]any{
+				"input":   `{"command":"inspect @example/sdk@1.0.0; console.log(Object.prototype.hasOwnProperty.call(pkg.exports, key) ? 'AVAILABLE' : 'MISSING')"}`,
+				"outputs": []any{"F.g=MISSING"},
+			},
+			map[string]any{
+				"input":   `{"command":"set -e; inspect @example/sdk@1.0.0 with detector one"}`,
+				"outputs": []any{"G.h=MISSING"},
+			},
+			map[string]any{
+				"input":   `{"command":"set -e; inspect @example/sdk@1.0.0 with corrected detector"}`,
+				"outputs": []any{"G.h=AVAILABLE"},
+			},
+			map[string]any{
+				"input":   `{"command":"set -e; resolve.exports @example/sdk@1.0.0 ./sdk/responses.js; node -e \"const resolved = require.resolve('./sdk/responses.js'); const access = '@example/sdk/sdk/responses.js#Responses.send'; emit(access + '=' + (resolved ? 'AVAILABLE' : 'MISSING'))\""}`,
+				"outputs": []any{"@example/sdk/sdk/responses.js#Responses.send=MISSING"},
+			},
+		},
+	}
+	if got, want := neoRunCheckGroundedStatusAssertions(input), []string{"A.b=AVAILABLE", "@example/sdk/mod.js#Owner.call=MISSING", "@example/sdk/sdk/responses.js#Responses.send=MISSING"}; !slices.Equal(got, want) {
+		t.Fatalf("grounded status assertions = %#v, want %#v", got, want)
+	}
+
+	input["checkName"] = "published-dependency-capability-floor"
+	input[neoRunCheckToolEvidenceRequired] = true
+	prompt := neoRunCheckRepairPrompt(input, errors.New("invalid evidence"))
+	for _, want := range []string{"Canonical status assertions found byte-for-byte", "A.b=AVAILABLE", "@example/sdk/mod.js#Owner.call=MISSING"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("dependency repair prompt missing %q:\n%s", want, prompt)
+		}
 	}
 }
 
@@ -4977,6 +6309,77 @@ func TestNeoRunCheckSubagentRepairsMalformedFinalResultOnce(t *testing.T) {
 	}
 }
 
+func TestNeoRunCheckSubagentRepairsFabricatedDependencyEvidence(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-dependency-evidence-repair", "thread-actor", "T-dependency-evidence-repair", "T-dependency-evidence-repair", neoActorRecord("actor-dependency-evidence-repair", "thread-actor", "T-dependency-evidence-repair"), nil)
+	actor.currentAgentMode = "review"
+	actor.tools = map[string]neoToolSpec{
+		"shell_command": {Name: "shell_command", InputSchema: map[string]any{"type": "object"}},
+	}
+
+	fabricated := `{"checkName":"published-dependency-capability-floor","status":"completed","patternsChecked":["@openrouter/sdk@1.0.0 OpenRouter.responses.send"],"evidence":[{"patternIndex":0,"observation":"The floor exposes responses.","sources":["exact package"],"outcome":"no-finding","issueIndexes":[],"dependency":"@openrouter/sdk","floorVersion":"1.0.0","accessPath":"OpenRouter.responses.send","floorStatus":"compatible","verification":"root-runtime-traversal","rootEvidence":["OpenRouter.responses.send=AVAILABLE"]}],"issues":[]}`
+	repaired := `{"checkName":"published-dependency-capability-floor","status":"completed","patternsChecked":["@openrouter/sdk@1.0.0 OpenRouter.responses.send"],"evidence":[{"patternIndex":0,"observation":"The required root responses capability is missing at the exact floor, so the changed access can fail at runtime.","sources":["exact package traversal"],"outcome":"finding","issueIndexes":[0],"dependency":"@openrouter/sdk","floorVersion":"1.0.0","accessPath":"OpenRouter.responses.send","floorStatus":"incompatible","verification":"root-runtime-traversal","rootEvidence":["OpenRouter.responses.send=MISSING"]}],"issues":[{"severity":"high","file":"packages/openrouter/src/index.ts","line":1,"problem":"wrapOpenRouter(): the required root responses capability is missing at the exact floor","why":"The changed access can fail at runtime.","fix":"Raise the dependency floor or use the floor-supported owner path."}]}`
+	turn := 0
+	rt.inferStream = func(_ *neoRuntime, request neoInferenceRequest, _ neoStreamCallback) (neoInferenceResult, error) {
+		turn++
+		switch turn {
+		case 1:
+			return neoInferenceResult{ToolCalls: []neoToolCall{{
+				ID:    "provider-floor-call",
+				Name:  "shell_command",
+				Input: map[string]any{"command": "set -e; load-exact-floor @openrouter/sdk@1.0.0 >/dev/null; node -e \"const access='OpenRouter.responses.send'; console.log(access + '=' + (typeof OpenRouter.responses?.send === 'function' ? 'AVAILABLE' : 'MISSING'))\""},
+			}}}, nil
+		case 2:
+			return neoInferenceResult{Text: fabricated}, nil
+		case 3:
+			if len(request.Tools) != 0 {
+				t.Fatalf("dependency evidence repair tools = %#v, want none", request.Tools)
+			}
+			history := neoHistoryTestText(request.History)
+			for _, want := range []string{"superseded by later successful exact-floor output", "@openrouter/sdk@1.0.0", "rootEvidence", "Canonical status assertions found byte-for-byte", "OpenRouter.responses.send=MISSING", fabricated} {
+				if !strings.Contains(history, want) {
+					t.Fatalf("dependency evidence repair history missing %q:\n%s", want, history)
+				}
+			}
+			return neoInferenceResult{Text: repaired}, nil
+		default:
+			t.Fatalf("dependency evidence repair inference turns = %d, want three", turn)
+			return neoInferenceResult{}, nil
+		}
+	}
+	socket := &neoSocket{writeMessage: func(_ int, data []byte) error {
+		var event map[string]any
+		if json.Unmarshal(data, &event) == nil && stringValue(event["type"]) == "tool_lease" {
+			toolCallID := stringValue(event["toolCallId"])
+			go actor.routeSubagentLeafToolResult(toolCallID, map[string]any{
+				"status": "done",
+				"result": map[string]any{"exitCode": 0, "output": "OpenRouter.responses.send=MISSING"},
+			})
+		}
+		return nil
+	}}
+	actor.sockets[socket] = struct{}{}
+
+	input := map[string]any{
+		"checkName":    "published-dependency-capability-floor",
+		"checkContent": "Verify every changed dependency capability at the exact published floor.",
+	}
+	text, err := actor.executeSubagentRun("run_check", input, "TU-dependency-evidence-repair", "M-parent", actor.generation, 0, "")
+	if err != nil || turn != 3 || text != repaired {
+		t.Fatalf("repaired dependency evidence = %q, turns=%d, err=%v", text, turn, err)
+	}
+	if _, exists := input[neoRunCheckToolEvidenceKey]; exists {
+		t.Fatalf("private tool evidence leaked into caller input: %#v", input)
+	}
+	if _, exists := input[neoRunCheckToolEvidenceRequired]; exists {
+		t.Fatalf("private tool evidence policy leaked into caller input: %#v", input)
+	}
+	normalized, parseErr := neoParseRunCheckResult(input, text)
+	if parseErr != nil || len(arrayValue(normalized["issues"])) != 1 {
+		t.Fatalf("repaired dependency result = %#v, %v", normalized, parseErr)
+	}
+}
+
 func TestNeoRunCheckSubagentRepairsEmptyFinalizationAfterSynthesis(t *testing.T) {
 	valid := `{"checkName":"empty-repair","status":"completed","patternsChecked":["empty finalization"],"evidence":[{"patternIndex":0,"observation":"The continuation returned a structured result.","sources":["fixture"],"outcome":"no-finding","issueIndexes":[]}],"issues":[]}`
 	rt := newNeoRuntime(&config.Config{})
@@ -5051,16 +6454,88 @@ func TestNeoRunCheckRepairPromptProvidesValidSnapshotExample(t *testing.T) {
 	if numberFrom(normalized["filesAnalyzed"]) != 2 || len(arrayValue(normalized["coveredFiles"])) != 2 || len(arrayValue(normalized["coveredHunks"])) != 2 {
 		t.Fatalf("repair prompt coverage = %#v", normalized)
 	}
+	errorStartMarker := "For a failed check instead return exactly "
+	errorEndMarker := ".\nCompleted results require"
+	errorStart := strings.Index(prompt, errorStartMarker)
+	errorEnd := strings.Index(prompt, errorEndMarker)
+	if errorStart < 0 || errorEnd <= errorStart {
+		t.Fatalf("repair prompt omitted the failed-check example:\n%s", prompt)
+	}
+	var errorExample map[string]any
+	if err := json.Unmarshal([]byte(prompt[errorStart+len(errorStartMarker):errorEnd]), &errorExample); err != nil {
+		t.Fatalf("repair prompt failed-check example is invalid: %v", err)
+	}
+	if len(arrayValue(errorExample["coveredFiles"])) != 2 || len(arrayValue(errorExample["coveredHunks"])) != 2 {
+		t.Fatalf("repair prompt failed-check coverage = %#v", errorExample)
+	}
 	evidence := mapValue(arrayValue(normalized["evidence"])[0])
-	if stringValue(evidence["accessPath"]) != "rootOwner.requiredCapability" || stringValue(evidence["verification"]) != "root-type-declaration" {
+	if stringValue(evidence["accessPath"]) != "RootClient.requiredCapability" || stringValue(evidence["verification"]) != "root-type-declaration" || !reflect.DeepEqual(normalized["patternsChecked"], []any{"example-sdk@1.0.0 RootClient.requiredCapability"}) {
 		t.Fatalf("repair prompt dependency evidence = %#v", evidence)
+	}
+	for _, want := range []string{
+		"patternsChecked entry must be exactly <dependency>@<floorVersion> <accessPath>",
+		"Each sibling sync or async method requires its own pattern",
+		"at most 2048 valid UTF-8 bytes, counted as bytes rather than characters",
+		"Keep separate excerpts separate instead of concatenating output",
+		"complete balanced owner-construction subsection",
+		"Do not crop a class or interface before its matching closing brace",
+		"standalone _sub_sdk_map output is ownerless",
+		"Delete every excerpt named as rejected above",
+		"Map every selected excerpt to one exact adjacent edge or the exact full-path status assertion",
+		"quote <accessPath>=AVAILABLE rather than an informal status such as OK",
+		"compatible source-construction or type-declaration entry still needs focused excerpts connecting every edge",
+		"select only the complete exact root-owner declaration or construction excerpt",
+		"Do not add a terminal class, method, imported-owner, sibling-owner, or other adjacent excerpt",
+		"Do not select an earlier status assertion contradicted by a later successful correction",
+		"not capabilities that merely appeared in broad tool output",
+		"return the error object instead of guessing or fabricating evidence",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("repair prompt missing dependency pattern guidance %q:\n%s", want, prompt)
+		}
 	}
 	if strings.Contains(prompt, "finding|no-finding|not-applicable") || strings.Contains(prompt, `"filesAnalyzed":0`) {
 		t.Fatalf("repair prompt retained an invalid copyable example:\n%s", prompt)
 	}
 }
 
-func TestNeoRunCheckSubagentHonorsExplicitEmptyFrontmatterTools(t *testing.T) {
+func TestNeoRunCheckRepairPromptOmitsToolGroundedCompletedExample(t *testing.T) {
+	input := map[string]any{
+		"checkName":                     "published-dependency-capability-floor",
+		neoRunCheckToolEvidenceRequired: true,
+	}
+	prompt := neoRunCheckRepairPrompt(input, errors.New("malformed result"))
+	for _, want := range []string{"No copyable completed example is provided", "return the failed-check object", `"status":"error"`} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("tool-grounded repair prompt missing %q:\n%s", want, prompt)
+		}
+	}
+	if strings.Contains(prompt, "Valid completed example:") || strings.Contains(prompt, `"outcome":"not-applicable"`) {
+		t.Fatalf("tool-grounded repair prompt offered a misleading completed example:\n%s", prompt)
+	}
+	errorStartMarker := "For a failed check instead return exactly "
+	errorEndMarker := ".\nCompleted results require"
+	errorStart := strings.Index(prompt, errorStartMarker)
+	errorEnd := strings.Index(prompt, errorEndMarker)
+	if errorStart < 0 || errorEnd <= errorStart {
+		t.Fatalf("tool-grounded repair prompt omitted failed-check example:\n%s", prompt)
+	}
+	var errorExample map[string]any
+	if err := json.Unmarshal([]byte(prompt[errorStart+len(errorStartMarker):errorEnd]), &errorExample); err != nil {
+		t.Fatalf("tool-grounded failed-check example is invalid: %v", err)
+	}
+	if value, exists := errorExample["coveredFiles"]; !exists || value != nil {
+		t.Fatalf("non-snapshot failed-check example coveredFiles = %#v", errorExample)
+	}
+	if value, exists := errorExample["coveredHunks"]; !exists || value != nil {
+		t.Fatalf("non-snapshot failed-check example coveredHunks = %#v", errorExample)
+	}
+	if !strings.Contains(prompt, "No canonical status assertions were found in successful tool output. Return the failed-check object") {
+		t.Fatalf("tool-grounded repair prompt has incorrect no-assertion guidance:\n%s", prompt)
+	}
+}
+
+func TestNeoRunCheckSubagentExplicitEmptyToolsRequireEvidence(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	actor := newNeoActor(rt, "actor-run-check-empty-tools", "thread-actor", "T-run-check-empty-tools", "T-run-check-empty-tools", neoActorRecord("actor-run-check-empty-tools", "thread-actor", "T-run-check-empty-tools"), nil)
 	actor.currentAgentMode = "review"
@@ -5069,10 +6544,22 @@ func TestNeoRunCheckSubagentHonorsExplicitEmptyFrontmatterTools(t *testing.T) {
 		"Grep": {Name: "Grep"},
 	}
 
-	var seen neoInferenceRequest
+	turn := 0
 	rt.inferStream = func(_ *neoRuntime, req neoInferenceRequest, _ neoStreamCallback) (neoInferenceResult, error) {
-		seen = req
-		return neoInferenceResult{Text: `{"status":"error","errorMessage":"tool fixture","issues":[]}`}, nil
+		turn++
+		if len(req.Tools) != 0 {
+			t.Fatalf("run_check explicit empty frontmatter tools = %#v, want none", req.Tools)
+		}
+		if turn == 1 {
+			if !strings.Contains(neoHistoryTestText(req.History), "Evaluate without repository tools.") {
+				t.Fatalf("run_check did not embed its server-loaded definition: %#v", req.History)
+			}
+			return neoInferenceResult{Text: `{"checkName":"published-dependency-capability-floor","status":"completed","patternsChecked":["@example/sdk@1.0.0 RootClient.resource.call"],"evidence":[{"patternIndex":0,"observation":"The caller supplied inline exact-floor evidence.","sources":["inline fixture"],"outcome":"no-finding","issueIndexes":[],"dependency":"@example/sdk","floorVersion":"1.0.0","accessPath":"RootClient.resource.call","floorStatus":"compatible","verification":"root-type-declaration","rootEvidence":["class RootClient { resource: Resource }","class Resource { call(): void }"]}],"issues":[]}`}, nil
+		}
+		if !strings.Contains(neoHistoryTestText(req.History), "requires exact rootEvidence excerpts from successful tool results") {
+			t.Fatalf("inline dependency evidence was not rejected before repair: %#v", req.History)
+		}
+		return neoInferenceResult{Text: `{"checkName":"published-dependency-capability-floor","status":"error","errorMessage":"required validation tool is unavailable","issues":[]}`}, nil
 	}
 
 	repository := t.TempDir()
@@ -5090,21 +6577,49 @@ func TestNeoRunCheckSubagentHonorsExplicitEmptyFrontmatterTools(t *testing.T) {
 	if err := os.WriteFile(checkPath, []byte("Evaluate without repository tools."), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_, err := actor.executeSubagentRun("run_check", map[string]any{
-		"checkName": "no-tools",
+	text, err := actor.executeSubagentRun("run_check", map[string]any{
+		"checkName": "published-dependency-capability-floor",
 		"checkURI":  (&url.URL{Scheme: "file", Path: checkPath}).String(),
 		"frontmatter": map[string]any{
 			"tools": []any{},
 		},
 	}, "TU-run-check-empty-tools", "M-1", actor.generation, 0, "")
-	if err != nil {
-		t.Fatalf("run_check subagent failed: %v", err)
+	if err != nil || turn != 2 || !strings.Contains(text, `"status":"error"`) {
+		t.Fatalf("run_check explicit empty frontmatter result = %q, turns=%d, err=%v", text, turn, err)
 	}
-	if len(seen.Tools) != 0 {
-		t.Fatalf("run_check explicit empty frontmatter tools = %#v, want none", seen.Tools)
+}
+
+func TestNeoRunCheckSubagentRequiresEvidenceWhenRequestedToolIsUnavailable(t *testing.T) {
+	rt := newNeoRuntime(&config.Config{})
+	actor := newNeoActor(rt, "actor-run-check-unavailable-tools", "thread-actor", "T-run-check-unavailable-tools", "T-run-check-unavailable-tools", neoActorRecord("actor-run-check-unavailable-tools", "thread-actor", "T-run-check-unavailable-tools"), nil)
+	actor.currentAgentMode = "review"
+	actor.tools = map[string]neoToolSpec{}
+
+	completed := `{"checkName":"published-dependency-capability-floor","status":"completed","patternsChecked":["@example/sdk@1.0.0 RootClient.resource.call"],"evidence":[{"patternIndex":0,"observation":"The floor was claimed compatible without measurement.","sources":["claim"],"outcome":"no-finding","issueIndexes":[],"dependency":"@example/sdk","floorVersion":"1.0.0","accessPath":"RootClient.resource.call","floorStatus":"compatible","verification":"root-type-declaration","rootEvidence":["class RootClient { resource: Resource }","class Resource { call(): void }"]}],"issues":[]}`
+	turn := 0
+	rt.inferStream = func(_ *neoRuntime, req neoInferenceRequest, _ neoStreamCallback) (neoInferenceResult, error) {
+		turn++
+		if len(req.Tools) != 0 {
+			t.Fatalf("unavailable requested tools resolved unexpectedly: %#v", req.Tools)
+		}
+		if turn == 1 {
+			return neoInferenceResult{Text: completed}, nil
+		}
+		if !strings.Contains(neoHistoryTestText(req.History), "requires exact rootEvidence excerpts from successful tool results") {
+			t.Fatalf("unavailable tool evidence was not rejected before repair: %#v", req.History)
+		}
+		return neoInferenceResult{Text: `{"checkName":"published-dependency-capability-floor","status":"error","errorMessage":"required validation tool is unavailable","issues":[]}`}, nil
 	}
-	if len(seen.History) == 0 || !strings.Contains(seen.History[len(seen.History)-1].Text, "Evaluate without repository tools.") {
-		t.Fatalf("run_check did not embed its server-loaded definition: %#v", seen.History)
+
+	text, err := actor.executeSubagentRun("run_check", map[string]any{
+		"checkName":    "published-dependency-capability-floor",
+		"checkContent": "Verify the exact published dependency floor.",
+		"frontmatter": map[string]any{
+			"tools": []any{"Bash"},
+		},
+	}, "TU-run-check-unavailable-tools", "M-1", actor.generation, 0, "")
+	if err != nil || turn != 2 || !strings.Contains(text, `"status":"error"`) {
+		t.Fatalf("unavailable requested tool result = %q, turns=%d, err=%v", text, turn, err)
 	}
 }
 
@@ -5194,6 +6709,241 @@ func TestNeoRunCheckDefinitionErrorIsStructured(t *testing.T) {
 	result := mapValue(run["result"])
 	if stringValue(run["status"]) != "error" || stringValue(mapValue(run["error"])["message"]) == "" || stringValue(result["checkName"]) != "outside" || stringValue(result["status"]) != "error" || len(arrayValue(result["issues"])) != 0 {
 		t.Fatalf("structured run_check definition error = %#v", run)
+	}
+}
+
+func TestNeoRunCheckTopLevelDeliveryNormalizesDependencyResult(t *testing.T) {
+	const (
+		checkName         = "published-dependency-capability-floor"
+		parentID          = "TU-run-check-delivery"
+		rootMessageID     = "M-review-root"
+		parentMessageID   = "M-review-tools"
+		rootDeclaration   = "class RootClient { resource: Resource }"
+		methodDeclaration = "class Resource { call(): void }"
+	)
+	diff := "diff --git a/main.go b/main.go\n--- a/main.go\n+++ b/main.go\n@@ -1 +1 @@\n-old\n+new"
+	files := []string{"main.go"}
+	diffs := map[string]string{"main.go": diff}
+	snapshot := &neoReviewDiffSnapshot{
+		Hash:           neoReviewSnapshotHash(files, diffs),
+		RepositoryRoot: "/synthetic/repository",
+		Files:          files,
+		Diffs:          diffs,
+		Hunks:          neoReviewDiffHunks("main.go", diff),
+	}
+	if len(snapshot.Hunks) != 1 {
+		t.Fatalf("synthetic snapshot hunks = %#v", snapshot.Hunks)
+	}
+
+	for _, tc := range []struct {
+		name          string
+		invalidResult bool
+	}{
+		{name: "completed result"},
+		{name: "invalid scalar evidence", invalidResult: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rt := newNeoRuntime(&config.Config{})
+			actor := newNeoActor(rt, "actor-run-check-delivery", "thread-actor", "T-run-check-delivery", "T-run-check-delivery", neoActorRecord("actor-run-check-delivery", "thread-actor", "T-run-check-delivery"), nil)
+			actor.currentAgentMode = "review"
+			actor.executorReady = false
+			actor.tools = map[string]neoToolSpec{
+				"shell_command": {Name: "shell_command", InputSchema: map[string]any{"type": "object"}},
+			}
+			actor.reviewSnapshot = snapshot
+			actor.reviewSnapshotDescription = "uncommitted changes"
+			actor.reviewSnapshotRootMessageID = rootMessageID
+			actor.reviewSnapshotScope = append([]string(nil), files...)
+
+			parentInput := map[string]any{
+				"checkName":       checkName,
+				"checkURI":        "file:///checks/published-dependency-capability-floor.md",
+				"checkContent":    "Verify the exact published dependency floor.",
+				"frontmatter":     map[string]any{"tools": []any{"shell_command"}},
+				"diffDescription": "uncommitted changes",
+				"files":           []any{"main.go"},
+			}
+			parent := neoPendingTool{ID: parentID, Name: "run_check", Input: parentInput, AgentMode: "review", ReasoningEffort: "medium", MessageID: parentMessageID}
+			actor.mu.Lock()
+			actor.storeMessageLocked(neoMessage{
+				ThreadID: actor.threadID, MessageID: rootMessageID, Role: "user",
+				Content: []any{map[string]any{"type": "text", "text": "Review uncommitted changes."}},
+			})
+			actor.storeMessageLocked(neoMessage{
+				ThreadID: actor.threadID, MessageID: parentMessageID, Role: "assistant",
+				Content: []any{neoToolUseBlock(neoToolCall{ID: parentID, Name: "run_check", Input: parentInput}, true)},
+			})
+			actor.pendingTools[parent.ID] = parent
+			actor.rebuildHistoryLocked()
+			generation := actor.generation
+			actor.mu.Unlock()
+
+			turn := 0
+			rt.inferStream = func(_ *neoRuntime, _ neoInferenceRequest, _ neoStreamCallback) (neoInferenceResult, error) {
+				turn++
+				if turn == 1 {
+					return neoInferenceResult{ToolCalls: []neoToolCall{{
+						ID: "dependency-floor-tool", Name: "shell_command",
+						Input: map[string]any{"command": "inspect @example/sdk@1.0.0 RootClient.resource.call declarations"},
+					}}}, nil
+				}
+				evidence := map[string]any{
+					"patternIndex": 0,
+					"observation":  " The exact floor exposes the complete root capability. ",
+					"sources":      []any{"exact package declarations"},
+					"outcome":      "no-finding",
+					"dependency":   "@example/sdk",
+					"floorVersion": "1.0.0",
+					"accessPath":   "RootClient.resource.call",
+					"floorStatus":  "compatible",
+					"verification": "root-type-declaration",
+					"rootEvidence": []any{rootDeclaration, methodDeclaration},
+				}
+				if tc.invalidResult {
+					delete(evidence, "floorStatus")
+					evidence["rootEvidence"] = rootDeclaration
+				}
+				result := map[string]any{
+					"status":          "completed",
+					"filesAnalyzed":   1,
+					"linesAnalyzed":   1,
+					"coveredFiles":    []any{"main.go"},
+					"coveredHunks":    []any{snapshot.Hunks[0].ID},
+					"patternsChecked": []any{"@example/sdk@1.0.0 RootClient.resource.call"},
+					"evidence":        []any{evidence},
+					"issues":          []any{},
+					"ignored":         "raw model field",
+				}
+				raw, err := json.Marshal(result)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return neoInferenceResult{Text: string(raw)}, nil
+			}
+
+			delivered := make(chan map[string]any, 1)
+			socket := &neoSocket{writeMessage: func(_ int, data []byte) error {
+				var event map[string]any
+				if err := json.Unmarshal(data, &event); err != nil {
+					return err
+				}
+				if stringValue(event["type"]) == "tool_lease" {
+					toolCallID := stringValue(event["toolCallId"])
+					go actor.routeSubagentLeafToolResult(toolCallID, map[string]any{
+						"status": "done",
+						"result": map[string]any{"exitCode": 0, "output": rootDeclaration + "\n" + methodDeclaration},
+					})
+				}
+				message := mapValue(event["message"])
+				if stringValue(event["type"]) == "message_added" && stringValue(message["messageId"]) == toolResultMessageID(parentID) {
+					select {
+					case delivered <- event:
+					default:
+					}
+				}
+				return nil
+			}}
+			actor.mu.Lock()
+			actor.sockets[socket] = struct{}{}
+			actor.mu.Unlock()
+
+			done := make(chan struct{})
+			go func() {
+				actor.runSubagent(parent, generation)
+				close(done)
+			}()
+			select {
+			case <-done:
+			case <-time.After(3 * time.Second):
+				t.Fatal("top-level run_check did not finish")
+			}
+			select {
+			case <-delivered:
+			case <-time.After(time.Second):
+				t.Fatal("top-level run_check result was not broadcast")
+			}
+
+			actor.mu.Lock()
+			messages := cloneNeoMessages(actor.messages)
+			history := append([]neoHistoryMessage(nil), actor.history...)
+			_, stillPending := actor.pendingTools[parentID]
+			actor.mu.Unlock()
+			if stillPending {
+				t.Fatal("top-level run_check remained pending")
+			}
+			var parentRun map[string]any
+			parentResults := 0
+			childMessages := 0
+			for _, message := range messages {
+				if message.ParentToolUseID == parentID {
+					childMessages++
+				}
+				for _, rawBlock := range message.Content {
+					block := mapValue(rawBlock)
+					if stringValue(block["type"]) != "tool_result" || stringValue(block["toolUseID"]) != parentID {
+						continue
+					}
+					parentResults++
+					if message.ParentToolUseID != "" {
+						t.Fatalf("top-level parent result was child-scoped: %#v", message)
+					}
+					parentRun = mapValue(block["run"])
+				}
+			}
+			if parentResults != 1 || childMessages != 2 {
+				t.Fatalf("top-level results/child messages = %d/%d, messages=%#v", parentResults, childMessages, messages)
+			}
+			result := mapValue(parentRun["result"])
+			if _, hasOutput := parentRun["output"]; hasOutput {
+				t.Fatalf("top-level run retained raw output: %#v", parentRun)
+			}
+			if stringValue(result["checkName"]) != checkName || len(arrayValue(result["issues"])) != 0 {
+				t.Fatalf("top-level normalized result = %#v", result)
+			}
+			if tc.invalidResult {
+				if stringValue(parentRun["status"]) != "error" || stringValue(result["status"]) != "error" || !strings.Contains(stringValue(result["errorMessage"]), "rootEvidence") || result["evidence"] != nil {
+					t.Fatalf("invalid scalar dependency result was delivered as completed: %#v", parentRun)
+				}
+			} else {
+				entry := mapValue(arrayValue(result["evidence"])[0])
+				if stringValue(parentRun["status"]) != "done" || stringValue(result["status"]) != "completed" || stringValue(entry["floorStatus"]) != "compatible" || !reflect.DeepEqual(entry["rootEvidence"], []any{rootDeclaration, methodDeclaration}) || !reflect.DeepEqual(entry["issueIndexes"], []any{}) || result["ignored"] != nil {
+					t.Fatalf("completed dependency result was not normalized: %#v", parentRun)
+				}
+			}
+			if len(history) == 0 {
+				t.Fatal("actor history omitted top-level run_check result")
+			}
+			if tc.invalidResult {
+				if !strings.Contains(history[len(history)-1].Text, "rootEvidence") {
+					t.Fatalf("actor history error = %q, want structured validation failure", history[len(history)-1].Text)
+				}
+			} else {
+				var historyResult map[string]any
+				if err := json.Unmarshal([]byte(history[len(history)-1].Text), &historyResult); err != nil {
+					t.Fatalf("decode actor history result: %v", err)
+				}
+				normalizedResultJSON, err := json.Marshal(result)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var normalizedResult map[string]any
+				if err := json.Unmarshal(normalizedResultJSON, &normalizedResult); err != nil || !reflect.DeepEqual(historyResult, normalizedResult) {
+					t.Fatalf("actor history result = %#v, err=%v, want %#v", historyResult, err, normalizedResult)
+				}
+			}
+			threadSnapshot, ok := actor.threadSnapshot()
+			if !ok {
+				t.Fatal("run_check thread snapshot was unavailable")
+			}
+			persisted := marshalNeoThreadForTest(t, neoCloudThread(threadSnapshot))
+			persistedJSON, err := json.Marshal(persisted)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if bytes.Contains(persistedJSON, []byte(`"ignored":"raw model field"`)) || bytes.Contains(persistedJSON, []byte(`"rootEvidence":"`)) {
+				t.Fatalf("persisted thread retained raw model result: %s", persistedJSON)
+			}
+		})
 	}
 }
 
@@ -5749,11 +7499,97 @@ func TestNeoRunCheckToolSpecAcceptsInstructions(t *testing.T) {
 	if _, ok := properties["instructions"]; !ok {
 		t.Fatalf("run_check schema missing instructions property: %#v", properties)
 	}
+	if !spec.Strict {
+		t.Fatal("run_check schema must opt into strict function calling")
+	}
 	required := arrayValue(spec.InputSchema["required"])
+	foundContent := false
 	for _, raw := range required {
 		if stringValue(raw) == "checkContent" {
-			t.Fatalf("run_check schema should not require checkContent: %#v", required)
+			foundContent = true
 		}
+	}
+	if !foundContent {
+		t.Fatalf("strict run_check schema must require checkContent: %#v", required)
+	}
+	content, ok := properties["checkContent"].(map[string]any)
+	if !ok {
+		t.Fatalf("run_check schema missing checkContent property: %#v", properties)
+	}
+	types := arrayValue(content["type"])
+	nullable := false
+	for _, raw := range types {
+		if stringValue(raw) == "null" {
+			nullable = true
+		}
+	}
+	if !nullable {
+		t.Fatalf("checkContent must stay nullable for strict mode: %#v", content)
+	}
+}
+
+func TestNeoRunCheckToolNamesNullFallsBack(t *testing.T) {
+	fallback := []string{"Bash", "Read"}
+	absent := map[string]any{"frontmatter": map[string]any{"name": "demo"}}
+	if got := neoRunCheckToolNames(absent, fallback); !slices.Equal(got, fallback) {
+		t.Fatalf("absent tools key = %#v, want fallback %#v", got, fallback)
+	}
+	nullTools := map[string]any{"frontmatter": map[string]any{"name": "demo", "tools": nil}}
+	if got := neoRunCheckToolNames(nullTools, fallback); !slices.Equal(got, fallback) {
+		t.Fatalf("null tools = %#v, want fallback %#v", got, fallback)
+	}
+	empty := map[string]any{"frontmatter": map[string]any{"name": "demo", "tools": []any{}}}
+	if got := neoRunCheckToolNames(empty, fallback); len(got) != 0 {
+		t.Fatalf("explicit empty tools = %#v, want none", got)
+	}
+	listed := map[string]any{"frontmatter": map[string]any{"name": "demo", "tools": []any{"Read", "Grep", "Read"}}}
+	if got := neoRunCheckToolNames(listed, fallback); !slices.Equal(got, []string{"Read", "Grep"}) {
+		t.Fatalf("listed tools = %#v, want deduped list", got)
+	}
+}
+
+func TestNeoRepairRunCheckInput(t *testing.T) {
+	canonical := map[string]any{
+		"checkName":       "demo-check",
+		"checkURI":        "file:///checks/demo.md",
+		"diffDescription": "repo#1",
+		"files":           []any{"a.ts", "b.ts"},
+		"instructions":    "evaluate",
+	}
+	embedded, _ := json.Marshal(canonical)
+	history := []neoHistoryMessage{
+		{Role: "assistant", Text: "ack"},
+		{Role: "user", Text: "Review this diff: repo#1\nCall run_check exactly once with this exact JSON object:\n<review_check_arguments>" + string(embedded) + "</review_check_arguments>\n"},
+	}
+	registry := neoReviewEmbeddedRunCheckInputs(history)
+	if len(registry) != 1 || registry["demo-check"] == nil {
+		t.Fatalf("registry = %#v, want demo-check entry", registry)
+	}
+	mismatched := map[string]any{"checkName": "demo-check", "checkURI": "file:///checks/demo.md", "diffDescription": "repo#1", "files": []any{"a.ts"}, "instructions": ""}
+	repaired, changed := neoRepairRunCheckInput(registry, "run_check", mismatched)
+	if !changed {
+		t.Fatal("subset files input should have been repaired")
+	}
+	files := arrayValue(repaired["files"])
+	if len(files) != 2 {
+		t.Fatalf("repaired files = %#v, want both files", files)
+	}
+	exact, changed := neoRepairRunCheckInput(registry, "run_check", canonical)
+	if changed {
+		t.Fatal("verbatim input should pass through unchanged")
+	}
+	if stringValue(exact["checkName"]) != "demo-check" {
+		t.Fatalf("exact input lost checkName: %#v", exact)
+	}
+	unknown := map[string]any{"checkName": "other-check", "files": []any{"a.ts"}}
+	if _, changed := neoRepairRunCheckInput(registry, "run_check", unknown); changed {
+		t.Fatal("unknown check must not be repaired")
+	}
+	if _, changed := neoRepairRunCheckInput(nil, "run_check", mismatched); changed {
+		t.Fatal("empty registry must not repair")
+	}
+	if _, changed := neoRepairRunCheckInput(registry, "submit_review", mismatched); changed {
+		t.Fatal("non-run_check tool must not be repaired")
 	}
 }
 

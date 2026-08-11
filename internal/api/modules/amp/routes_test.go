@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"slices"
 	"strconv"
@@ -275,6 +276,86 @@ func TestRegisterManagementRoutes(t *testing.T) {
 	}
 }
 
+func TestLocalBrokerHeartbeatRouteOwnerIsolation(t *testing.T) {
+	useTempNeoThreadStore(t)
+	gin.SetMode(gin.TestMode)
+	ownerByAuthorization := map[string]string{
+		"Bearer upstream-a": "user_a",
+		"Bearer upstream-b": "user_b",
+	}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ownerUserID := ownerByAuthorization[r.Header.Get("Authorization")]
+		if r.URL.Path != "/api/internal" || r.URL.RawQuery != "getUserInfo" || ownerUserID == "" {
+			http.Error(w, "unexpected request", http.StatusUnauthorized)
+			return
+		}
+		writeNeoJSON(w, http.StatusOK, map[string]any{"ok": true, "result": map[string]any{"id": ownerUserID}})
+	}))
+	t.Cleanup(upstream.Close)
+	rt := newNeoRuntime(&config.Config{
+		SDKConfig: config.SDKConfig{APIKeys: []string{"client-a", "client-b"}},
+		AmpCode: config.AmpCode{
+			UpstreamURL:    upstream.URL,
+			UpstreamAPIKey: "upstream-a",
+		},
+	})
+	mapped := NewMappedSecretSource(NewStaticSecretSource("upstream-a"))
+	mapped.UpdateMappings([]config.AmpUpstreamAPIKeyEntry{{UpstreamAPIKey: "upstream-b", APIKeys: []string{"client-b"}}})
+	rt.setSecretSource(mapped)
+	m := &AmpModule{restrictToLocalhost: true, neoRuntime: rt}
+	router := gin.New()
+	auth := func(c *gin.Context) {
+		token := strings.TrimSpace(strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer "))
+		if token != "client-a" && token != "client-b" {
+			c.AbortWithStatus(http.StatusUnauthorized)
+			return
+		}
+		c.Set("userApiKey", token)
+		c.Next()
+	}
+	m.registerManagementRoutes(router, &handlers.BaseAPIHandler{}, auth)
+
+	payload := func(brokerID, sessionID, runnerID, directory string) string {
+		return fmt.Sprintf(`{"brokerId":%q,"sessionId":%q,"sessionGeneration":1,"hostname":"Mac","pid":1234,"runners":[{"runnerId":%q,"workingDirectory":%q,"repositoryURL":"","runningThreads":[]}]}`, brokerID, sessionID, runnerID, directory)
+	}
+	request := func(clientAPIKey, body, origin string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/ampcode/local-broker/heartbeat.json", strings.NewReader(body))
+		req.RemoteAddr = "203.0.113.42:1234"
+		req.Header.Set("Authorization", "Bearer "+clientAPIKey)
+		req.Header.Set("Content-Type", "application/json; charset=utf-8")
+		if origin != "" {
+			req.Header.Set("Origin", origin)
+		}
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		return rec
+	}
+	if rec := request("client-a", payload("broker-a", "session-a", "local-runner-shared", "/Users/a/Developer/app"), ""); rec.Code != http.StatusOK {
+		t.Fatalf("owner A heartbeat status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := request("client-b", payload("broker-b", "session-b", "local-runner-shared", "/Users/b/Developer/app"), ""); rec.Code != http.StatusOK {
+		t.Fatalf("owner B heartbeat status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	runnersA := rt.store.userExecutorRunnersForOwner("user_a")
+	runnersB := rt.store.userExecutorRunnersForOwner("user_b")
+	if len(runnersA) != 1 || stringValue(mapValue(runnersA[0])["workingDirectory"]) != "/Users/a/Developer/app" {
+		t.Fatalf("owner A runners = %#v", runnersA)
+	}
+	if len(runnersB) != 1 || stringValue(mapValue(runnersB[0])["workingDirectory"]) != "/Users/b/Developer/app" {
+		t.Fatalf("owner B runners = %#v", runnersB)
+	}
+	if rec := request("client-a", payload("browser-broker", "browser-session", "browser-runner", "/Users/a/Developer/browser"), "https://ampcode.com"); rec.Code != http.StatusForbidden || rec.Header().Get("Access-Control-Allow-Origin") != "" {
+		t.Fatalf("browser-origin heartbeat status = %d CORS=%q body=%s", rec.Code, rec.Header().Get("Access-Control-Allow-Origin"), rec.Body.String())
+	}
+	unauthorizedReq := httptest.NewRequest(http.MethodPost, "/ampcode/local-broker/heartbeat.json", strings.NewReader(payload("broker-a", "session-a", "runner-a", "/Users/a/Developer/app")))
+	unauthorizedReq.Header.Set("Content-Type", "application/json")
+	unauthorizedRec := httptest.NewRecorder()
+	router.ServeHTTP(unauthorizedRec, unauthorizedReq)
+	if unauthorizedRec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized heartbeat status = %d body=%s", unauthorizedRec.Code, unauthorizedRec.Body.String())
+	}
+}
+
 func TestWebLocalInferenceCORSRequiresOptIn(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
@@ -475,7 +556,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 	}
 	for _, want := range []string{
 		"// ==UserScript==",
-		"@version 0.1.200",
+		"@version 0.1.202",
 		"@match https://ampcode.com/*",
 		"@updateURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
 		"@downloadURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
@@ -492,7 +573,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"commandPaletteIntegrationCount",
 		"localThreadPickerOpenCount",
 		"removedLocalThreadControlCount",
-		`const userscriptVersion = "0.1.200"`,
+		`const userscriptVersion = "0.1.202"`,
 		"localThreadSearchEndpointPath",
 		"fetchLocalThreadSearch",
 		"mergeThreadSearchResponse",
@@ -619,7 +700,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"globalThis.localStorage.removeItem(workingDirectoryStorageKey)",
 		"normalizeLocalProject",
 		"fetchLocalProjects",
-		"function fetchLocalProjects(promptForKey = false, additionalSidebarThreadIDs = [])",
+		"function fetchLocalProjects(promptForKey = false, additionalSidebarThreadIDs = [], force = false)",
 		`const headers = localFetchHeaders("", false)`,
 		"localProjectLookupAPIKey",
 		"promptedProjectsAPIKey",
@@ -638,7 +719,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"localProjectFetchCount",
 		"localProjectFetchFailureCount",
 		"lastLocalProjectFetchFailure",
-		`localProjectsCache = { at: 0, projects: [], threadID, thread: null, threads: [], threadTitles: Object.assign({}, localSidebarTitleCache), sidebarTitleKey: "", promise: null }`,
+		`localProjectsCache = { at: 0, projects: [], runners: [], threadID, thread: null, threads: [], threadTitles: Object.assign({}, localSidebarTitleCache), sidebarTitleKey: "", promise: null }`,
 		"localProjectPickerIntegrationCount",
 		"localProjectIntegrationGeneration",
 		"projectMutationCandidateCount",
@@ -652,6 +733,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"normalizeExplicitReasoningEffort",
 		"lastInheritedWorkingDirectory",
 		"remoteShellCreateCount",
+		"executorType: localPayload.executorType",
 		"lastLocalThreadAgentMode",
 		"lastVisibleThreadModeBadge",
 		"lastLocalThreadChoice",
@@ -902,6 +984,165 @@ func TestWebLocalInferenceUserscriptSyntax(t *testing.T) {
 	}
 }
 
+func TestWebLocalInferenceUserscriptShellPayloadPreservesExecutorType(t *testing.T) {
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node not installed")
+	}
+	script := ampWebLocalInferenceUserscript("http://127.0.0.1:8317", nil)
+	start := strings.Index(script, "async function createRemoteThreadShell(localPayload)")
+	if start < 0 {
+		t.Fatal("userscript shell creation function was not found")
+	}
+	end := strings.Index(script[start:], "async function readJSONResponse")
+	if end < 0 {
+		t.Fatal("userscript shell creation function end was not found")
+	}
+	shellFunction := script[start : start+end]
+	if !strings.Contains(shellFunction, "executorType: localPayload.executorType") {
+		t.Fatalf("thread shell payload dropped executorType:\n%s", shellFunction)
+	}
+	runner := `
+(async () => {
+	const calls = [];
+	const diagnostics = { remoteShellCreateCount: 0 };
+	const localBaseURLString = () => "http://127.0.0.1:8317";
+	const localFetchHeaders = () => ({});
+	const originalFetch = async (_, options) => {
+		calls.push(JSON.parse(options.body));
+		return { text: async () => JSON.stringify({ threadId: "T-shell" }) };
+	};
+	const readJSONResponse = async (response) => JSON.parse(await response.text());
+	const responseThreadID = (response) => response.threadId || "";
+` + shellFunction + `
+	for (const executorType of ["sandbox", "local-client"]) {
+		await createRemoteThreadShell({
+			agentMode: "smart",
+			reasoningEffort: "high",
+			executorType,
+			runnerId: executorType === "local-client" ? "local-runner-a" : "",
+			spawnExecutor: executorType === "local-client" ? false : undefined,
+			settings: { agentMode: "smart" },
+			threadMeta: { executorType, runnerId: executorType === "local-client" ? "local-runner-a" : undefined },
+		});
+	}
+	if (calls.length !== 2 || calls[0].executorType !== "sandbox" || calls[1].executorType !== "local-client") {
+		throw new Error("shell executor types were not preserved: " + JSON.stringify(calls));
+	}
+	for (const call of calls) {
+		if (call.threadMeta.executorType !== call.executorType || call.threadMeta.cliProxyAPIWebLocalShell !== true) {
+			throw new Error("shell thread metadata was not preserved: " + JSON.stringify(call));
+		}
+	}
+	if (calls[0].runnerId || calls[0].spawnExecutor !== undefined || calls[1].runnerId || calls[1].spawnExecutor !== false || calls[1].threadMeta.runnerId) {
+		throw new Error("runner intent leaked into shell payload: " + JSON.stringify(calls));
+	}
+})().catch((error) => { console.error(error && error.stack ? error.stack : error); process.exit(1); });
+`
+	if output, err := exec.Command("node", "-e", runner).CombinedOutput(); err != nil {
+		t.Fatalf("userscript shell payload check failed: %v\n%s", err, output)
+	}
+}
+
+func TestWebLocalInferenceUserscriptRequiresExactLiveRunner(t *testing.T) {
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node not installed")
+	}
+	script := ampWebLocalInferenceUserscript("https://amp.aikins.xyz", nil)
+	pathStart := strings.Index(script, "function normalizeLocalRunnerWorkingDirectory(value)")
+	if pathStart < 0 {
+		t.Fatal("userscript local runner path normalizer was not found")
+	}
+	pathEnd := strings.Index(script[pathStart:], "function firstWorkingDirectory")
+	start := strings.Index(script, "function normalizeLocalRunner(value)")
+	if pathEnd < 0 || start < 0 {
+		t.Fatal("userscript local runner normalizer was not found")
+	}
+	end := strings.Index(script[start:], "async function readJSONResponse")
+	if end < 0 {
+		t.Fatal("userscript local runner block end was not found")
+	}
+	localRunnerFunctions := script[pathStart:pathStart+pathEnd] + script[start:start+end]
+	runner := `
+(async () => {
+	const assert = (condition, message) => { if (!condition) throw new Error(message); };
+	const calls = [];
+	let localProjectsCache = { projects: [], runners: [] };
+	let fetched = 0;
+	let fetchRunners = [];
+	const diagnostics = { remoteShellCreateCount: 0 };
+	const isPlainObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+	const firstString = (...values) => values.find((value) => typeof value === "string" && value.trim())?.trim() || "";
+	const normalizeWorkingDirectory = (value) => typeof value === "string" ? value.trim() : "";
+	const localThreadModeOptions = () => ({ agentMode: "smart", reasoningEffort: "high" });
+	const localProjectRepositoryURLForDirectory = () => "https://github.com/example/app.git";
+	const localFetchHeaders = () => ({});
+	const ensureDefaultWorkingDirectory = async () => "";
+	const fetchLocalProjects = async () => { fetched += 1; localProjectsCache.runners = fetchRunners.map(normalizeLocalRunner).filter(Boolean); return []; };
+	const localBaseURLString = () => "https://amp.aikins.xyz";
+	const readJSONResponse = async (response) => JSON.parse(await response.text());
+	const responseThreadID = (value) => value.threadId || "";
+	const rememberLocalThreadID = () => {};
+	const rememberThreadWorkingDirectory = () => {};
+	const rememberThreadSettings = () => {};
+	const localThreadModeLabel = () => "Smart";
+	const navigateToThread = () => {};
+	const originalFetch = async (url, options) => {
+		calls.push({ url, body: JSON.parse(options.body) });
+		return { ok: true, status: 200, text: async () => JSON.stringify({ threadId: "T-019f4000-0000-4000-8000-000000000031" }) };
+	};
+` + localRunnerFunctions + `
+
+	const directory = "/Users/test/Developer/app";
+	let missingCheckoutError = "";
+	try { requireLocalRunner(""); } catch (error) { missingCheckoutError = error.message; }
+	assert(missingCheckoutError === "Select a valid checkout before starting a Mac thread", "missing checkout error = " + missingCheckoutError);
+	fetchRunners = [{ runnerId: "local-runner-a", workingDirectory: directory + "/", hostname: "Mac" }];
+	await createLocalThread("hello", directory + "/nested/.././", {}, "local");
+	assert(fetched === 1, "local creation did not force a runner refresh");
+	assert(calls.length === 2, "local creation did not create shell and actor");
+	assert(!calls[0].body.runnerId && !calls[0].body.threadMeta.runnerId, "runner intent leaked into shell request: " + JSON.stringify(calls[0]));
+		assert(calls[0].body.spawnExecutor === false, "shell executor spawn not disabled in " + JSON.stringify(calls[0]));
+		assert(calls[1].body.runnerId === "local-runner-a", "runnerId missing from actor request: " + JSON.stringify(calls[1]));
+		assert(calls[1].body.spawnExecutor === false, "actor executor spawn not disabled in " + JSON.stringify(calls[1]));
+		assert(calls[1].body.threadMeta.runnerId === "local-runner-a", "nested runnerId missing from actor request: " + JSON.stringify(calls[1]));
+	assert(calls.every((call) => call.body.workingDirectory === directory), "catalog path did not replace browser path: " + JSON.stringify(calls));
+
+	calls.length = 0;
+	fetchRunners = [{ runnerId: "local-runner-a", workingDirectory: "/Users/test/Developer/other" }];
+	let mismatchError = "";
+	try { await createLocalThread("hello", directory, {}, "local"); } catch (error) { mismatchError = error.message; }
+	assert(mismatchError === "No Mac broker runner is connected for this checkout", "mismatch error = " + mismatchError);
+	assert(calls.length === 0, "mismatch sent a shell request");
+
+	calls.length = 0;
+	fetchRunners = [];
+	let offlineError = "";
+	try { await createLocalThread("hello", directory, {}, "local"); } catch (error) { offlineError = error.message; }
+	assert(offlineError === "No Mac broker runner is connected for this checkout", "offline error = " + offlineError);
+	assert(calls.length === 0, "offline broker sent a shell request");
+
+		fetchRunners = [
+			{ runnerId: "local-runner-a", workingDirectory: directory },
+			{ runnerId: "local-runner-b", workingDirectory: directory },
+		];
+		let ambiguousError = "";
+		try { await createLocalThread("hello", directory, {}, "local"); } catch (error) { ambiguousError = error.message; }
+		assert(ambiguousError === "Multiple Mac broker runners match this checkout; keep exactly one runner active or choose a different checkout", "ambiguous error = " + ambiguousError);
+		assert(calls.length === 0, "ambiguous broker sent a shell request");
+
+	calls.length = 0;
+	fetched = 0;
+	await createLocalThread("hello", directory, {}, "orb");
+	assert(fetched === 0, "Orb creation unexpectedly fetched a local runner");
+	assert(calls.length === 2 && calls.every((call) => call.body.executorType === "sandbox"), "Orb classification changed: " + JSON.stringify(calls));
+	assert(calls.every((call) => !call.body.runnerId && call.body.spawnExecutor === undefined), "Orb payload gained runner fields: " + JSON.stringify(calls));
+})().catch((error) => { console.error(error && error.stack ? error.stack : error); process.exit(1); });
+`
+	if output, err := exec.Command("node", "-e", runner).CombinedOutput(); err != nil {
+		t.Fatalf("userscript local runner check failed: %v\n%s", err, output)
+	}
+}
+
 func TestWebLocalInferenceUserscriptScopesDelayedAPIKeyHydration(t *testing.T) {
 	if _, err := exec.LookPath("node"); err != nil {
 		t.Skip("node not installed")
@@ -1125,7 +1366,7 @@ if (scenario === "cached-sidebar") {
 	assert(cachedSidebarTitle.textContent === "Cached local title", "scoped cached sidebar title was not rendered immediately");
 	assert(!documentElement.hasAttribute("data-cliproxy-local-sidebar-hydrating"), "cached visible sidebar waited for the hydration timeout");
 	assert(localProjectsFetchCount === 1, "cached sidebar hydration did not keep one bounded metadata refresh");
-	assert(pageShowCount === 1, "cached sidebar hydration did not rebuild once after background metadata arrived");
+	assert(pageShowCount === 1, "cached sidebar hydration rebuild count = " + pageShowCount + ", want 1 after background metadata arrived");
 	assert(globalThis.localStorage.getItem("cliproxyapi.ampLocalInference.sidebarTitles.v3." + scopeSuffix(viewerA, previousBaseURL)) !== null, "sidebar title cache was not scoped to the account and local server");
 	cachedSidebarTitle.textContent = "Untitled";
 	bridge.rememberAuthenticatedAmpUser({ id: viewerB });
@@ -1977,7 +2218,7 @@ if (typeof globalThis.btoa !== "function") {
 	require(scriptPath);
 	const bridge = globalThis.__cliproxyAmpLocalInference;
 	const regroupTestBridge = globalThis.__cliproxyAmpLocalInferenceTest;
-assert(bridge && bridge.userscriptVersion === "0.1.200", "bridge userscript version was not exposed");
+assert(bridge && bridge.userscriptVersion === "0.1.202", "bridge userscript version was not exposed");
 	assert(typeof regroupTestBridge?.requestLocalSidebarProjectRegroup === "function", "sidebar regroup test bridge was not exposed");
 	const projectPageTitle = globalThis.document.title;
 	const validProjectHost = new FakeElement("main");
@@ -1994,7 +2235,7 @@ assert(bridge && bridge.userscriptVersion === "0.1.200", "bridge userscript vers
 	assert(!regroupTestBridge.localSidebarProjectMatches(sharedRepositoryCheckout, sharedRepositoryWorktree), "same-repository worktrees matched as one sidebar project");
 	assert(regroupTestBridge.diffCaptureReadThreadID("/api/threads/%E0%A4%A/diff-captures/latest") === "", "malformed diff-capture thread path was not rejected");
 	assert(globalThis.document.documentElement.getAttribute("data-cliproxy-local-sidebar-hydrating") === "1", "sidebar hydration gate was not installed before rendering");
-assert(globalThis.document.documentElement.getAttribute("data-cliproxy-local-inference-version") === "0.1.200", "userscript version was not exposed on the document root");
+assert(globalThis.document.documentElement.getAttribute("data-cliproxy-local-inference-version") === "0.1.202", "userscript version was not exposed on the document root");
 	class InstrumentedWebSocket extends WebSocket {}
 	const instrumentedSocket = new InstrumentedWebSocket("wss://ampcode.com/gateway/userActor/?rvt-method=get&rvt-key=subclass-test");
 	assert(instrumentedSocket instanceof InstrumentedWebSocket, "patched WebSocket discarded a derived constructor prototype");
@@ -12489,4 +12730,161 @@ func TestLocalhostOnlyMiddleware_HotReload(t *testing.T) {
 	if w.Code != http.StatusForbidden {
 		t.Errorf("Expected 403 after re-enabling restriction, got %d", w.Code)
 	}
+}
+
+func TestLocalBrokerHeartbeatRouteSecurityAndStateContract(t *testing.T) {
+	useTempNeoThreadStore(t)
+	gin.SetMode(gin.TestMode)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/internal" || r.URL.RawQuery != "getUserInfo" || r.Header.Get("Authorization") == "Bearer upstream-unresolved" {
+			http.Error(w, "owner unavailable", http.StatusUnauthorized)
+			return
+		}
+		writeNeoJSON(w, http.StatusOK, map[string]any{"ok": true, "result": map[string]any{"id": "user_route_owner"}})
+	}))
+	t.Cleanup(upstream.Close)
+	rt := newNeoRuntime(&config.Config{
+		SDKConfig: config.SDKConfig{APIKeys: []string{"client-resolved", "client-unresolved"}},
+		AmpCode: config.AmpCode{
+			UpstreamURL:    upstream.URL,
+			UpstreamAPIKey: "upstream-resolved",
+		},
+	})
+	mapped := NewMappedSecretSource(NewStaticSecretSource("upstream-resolved"))
+	mapped.UpdateMappings([]config.AmpUpstreamAPIKeyEntry{{UpstreamAPIKey: "upstream-unresolved", APIKeys: []string{"client-unresolved"}}})
+	rt.setSecretSource(mapped)
+	m := &AmpModule{restrictToLocalhost: true, neoRuntime: rt}
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Header("Access-Control-Allow-Origin", "https://example.com")
+		c.Header("Access-Control-Allow-Methods", "POST, OPTIONS")
+		c.Header("Access-Control-Allow-Headers", "Authorization, Content-Type")
+		c.Header("Access-Control-Allow-Credentials", "true")
+		c.Next()
+	})
+	auth := func(c *gin.Context) {
+		token := strings.TrimSpace(strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer "))
+		if token != "client-resolved" && token != "client-unresolved" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing_key"})
+			return
+		}
+		c.Set("userApiKey", token)
+		c.Next()
+	}
+	m.registerManagementRoutes(router, &handlers.BaseAPIHandler{}, auth)
+
+	workingDirectory := t.TempDir()
+	payload := func(generation uint64, sessionID string) string {
+		raw, err := json.Marshal(map[string]any{
+			"brokerId":          "route-broker",
+			"sessionId":         sessionID,
+			"sessionGeneration": generation,
+			"hostname":          "Route Host",
+			"pid":               1234,
+			"runners": []any{map[string]any{
+				"runnerId":         "route-runner",
+				"workingDirectory": workingDirectory,
+				"repositoryURL":    "",
+				"runningThreads":   []any{},
+			}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(raw)
+	}
+	request := func(method, apiKey, contentType, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, "/ampcode/local-broker/heartbeat.json", strings.NewReader(body))
+		req.RemoteAddr = "203.0.113.42:4317"
+		if apiKey != "" {
+			req.Header.Set("Authorization", "Bearer "+apiKey)
+		}
+		if contentType != "" {
+			req.Header.Set("Content-Type", contentType)
+		}
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		return rec
+	}
+	assertNoPhysicalCORSHeaders := func(rec *httptest.ResponseRecorder) {
+		t.Helper()
+		for name := range rec.Header() {
+			if strings.HasPrefix(strings.ToLower(name), "access-control-") {
+				t.Fatalf("response physically contains CORS header %q: %#v", name, rec.Header())
+			}
+		}
+	}
+
+	for _, tc := range []struct {
+		name        string
+		contentType string
+	}{
+		{name: "missing content type"},
+		{name: "wrong content type", contentType: "text/plain"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := request(http.MethodPost, "client-resolved", tc.contentType, payload(1, "session-content-type"))
+			if rec.Code != http.StatusUnsupportedMediaType {
+				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			assertNoPhysicalCORSHeaders(rec)
+		})
+	}
+	oversized := request(http.MethodPost, "client-resolved", "application/json", strings.Repeat("x", neoLocalBrokerMaxBodyBytes+1))
+	if oversized.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized status=%d body=%s", oversized.Code, oversized.Body.String())
+	}
+	assertNoPhysicalCORSHeaders(oversized)
+	missingKey := request(http.MethodPost, "", "application/json", payload(1, "session-missing-key"))
+	if missingKey.Code != http.StatusUnauthorized {
+		t.Fatalf("missing-key status=%d body=%s", missingKey.Code, missingKey.Body.String())
+	}
+	assertNoPhysicalCORSHeaders(missingKey)
+	unresolved := request(http.MethodPost, "client-unresolved", "application/json", payload(1, "session-unresolved"))
+	var unresolvedBody map[string]any
+	if unresolved.Code != http.StatusUnauthorized || json.Unmarshal(unresolved.Body.Bytes(), &unresolvedBody) != nil || unresolvedBody["error"] != "owner_unavailable" {
+		t.Fatalf("unresolved-owner status=%d body=%s", unresolved.Code, unresolved.Body.String())
+	}
+	assertNoPhysicalCORSHeaders(unresolved)
+
+	accepted := request(http.MethodPost, "client-resolved", "application/json; charset=utf-8", payload(2, "session-2"))
+	if accepted.Code != http.StatusOK {
+		t.Fatalf("remote heartbeat status=%d body=%s", accepted.Code, accepted.Body.String())
+	}
+	assertNoPhysicalCORSHeaders(accepted)
+	userActor := rt.store.userActorForOwner("user_route_owner")
+	if userActor == nil {
+		t.Fatal("accepted route did not create owner user actor")
+	}
+	beforeRejected := neoLocalBrokerStateForTest(userActor)
+	stale := request(http.MethodPost, "client-resolved", "application/json", payload(1, "session-1"))
+	if stale.Code != http.StatusConflict {
+		t.Fatalf("stale heartbeat status=%d body=%s", stale.Code, stale.Body.String())
+	}
+	if after := neoLocalBrokerStateForTest(userActor); !reflect.DeepEqual(after, beforeRejected) {
+		t.Fatalf("stale route heartbeat mutated state:\nbefore=%#v\nafter=%#v", beforeRejected, after)
+	}
+	invalid := request(http.MethodPost, "client-resolved", "application/json", `{"brokerId":`)
+	if invalid.Code != http.StatusBadRequest {
+		t.Fatalf("invalid heartbeat status=%d body=%s", invalid.Code, invalid.Body.String())
+	}
+	if after := neoLocalBrokerStateForTest(userActor); !reflect.DeepEqual(after, beforeRejected) {
+		t.Fatalf("invalid route heartbeat mutated state:\nbefore=%#v\nafter=%#v", beforeRejected, after)
+	}
+	assertNoPhysicalCORSHeaders(stale)
+	assertNoPhysicalCORSHeaders(invalid)
+
+	options := request(http.MethodOptions, "", "", "")
+	if options.Code != http.StatusForbidden {
+		t.Fatalf("OPTIONS status=%d body=%s", options.Code, options.Body.String())
+	}
+	assertNoPhysicalCORSHeaders(options)
+	nonPost := request(http.MethodGet, "client-resolved", "", "")
+	if nonPost.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("non-POST status=%d body=%s", nonPost.Code, nonPost.Body.String())
+	}
+	if allow := nonPost.Header().Get("Allow"); allow != http.MethodPost {
+		t.Fatalf("non-POST Allow=%q, want POST", allow)
+	}
+	assertNoPhysicalCORSHeaders(nonPost)
 }

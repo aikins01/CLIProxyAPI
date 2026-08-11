@@ -312,11 +312,13 @@ func (m *AmpModule) serveWebLocalProjects(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"ok":                      true,
 		"projects":                projects,
+		"runners":                 m.neoRuntime.neoWebLocalUserExecutorRunners(c.Request.Context()),
 		"thread":                  thread,
 		"threads":                 threads,
 		"threadTitles":            threadTitles,
 		"archivedThreadIDs":       archivedThreadIDs,
 		"defaultWorkingDirectory": neoDefaultWebLocalWorkingDirectory(),
+		"orbsEnabled":             neoOrbsEnabled(cfg),
 	})
 }
 
@@ -504,7 +506,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	return fmt.Sprintf(`// ==UserScript==
 // @name CLIProxyAPI Amp Local Inference
 // @namespace https://github.com/router-for-me/CLIProxyAPI
-// @version 0.1.200
+// @version 0.1.202
 %s
 // @updateURL %s
 // @downloadURL %s
@@ -516,7 +518,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	"use strict";
 
 	const bridgeHeader = %s;
-	const userscriptVersion = "0.1.200";
+	const userscriptVersion = "0.1.202";
 	const apiKeyStorageKey = "cliproxyapi.ampLocalInference.apiKey";
 	const scopedAPIKeyStorageKeyPrefix = apiKeyStorageKey + ".user.";
 	const authenticatedAmpUserIDStorageKey = apiKeyStorageKey + ".authenticatedAmpUserID";
@@ -656,7 +658,8 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	let pendingLocalBootstrapThreadID = "";
 	let pendingLocalSidebarThreadID = "";
 	let localSidebarTitleCache = storedLocalSidebarTitles();
-	let localProjectsCache = { at: 0, projects: [], threadID: "", thread: null, threads: [], threadTitles: Object.assign({}, localSidebarTitleCache), sidebarTitleKey: "", promise: null };
+	let localProjectsCache = { at: 0, projects: [], runners: [], threadID: "", thread: null, threads: [], threadTitles: Object.assign({}, localSidebarTitleCache), sidebarTitleKey: "", promise: null };
+	let localOrbsEnabled = false;
 	let localProjectsCacheGeneration = 0;
 	let localActivityCache = { at: 0, key: "", value: null, promise: null };
 	let localActivityDOMRefreshPending = false;
@@ -665,6 +668,8 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	let localProjectPageGeneration = 0;
 	let localSidebarDOMRefreshPending = false;
 	let localSidebarDOMRefreshRequested = false;
+	let localSidebarMetadataStallKey = "";
+	let localSidebarMetadataStallCount = 0;
 	const localSidebarProjectRegroupPendingThreadIDs = new Set();
 	const localSidebarProjectRegroupStableSince = new Map();
 	let localSidebarProjectRegroupStableTimer;
@@ -684,7 +689,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	installLocalSidebarHydrationGate();
 
 	function resetLocalProjectsCache(threadID = "") {
-		localProjectsCache = { at: 0, projects: [], threadID, thread: null, threads: [], threadTitles: Object.assign({}, localSidebarTitleCache), sidebarTitleKey: "", promise: null };
+		localProjectsCache = { at: 0, projects: [], runners: [], threadID, thread: null, threads: [], threadTitles: Object.assign({}, localSidebarTitleCache), sidebarTitleKey: "", promise: null };
 	}
 
 	function installLocalSidebarHydrationGate() {
@@ -802,6 +807,10 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 				revealLocalSidebarHydration();
 			}
 		};
+		if (typeof globalThis.queueMicrotask === "function") {
+			globalThis.queueMicrotask(refresh);
+			return;
+		}
 		if (typeof globalThis.requestAnimationFrame === "function") {
 			globalThis.requestAnimationFrame(refresh);
 			return;
@@ -1814,6 +1823,28 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			}
 		}
 		return value;
+	}
+
+	function normalizeLocalRunnerWorkingDirectory(value) {
+		value = normalizeWorkingDirectory(value);
+		if (!value.startsWith("/") || /[\u0000-\u001f\u007f]/.test(value)) {
+			return "";
+		}
+		const segments = [];
+		for (const segment of value.split("/")) {
+			if (!segment || segment === ".") {
+				continue;
+			}
+			if (segment === "..") {
+				if (segments.length === 0) {
+					return "";
+				}
+				segments.pop();
+				continue;
+			}
+			segments.push(segment);
+		}
+		return "/" + segments.join("/");
 	}
 
 	function firstWorkingDirectory(...values) {
@@ -3912,6 +3943,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 				localProjectsCache = {
 					at: 0,
 					projects: localProjectsCache.projects,
+					runners: localProjectsCache.runners,
 					threadID,
 					thread,
 					threads: normalizeLocalSidebarThreads([thread, ...(localProjectsCache.threads || [])], null),
@@ -4699,8 +4731,11 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		});
 	}
 
-	function fetchLocalProjects(promptForKey = false, additionalSidebarThreadIDs = []) {
+	function fetchLocalProjects(promptForKey = false, additionalSidebarThreadIDs = [], force = false) {
 		reconcileActiveLocalThreadArchiveBadge();
+		if (force) {
+			localProjectsCache.runners = [];
+		}
 		const now = Date.now();
 		const activeThread = activeLocalThreadID();
 		let threadID = validThreadID(pendingLocalSidebarThreadID) ? pendingLocalSidebarThreadID : activeThread;
@@ -4755,12 +4790,12 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		);
 		const sidebarMetadataMissing = additionalSidebarThreadIDSet.size > 0 ? additionalSidebarMetadataMissing : visibleLocalSidebarMetadataMissing;
 		if (localProjectsCache.promise) {
-			if (localProjectsCache.threadID === threadID && !sidebarMetadataMissing) {
+			if (!force && localProjectsCache.threadID === threadID && !sidebarMetadataMissing) {
 				return localProjectsCache.promise;
 			}
-			return localProjectsCache.promise.then(() => fetchLocalProjects(promptForKey, additionalSidebarThreadIDs));
+			return localProjectsCache.promise.then(() => fetchLocalProjects(promptForKey, additionalSidebarThreadIDs, force));
 		}
-		if (localProjectsCache.threadID === threadID && !sidebarMetadataMissing && now - localProjectsCache.at < 10000) {
+		if (!force && localProjectsCache.threadID === threadID && !sidebarMetadataMissing && now - localProjectsCache.at < 10000) {
 			return Promise.resolve(localProjectsCache.projects);
 		}
 		const headers = localFetchHeaders("", false);
@@ -4792,7 +4827,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 				localProjectsCache.promise = null;
 				localProjectsCache.at = 0;
 			}
-			return fetchLocalProjects(promptForKey, additionalSidebarThreadIDs);
+			return fetchLocalProjects(promptForKey, additionalSidebarThreadIDs, force);
 		};
 		localProjectsCache.threadID = threadID;
 		localProjectsCache.sidebarTitleKey = sidebarTitleKey;
@@ -4812,36 +4847,39 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			if (refetch) {
 				return refetch;
 			}
-				if (!isPlainObject(decoded) || !Array.isArray(decoded.projects)) {
-					if (!responseFailed) {
-						rememberLocalProjectFetchFailure("invalid_payload");
-					}
-					resetLocalProjectsCache(threadID);
-					localProjectsCache.at = Date.now();
-					return [];
+			if (!isPlainObject(decoded) || !Array.isArray(decoded.projects)) {
+				if (!responseFailed) {
+					rememberLocalProjectFetchFailure("invalid_payload");
 				}
+				resetLocalProjectsCache(threadID);
+				localProjectsCache.at = Date.now();
+				return [];
+			}
 			const responseDefaultWorkingDirectory = normalizeWorkingDirectory(firstString(decoded.defaultWorkingDirectory, decoded.homeDirectory));
 			if (responseDefaultWorkingDirectory) {
 				defaultWorkingDirectory = responseDefaultWorkingDirectory;
 			}
-				const projects = decoded.projects.map(normalizeLocalProject).filter(Boolean);
-				const thread = normalizeLocalSidebarThread(decoded.thread);
-				const threadTitles = {};
-				if (isPlainObject(decoded.threadTitles)) {
-					for (const [threadID, title] of Object.entries(decoded.threadTitles)) {
-						if (validThreadID(threadID) && typeof title === "string" && title.trim() && title.trim().toLowerCase() !== "untitled") {
-							threadTitles[threadID] = title.trim();
-						}
+			const projects = decoded.projects.map(normalizeLocalProject).filter(Boolean);
+			const runners = (Array.isArray(decoded.runners) ? decoded.runners : []).map(normalizeLocalRunner).filter(Boolean);
+			const thread = normalizeLocalSidebarThread(decoded.thread);
+			const threadTitles = {};
+			if (isPlainObject(decoded.threadTitles)) {
+				for (const [threadID, title] of Object.entries(decoded.threadTitles)) {
+					if (validThreadID(threadID) && typeof title === "string" && title.trim() && title.trim().toLowerCase() !== "untitled") {
+						threadTitles[threadID] = title.trim();
 					}
 				}
-				archivedLocalSidebarThreadIDs = new Set(
-					(Array.isArray(decoded.archivedThreadIDs) ? decoded.archivedThreadIDs : []).filter(validThreadID),
-				);
-				localProjectsArchiveStateLoaded = true;
+			}
+			archivedLocalSidebarThreadIDs = new Set(
+				(Array.isArray(decoded.archivedThreadIDs) ? decoded.archivedThreadIDs : []).filter(validThreadID),
+			);
+			localProjectsArchiveStateLoaded = true;
+			localOrbsEnabled = decoded.orbsEnabled === true;
 			const threads = normalizeLocalSidebarThreads(decoded.threads, thread);
 			localProjectsCache = {
 				at: Date.now(),
 				projects,
+				runners,
 				threadID,
 				thread,
 				threads,
@@ -5164,22 +5202,49 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		return "";
 	}
 
+	function devalueSidebarThreadLists(values) {
+		const lists = [];
+		if (!Array.isArray(values)) {
+			return lists;
+		}
+		const push = (list) => {
+			if (Array.isArray(list)) {
+				lists.push(list);
+			}
+		};
+		for (const entry of values) {
+			if (!isPlainObject(entry)) {
+				continue;
+			}
+			for (const key of ["recentThreads", "openThreads", "snoozedThreads"]) {
+				if (Number.isInteger(entry[key])) {
+					push(values[entry[key]]);
+				}
+			}
+			if (Number.isInteger(entry.labelGroups)) {
+				const groups = values[entry.labelGroups];
+				if (Array.isArray(groups)) {
+					for (const groupRef of groups) {
+						const group = Number.isInteger(groupRef) ? values[groupRef] : null;
+						if (isPlainObject(group) && Number.isInteger(group.threads)) {
+							push(values[group.threads]);
+						}
+					}
+				}
+			}
+		}
+		return lists;
+	}
+
 	function removeDevalueSidebarThreadIDs(values, excludedThreadIDs) {
 		if (!Array.isArray(values) || excludedThreadIDs.size === 0) {
 			return 0;
 		}
 		let removed = 0;
-		for (const entry of values) {
-			if (!isPlainObject(entry) || !Number.isInteger(entry.recentThreads)) {
-				continue;
-			}
-			const recentThreads = values[entry.recentThreads];
-			if (!Array.isArray(recentThreads)) {
-				continue;
-			}
-			for (let i = recentThreads.length - 1; i >= 0; i -= 1) {
-				if (excludedThreadIDs.has(devalueSidebarThreadID(values, recentThreads[i]))) {
-					recentThreads.splice(i, 1);
+		for (const threadList of devalueSidebarThreadLists(values)) {
+			for (let i = threadList.length - 1; i >= 0; i -= 1) {
+				if (excludedThreadIDs.has(devalueSidebarThreadID(values, threadList[i]))) {
+					threadList.splice(i, 1);
 					removed += 1;
 				}
 			}
@@ -5331,18 +5396,16 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		}
 		const persistedPinnedOverride = typeof source[localPinnedOverrideField] === "boolean" ? source[localPinnedOverrideField] : undefined;
 		const pinnedOverride = typeof persistedPinnedOverride === "boolean" ? persistedPinnedOverride : localPinnedOverrides.get(threadID);
-		const originalLength = values.length;
-		for (let i = 0; i < originalLength; i += 1) {
-			const entry = values[i];
-			if (!isPlainObject(entry) || !Number.isInteger(entry.recentThreads)) {
-				continue;
+		const threadLists = devalueSidebarThreadLists(values);
+		const existingRefs = [];
+		for (const threadList of threadLists) {
+			const existingRef = threadList.find((ref) => devalueSidebarThreadID(values, ref) === threadID);
+			if (Number.isInteger(existingRef) && !existingRefs.includes(existingRef)) {
+				existingRefs.push(existingRef);
 			}
-			const recentThreads = values[entry.recentThreads];
-			if (!Array.isArray(recentThreads)) {
-				continue;
-			}
-			const existingRef = recentThreads.find((ref) => devalueSidebarThreadID(values, ref) === threadID);
-			if (Number.isInteger(existingRef)) {
+		}
+		if (existingRefs.length > 0) {
+			for (const existingRef of existingRefs) {
 				const existingEntry = values[existingRef];
 				const threadRef = Number.isInteger(existingEntry.thread) && isPlainObject(values[existingEntry.thread]) ? existingEntry.thread : existingRef;
 				const existingThread = values[threadRef];
@@ -5422,28 +5485,37 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 						existingEntry.repositoryGroupName = appendDevalueSidebarValue(values, sourceRepositoryGroupName, "repositoryGroupName");
 					}
 				}
-				return true;
 			}
-			const wrappedRows = recentThreads.some((ref) => {
-				const row = Number.isInteger(ref) ? values[ref] : null;
-				return isPlainObject(row) && Number.isInteger(row.thread) && isPlainObject(values[row.thread]);
-			});
-			const insertedProjectName = localSidebarProjectName(source);
-			const insertedRepositoryGroupName = localSidebarRepositoryGroupName(source);
-			const insertedThread = localSidebarPresentationThread(source, threadID, insertedProjectName, insertedRepositoryGroupName);
-			if (typeof pinnedOverride === "boolean") {
-				insertedThread.pinned = pinnedOverride;
-			}
-			const inserted = wrappedRows ? {
-				thread: insertedThread,
-				lastActivityTimestamp: localSidebarLastActivityTimestamp(source),
-				projectName: insertedProjectName,
-				repositoryGroupName: insertedRepositoryGroupName,
-			} : insertedThread;
-			recentThreads.unshift(appendDevalueSidebarValue(values, inserted));
 			return true;
 		}
-		return false;
+		let recentThreads = null;
+		for (const entry of values) {
+			if (isPlainObject(entry) && Number.isInteger(entry.recentThreads) && Array.isArray(values[entry.recentThreads])) {
+				recentThreads = values[entry.recentThreads];
+				break;
+			}
+		}
+		if (!Array.isArray(recentThreads)) {
+			return false;
+		}
+		const wrappedRows = recentThreads.some((ref) => {
+			const row = Number.isInteger(ref) ? values[ref] : null;
+			return isPlainObject(row) && Number.isInteger(row.thread) && isPlainObject(values[row.thread]);
+		});
+		const insertedProjectName = localSidebarProjectName(source);
+		const insertedRepositoryGroupName = localSidebarRepositoryGroupName(source);
+		const insertedThread = localSidebarPresentationThread(source, threadID, insertedProjectName, insertedRepositoryGroupName);
+		if (typeof pinnedOverride === "boolean") {
+			insertedThread.pinned = pinnedOverride;
+		}
+		const inserted = wrappedRows ? {
+			thread: insertedThread,
+			lastActivityTimestamp: localSidebarLastActivityTimestamp(source),
+			projectName: insertedProjectName,
+			repositoryGroupName: insertedRepositoryGroupName,
+		} : insertedThread;
+		recentThreads.unshift(appendDevalueSidebarValue(values, inserted));
+		return true;
 	}
 
 	function mergeReferencedSidebarProjects(values, threads) {
@@ -5527,15 +5599,8 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		try {
 			const values = originalJSONParse(parsed.data);
 			const threadIDs = new Set();
-			for (const entry of values) {
-				if (!isPlainObject(entry) || !Number.isInteger(entry.recentThreads)) {
-					continue;
-				}
-				const recentThreads = values[entry.recentThreads];
-				if (!Array.isArray(recentThreads)) {
-					continue;
-				}
-				for (const ref of recentThreads) {
+			for (const threadList of devalueSidebarThreadLists(values)) {
+				for (const ref of threadList) {
 					const threadID = devalueSidebarThreadID(values, ref);
 					if (validThreadID(threadID)) {
 						threadIDs.add(threadID);
@@ -5932,7 +5997,54 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		});
 	}
 
-	function localThreadPayload(promptText, workingDirectory, modeOptions) {
+	function localProjectRepositoryURLForDirectory(workingDirectory) {
+		const directory = normalizeWorkingDirectory(workingDirectory);
+		if (!directory) {
+			return "";
+		}
+		for (const project of localProjectsCache.projects || []) {
+			const normalized = normalizeLocalProject(project);
+			if (normalized && normalized.workingDirectory === directory) {
+				return firstString(normalized.repositoryURL);
+			}
+		}
+		return "";
+	}
+
+	function normalizeLocalRunner(value) {
+		if (!isPlainObject(value)) {
+			return null;
+		}
+		const runnerId = firstString(value.runnerId);
+		const workingDirectory = normalizeLocalRunnerWorkingDirectory(value.workingDirectory);
+		if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(runnerId) || !workingDirectory) {
+			return null;
+		}
+		return {
+			runnerId,
+			workingDirectory,
+			brokerId: firstString(value.brokerId),
+			hostname: firstString(value.hostname),
+			repositoryURL: firstString(value.repositoryURL),
+		};
+	}
+
+	function requireLocalRunner(workingDirectory) {
+		const normalized = normalizeLocalRunnerWorkingDirectory(workingDirectory);
+		if (!normalized) {
+			throw new Error("Select a valid checkout before starting a Mac thread");
+		}
+		const matches = (localProjectsCache.runners || []).filter((runner) => runner.workingDirectory === normalized);
+		if (matches.length === 0) {
+			throw new Error("No Mac broker runner is connected for this checkout");
+		}
+		if (matches.length > 1) {
+			throw new Error("Multiple Mac broker runners match this checkout; keep exactly one runner active or choose a different checkout");
+		}
+		return matches[0];
+	}
+
+	function localThreadPayload(promptText, workingDirectory, modeOptions, executor, runner = null) {
 		const mode = localThreadModeOptions(modeOptions);
 		const settings = {
 			agentMode: mode.agentMode,
@@ -5940,10 +6052,11 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		if (mode.reasoningEffort) {
 			settings["reasoning.effort"] = mode.reasoningEffort;
 		}
+		const orbExecutor = executor === "orb";
 		const payload = {
 			agentMode: mode.agentMode,
 			reasoningEffort: mode.reasoningEffort,
-			executorType: "local-client",
+			executorType: orbExecutor ? "sandbox" : "local-client",
 			usesThreadActors: true,
 			settings,
 			threadMeta: {
@@ -5953,8 +6066,20 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 				ampcodeConnectorMode: "local-neo",
 				agentMode: mode.agentMode,
 				reasoningEffort: mode.reasoningEffort,
+				executorType: orbExecutor ? "sandbox" : "local-client",
 			},
 		};
+		if (orbExecutor) {
+			const repositoryURL = localProjectRepositoryURLForDirectory(workingDirectory);
+			if (repositoryURL) {
+				payload.repositoryURL = repositoryURL;
+				payload.threadMeta.repositoryURL = repositoryURL;
+			}
+		} else if (runner) {
+			payload.runnerId = runner.runnerId;
+			payload.spawnExecutor = false;
+			payload.threadMeta.runnerId = runner.runnerId;
+		}
 		if (workingDirectory) {
 			payload.workingDirectory = workingDirectory;
 			payload.workspaceRoot = workingDirectory;
@@ -5965,10 +6090,16 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		return payload;
 	}
 
-	async function createLocalThread(promptText, workingDirectory, modeOptions) {
+	async function createLocalThread(promptText, workingDirectory, modeOptions, executor) {
 		const headers = localFetchHeaders("application/json");
 		workingDirectory = normalizeWorkingDirectory(workingDirectory) || await ensureDefaultWorkingDirectory(false);
-		const payload = localThreadPayload(promptText, workingDirectory, modeOptions);
+		let runner = null;
+		if (executor !== "orb") {
+			await fetchLocalProjects(false, [], true);
+			runner = requireLocalRunner(workingDirectory);
+			workingDirectory = runner.workingDirectory;
+		}
+		const payload = localThreadPayload(promptText, workingDirectory, modeOptions, executor, runner);
 		const shellThreadID = await createRemoteThreadShell(payload);
 		payload.threadId = shellThreadID;
 		payload.threadID = shellThreadID;
@@ -5991,15 +6122,22 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	}
 
 	async function createRemoteThreadShell(localPayload) {
+		const shellThreadMeta = Object.assign({}, localPayload.threadMeta || {}, {
+			cliProxyAPIWebLocalShell: true,
+		});
+		delete shellThreadMeta.runnerId;
+		delete shellThreadMeta.runnerID;
 		const shellPayload = {
 			agentMode: localPayload.agentMode,
 			reasoningEffort: localPayload.reasoningEffort,
+			executorType: localPayload.executorType,
 			usesThreadActors: true,
 			settings: localPayload.settings,
-			threadMeta: Object.assign({}, localPayload.threadMeta || {}, {
-				cliProxyAPIWebLocalShell: true,
-			}),
+			threadMeta: shellThreadMeta,
 		};
+		if (typeof localPayload.spawnExecutor === "boolean") {
+			shellPayload.spawnExecutor = localPayload.spawnExecutor;
+		}
 		if (localPayload.workingDirectory) {
 			shellPayload.workingDirectory = localPayload.workingDirectory;
 			shellPayload.workspaceRoot = localPayload.workspaceRoot || localPayload.workingDirectory;
@@ -6141,8 +6279,12 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			"box-shadow:0 18px 48px rgba(0,0,0,.22)",
 			"font:14px system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif",
 		].join(";");
+		const executorSelection = { value: localOrbsEnabled ? localThreadExecutorChoice() : "local" };
+		if (localOrbsEnabled) {
+			panel.appendChild(buildLocalExecutorToggle(executorSelection));
+		}
 		for (const choice of localThreadModeChoices()) {
-			panel.appendChild(buildLocalThreadChoiceButton(choice, promptText, workingDirectory));
+			panel.appendChild(buildLocalThreadChoiceButton(choice, promptText, workingDirectory, executorSelection));
 		}
 		globalThis.document.body.appendChild(panel);
 		positionLocalThreadPicker(panel, anchor);
@@ -6172,7 +6314,51 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		diagnostics.localThreadPickerOpenCount += 1;
 	}
 
-	function buildLocalThreadChoiceButton(choice, promptText, workingDirectory) {
+	function localThreadExecutorChoice() {
+		try {
+			return globalThis.localStorage.getItem("cliproxyapi.ampLocalInference.executor") === "orb" ? "orb" : "local";
+		} catch {
+			return "local";
+		}
+	}
+
+	function buildLocalExecutorToggle(selection) {
+		const row = globalThis.document.createElement("div");
+		row.style.cssText = "display:flex;gap:4px;padding:2px 2px 8px;margin-bottom:4px;border-bottom:1px solid rgba(128,128,128,.18)";
+		const buttons = [];
+		const paint = () => {
+			for (const entry of buttons) {
+				const active = entry.option.id === selection.value;
+				entry.button.style.background = active ? "rgba(127,127,127,.18)" : "transparent";
+				entry.button.style.opacity = active ? "1" : ".6";
+			}
+		};
+		for (const option of [{ id: "local", label: "Local machine" }, { id: "orb", label: "New Orb" }]) {
+			const button = globalThis.document.createElement("button");
+			button.type = "button";
+			button.textContent = option.label;
+			button.style.cssText = "flex:1;padding:5px 8px;border:0;border-radius:5px;background:transparent;color:inherit;font:inherit;font-size:12px;cursor:default";
+			button.addEventListener("click", (event) => {
+				event.preventDefault();
+				event.stopPropagation();
+				selection.value = option.id;
+				try {
+					globalThis.localStorage.setItem("cliproxyapi.ampLocalInference.executor", option.id);
+				} catch {
+				}
+				paint();
+			}, true);
+			buttons.push({ option, button });
+			if (option.id === "orb") {
+				button.title = "Run in a sandboxed container on this server";
+			}
+			row.appendChild(button);
+		}
+		paint();
+		return row;
+	}
+
+	function buildLocalThreadChoiceButton(choice, promptText, workingDirectory, executorSelection) {
 		const button = globalThis.document.createElement("button");
 		button.type = "button";
 		button.setAttribute("role", "menuitem");
@@ -6207,7 +6393,8 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			event.preventDefault();
 			event.stopPropagation();
 			removeLocalThreadPicker();
-			setTimeout(() => createLocalThread(promptText || "", workingDirectory || "", choice.options).catch((error) => {
+			const executor = executorSelection && executorSelection.value === "orb" ? "orb" : "local";
+			setTimeout(() => createLocalThread(promptText || "", workingDirectory || "", choice.options, executor).catch((error) => {
 				globalThis.alert("Local Amp thread failed: " + (error && error.message ? error.message : String(error)));
 			}), 0);
 		}, true);
@@ -7863,9 +8050,13 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		if (!item || projectPickerItemSelected(item)) {
 			return;
 		}
+		const generation = localProjectIntegrationGeneration;
 		list.dataset.cliproxyCurrentProjectAutoSelected = "1";
-		setTimeout(() => {
-			if (!globalThis.document.contains(item) || !localProjectPickerLooksLikeProjectPicker(picker)) {
+		const select = () => {
+			if (generation !== localProjectIntegrationGeneration ||
+				!globalThis.document.contains(item) ||
+				!localProjectPickerLooksLikeProjectPicker(picker) ||
+				currentProjectPickerItem(picker) !== item) {
 				return;
 			}
 			setProjectPickerSelectedItem(list, item);
@@ -7879,7 +8070,9 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 				rememberSelectedLocalProject(selectedProject);
 				refreshLocalProjectActivators(selectedProject, picker, true);
 			}
-		}, 0);
+		};
+		select();
+		setTimeout(select, 0);
 	}
 
 	function projectPickerItemSelected(item) {
@@ -8473,10 +8666,21 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			localSidebarDOMRefreshRequested = true;
 			return;
 		}
-		if (localSidebarMissingMetadataThreadIDs().length === 0) {
+		const initiallyMissingThreadIDs = localSidebarMissingMetadataThreadIDs();
+		if (initiallyMissingThreadIDs.length === 0) {
+			localSidebarMetadataStallKey = "";
+			localSidebarMetadataStallCount = 0;
 			return;
 		}
+		const missingKey = initiallyMissingThreadIDs.join(" ");
+		if (missingKey === localSidebarMetadataStallKey) {
+			localSidebarMetadataStallCount += 1;
+		} else {
+			localSidebarMetadataStallKey = missingKey;
+			localSidebarMetadataStallCount = 0;
+		}
 		localSidebarDOMRefreshPending = true;
+		const refreshDelay = localSidebarMetadataStallCount === 0 ? 0 : Math.min(30000, 250 * 2 ** Math.min(localSidebarMetadataStallCount, 8));
 		globalThis.setTimeout(() => {
 			const missingThreadIDs = localSidebarMissingMetadataThreadIDs();
 			const finishCycle = () => {
@@ -8501,7 +8705,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 				});
 			};
 			fetchBatch(0);
-		}, 0);
+		}, refreshDelay);
 	}
 
 	function localSidebarProjectRegroupMismatchThreadIDs() {

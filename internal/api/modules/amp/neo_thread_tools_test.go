@@ -1088,8 +1088,13 @@ func TestNeoCreateThreadDispatchesToSelectedRunner(t *testing.T) {
 		"type": "runnerHeartbeat",
 		"args": []any{map[string]any{"sessionId": "session-build-runner", "runningThreads": []any{}}},
 	}))
-	if heartbeat["ok"] != true || len(arrayValue(heartbeat["intents"])) != 0 {
-		t.Fatalf("runner should be idle before child receives work: %#v", heartbeat)
+	intents := arrayValue(heartbeat["intents"])
+	if heartbeat["ok"] != true || len(intents) != 1 {
+		t.Fatalf("runner should receive child intent: %#v", heartbeat)
+	}
+	intent := mapValue(intents[0])
+	if intent["threadId"] != childID || intent["desired"] != "running" || intent["agentMode"] != "low" || intent["reasoningEffort"] != "medium" {
+		t.Fatalf("runner child intent = %#v", intent)
 	}
 	if _, err := parent.executeLocalSendMessageToThreadTool(neoPendingTool{ID: "TU-start-runner-child", Input: map[string]any{
 		"thread":  childID,
@@ -1108,7 +1113,7 @@ func TestNeoCreateThreadDispatchesToSelectedRunner(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	intents := arrayValue(heartbeat["intents"])
+	intents = arrayValue(heartbeat["intents"])
 	if heartbeat["ok"] != true || len(intents) != 1 || stringValue(mapValue(intents[0])["threadId"]) != childID || stringValue(mapValue(intents[0])["desired"]) != "running" {
 		t.Fatalf("runner heartbeat = %#v", heartbeat)
 	}
@@ -1960,5 +1965,29 @@ amp.registerAgentMode({ key: "audit-local", label: "Audit Local", agent })`
 	}
 	if created["agentMode"] != "audit-local" || created["reasoningEffort"] != "high" {
 		t.Fatalf("plugin create result = %#v", created)
+	}
+}
+
+func TestNeoCreateThreadOrbExecutor(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	parent := rt.store.ensureThreadActor("T-019f7000-0000-7000-8000-000000000040")
+	parent.updateEnvironment(map[string]any{"workingDirectory": neoExistingDirectory(t.TempDir())})
+	input := map[string]any{"executor": map[string]any{"type": "orb"}}
+	if _, _, _, err := parent.localCreateThreadBody(input, "T-019f7000-0000-7000-8000-000000000041"); err == nil || !strings.Contains(err.Error(), "orb executors are not enabled") {
+		t.Fatalf("disabled orbs create_thread error = %v", err)
+	}
+
+	enabled := true
+	rtOrbs := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{Orbs: config.AmpOrbs{Enabled: &enabled, Provider: "docker"}}})
+	orbParent := rtOrbs.store.ensureThreadActor("T-019f7000-0000-7000-8000-000000000042")
+	orbParent.updateEnvironment(map[string]any{"workingDirectory": neoExistingDirectory(t.TempDir())})
+	body, _, _, err := orbParent.localCreateThreadBody(input, "T-019f7000-0000-7000-8000-000000000043")
+	if err != nil {
+		t.Fatalf("orb create_thread body error: %v", err)
+	}
+	meta := mapValue(body["threadMeta"])
+	if stringValue(body["executorType"]) != "sandbox" || stringValue(meta["executorType"]) != "sandbox" {
+		t.Fatalf("orb executorType = %#v", body)
 	}
 }
