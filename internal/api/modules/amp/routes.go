@@ -282,6 +282,26 @@ func wrapLocalConnectionManagementAuth(auth gin.HandlerFunc, prefixes ...string)
 	}
 }
 
+func wrapOrbPortalAuth(auth gin.HandlerFunc) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.GetBool(neoOrbPortalAuthenticated) {
+			c.Next()
+			return
+		}
+		auth(c)
+	}
+}
+
+func wrapOrbPortalLocalhost(localhost gin.HandlerFunc) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.GetBool(neoOrbPortalAuthenticated) {
+			c.Next()
+			return
+		}
+		localhost(c)
+	}
+}
+
 func managementPathMatches(path string, prefixes ...string) bool {
 	for _, prefix := range prefixes {
 		if strings.HasPrefix(path, prefix) && (len(path) == len(prefix) || path[len(prefix)] == '/') {
@@ -463,7 +483,11 @@ func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *ha
 	engine.Any("/ampcode/local-activity.json", append(localProjectMiddleware, m.serveWebLocalActivity)...)
 	engine.Any("/ampcode/local-thread-search.json", append(localProjectMiddleware, m.serveWebLocalThreadSearch)...)
 	engine.Any("/ampcode/local-thread-data.json", append(localProjectMiddleware, m.serveWebLocalThreadData)...)
-	orbPortalMiddleware := append([]gin.HandlerFunc{}, localProjectMiddleware...)
+	orbPortalMiddleware := []gin.HandlerFunc{m.webLocalInferenceCORSMiddleware(), m.orbPortalTokenMiddleware(), m.webLocalInferenceQueryAuthMiddleware(), noCORSMiddleware(), wrapOrbPortalLocalhost(m.localhostOnlyMiddleware())}
+	if auth != nil {
+		orbPortalMiddleware = append(orbPortalMiddleware, wrapOrbPortalAuth(auth))
+	}
+	orbPortalMiddleware = append(orbPortalMiddleware, clientAPIKeyMiddleware())
 	engine.Any("/orb/:threadID/p/:port/*path", append(orbPortalMiddleware, m.serveOrbPortal)...)
 	engine.Any("/threads", append(rootMiddleware, proxyHandler)...)
 	engine.Any("/threads/*path", append(rootMiddleware, proxyHandler)...)

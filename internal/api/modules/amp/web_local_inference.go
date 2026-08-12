@@ -317,7 +317,7 @@ func (m *AmpModule) serveWebLocalProjects(c *gin.Context) {
 		"threads":                 threads,
 		"threadTitles":            threadTitles,
 		"archivedThreadIDs":       archivedThreadIDs,
-		"defaultWorkingDirectory": neoDefaultWebLocalWorkingDirectory(),
+		"defaultWorkingDirectory": "",
 		"orbsEnabled":             neoOrbsEnabled(cfg),
 	})
 }
@@ -506,7 +506,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	return fmt.Sprintf(`// ==UserScript==
 // @name CLIProxyAPI Amp Local Inference
 // @namespace https://github.com/router-for-me/CLIProxyAPI
-// @version 0.1.202
+// @version 0.1.206
 %s
 // @updateURL %s
 // @downloadURL %s
@@ -518,7 +518,8 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	"use strict";
 
 	const bridgeHeader = %s;
-	const userscriptVersion = "0.1.202";
+	const userscriptVersion = "0.1.206";
+	const legacyLocalProjectUI = false;
 	const apiKeyStorageKey = "cliproxyapi.ampLocalInference.apiKey";
 	const scopedAPIKeyStorageKeyPrefix = apiKeyStorageKey + ".user.";
 	const authenticatedAmpUserIDStorageKey = apiKeyStorageKey + ".authenticatedAmpUserID";
@@ -761,9 +762,11 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			}
 			renderLocalSidebarMetadata();
 			requestLocalSidebarProjectRegroup();
-			integrateLocalProjectActivators(globalThis.document);
-			integrateLocalProjectPickers(globalThis.document);
-			scheduleLocalProjectListDecoration();
+			if (legacyLocalProjectUI) {
+				integrateLocalProjectActivators(globalThis.document);
+				integrateLocalProjectPickers(globalThis.document);
+				scheduleLocalProjectListDecoration();
+			}
 			if ((localProjectsCache.threads || []).length === 0 && archivedLocalSidebarThreadIDs.size === 0) {
 				revealLocalSidebarHydration();
 				return;
@@ -4835,6 +4838,15 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			if (!response.ok) {
 				responseFailed = true;
 				rememberLocalProjectFetchFailure("http_" + String(response.status || 0));
+				if (response.status === 401) {
+					const authorization = headers.get("Authorization") || "";
+					const requestAPIKey = authorization.replace(/^Bearer\s+/i, "");
+					if (requestAPIKey && storedLocalAPIKey() === requestAPIKey) {
+						forgetLocalAPIKey();
+						clearLocalAPIKeyPromptSuppression("api");
+						clearLocalAPIKeyPromptSuppression("projects");
+					}
+				}
 				return null;
 			}
 			return response.json().catch(() => {
@@ -6690,6 +6702,10 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	}
 
 	function scheduleLocalProjectListDecoration() {
+		if (!legacyLocalProjectUI) {
+			disableLegacyLocalProjectUI();
+			return;
+		}
 		if (localProjectListDecorationPending) {
 			return;
 		}
@@ -7041,10 +7057,39 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	function installLocalThreadControls() {
 		removeInjectedLocalThreadControls();
 		startLocalSidebarHydration();
-		installLocalProjectPickerIntegration();
-		installLocalProjectSettingsIntegration();
+		if (legacyLocalProjectUI) {
+			installLocalProjectPickerIntegration();
+			installLocalProjectSettingsIntegration();
+		} else {
+			disableLegacyLocalProjectUI();
+			for (const delay of [0, 500, 2000]) {
+				globalThis.setTimeout(disableLegacyLocalProjectUI, delay);
+			}
+		}
 		installLocalSidebarMetadataIntegration();
 		installLocalActivityIntegration();
+	}
+
+	function disableLegacyLocalProjectUI() {
+		localProjectIntegrationGeneration += 1;
+		closeLocalProjectSettings();
+		closeLocalProjectPage();
+		if (globalThis.__cliproxyAmpLocalProjectSettingsClick) {
+			globalThis.document.removeEventListener("click", globalThis.__cliproxyAmpLocalProjectSettingsClick, true);
+			globalThis.__cliproxyAmpLocalProjectSettingsClick = null;
+		}
+		for (const key of ["__cliproxyAmpLocalInferenceProjectPickerObserver", "__cliproxyAmpLocalProjectSettingsObserver"]) {
+			const observer = globalThis[key];
+			if (observer && typeof observer.cliproxyCleanup === "function") {
+				observer.cliproxyCleanup();
+			} else if (observer && typeof observer.disconnect === "function") {
+				observer.disconnect();
+			}
+			globalThis[key] = null;
+		}
+		globalThis.document.querySelectorAll("[data-cliproxy-project-scope-decoration],[data-cliproxy-local-project-item]").forEach((element) => element.remove());
+		globalThis.document.querySelectorAll("[data-cliproxy-project-scope]").forEach((element) => delete element.dataset.cliproxyProjectScope);
+		localProjectListDecorationPending = false;
 	}
 
 	function removeStaleLocalThreadButton() {
@@ -7239,6 +7284,9 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	}
 
 	function integrateLocalProjectActivators(root, context = localProjectActivatorContext()) {
+		if (!legacyLocalProjectUI) {
+			return;
+		}
 		const { workingDirectory, visibleName, visibleNeedsLookup, targetLabel } = context;
 		if (!workingDirectory && !visibleName) {
 			return;
@@ -7488,6 +7536,9 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	}
 
 	function integrateLocalProjectPickers(root) {
+		if (!legacyLocalProjectUI) {
+			return;
+		}
 		for (const picker of localProjectPickerCandidates(root)) {
 			if (!localProjectPickerLooksLikeProjectPicker(picker)) {
 				continue;
@@ -9718,7 +9769,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			const patchSidebar = shouldPatchSidebarResponseJSON(response);
 			const patchThreadSearch = shouldPatchThreadSearchResponseJSON(response);
 			const patchUsage = shouldPatchUsageResponseJSON(response);
-			const patchProjectList = shouldPatchProjectListResponseJSON(response);
+			const patchProjectList = legacyLocalProjectUI && shouldPatchProjectListResponseJSON(response);
 			const patchActivity = shouldPatchActivityResponseJSON(response);
 			const threadSearchContext = patchThreadSearch ? threadSearchResponseContexts.get(response) || threadSearchRequestContext(response.url) : null;
 			const activityFilterContext = activityFilterResponseContexts.get(response);

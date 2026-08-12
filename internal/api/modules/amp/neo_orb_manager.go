@@ -51,6 +51,7 @@ const (
 	neoOrbAgentBrowserPath      = "/usr/local/bin/agent-browser"
 	neoOrbAgentBrowserSocketDir = "/run/cliproxy-agent-browser"
 	neoOrbContainerIDMetaKey    = "cliproxyOrbContainerID"
+	neoOrbPortalTokenMetaKey    = "cliproxyOrbPortalToken"
 	neoOrbReapInterval          = 30 * time.Second
 
 	neoOrbNodeVersion         = "24.19.0"
@@ -73,6 +74,8 @@ type neoOrbRecord struct {
 	state          string
 	workDir        string
 	repositoryURL  string
+	portalToken    string
+	activePortals  int
 	idleSince      time.Time
 	failReason     string
 	portalIP       string
@@ -240,6 +243,7 @@ func (m *neoOrbManager) ensureRecovered(cfg *config.Config) error {
 	repositories := map[string]string{}
 	recoverable := map[string]bool{}
 	containerBindings := map[string]string{}
+	portalTokens := map[string]string{}
 	for _, container := range containers {
 		threadID := strings.TrimSpace(container.Labels["cliproxy.orb"])
 		if !neoThreadIDExactPattern.MatchString(threadID) {
@@ -254,6 +258,7 @@ func (m *neoOrbManager) ensureRecovered(cfg *config.Config) error {
 				recoverable[threadID] = true
 				repositories[threadID] = strings.TrimSpace(firstNonEmptyString(thread["repositoryURL"], nestedValue(thread["meta"], "repositoryURL"), nestedValue(thread["project"], "repositoryURL")))
 				containerBindings[threadID] = strings.TrimSpace(firstNonEmptyString(nestedValue(thread["meta"], neoOrbContainerIDMetaKey), nestedValue(thread["threadMeta"], neoOrbContainerIDMetaKey)))
+				portalTokens[threadID] = strings.TrimSpace(firstNonEmptyString(nestedValue(thread["meta"], neoOrbPortalTokenMetaKey), nestedValue(thread["threadMeta"], neoOrbPortalTokenMetaKey)))
 			}
 		}
 	}
@@ -288,6 +293,15 @@ func (m *neoOrbManager) ensureRecovered(cfg *config.Config) error {
 			log.Warnf("amp orbs: thread=%s labelled container does not match the persisted container binding; automatic provisioning is blocked", threadID)
 			continue
 		}
+		record.portalToken = strings.TrimSpace(matches[0].Labels[neoOrbPortalTokenLabel])
+		if !neoOrbPortalTokenValid(record.portalToken) {
+			record.portalToken = portalTokens[threadID]
+		}
+		persistPortalToken := false
+		if !neoOrbPortalTokenValid(record.portalToken) {
+			record.portalToken = neoOrbNewPortalToken()
+			persistPortalToken = true
+		}
 		record.containerID = matches[0].ID
 		state, errInspect := client.InspectContainer(ctx, record.containerID)
 		if errInspect != nil {
@@ -301,6 +315,17 @@ func (m *neoOrbManager) ensureRecovered(cfg *config.Config) error {
 		default:
 			record.failReason = "labelled container is not running or paused"
 			log.Warnf("amp orbs: thread=%s container=%s is not safely recoverable; automatic provisioning is blocked", threadID, record.containerID)
+		}
+		if persistPortalToken && record.failReason == "" {
+			actor, release := m.runtime.store.retainThreadActorWithoutReadyWork(threadID)
+			if actor == nil {
+				return fmt.Errorf("persist recovered orb portal token for thread %s: thread actor is unavailable", threadID)
+			}
+			errPersist := m.persistContainerBinding(actor, record.containerID, record.portalToken)
+			release()
+			if errPersist != nil {
+				return fmt.Errorf("persist recovered orb portal token for thread %s: %w", threadID, errPersist)
+			}
 		}
 		recovered[threadID] = record
 	}
@@ -374,7 +399,7 @@ func (m *neoOrbManager) spawnOrb(a *neoActor, msg map[string]any) map[string]any
 		return a.broadcastExecutorStatus(spawnID, "failed", "Cannot safely reconcile existing orb containers: "+err.Error(), map[string]any{"reasonCode": "environment_recovering", "threadId": threadID})
 	}
 
-	record := &neoOrbRecord{threadID: threadID, state: neoOrbStateProvisioning, workDir: neoOrbWorkDir, operationMu: &sync.Mutex{}}
+	record := &neoOrbRecord{threadID: threadID, state: neoOrbStateProvisioning, workDir: neoOrbWorkDir, portalToken: neoOrbNewPortalToken(), operationMu: &sync.Mutex{}}
 	m.mu.Lock()
 	existing := m.orbs[threadID]
 	existingState := ""
@@ -533,7 +558,7 @@ func (m *neoOrbManager) provisionOrb(a *neoActor, record *neoOrbRecord, spawnID,
 		NanoCPUs:    orbs.NanoCPUs,
 		MemoryMB:    orbs.MemoryMB,
 		ExtraHosts:  []string{"host.docker.internal:host-gateway"},
-		Labels:      map[string]string{"cliproxy.orb": threadID},
+		Labels:      map[string]string{"cliproxy.orb": threadID, neoOrbPortalTokenLabel: record.portalToken},
 		NetworkMode: network,
 	})
 	if err != nil {
@@ -544,7 +569,7 @@ func (m *neoOrbManager) provisionOrb(a *neoActor, record *neoOrbRecord, spawnID,
 	record.containerID = containerID
 	record.repositoryURL = repositoryURL
 	m.mu.Unlock()
-	if err := m.persistContainerBinding(a, containerID); err != nil {
+	if err := m.persistContainerBinding(a, containerID, record.portalToken); err != nil {
 		fail("persist", "Cannot persist the orb container binding", err)
 		return
 	}
@@ -565,6 +590,10 @@ func (m *neoOrbManager) provisionOrb(a *neoActor, record *neoOrbRecord, spawnID,
 		fail("executor", "Cannot install the Amp executor in the orb", err)
 		return
 	}
+	if err := m.orbConfigurePortalHelper(setupCtx, client, containerID); err != nil {
+		fail("portal", "Cannot prepare orb portals", err)
+		return
+	}
 	if neoOrbSyncLocalConfigEnabled(cfg) {
 		m.orbSyncLocalConfig(setupCtx, client, containerID)
 	}
@@ -581,7 +610,7 @@ func (m *neoOrbManager) provisionOrb(a *neoActor, record *neoOrbRecord, spawnID,
 		return
 	}
 
-	env := neoOrbExecutorEnv(cfg, threadID, record.workDir)
+	env := neoOrbExecutorEnv(cfg, threadID, record.workDir, record.portalToken)
 	args := neoHeadlessExecutorArgs(threadID, agentMode, reasoningEffort, neoOrbExecutorLog)
 	cmd := neoOrbHeadlessCommand(args)
 	a.broadcastExecutorStatus(spawnID, "starting", "Starting the headless executor in the orb.", map[string]any{"reasonCode": "starting_headless", "threadId": threadID})
@@ -594,8 +623,8 @@ func (m *neoOrbManager) provisionOrb(a *neoActor, record *neoOrbRecord, spawnID,
 	go m.watchOrbConnect(a, record, spawnID, neoExecutorConnectTimeout(cfg))
 }
 
-func (m *neoOrbManager) persistContainerBinding(a *neoActor, containerID string) error {
-	if a == nil || strings.TrimSpace(containerID) == "" {
+func (m *neoOrbManager) persistContainerBinding(a *neoActor, containerID, portalToken string) error {
+	if a == nil || strings.TrimSpace(containerID) == "" || !neoOrbPortalTokenValid(portalToken) {
 		return fmt.Errorf("orb container binding is unavailable")
 	}
 	a.mu.Lock()
@@ -603,7 +632,9 @@ func (m *neoOrbManager) persistContainerBinding(a *neoActor, containerID string)
 		a.meta = map[string]any{}
 	}
 	previousBinding, hadPreviousBinding := a.meta[neoOrbContainerIDMetaKey]
+	previousPortalToken, hadPreviousPortalToken := a.meta[neoOrbPortalTokenMetaKey]
 	a.meta[neoOrbContainerIDMetaKey] = containerID
+	a.meta[neoOrbPortalTokenMetaKey] = portalToken
 	a.measurements.revision++
 	if a.localThreadSnapshotsEnabled() {
 		a.measurements.localRequestedRevision = a.measurements.revision
@@ -614,11 +645,16 @@ func (m *neoOrbManager) persistContainerBinding(a *neoActor, containerID string)
 		return nil
 	}
 	a.mu.Lock()
-	if strings.TrimSpace(stringValue(a.meta[neoOrbContainerIDMetaKey])) == containerID {
+	if strings.TrimSpace(stringValue(a.meta[neoOrbContainerIDMetaKey])) == containerID && strings.TrimSpace(stringValue(a.meta[neoOrbPortalTokenMetaKey])) == portalToken {
 		if hadPreviousBinding {
 			a.meta[neoOrbContainerIDMetaKey] = previousBinding
 		} else {
 			delete(a.meta, neoOrbContainerIDMetaKey)
+		}
+		if hadPreviousPortalToken {
+			a.meta[neoOrbPortalTokenMetaKey] = previousPortalToken
+		} else {
+			delete(a.meta, neoOrbPortalTokenMetaKey)
 		}
 		a.measurements.revision++
 		if a.localThreadSnapshotsEnabled() {
@@ -643,6 +679,7 @@ func (m *neoOrbManager) clearContainerBinding(a *neoActor, containerID string) {
 		return
 	}
 	delete(a.meta, neoOrbContainerIDMetaKey)
+	delete(a.meta, neoOrbPortalTokenMetaKey)
 	a.measurements.revision++
 	if a.localThreadSnapshotsEnabled() {
 		a.measurements.localRequestedRevision = a.measurements.revision
@@ -687,7 +724,8 @@ func neoOrbToolchainInstallScript(arch string) (string, error) {
 		bunSHA = "951ee2aee855f08595aeec6225226a298d3fea83a3dcd6465c09cbccdf7e848f"
 		agentBrowserSHA = "b7bc3dfcf0a7326c1f5a60423163259ba2349eebfa5bd2e70e111af743da4a49"
 		browserReady = fmt.Sprintf(`test -x "/opt/chrome-for-testing-%[1]s/chrome-linux64/chrome" &&
-  test "$(readlink /usr/local/libexec/cliproxy-browser)" = "/opt/chrome-for-testing-%[1]s/chrome-linux64/chrome"`, neoOrbChromeVersion)
+  test "$(readlink /usr/local/libexec/cliproxy-browser)" = "/opt/chrome-for-testing-%[1]s/chrome-linux64/chrome" &&
+  test "$(readlink /usr/bin/google-chrome)" = "/opt/chrome-for-testing-%[1]s/chrome-linux64/chrome"`, neoOrbChromeVersion)
 		browserInstall = fmt.Sprintf(`
 mkdir -p /usr/local/libexec
 download_verify "https://storage.googleapis.com/chrome-for-testing-public/%[1]s/linux64/chrome-linux64.zip" "60a324a6e1d27b20f2035a2cdaf71641a739fe1f5571f63794773225820bce8a" "$tmp/chrome.zip"
@@ -695,6 +733,7 @@ rm -rf "/opt/chrome-for-testing-%[1]s"
 mkdir -p "/opt/chrome-for-testing-%[1]s"
 unzip -q "$tmp/chrome.zip" -d "/opt/chrome-for-testing-%[1]s"
 ln -sfn "/opt/chrome-for-testing-%[1]s/chrome-linux64/chrome" /usr/local/libexec/cliproxy-browser
+ln -sfn "/opt/chrome-for-testing-%[1]s/chrome-linux64/chrome" /usr/bin/google-chrome
 `, neoOrbChromeVersion)
 	case "arm64":
 		nodeArch = "arm64"
@@ -715,7 +754,7 @@ ln -sfn "/opt/chrome-for-testing-%[1]s/chrome-linux64/chrome" /usr/local/libexec
 	return fmt.Sprintf(`set -eu
 umask 022
 tools_ready=true
-for tool in git git-lfs gh curl tmux rg fd jq unzip zip xz ssh rsync ps lsof nc dig ping sqlite3 python3 pip3; do
+for tool in git git-lfs gh curl tmux supervisord supervisorctl rg fd jq unzip zip xz ssh rsync ps lsof nc dig ping sqlite3 python3 pip3; do
   command -v "$tool" >/dev/null || tools_ready=false
 done
 if "$tools_ready" &&
@@ -729,7 +768,7 @@ if "$tools_ready" &&
 fi
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq git git-lfs gh curl ca-certificates tmux ripgrep fd-find jq unzip zip xz-utils openssh-client rsync procps lsof netcat-openbsd dnsutils iputils-ping sqlite3 less file util-linux build-essential python3 python3-pip python3-venv pkg-config fonts-liberation libasound2 libatk-bridge2.0-0 libatk1.0-0 libcups2 libdbus-1-3 libdrm2 libgbm1 libglib2.0-0 libgtk-3-0 libnspr4 libnss3 libpango-1.0-0 libx11-6 libx11-xcb1 libxcb1 libxcomposite1 libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2 xdg-utils%[1]s >/dev/null
+apt-get install -y -qq git git-lfs gh curl ca-certificates tmux supervisor ripgrep fd-find jq unzip zip xz-utils openssh-client rsync procps lsof netcat-openbsd dnsutils iputils-ping sqlite3 less file util-linux build-essential python3 python3-pip python3-venv pkg-config fonts-liberation libasound2 libatk-bridge2.0-0 libatk1.0-0 libcups2 libdbus-1-3 libdrm2 libgbm1 libglib2.0-0 libgtk-3-0 libnspr4 libnss3 libpango-1.0-0 libx11-6 libx11-xcb1 libxcb1 libxcomposite1 libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2 xdg-utils%[1]s >/dev/null
 apt-get clean
 rm -rf /var/lib/apt/lists/*
 tmp="$(mktemp -d)"
@@ -790,7 +829,17 @@ exec /usr/local/libexec/agent-browser-native "$@"
 	if err := client.CopyFileToContainer(ctx, containerID, neoOrbAgentBrowserPath, []byte(wrapper), 0o755); err != nil {
 		return err
 	}
-	smoke := "set -eu; agent-browser doctor --offline --quick >/dev/null; trap 'agent-browser close --all >/dev/null 2>&1 || true' EXIT; agent-browser open 'data:text/html,<title>cliproxy-orb-browser-smoke</title><button>ready</button>' >/dev/null; test \"$(agent-browser get title)\" = cliproxy-orb-browser-smoke; agent-browser snapshot -i | grep -F button >/dev/null; agent-browser close --all >/dev/null; trap - EXIT"
+	smoke := `set -eu
+fail() { printf 'agent-browser smoke failed at %s\n' "$1" >&2; exit 1; }
+output="$(agent-browser doctor --offline --quick 2>&1)" || { printf '%s\n' "$output" >&2; fail doctor; }
+trap 'agent-browser close --all >/dev/null 2>&1 || true' EXIT
+output="$(agent-browser open 'data:text/html,<title>cliproxy-orb-browser-smoke</title><button>ready</button>' 2>&1)" || { printf '%s\n' "$output" >&2; fail open; }
+title="$(agent-browser get title 2>&1)" || { printf '%s\n' "$title" >&2; fail title; }
+test "$title" = cliproxy-orb-browser-smoke || { printf 'unexpected browser title: %s\n' "$title" >&2; fail title; }
+snapshot="$(agent-browser snapshot -i 2>&1)" || { printf '%s\n' "$snapshot" >&2; fail snapshot; }
+printf '%s\n' "$snapshot" | grep -F button >/dev/null || { printf '%s\n' "$snapshot" >&2; fail snapshot; }
+agent-browser close --all >/dev/null 2>&1 || fail close
+trap - EXIT`
 	result, err := client.Exec(ctx, containerID, []string{"timeout", "90", "/bin/sh", "-lc", smoke}, nil, "/")
 	if err != nil {
 		return err
@@ -1125,7 +1174,7 @@ func (m *neoOrbManager) resumeOrb(a *neoActor, record *neoOrbRecord, spawnID str
 	agentMode := a.agentModeLocked()
 	reasoningEffort := a.reasoningEffortForModeLocked(agentMode)
 	a.mu.Unlock()
-	env := neoOrbExecutorEnv(cfg, threadID, record.workDir)
+	env := neoOrbExecutorEnv(cfg, threadID, record.workDir, record.portalToken)
 	args := neoHeadlessExecutorArgs(threadID, agentMode, reasoningEffort, neoOrbExecutorLog)
 	resumeScript := fmt.Sprintf("if [ -x .agents/resume ]; then mkdir -p /home/user/.cache/amp/logs && timeout %d .agents/resume > /home/user/.cache/amp/logs/resume.log 2>&1 || true; fi", neoOrbResumeHookSeconds)
 	_, _ = client.Exec(resumeCtx, record.containerID, []string{"/bin/sh", "-lc", resumeScript}, nil, record.workDir)
@@ -1156,6 +1205,9 @@ func (m *neoOrbManager) prepareRecoveredOrb(ctx context.Context, cfg *config.Con
 	}
 	if err := m.orbInstallExecutor(ctx, cfg, client, record.containerID); err != nil {
 		return fmt.Errorf("install executor: %w", err)
+	}
+	if err := m.orbConfigurePortalHelper(ctx, client, record.containerID); err != nil {
+		return fmt.Errorf("prepare portals: %w", err)
 	}
 	if neoOrbSyncLocalConfigEnabled(cfg) {
 		m.orbSyncLocalConfig(ctx, client, record.containerID)
@@ -1219,6 +1271,7 @@ func (m *neoOrbManager) reprovisionOrb(a *neoActor, record *neoOrbRecord, spawnI
 		state:         neoOrbStateProvisioning,
 		workDir:       firstNonEmptyString(record.workDir, neoOrbWorkDir),
 		repositoryURL: record.repositoryURL,
+		portalToken:   neoOrbNewPortalToken(),
 		operationMu:   record.operationMu,
 	}
 	m.orbs[record.threadID] = replacement
@@ -1304,6 +1357,65 @@ func (m *neoOrbManager) portalAddress(ctx context.Context, cfg *config.Config, t
 	return state.IPAddress, nil
 }
 
+func (m *neoOrbManager) acquirePortal(ctx context.Context, cfg *config.Config, threadID string) (neoOrbRecord, func(), error) {
+	record := m.live(threadID)
+	if record == nil {
+		return neoOrbRecord{}, nil, fmt.Errorf("no orb for thread")
+	}
+	operationMu := m.orbOperationMutex(record)
+	operationMu.Lock()
+	defer operationMu.Unlock()
+	m.mu.Lock()
+	if m.orbs[threadID] != record {
+		m.mu.Unlock()
+		return neoOrbRecord{}, nil, fmt.Errorf("no orb for thread")
+	}
+	state := record.state
+	containerID := record.containerID
+	m.mu.Unlock()
+	if state == neoOrbStatePaused {
+		if containerID == "" {
+			return neoOrbRecord{}, nil, fmt.Errorf("no orb container for thread")
+		}
+		client, err := m.dockerClient(cfg)
+		if err != nil {
+			return neoOrbRecord{}, nil, err
+		}
+		if err := client.UnpauseContainer(ctx, containerID); err != nil {
+			return neoOrbRecord{}, nil, fmt.Errorf("orb portal resume failed: %w", err)
+		}
+	}
+	m.mu.Lock()
+	if m.orbs[threadID] == record && (record.state == neoOrbStatePaused || record.state == neoOrbStateRunning) {
+		record.state = neoOrbStateRunning
+		record.failReason = ""
+		record.idleSince = time.Time{}
+		record.portalIP = ""
+		record.portalIPAt = time.Time{}
+		record.activePortals++
+	}
+	snapshot := *record
+	m.mu.Unlock()
+	if snapshot.state != neoOrbStateRunning || snapshot.activePortals == 0 {
+		return neoOrbRecord{}, nil, fmt.Errorf("orb is not ready")
+	}
+	var once sync.Once
+	release := func() {
+		once.Do(func() {
+			m.mu.Lock()
+			if m.orbs[threadID] == record && record.activePortals > 0 {
+				record.activePortals--
+				if record.activePortals == 0 {
+					record.idleSince = time.Time{}
+				}
+			}
+			m.mu.Unlock()
+		})
+	}
+	m.ensureReaper()
+	return snapshot, release, nil
+}
+
 // markOrbActivity resets the idle clock for a thread's orb. Called when the
 // actor observes work or client activity.
 func (m *neoOrbManager) markOrbActivity(threadID string) {
@@ -1368,6 +1480,11 @@ func (m *neoOrbManager) reapRecord(record *neoOrbRecord) {
 		m.mu.Unlock()
 		return
 	}
+	if record.activePortals > 0 {
+		record.idleSince = time.Time{}
+		m.mu.Unlock()
+		return
+	}
 	m.mu.Unlock()
 	cfg := m.runtime.configSnapshot()
 	if !neoOrbsEnabled(cfg) {
@@ -1383,7 +1500,7 @@ func (m *neoOrbManager) reapRecord(record *neoOrbRecord) {
 	actor.mu.Unlock()
 
 	m.mu.Lock()
-	if !idle && !archived {
+	if !idle {
 		record.idleSince = time.Time{}
 		m.mu.Unlock()
 		return
@@ -1397,14 +1514,14 @@ func (m *neoOrbManager) reapRecord(record *neoOrbRecord) {
 	if !archived && idleFor < neoOrbAutoPause(cfg) {
 		return
 	}
-	if !archived && !m.orbActorIdle(actor) {
+	if !m.orbActorIdle(actor) {
 		m.mu.Lock()
 		record.idleSince = time.Time{}
 		m.mu.Unlock()
 		return
 	}
 	m.mu.Lock()
-	consistent := m.orbs[record.threadID] == record && record.state == neoOrbStateRunning && record.idleSince.Equal(decisionIdleSince)
+	consistent := m.orbs[record.threadID] == record && record.state == neoOrbStateRunning && record.activePortals == 0 && record.idleSince.Equal(decisionIdleSince)
 	m.mu.Unlock()
 	if !consistent {
 		return
@@ -1437,21 +1554,30 @@ func (m *neoOrbManager) orbActorIdle(actor *neoActor) bool {
 	actor.mu.Lock()
 	defer actor.mu.Unlock()
 	return normalizeNeoAgentState(actor.agentState) == "idle" &&
+		actor.executorID == "" &&
+		len(actor.pendingTools) == 0 &&
+		len(actor.subagentTools) == 0 &&
+		len(actor.approvalQueue) == 0 &&
+		len(actor.pluginUIRequests) == 0 &&
+		len(actor.terminalRelayChannels) == 0 &&
 		len(actor.queue) == 0 &&
+		actor.currentInference == nil &&
 		actor.pendingInference == nil &&
 		!actor.retryScheduled &&
-		actor.executorID == ""
+		!actor.compacting
 }
 
 // neoOrbExecutorEnv builds the executor environment for the in-orb headless
 // Amp CLI. Loopback proxy/runtime addresses are rewritten to the Docker host
 // gateway so the container can reach this proxy.
-func neoOrbExecutorEnv(cfg *config.Config, threadID, workDir string) []string {
+func neoOrbExecutorEnv(cfg *config.Config, threadID, workDir, portalToken string) []string {
 	proxyBase := neoOrbReachableURL(neoProxyBaseURL(cfg))
+	portalBase := neoOrbPortalBaseURL(cfg)
 	runtimeBase := neoOrbReachableURL(neoRuntimeBaseURL(cfg))
 	orbs := neoOrbsConfig(cfg)
 	if publicURL := strings.TrimRight(strings.TrimSpace(orbs.PublicURL), "/"); publicURL != "" {
 		proxyBase = publicURL
+		portalBase = publicURL
 	}
 	if runtimeURL := strings.TrimRight(strings.TrimSpace(orbs.RuntimePublicURL), "/"); runtimeURL != "" {
 		runtimeBase = runtimeURL
@@ -1467,6 +1593,8 @@ func neoOrbExecutorEnv(cfg *config.Config, threadID, workDir string) []string {
 		"AMP_HEADLESS_OAUTH=1",
 		"AMP_REMOTE_CONTROL_TERMINAL=1",
 		"AMP_ORB=1",
+		"AMP_ORB_PORTAL_BASE_URL=" + portalBase,
+		"AMP_ORB_PORTAL_TOKEN=" + portalToken,
 		"AMP_GATEWAY_URL=" + runtimeBase,
 		"AMP_RUNTIME_URL=" + runtimeBase,
 		"RIVET_ENDPOINT=" + runtimeBase,
@@ -1495,6 +1623,20 @@ func neoOrbExecutorEnv(cfg *config.Config, threadID, workDir string) []string {
 		env = append(env, key+"="+value)
 	}
 	return env
+}
+
+func neoOrbPortalBaseURL(cfg *config.Config) string {
+	orbs := neoOrbsConfig(cfg)
+	if publicURL := strings.TrimRight(strings.TrimSpace(orbs.PublicURL), "/"); publicURL != "" {
+		return publicURL
+	}
+	if cfg != nil {
+		switch strings.TrimSpace(cfg.Host) {
+		case "0.0.0.0", "::", "[::]":
+			return ""
+		}
+	}
+	return strings.TrimRight(strings.TrimSpace(neoProxyBaseURL(cfg)), "/")
 }
 
 // neoOrbEnvKeyValid allows ordinary variable names while protecting the

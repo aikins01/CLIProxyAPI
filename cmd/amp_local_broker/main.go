@@ -119,15 +119,22 @@ type heartbeatRunner struct {
 }
 
 type heartbeatResponse struct {
-	OK      bool                      `json:"ok"`
-	Error   json.RawMessage           `json:"error,omitempty"`
-	Message string                    `json:"message,omitempty"`
-	Runners *[]heartbeatRunnerIntents `json:"runners"`
+	OK              bool                        `json:"ok"`
+	Error           json.RawMessage             `json:"error,omitempty"`
+	Message         string                      `json:"message,omitempty"`
+	Runners         *[]heartbeatRunnerIntents   `json:"runners"`
+	RejectedRunners *[]heartbeatRunnerRejection `json:"rejectedRunners,omitempty"`
 }
 
 type heartbeatRunnerIntents struct {
 	RunnerID string             `json:"runnerId"`
 	Intents  *[]heartbeatIntent `json:"intents"`
+}
+
+type heartbeatRunnerRejection struct {
+	RunnerID string `json:"runnerId"`
+	Code     string `json:"code"`
+	Message  string `json:"message"`
 }
 
 type heartbeatIntent struct {
@@ -1328,6 +1335,11 @@ func (localBroker *broker) reconcile(ctx context.Context, response heartbeatResp
 	}
 	targets := make(map[childKey]string)
 	order := make([]childKey, 0)
+	if response.RejectedRunners != nil {
+		for _, rejected := range *response.RejectedRunners {
+			logrus.WithFields(logrus.Fields{"runner_id": rejected.RunnerID, "code": rejected.Code}).Warn(rejected.Message)
+		}
+	}
 	for _, runner := range *response.Runners {
 		for _, intent := range *runner.Intents {
 			key := childKey{runnerID: runner.RunnerID, threadID: intent.ThreadID}
@@ -1410,6 +1422,26 @@ func (localBroker *broker) validateHeartbeatResponse(response heartbeatResponse)
 			case "stopped":
 			default:
 				return fmt.Errorf("response contains invalid desired state for runner %s thread %s", heartbeatDiagnosticIdentifier(runner.RunnerID), heartbeatDiagnosticIdentifier(intent.ThreadID))
+			}
+		}
+	}
+	if response.RejectedRunners != nil {
+		if len(*response.Runners)+len(*response.RejectedRunners) > len(localBroker.workspacesByRunner) {
+			return errors.New("response contains too many runner results")
+		}
+		for _, rejected := range *response.RejectedRunners {
+			if _, known := localBroker.workspacesByRunner[rejected.RunnerID]; !known {
+				return fmt.Errorf("response rejects unapproved runner %s", heartbeatDiagnosticIdentifier(rejected.RunnerID))
+			}
+			if _, exists := seenRunners[rejected.RunnerID]; exists {
+				return fmt.Errorf("response contains duplicate runner result %s", heartbeatDiagnosticIdentifier(rejected.RunnerID))
+			}
+			seenRunners[rejected.RunnerID] = struct{}{}
+			if !heartbeatCodePattern.MatchString(rejected.Code) {
+				return fmt.Errorf("response contains invalid rejection code for runner %s", heartbeatDiagnosticIdentifier(rejected.RunnerID))
+			}
+			if strings.TrimSpace(rejected.Message) == "" || len(rejected.Message) > heartbeatMessageLimit || containsControl(rejected.Message) {
+				return fmt.Errorf("response contains invalid rejection message for runner %s", heartbeatDiagnosticIdentifier(rejected.RunnerID))
 			}
 		}
 	}

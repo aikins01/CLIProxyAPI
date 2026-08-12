@@ -3375,15 +3375,15 @@ func TestNeoRuntimeEditRerunStartsInferenceWithoutPreflightCompaction(t *testing
 			streamRequestSeen.Store(true)
 			closeStreamStarted.Do(func() { close(streamStarted) })
 			w.Header().Set("Content-Type", "text/event-stream")
-			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"rerun complete\"}}]}\n\n"))
-			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+			_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"rerun complete\"}\n\n"))
+			_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\ndata: [DONE]\n\n"))
 			return
 		}
 		if !streamRequestSeen.Load() {
 			preStreamCompactionCalls.Add(1)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"compact summary"}}]}`))
+		_, _ = w.Write([]byte(`{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"compact summary"}]}]}`))
 	}))
 	t.Cleanup(upstream.Close)
 	parsed, err := url.Parse(upstream.URL)
@@ -5229,14 +5229,14 @@ func TestNeoRuntimeWebLocalInferenceBootstrapExecutor(t *testing.T) {
 
 	waitForNeoRivetBareInit(t, conn, 2*time.Second)
 	status := waitForNeoRivetBareEventTypeWhere(t, conn, "executor_status", 2*time.Second, func(msg map[string]any) bool {
-		return mapValue(msg["details"])["reasonCode"] == "spawn_failed"
+		return mapValue(msg["details"])["reasonCode"] == "workspace_selection_required"
 	})
 	if status["status"] != "failed" {
 		t.Fatalf("executor status = %#v, want failed", status)
 	}
 	details := mapValue(status["details"])
-	if details["reasonCode"] != "spawn_failed" {
-		t.Fatalf("executor status details = %#v, want spawn_failed", details)
+	if details["reasonCode"] != "workspace_selection_required" {
+		t.Fatalf("executor status details = %#v, want workspace_selection_required", details)
 	}
 	if actor := rt.store.lookupThreadActor(threadID); actor == nil {
 		t.Fatal("web local inference bootstrap did not create thread actor")
@@ -6228,7 +6228,7 @@ func TestNeoCloudThreadShellUsesWorkingDirectoryRepository(t *testing.T) {
 	}
 }
 
-func TestNeoApplyWebLocalInferenceBootstrapQueryDefaultsWorkingDirectory(t *testing.T) {
+func TestNeoApplyWebLocalInferenceBootstrapQueryLeavesMissingWorkspaceUnbound(t *testing.T) {
 	enabled := true
 	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
 		NeoLocalRuntime: config.AmpNeoLocalRuntime{
@@ -6248,10 +6248,6 @@ func TestNeoApplyWebLocalInferenceBootstrapQueryDefaultsWorkingDirectory(t *test
 			"threadId": threadID,
 		},
 	}, true)
-	expectedWorkingDirectory := neoDefaultWebLocalWorkingDirectory()
-	if expectedWorkingDirectory == "" {
-		t.Skip("no user home directory available")
-	}
 	rawURL := "/gateway/threadActor/websocket/?rvt-method=get&rvt-key=" + threadID + "&cliproxy-bootstrap-executor=true"
 	req := httptest.NewRequest(http.MethodGet, rawURL, nil)
 	req.Header.Set("Origin", "https://ampcode.com")
@@ -6261,15 +6257,15 @@ func TestNeoApplyWebLocalInferenceBootstrapQueryDefaultsWorkingDirectory(t *test
 
 	actor.mu.Lock()
 	defer actor.mu.Unlock()
-	if got := stringValue(actor.environment["workingDirectory"]); got != expectedWorkingDirectory {
-		t.Fatalf("workingDirectory = %q, want %q", got, expectedWorkingDirectory)
+	if got := stringValue(actor.environment["workingDirectory"]); got != "" {
+		t.Fatalf("workingDirectory = %q, want no server-home default", got)
 	}
-	if got := stringValue(actor.environment["workspaceRoot"]); got != expectedWorkingDirectory {
-		t.Fatalf("workspaceRoot = %q, want %q", got, expectedWorkingDirectory)
+	if got := stringValue(actor.environment["workspaceRoot"]); got != "" {
+		t.Fatalf("workspaceRoot = %q, want no server-home default", got)
 	}
 }
 
-func TestNeoApplyWebLocalInferenceBootstrapQueryDefaultsInvalidWorkingDirectory(t *testing.T) {
+func TestNeoApplyWebLocalInferenceBootstrapQueryRejectsInvalidWorkingDirectoryWithoutHomeFallback(t *testing.T) {
 	enabled := true
 	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
 		NeoLocalRuntime: config.AmpNeoLocalRuntime{
@@ -6289,10 +6285,6 @@ func TestNeoApplyWebLocalInferenceBootstrapQueryDefaultsInvalidWorkingDirectory(
 			"threadId": threadID,
 		},
 	}, true)
-	expectedWorkingDirectory := neoDefaultWebLocalWorkingDirectory()
-	if expectedWorkingDirectory == "" {
-		t.Skip("no user home directory available")
-	}
 	rawURL := "/gateway/threadActor/websocket/?rvt-method=get&rvt-key=" + threadID +
 		"&cliproxy-bootstrap-executor=true&cliproxy-working-directory=" + url.QueryEscape(filepath.Join(t.TempDir(), "deleted"))
 	req := httptest.NewRequest(http.MethodGet, rawURL, nil)
@@ -6303,12 +6295,12 @@ func TestNeoApplyWebLocalInferenceBootstrapQueryDefaultsInvalidWorkingDirectory(
 
 	actor.mu.Lock()
 	defer actor.mu.Unlock()
-	if got := stringValue(actor.environment["workingDirectory"]); got != expectedWorkingDirectory {
-		t.Fatalf("workingDirectory = %q, want %q", got, expectedWorkingDirectory)
+	if got := stringValue(actor.environment["workingDirectory"]); got != "" {
+		t.Fatalf("workingDirectory = %q, want invalid request to remain unbound", got)
 	}
 }
 
-func TestNeoApplyWebLocalInferenceBootstrapQueryPreservesExistingWorkingDirectory(t *testing.T) {
+func TestNeoApplyWebLocalInferenceBootstrapQueryExplicitWorkingDirectoryBeatsExisting(t *testing.T) {
 	enabled := true
 	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
 		NeoLocalRuntime: config.AmpNeoLocalRuntime{
@@ -6343,15 +6335,15 @@ func TestNeoApplyWebLocalInferenceBootstrapQueryPreservesExistingWorkingDirector
 
 	actor.mu.Lock()
 	defer actor.mu.Unlock()
-	if got := stringValue(actor.environment["workingDirectory"]); got != existingWorkingDirectory {
-		t.Fatalf("workingDirectory = %q, want existing %q", got, existingWorkingDirectory)
+	if got := stringValue(actor.environment["workingDirectory"]); got != selectedWorkingDirectory {
+		t.Fatalf("workingDirectory = %q, want explicit %q", got, selectedWorkingDirectory)
 	}
-	if got := stringValue(actor.environment["workspaceRoot"]); got != existingWorkingDirectory {
-		t.Fatalf("workspaceRoot = %q, want existing %q", got, existingWorkingDirectory)
+	if got := stringValue(actor.environment["workspaceRoot"]); got != selectedWorkingDirectory {
+		t.Fatalf("workspaceRoot = %q, want explicit %q", got, selectedWorkingDirectory)
 	}
 }
 
-func TestNeoApplyWebLocalInferenceBootstrapQueryRestoresPersistedWorkingDirectory(t *testing.T) {
+func TestNeoApplyWebLocalInferenceBootstrapQueryExplicitWorkingDirectoryBeatsPersisted(t *testing.T) {
 	enabled := true
 	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
 		NeoLocalRuntime: config.AmpNeoLocalRuntime{
@@ -6399,15 +6391,15 @@ func TestNeoApplyWebLocalInferenceBootstrapQueryRestoresPersistedWorkingDirector
 
 	actor.mu.Lock()
 	defer actor.mu.Unlock()
-	if got := neoWorkingDirectoryFromEnvironment(actor.environment); got != persistedWorkingDirectory {
-		t.Fatalf("workingDirectory = %q, want persisted %q", got, persistedWorkingDirectory)
+	if got := neoWorkingDirectoryFromEnvironment(actor.environment); got != selectedWorkingDirectory {
+		t.Fatalf("workingDirectory = %q, want explicit %q", got, selectedWorkingDirectory)
 	}
-	if got := stringValue(actor.environment["taskMarker"]); got != "persisted" {
-		t.Fatalf("taskMarker = %q, want persisted", got)
+	if got := stringValue(actor.environment["taskMarker"]); got != "stale" {
+		t.Fatalf("taskMarker = %q, want current environment retained around explicit binding", got)
 	}
 }
 
-func TestNeoApplyWebLocalInferenceBootstrapQueryPreservesExistingTaskTree(t *testing.T) {
+func TestNeoApplyWebLocalInferenceBootstrapQueryExplicitWorkingDirectoryReplacesExistingTaskTree(t *testing.T) {
 	enabled := true
 	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
 		NeoLocalRuntime: config.AmpNeoLocalRuntime{
@@ -6451,11 +6443,853 @@ func TestNeoApplyWebLocalInferenceBootstrapQueryPreservesExistingTaskTree(t *tes
 
 	actor.mu.Lock()
 	defer actor.mu.Unlock()
-	if got := stringValue(actor.environment["workingDirectory"]); got != taskDirectory {
-		t.Fatalf("workingDirectory = %q, want task tree %q", got, taskDirectory)
+	if got := stringValue(actor.environment["workingDirectory"]); got != selectedDirectory {
+		t.Fatalf("workingDirectory = %q, want explicit %q", got, selectedDirectory)
 	}
-	if got := stringValue(actor.environment["workspaceRoot"]); got != taskDirectory {
-		t.Fatalf("workspaceRoot = %q, want task tree %q", got, taskDirectory)
+	if got := stringValue(actor.environment["workspaceRoot"]); got != selectedDirectory {
+		t.Fatalf("workspaceRoot = %q, want explicit %q", got, selectedDirectory)
+	}
+}
+
+func TestNeoApplyWebLocalInferenceBootstrapQueryPersistsExplicitRemoteRunnerBinding(t *testing.T) {
+	useTempNeoThreadStore(t)
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+		NeoLocalRuntime:   config.AmpNeoLocalRuntime{Enabled: &enabled, ForceThreadActors: true},
+		WebLocalInference: config.AmpWebLocalInference{Enabled: true, AllowedOrigins: []string{"https://ampcode.com"}},
+	}})
+	ownerID := "user-bootstrap-explicit-runner"
+	remoteDirectory := "/Users/aikins01/Developer/CLIProxyAPI"
+	repositoryURL := "https://github.com/router-for-me/CLIProxyAPI"
+	userActor, _, allowed := rt.store.upsertForOwner(map[string]any{"name": "userActor", "key": ownerID}, true, ownerID)
+	if !allowed || userActor == nil {
+		t.Fatal("owner user actor was not created")
+	}
+	heartbeat := neoLocalBrokerHeartbeatForTest("broker-bootstrap", "session-1", 1, "runner-bootstrap", remoteDirectory, nil)
+	(*heartbeat.Runners)[0].RepositoryURL = repositoryURL
+	if _, err := userActor.syncLocalBrokerHeartbeat(heartbeat); err != nil {
+		t.Fatal(err)
+	}
+	threadID := "T-12121212-1212-4121-8121-121212121230"
+	actor := rt.store.ensureThreadActor(threadID)
+	actor.mu.Lock()
+	actor.meta["ownerUserId"] = ownerID
+	actor.mu.Unlock()
+	req := httptest.NewRequest(http.MethodGet, "/gateway/threadActor/websocket/?rvt-method=get&rvt-key="+threadID+
+		"&cliproxy-bootstrap-executor=true&cliproxy-working-directory="+url.QueryEscape(remoteDirectory), nil)
+	req.Header.Set("Origin", "https://ampcode.com")
+	req.Header.Set(neoInternalClientAPIKeyHeader, "local-key")
+	authenticateNeoWebLocalOwnerForTest(t, rt, req, ownerID)
+
+	neoApplyWebLocalInferenceBootstrapQuery(req, actor)
+	waitForNeoActorSyncIdle(t, actor)
+
+	actor.mu.Lock()
+	environment := cloneMap(actor.environment)
+	meta := cloneMap(actor.meta)
+	actor.mu.Unlock()
+	assertNeoWebLocalBindingForTest(t, environment, meta, remoteDirectory, repositoryURL, "runner-bootstrap")
+	persisted, ok := loadNeoThreadFromDir(threadID, rt.threadDir)
+	if !ok {
+		t.Fatal("explicit remote runner binding was not persisted")
+	}
+	assertNeoWebLocalPersistedBindingForTest(t, mapValue(persisted["env"]), mapValue(persisted["meta"]), remoteDirectory, repositoryURL, "runner-bootstrap")
+}
+
+func TestNeoApplyWebLocalInferenceBootstrapQueryRestoresPersistedRemoteRunnerBinding(t *testing.T) {
+	useTempNeoThreadStore(t)
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+		NeoLocalRuntime:   config.AmpNeoLocalRuntime{Enabled: &enabled, ForceThreadActors: true},
+		WebLocalInference: config.AmpWebLocalInference{Enabled: true, AllowedOrigins: []string{"https://ampcode.com"}},
+	}})
+	ownerID := "user-bootstrap-persisted-runner"
+	remoteDirectory := "/Users/aikins01/Developer/CLIProxyAPI"
+	repositoryURL := "https://github.com/router-for-me/CLIProxyAPI"
+	projectID := "75616c3b-f4de-48b7-8b83-c1af6978a034"
+	userActor, _, allowed := rt.store.upsertForOwner(map[string]any{"name": "userActor", "key": ownerID}, true, ownerID)
+	if !allowed || userActor == nil {
+		t.Fatal("owner user actor was not created")
+	}
+	heartbeat := neoLocalBrokerHeartbeatForTest("broker-persisted", "session-1", 1, "runner-persisted", remoteDirectory, nil)
+	(*heartbeat.Runners)[0].RepositoryURL = repositoryURL
+	if _, err := userActor.syncLocalBrokerHeartbeat(heartbeat); err != nil {
+		t.Fatal(err)
+	}
+	threadID := "T-12121212-1212-4121-8121-121212121231"
+	if _, err := writeNeoLocalThreadFileInDir(rt.threadDir, threadID, map[string]any{
+		"id": threadID,
+		"meta": map[string]any{
+			"cliProxyAPILocalNeo": true,
+			"ownerUserId":         ownerID,
+			"projectID":           projectID,
+			"projectName":         "CLIProxyAPI",
+			"namespace":           "router-for-me",
+			"repositoryURL":       repositoryURL,
+			"runnerId":            "runner-persisted",
+		},
+		"env": neoEnvironmentWithResolvedWorkingDirectory(nil, remoteDirectory),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	actor := rt.store.ensureThreadActor(threadID)
+	actor.mu.Lock()
+	actor.meta["ownerUserId"] = ownerID
+	actor.mu.Unlock()
+	req := httptest.NewRequest(http.MethodGet, "/gateway/threadActor/websocket/?rvt-method=get&rvt-key="+threadID+"&cliproxy-bootstrap-executor=true", nil)
+	req.Header.Set("Origin", "https://ampcode.com")
+	req.Header.Set(neoInternalClientAPIKeyHeader, "local-key")
+	authenticateNeoWebLocalOwnerForTest(t, rt, req, ownerID)
+
+	neoApplyWebLocalInferenceBootstrapQuery(req, actor)
+
+	actor.mu.Lock()
+	environment := cloneMap(actor.environment)
+	meta := cloneMap(actor.meta)
+	actor.mu.Unlock()
+	assertNeoWebLocalBindingForTest(t, environment, meta, remoteDirectory, repositoryURL, "runner-persisted")
+	if stringValue(meta["projectID"]) != projectID {
+		t.Fatalf("projectID = %q, want persisted %q", meta["projectID"], projectID)
+	}
+}
+
+func TestNeoApplyWebLocalInferenceBootstrapQueryLegacyHomeInheritsParentBinding(t *testing.T) {
+	useTempNeoThreadStore(t)
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+		NeoLocalRuntime:   config.AmpNeoLocalRuntime{Enabled: &enabled, ForceThreadActors: true},
+		WebLocalInference: config.AmpWebLocalInference{Enabled: true, AllowedOrigins: []string{"https://ampcode.com"}},
+	}})
+	ownerID := "user-bootstrap-parent-runner"
+	remoteDirectory := "/Users/aikins01/Developer/CLIProxyAPI"
+	repositoryURL := "https://github.com/router-for-me/CLIProxyAPI"
+	projectID := "52985a32-458e-5b39-b673-79e1cf3cfc51"
+	userActor, _, allowed := rt.store.upsertForOwner(map[string]any{"name": "userActor", "key": ownerID}, true, ownerID)
+	if !allowed || userActor == nil {
+		t.Fatal("owner user actor was not created")
+	}
+	heartbeat := neoLocalBrokerHeartbeatForTest("broker-parent", "session-1", 1, "runner-parent", remoteDirectory, nil)
+	(*heartbeat.Runners)[0].RepositoryURL = repositoryURL
+	if _, err := userActor.syncLocalBrokerHeartbeat(heartbeat); err != nil {
+		t.Fatal(err)
+	}
+	parentThreadID := "T-12121212-1212-4121-8121-121212121232"
+	parent := rt.store.ensureThreadActor(parentThreadID)
+	parent.mu.Lock()
+	parent.environment = neoEnvironmentWithResolvedWorkingDirectory(nil, remoteDirectory)
+	parent.meta["ownerUserId"] = ownerID
+	parent.meta["projectID"] = projectID
+	parent.meta["projectName"] = "CLIProxyAPI"
+	parent.meta["namespace"] = "router-for-me"
+	parent.meta["repositoryURL"] = repositoryURL
+	parent.meta["runnerId"] = "runner-parent"
+	parent.meta["cliProxyAPILocalNeo"] = true
+	parent.mu.Unlock()
+	childThreadID := "T-12121212-1212-4121-8121-121212121233"
+	child := rt.store.ensureThreadActor(childThreadID)
+	legacyHome := neoDefaultWebLocalWorkingDirectory()
+	if legacyHome == "" {
+		t.Fatal("legacy server home is unavailable")
+	}
+	child.mu.Lock()
+	child.environment = neoEnvironmentWithResolvedWorkingDirectory(nil, legacyHome)
+	child.meta["ownerUserId"] = ownerID
+	child.relationships = []map[string]any{{"threadID": parentThreadID, "type": "mention", "role": "parent", "createdAt": time.Now().UnixMilli()}}
+	child.mu.Unlock()
+	req := httptest.NewRequest(http.MethodGet, "/gateway/threadActor/websocket/?rvt-method=get&rvt-key="+childThreadID+"&cliproxy-bootstrap-executor=true", nil)
+	req.Header.Set("Origin", "https://ampcode.com")
+	req.Header.Set(neoInternalClientAPIKeyHeader, "local-key")
+	authenticateNeoWebLocalOwnerForTest(t, rt, req, ownerID)
+
+	neoApplyWebLocalInferenceBootstrapQuery(req, child)
+	waitForNeoActorSyncIdle(t, child)
+
+	child.mu.Lock()
+	environment := cloneMap(child.environment)
+	meta := cloneMap(child.meta)
+	child.mu.Unlock()
+	assertNeoWebLocalBindingForTest(t, environment, meta, remoteDirectory, repositoryURL, "runner-parent")
+	if stringValue(meta["projectID"]) != projectID {
+		t.Fatalf("projectID = %q, want parent %q", meta["projectID"], projectID)
+	}
+	persisted, ok := loadNeoThreadFromDir(childThreadID, rt.threadDir)
+	if !ok {
+		t.Fatal("inherited parent binding was not persisted")
+	}
+	assertNeoWebLocalPersistedBindingForTest(t, mapValue(persisted["env"]), mapValue(persisted["meta"]), remoteDirectory, repositoryURL, "runner-parent")
+}
+
+func TestNeoApplyWebLocalInferenceBootstrapQueryInvalidExplicitSelectionDoesNotFallThrough(t *testing.T) {
+	tests := []struct {
+		name       string
+		query      string
+		wantReason string
+	}{
+		{name: "unknown runner does not restore persisted binding", query: "&cliproxy-runner-id=missing-runner", wantReason: "runner_unavailable"},
+		{name: "invalid path does not inherit parent binding", query: "&cliproxy-working-directory=" + url.QueryEscape("/Users/attacker/Invented"), wantReason: "workspace_selection_required"},
+		{name: "explicit server home does not inherit parent binding", query: "&cliproxy-working-directory=" + url.QueryEscape(neoDefaultWebLocalWorkingDirectory()), wantReason: "workspace_selection_required"},
+	}
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			useTempNeoThreadStore(t)
+			rt := newNeoWebLocalBindingRuntimeForTest()
+			ownerID := "user-explicit-precedence"
+			foreignDirectory := "/Users/aikins01/Developer/CLIProxyAPI"
+			repositoryURL := "https://github.com/router-for-me/CLIProxyAPI"
+			parentThreadID := fmt.Sprintf("T-13131313-1313-4131-8131-%012d", index*2+1)
+			parent := rt.store.ensureThreadActor(parentThreadID)
+			parent.mu.Lock()
+			parent.environment = neoEnvironmentWithResolvedWorkingDirectory(nil, foreignDirectory)
+			parent.meta = neoTrustedWebLocalBindingMetaForTest(ownerID, repositoryURL, "runner-stale")
+			parent.mu.Unlock()
+			threadID := fmt.Sprintf("T-13131313-1313-4131-8131-%012d", index*2+2)
+			if _, err := writeNeoLocalThreadFileInDir(rt.threadDir, threadID, map[string]any{
+				"id":   threadID,
+				"env":  neoEnvironmentWithResolvedWorkingDirectory(nil, foreignDirectory),
+				"meta": neoTrustedWebLocalBindingMetaForTest(ownerID, repositoryURL, "runner-stale"),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			actor := rt.store.ensureThreadActor(threadID)
+			actor.mu.Lock()
+			actor.environment = map[string]any{}
+			actor.meta = map[string]any{"ownerUserId": ownerID}
+			actor.relationships = []map[string]any{{"threadID": parentThreadID, "type": "mention", "role": "parent"}}
+			actor.mu.Unlock()
+			req := neoWebLocalBindingRequestForTest(threadID, test.query)
+			authenticateNeoWebLocalOwnerForTest(t, rt, req, ownerID)
+
+			if reason := neoApplyWebLocalInferenceBootstrapQuery(req, actor); reason != test.wantReason {
+				t.Fatalf("binding reason = %q, want %q", reason, test.wantReason)
+			}
+			actor.mu.Lock()
+			environment := cloneMap(actor.environment)
+			status := cloneMap(actor.lastExecutorStatus)
+			actor.mu.Unlock()
+			if workingDirectory := neoWorkingDirectoryFromEnvironment(environment); workingDirectory != "" {
+				t.Fatalf("invalid explicit selection fell through to workspace %q", workingDirectory)
+			}
+			if reason := stringValue(mapValue(status["details"])["reasonCode"]); reason != test.wantReason {
+				t.Fatalf("executor status = %#v, want reason %q", status, test.wantReason)
+			}
+		})
+	}
+}
+
+func TestNeoApplyWebLocalInferenceBootstrapQueryRejectsUnprovenRemotePath(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+	}{
+		{name: "remote path absent on proxy", path: "/Users/aikins01/Developer/Invented"},
+		{name: "existing proxy path", path: t.TempDir()},
+	}
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			useTempNeoThreadStore(t)
+			rt := newNeoWebLocalBindingRuntimeForTest()
+			ownerID := "user-unproven-path"
+			threadID := fmt.Sprintf("T-14141414-1414-4141-8141-%012d", index+1)
+			actor := rt.store.ensureThreadActor(threadID)
+			actor.mu.Lock()
+			actor.meta["ownerUserId"] = ownerID
+			actor.mu.Unlock()
+			req := neoWebLocalBindingRequestForTest(threadID, "&cliproxy-working-directory="+url.QueryEscape(test.path))
+			authenticateNeoWebLocalOwnerForTest(t, rt, req, ownerID)
+
+			if reason := neoApplyWebLocalInferenceBootstrapQuery(req, actor); reason != "workspace_selection_required" {
+				t.Fatalf("binding reason = %q, want workspace_selection_required", reason)
+			}
+			actor.mu.Lock()
+			defer actor.mu.Unlock()
+			if workingDirectory := neoWorkingDirectoryFromEnvironment(actor.environment); workingDirectory != "" {
+				t.Fatalf("unproven browser path was accepted: %q", workingDirectory)
+			}
+		})
+	}
+}
+
+func TestNeoApplyWebLocalInferenceBootstrapQueryRestoresTrustedRemoteBindingWithoutLiveRunner(t *testing.T) {
+	tests := []struct {
+		name      string
+		fromState string
+	}{
+		{name: "persisted", fromState: "persisted"},
+		{name: "parent", fromState: "parent"},
+	}
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			useTempNeoThreadStore(t)
+			rt := newNeoWebLocalBindingRuntimeForTest()
+			ownerID := "user-trusted-disconnected"
+			remoteDirectory := "/Users/aikins01/Developer/CLIProxyAPI"
+			repositoryURL := "https://github.com/router-for-me/CLIProxyAPI"
+			threadID := fmt.Sprintf("T-15151515-1515-4151-8151-%012d", index+1)
+			actor := rt.store.ensureThreadActor(threadID)
+			actor.mu.Lock()
+			actor.meta["ownerUserId"] = ownerID
+			actor.mu.Unlock()
+			bindingMeta := neoTrustedWebLocalBindingMetaForTest(ownerID, repositoryURL, "runner-disconnected")
+			if test.fromState == "persisted" {
+				if _, err := writeNeoLocalThreadFileInDir(rt.threadDir, threadID, map[string]any{
+					"id":   threadID,
+					"env":  neoEnvironmentWithResolvedWorkingDirectory(nil, remoteDirectory),
+					"meta": bindingMeta,
+				}); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				parentThreadID := fmt.Sprintf("T-15151515-1515-4151-8151-%012d", index+101)
+				parent := rt.store.ensureThreadActor(parentThreadID)
+				parent.mu.Lock()
+				parent.environment = neoEnvironmentWithResolvedWorkingDirectory(nil, remoteDirectory)
+				parent.meta = bindingMeta
+				parent.mu.Unlock()
+				actor.mu.Lock()
+				actor.relationships = []map[string]any{{"threadID": parentThreadID, "type": "mention", "role": "parent"}}
+				actor.mu.Unlock()
+			}
+			req := neoWebLocalBindingRequestForTest(threadID, "")
+			authenticateNeoWebLocalOwnerForTest(t, rt, req, ownerID)
+
+			if reason := neoApplyWebLocalInferenceBootstrapQuery(req, actor); reason != "" {
+				t.Fatalf("binding reason = %q", reason)
+			}
+			actor.mu.Lock()
+			environment := cloneMap(actor.environment)
+			meta := cloneMap(actor.meta)
+			actor.mu.Unlock()
+			assertNeoWebLocalBindingForTest(t, environment, meta, remoteDirectory, repositoryURL, "runner-disconnected")
+		})
+	}
+}
+
+func TestNeoApplyWebLocalInferenceBootstrapQueryRejectsForeignTrustedState(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoWebLocalBindingRuntimeForTest()
+	ownerID := "user-binding-owner"
+	foreignOwnerID := "user-binding-foreign"
+	remoteDirectory := "/Users/aikins01/Developer/CLIProxyAPI"
+	repositoryURL := "https://github.com/router-for-me/CLIProxyAPI"
+	parentThreadID := "T-16161616-1616-4161-8161-161616161601"
+	parent := rt.store.ensureThreadActor(parentThreadID)
+	parent.mu.Lock()
+	parent.environment = neoEnvironmentWithResolvedWorkingDirectory(nil, remoteDirectory)
+	parent.meta = neoTrustedWebLocalBindingMetaForTest(foreignOwnerID, repositoryURL, "runner-foreign")
+	parent.mu.Unlock()
+	threadID := "T-16161616-1616-4161-8161-161616161602"
+	if _, err := writeNeoLocalThreadFileInDir(rt.threadDir, threadID, map[string]any{
+		"id":   threadID,
+		"env":  neoEnvironmentWithResolvedWorkingDirectory(nil, remoteDirectory),
+		"meta": neoTrustedWebLocalBindingMetaForTest(foreignOwnerID, repositoryURL, "runner-foreign"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	actor := rt.store.ensureThreadActor(threadID)
+	actor.mu.Lock()
+	actor.environment = map[string]any{}
+	actor.meta = map[string]any{"ownerUserId": ownerID}
+	actor.relationships = []map[string]any{{"threadID": parentThreadID, "type": "mention", "role": "parent"}}
+	actor.mu.Unlock()
+	req := neoWebLocalBindingRequestForTest(threadID, "")
+	authenticateNeoWebLocalOwnerForTest(t, rt, req, ownerID)
+
+	if reason := neoApplyWebLocalInferenceBootstrapQuery(req, actor); reason != "" {
+		t.Fatalf("binding reason = %q", reason)
+	}
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if workingDirectory := neoWorkingDirectoryFromEnvironment(actor.environment); workingDirectory != "" {
+		t.Fatalf("foreign binding was accepted: %q", workingDirectory)
+	}
+}
+
+func TestNeoApplyWebLocalInferenceBootstrapQueryRejectsMarkerlessLiveParent(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoWebLocalBindingRuntimeForTest()
+	ownerID := "user-markerless-parent"
+	remoteDirectory := "/Users/aikins01/Developer/CLIProxyAPI"
+	repositoryURL := "https://github.com/router-for-me/CLIProxyAPI"
+	parentThreadID := "T-16666666-1616-4161-8161-161616161601"
+	parent := rt.store.ensureThreadActor(parentThreadID)
+	parentMeta := neoTrustedWebLocalBindingMetaForTest(ownerID, repositoryURL, "runner-markerless")
+	delete(parentMeta, "cliProxyAPILocalNeo")
+	parent.mu.Lock()
+	parent.environment = neoEnvironmentWithResolvedWorkingDirectory(nil, remoteDirectory)
+	parent.meta = parentMeta
+	parent.mu.Unlock()
+	threadID := "T-16666666-1616-4161-8161-161616161602"
+	actor := rt.store.ensureThreadActor(threadID)
+	actor.mu.Lock()
+	actor.meta["ownerUserId"] = ownerID
+	actor.relationships = []map[string]any{{"threadID": parentThreadID, "type": "mention", "role": "parent"}}
+	actor.mu.Unlock()
+	req := neoWebLocalBindingRequestForTest(threadID, "")
+	authenticateNeoWebLocalOwnerForTest(t, rt, req, ownerID)
+
+	if reason := neoApplyWebLocalInferenceBootstrapQuery(req, actor); reason != "" {
+		t.Fatalf("binding reason = %q", reason)
+	}
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if workingDirectory := neoWorkingDirectoryFromEnvironment(actor.environment); workingDirectory != "" {
+		t.Fatalf("markerless live parent was trusted: %q", workingDirectory)
+	}
+}
+
+func TestNeoApplyWebLocalInferenceBootstrapQueryRejectsInventedProjectMetadata(t *testing.T) {
+	tests := []struct {
+		name     string
+		selector string
+	}{
+		{name: "project ID", selector: "&cliproxy-project-id=aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"},
+		{name: "project name", selector: "&cliproxy-project-name=Invented"},
+		{name: "namespace", selector: "&cliproxy-project-namespace=attacker"},
+		{name: "repository", selector: "&cliproxy-repository-url=" + url.QueryEscape("https://github.com/attacker/Invented")},
+	}
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			useTempNeoThreadStore(t)
+			rt := newNeoWebLocalBindingRuntimeForTest()
+			ownerID := "user-invented-project"
+			remoteDirectory := "/Users/aikins01/Developer/CLIProxyAPI"
+			repositoryURL := "https://github.com/router-for-me/CLIProxyAPI"
+			addNeoWebLocalRunnerForTest(t, rt, ownerID, "runner-authoritative", remoteDirectory, repositoryURL)
+			threadID := fmt.Sprintf("T-17171717-1717-4171-8171-%012d", index+1)
+			actor := rt.store.ensureThreadActor(threadID)
+			actor.mu.Lock()
+			actor.meta["ownerUserId"] = ownerID
+			actor.mu.Unlock()
+			query := "&cliproxy-working-directory=" + url.QueryEscape(remoteDirectory) + "&cliproxy-runner-id=runner-authoritative" + test.selector
+			req := neoWebLocalBindingRequestForTest(threadID, query)
+			authenticateNeoWebLocalOwnerForTest(t, rt, req, ownerID)
+
+			if reason := neoApplyWebLocalInferenceBootstrapQuery(req, actor); reason != "workspace_selection_required" {
+				t.Fatalf("binding reason = %q, want workspace_selection_required", reason)
+			}
+			actor.mu.Lock()
+			defer actor.mu.Unlock()
+			if workingDirectory := neoWorkingDirectoryFromEnvironment(actor.environment); workingDirectory != "" {
+				t.Fatalf("invented metadata bound workspace %q", workingDirectory)
+			}
+		})
+	}
+}
+
+func TestNeoApplyWebLocalInferenceBootstrapQueryIgnoresForeignProjectCache(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoWebLocalBindingRuntimeForTest()
+	ownerID := "user-foreign-project-cache"
+	remoteDirectory := "/Users/aikins01/Developer/CLIProxyAPI"
+	repositoryURL := "https://github.com/router-for-me/CLIProxyAPI"
+	foreignProjectID := "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+	rt.projectIndexMu.Lock()
+	rt.projectIndexLoaded = true
+	rt.projectIndexCache = []any{map[string]any{
+		"id":               foreignProjectID,
+		"projectID":        foreignProjectID,
+		"name":             "ForeignProject",
+		"namespace":        "attacker",
+		"workingDirectory": remoteDirectory,
+		"repositoryURL":    repositoryURL,
+	}}
+	rt.projectIndexMu.Unlock()
+	addNeoWebLocalRunnerForTest(t, rt, ownerID, "runner-cache-proof", remoteDirectory, repositoryURL)
+	threadID := "T-17777777-1717-4171-8171-171717171717"
+	actor := rt.store.ensureThreadActor(threadID)
+	actor.mu.Lock()
+	actor.meta["ownerUserId"] = ownerID
+	actor.mu.Unlock()
+	query := "&cliproxy-working-directory=" + url.QueryEscape(remoteDirectory) + "&cliproxy-runner-id=runner-cache-proof&cliproxy-project-id=" + foreignProjectID
+	req := neoWebLocalBindingRequestForTest(threadID, query)
+	authenticateNeoWebLocalOwnerForTest(t, rt, req, ownerID)
+
+	if reason := neoApplyWebLocalInferenceBootstrapQuery(req, actor); reason != "workspace_selection_required" {
+		t.Fatalf("binding reason = %q, want workspace_selection_required", reason)
+	}
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if stringValue(actor.meta["projectID"]) == foreignProjectID {
+		t.Fatalf("foreign cached project metadata was accepted: %#v", actor.meta)
+	}
+}
+
+func TestNeoApplyWebLocalInferenceBootstrapQueryRejectsRepositoryWithoutRunnerProof(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoWebLocalBindingRuntimeForTest()
+	ownerID := "user-runner-no-repository"
+	remoteDirectory := "/Users/aikins01/Developer/CLIProxyAPI"
+	addNeoWebLocalRunnerForTest(t, rt, ownerID, "runner-no-repository", remoteDirectory, "")
+	threadID := "T-18181818-1818-4181-8181-181818181818"
+	actor := rt.store.ensureThreadActor(threadID)
+	actor.mu.Lock()
+	actor.meta["ownerUserId"] = ownerID
+	actor.mu.Unlock()
+	query := "&cliproxy-working-directory=" + url.QueryEscape(remoteDirectory) + "&cliproxy-runner-id=runner-no-repository&cliproxy-repository-url=" + url.QueryEscape("https://github.com/router-for-me/CLIProxyAPI")
+	req := neoWebLocalBindingRequestForTest(threadID, query)
+	authenticateNeoWebLocalOwnerForTest(t, rt, req, ownerID)
+
+	if reason := neoApplyWebLocalInferenceBootstrapQuery(req, actor); reason != "workspace_selection_required" {
+		t.Fatalf("binding reason = %q, want workspace_selection_required", reason)
+	}
+}
+
+func TestNeoApplyWebLocalInferenceBootstrapQueryClearsStaleBindingAliasesAndTrees(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoWebLocalBindingRuntimeForTest()
+	ownerID := "user-canonical-binding"
+	remoteDirectory := "/Users/aikins01/Developer/CLIProxyAPI"
+	repositoryURL := "https://github.com/router-for-me/CLIProxyAPI"
+	addNeoWebLocalRunnerForTest(t, rt, ownerID, "runner-canonical", remoteDirectory, repositoryURL)
+	threadID := "T-19191919-1919-4191-8191-191919191919"
+	actor := rt.store.ensureThreadActor(threadID)
+	actor.mu.Lock()
+	actor.environment = map[string]any{
+		"trees": []any{map[string]any{"uri": "file:///stale-one"}, map[string]any{"uri": "file:///stale-two"}},
+		"initial": map[string]any{
+			"trees": []any{map[string]any{"uri": "file:///stale-three"}, map[string]any{"uri": "file:///stale-four"}},
+		},
+	}
+	actor.meta = map[string]any{
+		"ownerUserId":       ownerID,
+		"ownerUserID":       "foreign-owner",
+		"creatorUserId":     "foreign-creator",
+		"projectId":         "stale",
+		"project_id":        "stale",
+		"project_name":      "stale",
+		"projectNamespace":  "stale",
+		"project_namespace": "stale",
+		"repositoryName":    "stale",
+		"repositoryUrl":     "stale",
+		"repository_url":    "stale",
+		"repoURL":           "stale",
+		"runnerID":          "stale",
+		"runner_id":         "stale",
+	}
+	actor.mu.Unlock()
+	query := "&cliproxy-working-directory=" + url.QueryEscape(remoteDirectory) + "&cliproxy-runner-id=runner-canonical"
+	req := neoWebLocalBindingRequestForTest(threadID, query)
+	authenticateNeoWebLocalOwnerForTest(t, rt, req, ownerID)
+
+	if reason := neoApplyWebLocalInferenceBootstrapQuery(req, actor); reason != "" {
+		t.Fatalf("binding reason = %q", reason)
+	}
+	actor.mu.Lock()
+	environment := cloneMap(actor.environment)
+	meta := cloneMap(actor.meta)
+	actor.mu.Unlock()
+	assertNeoWebLocalBindingForTest(t, environment, meta, remoteDirectory, repositoryURL, "runner-canonical")
+	if trees := arrayValue(environment["trees"]); len(trees) != 1 {
+		t.Fatalf("top-level trees = %#v, want one canonical tree", trees)
+	}
+	if trees := arrayValue(mapValue(environment["initial"])["trees"]); len(trees) != 1 {
+		t.Fatalf("initial trees = %#v, want one canonical tree", trees)
+	}
+	if stringValue(meta["ownerUserId"]) != ownerID || stringValue(meta["creatorUserID"]) != ownerID {
+		t.Fatalf("canonical owner metadata = %#v", meta)
+	}
+	for _, alias := range []string{"ownerUserID", "creatorUserId"} {
+		if _, ok := meta[alias]; ok {
+			t.Fatalf("canonical metadata retained owner alias %q: %#v", alias, meta)
+		}
+	}
+}
+
+func TestNeoApplyWebLocalInferenceBootstrapQueryCurrentBindingBeatsStalePersistedBinding(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoWebLocalBindingRuntimeForTest()
+	ownerID := "user-current-binding"
+	staleDirectory := "/Users/aikins01/Developer/StaleProject"
+	currentDirectory := "/Users/aikins01/Developer/CLIProxyAPI"
+	staleRepositoryURL := "https://github.com/router-for-me/StaleProject"
+	currentRepositoryURL := "https://github.com/router-for-me/CLIProxyAPI"
+	addNeoWebLocalRunnerForTest(t, rt, ownerID, "runner-stale-binding", staleDirectory, staleRepositoryURL)
+	addNeoWebLocalRunnerForTest(t, rt, ownerID, "runner-current-binding", currentDirectory, currentRepositoryURL)
+	threadID := "T-19999999-1919-4191-8191-191919191919"
+	staleMeta := neoTrustedWebLocalBindingMetaForTest(ownerID, staleRepositoryURL, "runner-stale-binding")
+	staleMeta["projectID"] = "11111111-2222-4333-8444-555555555555"
+	staleMeta[neoWebLocalBindingRevisionMetaKey] = 1
+	if _, err := writeNeoLocalThreadFileInDir(rt.threadDir, threadID, map[string]any{
+		"id":   threadID,
+		"env":  neoEnvironmentWithResolvedWorkingDirectory(nil, staleDirectory),
+		"meta": staleMeta,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	actor := rt.store.ensureThreadActor(threadID)
+	currentMeta := neoTrustedWebLocalBindingMetaForTest(ownerID, currentRepositoryURL, "runner-current-binding")
+	currentMeta["projectID"] = "66666666-7777-4888-8999-aaaaaaaaaaaa"
+	currentMeta[neoWebLocalBindingRevisionMetaKey] = 2
+	actor.mu.Lock()
+	actor.environment = neoEnvironmentWithResolvedWorkingDirectory(map[string]any{"liveMarker": "keep"}, currentDirectory)
+	actor.meta = currentMeta
+	actor.mu.Unlock()
+	req := neoWebLocalBindingRequestForTest(threadID, "")
+	authenticateNeoWebLocalOwnerForTest(t, rt, req, ownerID)
+
+	if reason := neoApplyWebLocalInferenceBootstrapQuery(req, actor); reason != "" {
+		t.Fatalf("binding reason = %q", reason)
+	}
+	actor.mu.Lock()
+	environment := cloneMap(actor.environment)
+	meta := cloneMap(actor.meta)
+	actor.mu.Unlock()
+	assertNeoWebLocalBindingForTest(t, environment, meta, currentDirectory, currentRepositoryURL, "runner-current-binding")
+	if stringValue(meta["projectID"]) != stringValue(currentMeta["projectID"]) || stringValue(environment["liveMarker"]) != "keep" {
+		t.Fatalf("current binding was rolled back: env=%#v meta=%#v", environment, meta)
+	}
+}
+
+func TestNeoApplyWebLocalInferenceBootstrapQueryCurrentProjectIdentityBeatsStalePersistedIdentityForSameBinding(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoWebLocalBindingRuntimeForTest()
+	ownerID := "user-current-project-identity"
+	workingDirectory := "/Users/aikins01/Developer/CLIProxyAPI"
+	repositoryURL := "https://github.com/router-for-me/CLIProxyAPI"
+	runnerID := "runner-current-project-identity"
+	addNeoWebLocalRunnerForTest(t, rt, ownerID, runnerID, workingDirectory, repositoryURL)
+	threadID := "T-20000000-2020-4202-8202-202020202020"
+	staleMeta := neoTrustedWebLocalBindingMetaForTest(ownerID, repositoryURL, runnerID)
+	staleMeta["projectID"] = "11111111-2222-4333-8444-555555555555"
+	staleMeta[neoWebLocalBindingRevisionMetaKey] = 6
+	if _, err := writeNeoLocalThreadFileInDir(rt.threadDir, threadID, map[string]any{
+		"id":   threadID,
+		"env":  neoEnvironmentWithResolvedWorkingDirectory(nil, workingDirectory),
+		"meta": staleMeta,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	actor := rt.store.ensureThreadActor(threadID)
+	currentMeta := neoTrustedWebLocalBindingMetaForTest(ownerID, repositoryURL, runnerID)
+	currentMeta["projectID"] = "66666666-7777-4888-8999-aaaaaaaaaaaa"
+	currentMeta[neoWebLocalBindingRevisionMetaKey] = 7
+	actor.mu.Lock()
+	actor.environment = neoEnvironmentWithResolvedWorkingDirectory(nil, workingDirectory)
+	actor.meta = currentMeta
+	actor.mu.Unlock()
+	req := neoWebLocalBindingRequestForTest(threadID, "")
+	authenticateNeoWebLocalOwnerForTest(t, rt, req, ownerID)
+
+	if reason := neoApplyWebLocalInferenceBootstrapQuery(req, actor); reason != "" {
+		t.Fatalf("binding reason = %q", reason)
+	}
+	actor.mu.Lock()
+	environment := cloneMap(actor.environment)
+	meta := cloneMap(actor.meta)
+	actor.mu.Unlock()
+	assertNeoWebLocalBindingForTest(t, environment, meta, workingDirectory, repositoryURL, runnerID)
+	if got := stringValue(meta["projectID"]); got != stringValue(currentMeta["projectID"]) {
+		t.Fatalf("project ID = %q, want current identity %q; meta=%#v", got, currentMeta["projectID"], meta)
+	}
+}
+
+func TestNeoWebLocalClientSpawnExecutorRequiresBoundWorkspace(t *testing.T) {
+	rt := newNeoWebLocalBindingRuntimeForTest()
+	threadID := "T-20202020-2020-4202-8202-202020202020"
+	actor := rt.store.ensureThreadActor(threadID)
+	actor.mu.Lock()
+	actor.bootstrapExecutorType = "local-client"
+	actor.meta["cliProxyAPIWebLocalShell"] = true
+	actor.mu.Unlock()
+	socket := &neoSocket{webLocalObserver: true}
+
+	result := mapValue(actor.handleForSocket(socket, map[string]any{"type": "client_spawn_executor", "requestId": "spawn-unbound"}))
+	if stringValue(result["status"]) != "failed" || stringValue(mapValue(result["details"])["reasonCode"]) != "workspace_selection_required" {
+		t.Fatalf("spawn result = %#v", result)
+	}
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if len(actor.spawnedExecutors) != 0 {
+		t.Fatalf("unbound web client spawned executors: %#v", actor.spawnedExecutors)
+	}
+}
+
+func TestNeoWebLocalClientSpawnExecutorRejectsAuthenticatedRemoteProxyPathBeforeSideEffects(t *testing.T) {
+	useTempNeoThreadStore(t)
+	enabled := true
+	root := t.TempDir()
+	workingDirectory := filepath.Join(root, "existing-proxy-workspace")
+	ownedPIDDir := filepath.Join(root, "owned-pids")
+	ampPIDDir := filepath.Join(root, "amp-pids")
+	for _, dir := range []string{workingDirectory, ownedPIDDir, ampPIDDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, dir := range []string{ownedPIDDir, ampPIDDir} {
+		if err := os.WriteFile(filepath.Join(dir, "sentinel"), []byte("unchanged"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(replaceNeoHeadlessPIDDir(func() string { return ownedPIDDir }))
+	t.Cleanup(replaceNeoAmpHeadlessPIDDir(func() string { return ampPIDDir }))
+	invocationMarker := filepath.Join(root, "executor-invoked")
+	executorCommand := filepath.Join(root, "record-executor-invocation")
+	executorScript := fmt.Sprintf("#!/bin/sh\nprintf invoked > %q\nsleep 30\n", invocationMarker)
+	if err := os.WriteFile(executorCommand, []byte(executorScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+		NeoLocalRuntime: config.AmpNeoLocalRuntime{
+			Enabled:           &enabled,
+			ForceThreadActors: true,
+			ExecutorCommand:   executorCommand,
+		},
+		WebLocalInference: config.AmpWebLocalInference{Enabled: true, AllowedOrigins: []string{"https://ampcode.com"}},
+		Orbs:              config.AmpOrbs{Enabled: &enabled, Provider: "docker"},
+	}})
+	threadID := "T-20202020-2020-4202-8202-202020202021"
+	ownerID := "user-authenticated-remote-no-runner"
+	actor := rt.store.ensureThreadActor(threadID)
+	t.Cleanup(actor.stopSpawnedExecutors)
+	actor.mu.Lock()
+	actor.meta["ownerUserId"] = ownerID
+	actor.meta["cliProxyAPIWebLocalShell"] = true
+	actor.mu.Unlock()
+	query := "&cliproxy-working-directory=" + url.QueryEscape(workingDirectory)
+	req := neoWebLocalBindingRequestForTest(threadID, query)
+	authenticateNeoWebLocalOwnerForTest(t, rt, req, ownerID)
+
+	snapshotPIDFiles := func() map[string]string {
+		t.Helper()
+		files := map[string]string{}
+		for _, dir := range []string{ownedPIDDir, ampPIDDir} {
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, entry := range entries {
+				raw, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+				if err != nil {
+					t.Fatal(err)
+				}
+				files[filepath.Join(dir, entry.Name())] = string(raw)
+			}
+		}
+		return files
+	}
+	beforePIDFiles := snapshotPIDFiles()
+	if reason := neoApplyWebLocalInferenceBootstrapQuery(req, actor); reason != "workspace_selection_required" {
+		t.Fatalf("binding reason = %q, want workspace_selection_required", reason)
+	}
+	result := mapValue(actor.handleForSocket(&neoSocket{webLocalObserver: true}, map[string]any{
+		"type":      "client_spawn_executor",
+		"requestId": "spawn-authenticated-remote-proxy-path",
+	}))
+	if stringValue(result["status"]) != "failed" || stringValue(mapValue(result["details"])["reasonCode"]) != "workspace_selection_required" {
+		t.Fatalf("spawn result = %#v", result)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if _, err := os.Stat(invocationMarker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("executor invocation marker stat error = %v", err)
+	}
+	if afterPIDFiles := snapshotPIDFiles(); !reflect.DeepEqual(afterPIDFiles, beforePIDFiles) {
+		t.Fatalf("rejected spawn touched owned/Amp PID files:\nbefore=%#v\nafter=%#v", beforePIDFiles, afterPIDFiles)
+	}
+	actor.mu.Lock()
+	spawned := len(actor.spawnedExecutors)
+	actor.mu.Unlock()
+	if spawned != 0 {
+		t.Fatalf("rejected spawn created %d proxy executors", spawned)
+	}
+	if _, exists := rt.orbManagerFor().snapshot(threadID); exists {
+		t.Fatal("rejected spawn created an orb record")
+	}
+}
+
+func newNeoWebLocalBindingRuntimeForTest() *neoRuntime {
+	enabled := true
+	return newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+		NeoLocalRuntime:   config.AmpNeoLocalRuntime{Enabled: &enabled, ForceThreadActors: true},
+		WebLocalInference: config.AmpWebLocalInference{Enabled: true, AllowedOrigins: []string{"https://ampcode.com"}},
+	}})
+}
+
+func addNeoWebLocalRunnerForTest(t *testing.T, rt *neoRuntime, ownerID, runnerID, workingDirectory, repositoryURL string) {
+	t.Helper()
+	userActor, _, allowed := rt.store.upsertForOwner(map[string]any{"name": "userActor", "key": ownerID}, true, ownerID)
+	if !allowed || userActor == nil {
+		t.Fatal("owner user actor was not created")
+	}
+	heartbeat := neoLocalBrokerHeartbeatForTest("broker-"+runnerID, "session-1", 1, runnerID, workingDirectory, nil)
+	(*heartbeat.Runners)[0].RepositoryURL = repositoryURL
+	if _, err := userActor.syncLocalBrokerHeartbeat(heartbeat); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func neoTrustedWebLocalBindingMetaForTest(ownerID, repositoryURL, runnerID string) map[string]any {
+	return map[string]any{
+		"cliProxyAPILocalNeo": true,
+		"ownerUserId":         ownerID,
+		"projectID":           "d6fc35ee-64b9-5905-986b-b07b70eb03f3",
+		"projectName":         "CLIProxyAPI",
+		"namespace":           "router-for-me",
+		"repositoryURL":       repositoryURL,
+		"runnerId":            runnerID,
+	}
+}
+
+func neoWebLocalBindingRequestForTest(threadID, query string) *http.Request {
+	req := httptest.NewRequest(http.MethodGet, "/gateway/threadActor/websocket/?rvt-method=get&rvt-key="+threadID+"&cliproxy-bootstrap-executor=true"+query, nil)
+	req.Header.Set("Origin", "https://ampcode.com")
+	req.Header.Set(neoInternalClientAPIKeyHeader, "local-key")
+	return req
+}
+
+func authenticateNeoWebLocalOwnerForTest(t *testing.T, rt *neoRuntime, req *http.Request, ownerID string) {
+	t.Helper()
+	cfg := *rt.configSnapshot()
+	cfg.AmpCode.UpstreamURL = "https://amp.invalid"
+	cfg.AmpCode.UpstreamAPIKey = "upstream-key"
+	if err := rt.updateConfig(&cfg); err != nil {
+		t.Fatalf("update runtime config: %v", err)
+	}
+	cacheKey, err := rt.recentThreadSeedKey(neoRequestContextWithClientAPIKey(req))
+	if err != nil {
+		t.Fatalf("user profile cache key: %v", err)
+	}
+	rt.mu.Lock()
+	rt.webLocalUserProfiles[cacheKey] = neoWebLocalUserProfile{fetchedAt: time.Now(), user: map[string]any{"id": ownerID}}
+	rt.mu.Unlock()
+	if got, resolved := rt.neoActorRequestOwner(req); !resolved || got != ownerID {
+		t.Fatalf("authenticated request owner = %q/%v, want %q/true", got, resolved, ownerID)
+	}
+}
+
+func assertNeoWebLocalBindingForTest(t *testing.T, environment, meta map[string]any, workingDirectory, repositoryURL, runnerID string) {
+	t.Helper()
+	assertNeoWebLocalBindingStateForTest(t, environment, meta, workingDirectory, repositoryURL, runnerID, true)
+}
+
+func assertNeoWebLocalPersistedBindingForTest(t *testing.T, environment, meta map[string]any, workingDirectory, repositoryURL, runnerID string) {
+	t.Helper()
+	assertNeoWebLocalBindingStateForTest(t, environment, meta, workingDirectory, repositoryURL, runnerID, false)
+}
+
+func assertNeoWebLocalBindingStateForTest(t *testing.T, environment, meta map[string]any, workingDirectory, repositoryURL, runnerID string, requireTopLevel bool) {
+	t.Helper()
+	if gotWork, gotRoot := neoResolvedEnvironmentWorkspacePaths(environment); gotWork != workingDirectory || gotRoot != workingDirectory {
+		t.Fatalf("binding workspace = %q/%q, want %q", gotWork, gotRoot, workingDirectory)
+	}
+	initial := mapValue(environment["initial"])
+	if stringValue(initial["cwd"]) != workingDirectory || stringValue(initial["workingDirectory"]) != workingDirectory || stringValue(initial["workspaceRoot"]) != workingDirectory {
+		t.Fatalf("binding cwd aliases = %#v", environment)
+	}
+	if requireTopLevel && (stringValue(environment["cwd"]) != workingDirectory || stringValue(environment["workingDirectory"]) != workingDirectory || stringValue(environment["workspaceRoot"]) != workingDirectory) {
+		t.Fatalf("live binding workspace aliases = %#v", environment)
+	}
+	trees := arrayValue(initial["trees"])
+	if len(trees) == 0 || stringValue(mapValue(trees[0])["uri"]) != neoFileURLForDirectory(workingDirectory) {
+		t.Fatalf("binding trees = %#v", trees)
+	}
+	if stringValue(meta["repositoryURL"]) != repositoryURL || stringValue(meta["runnerId"]) != runnerID || stringValue(meta["projectID"]) == "" || stringValue(meta["projectName"]) == "" || stringValue(meta["namespace"]) == "" {
+		t.Fatalf("binding metadata = %#v", meta)
+	}
+	for _, alias := range []string{"projectId", "project_id", "project_name", "projectNamespace", "project_namespace", "repositoryName", "repositoryUrl", "repository_url", "repoURL", "runnerID", "runner_id"} {
+		if _, exists := meta[alias]; exists {
+			t.Fatalf("binding retained stale alias %q: %#v", alias, meta)
+		}
 	}
 }
 
@@ -6496,14 +7330,14 @@ func TestNeoRuntimeWebLocalInferenceOriginBootstrapsExecutor(t *testing.T) {
 
 	waitForNeoRivetBareInit(t, conn, 2*time.Second)
 	status := waitForNeoRivetBareEventTypeWhere(t, conn, "executor_status", 2*time.Second, func(msg map[string]any) bool {
-		return mapValue(msg["details"])["reasonCode"] == "spawn_failed"
+		return mapValue(msg["details"])["reasonCode"] == "workspace_selection_required"
 	})
 	if status["status"] != "failed" {
 		t.Fatalf("executor status = %#v, want failed", status)
 	}
 	details := mapValue(status["details"])
-	if details["reasonCode"] != "spawn_failed" {
-		t.Fatalf("executor status details = %#v, want spawn_failed", details)
+	if details["reasonCode"] != "workspace_selection_required" {
+		t.Fatalf("executor status details = %#v, want workspace_selection_required", details)
 	}
 }
 
@@ -15220,6 +16054,70 @@ func TestNeoLocalBrokerMissingRunnerIntentAcknowledgement(t *testing.T) {
 	}
 }
 
+func TestNeoLocalBrokerHeartbeatKeepsNonConflictingWorkspacesAvailable(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	ownerUserID := "user-broker-partial-conflict"
+	userActor, _, allowed := rt.store.upsertForOwner(map[string]any{"name": "userActor", "key": ownerUserID}, true, ownerUserID)
+	if !allowed || userActor == nil {
+		t.Fatal("owner user actor was not created")
+	}
+	occupiedDirectory := t.TempDir()
+	availableDirectory := t.TempDir()
+	stockSocket := &neoSocket{runnerID: "stock-runner"}
+	registered := mapValue(userActor.handleForSocket(stockSocket, map[string]any{
+		"type": "registerRunner",
+		"args": []any{map[string]any{
+			"sessionId":        "stock-session",
+			"workingDirectory": occupiedDirectory,
+			"runningThreads":   []any{},
+		}},
+	}))
+	if registered["ok"] != true {
+		t.Fatalf("stock runner registration = %#v", registered)
+	}
+	emptyThreads := []string{}
+	brokerRunners := []neoLocalBrokerHeartbeatRunner{
+		{RunnerID: "broker-occupied", WorkingDirectory: occupiedDirectory, RunningThreads: &emptyThreads},
+		{RunnerID: "broker-available", WorkingDirectory: availableDirectory, RunningThreads: &emptyThreads},
+	}
+	heartbeat := neoLocalBrokerHeartbeatRequest{
+		BrokerID:          "broker-partial-conflict",
+		SessionID:         "broker-session",
+		SessionGeneration: 1,
+		Hostname:          "Test Host",
+		PID:               1234,
+		Runners:           &brokerRunners,
+	}
+	result, err := userActor.syncLocalBrokerHeartbeatResult(heartbeat)
+	if err != nil {
+		t.Fatalf("partially conflicting heartbeat: %v", err)
+	}
+	accepted := result.Runners
+	if len(accepted) != 1 || accepted[0].runnerID != "broker-available" {
+		t.Fatalf("accepted runners = %#v, want only non-conflicting workspace", accepted)
+	}
+	if len(result.Rejected) != 1 || result.Rejected[0].RunnerID != "broker-occupied" || result.Rejected[0].Code != "working_directory_conflict" {
+		t.Fatalf("rejected runners = %#v, want occupied workspace reason", result.Rejected)
+	}
+	userActor.mu.Lock()
+	stockRunner := userActor.userRunners["stock-runner"]
+	stockRunner.updatedAt = time.Now().Add(-neoLocalBrokerHeartbeatTTL - time.Second)
+	userActor.userRunners["stock-runner"] = stockRunner
+	userActor.mu.Unlock()
+	result, err = userActor.syncLocalBrokerHeartbeatResult(heartbeat)
+	if err != nil {
+		t.Fatalf("heartbeat after stock runner expiry: %v", err)
+	}
+	accepted = result.Runners
+	if len(accepted) != 2 {
+		t.Fatalf("accepted runners after expiry = %#v, want both workspaces", accepted)
+	}
+	if len(result.Rejected) != 0 {
+		t.Fatalf("rejected runners after expiry = %#v", result.Rejected)
+	}
+}
+
 func TestNeoLocalBrokerHeartbeatSessionReplacementAndOmission(t *testing.T) {
 	useTempNeoThreadStore(t)
 	rt := newNeoRuntime(&config.Config{})
@@ -18616,6 +19514,40 @@ func TestNeoRuntimeTerminalOpenRejectsUnavailableWorkspace(t *testing.T) {
 		t.Fatalf("unavailable workspace exit = %#v", exit)
 	}
 	assertNoNeoMessageType(t, executor, "executor_relay_open", 100*time.Millisecond)
+}
+
+func TestNeoRuntimeRunnerTerminalOpenUsesExecutorWorkspace(t *testing.T) {
+	threadID := "T-019f7a11-0000-4000-8000-00000000003a"
+	workingDirectory := "/Users/runner/Developer/project"
+	rt := newNeoRuntime(&config.Config{})
+	actor := rt.store.ensureThreadActor(threadID)
+	actor.mu.Lock()
+	actor.bootstrapExecutorType = "local-client"
+	actor.meta["runnerId"] = "runner-terminal"
+	actor.environment = map[string]any{"workingDirectory": workingDirectory, "workspaceRoot": workingDirectory}
+	actor.mu.Unlock()
+	server := httptest.NewServer(http.HandlerFunc(rt.handleHTTP))
+	t.Cleanup(server.Close)
+
+	client := dialNeoActorWebSocket(t, server.URL, threadID)
+	defer client.Close()
+	executor := dialNeoActorWebSocket(t, server.URL, threadID)
+	defer executor.Close()
+	waitForNeoMessageType(t, client, "agent_state", 2*time.Second)
+	waitForNeoMessageType(t, executor, "agent_state", 2*time.Second)
+	if err := executor.WriteJSON(map[string]any{"type": "executor_connected", "executorId": "runner-executor"}); err != nil {
+		t.Fatalf("write executor_connected: %v", err)
+	}
+	waitForNeoMessageType(t, executor, "executor_connected", 2*time.Second)
+
+	if err := client.WriteJSON(map[string]any{"type": "client_executor_relay_open", "channelId": "runner-terminal", "service": neoTerminalRelayService}); err != nil {
+		t.Fatalf("write terminal relay open: %v", err)
+	}
+	open := waitForNeoMessageType(t, executor, "executor_relay_open", 2*time.Second)
+	if open["channelId"] != "runner-terminal" || open["service"] != neoTerminalRelayService {
+		t.Fatalf("runner terminal relay open = %#v", open)
+	}
+	assertNoNeoMessageType(t, client, "client_executor_relay_exit", 150*time.Millisecond)
 }
 
 func TestNeoRuntimeEstablishedTerminalReportsDisconnectedExecutor(t *testing.T) {
@@ -27857,17 +28789,17 @@ func TestNeoHeadlessExecutorArgsByMode(t *testing.T) {
 		effort string
 		want   []string
 	}{
-		{name: "low", mode: "low", effort: "medium", want: []string{"--mode", "low", "--headless=T-test"}},
-		{name: "medium", mode: "medium", effort: "medium", want: []string{"--mode", "medium", "--headless=T-test"}},
-		{name: "high", mode: "high", effort: "xhigh", want: []string{"--mode", "high", "--headless=T-test"}},
-		{name: "ultra", mode: "ultra", effort: "high", want: []string{"--mode", "ultra", "--headless=T-test"}},
-		{name: "smart", mode: "smart", effort: "high", want: []string{"--mode", "medium", "--headless=T-test"}},
-		{name: "deep", mode: "deep", effort: "medium", want: []string{"--mode", "medium", "--headless=T-test"}},
-		{name: "deep 3", mode: "deep", effort: "xhigh", want: []string{"--mode", "high", "--headless=T-test"}},
-		{name: "rush", mode: "rush", effort: "none", want: []string{"--mode", "low", "--headless=T-test"}},
-		{name: "large", mode: "large", effort: "", want: []string{"--mode", "ultra", "--headless=T-test"}},
-		{name: "plugin mode", mode: "custom-mode", effort: "", want: []string{"--mode", "custom-mode", "--headless=T-test"}},
-		{name: "default", mode: "", effort: "", want: []string{"--mode", "medium", "--headless=T-test"}},
+		{name: "low", mode: "low", effort: "medium", want: []string{"--mode", "low", "--headless=T-test", "--log-level", "warn"}},
+		{name: "medium", mode: "medium", effort: "medium", want: []string{"--mode", "medium", "--headless=T-test", "--log-level", "warn"}},
+		{name: "high", mode: "high", effort: "xhigh", want: []string{"--mode", "high", "--headless=T-test", "--log-level", "warn"}},
+		{name: "ultra", mode: "ultra", effort: "high", want: []string{"--mode", "ultra", "--headless=T-test", "--log-level", "warn"}},
+		{name: "smart", mode: "smart", effort: "high", want: []string{"--mode", "medium", "--headless=T-test", "--log-level", "warn"}},
+		{name: "deep", mode: "deep", effort: "medium", want: []string{"--mode", "medium", "--headless=T-test", "--log-level", "warn"}},
+		{name: "deep 3", mode: "deep", effort: "xhigh", want: []string{"--mode", "high", "--headless=T-test", "--log-level", "warn"}},
+		{name: "rush", mode: "rush", effort: "none", want: []string{"--mode", "low", "--headless=T-test", "--log-level", "warn"}},
+		{name: "large", mode: "large", effort: "", want: []string{"--mode", "ultra", "--headless=T-test", "--log-level", "warn"}},
+		{name: "plugin mode", mode: "custom-mode", effort: "", want: []string{"--mode", "custom-mode", "--headless=T-test", "--log-level", "warn"}},
+		{name: "default", mode: "", effort: "", want: []string{"--mode", "medium", "--headless=T-test", "--log-level", "warn"}},
 	}
 
 	for _, tt := range tests {
@@ -32675,7 +33607,7 @@ func TestNeoSystemPromptMatchesBinaryEnvironmentThreadContext(t *testing.T) {
 	}
 }
 
-func TestNeoSystemPromptMatchesBinarySandboxEnvironmentHints(t *testing.T) {
+func TestNeoSystemPromptIncludesOrbPortalGuidance(t *testing.T) {
 	prompt := neoSystemPrompt(neoInferenceRequest{
 		ThreadID:  "T-sandbox",
 		AgentMode: "deep",
@@ -32689,7 +33621,9 @@ func TestNeoSystemPromptMatchesBinarySandboxEnvironmentHints(t *testing.T) {
 	for _, want := range []string{
 		"Use `.amp/in/artifacts` only for files the user should review in the Artifacts tab",
 		"Git history note: This checkout is shallow; run `git fetch --unshallow`",
-		"Sandbox preview URLs: The user cannot open sandbox-local URLs directly",
+		"Orb portals: The user cannot open orb-local localhost or 127.0.0.1 URLs",
+		"amp-orb-service start <stable-name>",
+		"amp-orb-portal <port-or-loopback-URL>",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("sandbox environment prompt missing %q:\n%s", want, prompt)
@@ -38745,6 +39679,42 @@ func TestInferNeoOpenAIResponsesStreamUsesDoneTextForFinalResult(t *testing.T) {
 	}
 	if text.String() != "hello" || result.Text != "hello" {
 		t.Fatalf("text result=%q delta=%q, want hello", result.Text, text.String())
+	}
+}
+
+func TestInferNeoOpenAIResponsesStreamRejectsEmptyCompletion(t *testing.T) {
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/provider/openai/v1/responses" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		calls++
+		payload := readNeoJSON(r.Body)
+		if boolValue(payload["stream"]) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":3},\"output\":[{\"type\":\"future_tool_call\"}]}}\n\ndata: [DONE]\n\n"))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"completed","usage":{"input_tokens":10,"output_tokens":3},"output":[{"type":"future_tool_call"}]}`))
+	}))
+	defer upstream.Close()
+
+	result, err := inferNeoLocalStream(testNeoRuntimeForServer(t, upstream), neoInferenceRequest{
+		ThreadID:        "T-test",
+		AgentMode:       "deep",
+		ReasoningEffort: "xhigh",
+		Settings:        map[string]any{"internal.model": "openai/gpt-5.5"},
+		History:         []neoHistoryMessage{{Role: "user", Text: "hi"}},
+	}, nil)
+	if err == nil || !strings.Contains(err.Error(), "no usable content (output types: future_tool_call)") {
+		t.Fatalf("error = %v, want safe empty-output diagnostic", err)
+	}
+	if calls != 2 {
+		t.Fatalf("provider calls = %d, want streaming attempt and non-streaming fallback", calls)
+	}
+	if numberFrom(result.Usage["input_tokens"]) != 10 || numberFrom(result.Usage["output_tokens"]) != 3 {
+		t.Fatalf("usage = %#v, want empty completion usage preserved", result.Usage)
 	}
 }
 
@@ -52409,6 +53379,41 @@ func TestNeoWebLocalDeepAgentModesCreateCanonicalDeepThreads(t *testing.T) {
 	}
 }
 
+func TestNeoWebCreateProjectThreadSpawnExecutorCreatesOrbWithoutHostDirectory(t *testing.T) {
+	useTempNeoThreadStore(t)
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+		NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled, ForceThreadActors: true},
+		Orbs:            config.AmpOrbs{Enabled: &enabled, Provider: "docker"},
+	}})
+	threadID := "T-019f75f2-5bf4-736b-909c-a71b64a1d9c8"
+	rt.store.ensureThreadActor(threadID)
+	result := rt.neoWebLocalCreateProjectThread(context.Background(), nil, map[string]any{
+		"threadID":      threadID,
+		"agentMode":     "high",
+		"projectID":     "019f75f2-5bf4-736b-909c-a71b64a1d9c7",
+		"repositoryURL": "https://github.com/example/project.git",
+		"spawnExecutor": true,
+	}, "https://amp.example.test", "local-key")
+	if result["ok"] != true || stringValue(result["executorType"]) != "sandbox" {
+		t.Fatalf("orb create result = %#v", result)
+	}
+	if stringValue(result["workingDirectory"]) != "" || stringValue(result["workspaceRoot"]) != "" {
+		t.Fatalf("orb create leaked a host directory: %#v", result)
+	}
+	actor := rt.store.lookupThreadActor(threadID)
+	if actor == nil {
+		t.Fatal("orb actor was not created")
+	}
+	actor.mu.Lock()
+	bootstrapExecutorType := actor.bootstrapExecutorType
+	meta := cloneMap(actor.meta)
+	actor.mu.Unlock()
+	if bootstrapExecutorType != "sandbox" || stringValue(meta["repositoryURL"]) == "" {
+		t.Fatalf("orb actor bootstrap=%q meta=%#v", bootstrapExecutorType, meta)
+	}
+}
+
 func TestParseNeoPluginAgentModeSourceReadsAgentName(t *testing.T) {
 	source := "// @amp-agent-mode {\"key\":\"deep-red\",\"label\":\"Deep Red\"}\n\n" +
 		"const ORIGINAL_ENI_PROMPT = `prompt`;\n\n" +
@@ -54696,6 +55701,21 @@ func TestNeoLocalThreadSearchExcerptPreservesRawOffsetAcrossExpandedLowercase(t 
 	}
 }
 
+func TestNeoLocalThreadSearchExcerptRedactsOrbPortalToken(t *testing.T) {
+	token := strings.Repeat("p", neoOrbPortalTokenByteCount)
+	raw := []byte(`{"id":"T-019fdec9-b0cf-745d-8da4-f250184e870e","meta":{"` + neoOrbPortalTokenMetaKey + `":"` + token + `"},"messages":[{"role":"assistant","content":[{"type":"text","text":"Wrote portal manifest https://amp.example.test/orb/T-019fdec9-b0cf-745d-8da4-f250184e870e/p/8805/?cliproxy-orb-token=` + token + `"}]}]}`)
+	terms := []string{"wrote portal manifest"}
+	matchIndexes, matched := newNeoLocalThreadSearchMatcher(terms).match(raw)
+	if !matched {
+		t.Fatal("expected portal output to match persisted thread")
+	}
+	result := neoLocalThreadSearchThread(gjson.ParseBytes(raw), raw, "", terms, matchIndexes)
+	excerpt := stringValue(result.thread["matchedSearchText"])
+	if strings.Contains(excerpt, token) || !strings.Contains(excerpt, strings.Repeat("*", neoOrbPortalTokenByteCount)) {
+		t.Fatalf("search excerpt exposed portal token: %q", excerpt)
+	}
+}
+
 func TestNeoLocalThreadSearchPermitHonorsCancellation(t *testing.T) {
 	semaphore := make(chan struct{}, 1)
 	semaphore <- struct{}{}
@@ -56213,6 +57233,9 @@ func TestNeoRunnerBackedSpawnsFailClosedBeforeLocalExecutorSideEffects(t *testin
 		"T-019f9000-0000-7000-8000-000000000020",
 		"T-019f9000-0000-7000-8000-000000000021",
 		"T-019f9000-0000-7000-8000-000000000022",
+		"T-019f9000-0000-7000-8000-000000000023",
+		"T-019f9000-0000-7000-8000-000000000024",
+		"T-019f9000-0000-7000-8000-000000000025",
 	}
 	for _, dir := range []string{ownedPIDDir, ampPIDDir} {
 		for _, threadID := range threadIDs {
@@ -56259,7 +57282,7 @@ func TestNeoRunnerBackedSpawnsFailClosedBeforeLocalExecutorSideEffects(t *testin
 	unavailableActor.bootstrapExecutorType = "local-client"
 	unavailableActor.meta["ownerUserId"] = ownerUserID
 	unavailableActor.meta["runnerId"] = "runner-missing"
-	unavailableActor.environment = map[string]any{"workingDirectory": workingDirectory}
+	unavailableActor.environment = map[string]any{"workingDirectory": t.TempDir()}
 	unavailableActor.mu.Unlock()
 	unavailableStatus := unavailableActor.spawnExecutor(map[string]any{"requestId": "runner-unavailable"})
 	if unavailableStatus["status"] != "failed" || stringValue(mapValue(unavailableStatus["details"])["reasonCode"]) != "runner_unavailable" {
@@ -56310,15 +57333,322 @@ func TestNeoRunnerBackedSpawnsFailClosedBeforeLocalExecutorSideEffects(t *testin
 	if webSocketStatus["status"] != "running" || stringValue(mapValue(webSocketStatus["details"])["reasonCode"]) != "waiting_for_runner" {
 		t.Fatalf("runner-backed websocket bootstrap = %#v", webSocketStatus)
 	}
+
+	legacyActor := rt.store.ensureThreadActor(threadIDs[3])
+	legacyActor.mu.Lock()
+	legacyActor.bootstrapExecutorType = "local-client"
+	legacyActor.agentState = "idle"
+	legacyActor.meta["ownerUserId"] = ownerUserID
+	legacyActor.meta["cliProxyAPIWebLocalShell"] = true
+	legacyActor.meta["projectName"] = filepath.Base(workingDirectory)
+	legacyActor.queue = []neoQueuedMessage{{MessageID: "M-0000000000000000000023", Content: []any{map[string]any{"type": "text", "text": "resume legacy web task"}}}}
+	legacyActor.mu.Unlock()
+	legacyStatus := legacyActor.maybeSpawnWebLocalExecutorForPendingWork()
+	if legacyStatus["status"] != "running" || !strings.Contains(stringValue(legacyStatus["message"]), "selected runner") {
+		t.Fatalf("legacy runner migration = %#v", legacyStatus)
+	}
+	legacyActor.mu.Lock()
+	legacyRunnerID := stringValue(legacyActor.meta["runnerId"])
+	legacyActor.mu.Unlock()
+	if legacyRunnerID != runnerID {
+		t.Fatalf("legacy runner binding = %q, want %q", legacyRunnerID, runnerID)
+	}
+	if desired, ok := neoUserRunnerIntentForTest(userActor, runnerID, threadIDs[3]); !ok || desired != "running" {
+		t.Fatalf("legacy runner intent desired=%q present=%v", desired, ok)
+	}
+
+	legacyReconnectActor := rt.store.ensureThreadActor(threadIDs[5])
+	legacyReconnectActor.mu.Lock()
+	legacyReconnectActor.bootstrapExecutorType = "local-client"
+	legacyReconnectActor.agentState = "idle"
+	legacyReconnectActor.meta["ownerUserId"] = ownerUserID
+	legacyReconnectActor.meta["cliProxyAPIWebLocalShell"] = true
+	legacyReconnectActor.meta["projectName"] = filepath.Base(workingDirectory)
+	legacyReconnectActor.mu.Unlock()
+	legacyReconnectURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/gateway/threadActor/websocket/?rvt-method=get&rvt-key=" + threadIDs[5] + "&cliproxy-bootstrap-executor=true&cliproxy-client=amp-web-local-inference"
+	legacyReconnectConn, legacyReconnectResponse, err := websocket.DefaultDialer.Dial(legacyReconnectURL, header)
+	if err != nil {
+		status := 0
+		if legacyReconnectResponse != nil {
+			status = legacyReconnectResponse.StatusCode
+		}
+		t.Fatalf("legacy reconnect websocket dial status=%d err=%v", status, err)
+	}
+	t.Cleanup(func() { _ = legacyReconnectConn.Close() })
+	legacyReconnectStatus := waitForNeoMessageType(t, legacyReconnectConn, "executor_status", 2*time.Second)
+	if legacyReconnectStatus["status"] != "running" || stringValue(mapValue(legacyReconnectStatus["details"])["reasonCode"]) != "waiting_for_runner" {
+		t.Fatalf("legacy reconnect websocket bootstrap = %#v", legacyReconnectStatus)
+	}
+	legacyReconnectActor.mu.Lock()
+	legacyReconnectRunnerID := stringValue(legacyReconnectActor.meta["runnerId"])
+	legacyReconnectActor.mu.Unlock()
+	if legacyReconnectRunnerID != runnerID {
+		t.Fatalf("legacy reconnect runner binding = %q, want %q", legacyReconnectRunnerID, runnerID)
+	}
+	if desired, ok := neoUserRunnerIntentForTest(userActor, runnerID, threadIDs[5]); !ok || desired != "running" {
+		t.Fatalf("legacy reconnect intent desired=%q present=%v", desired, ok)
+	}
+
+	mismatchedLegacyActor := rt.store.ensureThreadActor(threadIDs[4])
+	mismatchedLegacyActor.mu.Lock()
+	mismatchedLegacyActor.bootstrapExecutorType = "local-client"
+	mismatchedLegacyActor.agentState = "idle"
+	mismatchedLegacyActor.meta["ownerUserId"] = ownerUserID
+	mismatchedLegacyActor.meta["cliProxyAPIWebLocalShell"] = true
+	mismatchedLegacyActor.meta["projectName"] = "different-project"
+	mismatchedLegacyActor.queue = []neoQueuedMessage{{MessageID: "M-0000000000000000000024", Content: []any{map[string]any{"type": "text", "text": "do not resume on a mismatched runner"}}}}
+	mismatchedLegacyActor.mu.Unlock()
+	mismatchedLegacyStatus := mismatchedLegacyActor.maybeSpawnWebLocalExecutorForPendingWork()
+	if mismatchedLegacyStatus["status"] != "failed" || !strings.Contains(stringValue(mismatchedLegacyStatus["message"]), "no longer available") {
+		t.Fatalf("mismatched legacy runner migration = %#v", mismatchedLegacyStatus)
+	}
 	if afterPIDFiles := snapshotPIDFiles(); !reflect.DeepEqual(afterPIDFiles, beforePIDFiles) {
 		t.Fatalf("runner-backed spawn touched owned/Amp PID sentinels:\nbefore=%#v\nafter=%#v", beforePIDFiles, afterPIDFiles)
 	}
-	for _, actor := range []*neoActor{directActor, unavailableActor, pendingActor, webSocketActor} {
+	for _, actor := range []*neoActor{directActor, unavailableActor, pendingActor, webSocketActor, legacyActor, legacyReconnectActor, mismatchedLegacyActor} {
 		actor.mu.Lock()
 		spawned := len(actor.spawnedExecutors)
 		actor.mu.Unlock()
 		if spawned != 0 {
 			t.Fatalf("runner-backed actor spawned %d proxy executors", spawned)
 		}
+	}
+}
+
+func TestNeoLegacyRunnerBindingIsAtomic(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	ownerUserID := neoLocalOwnerUserID
+	runnerID := "runner-atomic-bind"
+	workingDirectory := t.TempDir()
+	userActor, _, _ := rt.store.upsertForOwner(map[string]any{"name": "userActor", "key": ownerUserID}, true, ownerUserID)
+	if _, err := userActor.syncLocalBrokerHeartbeat(neoLocalBrokerHeartbeatForTest("broker-atomic-bind", "session-1", 1, runnerID, workingDirectory, nil)); err != nil {
+		t.Fatal(err)
+	}
+	threadID := "T-019f9000-0000-7000-8000-000000000026"
+	actor := rt.store.ensureThreadActor(threadID)
+	actor.mu.Lock()
+	actor.bootstrapExecutorType = "local-client"
+	actor.meta["ownerUserId"] = ownerUserID
+	actor.meta["cliProxyAPIWebLocalShell"] = true
+	actor.meta["projectName"] = filepath.Base(workingDirectory)
+	actor.mu.Unlock()
+
+	results := make(chan string, 16)
+	var group sync.WaitGroup
+	for range 16 {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			boundRunnerID, handled := actor.bindSingleLegacyWebLocalRunner(threadID)
+			if !handled {
+				results <- "not-handled"
+				return
+			}
+			results <- boundRunnerID
+		}()
+	}
+	group.Wait()
+	close(results)
+	for result := range results {
+		if result != runnerID {
+			t.Fatalf("concurrent binding result = %q", result)
+		}
+	}
+	if desired, ok := neoUserRunnerIntentForTest(userActor, runnerID, threadID); !ok || desired != "running" {
+		t.Fatalf("atomic binding intent desired=%q present=%v", desired, ok)
+	}
+}
+
+func TestNeoExplicitBootstrapWaitsForLegacyRunnerBinding(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoWebLocalBindingRuntimeForTest()
+	legacyOwnerID := neoLocalOwnerUserID
+	explicitOwnerID := "user-explicit-binding"
+	legacyDirectory := t.TempDir()
+	explicitDirectory := t.TempDir()
+	legacyUserActor, _, _ := rt.store.upsertForOwner(map[string]any{"name": "userActor", "key": legacyOwnerID}, true, legacyOwnerID)
+	if _, err := legacyUserActor.syncLocalBrokerHeartbeat(neoLocalBrokerHeartbeatForTest("broker-legacy-binding", "session-1", 1, "runner-legacy-binding", legacyDirectory, nil)); err != nil {
+		t.Fatal(err)
+	}
+	addNeoWebLocalRunnerForTest(t, rt, explicitOwnerID, "runner-explicit-binding", explicitDirectory, "")
+	threadID := "T-019f9000-0000-7000-8000-000000000027"
+	actor := rt.store.ensureThreadActor(threadID)
+	actor.mu.Lock()
+	actor.bootstrapExecutorType = "local-client"
+	actor.meta["ownerUserId"] = legacyOwnerID
+	actor.meta["cliProxyAPIWebLocalShell"] = true
+	actor.meta["projectName"] = filepath.Base(legacyDirectory)
+	actor.mu.Unlock()
+
+	legacyUserActor.mu.Lock()
+	legacyUnlocked := false
+	t.Cleanup(func() {
+		if !legacyUnlocked {
+			legacyUserActor.mu.Unlock()
+		}
+	})
+	legacyDone := make(chan struct{})
+	go func() {
+		actor.bindSingleLegacyWebLocalRunner(threadID)
+		close(legacyDone)
+	}()
+	deadline := time.Now().Add(time.Second)
+	for actor.webLocalRunnerBindingMu.TryLock() {
+		actor.webLocalRunnerBindingMu.Unlock()
+		if time.Now().After(deadline) {
+			t.Fatal("legacy binding did not acquire the binding guard")
+		}
+		runtime.Gosched()
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/gateway/threadActor/websocket/?rvt-method=get&rvt-key="+threadID+
+		"&cliproxy-bootstrap-executor=true&cliproxy-runner-id=runner-explicit-binding", nil)
+	req.Header.Set("Origin", "https://ampcode.com")
+	req.Header.Set(neoInternalClientAPIKeyHeader, "local-key")
+	authenticateNeoWebLocalOwnerForTest(t, rt, req, explicitOwnerID)
+	explicitStarted := make(chan struct{})
+	explicitDone := make(chan struct{})
+	go func() {
+		close(explicitStarted)
+		neoApplyWebLocalInferenceBootstrapQuery(req, actor)
+		close(explicitDone)
+	}()
+	<-explicitStarted
+	select {
+	case <-explicitDone:
+		t.Fatal("explicit bootstrap bypassed the in-progress legacy binding guard")
+	case <-time.After(50 * time.Millisecond):
+	}
+	legacyUserActor.mu.Unlock()
+	legacyUnlocked = true
+	select {
+	case <-legacyDone:
+	case <-time.After(time.Second):
+		t.Fatal("legacy binding did not complete")
+	}
+	select {
+	case <-explicitDone:
+	case <-time.After(time.Second):
+		t.Fatal("explicit bootstrap did not resume")
+	}
+	actor.mu.Lock()
+	boundRunnerID := stringValue(actor.meta["runnerId"])
+	actor.mu.Unlock()
+	if boundRunnerID != "runner-explicit-binding" {
+		t.Fatalf("final runner binding = %q, want explicit runner", boundRunnerID)
+	}
+}
+
+func TestNeoStaleRunnerIDRebindsToOwnerRunnerAtSameWorkspace(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	ownerID := "user-runner-rebind"
+	workingDirectory := t.TempDir()
+	userActor, _, allowed := rt.store.upsertForOwner(map[string]any{"name": "userActor", "key": ownerID}, true, ownerID)
+	if !allowed || userActor == nil {
+		t.Fatal("owner user actor was not created")
+	}
+	if _, err := userActor.syncLocalBrokerHeartbeat(neoLocalBrokerHeartbeatForTest("broker-rebind", "session-1", 1, "runner-current", workingDirectory, nil)); err != nil {
+		t.Fatal(err)
+	}
+	foreignActor, _, allowed := rt.store.upsertForOwner(map[string]any{"name": "userActor", "key": "user-foreign"}, true, "user-foreign")
+	if !allowed || foreignActor == nil {
+		t.Fatal("foreign user actor was not created")
+	}
+	if _, err := foreignActor.syncLocalBrokerHeartbeat(neoLocalBrokerHeartbeatForTest("broker-foreign", "session-1", 1, "runner-foreign", workingDirectory, nil)); err != nil {
+		t.Fatal(err)
+	}
+	matchingRunner := rt.store.userExecutorRunnerForWorkspaceForOwner(ownerID, workingDirectory, "")
+	if stringValue(matchingRunner["runnerId"]) != "runner-current" {
+		t.Fatalf("owner workspace runner = %#v", matchingRunner)
+	}
+	if staleRunner := rt.store.userExecutorRunnerForOwner(ownerID, "runner-retired"); len(staleRunner) != 0 {
+		t.Fatalf("retired runner unexpectedly available: %#v", staleRunner)
+	}
+
+	threadID := "T-019f9000-0000-7000-8000-000000000030"
+	actor := rt.store.ensureThreadActor(threadID)
+	actor.mu.Lock()
+	actor.bootstrapExecutorType = "local-client"
+	actor.agentState = "idle"
+	actor.meta["ownerUserId"] = ownerID
+	actor.meta["cliProxyAPIWebLocalShell"] = true
+	actor.meta["runnerId"] = "runner-retired"
+	actor.environment = neoEnvironmentWithRunnerWorkingDirectory(nil, workingDirectory)
+	actor.queue = []neoQueuedMessage{{MessageID: "M-0000000000000000000030", Content: []any{map[string]any{"type": "text", "text": "resume on current runner"}}}}
+	actor.mu.Unlock()
+	if rebound := actor.rebindUnavailableWebLocalRunner(); rebound != "runner-current" {
+		actor.mu.Lock()
+		meta := cloneMap(actor.meta)
+		environment := cloneMap(actor.environment)
+		bootstrap := actor.bootstrapExecutorType
+		actor.mu.Unlock()
+		t.Fatalf("direct stale runner rebound = %q bootstrap=%q meta=%#v environment=%#v", rebound, bootstrap, meta, environment)
+	}
+
+	status := actor.maybeSpawnWebLocalExecutorForPendingWork()
+	if status["status"] != "running" || !strings.Contains(stringValue(status["message"]), "selected runner") {
+		t.Fatalf("stale runner recovery status = %#v", status)
+	}
+	actor.mu.Lock()
+	reboundRunnerID := stringValue(actor.meta["runnerId"])
+	reboundDirectory := neoWorkingDirectoryFromEnvironment(actor.environment)
+	actor.mu.Unlock()
+	if reboundRunnerID != "runner-current" || reboundDirectory != neoExistingDirectory(neoUserExecutorRunnerWorkingDirectory(matchingRunner["workingDirectory"])) {
+		t.Fatalf("rebound runner/directory = %q/%q", reboundRunnerID, reboundDirectory)
+	}
+	if desired, ok := neoUserRunnerIntentForTest(userActor, "runner-current", threadID); !ok || desired != "running" {
+		t.Fatalf("rebound runner intent desired=%q present=%v", desired, ok)
+	}
+	if _, ok := neoUserRunnerIntentForTest(foreignActor, "runner-foreign", threadID); ok {
+		t.Fatal("stale runner recovery crossed owner scope")
+	}
+}
+
+func TestNeoStaleRunnerIDRebindsByUniqueOwnerRepositoryWhenHostPathWasLost(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	ownerID := "user-runner-repository-rebind"
+	workingDirectory := t.TempDir()
+	userActor, _, allowed := rt.store.upsertForOwner(map[string]any{"name": "userActor", "key": ownerID}, true, ownerID)
+	if !allowed || userActor == nil {
+		t.Fatal("owner user actor was not created")
+	}
+	heartbeat := neoLocalBrokerHeartbeatForTest("broker-repository-rebind", "session-1", 1, "runner-current", workingDirectory, nil)
+	(*heartbeat.Runners)[0].RepositoryURL = "https://github.com/example/project.git"
+	if _, err := userActor.syncLocalBrokerHeartbeat(heartbeat); err != nil {
+		t.Fatal(err)
+	}
+
+	actor := rt.store.ensureThreadActor("T-019f9000-0000-7000-8000-000000000031")
+	actor.mu.Lock()
+	actor.bootstrapExecutorType = "local-client"
+	actor.meta["ownerUserId"] = ownerID
+	actor.meta["runnerId"] = "runner-retired"
+	actor.meta["repositoryURL"] = "https://github.com/example/project.git"
+	actor.environment = neoEnvironmentWithResolvedWorkingDirectory(nil, "/root")
+	actor.mu.Unlock()
+	if rebound := actor.rebindUnavailableWebLocalRunner(); rebound != "runner-current" {
+		t.Fatalf("repository stale runner rebound = %q", rebound)
+	}
+	duplicate := (*heartbeat.Runners)[0]
+	duplicate.RunnerID = "runner-duplicate"
+	duplicate.WorkingDirectory = t.TempDir()
+	*heartbeat.Runners = append(*heartbeat.Runners, duplicate)
+	heartbeat.SessionGeneration = 2
+	if _, err := userActor.syncLocalBrokerHeartbeat(heartbeat); err != nil {
+		t.Fatal(err)
+	}
+	ambiguousActor := rt.store.ensureThreadActor("T-019f9000-0000-7000-8000-000000000032")
+	ambiguousActor.mu.Lock()
+	ambiguousActor.bootstrapExecutorType = "local-client"
+	ambiguousActor.meta["ownerUserId"] = ownerID
+	ambiguousActor.meta["runnerId"] = "runner-retired"
+	ambiguousActor.meta["repositoryURL"] = "https://github.com/example/project.git"
+	ambiguousActor.environment = neoEnvironmentWithResolvedWorkingDirectory(nil, "/root")
+	ambiguousActor.mu.Unlock()
+	if rebound := ambiguousActor.rebindUnavailableWebLocalRunner(); rebound != "runner-retired" {
+		t.Fatalf("ambiguous repository stale runner rebound = %q", rebound)
 	}
 }

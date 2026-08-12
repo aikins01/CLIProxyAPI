@@ -306,6 +306,12 @@ func TestNeoOrbSpawnProvisionsContainerAndStartsExecutor(t *testing.T) {
 	if fake.callCount("exec-detached:/usr/bin/flock -n /run/cliproxy-amp-executor.lock /usr/local/bin/amp") != 1 {
 		t.Fatalf("executor was not started detached: %#v", fake.calls)
 	}
+	if fake.callCount("copy:"+neoOrbPortalHelperPath) != 1 {
+		t.Fatalf("portal helper was not installed: %#v", fake.calls)
+	}
+	if fake.callCount("copy:"+neoOrbServiceHelperPath) != 1 {
+		t.Fatalf("service helper was not installed: %#v", fake.calls)
+	}
 	if fake.callCount("exec:git clone --depth 1 https://example.test/repo.git") != 1 {
 		t.Fatalf("workspace clone missing: %#v", fake.calls)
 	}
@@ -377,14 +383,17 @@ func TestNeoOrbSpawnReprovisionsWhenContainerMissing(t *testing.T) {
 	}
 }
 
-func writeNeoOrbPersistedThread(t *testing.T, rt *neoRuntime, threadID, executorType string, containerID ...string) {
+func writeNeoOrbPersistedThread(t *testing.T, rt *neoRuntime, threadID, executorType string, binding ...string) {
 	t.Helper()
 	meta := map[string]any{
 		"cliProxyAPILocalNeo": true,
 		"executorType":        executorType,
 	}
-	if len(containerID) > 0 && strings.TrimSpace(containerID[0]) != "" {
-		meta[neoOrbContainerIDMetaKey] = containerID[0]
+	if len(binding) > 0 && strings.TrimSpace(binding[0]) != "" {
+		meta[neoOrbContainerIDMetaKey] = binding[0]
+	}
+	if len(binding) > 1 && neoOrbPortalTokenValid(binding[1]) {
+		meta[neoOrbPortalTokenMetaKey] = binding[1]
 	}
 	if _, err := writeNeoLocalThreadFileInDir(rt.threadDir, threadID, map[string]any{
 		"id":   threadID,
@@ -392,6 +401,19 @@ func writeNeoOrbPersistedThread(t *testing.T, rt *neoRuntime, threadID, executor
 	}); err != nil {
 		t.Fatalf("write persisted orb thread: %v", err)
 	}
+}
+
+func readNeoOrbPersistedPortalToken(t *testing.T, rt *neoRuntime, threadID string) string {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(rt.threadDir, threadID+".json"))
+	if err != nil {
+		t.Fatalf("read persisted orb thread: %v", err)
+	}
+	var thread map[string]any
+	if err := json.Unmarshal(raw, &thread); err != nil {
+		t.Fatalf("decode persisted orb thread: %v", err)
+	}
+	return strings.TrimSpace(stringValue(mapValue(thread["meta"])[neoOrbPortalTokenMetaKey]))
 }
 
 func readNeoOrbPersistedBinding(t *testing.T, rt *neoRuntime, threadID string) string {
@@ -433,6 +455,9 @@ func TestNeoOrbRestartRecoversRunningAndPausedContainers(t *testing.T) {
 			record, ok := manager.snapshot(threadID)
 			if !ok || record.containerID != "recovered-container" || record.state != test.wantState {
 				t.Fatalf("recovered record = %#v, %t", record, ok)
+			}
+			if !neoOrbPortalTokenValid(record.portalToken) || readNeoOrbPersistedPortalToken(t, rt, threadID) != record.portalToken {
+				t.Fatalf("recovered portal token was not persisted: %q", record.portalToken)
 			}
 			for _, forbidden := range []string{"create:", "start:", "unpause:", "exec-detached:"} {
 				if fake.callCount(forbidden) != 0 {
@@ -915,6 +940,68 @@ func TestNeoOrbReaperKeepsActiveOrbRunning(t *testing.T) {
 	}
 }
 
+func TestNeoOrbReaperKeepsLiveSessionsRunning(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		prepare func(*neoActor, *neoOrbRecord)
+	}{
+		{
+			name: "connected executor",
+			prepare: func(actor *neoActor, _ *neoOrbRecord) {
+				actor.executorID = "cli-headless-orb"
+				actor.executorReady = true
+			},
+		},
+		{
+			name: "archived terminal relay",
+			prepare: func(actor *neoActor, _ *neoOrbRecord) {
+				actor.archived = true
+				actor.terminalRelayChannels = map[string]struct{}{"terminal-channel": {}}
+			},
+		},
+		{
+			name: "archived inference",
+			prepare: func(actor *neoActor, _ *neoOrbRecord) {
+				actor.archived = true
+				actor.currentInference = &neoInferenceInflight{messageID: "M-active"}
+			},
+		},
+		{
+			name: "archived portal",
+			prepare: func(actor *neoActor, record *neoOrbRecord) {
+				actor.archived = true
+				record.activePortals = 1
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			rt, fake := newNeoOrbTestRuntime(t)
+			threadID := "T-019fdec9-b0cf-745d-8da4-f250184e870e"
+			actor := neoOrbTestActor(rt, threadID)
+			t.Cleanup(actor.cancel)
+			manager := rt.orbManagerFor()
+
+			actor.spawnExecutor(map[string]any{"requestId": "spawn-session"})
+			waitNeoOrbState(t, manager, threadID, neoOrbStateRunning)
+			manager.mu.Lock()
+			record := manager.orbs[threadID]
+			record.idleSince = time.Now().Add(-time.Hour)
+			manager.mu.Unlock()
+			actor.mu.Lock()
+			test.prepare(actor, record)
+			actor.mu.Unlock()
+
+			manager.reapRecord(record)
+			if fake.callCount("pause:") != 0 {
+				t.Fatalf("live session was paused: %#v", fake.calls)
+			}
+			if state, _ := manager.snapshot(threadID); state.state != neoOrbStateRunning {
+				t.Fatalf("record state = %q, want running", state.state)
+			}
+		})
+	}
+}
+
 func TestNeoOrbReaperDoesNotPauseRecoveredOrbBeforeMigration(t *testing.T) {
 	rt, fake := newNeoOrbTestRuntime(t)
 	threadID := "T-019fdec9-b0cf-745d-8da4-f250184e870e"
@@ -986,10 +1073,12 @@ func TestNeoOrbReachableURLRewritesLoopback(t *testing.T) {
 
 func TestNeoOrbExecutorEnv(t *testing.T) {
 	cfg := &config.Config{Host: "127.0.0.1", Port: 8317}
-	env := neoOrbExecutorEnv(cfg, "T-019fdec9-b0cf-745d-8da4-f250184e870e", "/home/user/workspace/repo")
+	env := neoOrbExecutorEnv(cfg, "T-019fdec9-b0cf-745d-8da4-f250184e870e", "/home/user/workspace/repo", "portal-token")
 	joined := strings.Join(env, "\n")
 	for _, want := range []string{
 		"AMP_URL=http://host.docker.internal:8317",
+		"AMP_ORB_PORTAL_BASE_URL=http://127.0.0.1:8317",
+		"AMP_ORB_PORTAL_TOKEN=portal-token",
 		"AMP_THREAD_ID=T-019fdec9-b0cf-745d-8da4-f250184e870e",
 		"AMP_EXECUTOR=1",
 		"AMP_ORB=1",
@@ -1040,7 +1129,7 @@ func TestNeoOrbExecutorEnvInjectsConfigEnv(t *testing.T) {
 			"9BAD":                          "nope",
 		}}},
 	}
-	env := strings.Join(neoOrbExecutorEnv(cfg, "T-019fdec9-b0cf-745d-8da4-f250184e870e", "/work"), "\n")
+	env := strings.Join(neoOrbExecutorEnv(cfg, "T-019fdec9-b0cf-745d-8da4-f250184e870e", "/work", "portal-token"), "\n")
 	if !strings.Contains(env, "GH_TOKEN=ghp_test") || !strings.Contains(env, "EDITOR=vim") {
 		t.Fatalf("config env not injected:\n%s", env)
 	}
@@ -1257,6 +1346,12 @@ func TestNeoOrbToolchainPlanPinsVersionsAndArchitectures(t *testing.T) {
 	if !strings.Contains(amd64, "chrome-for-testing-public/"+neoOrbChromeVersion+"/linux64") || strings.Contains(amd64, "apt-get install -y -qq chromium") {
 		t.Fatalf("amd64 browser selection is not pinned Chrome for Testing")
 	}
+	if !strings.Contains(amd64, "/usr/bin/google-chrome") {
+		t.Fatal("amd64 Chrome is not exposed through a path agent-browser doctor discovers")
+	}
+	if !strings.Contains(amd64, "supervisor") {
+		t.Fatal("orb toolchain does not install the unprivileged service supervisor")
+	}
 	libexecDirectory := strings.Index(amd64, "mkdir -p /usr/local/libexec /home/user")
 	browserSymlink := strings.LastIndex(amd64, "/usr/local/libexec/cliproxy-browser")
 	if libexecDirectory < 0 || browserSymlink < 0 || libexecDirectory > browserSymlink {
@@ -1454,7 +1549,8 @@ func TestNeoOrbContainerBindingCleanupOnlyClearsMatchingBinding(t *testing.T) {
 	actor := neoOrbTestActor(rt, threadID)
 	t.Cleanup(actor.cancel)
 	manager := rt.orbManagerFor()
-	if err := manager.persistContainerBinding(actor, "replacement-container"); err != nil {
+	portalToken := strings.Repeat("p", neoOrbPortalTokenByteCount)
+	if err := manager.persistContainerBinding(actor, "replacement-container", portalToken); err != nil {
 		t.Fatalf("persist replacement binding: %v", err)
 	}
 
@@ -1462,9 +1558,48 @@ func TestNeoOrbContainerBindingCleanupOnlyClearsMatchingBinding(t *testing.T) {
 	if binding := readNeoOrbPersistedBinding(t, rt, threadID); binding != "replacement-container" {
 		t.Fatalf("nonmatching cleanup changed binding: %q", binding)
 	}
+	if token := readNeoOrbPersistedPortalToken(t, rt, threadID); token != portalToken {
+		t.Fatalf("nonmatching cleanup changed portal token: %q", token)
+	}
 	manager.clearContainerBinding(actor, "replacement-container")
 	if binding := readNeoOrbPersistedBinding(t, rt, threadID); binding != "" {
 		t.Fatalf("matching cleanup retained binding: %q", binding)
+	}
+	if token := readNeoOrbPersistedPortalToken(t, rt, threadID); token != "" {
+		t.Fatalf("matching cleanup retained portal token: %q", token)
+	}
+}
+
+func TestNeoOrbPortalTokenStaysLocal(t *testing.T) {
+	portalToken := strings.Repeat("p", neoOrbPortalTokenByteCount)
+	snapshot := neoCloudThreadSnapshot{
+		threadID: "T-019fdec9-b0cf-745d-8da4-f250184e870e",
+		meta: map[string]any{
+			neoOrbContainerIDMetaKey: "container-fake",
+			neoOrbPortalTokenMetaKey: portalToken,
+		},
+	}
+	if token := stringValue(mapValue(neoLocalPersistedThread(snapshot, nil)["meta"])[neoOrbPortalTokenMetaKey]); token != portalToken {
+		t.Fatalf("local snapshot portal token = %q", token)
+	}
+	for name, thread := range map[string]map[string]any{
+		"cloud": neoCloudThread(snapshot),
+		"web":   neoWebLocalThread(snapshot),
+	} {
+		if token := stringValue(mapValue(thread["meta"])[neoOrbPortalTokenMetaKey]); token != "" {
+			t.Fatalf("%s thread exposed portal token %q", name, token)
+		}
+	}
+	actor := &neoActor{threadID: snapshot.threadID, meta: cloneMap(snapshot.meta), settings: map[string]any{}, tools: map[string]neoToolSpec{}}
+	if token := stringValue(mapValue(actor.stateSnapshotResponse()["meta"])[neoOrbPortalTokenMetaKey]); token != "" {
+		t.Fatalf("actor state exposed portal token %q", token)
+	}
+	status, _ := neoRecentThreadStatusFromThreadMap(map[string]any{
+		"id":   snapshot.threadID,
+		"meta": cloneMap(snapshot.meta),
+	})
+	if token := stringValue(mapValue(status["meta"])[neoOrbPortalTokenMetaKey]); token != "" {
+		t.Fatalf("recent thread status exposed portal token %q", token)
 	}
 }
 
@@ -1477,7 +1612,7 @@ func TestNeoOrbExecutorEnvPublicURLOverride(t *testing.T) {
 			RuntimePublicURL: "https://amp-runtime.example.test",
 		}},
 	}
-	env := strings.Join(neoOrbExecutorEnv(cfg, "T-019fdec9-b0cf-745d-8da4-f250184e870e", "/work"), "\n")
+	env := strings.Join(neoOrbExecutorEnv(cfg, "T-019fdec9-b0cf-745d-8da4-f250184e870e", "/work", "portal-token"), "\n")
 	if !strings.Contains(env, "AMP_URL=https://amp-proxy.example.test") {
 		t.Fatalf("public-url override missing:\n%s", env)
 	}
@@ -1486,6 +1621,14 @@ func TestNeoOrbExecutorEnvPublicURLOverride(t *testing.T) {
 	}
 	if strings.Contains(env, "host.docker.internal") {
 		t.Fatalf("loopback rewrite leaked past the public-url override:\n%s", env)
+	}
+}
+
+func TestNeoOrbExecutorEnvRequiresPublicURLForWildcardBind(t *testing.T) {
+	cfg := &config.Config{Host: "0.0.0.0", Port: 8317}
+	env := strings.Join(neoOrbExecutorEnv(cfg, "T-019fdec9-b0cf-745d-8da4-f250184e870e", "/work", "portal-token"), "\n")
+	if !strings.Contains(env, "AMP_ORB_PORTAL_BASE_URL=\n") {
+		t.Fatalf("wildcard bind exposed an unusable browser portal URL:\n%s", env)
 	}
 }
 
