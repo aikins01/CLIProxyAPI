@@ -451,6 +451,23 @@ func TestValidateHeartbeatResponseAcceptsStoppedUnknownMode(t *testing.T) {
 	}
 }
 
+func TestValidateHeartbeatResponseAcceptsExplicitRunnerRejection(t *testing.T) {
+	acceptedID := "local-runner-accepted"
+	rejectedID := "local-runner-rejected"
+	intents := []heartbeatIntent{}
+	runners := []heartbeatRunnerIntents{{RunnerID: acceptedID, Intents: &intents}}
+	rejected := []heartbeatRunnerRejection{{RunnerID: rejectedID, Code: "working_directory_conflict", Message: "working directory is already registered by another live runner"}}
+	localBroker := &broker{workspacesByRunner: map[string]*workspaceConfig{acceptedID: {}, rejectedID: {}}}
+	response := heartbeatResponse{OK: true, Runners: &runners, RejectedRunners: &rejected}
+	if err := localBroker.validateHeartbeatResponse(response); err != nil {
+		t.Fatalf("validateHeartbeatResponse error = %v", err)
+	}
+	rejected[0].RunnerID = acceptedID
+	if err := localBroker.validateHeartbeatResponse(response); err == nil || !strings.Contains(err.Error(), "duplicate runner result") {
+		t.Fatalf("duplicate runner rejection error = %v", err)
+	}
+}
+
 func TestHeartbeatPayloadEmitsEmptyRunningThreadsArray(t *testing.T) {
 	workspace := workspaceConfig{RunnerID: "local-runner-approved", Path: "/workspace"}
 	localBroker := &broker{

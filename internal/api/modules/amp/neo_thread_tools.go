@@ -1002,6 +1002,7 @@ func (a *neoActor) executeLocalCreateThreadTool(pending neoPendingTool) (map[str
 }
 
 func (a *neoActor) localCreateThreadBody(input map[string]any, threadID string) (map[string]any, string, bool, error) {
+	a.rebindUnavailableWebLocalRunner()
 	a.mu.Lock()
 	parentEnvironment := cloneMap(a.environment)
 	parentMeta := cloneMap(a.meta)
@@ -1015,8 +1016,6 @@ func (a *neoActor) localCreateThreadBody(input map[string]any, threadID string) 
 	}
 	a.mu.Unlock()
 	parentWorkingDirectory, parentWorkspaceRoot := neoResolvedEnvironmentWorkspacePaths(parentEnvironment)
-	parentWorkingDirectory = neoExistingDirectory(parentWorkingDirectory)
-	parentWorkspaceRoot = neoExistingDirectory(parentWorkspaceRoot)
 
 	executor := strings.TrimSpace(stringValue(input["executor"]))
 	runnerID := firstNonEmptyString(input["runnerId"], input["runnerID"], input["runner_id"])
@@ -1054,6 +1053,11 @@ func (a *neoActor) localCreateThreadBody(input map[string]any, threadID string) 
 			return nil, "", false, errors.New("create_thread executor conflicts with runnerId")
 		}
 		runnerID = executor
+	}
+	orbExecutor := strings.EqualFold(executor, "orb")
+	if !orbExecutor {
+		parentWorkingDirectory = neoExistingDirectory(parentWorkingDirectory)
+		parentWorkspaceRoot = neoExistingDirectory(parentWorkspaceRoot)
 	}
 	explicitRunnerSelection := runnerID != ""
 	var ownedProjectDirectories map[string]map[string]struct{}
@@ -1108,7 +1112,7 @@ func (a *neoActor) localCreateThreadBody(input map[string]any, threadID string) 
 			workingDirectory = runnerWorkingDirectory
 		}
 	}
-	if runnerID == "" {
+	if runnerID == "" && !orbExecutor {
 		workingDirectory = neoExistingDirectory(rawWorkingDirectory)
 		if rawWorkingDirectory != "" && workingDirectory == "" {
 			return nil, "", false, errors.New("create_thread workingDirectory must be an existing directory on the proxy host")
@@ -1117,7 +1121,7 @@ func (a *neoActor) localCreateThreadBody(input map[string]any, threadID string) 
 			return nil, "", false, errors.New("create_thread workingDirectory must be within the current or an indexed project workspace")
 		}
 	}
-	if requestedProjectID != "" && runnerID == "" {
+	if requestedProjectID != "" && runnerID == "" && !orbExecutor {
 		projectDirectories := getOwnedProjectDirectories()[requestedProjectID]
 		if workingDirectory != "" {
 			if _, ok := projectDirectories[workingDirectory]; !ok {
@@ -1135,7 +1139,7 @@ func (a *neoActor) localCreateThreadBody(input map[string]any, threadID string) 
 		}
 	}
 	parentRunnerID := firstNonEmptyString(parentMeta["runnerId"], parentMeta["runnerID"])
-	if workingDirectory == "" && requestedProjectID == "" {
+	if workingDirectory == "" && requestedProjectID == "" && !orbExecutor {
 		if strings.EqualFold(executor, "local") && parentRunnerID != "" {
 			if projectID != "" {
 				var ambiguous bool
@@ -1155,12 +1159,12 @@ func (a *neoActor) localCreateThreadBody(input map[string]any, threadID string) 
 			}
 		}
 	}
-	if runnerID == "" && workingDirectory != "" {
+	if runnerID == "" && workingDirectory != "" && !orbExecutor {
 		workingDirectory = neoExistingDirectory(workingDirectory)
 	}
 	workspaceOverridesInheritedProject := false
 	workspaceProject := map[string]any(nil)
-	if requestedProjectID == "" && (rawWorkingDirectory != "" || explicitRunnerSelection) && workingDirectory != "" {
+	if !orbExecutor && requestedProjectID == "" && (rawWorkingDirectory != "" || explicitRunnerSelection) && workingDirectory != "" {
 		parentWorkspace := firstNonEmptyString(parentWorkspaceRoot, parentWorkingDirectory)
 		indexedProject := neoCreateThreadIndexedProjectForWorkingDirectory(a.runtime, workingDirectory)
 		indexedProjectID := firstNonEmptyString(indexedProject["id"], indexedProject["projectID"])
@@ -1177,7 +1181,7 @@ func (a *neoActor) localCreateThreadBody(input map[string]any, threadID string) 
 		}
 	}
 	workspaceRoot := workingDirectory
-	if runnerID == "" && requestedProjectID == "" && !workspaceOverridesInheritedProject && parentWorkspaceRoot != "" && neoThreadFilePathWithin(parentWorkspaceRoot, workingDirectory) {
+	if !orbExecutor && runnerID == "" && requestedProjectID == "" && !workspaceOverridesInheritedProject && parentWorkspaceRoot != "" && neoThreadFilePathWithin(parentWorkspaceRoot, workingDirectory) {
 		workspaceRoot = parentWorkspaceRoot
 	}
 
@@ -1264,6 +1268,7 @@ func (a *neoActor) localCreateThreadBody(input map[string]any, threadID string) 
 	body := map[string]any{
 		"threadId":         threadID,
 		"threadID":         threadID,
+		"parentThreadID":   parentThreadID,
 		"usesThreadActors": true,
 		"agentMode":        omitEmpty(agentMode),
 		"reasoningEffort":  omitEmpty(reasoningEffort),

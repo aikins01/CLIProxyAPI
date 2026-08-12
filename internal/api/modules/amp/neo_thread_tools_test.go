@@ -1981,7 +1981,11 @@ func TestNeoCreateThreadOrbExecutor(t *testing.T) {
 	enabled := true
 	rtOrbs := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{Orbs: config.AmpOrbs{Enabled: &enabled, Provider: "docker"}}})
 	orbParent := rtOrbs.store.ensureThreadActor("T-019f7000-0000-7000-8000-000000000042")
-	orbParent.updateEnvironment(map[string]any{"workingDirectory": neoExistingDirectory(t.TempDir())})
+	orbParent.mu.Lock()
+	orbParent.environment = map[string]any{"workingDirectory": "/Users/runner/Developer/project", "workspaceRoot": "/Users/runner/Developer/project"}
+	orbParent.meta["projectID"] = "019f7000-0000-7000-8000-000000000044"
+	orbParent.meta["repositoryURL"] = "https://github.com/example/project.git"
+	orbParent.mu.Unlock()
 	body, _, _, err := orbParent.localCreateThreadBody(input, "T-019f7000-0000-7000-8000-000000000043")
 	if err != nil {
 		t.Fatalf("orb create_thread body error: %v", err)
@@ -1989,5 +1993,8 @@ func TestNeoCreateThreadOrbExecutor(t *testing.T) {
 	meta := mapValue(body["threadMeta"])
 	if stringValue(body["executorType"]) != "sandbox" || stringValue(meta["executorType"]) != "sandbox" {
 		t.Fatalf("orb executorType = %#v", body)
+	}
+	if stringValue(body["workingDirectory"]) != "" || stringValue(meta["repositoryURL"]) != "https://github.com/example/project.git" {
+		t.Fatalf("orb inherited host directory instead of repository metadata: %#v", body)
 	}
 }
