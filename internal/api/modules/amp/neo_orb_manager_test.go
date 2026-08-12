@@ -1336,8 +1336,10 @@ func TestNeoOrbToolchainPlanPinsVersionsAndArchitectures(t *testing.T) {
 		}
 	}
 	readyGuard := strings.Index(amd64, "tools_ready=true")
+	readyExit := strings.Index(amd64, "exit 0")
+	markerInvalidation := strings.Index(amd64, "rm -f "+shellQuoteNeoOrb(neoOrbAgentBrowserSmokeMarker()))
 	install := strings.Index(amd64, "apt-get update")
-	if readyGuard < 0 || install < 0 || readyGuard >= install || !strings.Contains(amd64, "readlink /usr/local/libexec/cliproxy-browser") {
+	if readyGuard < 0 || readyExit < 0 || markerInvalidation < 0 || install < 0 || readyGuard >= readyExit || readyExit >= markerInvalidation || markerInvalidation >= install || !strings.Contains(amd64, "readlink /usr/local/libexec/cliproxy-browser") {
 		t.Fatalf("amd64 toolchain does not validate pinned tools before installation")
 	}
 	if !strings.Contains(amd64, "github.com/vercel-labs/agent-browser/releases/download/v"+neoOrbAgentBrowserVersion+"/agent-browser-linux-x64") || strings.Contains(amd64, "registry.npmjs.org/agent-browser") {
@@ -1367,6 +1369,9 @@ func TestNeoOrbToolchainPlanPinsVersionsAndArchitectures(t *testing.T) {
 	if !strings.Contains(arm64, "agent-browser-linux-arm64") {
 		t.Fatalf("arm64 agent-browser release selection is incorrect")
 	}
+	if !strings.Contains(arm64, "rm -f "+shellQuoteNeoOrb(neoOrbAgentBrowserSmokeMarker())) {
+		t.Fatal("arm64 toolchain mutation does not invalidate the browser smoke marker")
+	}
 	if _, err := neoOrbToolchainInstallScript("ppc64le"); err == nil {
 		t.Fatal("unsupported architecture accepted")
 	}
@@ -1380,7 +1385,7 @@ func TestNeoOrbAgentBrowserIsolationAndSmoke(t *testing.T) {
 	if neoOrbBrowserNamespace(firstThread) == neoOrbBrowserNamespace(secondThread) || len(neoOrbBrowserNamespace(firstThread)) > 32 {
 		t.Fatal("browser namespace is not stable, bounded, and thread-specific")
 	}
-	if err := manager.orbConfigureAgentBrowser(context.Background(), fake, "container", firstThread); err != nil {
+	if err := manager.orbConfigureAgentBrowser(context.Background(), fake, "container", firstThread, true); err != nil {
 		t.Fatalf("orbConfigureAgentBrowser: %v", err)
 	}
 	fake.mu.Lock()
@@ -1398,9 +1403,28 @@ func TestNeoOrbAgentBrowserIsolationAndSmoke(t *testing.T) {
 		}
 	}
 	joined := strings.Join(fake.calls, "\n")
-	for _, required := range []string{"doctor --offline --quick", "data:text/html", "get title", "snapshot -i", "close --all"} {
+	for _, required := range []string{"doctor --offline --quick", neoOrbAgentBrowserSmokeMarker(), "data:text/html", "get title", "snapshot -i", "close --all"} {
 		if !strings.Contains(joined, required) {
 			t.Fatalf("browser smoke missing %q:\n%s", required, joined)
+		}
+	}
+	if marker := strings.Index(joined, neoOrbAgentBrowserSmokeMarker()); marker < 0 || marker > strings.Index(joined, "data:text/html") {
+		t.Fatalf("browser smoke marker does not bypass the interactive probe:\n%s", joined)
+	}
+	if !strings.Contains(joined, "rm -f "+shellQuoteNeoOrb(neoOrbAgentBrowserSmokeMarker())) {
+		t.Fatalf("browser smoke marker is not consumed after the prewarm bypass:\n%s", joined)
+	}
+	fake.calls = nil
+	if err := manager.orbConfigureAgentBrowser(context.Background(), fake, "container", firstThread, false); err != nil {
+		t.Fatalf("orbConfigureAgentBrowser recovery: %v", err)
+	}
+	recovery := strings.Join(fake.calls, "\n")
+	if strings.Contains(recovery, "test -f "+shellQuoteNeoOrb(neoOrbAgentBrowserSmokeMarker())) || !strings.Contains(recovery, "rm -f "+shellQuoteNeoOrb(neoOrbAgentBrowserSmokeMarker())) {
+		t.Fatalf("recovery trusted a browser smoke marker:\n%s", recovery)
+	}
+	for _, required := range []string{"data:text/html", "get title", "snapshot -i", "close --all"} {
+		if !strings.Contains(recovery, required) {
+			t.Fatalf("recovery browser smoke missing %q:\n%s", required, recovery)
 		}
 	}
 }
@@ -1457,10 +1481,27 @@ func TestNeoOrbConcurrentResumeClaimsOnce(t *testing.T) {
 	manager.mu.Unlock()
 	fake.mu.Lock()
 	fake.inspectState.Paused = true
+	fake.detachedStart = make(chan struct{}, 1)
+	fake.detachedResume = make(chan struct{})
+	detachedStart := fake.detachedStart
+	detachedResume := fake.detachedResume
 	fake.mu.Unlock()
+	t.Cleanup(func() {
+		select {
+		case <-detachedResume:
+		default:
+			close(detachedResume)
+		}
+	})
 
 	actor.spawnExecutor(map[string]any{"requestId": "resume-one"})
+	select {
+	case <-detachedStart:
+	case <-time.After(time.Second):
+		t.Fatal("first resume did not reach executor restart")
+	}
 	second := actor.spawnExecutor(map[string]any{"requestId": "resume-two"})
+	close(detachedResume)
 	waitNeoOrbState(t, manager, threadID, neoOrbStateRunning)
 	if fake.callCount("unpause:container-fake") != 1 {
 		t.Fatalf("concurrent resumes unpause count = %d: %#v", fake.callCount("unpause:container-fake"), fake.calls)
