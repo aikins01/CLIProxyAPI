@@ -1038,8 +1038,8 @@ func TestWebLocalInferenceUserscriptShellPayloadPreservesExecutorType(t *testing
 			throw new Error("shell thread metadata was not preserved: " + JSON.stringify(call));
 		}
 	}
-	if (calls[0].runnerId || calls[0].spawnExecutor !== undefined || calls[1].runnerId || calls[1].spawnExecutor !== false || calls[1].threadMeta.runnerId) {
-		throw new Error("runner intent leaked into shell payload: " + JSON.stringify(calls));
+	if (calls[0].runnerId || calls[0].spawnExecutor !== undefined || calls[1].runnerId !== "local-runner-a" || calls[1].spawnExecutor !== false || calls[1].threadMeta.runnerId) {
+		throw new Error("runner reservation was not isolated from cloud thread metadata: " + JSON.stringify(calls));
 	}
 })().catch((error) => { console.error(error && error.stack ? error.stack : error); process.exit(1); });
 `
@@ -1104,12 +1104,11 @@ func TestWebLocalInferenceUserscriptRequiresExactLiveRunner(t *testing.T) {
 	fetchRunners = [{ runnerId: "local-runner-a", workingDirectory: directory + "/", hostname: "Mac" }];
 	await createLocalThread("hello", directory + "/nested/.././", {}, "local");
 	assert(fetched === 1, "local creation did not force a runner refresh");
-	assert(calls.length === 2, "local creation did not create shell and actor");
-	assert(!calls[0].body.runnerId && !calls[0].body.threadMeta.runnerId, "runner intent leaked into shell request: " + JSON.stringify(calls[0]));
-		assert(calls[0].body.spawnExecutor === false, "shell executor spawn not disabled in " + JSON.stringify(calls[0]));
-		assert(calls[1].body.runnerId === "local-runner-a", "runnerId missing from actor request: " + JSON.stringify(calls[1]));
-		assert(calls[1].body.spawnExecutor === false, "actor executor spawn not disabled in " + JSON.stringify(calls[1]));
-		assert(calls[1].body.threadMeta.runnerId === "local-runner-a", "nested runnerId missing from actor request: " + JSON.stringify(calls[1]));
+	assert(calls.length === 1, "local creation was not atomic");
+	assert(calls[0].body.runnerId === "local-runner-a", "runnerId missing from create request: " + JSON.stringify(calls[0]));
+	assert(!calls[0].body.threadMeta.runnerId, "runnerId leaked into cloud thread metadata: " + JSON.stringify(calls[0]));
+		assert(calls[0].body.spawnExecutor === false, "executor spawn not disabled in " + JSON.stringify(calls[0]));
+		assert(calls[0].body.prompt === "hello", "initial prompt was not created atomically: " + JSON.stringify(calls[0]));
 	assert(calls.every((call) => call.body.workingDirectory === directory), "catalog path did not replace browser path: " + JSON.stringify(calls));
 
 	calls.length = 0;
@@ -1139,7 +1138,7 @@ func TestWebLocalInferenceUserscriptRequiresExactLiveRunner(t *testing.T) {
 	fetched = 0;
 	await createLocalThread("hello", directory, {}, "orb");
 	assert(fetched === 0, "Orb creation unexpectedly fetched a local runner");
-	assert(calls.length === 2 && calls.every((call) => call.body.executorType === "sandbox"), "Orb classification changed: " + JSON.stringify(calls));
+	assert(calls.length === 1 && calls.every((call) => call.body.executorType === "sandbox"), "Orb classification changed: " + JSON.stringify(calls));
 	assert(calls.every((call) => !call.body.runnerId && call.body.spawnExecutor === undefined), "Orb payload gained runner fields: " + JSON.stringify(calls));
 })().catch((error) => { console.error(error && error.stack ? error.stack : error); process.exit(1); });
 `

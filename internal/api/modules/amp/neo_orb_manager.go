@@ -582,7 +582,7 @@ func (m *neoOrbManager) provisionOrb(a *neoActor, record *neoOrbRecord, spawnID,
 		fail("tools", "Cannot prepare orb tooling", err)
 		return
 	}
-	if err := m.orbConfigureAgentBrowser(setupCtx, client, containerID, threadID); err != nil {
+	if err := m.orbConfigureAgentBrowser(setupCtx, client, containerID, threadID, true); err != nil {
 		fail("browser", "Cannot prepare the isolated orb browser", err)
 		return
 	}
@@ -766,6 +766,7 @@ if "$tools_ready" &&
   %[13]s; then
   exit 0
 fi
+rm -f %[14]s
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq git git-lfs gh curl ca-certificates tmux supervisor ripgrep fd-find jq unzip zip xz-utils openssh-client rsync procps lsof netcat-openbsd dnsutils iputils-ping sqlite3 less file util-linux build-essential python3 python3-pip python3-venv pkg-config fonts-liberation libasound2 libatk-bridge2.0-0 libatk1.0-0 libcups2 libdbus-1-3 libdrm2 libgbm1 libglib2.0-0 libgtk-3-0 libnspr4 libnss3 libpango-1.0-0 libx11-6 libx11-xcb1 libxcb1 libxcomposite1 libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2 xdg-utils%[1]s >/dev/null
@@ -803,7 +804,7 @@ test "$(node --version)" = "v%[2]s"
 test "$(pnpm --version)" = "%[5]s"
 test "$(bun --version)" = "%[6]s"
 test "$(/usr/local/libexec/agent-browser-native --version)" = "agent-browser %[9]s"
-`, chromiumPackage, neoOrbNodeVersion, nodeArch, nodeSHA, neoOrbPNPMVersion, neoOrbBunVersion, bunArch, bunSHA, neoOrbAgentBrowserVersion, agentBrowserSHA, nodeArch, browserInstall, browserReady), nil
+`, chromiumPackage, neoOrbNodeVersion, nodeArch, nodeSHA, neoOrbPNPMVersion, neoOrbBunVersion, bunArch, bunSHA, neoOrbAgentBrowserVersion, agentBrowserSHA, nodeArch, browserInstall, browserReady, shellQuoteNeoOrb(neoOrbAgentBrowserSmokeMarker())), nil
 }
 
 func neoOrbBrowserNamespace(threadID string) string {
@@ -811,7 +812,11 @@ func neoOrbBrowserNamespace(threadID string) string {
 	return fmt.Sprintf("orb-%x", digest[:12])
 }
 
-func (m *neoOrbManager) orbConfigureAgentBrowser(ctx context.Context, client neoOrbProviderClient, containerID, threadID string) error {
+func neoOrbAgentBrowserSmokeMarker() string {
+	return fmt.Sprintf("/opt/cliproxy-orb-browser-smoke/%s-%s", neoOrbAgentBrowserVersion, neoOrbChromeVersion)
+}
+
+func (m *neoOrbManager) orbConfigureAgentBrowser(ctx context.Context, client neoOrbProviderClient, containerID, threadID string, allowPrewarmAttestation bool) error {
 	namespace := neoOrbBrowserNamespace(threadID)
 	wrapper := fmt.Sprintf(`#!/bin/sh
 set -eu
@@ -829,17 +834,22 @@ exec /usr/local/libexec/agent-browser-native "$@"
 	if err := client.CopyFileToContainer(ctx, containerID, neoOrbAgentBrowserPath, []byte(wrapper), 0o755); err != nil {
 		return err
 	}
-	smoke := `set -eu
-fail() { printf 'agent-browser smoke failed at %s\n' "$1" >&2; exit 1; }
-output="$(agent-browser doctor --offline --quick 2>&1)" || { printf '%s\n' "$output" >&2; fail doctor; }
+	markerAction := "rm -f " + shellQuoteNeoOrb(neoOrbAgentBrowserSmokeMarker())
+	if allowPrewarmAttestation {
+		markerAction = fmt.Sprintf("if test -f %[1]s; then\n  rm -f %[1]s\n  exit 0\nfi", shellQuoteNeoOrb(neoOrbAgentBrowserSmokeMarker()))
+	}
+	smoke := fmt.Sprintf(`set -eu
+fail() { printf 'agent-browser smoke failed at %%s\n' "$1" >&2; exit 1; }
+output="$(agent-browser doctor --offline --quick 2>&1)" || { printf '%%s\n' "$output" >&2; fail doctor; }
+%[1]s
 trap 'agent-browser close --all >/dev/null 2>&1 || true' EXIT
-output="$(agent-browser open 'data:text/html,<title>cliproxy-orb-browser-smoke</title><button>ready</button>' 2>&1)" || { printf '%s\n' "$output" >&2; fail open; }
-title="$(agent-browser get title 2>&1)" || { printf '%s\n' "$title" >&2; fail title; }
-test "$title" = cliproxy-orb-browser-smoke || { printf 'unexpected browser title: %s\n' "$title" >&2; fail title; }
-snapshot="$(agent-browser snapshot -i 2>&1)" || { printf '%s\n' "$snapshot" >&2; fail snapshot; }
-printf '%s\n' "$snapshot" | grep -F button >/dev/null || { printf '%s\n' "$snapshot" >&2; fail snapshot; }
+output="$(agent-browser open 'data:text/html,<title>cliproxy-orb-browser-smoke</title><button>ready</button>' 2>&1)" || { printf '%%s\n' "$output" >&2; fail open; }
+title="$(agent-browser get title 2>&1)" || { printf '%%s\n' "$title" >&2; fail title; }
+test "$title" = cliproxy-orb-browser-smoke || { printf 'unexpected browser title: %%s\n' "$title" >&2; fail title; }
+snapshot="$(agent-browser snapshot -i 2>&1)" || { printf '%%s\n' "$snapshot" >&2; fail snapshot; }
+printf '%%s\n' "$snapshot" | grep -F button >/dev/null || { printf '%%s\n' "$snapshot" >&2; fail snapshot; }
 agent-browser close --all >/dev/null 2>&1 || fail close
-trap - EXIT`
+trap - EXIT`, markerAction)
 	result, err := client.Exec(ctx, containerID, []string{"timeout", "90", "/bin/sh", "-lc", smoke}, nil, "/")
 	if err != nil {
 		return err
@@ -1200,7 +1210,7 @@ func (m *neoOrbManager) prepareRecoveredOrb(ctx context.Context, cfg *config.Con
 	if err := m.orbStopRecoveredExecutor(ctx, client, record.containerID); err != nil {
 		return fmt.Errorf("stop stale executor: %w", err)
 	}
-	if err := m.orbConfigureAgentBrowser(ctx, client, record.containerID, record.threadID); err != nil {
+	if err := m.orbConfigureAgentBrowser(ctx, client, record.containerID, record.threadID, false); err != nil {
 		return fmt.Errorf("prepare browser: %w", err)
 	}
 	if err := m.orbInstallExecutor(ctx, cfg, client, record.containerID); err != nil {
