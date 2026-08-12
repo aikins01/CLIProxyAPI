@@ -556,7 +556,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 	}
 	for _, want := range []string{
 		"// ==UserScript==",
-		"@version 0.1.202",
+		"@version 0.1.206",
 		"@match https://ampcode.com/*",
 		"@updateURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
 		"@downloadURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
@@ -573,7 +573,12 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"commandPaletteIntegrationCount",
 		"localThreadPickerOpenCount",
 		"removedLocalThreadControlCount",
-		`const userscriptVersion = "0.1.202"`,
+		`const userscriptVersion = "0.1.206"`,
+		"const legacyLocalProjectUI = false;",
+		"disableLegacyLocalProjectUI",
+		"if (!legacyLocalProjectUI) {",
+		"localProjectIntegrationGeneration += 1;",
+		"legacyLocalProjectUI && shouldPatchProjectListResponseJSON(response)",
 		"localThreadSearchEndpointPath",
 		"fetchLocalThreadSearch",
 		"mergeThreadSearchResponse",
@@ -1169,6 +1174,7 @@ func TestWebLocalInferenceUserscriptScopesDelayedAPIKeyHydration(t *testing.T) {
 		{name: "legacy session key migrates after identity", baseURL: "http://127.0.0.1:8317", scenario: "legacy"},
 		{name: "legacy key cannot overwrite scoped key", baseURL: "http://127.0.0.1:8317", scenario: "legacy-existing"},
 		{name: "corrected credential retries hydration", baseURL: "http://127.0.0.1:8317", scenario: "retry"},
+		{name: "non-auth forbidden response preserves credential", baseURL: "http://127.0.0.1:8317", scenario: "forbidden"},
 		{name: "forgotten credential invalidates hydration", baseURL: "http://127.0.0.1:8317", scenario: "forget"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -1294,6 +1300,9 @@ globalThis.fetch = async (input) => {
 		}
 		if (scenario === "retry" && localProjectsFetchCount === 1) {
 			return new Response(JSON.stringify({ error: "invalid api key" }), { status: 401, headers: { "Content-Type": "application/json" } });
+		}
+		if (scenario === "forbidden") {
+			return new Response(JSON.stringify({ error: "remote access forbidden" }), { status: 403, headers: { "Content-Type": "application/json" } });
 		}
 		if (scenario === "forget" && localProjectsFetchCount === 1) {
 			await localProjectsFetchGate;
@@ -1451,15 +1460,25 @@ if (scenario === "base") {
 	assert(promptCount === 1 && localProjectsFetchCount === 0, "local-base switch did not prompt independently without hydrating");
 	return;
 }
-assert(bridge.storedLocalAPIKey() === "persistent-key", "delayed identity did not reuse its scoped persistent key");
-assert(promptCount === 0 && localProjectsFetchCount === 1, "delayed identity did not hydrate exactly once without prompting");
 if (scenario === "retry") {
+	assert(bridge.storedLocalAPIKey() === "", "rejected scoped API key remained available after 401");
+	assert(globalThis.sessionStorage.getItem(bridge.sessionLocalAPIKeyStorageKey()) === null, "rejected scoped API key remained in session storage");
+	assert(globalThis.localStorage.getItem(bridge.persistentLocalAPIKeyStorageKey()) === null, "rejected scoped API key remained in persistent storage");
+	assert(promptCount === 0 && localProjectsFetchCount === 1, "rejected passive hydration prompted or retried automatically");
 	bridge.rememberLocalAPIKey("corrected-key");
 	await new Promise((resolve) => setTimeout(resolve, 20));
 	assert(bridge.storedLocalAPIKey() === "corrected-key", "corrected scoped API key was not retained");
 	assert(localProjectsFetchCount === 2, "corrected scoped API key did not retry failed passive hydration");
 	return;
 }
+if (scenario === "forbidden") {
+	assert(bridge.storedLocalAPIKey() === "persistent-key", "non-auth 403 removed a valid scoped API key");
+	assert(globalThis.localStorage.getItem(bridge.persistentLocalAPIKeyStorageKey()) === "persistent-key", "non-auth 403 removed persistent storage");
+	assert(promptCount === 0 && localProjectsFetchCount === 1, "non-auth 403 prompted or retried automatically");
+	return;
+}
+assert(bridge.storedLocalAPIKey() === "persistent-key", "delayed identity did not reuse its scoped persistent key");
+assert(promptCount === 0 && localProjectsFetchCount === 1, "delayed identity did not hydrate exactly once without prompting");
 if (scenario !== "account") return;
 const viewerAArchivedThreadID = "T-019f324b-2802-7868-b1b1-5f0fa3e87e99";
 assert(bridge.localSidebarArchivedThreadID(viewerAArchivedThreadID), "first account archive state was not hydrated");
@@ -2218,7 +2237,7 @@ if (typeof globalThis.btoa !== "function") {
 	require(scriptPath);
 	const bridge = globalThis.__cliproxyAmpLocalInference;
 	const regroupTestBridge = globalThis.__cliproxyAmpLocalInferenceTest;
-assert(bridge && bridge.userscriptVersion === "0.1.202", "bridge userscript version was not exposed");
+assert(bridge && bridge.userscriptVersion === "0.1.206", "bridge userscript version was not exposed");
 	assert(typeof regroupTestBridge?.requestLocalSidebarProjectRegroup === "function", "sidebar regroup test bridge was not exposed");
 	const projectPageTitle = globalThis.document.title;
 	const validProjectHost = new FakeElement("main");
@@ -2235,7 +2254,7 @@ assert(bridge && bridge.userscriptVersion === "0.1.202", "bridge userscript vers
 	assert(!regroupTestBridge.localSidebarProjectMatches(sharedRepositoryCheckout, sharedRepositoryWorktree), "same-repository worktrees matched as one sidebar project");
 	assert(regroupTestBridge.diffCaptureReadThreadID("/api/threads/%E0%A4%A/diff-captures/latest") === "", "malformed diff-capture thread path was not rejected");
 	assert(globalThis.document.documentElement.getAttribute("data-cliproxy-local-sidebar-hydrating") === "1", "sidebar hydration gate was not installed before rendering");
-assert(globalThis.document.documentElement.getAttribute("data-cliproxy-local-inference-version") === "0.1.202", "userscript version was not exposed on the document root");
+assert(globalThis.document.documentElement.getAttribute("data-cliproxy-local-inference-version") === "0.1.206", "userscript version was not exposed on the document root");
 	class InstrumentedWebSocket extends WebSocket {}
 	const instrumentedSocket = new InstrumentedWebSocket("wss://ampcode.com/gateway/userActor/?rvt-method=get&rvt-key=subclass-test");
 	assert(instrumentedSocket instanceof InstrumentedWebSocket, "patched WebSocket discarded a derived constructor prototype");
@@ -4142,6 +4161,7 @@ func TestWebLocalInferenceUserscriptProjectPickerPrefersVisibleProject(t *testin
 	dir := t.TempDir()
 	scriptPath := filepath.Join(dir, "local-inference.user.js")
 	script := ampWebLocalInferenceUserscript("http://127.0.0.1:8317", nil)
+	script = strings.Replace(script, "\tconst legacyLocalProjectUI = false;", "\tconst legacyLocalProjectUI = true;", 1)
 	exported := strings.Replace(script, "\tglobalThis.__cliproxyAmpLocalInference = {", "\tglobalThis.__cliproxyAmpLocalInferenceProjectListTest = { mergeProjectListResponse };\n\tglobalThis.__cliproxyAmpLocalInference = {", 1)
 	if exported == script {
 		t.Fatal("userscript missing local inference bridge")
@@ -6446,9 +6466,8 @@ func TestWebLocalInferenceLocalProjectsRoute(t *testing.T) {
 	if response["ok"] != true || len(projects) != 2 {
 		t.Fatalf("local projects response = %#v", response)
 	}
-	homeDirectory := neoDefaultWebLocalWorkingDirectory()
-	if stringValue(response["defaultWorkingDirectory"]) != homeDirectory {
-		t.Fatalf("defaultWorkingDirectory = %#v, want %q", response["defaultWorkingDirectory"], homeDirectory)
+	if stringValue(response["defaultWorkingDirectory"]) != "" {
+		t.Fatalf("defaultWorkingDirectory = %#v, want no server-home browser default", response["defaultWorkingDirectory"])
 	}
 	var project map[string]any
 	for _, rawProject := range projects {
@@ -6847,6 +6866,8 @@ func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.
 		localProjectThreadID  = "T-019f20b2-5e05-7501-8ddd-994e151ee959"
 		projectOnlyThreadID   = "T-019f20b2-5e05-7501-8ddd-994e151ee952"
 		runnerThreadID        = "T-019f20b2-5e05-7501-8ddd-994e151ee955"
+		runnerMismatchID      = "T-019f20b2-5e05-7501-8ddd-994e151ee957"
+		repositoryMismatchID  = "T-019f20b2-5e05-7501-8ddd-994e151ee958"
 		runnerOptOutThreadID  = "T-019f20b2-5e05-7501-8ddd-994e151ee956"
 		explicitFalseThreadID = "T-019f20b2-5e05-7501-8ddd-994e151ee954"
 		missingDirectoryID    = "T-019f20b2-5e05-7501-8ddd-994e151ee953"
@@ -6982,6 +7003,21 @@ func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.
 	}, ""); status != http.StatusOK {
 		t.Fatalf("seed parent status = %d", status)
 	}
+	userActor, _ := rt.store.upsert(map[string]any{"name": "userActor", "key": "user_cloud"}, true)
+	runnerSocket := &neoSocket{runnerID: "runner-local-test"}
+	runnerRegistration := mapValue(userActor.handleForSocket(runnerSocket, map[string]any{
+		"type": "registerRunner",
+		"args": []any{map[string]any{
+			"sessionId":        "session-local-test",
+			"hostname":         "Local Machine",
+			"workingDirectory": expectedWorkDir,
+			"repositoryURL":    neoFileURLForDirectory(expectedWorkDir),
+			"runningThreads":   []any{},
+		}},
+	}))
+	if runnerRegistration["ok"] != true {
+		t.Fatalf("runner registration = %#v", runnerRegistration)
+	}
 
 	imageData := testNeoPNGBase64(t, 1, 1)
 	requestBody := neoSvelteKitRemoteCommandBodyForTest(t, map[string]any{
@@ -6990,10 +7026,10 @@ func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.
 			map[string]any{"type": "text", "text": "Following @" + parentThreadID},
 		},
 		"agentMode":       "deep",
-		"spawnExecutor":   true,
 		"threadID":        threadID,
 		"projectID":       projectID,
 		"reasoningEffort": "medium",
+		"runnerId":        "runner-local-test",
 	})
 	req := httptest.NewRequest(http.MethodPost, "/_app/remote/3abror/createProjectThread?"+ampWebLocalInferenceAPIKeyQuery+"=local-key", strings.NewReader(requestBody))
 	req.Header.Set("Content-Type", "application/json")
@@ -7080,16 +7116,16 @@ func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.
 	if stringValue(meta["projectID"]) != projectID || stringValue(meta["ampcodeConnectorMode"]) != "local-neo" {
 		t.Fatalf("meta = %#v", meta)
 	}
-	if bootstrapExecutorType != "local-client" || spawnedCount != 1 {
+	if bootstrapExecutorType != "local-client" || spawnedCount != 0 {
 		t.Fatalf("executor bootstrap = type:%q spawned:%d", bootstrapExecutorType, spawnedCount)
 	}
 
 	localProjectBody := neoSvelteKitRemoteCommandBodyForTest(t, map[string]any{
-		"content":       []any{map[string]any{"type": "text", "text": "Use injected local project"}},
-		"agentMode":     "medium",
-		"spawnExecutor": true,
-		"threadID":      localProjectThreadID,
-		"projectID":     projectID,
+		"content":   []any{map[string]any{"type": "text", "text": "Use injected local project"}},
+		"agentMode": "medium",
+		"threadID":  localProjectThreadID,
+		"projectID": projectID,
+		"runnerId":  "runner-local-test",
 	})
 	expectedLocalProjectID := stringValue(rt.neoWebLocalProjectForWorkingDirectory(expectedWorkDir)["id"])
 	if expectedLocalProjectID == "" {
@@ -7126,6 +7162,7 @@ func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.
 		"threadID":        projectOnlyThreadID,
 		"projectID":       projectID,
 		"reasoningEffort": "high",
+		"runnerId":        "runner-local-test",
 	})
 	projectOnlyReq := httptest.NewRequest(http.MethodPost, "/_app/remote/3abror/createProjectThread?"+ampWebLocalInferenceAPIKeyQuery+"=local-key", strings.NewReader(projectOnlyBody))
 	projectOnlyReq.Header.Set("Content-Type", "application/json")
@@ -7159,23 +7196,8 @@ func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.
 	if got := stringValue(projectOnlyEnvironment["workingDirectory"]); got != expectedWorkDir {
 		t.Fatalf("project-only workingDirectory = %q, want %q", got, expectedWorkDir)
 	}
-	if projectOnlyBootstrapExecutorType != "local-client" || projectOnlySpawnedCount != 1 {
+	if projectOnlyBootstrapExecutorType != "local-client" || projectOnlySpawnedCount != 0 {
 		t.Fatalf("project-only executor bootstrap = type:%q spawned:%d", projectOnlyBootstrapExecutorType, projectOnlySpawnedCount)
-	}
-
-	userActor, _ := rt.store.upsert(map[string]any{"name": "userActor", "key": "user_cloud"}, true)
-	runnerSocket := &neoSocket{runnerID: "runner-local-test"}
-	runnerRegistration := mapValue(userActor.handleForSocket(runnerSocket, map[string]any{
-		"type": "registerRunner",
-		"args": []any{map[string]any{
-			"sessionId":        "session-local-test",
-			"hostname":         "Local Machine",
-			"workingDirectory": expectedWorkDir,
-			"runningThreads":   []any{},
-		}},
-	}))
-	if runnerRegistration["ok"] != true {
-		t.Fatalf("runner registration = %#v", runnerRegistration)
 	}
 
 	runnerBody := neoSvelteKitRemoteCommandBodyForTest(t, map[string]any{
@@ -7221,12 +7243,81 @@ func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.
 	if runnerBootstrapExecutorType != "local-client" || runnerSpawnedCount != 0 {
 		t.Fatalf("runner executor bootstrap = type:%q spawned:%d", runnerBootstrapExecutorType, runnerSpawnedCount)
 	}
+	mismatchDirectory := neoExistingDirectory(t.TempDir())
+	mismatchRunnerSocket := &neoSocket{runnerID: "runner-local-mismatch"}
+	mismatchRunnerRegistration := mapValue(userActor.handleForSocket(mismatchRunnerSocket, map[string]any{
+		"type": "registerRunner",
+		"args": []any{map[string]any{
+			"sessionId":        "session-local-mismatch",
+			"hostname":         "Local Machine",
+			"workingDirectory": mismatchDirectory,
+			"runningThreads":   []any{},
+		}},
+	}))
+	if mismatchRunnerRegistration["ok"] != true {
+		t.Fatalf("mismatch runner registration = %#v", mismatchRunnerRegistration)
+	}
+	mismatchRunnerBody := neoSvelteKitRemoteCommandBodyForTest(t, map[string]any{
+		"content":   []any{map[string]any{"type": "text", "text": "Reject mismatched runner"}},
+		"agentMode": "smart",
+		"threadID":  runnerMismatchID,
+		"projectID": projectID,
+		"runnerId":  "runner-local-mismatch",
+	})
+	mismatchRunnerReq := httptest.NewRequest(http.MethodPost, "/_app/remote/3abror/createProjectThread?"+ampWebLocalInferenceAPIKeyQuery+"=local-key", strings.NewReader(mismatchRunnerBody))
+	mismatchRunnerReq.Header.Set("Content-Type", "application/json")
+	mismatchRunnerReq.Header.Set("Origin", "https://ampcode.com")
+	mismatchRunnerReq.Header.Set(ampWebLocalInferenceHeader, "1")
+	mismatchRunnerRec := httptest.NewRecorder()
+	r.ServeHTTP(mismatchRunnerRec, mismatchRunnerReq)
+	if mismatchRunnerRec.Code != http.StatusOK {
+		t.Fatalf("mismatch runner create status = %d, body=%s", mismatchRunnerRec.Code, mismatchRunnerRec.Body.String())
+	}
+	mismatchRunnerResult := mapValue(decodeSvelteKitRemoteEnvelopeForTest(t, mismatchRunnerRec.Body.Bytes())["_"])
+	if mismatchRunnerResult["ok"] != false || stringValue(mapValue(mismatchRunnerResult["error"])["message"]) != "selected local runner does not match the selected project" {
+		t.Fatalf("mismatch runner create result = %#v", mismatchRunnerResult)
+	}
+	if actor := rt.store.lookupThreadActor(runnerMismatchID); actor != nil {
+		t.Fatalf("mismatched runner created actor %#v", actor)
+	}
+	repositoryMismatchBody := neoSvelteKitRemoteCommandBodyForTest(t, map[string]any{
+		"content":       []any{map[string]any{"type": "text", "text": "Reject mismatched repository"}},
+		"agentMode":     "smart",
+		"threadID":      repositoryMismatchID,
+		"projectID":     projectID,
+		"runnerId":      "runner-local-test",
+		"repositoryURL": "https://github.com/example/wrong-project.git",
+	})
+	repositoryMismatchReq := httptest.NewRequest(http.MethodPost, "/_app/remote/3abror/createProjectThread?"+ampWebLocalInferenceAPIKeyQuery+"=local-key", strings.NewReader(repositoryMismatchBody))
+	repositoryMismatchReq.Header.Set("Content-Type", "application/json")
+	repositoryMismatchReq.Header.Set("Origin", "https://ampcode.com")
+	repositoryMismatchReq.Header.Set(ampWebLocalInferenceHeader, "1")
+	repositoryMismatchRec := httptest.NewRecorder()
+	r.ServeHTTP(repositoryMismatchRec, repositoryMismatchReq)
+	if repositoryMismatchRec.Code != http.StatusOK {
+		t.Fatalf("repository mismatch create status = %d, body=%s", repositoryMismatchRec.Code, repositoryMismatchRec.Body.String())
+	}
+	repositoryMismatchResult := mapValue(decodeSvelteKitRemoteEnvelopeForTest(t, repositoryMismatchRec.Body.Bytes())["_"])
+	if repositoryMismatchResult["ok"] != false || !strings.Contains(stringValue(mapValue(repositoryMismatchResult["error"])["message"]), "selected repository does not match") {
+		t.Fatalf("repository mismatch create result = %#v", repositoryMismatchResult)
+	}
+	if actor := rt.store.lookupThreadActor(repositoryMismatchID); actor != nil {
+		t.Fatalf("mismatched repository created actor %#v", actor)
+	}
 	runnerHeartbeat := mapValue(userActor.handleForSocket(runnerSocket, map[string]any{
 		"type": "runnerHeartbeat",
 		"args": []any{map[string]any{"sessionId": "session-local-test", "runningThreads": []any{}}},
 	}))
 	runnerIntents := arrayValue(runnerHeartbeat["intents"])
-	if runnerHeartbeat["ok"] != true || len(runnerIntents) != 1 || stringValue(mapValue(runnerIntents[0])["threadId"]) != runnerThreadID || stringValue(mapValue(runnerIntents[0])["desired"]) != "running" {
+	foundRunnerIntent := false
+	for _, rawIntent := range runnerIntents {
+		intent := mapValue(rawIntent)
+		if stringValue(intent["threadId"]) == runnerThreadID && stringValue(intent["desired"]) == "running" {
+			foundRunnerIntent = true
+			break
+		}
+	}
+	if runnerHeartbeat["ok"] != true || !foundRunnerIntent {
 		t.Fatalf("runner heartbeat = %#v", runnerHeartbeat)
 	}
 
