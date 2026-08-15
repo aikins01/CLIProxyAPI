@@ -213,6 +213,56 @@ func TestEnsureCacheControl(t *testing.T) {
 			t.Errorf("existing cache_control should be preserved. Output: %s", string(output))
 		}
 	})
+
+	t.Run("Preserves Four Client Breakpoints", func(t *testing.T) {
+		input := []byte(`{
+			"tools": [{"name": "tool1"}],
+			"system": [{"type": "text", "text": "System"}],
+			"messages": [
+				{"role": "user", "content": [
+					{"type": "text", "text": "One", "cache_control": {"type": "ephemeral"}},
+					{"type": "text", "text": "Two", "cache_control": {"type": "ephemeral"}},
+					{"type": "text", "text": "Three", "cache_control": {"type": "ephemeral"}},
+					{"type": "text", "text": "Four", "cache_control": {"type": "ephemeral"}}
+				]}
+			]
+		}`)
+
+		output := ensureCacheControl(input)
+
+		if countCacheControls(output) != maxClaudeCacheControlBlocks {
+			t.Fatalf("cache_control count = %d, want %d", countCacheControls(output), maxClaudeCacheControlBlocks)
+		}
+		if gjson.GetBytes(output, "tools.0.cache_control").Exists() {
+			t.Fatal("tool cache_control should not displace a client breakpoint")
+		}
+		if gjson.GetBytes(output, "system.0.cache_control").Exists() {
+			t.Fatal("system cache_control should not displace a client breakpoint")
+		}
+	})
+
+	t.Run("Preserves One Hour TTL Ordering", func(t *testing.T) {
+		input := []byte(`{
+			"tools": [{"name": "tool1"}],
+			"system": [{"type": "text", "text": "System"}],
+			"messages": [
+				{"role": "user", "content": [{"type": "text", "text": "Old"}]},
+				{"role": "user", "content": [{"type": "text", "text": "Cached", "cache_control": {"type": "ephemeral", "ttl": "1h"}}]}
+			]
+		}`)
+
+		output := normalizeCacheControlTTL(ensureCacheControl(input))
+
+		for _, path := range []string{
+			"tools.0.cache_control.ttl",
+			"system.0.cache_control.ttl",
+			"messages.1.content.0.cache_control.ttl",
+		} {
+			if got := gjson.GetBytes(output, path).String(); got != "1h" {
+				t.Fatalf("%s = %q, want 1h", path, got)
+			}
+		}
+	})
 }
 
 // TestCacheControlOrder verifies the correct order: tools -> system -> messages

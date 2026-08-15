@@ -2,11 +2,15 @@ package amp
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
+	"crypto/sha1"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"math"
 	"os"
@@ -22,20 +26,43 @@ import (
 )
 
 const (
-	neoReviewMaxChangedFiles         = 100
-	neoReviewMaxChangedLines         = 10000
-	neoReviewMaxChangedBytes         = 4 * 1024 * 1024
-	neoReviewSnapshotHashKey         = "internal.reviewSnapshotHash"
-	neoReviewSnapshotFilesKey        = "internal.reviewSnapshotFiles"
-	neoReviewSnapshotHunksKey        = "internal.reviewSnapshotHunks"
-	neoReviewSnapshotLinesKey        = "internal.reviewSnapshotChangedLines"
-	neoReviewSnapshotDeletedLinesKey = "internal.reviewSnapshotDeletedLines"
-	neoReviewSnapshotDeletedKey      = "internal.reviewSnapshotDeletedFiles"
-	neoReviewSnapshotZeroLineKey     = "internal.reviewSnapshotZeroLineFiles"
-	neoReviewSnapshotTextKey         = "internal.reviewSnapshotText"
-	neoReviewSnapshotStateMetaKey    = "internal.reviewSnapshot"
-	neoRunCheckToolEvidenceKey       = "internal.runCheckToolEvidence"
-	neoRunCheckToolEvidenceRequired  = "internal.runCheckToolEvidenceRequired"
+	neoReviewMaxChangedFiles                = 100
+	neoReviewMaxChangedLines                = 10000
+	neoReviewMaxChangedBytes                = 4 * 1024 * 1024
+	neoReviewSnapshotHashKey                = "internal.reviewSnapshotHash"
+	neoReviewSnapshotFilesKey               = "internal.reviewSnapshotFiles"
+	neoReviewSnapshotHunksKey               = "internal.reviewSnapshotHunks"
+	neoReviewSnapshotLinesKey               = "internal.reviewSnapshotChangedLines"
+	neoReviewSnapshotDeletedLinesKey        = "internal.reviewSnapshotDeletedLines"
+	neoReviewSnapshotDeletedKey             = "internal.reviewSnapshotDeletedFiles"
+	neoReviewSnapshotZeroLineKey            = "internal.reviewSnapshotZeroLineFiles"
+	neoReviewSnapshotTextKey                = "internal.reviewSnapshotText"
+	neoReviewSnapshotStateMetaKey           = "internal.reviewSnapshot"
+	neoRunCheckToolEvidenceKey              = "internal.runCheckToolEvidence"
+	neoRunCheckToolEvidenceRequired         = "internal.runCheckToolEvidenceRequired"
+	neoReviewExecutorSnapshotParent         = "TU-CLIPROXYREVIEWCAPTUREX"
+	neoReviewExecutorFormatLine             = "CLIPROXY_REVIEW_FORMAT=2"
+	neoReviewExecutorPayloadPrefix          = "CLIPROXY_REVIEW_PAYLOAD="
+	neoReviewExecutorPayloadBytes           = "CLIPROXY_REVIEW_PAYLOAD_BYTES="
+	neoReviewExecutorCompressedBytes        = "CLIPROXY_REVIEW_COMPRESSED_BYTES="
+	neoReviewExecutorHashPrefix             = "CLIPROXY_REVIEW_HASH="
+	neoReviewExecutorEnvelopeEnd            = "CLIPROXY_REVIEW_ENVELOPE_END"
+	neoReviewExecutorMaxEncodedBytes        = 6 * 1024 * 1024
+	neoReviewExecutorChunkBytes             = 976
+	neoReviewExecutorFramingReserve         = 512 + ((neoReviewExecutorMaxEncodedBytes+neoReviewExecutorChunkBytes-1)/neoReviewExecutorChunkBytes)*(len(neoReviewExecutorPayloadPrefix)+1)
+	neoReviewExecutorMaxEncodedPayloadBytes = neoReviewExecutorMaxEncodedBytes - neoReviewExecutorFramingReserve
+	neoReviewExecutorBatchChunks            = 32
+	neoReviewExecutorChunkDelayMS           = 400
+	neoReviewExecutorFirstDelayMS           = 1200
+	neoReviewExecutorInitialChunks          = 40
+	neoReviewExecutorMaxPayloadBytes        = 4 * neoReviewMaxChangedBytes
+	neoReviewExecutorRootPrefix             = "CLIPROXY_REVIEW_ROOT="
+	neoReviewExecutorCWDPrefix              = "CLIPROXY_REVIEW_CWD="
+	neoReviewExecutorNamesPrefix            = "CLIPROXY_REVIEW_NAMES="
+	neoReviewExecutorPatchPrefix            = "CLIPROXY_REVIEW_PATCH_NAMES="
+	neoReviewExecutorBytesPrefix            = "CLIPROXY_REVIEW_BYTES="
+	neoReviewExecutorDiffMarker             = "CLIPROXY_REVIEW_DIFF"
+	neoReviewExecutorEndMarker              = "CLIPROXY_REVIEW_END"
 )
 
 var (
@@ -44,6 +71,7 @@ var (
 	neoRunCheckExportIndexPattern     = regexp.MustCompile(`(?is)(?:\bexports\b|\bexportsmap\b|\.exports)\s*(?:\?\.)?\s*\[[^]]+\]`)
 	neoRunCheckWildcardExportPattern  = regexp.MustCompile(`(?m)["'][^"'\r\n]*\*[^"'\r\n]*["']\s*:`)
 	neoRunCheckExportPacketPattern    = regexp.MustCompile(`(?is)["']CLIPROXY_PACKAGE_EXPORTS=["']\s*\+\s*JSON\.stringify\(\s*pkg\.exports\s*\)`)
+	neoReviewListedCheckPattern       = regexp.MustCompile(`(?s)<check[ \t]+name="([^"\r\n]*)"[ \t]+uri="([^"\r\n]*)">[ \t\r\n]*<frontmatter>(.*?)</frontmatter>[ \t\r\n]*</check>`)
 )
 
 type neoDependencyAccessPath struct {
@@ -90,6 +118,447 @@ func neoCaptureWorkingTreeReviewSnapshotContext(ctx context.Context, cwd, diffDe
 		return neoCaptureGitDiffReviewSnapshotContext(ctx, cwd, pathspec, revisions...)
 	}
 	return neoCaptureReviewWorkingTreeSnapshotForFilesContext(ctx, cwd, neoNormalizedReviewSnapshotScope(files))
+}
+
+func neoReviewExecutorSnapshotCommand(diffDescription, workingDirectory string, files []string) (string, error) {
+	if !neoFinderPathIsAbsolute(workingDirectory) || strings.ContainsRune(workingDirectory, '\x00') || !utf8.ValidString(workingDirectory) {
+		return "", fmt.Errorf("capture review diff: invalid working directory")
+	}
+	pathspec, exact := neoReviewGitDiffPathspec(diffDescription)
+	if exact {
+		files = pathspec
+	}
+	files = neoNormalizedReviewSnapshotScope(files)
+	if len(files) > neoReviewMaxChangedFiles {
+		return "", fmt.Errorf("capture review diff: more than %d scoped files", neoReviewMaxChangedFiles)
+	}
+	for _, filename := range files {
+		if filename == "" || !utf8.ValidString(filename) || strings.ContainsRune(filename, '\x00') || filepath.IsAbs(filename) {
+			return "", fmt.Errorf("capture review diff: invalid path %q", filename)
+		}
+		cleaned := path.Clean(strings.ReplaceAll(filename, `\`, "/"))
+		if cleaned != strings.ReplaceAll(filename, `\`, "/") || cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+			return "", fmt.Errorf("capture review diff: invalid path %q", filename)
+		}
+	}
+	rootQuotedFiles := make([]string, 0, len(files))
+	for _, filename := range files {
+		rootQuotedFiles = append(rootQuotedFiles, `"${prefix}"`+neoReviewShellQuote(filename))
+	}
+	pathArgs := ""
+	if len(rootQuotedFiles) != 0 {
+		pathArgs = " -- " + strings.Join(rootQuotedFiles, " ")
+	}
+	exactPathArgs := pathArgs
+	commandLines := []string{
+		"set -eu",
+		"cd -P " + neoReviewShellQuote(workingDirectory) + " || exit 66",
+		"actual_workdir=$(pwd -P)",
+		"prefix=$(git rev-parse --show-prefix)",
+		"root=$(git rev-parse --show-toplevel)",
+		"cd \"$root\"",
+		"base=HEAD",
+		"if ! git rev-parse --verify HEAD >/dev/null 2>&1; then base=$(printf '' | git hash-object -t tree --stdin); fi",
+		"names_file=$(mktemp \"${TMPDIR:-/tmp}/cliproxy-review-names.XXXXXX\")",
+		"patch_names_file=$(mktemp \"${TMPDIR:-/tmp}/cliproxy-review-patch-names.XXXXXX\")",
+		"diff_file=$(mktemp \"${TMPDIR:-/tmp}/cliproxy-review-diff.XXXXXX\")",
+		"index_file=$(mktemp \"${TMPDIR:-/tmp}/cliproxy-review-index.XXXXXX\")",
+		"untracked_file=$(mktemp \"${TMPDIR:-/tmp}/cliproxy-review-untracked.XXXXXX\")",
+		"status_file=$(mktemp \"${TMPDIR:-/tmp}/cliproxy-review-status.XXXXXX\")",
+		"scoped_status_file=$(mktemp \"${TMPDIR:-/tmp}/cliproxy-review-scoped-status.XXXXXX\")",
+		"selected_file=$(mktemp \"${TMPDIR:-/tmp}/cliproxy-review-selected.XXXXXX\")",
+		"tracked_file=$(mktemp \"${TMPDIR:-/tmp}/cliproxy-review-tracked.XXXXXX\")",
+		"pending_file=$(mktemp \"${TMPDIR:-/tmp}/cliproxy-review-pending.XXXXXX\")",
+		"pending_name_file=$(mktemp \"${TMPDIR:-/tmp}/cliproxy-review-pending-name.XXXXXX\")",
+		"payload_file=$(mktemp \"${TMPDIR:-/tmp}/cliproxy-review-payload.XXXXXX\")",
+		"compressed_file=$(mktemp \"${TMPDIR:-/tmp}/cliproxy-review-compressed.XXXXXX\")",
+		"encoded_file=$(mktemp \"${TMPDIR:-/tmp}/cliproxy-review-encoded.XXXXXX\")",
+		"prefix_file=$(mktemp \"${TMPDIR:-/tmp}/cliproxy-review-prefix.XXXXXX\")",
+		"rm -f \"$index_file\"",
+		"trap 'rm -f \"$names_file\" \"$patch_names_file\" \"$diff_file\" \"$index_file\" \"$untracked_file\" \"$status_file\" \"$scoped_status_file\" \"$selected_file\" \"$tracked_file\" \"$pending_file\" \"$pending_name_file\" \"$payload_file\" \"$compressed_file\" \"$encoded_file\" \"$prefix_file\"' EXIT HUP INT TERM",
+	}
+	if exact {
+		revisions, _ := neoReviewGitDiffRevisions(diffDescription)
+		revisionArgs := ""
+		if slices.Equal(revisions, []string{"HEAD"}) {
+			revisionArgs = ` "$base"`
+		}
+		commandLines = append(commandLines,
+			"git --literal-pathspecs -c core.quotepath=false diff --no-color --no-ext-diff --name-only -z"+revisionArgs+exactPathArgs+" >\"$names_file\"",
+			"cp \"$names_file\" \"$patch_names_file\"",
+			"git --literal-pathspecs -c core.quotepath=false diff --no-color --no-ext-diff"+revisionArgs+exactPathArgs+" >\"$diff_file\"",
+			": >\"$untracked_file\"",
+		)
+	} else if neoReviewFileScopedWorkingTreeDescription(diffDescription) {
+		commandLines = append(commandLines,
+			"git --literal-pathspecs status --porcelain=v1 --untracked-files=all -z"+pathArgs+" >\"$scoped_status_file\"",
+			"git status --porcelain=v1 --untracked-files=all -z >\"$status_file\"",
+			": >\"$selected_file\"",
+			": >\"$pending_file\"",
+			`SELECTED_FILE="$selected_file" PENDING_FILE="$pending_file" xargs -0 -n 1 sh -c '
+  [ "$#" -gt 0 ] || exit 0
+  item=$1
+  if [ -s "$PENDING_FILE" ]; then
+    printf "%s" "$item" | base64 | tr -d "\n" >>"$SELECTED_FILE"
+    printf "\n" >>"$SELECTED_FILE"
+    : >"$PENDING_FILE"
+    exit 0
+  fi
+  [ "${#item}" -ge 4 ] || exit 0
+  status=${item%"${item#??}"}
+  filename=${item#???}
+  [ -n "$filename" ] || exit 0
+  printf "%s" "$filename" | base64 | tr -d "\n" >>"$SELECTED_FILE"
+  printf "\n" >>"$SELECTED_FILE"
+  case "$status" in *R*|*C*) printf 1 >"$PENDING_FILE" ;; esac
+' sh <"$scoped_status_file"`,
+			"[ ! -s \"$pending_file\" ] || exit 67",
+			": >\"$names_file\"",
+			": >\"$tracked_file\"",
+			": >\"$untracked_file\"",
+			": >\"$pending_file\"",
+			": >\"$pending_name_file\"",
+			`SELECTED_FILE="$selected_file" PENDING_FILE="$pending_file" PENDING_NAME_FILE="$pending_name_file" NAMES_FILE="$names_file" TRACKED_FILE="$tracked_file" UNTRACKED_FILE="$untracked_file" xargs -0 -n 1 sh -c '
+  [ "$#" -gt 0 ] || exit 0
+  selected_path() {
+    encoded=$(printf "%s" "$1" | base64 | tr -d "\n")
+    grep -Fqx "$encoded" "$SELECTED_FILE"
+  }
+  item=$1
+  if [ -s "$PENDING_FILE" ]; then
+    selected_current=$(cat "$PENDING_FILE")
+    selected_previous=0
+    if selected_path "$item"; then selected_previous=1; fi
+    if [ "$selected_current" -eq 1 ] || [ "$selected_previous" -eq 1 ]; then
+      if [ "$selected_current" -ne 1 ]; then
+        cat "$PENDING_NAME_FILE" >>"$NAMES_FILE"
+        printf "\0" >>"$NAMES_FILE"
+        cat "$PENDING_NAME_FILE" >>"$TRACKED_FILE"
+        printf "\0" >>"$TRACKED_FILE"
+      fi
+      printf "%s\0" "$item" >>"$TRACKED_FILE"
+    fi
+    : >"$PENDING_FILE"
+    : >"$PENDING_NAME_FILE"
+    exit 0
+  fi
+  [ "${#item}" -ge 4 ] || exit 0
+  status=${item%"${item#??}"}
+  filename=${item#???}
+  [ -n "$filename" ] || exit 0
+  case "$status" in
+    *R*|*C*)
+      printf "%s" "$filename" >"$PENDING_NAME_FILE"
+      if selected_path "$filename"; then
+        printf 1 >"$PENDING_FILE"
+        printf "%s\0" "$filename" >>"$NAMES_FILE"
+        printf "%s\0" "$filename" >>"$TRACKED_FILE"
+      else
+        printf 0 >"$PENDING_FILE"
+      fi
+      ;;
+    *)
+      if selected_path "$filename"; then
+        printf "%s\0" "$filename" >>"$NAMES_FILE"
+        if [ "$status" = "??" ]; then
+          printf "%s\0" "$filename" >>"$UNTRACKED_FILE"
+        else
+          printf "%s\0" "$filename" >>"$TRACKED_FILE"
+        fi
+      fi
+      ;;
+  esac
+' sh <"$status_file"`,
+			"[ ! -s \"$pending_file\" ] || exit 67",
+			": >\"$patch_names_file\"",
+			": >\"$diff_file\"",
+			"if [ -s \"$tracked_file\" ]; then",
+			"  xargs -0 git --literal-pathspecs -c core.quotepath=false diff --no-color --no-ext-diff --name-only -z \"$base\" -- <\"$tracked_file\" >\"$patch_names_file\"",
+			"  xargs -0 git --literal-pathspecs -c core.quotepath=false diff --no-color --no-ext-diff \"$base\" -- <\"$tracked_file\" >\"$diff_file\"",
+			"fi",
+		)
+	} else {
+		return "", nil
+	}
+	commandLines = append(commandLines,
+		"if [ -s \"$untracked_file\" ]; then",
+		"  GIT_INDEX_FILE=\"$index_file\" git read-tree --empty",
+		"  GIT_INDEX_FILE=\"$index_file\" git --literal-pathspecs add -N --pathspec-from-file=\"$untracked_file\" --pathspec-file-nul",
+		"  GIT_INDEX_FILE=\"$index_file\" git -c core.quotepath=false diff --no-color --no-ext-diff --name-only -z >>\"$patch_names_file\"",
+		"  GIT_INDEX_FILE=\"$index_file\" git -c core.quotepath=false diff --no-color --no-ext-diff >>\"$diff_file\"",
+		"fi",
+		"diff_bytes=$(wc -c <\"$diff_file\" | tr -d ' ')",
+		"names_bytes=$(wc -c <\"$names_file\" | tr -d ' ')",
+		fmt.Sprintf("[ \"$diff_bytes\" -le %d ] && [ \"$names_bytes\" -le %d ] || exit 65", neoReviewMaxChangedBytes, neoReviewMaxChangedBytes),
+		"{",
+		"  printf '"+neoReviewExecutorRootPrefix+"%s\\n' \"$(printf '%s' \"$root\" | base64 | tr -d '\\n')\"",
+		"  printf '"+neoReviewExecutorCWDPrefix+"%s\\n' \"$(printf '%s' \"$actual_workdir\" | base64 | tr -d '\\n')\"",
+		"  printf '"+neoReviewExecutorNamesPrefix+"%s\\n' \"$(base64 <\"$names_file\" | tr -d '\\n')\"",
+		"  printf '"+neoReviewExecutorPatchPrefix+"%s\\n' \"$(base64 <\"$patch_names_file\" | tr -d '\\n')\"",
+		"  printf '"+neoReviewExecutorBytesPrefix+"%s\\n' \"$diff_bytes\"",
+		"  printf '"+neoReviewExecutorDiffMarker+"\\n'",
+		"  cat \"$diff_file\"",
+		"  printf '\\n"+neoReviewExecutorEndMarker+"\\n'",
+		"} >\"$payload_file\"",
+		fmt.Sprintf("payload_bytes=$(wc -c <\"$payload_file\" | tr -d ' '); [ \"$payload_bytes\" -le %d ] || exit 65", neoReviewExecutorMaxPayloadBytes),
+		"gzip -n -c \"$payload_file\" >\"$compressed_file\"",
+		"compressed_bytes=$(wc -c <\"$compressed_file\" | tr -d ' ')",
+		"base64 <\"$compressed_file\" | tr -d '\\n' >\"$encoded_file\"",
+		fmt.Sprintf("encoded_bytes=$(wc -c <\"$encoded_file\" | tr -d ' '); [ \"$encoded_bytes\" -le %d ] || exit 65", neoReviewExecutorMaxEncodedPayloadBytes),
+		"payload_hash=$(git hash-object --stdin <\"$payload_file\")",
+		"printf '"+neoReviewExecutorFormatLine+"\\n' >\"$prefix_file\"",
+		"printf '"+neoReviewExecutorPayloadBytes+"%s\\n' \"$payload_bytes\" >>\"$prefix_file\"",
+		"printf '"+neoReviewExecutorCompressedBytes+"%s\\n' \"$compressed_bytes\" >>\"$prefix_file\"",
+		"printf '"+neoReviewExecutorHashPrefix+"%s\\n' \"$payload_hash\" >>\"$prefix_file\"",
+		fmt.Sprintf("initial=0; while [ \"$initial\" -lt %d ]; do chunk=$(dd if=\"$encoded_file\" bs=%d skip=\"$initial\" count=1 2>/dev/null); [ -n \"$chunk\" ] || break; printf '%s%%s\\n' \"$chunk\" >>\"$prefix_file\"; initial=$((initial + 1)); done; cat \"$prefix_file\"; if [ $((initial * %d)) -lt \"$encoded_bytes\" ]; then sleep %d.%03d; fi", neoReviewExecutorInitialChunks, neoReviewExecutorChunkBytes, neoReviewExecutorPayloadPrefix, neoReviewExecutorChunkBytes, neoReviewExecutorFirstDelayMS/1000, neoReviewExecutorFirstDelayMS%1000),
+		fmt.Sprintf("count=0; tail -c +$((initial * %d + 1)) \"$encoded_file\" | fold -w %d | while IFS= read -r chunk || [ -n \"$chunk\" ]; do printf '%s%%s\\n' \"$chunk\"; count=$((count + 1)); if [ $((count %% %d)) -eq 0 ]; then sleep 0.%03d; fi; done", neoReviewExecutorChunkBytes, neoReviewExecutorChunkBytes, neoReviewExecutorPayloadPrefix, neoReviewExecutorBatchChunks, neoReviewExecutorChunkDelayMS),
+		"printf '"+neoReviewExecutorEnvelopeEnd+"\\n'",
+	)
+	return strings.Join(commandLines, "\n"), nil
+}
+
+func neoReviewShellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
+}
+
+func neoReviewSnapshotFromExecutorOutput(output string) (*neoReviewDiffSnapshot, error) {
+	readLine := func(input string) (string, string, bool) {
+		line, rest, found := strings.Cut(input, "\n")
+		return strings.TrimSuffix(line, "\r"), rest, found
+	}
+	formatLine, remaining, ok := readLine(output)
+	if !ok || formatLine != neoReviewExecutorFormatLine {
+		return nil, fmt.Errorf("capture review diff: executor output omitted snapshot format")
+	}
+	payloadBytesLine, remaining, ok := readLine(remaining)
+	if !ok || !strings.HasPrefix(payloadBytesLine, neoReviewExecutorPayloadBytes) {
+		return nil, fmt.Errorf("capture review diff: executor output omitted payload size")
+	}
+	compressedBytesLine, remaining, ok := readLine(remaining)
+	if !ok || !strings.HasPrefix(compressedBytesLine, neoReviewExecutorCompressedBytes) {
+		return nil, fmt.Errorf("capture review diff: executor output omitted compressed size")
+	}
+	hashLine, remaining, ok := readLine(remaining)
+	if !ok || !strings.HasPrefix(hashLine, neoReviewExecutorHashPrefix) {
+		return nil, fmt.Errorf("capture review diff: executor output omitted payload hash")
+	}
+	var encodedBuilder strings.Builder
+	for {
+		line, rest, found := readLine(remaining)
+		if !found {
+			return nil, fmt.Errorf("capture review diff: executor output was incomplete")
+		}
+		remaining = rest
+		if line == neoReviewExecutorEnvelopeEnd {
+			if remaining != "" {
+				return nil, fmt.Errorf("capture review diff: executor output was incomplete")
+			}
+			break
+		}
+		if !strings.HasPrefix(line, neoReviewExecutorPayloadPrefix) {
+			return nil, fmt.Errorf("capture review diff: executor output omitted compressed payload")
+		}
+		chunk := strings.TrimPrefix(line, neoReviewExecutorPayloadPrefix)
+		if chunk == "" || len(chunk) > neoReviewExecutorChunkBytes || encodedBuilder.Len()+len(chunk) > neoReviewExecutorMaxEncodedPayloadBytes {
+			return nil, fmt.Errorf("capture review diff: executor returned an invalid compressed payload")
+		}
+		encodedBuilder.WriteString(chunk)
+	}
+	parseSize := func(line, prefix string, maximum int) (int, error) {
+		value := strings.TrimPrefix(line, prefix)
+		size, err := strconv.Atoi(value)
+		if err != nil || size < 0 || size > maximum || strconv.Itoa(size) != value {
+			return 0, fmt.Errorf("capture review diff: executor returned an invalid payload size")
+		}
+		return size, nil
+	}
+	payloadBytes, err := parseSize(payloadBytesLine, neoReviewExecutorPayloadBytes, neoReviewExecutorMaxPayloadBytes)
+	if err != nil {
+		return nil, err
+	}
+	compressedBytes, err := parseSize(compressedBytesLine, neoReviewExecutorCompressedBytes, neoReviewExecutorMaxEncodedBytes)
+	if err != nil {
+		return nil, err
+	}
+	encoded := encodedBuilder.String()
+	if len(encoded) == 0 || len(encoded) > neoReviewExecutorMaxEncodedPayloadBytes {
+		return nil, fmt.Errorf("capture review diff: executor returned an invalid compressed payload")
+	}
+	compressed, err := base64.StdEncoding.Strict().DecodeString(encoded)
+	if err != nil || len(compressed) != compressedBytes {
+		return nil, fmt.Errorf("capture review diff: executor returned an invalid compressed payload")
+	}
+	compressedReader := bytes.NewReader(compressed)
+	reader, err := gzip.NewReader(compressedReader)
+	if err != nil {
+		return nil, fmt.Errorf("capture review diff: executor returned an invalid compressed payload")
+	}
+	reader.Multistream(false)
+	payload, readErr := io.ReadAll(io.LimitReader(reader, int64(payloadBytes)+1))
+	closeErr := reader.Close()
+	if readErr != nil || closeErr != nil || len(payload) != payloadBytes || compressedReader.Len() != 0 {
+		return nil, fmt.Errorf("capture review diff: executor returned an incomplete compressed payload")
+	}
+	expectedHash := strings.TrimPrefix(hashLine, neoReviewExecutorHashPrefix)
+	if expectedHash == "" || expectedHash != neoReviewExecutorPayloadHash(payload, len(expectedHash)) {
+		return nil, fmt.Errorf("capture review diff: executor payload hash mismatch")
+	}
+	return neoReviewSnapshotFromExecutorPayload(string(payload))
+}
+
+func neoReviewExecutorPayloadHash(payload []byte, digestLength int) string {
+	prefix := []byte(fmt.Sprintf("blob %d\x00", len(payload)))
+	if digestLength == sha256.Size*2 {
+		hash := sha256.New()
+		_, _ = hash.Write(prefix)
+		_, _ = hash.Write(payload)
+		return hex.EncodeToString(hash.Sum(nil))
+	}
+	if digestLength == sha1.Size*2 {
+		hash := sha1.New()
+		_, _ = hash.Write(prefix)
+		_, _ = hash.Write(payload)
+		return hex.EncodeToString(hash.Sum(nil))
+	}
+	return ""
+}
+
+func neoReviewSnapshotFromExecutorPayload(output string) (*neoReviewDiffSnapshot, error) {
+	readLine := func(input string) (string, string, bool) {
+		line, rest, found := strings.Cut(input, "\n")
+		return strings.TrimSuffix(line, "\r"), rest, found
+	}
+	rootLine, remaining, ok := readLine(output)
+	if !ok || !strings.HasPrefix(rootLine, neoReviewExecutorRootPrefix) {
+		return nil, fmt.Errorf("capture review diff: executor output omitted repository root")
+	}
+	cwdLine, remaining, ok := readLine(remaining)
+	if !ok || !strings.HasPrefix(cwdLine, neoReviewExecutorCWDPrefix) {
+		return nil, fmt.Errorf("capture review diff: executor output omitted working directory")
+	}
+	namesLine, remaining, ok := readLine(remaining)
+	if !ok || !strings.HasPrefix(namesLine, neoReviewExecutorNamesPrefix) {
+		return nil, fmt.Errorf("capture review diff: executor output omitted changed files")
+	}
+	patchNamesLine, remaining, ok := readLine(remaining)
+	if !ok || !strings.HasPrefix(patchNamesLine, neoReviewExecutorPatchPrefix) {
+		return nil, fmt.Errorf("capture review diff: executor output omitted patch names")
+	}
+	bytesLine, remaining, ok := readLine(remaining)
+	if !ok || !strings.HasPrefix(bytesLine, neoReviewExecutorBytesPrefix) {
+		return nil, fmt.Errorf("capture review diff: executor output omitted diff size")
+	}
+	marker, remaining, ok := readLine(remaining)
+	if !ok || marker != neoReviewExecutorDiffMarker {
+		return nil, fmt.Errorf("capture review diff: executor output omitted diff marker")
+	}
+	diffBytes, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(bytesLine, neoReviewExecutorBytesPrefix)))
+	if err != nil || diffBytes < 0 || diffBytes > neoReviewMaxChangedBytes || diffBytes > len(remaining) {
+		return nil, fmt.Errorf("capture review diff: executor returned an invalid diff size")
+	}
+	diff := remaining[:diffBytes]
+	if remaining[diffBytes:] != "\n"+neoReviewExecutorEndMarker+"\n" {
+		return nil, fmt.Errorf("capture review diff: executor output was incomplete")
+	}
+	if !utf8.ValidString(diff) || strings.IndexByte(diff, 0) >= 0 {
+		return nil, fmt.Errorf("capture review diff: executor diff must be text")
+	}
+	decode := func(value string) ([]byte, error) {
+		decoded, err := base64.StdEncoding.DecodeString(value)
+		if err != nil {
+			return nil, fmt.Errorf("capture review diff: executor output contained invalid base64")
+		}
+		return decoded, nil
+	}
+	rootBytes, err := decode(strings.TrimPrefix(rootLine, neoReviewExecutorRootPrefix))
+	if err != nil {
+		return nil, err
+	}
+	root := string(rootBytes)
+	root = strings.ReplaceAll(root, `\`, "/")
+	cwdBytes, err := decode(strings.TrimPrefix(cwdLine, neoReviewExecutorCWDPrefix))
+	if err != nil {
+		return nil, err
+	}
+	workingDirectory := strings.ReplaceAll(string(cwdBytes), `\`, "/")
+	if !utf8.ValidString(root) || strings.ContainsRune(root, '\x00') || !neoFinderPathIsAbsolute(root) || path.Clean(root) != root ||
+		!utf8.ValidString(workingDirectory) || strings.ContainsRune(workingDirectory, '\x00') || !neoFinderPathIsAbsolute(workingDirectory) || path.Clean(workingDirectory) != workingDirectory ||
+		workingDirectory != root && !strings.HasPrefix(workingDirectory, strings.TrimSuffix(root, "/")+"/") {
+		return nil, fmt.Errorf("capture review diff: executor returned an invalid repository root")
+	}
+	namesBytes, err := decode(strings.TrimPrefix(namesLine, neoReviewExecutorNamesPrefix))
+	if err != nil {
+		return nil, err
+	}
+	patchNamesBytes, err := decode(strings.TrimPrefix(patchNamesLine, neoReviewExecutorPatchPrefix))
+	if err != nil {
+		return nil, err
+	}
+	parseNames := func(raw []byte) ([]string, error) {
+		names := make([]string, 0)
+		seen := make(map[string]struct{})
+		for _, filename := range bytes.Split(raw, []byte{0}) {
+			if len(filename) == 0 {
+				continue
+			}
+			name := string(filename)
+			cleaned := path.Clean(name)
+			traversal := path.Clean(strings.ReplaceAll(name, `\`, "/"))
+			if !utf8.ValidString(name) || cleaned != name || cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") || traversal == ".." || strings.HasPrefix(traversal, "../") {
+				return nil, fmt.Errorf("capture review diff: executor returned invalid path %q", name)
+			}
+			if _, exists := seen[name]; exists {
+				return nil, fmt.Errorf("capture review diff: executor returned duplicate path %q", name)
+			}
+			seen[name] = struct{}{}
+			names = append(names, name)
+		}
+		return names, nil
+	}
+	names, err := parseNames(namesBytes)
+	if err != nil {
+		return nil, err
+	}
+	patchNames, err := parseNames(patchNamesBytes)
+	if err != nil {
+		return nil, err
+	}
+	if len(names) > neoReviewMaxChangedFiles {
+		return nil, fmt.Errorf("capture review diff: more than %d changed files", neoReviewMaxChangedFiles)
+	}
+	patches := neoReviewSplitGitDiffPatches(strings.TrimRight(diff, "\n"))
+	diffs := make(map[string]string, len(names))
+	for _, filename := range names {
+		diffs[filename] = ""
+	}
+	if len(patches) != len(patchNames) {
+		return nil, fmt.Errorf("capture review diff: found %d patches for %d patch names", len(patches), len(patchNames))
+	}
+	for index, filename := range patchNames {
+		if _, exists := diffs[filename]; !exists {
+			return nil, fmt.Errorf("capture review diff: patch path %q was not listed as changed", filename)
+		}
+		diffs[filename] = patches[index]
+	}
+	sort.Strings(names)
+	lineCount := 0
+	for _, filename := range names {
+		lineCount += neoReviewDiffLineCount(diffs[filename])
+		if lineCount > neoReviewMaxChangedLines {
+			return nil, fmt.Errorf("capture review diff: more than %d diff lines", neoReviewMaxChangedLines)
+		}
+	}
+	hunks := make([]neoReviewDiffHunk, 0)
+	for _, filename := range names {
+		hunks = append(hunks, neoReviewDiffHunks(filename, diffs[filename])...)
+	}
+	return &neoReviewDiffSnapshot{
+		Hash:           neoReviewSnapshotHash(names, diffs),
+		RepositoryRoot: root,
+		Files:          names,
+		Diffs:          diffs,
+		Hunks:          hunks,
+	}, nil
 }
 
 func neoCaptureReviewWorkingTreeSnapshot(cwd string) (*neoReviewDiffSnapshot, error) {
@@ -1165,11 +1634,12 @@ func neoReviewEmbeddedRunCheckInputs(history []neoHistoryMessage) map[string]map
 	var registry map[string]map[string]any
 	const openTag = "<review_check_arguments>"
 	const closeTag = "</review_check_arguments>"
+	history = neoReviewActiveRootHistory(history)
 	for _, message := range history {
-		if !strings.EqualFold(strings.TrimSpace(message.Role), "user") {
+		text, ok := neoReviewPreDiscoveredCheckSection(message)
+		if !ok {
 			continue
 		}
-		text := message.Text
 		for {
 			start := strings.Index(text, openTag)
 			if start < 0 {
@@ -1197,6 +1667,168 @@ func neoReviewEmbeddedRunCheckInputs(history []neoHistoryMessage) map[string]map
 		}
 	}
 	return registry
+}
+
+type neoReviewListedCheck struct {
+	Name        string
+	URI         string
+	Frontmatter map[string]any
+}
+
+type neoReviewRunCheckReference uint8
+
+const (
+	neoReviewRunCheckReferenceNone neoReviewRunCheckReference = iota
+	neoReviewRunCheckReferenceEmbedded
+	neoReviewRunCheckReferenceListed
+)
+
+func neoReviewListedChecksFromHistory(history []neoHistoryMessage) map[string][]neoReviewListedCheck {
+	var registry map[string][]neoReviewListedCheck
+	for _, message := range history {
+		section, ok := neoReviewPreDiscoveredCheckSection(message)
+		if !ok {
+			continue
+		}
+		for _, match := range neoReviewListedCheckPattern.FindAllStringSubmatch(section, -1) {
+			var frontmatter map[string]any
+			if len(match) != 4 || json.Unmarshal([]byte(strings.TrimSpace(match[3])), &frontmatter) != nil {
+				continue
+			}
+			check := neoReviewListedCheck{
+				Name:        html.UnescapeString(match[1]),
+				URI:         html.UnescapeString(match[2]),
+				Frontmatter: frontmatter,
+			}
+			if check.Name == "" || check.URI == "" {
+				continue
+			}
+			if registry == nil {
+				registry = make(map[string][]neoReviewListedCheck)
+			}
+			registry[check.Name] = append(registry[check.Name], check)
+		}
+	}
+	return registry
+}
+
+func neoReviewPreDiscoveredCheckSection(message neoHistoryMessage) (string, bool) {
+	const marker = "Pre-discovered review checks are listed below."
+	const noChecksMarker = "No review checks were pre-discovered by the CLI."
+	if !strings.EqualFold(strings.TrimSpace(message.Role), "user") || strings.TrimSpace(message.ParentToolUseID) != "" ||
+		strings.TrimSpace(message.ToolCallID) != "" || strings.TrimSpace(message.ToolName) != "" || message.ToolResultTerminal {
+		return "", false
+	}
+	text := message.Text
+	if index := strings.Index(text, "\n<review_diff_snapshot>"); index >= 0 {
+		text = text[:index]
+	}
+	start := strings.LastIndex(text, marker)
+	if start < 0 {
+		return "", false
+	}
+	section := text[start+len(marker):]
+	end := len(section)
+	for _, boundary := range []string{"\nRemember: call submit_review exactly once."} {
+		if index := strings.Index(section, boundary); index >= 0 && index < end {
+			end = index
+		}
+	}
+	if strings.Contains(section[:end], noChecksMarker) {
+		return "", false
+	}
+	return section[:end], true
+}
+
+func neoReviewActiveRootHistory(history []neoHistoryMessage) []neoHistoryMessage {
+	for index := len(history) - 1; index >= 0; index-- {
+		message := history[index]
+		if !strings.EqualFold(strings.TrimSpace(message.Role), "user") || strings.TrimSpace(message.ParentToolUseID) != "" ||
+			strings.TrimSpace(message.ToolCallID) != "" || strings.TrimSpace(message.ToolName) != "" || message.ToolResultTerminal {
+			continue
+		}
+		if _, ok := neoReviewPreDiscoveredCheckSection(message); !ok {
+			return nil
+		}
+		return []neoHistoryMessage{message}
+	}
+	return nil
+}
+
+func neoReviewRunCheckReferenceKind(history []neoHistoryMessage, input map[string]any) neoReviewRunCheckReference {
+	name := stringValue(input["checkName"])
+	uri := stringValue(input["checkURI"])
+	frontmatter := neoCanonicalReviewCheckFrontmatter(input["frontmatter"])
+	if canonical := neoReviewEmbeddedRunCheckInputs(history)[name]; canonical != nil {
+		canonicalJSON, canonicalErr := json.Marshal(canonical)
+		inputJSON, inputErr := json.Marshal(neoReviewRunCheckAuthorizationInput(input))
+		if canonicalErr == nil && inputErr == nil && bytes.Equal(canonicalJSON, inputJSON) {
+			return neoReviewRunCheckReferenceEmbedded
+		}
+		return neoReviewRunCheckReferenceNone
+	}
+	if strings.TrimSpace(stringValue(input["checkContent"])) != "" {
+		return neoReviewRunCheckReferenceNone
+	}
+	for _, listed := range neoReviewListedChecksFromHistory(history)[name] {
+		if listed.Name == name && listed.URI == uri && reflect.DeepEqual(neoCanonicalReviewCheckFrontmatter(listed.Frontmatter), frontmatter) {
+			return neoReviewRunCheckReferenceListed
+		}
+	}
+	return neoReviewRunCheckReferenceNone
+
+}
+
+func neoReviewRunCheckAuthorizationInput(input map[string]any) map[string]any {
+	public := cloneMap(input)
+	for _, key := range []string{
+		neoReviewSnapshotHashKey,
+		neoReviewSnapshotFilesKey,
+		neoReviewSnapshotHunksKey,
+		neoReviewSnapshotLinesKey,
+		neoReviewSnapshotDeletedLinesKey,
+		neoReviewSnapshotDeletedKey,
+		neoReviewSnapshotZeroLineKey,
+		neoReviewSnapshotTextKey,
+		neoRunCheckToolEvidenceKey,
+		neoRunCheckToolEvidenceRequired,
+	} {
+		delete(public, key)
+	}
+	return public
+}
+
+func neoReviewRunCheckReferenceMatches(history []neoHistoryMessage, input map[string]any) bool {
+	return neoReviewRunCheckReferenceKind(history, input) != neoReviewRunCheckReferenceNone
+}
+
+func neoReviewRunCheckDiscoveryAuthorized(history []neoHistoryMessage) bool {
+	if len(history) != 1 {
+		return false
+	}
+	message := history[0]
+	if !strings.EqualFold(strings.TrimSpace(message.Role), "user") || strings.TrimSpace(message.ParentToolUseID) != "" ||
+		strings.TrimSpace(message.ToolCallID) != "" || strings.TrimSpace(message.ToolName) != "" || message.ToolResultTerminal {
+		return false
+	}
+	text := message.Text
+	const footer = "No review checks were pre-discovered by the CLI. Discover applicable .agents/checks/*.md files yourself before submitting the final review.\n\n" +
+		"Remember: call submit_review exactly once. Do not include run_check findings in submit_review; the CLI appends structured check findings mechanically."
+	return strings.HasSuffix(strings.TrimSpace(text), footer)
+}
+
+func neoCanonicalReviewCheckFrontmatter(value any) map[string]any {
+	frontmatter, ok := asMap(value)
+	if !ok || frontmatter == nil {
+		return nil
+	}
+	frontmatter = cloneMap(frontmatter)
+	for _, key := range []string{"name", "description", "severity-default", "tools"} {
+		if _, exists := frontmatter[key]; !exists {
+			frontmatter[key] = nil
+		}
+	}
+	return frontmatter
 }
 
 func neoRepairRunCheckInput(registry map[string]map[string]any, name string, input map[string]any) (map[string]any, bool) {
@@ -2020,7 +2652,7 @@ func neoParseDependencyAccessPath(value string) (neoDependencyAccessPath, error)
 		memberChain = value[hash+1:]
 	}
 	parsed.members = strings.Split(memberChain, ".")
-	if len(parsed.members) < 2 {
+	if len(parsed.members) < 2 && parsed.module == "" {
 		return neoDependencyAccessPath{}, fmt.Errorf("%q must include an owner and terminal capability", value)
 	}
 	for _, member := range parsed.members {
@@ -4301,5 +4933,5 @@ Return exactly one pure JSON object now. Do not use markdown fences, prose befor
 %s
 
 For a failed check instead return exactly %s.
-Completed results require a non-empty patternsChecked array, exactly one evidence entry for every pattern index, and every issue referenced by finding evidence. Use outcome finding with issueIndexes for a real issue, and include severity, file, line, endLine, problem, why, and fix in that issue. Use no-finding only when the cited evidence supports a clean conclusion. no-finding and not-applicable evidence must not reference issues. Dependency-floor evidence that is not not-applicable additionally requires dependency, floorVersion, accessPath, floorStatus, verification, and rootEvidence. Its patternsChecked entry must be exactly <dependency>@<floorVersion> <accessPath>, with no descriptive prefix or suffix. rootEvidence must be an array of exact, focused excerpts copied byte-for-byte from successful tool results; do not add file labels, line labels, separators, ellipses, trim source indentation, or paraphrase unless they occur in the result. Each excerpt's tool call must identify the exact dependency and floor, and each excerpt must contain at most 2048 valid UTF-8 bytes, counted as bytes rather than characters. Keep separate excerpts separate instead of concatenating output. Every selected excerpt must individually prove an access-path edge or the exact status for its evidence entry. Delete every excerpt named as rejected above before rebuilding the failed entry; occurrence in successful output does not make an irrelevant excerpt valid. For a source-proven missing edge, select either the complete owner declaration when it fits or a complete balanced owner-construction subsection such as the root-owned resource map; do not copy a whole package or source dump. Do not crop a class or interface before its matching closing brace, and do not crop a construction map needed to prove absence. A Python root-owned map is valid only when the successful producer output includes the matched enclosing root class; a standalone _sub_sdk_map output is ownerless even when the selected excerpt is balanced. For RootClient.resource.method, the root-owner excerpt must be scoped to RootClient and expose or omit resource; when compatibility is source/type-proven, a separate excerpt scoped to resource's owner must expose method. Map every selected excerpt to one exact adjacent edge or the exact full-path status assertion, and omit it when it maps to neither. Use accessPath RootClient.resource.method for a root-owned chain or module-specifier#Export.member for an imported owner, including the terminal member. Each sibling sync or async method requires its own pattern, evidence entry, full accessPath, and full-path status assertion, even when those entries reference one consolidated issue caused by the same missing root edge. Include only changed owning-client chains required by the check, not capabilities that merely appeared in broad tool output. Use floorStatus compatible with no-finding, or incompatible/unverified with finding. For a compatible traversal or exact test, quote <accessPath>=AVAILABLE rather than an informal status such as OK; otherwise quote focused owner and terminal-member excerpts that connect every path edge. A compatible source-construction or type-declaration entry still needs focused excerpts connecting every edge; its status line alone is insufficient, and a source/type predicate must not be labeled as a runtime traversal or exact behavior test. For incompatible or unverified, quote an exact traversal/test line <accessPath>=MISSING or <accessPath>=UNVERIFIED that was derived by the test, not unconditionally echoed. When source or type inspection proves the first root edge missing, select only the complete exact root-owner declaration or construction excerpt that omits that edge and the derived full-path MISSING assertion for each affected entry. Do not add a terminal class, method, imported-owner, sibling-owner, or other adjacent excerpt after the first root edge is proven absent: no later edge needs evidence, and every selected excerpt must remain relevant to that exact path. Do not select an earlier status assertion contradicted by a later successful correction; use the correction only when its producer is sound and explicitly resolves the earlier detector error, and otherwise return the error object. verification must be one of root-runtime-traversal, root-source-construction, root-type-declaration, exact-export-inspection, or exact-behavior-test. If the available successful output cannot support every required entry under these rules, return the error object instead of guessing or fabricating evidence. Bounded-artifact evidence that is not not-applicable requires phaseRelationship, budgetOrigin (original, remaining, or independent), and decisiveSequence. Generated-artifact finding evidence requires implementationOwner equal to the file of every referenced issue. Classifier evidence that is not not-applicable requires sourceLifetime (mutable, immutable, or unknown), decisionLifetime (per-use, retained, or unknown), mutationPath, and usePath.`, parseErr, groundedStatusAssertions, completedSection, errorJSON)
+Completed results require a non-empty patternsChecked array, exactly one evidence entry for every pattern index, and every issue referenced by finding evidence. Use outcome finding with issueIndexes for a real issue, and include severity, file, line, endLine, problem, why, and fix in that issue. Use no-finding only when the cited evidence supports a clean conclusion. no-finding and not-applicable evidence must not reference issues. Dependency-floor evidence that is not not-applicable additionally requires dependency, floorVersion, accessPath, floorStatus, verification, and rootEvidence. Its patternsChecked entry must be exactly <dependency>@<floorVersion> <accessPath>, with no descriptive prefix or suffix. rootEvidence must be an array of exact, focused excerpts copied byte-for-byte from successful tool results; do not add file labels, line labels, separators, ellipses, trim source indentation, or paraphrase unless they occur in the result. Each excerpt's tool call must identify the exact dependency and floor, and each excerpt must contain at most 2048 valid UTF-8 bytes, counted as bytes rather than characters. Keep separate excerpts separate instead of concatenating output. Every selected excerpt must individually prove an access-path edge or the exact status for its evidence entry. Delete every excerpt named as rejected above before rebuilding the failed entry; occurrence in successful output does not make an irrelevant excerpt valid. For a source-proven missing edge, select either the complete owner declaration when it fits or a complete balanced owner-construction subsection such as the root-owned resource map; do not copy a whole package or source dump. Do not crop a class or interface before its matching closing brace, and do not crop a construction map needed to prove absence. A Python root-owned map is valid only when the successful producer output includes the matched enclosing root class; a standalone _sub_sdk_map output is ownerless even when the selected excerpt is balanced. For RootClient.resource.method, the root-owner excerpt must be scoped to RootClient and expose or omit resource; when compatibility is source/type-proven, a separate excerpt scoped to resource's owner must expose method. Map every selected excerpt to one exact adjacent edge or the exact full-path status assertion, and omit it when it maps to neither. Use accessPath RootClient.resource.method for a root-owned chain, module-specifier#Export.member for an imported owner member, or module-specifier#Export when the named export is itself the terminal capability; do not invent an owner segment for a direct export. Each sibling sync or async method requires its own pattern, evidence entry, full accessPath, and full-path status assertion, even when those entries reference one consolidated issue caused by the same missing root edge. Include only changed owning-client chains required by the check, not capabilities that merely appeared in broad tool output. Use floorStatus compatible with no-finding, or incompatible/unverified with finding. For a compatible traversal or exact test, quote <accessPath>=AVAILABLE rather than an informal status such as OK; otherwise quote focused owner and terminal-member excerpts that connect every path edge. A compatible source-construction or type-declaration entry still needs focused excerpts connecting every edge; its status line alone is insufficient, and a source/type predicate must not be labeled as a runtime traversal or exact behavior test. Source or type excerpts cannot prove a direct named export absent; use an exact traversal, exact test, or export-map inspection deriving <accessPath>=MISSING. For incompatible or unverified, quote an exact traversal/test line <accessPath>=MISSING or <accessPath>=UNVERIFIED that was derived by the test, not unconditionally echoed. When source or type inspection proves the first root edge missing, select only the complete exact root-owner declaration or construction excerpt that omits that edge and the derived full-path MISSING assertion for each affected entry. Do not add a terminal class, method, imported-owner, sibling-owner, or other adjacent excerpt after the first root edge is proven absent: no later edge needs evidence, and every selected excerpt must remain relevant to that exact path. Do not select an earlier status assertion contradicted by a later successful correction; use the correction only when its producer is sound and explicitly resolves the earlier detector error, and otherwise return the error object. verification must be one of root-runtime-traversal, root-source-construction, root-type-declaration, exact-export-inspection, or exact-behavior-test. If the available successful output cannot support every required entry under these rules, return the error object instead of guessing or fabricating evidence. Bounded-artifact evidence that is not not-applicable requires phaseRelationship, budgetOrigin (original, remaining, or independent), and decisiveSequence. Generated-artifact finding evidence requires implementationOwner equal to the file of every referenced issue. Classifier evidence that is not not-applicable requires sourceLifetime (mutable, immutable, or unknown), decisionLifetime (per-use, retained, or unknown), mutationPath, and usePath.`, parseErr, groundedStatusAssertions, completedSection, errorJSON)
 }

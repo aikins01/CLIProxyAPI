@@ -3,22 +3,26 @@ package helps
 import (
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 )
 
-type CodexCache struct {
-	ID     string
-	Expire time.Time
+type codexCacheEntry struct {
+	id     string
+	expire time.Time
 }
 
 // codexCacheMap stores prompt cache IDs keyed by model+user_id.
 // Protected by codexCacheMu. Entries expire after 1 hour.
 var (
-	codexCacheMap = make(map[string]CodexCache)
+	codexCacheMap = make(map[string]codexCacheEntry)
 	codexCacheMu  sync.RWMutex
 )
 
 // codexCacheCleanupInterval controls how often expired entries are purged.
 const codexCacheCleanupInterval = 15 * time.Minute
+
+const codexPromptCacheLimit = 4096
 
 // codexCacheCleanupOnce ensures the background cleanup goroutine starts only once.
 var codexCacheCleanupOnce sync.Once
@@ -41,28 +45,38 @@ func purgeExpiredCodexCache() {
 	codexCacheMu.Lock()
 	defer codexCacheMu.Unlock()
 	for key, cache := range codexCacheMap {
-		if cache.Expire.Before(now) {
+		if cache.expire.Before(now) {
 			delete(codexCacheMap, key)
 		}
 	}
 }
 
-// GetCodexCache retrieves a cached entry, returning ok=false if not found or expired.
-func GetCodexCache(key string) (CodexCache, bool) {
-	codexCacheCleanupOnce.Do(startCodexCacheCleanup)
-	codexCacheMu.RLock()
-	cache, ok := codexCacheMap[key]
-	codexCacheMu.RUnlock()
-	if !ok || cache.Expire.Before(time.Now()) {
-		return CodexCache{}, false
+// CodexPromptCacheID returns the stable prompt cache ID for a model and user key, or an empty string when the cache is full.
+func CodexPromptCacheID(key string) string {
+	if key == "" {
+		return ""
 	}
-	return cache, true
-}
-
-// SetCodexCache stores a cache entry.
-func SetCodexCache(key string, cache CodexCache) {
 	codexCacheCleanupOnce.Do(startCodexCacheCleanup)
+	now := time.Now()
 	codexCacheMu.Lock()
-	codexCacheMap[key] = cache
-	codexCacheMu.Unlock()
+	defer codexCacheMu.Unlock()
+	if cache, ok := codexCacheMap[key]; ok && cache.expire.After(now) {
+		cache.expire = now.Add(time.Hour)
+		codexCacheMap[key] = cache
+		return cache.id
+	}
+	delete(codexCacheMap, key)
+	if len(codexCacheMap) >= codexPromptCacheLimit {
+		for cachedKey, cache := range codexCacheMap {
+			if !cache.expire.After(now) {
+				delete(codexCacheMap, cachedKey)
+			}
+		}
+	}
+	if len(codexCacheMap) >= codexPromptCacheLimit {
+		return ""
+	}
+	id := uuid.NewString()
+	codexCacheMap[key] = codexCacheEntry{id: id, expire: now.Add(time.Hour)}
+	return id
 }

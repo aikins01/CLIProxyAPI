@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"net/http/httptest"
+	"sync"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -60,5 +61,62 @@ func TestCodexExecutorCacheHelper_OpenAIChatCompletions_StablePromptCacheKeyFrom
 	gotKey2 := gjson.GetBytes(body2, "prompt_cache_key").String()
 	if gotKey2 != expectedKey {
 		t.Fatalf("prompt_cache_key (second call) = %q, want %q", gotKey2, expectedKey)
+	}
+}
+
+func TestApplyCodexPromptCacheHeaders_OpenAIChatCompletionsMatchesHTTP(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Set("userApiKey", "websocket-api-key")
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+	req := cliproxyexecutor.Request{Model: "gpt-5.3-codex", Payload: []byte(`{"model":"gpt-5.3-codex"}`)}
+
+	body, headers, cacheID := applyCodexPromptCacheHeaders(ctx, sdktranslator.FromString("openai"), req, []byte(`{"model":"gpt-5.3-codex"}`))
+
+	expectedKey := uuid.NewSHA1(uuid.NameSpaceOID, []byte("cli-proxy-api:codex:prompt-cache:websocket-api-key")).String()
+	if cacheID != expectedKey {
+		t.Fatalf("cache ID = %q, want %q", cacheID, expectedKey)
+	}
+	if got := gjson.GetBytes(body, "prompt_cache_key").String(); got != expectedKey {
+		t.Fatalf("prompt_cache_key = %q, want %q", got, expectedKey)
+	}
+	if got := headerValueCaseInsensitive(headers, "Session_id"); got != expectedKey {
+		t.Fatalf("Session_id = %q, want %q", got, expectedKey)
+	}
+	if got := headers.Get("Conversation_id"); got != "" {
+		t.Fatalf("Conversation_id = %q, want empty", got)
+	}
+}
+
+func TestCodexPromptCacheID_ConcurrentClaudeRequestsReuseID(t *testing.T) {
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5.3-codex",
+		Payload: []byte(`{"metadata":{"user_id":"concurrent-user"}}`),
+	}
+	const requestCount = 64
+	ids := make(chan string, requestCount)
+	var wg sync.WaitGroup
+	for range requestCount {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ids <- codexPromptCacheID(context.Background(), sdktranslator.FromString("claude"), req)
+		}()
+	}
+	wg.Wait()
+	close(ids)
+
+	var expected string
+	for id := range ids {
+		if id == "" {
+			t.Fatal("expected a non-empty prompt cache ID")
+		}
+		if expected == "" {
+			expected = id
+			continue
+		}
+		if id != expected {
+			t.Fatalf("concurrent prompt cache IDs differ: %q and %q", expected, id)
+		}
 	}
 }

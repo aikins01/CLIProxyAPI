@@ -80,12 +80,22 @@ func (m *AmpModule) orbPortalTokenMiddleware() gin.HandlerFunc {
 				if record, ok := manager.snapshot(threadID); ok && hmac.Equal([]byte(presented), []byte(record.portalToken)) {
 					if actor, release := m.neoRuntime.store.retainThreadActorWithoutReadyWork(threadID); actor != nil {
 						defer release()
-						ownerUserID := actor.threadToolOwnerID()
-						ctx := context.WithValue(c.Request.Context(), neoOrbPortalOwnerContextKey{}, ownerUserID)
-						c.Request = c.Request.WithContext(ctx)
-						c.Set(neoOrbPortalAuthenticated, true)
-						c.Set("userApiKey", neoOrbPortalPrincipal)
-						authenticated = true
+						admitted := !record.recovered
+						if admitted && record.lifecycleV1 {
+							operation, admissionErr := manager.beginLifecycleAdmission(c.Request.Context(), actor, threadID, neoOrbStateRunning, neoOrbStatePaused)
+							admitted = admissionErr == nil
+							if operation != nil {
+								operation.close()
+							}
+						}
+						if admitted {
+							ownerUserID := actor.threadToolOwnerID()
+							ctx := context.WithValue(c.Request.Context(), neoOrbPortalOwnerContextKey{}, ownerUserID)
+							c.Request = c.Request.WithContext(ctx)
+							c.Set(neoOrbPortalAuthenticated, true)
+							c.Set("userApiKey", neoOrbPortalPrincipal)
+							authenticated = true
+						}
 					}
 				}
 			}
@@ -572,6 +582,10 @@ func (m *AmpModule) serveOrbPortal(c *gin.Context) {
 		c.JSON(http.StatusConflict, body)
 		return
 	}
+	if record.lifecycleV1 && record.state != neoOrbStateRunning {
+		c.JSON(http.StatusConflict, gin.H{"error": "orb is not ready", "state": record.state})
+		return
+	}
 	wakeCtx, wakeCancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	record, releasePortal, err := manager.acquirePortal(wakeCtx, cfg, threadID)
 	wakeCancel()
@@ -619,6 +633,18 @@ func (m *AmpModule) serveOrbPortal(c *gin.Context) {
 			w.WriteHeader(http.StatusBadGateway)
 			_, _ = w.Write([]byte(`{"error":"orb portal upstream unavailable"}`))
 		},
+	}
+	if record.lifecycleV1 {
+		operation, admissionErr := manager.beginLifecycleAdmission(c.Request.Context(), actor, threadID, neoOrbStateRunning)
+		if admissionErr != nil {
+			body := gin.H{"error": "orb is not ready"}
+			if current, ok := manager.snapshot(threadID); ok && current.state != "" {
+				body["state"] = current.state
+			}
+			c.JSON(http.StatusConflict, body)
+			return
+		}
+		operation.close()
 	}
 	proxy.ServeHTTP(c.Writer, c.Request)
 }

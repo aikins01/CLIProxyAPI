@@ -18,6 +18,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/orbconfig"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/orbcredentials"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers/claude"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers/gemini"
@@ -478,6 +480,9 @@ func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *ha
 	}
 	localBrokerMiddleware = append(localBrokerMiddleware, clientAPIKeyMiddleware())
 	engine.Any("/ampcode/local-broker/heartbeat.json", append(localBrokerMiddleware, m.serveLocalBrokerHeartbeat)...)
+	engine.Any("/ampcode/local-broker/publish-image-result.json", append(localBrokerMiddleware, m.serveLocalBrokerPublishImageResult)...)
+	engine.Any(orbconfig.EndpointPath, append(localBrokerMiddleware, m.serveLocalBrokerOrbConfigBundle)...)
+	engine.Any(orbcredentials.EndpointPath, append(localBrokerMiddleware, m.serveLocalBrokerOrbCredentials)...)
 	engine.Any("/ampcode/local-projects.json", append(localProjectMiddleware, m.serveWebLocalProjects)...)
 	engine.Any("/ampcode/local-project-details.json", append(localProjectMiddleware, m.serveWebLocalProjectDetails)...)
 	engine.Any("/ampcode/local-activity.json", append(localProjectMiddleware, m.serveWebLocalActivity)...)

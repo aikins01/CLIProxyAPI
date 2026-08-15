@@ -2,6 +2,7 @@ package amp
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	_ "embed"
 	"encoding/base64"
@@ -9,14 +10,18 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/url"
 	"os"
 	"path"
 	"path/filepath"
+	"reflect"
+	"regexp"
 	"runtime"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,6 +32,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	log "github.com/sirupsen/logrus"
+	"gopkg.in/yaml.v3"
 )
 
 // Subagent tools (finder/oracle/librarian/Task) are advertised by the Amp
@@ -527,11 +533,24 @@ const (
 	neoSubagentAttachmentMaxTextLines  = 500
 	neoSubagentAttachmentMaxLineBytes  = 2048
 	neoRunCheckDefinitionMaxBytes      = 1024 * 1024
+	neoRunCheckDefinitionMaxEncoded    = 2 * neoRunCheckDefinitionMaxBytes
+	neoRunCheckDefinitionReadLineLimit = 20000
 	neoRunCheckToolEvidenceMaxBytes    = 4 * 1024 * 1024
 	neoRunCheckToolOutputMaxBytes      = 1024 * 1024
+	neoRunCheckDefinitionFormatLine    = "CLIPROXY_CHECK_FORMAT=1"
+	neoRunCheckDefinitionPathPrefix    = "CLIPROXY_CHECK_PATH="
+	neoRunCheckDefinitionBytesPrefix   = "CLIPROXY_CHECK_PAYLOAD_BYTES="
+	neoRunCheckDefinitionGzipPrefix    = "CLIPROXY_CHECK_COMPRESSED_BYTES="
+	neoRunCheckDefinitionPayloadPrefix = "CLIPROXY_CHECK_PAYLOAD="
+	neoRunCheckDefinitionEnvelopeEnd   = "CLIPROXY_CHECK_ENVELOPE_END"
 )
 
 var neoSubagentRunObserverForTest atomic.Pointer[neoSubagentRunObserver]
+
+var errNeoRunCheckDefinitionInvalid = errors.New("invalid run_check definition")
+var errNeoRunCheckDefinitionReadIncomplete = errors.New("run_check definition Read was incomplete")
+
+var neoRunCheckReadTruncationPattern = regexp.MustCompile(`…\[\+[0-9]+(?:\.[0-9]+)?(?:B|KB|MB|GB)\]$`)
 
 type neoSubagentRunObserver struct {
 	completed func(string)
@@ -588,6 +607,29 @@ func (a *neoActor) prepareRunCheckInput(input map[string]any) (map[string]any, e
 	return a.prepareRunCheckInputContext(context.Background(), input)
 }
 
+func (a *neoActor) activeReviewRootHistory() []neoHistoryMessage {
+	a.reviewSnapshotMu.Lock()
+	rootMessageID := a.reviewSnapshotRootMessageID
+	a.reviewSnapshotMu.Unlock()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if rootMessageID == "" {
+		rootMessageID = stringValue(mapValue(a.meta[neoReviewSnapshotStateMetaKey])["rootMessageID"])
+	}
+	for _, message := range a.messages {
+		if message.MessageID != rootMessageID || message.Role != "user" || strings.TrimSpace(message.ParentToolUseID) != "" {
+			continue
+		}
+		for _, raw := range message.Content {
+			if stringValue(mapValue(raw)["type"]) == "tool_result" {
+				return nil
+			}
+		}
+		return []neoHistoryMessage{neoUserHistoryMessage(message.Content, message.UserState, message.FileMentions, message.ParentToolUseID, message.Meta)}
+	}
+	return nil
+}
+
 func (a *neoActor) prepareRunCheckInputContext(ctx context.Context, input map[string]any) (map[string]any, error) {
 	diffDescription := stringValue(input["diffDescription"])
 	snapshot, authoritativeDescription, err := a.ensureReviewSnapshotForRunCheckContext(ctx, diffDescription, neoStringSlice(input["files"])...)
@@ -627,7 +669,13 @@ func (a *neoActor) ensureReviewSnapshotWithScopeContext(ctx context.Context, dif
 
 func (a *neoActor) ensureReviewSnapshotWithScopeContextLocked(ctx context.Context, diffDescription string, useEstablishedScope bool, files ...string) (*neoReviewDiffSnapshot, error) {
 	a.mu.Lock()
-	workingDirectory := neoWorkingDirectoryFromEnvironment(a.environment)
+	resolvedWorkingDirectory, _ := neoResolvedEnvironmentWorkspacePaths(a.environment)
+	generation := a.generation
+	executorReady := a.executorReady && len(a.sockets) != 0
+	workingDirectory := neoExistingDirectory(resolvedWorkingDirectory)
+	if executorReady {
+		workingDirectory = resolvedWorkingDirectory
+	}
 	persistedState := cloneMap(mapValue(a.meta[neoReviewSnapshotStateMetaKey]))
 	rootMessageID := ""
 	for i := len(a.messages) - 1; i >= 0; i-- {
@@ -681,7 +729,11 @@ func (a *neoActor) ensureReviewSnapshotWithScopeContextLocked(ctx context.Contex
 	a.reviewSnapshotErr = nil
 	var snapshot *neoReviewDiffSnapshot
 	var err error
-	snapshot, err = neoCaptureWorkingTreeReviewSnapshotContext(ctx, workingDirectory, diffDescription, scope...)
+	if executorReady {
+		snapshot, err = a.captureReviewSnapshotFromExecutor(ctx, workingDirectory, diffDescription, rootMessageID, generation, scope...)
+	} else {
+		snapshot, err = neoCaptureWorkingTreeReviewSnapshotContext(ctx, workingDirectory, diffDescription, scope...)
+	}
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return nil, err
@@ -700,6 +752,58 @@ func (a *neoActor) ensureReviewSnapshotWithScopeContextLocked(ctx context.Contex
 	a.mu.Unlock()
 	a.syncLocalThreadSnapshotAsync()
 	return snapshot, nil
+}
+
+func (a *neoActor) captureReviewSnapshotFromExecutor(ctx context.Context, workingDirectory, diffDescription, rootMessageID string, generation int, files ...string) (*neoReviewDiffSnapshot, error) {
+	command, err := neoReviewExecutorSnapshotCommand(diffDescription, workingDirectory, files)
+	if err != nil || command == "" {
+		return nil, err
+	}
+	capture := func() (*neoReviewDiffSnapshot, string, error) {
+		call := neoToolCall{
+			ID:   newNeoToolCallID(),
+			Name: "shell_command",
+			Input: map[string]any{
+				"command": command,
+				"workdir": workingDirectory,
+			},
+		}
+		run := a.execSubagentLeafTool(ctx, call, neoReviewExecutorSnapshotParent, rootMessageID, generation)
+		status := strings.ToLower(strings.TrimSpace(stringValue(run["status"])))
+		if status != "done" {
+			if ctx.Err() != nil {
+				return nil, "", ctx.Err()
+			}
+			detail := strings.TrimSpace(runToText(run))
+			if detail == "" {
+				detail = fallbackString(status, "unknown status")
+			}
+			return nil, "", fmt.Errorf("capture review diff from executor: %s", detail)
+		}
+		result := mapValue(run["result"])
+		exitCode, hasExitCode := result["exitCode"]
+		if boolValue(result["running"]) || !hasExitCode || numberFrom(exitCode) != 0 {
+			return nil, "", fmt.Errorf("capture review diff from executor: shell command failed")
+		}
+		output := stringValue(result["output"])
+		if output == "" {
+			output = stringValue(run["output"])
+		}
+		snapshot, err := neoReviewSnapshotFromExecutorOutput(output)
+		return snapshot, output, err
+	}
+	first, firstOutput, err := capture()
+	if err != nil {
+		return nil, err
+	}
+	second, secondOutput, err := capture()
+	if err != nil {
+		return nil, err
+	}
+	if first.Hash != second.Hash || firstOutput != secondOutput {
+		return nil, fmt.Errorf("capture review diff: index or working tree changed during capture")
+	}
+	return second, nil
 }
 
 func (a *neoActor) reviewSnapshotForValidation() (*neoReviewDiffSnapshot, error) {
@@ -1169,6 +1273,9 @@ func neoSubagentRouteFallbackEligible(err error) bool {
 func (a *neoActor) executeSubagentRun(name string, input map[string]any, parentToolCallID, parentMessageID string, generation, depth int, clientAPIKey string) (string, error) {
 	name = strings.TrimSpace(name)
 	dependencyFloorCheck := false
+	runCheckHydrationPath := ""
+	workingDirectory := ""
+	workspaceRoot := ""
 	def, ok := neoSubagentDefFor(name)
 	if !ok {
 		return "", fmt.Errorf("unknown subagent %q", name)
@@ -1180,11 +1287,38 @@ func (a *neoActor) executeSubagentRun(name string, input map[string]any, parentT
 		delete(input, neoRunCheckToolEvidenceRequired)
 		dependencyFloorCheck = stringValue(input["checkName"]) == "published-dependency-capability-floor"
 		a.mu.Lock()
-		workingDirectory := neoWorkingDirectoryFromEnvironment(a.environment)
+		workingDirectory = neoWorkingDirectoryFromEnvironment(a.environment)
+		_, workspaceRoot = neoFinderEnvironmentPaths(a.environment)
 		a.mu.Unlock()
-		input, err = neoPrepareRunCheckDefinition(input, workingDirectory)
+		history := a.activeReviewRootHistory()
+		reference := neoReviewRunCheckReferenceKind(history, input)
+		inlineCheck := strings.TrimSpace(stringValue(input["checkContent"])) != ""
+		if reference == neoReviewRunCheckReferenceNone && !neoReviewRunCheckDiscoveryAuthorized(history) && !(len(history) == 0 && inlineCheck) {
+			return "", fmt.Errorf("run_check definition is not authorized by the active review root")
+		}
+		preparedInput, err := neoPrepareRunCheckDefinition(input, workingDirectory)
 		if err != nil {
-			return "", err
+			if !neoRunCheckDefinitionExecutorFallbackEligible(err) {
+				return "", err
+			}
+			runCheckHydrationPath, err = neoRunCheckExecutorFilePath(stringValue(input["checkURI"]))
+			if err != nil {
+				return "", err
+			}
+			if !neoRunCheckExecutorDefinitionTrusted(runCheckHydrationPath, workspaceRoot) {
+				return "", fmt.Errorf("run_check executor definition is outside trusted check directories")
+			}
+		} else if inlineCheck {
+			input = preparedInput
+		} else {
+			checkPath, pathErr := neoRunCheckExecutorFilePath(stringValue(input["checkURI"]))
+			if pathErr != nil {
+				return "", pathErr
+			}
+			if err := neoValidateDiscoveredRunCheckIdentity(stringValue(preparedInput["checkContent"]), checkPath, input); err != nil {
+				return "", err
+			}
+			input = preparedInput
 		}
 		delete(input, neoRunCheckToolEvidenceKey)
 		delete(input, neoRunCheckToolEvidenceRequired)
@@ -1194,6 +1328,16 @@ func (a *neoActor) executeSubagentRun(name string, input map[string]any, parentT
 		return "", nil
 	}
 	defer a.releaseSubagentRun(subagentRunID)
+	if runCheckHydrationPath != "" {
+		content, err := a.hydrateRunCheckDefinition(runContext, runCheckHydrationPath, workingDirectory, workspaceRoot, parentToolCallID, parentMessageID, generation)
+		if err != nil {
+			return "", err
+		}
+		if err := neoValidateDiscoveredRunCheckIdentity(content, runCheckHydrationPath, input); err != nil {
+			return "", err
+		}
+		input["checkContent"] = content
+	}
 	if name == "finder" {
 		finderContext, finderRunID, acquired := a.acquireFinderRun(runContext, generation)
 		if !acquired {
@@ -2007,7 +2151,10 @@ func neoSubagentRetryableInferenceValue(value any) bool {
 }
 
 func neoPrepareRunCheckDefinition(input map[string]any, workingDirectory string) (map[string]any, error) {
-	if strings.TrimSpace(stringValue(input["checkContent"])) != "" {
+	if content := stringValue(input["checkContent"]); strings.TrimSpace(content) != "" {
+		if err := neoValidateRunCheckDefinitionContent(content); err != nil {
+			return nil, err
+		}
 		return input, nil
 	}
 	checkURI := strings.TrimSpace(stringValue(input["checkURI"]))
@@ -2030,7 +2177,7 @@ func neoPrepareRunCheckDefinition(input map[string]any, workingDirectory string)
 	}
 	if !info.Mode().IsRegular() || info.Size() > neoRunCheckDefinitionMaxBytes {
 		_ = file.Close()
-		return nil, fmt.Errorf("run_check definition must be a regular file no larger than %d bytes", neoRunCheckDefinitionMaxBytes)
+		return nil, fmt.Errorf("%w: run_check definition must be a regular file no larger than %d bytes", errNeoRunCheckDefinitionInvalid, neoRunCheckDefinitionMaxBytes)
 	}
 	content, err := io.ReadAll(io.LimitReader(file, neoRunCheckDefinitionMaxBytes+1))
 	errClose := file.Close()
@@ -2040,15 +2187,333 @@ func neoPrepareRunCheckDefinition(input map[string]any, workingDirectory string)
 	if errClose != nil {
 		return nil, fmt.Errorf("close run_check definition: %w", errClose)
 	}
-	if len(content) > neoRunCheckDefinitionMaxBytes {
-		return nil, fmt.Errorf("run_check definition must be a regular file no larger than %d bytes", neoRunCheckDefinitionMaxBytes)
-	}
-	if strings.TrimSpace(string(content)) == "" {
-		return nil, fmt.Errorf("run_check definition is empty")
+	if err := neoValidateRunCheckDefinitionContent(string(content)); err != nil {
+		return nil, err
 	}
 	prepared := cloneMap(input)
 	prepared["checkContent"] = string(content)
 	return prepared, nil
+}
+
+func neoValidateRunCheckDefinitionContent(content string) error {
+	if len(content) > neoRunCheckDefinitionMaxBytes {
+		return fmt.Errorf("%w: run_check definition must be no larger than %d bytes", errNeoRunCheckDefinitionInvalid, neoRunCheckDefinitionMaxBytes)
+	}
+	if strings.TrimSpace(content) == "" {
+		return fmt.Errorf("%w: run_check definition is empty", errNeoRunCheckDefinitionInvalid)
+	}
+	if !utf8.ValidString(content) || strings.IndexByte(content, 0) >= 0 {
+		return fmt.Errorf("%w: run_check definition must be text", errNeoRunCheckDefinitionInvalid)
+	}
+	return nil
+}
+
+func neoValidateDiscoveredRunCheckIdentity(content, checkPath string, input map[string]any) error {
+	frontmatter, err := neoRunCheckDefinitionFrontmatter(content)
+	if err != nil {
+		return err
+	}
+	expectedName := stringValue(frontmatter["name"])
+	if expectedName == "" {
+		expectedName = strings.TrimSuffix(path.Base(strings.ReplaceAll(checkPath, `\`, "/")), path.Ext(checkPath))
+	}
+	if stringValue(input["checkName"]) != expectedName || !reflect.DeepEqual(neoCanonicalReviewCheckFrontmatter(input["frontmatter"]), neoCanonicalReviewCheckFrontmatter(frontmatter)) {
+		return fmt.Errorf("run_check discovered definition identity does not match hydrated content")
+	}
+	return nil
+}
+
+func neoRunCheckDefinitionFrontmatter(content string) (map[string]any, error) {
+	content = strings.TrimPrefix(content, "\ufeff")
+	lines := strings.Split(content, "\n")
+	if len(lines) == 0 || strings.TrimSpace(strings.TrimSuffix(lines[0], "\r")) != "---" {
+		return nil, nil
+	}
+	end := -1
+	for index := 1; index < len(lines); index++ {
+		if strings.TrimSpace(strings.TrimSuffix(lines[index], "\r")) == "---" {
+			end = index
+			break
+		}
+	}
+	if end < 0 {
+		return nil, fmt.Errorf("run_check discovered definition has unterminated YAML frontmatter")
+	}
+	var frontmatter map[string]any
+	if err := yaml.Unmarshal([]byte(strings.Join(lines[1:end], "\n")), &frontmatter); err != nil || len(frontmatter) == 0 {
+		return nil, fmt.Errorf("run_check discovered definition has invalid YAML frontmatter")
+	}
+	return frontmatter, nil
+}
+
+func neoRunCheckDefinitionExecutorFallbackEligible(err error) bool {
+	if errors.Is(err, errNeoRunCheckDefinitionInvalid) {
+		return false
+	}
+	return errors.Is(err, fs.ErrNotExist)
+}
+
+func neoRunCheckExecutorFilePath(checkURI string) (string, error) {
+	parsed, err := url.Parse(strings.TrimSpace(checkURI))
+	if err != nil || !strings.EqualFold(parsed.Scheme, "file") || (parsed.Host != "" && !strings.EqualFold(parsed.Host, "localhost")) || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", fmt.Errorf("run_check executor hydration requires a local file check URI")
+	}
+	checkPath := strings.ReplaceAll(parsed.Path, `\`, "/")
+	if len(checkPath) >= 3 && checkPath[0] == '/' && checkPath[2] == ':' &&
+		((checkPath[1] >= 'A' && checkPath[1] <= 'Z') || (checkPath[1] >= 'a' && checkPath[1] <= 'z')) {
+		checkPath = checkPath[1:]
+	}
+	if !utf8.ValidString(checkPath) || strings.IndexByte(checkPath, 0) >= 0 {
+		return "", fmt.Errorf("run_check executor path must be text")
+	}
+	if !neoFinderPathIsAbsolute(checkPath) {
+		return "", fmt.Errorf("run_check check URI must resolve to an absolute executor path")
+	}
+	if path.Clean(checkPath) != checkPath {
+		return "", fmt.Errorf("run_check executor path must be normalized")
+	}
+	return checkPath, nil
+}
+
+func neoRunCheckExecutorDefinitionTrusted(checkPath, workspaceRoot string) bool {
+	return len(neoRunCheckExecutorTrustedPaths(checkPath, workspaceRoot)) != 0
+}
+
+func neoRunCheckExecutorTrustedPaths(checkPath, workspaceRoot string) []map[string]string {
+	trustedPaths := make([]map[string]string, 0, 3)
+	if home := neoRunCheckExecutorHomeDirectory(workspaceRoot); home != "" {
+		ampChecks := home + "/.config/amp/checks"
+		agentChecks := home + "/.config/agents/checks"
+		for _, root := range []string{ampChecks, agentChecks} {
+			if neoFinderPathWithin(root, checkPath) && !neoFinderPathEqual(root, checkPath) {
+				relative, ok := neoFinderRelative(home, checkPath)
+				if ok {
+					trustedPaths = append(trustedPaths, map[string]string{"base": home, "relative": relative})
+				}
+			}
+		}
+	}
+	if workspaceRoot == "" || !neoFinderPathWithin(workspaceRoot, checkPath) {
+		return trustedPaths
+	}
+	relative, ok := neoFinderRelative(workspaceRoot, checkPath)
+	if !ok {
+		return trustedPaths
+	}
+	parts := strings.Split(relative, "/")
+	for index := 0; index+2 < len(parts); index++ {
+		if parts[index] == ".agents" && parts[index+1] == "checks" {
+			trustedPaths = append(trustedPaths, map[string]string{"base": workspaceRoot, "relative": relative})
+			break
+		}
+	}
+	return trustedPaths
+}
+
+func neoRunCheckExecutorHomeDirectory(workspaceRoot string) string {
+	root, err := neoFinderPathValue(workspaceRoot)
+	if err != nil || !strings.HasPrefix(root, "/") || strings.HasPrefix(root, "//") {
+		return ""
+	}
+	parts := strings.Split(strings.TrimPrefix(root, "/"), "/")
+	if len(parts) >= 2 && (parts[0] == "Users" || parts[0] == "home") && parts[1] != "" {
+		return "/" + parts[0] + "/" + parts[1]
+	}
+	if len(parts) >= 1 && parts[0] == "root" {
+		return "/root"
+	}
+	return ""
+}
+
+func (a *neoActor) hydrateRunCheckDefinition(ctx context.Context, checkPath, workingDirectory, workspaceRoot, parentToolCallID, parentMessageID string, generation int) (string, error) {
+	content, err := a.hydrateRunCheckDefinitionFallback(ctx, checkPath, workingDirectory, workspaceRoot, parentToolCallID, parentMessageID, generation)
+	if err != nil {
+		return "", fmt.Errorf("read complete run_check definition from executor: %w", err)
+	}
+	return content, nil
+}
+
+func neoRunCheckDefinitionText(value any) (string, error) {
+	numbered := stringValue(value)
+	if numbered == "" {
+		return "", nil
+	}
+	lines := strings.Split(numbered, "\n")
+	for index, line := range lines {
+		if strings.HasPrefix(line, "[... omitted lines ") {
+			return "", errNeoRunCheckDefinitionReadIncomplete
+		}
+		prefix := strconv.Itoa(index+1) + ":"
+		if !strings.HasPrefix(line, prefix) || (len(line) > len(prefix) && line[len(prefix)] != ' ') {
+			return "", fmt.Errorf("run_check definition Read returned invalid line numbering")
+		}
+		line = strings.TrimPrefix(line[len(prefix):], " ")
+		if neoRunCheckReadTruncationPattern.MatchString(line) {
+			return "", fmt.Errorf("%w: run_check definition Read truncated a line", errNeoRunCheckDefinitionReadIncomplete)
+		}
+		lines[index] = line
+	}
+	if len(lines) >= neoRunCheckDefinitionReadLineLimit {
+		return "", errNeoRunCheckDefinitionReadIncomplete
+	}
+	return strings.Join(lines, "\n"), nil
+}
+
+func (a *neoActor) hydrateRunCheckDefinitionFallback(ctx context.Context, checkPath, workingDirectory, workspaceRoot, parentToolCallID, parentMessageID string, generation int) (string, error) {
+	pathJSON, _ := json.Marshal(checkPath)
+	pathsJSON, _ := json.Marshal(neoRunCheckExecutorTrustedPaths(checkPath, workspaceRoot))
+	command := fmt.Sprintf(`python3 - <<'PY'
+import base64, gzip, json, os, stat
+
+check_path = os.path.normpath(json.loads(%q))
+trusted_paths = json.loads(%q)
+trusted = next((candidate for candidate in trusted_paths if os.path.normpath(os.path.join(candidate["base"], candidate["relative"])) == check_path), None)
+if trusted is None:
+    raise SystemExit(66)
+base = os.path.normpath(trusted["base"])
+relative = trusted["relative"]
+parts = relative.split(os.sep)
+if not parts or any(part in ("", ".", "..") for part in parts):
+    raise SystemExit(66)
+resolved_base = os.path.realpath(base)
+base_parts = [part for part in resolved_base.split(os.sep) if part]
+directory_fd = os.open(os.sep, os.O_RDONLY | os.O_DIRECTORY)
+try:
+    for part in base_parts:
+        next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory_fd)
+        os.close(directory_fd)
+        directory_fd = next_fd
+    for part in parts[:-1]:
+        next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory_fd)
+        os.close(directory_fd)
+        directory_fd = next_fd
+    fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+finally:
+    os.close(directory_fd)
+try:
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_size > %d:
+        raise SystemExit(65)
+    payload = b""
+    while len(payload) <= %d:
+        chunk = os.read(fd, min(65536, %d + 1 - len(payload)))
+        if not chunk:
+            break
+        payload += chunk
+finally:
+    os.close(fd)
+if len(payload) > %d:
+    raise SystemExit(65)
+compressed = gzip.compress(payload, mtime=0)
+encoded = base64.b64encode(compressed).decode("ascii")
+if len(encoded) > %d:
+    raise SystemExit(65)
+print(%q)
+print(%q + base64.b64encode(check_path.encode()).decode("ascii"))
+print(%q + str(len(payload)))
+print(%q + str(len(compressed)))
+print(%q + encoded)
+print(%q)
+PY`, string(pathJSON), string(pathsJSON), neoRunCheckDefinitionMaxBytes, neoRunCheckDefinitionMaxBytes,
+		neoRunCheckDefinitionMaxBytes, neoRunCheckDefinitionMaxBytes, neoRunCheckDefinitionMaxEncoded,
+		neoRunCheckDefinitionFormatLine, neoRunCheckDefinitionPathPrefix, neoRunCheckDefinitionBytesPrefix,
+		neoRunCheckDefinitionGzipPrefix, neoRunCheckDefinitionPayloadPrefix, neoRunCheckDefinitionEnvelopeEnd)
+	call := neoToolCall{ID: newNeoToolCallID(), Name: "shell_command", Input: map[string]any{
+		"command": command, "workdir": workingDirectory,
+	}}
+	run := a.execSubagentLeafTool(ctx, call, parentToolCallID, parentMessageID, generation)
+	status := strings.ToLower(strings.TrimSpace(stringValue(run["status"])))
+	result := mapValue(run["result"])
+	exitCode, hasExitCode := result["exitCode"]
+	if status != "done" {
+		if ctx.Err() != nil {
+			return "", fmt.Errorf("executor read of run_check definition was cancelled: %w", ctx.Err())
+		}
+		if status == "cancelled" {
+			return "", fmt.Errorf("executor read of run_check definition was cancelled")
+		}
+		return "", fmt.Errorf("executor could not read run_check definition")
+	}
+	if boolValue(result["running"]) || !hasExitCode {
+		return "", fmt.Errorf("executor could not read run_check definition")
+	}
+	switch numberFrom(exitCode) {
+	case 0:
+	case 65:
+		return "", fmt.Errorf("executor rejected an invalid, oversized, or non-regular run_check definition")
+	case 66:
+		return "", fmt.Errorf("executor rejected an untrusted run_check definition path")
+	default:
+		return "", fmt.Errorf("executor could not read run_check definition")
+	}
+	output := stringValue(result["output"])
+	if output == "" {
+		output = stringValue(run["output"])
+	}
+	return neoRunCheckDefinitionFromExecutorOutput(output, checkPath)
+}
+
+func neoRunCheckDefinitionFromExecutorOutput(output, checkPath string) (string, error) {
+	lines := strings.Split(output, "\n")
+	if len(lines) != 7 || lines[0] != neoRunCheckDefinitionFormatLine || lines[6] != "" || lines[5] != neoRunCheckDefinitionEnvelopeEnd {
+		return "", fmt.Errorf("read complete run_check definition from executor: invalid envelope")
+	}
+	decode := func(line, prefix string) ([]byte, error) {
+		if !strings.HasPrefix(line, prefix) {
+			return nil, fmt.Errorf("invalid envelope")
+		}
+		return base64.StdEncoding.Strict().DecodeString(strings.TrimPrefix(line, prefix))
+	}
+	pathBytes, err := decode(lines[1], neoRunCheckDefinitionPathPrefix)
+	if err != nil || string(pathBytes) != checkPath {
+		return "", fmt.Errorf("read complete run_check definition from executor: unexpected path")
+	}
+	parseSize := func(line, prefix string, maximum int) (int, error) {
+		if !strings.HasPrefix(line, prefix) {
+			return 0, fmt.Errorf("invalid size")
+		}
+		value, err := strconv.Atoi(strings.TrimPrefix(line, prefix))
+		if err != nil || value < 0 || value > maximum {
+			return 0, fmt.Errorf("invalid size")
+		}
+		return value, nil
+	}
+	payloadBytes, err := parseSize(lines[2], neoRunCheckDefinitionBytesPrefix, neoRunCheckDefinitionMaxBytes)
+	if err != nil {
+		return "", fmt.Errorf("read complete run_check definition from executor: invalid payload size")
+	}
+	compressedBytes, err := parseSize(lines[3], neoRunCheckDefinitionGzipPrefix, neoRunCheckDefinitionMaxEncoded)
+	if err != nil {
+		return "", fmt.Errorf("read complete run_check definition from executor: invalid compressed size")
+	}
+	compressed, err := decode(lines[4], neoRunCheckDefinitionPayloadPrefix)
+	if err != nil || len(compressed) != compressedBytes {
+		return "", fmt.Errorf("read complete run_check definition from executor: invalid compressed payload")
+	}
+	compressedReader := bytes.NewReader(compressed)
+	reader, err := gzip.NewReader(compressedReader)
+	if err != nil {
+		return "", fmt.Errorf("read complete run_check definition from executor: invalid compressed payload")
+	}
+	reader.Multistream(false)
+	payload, readErr := io.ReadAll(io.LimitReader(reader, int64(neoRunCheckDefinitionMaxBytes+1)))
+	closeErr := reader.Close()
+	if readErr != nil || closeErr != nil || len(payload) != payloadBytes || compressedReader.Len() != 0 {
+		return "", fmt.Errorf("read complete run_check definition from executor: incomplete compressed payload")
+	}
+	content := string(payload)
+	if err := neoValidateRunCheckDefinitionContent(content); err != nil {
+		return "", err
+	}
+	return content, nil
+}
+
+func neoRunCheckDefinitionReadMatches(numbered, content string) bool {
+	displayed, err := neoRunCheckDefinitionText(numbered)
+	if err != nil {
+		return false
+	}
+	return displayed == content || displayed+"\n" == content
 }
 
 func neoRunCheckFileURLPath(parsedPath, goos string) string {
@@ -2465,6 +2930,7 @@ func (a *neoActor) prepareSubagentTurnTools(items []neoSubagentTurnTool, parentT
 		item.waiter = make(chan map[string]any, 1)
 		a.subagentWaiters[item.executable.ID] = item.waiter
 		delete(a.subagentToolLeaseAcks, item.executable.ID)
+		delete(a.subagentToolProgress, item.executable.ID)
 		emissions = append(emissions, withNeoParentToolCallID(map[string]any{
 			"type":       "tool_lease",
 			"toolCallId": item.executable.ID,
@@ -2593,6 +3059,7 @@ func (a *neoActor) prepareFinderTurnTools(items []neoSubagentTurnTool, parentToo
 			ParentToolCallID: parentToolCallID,
 		}
 		delete(a.subagentToolLeaseAcks, item.executable.ID)
+		delete(a.subagentToolProgress, item.executable.ID)
 		emissions = append(emissions, withNeoParentToolCallID(map[string]any{
 			"type":       "tool_lease",
 			"toolCallId": item.executable.ID,
@@ -3497,6 +3964,7 @@ func (a *neoActor) storeSubagentToolResultMessageForGeneration(toolCallID string
 		delete(a.subagentWaiters, toolCallID)
 		delete(a.subagentTools, toolCallID)
 		delete(a.subagentToolLeaseAcks, toolCallID)
+		delete(a.subagentToolProgress, toolCallID)
 	}
 	sockets := a.socketListLocked()
 	a.mu.Unlock()
@@ -3585,7 +4053,9 @@ func (a *neoActor) storeSubagentToolExchanges(exchanges []neoSubagentToolExchang
 func (a *neoActor) execSubagentLeafTool(ctx context.Context, call neoToolCall, parentToolCallID, childMessageID string, generation int) map[string]any {
 	cancelled := map[string]any{"status": "cancelled", "reason": "user:cancelled"}
 	if ctx.Err() != nil {
-		a.storeSubagentToolResultMessageForGeneration(call.ID, cloneMap(cancelled), parentToolCallID, "", generation)
+		if parentToolCallID != neoReviewExecutorSnapshotParent {
+			a.storeSubagentToolResultMessageForGeneration(call.ID, cloneMap(cancelled), parentToolCallID, "", generation)
+		}
 		return cancelled
 	}
 	ch := make(chan map[string]any, 1)
@@ -3623,7 +4093,11 @@ func (a *neoActor) cancelSubagentLeafToolWaiter(toolCallID string, ch chan map[s
 	delete(a.subagentWaiters, toolCallID)
 	delete(a.subagentTools, toolCallID)
 	delete(a.subagentToolLeaseAcks, toolCallID)
-	event := a.storeSubagentToolResultMessageLocked(toolCallID, run, pending.ParentToolCallID, "")
+	delete(a.subagentToolProgress, toolCallID)
+	var event map[string]any
+	if pending.ParentToolCallID != neoReviewExecutorSnapshotParent {
+		event = a.storeSubagentToolResultMessageLocked(toolCallID, run, pending.ParentToolCallID, "")
+	}
 	sockets := a.socketListLocked()
 	a.mu.Unlock()
 	revoked := map[string]any{"type": "executor_tool_lease_revoked", "toolCallId": toolCallID, "reason": "user_canceled"}
@@ -3631,7 +4105,9 @@ func (a *neoActor) cancelSubagentLeafToolWaiter(toolCallID string, ch chan map[s
 		if socket == nil || !socket.canSend() {
 			continue
 		}
-		socket.send(event)
+		if event != nil {
+			socket.send(event)
+		}
 		socket.send(revoked)
 	}
 	a.emissionMu.Unlock()
@@ -3670,6 +4146,7 @@ func (a *neoActor) registerSubagentLeafTool(call neoToolCall, parentToolCallID, 
 		ParentToolCallID: parentToolCallID,
 	}
 	delete(a.subagentToolLeaseAcks, call.ID)
+	delete(a.subagentToolProgress, call.ID)
 	sockets := a.socketListLocked()
 	a.mu.Unlock()
 
@@ -3691,8 +4168,16 @@ func (a *neoActor) registerSubagentLeafTool(call neoToolCall, parentToolCallID, 
 
 // routeSubagentLeafToolResult delivers an executor tool result to the waiting
 // subagent loop. Returns true when the result was consumed by a subagent.
-func (a *neoActor) routeSubagentLeafToolResult(toolCallID string, run map[string]any) bool {
+func (a *neoActor) routeSubagentLeafToolResult(toolCallID string, run map[string]any, sourceSockets ...*neoSocket) bool {
+	var source *neoSocket
+	if len(sourceSockets) > 0 {
+		source = sourceSockets[0]
+	}
 	a.mu.Lock()
+	if source != nil && (!source.isExecutor() || a.executorSocket != source) {
+		a.mu.Unlock()
+		return false
+	}
 	ch, ok := a.subagentWaiters[toolCallID]
 	pending := neoPendingTool{ID: toolCallID}
 	if a.subagentTools != nil {
@@ -3700,6 +4185,7 @@ func (a *neoActor) routeSubagentLeafToolResult(toolCallID string, run map[string
 			pending = tracked
 		}
 	}
+	run = neoCanonicalizeTerminalToolRun(pending, run)
 	terminal := neoToolRunTerminalForPending(pending, run)
 	if !ok {
 		a.mu.Unlock()
@@ -3707,9 +4193,12 @@ func (a *neoActor) routeSubagentLeafToolResult(toolCallID string, run map[string
 	}
 	a.mu.Unlock()
 	if !terminal {
+		if pending.ParentToolCallID == neoReviewExecutorSnapshotParent {
+			return true
+		}
 		a.emissionMu.Lock()
 		a.mu.Lock()
-		if a.subagentWaiters[toolCallID] != ch {
+		if source != nil && a.executorSocket != source || a.subagentWaiters[toolCallID] != ch {
 			a.mu.Unlock()
 			a.emissionMu.Unlock()
 			return false
@@ -3730,15 +4219,18 @@ func (a *neoActor) routeSubagentLeafToolResult(toolCallID string, run map[string
 	normalized := normalizeNeoExecutorToolRun(context.Background(), a.runtime, pending, run, a.threadID)
 	a.emissionMu.Lock()
 	a.mu.Lock()
-	owner := a.subagentWaiters[toolCallID] == ch
+	owner := (source == nil || a.executorSocket == source) && a.subagentWaiters[toolCallID] == ch
 	var event map[string]any
-	var sockets []*neoSocket
+	var targets []*neoSocket
 	if owner {
 		delete(a.subagentWaiters, toolCallID)
 		delete(a.subagentTools, toolCallID)
 		delete(a.subagentToolLeaseAcks, toolCallID)
-		event = a.storeSubagentToolResultMessageLocked(toolCallID, normalized, pending.ParentToolCallID, "")
-		sockets = a.socketListLocked()
+		delete(a.subagentToolProgress, toolCallID)
+		if pending.ParentToolCallID != neoReviewExecutorSnapshotParent {
+			event = a.storeSubagentToolResultMessageLocked(toolCallID, normalized, pending.ParentToolCallID, "")
+		}
+		targets = a.socketListLocked()
 	}
 	a.mu.Unlock()
 	if !owner {
@@ -3746,11 +4238,13 @@ func (a *neoActor) routeSubagentLeafToolResult(toolCallID string, run map[string
 		return false
 	}
 	ack := map[string]any{"type": "executor_tool_result_ack", "toolCallId": toolCallID}
-	for _, socket := range sockets {
+	for _, socket := range targets {
 		if socket == nil || !socket.canSend() {
 			continue
 		}
-		socket.send(event)
+		if event != nil {
+			socket.send(event)
+		}
 		socket.send(ack)
 	}
 	select {
@@ -3784,6 +4278,7 @@ func (a *neoActor) takeSubagentCancellationLocked() neoSubagentCancellation {
 	a.subagentWaiters = map[string]chan map[string]any{}
 	a.subagentTools = map[string]neoPendingTool{}
 	a.subagentToolLeaseAcks = map[string]bool{}
+	a.subagentToolProgress = map[string]map[string]any{}
 	return neoSubagentCancellation{IDs: ids, Waiters: waiters}
 }
 
@@ -3932,7 +4427,7 @@ func neoSubagentInputText(toolName string, input map[string]any) string {
 			b.WriteString(snapshotText)
 			b.WriteString("\n\n")
 		}
-		frontmatter, _ := json.Marshal(mapValue(input["frontmatter"]))
+		frontmatter, _ := json.Marshal(input["frontmatter"])
 		checkURI := stringValue(input["checkURI"])
 		checkContent := stringValue(input["checkContent"])
 		hasCheckContent := strings.TrimSpace(checkContent) != ""

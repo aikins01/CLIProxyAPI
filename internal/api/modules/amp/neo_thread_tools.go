@@ -25,7 +25,7 @@ const neoAmpInternalRPCMaxResponseBytes = 1024 * 1024
 
 func isNeoThreadTool(name string) bool {
 	switch strings.TrimSpace(name) {
-	case "find_thread", "list_agent_modes", "list_runners", "list_workspace_members", "find_shared_plugins_and_skills", "create_thread", "get_current_user_identity", "thread_interact", "get_thread_metadata", "update_thread", "rename_thread", "set_thread_pinned", "add_thread_labels", "remove_thread_labels", "archive_current_thread", "archive_thread", "archive_threads", "unarchive_thread", "send_message_to_thread", "download_thread_file", "upload_thread_file", "get_schedule", "set_schedule", "update_schedule", "clear_schedule":
+	case "publish_image", "find_thread", "list_agent_modes", "list_runners", "list_workspace_members", "find_shared_plugins_and_skills", "create_thread", "get_current_user_identity", "thread_interact", "get_thread_metadata", "update_thread", "rename_thread", "set_thread_pinned", "add_thread_labels", "remove_thread_labels", "archive_current_thread", "archive_thread", "archive_threads", "unarchive_thread", "send_message_to_thread", "download_thread_file", "upload_thread_file", "get_schedule", "set_schedule", "update_schedule", "clear_schedule":
 		return true
 	default:
 		return false
@@ -36,6 +36,8 @@ func neoThreadToolSpec(toolName string) (neoToolSpec, bool) {
 	name := strings.TrimSpace(toolName)
 	threadID := map[string]any{"type": "string", "description": "Amp thread ID or thread URL."}
 	switch name {
+	case "publish_image":
+		return neoPublishImageToolSpec(), true
 	case "find_thread":
 		return neoToolSpec{
 			Name:        name,
@@ -375,7 +377,7 @@ func (a *neoActor) runLocalThreadActorTool(pending neoPendingTool, generation in
 
 func isNeoAmpWorkspaceTool(name string) bool {
 	switch strings.TrimSpace(name) {
-	case "list_workspace_members", "find_shared_plugins_and_skills":
+	case "list_workspace_members", "find_shared_plugins_and_skills", "publish_image":
 		return true
 	default:
 		return false
@@ -387,6 +389,8 @@ func neoThreadToolProgressText(name string, input map[string]any) string {
 	switch strings.TrimSpace(name) {
 	case "find_thread":
 		return "Searching threads"
+	case "publish_image":
+		return "Publishing image"
 	case "list_agent_modes":
 		return "Listing agent modes"
 	case "list_runners":
@@ -476,6 +480,8 @@ func (a *neoActor) executeLocalThreadTool(pending neoPendingTool) (map[string]an
 
 func (a *neoActor) executeLocalThreadToolContext(ctx context.Context, pending neoPendingTool) (map[string]any, error) {
 	switch strings.TrimSpace(pending.Name) {
+	case "publish_image":
+		return a.executeLocalPublishImageTool(ctx, pending.Input)
 	case "find_thread":
 		return a.executeLocalFindThreadTool(pending.Input)
 	case "list_agent_modes":
@@ -1205,11 +1211,11 @@ func (a *neoActor) localCreateThreadBody(input map[string]any, threadID string) 
 		agent = neoCustomAgentDefinitionFromSettings(parentSettings)
 	}
 	if len(agent) == 0 && agentMode != "" && !validNeoClientAgentMode(agentMode) {
-		pluginMode, pluginErr := loadNeoPluginAgentMode(agentMode)
+		pluginMode, pluginErr := a.runtime.loadNeoPluginAgentModeForOwner(a.threadToolOwnerID(), agentMode)
 		if pluginErr != nil {
 			return nil, "", false, fmt.Errorf("create_thread received unsupported agentMode %q", agentMode)
 		}
-		agent = pluginMode.agentDefinition()
+		agent = pluginMode.AgentDefinition()
 		if reasoningEffort == "" {
 			reasoningEffort = pluginMode.ReasoningEffort
 		}

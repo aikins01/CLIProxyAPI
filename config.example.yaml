@@ -433,6 +433,16 @@ nonstream-keepalive-interval: 0
 #     #                               # browser/desktop skills stay local. Endpoints, MCP
 #     #                               # definitions, permissions, thread state, plugins,
 #     #                               # and credential-shaped files are never copied.
+#     #                               # This is the fallback when an authenticated Mac
+#     #                               # broker has not published an owner bundle. Owner
+#     #                               # bundles contain only checks, compatible skills,
+#     #                               # and commit-pinned gh-* GitHub CLI extension declarations.
+#     #                               # Fresh and resumed orbs exact-reconcile them before
+#     #                               # executor startup; credentials are never included.
+#     #                               # Opt-in Mac broker credential sync uses a separate
+#     #                               # channel and requires the server process environment
+#     #                               # CLIPROXYAPI_ORB_CREDENTIALS_KEY_FILE to name a
+#     #                               # private 0600 file containing a base64 32-byte key.
 #   # Amp Model Mappings
 #   # Route unavailable Amp models to alternative models available in your local proxy.
 #   # Useful when Amp CLI requests models you don't have access to (e.g., Claude Opus 4.5)

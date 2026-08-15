@@ -37,6 +37,8 @@ var neoModeRuntimeOnlyTools = map[string]map[string]bool{
 	"puck": toolSet("rename_thread", "set_thread_pinned", "add_thread_labels", "remove_thread_labels", "set_schedule"),
 }
 
+var neoModeGlobalRuntimeOnlyTools = toolSet("publish_image")
+
 var neoModeAuditBaselineClientRegisteredTools = toolSet("portal_observe", "portal_control")
 
 var neoModeAuditBaselineClientRegisteredModes = toolSet("smart", "large", "rush", "deep", "nostromo", "low", "medium", "high", "ultra")
@@ -45,7 +47,7 @@ func neoModeBinaryComparableTools(mode string, names []string) []string {
 	runtimeOnly := neoModeRuntimeOnlyTools[mode]
 	out := make([]string, 0, len(names))
 	for _, name := range names {
-		if !runtimeOnly[name] {
+		if !runtimeOnly[name] && !neoModeGlobalRuntimeOnlyTools[name] {
 			out = append(out, name)
 		}
 	}
@@ -101,6 +103,36 @@ func TestNeoKnownModeToolsMatchesModeUnion(t *testing.T) {
 	}
 	if extra := neoToolParityDiff(neoKnownModeTools, union); len(extra) > 0 {
 		t.Errorf("neoKnownModeTools contains tools that no mode includes or defers: %v", extra)
+	}
+}
+
+func TestNeoPublishImageRuntimeOnlyExposureContract(t *testing.T) {
+	if !neoModeGlobalRuntimeOnlyTools["publish_image"] {
+		t.Fatal("publish_image is not marked as an intentional runtime-only binary parity exclusion")
+	}
+	spec, ok := neoSyntheticLocalToolSpec("publish_image")
+	if !ok || spec.Name != "publish_image" || stringValue(spec.Meta["source"]) != "server" {
+		t.Fatalf("publish_image runtime spec = %#v, %v", spec, ok)
+	}
+	exposed := map[string]bool{}
+	for mode, names := range neoModeToolOrder {
+		for _, name := range names {
+			if name == "publish_image" {
+				exposed[mode] = true
+			}
+		}
+		for _, name := range neoModeBinaryComparableTools(mode, names) {
+			if name == "publish_image" {
+				t.Fatalf("mode %q still exposes publish_image to binary parity", mode)
+			}
+		}
+	}
+	want := toolSet("smart", "large", "rush", "deep", "nostromo", "low", "medium", "high", "ultra")
+	if missing := neoToolParityDiff(want, exposed); len(missing) != 0 {
+		t.Errorf("publish_image missing runtime mode exposure: %v", missing)
+	}
+	if extra := neoToolParityDiff(exposed, want); len(extra) != 0 {
+		t.Errorf("publish_image has unexpected runtime mode exposure: %v", extra)
 	}
 }
 

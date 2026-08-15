@@ -29,6 +29,29 @@ import (
 
 const testThreadID = "T-01234567-89ab-cdef-0123-456789abcdef"
 
+type brokerRoundTripper func(*http.Request) (*http.Response, error)
+
+func (roundTrip brokerRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	return roundTrip(request)
+}
+
+func assertBrokerCallerContext(t *testing.T, requestContext context.Context, cancel context.CancelFunc) {
+	t.Helper()
+	if requestContext == nil {
+		t.Fatal("request context was not captured")
+	}
+	if _, ok := requestContext.Deadline(); ok {
+		t.Fatal("request context unexpectedly has a child deadline")
+	}
+	if err := requestContext.Err(); err != nil {
+		t.Fatalf("request context error before caller cancellation = %v", err)
+	}
+	cancel()
+	if err := requestContext.Err(); !errors.Is(err, context.Canceled) {
+		t.Fatalf("request context error after caller cancellation = %v, want context canceled", err)
+	}
+}
+
 type validationFixture struct {
 	root       string
 	home       string
@@ -265,6 +288,109 @@ func TestChildEnvironmentFiltersBase(t *testing.T) {
 	}
 	if values["AMP_URL"] != cfg.APIURL || values["AMP_API_KEY"] != cfg.apiKey {
 		t.Fatalf("deliberate Amp environment updates were not preserved")
+	}
+	wantPath := strings.Join([]string{
+		"/usr/bin",
+		"/bin",
+		"/Users/test/.local/bin",
+		"/Users/test/.amp/bin",
+		"/Users/test/.bun/bin",
+		"/Users/test/.local/share/mise/shims",
+		"/Users/test/.local/share/mise/installs/node/latest/bin",
+		"/opt/homebrew/bin",
+		"/opt/homebrew/sbin",
+		"/usr/local/bin",
+		"/usr/local/sbin",
+		"/usr/sbin",
+		"/sbin",
+	}, string(os.PathListSeparator))
+	if values["PATH"] != wantPath {
+		t.Fatalf("PATH = %q, want %q", values["PATH"], wantPath)
+	}
+}
+
+func TestChildEnvironmentPathIsAbsoluteAndDeduplicated(t *testing.T) {
+	home := t.TempDir()
+	base := []string{
+		"HOME=" + home,
+		"PATH=/custom/bin:relative:/usr/bin:/custom/bin:../other:/opt/homebrew/bin:",
+	}
+	environment := childEnvironment(base, &brokerConfig{}, "/workspace", testThreadID, "/logs/thread.log")
+	values := make(map[string]string, len(environment))
+	for _, entry := range environment {
+		key, value, found := strings.Cut(entry, "=")
+		if found {
+			values[key] = value
+		}
+	}
+	paths := filepath.SplitList(values["PATH"])
+	want := []string{
+		"/custom/bin",
+		"/usr/bin",
+		"/opt/homebrew/bin",
+		filepath.Join(home, ".local", "bin"),
+		filepath.Join(home, ".amp", "bin"),
+		filepath.Join(home, ".bun", "bin"),
+		filepath.Join(home, ".local", "share", "mise", "shims"),
+		filepath.Join(home, ".local", "share", "mise", "installs", "node", "latest", "bin"),
+		"/opt/homebrew/sbin",
+		"/usr/local/bin",
+		"/usr/local/sbin",
+		"/bin",
+		"/usr/sbin",
+		"/sbin",
+	}
+	if !reflect.DeepEqual(paths, want) {
+		t.Fatalf("PATH entries = %#v, want %#v", paths, want)
+	}
+	seen := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		if !filepath.IsAbs(path) {
+			t.Errorf("PATH contains relative entry %q", path)
+		}
+		if _, exists := seen[path]; exists {
+			t.Errorf("PATH contains duplicate entry %q", path)
+		}
+		seen[path] = struct{}{}
+	}
+}
+
+func TestChildEnvironmentFindsHomeTools(t *testing.T) {
+	home := t.TempDir()
+	inheritedBin := filepath.Join(home, "inherited-bin")
+	if err := os.Mkdir(inheritedBin, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	tools := map[string]string{
+		"tmux":              filepath.Join(home, ".local", "bin"),
+		"open-computer-use": filepath.Join(home, ".amp", "bin"),
+		"bun":               filepath.Join(home, ".bun", "bin"),
+		"open-browser-use":  filepath.Join(home, ".local", "share", "mise", "shims"),
+		"node":              filepath.Join(home, ".local", "share", "mise", "installs", "node", "latest", "bin"),
+	}
+	for name, directory := range tools {
+		if err := os.MkdirAll(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		writePrivateFile(t, filepath.Join(directory, name), []byte("#!/bin/sh\n"), 0o700)
+	}
+	environment := childEnvironment([]string{"HOME=" + home, "PATH=" + inheritedBin}, &brokerConfig{}, "/workspace", testThreadID, "/logs/thread.log")
+	for _, entry := range environment {
+		if path, found := strings.CutPrefix(entry, "PATH="); found {
+			t.Setenv("PATH", path)
+			break
+		}
+	}
+	for name, directory := range tools {
+		path, err := exec.LookPath(name)
+		if err != nil {
+			t.Errorf("locate %s: %v", name, err)
+			continue
+		}
+		want := filepath.Join(directory, name)
+		if path != want {
+			t.Errorf("%s path = %q, want %q", name, path, want)
+		}
 	}
 }
 
@@ -1479,4 +1605,61 @@ func readKeyValues(t *testing.T, path string) map[string]string {
 		values[key] = value
 	}
 	return values
+}
+
+func TestHeartbeatPayloadAdvertisesPluginAgentModesOnlyWhenSupported(t *testing.T) {
+	pluginsHome := t.TempDir()
+	pluginsDir := filepath.Join(pluginsHome, "amp", "plugins")
+	if err := os.MkdirAll(pluginsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	plugin := `// @amp-agent-mode {"key":"deep-blue","label":"Deep Blue","description":"synced mode"}
+const agent = amp.createAgent({
+  name: "deep-blue",
+  model: "openai/gpt-5",
+  instructions: "You are deep blue.",
+})
+amp.registerAgentMode({ key: "deep-blue", label: "Deep Blue", agent })
+`
+	if err := os.WriteFile(filepath.Join(pluginsDir, "deep-blue.ts"), []byte(plugin), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_CONFIG_HOME", pluginsHome)
+	workspace := workspaceConfig{RunnerID: "local-runner-approved", Path: "/workspace"}
+	localBroker := &broker{
+		config:   &brokerConfig{BrokerID: "broker-one", Workspaces: []workspaceConfig{workspace}},
+		children: map[childKey]*childProcess{},
+	}
+	withoutSupport := localBroker.heartbeatPayload(false)
+	if withoutSupport.PluginAgentModes != nil {
+		t.Fatalf("plugin agent modes advertised without server support: %#v", withoutSupport.PluginAgentModes)
+	}
+	localBroker.pluginModesSupport = true
+	withSupport := localBroker.heartbeatPayload(false)
+	if len(withSupport.PluginAgentModes) != 1 {
+		t.Fatalf("advertised plugin agent modes = %#v", withSupport.PluginAgentModes)
+	}
+	mode := withSupport.PluginAgentModes[0]
+	if mode.Key != "deep-blue" || mode.Label != "Deep Blue" || mode.AgentModel != "openai/gpt-5" || mode.AgentInstructions != "You are deep blue." {
+		t.Fatalf("advertised plugin agent mode = %#v", mode)
+	}
+	if mode.PluginName != "deep-blue" || mode.PluginScope != "user" || mode.PluginRepositoryName != "amp-user-plugins" {
+		t.Fatalf("advertised plugin metadata = %#v", mode)
+	}
+	if empty := localBroker.heartbeatPayload(true); empty.PluginAgentModes != nil {
+		t.Fatalf("shutdown heartbeat advertised plugin agent modes: %#v", empty.PluginAgentModes)
+	}
+}
+
+func TestReservedAgentModeKey(t *testing.T) {
+	for _, key := range []string{"smart", "rush", "deep", "large", "review", "puck", "low", "medium", "high", "ultra", "deep-1", "deep-2", "deep-3"} {
+		if !reservedAgentModeKey(key) {
+			t.Fatalf("reservedAgentModeKey(%q) = false, want true", key)
+		}
+	}
+	for _, key := range []string{"", "deep-blue", "kimi-k3", "custom"} {
+		if reservedAgentModeKey(key) {
+			t.Fatalf("reservedAgentModeKey(%q) = true, want false", key)
+		}
+	}
 }

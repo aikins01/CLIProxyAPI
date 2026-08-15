@@ -1155,6 +1155,13 @@ func TestNormalizeAmpThreadListResponseFiltersBeforeLocalLimit(t *testing.T) {
 	}
 }
 
+func TestAmpThreadListHasExcludedLabelIsCaseInsensitive(t *testing.T) {
+	thread := map[string]any{"labels": []any{map[string]any{"name": "Review"}}}
+	if !ampThreadListHasExcludedLabel(thread, map[string]bool{"review": true}) {
+		t.Fatal("Review label was not excluded by review selector")
+	}
+}
+
 func TestAmpProxyThreadListAugmenterRequestsGzipEncoding(t *testing.T) {
 	proxy, err := createReverseProxy("http://example.com", NewStaticSecretSource("k"))
 	if err != nil {

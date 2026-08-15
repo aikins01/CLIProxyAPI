@@ -214,7 +214,7 @@ func TestNeoOrbPortalCapabilityBypassesManagementLocalhostRestriction(t *testing
 	}
 }
 
-func TestNeoOrbPortalTokenMiddlewareImportsPersistedActorAfterRestart(t *testing.T) {
+func TestNeoOrbPortalTokenMiddlewareRejectsRecoveredLegacyCapability(t *testing.T) {
 	module, fake, threadID := newNeoOrbPortalTestModule(t)
 	token := strings.Repeat("r", neoOrbPortalTokenByteCount)
 	writeNeoOrbPersistedThread(t, module.neoRuntime, threadID, "sandbox", "container-fake")
@@ -236,18 +236,15 @@ func TestNeoOrbPortalTokenMiddlewareImportsPersistedActorAfterRestart(t *testing
 	req := httptest.NewRequest(http.MethodGet, "/orb/"+threadID+"/p/3000/?"+neoOrbPortalTokenQuery+"="+token, nil)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
-	if rec.Code != http.StatusFound {
-		t.Fatalf("cold portal capability status = %d body=%s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("recovered portal capability status = %d body=%s", rec.Code, rec.Body.String())
 	}
 	loaded := module.neoRuntime.store.lookupThreadActor(threadID)
-	if loaded == nil {
-		t.Fatal("persisted portal actor was not imported")
+	if loaded != nil {
+		t.Fatal("recovered portal capability imported the persisted actor")
 	}
-	loaded.mu.Lock()
-	pruneLeases := loaded.pruneLeases
-	loaded.mu.Unlock()
-	if pruneLeases != 0 {
-		t.Fatalf("persisted portal actor prune leases = %d, want released", pruneLeases)
+	if fake.callCount("inspect:") != 0 {
+		t.Fatalf("recovered portal capability accessed container: %#v", fake.calls)
 	}
 }
 
@@ -579,7 +576,7 @@ func TestNeoOrbPortalProxiesToContainer(t *testing.T) {
 	}
 }
 
-func TestNeoOrbPortalRecoversContainerOnFirstRequest(t *testing.T) {
+func TestNeoOrbPortalQuarantinesRecoveredContainerOnFirstRequest(t *testing.T) {
 	module, fake, threadID := newNeoOrbPortalTestModule(t)
 	manager := module.neoRuntime.orbManagerFor()
 	manager.mu.Lock()
@@ -591,28 +588,14 @@ func TestNeoOrbPortalRecoversContainerOnFirstRequest(t *testing.T) {
 	fake.containers = []neoOrbContainerSummary{{ID: "recovered-container", Labels: map[string]string{"cliproxy.orb": threadID}}}
 	fake.inspectState = neoOrbContainerState{Exists: true, Running: true, IPAddress: "172.17.0.10"}
 
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("recovered portal"))
-	}))
-	defer upstream.Close()
-	original := neoOrbPortalTargetURL
-	neoOrbPortalTargetURL = func(containerIP string, port int) (string, error) {
-		if containerIP != "172.17.0.10" || port != 3000 {
-			t.Fatalf("portal target = %q:%d", containerIP, port)
-		}
-		return upstream.URL, nil
-	}
-	t.Cleanup(func() { neoOrbPortalTargetURL = original })
-
 	recorder := neoOrbPortalRequest(t, module, "/orb/"+threadID+"/p/3000/", nil)
-	if recorder.status != http.StatusOK || recorder.body != "recovered portal" {
+	if recorder.status != http.StatusConflict || !strings.Contains(recorder.body, "migration approval") {
 		t.Fatalf("recovered portal response = %d %q", recorder.status, recorder.body)
 	}
-	if record, ok := manager.snapshot(threadID); !ok || record.containerID != "recovered-container" {
+	if record, ok := manager.snapshot(threadID); !ok || record.containerID != "recovered-container" || record.state != neoOrbStateConflict || !record.recovered {
 		t.Fatalf("recovered portal record = %#v, %t", record, ok)
 	}
-	if fake.callCount("list-orbs") != 1 {
+	if fake.callCount("list-orbs") != 1 || fake.callCount("inspect:") != 0 {
 		t.Fatalf("portal recovery calls = %#v", fake.calls)
 	}
 }
@@ -628,4 +611,73 @@ func TestNeoOrbPortalDisabledOrbs(t *testing.T) {
 	if !strings.Contains(recorder.body, "not found") {
 		t.Fatalf("disabled orbs body = %s", recorder.body)
 	}
+}
+
+func TestNeoOrbPortalRequiresActionableLifecycle(t *testing.T) {
+	for _, activation := range []string{"missing", neoOrbLifecycleActivationBinding, neoOrbLifecycleActivationLaunching, neoOrbLifecycleActivationActionable} {
+		t.Run(activation, func(t *testing.T) {
+			fixture := newNeoOrbLifecycleAdmissionFixture(t, activation)
+			module := &AmpModule{neoRuntime: fixture.runtime}
+			proxied := 0
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				proxied++
+				_, _ = w.Write([]byte("actionable portal"))
+			}))
+			t.Cleanup(upstream.Close)
+			original := neoOrbPortalTargetURL
+			neoOrbPortalTargetURL = func(string, int) (string, error) { return upstream.URL, nil }
+			t.Cleanup(func() { neoOrbPortalTargetURL = original })
+
+			response := neoOrbPortalRequest(t, module, "/orb/"+fixture.record.threadID+"/p/3000/", nil)
+			if activation == neoOrbLifecycleActivationActionable {
+				if response.status != http.StatusOK || response.body != "actionable portal" || proxied != 1 {
+					t.Fatalf("actionable portal response = %d %q proxied=%d", response.status, response.body, proxied)
+				}
+			} else if response.status < 400 || proxied != 0 {
+				t.Fatalf("inert portal response = %d %q proxied=%d", response.status, response.body, proxied)
+			}
+			assertNeoOrbNoProviderMutation(t, fixture.fake)
+		})
+	}
+}
+
+func TestNeoOrbPortalFinalAdmissionRejectsLifecycleTransition(t *testing.T) {
+	fixture := newNeoOrbLifecycleAdmissionFixture(t, neoOrbLifecycleActivationActionable)
+	module := &AmpModule{neoRuntime: fixture.runtime}
+	proxied := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		proxied++
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(upstream.Close)
+	original := neoOrbPortalTargetURL
+	neoOrbPortalTargetURL = func(string, int) (string, error) {
+		active := fixture.store.snapshot().Threads[fixture.record.threadID].Active
+		if active == nil || !neoOrbLifecycleActionable(active) {
+			t.Fatalf("portal race active generation = %#v", active)
+		}
+		launching, err := fixture.store.beginActivation(*active, "portal-final-recheck", neoOrbLifecycleOperationUnpause)
+		if err != nil {
+			t.Fatalf("begin portal race transition: %v", err)
+		}
+		fixture.manager.mu.Lock()
+		fixture.record.activeGeneration = cloneNeoOrbLifecycleGeneration(&launching)
+		fixture.manager.mu.Unlock()
+		return upstream.URL, nil
+	}
+	t.Cleanup(func() { neoOrbPortalTargetURL = original })
+
+	response := neoOrbPortalRequest(t, module, "/orb/"+fixture.record.threadID+"/p/3000/", nil)
+	if response.status != http.StatusConflict || proxied != 0 {
+		t.Fatalf("portal final recheck response = %d %q proxied=%d", response.status, response.body, proxied)
+	}
+	var body map[string]any
+	if err := json.Unmarshal([]byte(response.body), &body); err != nil || body["error"] != "orb is not ready" || body["state"] != neoOrbStateRunning || len(body) != 2 {
+		t.Fatalf("portal final recheck diagnostic err=%v body=%#v", err, body)
+	}
+	record, ok := fixture.manager.snapshot(fixture.record.threadID)
+	if !ok || record.activePortals != 0 || record.activeGeneration == nil || record.activeGeneration.ActivationState != neoOrbLifecycleActivationLaunching || record.activeGeneration.OperationKind != neoOrbLifecycleOperationUnpause {
+		t.Fatalf("portal race record = %#v, exists=%v", record, ok)
+	}
+	assertNeoOrbNoProviderMutation(t, fixture.fake)
 }

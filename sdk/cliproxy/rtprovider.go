@@ -10,11 +10,14 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+const roundTripperCacheLimit = 32
+
 // defaultRoundTripperProvider returns a per-auth HTTP RoundTripper based on
 // the Auth.ProxyURL value. It caches transports per proxy URL string.
 type defaultRoundTripperProvider struct {
-	mu    sync.RWMutex
+	mu    sync.Mutex
 	cache map[string]http.RoundTripper
+	order []string
 }
 
 func newDefaultRoundTripperProvider() *defaultRoundTripperProvider {
@@ -30,22 +33,47 @@ func (p *defaultRoundTripperProvider) RoundTripperFor(auth *coreauth.Auth) http.
 	if proxyStr == "" {
 		return nil
 	}
-	p.mu.RLock()
+	p.mu.Lock()
 	rt := p.cache[proxyStr]
-	p.mu.RUnlock()
 	if rt != nil {
+		p.touch(proxyStr)
+		p.mu.Unlock()
 		return rt
 	}
 	transport, _, errBuild := proxyutil.BuildHTTPTransport(proxyStr)
 	if errBuild != nil {
+		p.mu.Unlock()
 		log.Errorf("%v", errBuild)
 		return nil
 	}
 	if transport == nil {
+		p.mu.Unlock()
 		return nil
 	}
-	p.mu.Lock()
+	var evicted http.RoundTripper
+	if len(p.cache) >= roundTripperCacheLimit && len(p.order) > 0 {
+		evictKey := p.order[0]
+		p.order = p.order[1:]
+		evicted = p.cache[evictKey]
+		delete(p.cache, evictKey)
+	}
 	p.cache[proxyStr] = transport
+	p.order = append(p.order, proxyStr)
 	p.mu.Unlock()
+	if closer, ok := evicted.(interface{ CloseIdleConnections() }); ok {
+		closer.CloseIdleConnections()
+	}
 	return transport
+}
+
+func (p *defaultRoundTripperProvider) touch(key string) {
+	for i, cachedKey := range p.order {
+		if cachedKey != key {
+			continue
+		}
+		copy(p.order[i:], p.order[i+1:])
+		p.order[len(p.order)-1] = key
+		return
+	}
+	p.order = append(p.order, key)
 }

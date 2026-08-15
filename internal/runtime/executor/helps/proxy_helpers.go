@@ -3,8 +3,10 @@ package helps
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -12,6 +14,142 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
 )
+
+const httpTransportCacheLimit = 32
+
+type roundTripperCache struct {
+	mu      sync.Mutex
+	entries map[string]*retiringRoundTripper
+	order   []string
+	limit   int
+}
+
+type retiringRoundTripper struct {
+	transport http.RoundTripper
+	mu        sync.Mutex
+	active    int
+	retired   bool
+}
+
+type trackedResponseBody struct {
+	io.ReadCloser
+	once    sync.Once
+	release func()
+}
+
+func (c *roundTripperCache) get(key string, build func() http.RoundTripper) http.RoundTripper {
+	c.mu.Lock()
+	if cached := c.entries[key]; cached != nil {
+		c.touch(key)
+		c.mu.Unlock()
+		return cached
+	}
+
+	transport := build()
+	if transport == nil {
+		c.mu.Unlock()
+		return nil
+	}
+	if c.entries == nil {
+		c.entries = make(map[string]*retiringRoundTripper)
+	}
+	limit := c.limit
+	if limit <= 0 {
+		limit = httpTransportCacheLimit
+	}
+	var evicted *retiringRoundTripper
+	if len(c.entries) >= limit && len(c.order) > 0 {
+		evictKey := c.order[0]
+		c.order = c.order[1:]
+		evicted = c.entries[evictKey]
+		delete(c.entries, evictKey)
+	}
+	cached := &retiringRoundTripper{transport: transport}
+	c.entries[key] = cached
+	c.order = append(c.order, key)
+	c.mu.Unlock()
+
+	if evicted != nil {
+		evicted.retire()
+	}
+	return cached
+}
+
+func (c *roundTripperCache) touch(key string) {
+	for i, cachedKey := range c.order {
+		if cachedKey != key {
+			continue
+		}
+		copy(c.order[i:], c.order[i+1:])
+		c.order[len(c.order)-1] = key
+		return
+	}
+	c.order = append(c.order, key)
+}
+
+func (t *retiringRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	t.mu.Lock()
+	t.active++
+	t.mu.Unlock()
+
+	resp, err := t.transport.RoundTrip(req)
+	if err != nil || resp == nil || resp.Body == nil {
+		t.release()
+		return resp, err
+	}
+	resp.Body = &trackedResponseBody{ReadCloser: resp.Body, release: t.release}
+	return resp, nil
+}
+
+func (t *retiringRoundTripper) CloseIdleConnections() {
+	if closer, ok := t.transport.(interface{ CloseIdleConnections() }); ok {
+		closer.CloseIdleConnections()
+	}
+}
+
+func (t *retiringRoundTripper) retire() {
+	t.mu.Lock()
+	t.retired = true
+	closeNow := t.active == 0
+	t.mu.Unlock()
+	if closeNow {
+		t.CloseIdleConnections()
+	}
+}
+
+func (t *retiringRoundTripper) release() {
+	t.mu.Lock()
+	t.active--
+	closeNow := t.retired && t.active == 0
+	t.mu.Unlock()
+	if closeNow {
+		t.CloseIdleConnections()
+	}
+}
+
+func (b *trackedResponseBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err != nil {
+		b.once.Do(b.release)
+	}
+	return n, err
+}
+
+func (b *trackedResponseBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.once.Do(b.release)
+	return err
+}
+
+var proxyHTTPTransportCache = roundTripperCache{limit: httpTransportCacheLimit}
+
+// UnwrapCachedRoundTripper returns the transport wrapped by the shared transport cache.
+func UnwrapCachedRoundTripper(transport http.RoundTripper) http.RoundTripper {
+	if cached, ok := transport.(*retiringRoundTripper); ok {
+		return cached.transport
+	}
+	return transport
+}
 
 type authStateNeutralError struct {
 	err error
@@ -99,7 +237,9 @@ func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 
 	// If we have a proxy URL configured, set up the transport
 	if proxyURL != "" {
-		transport := buildProxyTransport(proxyURL)
+		transport := proxyHTTPTransportCache.get(proxyURL, func() http.RoundTripper {
+			return buildProxyTransport(proxyURL)
+		})
 		if transport != nil {
 			httpClient.Transport = transport
 			return httpClient

@@ -474,6 +474,8 @@ var browserFingerprintHosts = map[string]struct{}{
 	"www.chatgpt.com":   {},
 }
 
+var utlsHTTPTransportCache = roundTripperCache{limit: httpTransportCacheLimit}
+
 // fallbackRoundTripper uses utls for fingerprinted HTTPS hosts and falls back
 // to the standard transport for everything else.
 type fallbackRoundTripper struct {
@@ -527,7 +529,11 @@ func NewUtlsHTTPRoundTripper(cfg *config.Config, auth *cliproxyauth.Auth) http.R
 // the standard transport for non-HTTPS requests and for HTTPS hosts not in
 // that list.
 func NewUtlsHTTPClient(cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) *http.Client {
-	client := &http.Client{Transport: NewUtlsHTTPRoundTripper(cfg, auth)}
+	proxyURL := EffectiveProxyURL(cfg, auth)
+	transport := utlsHTTPTransportCache.get(proxyURL, func() http.RoundTripper {
+		return NewUtlsHTTPRoundTripper(cfg, auth)
+	})
+	client := &http.Client{Transport: transport}
 	if timeout > 0 {
 		client.Timeout = timeout
 	}

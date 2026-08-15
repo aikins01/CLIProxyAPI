@@ -1845,7 +1845,7 @@ func TestNeoReviewPR148LargeSnapshotSurvivesRunCheckProviderRequest(t *testing.T
 	actor.currentAgentMode = "review"
 	actor.environment = map[string]any{"workingDirectory": "/benchmark/repository", "workspaceRoot": "/benchmark/repository"}
 	rootMessageID := "M-pr148-snapshot-root"
-	actor.messages = []neoMessage{{MessageID: rootMessageID, Role: "user"}}
+	actor.messages = []neoMessage{{MessageID: rootMessageID, Role: "user", Content: []any{map[string]any{"type": "text", "text": neoReviewBenchmarkUserPrompt(tc, neoReviewBenchmarkIntegrated)}}}}
 	actor.reviewSnapshot = snapshot
 	actor.reviewSnapshotDescription = neoReviewBenchmarkDiffDescription(tc)
 	actor.reviewSnapshotRootMessageID = rootMessageID
