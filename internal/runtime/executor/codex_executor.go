@@ -837,42 +837,37 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 }
 
 func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Format, url string, req cliproxyexecutor.Request, rawJSON []byte) (*http.Request, error) {
-	var cache helps.CodexCache
-	if from == "claude" {
-		userIDResult := gjson.GetBytes(req.Payload, "metadata.user_id")
-		if userIDResult.Exists() {
-			key := fmt.Sprintf("%s-%s", req.Model, userIDResult.String())
-			var ok bool
-			if cache, ok = helps.GetCodexCache(key); !ok {
-				cache = helps.CodexCache{
-					ID:     uuid.New().String(),
-					Expire: time.Now().Add(1 * time.Hour),
-				}
-				helps.SetCodexCache(key, cache)
-			}
-		}
-	} else if from == "openai-response" {
-		promptCacheKey := gjson.GetBytes(req.Payload, "prompt_cache_key")
-		if promptCacheKey.Exists() {
-			cache.ID = promptCacheKey.String()
-		}
-	} else if from == "openai" {
-		if apiKey := strings.TrimSpace(helps.APIKeyFromContext(ctx)); apiKey != "" {
-			cache.ID = uuid.NewSHA1(uuid.NameSpaceOID, []byte("cli-proxy-api:codex:prompt-cache:"+apiKey)).String()
-		}
-	}
+	cacheID := codexPromptCacheID(ctx, from, req)
 
-	if cache.ID != "" {
-		rawJSON, _ = sjson.SetBytes(rawJSON, "prompt_cache_key", cache.ID)
+	if cacheID != "" {
+		rawJSON, _ = sjson.SetBytes(rawJSON, "prompt_cache_key", cacheID)
 	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(rawJSON))
 	if err != nil {
 		return nil, err
 	}
-	if cache.ID != "" {
-		httpReq.Header.Set("Session_id", cache.ID)
+	if cacheID != "" {
+		httpReq.Header.Set("Session_id", cacheID)
 	}
 	return httpReq, nil
+}
+
+func codexPromptCacheID(ctx context.Context, from sdktranslator.Format, req cliproxyexecutor.Request) string {
+	switch from {
+	case "claude":
+		if userID := gjson.GetBytes(req.Payload, "metadata.user_id"); userID.Exists() {
+			return helps.CodexPromptCacheID(req.Model + "\x00" + userID.String())
+		}
+	case "openai-response":
+		if promptCacheKey := gjson.GetBytes(req.Payload, "prompt_cache_key"); promptCacheKey.Exists() {
+			return promptCacheKey.String()
+		}
+	case "openai":
+		if apiKey := strings.TrimSpace(helps.APIKeyFromContext(ctx)); apiKey != "" {
+			return uuid.NewSHA1(uuid.NameSpaceOID, []byte("cli-proxy-api:codex:prompt-cache:"+apiKey)).String()
+		}
+	}
+	return ""
 }
 
 func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config) {

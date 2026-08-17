@@ -28,65 +28,86 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/gorilla/websocket"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/ampplugins"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/orbconfig"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 )
 
 const (
-	configVersion          = 1
-	defaultHeartbeat       = 15
-	maxHeartbeatSeconds    = 60
-	heartbeatRequestLimit  = 30 * time.Second
-	shutdownRequestLimit   = 5 * time.Second
-	maxConfigBody          = 64 * 1024
-	maxAPIKeyBody          = 16 * 1024
-	maxHeartbeatBody       = 1 << 20
-	maxGenerationBody      = 21
-	maxJSONDepth           = 64
-	identifierLimit        = 128
-	heartbeatMessageLimit  = 512
-	gitDiagnosticLimit     = 2048
-	hostnameLimit          = 255
-	URLLimit               = 2048
-	repositoryURLLimit     = 4096
-	workspaceLimit         = 128
-	intentLimit            = 4096
-	stopGracePeriod        = 3 * time.Second
-	killGracePeriod        = time.Second
-	heartbeatEndpoint      = "/ampcode/local-broker/heartbeat.json"
-	runnerIDPrefix         = "local-runner-"
-	runnerIDDigestBytes    = 16
-	localRuntimeToken      = "local-neo"
-	localRuntimeNamespace  = "default"
-	localRuntimePool       = "default"
-	configurationLockLabel = "amp-local-broker-"
-	sessionGenerationLabel = "amp-local-broker-session-generation-"
+	configVersion              = 1
+	defaultHeartbeat           = 15
+	maxHeartbeatSeconds        = 60
+	heartbeatRequestLimit      = 30 * time.Second
+	shutdownRequestLimit       = 5 * time.Second
+	maxConfigBody              = 64 * 1024
+	maxAPIKeyBody              = 16 * 1024
+	maxHeartbeatBody           = 1 << 20
+	maxGenerationBody          = 21
+	maxJSONDepth               = 64
+	identifierLimit            = 128
+	heartbeatMessageLimit      = 512
+	gitDiagnosticLimit         = 2048
+	hostnameLimit              = 255
+	URLLimit                   = 2048
+	repositoryURLLimit         = 4096
+	workspaceLimit             = 128
+	workspaceRootLimit         = 8
+	workspaceDiscoveryDepth    = 3
+	workspaceDiscoveryInterval = time.Minute
+	intentLimit                = 4096
+	controlReconnectMin        = time.Second
+	controlReconnectMax        = 15 * time.Second
+	controlPingInterval        = 30 * time.Second
+	maxHeartbeatInterval       = 15 * time.Second
+	controlMessageType         = "broker_intents"
+	stopGracePeriod            = 3 * time.Second
+	killGracePeriod            = time.Second
+	heartbeatEndpoint          = "/ampcode/local-broker/heartbeat.json"
+	controlEndpoint            = "/ampcode/local-broker/control.ws"
+	controlBrokerIDHeader      = "X-Cliproxy-Local-Broker-ID"
+	controlSessionIDHeader     = "X-Cliproxy-Local-Broker-Session-ID"
+	controlGenerationHeader    = "X-Cliproxy-Local-Broker-Session-Generation"
+	intentEpochHeader          = "X-Cliproxy-Local-Broker-Intent-Epoch"
+	intentRevisionHeader       = "X-Cliproxy-Local-Broker-Intent-Revision"
+	runnerIDPrefix             = "local-runner-"
+	runnerIDDigestBytes        = 16
+	localRuntimeToken          = "local-neo"
+	localRuntimeNamespace      = "default"
+	localRuntimePool           = "default"
+	configurationLockLabel     = "amp-local-broker-"
+	sessionGenerationLabel     = "amp-local-broker-session-generation-"
 )
 
 var (
-	errStaleSession      = errors.New("broker session is stale")
-	threadIDPattern      = regexp.MustCompile(`^T-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
-	heartbeatCodePattern = regexp.MustCompile(`^[a-z][a-z0-9_]{1,63}$`)
-	agentModePattern     = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,127}$`)
-	processGroupSignal   = syscall.Kill
-	processLockOpenat    = unix.Openat
-	processStart         = func(_ context.Context, command *exec.Cmd) error {
+	errStaleSession               = errors.New("broker session is stale")
+	errOrbConfigDigestUnsupported = errors.New("orb config digest is unsupported")
+	threadIDPattern               = regexp.MustCompile(`^T-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+	heartbeatCodePattern          = regexp.MustCompile(`^[a-z][a-z0-9_]{1,63}$`)
+	orbConfigDigestPattern        = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	agentModePattern              = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,127}$`)
+	processGroupSignal            = syscall.Kill
+	processLockOpenat             = unix.Openat
+	processStart                  = func(_ context.Context, command *exec.Cmd) error {
 		return command.Start()
 	}
 )
 
 type brokerConfig struct {
-	Version               int               `json:"version"`
-	BrokerID              string            `json:"brokerId"`
-	APIURL                string            `json:"apiURL"`
-	RuntimeURL            string            `json:"runtimeURL"`
-	APIKeyFile            string            `json:"apiKeyFile"`
-	AmpBinary             string            `json:"ampBinary"`
-	StateDirectory        string            `json:"stateDirectory"`
-	LogDirectory          string            `json:"logDirectory"`
-	HeartbeatSeconds      int               `json:"heartbeatSeconds"`
-	AllowInsecureLoopback bool              `json:"allowInsecureLoopback"`
-	Workspaces            []workspaceConfig `json:"workspaces"`
+	Version               int                      `json:"version"`
+	BrokerID              string                   `json:"brokerId"`
+	APIURL                string                   `json:"apiURL"`
+	RuntimeURL            string                   `json:"runtimeURL"`
+	APIKeyFile            string                   `json:"apiKeyFile"`
+	AmpBinary             string                   `json:"ampBinary"`
+	StateDirectory        string                   `json:"stateDirectory"`
+	LogDirectory          string                   `json:"logDirectory"`
+	HeartbeatSeconds      int                      `json:"heartbeatSeconds"`
+	AllowInsecureLoopback bool                     `json:"allowInsecureLoopback"`
+	OrbCredentials        *orbCredentialSyncConfig `json:"orbCredentials,omitempty"`
+	Workspaces            []workspaceConfig        `json:"workspaces"`
+	WorkspaceRoots        []string                 `json:"workspaceRoots,omitempty"`
 	apiKey                string
 	ampBinaryInfo         os.FileInfo
 	stateDirectoryInfo    os.FileInfo
@@ -103,12 +124,14 @@ type workspaceConfig struct {
 }
 
 type heartbeatRequest struct {
-	BrokerID          string            `json:"brokerId"`
-	SessionID         string            `json:"sessionId"`
-	SessionGeneration uint64            `json:"sessionGeneration"`
-	Hostname          string            `json:"hostname"`
-	PID               int               `json:"pid"`
-	Runners           []heartbeatRunner `json:"runners"`
+	BrokerID          string                 `json:"brokerId"`
+	SessionID         string                 `json:"sessionId"`
+	SessionGeneration uint64                 `json:"sessionGeneration"`
+	Hostname          string                 `json:"hostname"`
+	PID               int                    `json:"pid"`
+	Runners           []heartbeatRunner      `json:"runners"`
+	OrbConfigDigest   *string                `json:"orbConfigDigest,omitempty"`
+	PluginAgentModes  []ampplugins.AgentMode `json:"pluginAgentModes,omitempty"`
 }
 
 type heartbeatRunner struct {
@@ -119,11 +142,29 @@ type heartbeatRunner struct {
 }
 
 type heartbeatResponse struct {
-	OK              bool                        `json:"ok"`
-	Error           json.RawMessage             `json:"error,omitempty"`
-	Message         string                      `json:"message,omitempty"`
-	Runners         *[]heartbeatRunnerIntents   `json:"runners"`
-	RejectedRunners *[]heartbeatRunnerRejection `json:"rejectedRunners,omitempty"`
+	OK                      bool                        `json:"ok"`
+	Error                   json.RawMessage             `json:"error,omitempty"`
+	Message                 string                      `json:"message,omitempty"`
+	Runners                 *[]heartbeatRunnerIntents   `json:"runners"`
+	RejectedRunners         *[]heartbeatRunnerRejection `json:"rejectedRunners,omitempty"`
+	PublishImageRequests    *[]publishImageRequest      `json:"publishImageRequests,omitempty"`
+	OrbConfigDigest         *string                     `json:"orbConfigDigest,omitempty"`
+	OrbConfigSupport        bool                        `json:"-"`
+	OrbCredentialSupport    bool                        `json:"-"`
+	OrbCredentialRevision   string                      `json:"-"`
+	PluginAgentModesSupport bool                        `json:"-"`
+	IntentEpoch             string                      `json:"-"`
+	IntentRevision          *uint64                     `json:"-"`
+}
+
+type controlMessage struct {
+	Type              string                    `json:"type"`
+	BrokerID          string                    `json:"brokerId"`
+	SessionID         string                    `json:"sessionId"`
+	SessionGeneration uint64                    `json:"sessionGeneration"`
+	IntentEpoch       string                    `json:"intentEpoch"`
+	IntentRevision    uint64                    `json:"intentRevision"`
+	Runners           *[]heartbeatRunnerIntents `json:"runners"`
 }
 
 type heartbeatRunnerIntents struct {
@@ -170,18 +211,34 @@ type childLaunch struct {
 }
 
 type broker struct {
-	config             *brokerConfig
-	client             *http.Client
-	requestLimit       time.Duration
-	sessionID          string
-	sessionGeneration  uint64
-	hostname           string
-	pid                int
-	workspacesByRunner map[string]*workspaceConfig
-	mu                 sync.Mutex
-	children           map[childKey]*childProcess
-	launches           map[childKey]*childLaunch
-	shuttingDown       bool
+	config              *brokerConfig
+	client              *http.Client
+	requestLimit        time.Duration
+	sessionID           string
+	sessionGeneration   uint64
+	hostname            string
+	pid                 int
+	workspacesByRunner  map[string]*workspaceConfig
+	discoveryMu         sync.RWMutex
+	discovered          []workspaceConfig
+	lastDiscovery       time.Time
+	orbConfigDigest     *string
+	orbConfigSupport    bool
+	orbCredentials      orbCredentialState
+	pluginModesSupport  bool
+	mu                  sync.Mutex
+	children            map[childKey]*childProcess
+	launches            map[childKey]*childLaunch
+	publishImageActive  map[string]struct{}
+	publishImageErrors  chan error
+	publishImageCtx     context.Context
+	controlMessages     chan heartbeatResponse
+	intentEpoch         string
+	intentRevision      uint64
+	intentRevisionKnown bool
+	publishImageCancel  context.CancelFunc
+	publishImageWG      sync.WaitGroup
+	shuttingDown        bool
 }
 
 type processLock struct {
@@ -450,8 +507,30 @@ func validateConfig(cfg *brokerConfig) error {
 	}
 	cfg.ampBinaryInfo = ampInfo
 
-	if len(cfg.Workspaces) == 0 {
-		return errors.New("workspaces must not be empty")
+	if len(cfg.Workspaces) == 0 && len(cfg.WorkspaceRoots) == 0 {
+		return errors.New("workspaces or workspaceRoots must not be empty")
+	}
+	if len(cfg.WorkspaceRoots) > workspaceRootLimit {
+		return fmt.Errorf("workspaceRoots exceeds %d entries", workspaceRootLimit)
+	}
+	seenRoots := make(map[string]struct{}, len(cfg.WorkspaceRoots))
+	for index := range cfg.WorkspaceRoots {
+		canonicalRoot, err := canonicalExistingDirectory(cfg.WorkspaceRoots[index])
+		if err != nil {
+			return fmt.Errorf("validate workspaceRoot: %w", err)
+		}
+		broad, err := isBroadWorkspaceRoot(canonicalRoot)
+		if err != nil {
+			return fmt.Errorf("validate workspaceRoot %q broad root: %w", canonicalRoot, err)
+		}
+		if broad {
+			return fmt.Errorf("workspaceRoot %q is a broad root; use an explicit workspace with allowBroadRoot to approve it", canonicalRoot)
+		}
+		if _, exists := seenRoots[canonicalRoot]; exists {
+			return fmt.Errorf("duplicate workspaceRoot %q", canonicalRoot)
+		}
+		seenRoots[canonicalRoot] = struct{}{}
+		cfg.WorkspaceRoots[index] = canonicalRoot
 	}
 	if len(cfg.Workspaces) > workspaceLimit {
 		return fmt.Errorf("workspaces exceeds %d entries", workspaceLimit)
@@ -824,6 +903,11 @@ func canonicalExistingDirectory(path string) (string, error) {
 	return canonical, nil
 }
 
+func canonicalPathWithinRoot(root, path string) bool {
+	relative, err := filepath.Rel(root, path)
+	return err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
+}
+
 func createPrivateDirectory(path string) (string, error) {
 	if strings.TrimSpace(path) == "" {
 		return "", errors.New("path is required")
@@ -888,6 +972,190 @@ func containsControl(value string) bool {
 func stableRunnerID(brokerID, workspaceID, canonicalPath string) string {
 	digest := sha256.Sum256([]byte(brokerID + "\x00" + workspaceID + "\x00" + canonicalPath))
 	return runnerIDPrefix + hex.EncodeToString(digest[:runnerIDDigestBytes])
+}
+
+func discoverWorkspacesUnderRoots(cfg *brokerConfig) []workspaceConfig {
+	if cfg == nil || len(cfg.WorkspaceRoots) == 0 {
+		return nil
+	}
+	discoveryLimit := workspaceLimit - len(cfg.Workspaces)
+	if discoveryLimit <= 0 {
+		return nil
+	}
+	explicitPaths := make(map[string]struct{}, len(cfg.Workspaces))
+	takenPaths := make(map[string]struct{}, len(cfg.Workspaces))
+	takenIDs := make(map[string]struct{}, len(cfg.Workspaces))
+	for _, workspace := range cfg.Workspaces {
+		explicitPaths[workspace.Path] = struct{}{}
+		takenPaths[workspace.Path] = struct{}{}
+		takenIDs[workspace.ID] = struct{}{}
+	}
+	discovered := make([]workspaceConfig, 0)
+	for _, root := range cfg.WorkspaceRoots {
+		scanWorkspaceRoot(root, root, 0, discoveryLimit, explicitPaths, takenPaths, takenIDs, &discovered)
+		if len(discovered) >= discoveryLimit {
+			break
+		}
+	}
+	sort.Slice(discovered, func(i, j int) bool { return discovered[i].Path < discovered[j].Path })
+	for index := range discovered {
+		workspace := &discovered[index]
+		workspace.RunnerID = stableRunnerID(cfg.BrokerID, workspace.ID, workspace.Path)
+	}
+	return discovered
+}
+
+func scanWorkspaceRoot(root, directory string, depth, limit int, explicitPaths, takenPaths, takenIDs map[string]struct{}, discovered *[]workspaceConfig) {
+	if depth > workspaceDiscoveryDepth || len(*discovered) >= limit {
+		return
+	}
+	_, explicit := explicitPaths[directory]
+	if _, exists := takenPaths[directory]; exists && !explicit {
+		return
+	}
+	if _, err := os.Lstat(filepath.Join(directory, ".git")); err == nil {
+		if canonical, workspaceErr := canonicalWorkspace(directory); workspaceErr == nil {
+			if _, exists := takenPaths[canonical]; !exists {
+				takenPaths[canonical] = struct{}{}
+				workspace := workspaceConfig{Path: canonical, RepositoryURL: readWorkspaceRepositoryURL(canonical)}
+				workspace.ID = derivedWorkspaceID(root, canonical, takenIDs)
+				takenIDs[workspace.ID] = struct{}{}
+				if info, statErr := os.Stat(canonical); statErr == nil {
+					workspace.info = info
+				}
+				*discovered = append(*discovered, workspace)
+				return
+			}
+		}
+	}
+	if depth == workspaceDiscoveryDepth {
+		return
+	}
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if strings.HasPrefix(name, ".") || name == "node_modules" {
+			continue
+		}
+		canonical, err := canonicalExistingDirectory(filepath.Join(directory, name))
+		if err != nil {
+			continue
+		}
+		if !canonicalPathWithinRoot(root, canonical) {
+			continue
+		}
+		scanWorkspaceRoot(root, canonical, depth+1, limit, explicitPaths, takenPaths, takenIDs, discovered)
+		if len(*discovered) >= limit {
+			return
+		}
+	}
+}
+
+func derivedWorkspaceID(root, canonicalPath string, takenIDs map[string]struct{}) string {
+	relative, err := filepath.Rel(root, canonicalPath)
+	if err != nil || relative == "." || strings.HasPrefix(relative, "..") {
+		relative = filepath.Base(canonicalPath)
+	}
+	var slug strings.Builder
+	previousDash := true
+	for _, character := range strings.ToLower(relative) {
+		safe := character >= 'a' && character <= 'z' || character >= '0' && character <= '9' || character == '.' || character == '_'
+		if !safe && character != '-' {
+			character = '-'
+		}
+		if character == '-' || character == '.' || character == '_' {
+			if previousDash {
+				continue
+			}
+			previousDash = true
+			slug.WriteRune(character)
+			continue
+		}
+		previousDash = false
+		slug.WriteRune(character)
+	}
+	identifier := strings.TrimRight(slug.String(), "-._")
+	if identifier == "" {
+		identifier = "repo"
+	}
+	if len(identifier) > identifierLimit-9 {
+		identifier = strings.TrimRight(identifier[:identifierLimit-9], "-._")
+	}
+	if _, exists := takenIDs[identifier]; exists {
+		digest := sha256.Sum256([]byte(canonicalPath))
+		identifier = identifier + "-" + hex.EncodeToString(digest[:4])
+	}
+	return identifier
+}
+
+func readWorkspaceRepositoryURL(workspacePath string) string {
+	data, err := os.ReadFile(filepath.Join(workspacePath, ".git", "config"))
+	if err != nil || len(data) > 1<<20 {
+		return ""
+	}
+	inOrigin := false
+	for _, line := range strings.Split(string(data), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "[") {
+			inOrigin = trimmed == `[remote "origin"]`
+			continue
+		}
+		if !inOrigin {
+			continue
+		}
+		key, value, found := strings.Cut(trimmed, "=")
+		if !found || strings.TrimSpace(key) != "url" {
+			continue
+		}
+		candidate := strings.TrimSpace(value)
+		if err := validateRepositoryURL(candidate); err == nil {
+			return candidate
+		}
+		return ""
+	}
+	return ""
+}
+
+func (localBroker *broker) refreshDiscoveredWorkspaces() {
+	if localBroker == nil || localBroker.config == nil || len(localBroker.config.WorkspaceRoots) == 0 {
+		return
+	}
+	localBroker.discoveryMu.Lock()
+	defer localBroker.discoveryMu.Unlock()
+	if time.Since(localBroker.lastDiscovery) < workspaceDiscoveryInterval {
+		return
+	}
+	localBroker.lastDiscovery = time.Now()
+	localBroker.discovered = discoverWorkspacesUnderRoots(localBroker.config)
+}
+
+func (localBroker *broker) discoveredSnapshot() []workspaceConfig {
+	localBroker.discoveryMu.RLock()
+	defer localBroker.discoveryMu.RUnlock()
+	return localBroker.discovered
+}
+
+func (localBroker *broker) workspaceByRunnerID(runnerID string) *workspaceConfig {
+	if workspace := localBroker.workspacesByRunner[runnerID]; workspace != nil {
+		return workspace
+	}
+	discovered := localBroker.discoveredSnapshot()
+	for index := range discovered {
+		if discovered[index].RunnerID == runnerID {
+			return &discovered[index]
+		}
+	}
+	return nil
+}
+
+func (localBroker *broker) approvedWorkspaceCount() int {
+	return min(workspaceLimit, len(localBroker.workspacesByRunner)+len(localBroker.discoveredSnapshot()))
 }
 
 func acquireProcessLock(stateDirectory, brokerID string, expected ...os.FileInfo) (*processLock, error) {
@@ -1123,10 +1391,12 @@ func newBroker(cfg *brokerConfig, client *http.Client) (*broker, error) {
 		workspace := &cfg.Workspaces[index]
 		workspacesByRunner[workspace.RunnerID] = workspace
 	}
+	discovered := discoverWorkspacesUnderRoots(cfg)
 	sessionGeneration, err := allocateSessionGeneration(cfg.StateDirectory, cfg.BrokerID, cfg.stateDirectoryInfo)
 	if err != nil {
 		return nil, fmt.Errorf("allocate session generation: %w", err)
 	}
+	publishImageCtx, publishImageCancel := context.WithCancel(context.Background())
 	return &broker{
 		config:             cfg,
 		client:             client,
@@ -1136,8 +1406,15 @@ func newBroker(cfg *brokerConfig, client *http.Client) (*broker, error) {
 		hostname:           hostname,
 		pid:                os.Getpid(),
 		workspacesByRunner: workspacesByRunner,
+		discovered:         discovered,
+		lastDiscovery:      time.Now(),
 		children:           make(map[childKey]*childProcess),
 		launches:           make(map[childKey]*childLaunch),
+		publishImageActive: make(map[string]struct{}),
+		publishImageErrors: make(chan error, publishImageMaxCount),
+		publishImageCtx:    publishImageCtx,
+		controlMessages:    make(chan heartbeatResponse, 1),
+		publishImageCancel: publishImageCancel,
 	}, nil
 }
 
@@ -1152,15 +1429,35 @@ func (localBroker *broker) loop(ctx context.Context, stderr io.Writer) error {
 			}
 		}
 	}
-	ticker := time.NewTicker(time.Duration(localBroker.config.HeartbeatSeconds) * time.Second)
+	controlCtx, cancelControl := context.WithCancel(ctx)
+	controlDone := make(chan struct{})
+	go func() {
+		defer close(controlDone)
+		localBroker.controlLoop(controlCtx)
+	}()
+	var stopControlOnce sync.Once
+	stopControl := func() {
+		stopControlOnce.Do(func() {
+			cancelControl()
+			<-controlDone
+		})
+	}
+	defer stopControl()
+	ticker := time.NewTicker(brokerHeartbeatInterval(localBroker.config.HeartbeatSeconds))
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
+			stopControl()
 			return localBroker.shutdown()
+		case response := <-localBroker.controlMessages:
+			if err := localBroker.applyIntentResponse(ctx, response, false); err != nil && ctx.Err() == nil {
+				fmt.Fprintf(stderr, "control update failed: %v\n", err)
+			}
 		case <-ticker.C:
 			if err := localBroker.performHeartbeat(ctx); err != nil {
 				if errors.Is(err, errStaleSession) {
+					stopControl()
 					return err
 				}
 				if ctx.Err() == nil {
@@ -1171,8 +1468,296 @@ func (localBroker *broker) loop(ctx context.Context, stderr io.Writer) error {
 	}
 }
 
+func brokerHeartbeatInterval(seconds int) time.Duration {
+	interval := time.Duration(seconds) * time.Second
+	if interval > maxHeartbeatInterval {
+		return maxHeartbeatInterval
+	}
+	return interval
+}
+
+func (localBroker *broker) controlLoop(ctx context.Context) {
+	reconnectDelay := controlReconnectMin
+	for ctx.Err() == nil {
+		connected, err := localBroker.runControlConnection(ctx)
+		if ctx.Err() != nil {
+			return
+		}
+		if err != nil {
+			logrus.WithError(err).Debug("local broker control channel disconnected")
+		}
+		if connected {
+			reconnectDelay = controlReconnectMin
+		}
+		timer := time.NewTimer(reconnectDelay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return
+		case <-timer.C:
+		}
+		if !connected && reconnectDelay < controlReconnectMax {
+			reconnectDelay *= 2
+			if reconnectDelay > controlReconnectMax {
+				reconnectDelay = controlReconnectMax
+			}
+		}
+	}
+}
+
+func (localBroker *broker) runControlConnection(ctx context.Context) (bool, error) {
+	controlURL, err := localBroker.controlURL()
+	if err != nil {
+		return false, err
+	}
+	headers := make(http.Header)
+	headers.Set("Authorization", "Bearer "+localBroker.config.apiKey)
+	headers.Set(controlBrokerIDHeader, localBroker.config.BrokerID)
+	headers.Set(controlSessionIDHeader, localBroker.sessionID)
+	headers.Set(controlGenerationHeader, strconv.FormatUint(localBroker.sessionGeneration, 10))
+	conn, response, err := localBroker.controlDialer().DialContext(ctx, controlURL, headers)
+	if response != nil {
+		if closeErr := response.Body.Close(); closeErr != nil {
+			logrus.WithError(closeErr).Debug("close local broker control response")
+		}
+	}
+	if err != nil {
+		if response != nil {
+			return false, fmt.Errorf("connect local broker control channel: HTTP %d", response.StatusCode)
+		}
+		return false, fmt.Errorf("connect local broker control channel: %w", err)
+	}
+
+	conn.SetReadLimit(maxHeartbeatBody)
+	var writeMu sync.Mutex
+	conn.SetPingHandler(func(data string) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		return conn.WriteControl(websocket.PongMessage, []byte(data), time.Time{})
+	})
+	connectionDone := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-connectionDone:
+		}
+	}()
+	pingCtx, cancelPing := context.WithCancel(ctx)
+	pingDone := make(chan struct{})
+	go func() {
+		defer close(pingDone)
+		ticker := time.NewTicker(controlPingInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-pingCtx.Done():
+				return
+			case <-ticker.C:
+				writeMu.Lock()
+				errPing := conn.WriteControl(websocket.PingMessage, nil, time.Time{})
+				writeMu.Unlock()
+				if errPing != nil {
+					_ = conn.Close()
+					return
+				}
+			}
+		}
+	}()
+
+	readErr := localBroker.readControlMessages(conn)
+	cancelPing()
+	_ = conn.Close()
+	<-pingDone
+	close(connectionDone)
+	if ctx.Err() != nil {
+		return true, ctx.Err()
+	}
+	return true, readErr
+}
+
+func (localBroker *broker) controlURL() (string, error) {
+	parsed, err := url.Parse(localBroker.config.APIURL)
+	if err != nil {
+		return "", fmt.Errorf("parse control URL: %w", err)
+	}
+	switch parsed.Scheme {
+	case "http":
+		parsed.Scheme = "ws"
+	case "https":
+		parsed.Scheme = "wss"
+	default:
+		return "", errors.New("control URL must use HTTP or HTTPS")
+	}
+	parsed.Path = controlEndpoint
+	return parsed.String(), nil
+}
+
+func (localBroker *broker) controlDialer() *websocket.Dialer {
+	dialer := &websocket.Dialer{
+		Proxy:            http.ProxyFromEnvironment,
+		HandshakeTimeout: localBroker.requestLimit,
+	}
+	transport, ok := localBroker.client.Transport.(*http.Transport)
+	if !ok || transport == nil {
+		return dialer
+	}
+	dialer.Proxy = transport.Proxy
+	dialer.NetDialContext = transport.DialContext
+	dialer.NetDialTLSContext = transport.DialTLSContext
+	if transport.TLSClientConfig != nil {
+		dialer.TLSClientConfig = transport.TLSClientConfig.Clone()
+	}
+	if transport.TLSHandshakeTimeout > 0 {
+		dialer.HandshakeTimeout = transport.TLSHandshakeTimeout
+	}
+	return dialer
+}
+
+func (localBroker *broker) readControlMessages(conn *websocket.Conn) error {
+	for {
+		messageType, data, err := conn.ReadMessage()
+		if err != nil {
+			return err
+		}
+		if messageType != websocket.TextMessage {
+			return errors.New("local broker control message must be text")
+		}
+		response, err := localBroker.decodeControlMessage(data)
+		if err != nil {
+			return err
+		}
+		localBroker.queueControlMessage(response)
+	}
+}
+
+func (localBroker *broker) queueControlMessage(response heartbeatResponse) {
+	for {
+		select {
+		case localBroker.controlMessages <- response:
+			return
+		default:
+		}
+		select {
+		case pending := <-localBroker.controlMessages:
+			if pending.IntentEpoch == response.IntentEpoch && pending.IntentRevision != nil && response.IntentRevision != nil && *pending.IntentRevision > *response.IntentRevision {
+				response = pending
+			}
+		default:
+		}
+	}
+}
+
+func (localBroker *broker) decodeControlMessage(data []byte) (heartbeatResponse, error) {
+	if len(data) > maxHeartbeatBody {
+		return heartbeatResponse{}, errors.New("local broker control message exceeds 1 MiB")
+	}
+	if err := rejectDuplicateJSONFields(data); err != nil {
+		return heartbeatResponse{}, errors.New("local broker control message is invalid JSON")
+	}
+	var message controlMessage
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&message); err != nil {
+		return heartbeatResponse{}, errors.New("local broker control message is invalid JSON")
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return heartbeatResponse{}, errors.New("local broker control message contains trailing JSON")
+	}
+	if message.Type != controlMessageType {
+		return heartbeatResponse{}, errors.New("local broker control message has an invalid type")
+	}
+	if message.BrokerID != localBroker.config.BrokerID || message.SessionID != localBroker.sessionID || message.SessionGeneration != localBroker.sessionGeneration {
+		return heartbeatResponse{}, errors.New("local broker control message has stale identity")
+	}
+	if err := validateIdentifier("intent epoch", message.IntentEpoch); err != nil {
+		return heartbeatResponse{}, errors.New("local broker control message has an invalid intent epoch")
+	}
+	revision := message.IntentRevision
+	response := heartbeatResponse{
+		OK:             true,
+		Runners:        message.Runners,
+		IntentEpoch:    message.IntentEpoch,
+		IntentRevision: &revision,
+	}
+	if err := localBroker.validateHeartbeatResponse(response); err != nil {
+		return heartbeatResponse{}, fmt.Errorf("local broker control message failed validation: %w", err)
+	}
+	return response, nil
+}
+
+func (localBroker *broker) applyIntentResponse(ctx context.Context, response heartbeatResponse, authoritative bool) error {
+	if err := localBroker.validateHeartbeatResponse(response); err != nil {
+		return err
+	}
+	if response.IntentEpoch != "" {
+		if err := validateIdentifier("intent epoch", response.IntentEpoch); err != nil {
+			return err
+		}
+	}
+	if authoritative {
+		if response.IntentEpoch == "" && response.IntentRevision == nil {
+			localBroker.intentEpoch = ""
+			localBroker.intentRevision = 0
+			localBroker.intentRevisionKnown = false
+		} else if response.IntentEpoch == "" || response.IntentRevision == nil {
+			return errors.New("heartbeat response has incomplete intent version")
+		} else {
+			if localBroker.intentRevisionKnown && response.IntentEpoch == localBroker.intentEpoch && *response.IntentRevision < localBroker.intentRevision {
+				return nil
+			}
+			localBroker.intentEpoch = response.IntentEpoch
+			localBroker.intentRevision = *response.IntentRevision
+			localBroker.intentRevisionKnown = true
+		}
+		return localBroker.reconcile(ctx, response)
+	}
+	if response.IntentEpoch == "" || response.IntentRevision == nil {
+		return errors.New("local broker control message has incomplete intent version")
+	}
+	if localBroker.intentRevisionKnown {
+		if response.IntentEpoch != localBroker.intentEpoch || *response.IntentRevision < localBroker.intentRevision {
+			return nil
+		}
+	}
+	localBroker.intentEpoch = response.IntentEpoch
+	localBroker.intentRevision = *response.IntentRevision
+	localBroker.intentRevisionKnown = true
+	return localBroker.reconcile(ctx, response)
+}
+
 func (localBroker *broker) performHeartbeat(ctx context.Context) error {
+	var bundle orbconfig.Bundle
+	var collectionErr error
+	collectedOrbConfig := false
+	collectOrbConfig := func() {
+		if collectedOrbConfig {
+			return
+		}
+		collectedOrbConfig = true
+		home, homeErr := os.UserHomeDir()
+		if homeErr != nil {
+			collectionErr = fmt.Errorf("find home directory for orb configuration: %w", homeErr)
+			return
+		}
+		bundle, collectionErr = collectOrbConfigBundle(home)
+	}
+	if localBroker.orbConfigSupport {
+		collectOrbConfig()
+		if collectionErr == nil {
+			localBroker.orbConfigDigest = &bundle.Digest
+		}
+	}
+	advertisedOrbConfig := localBroker.orbConfigDigest != nil
 	response, err := localBroker.postHeartbeat(ctx, false)
+	localBroker.orbConfigDigest = nil
+	if err != nil && advertisedOrbConfig && errors.Is(err, errOrbConfigDigestUnsupported) && ctx.Err() == nil {
+		localBroker.orbConfigSupport = false
+		response, err = localBroker.postHeartbeat(ctx, false)
+	}
 	if err != nil {
 		if errors.Is(err, errStaleSession) {
 			if errStop := localBroker.stopAll(); errStop != nil {
@@ -1185,11 +1770,37 @@ func (localBroker *broker) performHeartbeat(ctx context.Context) error {
 		}
 		return err
 	}
+	localBroker.orbConfigSupport = response.OrbConfigSupport
+	localBroker.orbCredentials.support = response.OrbCredentialSupport
+	localBroker.orbCredentials.serverRevision = response.OrbCredentialRevision
+	localBroker.pluginModesSupport = response.PluginAgentModesSupport
+	if response.OrbConfigSupport {
+		collectOrbConfig()
+	}
 	if err := ctx.Err(); err != nil {
 		localBroker.markShuttingDown()
 		return err
 	}
-	return localBroker.reconcile(ctx, response)
+	var uploadErr error
+	if collectionErr == nil && response.OrbConfigSupport && response.OrbConfigDigest != nil && *response.OrbConfigDigest != bundle.Digest {
+		uploadErr = localBroker.putOrbConfigBundle(ctx, bundle)
+		if errors.Is(uploadErr, errStaleSession) {
+			if errStop := localBroker.stopAll(); errStop != nil {
+				return errors.Join(errStaleSession, errStop)
+			}
+			return errStaleSession
+		}
+	}
+	credentialErr := localBroker.syncOrbCredentials(ctx)
+	if errors.Is(credentialErr, errStaleSession) {
+		if errStop := localBroker.stopAll(); errStop != nil {
+			return errors.Join(errStaleSession, errStop)
+		}
+		return errStaleSession
+	}
+	publishImageErr := localBroker.processPublishImageRequests(ctx, response)
+	reconcileErr := localBroker.applyIntentResponse(ctx, response, true)
+	return errors.Join(collectionErr, uploadErr, credentialErr, publishImageErr, reconcileErr)
 }
 
 func (localBroker *broker) postHeartbeat(ctx context.Context, emptyRunners bool) (heartbeatResponse, error) {
@@ -1210,6 +1821,11 @@ func (localBroker *broker) postHeartbeat(ctx context.Context, emptyRunners bool)
 	if err != nil {
 		return heartbeatResponse{}, fmt.Errorf("send heartbeat: %w", err)
 	}
+	orbConfigSupport := response.Header.Get(orbConfigSupportHeader) == "1"
+	orbConfigDigest := response.Header.Get(orbConfigDigestHeader)
+	orbCredentialSupport := response.Header.Get(orbCredentialSupportHeader) == "1"
+	orbCredentialRevision := response.Header.Get(orbCredentialRevisionHeader)
+	pluginModesSupport := response.Header.Get(ampplugins.SupportHeader) == "1"
 	responseBody, readErr := io.ReadAll(io.LimitReader(response.Body, maxHeartbeatBody+1))
 	closeErr := response.Body.Close()
 	if readErr != nil {
@@ -1228,7 +1844,11 @@ func (localBroker *broker) postHeartbeat(ctx context.Context, emptyRunners bool)
 		return heartbeatResponse{}, errors.New("heartbeat response is invalid JSON")
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return heartbeatResponse{}, heartbeatRejectionError(response.StatusCode, responseBody)
+		rejectionErr := heartbeatRejectionError(response.StatusCode, responseBody)
+		if payload.OrbConfigDigest != nil && orbConfigDigestUnsupported(response.StatusCode, responseBody) {
+			return heartbeatResponse{}, fmt.Errorf("%w: %v", errOrbConfigDigestUnsupported, rejectionErr)
+		}
+		return heartbeatResponse{}, rejectionErr
 	}
 	var decoded heartbeatResponse
 	decoder := json.NewDecoder(bytes.NewReader(responseBody))
@@ -1243,10 +1863,53 @@ func (localBroker *broker) postHeartbeat(ctx context.Context, emptyRunners bool)
 	if !decoded.OK {
 		return heartbeatResponse{}, heartbeatRejectionError(response.StatusCode, responseBody)
 	}
+	intentEpoch, intentRevision, err := parseIntentVersionHeaders(response.Header)
+	if err != nil {
+		return heartbeatResponse{}, fmt.Errorf("heartbeat response failed validation: %w", err)
+	}
+	decoded.OrbConfigSupport = orbConfigSupport
+	decoded.OrbCredentialSupport = orbCredentialSupport
+	decoded.OrbCredentialRevision = orbCredentialRevision
+	decoded.PluginAgentModesSupport = pluginModesSupport
+	decoded.IntentEpoch = intentEpoch
+	decoded.IntentRevision = intentRevision
+	if decoded.OrbConfigDigest == nil && orbConfigSupport {
+		decoded.OrbConfigDigest = &orbConfigDigest
+	}
 	if err := localBroker.validateHeartbeatResponse(decoded); err != nil {
 		return heartbeatResponse{}, fmt.Errorf("heartbeat response failed validation: %w", err)
 	}
 	return decoded, nil
+}
+
+func parseIntentVersionHeaders(headers http.Header) (string, *uint64, error) {
+	epochValues, epochPresent := matchingHeaderValues(headers, intentEpochHeader)
+	revisionValues, revisionPresent := matchingHeaderValues(headers, intentRevisionHeader)
+	if !epochPresent && !revisionPresent {
+		return "", nil, nil
+	}
+	if !epochPresent || !revisionPresent || len(epochValues) != 1 || len(revisionValues) != 1 {
+		return "", nil, errors.New("heartbeat response has incomplete intent version")
+	}
+	epoch := epochValues[0]
+	if err := validateIdentifier("intent epoch", epoch); err != nil {
+		return "", nil, errors.New("heartbeat response has an invalid intent epoch")
+	}
+	revision, err := strconv.ParseUint(revisionValues[0], 10, 64)
+	if err != nil || strconv.FormatUint(revision, 10) != revisionValues[0] {
+		return "", nil, errors.New("heartbeat response has an invalid intent revision")
+	}
+	return epoch, &revision, nil
+}
+
+func matchingHeaderValues(headers http.Header, name string) ([]string, bool) {
+	var values []string
+	for key, candidates := range headers {
+		if strings.EqualFold(key, name) {
+			values = append(values, candidates...)
+		}
+	}
+	return values, values != nil
 }
 
 func heartbeatRejectionError(status int, body []byte) error {
@@ -1290,20 +1953,82 @@ func heartbeatRejectionError(status int, body []byte) error {
 	return fmt.Errorf("heartbeat rejected with HTTP %d", status)
 }
 
+func orbConfigDigestUnsupported(status int, body []byte) bool {
+	if status != http.StatusBadRequest {
+		return false
+	}
+	var response map[string]any
+	if err := json.Unmarshal(body, &response); err != nil {
+		return false
+	}
+	code, _ := response["code"].(string)
+	if code == "" {
+		switch detail := response["error"].(type) {
+		case string:
+			code = detail
+		case map[string]any:
+			code, _ = detail["code"].(string)
+		}
+	}
+	switch code {
+	case "orb_config_digest_unsupported", "unsupported_orb_config_digest", "orb_config_digest_not_supported":
+		return true
+	case "invalid_request":
+		return orbConfigDigestErrorEvidence(response)
+	default:
+		return false
+	}
+}
+
+func orbConfigDigestErrorEvidence(value any) bool {
+	switch typed := value.(type) {
+	case string:
+		return strings.Contains(typed, "orbConfigDigest")
+	case map[string]any:
+		for key, nested := range typed {
+			switch strings.ToLower(key) {
+			case "error", "message", "detail", "field", "parameter", "param":
+				if orbConfigDigestErrorEvidence(nested) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 func (localBroker *broker) heartbeatPayload(emptyRunners bool) heartbeatRequest {
+	localBroker.refreshDiscoveredWorkspaces()
+	workspaces := make([]workspaceConfig, 0, len(localBroker.config.Workspaces)+len(localBroker.discoveredSnapshot()))
+	workspaces = append(workspaces, localBroker.config.Workspaces...)
+	workspaces = append(workspaces, localBroker.discoveredSnapshot()...)
 	payload := heartbeatRequest{
 		BrokerID:          localBroker.config.BrokerID,
 		SessionID:         localBroker.sessionID,
 		SessionGeneration: localBroker.sessionGeneration,
 		Hostname:          localBroker.hostname,
 		PID:               localBroker.pid,
-		Runners:           make([]heartbeatRunner, 0, len(localBroker.config.Workspaces)),
+		Runners:           make([]heartbeatRunner, 0, len(workspaces)),
+		OrbConfigDigest:   localBroker.orbConfigDigest,
 	}
 	if emptyRunners {
 		return payload
 	}
+	if localBroker.pluginModesSupport {
+		if modes, err := ampplugins.Discover(ampplugins.DefaultPluginsDir(), reservedAgentModeKey); err != nil {
+			logrus.WithError(err).Debug("discover amp plugin agent modes")
+		} else if len(modes) > 0 {
+			advertised := make([]ampplugins.AgentMode, 0, len(modes))
+			for _, mode := range modes {
+				if mode != nil {
+					advertised = append(advertised, *mode)
+				}
+			}
+			payload.PluginAgentModes = advertised
+		}
+	}
 	running := localBroker.runningThreadsByRunner()
-	for _, workspace := range localBroker.config.Workspaces {
+	for _, workspace := range workspaces {
 		threads := append([]string{}, running[workspace.RunnerID]...)
 		sort.Strings(threads)
 		payload.Runners = append(payload.Runners, heartbeatRunner{
@@ -1385,14 +2110,24 @@ func (localBroker *broker) validateHeartbeatResponse(response heartbeatResponse)
 	if response.Runners == nil {
 		return errors.New("runners is required")
 	}
-	if len(*response.Runners) > len(localBroker.workspacesByRunner) {
+	if response.OrbConfigDigest != nil && *response.OrbConfigDigest != "" && !orbConfigDigestPattern.MatchString(*response.OrbConfigDigest) {
+		return errors.New("orbConfigDigest is invalid")
+	}
+	if response.OrbCredentialSupport {
+		if response.OrbCredentialRevision != orbCredentialAbsentRevision && response.OrbCredentialRevision != orbCredentialRevokedRevision && response.OrbCredentialRevision != orbCredentialRepairRevision && !orbCredentialRevisionPattern.MatchString(response.OrbCredentialRevision) {
+			return errors.New("orb credential revision is invalid")
+		}
+	} else if response.OrbCredentialRevision != "" {
+		return errors.New("orb credential revision is unexpected")
+	}
+	if len(*response.Runners) > localBroker.approvedWorkspaceCount() {
 		return errors.New("response contains too many runners")
 	}
 	seenRunners := make(map[string]struct{}, len(*response.Runners))
 	seenThreads := make(map[string]struct{})
 	intentCount := 0
 	for _, runner := range *response.Runners {
-		if _, known := localBroker.workspacesByRunner[runner.RunnerID]; !known {
+		if localBroker.workspaceByRunnerID(runner.RunnerID) == nil {
 			return fmt.Errorf("response contains unapproved runner %s", heartbeatDiagnosticIdentifier(runner.RunnerID))
 		}
 		if _, exists := seenRunners[runner.RunnerID]; exists {
@@ -1426,11 +2161,11 @@ func (localBroker *broker) validateHeartbeatResponse(response heartbeatResponse)
 		}
 	}
 	if response.RejectedRunners != nil {
-		if len(*response.Runners)+len(*response.RejectedRunners) > len(localBroker.workspacesByRunner) {
+		if len(*response.Runners)+len(*response.RejectedRunners) > localBroker.approvedWorkspaceCount() {
 			return errors.New("response contains too many runner results")
 		}
 		for _, rejected := range *response.RejectedRunners {
-			if _, known := localBroker.workspacesByRunner[rejected.RunnerID]; !known {
+			if localBroker.workspaceByRunnerID(rejected.RunnerID) == nil {
 				return fmt.Errorf("response rejects unapproved runner %s", heartbeatDiagnosticIdentifier(rejected.RunnerID))
 			}
 			if _, exists := seenRunners[rejected.RunnerID]; exists {
@@ -1445,6 +2180,9 @@ func (localBroker *broker) validateHeartbeatResponse(response heartbeatResponse)
 			}
 		}
 	}
+	if err := localBroker.validatePublishImageRequests(response.PublishImageRequests); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -1453,6 +2191,15 @@ func heartbeatDiagnosticIdentifier(value string) string {
 		return strconv.QuoteToASCII(value[:identifierLimit]) + "..."
 	}
 	return strconv.QuoteToASCII(value)
+}
+
+func reservedAgentModeKey(key string) bool {
+	switch key {
+	case "smart", "rush", "deep", "large", "review", "puck", "low", "medium", "high", "ultra", "deep-1", "deep-2", "deep-3":
+		return true
+	default:
+		return false
+	}
 }
 
 func mapAgentMode(agentMode, reasoningEffort string) string {
@@ -1485,8 +2232,21 @@ func mapAgentMode(agentMode, reasoningEffort string) string {
 	}
 }
 
+func brokerPublicationRunnerID(brokerID, sessionID string, sessionGeneration uint64, runnerID, threadID string) string {
+	payload := strings.Join([]string{
+		"cliproxy-local-broker-publication-v1",
+		brokerID,
+		sessionID,
+		strconv.FormatUint(sessionGeneration, 10),
+		runnerID,
+		threadID,
+	}, "\x00")
+	digest := sha256.Sum256([]byte(payload))
+	return "broker-" + hex.EncodeToString(digest[:16])
+}
+
 func (localBroker *broker) launchChild(ctx context.Context, key childKey, mode string) error {
-	workspace := localBroker.workspacesByRunner[key.runnerID]
+	workspace := localBroker.workspaceByRunnerID(key.runnerID)
 	if workspace == nil || !threadIDPattern.MatchString(key.threadID) {
 		return errors.New("runner or thread is not approved")
 	}
@@ -1571,6 +2331,7 @@ func (localBroker *broker) launchChild(ctx context.Context, key childKey, mode s
 	command := exec.Command(localBroker.config.AmpBinary,
 		"--mode", mode,
 		"--headless="+key.threadID,
+		"--runner-id", brokerPublicationRunnerID(localBroker.config.BrokerID, localBroker.sessionID, localBroker.sessionGeneration, key.runnerID, key.threadID),
 		"--log-file", logPath,
 	)
 	command.Dir = workspace.Path
@@ -1705,23 +2466,85 @@ func childEnvironment(base []string, cfg *brokerConfig, workingDirectory, thread
 		{key: "AMP_PWD", value: workingDirectory},
 	}
 	allowed := map[string]struct{}{
-		"HOME": {}, "USER": {}, "LOGNAME": {}, "PATH": {}, "SHELL": {},
+		"HOME": {}, "USER": {}, "LOGNAME": {}, "SHELL": {},
 		"TMPDIR": {}, "TMP": {}, "TEMP": {}, "LANG": {}, "TERM": {}, "COLORTERM": {},
 	}
-	environment := make([]string, 0, len(allowed)+len(updates))
+	home := ""
+	inheritedPath := ""
+	for _, entry := range base {
+		key, value, found := strings.Cut(entry, "=")
+		if !found {
+			continue
+		}
+		switch key {
+		case "HOME":
+			home = value
+		case "PATH":
+			inheritedPath = value
+		}
+	}
+	environment := make([]string, 0, len(allowed)+len(updates)+1)
 	for _, entry := range base {
 		key, _, found := strings.Cut(entry, "=")
 		if !found {
+			continue
+		}
+		if key == "PATH" {
 			continue
 		}
 		if _, ok := allowed[key]; ok || strings.HasPrefix(key, "LC_") {
 			environment = append(environment, entry)
 		}
 	}
+	environment = append(environment, "PATH="+childPath(home, inheritedPath))
 	for _, update := range updates {
 		environment = append(environment, update.key+"="+update.value)
 	}
 	return environment
+}
+
+func childPath(home, inherited string) string {
+	paths := make([]string, 0, len(filepath.SplitList(inherited))+13)
+	seen := make(map[string]struct{}, cap(paths))
+	add := func(path string) {
+		path = filepath.Clean(path)
+		if !filepath.IsAbs(path) {
+			return
+		}
+		if _, exists := seen[path]; exists {
+			return
+		}
+		seen[path] = struct{}{}
+		paths = append(paths, path)
+	}
+	for _, path := range filepath.SplitList(inherited) {
+		add(path)
+	}
+	if filepath.IsAbs(home) {
+		home = filepath.Clean(home)
+		for _, path := range []string{
+			filepath.Join(home, ".local", "bin"),
+			filepath.Join(home, ".amp", "bin"),
+			filepath.Join(home, ".bun", "bin"),
+			filepath.Join(home, ".local", "share", "mise", "shims"),
+			filepath.Join(home, ".local", "share", "mise", "installs", "node", "latest", "bin"),
+		} {
+			add(path)
+		}
+	}
+	for _, path := range []string{
+		"/opt/homebrew/bin",
+		"/opt/homebrew/sbin",
+		"/usr/local/bin",
+		"/usr/local/sbin",
+		"/usr/bin",
+		"/bin",
+		"/usr/sbin",
+		"/sbin",
+	} {
+		add(path)
+	}
+	return strings.Join(paths, string(os.PathListSeparator))
 }
 
 func (localBroker *broker) waitChild(child *childProcess) {
@@ -1917,6 +2740,9 @@ func (localBroker *broker) beginShutdown() ([]*childProcess, []*childLaunch) {
 	localBroker.mu.Lock()
 	defer localBroker.mu.Unlock()
 	localBroker.shuttingDown = true
+	if localBroker.publishImageCancel != nil {
+		localBroker.publishImageCancel()
+	}
 	children := make([]*childProcess, 0, len(localBroker.children))
 	for _, child := range localBroker.children {
 		child.stopping = true
@@ -1936,6 +2762,7 @@ func (localBroker *broker) stopAll() error {
 	for _, launch := range launches {
 		<-launch.done
 	}
+	localBroker.publishImageWG.Wait()
 	return err
 }
 

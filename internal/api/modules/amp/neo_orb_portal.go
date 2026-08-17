@@ -80,12 +80,22 @@ func (m *AmpModule) orbPortalTokenMiddleware() gin.HandlerFunc {
 				if record, ok := manager.snapshot(threadID); ok && hmac.Equal([]byte(presented), []byte(record.portalToken)) {
 					if actor, release := m.neoRuntime.store.retainThreadActorWithoutReadyWork(threadID); actor != nil {
 						defer release()
-						ownerUserID := actor.threadToolOwnerID()
-						ctx := context.WithValue(c.Request.Context(), neoOrbPortalOwnerContextKey{}, ownerUserID)
-						c.Request = c.Request.WithContext(ctx)
-						c.Set(neoOrbPortalAuthenticated, true)
-						c.Set("userApiKey", neoOrbPortalPrincipal)
-						authenticated = true
+						admitted := !record.recovered
+						if admitted && record.lifecycleV1 {
+							operation, admissionErr := manager.beginLifecycleAdmission(c.Request.Context(), actor, threadID, neoOrbStateRunning, neoOrbStatePaused)
+							admitted = admissionErr == nil
+							if operation != nil {
+								operation.close()
+							}
+						}
+						if admitted {
+							ownerUserID := actor.threadToolOwnerID()
+							ctx := context.WithValue(c.Request.Context(), neoOrbPortalOwnerContextKey{}, ownerUserID)
+							c.Request = c.Request.WithContext(ctx)
+							c.Set(neoOrbPortalAuthenticated, true)
+							c.Set("userApiKey", neoOrbPortalPrincipal)
+							authenticated = true
+						}
 					}
 				}
 			}
@@ -96,13 +106,18 @@ func (m *AmpModule) orbPortalTokenMiddleware() gin.HandlerFunc {
 		}
 		if authenticated && fromQuery {
 			secure := c.Request.TLS != nil || strings.EqualFold(strings.TrimSpace(c.GetHeader("X-Forwarded-Proto")), "https")
+			sameSite := http.SameSiteLaxMode
+			if secure {
+				sameSite = http.SameSiteNoneMode
+			}
 			http.SetCookie(c.Writer, &http.Cookie{
-				Name:     neoOrbPortalCookieName,
-				Value:    presented,
-				Path:     fmt.Sprintf("/orb/%s/p/%d/", threadID, port),
-				HttpOnly: true,
-				Secure:   secure,
-				SameSite: http.SameSiteLaxMode,
+				Name:        neoOrbPortalCookieName,
+				Value:       presented,
+				Path:        fmt.Sprintf("/orb/%s/p/%d/", threadID, port),
+				HttpOnly:    true,
+				Secure:      secure,
+				SameSite:    sameSite,
+				Partitioned: secure,
 			})
 			if c.Request.Method == http.MethodGet || c.Request.Method == http.MethodHead {
 				location := c.Request.URL.Path
@@ -121,10 +136,14 @@ func (m *AmpModule) orbPortalTokenMiddleware() gin.HandlerFunc {
 func neoOrbPortalHelperScript() string {
 	return `#!/usr/bin/env python3
 import argparse
+import http.client
 import json
 import os
 import pathlib
 import re
+import socket
+import tempfile
+import time
 import urllib.parse
 
 parser = argparse.ArgumentParser(prog="amp-orb-portal", description="Expose an HTTP server in this CLIProxyAPI orb")
@@ -132,6 +151,7 @@ parser.add_argument("target", help="local port or loopback URL")
 parser.add_argument("--name", default="")
 parser.add_argument("--title", default="")
 parser.add_argument("--description", default="")
+parser.add_argument("--health", default="", metavar="PATH", help="wait up to 10 seconds for a 2xx/3xx response from an absolute HTTP path before publishing")
 parser.add_argument("--no-manifest", action="store_true", help=argparse.SUPPRESS)
 args = parser.parse_args()
 
@@ -142,6 +162,7 @@ if not thread_id or not base_url or not token:
     parser.error("AMP_THREAD_ID, AMP_ORB_PORTAL_BASE_URL, and AMP_ORB_PORTAL_TOKEN must be set")
 
 target = args.target.strip()
+host = "127.0.0.1"
 if target.isdigit():
     port = int(target)
     suffix = "/"
@@ -151,12 +172,73 @@ else:
         parser.error("target URL scheme must be http")
     if parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
         parser.error("target URL must use localhost or a loopback address")
+    host = parsed.hostname
     port = parsed.port or 80
     suffix = parsed.path or "/"
     if parsed.query:
         suffix += "?" + parsed.query
 if port < 1 or port > 65535:
     parser.error("port must be between 1 and 65535")
+health = args.health.strip()
+health_url = urllib.parse.urlsplit(health)
+if health and (not health.startswith("/") or health_url.scheme or health_url.netloc or health_url.fragment or not all(0x21 <= ord(character) < 0x7f for character in health)):
+    parser.error("health must be an absolute HTTP path")
+
+durable_root = pathlib.Path("/home/user").resolve()
+
+def durable_directory(path):
+    resolved = path.resolve()
+    try:
+        relative = resolved.relative_to(durable_root)
+    except ValueError:
+        parser.error(f"portal directory must be under {durable_root}")
+    parts = relative.parts
+    if any(parts[index] == ".amp" and parts[index + 1] == "out" for index in range(len(parts) - 1)):
+        parser.error(".amp/out cannot be used as durable portal storage")
+    return resolved
+
+def atomic_write(path, text, mode):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix="." + path.name + "-", dir=path.parent, text=True)
+    try:
+        with os.fdopen(descriptor, "w") as output:
+            output.write(text)
+            output.flush()
+            os.fsync(output.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+def ready():
+    try:
+        if not health:
+            with socket.create_connection((host, port), timeout=0.25):
+                return True
+        connection = http.client.HTTPConnection(host, port, timeout=0.5)
+        try:
+            connection.request("GET", health)
+            response = connection.getresponse()
+            return 200 <= response.status < 400
+        finally:
+            connection.close()
+    except (OSError, http.client.HTTPException):
+        return False
+
+deadline = time.monotonic() + 10
+while not ready():
+    if time.monotonic() >= deadline:
+        health_detail = f" with health path {health}" if health else ""
+        raise SystemExit(f"local service on port {port}{health_detail} did not become ready")
+    time.sleep(0.1)
 
 portal = f"{base_url}/orb/{urllib.parse.quote(thread_id, safe='')}/p/{port}{suffix}"
 separator = "&" if "?" in portal else "?"
@@ -168,13 +250,13 @@ title = args.title.strip() or name
 link = {"label": title, "url": portal}
 if args.description.strip():
     link["note"] = args.description.strip()
+portal_directory = durable_directory(pathlib.Path.cwd())
 if not args.no_manifest:
-    manifest_dir = pathlib.Path.cwd() / ".amp" / "portals"
+    manifest_dir = portal_directory / ".amp" / "portals"
     manifest_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(manifest_dir, 0o700)
     manifest_path = manifest_dir / f"{name}.json"
-    manifest_path.write_text(json.dumps({"links": [link]}, indent=2) + "\n")
-    os.chmod(manifest_path, 0o600)
+    atomic_write(manifest_path, json.dumps({"links": [link]}, indent=2) + "\n", 0o600)
     print(f"Wrote portal manifest {manifest_path}.")
 print(portal)
 `
@@ -184,6 +266,7 @@ func neoOrbServiceHelperScript() string {
 	return `#!/usr/bin/env python3
 import argparse
 import fcntl
+import http.client
 import json
 import os
 import pathlib
@@ -194,8 +277,10 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 
-root = pathlib.Path.home() / ".cache" / "amp" / "services"
+durable_root = pathlib.Path("/home/user").resolve()
+root = durable_root / ".cache" / "amp" / "services"
 conf_dir = root / "conf.d"
 command_dir = root / "commands"
 state_path = root / "state.json"
@@ -265,15 +350,81 @@ def valid_name(value):
         raise SystemExit("service name must contain only letters, numbers, dot, underscore, or hyphen")
     return value
 
-def load_state():
+def load_state(strict=False):
     try:
         value = json.loads(state_path.read_text())
-        return value if isinstance(value, dict) else {}
-    except (FileNotFoundError, json.JSONDecodeError):
+        if isinstance(value, dict):
+            return value
+        if strict:
+            raise SystemExit("service state must contain a JSON object")
+        return {}
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError as error:
+        if strict:
+            raise SystemExit(f"service state is invalid JSON: {error}")
         return {}
 
 def save_state(value):
     atomic_write(state_path, json.dumps(value, indent=2, sort_keys=True) + "\n", 0o600)
+
+def durable_directory(path):
+    resolved = path.resolve()
+    try:
+        relative = resolved.relative_to(durable_root)
+    except ValueError:
+        raise ValueError(f"service directory must be under {durable_root}")
+    parts = relative.parts
+    if any(parts[index] == ".amp" and parts[index + 1] == "out" for index in range(len(parts) - 1)):
+        raise ValueError(".amp/out cannot be used as durable service storage")
+    return resolved
+
+def valid_health(value):
+    parsed = urllib.parse.urlsplit(value)
+    return not value or value.startswith("/") and not parsed.scheme and not parsed.netloc and not parsed.fragment and all(0x21 <= ord(character) < 0x7f for character in value)
+
+def portal_url(port):
+    thread_id = os.environ.get("AMP_THREAD_ID", "").strip()
+    base_url = os.environ.get("AMP_ORB_PORTAL_BASE_URL", "").strip().rstrip("/")
+    token = os.environ.get("AMP_ORB_PORTAL_TOKEN", "").strip()
+    if not thread_id or not base_url or not token:
+        raise SystemExit("AMP_THREAD_ID, AMP_ORB_PORTAL_BASE_URL, and AMP_ORB_PORTAL_TOKEN must be set")
+    public_url = f"{base_url}/orb/{urllib.parse.quote(thread_id, safe='')}/p/{port}/"
+    return public_url + "?" + urllib.parse.urlencode({"` + neoOrbPortalTokenQuery + `": token})
+
+def remove_manifest_path(path):
+    path.unlink(missing_ok=True)
+
+def service_manifest_path(name, path):
+    try:
+        resolved = pathlib.Path(path).resolve()
+        resolved.relative_to(durable_root)
+    except (OSError, TypeError, ValueError):
+        return None
+    if resolved.name != f"{name}.json" or resolved.parent.name != "portals" or resolved.parent.parent.name != ".amp":
+        return None
+    return resolved
+
+def hide_service_manifest(name, service):
+    if not isinstance(service, dict):
+        return True
+    candidates = []
+    manifest = service.get("manifest")
+    directory = service.get("directory")
+    if isinstance(manifest, str) and manifest:
+        candidates.append(pathlib.Path(manifest))
+    if isinstance(directory, str) and directory:
+        candidates.append(pathlib.Path(directory) / ".amp" / "portals" / f"{name}.json")
+    removed = True
+    for candidate in candidates:
+        resolved = service_manifest_path(name, candidate)
+        if resolved is None:
+            continue
+        try:
+            remove_manifest_path(resolved)
+        except OSError:
+            removed = False
+    return removed
 
 def available_port():
     with socket.socket() as listener:
@@ -292,6 +443,32 @@ def service_state(result, name):
         return fields[1]
     return ""
 
+def service_ready(port, health=""):
+    try:
+        if not health:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.25):
+                return True
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=0.5)
+        try:
+            connection.request("GET", health)
+            response = connection.getresponse()
+            return 200 <= response.status < 400
+        finally:
+            connection.close()
+    except (OSError, http.client.HTTPException):
+        return False
+
+def wait_ready(port, health="", deadline=None):
+    if deadline is None:
+        deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if service_ready(port, health):
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(0.1, remaining))
+    return False
+
 parser = argparse.ArgumentParser(prog="amp-orb-service")
 subparsers = parser.add_subparsers(dest="action", required=True)
 start = subparsers.add_parser("start")
@@ -301,12 +478,14 @@ start.add_argument("--port", type=int)
 start.add_argument("--portal", action="store_true")
 start.add_argument("--title", default="")
 start.add_argument("--description", default="")
+start.add_argument("--health", default="", metavar="PATH", help="wait up to 10 seconds for a 2xx/3xx response from an absolute HTTP path before publishing")
 for action in ("restart", "stop", "status", "logs"):
     child = subparsers.add_parser(action)
     child.add_argument("name")
     if action == "logs":
         child.add_argument("--lines", type=int, default=200)
 subparsers.add_parser("list")
+subparsers.add_parser("reconcile", help=argparse.SUPPRESS)
 args = parser.parse_args()
 
 root.mkdir(parents=True, exist_ok=True)
@@ -318,6 +497,118 @@ if args.action == "list":
     result = run_ctl("status", check=False)
     sys.stdout.write(result.stdout or result.stderr)
     raise SystemExit(result.returncode)
+if args.action == "reconcile":
+    state = load_state(strict=True)
+    run_ctl("reread", check=False)
+    run_ctl("update", check=False)
+    reconcile_deadline = time.monotonic() + 10
+    for name in sorted(list(state)):
+        service = state[name]
+        has_portal_manifest = isinstance(service, dict) and bool(service.get("portal") or service.get("manifest"))
+        try:
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", name) or not isinstance(service, dict):
+                raise ValueError("invalid service record")
+            port = service.get("port")
+            command = service.get("command")
+            portal_url = service.get("portal", "")
+            manifest = service.get("manifest", "")
+            title = service.get("title", name)
+            description = service.get("description", "")
+            health = service.get("health", "")
+            if type(port) is not int or port < 1 or port > 65535:
+                raise ValueError("invalid port")
+            if not isinstance(command, str) or not command or not isinstance(portal_url, str) or not isinstance(manifest, str) or not isinstance(title, str) or not isinstance(description, str) or not isinstance(health, str) or not valid_health(health):
+                raise ValueError("invalid service fields")
+            conf_path = conf_dir / f"{name}.conf"
+            command_path = command_dir / name
+            if not conf_path.is_file() or not command_path.is_file():
+                raise ValueError("missing supervisor files")
+            directory = service.get("directory", "")
+            if not isinstance(directory, str):
+                raise ValueError("invalid directory")
+            if not directory and manifest:
+                directory = str(pathlib.Path(manifest).parent.parent.parent)
+            if not directory:
+                for line in conf_path.read_text().splitlines():
+                    if line.startswith("directory="):
+                        directory = line.removeprefix("directory=").replace("%%", "%")
+                        break
+            directory_path = durable_directory(pathlib.Path(directory))
+            if not directory_path.is_dir():
+                raise ValueError("missing service directory")
+        except (OSError, TypeError, ValueError) as error:
+            if not hide_service_manifest(name, service):
+                print(f"Service {name} has an invalid persisted registration ({error}); its portal manifest could not be removed.", file=sys.stderr)
+                continue
+            state.pop(name, None)
+            if has_portal_manifest:
+                print(f"Service {name} has an invalid persisted registration ({error}); its portal manifest was removed.", file=sys.stderr)
+            else:
+                print(f"Service {name} has an invalid persisted registration ({error}); its registration was removed.", file=sys.stderr)
+            continue
+        expected_manifest = directory_path / ".amp" / "portals" / f"{name}.json"
+        if portal_url and pathlib.Path(manifest).resolve() != expected_manifest:
+            if not hide_service_manifest(name, service):
+                print(f"Service {name} has an invalid persisted registration (unexpected portal manifest path); its portal manifest could not be removed.", file=sys.stderr)
+                continue
+            state.pop(name, None)
+            print(f"Service {name} has an invalid persisted registration (unexpected portal manifest path); its portal manifest was removed.", file=sys.stderr)
+            continue
+        status = run_ctl("status", name, check=False)
+        state_name = service_state(status, name)
+        running = state_name == "RUNNING"
+        if not running:
+            run_ctl("start", name, check=False)
+            while time.monotonic() < reconcile_deadline:
+                status = run_ctl("status", name, check=False)
+                state_name = service_state(status, name)
+                if state_name == "RUNNING":
+                    running = True
+                    break
+                if state_name in {"BACKOFF", "EXITED", "FATAL", "UNKNOWN"}:
+                    break
+                remaining = reconcile_deadline - time.monotonic()
+                if remaining > 0:
+                    time.sleep(min(0.1, remaining))
+        if not running:
+            manifest_removed = not portal_url or hide_service_manifest(name, service)
+            if manifest_removed:
+                print(f"Service {name} is not running (supervisor state {state_name or 'unknown'}); its portal manifest was not published.", file=sys.stderr)
+            else:
+                print(f"Service {name} is not running (supervisor state {state_name or 'unknown'}); its portal manifest could not be removed.", file=sys.stderr)
+            continue
+        if not wait_ready(port, health, reconcile_deadline):
+            manifest_removed = not portal_url or hide_service_manifest(name, service)
+            health_detail = f" with health path {health}" if health else ""
+            if manifest_removed:
+                print(f"Service {name} did not become ready on port {port}{health_detail}; its portal manifest was not published.", file=sys.stderr)
+            else:
+                print(f"Service {name} did not become ready on port {port}{health_detail}; its portal manifest could not be removed.", file=sys.stderr)
+            continue
+        if portal_url:
+            portal_command = [
+                "amp-orb-portal", str(port), "--name", name,
+                "--title", title or name, "--description", description,
+            ]
+            portal = subprocess.run(portal_command, text=True, capture_output=True, check=False, cwd=directory_path)
+            if portal.returncode != 0:
+                manifest_removed = hide_service_manifest(name, service)
+                detail = portal.stderr.strip()
+                detail_suffix = f": {detail}" if detail else ""
+                if manifest_removed:
+                    print(f"Service {name} portal registration could not be restored (exit {portal.returncode}){detail_suffix}.", file=sys.stderr)
+                else:
+                    print(f"Service {name} portal registration could not be restored (exit {portal.returncode}) and its stale manifest could not be removed{detail_suffix}.", file=sys.stderr)
+                continue
+            portal_lines = portal.stdout.strip().splitlines()
+            if portal_lines:
+                service["portal"] = portal_lines[-1]
+        service["directory"] = str(directory_path)
+        service["title"] = title or name
+        service["description"] = description
+        service["health"] = health
+    save_state(state)
+    raise SystemExit(0)
 
 name = valid_name(args.name)
 conf_path = conf_dir / f"{name}.conf"
@@ -329,46 +620,113 @@ if args.action == "start":
     previous_conf = conf_path.read_text() if conf_path.exists() else None
     previous_command = command_path.read_text() if command_path.exists() else None
     port = args.port or previous.get("port") or available_port()
-    if not isinstance(port, int) or port < 1 or port > 65535:
+    if type(port) is not int or port < 1 or port > 65535:
         raise SystemExit("port must be between 1 and 65535")
-    manifest_path = pathlib.Path.cwd() / ".amp" / "portals" / f"{name}.json"
-    stale_manifests = {str(manifest_path)}
-    if isinstance(previous.get("manifest"), str) and previous.get("manifest"):
-        stale_manifests.add(previous["manifest"])
-    previous_manifests = {}
-    for stale_manifest in stale_manifests:
-        stale_path = pathlib.Path(stale_manifest)
-        try:
-            previous_manifests[stale_manifest] = stale_path.read_text()
-        except FileNotFoundError:
-            pass
-        try:
-            stale_path.unlink()
-        except FileNotFoundError:
-            pass
+    health = args.health.strip()
+    if not valid_health(health):
+        raise SystemExit("health must be an absolute HTTP path")
+    try:
+        service_directory = durable_directory(pathlib.Path.cwd())
+    except ValueError as error:
+        raise SystemExit(str(error))
+    title = args.title.strip() or name
+    description = args.description.strip()
     public_url = ""
     if args.portal:
+        public_url = portal_url(port)
+    manifest_path = service_directory / ".amp" / "portals" / f"{name}.json"
+    manifest_path = service_manifest_path(name, manifest_path)
+    if manifest_path is None:
+        raise SystemExit("service manifest path must remain under the durable root")
+    stale_manifests = {str(manifest_path)}
+    previous_manifest = service_manifest_path(name, previous.get("manifest"))
+    if previous_manifest is not None:
+        stale_manifests.add(str(previous_manifest))
+    registration = {
+        "port": port,
+        "command": args.command,
+        "portal": public_url,
+        "manifest": str(manifest_path) if args.portal else "",
+        "directory": str(service_directory),
+        "title": title,
+        "description": description,
+        "health": health,
+    }
+    registration_changed = any(previous.get(key) != value for key, value in registration.items())
+    expected_link = {"label": title, "url": public_url}
+    if description:
+        expected_link["note"] = description
+    expected_manifest_text = json.dumps({"links": [expected_link]}, indent=2) + "\n"
+    try:
+        portal_manifest_current = args.portal and not registration_changed and manifest_path.read_text() == expected_manifest_text and manifest_path.stat().st_mode & 0o777 == 0o600
+    except OSError:
+        portal_manifest_current = False
+    manifests_to_replace = set() if portal_manifest_current else stale_manifests
+    previous_manifests = {}
+    for stale_manifest in manifests_to_replace:
+        stale_path = pathlib.Path(stale_manifest)
         try:
-            portal = subprocess.run([
-                "amp-orb-portal", str(port), "--name", name,
-                "--title", args.title or name, "--description", args.description, "--no-manifest",
-            ], text=True, capture_output=True, check=True)
-        except (subprocess.CalledProcessError, OSError):
-            for manifest, content in previous_manifests.items():
-                atomic_write(pathlib.Path(manifest), content, 0o600)
-            raise
-        public_url = portal.stdout.strip().splitlines()[-1]
-    atomic_write(command_path, "#!/bin/sh\nexec /bin/sh -lc " + shlex.quote(args.command) + "\n", 0o700)
+            previous_manifests[stale_manifest] = (stale_path.read_text(), stale_path.stat().st_mode & 0o777)
+        except FileNotFoundError:
+            pass
+
+    def rollback():
+        rollback_errors = []
+        try:
+            run_ctl("stop", name, check=False)
+        except (OSError, subprocess.CalledProcessError) as error:
+            rollback_errors.append(error)
+        try:
+            if previous_command is None:
+                command_path.unlink(missing_ok=True)
+            else:
+                atomic_write(command_path, previous_command, 0o700)
+        except OSError as error:
+            rollback_errors.append(error)
+        try:
+            if previous_conf is None:
+                conf_path.unlink(missing_ok=True)
+            else:
+                atomic_write(conf_path, previous_conf, 0o600)
+        except OSError as error:
+            rollback_errors.append(error)
+        for stale_manifest in manifests_to_replace:
+            try:
+                remove_manifest_path(pathlib.Path(stale_manifest))
+            except OSError as error:
+                rollback_errors.append(error)
+        for stale_manifest, (contents, mode) in previous_manifests.items():
+            try:
+                atomic_write(pathlib.Path(stale_manifest), contents, mode)
+            except OSError as error:
+                rollback_errors.append(error)
+        for action in ("reread", "update"):
+            try:
+                run_ctl(action, check=False)
+            except (OSError, subprocess.CalledProcessError) as error:
+                rollback_errors.append(error)
+        if previous_conf is not None:
+            try:
+                run_ctl("start", name, check=False)
+            except (OSError, subprocess.CalledProcessError) as error:
+                rollback_errors.append(error)
+        if rollback_errors:
+            raise rollback_errors[0]
+
     command = supervisor_value(str(command_path))
-    directory = supervisor_value(str(pathlib.Path.cwd()))
+    directory = supervisor_value(str(service_directory))
     environment = ",".join([
         f'PORT="{port}"',
         f'PUBLIC_URL="{environment_value(public_url)}"',
         'AMP_ORB="1"',
-        f'HOME="{environment_value(os.environ.get("HOME", "/home/user"))}"',
+        'HOME="/home/user"',
         f'PATH="{environment_value(os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"))}"',
     ])
-    atomic_write(conf_path, f"""[program:{name}]
+    try:
+        for stale_manifest in manifests_to_replace:
+            remove_manifest_path(pathlib.Path(stale_manifest))
+        atomic_write(command_path, "#!/bin/sh\nexec /bin/sh -lc " + shlex.quote(args.command) + "\n", 0o700)
+        atomic_write(conf_path, f"""[program:{name}]
 command={command}
 directory={directory}
 environment={environment}
@@ -383,47 +741,37 @@ stdout_logfile={log_path}
 stdout_logfile_maxbytes=10MB
 stdout_logfile_backups=3
 """, 0o600)
-    run_ctl("reread")
-    run_ctl("update")
-    if previous:
-        run_ctl("restart", name, check=False)
+        run_ctl("reread")
+        run_ctl("update")
+        if previous:
+            run_ctl("restart", name, check=False)
+    except (OSError, subprocess.CalledProcessError):
+        rollback()
+        raise
     started = False
     for _ in range(100):
         status = run_ctl("status", name, check=False)
         state_name = service_state(status, name)
         if state_name == "RUNNING":
+            if not wait_ready(port, health):
+                rollback()
+                health_detail = f" with health path {health}" if health else ""
+                raise SystemExit(f"service {name} did not become ready on port {port}{health_detail}")
             if args.portal:
-                try:
-                    portal = subprocess.run([
-                        "amp-orb-portal", str(port), "--name", name,
-                        "--title", args.title or name, "--description", args.description,
-                    ], text=True, capture_output=True, check=True)
-                except (subprocess.CalledProcessError, OSError):
-                    run_ctl("stop", name, check=False)
-                    if previous_command is None:
-                        command_path.unlink(missing_ok=True)
-                    else:
-                        atomic_write(command_path, previous_command, 0o700)
-                    if previous_conf is None:
-                        conf_path.unlink(missing_ok=True)
-                    else:
-                        atomic_write(conf_path, previous_conf, 0o600)
-                    for stale_manifest in stale_manifests:
-                        pathlib.Path(stale_manifest).unlink(missing_ok=True)
-                    for manifest, content in previous_manifests.items():
-                        atomic_write(pathlib.Path(manifest), content, 0o600)
-                    run_ctl("reread", check=False)
-                    run_ctl("update", check=False)
-                    if previous_conf is not None:
-                        run_ctl("start", name, check=False)
-                    raise
-                sys.stdout.write(portal.stdout)
-            state[name] = {
-                "port": port,
-                "command": args.command,
-                "portal": public_url,
-                "manifest": str(manifest_path) if args.portal else "",
-            }
+                if portal_manifest_current:
+                    sys.stdout.write(public_url + "\n")
+                else:
+                    try:
+                        portal_command = [
+                            "amp-orb-portal", str(port), "--name", name,
+                            "--title", title, "--description", description,
+                        ]
+                        portal = subprocess.run(portal_command, text=True, capture_output=True, check=True, cwd=service_directory)
+                    except (subprocess.CalledProcessError, OSError):
+                        rollback()
+                        raise
+                    sys.stdout.write(portal.stdout)
+            state[name] = registration
             save_state(state)
             sys.stdout.write(status.stdout)
             raise SystemExit(0)
@@ -432,9 +780,11 @@ stdout_logfile_backups=3
             started = True
         if state_name in {"BACKOFF", "EXITED", "FATAL", "UNKNOWN"}:
             sys.stdout.write(status.stdout or status.stderr)
+            rollback()
             raise SystemExit(1)
         time.sleep(0.1)
     sys.stdout.write(status.stdout or status.stderr)
+    rollback()
     raise SystemExit(1)
 
 if not conf_path.exists():
@@ -572,6 +922,10 @@ func (m *AmpModule) serveOrbPortal(c *gin.Context) {
 		c.JSON(http.StatusConflict, body)
 		return
 	}
+	if record.lifecycleV1 && record.state != neoOrbStateRunning {
+		c.JSON(http.StatusConflict, gin.H{"error": "orb is not ready", "state": record.state})
+		return
+	}
 	wakeCtx, wakeCancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	record, releasePortal, err := manager.acquirePortal(wakeCtx, cfg, threadID)
 	wakeCancel()
@@ -619,6 +973,18 @@ func (m *AmpModule) serveOrbPortal(c *gin.Context) {
 			w.WriteHeader(http.StatusBadGateway)
 			_, _ = w.Write([]byte(`{"error":"orb portal upstream unavailable"}`))
 		},
+	}
+	if record.lifecycleV1 {
+		operation, admissionErr := manager.beginLifecycleAdmission(c.Request.Context(), actor, threadID, neoOrbStateRunning)
+		if admissionErr != nil {
+			body := gin.H{"error": "orb is not ready"}
+			if current, ok := manager.snapshot(threadID); ok && current.state != "" {
+				body["state"] = current.state
+			}
+			c.JSON(http.StatusConflict, body)
+			return
+		}
+		operation.close()
 	}
 	proxy.ServeHTTP(c.Writer, c.Request)
 }

@@ -550,6 +550,18 @@ func (d *unreachableDialer) Dial(network, addr string) (net.Conn, error) {
 	return nil, errors.New("utls stub: unreachable")
 }
 
+func TestNewUtlsHTTPClientReusesTransport(t *testing.T) {
+	first := NewUtlsHTTPClient(nil, nil, 0)
+	second := NewUtlsHTTPClient(nil, nil, time.Second)
+
+	if first.Transport != second.Transport {
+		t.Fatal("expected uTLS transport to be reused")
+	}
+	if first.Timeout != 0 || second.Timeout != time.Second {
+		t.Fatalf("client timeouts = %v and %v", first.Timeout, second.Timeout)
+	}
+}
+
 func (d *unreachableDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	return nil, errors.New("utls stub: unreachable")
 }

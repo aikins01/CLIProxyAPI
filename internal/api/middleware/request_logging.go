@@ -7,11 +7,14 @@ import (
 	"bytes"
 	"io"
 	"net/http"
+	"path"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/orbconfig"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/orbcredentials"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 )
 
@@ -152,13 +155,18 @@ func captureRequestInfo(c *gin.Context, captureBody bool) (*RequestInfo, error) 
 // shouldLogRequest determines whether the request should be logged.
 // It skips management endpoints to avoid leaking secrets but allows
 // all other routes, including module-provided ones, to honor request-log.
-func shouldLogRequest(path string) bool {
-	if strings.HasPrefix(path, "/v0/management") || strings.HasPrefix(path, "/management") {
+func shouldLogRequest(requestPath string) bool {
+	cleanPath := path.Clean("/" + requestPath)
+	if cleanPath == orbconfig.EndpointPath || cleanPath == orbcredentials.EndpointPath || cleanPath == "/ampcode/local-broker/publish-image-result.json" {
 		return false
 	}
 
-	if strings.HasPrefix(path, "/api") {
-		return strings.HasPrefix(path, "/api/provider")
+	if strings.HasPrefix(requestPath, "/v0/management") || strings.HasPrefix(requestPath, "/management") {
+		return false
+	}
+
+	if strings.HasPrefix(requestPath, "/api") {
+		return strings.HasPrefix(requestPath, "/api/provider")
 	}
 
 	return true

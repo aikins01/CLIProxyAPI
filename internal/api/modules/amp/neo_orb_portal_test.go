@@ -4,18 +4,35 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 )
+
+func neoOrbHelperScriptForRoot(script, root string) string {
+	return strings.ReplaceAll(script, `pathlib.Path("/home/user").resolve()`, "pathlib.Path("+strconv.Quote(root)+").resolve()")
+}
+
+func neoOrbTestServerPort(t *testing.T, server *httptest.Server) string {
+	t.Helper()
+	parsed, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatalf("parse test server URL: %v", err)
+	}
+	return parsed.Port()
+}
 
 func newNeoOrbPortalTestModule(t *testing.T) (*AmpModule, *neoOrbFakeProvider, string) {
 	t.Helper()
@@ -152,6 +169,21 @@ func TestNeoOrbPortalTokenMiddlewareAuthenticatesAndStripsToken(t *testing.T) {
 	if len(cookies) != 1 || cookies[0].Name != neoOrbPortalCookieName || !cookies[0].HttpOnly || cookies[0].Path != "/orb/"+threadID+"/p/3000/" {
 		t.Fatalf("portal cookies = %#v", cookies)
 	}
+	if cookies[0].Secure || cookies[0].SameSite != http.SameSiteLaxMode || cookies[0].Partitioned {
+		t.Fatalf("insecure portal cookie attributes = %#v", cookies[0])
+	}
+	secureReq := httptest.NewRequest(http.MethodGet, "/orb/"+threadID+"/p/3000/app?"+neoOrbPortalTokenQuery+"="+token, nil)
+	secureReq.Header.Set("X-Forwarded-Proto", "https")
+	secureRec := httptest.NewRecorder()
+	router.ServeHTTP(secureRec, secureReq)
+	secureCookies := secureRec.Result().Cookies()
+	if secureRec.Code != http.StatusFound || len(secureCookies) != 1 || !secureCookies[0].Secure || secureCookies[0].SameSite != http.SameSiteNoneMode || !secureCookies[0].Partitioned {
+		t.Fatalf("secure portal cookie response = %d cookies=%#v", secureRec.Code, secureCookies)
+	}
+	setCookie := secureRec.Header().Get("Set-Cookie")
+	if !strings.Contains(setCookie, "Secure") || !strings.Contains(setCookie, "SameSite=None") || !strings.Contains(setCookie, "Partitioned") {
+		t.Fatalf("secure portal Set-Cookie = %q", setCookie)
+	}
 	req = httptest.NewRequest(http.MethodGet, "/orb/"+threadID+"/p/3000/app?x=1", nil)
 	req.AddCookie(cookies[0])
 	rec = httptest.NewRecorder()
@@ -214,7 +246,7 @@ func TestNeoOrbPortalCapabilityBypassesManagementLocalhostRestriction(t *testing
 	}
 }
 
-func TestNeoOrbPortalTokenMiddlewareImportsPersistedActorAfterRestart(t *testing.T) {
+func TestNeoOrbPortalTokenMiddlewareRejectsRecoveredLegacyCapability(t *testing.T) {
 	module, fake, threadID := newNeoOrbPortalTestModule(t)
 	token := strings.Repeat("r", neoOrbPortalTokenByteCount)
 	writeNeoOrbPersistedThread(t, module.neoRuntime, threadID, "sandbox", "container-fake")
@@ -236,29 +268,44 @@ func TestNeoOrbPortalTokenMiddlewareImportsPersistedActorAfterRestart(t *testing
 	req := httptest.NewRequest(http.MethodGet, "/orb/"+threadID+"/p/3000/?"+neoOrbPortalTokenQuery+"="+token, nil)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
-	if rec.Code != http.StatusFound {
-		t.Fatalf("cold portal capability status = %d body=%s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("recovered portal capability status = %d body=%s", rec.Code, rec.Body.String())
 	}
 	loaded := module.neoRuntime.store.lookupThreadActor(threadID)
-	if loaded == nil {
-		t.Fatal("persisted portal actor was not imported")
+	if loaded != nil {
+		t.Fatal("recovered portal capability imported the persisted actor")
 	}
-	loaded.mu.Lock()
-	pruneLeases := loaded.pruneLeases
-	loaded.mu.Unlock()
-	if pruneLeases != 0 {
-		t.Fatalf("persisted portal actor prune leases = %d, want released", pruneLeases)
+	if fake.callCount("inspect:") != 0 {
+		t.Fatalf("recovered portal capability accessed container: %#v", fake.calls)
 	}
 }
 
 func TestNeoOrbPortalHelperWritesLocalManifest(t *testing.T) {
-	dir := t.TempDir()
+	durableRoot := t.TempDir()
+	dir := filepath.Join(durableRoot, "workspace", "repo")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("create portal workspace: %v", err)
+	}
 	helper := filepath.Join(dir, "amp-orb-portal")
-	if err := os.WriteFile(helper, []byte(neoOrbPortalHelperScript()), 0o755); err != nil {
+	if err := os.WriteFile(helper, []byte(neoOrbHelperScriptForRoot(neoOrbPortalHelperScript(), durableRoot)), 0o755); err != nil {
 		t.Fatalf("write helper: %v", err)
 	}
+	followed := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/redirect":
+			http.Redirect(w, request, "/followed", http.StatusFound)
+		case "/followed":
+			followed <- struct{}{}
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	t.Cleanup(server.Close)
+	port := neoOrbTestServerPort(t, server)
 	threadID := "T-019fdec9-b0cf-745d-8da4-f250184e870e"
-	cmd := exec.Command(helper, "http://localhost:8765/app?q=1", "--name", "preview", "--title", "Preview", "--description", "Use test data")
+	cmd := exec.Command(helper, "http://localhost:"+port+"/app?q=1", "--name", "preview", "--title", "Preview", "--description", "Use test data")
 	cmd.Dir = dir
 	token := strings.Repeat("p", neoOrbPortalTokenByteCount)
 	cmd.Env = append(os.Environ(), "AMP_THREAD_ID="+threadID, "AMP_ORB_PORTAL_BASE_URL=https://amp.example.test", "AMP_ORB_PORTAL_TOKEN="+token)
@@ -266,7 +313,7 @@ func TestNeoOrbPortalHelperWritesLocalManifest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run helper: %v", err)
 	}
-	wantURL := "https://amp.example.test/orb/" + threadID + "/p/8765/app?q=1&" + neoOrbPortalTokenQuery + "=" + token
+	wantURL := "https://amp.example.test/orb/" + threadID + "/p/" + port + "/app?q=1&" + neoOrbPortalTokenQuery + "=" + token
 	if !strings.Contains(string(output), wantURL) {
 		t.Fatalf("helper output = %q, want %q", output, wantURL)
 	}
@@ -289,20 +336,55 @@ func TestNeoOrbPortalHelperWritesLocalManifest(t *testing.T) {
 	if manifestInfo.Mode().Perm() != 0o600 {
 		t.Fatalf("manifest mode = %v", manifestInfo.Mode().Perm())
 	}
-	printOnly := exec.Command(helper, "8766", "--name", "print-only", "--no-manifest")
+	printOnly := exec.Command(helper, port, "--name", "print-only", "--no-manifest")
 	printOnly.Dir = dir
 	printOnly.Env = cmd.Env
-	if output, err := printOnly.CombinedOutput(); err != nil || !strings.Contains(string(output), "/p/8766/") {
+	if output, err := printOnly.CombinedOutput(); err != nil || !strings.Contains(string(output), "/p/"+port+"/") {
 		t.Fatalf("print-only portal err=%v output=%q", err, output)
 	}
 	if _, err := os.Stat(filepath.Join(dir, ".amp", "portals", "print-only.json")); !os.IsNotExist(err) {
 		t.Fatalf("print-only portal published a manifest: %v", err)
 	}
-	unsupported := exec.Command(helper, "https://localhost:8765/", "--name", "secure")
+	health := exec.Command(helper, port, "--name", "healthy", "--health", "/redirect", "--no-manifest")
+	health.Dir = dir
+	health.Env = cmd.Env
+	if output, err := health.CombinedOutput(); err != nil || !strings.Contains(string(output), "/p/"+port+"/") {
+		t.Fatalf("redirect health err=%v output=%q", err, output)
+	}
+	select {
+	case <-followed:
+		t.Fatal("portal health probe followed a redirect")
+	default:
+	}
+	for _, healthPath := range []string{"/ready#fragment", "/ready path", "/ready\x01"} {
+		malformedHealth := exec.Command(helper, port, "--name", "malformed", "--health", healthPath)
+		malformedHealth.Dir = dir
+		malformedHealth.Env = cmd.Env
+		if output, err := malformedHealth.CombinedOutput(); err == nil || !strings.Contains(string(output), "health must be an absolute HTTP path") {
+			t.Fatalf("malformed health %q err=%v output=%q", healthPath, err, output)
+		}
+	}
+	unsupported := exec.Command(helper, "https://localhost:"+port+"/", "--name", "secure")
 	unsupported.Dir = dir
 	unsupported.Env = cmd.Env
 	if output, err := unsupported.CombinedOutput(); err == nil || !strings.Contains(string(output), "target URL scheme must be http") {
 		t.Fatalf("unsupported scheme err=%v output=%q", err, output)
+	}
+	if listener, err := net.Listen("tcp6", "[::1]:0"); err == nil {
+		ipv6Server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		ipv6Server.Listener = listener
+		ipv6Server.Start()
+		t.Cleanup(ipv6Server.Close)
+		ipv6 := exec.Command(helper, ipv6Server.URL+"/ipv6", "--name", "ipv6", "--no-manifest")
+		ipv6.Dir = dir
+		ipv6.Env = cmd.Env
+		if output, err := ipv6.CombinedOutput(); err != nil || !strings.Contains(string(output), "/ipv6") {
+			t.Fatalf("IPv6 loopback portal err=%v output=%q", err, output)
+		}
+	} else {
+		t.Logf("IPv6 loopback is unavailable: %v", err)
 	}
 }
 
@@ -313,8 +395,14 @@ func TestNeoOrbServiceHelperSupportsSupervisedLifecycle(t *testing.T) {
 			t.Fatalf("service helper missing %q", want)
 		}
 	}
-	helper := filepath.Join(t.TempDir(), "amp-orb-service")
-	if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {
+	testRoot := t.TempDir()
+	durableRoot := filepath.Join(testRoot, "home")
+	serviceDir := filepath.Join(durableRoot, "workspace", "repo")
+	if err := os.MkdirAll(serviceDir, 0o755); err != nil {
+		t.Fatalf("create service workspace: %v", err)
+	}
+	helper := filepath.Join(testRoot, "amp-orb-service")
+	if err := os.WriteFile(helper, []byte(neoOrbHelperScriptForRoot(script, durableRoot)), 0o755); err != nil {
 		t.Fatalf("write service helper: %v", err)
 	}
 	if output, err := exec.Command("python3", "-m", "py_compile", helper).CombinedOutput(); err != nil {
@@ -328,35 +416,53 @@ func TestNeoOrbServiceHelperSupportsSupervisedLifecycle(t *testing.T) {
 	if err := os.WriteFile(ctl, []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HOME/ctl-calls\"\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    pid) exit 0 ;;\n    status) printf 'multiline RUNNING pid 1, uptime 0:00:01\\n'; exit 0 ;;\n  esac\ndone\nexit 0\n"), 0o755); err != nil {
 		t.Fatalf("write fake supervisorctl: %v", err)
 	}
-	home := filepath.Join(filepath.Dir(helper), "home")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(server.Close)
+	port := neoOrbTestServerPort(t, server)
 	command := "printf 'first\\nsecond\\n'\nprintf 'third\\n'"
-	start := exec.Command(helper, "start", "multiline", "--command", command, "--port", "8787")
-	start.Env = append(os.Environ(), "HOME="+home, "PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	start := exec.Command(helper, "start", "multiline", "--command", command, "--port", port)
+	start.Dir = serviceDir
+	start.Env = append(os.Environ(), "HOME="+durableRoot, "PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	for _, healthPath := range []string{"/ready path", "/ready\x01"} {
+		invalidHealth := exec.Command(helper, "start", "invalid-health", "--command", "sleep 1", "--port", port, "--health", healthPath)
+		invalidHealth.Dir = serviceDir
+		invalidHealth.Env = start.Env
+		if output, err := invalidHealth.CombinedOutput(); err == nil || !strings.Contains(string(output), "health must be an absolute HTTP path") {
+			t.Fatalf("invalid service health %q err=%v output=%q", healthPath, err, output)
+		}
+	}
 	if output, err := start.CombinedOutput(); err != nil {
 		t.Fatalf("start multiline service: %v: %s", err, output)
 	}
-	serviceCommand := filepath.Join(home, ".cache", "amp", "services", "commands", "multiline")
+	serviceCommand := filepath.Join(durableRoot, ".cache", "amp", "services", "commands", "multiline")
 	output, err := exec.Command(serviceCommand).CombinedOutput()
 	if err != nil || string(output) != "first\nsecond\nthird\n" {
 		t.Fatalf("multiline service command: err=%v output=%q", err, output)
 	}
-	conf, err := os.ReadFile(filepath.Join(home, ".cache", "amp", "services", "conf.d", "multiline.conf"))
+	conf, err := os.ReadFile(filepath.Join(durableRoot, ".cache", "amp", "services", "conf.d", "multiline.conf"))
 	if err != nil {
 		t.Fatalf("read multiline service config: %v", err)
 	}
-	if strings.Contains(string(conf), "second") || !strings.Contains(string(conf), "command="+serviceCommand) {
+	canonicalServiceCommand, err := filepath.EvalSymlinks(serviceCommand)
+	if err != nil {
+		t.Fatalf("resolve multiline service command: %v", err)
+	}
+	if strings.Contains(string(conf), "second") || !strings.Contains(string(conf), "command="+canonicalServiceCommand) {
 		t.Fatalf("multiline service config = %q", conf)
 	}
-	restart := exec.Command(helper, "start", "multiline", "--command", "printf 'changed\\n'", "--port", "8787")
+	restart := exec.Command(helper, "start", "multiline", "--command", "printf 'changed\\n'", "--port", port)
+	restart.Dir = serviceDir
 	restart.Env = start.Env
 	if output, err := restart.CombinedOutput(); err != nil {
 		t.Fatalf("restart changed service: %v: %s", err, output)
 	}
-	ctlCalls, err := os.ReadFile(filepath.Join(home, "ctl-calls"))
+	ctlCalls, err := os.ReadFile(filepath.Join(durableRoot, "ctl-calls"))
 	if err != nil || !strings.Contains(string(ctlCalls), "restart multiline") {
 		t.Fatalf("changed command did not restart service: err=%v calls=%q", err, ctlCalls)
 	}
-	logPath := filepath.Join(home, ".cache", "amp", "services", "multiline.log")
+	logPath := filepath.Join(durableRoot, ".cache", "amp", "services", "multiline.log")
 	if err := os.WriteFile(logPath, []byte("secret log\n"), 0o600); err != nil {
 		t.Fatalf("write service log: %v", err)
 	}
@@ -367,10 +473,132 @@ func TestNeoOrbServiceHelperSupportsSupervisedLifecycle(t *testing.T) {
 	}
 }
 
+func TestNeoOrbServiceHelperDoesNotPublishBeforeHealthReadiness(t *testing.T) {
+	testRoot := t.TempDir()
+	durableRoot := filepath.Join(testRoot, "home")
+	serviceDir := filepath.Join(durableRoot, "workspace", "repo")
+	binDir := filepath.Join(testRoot, "bin")
+	if err := os.MkdirAll(serviceDir, 0o755); err != nil {
+		t.Fatalf("create service workspace: %v", err)
+	}
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("create fake bin: %v", err)
+	}
+	script := neoOrbHelperScriptForRoot(neoOrbServiceHelperScript(), durableRoot)
+	script = strings.ReplaceAll(script, "deadline = time.monotonic() + 10", "deadline = time.monotonic() + 0.3")
+	helper := filepath.Join(testRoot, "amp-orb-service")
+	if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {
+		t.Fatalf("write service helper: %v", err)
+	}
+	ctl := filepath.Join(binDir, "supervisorctl")
+	ctlScript := "#!/bin/sh\nlast=\"\"\nhas_status=false\nfor arg in \"$@\"; do\n  [ \"$arg\" = pid ] && exit 0\n  [ \"$arg\" = status ] && has_status=true\n  last=\"$arg\"\ndone\nif \"$has_status\"; then printf '%s RUNNING pid 1, uptime 0:00:01\\n' \"$last\"; fi\nexit 0\n"
+	if err := os.WriteFile(ctl, []byte(ctlScript), 0o755); err != nil {
+		t.Fatalf("write fake supervisorctl: %v", err)
+	}
+	portalHelper := filepath.Join(binDir, "amp-orb-portal")
+	if err := os.WriteFile(portalHelper, []byte(neoOrbHelperScriptForRoot(neoOrbPortalHelperScript(), durableRoot)), 0o755); err != nil {
+		t.Fatalf("write portal helper: %v", err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "document root missing", http.StatusNotFound)
+	}))
+	t.Cleanup(server.Close)
+	port := neoOrbTestServerPort(t, server)
+	threadID := "T-019fdec9-b0cf-745d-8da4-f250184e870e"
+	token := strings.Repeat("p", neoOrbPortalTokenByteCount)
+	command := exec.Command(helper, "start", "not-ready", "--command", "sleep 1", "--port", port, "--portal", "--health", "/")
+	command.Dir = serviceDir
+	command.Env = append(os.Environ(), "HOME="+durableRoot, "PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"), "AMP_THREAD_ID="+threadID, "AMP_ORB_PORTAL_BASE_URL=https://amp.example.test", "AMP_ORB_PORTAL_TOKEN="+token)
+	output, err := command.CombinedOutput()
+	if err == nil || !strings.Contains(string(output), "did not become ready") || !strings.Contains(string(output), "health path /") || strings.Contains(string(output), "/orb/"+threadID+"/p/") {
+		t.Fatalf("unready service err=%v output=%q", err, output)
+	}
+	if _, err := os.Stat(filepath.Join(serviceDir, ".amp", "portals", "not-ready.json")); !os.IsNotExist(err) {
+		t.Fatalf("unready service published manifest: %v", err)
+	}
+	stateRaw, err := os.ReadFile(filepath.Join(durableRoot, ".cache", "amp", "services", "state.json"))
+	if err == nil {
+		var state map[string]any
+		if json.Unmarshal(stateRaw, &state) != nil || state["not-ready"] != nil {
+			t.Fatalf("unready service persisted registration: %#v", state)
+		}
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("read unready service state: %v", err)
+	}
+
+	var requestMu sync.Mutex
+	requests := map[string]int{}
+	reconcileServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestMu.Lock()
+		requests[r.URL.Path]++
+		requestMu.Unlock()
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(reconcileServer.Close)
+	reconcilePort := neoOrbTestServerPort(t, reconcileServer)
+	reconcilePortNumber, err := strconv.Atoi(reconcilePort)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serviceRoot := filepath.Join(durableRoot, ".cache", "amp", "services")
+	confDir := filepath.Join(serviceRoot, "conf.d")
+	commandDir := filepath.Join(serviceRoot, "commands")
+	if err := os.MkdirAll(confDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(commandDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	state := map[string]any{}
+	for _, name := range []string{"first", "second"} {
+		if err := os.WriteFile(filepath.Join(confDir, name+".conf"), []byte("[program:"+name+"]\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(commandDir, name), []byte("#!/bin/sh\n"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		state[name] = map[string]any{
+			"port":        reconcilePortNumber,
+			"command":     "sleep 1",
+			"portal":      "",
+			"manifest":    "",
+			"directory":   serviceDir,
+			"title":       name,
+			"description": "",
+			"health":      "/" + name,
+		}
+	}
+	stateRaw, err = json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(serviceRoot, "state.json"), append(stateRaw, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reconcile := exec.Command(helper, "reconcile")
+	reconcile.Dir = serviceDir
+	reconcile.Env = command.Env
+	if output, err := reconcile.CombinedOutput(); err != nil {
+		t.Fatalf("reconcile unready services: %v: %s", err, output)
+	}
+	requestMu.Lock()
+	firstRequests := requests["/first"]
+	secondRequests := requests["/second"]
+	requestMu.Unlock()
+	if firstRequests == 0 || secondRequests != 0 {
+		t.Fatalf("reconcile readiness requests = first:%d second:%d, want one total shared wait budget", firstRequests, secondRequests)
+	}
+}
+
 func TestNeoOrbServiceHelperSerializesStateAndParsesStatus(t *testing.T) {
 	dir := t.TempDir()
+	durableRoot := filepath.Join(dir, "home")
+	portalWorkDir := filepath.Join(durableRoot, "workspace", "repo")
+	if err := os.MkdirAll(portalWorkDir, 0o755); err != nil {
+		t.Fatalf("create portal workspace: %v", err)
+	}
 	helper := filepath.Join(dir, "amp-orb-service")
-	if err := os.WriteFile(helper, []byte(neoOrbServiceHelperScript()), 0o755); err != nil {
+	if err := os.WriteFile(helper, []byte(neoOrbHelperScriptForRoot(neoOrbServiceHelperScript(), durableRoot)), 0o755); err != nil {
 		t.Fatalf("write service helper: %v", err)
 	}
 	binDir := filepath.Join(dir, "bin")
@@ -400,18 +628,28 @@ exit 0
 		t.Fatalf("write fake supervisorctl: %v", err)
 	}
 	portalHelper := filepath.Join(binDir, "amp-orb-portal")
-	if err := os.WriteFile(portalHelper, []byte(neoOrbPortalHelperScript()), 0o755); err != nil {
+	if err := os.WriteFile(portalHelper, []byte(neoOrbHelperScriptForRoot(neoOrbPortalHelperScript(), durableRoot)), 0o755); err != nil {
 		t.Fatalf("write portal helper: %v", err)
 	}
-	home := filepath.Join(dir, "home")
+	alphaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(alphaServer.Close)
+	betaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(betaServer.Close)
+	alphaPort := neoOrbTestServerPort(t, alphaServer)
+	betaPort := neoOrbTestServerPort(t, betaServer)
 	threadID := "T-019fdec9-b0cf-745d-8da4-f250184e870e"
 	portalToken := strings.Repeat("p", neoOrbPortalTokenByteCount)
-	environment := append(os.Environ(), "HOME="+home, "PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"), "AMP_THREAD_ID="+threadID, "AMP_ORB_PORTAL_BASE_URL=https://amp.example.test", "AMP_ORB_PORTAL_TOKEN="+portalToken)
+	environment := append(os.Environ(), "HOME="+durableRoot, "PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"), "AMP_THREAD_ID="+threadID, "AMP_ORB_PORTAL_BASE_URL=https://amp.example.test", "AMP_ORB_PORTAL_TOKEN="+portalToken)
 	commands := []*exec.Cmd{
-		exec.Command(helper, "start", "alpha", "--command", "sleep 1", "--port", "8801"),
-		exec.Command(helper, "start", "beta", "--command", "sleep 1", "--port", "8802"),
+		exec.Command(helper, "start", "alpha", "--command", "sleep 1", "--port", alphaPort),
+		exec.Command(helper, "start", "beta", "--command", "sleep 1", "--port", betaPort),
 	}
 	for _, command := range commands {
+		command.Dir = portalWorkDir
 		command.Env = environment
 		if err := command.Start(); err != nil {
 			t.Fatalf("start concurrent helper: %v", err)
@@ -422,19 +660,17 @@ exit 0
 			t.Fatalf("wait concurrent helper: %v", err)
 		}
 	}
-	stateRaw, err := os.ReadFile(filepath.Join(home, ".cache", "amp", "services", "state.json"))
+	stateRaw, err := os.ReadFile(filepath.Join(durableRoot, ".cache", "amp", "services", "state.json"))
 	if err != nil {
 		t.Fatalf("read service state: %v", err)
 	}
 	var state map[string]any
-	if err := json.Unmarshal(stateRaw, &state); err != nil || len(state) != 2 || mapValue(state["alpha"])["port"] != float64(8801) || mapValue(state["beta"])["port"] != float64(8802) {
+	alphaPortNumber, _ := strconv.Atoi(alphaPort)
+	betaPortNumber, _ := strconv.Atoi(betaPort)
+	if err := json.Unmarshal(stateRaw, &state); err != nil || len(state) != 2 || mapValue(state["alpha"])["port"] != float64(alphaPortNumber) || mapValue(state["beta"])["port"] != float64(betaPortNumber) {
 		t.Fatalf("serialized state err=%v state=%#v", err, state)
 	}
-	portalWorkDir := filepath.Join(dir, "workspace")
-	if err := os.MkdirAll(portalWorkDir, 0o755); err != nil {
-		t.Fatalf("create portal workspace: %v", err)
-	}
-	nearMatch := exec.Command(helper, "start", "RUNNING-app", "--command", "exit 1", "--port", "8803", "--portal")
+	nearMatch := exec.Command(helper, "start", "RUNNING-app", "--command", "exit 1", "--port", alphaPort, "--portal")
 	nearMatch.Env = environment
 	nearMatch.Dir = portalWorkDir
 	if output, err := nearMatch.CombinedOutput(); err == nil || !strings.Contains(string(output), "RUNNING-app FATAL") {
@@ -446,44 +682,224 @@ exit 0
 	failingPortal := `#!/usr/bin/env python3
 import os
 import sys
-if "--no-manifest" in sys.argv:
-    os.rename(__file__, __file__ + ".unavailable")
-    print("https://amp.example.test/orb/test/p/8805/")
-    raise SystemExit(0)
 raise SystemExit(42)
 `
 	if err := os.WriteFile(portalHelper, []byte(failingPortal), 0o755); err != nil {
 		t.Fatalf("write failing portal helper: %v", err)
 	}
-	portalFailure := exec.Command(helper, "start", "portal-failure", "--command", "sleep 1", "--port", "8805", "--portal")
+	portalFailure := exec.Command(helper, "start", "portal-failure", "--command", "sleep 1", "--port", alphaPort, "--portal")
 	portalFailure.Env = environment
 	portalFailure.Dir = portalWorkDir
 	if output, err := portalFailure.CombinedOutput(); err == nil {
 		t.Fatalf("manifest publication unexpectedly succeeded: %q", output)
 	}
 	for _, path := range []string{
-		filepath.Join(home, ".cache", "amp", "services", "commands", "portal-failure"),
-		filepath.Join(home, ".cache", "amp", "services", "conf.d", "portal-failure.conf"),
+		filepath.Join(durableRoot, ".cache", "amp", "services", "commands", "portal-failure"),
+		filepath.Join(durableRoot, ".cache", "amp", "services", "conf.d", "portal-failure.conf"),
 	} {
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Fatalf("failed service artifact remains at %s: %v", path, err)
 		}
 	}
-	ctlCalls, err := os.ReadFile(filepath.Join(home, "ctl-calls"))
+	ctlCalls, err := os.ReadFile(filepath.Join(durableRoot, "ctl-calls"))
 	if err != nil || !strings.Contains(string(ctlCalls), "stop portal-failure") {
 		t.Fatalf("failed manifest publication did not stop service: err=%v calls=%q", err, ctlCalls)
 	}
-	if err := os.WriteFile(portalHelper, []byte(neoOrbPortalHelperScript()), 0o755); err != nil {
+	if err := os.WriteFile(portalHelper, []byte(neoOrbHelperScriptForRoot(neoOrbPortalHelperScript(), durableRoot)), 0o755); err != nil {
 		t.Fatalf("restore portal helper: %v", err)
 	}
-	portalSuccess := exec.Command(helper, "start", "portal-success", "--command", "sleep 1", "--port", "8804", "--portal")
+	portalSuccess := exec.Command(helper, "start", "portal-success", "--command", "sleep 1", "--port", betaPort, "--portal")
+	portalSuccess.Env = environment
+	portalSuccess.Dir = portalWorkDir
+	portalOutput, err := portalSuccess.CombinedOutput()
+	if err != nil || !strings.Contains(string(portalOutput), "Wrote portal manifest") {
+		t.Fatalf("running service portal err=%v output=%q", err, portalOutput)
+	}
+	portalManifestPath := filepath.Join(portalWorkDir, ".amp", "portals", "portal-success.json")
+	previousPortalManifest, err := os.ReadFile(portalManifestPath)
+	if err != nil {
+		t.Fatalf("read initial portal manifest: %v", err)
+	}
+	failingSupervisorScript := strings.Replace(ctlScript, "last=\"\"\n", "for arg in \"$@\"; do\n  [ \"$arg\" = reread ] && exit 42\ndone\nlast=\"\"\n", 1)
+	if err := os.WriteFile(ctl, []byte(failingSupervisorScript), 0o755); err != nil {
+		t.Fatalf("write failing supervisorctl: %v", err)
+	}
+	failedSupervisorUpdate := exec.Command(helper, "start", "portal-success", "--command", "printf 'supervisor changed\\n'", "--port", betaPort, "--portal")
+	failedSupervisorUpdate.Env = environment
+	failedSupervisorUpdate.Dir = portalWorkDir
+	if output, err := failedSupervisorUpdate.CombinedOutput(); err == nil {
+		t.Fatalf("supervisor update unexpectedly succeeded: %q", output)
+	}
+	restoredPortalManifest, err := os.ReadFile(portalManifestPath)
+	if err != nil || string(restoredPortalManifest) != string(previousPortalManifest) {
+		t.Fatalf("supervisor update rollback manifest err=%v got=%q want=%q", err, restoredPortalManifest, previousPortalManifest)
+	}
+	if err := os.WriteFile(ctl, []byte(ctlScript), 0o755); err != nil {
+		t.Fatalf("restore supervisorctl: %v", err)
+	}
+	if err := os.WriteFile(portalHelper, []byte(failingPortal), 0o755); err != nil {
+		t.Fatalf("write failing portal helper for update: %v", err)
+	}
+	failedUpdate := exec.Command(helper, "start", "portal-success", "--command", "printf 'changed\\n'", "--port", betaPort, "--portal")
+	failedUpdate.Env = environment
+	failedUpdate.Dir = portalWorkDir
+	if output, err := failedUpdate.CombinedOutput(); err == nil {
+		t.Fatalf("portal update unexpectedly succeeded: %q", output)
+	}
+	restoredPortalManifest, err = os.ReadFile(portalManifestPath)
+	if err != nil || string(restoredPortalManifest) != string(previousPortalManifest) {
+		t.Fatalf("portal update rollback manifest err=%v got=%q want=%q", err, restoredPortalManifest, previousPortalManifest)
+	}
+	restoredCommand, err := os.ReadFile(filepath.Join(durableRoot, ".cache", "amp", "services", "commands", "portal-success"))
+	if err != nil || !strings.Contains(string(restoredCommand), "sleep 1") || strings.Contains(string(restoredCommand), "changed") {
+		t.Fatalf("portal update rollback command err=%v command=%q", err, restoredCommand)
+	}
+	portalSuccess = exec.Command(helper, "start", "portal-success", "--command", "sleep 1", "--port", betaPort, "--portal")
+	portalSuccess.Env = environment
+	portalSuccess.Dir = portalWorkDir
+	unchangedOutput, err := portalSuccess.CombinedOutput()
+	if err != nil || strings.Contains(string(unchangedOutput), "Wrote portal manifest") || !strings.Contains(string(unchangedOutput), "/orb/"+threadID+"/p/") {
+		t.Fatalf("unchanged portal registration err=%v output=%q", err, unchangedOutput)
+	}
+	if err := os.WriteFile(portalHelper, []byte(neoOrbHelperScriptForRoot(neoOrbPortalHelperScript(), durableRoot)), 0o755); err != nil {
+		t.Fatalf("restore portal helper after unchanged update: %v", err)
+	}
+	var portalManifestValue any
+	if err := json.Unmarshal(previousPortalManifest, &portalManifestValue); err != nil {
+		t.Fatalf("decode portal manifest for stale formatting: %v", err)
+	}
+	stalePortalManifest, err := json.Marshal(portalManifestValue)
+	if err != nil {
+		t.Fatalf("encode stale portal manifest: %v", err)
+	}
+	if err := os.WriteFile(portalManifestPath, append(stalePortalManifest, '\n'), 0o600); err != nil {
+		t.Fatalf("write stale portal manifest: %v", err)
+	}
+	portalSuccess = exec.Command(helper, "start", "portal-success", "--command", "sleep 1", "--port", betaPort, "--portal")
+	portalSuccess.Env = environment
+	portalSuccess.Dir = portalWorkDir
+	repairedOutput, err := portalSuccess.CombinedOutput()
+	if err != nil || !strings.Contains(string(repairedOutput), "Wrote portal manifest") {
+		t.Fatalf("repair stale portal manifest err=%v output=%q", err, repairedOutput)
+	}
+	repairedPortalManifest, err := os.ReadFile(portalManifestPath)
+	if err != nil || string(repairedPortalManifest) != string(previousPortalManifest) {
+		t.Fatalf("repaired portal manifest err=%v got=%q want=%q", err, repairedPortalManifest, previousPortalManifest)
+	}
+	if _, err := os.Stat(portalManifestPath); err != nil {
+		t.Fatalf("running service portal manifest: %v", err)
+	}
+	protectedPath := filepath.Join(dir, "protected.txt")
+	if err := os.WriteFile(protectedPath, []byte("keep\n"), 0o600); err != nil {
+		t.Fatalf("write protected file: %v", err)
+	}
+	stateRaw, err = os.ReadFile(filepath.Join(durableRoot, ".cache", "amp", "services", "state.json"))
+	if err != nil || json.Unmarshal(stateRaw, &state) != nil {
+		t.Fatalf("reload service state for manifest binding: %v", err)
+	}
+	mapValue(state["portal-success"])["manifest"] = protectedPath
+	stateRaw, err = json.Marshal(state)
+	if err != nil {
+		t.Fatalf("encode service state with untrusted manifest: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(durableRoot, ".cache", "amp", "services", "state.json"), append(stateRaw, '\n'), 0o600); err != nil {
+		t.Fatalf("persist service state with untrusted manifest: %v", err)
+	}
+	portalSuccess = exec.Command(helper, "start", "portal-success", "--command", "sleep 1", "--port", betaPort, "--portal")
 	portalSuccess.Env = environment
 	portalSuccess.Dir = portalWorkDir
 	if output, err := portalSuccess.CombinedOutput(); err != nil || !strings.Contains(string(output), "Wrote portal manifest") {
-		t.Fatalf("running service portal err=%v output=%q", err, output)
+		t.Fatalf("repair untrusted persisted manifest err=%v output=%q", err, output)
 	}
-	if _, err := os.Stat(filepath.Join(portalWorkDir, ".amp", "portals", "portal-success.json")); err != nil {
-		t.Fatalf("running service portal manifest: %v", err)
+	if protected, err := os.ReadFile(protectedPath); err != nil || string(protected) != "keep\n" {
+		t.Fatalf("untrusted persisted manifest changed protected file err=%v contents=%q", err, protected)
+	}
+	nondurableDir := filepath.Join(portalWorkDir, ".amp", "out", "preview")
+	if err := os.MkdirAll(nondurableDir, 0o755); err != nil {
+		t.Fatalf("create nondurable directory: %v", err)
+	}
+	nondurable := exec.Command(helper, "start", "nondurable", "--command", "sleep 1", "--port", alphaPort, "--portal")
+	nondurable.Env = environment
+	nondurable.Dir = nondurableDir
+	if output, err := nondurable.CombinedOutput(); err == nil || !strings.Contains(string(output), ".amp/out cannot be used as durable service storage") {
+		t.Fatalf("nondurable service err=%v output=%q", err, output)
+	}
+	brokenManifest := filepath.Join(nondurableDir, ".amp", "portals", "broken.json")
+	if err := os.MkdirAll(filepath.Dir(brokenManifest), 0o700); err != nil {
+		t.Fatalf("create broken manifest directory: %v", err)
+	}
+	if err := os.WriteFile(brokenManifest, []byte("{}\n"), 0o600); err != nil {
+		t.Fatalf("write broken manifest: %v", err)
+	}
+	stateRaw, err = os.ReadFile(filepath.Join(durableRoot, ".cache", "amp", "services", "state.json"))
+	if err != nil || json.Unmarshal(stateRaw, &state) != nil {
+		t.Fatalf("reload service state: %v", err)
+	}
+	state["broken"] = map[string]any{
+		"port":        alphaPortNumber,
+		"command":     "sleep 1",
+		"portal":      "https://amp.example.test/orb/broken",
+		"manifest":    brokenManifest,
+		"directory":   nondurableDir,
+		"title":       "Broken",
+		"description": "",
+		"health":      "",
+	}
+	stateRaw, err = json.Marshal(state)
+	if err != nil {
+		t.Fatalf("write broken service state: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(durableRoot, ".cache", "amp", "services", "state.json"), append(stateRaw, '\n'), 0o600); err != nil {
+		t.Fatalf("write broken service state: %v", err)
+	}
+	reconcile := exec.Command(helper, "reconcile")
+	reconcile.Env = environment
+	reconcile.Dir = portalWorkDir
+	if output, err := reconcile.CombinedOutput(); err != nil || !strings.Contains(string(output), "invalid persisted registration") {
+		t.Fatalf("reconcile broken registration err=%v output=%q", err, output)
+	}
+	if _, err := os.Stat(brokenManifest); !os.IsNotExist(err) {
+		t.Fatalf("reconcile retained broken manifest: %v", err)
+	}
+	stateRaw, err = os.ReadFile(filepath.Join(durableRoot, ".cache", "amp", "services", "state.json"))
+	state = nil
+	if err != nil || json.Unmarshal(stateRaw, &state) != nil || state["broken"] != nil {
+		t.Fatalf("reconcile retained broken state err=%v state=%#v", err, state)
+	}
+	blockedManifest := filepath.Join(portalWorkDir, ".amp", "portals", "blocked.json")
+	if err := os.MkdirAll(blockedManifest, 0o700); err != nil {
+		t.Fatalf("create blocked portal manifest: %v", err)
+	}
+	state["blocked"] = map[string]any{
+		"port":        alphaPortNumber,
+		"command":     "sleep 1",
+		"portal":      "https://amp.example.test/orb/blocked",
+		"manifest":    blockedManifest,
+		"directory":   portalWorkDir,
+		"title":       "Blocked",
+		"description": "",
+		"health":      "",
+	}
+	stateRaw, err = json.Marshal(state)
+	if err != nil {
+		t.Fatalf("write blocked service state: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(durableRoot, ".cache", "amp", "services", "state.json"), append(stateRaw, '\n'), 0o600); err != nil {
+		t.Fatalf("persist blocked service state: %v", err)
+	}
+	reconcile = exec.Command(helper, "reconcile")
+	reconcile.Env = environment
+	reconcile.Dir = portalWorkDir
+	if output, err := reconcile.CombinedOutput(); err != nil || !strings.Contains(string(output), "portal manifest could not be removed") {
+		t.Fatalf("reconcile blocked manifest err=%v output=%q", err, output)
+	}
+	if info, err := os.Stat(blockedManifest); err != nil || !info.IsDir() {
+		t.Fatalf("reconcile changed blocked manifest: info=%v err=%v", info, err)
+	}
+	stateRaw, err = os.ReadFile(filepath.Join(durableRoot, ".cache", "amp", "services", "state.json"))
+	state = nil
+	if err != nil || json.Unmarshal(stateRaw, &state) != nil || state["blocked"] == nil {
+		t.Fatalf("reconcile discarded blocked state err=%v state=%#v", err, state)
 	}
 }
 
@@ -579,7 +995,7 @@ func TestNeoOrbPortalProxiesToContainer(t *testing.T) {
 	}
 }
 
-func TestNeoOrbPortalRecoversContainerOnFirstRequest(t *testing.T) {
+func TestNeoOrbPortalQuarantinesRecoveredContainerOnFirstRequest(t *testing.T) {
 	module, fake, threadID := newNeoOrbPortalTestModule(t)
 	manager := module.neoRuntime.orbManagerFor()
 	manager.mu.Lock()
@@ -591,28 +1007,14 @@ func TestNeoOrbPortalRecoversContainerOnFirstRequest(t *testing.T) {
 	fake.containers = []neoOrbContainerSummary{{ID: "recovered-container", Labels: map[string]string{"cliproxy.orb": threadID}}}
 	fake.inspectState = neoOrbContainerState{Exists: true, Running: true, IPAddress: "172.17.0.10"}
 
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("recovered portal"))
-	}))
-	defer upstream.Close()
-	original := neoOrbPortalTargetURL
-	neoOrbPortalTargetURL = func(containerIP string, port int) (string, error) {
-		if containerIP != "172.17.0.10" || port != 3000 {
-			t.Fatalf("portal target = %q:%d", containerIP, port)
-		}
-		return upstream.URL, nil
-	}
-	t.Cleanup(func() { neoOrbPortalTargetURL = original })
-
 	recorder := neoOrbPortalRequest(t, module, "/orb/"+threadID+"/p/3000/", nil)
-	if recorder.status != http.StatusOK || recorder.body != "recovered portal" {
+	if recorder.status != http.StatusConflict || !strings.Contains(recorder.body, "migration approval") {
 		t.Fatalf("recovered portal response = %d %q", recorder.status, recorder.body)
 	}
-	if record, ok := manager.snapshot(threadID); !ok || record.containerID != "recovered-container" {
+	if record, ok := manager.snapshot(threadID); !ok || record.containerID != "recovered-container" || record.state != neoOrbStateConflict || !record.recovered {
 		t.Fatalf("recovered portal record = %#v, %t", record, ok)
 	}
-	if fake.callCount("list-orbs") != 1 {
+	if fake.callCount("list-orbs") != 1 || fake.callCount("inspect:") != 0 {
 		t.Fatalf("portal recovery calls = %#v", fake.calls)
 	}
 }
@@ -628,4 +1030,73 @@ func TestNeoOrbPortalDisabledOrbs(t *testing.T) {
 	if !strings.Contains(recorder.body, "not found") {
 		t.Fatalf("disabled orbs body = %s", recorder.body)
 	}
+}
+
+func TestNeoOrbPortalRequiresActionableLifecycle(t *testing.T) {
+	for _, activation := range []string{"missing", neoOrbLifecycleActivationBinding, neoOrbLifecycleActivationLaunching, neoOrbLifecycleActivationActionable} {
+		t.Run(activation, func(t *testing.T) {
+			fixture := newNeoOrbLifecycleAdmissionFixture(t, activation)
+			module := &AmpModule{neoRuntime: fixture.runtime}
+			proxied := 0
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				proxied++
+				_, _ = w.Write([]byte("actionable portal"))
+			}))
+			t.Cleanup(upstream.Close)
+			original := neoOrbPortalTargetURL
+			neoOrbPortalTargetURL = func(string, int) (string, error) { return upstream.URL, nil }
+			t.Cleanup(func() { neoOrbPortalTargetURL = original })
+
+			response := neoOrbPortalRequest(t, module, "/orb/"+fixture.record.threadID+"/p/3000/", nil)
+			if activation == neoOrbLifecycleActivationActionable {
+				if response.status != http.StatusOK || response.body != "actionable portal" || proxied != 1 {
+					t.Fatalf("actionable portal response = %d %q proxied=%d", response.status, response.body, proxied)
+				}
+			} else if response.status < 400 || proxied != 0 {
+				t.Fatalf("inert portal response = %d %q proxied=%d", response.status, response.body, proxied)
+			}
+			assertNeoOrbNoProviderMutation(t, fixture.fake)
+		})
+	}
+}
+
+func TestNeoOrbPortalFinalAdmissionRejectsLifecycleTransition(t *testing.T) {
+	fixture := newNeoOrbLifecycleAdmissionFixture(t, neoOrbLifecycleActivationActionable)
+	module := &AmpModule{neoRuntime: fixture.runtime}
+	proxied := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		proxied++
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(upstream.Close)
+	original := neoOrbPortalTargetURL
+	neoOrbPortalTargetURL = func(string, int) (string, error) {
+		active := fixture.store.snapshot().Threads[fixture.record.threadID].Active
+		if active == nil || !neoOrbLifecycleActionable(active) {
+			t.Fatalf("portal race active generation = %#v", active)
+		}
+		launching, err := fixture.store.beginActivation(*active, "portal-final-recheck", neoOrbLifecycleOperationUnpause)
+		if err != nil {
+			t.Fatalf("begin portal race transition: %v", err)
+		}
+		fixture.manager.mu.Lock()
+		fixture.record.activeGeneration = cloneNeoOrbLifecycleGeneration(&launching)
+		fixture.manager.mu.Unlock()
+		return upstream.URL, nil
+	}
+	t.Cleanup(func() { neoOrbPortalTargetURL = original })
+
+	response := neoOrbPortalRequest(t, module, "/orb/"+fixture.record.threadID+"/p/3000/", nil)
+	if response.status != http.StatusConflict || proxied != 0 {
+		t.Fatalf("portal final recheck response = %d %q proxied=%d", response.status, response.body, proxied)
+	}
+	var body map[string]any
+	if err := json.Unmarshal([]byte(response.body), &body); err != nil || body["error"] != "orb is not ready" || body["state"] != neoOrbStateRunning || len(body) != 2 {
+		t.Fatalf("portal final recheck diagnostic err=%v body=%#v", err, body)
+	}
+	record, ok := fixture.manager.snapshot(fixture.record.threadID)
+	if !ok || record.activePortals != 0 || record.activeGeneration == nil || record.activeGeneration.ActivationState != neoOrbLifecycleActivationLaunching || record.activeGeneration.OperationKind != neoOrbLifecycleOperationUnpause {
+		t.Fatalf("portal race record = %#v, exists=%v", record, ok)
+	}
+	assertNeoOrbNoProviderMutation(t, fixture.fake)
 }

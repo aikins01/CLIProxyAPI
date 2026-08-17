@@ -25,7 +25,7 @@ const neoAmpInternalRPCMaxResponseBytes = 1024 * 1024
 
 func isNeoThreadTool(name string) bool {
 	switch strings.TrimSpace(name) {
-	case "find_thread", "list_agent_modes", "list_runners", "list_workspace_members", "find_shared_plugins_and_skills", "create_thread", "get_current_user_identity", "thread_interact", "get_thread_metadata", "update_thread", "rename_thread", "set_thread_pinned", "add_thread_labels", "remove_thread_labels", "archive_current_thread", "archive_thread", "archive_threads", "unarchive_thread", "send_message_to_thread", "download_thread_file", "upload_thread_file", "get_schedule", "set_schedule", "update_schedule", "clear_schedule":
+	case "publish_image", "find_thread", "list_agent_modes", "list_runners", "list_workspace_members", "find_shared_plugins_and_skills", "create_thread", "get_current_user_identity", "thread_interact", "get_thread_metadata", "update_thread", "rename_thread", "set_thread_pinned", "add_thread_labels", "remove_thread_labels", "archive_current_thread", "archive_thread", "archive_threads", "unarchive_thread", "send_message_to_thread", "download_thread_file", "upload_thread_file", "get_schedule", "set_schedule", "update_schedule", "clear_schedule":
 		return true
 	default:
 		return false
@@ -36,6 +36,8 @@ func neoThreadToolSpec(toolName string) (neoToolSpec, bool) {
 	name := strings.TrimSpace(toolName)
 	threadID := map[string]any{"type": "string", "description": "Amp thread ID or thread URL."}
 	switch name {
+	case "publish_image":
+		return neoPublishImageToolSpec(), true
 	case "find_thread":
 		return neoToolSpec{
 			Name:        name,
@@ -146,8 +148,14 @@ func neoThreadToolSpec(toolName string) (neoToolSpec, bool) {
 					},
 				},
 				"spawnExecutor": map[string]any{"type": "boolean", "description": "Whether to start the selected executor when work is queued. Default: true."},
-				"agent":         map[string]any{"type": "object", "description": "Optional custom agent definition."},
-				"comment":       map[string]any{"type": "string", "description": "Optional relationship note."},
+				"multiplayerTTLSeconds": map[string]any{
+					"type":        "integer",
+					"minimum":     neoThreadOpenTTLMinSeconds,
+					"maximum":     neoThreadOpenTTLMaxSeconds,
+					"description": "Optional multiplayer duration for a spawned Orb workspace, from 5 minutes through 7 days. Requires executor=orb and spawnExecutor=true.",
+				},
+				"agent":   map[string]any{"type": "object", "description": "Optional custom agent definition."},
+				"comment": map[string]any{"type": "string", "description": "Optional relationship note."},
 			}, nil),
 			Meta: map[string]any{"source": "server"},
 		}, true
@@ -375,7 +383,7 @@ func (a *neoActor) runLocalThreadActorTool(pending neoPendingTool, generation in
 
 func isNeoAmpWorkspaceTool(name string) bool {
 	switch strings.TrimSpace(name) {
-	case "list_workspace_members", "find_shared_plugins_and_skills":
+	case "list_workspace_members", "find_shared_plugins_and_skills", "publish_image":
 		return true
 	default:
 		return false
@@ -387,6 +395,8 @@ func neoThreadToolProgressText(name string, input map[string]any) string {
 	switch strings.TrimSpace(name) {
 	case "find_thread":
 		return "Searching threads"
+	case "publish_image":
+		return "Publishing image"
 	case "list_agent_modes":
 		return "Listing agent modes"
 	case "list_runners":
@@ -476,6 +486,8 @@ func (a *neoActor) executeLocalThreadTool(pending neoPendingTool) (map[string]an
 
 func (a *neoActor) executeLocalThreadToolContext(ctx context.Context, pending neoPendingTool) (map[string]any, error) {
 	switch strings.TrimSpace(pending.Name) {
+	case "publish_image":
+		return a.executeLocalPublishImageTool(ctx, pending.Input)
 	case "find_thread":
 		return a.executeLocalFindThreadTool(pending.Input)
 	case "list_agent_modes":
@@ -637,6 +649,18 @@ func neoStrictInteger(value any) (int, bool) {
 	default:
 		return 0, false
 	}
+}
+
+func neoMultiplayerTTLSeconds(values map[string]any) (int, bool, error) {
+	raw, exists := values["multiplayerTTLSeconds"]
+	if !exists {
+		return 0, false, nil
+	}
+	ttlSeconds, ok := neoStrictInteger(raw)
+	if !ok || ttlSeconds < neoThreadOpenTTLMinSeconds || ttlSeconds > neoThreadOpenTTLMaxSeconds {
+		return 0, false, fmt.Errorf("multiplayerTTLSeconds must be an integer from %d to %d", neoThreadOpenTTLMinSeconds, neoThreadOpenTTLMaxSeconds)
+	}
+	return ttlSeconds, true, nil
 }
 
 func (rt *neoRuntime) callAmpInternalRPC(ctx context.Context, method string, params map[string]any) (any, error) {
@@ -957,12 +981,9 @@ func (a *neoActor) executeLocalCreateThreadTool(pending neoPendingTool) (map[str
 	localExecutorAttempted := false
 	localExecutorStatus := map[string]any(nil)
 	if runnerID != "" && spawnExecutor {
-		_, _, hasPendingWork := child.pendingWebLocalExecutorRequest()
-		if hasPendingWork {
-			runnerExecutorRequested = a.runtime.store.requestUserExecutorRunnerThreadForOwner(ownerID, runnerID, threadID)
-			if !runnerExecutorRequested {
-				runnerExecutorError = "selected runner is no longer available"
-			}
+		runnerExecutorRequested = boolValue(response["runnerExecutorRequested"])
+		if !runnerExecutorRequested {
+			runnerExecutorError = "selected runner is no longer available"
 		}
 	} else if spawnExecutor {
 		_, _, localExecutorAttempted = child.pendingWebLocalExecutorRequest()
@@ -1002,6 +1023,10 @@ func (a *neoActor) executeLocalCreateThreadTool(pending neoPendingTool) (map[str
 }
 
 func (a *neoActor) localCreateThreadBody(input map[string]any, threadID string) (map[string]any, string, bool, error) {
+	multiplayerTTLSeconds, hasMultiplayerTTL, err := neoMultiplayerTTLSeconds(input)
+	if err != nil {
+		return nil, "", false, errors.New("create_thread " + err.Error())
+	}
 	a.rebindUnavailableWebLocalRunner()
 	a.mu.Lock()
 	parentEnvironment := cloneMap(a.environment)
@@ -1205,11 +1230,11 @@ func (a *neoActor) localCreateThreadBody(input map[string]any, threadID string) 
 		agent = neoCustomAgentDefinitionFromSettings(parentSettings)
 	}
 	if len(agent) == 0 && agentMode != "" && !validNeoClientAgentMode(agentMode) {
-		pluginMode, pluginErr := loadNeoPluginAgentMode(agentMode)
+		pluginMode, pluginErr := a.runtime.loadNeoPluginAgentModeForOwner(a.threadToolOwnerID(), agentMode)
 		if pluginErr != nil {
 			return nil, "", false, fmt.Errorf("create_thread received unsupported agentMode %q", agentMode)
 		}
-		agent = pluginMode.agentDefinition()
+		agent = pluginMode.AgentDefinition()
 		if reasoningEffort == "" {
 			reasoningEffort = pluginMode.ReasoningEffort
 		}
@@ -1244,6 +1269,12 @@ func (a *neoActor) localCreateThreadBody(input map[string]any, threadID string) 
 	if spawnExecutor && runnerID == "" && strings.EqualFold(executor, "local") && workingDirectory == "" {
 		return nil, "", false, errors.New("create_thread local executor requires an existing workingDirectory on the proxy host")
 	}
+	if hasMultiplayerTTL && !spawnExecutor {
+		return nil, "", false, errors.New("create_thread multiplayerTTLSeconds requires spawnExecutor=true")
+	}
+	if hasMultiplayerTTL && !orbExecutor {
+		return nil, "", false, errors.New("create_thread multiplayerTTLSeconds requires an Orb executor")
+	}
 
 	repositoryURL := firstNonEmptyString(parentMeta["repositoryURL"], parentMeta["repositoryUrl"])
 	if workspaceOverridesInheritedProject {
@@ -1275,6 +1306,13 @@ func (a *neoActor) localCreateThreadBody(input map[string]any, threadID string) 
 		"projectID":        omitEmpty(projectID),
 		"threadMeta":       threadMeta,
 		"prompt":           omitEmpty(prompt),
+		"spawnExecutor":    spawnExecutor,
+	}
+	if hasMultiplayerTTL {
+		body["multiplayerTTLSeconds"] = multiplayerTTLSeconds
+	}
+	if runnerID != "" && explicitRunnerSelection {
+		threadMeta[neoRequiredRunnerIDMetaKey] = runnerID
 	}
 	if len(initialContent) > 0 {
 		body["content"] = initialContent

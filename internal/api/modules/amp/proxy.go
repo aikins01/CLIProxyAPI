@@ -630,7 +630,7 @@ func ampThreadListHasExcludedLabel(thread map[string]any, excluded map[string]bo
 		return false
 	}
 	for _, rawLabel := range arrayValue(thread["labels"]) {
-		label := strings.TrimSpace(firstNonEmptyString(rawLabel, mapValue(rawLabel)["name"]))
+		label := strings.ToLower(strings.TrimSpace(firstNonEmptyString(rawLabel, mapValue(rawLabel)["name"])))
 		if excluded[label] {
 			return true
 		}
@@ -927,8 +927,8 @@ func ampThreadListRequestAugmenter(req *http.Request) (ampProxyThreadListAugment
 	body, err := readAndRestoreNeoJSONBody(req)
 	if err != nil {
 		augmenter.includeEmpty, _ = strconv.ParseBool(strings.TrimSpace(query.Get("includeEmpty")))
-		augmenter.threadIDs = ampThreadListStringSet(query["threadIDs"])
-		augmenter.excludedLabelNames = ampThreadListStringSet(query["excludeLabelNames"])
+		augmenter.threadIDs = ampThreadListStringSet(query["threadIDs"], false)
+		augmenter.excludedLabelNames = ampThreadListStringSet(query["excludeLabelNames"], true)
 		return augmenter, true
 	}
 	params := mapValue(body["params"])
@@ -951,13 +951,13 @@ func ampThreadListRequestAugmenter(req *http.Request) (ampProxyThreadListAugment
 	if query.Has("includeEmpty") {
 		augmenter.includeEmpty, _ = strconv.ParseBool(strings.TrimSpace(query.Get("includeEmpty")))
 	}
-	augmenter.threadIDs = ampThreadListStringSet(params["threadIDs"])
+	augmenter.threadIDs = ampThreadListStringSet(params["threadIDs"], false)
 	if query.Has("threadIDs") {
-		augmenter.threadIDs = ampThreadListStringSet(query["threadIDs"])
+		augmenter.threadIDs = ampThreadListStringSet(query["threadIDs"], false)
 	}
-	augmenter.excludedLabelNames = ampThreadListStringSet(params["excludeLabelNames"])
+	augmenter.excludedLabelNames = ampThreadListStringSet(params["excludeLabelNames"], true)
 	if query.Has("excludeLabelNames") {
-		augmenter.excludedLabelNames = ampThreadListStringSet(query["excludeLabelNames"])
+		augmenter.excludedLabelNames = ampThreadListStringSet(query["excludeLabelNames"], true)
 	}
 	return augmenter, true
 }
@@ -1011,7 +1011,7 @@ func rewriteAmpThreadListRequestWindow(req *http.Request, augmenter ampProxyThre
 	return true
 }
 
-func ampThreadListStringSet(raw any) map[string]bool {
+func ampThreadListStringSet(raw any, lower bool) map[string]bool {
 	values := stringArrayValue(raw)
 	if value := strings.TrimSpace(stringValue(raw)); value != "" {
 		values = []any{value}
@@ -1022,6 +1022,9 @@ func ampThreadListStringSet(raw any) map[string]bool {
 	set := make(map[string]bool, len(values))
 	for _, rawValue := range values {
 		if value := strings.TrimSpace(stringValue(rawValue)); value != "" {
+			if lower {
+				value = strings.ToLower(value)
+			}
 			set[value] = true
 		}
 	}

@@ -25,9 +25,34 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 const testThreadID = "T-01234567-89ab-cdef-0123-456789abcdef"
+
+type brokerRoundTripper func(*http.Request) (*http.Response, error)
+
+func (roundTrip brokerRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	return roundTrip(request)
+}
+
+func assertBrokerCallerContext(t *testing.T, requestContext context.Context, cancel context.CancelFunc) {
+	t.Helper()
+	if requestContext == nil {
+		t.Fatal("request context was not captured")
+	}
+	if _, ok := requestContext.Deadline(); ok {
+		t.Fatal("request context unexpectedly has a child deadline")
+	}
+	if err := requestContext.Err(); err != nil {
+		t.Fatalf("request context error before caller cancellation = %v", err)
+	}
+	cancel()
+	if err := requestContext.Err(); !errors.Is(err, context.Canceled) {
+		t.Fatalf("request context error after caller cancellation = %v, want context canceled", err)
+	}
+}
 
 type validationFixture struct {
 	root       string
@@ -146,6 +171,22 @@ func TestLoadConfigValidation(t *testing.T) {
 	})
 }
 
+func TestBrokerHeartbeatIntervalCapsFallbackAtFifteenSeconds(t *testing.T) {
+	tests := []struct {
+		seconds int
+		want    time.Duration
+	}{
+		{seconds: 1, want: time.Second},
+		{seconds: defaultHeartbeat, want: 15 * time.Second},
+		{seconds: maxHeartbeatSeconds, want: 15 * time.Second},
+	}
+	for _, test := range tests {
+		if got := brokerHeartbeatInterval(test.seconds); got != test.want {
+			t.Errorf("brokerHeartbeatInterval(%d) = %s, want %s", test.seconds, got, test.want)
+		}
+	}
+}
+
 func TestValidateBaseURL(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -198,6 +239,22 @@ func TestStableRunnerID(t *testing.T) {
 	}
 	if got == stableRunnerID(brokerID, workspaceID, path+"-other") {
 		t.Fatal("runner ID did not change with canonical path")
+	}
+}
+
+func TestBrokerPublicationRunnerIDGoldenVector(t *testing.T) {
+	got := brokerPublicationRunnerID(
+		"broker-golden",
+		"session-golden",
+		7,
+		"local-runner-golden",
+		"T-019f9000-0000-7000-8000-000000000099",
+	)
+	if want := "broker-c41acab039a0cb7ba6f682b6027e312a"; got != want {
+		t.Fatalf("publication runner ID = %q, want %q", got, want)
+	}
+	if got == brokerPublicationRunnerID("broker-golden", "session-other", 7, "local-runner-golden", "T-019f9000-0000-7000-8000-000000000099") {
+		t.Fatal("publication runner ID did not change with the broker session")
 	}
 }
 
@@ -265,6 +322,109 @@ func TestChildEnvironmentFiltersBase(t *testing.T) {
 	}
 	if values["AMP_URL"] != cfg.APIURL || values["AMP_API_KEY"] != cfg.apiKey {
 		t.Fatalf("deliberate Amp environment updates were not preserved")
+	}
+	wantPath := strings.Join([]string{
+		"/usr/bin",
+		"/bin",
+		"/Users/test/.local/bin",
+		"/Users/test/.amp/bin",
+		"/Users/test/.bun/bin",
+		"/Users/test/.local/share/mise/shims",
+		"/Users/test/.local/share/mise/installs/node/latest/bin",
+		"/opt/homebrew/bin",
+		"/opt/homebrew/sbin",
+		"/usr/local/bin",
+		"/usr/local/sbin",
+		"/usr/sbin",
+		"/sbin",
+	}, string(os.PathListSeparator))
+	if values["PATH"] != wantPath {
+		t.Fatalf("PATH = %q, want %q", values["PATH"], wantPath)
+	}
+}
+
+func TestChildEnvironmentPathIsAbsoluteAndDeduplicated(t *testing.T) {
+	home := t.TempDir()
+	base := []string{
+		"HOME=" + home,
+		"PATH=/custom/bin:relative:/usr/bin:/custom/bin:../other:/opt/homebrew/bin:",
+	}
+	environment := childEnvironment(base, &brokerConfig{}, "/workspace", testThreadID, "/logs/thread.log")
+	values := make(map[string]string, len(environment))
+	for _, entry := range environment {
+		key, value, found := strings.Cut(entry, "=")
+		if found {
+			values[key] = value
+		}
+	}
+	paths := filepath.SplitList(values["PATH"])
+	want := []string{
+		"/custom/bin",
+		"/usr/bin",
+		"/opt/homebrew/bin",
+		filepath.Join(home, ".local", "bin"),
+		filepath.Join(home, ".amp", "bin"),
+		filepath.Join(home, ".bun", "bin"),
+		filepath.Join(home, ".local", "share", "mise", "shims"),
+		filepath.Join(home, ".local", "share", "mise", "installs", "node", "latest", "bin"),
+		"/opt/homebrew/sbin",
+		"/usr/local/bin",
+		"/usr/local/sbin",
+		"/bin",
+		"/usr/sbin",
+		"/sbin",
+	}
+	if !reflect.DeepEqual(paths, want) {
+		t.Fatalf("PATH entries = %#v, want %#v", paths, want)
+	}
+	seen := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		if !filepath.IsAbs(path) {
+			t.Errorf("PATH contains relative entry %q", path)
+		}
+		if _, exists := seen[path]; exists {
+			t.Errorf("PATH contains duplicate entry %q", path)
+		}
+		seen[path] = struct{}{}
+	}
+}
+
+func TestChildEnvironmentFindsHomeTools(t *testing.T) {
+	home := t.TempDir()
+	inheritedBin := filepath.Join(home, "inherited-bin")
+	if err := os.Mkdir(inheritedBin, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	tools := map[string]string{
+		"tmux":              filepath.Join(home, ".local", "bin"),
+		"open-computer-use": filepath.Join(home, ".amp", "bin"),
+		"bun":               filepath.Join(home, ".bun", "bin"),
+		"open-browser-use":  filepath.Join(home, ".local", "share", "mise", "shims"),
+		"node":              filepath.Join(home, ".local", "share", "mise", "installs", "node", "latest", "bin"),
+	}
+	for name, directory := range tools {
+		if err := os.MkdirAll(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		writePrivateFile(t, filepath.Join(directory, name), []byte("#!/bin/sh\n"), 0o700)
+	}
+	environment := childEnvironment([]string{"HOME=" + home, "PATH=" + inheritedBin}, &brokerConfig{}, "/workspace", testThreadID, "/logs/thread.log")
+	for _, entry := range environment {
+		if path, found := strings.CutPrefix(entry, "PATH="); found {
+			t.Setenv("PATH", path)
+			break
+		}
+	}
+	for name, directory := range tools {
+		path, err := exec.LookPath(name)
+		if err != nil {
+			t.Errorf("locate %s: %v", name, err)
+			continue
+		}
+		want := filepath.Join(directory, name)
+		if path != want {
+			t.Errorf("%s path = %q, want %q", name, path, want)
+		}
 	}
 }
 
@@ -468,6 +628,37 @@ func TestValidateHeartbeatResponseAcceptsExplicitRunnerRejection(t *testing.T) {
 	}
 }
 
+func TestValidateHeartbeatResponseEnforcesCumulativeIntentLimit(t *testing.T) {
+	runnerIDs := []string{"local-runner-cap-a", "local-runner-cap-b"}
+	workspaceByRunner := map[string]*workspaceConfig{}
+	runners := make([]heartbeatRunnerIntents, 0, len(runnerIDs))
+	for runnerIndex, runnerID := range runnerIDs {
+		workspaceByRunner[runnerID] = &workspaceConfig{}
+		intents := make([]heartbeatIntent, intentLimit/len(runnerIDs))
+		for intentIndex := range intents {
+			intents[intentIndex] = heartbeatIntent{
+				ThreadID:  fmt.Sprintf("T-019f9000-%04x-7000-8000-%012x", runnerIndex, intentIndex),
+				Desired:   "running",
+				AgentMode: "smart",
+			}
+		}
+		runners = append(runners, heartbeatRunnerIntents{RunnerID: runnerID, Intents: &intents})
+	}
+	localBroker := &broker{workspacesByRunner: workspaceByRunner}
+	response := heartbeatResponse{OK: true, Runners: &runners}
+	if err := localBroker.validateHeartbeatResponse(response); err != nil {
+		t.Fatalf("%d cumulative intents were rejected: %v", intentLimit, err)
+	}
+	*runners[1].Intents = append(*runners[1].Intents, heartbeatIntent{
+		ThreadID:  "T-019f9000-0001-7000-8001-000000000000",
+		Desired:   "running",
+		AgentMode: "smart",
+	})
+	if err := localBroker.validateHeartbeatResponse(response); err == nil || !strings.Contains(err.Error(), "intents to exceed 4096 entries") {
+		t.Fatalf("%d cumulative intents error = %v", intentLimit+1, err)
+	}
+}
+
 func TestHeartbeatPayloadEmitsEmptyRunningThreadsArray(t *testing.T) {
 	workspace := workspaceConfig{RunnerID: "local-runner-approved", Path: "/workspace"}
 	localBroker := &broker{
@@ -581,6 +772,248 @@ func TestHeartbeatResponseBounds(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestParseIntentVersionHeaders(t *testing.T) {
+	tests := []struct {
+		name         string
+		headers      http.Header
+		wantEpoch    string
+		wantRevision *uint64
+		wantError    bool
+	}{
+		{name: "legacy", headers: http.Header{}},
+		{name: "versioned", headers: http.Header{intentEpochHeader: {"epoch-1"}, intentRevisionHeader: {"7"}}, wantEpoch: "epoch-1", wantRevision: uint64Pointer(7)},
+		{name: "missing revision", headers: http.Header{intentEpochHeader: {"epoch-1"}}, wantError: true},
+		{name: "missing epoch", headers: http.Header{intentRevisionHeader: {"7"}}, wantError: true},
+		{name: "invalid epoch", headers: http.Header{intentEpochHeader: {"bad epoch"}, intentRevisionHeader: {"7"}}, wantError: true},
+		{name: "invalid revision", headers: http.Header{intentEpochHeader: {"epoch-1"}, intentRevisionHeader: {"07"}}, wantError: true},
+		{name: "duplicate epoch", headers: http.Header{intentEpochHeader: {"epoch-1", "epoch-2"}, intentRevisionHeader: {"7"}}, wantError: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			epoch, revision, err := parseIntentVersionHeaders(test.headers)
+			if (err != nil) != test.wantError {
+				t.Fatalf("parseIntentVersionHeaders error = %v", err)
+			}
+			if err == nil && (epoch != test.wantEpoch || !reflect.DeepEqual(revision, test.wantRevision)) {
+				t.Fatalf("parseIntentVersionHeaders = (%q, %v), want (%q, %v)", epoch, revision, test.wantEpoch, test.wantRevision)
+			}
+		})
+	}
+}
+
+func TestDecodeControlMessageStrictValidation(t *testing.T) {
+	runnerID := "local-runner-approved"
+	localBroker := &broker{
+		config:             &brokerConfig{BrokerID: "broker-one"},
+		sessionID:          "session-one",
+		sessionGeneration:  3,
+		workspacesByRunner: map[string]*workspaceConfig{runnerID: {}},
+	}
+	valid := fmt.Sprintf(`{"type":"broker_intents","brokerId":"broker-one","sessionId":"session-one","sessionGeneration":3,"intentEpoch":"epoch-1","intentRevision":4,"runners":[{"runnerId":%q,"intents":[]}]}`, runnerID)
+	response, err := localBroker.decodeControlMessage([]byte(valid))
+	if err != nil {
+		t.Fatalf("decodeControlMessage valid: %v", err)
+	}
+	if response.IntentEpoch != "epoch-1" || response.IntentRevision == nil || *response.IntentRevision != 4 || response.Runners == nil || len(*response.Runners) != 1 {
+		t.Fatalf("decoded control response = %+v", response)
+	}
+
+	invalid := map[string][]byte{
+		"duplicate":   []byte(strings.Replace(valid, `"type":"broker_intents"`, `"type":"broker_intents","type":"broker_intents"`, 1)),
+		"trailing":    []byte(valid + `{}`),
+		"unknown":     []byte(strings.Replace(valid, `"runners":`, `"unknown":true,"runners":`, 1)),
+		"identity":    []byte(strings.Replace(valid, `"sessionGeneration":3`, `"sessionGeneration":2`, 1)),
+		"epoch":       []byte(strings.Replace(valid, `"intentEpoch":"epoch-1"`, `"intentEpoch":"bad epoch"`, 1)),
+		"binary size": bytes.Repeat([]byte("x"), maxHeartbeatBody+1),
+	}
+	for name, payload := range invalid {
+		t.Run(name, func(t *testing.T) {
+			if _, err := localBroker.decodeControlMessage(payload); err == nil {
+				t.Fatal("decodeControlMessage unexpectedly succeeded")
+			}
+		})
+	}
+}
+
+func TestApplyIntentResponseOrdering(t *testing.T) {
+	localBroker := &broker{
+		workspacesByRunner:  map[string]*workspaceConfig{},
+		children:            map[childKey]*childProcess{},
+		launches:            map[childKey]*childLaunch{},
+		intentEpoch:         "epoch-a",
+		intentRevision:      5,
+		intentRevisionKnown: true,
+	}
+	runners := []heartbeatRunnerIntents{}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	response := func(epoch string, revision uint64) heartbeatResponse {
+		return heartbeatResponse{OK: true, Runners: &runners, IntentEpoch: epoch, IntentRevision: &revision}
+	}
+	if err := localBroker.applyIntentResponse(canceled, response("epoch-a", 4), false); err != nil {
+		t.Fatalf("lower revision was not ignored: %v", err)
+	}
+	if err := localBroker.applyIntentResponse(canceled, response("epoch-b", 6), false); err != nil {
+		t.Fatalf("mismatched epoch was not ignored: %v", err)
+	}
+	if err := localBroker.applyIntentResponse(canceled, response("epoch-a", 5), false); !errors.Is(err, context.Canceled) {
+		t.Fatalf("equal revision error = %v, want context canceled", err)
+	}
+	if err := localBroker.applyIntentResponse(canceled, response("epoch-b", 1), true); !errors.Is(err, context.Canceled) {
+		t.Fatalf("authoritative heartbeat error = %v, want context canceled", err)
+	}
+	if localBroker.intentEpoch != "epoch-b" || localBroker.intentRevision != 1 || !localBroker.intentRevisionKnown {
+		t.Fatalf("authoritative version = (%q, %d, %t)", localBroker.intentEpoch, localBroker.intentRevision, localBroker.intentRevisionKnown)
+	}
+	if err := localBroker.applyIntentResponse(canceled, heartbeatResponse{OK: true, Runners: &runners}, true); !errors.Is(err, context.Canceled) {
+		t.Fatalf("legacy authoritative heartbeat error = %v, want context canceled", err)
+	}
+	if localBroker.intentEpoch != "" || localBroker.intentRevision != 0 || localBroker.intentRevisionKnown {
+		t.Fatalf("legacy authoritative version = (%q, %d, %t)", localBroker.intentEpoch, localBroker.intentRevision, localBroker.intentRevisionKnown)
+	}
+}
+
+func TestQueueControlMessagePreservesNewestCompatibleRevision(t *testing.T) {
+	localBroker := &broker{controlMessages: make(chan heartbeatResponse, 1)}
+	response := func(epoch string, revision uint64, ok bool) heartbeatResponse {
+		return heartbeatResponse{OK: ok, IntentEpoch: epoch, IntentRevision: &revision}
+	}
+
+	localBroker.queueControlMessage(response("epoch-a", 2, true))
+	localBroker.queueControlMessage(response("epoch-a", 1, false))
+	queued := <-localBroker.controlMessages
+	if queued.IntentRevision == nil || *queued.IntentRevision != 2 || !queued.OK {
+		t.Fatalf("queued response = %+v, want revision 2", queued)
+	}
+
+	localBroker.queueControlMessage(response("epoch-a", 2, false))
+	localBroker.queueControlMessage(response("epoch-a", 2, true))
+	queued = <-localBroker.controlMessages
+	if queued.IntentRevision == nil || *queued.IntentRevision != 2 || !queued.OK {
+		t.Fatalf("equal-revision retry = %+v, want latest body", queued)
+	}
+
+	localBroker.queueControlMessage(response("epoch-a", 9, false))
+	localBroker.queueControlMessage(response("epoch-b", 1, true))
+	queued = <-localBroker.controlMessages
+	if queued.IntentEpoch != "epoch-b" || queued.IntentRevision == nil || *queued.IntentRevision != 1 {
+		t.Fatalf("new epoch response = %+v", queued)
+	}
+}
+
+func TestApplyIntentResponseIgnoresStaleVersionedHeartbeat(t *testing.T) {
+	runnerID := "runner-one"
+	threadID := "T-019f5000-0000-4000-8000-000000000001"
+	workspace := &workspaceConfig{RunnerID: runnerID}
+	localBroker := &broker{
+		workspacesByRunner: map[string]*workspaceConfig{runnerID: workspace},
+		children:           map[childKey]*childProcess{},
+		launches:           map[childKey]*childLaunch{},
+	}
+	stoppedIntents := []heartbeatIntent{{ThreadID: threadID, Desired: "stopped"}}
+	runners := []heartbeatRunnerIntents{{RunnerID: runnerID, Intents: &stoppedIntents}}
+	revision := uint64(2)
+	if err := localBroker.applyIntentResponse(context.Background(), heartbeatResponse{OK: true, Runners: &runners, IntentEpoch: "epoch-a", IntentRevision: &revision}, false); err != nil {
+		t.Fatalf("apply control response: %v", err)
+	}
+	runningIntents := []heartbeatIntent{{ThreadID: threadID, Desired: "running", AgentMode: "smart"}}
+	runners[0].Intents = &runningIntents
+	revision = 1
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := localBroker.applyIntentResponse(canceled, heartbeatResponse{OK: true, Runners: &runners, IntentEpoch: "epoch-a", IntentRevision: &revision}, true); err != nil {
+		t.Fatalf("stale heartbeat was not ignored: %v", err)
+	}
+	if localBroker.intentEpoch != "epoch-a" || localBroker.intentRevision != 2 || !localBroker.intentRevisionKnown {
+		t.Fatalf("intent version = (%q, %d, %t), want (epoch-a, 2, true)", localBroker.intentEpoch, localBroker.intentRevision, localBroker.intentRevisionKnown)
+	}
+}
+
+func TestControlPushReconcilesRunningAndEmptyIntents(t *testing.T) {
+	fixture := newValidationFixture(t)
+	readyPath := filepath.Join(fixture.root, "control-ready")
+	fakeAmp := filepath.Join(fixture.root, "fake-amp")
+	writePrivateFile(t, fakeAmp, []byte(fmt.Sprintf("#!/bin/sh\n: > %q\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n", readyPath)), 0o700)
+	fixture.config.AmpBinary = fakeAmp
+	cfg, err := loadConfig(fixture.writeConfig(t, fixture.config))
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	localBroker, err := newBroker(cfg, http.DefaultClient)
+	if err != nil {
+		t.Fatalf("newBroker: %v", err)
+	}
+	t.Cleanup(func() { _ = localBroker.stopAll() })
+	runningIntents := []heartbeatIntent{{ThreadID: testThreadID, Desired: "running", AgentMode: "smart"}}
+	runners := []heartbeatRunnerIntents{{RunnerID: cfg.Workspaces[0].RunnerID, Intents: &runningIntents}}
+	revision := uint64(1)
+	if err := localBroker.applyIntentResponse(context.Background(), heartbeatResponse{OK: true, Runners: &runners, IntentEpoch: "epoch-1", IntentRevision: &revision}, false); err != nil {
+		t.Fatalf("apply running control response: %v", err)
+	}
+	waitForPath(t, readyPath)
+	emptyIntents := []heartbeatIntent{}
+	runners[0].Intents = &emptyIntents
+	revision++
+	if err := localBroker.applyIntentResponse(context.Background(), heartbeatResponse{OK: true, Runners: &runners, IntentEpoch: "epoch-1", IntentRevision: &revision}, false); err != nil {
+		t.Fatalf("apply empty control response: %v", err)
+	}
+	waitForNoChildren(t, localBroker)
+}
+
+func TestRunControlConnectionCancellationClosesBlockedRead(t *testing.T) {
+	connected := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.Header.Get("Authorization") != "Bearer secret" || request.Header.Get(controlBrokerIDHeader) != "broker-one" || request.Header.Get(controlSessionIDHeader) != "session-one" || request.Header.Get(controlGenerationHeader) != "3" {
+			http.Error(response, "invalid control identity", http.StatusUnauthorized)
+			return
+		}
+		conn, err := (&websocket.Upgrader{}).Upgrade(response, request, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		close(connected)
+		_, _, _ = conn.ReadMessage()
+	}))
+	defer server.Close()
+	localBroker := &broker{
+		config:             &brokerConfig{BrokerID: "broker-one", APIURL: server.URL, apiKey: "secret"},
+		client:             server.Client(),
+		requestLimit:       time.Second,
+		sessionID:          "session-one",
+		sessionGeneration:  3,
+		workspacesByRunner: map[string]*workspaceConfig{},
+		controlMessages:    make(chan heartbeatResponse, 1),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		wasConnected, err := localBroker.runControlConnection(ctx)
+		if !wasConnected && err == nil {
+			err = errors.New("control connection was not established")
+		}
+		done <- err
+	}()
+	select {
+	case <-connected:
+	case <-time.After(time.Second):
+		t.Fatal("control connection was not established")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("runControlConnection error = %v, want context canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("control connection did not stop after cancellation")
+	}
+}
+
+func uint64Pointer(value uint64) *uint64 {
+	return &value
 }
 
 func TestStaleSessionStopsChildrenAndTerminatesLoop(t *testing.T) {
@@ -1248,12 +1681,14 @@ while :; do sleep 1; done
 	logPath := filepath.Join(cfg.LogDirectory, cfg.Workspaces[0].RunnerID+"-"+testThreadID+".log")
 	wantValues := map[string]string{
 		"PWD":                             cfg.Workspaces[0].Path,
-		"ARG_COUNT":                       "5",
+		"ARG_COUNT":                       "7",
 		"ARG0":                            "--mode",
 		"ARG1":                            "high",
 		"ARG2":                            "--headless=" + testThreadID,
-		"ARG3":                            "--log-file",
-		"ARG4":                            logPath,
+		"ARG3":                            "--runner-id",
+		"ARG4":                            brokerPublicationRunnerID(cfg.BrokerID, localBroker.sessionID, localBroker.sessionGeneration, cfg.Workspaces[0].RunnerID, testThreadID),
+		"ARG5":                            "--log-file",
+		"ARG6":                            logPath,
 		"ENV_AMP_EXECUTOR":                "1",
 		"ENV_AMP_URL":                     server.URL,
 		"ENV_AMP_API_KEY":                 "top-secret-api-key",
@@ -1479,4 +1914,325 @@ func readKeyValues(t *testing.T, path string) map[string]string {
 		values[key] = value
 	}
 	return values
+}
+
+func TestHeartbeatPayloadAdvertisesPluginAgentModesOnlyWhenSupported(t *testing.T) {
+	pluginsHome := t.TempDir()
+	pluginsDir := filepath.Join(pluginsHome, "amp", "plugins")
+	if err := os.MkdirAll(pluginsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	plugin := `// @amp-agent-mode {"key":"deep-blue","label":"Deep Blue","description":"synced mode"}
+const agent = amp.createAgent({
+  name: "deep-blue",
+  model: "openai/gpt-5",
+  instructions: "You are deep blue.",
+})
+amp.registerAgentMode({ key: "deep-blue", label: "Deep Blue", agent })
+`
+	if err := os.WriteFile(filepath.Join(pluginsDir, "deep-blue.ts"), []byte(plugin), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_CONFIG_HOME", pluginsHome)
+	workspace := workspaceConfig{RunnerID: "local-runner-approved", Path: "/workspace"}
+	localBroker := &broker{
+		config:   &brokerConfig{BrokerID: "broker-one", Workspaces: []workspaceConfig{workspace}},
+		children: map[childKey]*childProcess{},
+	}
+	withoutSupport := localBroker.heartbeatPayload(false)
+	if withoutSupport.PluginAgentModes != nil {
+		t.Fatalf("plugin agent modes advertised without server support: %#v", withoutSupport.PluginAgentModes)
+	}
+	localBroker.pluginModesSupport = true
+	withSupport := localBroker.heartbeatPayload(false)
+	if len(withSupport.PluginAgentModes) != 1 {
+		t.Fatalf("advertised plugin agent modes = %#v", withSupport.PluginAgentModes)
+	}
+	mode := withSupport.PluginAgentModes[0]
+	if mode.Key != "deep-blue" || mode.Label != "Deep Blue" || mode.AgentModel != "openai/gpt-5" || mode.AgentInstructions != "You are deep blue." {
+		t.Fatalf("advertised plugin agent mode = %#v", mode)
+	}
+	if mode.PluginName != "deep-blue" || mode.PluginScope != "user" || mode.PluginRepositoryName != "amp-user-plugins" {
+		t.Fatalf("advertised plugin metadata = %#v", mode)
+	}
+	if empty := localBroker.heartbeatPayload(true); empty.PluginAgentModes != nil {
+		t.Fatalf("shutdown heartbeat advertised plugin agent modes: %#v", empty.PluginAgentModes)
+	}
+}
+
+func TestReservedAgentModeKey(t *testing.T) {
+	for _, key := range []string{"smart", "rush", "deep", "large", "review", "puck", "low", "medium", "high", "ultra", "deep-1", "deep-2", "deep-3"} {
+		if !reservedAgentModeKey(key) {
+			t.Fatalf("reservedAgentModeKey(%q) = false, want true", key)
+		}
+	}
+	for _, key := range []string{"", "deep-blue", "kimi-k3", "custom"} {
+		if reservedAgentModeKey(key) {
+			t.Fatalf("reservedAgentModeKey(%q) = true, want false", key)
+		}
+	}
+}
+
+func TestDiscoverWorkspacesUnderRootsFindsGitRepositories(t *testing.T) {
+	base := t.TempDir()
+	root, err := canonicalExistingDirectory(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alpha := filepath.Join(root, "alpha")
+	nested := filepath.Join(root, "group", "beta")
+	plain := filepath.Join(root, "notes")
+	hidden := filepath.Join(root, ".cache", "gamma")
+	pinned := filepath.Join(root, "pinned")
+	invalid := filepath.Join(root, "invalid")
+	for _, directory := range []string{alpha, nested, plain, hidden, pinned, invalid} {
+		if err := os.MkdirAll(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, repository := range []string{alpha, nested, hidden, pinned} {
+		initGitRepository(t, repository)
+	}
+	if err := os.Mkdir(filepath.Join(invalid, ".git"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("git", "-C", alpha, "remote", "add", "origin", "https://example.com/alpha.git")
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("add alpha remote: %v: %s", err, output)
+	}
+	cfg := &brokerConfig{
+		BrokerID:       "broker-one",
+		Workspaces:     []workspaceConfig{{ID: "pinned", Path: pinned}},
+		WorkspaceRoots: []string{root},
+	}
+	discovered := discoverWorkspacesUnderRoots(cfg)
+	if len(discovered) != 2 {
+		t.Fatalf("discovered = %#v, want alpha and group/beta only", discovered)
+	}
+	if discovered[0].Path != alpha || discovered[1].Path != nested {
+		t.Fatalf("discovered order = %#v", discovered)
+	}
+	if discovered[0].ID != "alpha" || discovered[1].ID != "group-beta" {
+		t.Fatalf("discovered IDs = %q, %q", discovered[0].ID, discovered[1].ID)
+	}
+	if discovered[0].RepositoryURL != "https://example.com/alpha.git" || discovered[1].RepositoryURL != "" {
+		t.Fatalf("discovered repositoryURLs = %q, %q", discovered[0].RepositoryURL, discovered[1].RepositoryURL)
+	}
+	if discovered[0].RunnerID != stableRunnerID("broker-one", "alpha", alpha) {
+		t.Fatalf("alpha runner ID = %q", discovered[0].RunnerID)
+	}
+	for _, workspace := range discovered {
+		if err := validateIdentifier("workspace id", workspace.ID); err != nil {
+			t.Fatalf("derived ID %q invalid: %v", workspace.ID, err)
+		}
+		if workspace.info == nil {
+			t.Fatalf("discovered workspace %q missing file info", workspace.ID)
+		}
+	}
+	again := discoverWorkspacesUnderRoots(cfg)
+	if len(again) != len(discovered) || again[0].RunnerID != discovered[0].RunnerID || again[1].RunnerID != discovered[1].RunnerID {
+		t.Fatal("discovery is not stable across scans")
+	}
+}
+
+func TestDiscoverWorkspacesUnderRootsIgnoresSymlinkEscapes(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "approved")
+	external := filepath.Join(base, "external")
+	for _, directory := range []string{root, external} {
+		if err := os.Mkdir(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	root, err := canonicalExistingDirectory(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	external, err = canonicalExistingDirectory(external)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initGitRepository(t, external)
+	if err := os.Symlink(external, filepath.Join(root, "external-repository")); err != nil {
+		t.Fatal(err)
+	}
+
+	discovered := discoverWorkspacesUnderRoots(&brokerConfig{BrokerID: "broker-one", WorkspaceRoots: []string{root}})
+	if len(discovered) != 0 {
+		t.Fatalf("discovered workspace outside approved root = %#v", discovered)
+	}
+	if canonicalPathWithinRoot(root, external) {
+		t.Fatalf("external repository %q classified beneath %q", external, root)
+	}
+}
+
+func TestDiscoverWorkspacesUnderRootsIncludesRootAndHonorsDepth(t *testing.T) {
+	t.Run("configured root", func(t *testing.T) {
+		root, err := canonicalExistingDirectory(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		initGitRepository(t, root)
+		discovered := discoverWorkspacesUnderRoots(&brokerConfig{BrokerID: "broker-one", WorkspaceRoots: []string{root}})
+		if len(discovered) != 1 || discovered[0].Path != root {
+			t.Fatalf("discovered root = %#v", discovered)
+		}
+	})
+
+	t.Run("explicit configured root", func(t *testing.T) {
+		root, err := canonicalExistingDirectory(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		initGitRepository(t, root)
+		child := filepath.Join(root, "nested")
+		if err := os.MkdirAll(child, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		initGitRepository(t, child)
+		discovered := discoverWorkspacesUnderRoots(&brokerConfig{
+			BrokerID:       "broker-one",
+			Workspaces:     []workspaceConfig{{ID: "explicit-root", Path: root}},
+			WorkspaceRoots: []string{root},
+		})
+		if len(discovered) != 1 || discovered[0].Path != child {
+			t.Fatalf("explicit-root discovery = %#v, want only %s", discovered, child)
+		}
+	})
+
+	t.Run("bounded depth", func(t *testing.T) {
+		root, err := canonicalExistingDirectory(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		depthThree := filepath.Join(root, "one", "two", "three")
+		depthFour := filepath.Join(root, "a", "b", "c", "four")
+		for _, repository := range []string{depthThree, depthFour} {
+			if err := os.MkdirAll(repository, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			initGitRepository(t, repository)
+		}
+		discovered := discoverWorkspacesUnderRoots(&brokerConfig{BrokerID: "broker-one", WorkspaceRoots: []string{root}})
+		if len(discovered) != 1 || discovered[0].Path != depthThree {
+			t.Fatalf("depth-bounded discovery = %#v, want only %s", discovered, depthThree)
+		}
+	})
+}
+
+func TestDiscoverWorkspacesUnderRootsHonorsTotalWorkspaceLimit(t *testing.T) {
+	root, err := canonicalExistingDirectory(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"alpha", "beta"} {
+		repository := filepath.Join(root, name)
+		if err := os.MkdirAll(repository, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		initGitRepository(t, repository)
+	}
+	workspaces := make([]workspaceConfig, workspaceLimit-1)
+	for index := range workspaces {
+		workspaces[index] = workspaceConfig{ID: fmt.Sprintf("explicit-%d", index), Path: fmt.Sprintf("/explicit/%d", index)}
+	}
+	cfg := &brokerConfig{BrokerID: "broker-one", Workspaces: workspaces, WorkspaceRoots: []string{root}}
+	if discovered := discoverWorkspacesUnderRoots(cfg); len(discovered) != 1 {
+		t.Fatalf("discovered workspaces = %d, want 1 with %d explicit workspaces", len(discovered), len(workspaces))
+	}
+	cfg.Workspaces = append(cfg.Workspaces, workspaceConfig{ID: "explicit-last", Path: "/explicit/last"})
+	if discovered := discoverWorkspacesUnderRoots(cfg); len(discovered) != 0 {
+		t.Fatalf("discovered workspaces = %d, want 0 at total limit", len(discovered))
+	}
+}
+
+func TestHeartbeatPayloadIncludesDiscoveredWorkspaces(t *testing.T) {
+	base := t.TempDir()
+	root, err := canonicalExistingDirectory(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository := filepath.Join(root, "laminar")
+	if err := os.MkdirAll(repository, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	initGitRepository(t, repository)
+	cfg := &brokerConfig{
+		BrokerID:       "broker-one",
+		Workspaces:     []workspaceConfig{{ID: "explicit", Path: "/workspace", RunnerID: "local-runner-explicit"}},
+		WorkspaceRoots: []string{root},
+	}
+	localBroker := &broker{config: cfg, children: map[childKey]*childProcess{}}
+	payload := localBroker.heartbeatPayload(false)
+	if len(payload.Runners) != 2 {
+		t.Fatalf("payload runners = %#v", payload.Runners)
+	}
+	var discoveredRunner *heartbeatRunner
+	for index := range payload.Runners {
+		if payload.Runners[index].WorkingDirectory == repository {
+			discoveredRunner = &payload.Runners[index]
+		}
+	}
+	if discoveredRunner == nil {
+		t.Fatalf("payload missing discovered runner: %#v", payload.Runners)
+	}
+	if discoveredRunner.RunningThreads == nil {
+		t.Fatal("discovered runner has nil runningThreads")
+	}
+	intents := []heartbeatIntent{}
+	runners := []heartbeatRunnerIntents{{RunnerID: discoveredRunner.RunnerID, Intents: &intents}}
+	if err := localBroker.validateHeartbeatResponse(heartbeatResponse{OK: true, Runners: &runners}); err != nil {
+		t.Fatalf("discovered runner rejected by response validation: %v", err)
+	}
+	if localBroker.workspaceByRunnerID(discoveredRunner.RunnerID) == nil {
+		t.Fatal("discovered runner not dispatchable")
+	}
+}
+
+func TestLoadConfigWorkspaceRoots(t *testing.T) {
+	fixture := newValidationFixture(t)
+	developerRoot := filepath.Join(fixture.home, "Developer", "projects")
+	if err := os.Mkdir(developerRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("roots only", func(t *testing.T) {
+		cfg := fixture.config
+		cfg.Workspaces = nil
+		cfg.WorkspaceRoots = []string{developerRoot}
+		loaded, err := loadConfig(fixture.writeConfig(t, cfg))
+		if err != nil {
+			t.Fatalf("loadConfig with roots only: %v", err)
+		}
+		if len(loaded.WorkspaceRoots) != 1 || loaded.WorkspaceRoots[0] == "" {
+			t.Fatalf("workspaceRoots = %#v", loaded.WorkspaceRoots)
+		}
+	})
+
+	t.Run("duplicate roots", func(t *testing.T) {
+		cfg := fixture.config
+		cfg.WorkspaceRoots = []string{developerRoot, developerRoot}
+		assertLoadConfigError(t, fixture.writeConfig(t, cfg), "duplicate workspaceRoot")
+	})
+
+	t.Run("missing root", func(t *testing.T) {
+		cfg := fixture.config
+		cfg.WorkspaceRoots = []string{filepath.Join(fixture.root, "absent")}
+		assertLoadConfigError(t, fixture.writeConfig(t, cfg), "workspaceRoot")
+	})
+
+	t.Run("broad root", func(t *testing.T) {
+		cfg := fixture.config
+		cfg.Workspaces = nil
+		cfg.WorkspaceRoots = []string{fixture.home}
+		path := fixture.writeConfig(t, cfg)
+		assertLoadConfigError(t, path, "use an explicit workspace with allowBroadRoot")
+	})
+
+	t.Run("empty workspaces and roots", func(t *testing.T) {
+		cfg := fixture.config
+		cfg.Workspaces = nil
+		cfg.WorkspaceRoots = nil
+		assertLoadConfigError(t, fixture.writeConfig(t, cfg), "must not be empty")
+	})
 }

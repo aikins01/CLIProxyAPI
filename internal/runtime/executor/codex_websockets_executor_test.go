@@ -103,6 +103,68 @@ func TestCodexWebsocketsExecutePreservesPreviousResponseIDUpstream(t *testing.T)
 	}
 }
 
+func TestCodexWebsocketsExecuteStreamTranslatesOpenAIResponsesRequest(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	capturedPayload := make(chan []byte, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Fatalf("upgrade websocket: %v", err)
+		}
+		defer func() { _ = conn.Close() }()
+
+		_, payload, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("read upstream websocket message: %v", err)
+		}
+		capturedPayload <- bytes.Clone(payload)
+		completed := []byte(`{"type":"response.completed","response":{"id":"resp-2","output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`)
+		if errWrite := conn.WriteMessage(websocket.TextMessage, completed); errWrite != nil {
+			t.Fatalf("write completed websocket message: %v", errWrite)
+		}
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5.6-sol",
+		Payload: []byte(`{"model":"gpt-5.6-sol","input":[{"role":"user","content":[{"type":"input_text","text":"hello"}]}],"max_output_tokens":128000,"prompt_cache_key":"T-live-thread","reasoning":{"effort":"high"},"tools":[{"type":"function","name":"read_file","description":"read a file","parameters":{"type":"object"}}],"stream":true}`),
+	}
+	result, err := exec.ExecuteStream(context.Background(), auth, req, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream error = %v", chunk.Err)
+		}
+	}
+
+	select {
+	case payload := <-capturedPayload:
+		if gjson.GetBytes(payload, "max_output_tokens").Exists() {
+			t.Fatalf("upstream request retained max_output_tokens: %s", payload)
+		}
+		if got := gjson.GetBytes(payload, "prompt_cache_key").String(); got != "T-live-thread" {
+			t.Fatalf("prompt_cache_key = %q, want T-live-thread", got)
+		}
+		if got := gjson.GetBytes(payload, "model").String(); got != "gpt-5.6-sol" {
+			t.Fatalf("model = %q, want gpt-5.6-sol", got)
+		}
+		if got := gjson.GetBytes(payload, "reasoning.effort").String(); got != "high" {
+			t.Fatalf("reasoning effort = %q, want high", got)
+		}
+		if got := gjson.GetBytes(payload, "tools.0.name").String(); got != "read_file" {
+			t.Fatalf("tool name = %q, want read_file", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for upstream websocket payload")
+	}
+}
+
 func TestCodexWebsocketsLocalNeoRequestDoesNotInjectImageGeneration(t *testing.T) {
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	capturedPayload := make(chan []byte, 1)
@@ -629,7 +691,7 @@ func TestApplyCodexWebsocketHeadersPreservesExplicitAPIKeyUserAgent(t *testing.T
 func TestApplyCodexPromptCacheHeadersSetsLowercaseSessionAndLegacyConversation(t *testing.T) {
 	req := cliproxyexecutor.Request{Model: "gpt-5-codex", Payload: []byte(`{"prompt_cache_key":"cache-1"}`)}
 
-	_, headers, _ := applyCodexPromptCacheHeaders("openai-response", req, []byte(`{"model":"gpt-5-codex"}`))
+	_, headers, _ := applyCodexPromptCacheHeaders(context.Background(), "openai-response", req, []byte(`{"model":"gpt-5-codex"}`))
 
 	if got := headerValueCaseInsensitive(headers, "session_id"); got != "cache-1" {
 		t.Fatalf("session_id = %s, want cache-1", got)

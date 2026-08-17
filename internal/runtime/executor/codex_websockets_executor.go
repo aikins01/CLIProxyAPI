@@ -203,13 +203,13 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("codex")
-	originalPayloadSource := req.Payload
-	if len(opts.OriginalRequest) > 0 {
-		originalPayloadSource = opts.OriginalRequest
-	}
-	originalPayload := originalPayloadSource
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, false)
 	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, false)
+	originalPayload := req.Payload
+	originalTranslated := bytes.Clone(body)
+	if len(opts.OriginalRequest) > 0 {
+		originalPayload = opts.OriginalRequest
+		originalTranslated = sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, false)
+	}
 
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -234,7 +234,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		return resp, err
 	}
 
-	body, wsHeaders, promptCacheID := applyCodexPromptCacheHeaders(from, req, body)
+	body, wsHeaders, promptCacheID := applyCodexPromptCacheHeaders(ctx, from, req, body)
 	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg)
 
 	var authID, authLabel, authType, authValue string
@@ -438,7 +438,13 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("codex")
-	body := req.Payload
+	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, true)
+	originalPayload := req.Payload
+	originalTranslated := bytes.Clone(body)
+	if len(opts.OriginalRequest) > 0 {
+		originalPayload = opts.OriginalRequest
+		originalTranslated = sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
+	}
 
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -447,7 +453,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
-	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, body, requestedModel, requestPath)
+	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel, requestPath)
 	body = normalizeCodexInstructions(body)
 	if shouldEnsureImageGenerationTool(ctx, e.cfg) {
 		body = ensureImageGenerationTool(body, baseModel, auth)
@@ -459,7 +465,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		return nil, err
 	}
 
-	body, wsHeaders, promptCacheID := applyCodexPromptCacheHeaders(from, req, body)
+	body, wsHeaders, promptCacheID := applyCodexPromptCacheHeaders(ctx, from, req, body)
 	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg)
 
 	var authID, authLabel, authType, authValue string
@@ -686,7 +692,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			}
 
 			line := encodeCodexWebsocketAsSSE(payload)
-			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, body, body, line, &param)
+			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalPayload, body, line, &param)
 			for i := range chunks {
 				if !send(cliproxyexecutor.StreamChunk{Payload: chunks[i]}) {
 					terminateReason = "context_done"
@@ -890,40 +896,23 @@ func buildCodexResponsesWebsocketURL(httpURL string) (string, error) {
 	return parsed.String(), nil
 }
 
-func applyCodexPromptCacheHeaders(from sdktranslator.Format, req cliproxyexecutor.Request, rawJSON []byte) ([]byte, http.Header, string) {
+func applyCodexPromptCacheHeaders(ctx context.Context, from sdktranslator.Format, req cliproxyexecutor.Request, rawJSON []byte) ([]byte, http.Header, string) {
 	headers := http.Header{}
 	if len(rawJSON) == 0 {
 		return rawJSON, headers, ""
 	}
 
-	var cache helps.CodexCache
-	if from == "claude" {
-		userIDResult := gjson.GetBytes(req.Payload, "metadata.user_id")
-		if userIDResult.Exists() {
-			key := fmt.Sprintf("%s-%s", req.Model, userIDResult.String())
-			if cached, ok := helps.GetCodexCache(key); ok {
-				cache = cached
-			} else {
-				cache = helps.CodexCache{
-					ID:     uuid.New().String(),
-					Expire: time.Now().Add(1 * time.Hour),
-				}
-				helps.SetCodexCache(key, cache)
-			}
-		}
-	} else if from == "openai-response" {
-		if promptCacheKey := gjson.GetBytes(req.Payload, "prompt_cache_key"); promptCacheKey.Exists() {
-			cache.ID = promptCacheKey.String()
+	cacheID := codexPromptCacheID(ctx, from, req)
+
+	if cacheID != "" {
+		rawJSON, _ = sjson.SetBytes(rawJSON, "prompt_cache_key", cacheID)
+		setHeaderCasePreserved(headers, "session_id", cacheID)
+		if from != "openai" {
+			headers.Set("Conversation_id", cacheID)
 		}
 	}
 
-	if cache.ID != "" {
-		rawJSON, _ = sjson.SetBytes(rawJSON, "prompt_cache_key", cache.ID)
-		setHeaderCasePreserved(headers, "session_id", cache.ID)
-		headers.Set("Conversation_id", cache.ID)
-	}
-
-	return rawJSON, headers, cache.ID
+	return rawJSON, headers, cacheID
 }
 
 func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *cliproxyauth.Auth, token string, cfg *config.Config) http.Header {

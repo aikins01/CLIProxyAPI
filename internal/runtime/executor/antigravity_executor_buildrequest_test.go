@@ -4,10 +4,36 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net/http"
 	"testing"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
+
+func TestNewAntigravityHTTPClientPreservesHTTP11WithCachedProxyTransport(t *testing.T) {
+	cfg := &config.Config{SDKConfig: config.SDKConfig{ProxyURL: "http://proxy.example.com:8080"}}
+
+	client := newAntigravityHTTPClient(context.Background(), cfg, nil, 0)
+
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport type = %T, want *http.Transport", client.Transport)
+	}
+	if transport.ForceAttemptHTTP2 {
+		t.Fatal("expected HTTP/2 to remain disabled")
+	}
+	if transport.TLSClientConfig == nil || len(transport.TLSClientConfig.NextProtos) != 1 || transport.TLSClientConfig.NextProtos[0] != "http/1.1" {
+		t.Fatalf("TLS ALPN protocols = %#v, want [http/1.1]", transport.TLSClientConfig)
+	}
+	if transport.Proxy == nil {
+		t.Fatal("expected configured proxy to be preserved")
+	}
+	second := newAntigravityHTTPClient(context.Background(), cfg, nil, 0)
+	if second.Transport != transport {
+		t.Fatal("expected proxied HTTP/1.1 transport to be reused")
+	}
+}
 
 func TestAntigravityBuildRequest_SanitizesGeminiToolSchema(t *testing.T) {
 	body := buildRequestBodyFromPayload(t, "gemini-2.5-pro")

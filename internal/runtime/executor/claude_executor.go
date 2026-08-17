@@ -79,7 +79,10 @@ var oauthToolsToRemove = map[string]bool{}
 
 // Anthropic-compatible upstreams may reject or even crash when Claude models
 // omit max_tokens. Prefer registered model metadata before using a fallback.
-const defaultModelMaxTokens = 1024
+const (
+	defaultModelMaxTokens       = 1024
+	maxClaudeCacheControlBlocks = 4
+)
 
 func NewClaudeExecutor(cfg *config.Config) *ClaudeExecutor { return &ClaudeExecutor{cfg: cfg} }
 
@@ -175,15 +178,12 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	body = disableThinkingIfToolChoiceForced(body)
 	body = normalizeClaudeTemperatureForThinking(body)
 
-	// Auto-inject cache_control if missing (optimization for ClawdBot/clients without caching support)
-	if countCacheControls(body) == 0 {
-		body = ensureCacheControl(body)
-	}
+	body = ensureCacheControl(body)
 
 	// Enforce Anthropic's cache_control block limit (max 4 breakpoints per request).
 	// Cloaking and ensureCacheControl may push the total over 4 when the client
 	// (e.g. Amp CLI) already sends multiple cache_control blocks.
-	body = enforceCacheControlLimit(body, 4)
+	body = enforceCacheControlLimit(body, maxClaudeCacheControlBlocks)
 
 	// Normalize TTL values to prevent ordering violations under prompt-caching-scope-2026-01-05.
 	// A 1h-TTL block must not appear after a 5m-TTL block in evaluation order (tools→system→messages).
@@ -354,13 +354,10 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	body = disableThinkingIfToolChoiceForced(body)
 	body = normalizeClaudeTemperatureForThinking(body)
 
-	// Auto-inject cache_control if missing (optimization for ClawdBot/clients without caching support)
-	if countCacheControls(body) == 0 {
-		body = ensureCacheControl(body)
-	}
+	body = ensureCacheControl(body)
 
 	// Enforce Anthropic's cache_control block limit (max 4 breakpoints per request).
-	body = enforceCacheControlLimit(body, 4)
+	body = enforceCacheControlLimit(body, maxClaudeCacheControlBlocks)
 
 	// Normalize TTL values to prevent ordering violations under prompt-caching-scope-2026-01-05.
 	body = normalizeCacheControlTTL(body)
@@ -613,7 +610,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	}
 
 	// Keep count_tokens requests compatible with Anthropic cache-control constraints too.
-	body = enforceCacheControlLimit(body, 4)
+	body = enforceCacheControlLimit(body, maxClaudeCacheControlBlocks)
 	body = normalizeCacheControlTTL(body)
 
 	// Extract betas from body and convert to header (for count_tokens too)
@@ -1905,19 +1902,54 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 // This enables up to 90% cost reduction on cached tokens (cache read = 0.1x base price).
 // See: https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching
 func ensureCacheControl(payload []byte) []byte {
-	// 1. Inject cache_control into the LAST tool (caches all tool definitions)
-	// Tools are cached first in the hierarchy, so this is the most important breakpoint.
-	payload = injectToolsCacheControl(payload)
-
-	// 2. Inject cache_control into the LAST system prompt element
-	// System is the second level in the cache hierarchy.
-	payload = injectSystemCacheControl(payload)
-
-	// 3. Inject cache_control into messages for multi-turn conversation caching
-	// This caches the conversation history up to the second-to-last user turn.
-	payload = injectMessagesCacheControl(payload)
+	if countCacheControls(payload) < maxClaudeCacheControlBlocks {
+		payload = injectToolsCacheControl(payload)
+	}
+	if countCacheControls(payload) < maxClaudeCacheControlBlocks {
+		payload = injectSystemCacheControl(payload)
+	}
+	if countCacheControls(payload) < maxClaudeCacheControlBlocks {
+		payload = injectMessagesCacheControl(payload)
+	}
 
 	return payload
+}
+
+func injectedCacheControl(payload []byte) map[string]string {
+	cacheControl := map[string]string{"type": "ephemeral"}
+	foundOneHour := false
+	visit := func(block gjson.Result) bool {
+		if block.Get("cache_control.ttl").String() == "1h" {
+			foundOneHour = true
+			return false
+		}
+		return true
+	}
+	for _, section := range []string{"tools", "system"} {
+		items := gjson.GetBytes(payload, section)
+		if items.IsArray() {
+			items.ForEach(func(_, item gjson.Result) bool { return visit(item) })
+		}
+		if foundOneHour {
+			break
+		}
+	}
+	if !foundOneHour {
+		messages := gjson.GetBytes(payload, "messages")
+		if messages.IsArray() {
+			messages.ForEach(func(_, message gjson.Result) bool {
+				content := message.Get("content")
+				if content.IsArray() {
+					content.ForEach(func(_, item gjson.Result) bool { return visit(item) })
+				}
+				return !foundOneHour
+			})
+		}
+	}
+	if foundOneHour {
+		cacheControl["ttl"] = "1h"
+	}
+	return cacheControl
 }
 
 func countCacheControls(payload []byte) int {
@@ -2284,7 +2316,7 @@ func injectMessagesCacheControl(payload []byte) []byte {
 		contentCount := int(content.Get("#").Int())
 		if contentCount > 0 {
 			cacheControlPath := fmt.Sprintf("messages.%d.content.%d.cache_control", secondToLastUserIdx, contentCount-1)
-			result, err := sjson.SetBytes(payload, cacheControlPath, map[string]string{"type": "ephemeral"})
+			result, err := sjson.SetBytes(payload, cacheControlPath, injectedCacheControl(payload))
 			if err != nil {
 				log.Warnf("failed to inject cache_control into messages: %v", err)
 				return payload
@@ -2296,11 +2328,9 @@ func injectMessagesCacheControl(payload []byte) []byte {
 		text := content.String()
 		newContent := []map[string]interface{}{
 			{
-				"type": "text",
-				"text": text,
-				"cache_control": map[string]string{
-					"type": "ephemeral",
-				},
+				"type":          "text",
+				"text":          text,
+				"cache_control": injectedCacheControl(payload),
 			},
 		}
 		result, err := sjson.SetBytes(payload, contentPath, newContent)
@@ -2343,7 +2373,7 @@ func injectToolsCacheControl(payload []byte) []byte {
 
 	// Add cache_control to the last tool
 	lastToolPath := fmt.Sprintf("tools.%d.cache_control", toolCount-1)
-	result, err := sjson.SetBytes(payload, lastToolPath, map[string]string{"type": "ephemeral"})
+	result, err := sjson.SetBytes(payload, lastToolPath, injectedCacheControl(payload))
 	if err != nil {
 		log.Warnf("failed to inject cache_control into tools array: %v", err)
 		return payload
@@ -2382,7 +2412,7 @@ func injectSystemCacheControl(payload []byte) []byte {
 
 		// Add cache_control to the last system element
 		lastSystemPath := fmt.Sprintf("system.%d.cache_control", count-1)
-		result, err := sjson.SetBytes(payload, lastSystemPath, map[string]string{"type": "ephemeral"})
+		result, err := sjson.SetBytes(payload, lastSystemPath, injectedCacheControl(payload))
 		if err != nil {
 			log.Warnf("failed to inject cache_control into system array: %v", err)
 			return payload
@@ -2394,11 +2424,9 @@ func injectSystemCacheControl(payload []byte) []byte {
 		text := system.String()
 		newSystem := []map[string]interface{}{
 			{
-				"type": "text",
-				"text": text,
-				"cache_control": map[string]string{
-					"type": "ephemeral",
-				},
+				"type":          "text",
+				"text":          text,
+				"cache_control": injectedCacheControl(payload),
 			},
 		}
 		result, err := sjson.SetBytes(payload, "system", newSystem)

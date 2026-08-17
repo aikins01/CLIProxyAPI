@@ -78,6 +78,17 @@ func TestNeoActorRunsTopLevelThreadToolsLocallyWhenExecutorOmitsThem(t *testing.
 	}
 }
 
+func TestNeoCreateThreadToolSchemaOmitsUnsupportedShow(t *testing.T) {
+	spec, ok := neoThreadToolSpec("create_thread")
+	properties := mapValue(spec.InputSchema["properties"])
+	if !ok || properties == nil {
+		t.Fatalf("create_thread spec = %#v, ok=%v", spec, ok)
+	}
+	if _, exists := properties["show"]; exists {
+		t.Fatalf("create_thread schema advertises unsupported show: %#v", properties["show"])
+	}
+}
+
 func TestNeoPuckWithoutExecutorExposesOnlyRunnableServerTools(t *testing.T) {
 	useTempNeoThreadStore(t)
 	rt := newNeoRuntime(&config.Config{})
@@ -1498,6 +1509,36 @@ func TestNeoCreateThreadRejectsStaleInheritedRunner(t *testing.T) {
 	}
 }
 
+func TestNeoCreateThreadRebindsStaleInheritedRunner(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	ownerID := "user-create-thread-rebind"
+	workingDirectory := t.TempDir()
+	userActor, _, allowed := rt.store.upsertForOwner(map[string]any{"name": "userActor", "key": ownerID}, true, ownerID)
+	if !allowed || userActor == nil {
+		t.Fatal("owner user actor was not created")
+	}
+	heartbeat := neoLocalBrokerHeartbeatForTest("broker-create-thread-rebind", "session-1", 1, "runner-current", workingDirectory, nil)
+	if _, err := userActor.syncLocalBrokerHeartbeat(heartbeat); err != nil {
+		t.Fatal(err)
+	}
+	parent := rt.store.ensureThreadActor("T-019f7000-0000-7000-8000-000000000023")
+	parent.mu.Lock()
+	parent.bootstrapExecutorType = "local-client"
+	parent.meta["ownerUserId"] = ownerID
+	parent.meta["runnerId"] = "runner-retired"
+	parent.environment = neoEnvironmentWithResolvedWorkingDirectory(nil, workingDirectory)
+	parent.mu.Unlock()
+
+	body, runnerID, _, err := parent.localCreateThreadBody(nil, "T-019f7000-0000-7000-8000-000000000024")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runnerID != "runner-current" || stringValue(mapValue(body["threadMeta"])["runnerId"]) != "runner-current" {
+		t.Fatalf("rebound create_thread body = runner:%q body:%#v", runnerID, body)
+	}
+}
+
 func TestNeoThreadFileToolsCopyWithinLocalWorkspaces(t *testing.T) {
 	useTempNeoThreadStore(t)
 	rt := newNeoRuntime(&config.Config{})
@@ -1973,7 +2014,7 @@ func TestNeoCreateThreadOrbExecutor(t *testing.T) {
 	rt := newNeoRuntime(&config.Config{})
 	parent := rt.store.ensureThreadActor("T-019f7000-0000-7000-8000-000000000040")
 	parent.updateEnvironment(map[string]any{"workingDirectory": neoExistingDirectory(t.TempDir())})
-	input := map[string]any{"executor": map[string]any{"type": "orb"}}
+	input := map[string]any{"executor": map[string]any{"type": "orb"}, "multiplayerTTLSeconds": float64(neoThreadOpenTTLMinSeconds)}
 	if _, _, _, err := parent.localCreateThreadBody(input, "T-019f7000-0000-7000-8000-000000000041"); err == nil || !strings.Contains(err.Error(), "orb executors are not enabled") {
 		t.Fatalf("disabled orbs create_thread error = %v", err)
 	}
@@ -1993,6 +2034,9 @@ func TestNeoCreateThreadOrbExecutor(t *testing.T) {
 	meta := mapValue(body["threadMeta"])
 	if stringValue(body["executorType"]) != "sandbox" || stringValue(meta["executorType"]) != "sandbox" {
 		t.Fatalf("orb executorType = %#v", body)
+	}
+	if numberFrom(body["multiplayerTTLSeconds"]) != neoThreadOpenTTLMinSeconds {
+		t.Fatalf("orb multiplayerTTLSeconds = %#v", body)
 	}
 	if stringValue(body["workingDirectory"]) != "" || stringValue(meta["repositoryURL"]) != "https://github.com/example/project.git" {
 		t.Fatalf("orb inherited host directory instead of repository metadata: %#v", body)

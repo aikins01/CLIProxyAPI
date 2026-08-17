@@ -56,6 +56,7 @@ const (
 	antigravityCreditsHintRefreshTimeout   = 5 * time.Second
 	antigravityShortQuotaCooldownThreshold = 5 * time.Minute
 	antigravityInstantRetryThreshold       = 3 * time.Second
+	antigravityTransportCacheLimit         = 32
 	// systemInstruction              = "You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.You are pair programming with a USER to solve their coding task. The task may require creating a new codebase, modifying or debugging an existing codebase, or simply answering a question.**Absolute paths only****Proactiveness**"
 )
 
@@ -188,8 +189,11 @@ func NewAntigravityExecutor(cfg *config.Config) *AntigravityExecutor {
 // It is initialized once via antigravityTransportOnce to avoid leaking a new connection pool
 // (and the goroutines managing it) on every request.
 var (
-	antigravityTransport     *http.Transport
-	antigravityTransportOnce sync.Once
+	antigravityTransport           *http.Transport
+	antigravityTransportOnce       sync.Once
+	antigravityTransportCacheMu    sync.Mutex
+	antigravityTransportCache      = make(map[*http.Transport]*http.Transport)
+	antigravityTransportCacheOrder []*http.Transport
 )
 
 func cloneTransportWithHTTP11(base *http.Transport) *http.Transport {
@@ -220,9 +224,42 @@ func initAntigravityTransport() {
 	antigravityTransport = cloneTransportWithHTTP11(base)
 }
 
+func cachedAntigravityHTTP11Transport(base *http.Transport) *http.Transport {
+	antigravityTransportCacheMu.Lock()
+	if cached := antigravityTransportCache[base]; cached != nil {
+		for i, cachedBase := range antigravityTransportCacheOrder {
+			if cachedBase != base {
+				continue
+			}
+			copy(antigravityTransportCacheOrder[i:], antigravityTransportCacheOrder[i+1:])
+			antigravityTransportCacheOrder[len(antigravityTransportCacheOrder)-1] = base
+			break
+		}
+		antigravityTransportCacheMu.Unlock()
+		return cached
+	}
+
+	var evicted *http.Transport
+	if len(antigravityTransportCache) >= antigravityTransportCacheLimit {
+		evictBase := antigravityTransportCacheOrder[0]
+		antigravityTransportCacheOrder = antigravityTransportCacheOrder[1:]
+		evicted = antigravityTransportCache[evictBase]
+		delete(antigravityTransportCache, evictBase)
+	}
+	cached := cloneTransportWithHTTP11(base)
+	antigravityTransportCache[base] = cached
+	antigravityTransportCacheOrder = append(antigravityTransportCacheOrder, base)
+	antigravityTransportCacheMu.Unlock()
+
+	if evicted != nil {
+		evicted.CloseIdleConnections()
+	}
+	return cached
+}
+
 // newAntigravityHTTPClient creates an HTTP client specifically for Antigravity,
 // enforcing HTTP/1.1 by disabling HTTP/2 to perfectly mimic Node.js https defaults.
-// The underlying Transport is a singleton to avoid leaking connection pools.
+// The underlying transports are reused to avoid leaking connection pools.
 func newAntigravityHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) *http.Client {
 	antigravityTransportOnce.Do(initAntigravityTransport)
 
@@ -234,8 +271,8 @@ func newAntigravityHTTPClient(ctx context.Context, cfg *config.Config, auth *cli
 	}
 
 	// Preserve proxy settings from proxy-aware transports while forcing HTTP/1.1.
-	if transport, ok := client.Transport.(*http.Transport); ok {
-		client.Transport = cloneTransportWithHTTP11(transport)
+	if transport, ok := helps.UnwrapCachedRoundTripper(client.Transport).(*http.Transport); ok {
+		client.Transport = cachedAntigravityHTTP11Transport(transport)
 	}
 	return client
 }

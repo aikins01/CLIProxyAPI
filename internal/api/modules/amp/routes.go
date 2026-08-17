@@ -18,6 +18,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/orbconfig"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/orbcredentials"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers/claude"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers/gemini"
@@ -362,6 +364,8 @@ func requestAddrIP(addr string) net.IP {
 func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *handlers.BaseAPIHandler, auth gin.HandlerFunc) {
 	engine.GET("/ampcode/local-inference.user.js", m.serveWebLocalInferenceUserscript)
 	engine.HEAD("/ampcode/local-inference.user.js", m.serveWebLocalInferenceUserscript)
+	engine.GET("/ampcode/attachment-view/:token", noCORSMiddleware(), m.localhostOnlyMiddleware(), m.serveNeoAttachmentView)
+	engine.HEAD("/ampcode/attachment-view/:token", noCORSMiddleware(), m.localhostOnlyMiddleware(), m.serveNeoAttachmentView)
 
 	ampAPI := engine.Group("/api")
 
@@ -426,6 +430,9 @@ func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *ha
 		}
 		m.attachNeoLocalThreadDelete(c.Request)
 		m.attachNeoLocalThreadListAugmenter(c.Request)
+		if m.tryProxyAmpAttachmentUpload(c, proxy) {
+			return
+		}
 		proxy.ServeHTTP(c.Writer, c.Request)
 	}
 
@@ -478,6 +485,10 @@ func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *ha
 	}
 	localBrokerMiddleware = append(localBrokerMiddleware, clientAPIKeyMiddleware())
 	engine.Any("/ampcode/local-broker/heartbeat.json", append(localBrokerMiddleware, m.serveLocalBrokerHeartbeat)...)
+	engine.Any(neoLocalBrokerControlEndpointPath, append(localBrokerMiddleware, m.serveLocalBrokerControl)...)
+	engine.Any("/ampcode/local-broker/publish-image-result.json", append(localBrokerMiddleware, m.serveLocalBrokerPublishImageResult)...)
+	engine.Any(orbconfig.EndpointPath, append(localBrokerMiddleware, m.serveLocalBrokerOrbConfigBundle)...)
+	engine.Any(orbcredentials.EndpointPath, append(localBrokerMiddleware, m.serveLocalBrokerOrbCredentials)...)
 	engine.Any("/ampcode/local-projects.json", append(localProjectMiddleware, m.serveWebLocalProjects)...)
 	engine.Any("/ampcode/local-project-details.json", append(localProjectMiddleware, m.serveWebLocalProjectDetails)...)
 	engine.Any("/ampcode/local-activity.json", append(localProjectMiddleware, m.serveWebLocalActivity)...)
@@ -556,6 +567,89 @@ func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *ha
 		// Non-POST or no local provider available -> proxy upstream
 		proxyHandler(c)
 	})
+}
+
+func (m *AmpModule) tryProxyAmpAttachmentUpload(c *gin.Context, proxy *httputil.ReverseProxy) bool {
+	if c == nil || c.Request == nil || c.Request.URL == nil || proxy == nil || c.Request.Method != http.MethodPost || !requestHasAmpClientHeaders(c.Request) {
+		return false
+	}
+	requestPath := "/" + strings.Trim(c.Request.URL.Path, "/")
+	if requestPath != "/api/attachments" && requestPath != "/api/attachments/resumable" {
+		return false
+	}
+	trustedRequest := c.Request.Clone(c.Request.Context())
+	trustedRequest.Header.Del("X-Forwarded-Host")
+	trustedRequest.Header.Del("X-Forwarded-Proto")
+	localOrigin := neoAttachmentViewBaseURL(neoLocalAttachmentBaseURL(trustedRequest))
+	if localOrigin == "" {
+		return false
+	}
+	attachmentProxy := *proxy
+	originalModifyResponse := proxy.ModifyResponse
+	attachmentProxy.ModifyResponse = func(resp *http.Response) error {
+		if originalModifyResponse != nil {
+			if err := originalModifyResponse(resp); err != nil {
+				return err
+			}
+		}
+		return rewriteAmpAttachmentUploadResponse(resp, localOrigin)
+	}
+	attachmentProxy.ServeHTTP(c.Writer, c.Request)
+	return true
+}
+
+const ampAttachmentUploadResponseLimit = 64 * 1024
+
+func rewriteAmpAttachmentUploadResponse(resp *http.Response, localOrigin string) error {
+	if resp == nil || resp.Body == nil || resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices || strings.TrimSpace(resp.Header.Get("Content-Encoding")) != "" {
+		return nil
+	}
+	if resp.ContentLength > ampAttachmentUploadResponseLimit {
+		return nil
+	}
+	originalBody := resp.Body
+	body, err := io.ReadAll(io.LimitReader(originalBody, ampAttachmentUploadResponseLimit+1))
+	if err != nil || len(body) > ampAttachmentUploadResponseLimit {
+		resp.Body = struct {
+			io.Reader
+			io.Closer
+		}{Reader: io.MultiReader(bytes.NewReader(body), originalBody), Closer: originalBody}
+		return nil
+	}
+	if errClose := originalBody.Close(); errClose != nil {
+		log.Debugf("amp attachment upload response close failed: %v", errClose)
+	}
+	replaceAmpProxyResponseBody(resp, body)
+
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil
+	}
+	var rawURL string
+	if err := json.Unmarshal(payload["url"], &rawURL); err != nil || !neoAmpHostedAttachmentURL(rawURL) {
+		return nil
+	}
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return nil
+	}
+	base, err := url.Parse(localOrigin)
+	if err != nil {
+		return nil
+	}
+	parsed.Scheme = base.Scheme
+	parsed.Host = base.Host
+	parsed.User = nil
+	payload["url"], err = json.Marshal(parsed.String())
+	if err != nil {
+		return err
+	}
+	rewritten, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	replaceAmpProxyResponseBody(resp, rewritten)
+	return nil
 }
 
 func (m *AmpModule) attachNeoLocalThreadDelete(req *http.Request) {
