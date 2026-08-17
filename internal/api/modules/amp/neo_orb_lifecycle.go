@@ -44,20 +44,21 @@ const (
 )
 
 type neoOrbLifecycleGeneration struct {
-	ThreadID             string `json:"threadId"`
-	Generation           uint64 `json:"generation"`
-	ContainerID          string `json:"containerId"`
-	ContainerName        string `json:"containerName"`
-	PortalToken          string `json:"portalToken"`
-	HomeVolumeName       string `json:"homeVolumeName"`
-	RootVolumeName       string `json:"rootVolumeName"`
-	Phase                string `json:"phase"`
-	CreatedAt            string `json:"createdAt"`
-	AuthenticatedOwnerID string `json:"authenticatedOwnerId,omitempty"`
-	Revision             uint64 `json:"revision,omitempty"`
-	ActivationState      string `json:"activationState,omitempty"`
-	OperationID          string `json:"operationId,omitempty"`
-	OperationKind        string `json:"operationKind,omitempty"`
+	ThreadID              string `json:"threadId"`
+	Generation            uint64 `json:"generation"`
+	ContainerID           string `json:"containerId"`
+	ContainerName         string `json:"containerName"`
+	PortalToken           string `json:"portalToken"`
+	HomeVolumeName        string `json:"homeVolumeName"`
+	RootVolumeName        string `json:"rootVolumeName"`
+	Phase                 string `json:"phase"`
+	CreatedAt             string `json:"createdAt"`
+	AuthenticatedOwnerID  string `json:"authenticatedOwnerId,omitempty"`
+	Revision              uint64 `json:"revision,omitempty"`
+	ActivationState       string `json:"activationState,omitempty"`
+	OperationID           string `json:"operationId,omitempty"`
+	OperationKind         string `json:"operationKind,omitempty"`
+	MultiplayerTTLSeconds int    `json:"multiplayerTTLSeconds,omitempty"`
 }
 
 type neoOrbLifecycleActivation struct {
@@ -373,12 +374,22 @@ func (store *neoOrbLifecycleStore) prepareMutationLocked() error {
 	return nil
 }
 
-func (store *neoOrbLifecycleStore) reserveGeneration(threadID, portalToken string) (neoOrbLifecycleGeneration, error) {
+func (store *neoOrbLifecycleStore) reserveGeneration(threadID, portalToken string, multiplayerTTL ...int) (neoOrbLifecycleGeneration, error) {
 	if !neoThreadIDExactPattern.MatchString(threadID) || len(threadID) > 180 {
 		return neoOrbLifecycleGeneration{}, errors.New("orb lifecycle thread is invalid")
 	}
 	if !neoOrbLifecycleSafeValue(portalToken, 256) {
 		return neoOrbLifecycleGeneration{}, errors.New("orb lifecycle portal token is invalid")
+	}
+	multiplayerTTLSeconds := 0
+	if len(multiplayerTTL) > 1 {
+		return neoOrbLifecycleGeneration{}, errors.New("orb lifecycle multiplayer TTL is invalid")
+	}
+	if len(multiplayerTTL) == 1 {
+		multiplayerTTLSeconds = multiplayerTTL[0]
+		if multiplayerTTLSeconds != 0 && (multiplayerTTLSeconds < neoThreadOpenTTLMinSeconds || multiplayerTTLSeconds > neoThreadOpenTTLMaxSeconds) {
+			return neoOrbLifecycleGeneration{}, errors.New("orb lifecycle multiplayer TTL is invalid")
+		}
 	}
 	store.mu.Lock()
 	defer store.mu.Unlock()
@@ -402,14 +413,15 @@ func (store *neoOrbLifecycleStore) reserveGeneration(threadID, portalToken strin
 	generation := maximum + 1
 	containerName, homeVolumeName, rootVolumeName := neoOrbLifecycleResourceNames(store.state.OwnerID, threadID, generation)
 	pending := neoOrbLifecycleGeneration{
-		ThreadID:       threadID,
-		Generation:     generation,
-		ContainerName:  containerName,
-		PortalToken:    portalToken,
-		HomeVolumeName: homeVolumeName,
-		RootVolumeName: rootVolumeName,
-		Phase:          neoOrbLifecyclePhasePending,
-		CreatedAt:      store.now().UTC().Format(time.RFC3339Nano),
+		ThreadID:              threadID,
+		Generation:            generation,
+		ContainerName:         containerName,
+		PortalToken:           portalToken,
+		HomeVolumeName:        homeVolumeName,
+		RootVolumeName:        rootVolumeName,
+		Phase:                 neoOrbLifecyclePhasePending,
+		CreatedAt:             store.now().UTC().Format(time.RFC3339Nano),
+		MultiplayerTTLSeconds: multiplayerTTLSeconds,
 	}
 	previous := cloneNeoOrbLifecycleState(store.state)
 	record.Pending = &pending
@@ -876,6 +888,9 @@ func validateNeoOrbLifecycleState(state neoOrbLifecycleState) error {
 		if !neoOrbLifecycleSafeValue(generation.PortalToken, 256) {
 			return errors.New("orb lifecycle portal token is invalid")
 		}
+		if generation.MultiplayerTTLSeconds != 0 && (generation.MultiplayerTTLSeconds < neoThreadOpenTTLMinSeconds || generation.MultiplayerTTLSeconds > neoThreadOpenTTLMaxSeconds) {
+			return errors.New("orb lifecycle multiplayer TTL is invalid")
+		}
 		createdAt, err := time.Parse(time.RFC3339Nano, generation.CreatedAt)
 		if err != nil || createdAt.UTC().Format(time.RFC3339Nano) != generation.CreatedAt {
 			return errors.New("orb lifecycle creation timestamp is invalid")
@@ -986,6 +1001,7 @@ func neoOrbLifecyclePendingMatches(pending, candidate neoOrbLifecycleGeneration)
 		pending.PortalToken == candidate.PortalToken &&
 		pending.HomeVolumeName == candidate.HomeVolumeName &&
 		pending.RootVolumeName == candidate.RootVolumeName &&
+		pending.MultiplayerTTLSeconds == candidate.MultiplayerTTLSeconds &&
 		pending.Phase == candidate.Phase &&
 		pending.CreatedAt == candidate.CreatedAt
 }

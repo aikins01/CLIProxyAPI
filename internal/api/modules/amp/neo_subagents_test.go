@@ -34,6 +34,13 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 )
 
+func neoGitTestCommand(dir string, args ...string) *exec.Cmd {
+	command := exec.Command("git", args...)
+	command.Dir = dir
+	command.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_SYSTEM="+os.DevNull, "GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_TERMINAL_PROMPT=0")
+	return command
+}
+
 func TestNeoSubagentRegistryMatchesLocalContract(t *testing.T) {
 	cases := []struct {
 		tool     string
@@ -3949,7 +3956,7 @@ func TestNeoActorPrepareRunCheckCapturesImmutableSnapshot(t *testing.T) {
 	repository := t.TempDir()
 	runGit := func(args ...string) {
 		t.Helper()
-		command := exec.Command("git", args...)
+		command := neoGitTestCommand("", args...)
 		command.Dir = repository
 		if output, err := command.CombinedOutput(); err != nil {
 			t.Fatalf("git %v: %v\n%s", args, err, output)
@@ -4079,7 +4086,7 @@ func TestNeoActorReviewSnapshotCapturesNaturalDescriptionWithFiles(t *testing.T)
 	repository := t.TempDir()
 	runGit := func(args ...string) {
 		t.Helper()
-		command := exec.Command("git", args...)
+		command := neoGitTestCommand("", args...)
 		command.Dir = repository
 		if output, err := command.CombinedOutput(); err != nil {
 			t.Fatalf("git %v: %v\n%s", args, err, output)
@@ -5765,7 +5772,7 @@ func TestNeoCaptureReviewWorkingTreeSnapshotForFiles(t *testing.T) {
 	repository := t.TempDir()
 	runGit := func(args ...string) {
 		t.Helper()
-		command := exec.Command("git", args...)
+		command := neoGitTestCommand("", args...)
 		command.Dir = repository
 		if output, err := command.CombinedOutput(); err != nil {
 			t.Fatalf("git %v: %v\n%s", args, err, output)
@@ -5837,7 +5844,7 @@ func TestNeoReviewSnapshotUsesExecutorWorktree(t *testing.T) {
 	repository := t.TempDir()
 	runGit := func(args ...string) {
 		t.Helper()
-		command := exec.Command("git", args...)
+		command := neoGitTestCommand("", args...)
 		command.Dir = repository
 		if output, err := command.CombinedOutput(); err != nil {
 			t.Fatalf("git %v: %v\n%s", args, err, output)
@@ -6232,7 +6239,7 @@ func TestNeoReviewExecutorSnapshotMatchesLocalCapture(t *testing.T) {
 	}
 	runGit := func(args ...string) {
 		t.Helper()
-		command := exec.Command("git", args...)
+		command := neoGitTestCommand("", args...)
 		command.Dir = repository
 		if output, err := command.CombinedOutput(); err != nil {
 			t.Fatalf("git %v: %v\n%s", args, err, output)
@@ -6286,7 +6293,7 @@ func TestNeoReviewExecutorSnapshotPrefixesSubdirectoryWorkingTreeScope(t *testin
 	}
 	runGit := func(args ...string) {
 		t.Helper()
-		command := exec.Command("git", args...)
+		command := neoGitTestCommand("", args...)
 		command.Dir = repository
 		if output, err := command.CombinedOutput(); err != nil {
 			t.Fatalf("git %v: %v\n%s", args, err, output)
@@ -6335,7 +6342,7 @@ func TestNeoReviewExecutorSnapshotPreservesWorktreeMetadata(t *testing.T) {
 	repository := t.TempDir()
 	runGit := func(args ...string) {
 		t.Helper()
-		command := exec.Command("git", args...)
+		command := neoGitTestCommand("", args...)
 		command.Dir = repository
 		if output, err := command.CombinedOutput(); err != nil {
 			t.Fatalf("git %v: %v\n%s", args, err, output)
@@ -6398,7 +6405,7 @@ func TestNeoReviewExecutorSnapshotRunsUnderBinShWithArbitraryFilenames(t *testin
 	repository := t.TempDir()
 	runGit := func(args ...string) {
 		t.Helper()
-		command := exec.Command("git", args...)
+		command := neoGitTestCommand("", args...)
 		command.Dir = repository
 		if output, err := command.CombinedOutput(); err != nil {
 			t.Fatalf("git %v: %v\n%s", args, err, output)
@@ -6457,7 +6464,7 @@ func TestNeoReviewExecutorSnapshotCompressesLargeOutputDeterministically(t *test
 	repository := t.TempDir()
 	runGit := func(args ...string) {
 		t.Helper()
-		command := exec.Command("git", args...)
+		command := neoGitTestCommand("", args...)
 		command.Dir = repository
 		if output, err := command.CombinedOutput(); err != nil {
 			t.Fatalf("git %v: %v\n%s", args, err, output)
@@ -6525,7 +6532,7 @@ func TestNeoReviewExecutorSnapshotTransportsIncompressibleOutput(t *testing.T) {
 	repository := t.TempDir()
 	runGit := func(args ...string) {
 		t.Helper()
-		command := exec.Command("git", args...)
+		command := neoGitTestCommand("", args...)
 		command.Dir = repository
 		if output, err := command.CombinedOutput(); err != nil {
 			t.Fatalf("git %v: %v\n%s", args, err, output)
@@ -6860,7 +6867,7 @@ func TestNeoCaptureReviewWorkingTreeSnapshotTreatsFocusedFilenamesLiterally(t *t
 	repository := t.TempDir()
 	runGit := func(args ...string) {
 		t.Helper()
-		command := exec.Command("git", args...)
+		command := neoGitTestCommand("", args...)
 		command.Dir = repository
 		if output, err := command.CombinedOutput(); err != nil {
 			t.Fatalf("git %v: %v\n%s", args, err, output)
@@ -6904,7 +6911,7 @@ func TestNeoCaptureReviewSnapshotPreservesRenamePathsAndMetadataRange(t *testing
 	repository := t.TempDir()
 	runGit := func(args ...string) {
 		t.Helper()
-		command := exec.Command("git", args...)
+		command := neoGitTestCommand("", args...)
 		command.Dir = repository
 		if output, err := command.CombinedOutput(); err != nil {
 			t.Fatalf("git %v: %v\n%s", args, err, output)
@@ -6947,7 +6954,7 @@ func TestNeoCaptureReviewSnapshotPreservesNULDelimitedFilenameWhitespace(t *test
 	repository := t.TempDir()
 	runGit := func(args ...string) {
 		t.Helper()
-		command := exec.Command("git", args...)
+		command := neoGitTestCommand("", args...)
 		command.Dir = repository
 		if output, err := command.CombinedOutput(); err != nil {
 			t.Fatalf("git %v: %v\n%s", args, err, output)
@@ -6990,7 +6997,7 @@ func TestNeoCaptureReviewSnapshotIncludesIntentToAdd(t *testing.T) {
 	repository := t.TempDir()
 	runGit := func(args ...string) {
 		t.Helper()
-		command := exec.Command("git", args...)
+		command := neoGitTestCommand("", args...)
 		command.Dir = repository
 		if output, err := command.CombinedOutput(); err != nil {
 			t.Fatalf("git %v: %v\n%s", args, err, output)
@@ -7022,7 +7029,7 @@ func TestNeoCaptureReviewSnapshotUsesCurrentWorktreeOnUnbornBranch(t *testing.T)
 	repository := t.TempDir()
 	runGit := func(args ...string) {
 		t.Helper()
-		command := exec.Command("git", args...)
+		command := neoGitTestCommand("", args...)
 		command.Dir = repository
 		if output, err := command.CombinedOutput(); err != nil {
 			t.Fatalf("git %v: %v\n%s", args, err, output)
@@ -7059,7 +7066,7 @@ func TestNeoCaptureReviewSnapshotPreservesSupportedGitDiffForms(t *testing.T) {
 	repository := t.TempDir()
 	runGit := func(args ...string) {
 		t.Helper()
-		command := exec.Command("git", args...)
+		command := neoGitTestCommand("", args...)
 		command.Dir = repository
 		if output, err := command.CombinedOutput(); err != nil {
 			t.Fatalf("git %v: %v\n%s", args, err, output)
@@ -7178,7 +7185,7 @@ func TestNeoCaptureReviewSnapshotRejectsConcurrentMutation(t *testing.T) {
 	repository := t.TempDir()
 	runGit := func(args ...string) {
 		t.Helper()
-		command := exec.Command("git", args...)
+		command := neoGitTestCommand("", args...)
 		command.Dir = repository
 		if output, err := command.CombinedOutput(); err != nil {
 			t.Fatalf("git %v: %v\n%s", args, err, output)

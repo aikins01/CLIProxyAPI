@@ -512,7 +512,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	return fmt.Sprintf(`// ==UserScript==
 // @name CLIProxyAPI Amp Local Inference
 // @namespace https://github.com/router-for-me/CLIProxyAPI
-// @version 0.1.231
+// @version 0.1.232
 %s
 // @updateURL %s
 // @downloadURL %s
@@ -524,7 +524,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	"use strict";
 
 	const bridgeHeader = %s;
-	const userscriptVersion = "0.1.231";
+	const userscriptVersion = "0.1.232";
 	const legacyLocalProjectUI = false;
 	const apiKeyStorageKey = "cliproxyapi.ampLocalInference.apiKey";
 	const scopedAPIKeyStorageKeyPrefix = apiKeyStorageKey + ".user.";
@@ -4488,12 +4488,14 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		if (!workingDirectory && !repositoryURL) {
 			return null;
 		}
+		const lastActivityAt = new Date(firstString(project.lastActivityAt, project.updatedAt, project.createdAt));
 		const normalized = {
 			id: firstString(project.id, project.projectID, project.projectId, project.project_id),
 			name: firstString(project.name, project.projectName, pathBaseName(workingDirectory), pathBaseName(repositoryURL.replace(/\/+$/, "").replace(/\.git$/i, "")), "local"),
 			namespace: firstString(project.namespace, project.projectNamespace, "local"),
 			repositoryURL,
 			additionalRepositories: Array.isArray(project.additionalRepositories) ? project.additionalRepositories.slice() : [],
+			lastActivityAt: Number.isFinite(lastActivityAt.getTime()) ? lastActivityAt.toISOString() : "1970-01-01T00:00:00.000Z",
 			localOnly: project.localOnly === true,
 		};
 		if (workingDirectory) {
@@ -4656,6 +4658,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		const repositoryURL = firstString(project.repositoryURL, project.repoURL);
 		const changesWorkflow = localProjectChangesWorkflow(project);
 		const projectID = firstString(webProjectID, project.id, project.projectID);
+		const lastActivityAt = new Date(firstString(project.lastActivityAt));
 		return {
 			id: projectID,
 			projectID,
@@ -4666,6 +4669,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			repositoryMode: "mapped",
 			changesWorkflow,
 			additionalRepositories: Array.isArray(project.additionalRepositories) ? project.additionalRepositories.slice() : [],
+			lastActivityAt: Number.isFinite(lastActivityAt.getTime()) ? lastActivityAt.toISOString() : "1970-01-01T00:00:00.000Z",
 			workingDirectory: project.workingDirectory,
 			owner: isPlainObject(owner) ? owner : { type: "user", userID: authenticatedAmpUserID },
 			creatorUserID: firstString(owner?.userID, authenticatedAmpUserID, "local-user"),
@@ -5581,7 +5585,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		return true;
 	}
 
-	const sidebarDateFields = new Set(["updatedAt", "firstSyncAt", "lastUserMessageAt", "createdAt", "userLastInteractedAt"]);
+	const sidebarDateFields = new Set(["updatedAt", "firstSyncAt", "lastUserMessageAt", "createdAt", "userLastInteractedAt", "lastActivityAt"]);
 
 	function appendDevalueSidebarValue(values, value, key = "") {
 		if (sidebarDateFields.has(key) && typeof value === "string") {
@@ -9421,7 +9425,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			if (!thread || !rememberedLocalThreadID(threadID)) {
 				continue;
 			}
-			const expectedGroup = thread ? localSidebarRepositoryGroupName(thread) : "No project";
+			const expectedGroup = localSidebarRepositoryGroupName(thread);
 			const actualGroup = firstString(anchor?.dataset?.sidebarGroupId, anchor?.getAttribute?.("data-sidebar-group-id"));
 			if (actualGroup !== "project:" + expectedGroup) {
 				regroupThreadIDs.add(threadID);

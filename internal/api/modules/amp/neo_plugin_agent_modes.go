@@ -273,13 +273,13 @@ func validateNeoBrokerPluginAgentModes(modes *[]ampplugins.AgentMode) error {
 		}
 		seen[mode.Key] = true
 		if !neoLocalBrokerSafeText(mode.Label, neoBrokerPluginAgentModeLabelLimit, false) ||
-			!neoLocalBrokerSafeText(mode.Description, neoBrokerPluginAgentModeTextLimit, true) ||
+			!neoLocalBrokerSafeMultilineText(mode.Description, neoBrokerPluginAgentModeTextLimit, true) ||
 			!neoLocalBrokerSafeText(mode.Color, 64, true) ||
 			!neoLocalBrokerSafeText(mode.PluginName, neoBrokerPluginAgentModeLabelLimit, false) ||
 			!neoLocalBrokerSafeText(mode.PluginRepositoryName, neoBrokerPluginAgentModeLabelLimit, false) ||
 			!neoLocalBrokerSafeText(mode.AgentName, neoBrokerPluginAgentModeLabelLimit, true) ||
 			!neoLocalBrokerSafeText(mode.AgentModel, neoBrokerPluginAgentModeLabelLimit, false) ||
-			!neoLocalBrokerSafeText(mode.AgentInstructions, neoBrokerPluginAgentModeInstructionsLimit, false) {
+			!neoLocalBrokerSafeMultilineText(mode.AgentInstructions, neoBrokerPluginAgentModeInstructionsLimit, false) {
 			return fmt.Errorf("pluginAgentModes entry %q is invalid", mode.Key)
 		}
 		if mode.PluginScope != neoPluginAgentModeUserScope {

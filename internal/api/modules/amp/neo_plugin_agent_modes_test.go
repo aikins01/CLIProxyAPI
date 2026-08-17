@@ -118,7 +118,10 @@ func TestValidateNeoBrokerPluginAgentModes(t *testing.T) {
 	valid := neoTestSyncedPluginAgentMode("deep-blue")
 	validTools := neoTestSyncedPluginAgentMode("kimi-k3")
 	validTools.AgentTools = map[string]any{"include": []any{"shell_command"}}
-	if err := validateNeoBrokerPluginAgentModes(&[]ampplugins.AgentMode{valid, validTools}); err != nil {
+	validMultiline := neoTestSyncedPluginAgentMode("multiline-mode")
+	validMultiline.AgentInstructions = "first line\nsecond line\r\nthird\tline"
+	validMultiline.Description = "line one\nline two"
+	if err := validateNeoBrokerPluginAgentModes(&[]ampplugins.AgentMode{valid, validTools, validMultiline}); err != nil {
 		t.Fatalf("valid payload rejected: %v", err)
 	}
 
@@ -132,6 +135,8 @@ func TestValidateNeoBrokerPluginAgentModes(t *testing.T) {
 		{"wrong scope", func(mode *ampplugins.AgentMode) { mode.PluginScope = "workspace" }},
 		{"missing model", func(mode *ampplugins.AgentMode) { mode.AgentModel = "" }},
 		{"missing instructions", func(mode *ampplugins.AgentMode) { mode.AgentInstructions = "" }},
+		{"control characters in instructions", func(mode *ampplugins.AgentMode) { mode.AgentInstructions = "valid\nwith\x00bell\a" }},
+		{"label with newline", func(mode *ampplugins.AgentMode) { mode.Label = "two\nlines" }},
 		{"invalid reasoning effort", func(mode *ampplugins.AgentMode) { mode.ReasoningEffort = "ludicrous" }},
 		{"invalid tools", func(mode *ampplugins.AgentMode) { mode.AgentTools = map[string]any{"only": "shell_command"} }},
 		{"oversized instructions", func(mode *ampplugins.AgentMode) {

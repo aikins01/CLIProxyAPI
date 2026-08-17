@@ -34,12 +34,12 @@ var neoModeServerOnlyInAmpBinary = map[string]bool{
 }
 
 var neoModeRuntimeOnlyTools = map[string]map[string]bool{
-	"puck": toolSet("rename_thread", "set_thread_pinned", "add_thread_labels", "remove_thread_labels", "set_schedule"),
+	"puck": toolSet("rename_thread", "set_thread_pinned", "add_thread_labels", "remove_thread_labels"),
 }
 
 var neoModeGlobalRuntimeOnlyTools = toolSet("publish_image")
 
-var neoModeAuditBaselineClientRegisteredTools = toolSet("portal_observe", "portal_control")
+var neoModeAuditBaselineClientRegisteredTools = toolSet("portal_observe", "portal_control", "thread_portal_login_url")
 
 var neoModeAuditBaselineClientRegisteredModes = toolSet("smart", "large", "rush", "deep", "nostromo", "low", "medium", "high", "ultra")
 
@@ -60,6 +60,7 @@ func neoModeAuditBaselineComparableTools(mode string, names []string) ([]string,
 	}
 	out := make([]string, 0, len(names))
 	portalState := 0
+	threadPortalSeen := false
 	for _, name := range names {
 		switch name {
 		case "portal_observe":
@@ -72,6 +73,11 @@ func neoModeAuditBaselineComparableTools(mode string, names []string) ([]string,
 				return nil, false
 			}
 			portalState = 2
+		case "thread_portal_login_url":
+			if threadPortalSeen || len(out) == 0 || out[len(out)-1] != "thread_file_url" {
+				return nil, false
+			}
+			threadPortalSeen = true
 		default:
 			if portalState == 1 {
 				return nil, false
@@ -79,7 +85,7 @@ func neoModeAuditBaselineComparableTools(mode string, names []string) ([]string,
 			out = append(out, name)
 		}
 	}
-	return out, portalState == 2
+	return out, portalState == 2 && threadPortalSeen
 }
 
 // TestNeoKnownModeToolsMatchesModeUnion is a pure runtime invariant (no binary
@@ -154,7 +160,7 @@ func TestNeoModeToolOrderMatchesAuditBaseline(t *testing.T) {
 		want = neoModeBinaryComparableTools(mode, want)
 		want, comparable := neoModeAuditBaselineComparableTools(mode, want)
 		if !comparable {
-			t.Fatalf("mode %q runtime tools do not contain the client-registered portal pair immediately after read_web_page", mode)
+			t.Fatalf("mode %q runtime tools do not contain client-registered portal tools in their expected positions", mode)
 		}
 		got, ok := profiles[mode]
 		if !ok {

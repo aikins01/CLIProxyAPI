@@ -84,6 +84,62 @@ func activateNeoOrbBoundLifecycleTestGeneration(t *testing.T, store *neoOrbLifec
 	return active
 }
 
+func TestNeoOrbLifecyclePersistsMultiplayerTTL(t *testing.T) {
+	store, threadDir := newNeoOrbLifecycleTestStore(t, neoOrbLifecycleTestProvider)
+	threadID := "T-019fdec9-b0cf-745d-8da4-f250184e8790"
+	generation, err := store.reserveGeneration(threadID, "portal-token", 900)
+	if err != nil {
+		t.Fatalf("reserve lifecycle generation with multiplayer TTL: %v", err)
+	}
+	if generation.MultiplayerTTLSeconds != 900 {
+		t.Fatalf("reserved multiplayer TTL = %d, want 900", generation.MultiplayerTTLSeconds)
+	}
+	mismatched := generation
+	mismatched.ContainerID = "container-multiplayer"
+	mismatched.MultiplayerTTLSeconds++
+	if err := store.promoteGeneration(mismatched); err == nil {
+		t.Fatal("promoted lifecycle generation with mismatched multiplayer TTL")
+	}
+	generation.ContainerID = "container-multiplayer"
+	if err := store.promoteGeneration(generation); err != nil {
+		t.Fatalf("promote lifecycle generation with multiplayer TTL: %v", err)
+	}
+	active := store.snapshot().Threads[threadID].Active
+	if active == nil || active.MultiplayerTTLSeconds != 900 {
+		t.Fatalf("active generation multiplayer TTL = %#v", active)
+	}
+	cloned := cloneNeoOrbLifecycleState(store.snapshot())
+	if cloned.Threads[threadID].Active == nil || cloned.Threads[threadID].Active.MultiplayerTTLSeconds != 900 {
+		t.Fatalf("cloned generation multiplayer TTL = %#v", cloned.Threads[threadID].Active)
+	}
+	invalid := cloneNeoOrbLifecycleState(store.snapshot())
+	invalidActive := *invalid.Threads[threadID].Active
+	invalidActive.MultiplayerTTLSeconds = neoThreadOpenTTLMinSeconds - 1
+	invalidRecord := invalid.Threads[threadID]
+	invalidRecord.Active = &invalidActive
+	invalid.Threads[threadID] = invalidRecord
+	if err := validateNeoOrbLifecycleState(invalid); err == nil {
+		t.Fatal("invalid lifecycle multiplayer TTL was accepted")
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close lifecycle store before reload: %v", err)
+	}
+	reloaded, err := newNeoOrbLifecycleStore(threadDir, neoOrbLifecycleTestProvider)
+	if err != nil {
+		t.Fatalf("reload lifecycle store with multiplayer TTL: %v", err)
+	}
+	t.Cleanup(func() { _ = reloaded.Close() })
+	reloadedActive := reloaded.snapshot().Threads[threadID].Active
+	if reloadedActive == nil || reloadedActive.MultiplayerTTLSeconds != 900 {
+		t.Fatalf("reloaded generation multiplayer TTL = %#v", reloadedActive)
+	}
+	for _, invalidTTL := range []int{-1, neoThreadOpenTTLMinSeconds - 1, neoThreadOpenTTLMaxSeconds + 1} {
+		if _, err := reloaded.reserveGeneration("T-019fdec9-b0cf-745d-8da4-f250184e8791", "other-token", invalidTTL); err == nil {
+			t.Fatalf("invalid reserve multiplayer TTL %d was accepted", invalidTTL)
+		}
+	}
+}
+
 func TestNeoOrbLifecycleStoreReplacesOnlyExactActiveContainerID(t *testing.T) {
 	store, threadDir := newNeoOrbLifecycleTestStore(t, neoOrbLifecycleTestProvider)
 	threadID := "T-019fdec9-b0cf-745d-8da4-f250184e870e"

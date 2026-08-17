@@ -148,8 +148,14 @@ func neoThreadToolSpec(toolName string) (neoToolSpec, bool) {
 					},
 				},
 				"spawnExecutor": map[string]any{"type": "boolean", "description": "Whether to start the selected executor when work is queued. Default: true."},
-				"agent":         map[string]any{"type": "object", "description": "Optional custom agent definition."},
-				"comment":       map[string]any{"type": "string", "description": "Optional relationship note."},
+				"multiplayerTTLSeconds": map[string]any{
+					"type":        "integer",
+					"minimum":     neoThreadOpenTTLMinSeconds,
+					"maximum":     neoThreadOpenTTLMaxSeconds,
+					"description": "Optional multiplayer duration for a spawned Orb workspace, from 5 minutes through 7 days. Requires executor=orb and spawnExecutor=true.",
+				},
+				"agent":   map[string]any{"type": "object", "description": "Optional custom agent definition."},
+				"comment": map[string]any{"type": "string", "description": "Optional relationship note."},
 			}, nil),
 			Meta: map[string]any{"source": "server"},
 		}, true
@@ -645,6 +651,18 @@ func neoStrictInteger(value any) (int, bool) {
 	}
 }
 
+func neoMultiplayerTTLSeconds(values map[string]any) (int, bool, error) {
+	raw, exists := values["multiplayerTTLSeconds"]
+	if !exists {
+		return 0, false, nil
+	}
+	ttlSeconds, ok := neoStrictInteger(raw)
+	if !ok || ttlSeconds < neoThreadOpenTTLMinSeconds || ttlSeconds > neoThreadOpenTTLMaxSeconds {
+		return 0, false, fmt.Errorf("multiplayerTTLSeconds must be an integer from %d to %d", neoThreadOpenTTLMinSeconds, neoThreadOpenTTLMaxSeconds)
+	}
+	return ttlSeconds, true, nil
+}
+
 func (rt *neoRuntime) callAmpInternalRPC(ctx context.Context, method string, params map[string]any) (any, error) {
 	if rt == nil {
 		return nil, errors.New("amp upstream is unavailable: missing local runtime")
@@ -963,12 +981,9 @@ func (a *neoActor) executeLocalCreateThreadTool(pending neoPendingTool) (map[str
 	localExecutorAttempted := false
 	localExecutorStatus := map[string]any(nil)
 	if runnerID != "" && spawnExecutor {
-		_, _, hasPendingWork := child.pendingWebLocalExecutorRequest()
-		if hasPendingWork {
-			runnerExecutorRequested = a.runtime.store.requestUserExecutorRunnerThreadForOwner(ownerID, runnerID, threadID)
-			if !runnerExecutorRequested {
-				runnerExecutorError = "selected runner is no longer available"
-			}
+		runnerExecutorRequested = boolValue(response["runnerExecutorRequested"])
+		if !runnerExecutorRequested {
+			runnerExecutorError = "selected runner is no longer available"
 		}
 	} else if spawnExecutor {
 		_, _, localExecutorAttempted = child.pendingWebLocalExecutorRequest()
@@ -1008,6 +1023,10 @@ func (a *neoActor) executeLocalCreateThreadTool(pending neoPendingTool) (map[str
 }
 
 func (a *neoActor) localCreateThreadBody(input map[string]any, threadID string) (map[string]any, string, bool, error) {
+	multiplayerTTLSeconds, hasMultiplayerTTL, err := neoMultiplayerTTLSeconds(input)
+	if err != nil {
+		return nil, "", false, errors.New("create_thread " + err.Error())
+	}
 	a.rebindUnavailableWebLocalRunner()
 	a.mu.Lock()
 	parentEnvironment := cloneMap(a.environment)
@@ -1250,6 +1269,12 @@ func (a *neoActor) localCreateThreadBody(input map[string]any, threadID string) 
 	if spawnExecutor && runnerID == "" && strings.EqualFold(executor, "local") && workingDirectory == "" {
 		return nil, "", false, errors.New("create_thread local executor requires an existing workingDirectory on the proxy host")
 	}
+	if hasMultiplayerTTL && !spawnExecutor {
+		return nil, "", false, errors.New("create_thread multiplayerTTLSeconds requires spawnExecutor=true")
+	}
+	if hasMultiplayerTTL && !orbExecutor {
+		return nil, "", false, errors.New("create_thread multiplayerTTLSeconds requires an Orb executor")
+	}
 
 	repositoryURL := firstNonEmptyString(parentMeta["repositoryURL"], parentMeta["repositoryUrl"])
 	if workspaceOverridesInheritedProject {
@@ -1281,6 +1306,13 @@ func (a *neoActor) localCreateThreadBody(input map[string]any, threadID string) 
 		"projectID":        omitEmpty(projectID),
 		"threadMeta":       threadMeta,
 		"prompt":           omitEmpty(prompt),
+		"spawnExecutor":    spawnExecutor,
+	}
+	if hasMultiplayerTTL {
+		body["multiplayerTTLSeconds"] = multiplayerTTLSeconds
+	}
+	if runnerID != "" && explicitRunnerSelection {
+		threadMeta[neoRequiredRunnerIDMetaKey] = runnerID
 	}
 	if len(initialContent) > 0 {
 		body["content"] = initialContent

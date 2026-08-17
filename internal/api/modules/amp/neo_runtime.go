@@ -97,6 +97,12 @@ const (
 	neoLocalBrokerThreadLimit          = 4096
 	neoLocalBrokerSessionLimit         = 128
 	neoLocalBrokerHeartbeatTTL         = 2 * time.Minute
+	neoLocalBrokerControlEndpointPath  = "/ampcode/local-broker/control.ws"
+	neoLocalBrokerIDHeader             = "X-Cliproxy-Local-Broker-ID"
+	neoLocalBrokerSessionIDHeader      = "X-Cliproxy-Local-Broker-Session-ID"
+	neoLocalBrokerGenerationHeader     = "X-Cliproxy-Local-Broker-Session-Generation"
+	neoLocalBrokerIntentEpochHeader    = "X-Cliproxy-Local-Broker-Intent-Epoch"
+	neoLocalBrokerIntentRevisionHeader = "X-Cliproxy-Local-Broker-Intent-Revision"
 	neoLocalBrokerFenceStoreFileName   = ".cliproxyapi-local-broker-fences.json"
 	neoLocalBrokerFenceStoreVersion    = 1
 	neoActorIdleTTL                    = 30 * time.Minute
@@ -164,10 +170,11 @@ const (
 	neoWebLocalThreadSummaryVersion    = 2
 	neoWebLocalThreadSummaryVersionKey = "cliProxyAPISummaryVersion"
 	neoWebLocalBindingRevisionMetaKey  = "cliProxyAPIBindingRevision"
+	neoRequiredRunnerIDMetaKey         = "cliProxyAPIRequiredRunnerID"
 	neoWebLocalSidebarScanFactor       = 4
 	neoWebLocalSidebarLabelQueryLimit  = 8
 	neoWebLocalSummaryIndexTTL         = 5 * time.Second
-	neoWebLocalThreadSummaryCacheLimit = 1024
+	neoWebLocalThreadSummaryCacheLimit = 16384
 	neoWebLocalActivityScanLimit       = 1000
 	neoWebLocalUserProfileTTL          = 15 * time.Minute
 	neoTerminalWorkspaceStampAttempts  = 20
@@ -190,6 +197,7 @@ const (
 	neoActiveErrorStateMetaKey         = "cliProxyAPIActiveErrorState"
 	neoLocalReplayStateKey             = "cliProxyAPIReplayState"
 	neoLocalPinnedOverrideKey          = "cliProxyAPILocalPinnedOverride"
+	neoLocalExecutorStatusKey          = "cliProxyAPIExecutorStatus"
 )
 
 var neoHeadlessLoginShellPath = neoDiscoverHeadlessLoginShellPath
@@ -235,6 +243,7 @@ var (
 	neoHeadlessExecutorLogDir         = defaultNeoHeadlessExecutorLogDir
 	neoHeadlessPIDDirMu               sync.RWMutex
 	neoHeadlessPIDDir                 = defaultNeoHeadlessPIDDir
+	neoHeadlessPIDFileMu              sync.Mutex
 	neoAmpHeadlessPIDDirMu            sync.RWMutex
 	neoAmpHeadlessPIDDir              = defaultNeoAmpHeadlessPIDDir
 	neoAmpTaskStoreMu                 sync.Mutex
@@ -263,18 +272,18 @@ var (
 	neoSharedModeToolOrder         = toolList("send_email", "slack_write", "slack_read", "get_schedule", "set_schedule", "update_schedule", "clear_schedule", "create_slack_trigger")
 	neoXModeToolOrder              = toolList("x_read", "x_reply")
 	neoModeToolOrder               = map[string][]string{
-		"smart":    append(toolList("finder", "shell_command", "shell_command_status", "create_file", "edit_file", "publish_image", "web_search", "read_web_page", "portal_observe", "portal_control", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "thread_interact", "wait_for_threads", "download_thread_file", "upload_thread_file", "notepad", "skill", "load_plugin", "reload_plugins", "reload_skills", "oracle", "librarian", "Task", "view_media", "painter", "public_artifact_url", "thread_file_url", "read_mcp_resource", "get_current_user_identity", "list_workspace_members", "find_shared_plugins_and_skills"), neoSharedModeToolOrder...),
-		"large":    append(toolList("finder", "shell_command", "shell_command_status", "create_file", "edit_file", "publish_image", "web_search", "read_web_page", "portal_observe", "portal_control", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "thread_interact", "wait_for_threads", "download_thread_file", "upload_thread_file", "notepad", "skill", "load_plugin", "reload_plugins", "reload_skills", "oracle", "librarian", "Task", "view_media", "painter", "public_artifact_url", "thread_file_url", "read_mcp_resource", "get_current_user_identity", "list_workspace_members", "find_shared_plugins_and_skills"), neoSharedModeToolOrder...),
-		"rush":     append(toolList("finder", "shell_command", "shell_command_status", "apply_patch", "publish_image", "web_search", "read_web_page", "portal_observe", "portal_control", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "thread_interact", "wait_for_threads", "download_thread_file", "upload_thread_file", "notepad", "skill", "load_plugin", "reload_plugins", "reload_skills", "oracle", "librarian", "Task", "view_media", "painter", "public_artifact_url", "thread_file_url", "get_current_user_identity", "list_workspace_members", "find_shared_plugins_and_skills"), neoSharedModeToolOrder...),
+		"smart":    append(toolList("finder", "shell_command", "shell_command_status", "create_file", "edit_file", "publish_image", "web_search", "read_web_page", "portal_observe", "portal_control", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "thread_interact", "wait_for_threads", "download_thread_file", "upload_thread_file", "notepad", "skill", "load_plugin", "reload_plugins", "reload_skills", "oracle", "librarian", "Task", "view_media", "painter", "public_artifact_url", "thread_file_url", "thread_portal_login_url", "read_mcp_resource", "get_current_user_identity", "list_workspace_members", "find_shared_plugins_and_skills"), neoSharedModeToolOrder...),
+		"large":    append(toolList("finder", "shell_command", "shell_command_status", "create_file", "edit_file", "publish_image", "web_search", "read_web_page", "portal_observe", "portal_control", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "thread_interact", "wait_for_threads", "download_thread_file", "upload_thread_file", "notepad", "skill", "load_plugin", "reload_plugins", "reload_skills", "oracle", "librarian", "Task", "view_media", "painter", "public_artifact_url", "thread_file_url", "thread_portal_login_url", "read_mcp_resource", "get_current_user_identity", "list_workspace_members", "find_shared_plugins_and_skills"), neoSharedModeToolOrder...),
+		"rush":     append(toolList("finder", "shell_command", "shell_command_status", "apply_patch", "publish_image", "web_search", "read_web_page", "portal_observe", "portal_control", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "thread_interact", "wait_for_threads", "download_thread_file", "upload_thread_file", "notepad", "skill", "load_plugin", "reload_plugins", "reload_skills", "oracle", "librarian", "Task", "view_media", "painter", "public_artifact_url", "thread_file_url", "thread_portal_login_url", "get_current_user_identity", "list_workspace_members", "find_shared_plugins_and_skills"), neoSharedModeToolOrder...),
 		"agg-man":  toolList("find_thread", "read_thread", "web_search", "read_web_page", "docs_list", "docs_read", "docs_write", "create_project", "list_agent_modes", "list_runners", "create_thread", "archive_thread", "archive_threads", "unarchive_thread", "send_message_to_thread", "sleep", "publish_thread_artifacts", "slack_write", "slack_read", "github_repo_ci_status", "read_github", "search_github", "commit_search", "list_directory_github", "list_repositories", "glob_github", "diff"),
-		"puck":     toolList("find_thread", "read_thread", "web_search", "read_web_page", "docs_list", "docs_read", "docs_write", "create_project", "update_project", "list_agent_modes", "list_runners", "list_workspace_members", "find_shared_plugins_and_skills", "create_thread", "get_current_time", "thread_interact", "update_thread", "archive_threads", "wait_for_threads", "thread_file_url", "get_schedule", "set_schedule", "update_schedule", "clear_schedule", "send_email", "slack_write", "slack_read", "painter", "x_read", "x_reply", "github_repo_ci_status", "read_github", "search_github", "commit_search", "list_directory_github", "list_repositories", "glob_github", "diff"),
-		"deep":     append(toolList("shell_command", "shell_command_status", "apply_patch", "publish_image", "web_search", "read_web_page", "portal_observe", "portal_control", "Task", "skill", "load_plugin", "reload_plugins", "reload_skills", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "thread_interact", "wait_for_threads", "download_thread_file", "upload_thread_file", "notepad", "librarian", "oracle", "finder", "view_media", "painter", "public_artifact_url", "thread_file_url", "get_current_user_identity", "list_workspace_members", "find_shared_plugins_and_skills"), neoSharedModeToolOrder...),
+		"puck":     toolList("find_thread", "navigate_platform", "read_thread", "web_search", "read_web_page", "create_project", "update_project", "list_agent_modes", "list_runners", "list_workspace_members", "find_shared_plugins_and_skills", "create_thread", "get_current_time", "thread_interact", "update_thread", "archive_threads", "wait_for_threads", "thread_file_url", "get_schedule", "set_schedule", "update_schedule", "clear_schedule", "send_email", "slack_write", "slack_read", "painter", "x_read", "x_reply", "github_repo_ci_status", "read_github", "search_github", "commit_search", "list_directory_github", "list_repositories", "glob_github", "diff"),
+		"deep":     append(toolList("shell_command", "shell_command_status", "apply_patch", "publish_image", "web_search", "read_web_page", "portal_observe", "portal_control", "Task", "skill", "load_plugin", "reload_plugins", "reload_skills", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "thread_interact", "wait_for_threads", "download_thread_file", "upload_thread_file", "notepad", "librarian", "oracle", "finder", "view_media", "painter", "public_artifact_url", "thread_file_url", "thread_portal_login_url", "get_current_user_identity", "list_workspace_members", "find_shared_plugins_and_skills"), neoSharedModeToolOrder...),
 		"review":   toolList("shell_command", "run_check", "submit_review", "list_agent_modes", "list_runners", "create_thread"),
-		"nostromo": append(append(toolList("finder", "shell_command", "shell_command_status", "create_file", "edit_file", "publish_image", "web_search", "read_web_page", "portal_observe", "portal_control", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "thread_interact", "wait_for_threads", "download_thread_file", "upload_thread_file", "notepad", "skill", "load_plugin", "reload_plugins", "reload_skills", "oracle", "librarian", "Task", "view_media", "painter", "public_artifact_url", "thread_file_url", "read_mcp_resource", "get_current_user_identity", "list_workspace_members", "find_shared_plugins_and_skills"), neoSharedModeToolOrder...), "apply_patch"),
-		"low":      append(append(toolList("finder", "shell_command", "shell_command_status", "apply_patch", "publish_image", "web_search", "read_web_page", "portal_observe", "portal_control", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "thread_interact", "wait_for_threads", "download_thread_file", "upload_thread_file", "notepad", "skill", "load_plugin", "reload_plugins", "reload_skills", "oracle", "librarian", "Task", "view_media", "painter", "public_artifact_url", "thread_file_url", "get_current_user_identity", "list_workspace_members", "find_shared_plugins_and_skills"), neoSharedModeToolOrder...), neoXModeToolOrder...),
-		"medium":   append(append(toolList("shell_command", "shell_command_status", "apply_patch", "publish_image", "web_search", "read_web_page", "portal_observe", "portal_control", "Task", "skill", "load_plugin", "reload_plugins", "reload_skills", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "thread_interact", "wait_for_threads", "download_thread_file", "upload_thread_file", "notepad", "librarian", "oracle", "finder", "view_media", "painter", "public_artifact_url", "thread_file_url", "get_current_user_identity", "list_workspace_members", "find_shared_plugins_and_skills"), neoSharedModeToolOrder...), neoXModeToolOrder...),
-		"high":     append(append(toolList("shell_command", "shell_command_status", "apply_patch", "publish_image", "web_search", "read_web_page", "portal_observe", "portal_control", "Task", "skill", "load_plugin", "reload_plugins", "reload_skills", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "thread_interact", "wait_for_threads", "download_thread_file", "upload_thread_file", "notepad", "librarian", "oracle", "finder", "view_media", "painter", "public_artifact_url", "thread_file_url", "get_current_user_identity", "list_workspace_members", "find_shared_plugins_and_skills"), neoSharedModeToolOrder...), neoXModeToolOrder...),
-		"ultra":    append(append(toolList("finder", "shell_command", "shell_command_status", "create_file", "edit_file", "publish_image", "web_search", "read_web_page", "portal_observe", "portal_control", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "thread_interact", "wait_for_threads", "download_thread_file", "upload_thread_file", "notepad", "skill", "load_plugin", "reload_plugins", "reload_skills", "oracle", "librarian", "Task", "view_media", "painter", "public_artifact_url", "thread_file_url", "read_mcp_resource", "get_current_user_identity", "list_workspace_members", "find_shared_plugins_and_skills"), neoSharedModeToolOrder...), neoXModeToolOrder...),
+		"nostromo": append(append(toolList("finder", "shell_command", "shell_command_status", "create_file", "edit_file", "publish_image", "web_search", "read_web_page", "portal_observe", "portal_control", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "thread_interact", "wait_for_threads", "download_thread_file", "upload_thread_file", "notepad", "skill", "load_plugin", "reload_plugins", "reload_skills", "oracle", "librarian", "Task", "view_media", "painter", "public_artifact_url", "thread_file_url", "thread_portal_login_url", "read_mcp_resource", "get_current_user_identity", "list_workspace_members", "find_shared_plugins_and_skills"), neoSharedModeToolOrder...), "apply_patch"),
+		"low":      append(append(toolList("finder", "shell_command", "shell_command_status", "apply_patch", "publish_image", "web_search", "read_web_page", "portal_observe", "portal_control", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "thread_interact", "wait_for_threads", "download_thread_file", "upload_thread_file", "notepad", "skill", "load_plugin", "reload_plugins", "reload_skills", "oracle", "librarian", "Task", "view_media", "painter", "public_artifact_url", "thread_file_url", "thread_portal_login_url", "get_current_user_identity", "list_workspace_members", "find_shared_plugins_and_skills"), neoSharedModeToolOrder...), neoXModeToolOrder...),
+		"medium":   append(append(toolList("shell_command", "shell_command_status", "apply_patch", "publish_image", "web_search", "read_web_page", "portal_observe", "portal_control", "Task", "skill", "load_plugin", "reload_plugins", "reload_skills", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "thread_interact", "wait_for_threads", "download_thread_file", "upload_thread_file", "notepad", "librarian", "oracle", "finder", "view_media", "painter", "public_artifact_url", "thread_file_url", "thread_portal_login_url", "get_current_user_identity", "list_workspace_members", "find_shared_plugins_and_skills"), neoSharedModeToolOrder...), neoXModeToolOrder...),
+		"high":     append(append(toolList("shell_command", "shell_command_status", "apply_patch", "publish_image", "web_search", "read_web_page", "portal_observe", "portal_control", "Task", "skill", "load_plugin", "reload_plugins", "reload_skills", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "thread_interact", "wait_for_threads", "download_thread_file", "upload_thread_file", "notepad", "librarian", "oracle", "finder", "view_media", "painter", "public_artifact_url", "thread_file_url", "thread_portal_login_url", "get_current_user_identity", "list_workspace_members", "find_shared_plugins_and_skills"), neoSharedModeToolOrder...), neoXModeToolOrder...),
+		"ultra":    append(append(toolList("finder", "shell_command", "shell_command_status", "create_file", "edit_file", "publish_image", "web_search", "read_web_page", "portal_observe", "portal_control", "read_thread", "find_thread", "list_agent_modes", "list_runners", "create_thread", "thread_interact", "wait_for_threads", "download_thread_file", "upload_thread_file", "notepad", "skill", "load_plugin", "reload_plugins", "reload_skills", "oracle", "librarian", "Task", "view_media", "painter", "public_artifact_url", "thread_file_url", "thread_portal_login_url", "read_mcp_resource", "get_current_user_identity", "list_workspace_members", "find_shared_plugins_and_skills"), neoSharedModeToolOrder...), neoXModeToolOrder...),
 	}
 	neoModeToolAllowlist         = orderedToolSets(neoModeToolOrder)
 	neoModeDeferredToolAllowlist = map[string]map[string]bool{
@@ -287,7 +296,7 @@ var (
 	}
 	neoKnownModeTools = toolSet(
 		"finder", "create_file", "edit_file", "publish_image", "notepad",
-		"web_search", "read_web_page", "portal_observe", "portal_control", "read_mcp_resource", "read_thread", "find_thread", "skill", "load_plugin", "reload_plugins", "reload_skills", "oracle",
+		"web_search", "read_web_page", "portal_observe", "portal_control", "read_mcp_resource", "read_thread", "find_thread", "navigate_platform", "thread_portal_login_url", "skill", "load_plugin", "reload_plugins", "reload_skills", "oracle",
 		"librarian", "Task", "view_media", "painter", "public_artifact_url",
 		"gmail_read", "gmail_write",
 		"shell_command", "shell_command_status", "apply_patch", "run_check", "submit_review", "docs_list", "docs_read", "docs_write",
@@ -314,11 +323,13 @@ type neoRuntime struct {
 	connections                   map[net.Conn]struct{}
 	threadDir                     string
 	attachmentCache               *neoAttachmentCache
+	attachmentViews               *neoAttachmentViewStore
 	githubClient                  *http.Client
 	githubAPIBase                 string
 	githubRawBase                 string
 	orbManagerMu                  sync.Mutex
 	orbManager                    *neoOrbManager
+	orbManagerStopping            bool
 	orbLifecycleStore             *neoOrbLifecycleStore
 	orbLifecycleStoreProvider     string
 	orbLifecycleStoreErr          error
@@ -348,9 +359,13 @@ type neoRuntime struct {
 	localArchivedSummaryScanGroup singleflight.Group
 	localSidebarSummaryMu         sync.Mutex
 	localSidebarSummaryIndex      []neoWebLocalSidebarThreadIndexEntry
+	localSidebarSummaryByID       map[string]neoWebLocalSidebarThreadIndexEntry
+	localSidebarFileVersions      map[string]neoWebLocalSidebarFileVersion
+	localSidebarSummarySkips      map[string]bool
 	localSidebarSummaryLoaded     bool
-	localSidebarSummaryStamp      neoWebLocalFileStamp
+	localSidebarSummaryScannedAt  time.Time
 	localSidebarSnapshotStamp     neoWebLocalFileStamp
+	localSidebarSummaryStamp      neoWebLocalFileStamp
 	localSidebarSummaryScanGroup  singleflight.Group
 	localSidebarSummaryScanStart  func()
 	localSidebarSummaryJoined     func()
@@ -378,6 +393,9 @@ type neoRuntime struct {
 	brokerFencePath               string
 	brokerFenceStoreErr           error
 	syncBrokerFenceDir            func(string) error
+	brokerControlMu               sync.Mutex
+	brokerControls                map[string]*neoLocalBrokerControl
+	brokerControlEpoch            string
 	orbConfigStore                *neoOwnerOrbConfigStore
 	orbCredentialStore            *neoOwnerOrbCredentialStore
 	legacyOwnerMigrationMu        sync.Mutex
@@ -466,6 +484,7 @@ func newNeoRuntime(cfg *config.Config) *neoRuntime {
 		connections:                  map[net.Conn]struct{}{},
 		threadDir:                    neoAmpThreadStoreDir(),
 		attachmentCache:              newNeoAttachmentCache(),
+		attachmentViews:              newNeoAttachmentViewStore(),
 		recentThreadSeeds:            map[string]neoRecentThreadSeed{},
 		webLocalUserProfiles:         map[string]neoWebLocalUserProfile{},
 		deletedThreadIDs:             map[string]struct{}{},
@@ -475,6 +494,8 @@ func newNeoRuntime(cfg *config.Config) *neoRuntime {
 		scheduleCancelling:           map[string]string{},
 		scheduleWake:                 make(chan struct{}, 1),
 		brokerFences:                 map[string]map[string]neoUserExecutorBrokerFence{},
+		brokerControls:               map[string]*neoLocalBrokerControl{},
+		brokerControlEpoch:           randomBase62(22),
 		localThreadSearchScans:       make(chan struct{}, neoLocalThreadSearchWorkers),
 		localThreadSearchDecodes:     make(chan struct{}, neoLocalThreadSearchDecoders),
 		localThreadSearchIndexPrunes: true,
@@ -505,6 +526,9 @@ func (rt *neoRuntime) orbManagerFor() *neoOrbManager {
 	defer rt.orbManagerMu.Unlock()
 	if rt.orbManager == nil {
 		rt.orbManager = newNeoOrbManager(rt)
+		if rt.orbManagerStopping {
+			_ = rt.orbManager.stop(context.Background())
+		}
 	}
 	return rt.orbManager
 }
@@ -729,7 +753,11 @@ func (rt *neoRuntime) stopWithOptions(ctx context.Context, options neoRuntimeSto
 	if rt == nil {
 		return nil
 	}
-	orbManagerErr := rt.stopOrbManager(ctx)
+	releaseOrbManager, orbManagerErr := rt.stopOrbManagerRetained(ctx)
+	if releaseOrbManager != nil {
+		defer releaseOrbManager()
+	}
+	rt.closeLocalBrokerControls()
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	if !rt.started || rt.server == nil {
@@ -783,7 +811,16 @@ func (rt *neoRuntime) stopWithOptions(ctx context.Context, options neoRuntimeSto
 }
 
 func (rt *neoRuntime) stopOrbManager(ctx context.Context) error {
+	release, err := rt.stopOrbManagerRetained(ctx)
+	if release != nil {
+		release()
+	}
+	return err
+}
+
+func (rt *neoRuntime) stopOrbManagerRetained(ctx context.Context) (func(), error) {
 	rt.orbManagerMu.Lock()
+	rt.orbManagerStopping = true
 	manager := rt.orbManager
 	if manager == nil {
 		store := rt.orbLifecycleStore
@@ -796,27 +833,36 @@ func (rt *neoRuntime) stopOrbManager(ctx context.Context) error {
 		rt.orbLifecycleStoreErr = nil
 		rt.orbLifecycleStoreInitialized = false
 		rt.orbManagerMu.Unlock()
-		return closeErr
+		return rt.releaseStoppedOrbManager, closeErr
 	}
 	rt.orbManagerMu.Unlock()
 	if err := manager.stop(ctx); err != nil {
-		return err
+		return nil, err
 	}
 	rt.orbManagerMu.Lock()
-	defer rt.orbManagerMu.Unlock()
 	if rt.orbManager != manager {
-		return nil
+		rt.orbManagerMu.Unlock()
+		return rt.releaseStoppedOrbManager, nil
 	}
 	var closeErr error
 	if rt.orbLifecycleStore != nil {
 		closeErr = rt.orbLifecycleStore.Close()
 	}
-	rt.orbManager = nil
 	rt.orbLifecycleStore = nil
 	rt.orbLifecycleStoreProvider = ""
 	rt.orbLifecycleStoreErr = nil
 	rt.orbLifecycleStoreInitialized = false
-	return closeErr
+	rt.orbManagerMu.Unlock()
+	return rt.releaseStoppedOrbManager, closeErr
+}
+
+func (rt *neoRuntime) releaseStoppedOrbManager() {
+	rt.orbManagerMu.Lock()
+	if rt.orbManagerStopping {
+		rt.orbManager = nil
+		rt.orbManagerStopping = false
+	}
+	rt.orbManagerMu.Unlock()
 }
 
 func (rt *neoRuntime) trackConnectionState(conn net.Conn, state http.ConnState) {
@@ -860,6 +906,70 @@ func (rt *neoRuntime) closeTrackedConnections() {
 		if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 			log.Debugf("amp neo local runtime connection close failed: %v", err)
 		}
+	}
+}
+
+func neoLocalBrokerControlKey(ownerUserID, brokerID string) string {
+	return ownerUserID + "\x00" + brokerID
+}
+
+func (rt *neoRuntime) registerLocalBrokerControl(control *neoLocalBrokerControl) {
+	if rt == nil || control == nil {
+		return
+	}
+	key := neoLocalBrokerControlKey(control.ownerUserID, control.brokerID)
+	rt.brokerControlMu.Lock()
+	if rt.brokerControls == nil {
+		rt.brokerControls = map[string]*neoLocalBrokerControl{}
+	}
+	previous := rt.brokerControls[key]
+	rt.brokerControls[key] = control
+	rt.brokerControlMu.Unlock()
+	if previous != nil && previous != control {
+		previous.close()
+	}
+}
+
+func (rt *neoRuntime) unregisterLocalBrokerControl(control *neoLocalBrokerControl) {
+	if rt == nil || control == nil {
+		return
+	}
+	key := neoLocalBrokerControlKey(control.ownerUserID, control.brokerID)
+	rt.brokerControlMu.Lock()
+	if rt.brokerControls[key] == control {
+		delete(rt.brokerControls, key)
+	}
+	rt.brokerControlMu.Unlock()
+}
+
+func (rt *neoRuntime) pushLocalBrokerControl(ownerUserID string, message neoLocalBrokerControlMessage) {
+	if rt == nil {
+		return
+	}
+	rt.brokerControlMu.Lock()
+	control := rt.brokerControls[neoLocalBrokerControlKey(ownerUserID, message.BrokerID)]
+	if control != nil && (control.sessionID != message.SessionID || control.sessionGeneration != message.SessionGeneration) {
+		control = nil
+	}
+	rt.brokerControlMu.Unlock()
+	if control != nil {
+		control.queue(message)
+	}
+}
+
+func (rt *neoRuntime) closeLocalBrokerControls() {
+	if rt == nil {
+		return
+	}
+	rt.brokerControlMu.Lock()
+	controls := make([]*neoLocalBrokerControl, 0, len(rt.brokerControls))
+	for _, control := range rt.brokerControls {
+		controls = append(controls, control)
+	}
+	rt.brokerControls = map[string]*neoLocalBrokerControl{}
+	rt.brokerControlMu.Unlock()
+	for _, control := range controls {
+		control.close()
 	}
 }
 
@@ -1178,6 +1288,7 @@ func (rt *neoRuntime) actorPruneLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			_ = rt.store.userExecutorRunners()
 			pruned := rt.store.pruneIdle(time.Now(), neoActorIdleTTL)
 			if pruned > 0 {
 				log.Debugf("amp neo local runtime pruned %d idle actor(s)", pruned)
@@ -1369,6 +1480,11 @@ func (rt *neoRuntime) handleGatewayActionRequest(w http.ResponseWriter, r *http.
 		writeNeoJSON(w, http.StatusNotFound, map[string]any{"error": "actor_not_found"})
 		return
 	}
+	action := neoGatewayActionName(r.URL.Path)
+	if neoInboundExecutorMessage(action) {
+		writeNeoJSON(w, http.StatusForbidden, map[string]any{"error": "executor_transport_required"})
+		return
+	}
 	args, version, err := decodeNeoGatewayActionArgs(r)
 	if err != nil {
 		writeNeoJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_action_body"})
@@ -1379,7 +1495,7 @@ func (rt *neoRuntime) handleGatewayActionRequest(w http.ResponseWriter, r *http.
 		clientAPIKey: getClientAPIKeyFromContext(requestContext),
 		runnerID:     stringValue(neoRivetConnectionParams(r, nil)["runnerId"]),
 	}, map[string]any{
-		"type": neoGatewayActionName(r.URL.Path),
+		"type": action,
 		"args": args,
 	})
 	writeNeoGatewayActionResult(w, result, version)
@@ -1864,21 +1980,34 @@ func (rt *neoRuntime) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		clientAPIKey:     strings.TrimSpace(r.Header.Get(neoInternalClientAPIKeyHeader)),
 		runnerID:         stringValue(neoRivetConnectionParams(r, protocols)["runnerId"]),
 	}
+	actor.mu.Lock()
+	attachmentThreadID := firstNonEmptyString(actor.threadID, actor.key)
+	actor.mu.Unlock()
+	socket.bindAttachmentViewer(rt, neoLocalAttachmentBaseURL(r), attachmentThreadID)
 	if underlying := conn.UnderlyingConn(); underlying != nil {
 		defer rt.unregisterConnection(underlying)
 	}
 	if rivetAction {
 		socket.sendRivetInit(actor.id)
 	}
-	bindingErrorReason := neoApplyWebLocalInferenceBootstrapQuery(r, actor)
-	actor.open(socket, !rivetAction && !neoSkipReadyWaitRequested(r, protocols))
-	if bindingErrorReason == "" && neoWebLocalInferenceBootstrapExecutorRequested(r, actor) && actor.webLocalInferenceBootstrapNeeded() {
+	webLocalObserverOnly := actor.registerSocket(socket)
+	defer actor.close(socket)
+	bindingErrorReason := ""
+	if !webLocalObserverOnly && !actor.webLocalObserverOnlyForMessage(socket) {
+		bindingErrorReason = neoApplyWebLocalInferenceBootstrapQuery(r, actor)
+	}
+	actor.finishOpen(socket, !rivetAction && !neoSkipReadyWaitRequested(r, protocols))
+	bootstrapExecutorRequested := neoWebLocalInferenceBootstrapExecutorRequested(r, actor)
+	orbWakeHandled := false
+	if bindingErrorReason == "" && webLocalInferenceSocket && bootstrapExecutorRequested {
+		orbWakeHandled = actor.runtime.orbManagerFor().wakeExistingLifecycleOrb(actor)
+	}
+	if bindingErrorReason == "" && !orbWakeHandled && !actor.webLocalObserverOnlyForMessage(socket) && bootstrapExecutorRequested && actor.webLocalInferenceBootstrapNeeded() {
 		actor.maybeSpawnWebLocalExecutorForPendingWork()
 	}
 	if webLocalInferenceSocket {
 		actor.sendCurrentExecutorState(socket)
 	}
-	defer actor.close(socket)
 	defer conn.Close()
 
 	for {
@@ -3111,6 +3240,122 @@ func neoWebLocalInferenceSocketRequested(r *http.Request, actor *neoActor) bool 
 	return ampWebLocalInferenceRequestOriginAllowed(origin, cfg.AmpCode.WebLocalInference)
 }
 
+func (a *neoActor) webLocalInferenceObserverOnlyLocked() bool {
+	if a.webLocalExecutionOwnedLocked() {
+		return false
+	}
+	return a.executorID != "" ||
+		a.resumeExecutorID != "" ||
+		a.executorSocket != nil ||
+		a.executorReady ||
+		a.executorBootstrapComplete ||
+		a.replacingExecutorID != "" ||
+		a.webLocalExecutorExpected ||
+		a.spawnedExecutorInFlightLocked() ||
+		a.recoveredExecutorPID > 0 ||
+		a.nonWebLocalSocketConnectedLocked() ||
+		a.executorWorkActiveLocked()
+}
+
+func (a *neoActor) spawnedExecutorInFlightLocked() bool {
+	for _, spawned := range a.spawnedExecutors {
+		if spawned != nil && !spawned.stopping {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *neoActor) nonWebLocalSocketConnectedLocked() bool {
+	for socket := range a.sockets {
+		if socket != nil && !socket.isWebLocalObserver() && !socket.isExecutorRejected() {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *neoActor) webLocalExecutionOwnedLocked() bool {
+	if a.webLocalExecutorOwned && a.webLocalExecutorRunnerID != "" {
+		return true
+	}
+	if a.executorID != "" || a.resumeExecutorID != "" || a.executorSocket != nil || a.executorReady || a.executorBootstrapComplete || a.replacingExecutorID != "" || a.executorWorkActiveLocked() {
+		return false
+	}
+	if a.webLocalExecutorExpected && a.webLocalExpectedRunnerID != "" && !a.webLocalExpectedObserverOnly {
+		return true
+	}
+	for _, spawned := range a.spawnedExecutors {
+		if spawned != nil && spawned.webLocal && !spawned.stopping && spawned.runnerID != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *neoActor) webLocalObserverOnlyForMessage(socket *neoSocket) bool {
+	if a == nil || socket == nil {
+		return false
+	}
+	observerOnly := false
+	a.withWebLocalClassificationLock(func(orbBacked bool) {
+		if !socket.isWebLocalObserverOnly() && (orbBacked && !a.webLocalExecutionOwnedLocked() || a.webLocalInferenceObserverOnlyLocked()) {
+			socket.setWebLocalObserverOnly()
+		}
+		observerOnly = socket.isWebLocalObserverOnly()
+	})
+	return observerOnly
+}
+
+func (a *neoActor) withWebLocalClassificationLock(classify func(bool)) {
+	if a == nil || classify == nil {
+		return
+	}
+	for {
+		a.mu.Lock()
+		sandbox := strings.EqualFold(firstNonEmptyString(a.bootstrapExecutorType, a.meta["executorType"]), "sandbox")
+		threadID := firstNonEmptyString(a.threadID, a.key)
+		if !sandbox || a.runtime == nil {
+			classify(false)
+			a.mu.Unlock()
+			return
+		}
+		a.mu.Unlock()
+
+		manager := a.runtime.orbManagerFor()
+		if err := manager.ensureRecovered(a.runtime.configSnapshot()); err != nil {
+			a.mu.Lock()
+			if !strings.EqualFold(firstNonEmptyString(a.bootstrapExecutorType, a.meta["executorType"]), "sandbox") || firstNonEmptyString(a.threadID, a.key) != threadID {
+				a.mu.Unlock()
+				continue
+			}
+			classify(true)
+			a.mu.Unlock()
+			return
+		}
+		manager.mu.Lock()
+		a.mu.Lock()
+		if !strings.EqualFold(firstNonEmptyString(a.bootstrapExecutorType, a.meta["executorType"]), "sandbox") || firstNonEmptyString(a.threadID, a.key) != threadID {
+			a.mu.Unlock()
+			manager.mu.Unlock()
+			continue
+		}
+		record := manager.orbs[threadID]
+		classify(record != nil)
+		a.mu.Unlock()
+		manager.mu.Unlock()
+		return
+	}
+}
+
+func (a *neoActor) promoteWebLocalObserversLocked() {
+	for socket := range a.sockets {
+		if socket != nil && socket.isWebLocalObserver() {
+			socket.setWebLocalObserverOnly()
+		}
+	}
+}
+
 func (s *neoActorStore) gatewayThreadActorWithCloudState(r *http.Request, actor *neoActor, target, key string) *neoActor {
 	if s == nil || actor == nil || s.runtime == nil {
 		return actor
@@ -3411,6 +3656,25 @@ func (s *neoActorStore) userExecutorRunnerForOwner(ownerID, runnerID string) map
 	return nil
 }
 
+func (s *neoActorStore) userExecutorRunnerAvailabilityForOwner(ownerID, runnerID, threadID string) neoUserExecutorRunnerRequestResult {
+	actor := s.userActorForOwner(ownerID)
+	if actor == nil || runnerID == "" || threadID == "" {
+		return neoUserExecutorRunnerUnavailable
+	}
+	actor.mu.Lock()
+	runner, exists := actor.userRunners[runnerID]
+	if !exists || runner.updatedAt.Before(time.Now().Add(-neoLocalBrokerHeartbeatTTL)) || actor.localBrokerRunnerCleanupPendingLocked(runner) {
+		actor.mu.Unlock()
+		return neoUserExecutorRunnerUnavailable
+	}
+	if _, exists := runner.intents[threadID]; !exists && actor.userExecutorRunnerIntentCountLocked(runner) >= neoLocalBrokerThreadLimit {
+		actor.mu.Unlock()
+		return neoUserExecutorRunnerCapacityExceeded
+	}
+	actor.mu.Unlock()
+	return neoUserExecutorRunnerAccepted
+}
+
 func (s *neoActorStore) userExecutorRunnerForWorkspaceForOwner(ownerID, workingDirectory, repositoryURL string) map[string]any {
 	workingDirectory = neoUserExecutorRunnerWorkingDirectory(workingDirectory)
 	repositoryKey, _, _ := neoWebLocalRepositoryParts(repositoryURL)
@@ -3509,8 +3773,79 @@ func (s *neoActorStore) resumePendingWebLocalThreadsForBrokerRunners(ownerID str
 	}
 }
 
+func (s *neoActorStore) clearWebLocalExecutorReservationsForBrokerRunners(ownerID string, runners []neoUserExecutorRunner) {
+	if s == nil || ownerID == "" {
+		return
+	}
+	userActor := s.userActorForOwner(ownerID)
+	threadIDsByRunner := make([]map[string]bool, len(runners))
+	for index, runner := range runners {
+		threadIDs := make(map[string]bool, len(runner.intents)+len(runner.runningThreads))
+		for threadID := range runner.intents {
+			threadIDs[threadID] = true
+		}
+		for _, threadID := range runner.runningThreads {
+			threadIDs[threadID] = true
+		}
+		threadIDsByRunner[index] = threadIDs
+	}
+	for _, actor := range s.threadActors(0) {
+		actor.mu.Lock()
+		threadID := firstNonEmptyString(actor.threadID, actor.key)
+		expectedRunnerID := actor.webLocalExpectedRunnerID
+		executorRunnerID := actor.webLocalExecutorRunnerID
+		actor.mu.Unlock()
+		if expectedRunnerID == "" && executorRunnerID == "" {
+			continue
+		}
+		for index, runner := range runners {
+			publicationRunnerID := neoLocalBrokerPublicationRunnerID(runner, threadID)
+			if publicationRunnerID != "" && (publicationRunnerID == expectedRunnerID || publicationRunnerID == executorRunnerID) {
+				threadIDsByRunner[index][threadID] = true
+			}
+		}
+	}
+	for index, runner := range runners {
+		threadIDs := threadIDsByRunner[index]
+		for threadID := range threadIDs {
+			publicationRunnerID := neoLocalBrokerPublicationRunnerID(runner, threadID)
+			if publicationRunnerID == "" {
+				continue
+			}
+			actor := s.lookupThreadActor(threadID)
+			if actor == nil {
+				actor = s.pendingThreadActor(threadID)
+			}
+			if actor != nil {
+				actor.revokeBrokerExecutorPublication(userActor, runner.runnerID, publicationRunnerID)
+			}
+		}
+	}
+}
+
+func (s *neoActorStore) currentLocalBrokerPublicationForOwner(ownerID, catalogRunnerID, threadID string) string {
+	userActor := s.userActorForOwner(ownerID)
+	if userActor == nil {
+		return ""
+	}
+	return userActor.currentLocalBrokerPublication(catalogRunnerID, threadID)
+}
+
+func (s *neoActorStore) localBrokerPublicationAuthorizedForOwner(ownerID, threadID, publicationRunnerID string) bool {
+	userActor := s.userActorForOwner(ownerID)
+	return userActor != nil && userActor.localBrokerPublicationAuthorized(threadID, publicationRunnerID)
+}
+
 func (s *neoActorStore) requestUserExecutorRunnerThreadForOwner(ownerID, runnerID, threadID string) bool {
 	return s.requestUserExecutorRunnerThreadResultForOwner(ownerID, runnerID, threadID) == neoUserExecutorRunnerAccepted
+}
+
+func (s *neoActorStore) requestWebLocalExecutorRunnerThreadForOwner(ownerID, runnerID, threadID, spawnID string, threadActor *neoActor) (neoUserExecutorRunnerRequestResult, string) {
+	actor := s.userActorForOwner(ownerID)
+	if actor == nil {
+		return neoUserExecutorRunnerUnavailable, ""
+	}
+	return actor.requestUserExecutorRunnerThreadWithReservation(runnerID, threadID, spawnID, threadActor)
 }
 
 func (s *neoActorStore) requestUserExecutorRunnerThreadResultForOwner(ownerID, runnerID, threadID string) neoUserExecutorRunnerRequestResult {
@@ -3853,7 +4188,8 @@ func (a *neoActor) hasLocalThreadStateLocked() bool {
 		a.title != "" ||
 		a.archived ||
 		a.threadStatus != "" ||
-		a.activeErrorSeq > 0
+		a.activeErrorSeq > 0 ||
+		len(neoPersistedTerminalExecutorStatus(a.lastExecutorStatus)) > 0
 }
 
 func (a *neoActor) hasLocalThreadBootstrapState() bool {
@@ -4291,156 +4627,172 @@ func (s *neoActorStore) pruneIdle(now time.Time, ttl time.Duration) int {
 }
 
 type neoActor struct {
-	mu                          sync.Mutex
-	emissionMu                  sync.Mutex // acquire before mu when both are held
-	metadataMutationMu          sync.Mutex
-	cloudLabelSyncRunning       bool
-	cloudLabelSyncPending       bool
-	cloudLabelSyncPendingLabels []string
-	cloudLabelSyncContext       context.Context
-	cloudLabelSyncCancel        context.CancelFunc
-	cloudLabelSyncClosed        bool
-	runtime                     *neoRuntime
-	id                          string
-	name                        string
-	key                         string
-	threadID                    string
-	record                      map[string]any
-	settings                    map[string]any
-	threadFeatures              []string
-	environment                 map[string]any
-	capabilities                map[string]any
-	guidanceSnapshot            map[string]any
-	guidancePendingSnapshot     map[string]any
-	guidancePendingDiscoveries  map[string][]any
-	guidanceContentCache        map[string]string
-	tools                       map[string]neoToolSpec
-	toolOrder                   []string
-	skillSnapshot               map[string]any
-	skillPendingSnapshot        map[string]any
-	activatedSkills             []neoActivatedSkill
-	loadedSkills                []neoLoadedSkill
-	messages                    []neoMessage
-	history                     []neoHistoryMessage
-	historyDirty                bool
-	queue                       []neoQueuedMessage
-	queuedIDSeq                 int
-	pendingTools                map[string]neoPendingTool
-	proxyOwnedPendingTools      map[string]bool
-	recoveredProxyOwnedTools    map[string]neoPendingTool
-	closedNestedToolScopes      map[string]bool
-	subagentWaiters             map[string]chan map[string]any
-	subagentTools               map[string]neoPendingTool
-	subagentToolLeaseAcks       map[string]bool
-	subagentToolProgress        map[string]map[string]any
-	subagentRuns                map[uint64]neoSubagentRun
-	subagentRunSeq              uint64
-	pendingPublishImages        map[string]*neoPendingPublishImage
-	changesFileOrderStartMu     sync.Mutex
-	changesFileOrderMu          sync.Mutex
-	changesFileOrderRequests    map[neoChangesFileOrderRequestKey]neoChangesFileOrderRequest
-	reviewSnapshotMu            sync.Mutex
-	reviewSnapshot              *neoReviewDiffSnapshot
-	reviewSnapshotDescription   string
-	reviewSnapshotRootMessageID string
-	reviewSnapshotScope         []string
-	reviewSnapshotErr           error
-	webLocalRunnerBindingMu     sync.Mutex
-	finderRuns                  map[uint64]neoFinderRun
-	finderRunSeq                uint64
-	activeFinderRuns            int
-	approvalQueue               []map[string]any
-	sockets                     map[*neoSocket]struct{}
-	spawnedExecutors            map[string]*neoSpawnedExecutor
-	artifacts                   map[string]any
-	kv                          map[string]any
-	meta                        map[string]any
-	debug                       map[string]any
-	draft                       []any
-	autoSubmitDraft             bool
-	promptDrafts                map[*neoSocket]neoPromptDraft
-	pendingNavigation           string
-	maxTokens                   any
-	mainThreadID                string
-	notificationSubs            map[string]map[string]any
-	pluginUIRequests            map[string]map[string]any
-	pluginUIResponses           map[string]map[string]any
-	terminalRelayChannels       map[string]struct{}
-	userRunners                 map[string]neoUserExecutorRunner
-	userBrokerSessions          map[string]neoUserExecutorBrokerSession
-	userBrokerFences            map[string]neoUserExecutorBrokerFence
-	userPluginAgentModes        map[string]neoSyncedPluginAgentModes
-	lastUsed                    time.Time
-	pruneLeases                 int
-	recoveredExecutorPID        int
-	recoveredExecutorWebLocal   bool
-	syncRunning                 bool
-	syncPending                 bool
-	cloudSyncClosing            bool
-	cloudSyncWG                 sync.WaitGroup
-	localSyncRunning            bool
-	localSyncPending            bool
-	syncWG                      sync.WaitGroup
-	localSnapshotWake           chan struct{}
-	localSnapshotClosing        bool
-	localSnapshotEpoch          uint64
-	localSnapshotMessageCache   map[string]neoLocalSnapshotMessageCache
-	localSnapshotMessageGen     uint64
-	messageRevision             uint64
-	diffStats                   neoDiffStats
-	diffStatsRevision           uint64
-	diffStatsCached             bool
-	workerRevision              *neoThreadRevision
-	measurements                neoActorMeasurements
-	title                       string
-	titleSource                 string
-	titleGenerationStarted      bool
-	archived                    bool
-	pinned                      bool
-	pinnedOverride              *bool
-	hasUnreadMessages           bool
-	latestAssistantMessageID    string
-	unreadStatusUpdatedAt       string
-	threadStatus                string
-	threadOpenExpiresAt         int64
-	threadOpenStateSeq          int
-	compacting                  bool
-	compactionOwner             uint64
-	nextCompactionOwner         uint64
-	compactionRecords           []map[string]any
-	compactionRetryAfterLen     int
-	relationships               []map[string]any
-	origin                      map[string]any
-	retryScheduled              bool
-	pendingInference            *neoInferenceInflight
-	replayEvents                []neoReplayEvent
-	replayContinuityKnown       bool
-	replayFloorSeq              int
-	activeError                 map[string]any
-	activeErrorMessageID        string
-	activeErrorSeq              int
-	seq                         int
-	agentState                  string
-	executorID                  string
-	replacingExecutorID         string
-	executorSocket              *neoSocket
-	bootstrapExecutorType       string
-	bootstrapThreadActorFlow    bool
-	executorReady               bool
-	executorBootstrapComplete   bool
-	executorResumeBootstrap     bool
-	lastExecutorStatus          map[string]any
-	currentAgentMode            string
-	currentReasoningEffort      string
-	executorIdleGeneration      int
-	webLocalObserverGeneration  uint64
-	reconnectGeneration         int
-	generation                  int
-	currentInference            *neoInferenceInflight
-	mainInferenceContext        context.Context
-	mainInferenceCancel         context.CancelFunc
-	preserveExecutorWorkOnClose bool
-	resumeExecutorID            string
+	mu                           sync.Mutex
+	emissionMu                   sync.Mutex // acquire before mu when both are held
+	metadataMutationMu           sync.Mutex
+	cloudLabelSyncRunning        bool
+	cloudLabelSyncPending        bool
+	cloudLabelSyncPendingLabels  []string
+	cloudLabelSyncContext        context.Context
+	cloudLabelSyncCancel         context.CancelFunc
+	cloudLabelSyncClosed         bool
+	runtime                      *neoRuntime
+	id                           string
+	name                         string
+	key                          string
+	threadID                     string
+	record                       map[string]any
+	settings                     map[string]any
+	threadFeatures               []string
+	environment                  map[string]any
+	capabilities                 map[string]any
+	guidanceSnapshot             map[string]any
+	guidancePendingSnapshot      map[string]any
+	guidancePendingDiscoveries   map[string][]any
+	guidanceContentCache         map[string]string
+	tools                        map[string]neoToolSpec
+	toolOrder                    []string
+	skillSnapshot                map[string]any
+	skillPendingSnapshot         map[string]any
+	activatedSkills              []neoActivatedSkill
+	loadedSkills                 []neoLoadedSkill
+	messages                     []neoMessage
+	history                      []neoHistoryMessage
+	historyDirty                 bool
+	queue                        []neoQueuedMessage
+	queuedIDSeq                  int
+	pendingTools                 map[string]neoPendingTool
+	proxyOwnedPendingTools       map[string]bool
+	recoveredProxyOwnedTools     map[string]neoPendingTool
+	closedNestedToolScopes       map[string]bool
+	subagentWaiters              map[string]chan map[string]any
+	subagentTools                map[string]neoPendingTool
+	subagentToolLeaseAcks        map[string]bool
+	subagentToolProgress         map[string]map[string]any
+	subagentRuns                 map[uint64]neoSubagentRun
+	subagentRunSeq               uint64
+	pendingPublishImages         map[string]*neoPendingPublishImage
+	changesFileOrderStartMu      sync.Mutex
+	changesFileOrderMu           sync.Mutex
+	changesFileOrderRequests     map[neoChangesFileOrderRequestKey]neoChangesFileOrderRequest
+	reviewSnapshotMu             sync.Mutex
+	reviewSnapshot               *neoReviewDiffSnapshot
+	reviewSnapshotDescription    string
+	reviewSnapshotRootMessageID  string
+	reviewSnapshotScope          []string
+	reviewSnapshotErr            error
+	webLocalRunnerBindingMu      sync.Mutex
+	webLocalControlMu            sync.Mutex
+	brokerHeartbeatMu            sync.Mutex
+	finderRuns                   map[uint64]neoFinderRun
+	finderRunSeq                 uint64
+	activeFinderRuns             int
+	approvalQueue                []map[string]any
+	sockets                      map[*neoSocket]struct{}
+	spawnedExecutors             map[string]*neoSpawnedExecutor
+	executorSpawnGeneration      uint64
+	disposed                     bool
+	artifacts                    map[string]any
+	kv                           map[string]any
+	meta                         map[string]any
+	debug                        map[string]any
+	draft                        []any
+	autoSubmitDraft              bool
+	promptDrafts                 map[*neoSocket]neoPromptDraft
+	pendingNavigation            string
+	maxTokens                    any
+	mainThreadID                 string
+	notificationSubs             map[string]map[string]any
+	pluginUIRequests             map[string]map[string]any
+	pluginUIResponses            map[string]map[string]any
+	terminalRelayChannels        map[string]struct{}
+	userRunners                  map[string]neoUserExecutorRunner
+	userBrokerSessions           map[string]neoUserExecutorBrokerSession
+	userBrokerFences             map[string]neoUserExecutorBrokerFence
+	userBrokerRunnerCleanups     map[neoLocalBrokerRunnerIncarnation]neoLocalBrokerRunnerCleanup
+	userBrokerRunnerCleanupSeq   uint64
+	userPluginAgentModes         map[string]neoSyncedPluginAgentModes
+	lastUsed                     time.Time
+	pruneLeases                  int
+	recoveredExecutorPID         int
+	recoveredExecutorWebLocal    bool
+	recoveredExecutorRunnerID    string
+	syncRunning                  bool
+	syncPending                  bool
+	cloudSyncClosing             bool
+	cloudSyncWG                  sync.WaitGroup
+	localSyncRunning             bool
+	localSyncPending             bool
+	syncWG                       sync.WaitGroup
+	localSnapshotWake            chan struct{}
+	localSnapshotClosing         bool
+	localSnapshotEpoch           uint64
+	localSnapshotMessageCache    map[string]neoLocalSnapshotMessageCache
+	localSnapshotMessageGen      uint64
+	messageRevision              uint64
+	diffStats                    neoDiffStats
+	diffStatsRevision            uint64
+	diffStatsCached              bool
+	workerRevision               *neoThreadRevision
+	measurements                 neoActorMeasurements
+	title                        string
+	titleSource                  string
+	titleGenerationStarted       bool
+	archived                     bool
+	pinned                       bool
+	pinnedOverride               *bool
+	hasUnreadMessages            bool
+	latestAssistantMessageID     string
+	unreadStatusUpdatedAt        string
+	threadStatus                 string
+	multiplayerTTLSeconds        int
+	threadOpenExpiresAt          int64
+	threadOpenStateSeq           int
+	compacting                   bool
+	compactionOwner              uint64
+	nextCompactionOwner          uint64
+	compactionRecords            []map[string]any
+	compactionRetryAfterLen      int
+	relationships                []map[string]any
+	origin                       map[string]any
+	retryScheduled               bool
+	pendingInference             *neoInferenceInflight
+	replayEvents                 []neoReplayEvent
+	replayContinuityKnown        bool
+	replayFloorSeq               int
+	activeError                  map[string]any
+	activeErrorMessageID         string
+	activeErrorSeq               int
+	seq                          int
+	agentState                   string
+	executorID                   string
+	replacingExecutorID          string
+	executorSocket               *neoSocket
+	executorPublicationRunnerID  string
+	bootstrapExecutorType        string
+	bootstrapThreadActorFlow     bool
+	executorReady                bool
+	executorBootstrapComplete    bool
+	executorResumeBootstrap      bool
+	lastExecutorStatus           map[string]any
+	currentAgentMode             string
+	currentReasoningEffort       string
+	executorIdleGeneration       int
+	webLocalObserverGeneration   uint64
+	webLocalExecutorExpected     bool
+	webLocalExpectedRunnerID     string
+	webLocalExpectedSpawnID      string
+	webLocalExpectedObserverOnly bool
+	webLocalExecutorOwned        bool
+	webLocalExecutorRunnerID     string
+	webLocalExecutorSpawnID      string
+	reconnectGeneration          int
+	generation                   int
+	currentInference             *neoInferenceInflight
+	mainInferenceContext         context.Context
+	mainInferenceCancel          context.CancelFunc
+	preserveExecutorWorkOnClose  bool
+	resumeExecutorID             string
 }
 
 type neoUserExecutorRunner struct {
@@ -4457,6 +4809,7 @@ type neoUserExecutorRunner struct {
 	intentRevisions        map[string]uint64
 	reportedStoppedIntents map[string]bool
 	nextIntentRevision     uint64
+	cleanupGeneration      uint64
 	updatedAt              time.Time
 }
 
@@ -4471,12 +4824,27 @@ const (
 type neoUserExecutorBrokerSession struct {
 	sessionID         string
 	sessionGeneration uint64
+	intentRevision    uint64
+	intentSnapshot    *neoLocalBrokerControlMessage
 	updatedAt         time.Time
 }
 
 type neoUserExecutorBrokerFence struct {
 	sessionID         string
 	sessionGeneration uint64
+}
+
+type neoLocalBrokerRunnerIncarnation struct {
+	brokerID          string
+	sessionID         string
+	sessionGeneration uint64
+	runnerID          string
+}
+
+type neoLocalBrokerRunnerCleanup struct {
+	generation     uint64
+	brokerObserved bool
+	complete       bool
 }
 
 type neoLocalBrokerFenceStore struct {
@@ -4534,6 +4902,111 @@ type neoLocalBrokerRunnerRejection struct {
 type neoLocalBrokerHeartbeatResult struct {
 	Runners  []neoUserExecutorRunner
 	Rejected []neoLocalBrokerRunnerRejection
+}
+
+type neoLocalBrokerControlMessage struct {
+	Type              string                        `json:"type"`
+	BrokerID          string                        `json:"brokerId"`
+	SessionID         string                        `json:"sessionId"`
+	SessionGeneration uint64                        `json:"sessionGeneration"`
+	IntentEpoch       string                        `json:"intentEpoch"`
+	IntentRevision    uint64                        `json:"intentRevision"`
+	Runners           []neoLocalBrokerControlRunner `json:"runners"`
+}
+
+type neoLocalBrokerControlRunner struct {
+	RunnerID string `json:"runnerId"`
+	Intents  []any  `json:"intents"`
+}
+
+func cloneNeoLocalBrokerControlMessage(message neoLocalBrokerControlMessage) neoLocalBrokerControlMessage {
+	cloned := message
+	cloned.Runners = make([]neoLocalBrokerControlRunner, len(message.Runners))
+	for runnerIndex, runner := range message.Runners {
+		cloned.Runners[runnerIndex].RunnerID = runner.RunnerID
+		cloned.Runners[runnerIndex].Intents = make([]any, len(runner.Intents))
+		for intentIndex, intent := range runner.Intents {
+			cloned.Runners[runnerIndex].Intents[intentIndex] = cloneNeoJSONValue(intent)
+		}
+	}
+	return cloned
+}
+
+type neoLocalBrokerControl struct {
+	ownerUserID       string
+	brokerID          string
+	sessionID         string
+	sessionGeneration uint64
+	conn              *websocket.Conn
+	send              chan neoLocalBrokerControlMessage
+	done              chan struct{}
+	closeOnce         sync.Once
+	queueMu           sync.Mutex
+	writeMu           sync.Mutex
+	queuedEpoch       string
+	queuedRevision    uint64
+	queuedVersion     bool
+}
+
+func (control *neoLocalBrokerControl) queue(message neoLocalBrokerControlMessage) bool {
+	if control == nil {
+		return false
+	}
+	control.queueMu.Lock()
+	defer control.queueMu.Unlock()
+	select {
+	case <-control.done:
+		return false
+	default:
+	}
+	if control.queuedVersion && control.queuedEpoch == message.IntentEpoch && message.IntentRevision < control.queuedRevision {
+		return true
+	}
+	control.queuedEpoch = message.IntentEpoch
+	control.queuedRevision = message.IntentRevision
+	control.queuedVersion = true
+	select {
+	case control.send <- message:
+		return true
+	default:
+	}
+	select {
+	case <-control.send:
+	default:
+	}
+	select {
+	case control.send <- message:
+		return true
+	case <-control.done:
+		return false
+	}
+}
+
+func (control *neoLocalBrokerControl) close() {
+	if control == nil {
+		return
+	}
+	control.closeOnce.Do(func() {
+		close(control.done)
+		_ = control.conn.Close()
+	})
+}
+
+func (control *neoLocalBrokerControl) writeLoop() {
+	defer control.close()
+	for {
+		select {
+		case message := <-control.send:
+			control.writeMu.Lock()
+			err := control.conn.WriteJSON(message)
+			control.writeMu.Unlock()
+			if err != nil {
+				return
+			}
+		case <-control.done:
+			return
+		}
+	}
 }
 
 // neoInferenceInflight tracks the assistant message currently being
@@ -4741,6 +5214,7 @@ type neoSnapshotReplayFrame struct {
 type neoSpawnedExecutor struct {
 	spawnID       string
 	threadID      string
+	runnerID      string
 	command       string
 	logPath       string
 	cmd           *exec.Cmd
@@ -4793,6 +5267,15 @@ func (a *neoActor) executorConnectedLocked() bool {
 	return a != nil && a.executorID != "" && a.executorReady && a.executorBootstrapComplete
 }
 
+func (a *neoActor) executorConnectedForRunner(runnerID string) bool {
+	if a == nil || strings.TrimSpace(runnerID) == "" {
+		return false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.executorConnectedLocked() && a.executorSocket != nil && a.executorSocket.runnerKey() == runnerID
+}
+
 func newNeoActor(rt *neoRuntime, id, name, key, threadID string, record map[string]any, input map[string]any) *neoActor {
 	settings := map[string]any{}
 	if nested, ok := asMap(input["input"]); ok {
@@ -4839,6 +5322,7 @@ func newNeoActor(rt *neoRuntime, id, name, key, threadID string, record map[stri
 		userRunners:                map[string]neoUserExecutorRunner{},
 		userBrokerSessions:         map[string]neoUserExecutorBrokerSession{},
 		userBrokerFences:           map[string]neoUserExecutorBrokerFence{},
+		userBrokerRunnerCleanups:   map[neoLocalBrokerRunnerIncarnation]neoLocalBrokerRunnerCleanup{},
 		localSnapshotWake:          make(chan struct{}, 1),
 		lastUsed:                   time.Now(),
 		replayContinuityKnown:      true,
@@ -4850,14 +5334,42 @@ func newNeoActor(rt *neoRuntime, id, name, key, threadID string, record map[stri
 	}
 }
 
-func (a *neoActor) open(socket *neoSocket, eagerSnapshot bool) {
-	a.mu.Lock()
-	a.touchLocked()
-	a.sockets[socket] = struct{}{}
-	if socket != nil && socket.webLocalObserver {
-		a.webLocalObserverGeneration++
+func (a *neoActor) registerSocket(socket *neoSocket) bool {
+	webLocalObserverOnly := false
+	recoveredHeadless := false
+	if socket != nil {
+		a.mu.Lock()
+		attachmentBaseURL := stringValue(a.environment["ampURL"])
+		threadID := firstNonEmptyString(a.threadID, a.key)
+		a.mu.Unlock()
+		socket.bindAttachmentViewer(a.runtime, attachmentBaseURL, threadID)
 	}
-	a.mu.Unlock()
+	if socket != nil && socket.webLocalObserver {
+		a.mu.Lock()
+		threadID := firstNonEmptyString(a.threadID, a.key)
+		a.mu.Unlock()
+		_, recoveredHeadless = neoLiveHeadlessPIDRecord(threadID)
+	}
+	a.withWebLocalClassificationLock(func(orbBacked bool) {
+		a.touchLocked()
+		if socket != nil && socket.webLocalObserver {
+			webLocalObserverOnly = recoveredHeadless || orbBacked && !a.webLocalExecutionOwnedLocked() || a.webLocalInferenceObserverOnlyLocked()
+			if webLocalObserverOnly {
+				socket.setWebLocalObserverOnly()
+			}
+		}
+		a.sockets[socket] = struct{}{}
+		if socket != nil && !socket.webLocalObserver && a.webLocalInferenceObserverOnlyLocked() {
+			a.promoteWebLocalObserversLocked()
+		}
+		if socket != nil && socket.webLocalObserver {
+			a.webLocalObserverGeneration++
+		}
+	})
+	return webLocalObserverOnly
+}
+
+func (a *neoActor) finishOpen(socket *neoSocket, eagerSnapshot bool) {
 	if eagerSnapshot {
 		a.sendSnapshot(socket, 0)
 		socket.markSnapshotSent()
@@ -4865,10 +5377,16 @@ func (a *neoActor) open(socket *neoSocket, eagerSnapshot bool) {
 	a.broadcastObservers()
 }
 
+func (a *neoActor) open(socket *neoSocket, eagerSnapshot bool) {
+	a.registerSocket(socket)
+	a.finishOpen(socket, eagerSnapshot)
+}
+
 func (a *neoActor) close(socket *neoSocket) {
 	executorID := ""
 	executorSocket := false
 	webLocalObserver := socket != nil && socket.isWebLocalObserver()
+	webLocalObserverOnly := socket != nil && socket.isWebLocalObserverOnly()
 	if socket != nil && socket.isExecutor() {
 		executorSocket = true
 		executorID = socket.executorKey()
@@ -4894,6 +5412,7 @@ func (a *neoActor) close(socket *neoSocket) {
 		executorID = a.executorID
 	}
 	disconnectExecutor := executorSocket && activeExecutorSocket
+	stopWebLocalExecutor := webLocalObserver && !webLocalObserverOnly && !a.webLocalInferenceObserverOnlyLocked()
 	a.mu.Unlock()
 	a.cancelChangesFileOrderRequestsForSocket(socket)
 	if promptDraftRemoved {
@@ -4910,7 +5429,7 @@ func (a *neoActor) close(socket *neoSocket) {
 		return
 	}
 	a.broadcastObservers()
-	if webLocalObserver {
+	if stopWebLocalExecutor {
 		a.scheduleWebLocalExecutorStopIfUnobserved()
 	}
 }
@@ -4921,6 +5440,8 @@ func (a *neoActor) dispose() {
 
 func (a *neoActor) disposeWithOptions(stopExecutors bool, closeReason string, transportClose bool) {
 	a.mu.Lock()
+	a.disposed = true
+	a.executorSpawnGeneration++
 	a.cloudLabelSyncClosed = true
 	cloudLabelSyncCancel := a.cloudLabelSyncCancel
 	a.cloudLabelSyncPending = false
@@ -4942,30 +5463,37 @@ func (a *neoActor) disposeWithOptions(stopExecutors bool, closeReason string, tr
 
 func (a *neoActor) stopSpawnedExecutors() {
 	a.mu.Lock()
+	a.executorSpawnGeneration++
 	executors := a.spawnedExecutorListLocked()
 	a.spawnedExecutors = map[string]*neoSpawnedExecutor{}
-	recoveredPID := a.recoveredExecutorPID
+	recovered := neoHeadlessPIDRecord{PID: a.recoveredExecutorPID, WebLocal: a.recoveredExecutorWebLocal, RunnerID: a.recoveredExecutorRunnerID}
 	a.recoveredExecutorPID = 0
 	a.recoveredExecutorWebLocal = false
+	a.recoveredExecutorRunnerID = ""
+	a.clearWebLocalExecutorOwnershipLocked()
 	threadID := firstNonEmptyString(a.threadID, a.key)
 	a.mu.Unlock()
 	for _, executor := range executors {
 		executor.stop()
 	}
-	stopNeoRecoveredHeadlessPID(threadID, recoveredPID)
+	stopNeoRecoveredHeadlessPIDRecord(threadID, recovered)
 }
 
 func (a *neoActor) stopSpawnedExecutorsForRebind() {
 	a.mu.Lock()
+	a.executorSpawnGeneration++
 	executors := a.spawnedExecutorListLocked()
-	recoveredPID := a.recoveredExecutorPID
-	if len(executors) == 0 && recoveredPID == 0 {
+	recovered := neoHeadlessPIDRecord{PID: a.recoveredExecutorPID, WebLocal: a.recoveredExecutorWebLocal, RunnerID: a.recoveredExecutorRunnerID}
+	if len(executors) == 0 && recovered.PID == 0 {
+		a.clearWebLocalExecutorOwnershipLocked()
 		a.mu.Unlock()
 		return
 	}
 	a.spawnedExecutors = map[string]*neoSpawnedExecutor{}
 	a.recoveredExecutorPID = 0
 	a.recoveredExecutorWebLocal = false
+	a.recoveredExecutorRunnerID = ""
+	a.clearWebLocalExecutorOwnershipLocked()
 	threadID := firstNonEmptyString(a.threadID, a.key)
 	a.touchLocked()
 	a.executorIdleGeneration++
@@ -4976,6 +5504,7 @@ func (a *neoActor) stopSpawnedExecutorsForRebind() {
 	delete(a.meta, neoResumeExecutorIDMetaKey)
 	a.replacingExecutorID = ""
 	a.executorSocket = nil
+	a.executorPublicationRunnerID = ""
 	a.executorBootstrapComplete = false
 	a.executorResumeBootstrap = false
 	cleanup := a.clearExecutorWorkForDisconnectLocked(true)
@@ -4984,7 +5513,7 @@ func (a *neoActor) stopSpawnedExecutorsForRebind() {
 	for _, executor := range executors {
 		executor.stop()
 	}
-	stopNeoRecoveredHeadlessPID(threadID, recoveredPID)
+	stopNeoRecoveredHeadlessPIDRecord(threadID, recovered)
 	a.broadcastExecutorWorkCleanup(cleanup)
 }
 
@@ -5096,7 +5625,13 @@ func (a *neoActor) handle(msg map[string]any) {
 func (a *neoActor) handleForSocket(socket *neoSocket, msg map[string]any) any {
 	a.touch()
 	msgType := stringValue(msg["type"])
-	if socket != nil && socket.isWebLocalObserver() && msgType == "executor_plugin_message" {
+	webLocalObserver := socket != nil && socket.isWebLocalObserver()
+	if webLocalObserver && !neoInboundWebLocalObserverOnlyAllowedMessage(msgType) {
+		a.webLocalControlMu.Lock()
+		defer a.webLocalControlMu.Unlock()
+	}
+	webLocalObserverOnly := webLocalObserver && a.webLocalObserverOnlyForMessage(socket)
+	if webLocalObserver && !webLocalObserverOnly && msgType == "executor_plugin_message" {
 		message := normalizeNeoExecutorPluginMessage(msg)
 		if a.webLocalObserverPluginResponseAllowed(message) {
 			log.Debugf("amp neo local runtime WS recv web plugin response")
@@ -5104,11 +5639,15 @@ func (a *neoActor) handleForSocket(socket *neoSocket, msg map[string]any) any {
 			return nil
 		}
 	}
-	if socket != nil && socket.isWebLocalObserver() && neoInboundWebLocalObserverBlockedMessage(msgType) {
-		log.Debugf("amp neo local runtime ignored web local observer executor message %s", msgType)
+	if webLocalObserver &&
+		(neoInboundWebLocalObserverBlockedMessage(msgType) || webLocalObserverOnly && !neoInboundWebLocalObserverOnlyAllowedMessage(msgType)) {
+		log.Debugf("amp neo local runtime ignored web local observer message %s", msgType)
 		return nil
 	}
 	if socket != nil && msgType != "executor_notepad_operation" && msgType != "executor_notepad_operation_result" && neoInboundExecutorMessage(msgType) {
+		if socket.isExecutorRejected() {
+			return nil
+		}
 		socket.markExecutor()
 	}
 	log.Debugf("amp neo local runtime WS recv %s", msgType)
@@ -5776,6 +6315,14 @@ func (rt *neoRuntime) persistLocalBrokerFencesLocked() error {
 }
 
 func (a *neoActor) userExecutorRunnerIntentValues(runner neoUserExecutorRunner) []any {
+	return a.userExecutorRunnerIntentValuesWithAcknowledgement(runner, true)
+}
+
+func (a *neoActor) userExecutorRunnerControlIntentValues(runner neoUserExecutorRunner) []any {
+	return a.userExecutorRunnerIntentValuesWithAcknowledgement(runner, false)
+}
+
+func (a *neoActor) userExecutorRunnerIntentValuesWithAcknowledgement(runner neoUserExecutorRunner, acknowledgeMissing bool) []any {
 	intents := neoUserExecutorRunnerIntentValues(runner)
 	if a == nil || a.runtime == nil || a.runtime.store == nil {
 		return intents
@@ -5795,7 +6342,7 @@ func (a *neoActor) userExecutorRunnerIntentValues(runner neoUserExecutorRunner) 
 		}
 		if threadActor == nil {
 			intent["desired"] = "stopped"
-			if desired == "running" && a.reconcileReportedStoppedRunnerIntent(runner, threadID, running[threadID]) {
+			if acknowledgeMissing && desired == "running" && a.reconcileReportedStoppedRunnerIntent(runner, threadID, running[threadID]) {
 				continue
 			}
 			out = append(out, intent)
@@ -5809,11 +6356,11 @@ func (a *neoActor) userExecutorRunnerIntentValues(runner neoUserExecutorRunner) 
 		}
 		archived := threadActor.archived
 		threadActor.mu.Unlock()
-		if archived && desired == "running" {
+		if acknowledgeMissing && archived && desired == "running" {
 			if a.reconcileReportedStoppedRunnerIntent(runner, threadID, running[threadID]) {
 				continue
 			}
-		} else if !archived && desired == "running" {
+		} else if acknowledgeMissing && !archived && desired == "running" {
 			a.clearReportedStoppedRunnerIntent(runner, threadID)
 		}
 		out = append(out, intent)
@@ -5836,6 +6383,7 @@ func (a *neoActor) reconcileReportedStoppedRunnerIntent(snapshot neoUserExecutor
 		delete(runner.intentRevisions, threadID)
 		delete(runner.reportedStoppedIntents, threadID)
 		a.userRunners[runner.runnerID] = runner
+		a.advanceLocalBrokerIntentRevisionLocked(runner)
 		return true
 	}
 	runner.reportedStoppedIntents[threadID] = true
@@ -5869,14 +6417,11 @@ func (a *neoActor) registerUserExecutorRunner(socket *neoSocket, msg map[string]
 		a.userRunners = map[string]neoUserExecutorRunner{}
 	}
 	cutoff := time.Now().Add(-neoLocalBrokerHeartbeatTTL)
-	for existingRunnerID, existing := range a.userRunners {
-		if existing.updatedAt.Before(cutoff) {
-			delete(a.userRunners, existingRunnerID)
-		}
-	}
+	invalidatedRunners := a.pruneExpiredUserExecutorRunnersLocked(cutoff)
 	runner := a.userRunners[runnerID]
 	if runner.brokerID != "" {
 		a.mu.Unlock()
+		a.clearWebLocalExecutorReservationsForBrokerRunners(invalidatedRunners)
 		return map[string]any{"ok": false, "intents": []any{}}
 	}
 	if runner.intents == nil {
@@ -5894,8 +6439,119 @@ func (a *neoActor) registerUserExecutorRunner(socket *neoSocket, msg map[string]
 	a.userRunners[runnerID] = runner
 	runnerSnapshot := cloneNeoUserExecutorRunner(runner)
 	a.mu.Unlock()
+	a.clearWebLocalExecutorReservationsForBrokerRunners(invalidatedRunners)
 	intents := a.userExecutorRunnerIntentValues(runnerSnapshot)
 	return map[string]any{"ok": true, "intents": intents}
+}
+
+func neoLocalBrokerRunnerIncarnationFor(runner neoUserExecutorRunner) (neoLocalBrokerRunnerIncarnation, bool) {
+	key := neoLocalBrokerRunnerIncarnation{
+		brokerID:          runner.brokerID,
+		sessionID:         runner.sessionID,
+		sessionGeneration: runner.sessionGeneration,
+		runnerID:          runner.runnerID,
+	}
+	return key, key.brokerID != "" && key.sessionID != "" && key.sessionGeneration != 0 && key.runnerID != ""
+}
+
+func (a *neoActor) markLocalBrokerRunnerCleanupLocked(runner neoUserExecutorRunner) neoUserExecutorRunner {
+	key, ok := neoLocalBrokerRunnerIncarnationFor(runner)
+	if !ok {
+		return runner
+	}
+	if a.userBrokerRunnerCleanups == nil {
+		a.userBrokerRunnerCleanups = map[neoLocalBrokerRunnerIncarnation]neoLocalBrokerRunnerCleanup{}
+	}
+	a.userBrokerRunnerCleanupSeq++
+	if a.userBrokerRunnerCleanupSeq == 0 {
+		a.userBrokerRunnerCleanupSeq = 1
+	}
+	runner.cleanupGeneration = a.userBrokerRunnerCleanupSeq
+	a.userBrokerRunnerCleanups[key] = neoLocalBrokerRunnerCleanup{generation: runner.cleanupGeneration}
+	return runner
+}
+
+func (a *neoActor) localBrokerRunnerCleanupSupersededLocked(key neoLocalBrokerRunnerIncarnation) bool {
+	fence := a.userBrokerFences[key.brokerID]
+	return fence.sessionGeneration > key.sessionGeneration ||
+		fence.sessionGeneration == key.sessionGeneration && fence.sessionID != "" && fence.sessionID != key.sessionID
+}
+
+func (a *neoActor) localBrokerRunnerCleanupPendingLocked(runner neoUserExecutorRunner) bool {
+	key, ok := neoLocalBrokerRunnerIncarnationFor(runner)
+	if !ok {
+		return false
+	}
+	_, pending := a.userBrokerRunnerCleanups[key]
+	return pending
+}
+
+func (a *neoActor) observeLocalBrokerRunnerCleanupLocked(runner *neoUserExecutorRunner) {
+	if runner == nil {
+		return
+	}
+	key, ok := neoLocalBrokerRunnerIncarnationFor(*runner)
+	if !ok {
+		return
+	}
+	cleanup, pending := a.userBrokerRunnerCleanups[key]
+	if !pending {
+		return
+	}
+	if len(runner.runningThreads) == 0 {
+		cleanup.brokerObserved = true
+		if cleanup.complete || a.localBrokerRunnerCleanupSupersededLocked(key) {
+			delete(a.userBrokerRunnerCleanups, key)
+			return
+		}
+		a.userBrokerRunnerCleanups[key] = cleanup
+		return
+	}
+	for _, threadID := range runner.runningThreads {
+		setNeoUserExecutorRunnerIntent(runner, threadID, "stopped")
+	}
+}
+
+func (a *neoActor) completeLocalBrokerRunnerCleanup(runner neoUserExecutorRunner) {
+	key, ok := neoLocalBrokerRunnerIncarnationFor(runner)
+	if !ok || runner.cleanupGeneration == 0 {
+		return
+	}
+	a.mu.Lock()
+	cleanup, pending := a.userBrokerRunnerCleanups[key]
+	if pending && cleanup.generation == runner.cleanupGeneration {
+		cleanup.complete = true
+		if cleanup.brokerObserved || a.localBrokerRunnerCleanupSupersededLocked(key) {
+			delete(a.userBrokerRunnerCleanups, key)
+		} else {
+			a.userBrokerRunnerCleanups[key] = cleanup
+		}
+	}
+	a.mu.Unlock()
+}
+
+func (a *neoActor) pruneExpiredUserExecutorRunnersLocked(cutoff time.Time) []neoUserExecutorRunner {
+	invalidatedRunners := make([]neoUserExecutorRunner, 0)
+	for runnerID, runner := range a.userRunners {
+		if !runner.updatedAt.Before(cutoff) {
+			continue
+		}
+		if runner.brokerID != "" {
+			invalidatedRunners = append(invalidatedRunners, cloneNeoUserExecutorRunner(a.markLocalBrokerRunnerCleanupLocked(runner)))
+		}
+		delete(a.userRunners, runnerID)
+	}
+	return invalidatedRunners
+}
+
+func (a *neoActor) clearWebLocalExecutorReservationsForBrokerRunners(runners []neoUserExecutorRunner) {
+	if a == nil || a.runtime == nil || a.runtime.store == nil || len(runners) == 0 {
+		return
+	}
+	a.runtime.store.clearWebLocalExecutorReservationsForBrokerRunners(a.key, runners)
+	for _, runner := range runners {
+		a.completeLocalBrokerRunnerCleanup(runner)
+	}
 }
 
 func (a *neoActor) heartbeatUserExecutorRunner(socket *neoSocket, msg map[string]any) map[string]any {
@@ -5951,7 +6607,15 @@ func (a *neoActor) syncLocalBrokerHeartbeatResult(request neoLocalBrokerHeartbea
 	}
 	now := time.Now()
 	a.mu.Lock()
-	defer a.mu.Unlock()
+	invalidatedRunners := make(map[string]neoUserExecutorRunner)
+	defer func() {
+		a.mu.Unlock()
+		runners := make([]neoUserExecutorRunner, 0, len(invalidatedRunners))
+		for _, runner := range invalidatedRunners {
+			runners = append(runners, runner)
+		}
+		a.clearWebLocalExecutorReservationsForBrokerRunners(runners)
+	}()
 	fence := a.userBrokerFences[request.BrokerID]
 	if request.SessionGeneration < fence.sessionGeneration || request.SessionGeneration == fence.sessionGeneration && fence.sessionID != "" && fence.sessionID != request.SessionID {
 		return neoLocalBrokerHeartbeatResult{}, errNeoLocalBrokerStaleSession
@@ -5998,11 +6662,42 @@ func (a *neoActor) syncLocalBrokerHeartbeatResult(request neoLocalBrokerHeartbea
 	if a.userBrokerFences == nil {
 		a.userBrokerFences = map[string]neoUserExecutorBrokerFence{}
 	}
+	if session.sessionID != request.SessionID || session.sessionGeneration != request.SessionGeneration {
+		for runnerID, existing := range a.userRunners {
+			if existing.brokerID == request.BrokerID {
+				invalidatedRunners[runnerID] = cloneNeoUserExecutorRunner(existing)
+			}
+		}
+		session.intentRevision = 0
+		session.intentSnapshot = nil
+	} else {
+		session.intentRevision++
+		if session.intentRevision == 0 {
+			session.intentRevision = 1
+		}
+		session.intentSnapshot = nil
+	}
 	session.sessionID = request.SessionID
 	session.sessionGeneration = request.SessionGeneration
 	session.updatedAt = now
 	a.userBrokerSessions[request.BrokerID] = session
 	a.userBrokerFences[request.BrokerID] = neoUserExecutorBrokerFence{sessionID: request.SessionID, sessionGeneration: request.SessionGeneration}
+	for key, cleanup := range a.userBrokerRunnerCleanups {
+		if a.localBrokerRunnerCleanupSupersededLocked(key) {
+			if cleanup.complete {
+				delete(a.userBrokerRunnerCleanups, key)
+			}
+			continue
+		}
+		if key.brokerID == request.BrokerID && key.sessionID == request.SessionID && key.sessionGeneration == request.SessionGeneration && !requestedRunnerIDs[key.runnerID] {
+			cleanup.brokerObserved = true
+			if cleanup.complete {
+				delete(a.userBrokerRunnerCleanups, key)
+			} else {
+				a.userBrokerRunnerCleanups[key] = cleanup
+			}
+		}
+	}
 	a.storeSyncedPluginAgentModesLocked(request.BrokerID, request.SessionID, request.SessionGeneration, request.PluginAgentModes, now)
 	for brokerID, brokerSession := range a.userBrokerSessions {
 		if brokerSession.updatedAt.Before(cutoff) {
@@ -6012,8 +6707,18 @@ func (a *neoActor) syncLocalBrokerHeartbeatResult(request neoLocalBrokerHeartbea
 	}
 	for runnerID, existing := range a.userRunners {
 		if existing.updatedAt.Before(cutoff) || existing.brokerID == request.BrokerID && !requestedRunnerIDs[runnerID] {
+			invalidatedRunners[runnerID] = cloneNeoUserExecutorRunner(existing)
 			delete(a.userRunners, runnerID)
 		}
+	}
+	for runnerID, invalidated := range invalidatedRunners {
+		invalidated = a.markLocalBrokerRunnerCleanupLocked(invalidated)
+		if key, ok := neoLocalBrokerRunnerIncarnationFor(invalidated); ok && key.brokerID == request.BrokerID && key.sessionID == request.SessionID && key.sessionGeneration == request.SessionGeneration && !requestedRunnerIDs[runnerID] {
+			cleanup := a.userBrokerRunnerCleanups[key]
+			cleanup.brokerObserved = true
+			a.userBrokerRunnerCleanups[key] = cleanup
+		}
+		invalidatedRunners[runnerID] = cloneNeoUserExecutorRunner(invalidated)
 	}
 	runners := make([]neoUserExecutorRunner, 0, len(acceptedRunners))
 	for _, incoming := range acceptedRunners {
@@ -6041,6 +6746,7 @@ func (a *neoActor) syncLocalBrokerHeartbeatResult(request neoLocalBrokerHeartbea
 				delete(runner.reportedStoppedIntents, threadID)
 			}
 		}
+		a.observeLocalBrokerRunnerCleanupLocked(&runner)
 		runner.updatedAt = now
 		a.userRunners[runner.runnerID] = runner
 		runners = append(runners, cloneNeoUserExecutorRunner(runner))
@@ -6077,10 +6783,10 @@ func (a *neoActor) userExecutorRunners() []any {
 	}
 	cutoff := time.Now().Add(-neoLocalBrokerHeartbeatTTL)
 	a.mu.Lock()
+	invalidatedRunners := a.pruneExpiredUserExecutorRunnersLocked(cutoff)
 	runnerIDs := make([]string, 0, len(a.userRunners))
 	for runnerID, runner := range a.userRunners {
-		if runner.updatedAt.Before(cutoff) {
-			delete(a.userRunners, runnerID)
+		if a.localBrokerRunnerCleanupPendingLocked(runner) {
 			continue
 		}
 		runnerIDs = append(runnerIDs, runnerID)
@@ -6110,6 +6816,7 @@ func (a *neoActor) userExecutorRunners() []any {
 		})
 	}
 	a.mu.Unlock()
+	a.clearWebLocalExecutorReservationsForBrokerRunners(invalidatedRunners)
 	return runners
 }
 
@@ -6124,41 +6831,259 @@ func (a *neoActor) userExecutorRunnerSnapshot(runnerID string) (neoUserExecutorR
 	return runner, ok
 }
 
+func (a *neoActor) localBrokerIntentVersion(brokerID, sessionID string, sessionGeneration uint64) (string, uint64, bool) {
+	if a == nil || a.runtime == nil {
+		return "", 0, false
+	}
+	a.mu.Lock()
+	session, ok := a.userBrokerSessions[brokerID]
+	ok = ok && session.sessionID == sessionID && session.sessionGeneration == sessionGeneration && !session.updatedAt.Before(time.Now().Add(-neoLocalBrokerHeartbeatTTL))
+	revision := session.intentRevision
+	a.mu.Unlock()
+	return a.runtime.brokerControlEpoch, revision, ok
+}
+
+func (a *neoActor) localBrokerControlSnapshot(brokerID, sessionID string, sessionGeneration uint64) (neoLocalBrokerControlMessage, bool) {
+	if a == nil || a.runtime == nil {
+		return neoLocalBrokerControlMessage{}, false
+	}
+	for {
+		a.mu.Lock()
+		session, ok := a.userBrokerSessions[brokerID]
+		cutoff := time.Now().Add(-neoLocalBrokerHeartbeatTTL)
+		if !ok || session.sessionID != sessionID || session.sessionGeneration != sessionGeneration || session.updatedAt.Before(cutoff) {
+			a.mu.Unlock()
+			return neoLocalBrokerControlMessage{}, false
+		}
+		if snapshot := session.intentSnapshot; snapshot != nil && snapshot.IntentRevision == session.intentRevision && snapshot.IntentEpoch == a.runtime.brokerControlEpoch {
+			message := cloneNeoLocalBrokerControlMessage(*snapshot)
+			a.mu.Unlock()
+			return message, true
+		}
+		runners := make([]neoUserExecutorRunner, 0)
+		for _, runner := range a.userRunners {
+			if runner.brokerID == brokerID && runner.sessionID == sessionID && runner.sessionGeneration == sessionGeneration && !runner.updatedAt.Before(cutoff) {
+				runners = append(runners, cloneNeoUserExecutorRunner(runner))
+			}
+		}
+		revision := session.intentRevision
+		a.mu.Unlock()
+
+		sort.Slice(runners, func(i, j int) bool { return runners[i].runnerID < runners[j].runnerID })
+		message := neoLocalBrokerControlMessage{
+			Type:              "broker_intents",
+			BrokerID:          brokerID,
+			SessionID:         sessionID,
+			SessionGeneration: sessionGeneration,
+			IntentEpoch:       a.runtime.brokerControlEpoch,
+			IntentRevision:    revision,
+			Runners:           make([]neoLocalBrokerControlRunner, 0, len(runners)),
+		}
+		intentCount := 0
+		for _, runner := range runners {
+			intents := a.userExecutorRunnerControlIntentValues(runner)
+			intentCount += len(intents)
+			if intentCount > neoLocalBrokerThreadLimit {
+				return neoLocalBrokerControlMessage{}, false
+			}
+			message.Runners = append(message.Runners, neoLocalBrokerControlRunner{
+				RunnerID: runner.runnerID,
+				Intents:  intents,
+			})
+		}
+
+		a.mu.Lock()
+		current, ok := a.userBrokerSessions[brokerID]
+		cutoff = time.Now().Add(-neoLocalBrokerHeartbeatTTL)
+		if !ok || current.sessionID != sessionID || current.sessionGeneration != sessionGeneration || current.updatedAt.Before(cutoff) {
+			a.mu.Unlock()
+			return neoLocalBrokerControlMessage{}, false
+		}
+		if current.intentRevision != revision {
+			a.mu.Unlock()
+			continue
+		}
+		if snapshot := current.intentSnapshot; snapshot != nil && snapshot.IntentRevision == revision && snapshot.IntentEpoch == a.runtime.brokerControlEpoch {
+			message = cloneNeoLocalBrokerControlMessage(*snapshot)
+			a.mu.Unlock()
+			return message, true
+		}
+		cached := cloneNeoLocalBrokerControlMessage(message)
+		current.intentSnapshot = &cached
+		a.userBrokerSessions[brokerID] = current
+		a.mu.Unlock()
+		return cloneNeoLocalBrokerControlMessage(cached), true
+	}
+}
+
+func (a *neoActor) localBrokerHeartbeatSnapshot(request neoLocalBrokerHeartbeatRequest, accepted []neoUserExecutorRunner) (neoLocalBrokerControlMessage, bool) {
+	if a == nil || a.runtime == nil {
+		return neoLocalBrokerControlMessage{}, false
+	}
+	for _, runner := range accepted {
+		if current, ok := a.userExecutorRunnerSnapshot(runner.runnerID); ok {
+			_ = a.userExecutorRunnerIntentValues(current)
+		}
+	}
+	return a.localBrokerControlSnapshot(request.BrokerID, request.SessionID, request.SessionGeneration)
+}
+
+func (a *neoActor) advanceLocalBrokerIntentRevisionLocked(runner neoUserExecutorRunner) {
+	if runner.brokerID == "" {
+		return
+	}
+	session, ok := a.userBrokerSessions[runner.brokerID]
+	if !ok || session.sessionID != runner.sessionID || session.sessionGeneration != runner.sessionGeneration {
+		return
+	}
+	session.intentRevision++
+	if session.intentRevision == 0 {
+		session.intentRevision = 1
+	}
+	session.intentSnapshot = nil
+	a.userBrokerSessions[runner.brokerID] = session
+}
+
+func (a *neoActor) pushLocalBrokerControlSnapshot(runner neoUserExecutorRunner) {
+	if a == nil || a.runtime == nil || runner.brokerID == "" {
+		return
+	}
+	message, ok := a.localBrokerControlSnapshot(runner.brokerID, runner.sessionID, runner.sessionGeneration)
+	if ok {
+		a.runtime.pushLocalBrokerControl(a.key, message)
+	}
+}
+
 func (a *neoActor) requestUserExecutorRunnerThread(runnerID, threadID string) bool {
 	return a.requestUserExecutorRunnerThreadResult(runnerID, threadID) == neoUserExecutorRunnerAccepted
 }
 
 func (a *neoActor) requestUserExecutorRunnerThreadResult(runnerID, threadID string) neoUserExecutorRunnerRequestResult {
+	result, _ := a.requestUserExecutorRunnerThreadWithReservation(runnerID, threadID, "", nil)
+	return result
+}
+
+func (a *neoActor) requestUserExecutorRunnerThreadWithReservation(runnerID, threadID, spawnID string, threadActor *neoActor) (neoUserExecutorRunnerRequestResult, string) {
 	if a == nil || !neoGatewayUserActorTarget(a.name) || !neoThreadIDExactPattern.MatchString(threadID) {
-		return neoUserExecutorRunnerUnavailable
+		return neoUserExecutorRunnerUnavailable, ""
+	}
+	if threadActor != nil {
+		threadActor.mu.Lock()
 	}
 	a.mu.Lock()
 	cutoff := time.Now().Add(-neoLocalBrokerHeartbeatTTL)
-	for existingRunnerID, existing := range a.userRunners {
-		if existing.updatedAt.Before(cutoff) {
-			delete(a.userRunners, existingRunnerID)
-		}
-	}
+	invalidatedRunners := a.pruneExpiredUserExecutorRunnersLocked(cutoff)
 	runner, ok := a.userRunners[runnerID]
+	if ok && a.localBrokerRunnerCleanupPendingLocked(runner) {
+		ok = false
+	}
 	if ok {
 		if runner.intents == nil {
 			runner.intents = map[string]string{}
 		}
-		if _, exists := runner.intents[threadID]; !exists && a.userExecutorRunnerIntentCountLocked() >= neoLocalBrokerThreadLimit {
+		if _, exists := runner.intents[threadID]; !exists && a.userExecutorRunnerIntentCountLocked(runner) >= neoLocalBrokerThreadLimit {
 			a.mu.Unlock()
-			return neoUserExecutorRunnerCapacityExceeded
+			if threadActor != nil {
+				threadActor.mu.Unlock()
+			}
+			a.clearWebLocalExecutorReservationsForBrokerRunners(invalidatedRunners)
+			return neoUserExecutorRunnerCapacityExceeded, ""
+		}
+	}
+	publicationRunnerID := ""
+	if ok && threadActor != nil && runner.brokerID != "" {
+		publicationRunnerID = neoLocalBrokerPublicationRunnerID(runner, threadID)
+		if publicationRunnerID == "" || !threadActor.reserveWebLocalExecutorLocked(spawnID, publicationRunnerID) {
+			a.mu.Unlock()
+			threadActor.mu.Unlock()
+			a.clearWebLocalExecutorReservationsForBrokerRunners(invalidatedRunners)
+			return neoUserExecutorRunnerUnavailable, ""
 		}
 	}
 	if ok {
 		setNeoUserExecutorRunnerIntent(&runner, threadID, "running")
 		a.userRunners[runnerID] = runner
+		a.advanceLocalBrokerIntentRevisionLocked(runner)
 	}
 	a.mu.Unlock()
+	if threadActor != nil {
+		threadActor.mu.Unlock()
+	}
+	a.clearWebLocalExecutorReservationsForBrokerRunners(invalidatedRunners)
 	if ok {
 		a.broadcast(map[string]any{"type": "runnerIntentsUpdated", "runnerId": runnerID})
-		return neoUserExecutorRunnerAccepted
+		a.pushLocalBrokerControlSnapshot(runner)
+		return neoUserExecutorRunnerAccepted, publicationRunnerID
 	}
-	return neoUserExecutorRunnerUnavailable
+	return neoUserExecutorRunnerUnavailable, ""
+}
+
+func neoLocalBrokerPublicationRunnerID(runner neoUserExecutorRunner, threadID string) string {
+	if runner.brokerID == "" || runner.sessionID == "" || runner.sessionGeneration == 0 || runner.runnerID == "" || !neoThreadIDExactPattern.MatchString(threadID) {
+		return ""
+	}
+	payload := strings.Join([]string{
+		"cliproxy-local-broker-publication-v1",
+		runner.brokerID,
+		runner.sessionID,
+		strconv.FormatUint(runner.sessionGeneration, 10),
+		runner.runnerID,
+		threadID,
+	}, "\x00")
+	digest := sha256.Sum256([]byte(payload))
+	return "broker-" + hex.EncodeToString(digest[:16])
+}
+
+func neoLocalBrokerPublicationRunnerIDExact(runnerID string) bool {
+	if len(runnerID) != len("broker-")+32 || !strings.HasPrefix(runnerID, "broker-") {
+		return false
+	}
+	for _, character := range runnerID[len("broker-"):] {
+		if character < '0' || character > '9' && character < 'a' || character > 'f' {
+			return false
+		}
+	}
+	return true
+}
+
+func (a *neoActor) currentLocalBrokerPublication(catalogRunnerID, threadID string) string {
+	if a == nil || !neoThreadIDExactPattern.MatchString(threadID) {
+		return ""
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	runner, ok := a.userRunners[catalogRunnerID]
+	if !ok || runner.brokerID == "" || runner.intents[threadID] != "running" || a.localBrokerRunnerCleanupPendingLocked(runner) {
+		return ""
+	}
+	cutoff := time.Now().Add(-neoLocalBrokerHeartbeatTTL)
+	session, sessionOK := a.userBrokerSessions[runner.brokerID]
+	if runner.updatedAt.Before(cutoff) || !sessionOK || session.updatedAt.Before(cutoff) || session.sessionID != runner.sessionID || session.sessionGeneration != runner.sessionGeneration {
+		return ""
+	}
+	return neoLocalBrokerPublicationRunnerID(runner, threadID)
+}
+
+func (a *neoActor) localBrokerPublicationAuthorized(threadID, publicationRunnerID string) bool {
+	if !neoLocalBrokerPublicationRunnerIDExact(publicationRunnerID) {
+		return false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	cutoff := time.Now().Add(-neoLocalBrokerHeartbeatTTL)
+	for _, runner := range a.userRunners {
+		if runner.brokerID == "" || runner.intents[threadID] != "running" || runner.updatedAt.Before(cutoff) || a.localBrokerRunnerCleanupPendingLocked(runner) {
+			continue
+		}
+		session, ok := a.userBrokerSessions[runner.brokerID]
+		if !ok || session.updatedAt.Before(cutoff) || session.sessionID != runner.sessionID || session.sessionGeneration != runner.sessionGeneration {
+			continue
+		}
+		if neoLocalBrokerPublicationRunnerID(runner, threadID) == publicationRunnerID {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *neoActor) stopUserExecutorRunnerThread(runnerID, threadID string) bool {
@@ -6167,18 +7092,14 @@ func (a *neoActor) stopUserExecutorRunnerThread(runnerID, threadID string) bool 
 	}
 	a.mu.Lock()
 	cutoff := time.Now().Add(-neoLocalBrokerHeartbeatTTL)
-	for existingRunnerID, existing := range a.userRunners {
-		if existing.updatedAt.Before(cutoff) {
-			delete(a.userRunners, existingRunnerID)
-		}
-	}
+	invalidatedRunners := a.pruneExpiredUserExecutorRunnersLocked(cutoff)
 	runner, ok := a.userRunners[runnerID]
 	if ok {
 		if runner.intents == nil {
 			runner.intents = map[string]string{}
 		}
 		if _, exists := runner.intents[threadID]; !exists {
-			intentCount := a.userExecutorRunnerIntentCountLocked()
+			intentCount := a.userExecutorRunnerIntentCountLocked(runner)
 			reportedRunning := false
 			for _, runningThreadID := range runner.runningThreads {
 				if runningThreadID == threadID {
@@ -6186,18 +7107,65 @@ func (a *neoActor) stopUserExecutorRunnerThread(runnerID, threadID string) bool 
 					break
 				}
 			}
-			if intentCount >= neoLocalBrokerThreadLimit && (!reportedRunning || intentCount >= neoLocalBrokerThreadLimit*2) {
-				ok = false
+			if intentCount >= neoLocalBrokerThreadLimit {
+				removeCount := intentCount - neoLocalBrokerThreadLimit + 1
+				type removableIntent struct {
+					runnerID string
+					threadID string
+					revision uint64
+				}
+				removable := make([]removableIntent, 0, removeCount)
+				if reportedRunning {
+					for candidateRunnerID, candidateRunner := range a.userRunners {
+						if !neoUserExecutorRunnersShareIntentSnapshot(runner, candidateRunner) {
+							continue
+						}
+						for candidateThreadID, desired := range candidateRunner.intents {
+							if candidateRunnerID == runnerID && candidateThreadID == threadID || desired != "stopped" {
+								continue
+							}
+							removable = append(removable, removableIntent{
+								runnerID: candidateRunnerID,
+								threadID: candidateThreadID,
+								revision: candidateRunner.intentRevisions[candidateThreadID],
+							})
+						}
+					}
+					sort.Slice(removable, func(i, j int) bool {
+						if removable[i].revision != removable[j].revision {
+							return removable[i].revision < removable[j].revision
+						}
+						if removable[i].runnerID != removable[j].runnerID {
+							return removable[i].runnerID < removable[j].runnerID
+						}
+						return removable[i].threadID < removable[j].threadID
+					})
+				}
+				if len(removable) < removeCount {
+					ok = false
+				} else {
+					for _, candidate := range removable[:removeCount] {
+						candidateRunner := a.userRunners[candidate.runnerID]
+						delete(candidateRunner.intents, candidate.threadID)
+						delete(candidateRunner.intentRevisions, candidate.threadID)
+						delete(candidateRunner.reportedStoppedIntents, candidate.threadID)
+						a.userRunners[candidate.runnerID] = candidateRunner
+					}
+					runner = a.userRunners[runnerID]
+				}
 			}
 		}
 	}
 	if ok {
 		setNeoUserExecutorRunnerIntent(&runner, threadID, "stopped")
 		a.userRunners[runnerID] = runner
+		a.advanceLocalBrokerIntentRevisionLocked(runner)
 	}
 	a.mu.Unlock()
+	a.clearWebLocalExecutorReservationsForBrokerRunners(invalidatedRunners)
 	if ok {
 		a.broadcast(map[string]any{"type": "runnerIntentsUpdated", "runnerId": runnerID})
+		a.pushLocalBrokerControlSnapshot(runner)
 	}
 	return ok
 }
@@ -6218,12 +7186,23 @@ func setNeoUserExecutorRunnerIntent(runner *neoUserExecutorRunner, threadID, des
 	delete(runner.reportedStoppedIntents, threadID)
 }
 
-func (a *neoActor) userExecutorRunnerIntentCountLocked() int {
+func (a *neoActor) userExecutorRunnerIntentCountLocked(target neoUserExecutorRunner) int {
 	count := 0
 	for _, runner := range a.userRunners {
-		count += len(runner.intents)
+		if neoUserExecutorRunnersShareIntentSnapshot(target, runner) {
+			count += len(runner.intents)
+		}
 	}
 	return count
+}
+
+func neoUserExecutorRunnersShareIntentSnapshot(left, right neoUserExecutorRunner) bool {
+	if left.brokerID == "" || right.brokerID == "" {
+		return left.brokerID == "" && right.brokerID == "" && left.runnerID == right.runnerID
+	}
+	return left.brokerID == right.brokerID &&
+		left.sessionID == right.sessionID &&
+		left.sessionGeneration == right.sessionGeneration
 }
 
 func (a *neoActor) userExecutorRunnerBinding() (string, string, string) {
@@ -7560,23 +8539,27 @@ func (a *neoActor) executorConnect(msg map[string]any) {
 }
 
 func (a *neoActor) executorConnectForSocket(socket *neoSocket, msg map[string]any) {
-	releaseAdmission, rejected := a.rejectUnmigratedRecoveredOrbExecutor(socket)
+	a.webLocalControlMu.Lock()
+	defer a.webLocalControlMu.Unlock()
+	releaseAdmission, rejected := a.admitExecutorPublication(socket, msg)
 	if rejected {
 		return
 	}
 	a.mu.Lock()
 	incomingExecutorID := firstNonEmptyString(msg["clientId"], msg["executorId"])
-	resumePendingWork := a.onlyRecoveredProxyOwnedToolsLocked() || incomingExecutorID != "" && incomingExecutorID == a.resumeExecutorID && (len(a.pendingTools) > 0 || len(a.subagentTools) > 0 || len(a.approvalQueue) > 0 || len(a.pluginUIRequests) > 0)
+	resumePendingWork := a.onlyRecoveredProxyOwnedToolsLocked() || incomingExecutorID != "" && incomingExecutorID == a.resumeExecutorID && a.executorWorkActiveLocked()
 	sameExecutorHandoff := a.sameExecutorHandoffLocked(socket, incomingExecutorID)
-	if a.shouldRejectConcurrentExecutorLocked(socket) || a.shouldRejectReconnectingExecutorLocked(incomingExecutorID) {
+	if a.shouldRejectWebLocalExecutorTakeoverLocked(socket, msg) || a.shouldRejectConcurrentExecutorLocked(socket) || a.shouldRejectReconnectingExecutorLocked(incomingExecutorID) {
 		existingExecutorID := a.executorID
 		a.mu.Unlock()
 		releaseAdmission()
 		a.rejectConcurrentExecutor(socket, existingExecutorID)
 		return
 	}
+	threadID, recoveredToStop := a.reconcileRecoveredHeadlessExecutorLocked(socket, msg)
+	a.acceptExecutorOwnershipLocked(socket, msg, sameExecutorHandoff)
 	stopExecutors := a.spawnedExecutorsForAcceptedHandoffLocked(socket, msg)
-	threadID, recoveredPIDToStop := a.reconcileRecoveredHeadlessExecutorLocked(msg)
+	a.markSpawnedExecutorsConnectedLocked(socket, msg)
 	cleanup := neoExecutorWorkCleanup{}
 	if a.replacingExecutorID != "" ||
 		(socket != nil && a.executorSocket != nil && a.executorSocket != socket && !sameExecutorHandoff) ||
@@ -7618,7 +8601,7 @@ func (a *neoActor) executorConnectForSocket(socket *neoSocket, msg map[string]an
 	for _, executor := range stopExecutors {
 		executor.stop()
 	}
-	stopNeoRecoveredHeadlessPID(threadID, recoveredPIDToStop)
+	stopNeoRecoveredHeadlessPIDRecord(threadID, recoveredToStop)
 	a.closeSupersededExecutorSockets(socket, "Executor handoff")
 	a.broadcastStaleExecutorWorkCleanup(cleanup)
 	a.sendExecutorConnected(nil, false)
@@ -7633,7 +8616,6 @@ func (a *neoActor) executorToolsBootstrapComplete(msg map[string]any) {
 	a.mu.Lock()
 	a.executorReady = true
 	a.executorBootstrapComplete = true
-	a.markSpawnedExecutorsConnectedLocked()
 	a.executorIdleGeneration++
 	resumeBootstrap := a.executorResumeBootstrap
 	a.executorResumeBootstrap = false
@@ -7715,22 +8697,26 @@ func (a *neoActor) executorConnected(msg map[string]any) {
 }
 
 func (a *neoActor) executorConnectedForSocket(socket *neoSocket, msg map[string]any) {
-	releaseAdmission, rejected := a.rejectUnmigratedRecoveredOrbExecutor(socket)
+	a.webLocalControlMu.Lock()
+	defer a.webLocalControlMu.Unlock()
+	releaseAdmission, rejected := a.admitExecutorPublication(socket, msg)
 	if rejected {
 		return
 	}
 	a.mu.Lock()
 	incomingExecutorID := firstNonEmptyString(msg["executorId"], msg["clientId"])
 	sameExecutorHandoff := a.sameExecutorHandoffLocked(socket, incomingExecutorID)
-	if a.shouldRejectConcurrentExecutorLocked(socket) || a.shouldRejectReconnectingExecutorLocked(incomingExecutorID) {
+	if a.shouldRejectWebLocalExecutorTakeoverLocked(socket, msg) || a.shouldRejectConcurrentExecutorLocked(socket) || a.shouldRejectReconnectingExecutorLocked(incomingExecutorID) {
 		existingExecutorID := a.executorID
 		a.mu.Unlock()
 		releaseAdmission()
 		a.rejectConcurrentExecutor(socket, existingExecutorID)
 		return
 	}
+	threadID, recoveredToStop := a.reconcileRecoveredHeadlessExecutorLocked(socket, msg)
+	a.acceptExecutorOwnershipLocked(socket, msg, sameExecutorHandoff)
 	stopExecutors := a.spawnedExecutorsForAcceptedHandoffLocked(socket, msg)
-	threadID, recoveredPIDToStop := a.reconcileRecoveredHeadlessExecutorLocked(msg)
+	a.markSpawnedExecutorsConnectedLocked(socket, msg)
 	cleanup := neoExecutorWorkCleanup{}
 	if a.replacingExecutorID != "" || (socket != nil && a.executorSocket != nil && a.executorSocket != socket && !sameExecutorHandoff) {
 		cleanup = a.clearStaleExecutorWorkForDisconnectLocked()
@@ -7750,7 +8736,6 @@ func (a *neoActor) executorConnectedForSocket(socket *neoSocket, msg map[string]
 	}
 	a.executorReady = true
 	a.executorBootstrapComplete = true
-	a.markSpawnedExecutorsConnectedLocked()
 	a.executorResumeBootstrap = false
 	a.executorIdleGeneration++
 	a.reconnectGeneration++
@@ -7766,7 +8751,7 @@ func (a *neoActor) executorConnectedForSocket(socket *neoSocket, msg map[string]
 	for _, executor := range stopExecutors {
 		executor.stop()
 	}
-	stopNeoRecoveredHeadlessPID(threadID, recoveredPIDToStop)
+	stopNeoRecoveredHeadlessPIDRecord(threadID, recoveredToStop)
 	a.closeSupersededExecutorSockets(socket, "Executor handoff")
 	a.broadcastStaleExecutorWorkCleanup(cleanup)
 	payload := cloneMap(msg)
@@ -7787,40 +8772,113 @@ func (a *neoActor) executorConnectedForSocket(socket *neoSocket, msg map[string]
 	a.scheduleExecutorIdleStopIfNeeded()
 }
 
-func (a *neoActor) rejectUnmigratedRecoveredOrbExecutor(socket *neoSocket) (func(), bool) {
+func (a *neoActor) admitExecutorPublication(socket *neoSocket, msg map[string]any) (func(), bool) {
 	if a == nil || a.runtime == nil {
 		return func() {}, false
 	}
 	a.mu.Lock()
 	sandbox := strings.EqualFold(firstNonEmptyString(a.bootstrapExecutorType, a.meta["executorType"]), "sandbox")
 	threadID := firstNonEmptyString(a.threadID, a.key)
-	concurrent := a.shouldRejectConcurrentExecutorLocked(socket)
 	a.mu.Unlock()
-	if concurrent || !sandbox || !neoThreadIDExactPattern.MatchString(threadID) {
-		return func() {}, false
+	release := func() {}
+	if sandbox && neoThreadIDExactPattern.MatchString(threadID) {
+		incomingRunnerID := neoIncomingExecutorRunnerID(socket, msg)
+		if socket == nil || socket.conn == nil && socket.writeMessage != nil && incomingRunnerID == "" {
+			legacyRelease, migrationRequired, recoveryErr := a.runtime.orbManagerFor().orbExecutorAdmission(a, threadID)
+			if migrationRequired || recoveryErr != nil {
+				if socket != nil {
+					socket.rejectExecutor()
+					if socket.canSend() {
+						message := "Recovered orb executor must be migrated before reconnecting."
+						code := "EXECUTOR_MIGRATION_REQUIRED"
+						if recoveryErr != nil {
+							message = "Orb container recovery is unavailable; executor reconnect is blocked until recovery succeeds."
+							code = "EXECUTOR_RECOVERY_UNAVAILABLE"
+						}
+						socket.send(map[string]any{
+							"type":    "executor_error",
+							"message": message,
+							"code":    code,
+						})
+					}
+					socket.close(websocket.CloseGoingAway, "Orb executor migration required")
+				}
+				return nil, true
+			}
+			if legacyRelease != nil {
+				release = legacyRelease
+			}
+		} else {
+			admission, rejected, recoveryErr := a.runtime.orbManagerFor().orbExecutorSocketAdmission(a, threadID, incomingRunnerID)
+			if rejected || recoveryErr != nil {
+				a.rejectExecutorPublication(socket, recoveryErr != nil)
+				return nil, true
+			}
+			if admission != nil && admission.release != nil {
+				release = admission.release
+			}
+		}
 	}
-	release, migrationRequired, recoveryErr := a.runtime.orbManagerFor().orbExecutorAdmission(a, threadID)
-	if !migrationRequired && recoveryErr == nil {
+	incomingRunnerID := neoIncomingExecutorRunnerID(socket, msg)
+	if neoLocalBrokerPublicationRunnerIDExact(incomingRunnerID) &&
+		(!neoThreadIDExactPattern.MatchString(threadID) || a.runtime.store == nil || !a.runtime.store.localBrokerPublicationAuthorizedForOwner(a.threadToolOwnerID(), threadID, incomingRunnerID)) {
+		release()
+		a.rejectExecutorPublication(socket, false)
+		return nil, true
+	}
+	if !neoIncomingExecutorIsSpawnedHeadless(msg) || !neoThreadIDExactPattern.MatchString(threadID) {
 		return release, false
 	}
-	if socket != nil {
-		socket.clearExecutor()
-		if socket.canSend() {
-			message := "Recovered orb executor must be migrated before reconnecting."
-			code := "EXECUTOR_MIGRATION_REQUIRED"
-			if recoveryErr != nil {
-				message = "Orb container recovery is unavailable; executor reconnect is blocked until recovery succeeds."
-				code = "EXECUTOR_RECOVERY_UNAVAILABLE"
-			}
-			socket.send(map[string]any{
-				"type":    "executor_error",
-				"message": message,
-				"code":    code,
-			})
-		}
-		socket.close(websocket.CloseGoingAway, "Orb executor migration required")
+	recovered, recoveredOK := neoLiveHeadlessPIDRecord(threadID)
+	a.mu.Lock()
+	reject := a.spawnedHeadlessPublicationMismatchLocked(incomingRunnerID, recovered, recoveredOK)
+	a.mu.Unlock()
+	if !reject {
+		return release, false
 	}
+	release()
+	a.rejectExecutorPublication(socket, false)
 	return nil, true
+}
+
+func (a *neoActor) spawnedHeadlessPublicationMismatchLocked(incomingRunnerID string, recovered neoHeadlessPIDRecord, recoveredOK bool) bool {
+	incomingRunnerID = strings.TrimSpace(incomingRunnerID)
+	if a.webLocalExecutorExpected {
+		return incomingRunnerID == "" || incomingRunnerID != a.webLocalExpectedRunnerID
+	}
+	for _, spawned := range a.spawnedExecutors {
+		if spawned != nil && !spawned.stopping && spawned.runnerID != "" {
+			return incomingRunnerID == "" || incomingRunnerID != spawned.runnerID
+		}
+	}
+	if recoveredOK && recovered.WebLocal {
+		return recovered.RunnerID == "" || incomingRunnerID == "" || incomingRunnerID != recovered.RunnerID
+	}
+	if a.webLocalExecutorOwned && a.webLocalExecutorRunnerID != "" {
+		return incomingRunnerID == "" || incomingRunnerID != a.webLocalExecutorRunnerID
+	}
+	return false
+}
+
+func (a *neoActor) rejectExecutorPublication(socket *neoSocket, recoveryUnavailable bool) {
+	if socket == nil {
+		return
+	}
+	socket.rejectExecutor()
+	if socket.canSend() {
+		message := "Executor publication does not match the active thread launch."
+		code := "EXECUTOR_PUBLICATION_MISMATCH"
+		if recoveryUnavailable {
+			message = "Orb container recovery is unavailable; executor reconnect is blocked until recovery succeeds."
+			code = "EXECUTOR_RECOVERY_UNAVAILABLE"
+		}
+		socket.send(map[string]any{
+			"type":    "executor_error",
+			"message": message,
+			"code":    code,
+		})
+	}
+	socket.close(websocket.CloseGoingAway, "Executor publication rejected")
 }
 
 func (a *neoActor) rememberExecutorTypeLocked(msg map[string]any) {
@@ -7835,9 +8893,10 @@ func (a *neoActor) rememberExecutorTypeLocked(msg map[string]any) {
 	a.meta["executorType"] = executorType
 }
 
-func (a *neoActor) markSpawnedExecutorsConnectedLocked() {
+func (a *neoActor) markSpawnedExecutorsConnectedLocked(socket *neoSocket, msg map[string]any) {
+	incomingRunnerID := neoIncomingExecutorRunnerID(socket, msg)
 	for _, spawned := range a.spawnedExecutors {
-		if spawned != nil && !spawned.stopping {
+		if spawned != nil && !spawned.stopping && (spawned.runnerID == "" || incomingRunnerID == spawned.runnerID) {
 			spawned.connected = true
 		}
 	}
@@ -7860,12 +8919,74 @@ func (a *neoActor) sameExecutorHandoffLocked(socket *neoSocket, incomingExecutor
 		incomingExecutorID == a.executorID
 }
 
+func (a *neoActor) acceptExecutorOwnershipLocked(socket *neoSocket, msg map[string]any, sameExecutorHandoff bool) {
+	incomingExecutorID := firstNonEmptyString(msg["clientId"], msg["executorId"])
+	incomingRunnerID := neoIncomingExecutorRunnerID(socket, msg)
+	sameExecutorSocket := socket != nil && a.executorSocket == socket
+	reconnectingSameExecutor := a.executorSocket == nil && incomingExecutorID != "" && incomingExecutorID == a.executorID
+	continuingWebLocalExecutor := a.webLocalExecutorOwned && a.webLocalExecutorSpawnID != "" && incomingRunnerID != "" && incomingRunnerID == a.webLocalExecutorRunnerID &&
+		(sameExecutorSocket || sameExecutorHandoff || reconnectingSameExecutor)
+	webLocalExecutor := continuingWebLocalExecutor
+	webLocalSpawnID := ""
+	if continuingWebLocalExecutor {
+		webLocalSpawnID = a.webLocalExecutorSpawnID
+	}
+	if !webLocalExecutor && a.webLocalExecutorExpected && !a.webLocalExpectedObserverOnly && a.webLocalExpectedRunnerID != "" && a.webLocalExpectedSpawnID != "" && incomingRunnerID == a.webLocalExpectedRunnerID {
+		webLocalExecutor = true
+		webLocalSpawnID = a.webLocalExpectedSpawnID
+	}
+	if !webLocalExecutor {
+		for _, spawned := range a.spawnedExecutors {
+			if spawned != nil && spawned.webLocal && !spawned.stopping && spawned.spawnID != "" && spawned.runnerID != "" && incomingRunnerID == spawned.runnerID {
+				webLocalExecutor = true
+				webLocalSpawnID = spawned.spawnID
+				break
+			}
+		}
+	}
+	a.clearWebLocalExecutorReservationLocked()
+	a.webLocalExecutorOwned = webLocalExecutor
+	a.webLocalExecutorRunnerID = ""
+	a.webLocalExecutorSpawnID = ""
+	if webLocalExecutor {
+		a.webLocalExecutorRunnerID = incomingRunnerID
+		a.webLocalExecutorSpawnID = webLocalSpawnID
+	}
+	a.executorPublicationRunnerID = incomingRunnerID
+	if !webLocalExecutor {
+		a.promoteWebLocalObserversLocked()
+	}
+}
+
+func (a *neoActor) shouldRejectWebLocalExecutorTakeoverLocked(socket *neoSocket, msg map[string]any) bool {
+	if !neoIncomingExecutorIsSpawnedHeadless(msg) {
+		return false
+	}
+	incomingRunnerID := neoIncomingExecutorRunnerID(socket, msg)
+	if incomingRunnerID == "" {
+		return false
+	}
+	incomingWebLocal := a.webLocalExecutorOwned && incomingRunnerID == a.webLocalExecutorRunnerID ||
+		a.webLocalExecutorExpected && incomingRunnerID == a.webLocalExpectedRunnerID ||
+		a.recoveredExecutorPID > 0 && a.recoveredExecutorWebLocal
+	if !incomingWebLocal {
+		for _, spawned := range a.spawnedExecutors {
+			if spawned != nil && spawned.webLocal && !spawned.stopping && spawned.runnerID == incomingRunnerID {
+				incomingWebLocal = true
+				break
+			}
+		}
+	}
+	return incomingWebLocal && !a.webLocalExecutionOwnedLocked() &&
+		(a.executorID != "" || a.resumeExecutorID != "" || a.executorSocket != nil || a.executorReady || a.executorBootstrapComplete || a.replacingExecutorID != "" || a.executorWorkActiveLocked())
+}
+
 func (a *neoActor) shouldRejectReconnectingExecutorLocked(incomingExecutorID string) bool {
 	return a.executorSocket == nil &&
 		a.executorID != "" &&
 		incomingExecutorID != a.executorID &&
 		!a.onlyRecoveredProxyOwnedToolsLocked() &&
-		(len(a.pendingTools) > 0 || len(a.subagentTools) > 0 || len(a.approvalQueue) > 0 || len(a.pluginUIRequests) > 0)
+		a.executorWorkActiveLocked()
 }
 
 func (a *neoActor) onlyRecoveredProxyOwnedToolsLocked() bool {
@@ -7920,7 +9041,7 @@ func (a *neoActor) resumeRecoveredProxyOwnedTools() {
 }
 
 func (a *neoActor) executorWorkActiveLocked() bool {
-	if len(a.pendingTools) > 0 || len(a.subagentTools) > 0 || len(a.approvalQueue) > 0 || len(a.pluginUIRequests) > 0 || a.currentInference != nil {
+	if len(a.pendingTools) > 0 || len(a.subagentTools) > 0 || len(a.subagentWaiters) > 0 || len(a.subagentRuns) > 0 || len(a.approvalQueue) > 0 || len(a.pluginUIRequests) > 0 || a.currentInference != nil {
 		return true
 	}
 	switch normalizeNeoAgentState(a.agentState) {
@@ -7932,10 +9053,26 @@ func (a *neoActor) executorWorkActiveLocked() bool {
 }
 
 func (a *neoActor) spawnedExecutorsForAcceptedHandoffLocked(socket *neoSocket, msg map[string]any) []*neoSpawnedExecutor {
-	if socket == nil || a.executorSocket == nil || a.executorSocket == socket || neoIncomingExecutorIsSpawnedHeadless(msg) {
+	if socket == nil || a.executorSocket == socket {
+		return nil
+	}
+	incomingRunnerID := neoIncomingExecutorRunnerID(socket, msg)
+	for _, spawned := range a.spawnedExecutors {
+		if spawned != nil && !spawned.stopping && spawned.runnerID != "" && incomingRunnerID == spawned.runnerID {
+			return nil
+		}
+	}
+	if a.executorSocket == nil && len(a.spawnedExecutors) == 0 {
 		return nil
 	}
 	return a.markSpawnedExecutorsStoppingLocked(false)
+}
+
+func neoIncomingExecutorRunnerID(socket *neoSocket, msg map[string]any) string {
+	if socket != nil {
+		return socket.runnerKey()
+	}
+	return strings.TrimSpace(firstNonEmptyString(msg["runnerId"], msg["runnerID"], msg["runner_id"]))
 }
 
 func neoIncomingExecutorIsSpawnedHeadless(msg map[string]any) bool {
@@ -7961,28 +9098,36 @@ func (a *neoActor) stopBoundBrokerRunnerForInteractiveExecutor(msg map[string]an
 	a.runtime.store.stopUserExecutorRunnerThreadForOwner(ownerID, runnerID, threadID)
 }
 
-func (a *neoActor) reconcileRecoveredHeadlessExecutorLocked(msg map[string]any) (string, int) {
+func (a *neoActor) reconcileRecoveredHeadlessExecutorLocked(socket *neoSocket, msg map[string]any) (string, neoHeadlessPIDRecord) {
 	threadID := firstNonEmptyString(a.threadID, a.key)
 	if neoIncomingExecutorIsSpawnedHeadless(msg) {
 		if len(a.spawnedExecutors) == 0 {
 			record, ok := neoLiveHeadlessPIDRecord(threadID)
-			if ok {
+			incomingRunnerID := neoIncomingExecutorRunnerID(socket, msg)
+			correlatedWebLocal := record.WebLocal && record.RunnerID != "" && incomingRunnerID == record.RunnerID
+			if ok && (!record.WebLocal || correlatedWebLocal) {
 				a.recoveredExecutorPID = record.PID
-				a.recoveredExecutorWebLocal = record.WebLocal
-			} else {
+				a.recoveredExecutorWebLocal = correlatedWebLocal
+				a.recoveredExecutorRunnerID = record.RunnerID
+				return threadID, neoHeadlessPIDRecord{}
+			}
+			if ok && record.WebLocal {
 				a.recoveredExecutorPID = 0
 				a.recoveredExecutorWebLocal = false
+				a.recoveredExecutorRunnerID = ""
+				return threadID, record
 			}
-		} else {
-			a.recoveredExecutorPID = 0
-			a.recoveredExecutorWebLocal = false
 		}
-		return threadID, 0
+		a.recoveredExecutorPID = 0
+		a.recoveredExecutorWebLocal = false
+		a.recoveredExecutorRunnerID = ""
+		return threadID, neoHeadlessPIDRecord{}
 	}
-	recoveredPID := a.recoveredExecutorPID
+	recovered := neoHeadlessPIDRecord{PID: a.recoveredExecutorPID, WebLocal: a.recoveredExecutorWebLocal, RunnerID: a.recoveredExecutorRunnerID}
 	a.recoveredExecutorPID = 0
 	a.recoveredExecutorWebLocal = false
-	return threadID, recoveredPID
+	a.recoveredExecutorRunnerID = ""
+	return threadID, recovered
 }
 
 func (a *neoActor) rejectConcurrentExecutor(socket *neoSocket, existingExecutorID string) {
@@ -7990,7 +9135,7 @@ func (a *neoActor) rejectConcurrentExecutor(socket *neoSocket, existingExecutorI
 	executorType := firstNonEmptyString(a.bootstrapExecutorType, a.meta["executorType"])
 	a.mu.Unlock()
 	if socket != nil {
-		socket.clearExecutor()
+		socket.rejectExecutor()
 		if socket.conn != nil {
 			socket.send(map[string]any{
 				"type":                 "executor_error",
@@ -8049,8 +9194,10 @@ func (a *neoActor) disconnectExecutorForStop() {
 	delete(a.meta, neoResumeExecutorIDMetaKey)
 	a.replacingExecutorID = ""
 	a.executorSocket = nil
+	a.executorPublicationRunnerID = ""
 	a.executorBootstrapComplete = false
 	a.executorResumeBootstrap = false
+	a.clearWebLocalExecutorOwnershipLocked()
 	cleanup := a.clearExecutorWorkForDisconnectLocked(false)
 	a.pendingInference = nil
 	a.agentState = "idle"
@@ -8063,7 +9210,7 @@ func (a *neoActor) deferExecutorDisconnectForSocket(socket *neoSocket, executorI
 		return false
 	}
 	a.mu.Lock()
-	if a.executorSocket != socket || (len(a.pendingTools) == 0 && len(a.subagentTools) == 0 && len(a.approvalQueue) == 0 && len(a.pluginUIRequests) == 0) {
+	if a.executorSocket != socket || !a.executorWorkActiveLocked() {
 		a.mu.Unlock()
 		return false
 	}
@@ -8101,38 +9248,73 @@ func (a *neoActor) finalizeDeferredExecutorDisconnect(executorID string, generat
 }
 
 func (a *neoActor) executorDisconnectedForSocket(socket *neoSocket, msg map[string]any) {
+	a.webLocalControlMu.Lock()
 	msgExecutorID := firstNonEmptyString(msg["executorId"], msg["clientId"])
+	socketExecutorID := ""
+	if socket != nil {
+		socketExecutorID = socket.executorKey()
+	}
+	reconnectGeneration := int(numberFrom(msg["cliproxyReconnectGeneration"]))
 	a.mu.Lock()
-	if generation := int(numberFrom(msg["cliproxyReconnectGeneration"])); generation > 0 &&
-		(generation != a.reconnectGeneration || a.executorSocket != nil || a.executorID != msgExecutorID) {
+	activeExecutorSocket := socket != nil && a.executorSocket == socket
+	if socket != nil && !activeExecutorSocket {
 		a.mu.Unlock()
+		a.webLocalControlMu.Unlock()
+		return
+	}
+	if socket == nil {
+		if reconnectGeneration > 0 {
+			if reconnectGeneration != a.reconnectGeneration || a.executorSocket != nil || msgExecutorID == "" || a.executorID != msgExecutorID {
+				a.mu.Unlock()
+				a.webLocalControlMu.Unlock()
+				return
+			}
+		} else {
+			if a.executorID == "" && len(a.spawnedExecutors) > 0 || msgExecutorID != "" && a.replacingExecutorID != "" && msgExecutorID == a.replacingExecutorID {
+				cleanup := a.clearStaleExecutorWorkForDisconnectLocked()
+				a.mu.Unlock()
+				a.webLocalControlMu.Unlock()
+				a.broadcastStaleExecutorWorkCleanup(cleanup)
+				return
+			}
+			if msgExecutorID != "" && a.executorID != "" && a.executorID != msgExecutorID {
+				a.mu.Unlock()
+				a.webLocalControlMu.Unlock()
+				return
+			}
+		}
+	} else if msgExecutorID != "" && a.executorID != "" && msgExecutorID != a.executorID && msgExecutorID != socketExecutorID {
+		a.mu.Unlock()
+		a.webLocalControlMu.Unlock()
 		return
 	}
 	if socket != nil && a.preserveExecutorWorkOnClose {
 		a.mu.Unlock()
+		a.webLocalControlMu.Unlock()
 		return
 	}
-	activeExecutorSocket := socket != nil && a.executorSocket == socket
-	if socket != nil && socket.isExecutor() && a.executorSocket != nil && !activeExecutorSocket {
+	a.mu.Unlock()
+	if socket != nil && reconnectGeneration == 0 && a.deferExecutorDisconnectForSocket(socket, "") {
+		a.webLocalControlMu.Unlock()
+		return
+	}
+	a.mu.Lock()
+	activeExecutorSocket = socket != nil && a.executorSocket == socket
+	if socket != nil && !activeExecutorSocket {
 		a.mu.Unlock()
+		a.webLocalControlMu.Unlock()
 		return
 	}
-	if msgExecutorID != "" && a.executorID != "" && msgExecutorID != a.executorID && !activeExecutorSocket {
-		a.mu.Unlock()
-		return
+	if socket == nil {
+		if reconnectGeneration > 0 && (msgExecutorID == "" || a.executorID != msgExecutorID) ||
+			reconnectGeneration == 0 && msgExecutorID != "" && a.executorID != "" && a.executorID != msgExecutorID {
+			a.mu.Unlock()
+			a.webLocalControlMu.Unlock()
+			return
+		}
 	}
-	if !activeExecutorSocket && a.executorID == "" && len(a.spawnedExecutors) > 0 {
-		cleanup := a.clearStaleExecutorWorkForDisconnectLocked()
-		a.mu.Unlock()
-		a.broadcastStaleExecutorWorkCleanup(cleanup)
-		return
-	}
-	if msgExecutorID != "" && a.replacingExecutorID != "" && msgExecutorID == a.replacingExecutorID {
-		cleanup := a.clearStaleExecutorWorkForDisconnectLocked()
-		a.mu.Unlock()
-		a.broadcastStaleExecutorWorkCleanup(cleanup)
-		return
-	}
+	threadID := firstNonEmptyString(a.threadID, a.key)
+	publicationRunnerID := a.executorPublicationRunnerID
 	a.touchLocked()
 	a.executorIdleGeneration++
 	a.reconnectGeneration++
@@ -8140,14 +9322,20 @@ func (a *neoActor) executorDisconnectedForSocket(socket *neoSocket, msg map[stri
 	a.executorID = ""
 	a.replacingExecutorID = ""
 	a.executorSocket = nil
+	a.executorPublicationRunnerID = ""
 	a.executorBootstrapComplete = false
 	a.executorResumeBootstrap = false
 	a.recoveredExecutorPID = 0
 	a.recoveredExecutorWebLocal = false
+	a.recoveredExecutorRunnerID = ""
+	a.clearWebLocalExecutorOwnershipLocked()
 	spawnedExecutors := a.markSpawnedExecutorsStoppingLocked(true)
 	cleanup := a.clearExecutorWorkForDisconnectLocked(true)
 	a.agentState = "idle"
 	a.mu.Unlock()
+	if a.runtime != nil && publicationRunnerID != "" {
+		a.runtime.orbManagerFor().orbExecutorDisconnected(a, threadID, publicationRunnerID)
+	}
 	if a.runtime != nil && a.runtime.store != nil {
 		a.runtime.store.broadcastThreadStatusUpdated(a)
 	}
@@ -8172,6 +9360,7 @@ func (a *neoActor) executorDisconnectedForSocket(socket *neoSocket, msg map[stri
 	})
 	a.broadcastObservers()
 	a.syncCloudAsync()
+	a.webLocalControlMu.Unlock()
 	a.processQueue()
 	a.maybeSpawnWebLocalExecutorForPendingWork()
 }
@@ -8345,11 +9534,14 @@ func (a *neoActor) executorConnectRejectedForSocket(socket *neoSocket, msg map[s
 	a.executorID = ""
 	a.replacingExecutorID = ""
 	a.executorSocket = nil
+	a.executorPublicationRunnerID = ""
 	a.executorReady = false
 	a.executorBootstrapComplete = false
 	a.executorResumeBootstrap = false
 	a.recoveredExecutorPID = 0
 	a.recoveredExecutorWebLocal = false
+	a.recoveredExecutorRunnerID = ""
+	a.clearWebLocalExecutorOwnershipExactLocked(a.webLocalExecutorSpawnID, a.webLocalExecutorRunnerID)
 	spawnedExecutors := a.markSpawnedExecutorsStoppingLocked(false)
 	cleanup := a.clearExecutorWorkForDisconnectLocked(false)
 	a.agentState = "idle"
@@ -8410,7 +9602,38 @@ func normalizeNeoClientSpawnExecutor(msg map[string]any) (map[string]any, bool) 
 		}
 		out["additionalRepositories"] = repositories
 	}
+	_, hasExecutor := msg["executor"]
+	_, hasExecutorDemand := msg["executorDemand"]
+	if hasExecutor != hasExecutorDemand {
+		return nil, false
+	}
+	if value, exists := msg["executor"]; exists {
+		executor := mapValue(value)
+		runnerID := strings.TrimSpace(stringValue(executor["runnerId"]))
+		if len(executor) != 2 || stringValue(executor["type"]) != "runner" || runnerID == "" {
+			return nil, false
+		}
+		out["executor"] = map[string]any{"type": "runner", "runnerId": runnerID}
+	}
+	if value, exists := msg["executorDemand"]; exists {
+		demand, ok := value.(string)
+		if !ok || demand != "required" {
+			return nil, false
+		}
+		out["executorDemand"] = demand
+	}
 	return out, true
+}
+
+func neoClientSpawnExecutorRunnerID(msg map[string]any) string {
+	if stringValue(msg["executorDemand"]) != "required" {
+		return ""
+	}
+	executor := mapValue(msg["executor"])
+	if stringValue(executor["type"]) != "runner" {
+		return ""
+	}
+	return strings.TrimSpace(stringValue(executor["runnerId"]))
 }
 
 func normalizeNeoClientAdditionalRepositories(raw any) ([]any, bool) {
@@ -8470,7 +9693,15 @@ func (a *neoActor) webLocalInferenceBootstrapNeeded() bool {
 	}
 	a.mu.Lock()
 	threadID := firstNonEmptyString(a.threadID, a.key)
-	if a.executorID != "" || a.executorReady || a.executorBootstrapComplete {
+	if a.executorID != "" ||
+		a.resumeExecutorID != "" ||
+		a.executorSocket != nil ||
+		a.executorReady ||
+		a.executorBootstrapComplete ||
+		a.replacingExecutorID != "" ||
+		a.webLocalExecutorExpected ||
+		a.nonWebLocalSocketConnectedLocked() ||
+		a.executorWorkActiveLocked() {
 		a.mu.Unlock()
 		return false
 	}
@@ -8500,18 +9731,35 @@ func (a *neoActor) maybeSpawnWebLocalExecutorForPendingWork() map[string]any {
 	if !pending {
 		return nil
 	}
-	a.rebindUnavailableWebLocalRunner()
+	a.mu.Lock()
+	requiredRunnerID := strings.TrimSpace(stringValue(a.meta[neoRequiredRunnerIDMetaKey]))
+	reservedSpawnID := ""
+	if a.webLocalExecutorExpected {
+		reservedSpawnID = a.webLocalExpectedSpawnID
+	}
+	a.mu.Unlock()
+	if requiredRunnerID == "" {
+		a.rebindUnavailableWebLocalRunner()
+	}
 	runnerID, threadID, pending = a.pendingWebLocalExecutorRequest()
 	if !pending {
 		return nil
 	}
+	spawnID := reservedSpawnID
+	if spawnID == "" {
+		spawnID = "web-local-inference-work-" + randomBase62(12)
+	}
 	if runnerID != "" {
-		if a.runtime.store.requestUserExecutorRunnerThreadForOwner(a.threadToolOwnerID(), runnerID, threadID) {
+		result, _ := a.runtime.store.requestWebLocalExecutorRunnerThreadForOwner(a.threadToolOwnerID(), runnerID, threadID, spawnID, a)
+		if result == neoUserExecutorRunnerAccepted {
 			return map[string]any{"status": "running", "message": "Waiting for the selected runner to start the thread."}
+		}
+		if result == neoUserExecutorRunnerCapacityExceeded {
+			return map[string]any{"status": "failed", "message": "Selected runner capacity is exhausted.", "reasonCode": "runner_capacity_exceeded"}
 		}
 		return map[string]any{"status": "failed", "message": "Selected runner is no longer available."}
 	}
-	if runnerID, handled := a.bindSingleLegacyWebLocalRunner(threadID); handled {
+	if runnerID, handled := a.bindSingleLegacyWebLocalRunner(threadID, spawnID); handled {
 		if runnerID != "" {
 			return map[string]any{"status": "running", "message": "Waiting for the selected runner to start the thread."}
 		}
@@ -8522,7 +9770,7 @@ func (a *neoActor) maybeSpawnWebLocalExecutorForPendingWork() map[string]any {
 	}
 	return a.spawnWebLocalExecutor(map[string]any{
 		"type":                    "client_spawn_executor",
-		"requestId":               "web-local-inference-work-" + randomBase62(12),
+		"requestId":               spawnID,
 		"replaceExistingExecutor": false,
 	})
 }
@@ -8579,7 +9827,7 @@ func (a *neoActor) rebindUnavailableWebLocalRunner() string {
 	}
 }
 
-func (a *neoActor) bindSingleLegacyWebLocalRunner(threadID string) (string, bool) {
+func (a *neoActor) bindSingleLegacyWebLocalRunner(threadID, spawnID string) (string, bool) {
 	if a == nil || a.runtime == nil || a.runtime.store == nil {
 		return "", false
 	}
@@ -8623,7 +9871,8 @@ func (a *neoActor) bindSingleLegacyWebLocalRunner(threadID string) (string, bool
 	if runnerID == "" {
 		return "", true
 	}
-	if !a.runtime.store.requestUserExecutorRunnerThreadForOwner(ownerID, runnerID, threadID) {
+	requestResult, publicationRunnerID := a.runtime.store.requestWebLocalExecutorRunnerThreadForOwner(ownerID, runnerID, threadID, spawnID, a)
+	if requestResult != neoUserExecutorRunnerAccepted {
 		return "", true
 	}
 	candidateEnvironment := neoWebLocalEnvironmentWithWorkspacePaths(nil, workingDirectory, workingDirectory)
@@ -8631,16 +9880,19 @@ func (a *neoActor) bindSingleLegacyWebLocalRunner(threadID string) (string, bool
 	binding, ok := a.runtime.neoWebLocalThreadBindingFromState(ownerID, candidateEnvironment, candidateMeta)
 	if !ok {
 		a.runtime.store.stopUserExecutorRunnerThreadForOwner(ownerID, runnerID, threadID)
+		a.clearWebLocalExecutorReservation(spawnID, publicationRunnerID)
 		return "", true
 	}
 	if projectName != "" && !strings.EqualFold(binding.projectName, projectName) || namespace != "" && !strings.EqualFold(binding.namespace, namespace) || projectID != "" && binding.projectID != projectID {
 		a.runtime.store.stopUserExecutorRunnerThreadForOwner(ownerID, runnerID, threadID)
+		a.clearWebLocalExecutorReservation(spawnID, publicationRunnerID)
 		return "", true
 	}
 	a.mu.Lock()
 	if !reflect.DeepEqual(a.environment, environment) || !reflect.DeepEqual(neoWebLocalBindingRelevantMeta(a.meta), bindingMeta) {
 		a.mu.Unlock()
 		a.runtime.store.stopUserExecutorRunnerThreadForOwner(ownerID, runnerID, threadID)
+		a.clearWebLocalExecutorReservation(spawnID, publicationRunnerID)
 		return "", true
 	}
 	a.environment = neoWebLocalCanonicalBindingEnvironment(a.environment, binding.workingDirectory, binding.workspaceRoot, binding.repositoryURL)
@@ -8666,7 +9918,7 @@ func (a *neoActor) pendingWebLocalExecutorRequest() (string, string, bool) {
 	threadID := firstNonEmptyString(a.threadID, a.key)
 	hasPendingWork := len(a.queue) > 0 || a.pendingInference != nil || a.retryScheduled
 	executorConnected := a.executorReady || a.executorBootstrapComplete
-	executorInFlight := executorConnected || a.executorID != "" || len(a.spawnedExecutors) > 0
+	executorInFlight := executorConnected || a.executorID != "" || a.spawnedExecutorInFlightLocked()
 	agentIdle := normalizeNeoAgentState(a.agentState) == "idle" && len(a.pluginUIRequests) == 0
 	a.mu.Unlock()
 	sandbox := strings.EqualFold(bootstrapExecutorType, "sandbox")
@@ -8687,64 +9939,301 @@ func (a *neoActor) pendingWebLocalExecutorRequest() (string, string, bool) {
 }
 
 func (a *neoActor) spawnExecutor(msg map[string]any) map[string]any {
+	a.webLocalControlMu.Lock()
+	defer a.webLocalControlMu.Unlock()
 	return a.spawnExecutorWithProvenance(msg, false)
 }
 
 func (a *neoActor) spawnWebLocalExecutor(msg map[string]any) map[string]any {
+	a.webLocalControlMu.Lock()
+	defer a.webLocalControlMu.Unlock()
+	return a.spawnWebLocalExecutorLocked(msg)
+}
+
+func (a *neoActor) spawnWebLocalExecutorLocked(msg map[string]any) map[string]any {
 	return a.spawnExecutorWithProvenance(msg, true)
 }
 
+func (a *neoActor) reserveWebLocalExecutor(spawnID, runnerID string) bool {
+	spawnID = strings.TrimSpace(spawnID)
+	runnerID = strings.TrimSpace(runnerID)
+	if spawnID == "" || runnerID == "" {
+		return false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.reserveWebLocalExecutorLocked(spawnID, runnerID)
+}
+
+func (a *neoActor) reserveWebLocalExecutorLocked(spawnID, runnerID string) bool {
+	if a.webLocalInferenceObserverOnlyLocked() {
+		return false
+	}
+	if a.webLocalExecutorExpected {
+		return a.webLocalExpectedSpawnID == spawnID && a.webLocalExpectedRunnerID == runnerID
+	}
+	a.webLocalExecutorExpected = true
+	a.webLocalExpectedRunnerID = runnerID
+	a.webLocalExpectedSpawnID = spawnID
+	a.webLocalExpectedObserverOnly = false
+	return true
+}
+
+func (a *neoActor) clearWebLocalExecutorReservation(spawnID, runnerID string) {
+	spawnID = strings.TrimSpace(spawnID)
+	runnerID = strings.TrimSpace(runnerID)
+	if spawnID == "" || runnerID == "" {
+		return
+	}
+	a.mu.Lock()
+	a.clearWebLocalExecutorReservationExactLocked(spawnID, runnerID)
+	a.mu.Unlock()
+}
+
+func (a *neoActor) clearWebLocalExecutorReservationExactLocked(spawnID, runnerID string) {
+	if a.webLocalExecutorExpected && a.webLocalExpectedSpawnID == spawnID && a.webLocalExpectedRunnerID == runnerID {
+		a.clearWebLocalExecutorReservationLocked()
+	}
+}
+
+func (a *neoActor) clearWebLocalExecutorReservationForRunner(runnerID string) {
+	runnerID = strings.TrimSpace(runnerID)
+	if runnerID == "" {
+		return
+	}
+	a.mu.Lock()
+	if a.webLocalExecutorExpected && a.webLocalExpectedRunnerID == runnerID {
+		a.clearWebLocalExecutorReservationLocked()
+	}
+	a.mu.Unlock()
+}
+
+func (a *neoActor) revokeBrokerExecutorPublication(userActor *neoActor, catalogRunnerID, publicationRunnerID string) {
+	if a == nil || publicationRunnerID == "" {
+		return
+	}
+	a.webLocalControlMu.Lock()
+	a.mu.Lock()
+	threadID := firstNonEmptyString(a.threadID, a.key)
+	replacementRunnerID := ""
+	if userActor != nil {
+		replacementRunnerID = userActor.currentLocalBrokerPublication(catalogRunnerID, threadID)
+	}
+	if replacementRunnerID == publicationRunnerID {
+		a.mu.Unlock()
+		a.webLocalControlMu.Unlock()
+		return
+	}
+	reservationMatches := a.webLocalExecutorExpected && a.webLocalExpectedRunnerID == publicationRunnerID
+	activeMatches := a.executorPublicationRunnerID == publicationRunnerID &&
+		(a.executorID != "" || a.resumeExecutorID != "" || a.executorSocket != nil || a.executorReady || a.executorBootstrapComplete)
+	activeWebLocalMatches := activeMatches && a.webLocalExecutorOwned && a.webLocalExecutorRunnerID == publicationRunnerID && a.webLocalExecutorSpawnID != ""
+	activeWebLocalSpawnID := a.webLocalExecutorSpawnID
+	if reservationMatches {
+		if replacementRunnerID == "" {
+			a.clearWebLocalExecutorReservationLocked()
+		} else {
+			a.webLocalExpectedRunnerID = replacementRunnerID
+			a.webLocalExpectedObserverOnly = false
+		}
+	}
+	var socket *neoSocket
+	cleanup := neoExecutorWorkCleanup{}
+	if activeMatches {
+		socket = a.executorSocket
+		a.touchLocked()
+		a.executorIdleGeneration++
+		a.reconnectGeneration++
+		a.executorReady = false
+		a.executorID = ""
+		a.resumeExecutorID = ""
+		a.replacingExecutorID = ""
+		a.executorSocket = nil
+		a.executorPublicationRunnerID = ""
+		a.executorBootstrapComplete = false
+		a.executorResumeBootstrap = false
+		a.webLocalExecutorOwned = false
+		a.webLocalExecutorRunnerID = ""
+		a.webLocalExecutorSpawnID = ""
+		if replacementRunnerID != "" && activeWebLocalMatches {
+			a.webLocalExecutorExpected = true
+			a.webLocalExpectedRunnerID = replacementRunnerID
+			a.webLocalExpectedSpawnID = activeWebLocalSpawnID
+			a.webLocalExpectedObserverOnly = false
+		}
+		cleanup = a.clearExecutorWorkForDisconnectLocked(true)
+		a.agentState = "idle"
+	}
+	a.mu.Unlock()
+	if socket != nil {
+		socket.rejectExecutor()
+		if socket.canSend() {
+			socket.send(map[string]any{
+				"type":    "executor_error",
+				"message": "Local broker executor publication is no longer authoritative.",
+				"code":    "EXECUTOR_PUBLICATION_REVOKED",
+			})
+		}
+		socket.close(websocket.CloseGoingAway, "Executor publication revoked")
+	}
+	a.webLocalControlMu.Unlock()
+	if !activeMatches {
+		return
+	}
+	a.broadcastExecutorWorkCleanup(cleanup)
+	a.broadcastExecutorStatusPayload(map[string]any{
+		"type":    "executor_status",
+		"status":  "failed",
+		"message": "Local broker executor disconnected.",
+		"details": map[string]any{"reasonCode": "executor_disconnected"},
+	})
+	a.broadcastObservers()
+	a.syncCloudAsync()
+	a.processQueue()
+	a.maybeSpawnWebLocalExecutorForPendingWork()
+}
+
+func (a *neoActor) clearWebLocalExecutorReservationLocked() {
+	a.webLocalExecutorExpected = false
+	a.webLocalExpectedRunnerID = ""
+	a.webLocalExpectedSpawnID = ""
+	a.webLocalExpectedObserverOnly = false
+}
+
+func (a *neoActor) clearWebLocalExecutorOwnershipLocked() {
+	a.clearWebLocalExecutorReservationLocked()
+	a.webLocalExecutorOwned = false
+	a.webLocalExecutorRunnerID = ""
+	a.webLocalExecutorSpawnID = ""
+}
+
+func (a *neoActor) clearWebLocalExecutorOwnershipExactLocked(spawnID, runnerID string) {
+	a.clearWebLocalExecutorReservationExactLocked(spawnID, runnerID)
+	if a.webLocalExecutorOwned && a.webLocalExecutorSpawnID == spawnID && a.webLocalExecutorRunnerID == runnerID {
+		a.webLocalExecutorOwned = false
+		a.webLocalExecutorRunnerID = ""
+		a.webLocalExecutorSpawnID = ""
+	}
+}
+
 func (a *neoActor) spawnWebLocalExecutorWithRunnerRecovery(msg map[string]any) map[string]any {
+	spawnID := firstNonEmptyString(msg["spawnId"], msg["requestId"])
+	if spawnID == "" {
+		spawnID = "spawn-" + randomBase62(12)
+	}
 	a.mu.Lock()
 	bootstrapExecutorType := firstNonEmptyString(a.bootstrapExecutorType, a.meta["executorType"])
 	runnerID := strings.TrimSpace(firstNonEmptyString(a.meta["runnerId"], a.meta["runnerID"]))
 	threadID := firstNonEmptyString(a.threadID, a.key)
+	observerOnly := a.webLocalInferenceObserverOnlyLocked()
+	executorID := a.executorID
 	a.mu.Unlock()
+	if observerOnly {
+		return a.broadcastExecutorStatus(spawnID, "running", "Executor is already controlled by another client.", map[string]any{"reasonCode": "executor_connected", "executorId": executorID, "threadId": threadID})
+	}
+	if neoClientSpawnExecutorRunnerID(msg) != "" {
+		return a.spawnWebLocalExecutorLocked(msg)
+	}
 	if strings.EqualFold(bootstrapExecutorType, "sandbox") {
-		return a.spawnWebLocalExecutor(msg)
+		return a.spawnWebLocalExecutorLocked(msg)
 	}
 	if runnerID != "" {
-		return a.spawnWebLocalExecutor(msg)
+		return a.spawnWebLocalExecutorLocked(msg)
 	}
-	if runnerID, handled := a.bindSingleLegacyWebLocalRunner(threadID); handled {
-		spawnID := firstNonEmptyString(msg["spawnId"], msg["requestId"])
-		if spawnID == "" {
-			spawnID = "spawn-" + randomBase62(12)
-		}
+	if runnerID, handled := a.bindSingleLegacyWebLocalRunner(threadID, spawnID); handled {
 		if runnerID != "" {
 			return a.broadcastExecutorStatus(spawnID, "running", "Waiting for the selected runner to start the thread.", map[string]any{"reasonCode": "waiting_for_runner", "threadId": threadID})
 		}
 		return a.broadcastExecutorStatus(spawnID, "failed", "No matching runner is available.", map[string]any{"reasonCode": "runner_unavailable", "threadId": threadID})
 	}
 	if a.threadToolOwnerID() == neoLocalOwnerUserID {
-		return a.spawnWebLocalExecutor(msg)
-	}
-	spawnID := firstNonEmptyString(msg["spawnId"], msg["requestId"])
-	if spawnID == "" {
-		spawnID = "spawn-" + randomBase62(12)
+		return a.spawnWebLocalExecutorLocked(msg)
 	}
 	return a.broadcastExecutorStatus(spawnID, "failed", "Select a workspace and matching local runner before starting this thread.", map[string]any{"reasonCode": "workspace_selection_required", "threadId": threadID})
 }
 
 func (a *neoActor) spawnExecutorWithProvenance(msg map[string]any, webLocal bool) map[string]any {
-	a.rebindUnavailableWebLocalRunner()
+	spawnID := firstNonEmptyString(msg["spawnId"], msg["requestId"])
+	if spawnID == "" {
+		spawnID = "spawn-" + randomBase62(12)
+	}
+	explicitRunnerID := neoClientSpawnExecutorRunnerID(msg)
+	if explicitRunnerID != "" {
+		a.mu.Lock()
+		boundThreadID := firstNonEmptyString(a.threadID, a.key)
+		a.mu.Unlock()
+		requestResult := neoUserExecutorRunnerUnavailable
+		if a.runtime != nil && a.runtime.store != nil {
+			if webLocal {
+				requestResult, _ = a.runtime.store.requestWebLocalExecutorRunnerThreadForOwner(a.threadToolOwnerID(), explicitRunnerID, boundThreadID, spawnID, a)
+			} else {
+				requestResult = a.runtime.store.requestUserExecutorRunnerThreadResultForOwner(a.threadToolOwnerID(), explicitRunnerID, boundThreadID)
+			}
+		}
+		if requestResult != neoUserExecutorRunnerAccepted {
+			message := "Selected runner is no longer available."
+			reasonCode := "runner_unavailable"
+			if requestResult == neoUserExecutorRunnerCapacityExceeded {
+				message = "Selected runner capacity is exhausted."
+				reasonCode = "runner_capacity_exceeded"
+			}
+			return a.broadcastExecutorStatus(spawnID, "failed", message, map[string]any{"reasonCode": reasonCode, "threadId": boundThreadID})
+		}
+		runner := a.runtime.store.userExecutorRunnerForOwner(a.threadToolOwnerID(), explicitRunnerID)
+		workingDirectory := neoUserExecutorRunnerWorkingDirectory(runner["workingDirectory"])
+		a.mu.Lock()
+		if a.meta == nil {
+			a.meta = map[string]any{}
+		}
+		a.meta["runnerId"] = explicitRunnerID
+		a.meta[neoRequiredRunnerIDMetaKey] = explicitRunnerID
+		a.meta["executorType"] = "local-client"
+		a.bootstrapExecutorType = "local-client"
+		if workingDirectory != "" {
+			a.environment = neoEnvironmentWithRunnerWorkingDirectory(a.environment, workingDirectory)
+		}
+		a.mu.Unlock()
+		a.syncCloudAsync()
+		return a.broadcastExecutorStatus(spawnID, "running", "Waiting for the selected runner to start the thread.", map[string]any{"reasonCode": "waiting_for_runner", "threadId": boundThreadID})
+	}
+	a.mu.Lock()
+	requiredRunnerID := strings.TrimSpace(stringValue(a.meta[neoRequiredRunnerIDMetaKey]))
+	a.mu.Unlock()
+	if requiredRunnerID == "" {
+		a.rebindUnavailableWebLocalRunner()
+	}
 	a.mu.Lock()
 	bootstrapType := strings.TrimSpace(a.bootstrapExecutorType)
 	runnerID := strings.TrimSpace(firstNonEmptyString(a.meta["runnerId"], a.meta["runnerID"]))
 	boundThreadID := firstNonEmptyString(a.threadID, a.key)
 	webLocalShell := boolValue(a.meta["cliProxyAPIWebLocalShell"])
 	a.mu.Unlock()
-	spawnID := firstNonEmptyString(msg["spawnId"], msg["requestId"])
-	if spawnID == "" {
-		spawnID = "spawn-" + randomBase62(12)
-	}
 	if runnerID != "" {
-		if a.runtime != nil && a.runtime.store != nil && a.runtime.store.requestUserExecutorRunnerThreadForOwner(a.threadToolOwnerID(), runnerID, boundThreadID) {
+		requestResult := neoUserExecutorRunnerUnavailable
+		if a.runtime != nil && a.runtime.store != nil {
+			if webLocal {
+				requestResult, _ = a.runtime.store.requestWebLocalExecutorRunnerThreadForOwner(a.threadToolOwnerID(), runnerID, boundThreadID, spawnID, a)
+			} else {
+				requestResult = a.runtime.store.requestUserExecutorRunnerThreadResultForOwner(a.threadToolOwnerID(), runnerID, boundThreadID)
+			}
+		}
+		if requestResult == neoUserExecutorRunnerAccepted {
 			return a.broadcastExecutorStatus(spawnID, "running", "Waiting for the selected runner to start the thread.", map[string]any{"reasonCode": "waiting_for_runner", "threadId": boundThreadID})
 		}
-		return a.broadcastExecutorStatus(spawnID, "failed", "Selected runner is no longer available.", map[string]any{"reasonCode": "runner_unavailable", "threadId": boundThreadID})
+		message := "Selected runner is no longer available."
+		reasonCode := "runner_unavailable"
+		if requestResult == neoUserExecutorRunnerCapacityExceeded {
+			message = "Selected runner capacity is exhausted."
+			reasonCode = "runner_capacity_exceeded"
+		}
+		return a.broadcastExecutorStatus(spawnID, "failed", message, map[string]any{"reasonCode": reasonCode, "threadId": boundThreadID})
 	}
 	if strings.EqualFold(bootstrapType, "sandbox") && a.runtime != nil {
+		if webLocal {
+			runnerID = "web-local-" + randomBase62(22)
+			msg = cloneMap(msg)
+			msg["cliproxyWebLocalRunnerId"] = runnerID
+		}
 		return a.runtime.orbManagerFor().spawnOrb(a, msg)
 	}
 	if (webLocal || webLocalShell) && a.threadToolOwnerID() != neoLocalOwnerUserID {
@@ -8763,6 +10252,8 @@ func (a *neoActor) spawnExecutorWithProvenance(msg map[string]any, webLocal bool
 	environment := neoCanonicalizeEnvironmentWorkspace(cloneMap(a.environment))
 	ready := a.executorReady
 	executorID := a.executorID
+	spawnGeneration := a.executorSpawnGeneration
+	disposed := a.disposed
 	var existing *neoSpawnedExecutor
 	for _, spawned := range a.spawnedExecutors {
 		if spawned != nil && spawned.threadID == threadID && !spawned.stopping {
@@ -8774,6 +10265,9 @@ func (a *neoActor) spawnExecutorWithProvenance(msg map[string]any, webLocal bool
 
 	if !neoThreadIDExactPattern.MatchString(threadID) {
 		return a.broadcastExecutorStatus(spawnID, "failed", "Cannot spawn Amp headless executor without a valid thread ID.", map[string]any{"reasonCode": "environment_missing"})
+	}
+	if disposed {
+		return a.broadcastExecutorStatus(spawnID, "failed", "Cannot spawn an executor for a disposed thread actor.", map[string]any{"reasonCode": "spawn_rejected", "threadId": threadID})
 	}
 	replaceExisting := boolValue(msg["replaceExistingExecutor"])
 	if ready && !replaceExisting {
@@ -8788,39 +10282,12 @@ func (a *neoActor) spawnExecutorWithProvenance(msg map[string]any, webLocal bool
 		return a.broadcastExecutorStatus(spawnID, "failed", "Select a workspace and matching local runner before starting this thread.", map[string]any{"reasonCode": "workspace_selection_required", "threadId": threadID})
 	}
 	workDir := neoHeadlessWorkingDirectory(neoHeadlessExecutorSpawnOptions(msg), environment)
-	if webLocal {
-		recovered, recoveredOK := neoLiveHeadlessPIDRecord(threadID)
-		if recoveredOK && recovered.WebLocal && neoHeadlessProcessOwnedByThread(recovered.PID, threadID) {
-			stopNeoRecoveredHeadlessPID(threadID, recovered.PID)
-			if !waitNeoHeadlessProcessExit(recovered.PID, 2*time.Second) {
-				return a.broadcastExecutorStatus(spawnID, "failed", "Stale local Amp headless executor did not stop.", map[string]any{"reasonCode": "spawn_failed", "pid": recovered.PID, "threadId": threadID})
-			}
-		}
-	}
-	ampPID, err := prepareNeoAmpHeadlessPIDFile(threadID, workDir)
-	if err != nil {
-		return a.broadcastExecutorStatus(spawnID, "failed", "Cannot prepare Amp headless executor lock: "+err.Error(), map[string]any{"reasonCode": "spawn_failed", "threadId": threadID})
-	}
-	if ampPID > 0 {
-		owned, ownedOK := neoLiveHeadlessPIDRecord(threadID)
-		if ownedOK && owned.PID == ampPID && neoHeadlessProcessOwnedByThread(ampPID, threadID) {
-			return a.broadcastExecutorStatus(spawnID, "running", "Amp headless executor is already starting for this thread.", map[string]any{"reasonCode": "waiting_for_executor_connect", "pid": ampPID, "threadId": threadID})
-		}
-		return a.broadcastExecutorStatus(spawnID, "failed", "Another Amp process already owns this thread.", map[string]any{"reasonCode": "spawn_rejected", "pid": ampPID, "threadId": threadID})
-	}
-
 	command, err := neoAmpExecutorCommand(cfg)
 	if err != nil {
 		return a.broadcastExecutorStatus(spawnID, "failed", err.Error(), map[string]any{"reasonCode": "spawn_failed"})
 	}
 
 	replaceExecutorConnection := func() {}
-	if ready && replaceExisting {
-		if replacement := a.prepareExecutorConnectionReplacement("Replacing executor with local Amp headless executor"); replacement != nil {
-			replaceExecutorConnection = replacement
-		}
-	}
-
 	requestedLogPath := neoHeadlessExecutorLogPath(threadID, spawnID)
 	logPath := ""
 	var logFile *os.File
@@ -8836,7 +10303,24 @@ func (a *neoActor) spawnExecutorWithProvenance(msg map[string]any, webLocal bool
 			}
 		}
 	}
-	args := neoHeadlessExecutorArgs(threadID, agentMode, reasoningEffort, logPath)
+	executorRunnerID := "local-" + randomBase62(22)
+	if webLocal {
+		executorRunnerID = "web-local-" + randomBase62(22)
+		if !a.reserveWebLocalExecutor(spawnID, executorRunnerID) {
+			if logFile != nil {
+				_ = logFile.Close()
+			}
+			a.mu.Lock()
+			observerOnly := a.webLocalInferenceObserverOnlyLocked()
+			executorID = a.executorID
+			a.mu.Unlock()
+			if observerOnly {
+				return a.broadcastExecutorStatus(spawnID, "running", "Executor is already controlled by another client.", map[string]any{"reasonCode": "executor_connected", "executorId": executorID, "threadId": threadID})
+			}
+			return a.broadcastExecutorStatus(spawnID, "running", "A web-started executor is already starting for this thread.", map[string]any{"reasonCode": "waiting_for_executor_connect", "threadId": threadID})
+		}
+	}
+	args := neoHeadlessExecutorArgs(threadID, agentMode, reasoningEffort, logPath, executorRunnerID)
 	executorContext, cancelExecutor := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(executorContext, command, args...)
 	neoConfigureSpawnedExecutorProcess(cmd)
@@ -8856,22 +10340,10 @@ func (a *neoActor) spawnExecutorWithProvenance(msg map[string]any, webLocal bool
 		cmd.Stderr = io.Discard
 	}
 
-	a.broadcastExecutorStatus(spawnID, "starting", "Starting local Amp headless executor.", map[string]any{"reasonCode": "spawn_requested", "threadId": threadID, "command": command, "args": args})
-	if err := cmd.Start(); err != nil {
-		cancelExecutor()
-		if logFile != nil {
-			_ = logFile.Close()
-		}
-		return a.broadcastExecutorStatus(spawnID, "failed", "Failed to start local Amp headless executor: "+err.Error(), map[string]any{"reasonCode": "spawn_failed", "command": command, "args": args})
-	}
-	if err := writeNeoHeadlessPIDFile(threadID, cmd.Process.Pid, webLocal); err != nil {
-		log.Warnf("amp neo local runtime failed to record owned headless executor thread=%s pid=%d: %v", threadID, cmd.Process.Pid, err)
-	}
-	replaceExecutorConnection()
-
 	spawned := &neoSpawnedExecutor{
 		spawnID:   spawnID,
 		threadID:  threadID,
+		runnerID:  executorRunnerID,
 		command:   command,
 		logPath:   logPath,
 		cmd:       cmd,
@@ -8879,9 +10351,145 @@ func (a *neoActor) spawnExecutorWithProvenance(msg map[string]any, webLocal bool
 		startedAt: time.Now(),
 		webLocal:  webLocal,
 	}
-	a.trackSpawnedExecutor(spawnID, spawned)
+	a.mu.Lock()
+	ready = a.executorReady
+	executorID = a.executorID
+	existing = nil
+	for _, candidate := range a.spawnedExecutors {
+		if candidate != nil && candidate.threadID == threadID && !candidate.stopping {
+			existing = candidate
+			break
+		}
+	}
+	superseded := a.disposed || a.executorSpawnGeneration != spawnGeneration
+	if superseded || ready && !replaceExisting || existing != nil {
+		a.mu.Unlock()
+		cancelExecutor()
+		if logFile != nil {
+			_ = logFile.Close()
+		}
+		a.clearWebLocalExecutorReservation(spawnID, executorRunnerID)
+		if superseded {
+			return a.broadcastExecutorStatus(spawnID, "failed", "Executor start was superseded.", map[string]any{"reasonCode": "spawn_rejected", "threadId": threadID})
+		}
+		if ready && !replaceExisting {
+			return a.broadcastExecutorStatus(spawnID, "running", "Executor is already connected.", map[string]any{"reasonCode": "executor_connected", "executorId": executorID})
+		}
+		return a.broadcastExecutorStatus(spawnID, "running", "Headless executor is already starting for this thread.", map[string]any{"reasonCode": "waiting_for_executor_connect", "pid": existing.pid(), "threadId": threadID})
+	}
+	if a.spawnedExecutors == nil {
+		a.spawnedExecutors = map[string]*neoSpawnedExecutor{}
+	}
+	if current := a.spawnedExecutors[spawnID]; current != nil && !current.stopping {
+		a.mu.Unlock()
+		cancelExecutor()
+		if logFile != nil {
+			_ = logFile.Close()
+		}
+		a.clearWebLocalExecutorReservation(spawnID, executorRunnerID)
+		return a.broadcastExecutorStatus(spawnID, "running", "Headless executor is already starting for this thread.", map[string]any{"reasonCode": "waiting_for_executor_connect", "pid": current.pid(), "threadId": threadID})
+	}
+	a.spawnedExecutors[spawnID] = spawned
+	a.mu.Unlock()
+	releaseClaim := func() {
+		a.mu.Lock()
+		if a.spawnedExecutors[spawnID] == spawned {
+			delete(a.spawnedExecutors, spawnID)
+		}
+		a.mu.Unlock()
+		cancelExecutor()
+		if logFile != nil {
+			_ = logFile.Close()
+		}
+		a.clearWebLocalExecutorReservation(spawnID, executorRunnerID)
+	}
+	if ready && replaceExisting {
+		if replacement := a.prepareExecutorConnectionReplacement("Replacing executor with local Amp headless executor"); replacement != nil {
+			replaceExecutorConnection = replacement
+		}
+	}
 
-	status := a.broadcastExecutorStatus(spawnID, "running", "Waiting for local Amp headless executor to connect.", map[string]any{"reasonCode": "waiting_for_executor_connect", "pid": spawned.pid(), "threadId": threadID, "logFile": omitEmpty(logPath)})
+	if webLocal {
+		recovered, recoveredOK := neoLiveHeadlessPIDRecord(threadID)
+		if recoveredOK && recovered.WebLocal && neoHeadlessProcessOwnedByThreadAndRunner(recovered.PID, threadID, recovered.RunnerID) {
+			stopNeoRecoveredHeadlessPIDRecord(threadID, recovered)
+			if !waitNeoHeadlessProcessExit(recovered.PID, 2*time.Second) {
+				releaseClaim()
+				return a.broadcastExecutorStatus(spawnID, "failed", "Stale local Amp headless executor did not stop.", map[string]any{"reasonCode": "spawn_failed", "pid": recovered.PID, "threadId": threadID})
+			}
+		}
+	}
+	ampPID, err := prepareNeoAmpHeadlessPIDFile(threadID, workDir)
+	if err != nil {
+		releaseClaim()
+		return a.broadcastExecutorStatus(spawnID, "failed", "Cannot prepare Amp headless executor lock: "+err.Error(), map[string]any{"reasonCode": "spawn_failed", "threadId": threadID})
+	}
+	if ampPID > 0 {
+		owned, ownedOK := neoLiveHeadlessPIDRecord(threadID)
+		releaseClaim()
+		if ownedOK && owned.PID == ampPID && neoHeadlessProcessOwnedByThreadAndRunner(ampPID, threadID, owned.RunnerID) {
+			return a.broadcastExecutorStatus(spawnID, "running", "Amp headless executor is already starting for this thread.", map[string]any{"reasonCode": "waiting_for_executor_connect", "pid": ampPID, "threadId": threadID})
+		}
+		return a.broadcastExecutorStatus(spawnID, "failed", "Another Amp process already owns this thread.", map[string]any{"reasonCode": "spawn_rejected", "pid": ampPID, "threadId": threadID})
+	}
+
+	a.broadcastExecutorStatus(spawnID, "starting", "Starting local Amp headless executor.", map[string]any{"reasonCode": "spawn_requested", "threadId": threadID, "command": command, "args": args})
+	a.mu.Lock()
+	claimCurrent := !a.disposed && a.executorSpawnGeneration == spawnGeneration && a.spawnedExecutors[spawnID] == spawned && !spawned.stopping
+	a.mu.Unlock()
+	if !claimCurrent {
+		releaseClaim()
+		return a.broadcastExecutorStatus(spawnID, "failed", "Executor start was superseded.", map[string]any{"reasonCode": "spawn_rejected", "threadId": threadID})
+	}
+	if err := cmd.Start(); err != nil {
+		releaseClaim()
+		return a.broadcastExecutorStatus(spawnID, "failed", "Failed to start local Amp headless executor: "+err.Error(), map[string]any{"reasonCode": "spawn_failed", "command": command, "args": args})
+	}
+	status := normalizeNeoExecutorStatus(map[string]any{
+		"type":    "executor_status",
+		"spawnId": spawnID,
+		"status":  "running",
+		"message": "Waiting for local Amp headless executor to connect.",
+		"details": map[string]any{
+			"reasonCode": "waiting_for_executor_connect",
+			"pid":        spawned.pid(),
+			"threadId":   threadID,
+			"logFile":    omitEmpty(logPath),
+		},
+	})
+	a.emissionMu.Lock()
+	a.mu.Lock()
+	claimCurrent = !a.disposed && a.executorSpawnGeneration == spawnGeneration && a.spawnedExecutors[spawnID] == spawned && !spawned.stopping
+	if !claimCurrent {
+		a.mu.Unlock()
+		a.emissionMu.Unlock()
+		spawned.stop()
+		_ = cmd.Wait()
+		releaseClaim()
+		return a.broadcastExecutorStatus(spawnID, "failed", "Executor start was superseded.", map[string]any{"reasonCode": "spawn_rejected", "threadId": threadID})
+	}
+	pidFileErr := writeNeoHeadlessPIDFile(threadID, cmd.Process.Pid, webLocal, executorRunnerID)
+	if pidFileErr != nil && webLocal {
+		a.mu.Unlock()
+		a.emissionMu.Unlock()
+		spawned.stop()
+		_ = cmd.Wait()
+		releaseClaim()
+		return a.broadcastExecutorStatus(spawnID, "failed", "Failed to record local Amp headless executor ownership: "+pidFileErr.Error(), map[string]any{"reasonCode": "spawn_failed", "command": command, "args": args})
+	}
+	if pidFileErr != nil {
+		log.Warnf("amp neo local runtime failed to record owned headless executor thread=%s pid=%d: %v", threadID, cmd.Process.Pid, pidFileErr)
+	}
+	persistedStatusChanged := a.setLastExecutorStatusLocked(status)
+	sockets := a.socketListLocked()
+	a.mu.Unlock()
+	a.sendCapturedUnderEmissionLock(sockets, status)
+	a.emissionMu.Unlock()
+	if persistedStatusChanged {
+		a.syncCloudAsync()
+	}
+	replaceExecutorConnection()
+
 	go a.waitSpawnedExecutor(spawnID, spawned, logFile)
 	go a.watchSpawnedExecutorConnectTimeout(spawnID, spawned, neoExecutorConnectTimeout(cfg))
 	return status
@@ -8889,7 +10497,6 @@ func (a *neoActor) spawnExecutorWithProvenance(msg map[string]any, webLocal bool
 
 func (a *neoActor) trackSpawnedExecutor(spawnID string, spawned *neoSpawnedExecutor) {
 	a.mu.Lock()
-	spawned.connected = spawned.connected || a.executorConnectedLocked()
 	if a.spawnedExecutors == nil {
 		a.spawnedExecutors = map[string]*neoSpawnedExecutor{}
 	}
@@ -8936,6 +10543,7 @@ func (a *neoActor) prepareExecutorConnectionReplacement(reason string) func() {
 			a.executorID = ""
 			a.replacingExecutorID = oldExecutorID
 			a.executorSocket = nil
+			a.executorPublicationRunnerID = ""
 			a.executorReady = false
 			a.executorBootstrapComplete = false
 			a.executorResumeBootstrap = false
@@ -8951,7 +10559,7 @@ func (a *neoActor) prepareExecutorConnectionReplacement(reason string) func() {
 	}
 }
 
-func neoHeadlessExecutorArgs(threadID, agentMode, reasoningEffort, logPath string) []string {
+func neoHeadlessExecutorArgs(threadID, agentMode, reasoningEffort, logPath, runnerID string) []string {
 	mode := strings.ToLower(strings.TrimSpace(agentMode))
 	switch mode {
 	case "":
@@ -8970,6 +10578,9 @@ func neoHeadlessExecutorArgs(threadID, agentMode, reasoningEffort, logPath strin
 	}
 	args := []string{"--mode", mode}
 	args = append(args, "--headless="+threadID)
+	if strings.TrimSpace(runnerID) != "" {
+		args = append(args, "--runner-id", runnerID)
+	}
 	if strings.TrimSpace(logPath) != "" {
 		args = append(args, "--log-file", logPath)
 	}
@@ -8979,7 +10590,7 @@ func neoHeadlessExecutorArgs(threadID, agentMode, reasoningEffort, logPath strin
 
 func (a *neoActor) waitSpawnedExecutor(spawnID string, spawned *neoSpawnedExecutor, logFile *os.File) {
 	err := spawned.cmd.Wait()
-	removeNeoHeadlessPIDFile(spawned.threadID, spawned.pid())
+	removeNeoHeadlessPIDFileRecordExact(spawned.threadID, neoHeadlessPIDRecord{PID: spawned.pid(), WebLocal: spawned.webLocal, RunnerID: spawned.runnerID})
 	if _, cleanupErr := prepareNeoAmpHeadlessPIDFile(spawned.threadID, spawned.cmd.Dir); cleanupErr != nil {
 		log.Debugf("amp neo local runtime failed to clean Amp headless PID file thread=%s pid=%d: %v", spawned.threadID, spawned.pid(), cleanupErr)
 	}
@@ -8995,6 +10606,9 @@ func (a *neoActor) waitSpawnedExecutor(spawnID string, spawned *neoSpawnedExecut
 	connected := spawned.connected
 	stopping := spawned.stopping
 	respawnOnStop := spawned.respawnOnStop
+	if current == spawned && spawned.webLocal && !connected {
+		a.clearWebLocalExecutorOwnershipExactLocked(spawned.spawnID, spawned.runnerID)
+	}
 	a.mu.Unlock()
 
 	if current != spawned {
@@ -9041,6 +10655,9 @@ func (a *neoActor) watchSpawnedExecutorConnectTimeout(spawnID string, spawned *n
 		return
 	}
 	delete(a.spawnedExecutors, spawnID)
+	if spawned.webLocal {
+		a.clearWebLocalExecutorOwnershipLocked()
+	}
 	a.mu.Unlock()
 
 	spawned.stop()
@@ -9171,14 +10788,17 @@ func (a *neoActor) stopWebLocalExecutorIfUnobservedGeneration(generation uint64)
 	}
 	executors := a.spawnedExecutorListLocked()
 	a.markSpawnedExecutorsStoppingLocked(true)
-	recoveredPID := a.recoveredExecutorPID
+	recovered := neoHeadlessPIDRecord{PID: a.recoveredExecutorPID, WebLocal: a.recoveredExecutorWebLocal, RunnerID: a.recoveredExecutorRunnerID}
 	a.recoveredExecutorPID = 0
 	a.recoveredExecutorWebLocal = false
+	a.recoveredExecutorRunnerID = ""
+	a.clearWebLocalExecutorOwnershipLocked()
 	threadID := firstNonEmptyString(a.threadID, a.key)
 	a.executorID = ""
 	a.executorReady = false
 	a.replacingExecutorID = ""
 	a.executorSocket = nil
+	a.executorPublicationRunnerID = ""
 	a.executorBootstrapComplete = false
 	a.executorResumeBootstrap = false
 	a.executorIdleGeneration++
@@ -9187,7 +10807,7 @@ func (a *neoActor) stopWebLocalExecutorIfUnobservedGeneration(generation uint64)
 	for _, executor := range executors {
 		executor.stop()
 	}
-	stopNeoRecoveredHeadlessPID(threadID, recoveredPID)
+	stopNeoRecoveredHeadlessPIDRecord(threadID, recovered)
 	if a.runtime != nil && a.runtime.store != nil {
 		a.runtime.store.broadcastThreadStatusUpdated(a)
 	}
@@ -9241,14 +10861,17 @@ func (a *neoActor) stopIdleSpawnedExecutors(generation int, timeout time.Duratio
 	}
 	executors := a.spawnedExecutorListLocked()
 	a.markSpawnedExecutorsStoppingLocked(true)
-	recoveredPID := a.recoveredExecutorPID
+	recovered := neoHeadlessPIDRecord{PID: a.recoveredExecutorPID, WebLocal: a.recoveredExecutorWebLocal, RunnerID: a.recoveredExecutorRunnerID}
 	a.recoveredExecutorPID = 0
 	a.recoveredExecutorWebLocal = false
+	a.recoveredExecutorRunnerID = ""
+	a.clearWebLocalExecutorOwnershipLocked()
 	threadID := firstNonEmptyString(a.threadID, a.key)
 	a.executorID = ""
 	a.executorReady = false
 	a.replacingExecutorID = ""
 	a.executorSocket = nil
+	a.executorPublicationRunnerID = ""
 	a.executorBootstrapComplete = false
 	a.executorResumeBootstrap = false
 	a.executorIdleGeneration++
@@ -9257,7 +10880,7 @@ func (a *neoActor) stopIdleSpawnedExecutors(generation int, timeout time.Duratio
 	for _, executor := range executors {
 		executor.stop()
 	}
-	stopNeoRecoveredHeadlessPID(threadID, recoveredPID)
+	stopNeoRecoveredHeadlessPIDRecord(threadID, recovered)
 	if a.runtime != nil && a.runtime.store != nil {
 		a.runtime.store.broadcastThreadStatusUpdated(a)
 	}
@@ -9313,10 +10936,43 @@ func (a *neoActor) broadcastExecutorStatus(spawnID, status, message string, deta
 func (a *neoActor) broadcastExecutorStatusPayload(payload map[string]any) map[string]any {
 	payload = normalizeNeoExecutorStatus(payload)
 	a.mu.Lock()
-	a.lastExecutorStatus = cloneNeoJSONMap(payload)
+	persistedStatusChanged := a.setLastExecutorStatusLocked(payload)
 	a.mu.Unlock()
 	a.broadcast(payload)
+	if persistedStatusChanged {
+		a.syncCloudAsync()
+	}
 	return payload
+}
+
+func (a *neoActor) setLastExecutorStatusLocked(payload map[string]any) bool {
+	previous := neoPersistedTerminalExecutorStatus(a.lastExecutorStatus)
+	a.lastExecutorStatus = cloneNeoJSONMap(payload)
+	current := neoPersistedTerminalExecutorStatus(a.lastExecutorStatus)
+	return !reflect.DeepEqual(previous, current)
+}
+
+func neoPersistedTerminalExecutorStatus(payload map[string]any) map[string]any {
+	if stringValue(payload["type"]) != "executor_status" || stringValue(payload["status"]) != "failed" {
+		return nil
+	}
+	normalized := normalizeNeoExecutorStatus(payload)
+	if stringValue(normalized["status"]) != "failed" {
+		return nil
+	}
+	out := map[string]any{"type": "executor_status", "status": "failed"}
+	for _, key := range []string{"spawnId", "executorId"} {
+		if value := stringValue(normalized[key]); neoLocalBrokerSafeText(value, 256, false) {
+			out[key] = value
+		}
+	}
+	if message := stringValue(normalized["message"]); neoLocalBrokerSafeText(message, 2048, false) {
+		out["message"] = message
+	}
+	if reasonCode := stringValue(mapValue(normalized["details"])["reasonCode"]); validNeoExecutorReasonCode(reasonCode) {
+		out["details"] = map[string]any{"reasonCode": reasonCode}
+	}
+	return out
 }
 
 func (a *neoActor) broadcastExecutorConnectedStatus(executorID string) map[string]any {
@@ -9353,6 +11009,7 @@ func (a *neoActor) updateEnvironmentUpdate(environment map[string]any) {
 func (a *neoActor) updateEnvironmentState(environment map[string]any, merge bool) {
 	environment = cloneMap(environment)
 	a.mu.Lock()
+	priorWorkingDirectory, priorWorkspaceRoot := neoResolvedEnvironmentWorkspacePaths(a.environment)
 	if merge {
 		merged := cloneMap(a.environment)
 		for key, value := range environment {
@@ -9368,8 +11025,17 @@ func (a *neoActor) updateEnvironmentState(environment map[string]any, merge bool
 		}
 		environment = merged
 	}
+	workspaceBound := priorWorkingDirectory != "" || priorWorkspaceRoot != ""
+	workspaceEstablished := a.hasUserTurnLocked() || neoWebLocalBindingRevision(a.meta) > 0 || firstNonEmptyString(
+		a.meta["projectID"], a.meta["projectId"], a.meta["project_id"],
+		a.meta["projectName"], a.meta["project_name"],
+		a.meta["repositoryURL"], a.meta["repositoryUrl"], a.meta["repository_url"], a.meta["repoURL"],
+		a.meta["runnerId"], a.meta["runnerID"], a.meta["runner_id"],
+	) != ""
+	if workspaceBound && workspaceEstablished {
+		environment = neoEnvironmentWithWorkspaceFrom(environment, a.environment)
+	}
 	environment = neoCanonicalizeEnvironmentWorkspace(environment)
-	priorWorkingDirectory, priorWorkspaceRoot := neoResolvedEnvironmentWorkspacePaths(a.environment)
 	nextWorkingDirectory, nextWorkspaceRoot := neoResolvedEnvironmentWorkspacePaths(environment)
 	guidanceScopeChanged := priorWorkingDirectory != nextWorkingDirectory || priorWorkspaceRoot != nextWorkspaceRoot
 	a.environment = environment
@@ -9386,6 +11052,28 @@ func (a *neoActor) updateEnvironmentState(environment map[string]any, merge bool
 	a.mu.Unlock()
 	a.broadcast(map[string]any{"type": "environment_update", "environment": environment})
 	a.syncCloudAsync()
+}
+
+func neoEnvironmentWithWorkspaceFrom(environment, source map[string]any) map[string]any {
+	environment = neoWebLocalEnvironmentWithoutWorkspace(environment)
+	workspaceKeys := []string{"workingDirectory", "working_directory", "workspaceRoot", "workspace_root", "cwd", "trees"}
+	for _, key := range workspaceKeys {
+		if value, exists := source[key]; exists {
+			environment[key] = cloneNeoJSONValue(value)
+		}
+	}
+	initial := cloneNeoJSONMap(mapValue(environment["initial"]))
+	for _, key := range workspaceKeys {
+		if value, exists := mapValue(source["initial"])[key]; exists {
+			initial[key] = cloneNeoJSONValue(value)
+		}
+	}
+	if len(initial) == 0 {
+		delete(environment, "initial")
+	} else {
+		environment["initial"] = initial
+	}
+	return environment
 }
 
 func (a *neoActor) updateGuidanceSnapshot(msg map[string]any) {
@@ -15461,12 +17149,9 @@ func (a *neoActor) receiveToolResult(msg map[string]any, sockets ...*neoSocket) 
 		}
 		return
 	}
-	if pendingTool || pendingSubagentTool {
-		toolName := pending.Name
-		if !pendingTool {
-			toolName = pendingSubagent.Name
-		}
-		run = neoMergeSuccessfulTerminalToolRun(toolName, run, existingRun)
+	existingStatus := strings.ToLower(strings.TrimSpace(stringValue(existingRun["status"])))
+	if (pendingTool || pendingSubagentTool) && (!snapshotSubagent || existingStatus != "done") {
+		run = neoMergeSuccessfulTerminalToolRun(firstNonEmptyString(pending.Name, pendingSubagent.Name), run, existingRun)
 	}
 	if !pendingTool && pendingSubagentTool {
 		pending = pendingSubagent
@@ -16117,52 +17802,53 @@ func (a *neoActor) revokeToolLease(msg map[string]any) {
 }
 
 type neoCloudThreadSnapshot struct {
-	upstreamURL         string
-	apiKey              string
-	clientVersion       string
-	revision            uint64
-	threadID            string
-	seq                 int
-	createdMs           int64
-	firstSyncMs         int64
-	title               string
-	archived            bool
-	pinned              bool
-	pinnedOverride      *bool
-	hasUnreadMessages   bool
-	latestAssistantID   string
-	unreadStatusUpdated string
-	threadStatus        string
-	agentState          string
-	settings            map[string]any
-	threadFeatures      []string
-	messages            []neoMessage
-	messageJSON         []neoLocalSnapshotMessageJSON
-	preparedLocalThread map[string]any
-	environment         map[string]any
-	guidanceSnapshot    map[string]any
-	skillSnapshot       map[string]any
-	activatedSkills     []neoActivatedSkill
-	artifacts           []any
-	actorKV             map[string]any
-	meta                map[string]any
-	debug               map[string]any
-	draft               []any
-	autoSubmitDraft     bool
-	pendingNavigation   string
-	maxTokens           any
-	mainThreadID        string
-	queuedMessages      []any
-	compactionRecords   []any
-	relationships       []any
-	origin              map[string]any
-	currentInference    *neoInferenceInflight
-	pendingInference    *neoInferenceInflight
-	executorConnected   bool
-	executorType        string
-	replayEvents        []neoReplayEvent
-	replayFloorSeq      int
-	activeErrorSeq      int
+	upstreamURL            string
+	apiKey                 string
+	clientVersion          string
+	revision               uint64
+	threadID               string
+	seq                    int
+	createdMs              int64
+	firstSyncMs            int64
+	title                  string
+	archived               bool
+	pinned                 bool
+	pinnedOverride         *bool
+	hasUnreadMessages      bool
+	latestAssistantID      string
+	unreadStatusUpdated    string
+	threadStatus           string
+	agentState             string
+	settings               map[string]any
+	threadFeatures         []string
+	messages               []neoMessage
+	messageJSON            []neoLocalSnapshotMessageJSON
+	preparedLocalThread    map[string]any
+	environment            map[string]any
+	guidanceSnapshot       map[string]any
+	skillSnapshot          map[string]any
+	activatedSkills        []neoActivatedSkill
+	artifacts              []any
+	actorKV                map[string]any
+	meta                   map[string]any
+	debug                  map[string]any
+	draft                  []any
+	autoSubmitDraft        bool
+	pendingNavigation      string
+	maxTokens              any
+	mainThreadID           string
+	queuedMessages         []any
+	compactionRecords      []any
+	relationships          []any
+	origin                 map[string]any
+	currentInference       *neoInferenceInflight
+	pendingInference       *neoInferenceInflight
+	executorConnected      bool
+	executorType           string
+	replayEvents           []neoReplayEvent
+	replayFloorSeq         int
+	activeErrorSeq         int
+	terminalExecutorStatus map[string]any
 }
 
 type neoThreadRevision struct {
@@ -16734,48 +18420,49 @@ func (a *neoActor) threadSnapshotLocked(options neoThreadSnapshotOptions) (neoCl
 		neoTimeStringMillis(stringValue(a.record["firstSyncAt"])),
 	))
 	return neoCloudThreadSnapshot{
-		revision:            a.measurements.revision,
-		threadID:            a.threadID,
-		seq:                 a.lastSeqLocked(),
-		createdMs:           createdMs,
-		firstSyncMs:         firstSyncMs,
-		title:               a.title,
-		archived:            a.archived,
-		pinned:              a.pinned,
-		pinnedOverride:      pinnedOverride,
-		hasUnreadMessages:   hasUnreadMessages,
-		latestAssistantID:   latestAssistantMessageID,
-		unreadStatusUpdated: unreadStatusUpdatedAt,
-		threadStatus:        a.threadStatus,
-		agentState:          neoAgentStateOrIdle(a.agentState),
-		settings:            cloneNeoJSONMap(a.settings),
-		threadFeatures:      append([]string(nil), a.threadFeatures...),
-		messages:            messages,
-		messageJSON:         messageJSON,
-		environment:         cloneNeoJSONMap(a.environment),
-		guidanceSnapshot:    cloneNeoJSONMap(a.guidanceSnapshot),
-		skillSnapshot:       cloneNeoJSONMap(a.skillSnapshot),
-		activatedSkills:     cloneNeoActivatedSkills(a.activatedSkills),
-		artifacts:           cloneNeoJSONArray(a.artifactListLocked()),
-		actorKV:             cloneNeoJSONMap(a.kv),
-		meta:                meta,
-		debug:               cloneNeoJSONMap(a.debug),
-		draft:               cloneNeoJSONArray(a.draft),
-		autoSubmitDraft:     a.autoSubmitDraft,
-		pendingNavigation:   a.pendingNavigation,
-		maxTokens:           a.maxTokens,
-		mainThreadID:        a.mainThreadID,
-		queuedMessages:      cloneNeoJSONArray(a.threadQueuedMessageListLocked()),
-		compactionRecords:   cloneNeoJSONArray(a.compactionRecordListLocked()),
-		relationships:       cloneNeoJSONArray(a.relationshipListLocked()),
-		origin:              cloneNeoJSONMap(a.origin),
-		currentInference:    inflight,
-		pendingInference:    pending,
-		executorConnected:   executorConnected,
-		executorType:        executorType,
-		replayEvents:        cloneNeoReplayEvents(a.replayEvents),
-		replayFloorSeq:      a.replayFloorSeq,
-		activeErrorSeq:      a.activeErrorSeq,
+		revision:               a.measurements.revision,
+		threadID:               a.threadID,
+		seq:                    a.lastSeqLocked(),
+		createdMs:              createdMs,
+		firstSyncMs:            firstSyncMs,
+		title:                  a.title,
+		archived:               a.archived,
+		pinned:                 a.pinned,
+		pinnedOverride:         pinnedOverride,
+		hasUnreadMessages:      hasUnreadMessages,
+		latestAssistantID:      latestAssistantMessageID,
+		unreadStatusUpdated:    unreadStatusUpdatedAt,
+		threadStatus:           a.threadStatus,
+		agentState:             neoAgentStateOrIdle(a.agentState),
+		settings:               cloneNeoJSONMap(a.settings),
+		threadFeatures:         append([]string(nil), a.threadFeatures...),
+		messages:               messages,
+		messageJSON:            messageJSON,
+		environment:            cloneNeoJSONMap(a.environment),
+		guidanceSnapshot:       cloneNeoJSONMap(a.guidanceSnapshot),
+		skillSnapshot:          cloneNeoJSONMap(a.skillSnapshot),
+		activatedSkills:        cloneNeoActivatedSkills(a.activatedSkills),
+		artifacts:              cloneNeoJSONArray(a.artifactListLocked()),
+		actorKV:                cloneNeoJSONMap(a.kv),
+		meta:                   meta,
+		debug:                  cloneNeoJSONMap(a.debug),
+		draft:                  cloneNeoJSONArray(a.draft),
+		autoSubmitDraft:        a.autoSubmitDraft,
+		pendingNavigation:      a.pendingNavigation,
+		maxTokens:              a.maxTokens,
+		mainThreadID:           a.mainThreadID,
+		queuedMessages:         cloneNeoJSONArray(a.threadQueuedMessageListLocked()),
+		compactionRecords:      cloneNeoJSONArray(a.compactionRecordListLocked()),
+		relationships:          cloneNeoJSONArray(a.relationshipListLocked()),
+		origin:                 cloneNeoJSONMap(a.origin),
+		currentInference:       inflight,
+		pendingInference:       pending,
+		executorConnected:      executorConnected,
+		executorType:           executorType,
+		replayEvents:           cloneNeoReplayEvents(a.replayEvents),
+		replayFloorSeq:         a.replayFloorSeq,
+		activeErrorSeq:         a.activeErrorSeq,
+		terminalExecutorStatus: neoPersistedTerminalExecutorStatus(a.lastExecutorStatus),
 	}, true
 }
 
@@ -18021,6 +19708,9 @@ func neoLocalPersistedThread(snapshot neoCloudThreadSnapshot, messageValues []an
 	}
 	if replayState := neoLocalReplayState(snapshot); len(replayState) > 0 {
 		persistedThread[neoLocalReplayStateKey] = replayState
+	}
+	if len(snapshot.terminalExecutorStatus) > 0 {
+		persistedThread[neoLocalExecutorStatusKey] = cloneNeoJSONMap(snapshot.terminalExecutorStatus)
 	}
 	return persistedThread
 }
@@ -20289,6 +21979,8 @@ const (
 	neoAttachmentMaxAnimationFrames = 256
 	neoAttachmentCacheMaxEntries    = 32
 	neoAmpAttachmentFetchAttempts   = 3
+	neoAttachmentViewMaxEntries     = 256
+	neoAttachmentViewTTL            = 24 * time.Hour
 )
 
 var neoAttachmentIDPattern = regexp.MustCompile(`^[0-9A-Za-z]{16,64}$`)
@@ -20360,8 +22052,102 @@ type neoAttachmentCache struct {
 	inflight map[string]*neoAttachmentCacheLoad
 }
 
+type neoAttachmentView struct {
+	rawURL       string
+	clientAPIKey string
+	expiresAt    time.Time
+	key          string
+}
+
+type neoAttachmentViewStore struct {
+	mu      sync.Mutex
+	entries map[string]neoAttachmentView
+	byKey   map[string]string
+}
+
 func newNeoAttachmentCache() *neoAttachmentCache {
 	return &neoAttachmentCache{entries: map[string]neoAttachmentCacheEntry{}, inflight: map[string]*neoAttachmentCacheLoad{}}
+}
+
+func newNeoAttachmentViewStore() *neoAttachmentViewStore {
+	return &neoAttachmentViewStore{entries: map[string]neoAttachmentView{}, byKey: map[string]string{}}
+}
+
+func (s *neoAttachmentViewStore) mint(threadID, rawURL, clientAPIKey string) string {
+	if s == nil || !neoAmpHostedAttachmentURL(rawURL) {
+		return ""
+	}
+	now := time.Now()
+	keySum := sha256.Sum256([]byte(threadID + "\x00" + rawURL + "\x00" + clientAPIKey))
+	key := hex.EncodeToString(keySum[:])
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pruneLocked(now)
+	if token := s.byKey[key]; token != "" {
+		if entry, ok := s.entries[token]; ok {
+			entry.expiresAt = now.Add(neoAttachmentViewTTL)
+			s.entries[token] = entry
+			return token
+		}
+		delete(s.byKey, key)
+	}
+	for len(s.entries) >= neoAttachmentViewMaxEntries {
+		oldestToken := ""
+		var oldestExpiry time.Time
+		for token, entry := range s.entries {
+			if oldestToken == "" || entry.expiresAt.Before(oldestExpiry) {
+				oldestToken = token
+				oldestExpiry = entry.expiresAt
+			}
+		}
+		s.deleteLocked(oldestToken)
+	}
+	token := randomBase62(32)
+	for {
+		if _, exists := s.entries[token]; !exists {
+			break
+		}
+		token = randomBase62(32)
+	}
+	s.entries[token] = neoAttachmentView{rawURL: rawURL, clientAPIKey: clientAPIKey, expiresAt: now.Add(neoAttachmentViewTTL), key: key}
+	s.byKey[key] = token
+	return token
+}
+
+func (s *neoAttachmentViewStore) get(token string) (neoAttachmentView, bool) {
+	if s == nil || !neoAttachmentIDPattern.MatchString(token) {
+		return neoAttachmentView{}, false
+	}
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry, ok := s.entries[token]
+	if !ok || !entry.expiresAt.After(now) {
+		if ok {
+			s.deleteLocked(token)
+		}
+		return neoAttachmentView{}, false
+	}
+	return entry, true
+}
+
+func (s *neoAttachmentViewStore) pruneLocked(now time.Time) {
+	for token, entry := range s.entries {
+		if !entry.expiresAt.After(now) {
+			s.deleteLocked(token)
+		}
+	}
+}
+
+func (s *neoAttachmentViewStore) deleteLocked(token string) {
+	entry, ok := s.entries[token]
+	if !ok {
+		return
+	}
+	delete(s.entries, token)
+	if s.byKey[entry.key] == token {
+		delete(s.byKey, entry.key)
+	}
 }
 
 func (c *neoAttachmentCache) get(key string) ([]byte, string, bool) {
@@ -20533,6 +22319,40 @@ func (m *AmpModule) serveNeoLocalAttachmentUpload(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"url": neoLocalAttachmentURL(c.Request, id)})
+}
+
+func (m *AmpModule) serveNeoAttachmentView(c *gin.Context) {
+	if m == nil || m.neoRuntime == nil || m.neoRuntime.attachmentViews == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "attachment not found"})
+		return
+	}
+	view, ok := m.neoRuntime.attachmentViews.get(strings.TrimSpace(c.Param("token")))
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "attachment not found"})
+		return
+	}
+	ctx := c.Request.Context()
+	if view.clientAPIKey != "" {
+		ctx = context.WithValue(ctx, clientAPIKeyContextKey{}, view.clientAPIKey)
+	}
+	raw, mediaType, recognized, err := neoHydrateInferenceAttachment(m.neoRuntime, ctx, view.rawURL, nil, "", neoAttachmentMaxImageBytes)
+	if err != nil {
+		log.Warnf("amp neo attachment view fetch failed: %v", err)
+		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to fetch attachment"})
+		return
+	}
+	if !recognized {
+		c.JSON(http.StatusNotFound, gin.H{"error": "attachment not found"})
+		return
+	}
+	c.Header("Cache-Control", "private, max-age=300")
+	if c.Request.Method == http.MethodHead {
+		c.Header("Content-Type", mediaType)
+		c.Header("Content-Length", strconv.Itoa(len(raw)))
+		c.Status(http.StatusOK)
+		return
+	}
+	c.Data(http.StatusOK, mediaType, raw)
 }
 
 func decodeNeoAttachmentPayload(data, mediaType string) ([]byte, string, error) {
@@ -20867,6 +22687,125 @@ func neoAmpHostedAttachmentURL(rawURL string) bool {
 	return strings.HasPrefix(parsed.Path, "/user-content/attachments/") && len(strings.TrimPrefix(parsed.Path, "/user-content/attachments/")) > 0
 }
 
+func neoInferenceAmpAttachmentURL(rt *neoRuntime, rawURL, localBaseURL string) (string, bool) {
+	rawURL = strings.TrimSpace(rawURL)
+	if neoAmpHostedAttachmentURL(rawURL) {
+		return rawURL, true
+	}
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.User != nil || parsed.Host == "" || !strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https") || path.Clean(parsed.Path) != parsed.Path {
+		return "", false
+	}
+	const prefix = "/user-content/attachments/"
+	if !strings.HasPrefix(parsed.Path, prefix) || len(strings.TrimPrefix(parsed.Path, prefix)) == 0 {
+		return "", false
+	}
+	trustedOrigins := []string{localBaseURL}
+	if rt != nil {
+		if cfg := rt.configSnapshot(); cfg != nil {
+			trustedOrigins = append(trustedOrigins,
+				cfg.AmpCode.WebLocalInference.BaseURL,
+				cfg.AmpCode.Orbs.PublicURL,
+				neoProxyBaseURL(cfg),
+			)
+		}
+	}
+	for _, rawOrigin := range trustedOrigins {
+		origin, errOrigin := url.Parse(strings.TrimSpace(rawOrigin))
+		if errOrigin != nil || !neoAttachmentOriginsEqual(parsed, origin) {
+			continue
+		}
+		parsed.Scheme = "https"
+		parsed.Host = "ampcode.com"
+		parsed.User = nil
+		parsed.Fragment = ""
+		canonical := parsed.String()
+		if neoAmpHostedAttachmentURL(canonical) {
+			return canonical, true
+		}
+	}
+	return "", false
+}
+
+func neoAttachmentViewBaseURL(rawURL string) string {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || parsed.User != nil || parsed.Host == "" || !strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https") {
+		return ""
+	}
+	if strings.EqualFold(parsed.Hostname(), "ampcode.com") || strings.EqualFold(parsed.Hostname(), "www.ampcode.com") {
+		return ""
+	}
+	return strings.ToLower(parsed.Scheme) + "://" + parsed.Host
+}
+
+func neoLocalizeAttachmentViewValue(value any, viewerURL func(string) string) (any, bool) {
+	switch typed := value.(type) {
+	case map[string]any:
+		out := typed
+		changed := false
+		blockType := strings.ToLower(strings.TrimSpace(stringValue(typed["type"])))
+		if blockType == "image" || blockType == "image_url" || blockType == "input_image" {
+			rawURL := neoImageURL(typed)
+			if neoAmpHostedAttachmentURL(rawURL) {
+				if localURL := viewerURL(rawURL); localURL != "" {
+					out = neoReplaceAttachmentViewURL(typed, rawURL, localURL)
+					changed = true
+				}
+			}
+		}
+		for key, item := range out {
+			localized, itemChanged := neoLocalizeAttachmentViewValue(item, viewerURL)
+			if !itemChanged {
+				continue
+			}
+			if !changed {
+				out = cloneMap(out)
+				changed = true
+			}
+			out[key] = localized
+		}
+		return out, changed
+	case []any:
+		var out []any
+		for index, item := range typed {
+			localized, changed := neoLocalizeAttachmentViewValue(item, viewerURL)
+			if !changed {
+				continue
+			}
+			if out == nil {
+				out = append([]any(nil), typed...)
+			}
+			out[index] = localized
+		}
+		if out != nil {
+			return out, true
+		}
+	}
+	return value, false
+}
+
+func neoReplaceAttachmentViewURL(block map[string]any, rawURL, localURL string) map[string]any {
+	out := cloneMap(block)
+	if source := mapValue(out["source"]); stringValue(source["url"]) == rawURL {
+		source = cloneMap(source)
+		source["url"] = localURL
+		out["source"] = source
+	}
+	if imageURL, ok := out["image_url"].(string); ok && imageURL == rawURL {
+		out["image_url"] = localURL
+	} else if imageURL := mapValue(out["image_url"]); stringValue(imageURL["url"]) == rawURL {
+		imageURL = cloneMap(imageURL)
+		imageURL["url"] = localURL
+		out["image_url"] = imageURL
+	}
+	for _, key := range []string{"url", "uri", "href", "attachmentUrl", "sourcePath"} {
+		if stringValue(out[key]) == rawURL {
+			out[key] = localURL
+		}
+	}
+	return out
+}
+
 func neoAmpAttachmentRedirectURL(parsed *url.URL) bool {
 	if parsed == nil || !strings.EqualFold(parsed.Scheme, "https") || parsed.User != nil || parsed.Port() != "" && parsed.Port() != "443" {
 		return false
@@ -20929,13 +22868,14 @@ func neoHydrateInferenceAttachments(rt *neoRuntime, ctx context.Context, history
 				continue
 			}
 			imageURL := neoImageURL(block)
-			if imageURL == "" || !neoHydratableImageAttachment(block, imageURL, localBaseURL) {
+			if imageURL == "" || !neoHydratableImageAttachment(rt, block, imageURL, localBaseURL) {
 				continue
 			}
 			attachment, cached := cache[imageURL]
 			if !cached {
 				_, localAttachment := neoLocalAttachmentIDFromURL(imageURL, localBaseURL)
-				if !localAttachment && !neoAmpHostedAttachmentURL(imageURL) {
+				_, ampAttachment := neoInferenceAmpAttachmentURL(rt, imageURL, localBaseURL)
+				if !localAttachment && !ampAttachment {
 					continue
 				}
 				distinctAttachments++
@@ -20980,7 +22920,7 @@ func neoHydrateInferenceAttachments(rt *neoRuntime, ctx context.Context, history
 	return out, nil
 }
 
-func neoHydratableImageAttachment(block map[string]any, rawURL, localBaseURL string) bool {
+func neoHydratableImageAttachment(rt *neoRuntime, block map[string]any, rawURL, localBaseURL string) bool {
 	source := mapValue(block["source"])
 	switch strings.ToLower(strings.TrimSpace(stringValue(source["type"]))) {
 	case "", "url":
@@ -21043,11 +22983,13 @@ func neoHydratableImageAttachment(block map[string]any, rawURL, localBaseURL str
 		return false
 	}
 	_, localAttachment := neoLocalAttachmentIDFromURL(rawURL, localBaseURL)
-	return localAttachment || neoAmpHostedAttachmentURL(rawURL)
+	_, ampAttachment := neoInferenceAmpAttachmentURL(rt, rawURL, localBaseURL)
+	return localAttachment || ampAttachment
 }
 
 func neoHydrateInferenceAttachment(rt *neoRuntime, ctx context.Context, rawURL string, client *http.Client, localBaseURL string, maxBytes int) ([]byte, string, bool, error) {
-	if id, ok := neoLocalAttachmentIDFromURL(rawURL, localBaseURL); ok {
+	ampURL, ampAttachment := neoInferenceAmpAttachmentURL(rt, rawURL, localBaseURL)
+	if id, ok := neoLocalAttachmentIDFromURL(rawURL, localBaseURL); ok && (!ampAttachment || neoLocalAttachmentExists(id)) {
 		cacheKey := "local:" + id
 		if rt == nil || rt.attachmentCache == nil {
 			if info, err := os.Stat(filepath.Join(neoAmpDataDir(), "attachments", id+".bin")); err == nil && info.Size() > int64(maxBytes) {
@@ -21090,7 +23032,7 @@ func neoHydrateInferenceAttachment(rt *neoRuntime, ctx context.Context, rawURL s
 		}
 		return raw, mediaType, true, nil
 	}
-	if !neoAmpHostedAttachmentURL(rawURL) {
+	if !ampAttachment {
 		return nil, "", false, nil
 	}
 	if ctx == nil {
@@ -21110,15 +23052,15 @@ func neoHydrateInferenceAttachment(rt *neoRuntime, ctx context.Context, rawURL s
 		}
 	}
 	loader := func(loadCtx context.Context) ([]byte, string, error) {
-		return neoFetchAmpAttachment(loadCtx, rawURL, client, neoAttachmentMaxImageBytes, bearerToken)
+		return neoFetchAmpAttachment(loadCtx, ampURL, client, neoAttachmentMaxImageBytes, bearerToken)
 	}
 	var raw []byte
 	var mediaType string
 	var err error
-	cacheKey := rawURL
+	cacheKey := ampURL
 	if bearerToken != "" {
 		sum := sha256.Sum256([]byte(bearerToken))
-		cacheKey = "amp-auth:" + hex.EncodeToString(sum[:8]) + ":" + rawURL
+		cacheKey = "amp-auth:" + hex.EncodeToString(sum[:8]) + ":" + ampURL
 	}
 	if rt != nil && rt.attachmentCache != nil {
 		raw, mediaType, err = rt.attachmentCache.load(ctx, cacheKey, loader)
@@ -22240,6 +24182,14 @@ func (rt *neoRuntime) localThreadActorManagementResponse(ctx context.Context, bo
 }
 
 func (rt *neoRuntime) localThreadActorManagementResponseForOwner(ctx context.Context, body map[string]any, requestedThreadID, requestOwnerUserID string) (map[string]any, int) {
+	spawnExecutor := true
+	if rawSpawnExecutor, exists := body["spawnExecutor"]; exists {
+		var ok bool
+		spawnExecutor, ok = rawSpawnExecutor.(bool)
+		if !ok {
+			return map[string]any{"error": "invalid_spawn_executor", "message": "spawnExecutor must be a boolean"}, http.StatusBadRequest
+		}
+	}
 	rt.store.threadCreateMu.Lock()
 	defer rt.store.threadCreateMu.Unlock()
 	exclusiveThreadCreation, _ := ctx.Value(neoExclusiveThreadCreationContextKey{}).(bool)
@@ -22256,6 +24206,14 @@ func (rt *neoRuntime) localThreadActorManagementResponseForOwner(ctx context.Con
 	requestedWorkingDirectory := neoThreadActorRequestedWorkingDirectory(body)
 	requestedWorkspaceRoot := neoThreadActorRequestedWorkspaceRoot(body, requestedWorkingDirectory)
 	runnerID := firstNonEmptyString(body["runnerId"], body["runnerID"], body["runner_id"], nestedString(body["threadMeta"], "runnerId"), nestedString(body["threadMeta"], "runnerID"))
+	executorType := firstNonEmptyString(body["executorType"], nestedString(body["threadMeta"], "executorType"))
+	multiplayerTTLSeconds, hasMultiplayerTTL, err := neoMultiplayerTTLSeconds(body)
+	if err != nil {
+		return map[string]any{"error": "invalid_multiplayer_ttl", "message": err.Error()}, http.StatusBadRequest
+	}
+	if hasMultiplayerTTL && (!spawnExecutor || runnerID != "" || !strings.EqualFold(executorType, "sandbox")) {
+		return map[string]any{"error": "invalid_multiplayer_ttl", "message": "multiplayerTTLSeconds requires an Orb executor"}, http.StatusBadRequest
+	}
 	if runnerWorkingDirectory := rt.store.userExecutorRunnerWorkingDirectoryForOwner(runnerOwnerUserID, runnerID); runnerWorkingDirectory != "" {
 		requestedWorkingDirectory = runnerWorkingDirectory
 		requestedWorkspaceRoot = runnerWorkingDirectory
@@ -22290,6 +24248,15 @@ func (rt *neoRuntime) localThreadActorManagementResponseForOwner(ctx context.Con
 	}
 	if !neoThreadIDExactPattern.MatchString(threadID) {
 		return map[string]any{"error": "invalid_thread_id", "threadId": threadID}, http.StatusBadRequest
+	}
+	if runnerID != "" && spawnExecutor {
+		runnerResult := rt.store.userExecutorRunnerAvailabilityForOwner(runnerOwnerUserID, runnerID, threadID)
+		if runnerResult == neoUserExecutorRunnerCapacityExceeded {
+			return map[string]any{"error": "runner_capacity_exceeded", "message": "local runner thread capacity is exhausted", "threadId": threadID}, http.StatusTooManyRequests
+		}
+		if runnerResult != neoUserExecutorRunnerAccepted {
+			return map[string]any{"error": "runner_not_found", "message": "selected local runner is no longer available", "threadId": threadID}, http.StatusBadRequest
+		}
 	}
 	cleanupCloudThread := func(cloudThreadID, reason string) (map[string]any, int, bool) {
 		if err := rt.deleteNeoCloudThreadActor(ctx, cloudThreadID); err != nil {
@@ -22432,11 +24399,22 @@ func (rt *neoRuntime) localThreadActorManagementResponseForOwner(ctx context.Con
 		}
 		return map[string]any{"error": "cloud_thread_id_conflict", "message": "cloud threadId already exists locally", "threadId": threadID}, http.StatusConflict
 	}
+	runnerSpawnID := ""
+	runnerPublicationID := ""
+	releaseRunner := func() {
+		if runnerID == "" || runnerSpawnID == "" {
+			return
+		}
+		rt.store.stopUserExecutorRunnerThreadForOwner(runnerOwnerUserID, runnerID, threadID)
+		actor.clearWebLocalExecutorReservation(runnerSpawnID, runnerPublicationID)
+	}
 	reserveRunner := func() (map[string]any, int, bool) {
-		if runnerID == "" {
+		if runnerID == "" || !spawnExecutor {
 			return nil, 0, true
 		}
-		runnerResult := rt.store.requestUserExecutorRunnerThreadResultForOwner(runnerOwnerUserID, runnerID, threadID)
+		runnerSpawnID = "create-thread-" + randomBase62(12)
+		runnerResult, publicationRunnerID := rt.store.requestWebLocalExecutorRunnerThreadForOwner(runnerOwnerUserID, runnerID, threadID, runnerSpawnID, actor)
+		runnerPublicationID = publicationRunnerID
 		if runnerResult != neoUserExecutorRunnerAccepted {
 			if len(cloudThreadActor) > 0 {
 				if response, status, ok := cleanupCloudThread(threadID, "unclaimed cloud thread shell"); !ok {
@@ -22456,10 +24434,8 @@ func (rt *neoRuntime) localThreadActorManagementResponseForOwner(ctx context.Con
 		}
 		return nil, 0, true
 	}
-	if threadActorClaim == nil {
-		if response, status, ok := reserveRunner(); !ok {
-			return response, status
-		}
+	if response, status, ok := reserveRunner(); !ok {
+		return response, status
 	}
 	if neoThreadIDExactPattern.MatchString(threadID) {
 		rt.autoImportThreadActorWithReadyWork(actor, threadID, rt.threadDir, threadActorClaim == nil)
@@ -22479,7 +24455,6 @@ func (rt *neoRuntime) localThreadActorManagementResponseForOwner(ctx context.Con
 		requestedAgentMode = ""
 	}
 	requestedReasoningEffort := firstNonEmptyString(customAgent["reasoningEffort"], customAgent["reasoning_effort"], body["reasoningEffort"], body["reasoning_effort"], nestedString(body["threadMeta"], "reasoningEffort"), nestedString(body["threadMeta"], "reasoning_effort"), requestedSettings["reasoning.effort"])
-	executorType := firstNonEmptyString(body["executorType"], nestedString(body["threadMeta"], "executorType"))
 	initialPrompt := strings.TrimSpace(firstNonEmptyString(body["prompt"], body["initialPrompt"], body["message"]))
 	if len(initialContent) == 0 && initialPrompt != "" {
 		initialContent = []any{map[string]any{"type": "text", "text": initialPrompt}}
@@ -22487,6 +24462,9 @@ func (rt *neoRuntime) localThreadActorManagementResponseForOwner(ctx context.Con
 	seededInitialContent := false
 	customAgentSettingsChanged := hasCustomAgent
 	actor.mu.Lock()
+	if createdThreadActor {
+		actor.multiplayerTTLSeconds = multiplayerTTLSeconds
+	}
 	if len(persistedEnvironment) > 0 {
 		actor.environment = neoCanonicalizeEnvironmentWorkspace(persistedEnvironment)
 	}
@@ -22604,11 +24582,6 @@ func (rt *neoRuntime) localThreadActorManagementResponseForOwner(ctx context.Con
 	threadVersion := actor.lastSeqLocked()
 	bootstrapExecutorType := actor.bootstrapExecutorType
 	actor.mu.Unlock()
-	if threadActorClaim != nil {
-		if response, status, ok := reserveRunner(); !ok {
-			return response, status
-		}
-	}
 	if threadActorClaim != nil && !threadActorClaim.commit() {
 		var cleanupResponse map[string]any
 		cleanupStatus := 0
@@ -22616,9 +24589,7 @@ func (rt *neoRuntime) localThreadActorManagementResponseForOwner(ctx context.Con
 		if len(cloudThreadActor) > 0 {
 			cleanupResponse, cleanupStatus, cleanupOK = cleanupCloudThread(threadID, "unpublished cloud thread shell")
 		}
-		if runnerID != "" {
-			rt.store.stopUserExecutorRunnerThreadForOwner(runnerOwnerUserID, runnerID, threadID)
-		}
+		releaseRunner()
 		if !cleanupOK {
 			return cleanupResponse, cleanupStatus
 		}
@@ -22652,6 +24623,10 @@ func (rt *neoRuntime) localThreadActorManagementResponseForOwner(ctx context.Con
 		"wsToken":         wsToken,
 	} {
 		baseResponse[key] = value
+	}
+	if runnerSpawnID != "" {
+		baseResponse["runnerExecutorRequested"] = true
+		baseResponse["runnerRequestId"] = runnerSpawnID
 	}
 	notifyCreatedThreadActor := func() {
 		if createdThreadActor {
@@ -22741,6 +24716,10 @@ func (rt *neoRuntime) neoWebLocalCreateProjectThread(ctx context.Context, query 
 	if !neoRequestOwnerScopeResolved(ctx, requestOwnerUserID) {
 		return neoWebLocalRemoteCommandError("authenticated owner is unavailable")
 	}
+	multiplayerTTLSeconds, hasMultiplayerTTL, err := neoMultiplayerTTLSeconds(request)
+	if err != nil {
+		return neoWebLocalRemoteCommandError(err.Error())
+	}
 	runnerOwnerUserID := firstNonEmptyString(requestOwnerUserID, neoLocalOwnerUserID)
 	threadID := firstNonEmptyString(request["threadID"], request["threadId"], request["id"])
 	if threadID == "" {
@@ -22826,6 +24805,9 @@ func (rt *neoRuntime) neoWebLocalCreateProjectThread(ctx context.Context, query 
 		workingDirectory = runnerWorkingDirectory
 	}
 	spawnOrbExecutor := spawnExecutorProvided && boolValue(spawnExecutorValue) && runnerID == ""
+	if hasMultiplayerTTL && !spawnOrbExecutor {
+		return neoWebLocalRemoteCommandError("multiplayerTTLSeconds requires an Orb executor")
+	}
 	if spawnOrbExecutor {
 		if reason := neoOrbsAvailable(rt.configSnapshot()); reason != "" {
 			return neoWebLocalRemoteCommandError("cannot provision an orb: " + reason)
@@ -22872,6 +24854,7 @@ func (rt *neoRuntime) neoWebLocalCreateProjectThread(ctx context.Context, query 
 	repositoryURL := firstNonEmptyString(projectRepositoryURL, requestedRepositoryURL)
 	if nativeRunnerRequested {
 		repositoryURL = firstNonEmptyString(runnerRepositoryURL, projectRepositoryURL)
+		threadMeta[neoRequiredRunnerIDMetaKey] = runnerID
 	}
 	if repositoryURL != "" {
 		threadMeta["repositoryURL"] = repositoryURL
@@ -22892,6 +24875,9 @@ func (rt *neoRuntime) neoWebLocalCreateProjectThread(ctx context.Context, query 
 		"threadMeta":       threadMeta,
 		"projectID":        omitEmpty(projectID),
 	}
+	if spawnExecutorProvided {
+		body["spawnExecutor"] = spawnExecutorValue
+	}
 	if pluginMode != nil {
 		threadMeta["agentMode"] = pluginMode.Key
 		threadMeta["reasoningEffort"] = omitEmpty(reasoningEffort)
@@ -22907,6 +24893,9 @@ func (rt *neoRuntime) neoWebLocalCreateProjectThread(ctx context.Context, query 
 		body["executorType"] = "local-client"
 	} else if spawnOrbExecutor {
 		body["executorType"] = "sandbox"
+	}
+	if hasMultiplayerTTL {
+		body["multiplayerTTLSeconds"] = multiplayerTTLSeconds
 	}
 	if workingDirectory != "" {
 		body["workingDirectory"] = workingDirectory
@@ -22931,29 +24920,47 @@ func (rt *neoRuntime) neoWebLocalCreateProjectThread(ctx context.Context, query 
 			result[key] = value
 		}
 	}
+	threadDataThread := map[string]any{
+		"id":            createdThreadID,
+		"v":             0,
+		"creatorUserID": neoLocalOwnerUserID,
+		"ownerUserId":   neoLocalOwnerUserID,
+		"messages":      []any{},
+	}
+	if actor := rt.store.lookupThreadActor(createdThreadID); actor != nil {
+		if snapshot, ok := actor.threadSnapshotWithOptions(neoThreadSnapshotOptions{
+			skipLocalMessageJSON: true,
+		}); ok {
+			threadDataThread = neoWebLocalThread(snapshot)
+		}
+	}
+	if threadDataThread["hasExecutor"] == false {
+		delete(threadDataThread, "hasExecutor")
+	}
+	if threadDataThread["executorConnected"] == false {
+		delete(threadDataThread, "executorConnected")
+	}
+	projects := rt.neoWebLocalProjectCache()
+	finalProject := neoWebLocalProjectByWorkingDirectory(projects, neoWorkingDirectoryFromThread(threadDataThread))
+	if len(finalProject) == 0 {
+		finalProject = neoWebLocalProjectByMetadata(projects, mapValue(threadDataThread["meta"]))
+	}
+	if len(finalProject) == 0 {
+		projects = rt.reloadNeoWebLocalProjectCache()
+		finalProject = neoWebLocalProjectByWorkingDirectory(projects, neoWorkingDirectoryFromThread(threadDataThread))
+		if len(finalProject) == 0 {
+			finalProject = neoWebLocalProjectByMetadata(projects, mapValue(threadDataThread["meta"]))
+		}
+	}
+	if len(finalProject) == 0 {
+		finalProject = neoWebLocalProjectFromThread(threadDataThread)
+	}
+	if len(finalProject) != 0 {
+		result["project"] = cloneMap(finalProject)
+	}
+	result["initialThread"] = threadDataThread
 	if response["usesThreadActors"] == true {
 		threadActorConfig := neoWebLocalPlainThreadActorConfig(createdThreadID, firstNonEmptyString(clientToken, response["wsToken"]), localBaseURL)
-		threadDataThread := map[string]any{
-			"id":            createdThreadID,
-			"v":             0,
-			"creatorUserID": neoLocalOwnerUserID,
-			"ownerUserId":   neoLocalOwnerUserID,
-			"messages":      []any{},
-		}
-		if actor := rt.store.lookupThreadActor(createdThreadID); actor != nil {
-			if snapshot, ok := actor.threadSnapshotWithOptions(neoThreadSnapshotOptions{
-				skipLocalMessageJSON: true,
-			}); ok {
-				threadDataThread = neoWebLocalThread(snapshot)
-			}
-		}
-		if threadDataThread["hasExecutor"] == false {
-			delete(threadDataThread, "hasExecutor")
-		}
-		if threadDataThread["executorConnected"] == false {
-			delete(threadDataThread, "executorConnected")
-		}
-		result["initialThread"] = threadDataThread
 		result["threadActorConfig"] = threadActorConfig
 		result["threadData"] = map[string]any{
 			"thread":            threadDataThread,
@@ -22981,6 +24988,92 @@ func (rt *neoRuntime) neoWebLocalUserExecutorRunners(ctx context.Context) []any 
 		return []any{}
 	}
 	return rt.store.userExecutorRunnersForOwner(firstNonEmptyString(ownerUserID, neoLocalOwnerUserID))
+}
+
+func (m *AmpModule) serveLocalBrokerControl(c *gin.Context) {
+	if strings.TrimSpace(c.GetHeader("Origin")) != "" {
+		c.JSON(http.StatusForbidden, gin.H{"ok": false, "error": "browser_origin_forbidden", "message": "browser-origin requests are not accepted"})
+		return
+	}
+	if c.Request.Method != http.MethodGet {
+		c.Header("Allow", http.MethodGet)
+		c.JSON(http.StatusMethodNotAllowed, gin.H{"ok": false, "error": "method_not_allowed", "message": "method not allowed"})
+		return
+	}
+	if m == nil || m.neoRuntime == nil || m.neoRuntime.store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"ok": false, "error": "runtime_unavailable", "message": "local runner runtime is unavailable"})
+		return
+	}
+	if strings.TrimSpace(getClientAPIKeyFromContext(c.Request.Context())) == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"ok": false, "error": "authentication_required", "message": "authenticated client API key is required"})
+		return
+	}
+	ownerUserID := strings.TrimSpace(m.neoRuntime.neoRequestOwnerUserID(c.Request.Context()))
+	if ownerUserID == "" || !neoRequestOwnerScopeResolved(c.Request.Context(), ownerUserID) {
+		c.JSON(http.StatusUnauthorized, gin.H{"ok": false, "error": "owner_unavailable", "message": "authenticated owner is unavailable"})
+		return
+	}
+	brokerID := strings.TrimSpace(c.GetHeader(neoLocalBrokerIDHeader))
+	sessionID := strings.TrimSpace(c.GetHeader(neoLocalBrokerSessionIDHeader))
+	sessionGeneration, err := strconv.ParseUint(strings.TrimSpace(c.GetHeader(neoLocalBrokerGenerationHeader)), 10, 64)
+	if err != nil || sessionGeneration == 0 || !neoLocalBrokerIdentifierPattern.MatchString(brokerID) || !neoLocalBrokerIdentifierPattern.MatchString(sessionID) {
+		c.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": "invalid_request", "message": "invalid broker control identity"})
+		return
+	}
+	if !websocket.IsWebSocketUpgrade(c.Request) {
+		c.JSON(http.StatusUpgradeRequired, gin.H{"ok": false, "error": "websocket_required", "message": "websocket upgrade required"})
+		return
+	}
+	userActor := m.neoRuntime.store.userActorForOwner(ownerUserID)
+	_, ok := userActor.localBrokerControlSnapshot(brokerID, sessionID, sessionGeneration)
+	if !ok {
+		c.JSON(http.StatusConflict, gin.H{"ok": false, "error": "stale_session", "message": "broker heartbeat session is unavailable"})
+		return
+	}
+	upgrader := websocket.Upgrader{
+		CheckOrigin:     func(request *http.Request) bool { return strings.TrimSpace(request.Header.Get("Origin")) == "" },
+		ReadBufferSize:  1024,
+		WriteBufferSize: 32 * 1024,
+	}
+	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
+	if err != nil {
+		return
+	}
+	conn.SetReadLimit(1024)
+	control := &neoLocalBrokerControl{
+		ownerUserID:       ownerUserID,
+		brokerID:          brokerID,
+		sessionID:         sessionID,
+		sessionGeneration: sessionGeneration,
+		conn:              conn,
+		send:              make(chan neoLocalBrokerControlMessage, 1),
+		done:              make(chan struct{}),
+	}
+	conn.SetPingHandler(func(data string) error {
+		control.writeMu.Lock()
+		defer control.writeMu.Unlock()
+		return conn.WriteControl(websocket.PongMessage, []byte(data), time.Time{})
+	})
+	m.neoRuntime.registerLocalBrokerControl(control)
+	defer m.neoRuntime.unregisterLocalBrokerControl(control)
+	defer control.close()
+	go control.writeLoop()
+	snapshot, ok := userActor.localBrokerControlSnapshot(brokerID, sessionID, sessionGeneration)
+	if !ok {
+		return
+	}
+	if !control.queue(snapshot) {
+		return
+	}
+	for {
+		messageType, payload, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		if (messageType == websocket.TextMessage || messageType == websocket.BinaryMessage) && len(payload) != 0 {
+			return
+		}
+	}
 }
 
 func (m *AmpModule) serveLocalBrokerHeartbeat(c *gin.Context) {
@@ -23032,6 +25125,8 @@ func (m *AmpModule) serveLocalBrokerHeartbeat(c *gin.Context) {
 		c.JSON(http.StatusForbidden, gin.H{"ok": false, "error": "owner_forbidden", "message": "owner runner state is unavailable"})
 		return
 	}
+	userActor.brokerHeartbeatMu.Lock()
+	defer userActor.brokerHeartbeatMu.Unlock()
 	heartbeatResult, err := userActor.syncLocalBrokerHeartbeatResult(request)
 	if err != nil {
 		status := http.StatusConflict
@@ -23047,14 +25142,20 @@ func (m *AmpModule) serveLocalBrokerHeartbeat(c *gin.Context) {
 		return
 	}
 	m.neoRuntime.store.resumePendingWebLocalThreadsForBrokerRunners(ownerUserID, heartbeatResult.Runners)
-	responseRunners := make([]any, 0, len(heartbeatResult.Runners))
-	for _, runner := range heartbeatResult.Runners {
-		if current, ok := userActor.userExecutorRunnerSnapshot(runner.runnerID); ok {
-			runner = current
+	intentSnapshot, ok := userActor.localBrokerHeartbeatSnapshot(request, heartbeatResult.Runners)
+	if !ok {
+		if _, _, sessionCurrent := userActor.localBrokerIntentVersion(request.BrokerID, request.SessionID, request.SessionGeneration); sessionCurrent {
+			c.JSON(http.StatusConflict, gin.H{"ok": false, "error": "intent_capacity_exceeded", "message": "local broker intent snapshot exceeds capacity"})
+		} else {
+			c.JSON(http.StatusConflict, gin.H{"ok": false, "error": "stale_session", "message": "broker heartbeat session is unavailable"})
 		}
+		return
+	}
+	responseRunners := make([]any, 0, len(intentSnapshot.Runners))
+	for _, runner := range intentSnapshot.Runners {
 		responseRunners = append(responseRunners, map[string]any{
-			"runnerId": runner.runnerID,
-			"intents":  userActor.userExecutorRunnerIntentValues(runner),
+			"runnerId": runner.RunnerID,
+			"intents":  runner.Intents,
 		})
 	}
 	rejectedRunners := make([]any, 0, len(heartbeatResult.Rejected))
@@ -23066,6 +25167,8 @@ func (m *AmpModule) serveLocalBrokerHeartbeat(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"ok": false, "error": "config_store_unavailable", "message": "owner orb configuration store is unavailable"})
 		return
 	}
+	c.Header(neoLocalBrokerIntentEpochHeader, intentSnapshot.IntentEpoch)
+	c.Header(neoLocalBrokerIntentRevisionHeader, strconv.FormatUint(intentSnapshot.IntentRevision, 10))
 	c.Header(orbconfig.SupportHeader, "1")
 	c.Header(orbconfig.DigestHeader, orbConfigDigest)
 	c.Header(ampplugins.SupportHeader, "1")
@@ -23247,6 +25350,18 @@ func neoLocalBrokerSafeText(value string, limit int, allowEmpty bool) bool {
 	}
 	for _, character := range value {
 		if unicode.IsControl(character) {
+			return false
+		}
+	}
+	return true
+}
+
+func neoLocalBrokerSafeMultilineText(value string, limit int, allowEmpty bool) bool {
+	if len(value) > limit || !utf8.ValidString(value) || !allowEmpty && value == "" {
+		return false
+	}
+	for _, character := range value {
+		if unicode.IsControl(character) && character != '\n' && character != '\r' && character != '\t' {
 			return false
 		}
 	}
@@ -24649,6 +26764,7 @@ type neoPersistedThreadFile struct {
 	snapshotPath     string
 	threadID         string
 	snapshotModified time.Time
+	summaryStamp     neoWebLocalFileStamp
 }
 
 type neoWebLocalArchivedThreadSummary struct {
@@ -24665,6 +26781,11 @@ type neoWebLocalSidebarThreadIndexEntry struct {
 	archived       bool
 	pinned         bool
 	puck           bool
+}
+
+type neoWebLocalSidebarFileVersion struct {
+	snapshotModifiedNano int64
+	summaryStamp         neoWebLocalFileStamp
 }
 
 func (rt *neoRuntime) neoWebLocalPersistedThreadSummaries(limit int, skip map[string]bool) []any {
@@ -24752,7 +26873,7 @@ func neoSentinelLocalThreadID(threadID string) bool {
 }
 
 func neoLocalThreadSnapshotEmptyShell(snapshot neoCloudThreadSnapshot) bool {
-	if snapshot.preparedLocalThread != nil || snapshot.pendingInference != nil || snapshot.currentInference != nil || snapshot.pinned || snapshot.pinnedOverride != nil {
+	if snapshot.preparedLocalThread != nil || snapshot.pendingInference != nil || snapshot.currentInference != nil || snapshot.pinned || snapshot.pinnedOverride != nil || len(snapshot.terminalExecutorStatus) > 0 {
 		return false
 	}
 	if strings.TrimSpace(stringValue(snapshot.settings[neoCustomAgentModeSetting])) != "" {
@@ -24866,7 +26987,20 @@ func neoWebLocalPersistedThreadSummaryFilesContext(ctx context.Context, threadDi
 		if err != nil {
 			continue
 		}
-		files = append(files, neoPersistedThreadFile{snapshotPath: snapshotPath, threadID: threadID, snapshotModified: info.ModTime()})
+		summaryInfo, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		files = append(files, neoPersistedThreadFile{
+			snapshotPath:     snapshotPath,
+			threadID:         threadID,
+			snapshotModified: info.ModTime(),
+			summaryStamp: neoWebLocalFileStamp{
+				exists:       true,
+				size:         summaryInfo.Size(),
+				modifiedNano: summaryInfo.ModTime().UnixNano(),
+			},
+		})
 	}
 	sort.Slice(files, func(i, j int) bool {
 		if !files[i].snapshotModified.Equal(files[j].snapshotModified) {
@@ -24908,7 +27042,7 @@ func (rt *neoRuntime) neoWebLocalPersistedThreadSummaryFiles(ctx context.Context
 		rt.localSummaryIndexMu.Lock()
 		rt.localSummaryIndex = append(rt.localSummaryIndex[:0], files...)
 		rt.localSummaryIndexLoaded = true
-		rt.localSummaryIndexStamp = neoWebLocalFileSourceStamp(summaryDir)
+		rt.localSummaryIndexStamp = stamp
 		rt.localSummaryIndexLoadedAt = time.Now()
 		cached := append([]neoPersistedThreadFile(nil), rt.localSummaryIndex...)
 		rt.localSummaryIndexMu.Unlock()
@@ -24931,10 +27065,14 @@ func (rt *neoRuntime) neoWebLocalSidebarThreadIndex(ctx context.Context) []neoWe
 	if rt == nil || !rt.localThreadSnapshotsEnabled() || ctx.Err() != nil {
 		return nil
 	}
+	summaryDir := filepath.Join(rt.threadDir, neoWebLocalThreadSummaryDirName)
 	snapshotStamp := neoWebLocalFileSourceStamp(rt.threadDir)
-	summaryStamp := neoWebLocalFileSourceStamp(filepath.Join(rt.threadDir, neoWebLocalThreadSummaryDirName))
+	summaryStamp := neoWebLocalFileSourceStamp(summaryDir)
 	rt.localSidebarSummaryMu.Lock()
-	if rt.localSidebarSummaryLoaded && snapshotStamp == rt.localSidebarSnapshotStamp && summaryStamp == rt.localSidebarSummaryStamp {
+	if rt.localSidebarSummaryLoaded &&
+		snapshotStamp == rt.localSidebarSnapshotStamp &&
+		summaryStamp == rt.localSidebarSummaryStamp &&
+		time.Since(rt.localSidebarSummaryScannedAt) < neoWebLocalSummaryIndexTTL {
 		entries := cloneNeoWebLocalSidebarThreadIndex(rt.localSidebarSummaryIndex)
 		rt.localSidebarSummaryMu.Unlock()
 		return entries
@@ -24945,6 +27083,13 @@ func (rt *neoRuntime) neoWebLocalSidebarThreadIndex(ctx context.Context) []neoWe
 			rt.localSidebarSummaryScanStart()
 		}
 		scanCtx := context.WithoutCancel(ctx)
+		snapshotStamp := neoWebLocalFileSourceStamp(rt.threadDir)
+		summaryStamp := neoWebLocalFileSourceStamp(summaryDir)
+		rt.localSummaryIndexMu.Lock()
+		if rt.localSummaryIndexLoaded && summaryStamp != rt.localSummaryIndexStamp {
+			rt.localSummaryIndexLoadedAt = time.Time{}
+		}
+		rt.localSummaryIndexMu.Unlock()
 		files := rt.neoWebLocalPersistedThreadSummaryFiles(scanCtx)
 		indexed := make(map[string]bool, len(files))
 		for _, file := range files {
@@ -24952,19 +27097,48 @@ func (rt *neoRuntime) neoWebLocalSidebarThreadIndex(ctx context.Context) []neoWe
 		}
 		for _, file := range neoWebLocalPersistedThreadSnapshotFilesContext(scanCtx, rt.threadDir) {
 			if !indexed[file.threadID] {
+				indexed[file.threadID] = true
 				files = append(files, file)
 			}
 		}
+		rt.localSidebarSummaryMu.Lock()
+		previousEntries := rt.localSidebarSummaryByID
+		previousVersions := rt.localSidebarFileVersions
+		previousSkips := rt.localSidebarSummarySkips
+		rt.localSidebarSummaryMu.Unlock()
 		entries := make([]neoWebLocalSidebarThreadIndexEntry, 0, len(files))
+		entriesByID := make(map[string]neoWebLocalSidebarThreadIndexEntry, len(files))
+		versions := make(map[string]neoWebLocalSidebarFileVersion, len(files))
+		skips := make(map[string]bool)
 		for _, file := range files {
+			if scanCtx.Err() != nil {
+				return nil, scanCtx.Err()
+			}
+			version := neoWebLocalSidebarFileVersion{snapshotModifiedNano: file.snapshotModified.UnixNano(), summaryStamp: file.summaryStamp}
+			versions[file.threadID] = version
+			if previousVersions[file.threadID] == version {
+				if entry, kept := previousEntries[file.threadID]; kept {
+					entries = append(entries, entry)
+					entriesByID[file.threadID] = entry
+					continue
+				}
+				if previousSkips[file.threadID] {
+					skips[file.threadID] = true
+					continue
+				}
+			}
 			status, ok := rt.readNeoWebLocalThreadSummaryWithSnapshotFallback(file)
 			if !ok {
+				skips[file.threadID] = true
 				continue
 			}
 			entry, ok := neoWebLocalSidebarThreadIndexEntryFromStatus(status)
-			if ok {
-				entries = append(entries, entry)
+			if !ok {
+				skips[file.threadID] = true
+				continue
 			}
+			entries = append(entries, entry)
+			entriesByID[file.threadID] = entry
 		}
 		sort.Slice(entries, func(i, j int) bool {
 			if entries[i].updatedMs != entries[j].updatedMs {
@@ -24974,9 +27148,13 @@ func (rt *neoRuntime) neoWebLocalSidebarThreadIndex(ctx context.Context) []neoWe
 		})
 		rt.localSidebarSummaryMu.Lock()
 		rt.localSidebarSummaryIndex = cloneNeoWebLocalSidebarThreadIndex(entries)
+		rt.localSidebarSummaryByID = entriesByID
+		rt.localSidebarFileVersions = versions
+		rt.localSidebarSummarySkips = skips
 		rt.localSidebarSummaryLoaded = true
-		rt.localSidebarSnapshotStamp = neoWebLocalFileSourceStamp(rt.threadDir)
-		rt.localSidebarSummaryStamp = neoWebLocalFileSourceStamp(filepath.Join(rt.threadDir, neoWebLocalThreadSummaryDirName))
+		rt.localSidebarSummaryScannedAt = time.Now()
+		rt.localSidebarSnapshotStamp = snapshotStamp
+		rt.localSidebarSummaryStamp = summaryStamp
 		rt.localSidebarSummaryMu.Unlock()
 		return entries, nil
 	})
@@ -25566,19 +27744,21 @@ func neoWebLocalPersistedThreadStatus(thread gjson.Result, fallbackID string, mo
 	if !originValue.Exists() {
 		originValue = thread.Get("data.origin")
 	}
-	parentThreadID := firstNonEmptyString(
+	relationshipParentThreadID := firstNonEmptyString(
 		neoRecentParentThreadIDFromRawRelationships(thread.Get("relationships").Value()),
 		neoRecentParentThreadIDFromRawRelationships(thread.Get("data.relationships").Value()),
-		thread.Get("parentThreadID").String(),
-		thread.Get("parentThreadId").String(),
-		thread.Get("parent_thread_id").String(),
-		thread.Get("data.parentThreadID").String(),
-		thread.Get("data.parentThreadId").String(),
-		thread.Get("data.parent_thread_id").String(),
 	)
-	if origin := neoRecentThreadOrigin(originValue.Value(), parentThreadID); len(origin) > 0 {
+	if origin := neoRecentThreadOrigin(originValue.Value(), relationshipParentThreadID); len(origin) > 0 {
 		status["origin"] = origin
 		status["parentThreadID"] = stringValue(origin["sourceThreadID"])
+	} else {
+		for _, alias := range []string{"parentThreadID", "parentThreadId", "parent_thread_id"} {
+			value := firstNonEmptyString(thread.Get(alias).String(), thread.Get("data."+alias).String())
+			if neoThreadIDExactPattern.MatchString(value) {
+				status["parentThreadID"] = value
+				break
+			}
+		}
 	}
 	if firstSyncMs > 0 {
 		status["firstSyncAt"] = neoMillisRFC3339(firstSyncMs)
@@ -27753,6 +29933,7 @@ func neoWebLocalThread(snapshot neoCloudThreadSnapshot) map[string]any {
 func neoExternalThreadMeta(meta map[string]any) map[string]any {
 	out := cloneNeoJSONMap(meta)
 	delete(out, neoOrbPortalTokenMetaKey)
+	delete(out, neoRequiredRunnerIDMetaKey)
 	return out
 }
 
@@ -29122,7 +31303,8 @@ func neoKimiChatMessageBytesWithKnownAttachments(rt *neoRuntime, request neoInfe
 
 func neoKnownAttachmentSize(rt *neoRuntime, rawURL, localBaseURL string) (int, string, bool) {
 	mediaType := "image/png"
-	if id, ok := neoLocalAttachmentIDFromURL(rawURL, localBaseURL); ok {
+	ampURL, ampAttachment := neoInferenceAmpAttachmentURL(rt, rawURL, localBaseURL)
+	if id, ok := neoLocalAttachmentIDFromURL(rawURL, localBaseURL); ok && (!ampAttachment || neoLocalAttachmentExists(id)) {
 		if rt != nil && rt.attachmentCache != nil {
 			if data, cachedMediaType, found := rt.attachmentCache.get("local:" + id); found {
 				if neoProtocolImageMediaType(cachedMediaType) {
@@ -29140,10 +31322,10 @@ func neoKnownAttachmentSize(rt *neoRuntime, rawURL, localBaseURL string) (int, s
 		}
 		return int(info.Size()), mediaType, true
 	}
-	if !neoAmpHostedAttachmentURL(rawURL) || rt == nil || rt.attachmentCache == nil {
+	if !ampAttachment || rt == nil || rt.attachmentCache == nil {
 		return 0, "", false
 	}
-	data, cachedMediaType, found := rt.attachmentCache.get(rawURL)
+	data, cachedMediaType, found := rt.attachmentCache.get(ampURL)
 	if !found {
 		return 0, "", false
 	}
@@ -30352,6 +32534,10 @@ func (a *neoActor) importThreadWithSyncOptions(thread map[string]any, syncCloud,
 		}
 	}
 	approvalQueue := neoRestoredApprovalQueue(messages)
+	importedTerminalExecutorStatus := map[string]any(nil)
+	if preserveCompleteState {
+		importedTerminalExecutorStatus = neoPersistedTerminalExecutorStatus(mapValue(thread[neoLocalExecutorStatusKey]))
+	}
 	pendingTools := neoRestoredPendingTools(messages, agentMode, reasoningEffort)
 	recoveredProxyOwnedTools := neoRestoredProxyOwnedTools(pendingTools, meta)
 	orphanedNestedToolIDs := neoRestoredNestedPendingToolIDs(messages, pendingTools, recoveredProxyOwnedTools)
@@ -30515,6 +32701,7 @@ func (a *neoActor) importThreadWithSyncOptions(thread map[string]any, syncCloud,
 	a.activeError = cloneMap(importedActiveError)
 	a.activeErrorMessageID = importedActiveErrorMessageID
 	a.activeErrorSeq = activeErrorSeq
+	a.lastExecutorStatus = importedTerminalExecutorStatus
 	a.queue = queuedMessages
 	if len(approvalQueue) > 0 {
 		a.agentState = "awaiting_approval"
@@ -35138,6 +37325,7 @@ func (a *neoActor) archiveThread(archive bool, _ map[string]any) {
 	a.mu.Unlock()
 	ownerUserID, runnerID, threadID := a.userExecutorRunnerBinding()
 	if archive && runnerID != "" && a.runtime != nil && a.runtime.store != nil {
+		a.clearWebLocalExecutorReservationForRunner(runnerID)
 		a.runtime.store.stopUserExecutorRunnerThreadForOwner(ownerUserID, runnerID, threadID)
 	}
 	if a.runtime != nil && a.runtime.store != nil {
@@ -38233,20 +40421,25 @@ func (a *neoActor) approvalToolIDsLocked() []string {
 }
 
 type neoSocket struct {
-	mu               sync.Mutex
-	conn             *websocket.Conn
-	writeMessage     func(int, []byte) error
-	snapshotSent     bool
-	jsonRPC          bool
-	rivetAction      bool
-	rivetBare        bool
-	rivetConnection  string
-	localExtensions  bool
-	webLocalObserver bool
-	executor         bool
-	executorID       string
-	clientAPIKey     string
-	runnerID         string
+	mu                   sync.Mutex
+	conn                 *websocket.Conn
+	writeMessage         func(int, []byte) error
+	snapshotSent         bool
+	jsonRPC              bool
+	rivetAction          bool
+	rivetBare            bool
+	rivetConnection      string
+	localExtensions      bool
+	webLocalObserver     bool
+	webLocalObserverOnly bool
+	executor             bool
+	executorRejected     bool
+	executorID           string
+	clientAPIKey         string
+	runnerID             string
+	attachmentRuntime    *neoRuntime
+	attachmentBaseURL    string
+	attachmentThreadID   string
 }
 
 type neoPromptDraft struct {
@@ -38261,6 +40454,59 @@ func (s *neoSocket) clientKey() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.clientAPIKey
+}
+
+func (s *neoSocket) bindAttachmentViewer(rt *neoRuntime, baseURL, threadID string) {
+	if s == nil || rt == nil {
+		return
+	}
+	baseURL = neoAttachmentViewBaseURL(baseURL)
+	s.mu.Lock()
+	if s.attachmentRuntime == nil {
+		s.attachmentRuntime = rt
+	}
+	if s.attachmentBaseURL == "" && baseURL != "" {
+		s.attachmentBaseURL = baseURL
+	}
+	if s.attachmentThreadID == "" {
+		s.attachmentThreadID = strings.TrimSpace(threadID)
+	}
+	s.mu.Unlock()
+}
+
+func neoOutboundMayContainAttachmentViews(payload any) bool {
+	frame := mapValue(payload)
+	switch stringValue(frame["type"]) {
+	case "message_added", "message_updated", "queued_messages", "queued_message_added", "draft",
+		"user:message", "user:message:append-content", "assistant:message", "assistant:message-update":
+		return true
+	default:
+		_, hasContent := frame["content"]
+		return hasContent
+	}
+}
+
+func (s *neoSocket) localizeAttachmentViews(payload any) any {
+	if s == nil {
+		return payload
+	}
+	s.mu.Lock()
+	rt := s.attachmentRuntime
+	baseURL := s.attachmentBaseURL
+	threadID := s.attachmentThreadID
+	clientAPIKey := s.clientAPIKey
+	s.mu.Unlock()
+	if rt == nil || rt.attachmentViews == nil || baseURL == "" {
+		return payload
+	}
+	localized, _ := neoLocalizeAttachmentViewValue(payload, func(rawURL string) string {
+		token := rt.attachmentViews.mint(threadID, rawURL, clientAPIKey)
+		if token == "" {
+			return ""
+		}
+		return baseURL + "/ampcode/attachment-view/" + url.PathEscape(token)
+	})
+	return localized
 }
 
 func (s *neoSocket) runnerKey() string {
@@ -38301,6 +40547,26 @@ func (s *neoSocket) clearExecutor() {
 	s.executor = false
 	s.executorID = ""
 	s.mu.Unlock()
+}
+
+func (s *neoSocket) rejectExecutor() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.executor = false
+	s.executorRejected = true
+	s.executorID = ""
+	s.mu.Unlock()
+}
+
+func (s *neoSocket) isExecutorRejected() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.executorRejected
 }
 
 func (s *neoSocket) isExecutor() bool {
@@ -38409,6 +40675,24 @@ func (s *neoSocket) isWebLocalObserver() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.webLocalObserver
+}
+
+func (s *neoSocket) isWebLocalObserverOnly() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.webLocalObserverOnly
+}
+
+func (s *neoSocket) setWebLocalObserverOnly() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.webLocalObserverOnly = true
+	s.mu.Unlock()
 }
 
 func neoWebLocalObserverPayload(payload any) (any, bool) {
@@ -38698,6 +40982,9 @@ func (s *neoSocket) sendChecked(payload any) bool {
 		log.Debugf("amp neo local runtime WS skip local extension %s", neoProtocolSummary(cleaned))
 		return false
 	}
+	if neoOutboundMayContainAttachmentViews(cleaned) {
+		cleaned = s.localizeAttachmentViews(cleaned)
+	}
 	if s.isRivetAction() {
 		if frame, ok := neoRivetEventFrame(cleaned, s.isWebLocalObserver()); ok {
 			if s.isRivetBare() {
@@ -38899,6 +41186,15 @@ func neoInboundExecutorMessage(msgType string) bool {
 
 func neoInboundWebLocalObserverBlockedMessage(msgType string) bool {
 	return msgType != "executor_notepad_operation" && neoInboundExecutorMessage(msgType)
+}
+
+func neoInboundWebLocalObserverOnlyAllowedMessage(msgType string) bool {
+	switch msgType {
+	case "client_append_user_msg", "client_cancel", "client_resume", "client_set_presence", "user:message", "user:message-queue:enqueue":
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *neoSocket) sendJSONRPCResponse(id any, result any) {
@@ -42894,14 +45190,21 @@ func neoHeadlessExecutorLogPath(threadID, spawnID string) string {
 }
 
 type neoHeadlessPIDRecord struct {
-	PID      int  `json:"pid"`
-	WebLocal bool `json:"webLocal,omitempty"`
+	PID      int    `json:"pid"`
+	WebLocal bool   `json:"webLocal,omitempty"`
+	RunnerID string `json:"runnerId,omitempty"`
 }
 
-func writeNeoHeadlessPIDFile(threadID string, pid int, webLocal bool) error {
+func writeNeoHeadlessPIDFile(threadID string, pid int, webLocal bool, runnerID string) error {
 	if !neoThreadIDExactPattern.MatchString(threadID) || pid <= 0 {
 		return errors.New("invalid owned headless executor identity")
 	}
+	runnerID = strings.TrimSpace(runnerID)
+	if webLocal && runnerID == "" {
+		return errors.New("web local headless executor runner identity is required")
+	}
+	neoHeadlessPIDFileMu.Lock()
+	defer neoHeadlessPIDFileMu.Unlock()
 	dir := strings.TrimSpace(currentNeoHeadlessPIDDir())
 	if dir == "" {
 		return errors.New("owned headless executor PID directory unavailable")
@@ -42909,11 +45212,11 @@ func writeNeoHeadlessPIDFile(threadID string, pid int, webLocal bool) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	raw, err := json.Marshal(neoHeadlessPIDRecord{PID: pid, WebLocal: webLocal})
+	raw, err := json.Marshal(neoHeadlessPIDRecord{PID: pid, WebLocal: webLocal, RunnerID: runnerID})
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(dir, threadID+".pid"), raw, 0o600)
+	return writeNeoAtomicFile(filepath.Join(dir, threadID+".pid"), raw, 0o600)
 }
 
 func prepareNeoAmpHeadlessPIDFile(threadID, workingDirectory string) (int, error) {
@@ -43022,16 +45325,32 @@ func stopNeoRecoveredHeadlessPID(threadID string, pid int) {
 	if pid <= 0 {
 		return
 	}
-	if neoLiveHeadlessPID(threadID) != pid {
+	record, ok := neoLiveHeadlessPIDRecord(threadID)
+	if !ok || record.PID != pid {
 		return
 	}
-	if neoHeadlessProcessOwnedByThread(pid, threadID) {
-		_ = neoCancelRecoveredExecutorProcess(pid)
+	stopNeoRecoveredHeadlessPIDRecord(threadID, record)
+}
+
+func stopNeoRecoveredHeadlessPIDRecord(threadID string, record neoHeadlessPIDRecord) {
+	if record.PID <= 0 {
+		return
 	}
-	removeNeoHeadlessPIDFile(threadID, pid)
+	current, ok := neoLiveHeadlessPIDRecord(threadID)
+	if !ok || current.PID != record.PID || current.RunnerID != record.RunnerID || current.WebLocal != record.WebLocal {
+		return
+	}
+	if neoHeadlessProcessOwnedByThreadAndRunner(record.PID, threadID, record.RunnerID) {
+		_ = neoCancelRecoveredExecutorProcess(record.PID)
+	}
+	removeNeoHeadlessPIDFileRecordExact(threadID, record)
 }
 
 func neoHeadlessProcessOwnedByThread(pid int, threadID string) bool {
+	return neoHeadlessProcessOwnedByThreadAndRunner(pid, threadID, "")
+}
+
+func neoHeadlessProcessOwnedByThreadAndRunner(pid int, threadID, runnerID string) bool {
 	if pid <= 0 || !neoThreadIDExactPattern.MatchString(threadID) {
 		return false
 	}
@@ -43039,16 +45358,38 @@ func neoHeadlessProcessOwnedByThread(pid int, threadID string) bool {
 	if err != nil {
 		return false
 	}
-	expected := "--headless=" + threadID
+	expectedThread := "--headless=" + threadID
+	expectedRunner := strings.TrimSpace(runnerID)
+	threadMatched := false
+	runnerMatched := expectedRunner == ""
+	previous := ""
 	for _, arg := range strings.Fields(string(output)) {
-		if arg == expected {
-			return true
+		if arg == expectedThread {
+			threadMatched = true
 		}
+		if previous == "--runner-id" && arg == expectedRunner {
+			runnerMatched = true
+		}
+		previous = arg
 	}
-	return false
+	return threadMatched && runnerMatched
 }
 
 func removeNeoHeadlessPIDFile(threadID string, pid int) {
+	removeNeoHeadlessPIDFileExact(threadID, pid, "")
+}
+
+func removeNeoHeadlessPIDFileExact(threadID string, pid int, runnerID string) {
+	record, ok := neoLiveHeadlessPIDRecord(threadID)
+	if !ok || record.PID != pid || runnerID != "" && record.RunnerID != runnerID {
+		return
+	}
+	removeNeoHeadlessPIDFileRecordExact(threadID, record)
+}
+
+func removeNeoHeadlessPIDFileRecordExact(threadID string, expected neoHeadlessPIDRecord) {
+	neoHeadlessPIDFileMu.Lock()
+	defer neoHeadlessPIDFileMu.Unlock()
 	dir := strings.TrimSpace(currentNeoHeadlessPIDDir())
 	if dir == "" {
 		return
@@ -43062,7 +45403,7 @@ func removeNeoHeadlessPIDFile(threadID string, pid int) {
 	if err := json.Unmarshal(data, &record); err != nil {
 		record.PID, err = strconv.Atoi(strings.TrimSpace(string(data)))
 	}
-	if err == nil && record.PID == pid {
+	if err == nil && record == expected {
 		_ = os.Remove(path)
 	}
 }
@@ -44831,7 +47172,7 @@ func neoEnvironmentExecutorType(environment, settings map[string]any) string {
 const (
 	neoSandboxArtifactsPromptLine  = "Use `.amp/in/artifacts` only for files the user should review in the Artifacts tab, such as screenshots, videos, or data exports. Keep build artifacts, transient inspection screenshots, and other temporary scratch/debug files out of that folder. When you mention an artifact saved there, link to it; for image artifacts, prefer Markdown image format using a workspace file URI, for example `![screenshot](file:///workspace/.amp/in/artifacts/example.png)`. `.amp/out` is not indexed by that tab."
 	neoSandboxGitHistoryPromptLine = "Git history note: This checkout is shallow; run `git fetch --unshallow` before using git history commands like `git log` or `git blame`, or trying to find a specific commit."
-	neoSandboxPreviewPromptLine    = "Orb portals: The user cannot open orb-local localhost or 127.0.0.1 URLs. When the user asks to show an application in a portal, use the repository's existing server command and any `.agents/preview` guidance. Start it with `amp-orb-service start <stable-name> --command '<command using $PORT and binding 0.0.0.0>' --portal --title '<title>'`, then hyperlink the portal URL it prints. The supervised service restarts after failure, retains its port, survives orb pause/resume and proxy updates, exposes `$PORT`, `$PUBLIC_URL`, and `$AMP_ORB`, writes a Portal-tab manifest, and supports `restart`, `stop`, `status`, `logs`, and `list`. For an already-running ad-hoc server, `amp-orb-portal <port-or-loopback-URL> --name <stable-name> --title <title>` exposes it without supervision. Do not use `amp orb portal` or `amp orb service` in this CLIProxyAPI-managed orb because those commands target Amp's onamp.dev/systemd environment."
+	neoSandboxPreviewPromptLine    = "Orb portals: The user cannot open orb-local localhost or 127.0.0.1 URLs. When the user asks to show an application in a portal, use the repository's existing server command and any `.agents/preview` guidance. Run portal services from the repository or another durable directory under `/home/user`; never place required application files in `.amp/out`. Start one with `amp-orb-service start <stable-name> --command '<command using $PORT and binding 0.0.0.0>' --portal --title '<title>'`, adding `--health /path` when HTTP readiness matters. The helper waits for the assigned TCP port and any configured 2xx/3xx health response before publishing the manifest or URL. Hyperlink a URL when it prints one; restarting an unchanged registration intentionally prints no duplicate URL. The supervised definition and sticky port are reconciled after failure, orb pause/resume, and proxy updates, but its command still depends on application files remaining in durable storage. The service exposes `$PORT`, `$PUBLIC_URL`, and `$AMP_ORB` and supports `restart`, `stop`, `status`, `logs`, and `list`. For an already-running ad-hoc server, `amp-orb-portal <port-or-loopback-URL> --name <stable-name> --title <title>` exposes it after the same readiness check. Do not use `amp orb portal` or `amp orb service` in this CLIProxyAPI-managed orb because those commands target Amp's onamp.dev/systemd environment."
 )
 
 func neoAmpThreadURL(baseURL, threadID string) string {
@@ -48410,7 +50751,7 @@ func validNeoExecutorStatus(status string) bool {
 
 func validNeoExecutorReasonCode(reasonCode string) bool {
 	switch reasonCode {
-	case "spawn_requested", "spawn_rejected", "environment_recovering", "waiting_for_executor_connect", "waiting_for_runner", "runner_unavailable", "workspace_selection_required", "executor_connected", "executor_disconnected", "connect_timeout", "executor_connect_rejected", "spawn_failed", "restart_failed", "environment_missing":
+	case "spawn_requested", "spawn_rejected", "environment_recovering", "waiting_for_executor_connect", "waiting_for_runner", "runner_unavailable", "runner_capacity_exceeded", "workspace_selection_required", "executor_connected", "executor_disconnected", "connect_timeout", "executor_connect_rejected", "spawn_failed", "restart_failed", "environment_missing":
 		return true
 	default:
 		return false
@@ -49337,12 +51678,33 @@ func neoMergeSuccessfulTerminalToolRun(toolName string, run, existingRun map[str
 	if existingStatus != "in-progress" && existingStatus != "done" || existingRun["error"] != nil || stringValue(existingRun["reason"]) != "" {
 		return run
 	}
-	base, fallback := run, existingRun
-	if existingStatus == "done" && neoToolRunHasDonePayloadForTool(toolName, existingRun) && !neoRicherRendererTerminalToolRun(toolName, existingRun, run) {
-		base, fallback = existingRun, run
+	base := run
+	supplemental := existingRun
+	if existingStatus == "done" {
+		pending := neoPendingTool{Name: toolName}
+		canonicalRun := neoCanonicalizeTerminalToolRun(pending, run)
+		canonicalExisting := neoCanonicalizeTerminalToolRun(pending, existingRun)
+		if neoRicherRendererTerminalToolRun(toolName, canonicalRun, canonicalExisting) {
+			base = existingRun
+			supplemental = run
+		}
 	}
 	merged := cloneMap(base)
 	for _, key := range []string{"result", "output", "displayMessage", "message", "text", "progress"} {
+		if key == "result" {
+			result, resultOK := asMap(merged[key])
+			supplementalResult, supplementalOK := asMap(supplemental[key])
+			if resultOK && supplementalOK {
+				result = cloneMap(result)
+				for resultKey, value := range supplementalResult {
+					if _, exists := result[resultKey]; !exists {
+						result[resultKey] = cloneNeoJSONValue(value)
+					}
+				}
+				merged[key] = result
+				continue
+			}
+		}
 		if key == "output" {
 			if _, explicitResult := base["result"].(string); explicitResult {
 				continue
@@ -49351,7 +51713,7 @@ func neoMergeSuccessfulTerminalToolRun(toolName string, run, existingRun map[str
 		if _, exists := merged[key]; exists {
 			continue
 		}
-		if value, exists := fallback[key]; exists && value != nil {
+		if value, exists := supplemental[key]; exists && value != nil {
 			merged[key] = cloneNeoJSONValue(value)
 		}
 	}

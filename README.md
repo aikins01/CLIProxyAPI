@@ -98,7 +98,7 @@ CLIProxyAPI includes integrated support for [Amp CLI](https://ampcode.com) and A
 The optional Neo runtime can make CLIProxyAPI the authoritative thread gateway for two executor classes:
 
 - **Sandbox Orbs** run one headless Amp executor per thread in an isolated Docker container. Browser-created Orb threads persist `executorType: "sandbox"`, connect through the configured public runtime URL, run executable `.agents/setup` and bounded `.agents/resume` hooks, expose authenticated HTTP/WebSocket portals, and pause when archived or idle. On proxy restart, the Orb manager reconciles containers labelled `cliproxy.orb=<thread-id>` with persisted sandbox thread state. It preserves running and paused containers without creating a replacement; ambiguous, stopped, or incomplete records fail closed. This is container rediscovery, not Amp snapshot reuse.
-- **Mac local threads** use `cmd/amp_local_broker` on the owner-authenticated Mac. The browser must select exactly one live catalogued runner and submit its `runnerId`. The server treats browser paths as untrusted display data and never executes them. The broker maps the runner to one explicitly approved Git checkout, starts native `amp --headless=<thread-id>` with that checkout as both `cmd.Dir` and `AMP_PWD`, and supervises one child per active thread. Broker or runner loss fails clearly; runner-backed threads never fall back to finding or spawning Amp in the proxy container.
+- **Mac local threads** use `cmd/amp_local_broker` on the owner-authenticated Mac. The browser must select exactly one live catalogued runner and submit its `runnerId`. The server treats browser paths as untrusted display data and never executes them. The broker maps the runner to a Git checkout approved explicitly or discovered beneath an explicitly approved workspace root, starts native `amp --headless=<thread-id>` with that checkout as both `cmd.Dir` and `AMP_PWD`, and supervises one child per active thread. Broker or runner loss fails clearly; runner-backed threads never fall back to finding or spawning Amp in the proxy container.
 
 The direct Neo runtime listener is local control-plane infrastructure and accepts only loopback hosts such as `127.0.0.1`, `localhost`, or `::1`. Do not bind `neo-local-runtime.host` to `0.0.0.0`, a LAN address, or a public interface. Remote executors must connect through the authenticated public runtime gateway configured by `orbs.runtime-public-url` or the broker's `runtimeURL`, not directly to port 6420.
 
@@ -110,7 +110,7 @@ Owner credential sync is a separate, opt-in broker channel. Enable GitHub collec
 
 `creating-charts` is a version-matched built-in skill embedded in the native Amp executable, and the Amp web UI renders its fenced Flint output. `view_media` and Painter are also embedded Amp tools, backed by remote vision and image-generation models rather than Debian packages; they are therefore not listed by `amp tools list` inside an official Orb. CLIProxyAPI advertises and normalizes their tool and artifact protocol, but execution through the self-hosted gateway remains unverified. Deterministic PDF or image annotation utilities are not installed by default.
 
-The Mac broker uses a private JSON config and a separate private API-key file. A minimal configuration is:
+The Mac broker uses a private JSON config and a separate private API-key file. A configuration can combine explicit checkouts with approved discovery roots:
 
 ```json
 {
@@ -123,6 +123,9 @@ The Mac broker uses a private JSON config and a separate private API-key file. A
   "stateDirectory": "/private/path/amp-local-broker-state",
   "logDirectory": "/private/path/amp-local-broker-logs",
   "heartbeatSeconds": 15,
+  "workspaceRoots": [
+    "/absolute/path/to/a/dedicated/project-parent"
+  ],
   "workspaces": [
     {
       "id": "project-checkout",
@@ -133,7 +136,9 @@ The Mac broker uses a private JSON config and a separate private API-key file. A
 }
 ```
 
-Validate it with `go run ./cmd/amp_local_broker -config /private/path/broker.json -check`, then run the same command without `-check` under the Mac user's process supervisor. Config, key, state, and log paths must be owned by that user and private. Broad roots such as a home directory, a general development directory, or `~/.config` are rejected unless individually and explicitly overridden. The API key is intentionally available to the trusted native Amp child through its environment; it is excluded from argv and broker messages, but the checkout is not an OS filesystem sandbox and an arbitrary child can print its own environment to its private log.
+Either `workspaces`, `workspaceRoots`, or both must be present. Listing a `workspaceRoots` entry explicitly approves that directory, when it is a valid Git repository root, or valid Git repository roots up to 3 directory levels beneath it for native execution. A discovered repository is terminal, so nested repositories beneath it require their own root or explicit workspace entry. Use only dedicated project-parent directories or dedicated repositories, never a home or configuration directory. Discovery accepts at most 8 roots, skips dot directories and `node_modules`, refreshes at most once per minute, and shares the 128-workspace limit with explicit entries. Every discovered candidate must pass the same Git repository-root validation as an explicit workspace. Explicit entries take precedence when a checkout appears under a discovery root; an explicit checkout used as a discovery root is not duplicated, and its approved descendants are still scanned. `heartbeatSeconds` accepts values from 1 through 60, with values above 15 using an effective 15-second heartbeat interval.
+
+Validate the config with `go run ./cmd/amp_local_broker -config /private/path/broker.json -check`, then run the same command without `-check` under the Mac user's process supervisor. Config, key, state, and log paths must be owned by that user and private. An explicit workspace that is itself a broad root is rejected unless its `allowBroadRoot` field approves that scope. The API key is intentionally available to the trusted native Amp child through its environment; it is excluded from argv and broker messages, but the checkout is not an OS filesystem sandbox and an arbitrary child can print its own environment to its private log.
 
 Broker heartbeats use a durable, monotonically increasing `sessionGeneration`. The server stores the highest accepted generation per owner and broker in `.cliproxyapi-local-broker-fences.json` beside the thread directory. Older or conflicting sessions are rejected and stop their children. The broker generation directory and the server fence file must both be persistent; deploy protocol-compatible server and broker versions together.
 

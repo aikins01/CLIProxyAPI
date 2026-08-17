@@ -1111,6 +1111,7 @@ func waitNeoOrbSpawnAfterDetachedInvocation(t *testing.T, manager *neoOrbManager
 	case <-time.After(5 * time.Second):
 		t.Fatal("detached executor invocation did not occur")
 	}
+	waitNeoOrbState(t, manager, threadID, neoOrbStateRunning)
 	record := manager.live(threadID)
 	if record == nil || record.operationMu == nil {
 		t.Fatalf("spawn record is unavailable: %#v", record)
@@ -1376,6 +1377,63 @@ func TestNeoOrbSpawnResumesPausedOrb(t *testing.T) {
 	}
 	if fake.callCount("create:") != 1 {
 		t.Fatalf("resume unexpectedly re-created the container: %#v", fake.calls)
+	}
+}
+
+func TestNeoOrbSpawnAppliesMultiplayerTTLOnlyOnInitialProvision(t *testing.T) {
+	rt, fake := newNeoOrbTestRuntime(t)
+	threadID := "T-019fdec9-b0cf-745d-8da4-f250184e870e"
+	actor := neoOrbTestActor(rt, threadID)
+	t.Cleanup(actor.cancel)
+	actor.mu.Lock()
+	actor.multiplayerTTLSeconds = neoThreadOpenTTLMinSeconds
+	actor.mu.Unlock()
+	manager := rt.orbManagerFor()
+
+	initialDetached := make(chan struct{})
+	var initialDetachedOnce sync.Once
+	fake.execDetachedEnvHook = func([]string) { initialDetachedOnce.Do(func() { close(initialDetached) }) }
+	startedAt := time.Now()
+	result := actor.spawnExecutor(map[string]any{"requestId": "spawn-with-multiplayer-ttl"})
+	if stringValue(result["status"]) == "failed" {
+		t.Fatalf("initial TTL spawn failed: %#v", result)
+	}
+	record := waitNeoOrbSpawnAfterDetachedInvocation(t, manager, threadID, initialDetached)
+	finishedAt := time.Now()
+	actor.mu.Lock()
+	initialExpiresAt := actor.threadOpenExpiresAt
+	initialOpenStateSeq := actor.threadOpenStateSeq
+	actor.mu.Unlock()
+	if initialExpiresAt < startedAt.Add(time.Duration(neoThreadOpenTTLMinSeconds)*time.Second).UnixMilli() || initialExpiresAt > finishedAt.Add(time.Duration(neoThreadOpenTTLMinSeconds)*time.Second).UnixMilli() {
+		t.Fatalf("initial open expiry = %d, provision window = %s..%s", initialExpiresAt, startedAt, finishedAt)
+	}
+	if initialOpenStateSeq != 1 {
+		t.Fatalf("initial open state sequence = %d, want 1", initialOpenStateSeq)
+	}
+	if record.multiplayerTTLSeconds != neoThreadOpenTTLMinSeconds || record.activeGeneration == nil || record.activeGeneration.MultiplayerTTLSeconds != neoThreadOpenTTLMinSeconds {
+		t.Fatalf("running TTL record = %#v", record)
+	}
+
+	manager.mu.Lock()
+	record.state = neoOrbStatePaused
+	manager.mu.Unlock()
+	fake.mu.Lock()
+	fake.inspectState.Paused = true
+	fake.mu.Unlock()
+	resumeDetached := make(chan struct{})
+	var resumeDetachedOnce sync.Once
+	fake.execDetachedEnvHook = func([]string) { resumeDetachedOnce.Do(func() { close(resumeDetached) }) }
+	result = actor.spawnExecutor(map[string]any{"requestId": "resume-with-multiplayer-ttl"})
+	if stringValue(result["status"]) == "failed" {
+		t.Fatalf("TTL resume failed: %#v", result)
+	}
+	waitNeoOrbSpawnAfterDetachedInvocation(t, manager, threadID, resumeDetached)
+	actor.mu.Lock()
+	resumedExpiresAt := actor.threadOpenExpiresAt
+	resumedOpenStateSeq := actor.threadOpenStateSeq
+	actor.mu.Unlock()
+	if resumedExpiresAt != initialExpiresAt || resumedOpenStateSeq != initialOpenStateSeq {
+		t.Fatalf("resume renewed multiplayer TTL: expiry %d -> %d, sequence %d -> %d", initialExpiresAt, resumedExpiresAt, initialOpenStateSeq, resumedOpenStateSeq)
 	}
 }
 
@@ -3266,6 +3324,9 @@ func TestNeoOrbConcurrentResumeClaimsOnce(t *testing.T) {
 
 	actor.spawnExecutor(map[string]any{"requestId": "spawn-first"})
 	waitNeoOrbState(t, manager, threadID, neoOrbStateRunning)
+	fake.mu.Lock()
+	fake.calls = nil
+	fake.mu.Unlock()
 	manager.mu.Lock()
 	manager.orbs[threadID].state = neoOrbStatePaused
 	manager.mu.Unlock()
@@ -3279,8 +3340,17 @@ func TestNeoOrbConcurrentResumeClaimsOnce(t *testing.T) {
 	if fake.callCount("unpause:container-fake") != 1 {
 		t.Fatalf("concurrent resumes unpause count = %d: %#v", fake.callCount("unpause:container-fake"), fake.calls)
 	}
-	if fake.callCount("exec-detached:/usr/bin/flock -n /run/cliproxy-amp-executor.lock /usr/local/bin/amp") != 2 {
+	if fake.callCount("exec-detached:/usr/bin/flock -n /run/cliproxy-amp-executor.lock /usr/local/bin/amp") != 1 {
 		t.Fatalf("executor starts = %d, want exactly one resume restart: %#v", fake.callCount("exec-detached:/usr/bin/flock -n /run/cliproxy-amp-executor.lock /usr/local/bin/amp"), fake.calls)
+	}
+	if fake.callCount("copy:"+neoOrbPortalHelperPath) != 1 || fake.callCount("copy:"+neoOrbServiceHelperPath) != 1 {
+		t.Fatalf("resume did not refresh portal helpers: %#v", fake.calls)
+	}
+	if fake.callCount("exec:"+neoOrbServiceHelperPath+" reconcile") != 1 {
+		t.Fatalf("resume service reconciliation count = %d: %#v", fake.callCount("exec:"+neoOrbServiceHelperPath+" reconcile"), fake.calls)
+	}
+	if reconcileIndex, detachedIndex := fake.callIndex("exec:"+neoOrbServiceHelperPath+" reconcile"), fake.callIndex("exec-detached:/usr/bin/flock -n /run/cliproxy-amp-executor.lock /usr/local/bin/amp"); reconcileIndex < 0 || detachedIndex < 0 || reconcileIndex > detachedIndex {
+		t.Fatalf("resume started executor before service reconciliation: %#v", fake.calls)
 	}
 	if stringValue(second["status"]) != "starting" {
 		t.Fatalf("second concurrent spawn = %#v, want already-starting status", second)
@@ -4795,6 +4865,222 @@ func assertNeoOrbNoProviderMutation(t *testing.T, fake *neoOrbFakeProvider) {
 	}
 }
 
+func TestNeoOrbWebReopenFailsClosedForLaunchingLifecycle(t *testing.T) {
+	fixture := newNeoOrbLifecycleAdmissionFixture(t, neoOrbLifecycleActivationLaunching)
+
+	if !fixture.manager.wakeExistingLifecycleOrb(fixture.actor) {
+		t.Fatal("launching lifecycle was not handled by orb reconciliation")
+	}
+	fixture.actor.mu.Lock()
+	status := cloneNeoJSONMap(fixture.actor.lastExecutorStatus)
+	fixture.actor.mu.Unlock()
+	if stringValue(status["status"]) != "failed" || !strings.Contains(stringValue(status["message"]), "lifecycle-v1 activation is not actionable") {
+		t.Fatalf("launching lifecycle status = %#v", status)
+	}
+	assertNeoOrbNoProviderMutation(t, fixture.fake)
+}
+
+func TestNeoOrbWebReopenReportsRecoveryFailure(t *testing.T) {
+	rt, fake := newNeoOrbTestRuntime(t)
+	seedNeoOrbLifecycleStore(t, rt, func(*neoOrbLifecycleStore) {})
+	storePath := filepath.Join(filepath.Dir(rt.threadDir), neoOrbLifecycleFileName)
+	if err := os.WriteFile(storePath, []byte("{corrupt\n"), 0o600); err != nil {
+		t.Fatalf("corrupt lifecycle store: %v", err)
+	}
+	actor := neoOrbTestActor(rt, "T-019fdec9-b0cf-745d-8da4-f250184e871e")
+	t.Cleanup(actor.cancel)
+	if !rt.orbManagerFor().wakeExistingLifecycleOrb(actor) {
+		t.Fatal("orb recovery failure was treated as no existing lifecycle")
+	}
+	actor.mu.Lock()
+	status := cloneNeoJSONMap(actor.lastExecutorStatus)
+	actor.mu.Unlock()
+	if stringValue(status["status"]) != "failed" || stringValue(mapValue(status["details"])["reasonCode"]) != "environment_recovering" || !strings.Contains(stringValue(status["message"]), "Cannot safely reconcile existing orb containers") {
+		t.Fatalf("orb recovery failure status = %#v", status)
+	}
+	if len(fake.calls) != 0 {
+		t.Fatalf("failed orb recovery reached provider: %#v", fake.calls)
+	}
+}
+
+func TestNeoOrbConnectTimeoutPublishesRestartableTerminalFailure(t *testing.T) {
+	fixture := newNeoOrbLifecycleAdmissionFixture(t, neoOrbLifecycleActivationActionable)
+	expectedRunnerID := neoOrbRunnerID(fixture.record.threadID, fixture.record.portalToken)
+	fixture.manager.mu.Lock()
+	fixture.record.spawnID = "orb-connect-timeout"
+	fixture.record.runnerID = expectedRunnerID
+	fixture.record.runnerMigrationRequired = false
+	fixture.record.runnerMigrationFencing = false
+	fixture.manager.mu.Unlock()
+
+	fixture.manager.watchOrbConnect(t.Context(), fixture.actor, fixture.record, "orb-connect-timeout", time.Millisecond)
+
+	fixture.manager.mu.Lock()
+	state := fixture.record.state
+	reason := fixture.record.failReason
+	restartable := fixture.record.runnerMigrationRequired
+	fixture.manager.mu.Unlock()
+	fixture.actor.mu.Lock()
+	status := cloneNeoJSONMap(fixture.actor.lastExecutorStatus)
+	fixture.actor.mu.Unlock()
+	if state != neoOrbStateFailed || reason != "orb executor did not connect in time" || !restartable {
+		t.Fatalf("timeout record state=%q reason=%q restartable=%v", state, reason, restartable)
+	}
+	if stringValue(status["status"]) != "failed" || stringValue(status["message"]) != "Cannot provision an orb: orb executor did not connect in time." {
+		t.Fatalf("timeout status = %#v", status)
+	}
+	assertNeoOrbNoProviderMutation(t, fixture.fake)
+}
+
+func TestNeoOrbTimedOutLifecycleRestartIsSingleFlightAndReusesGeneration(t *testing.T) {
+	fixture := newNeoOrbLifecycleAdmissionFixture(t, neoOrbLifecycleActivationActionable)
+	originalRecord := fixture.record
+	originalGeneration := *fixture.record.activeGeneration
+	originalContainerID := fixture.record.containerID
+	originalPortalToken := fixture.record.portalToken
+	expectedRunnerID := neoOrbRunnerID(fixture.record.threadID, fixture.record.portalToken)
+	fixture.manager.mu.Lock()
+	fixture.record.spawnID = "orb-connect-timeout"
+	fixture.record.runnerID = expectedRunnerID
+	fixture.manager.mu.Unlock()
+	fixture.manager.watchOrbConnect(t.Context(), fixture.actor, fixture.record, "orb-connect-timeout", time.Millisecond)
+
+	staleStopStarted := make(chan struct{})
+	staleStopResume := make(chan struct{})
+	var staleStopStartedOnce sync.Once
+	var staleStopResumeOnce sync.Once
+	releaseStaleStop := func() { staleStopResumeOnce.Do(func() { close(staleStopResume) }) }
+	detachedStarted := make(chan struct{}, 1)
+	fixture.fake.mu.Lock()
+	fixture.fake.calls = nil
+	fixture.fake.execResultHandler = func(cmd []string) (neoOrbExecResult, error) {
+		if strings.Contains(strings.Join(cmd, " "), "pkill -TERM -f '[a]mp .*--headless='") {
+			staleStopStartedOnce.Do(func() { close(staleStopStarted) })
+			<-staleStopResume
+		}
+		return neoOrbExecResult{ExitCode: 0}, nil
+	}
+	fixture.fake.detachedStart = detachedStarted
+	fixture.fake.mu.Unlock()
+	t.Cleanup(func() {
+		releaseStaleStop()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := fixture.manager.stop(ctx); err != nil {
+			t.Errorf("stop timed-out lifecycle manager: %v", err)
+		}
+	})
+
+	first := fixture.actor.spawnExecutor(map[string]any{"requestId": "restart-timeout-one"})
+	if stringValue(first["status"]) != "starting" {
+		t.Fatalf("first timeout restart = %#v, want starting", first)
+	}
+	select {
+	case <-staleStopStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout restart did not reach stale executor fence")
+	}
+	fixture.manager.mu.Lock()
+	claimedSpawnID := fixture.record.spawnID
+	workersBeforeDuplicate := fixture.manager.workerCount
+	fixture.manager.mu.Unlock()
+	duplicate := fixture.actor.spawnExecutor(map[string]any{"requestId": "restart-timeout-two"})
+	fixture.manager.mu.Lock()
+	spawnIDAfterDuplicate := fixture.record.spawnID
+	workersAfterDuplicate := fixture.manager.workerCount
+	fixture.manager.mu.Unlock()
+	if stringValue(duplicate["status"]) != "running" || spawnIDAfterDuplicate != claimedSpawnID || workersAfterDuplicate != workersBeforeDuplicate {
+		t.Fatalf("duplicate timeout restart=%#v spawn=%q want=%q workers=%d want=%d", duplicate, spawnIDAfterDuplicate, claimedSpawnID, workersAfterDuplicate, workersBeforeDuplicate)
+	}
+
+	releaseStaleStop()
+	select {
+	case <-detachedStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout restart did not reach detached executor start")
+	}
+	waitNeoOrbState(t, fixture.manager, fixture.record.threadID, neoOrbStateRunning)
+	afterRecord := fixture.manager.live(fixture.record.threadID)
+	afterGeneration := fixture.store.snapshot().Threads[fixture.record.threadID].Active
+	if afterRecord != originalRecord || afterRecord.containerID != originalContainerID || afterRecord.portalToken != originalPortalToken || afterGeneration == nil || *afterGeneration != originalGeneration {
+		t.Fatalf("timeout restart replaced lifecycle record=%p want=%p container=%q want=%q generation=%#v want=%#v", afterRecord, originalRecord, afterRecord.containerID, originalContainerID, afterGeneration, originalGeneration)
+	}
+	staleStopPrefix := "exec:/bin/sh -lc set -eu\npkill -TERM -f '[a]mp .*--headless='"
+	if fixture.fake.callCount(staleStopPrefix) != 1 ||
+		fixture.fake.callCount("pause:"+originalContainerID) != 1 ||
+		fixture.fake.callCount("unpause:"+originalContainerID) != 1 ||
+		fixture.fake.callCount("exec:"+neoOrbServiceHelperPath+" reconcile") != 1 ||
+		fixture.fake.callCount("exec-detached:/usr/bin/flock -n /run/cliproxy-amp-executor.lock /usr/local/bin/amp") != 1 {
+		t.Fatalf("timeout restart did not reconcile exactly once: %#v", fixture.fake.calls)
+	}
+	for _, forbidden := range []string{"create:", "create-volume:", "remove:", "remove-volume:"} {
+		if fixture.fake.callCount(forbidden) != 0 {
+			t.Fatalf("timeout restart invoked forbidden provider call %q: %#v", forbidden, fixture.fake.calls)
+		}
+	}
+}
+
+func TestNeoOrbRunnerMismatchDoesNotFenceUnboundActor(t *testing.T) {
+	fixture := newNeoOrbLifecycleAdmissionFixture(t, neoOrbLifecycleActivationActionable)
+	fixture.manager.mu.Lock()
+	fixture.record.runnerMigrationRequired = true
+	fixture.record.runnerMigrationFencing = false
+	workersBefore := fixture.manager.workerCount
+	fixture.manager.mu.Unlock()
+	foreign := newNeoActor(fixture.runtime, "actor-unbound-runner-mismatch", "thread-actor", fixture.record.threadID, fixture.record.threadID, neoActorRecord("actor-unbound-runner-mismatch", "thread-actor", fixture.record.threadID), nil)
+	foreign.bootstrapExecutorType = "sandbox"
+	admission, rejected, err := fixture.manager.orbExecutorSocketAdmission(foreign, fixture.record.threadID, "runner-unbound-mismatch")
+	if err != nil {
+		t.Fatalf("unbound runner mismatch admission: %v", err)
+	}
+	if admission != nil {
+		admission.release()
+		t.Fatal("unbound runner mismatch returned an executor admission")
+	}
+	fixture.manager.mu.Lock()
+	state := fixture.record.state
+	fencing := fixture.record.runnerMigrationFencing
+	workersAfter := fixture.manager.workerCount
+	fixture.manager.mu.Unlock()
+	if !rejected || state != neoOrbStateRunning || fencing || workersAfter != workersBefore {
+		t.Fatalf("unbound runner mismatch rejected=%v state=%q fencing=%v workers=%d want=%d", rejected, state, fencing, workersAfter, workersBefore)
+	}
+	assertNeoOrbNoProviderMutation(t, fixture.fake)
+}
+
+func TestNeoOrbRejectedExactSocketKeepsFailedLifecycleRestartable(t *testing.T) {
+	fixture := newNeoOrbLifecycleAdmissionFixture(t, neoOrbLifecycleActivationActionable)
+	expectedRunnerID := neoOrbRunnerID(fixture.record.threadID, fixture.record.portalToken)
+	fixture.manager.mu.Lock()
+	fixture.record.state = neoOrbStateFailed
+	fixture.record.failReason = "orb executor did not connect in time"
+	fixture.record.runnerID = expectedRunnerID
+	fixture.record.runnerMigrationRequired = true
+	fixture.manager.mu.Unlock()
+
+	admission, rejected, err := fixture.manager.orbExecutorSocketAdmission(fixture.actor, fixture.record.threadID, expectedRunnerID)
+	if err != nil {
+		t.Fatalf("exact failed lifecycle admission: %v", err)
+	}
+	if admission != nil {
+		admission.release()
+		t.Fatal("failed lifecycle returned an executor admission")
+	}
+	if !rejected {
+		t.Fatal("failed lifecycle accepted a late executor socket")
+	}
+	fixture.manager.mu.Lock()
+	state := fixture.record.state
+	reason := fixture.record.failReason
+	restartable := fixture.record.runnerMigrationRequired
+	runnerID := fixture.record.runnerID
+	fixture.manager.mu.Unlock()
+	if state != neoOrbStateFailed || reason != "orb executor did not connect in time" || !restartable || runnerID != expectedRunnerID {
+		t.Fatalf("rejected socket changed lifecycle state=%q reason=%q restartable=%v runner=%q", state, reason, restartable, runnerID)
+	}
+	assertNeoOrbNoProviderMutation(t, fixture.fake)
+}
+
 func TestNeoOrbExecutorAdmissionWaitStopsWithManager(t *testing.T) {
 	fixture := newNeoOrbLifecycleAdmissionFixture(t, neoOrbLifecycleActivationActionable)
 	fixture.record.operationMu.Lock()
@@ -4833,6 +5119,78 @@ func TestNeoOrbExecutorAdmissionWaitStopsWithManager(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("manager stop did not cancel admission wait")
 	}
+}
+
+func TestNeoOrbExecutorSocketAdmissionWaitsForActionableLifecycle(t *testing.T) {
+	fixture := newNeoOrbLifecycleAdmissionFixture(t, neoOrbLifecycleActivationLaunching)
+	active := fixture.store.snapshot().Threads[fixture.record.threadID].Active
+	if active == nil {
+		t.Fatal("launching lifecycle is unavailable")
+	}
+	launching, err := fixture.store.beginActivation(*active, "admission-exec", neoOrbLifecycleOperationExecDetached)
+	if err != nil {
+		t.Fatalf("begin executor activation: %v", err)
+	}
+	fixture.manager.mu.Lock()
+	fixture.record.state = neoOrbStateProvisioning
+	fixture.record.activeGeneration = cloneNeoOrbLifecycleGeneration(&launching)
+	operationMu := fixture.record.operationMu
+	fixture.manager.mu.Unlock()
+	operationMu.Lock()
+	locked := true
+	t.Cleanup(func() {
+		if locked {
+			operationMu.Unlock()
+		}
+	})
+
+	type admissionResult struct {
+		admission *neoOrbExecutorSocketAdmission
+		rejected  bool
+		err       error
+	}
+	result := make(chan admissionResult, 1)
+	expectedRunnerID := neoOrbRunnerID(fixture.record.threadID, fixture.record.portalToken)
+	go func() {
+		admission, rejected, err := fixture.manager.orbExecutorSocketAdmission(fixture.actor, fixture.record.threadID, expectedRunnerID)
+		result <- admissionResult{admission: admission, rejected: rejected, err: err}
+	}()
+	select {
+	case admission := <-result:
+		if admission.admission != nil {
+			admission.admission.release()
+		}
+		t.Fatalf("executor admission returned before lifecycle publication: rejected=%v err=%v", admission.rejected, admission.err)
+	case <-time.After(2 * neoOrbOperationLockInterval):
+	}
+
+	actionable, err := fixture.manager.finishLifecycleActivationLocked(fixture.record, fixture.store, launching)
+	if err != nil {
+		t.Fatalf("finish executor activation: %v", err)
+	}
+	fixture.manager.mu.Lock()
+	if fixture.record.activeGeneration == nil || *fixture.record.activeGeneration != actionable {
+		fixture.manager.mu.Unlock()
+		t.Fatal("actionable lifecycle was not published to the record")
+	}
+	fixture.record.state = neoOrbStateRunning
+	fixture.manager.mu.Unlock()
+	operationMu.Unlock()
+	locked = false
+
+	select {
+	case admitted := <-result:
+		if admitted.err != nil || admitted.rejected || admitted.admission == nil {
+			t.Fatalf("actionable lifecycle admission = %#v", admitted)
+		}
+		if admitted.admission.record != fixture.record || admitted.admission.runnerID != expectedRunnerID {
+			t.Fatalf("executor admission identity = %#v", admitted.admission)
+		}
+		admitted.admission.release()
+	case <-time.After(time.Second):
+		t.Fatal("executor admission did not resume after actionable publication")
+	}
+	assertNeoOrbNoProviderMutation(t, fixture.fake)
 }
 
 func TestNeoOrbExecutorAdmissionRequiresActionableLifecycleAtBothConnectionPaths(t *testing.T) {

@@ -3,7 +3,9 @@ package amp
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,6 +29,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -38,6 +41,21 @@ type failingWebLocalThreadResponseWriter struct {
 	statusCode int
 	limit      int
 	writes     int
+}
+
+type countingAmpAttachmentResponseBody struct {
+	reader *bytes.Reader
+	read   int
+}
+
+func (b *countingAmpAttachmentResponseBody) Read(p []byte) (int, error) {
+	n, err := b.reader.Read(p)
+	b.read += n
+	return n, err
+}
+
+func (b *countingAmpAttachmentResponseBody) Close() error {
+	return nil
 }
 
 func (w *failingWebLocalThreadResponseWriter) Header() http.Header {
@@ -357,6 +375,263 @@ func TestLocalBrokerHeartbeatRouteOwnerIsolation(t *testing.T) {
 	}
 }
 
+func TestLocalBrokerControlRoutePushesOwnerScopedIntentSnapshots(t *testing.T) {
+	useTempNeoThreadStore(t)
+	gin.SetMode(gin.TestMode)
+	ownerByAuthorization := map[string]string{
+		"Bearer upstream-a": "user_control_a",
+		"Bearer upstream-b": "user_control_b",
+	}
+	upstream := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		ownerUserID := ownerByAuthorization[request.Header.Get("Authorization")]
+		if request.URL.Path != "/api/internal" || request.URL.RawQuery != "getUserInfo" || ownerUserID == "" {
+			http.Error(response, "unexpected request", http.StatusUnauthorized)
+			return
+		}
+		writeNeoJSON(response, http.StatusOK, map[string]any{"ok": true, "result": map[string]any{"id": ownerUserID}})
+	}))
+	t.Cleanup(upstream.Close)
+	rt := newNeoRuntime(&config.Config{
+		SDKConfig: config.SDKConfig{APIKeys: []string{"client-a", "client-b"}},
+		AmpCode: config.AmpCode{
+			UpstreamURL:    upstream.URL,
+			UpstreamAPIKey: "upstream-a",
+		},
+	})
+	mapped := NewMappedSecretSource(NewStaticSecretSource("upstream-a"))
+	mapped.UpdateMappings([]config.AmpUpstreamAPIKeyEntry{{UpstreamAPIKey: "upstream-b", APIKeys: []string{"client-b"}}})
+	rt.setSecretSource(mapped)
+	m := &AmpModule{restrictToLocalhost: true, neoRuntime: rt}
+	router := gin.New()
+	auth := func(c *gin.Context) {
+		token := strings.TrimSpace(strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer "))
+		if token != "client-a" && token != "client-b" {
+			c.AbortWithStatus(http.StatusUnauthorized)
+			return
+		}
+		c.Set("userApiKey", token)
+		c.Next()
+	}
+	m.registerManagementRoutes(router, &handlers.BaseAPIHandler{}, auth)
+	server := httptest.NewServer(router)
+	t.Cleanup(server.Close)
+
+	heartbeat := func(clientKey, sessionID, runnerID, workingDirectory string) *http.Response {
+		t.Helper()
+		body := fmt.Sprintf(`{"brokerId":"shared-broker","sessionId":%q,"sessionGeneration":1,"hostname":"Mac","pid":1234,"runners":[{"runnerId":%q,"workingDirectory":%q,"repositoryURL":"","runningThreads":[]}]}`, sessionID, runnerID, workingDirectory)
+		request, err := http.NewRequest(http.MethodPost, server.URL+"/ampcode/local-broker/heartbeat.json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Authorization", "Bearer "+clientKey)
+		request.Header.Set("Content-Type", "application/json")
+		response, err := server.Client().Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return response
+	}
+	controlHeaders := func(clientKey, sessionID string, generation uint64) http.Header {
+		headers := http.Header{}
+		headers.Set("Authorization", "Bearer "+clientKey)
+		headers.Set(neoLocalBrokerIDHeader, "shared-broker")
+		headers.Set(neoLocalBrokerSessionIDHeader, sessionID)
+		headers.Set(neoLocalBrokerGenerationHeader, strconv.FormatUint(generation, 10))
+		return headers
+	}
+	controlURL := "ws" + strings.TrimPrefix(server.URL, "http") + neoLocalBrokerControlEndpointPath
+	dial := func(headers http.Header) (*websocket.Conn, *http.Response, error) {
+		return websocket.DefaultDialer.Dial(controlURL, headers)
+	}
+	closeResponse := func(response *http.Response) {
+		t.Helper()
+		if response != nil && response.Body != nil {
+			if err := response.Body.Close(); err != nil {
+				t.Fatalf("close response: %v", err)
+			}
+		}
+	}
+
+	request, err := http.NewRequest(http.MethodGet, server.URL+neoLocalBrokerControlEndpointPath, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Origin", "https://ampcode.com")
+	request.Header.Set("Authorization", "Bearer client-a")
+	originResponse, err := server.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if originResponse.StatusCode != http.StatusForbidden {
+		t.Fatalf("browser-origin status = %d", originResponse.StatusCode)
+	}
+	closeResponse(originResponse)
+	request, err = http.NewRequest(http.MethodGet, server.URL+neoLocalBrokerControlEndpointPath, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unauthorizedResponse, err := server.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unauthorizedResponse.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status = %d", unauthorizedResponse.StatusCode)
+	}
+	closeResponse(unauthorizedResponse)
+	conn, response, err := dial(controlHeaders("client-a", "session-a", 1))
+	if err == nil || response == nil || response.StatusCode != http.StatusConflict {
+		if conn != nil {
+			_ = conn.Close()
+		}
+		t.Fatalf("pre-heartbeat dial status=%v err=%v", responseStatus(response), err)
+	}
+	closeResponse(response)
+
+	heartbeatA := heartbeat("client-a", "session-a", "runner-a", t.TempDir())
+	bodyA, err := io.ReadAll(heartbeatA.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := heartbeatA.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if heartbeatA.StatusCode != http.StatusOK || heartbeatA.Header.Get(neoLocalBrokerIntentEpochHeader) == "" || heartbeatA.Header.Get(neoLocalBrokerIntentRevisionHeader) != "0" {
+		t.Fatalf("owner A heartbeat status=%d headers=%v body=%s", heartbeatA.StatusCode, heartbeatA.Header, bodyA)
+	}
+	if bytes.Contains(bodyA, []byte("intentEpoch")) || bytes.Contains(bodyA, []byte("intentRevision")) {
+		t.Fatalf("heartbeat version leaked into strict JSON body: %s", bodyA)
+	}
+	heartbeatB := heartbeat("client-b", "session-b", "runner-b", t.TempDir())
+	closeResponse(heartbeatB)
+	if heartbeatB.StatusCode != http.StatusOK {
+		t.Fatalf("owner B heartbeat status = %d", heartbeatB.StatusCode)
+	}
+
+	connA, response, err := dial(controlHeaders("client-a", "session-a", 1))
+	closeResponse(response)
+	if err != nil {
+		t.Fatalf("owner A control dial: %v", err)
+	}
+	t.Cleanup(func() { _ = connA.Close() })
+	if err := connA.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var initialA neoLocalBrokerControlMessage
+	if err := connA.ReadJSON(&initialA); err != nil {
+		t.Fatalf("read owner A initial snapshot: %v", err)
+	}
+	if initialA.BrokerID != "shared-broker" || initialA.SessionID != "session-a" || initialA.SessionGeneration != 1 || initialA.IntentEpoch == "" || initialA.IntentRevision != 0 || len(initialA.Runners) != 1 || initialA.Runners[0].RunnerID != "runner-a" || initialA.Runners[0].Intents == nil || len(initialA.Runners[0].Intents) != 0 {
+		t.Fatalf("owner A initial snapshot = %+v", initialA)
+	}
+	prepareThread := func(threadID string) {
+		threadActor := rt.store.ensureThreadActor(threadID)
+		threadActor.mu.Lock()
+		threadActor.meta["ownerUserId"] = "user_control_a"
+		threadActor.mu.Unlock()
+	}
+	threadID := "T-019f9000-0000-7000-8000-000000000041"
+	prepareThread(threadID)
+	userActorA := rt.store.userActorForOwner("user_control_a")
+	if !userActorA.requestUserExecutorRunnerThread("runner-a", threadID) {
+		t.Fatal("owner A runner intent was not accepted")
+	}
+	var running neoLocalBrokerControlMessage
+	if err := connA.ReadJSON(&running); err != nil {
+		t.Fatalf("read running push: %v", err)
+	}
+	if running.IntentRevision != 1 || len(running.Runners) != 1 || len(running.Runners[0].Intents) != 1 || stringValue(mapValue(running.Runners[0].Intents[0])["desired"]) != "running" {
+		t.Fatalf("running push = %+v", running)
+	}
+	if !userActorA.stopUserExecutorRunnerThread("runner-a", threadID) {
+		t.Fatal("owner A stop intent was not accepted")
+	}
+	var stopped neoLocalBrokerControlMessage
+	if err := connA.ReadJSON(&stopped); err != nil {
+		t.Fatalf("read stopped push: %v", err)
+	}
+	if stopped.IntentRevision != 2 || len(stopped.Runners) != 1 || len(stopped.Runners[0].Intents) != 1 || stringValue(mapValue(stopped.Runners[0].Intents[0])["desired"]) != "stopped" {
+		t.Fatalf("stopped push = %+v", stopped)
+	}
+
+	connB, response, err := dial(controlHeaders("client-b", "session-b", 1))
+	closeResponse(response)
+	if err != nil {
+		t.Fatalf("owner B control dial: %v", err)
+	}
+	t.Cleanup(func() { _ = connB.Close() })
+	if err := connB.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var initialB neoLocalBrokerControlMessage
+	if err := connB.ReadJSON(&initialB); err != nil {
+		t.Fatalf("read owner B initial snapshot: %v", err)
+	}
+	secondThreadID := "T-019f9000-0000-7000-8000-000000000042"
+	prepareThread(secondThreadID)
+	if !userActorA.requestUserExecutorRunnerThread("runner-a", secondThreadID) {
+		t.Fatal("owner A second runner intent was not accepted")
+	}
+	var secondRunning neoLocalBrokerControlMessage
+	if err := connA.ReadJSON(&secondRunning); err != nil {
+		t.Fatalf("read owner A second push: %v", err)
+	}
+	if err := connB.SetReadDeadline(time.Now().Add(150 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := connB.ReadMessage(); err == nil {
+		t.Fatal("owner B received owner A intent push")
+	}
+
+	staleConn, staleResponse, err := dial(controlHeaders("client-a", "session-a", 2))
+	if staleConn != nil {
+		_ = staleConn.Close()
+	}
+	if err == nil || staleResponse == nil || staleResponse.StatusCode != http.StatusConflict {
+		t.Fatalf("stale generation dial status=%v err=%v", responseStatus(staleResponse), err)
+	}
+	closeResponse(staleResponse)
+
+	replacement, response, err := dial(controlHeaders("client-a", "session-a", 1))
+	closeResponse(response)
+	if err != nil {
+		t.Fatalf("replacement control dial: %v", err)
+	}
+	t.Cleanup(func() { _ = replacement.Close() })
+	if err := replacement.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var replacementInitial neoLocalBrokerControlMessage
+	if err := replacement.ReadJSON(&replacementInitial); err != nil {
+		t.Fatalf("read replacement initial snapshot: %v", err)
+	}
+	if _, _, err := connA.ReadMessage(); err == nil {
+		t.Fatal("replaced control socket remained open")
+	}
+	thirdThreadID := "T-019f9000-0000-7000-8000-000000000043"
+	prepareThread(thirdThreadID)
+	if !userActorA.requestUserExecutorRunnerThread("runner-a", thirdThreadID) {
+		t.Fatal("owner A third runner intent was not accepted")
+	}
+	var replacementPush neoLocalBrokerControlMessage
+	if err := replacement.ReadJSON(&replacementPush); err != nil {
+		t.Fatalf("read replacement push: %v", err)
+	}
+	if replacementPush.IntentRevision <= replacementInitial.IntentRevision {
+		t.Fatalf("replacement push revision=%d initial=%d", replacementPush.IntentRevision, replacementInitial.IntentRevision)
+	}
+	rt.closeLocalBrokerControls()
+	if _, _, err := replacement.ReadMessage(); err == nil {
+		t.Fatal("runtime control shutdown did not close socket")
+	}
+}
+
+func responseStatus(response *http.Response) int {
+	if response == nil {
+		return 0
+	}
+	return response.StatusCode
+}
+
 func TestWebLocalInferenceCORSRequiresOptIn(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
@@ -557,7 +832,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 	}
 	for _, want := range []string{
 		"// ==UserScript==",
-		"@version 0.1.231",
+		"@version 0.1.232",
 		"@match https://ampcode.com/*",
 		"@updateURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
 		"@downloadURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
@@ -574,7 +849,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"commandPaletteIntegrationCount",
 		"localThreadPickerOpenCount",
 		"removedLocalThreadControlCount",
-		`const userscriptVersion = "0.1.231"`,
+		`const userscriptVersion = "0.1.232"`,
 		"const legacyLocalProjectUI = false;",
 		"disableLegacyLocalProjectUI",
 		"if (!legacyLocalProjectUI) {",
@@ -2899,7 +3174,7 @@ if (typeof globalThis.btoa !== "function") {
 	require(scriptPath);
 	const bridge = globalThis.__cliproxyAmpLocalInference;
 	const regroupTestBridge = globalThis.__cliproxyAmpLocalInferenceTest;
-assert(bridge && bridge.userscriptVersion === "0.1.231", "bridge userscript version was not exposed");
+assert(bridge && bridge.userscriptVersion === "0.1.232", "bridge userscript version was not exposed");
 	assert(typeof regroupTestBridge?.requestLocalSidebarProjectRegroup === "function", "sidebar regroup test bridge was not exposed");
 	const projectPageTitle = globalThis.document.title;
 	const validProjectHost = new FakeElement("main");
@@ -2916,7 +3191,7 @@ assert(bridge && bridge.userscriptVersion === "0.1.231", "bridge userscript vers
 	assert(!regroupTestBridge.localSidebarProjectMatches(sharedRepositoryCheckout, sharedRepositoryWorktree), "same-repository worktrees matched as one sidebar project");
 	assert(regroupTestBridge.diffCaptureReadThreadID("/api/threads/%E0%A4%A/diff-captures/latest") === "", "malformed diff-capture thread path was not rejected");
 	assert(globalThis.document.documentElement.getAttribute("data-cliproxy-local-sidebar-hydrating") === "1", "sidebar hydration gate was not installed before rendering");
-assert(globalThis.document.documentElement.getAttribute("data-cliproxy-local-inference-version") === "0.1.231", "userscript version was not exposed on the document root");
+assert(globalThis.document.documentElement.getAttribute("data-cliproxy-local-inference-version") === "0.1.232", "userscript version was not exposed on the document root");
 	class InstrumentedWebSocket extends WebSocket {}
 	const instrumentedSocket = new InstrumentedWebSocket("wss://ampcode.com/gateway/userActor/?rvt-method=get&rvt-key=subclass-test");
 	assert(instrumentedSocket instanceof InstrumentedWebSocket, "patched WebSocket discarded a derived constructor prototype");
@@ -5718,19 +5993,37 @@ globalThis.location = new URL("https://ampcode.com/projects");
 		data: JSON.stringify([
 			{ projects: 1 },
 			[2],
-			{ id: 3, name: 4, namespace: 5, repositoryURL: 6 },
+			{ id: 3, name: 4, namespace: 5, repositoryURL: 6, lastActivityAt: 7 },
 			"75616c3b-f4de-48b7-8b83-c1af6978a034",
 			"on-chain",
 			"aikins01",
 			"https://github.com/Vela-Engineering/on-chain.git",
+			["Date", "2026-08-16T12:00:00.000Z"],
 		]),
 	}), { status: 200, headers: { "Content-Type": "application/json" } });
 	Object.defineProperty(projectListResponse, "url", { value: "https://ampcode.com/_app/remote/3abror/listProjects" });
 	const mergedProjectList = await projectListResponse.json();
 	const mergedProjectListValues = JSON.parse(mergedProjectList.data);
-	const mergedOnChain = mergedProjectListValues[mergedProjectListValues[0].projects].find((ref) => mergedProjectListValues[mergedProjectListValues[ref].name] === "on-chain");
+	const mergedProjectRefs = mergedProjectListValues[mergedProjectListValues[0].projects];
+	const mergedProjects = mergedProjectRefs.map((ref) => {
+		const project = mergedProjectListValues[ref];
+		const encodedDate = mergedProjectListValues[project.lastActivityAt];
+		return {
+			local: mergedProjectListValues[project.cliProxyAPILocalProject] === true,
+			name: mergedProjectListValues[project.name],
+			lastActivityAt: Array.isArray(encodedDate) && encodedDate[0] === "Date" ? new Date(encodedDate[1]) : undefined,
+		};
+	});
+	const injectedProjects = mergedProjects.filter((project) => project.local);
+	assert(injectedProjects.length > 0, "project response did not contain injected local projects");
+	assert(injectedProjects.every((project) => project.lastActivityAt instanceof Date && Number.isFinite(project.lastActivityAt.getTime())), "injected local project lastActivityAt did not decode to a valid Date");
+	assert(injectedProjects.some((project) => project.lastActivityAt.toISOString() === "1970-01-01T00:00:00.000Z"), "missing local project activity did not use the deterministic fallback");
+	const sortedProjects = mergedProjects.toSorted((left, right) => right.lastActivityAt.getTime() - left.lastActivityAt.getTime() || left.name.localeCompare(right.name));
+	assert(sortedProjects.length === mergedProjects.length, "combined project list sorting dropped a project");
+	const mergedOnChain = mergedProjectRefs.find((ref) => mergedProjectListValues[mergedProjectListValues[ref].name] === "on-chain");
 	const mergedOnChainProject = mergedProjectListValues[mergedOnChain];
 	assert(mergedProjectListValues[mergedOnChainProject.cliProxyAPILocalCheckout] === true, "hybrid project response was not marked as a local checkout");
+	assert(mergedProjectListValues[mergedOnChainProject.lastActivityAt][1] === "2026-08-16T12:00:00.000Z", "hybrid project response changed the cloud lastActivityAt");
 	flushAnimationFrames();
 	const onChainScopeText = onChainProjectRow.querySelectorAll("[data-cliproxy-project-scope-decoration]").map((element) => element.textContent).join(" | ");
 	assert(onChainScopeText.includes("Amp Cloud"), "hybrid project did not show its Amp Cloud scope: " + onChainScopeText);
@@ -8170,6 +8463,10 @@ func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.
 	if localProjectRec.Code != http.StatusOK {
 		t.Fatalf("local-project create status = %d, body=%s", localProjectRec.Code, localProjectRec.Body.String())
 	}
+	localProjectResult := mapValue(decodeSvelteKitRemoteEnvelopeForTest(t, localProjectRec.Body.Bytes())["_"])
+	if stringValue(mapValue(localProjectResult["initialThread"])["id"]) != localProjectThreadID {
+		t.Fatalf("local-project initial thread = %#v", localProjectResult["initialThread"])
+	}
 	localProjectActor := rt.store.lookupThreadActor(localProjectThreadID)
 	if localProjectActor == nil {
 		t.Fatal("local-project thread actor not found")
@@ -8180,6 +8477,10 @@ func TestWebLocalInferenceRemoteCreateProjectThreadCreatesLocalActor(t *testing.
 	localProjectActor.mu.Unlock()
 	if stringValue(localProjectMeta["projectID"]) != expectedLocalProjectID {
 		t.Fatalf("local-project create project ID = %#v, want %q", localProjectMeta, expectedLocalProjectID)
+	}
+	selectedLocalProject := mapValue(localProjectResult["project"])
+	if stringValue(selectedLocalProject["id"]) != expectedLocalProjectID || neoWebLocalProjectDirectory(selectedLocalProject["workingDirectory"]) != expectedWorkDir {
+		t.Fatalf("local-project response project = %#v, want id %q directory %q", selectedLocalProject, expectedLocalProjectID, expectedWorkDir)
 	}
 	workspace := neoRecentThreadWorkspace(localProjectEnvironment)
 	if stringValue(workspace["uri"]) != (&url.URL{Scheme: "file", Path: expectedWorkDir}).String() {
@@ -11795,16 +12096,34 @@ func TestRegisterManagementRoutesPassesAmpBinaryAttachmentsUpstream(t *testing.T
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	enabled := true
-	proxyCalled := false
+	const localAPIKey = "local-client-key"
+	const upstreamAPIKey = "upstream-amp-key"
+	imagePath := "/user-content/attachments/" + strings.Repeat("ab", 32) + "-file.png"
+	imageBase64 := testNeoPNGBase64(t, 1, 1)
+	imageData, err := base64.StdEncoding.DecodeString(imageBase64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uploadRequests := 0
+	imageRequests := 0
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		proxyCalled = true
-		if r.URL.Path != "/api/attachments" {
-			t.Fatalf("unexpected upstream request path=%s", r.URL.Path)
+		if got := r.Header.Get("Authorization"); got != "Bearer "+upstreamAPIKey {
+			t.Fatalf("upstream Authorization = %q", got)
 		}
-		if got := r.Header.Get("X-Amp-Client-Application"); got != "CLI" {
-			t.Fatalf("X-Amp-Client-Application = %q", got)
+		switch r.URL.Path {
+		case "/api/attachments":
+			uploadRequests++
+			if got := r.Header.Get("X-Amp-Client-Application"); got != "CLI" {
+				t.Fatalf("X-Amp-Client-Application = %q", got)
+			}
+			writeNeoJSON(w, http.StatusOK, map[string]any{"url": "https://ampcode.com" + imagePath})
+		case imagePath:
+			imageRequests++
+			w.Header().Set("Content-Type", "image/png")
+			_, _ = w.Write(imageData)
+		default:
+			http.NotFound(w, r)
 		}
-		writeNeoJSON(w, http.StatusOK, map[string]any{"url": "https://ampcode.com/api/attachments/upstream"})
 	}))
 	defer upstream.Close()
 
@@ -11818,18 +12137,26 @@ func TestRegisterManagementRoutesPassesAmpBinaryAttachmentsUpstream(t *testing.T
 			},
 		}}),
 	}
-	proxy, _ := createReverseProxy(upstream.URL, NewStaticSecretSource(""))
+	proxy, _ := createReverseProxy(upstream.URL, NewStaticSecretSource(upstreamAPIKey))
 	m.setProxy(proxy)
-	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, nil)
+	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, func(c *gin.Context) {
+		if c.GetHeader("Authorization") != "Bearer "+localAPIKey {
+			c.AbortWithStatus(http.StatusUnauthorized)
+			return
+		}
+		c.Set("userApiKey", localAPIKey)
+		c.Next()
+	})
 
 	localServer := httptest.NewServer(r)
 	defer localServer.Close()
 
-	req, err := http.NewRequest(http.MethodPost, localServer.URL+"/api/attachments", bytes.NewBufferString(`{"data":"aGVsbG8=","mediaType":"image/png"}`))
+	req, err := http.NewRequest(http.MethodPost, localServer.URL+"/api/attachments", bytes.NewBufferString(fmt.Sprintf(`{"data":%q,"mediaType":"image/png"}`, imageBase64)))
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+localAPIKey)
 	req.Header.Set("X-Amp-Client-Application", "CLI")
 	req.Header.Set("X-Amp-Client-Type", "cli")
 	resp, err := http.DefaultClient.Do(req)
@@ -11849,15 +12176,157 @@ func TestRegisterManagementRoutesPassesAmpBinaryAttachmentsUpstream(t *testing.T
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, body=%s", resp.StatusCode, string(body))
 	}
-	if !proxyCalled {
-		t.Fatal("Amp binary attachment upload should pass through to upstream")
+	if uploadRequests != 1 {
+		t.Fatalf("upstream upload requests = %d, want 1", uploadRequests)
 	}
 	var response map[string]any
 	if err := json.Unmarshal(body, &response); err != nil {
 		t.Fatalf("response JSON error: %v", err)
 	}
-	if stringValue(response["url"]) != "https://ampcode.com/api/attachments/upstream" {
-		t.Fatalf("unexpected upstream response: %#v", response)
+	attachmentURL := stringValue(response["url"])
+	if attachmentURL != localServer.URL+imagePath {
+		t.Fatalf("attachment URL = %q, want %q", attachmentURL, localServer.URL+imagePath)
+	}
+
+	getReq, err := http.NewRequest(http.MethodGet, attachmentURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	getReq.Header.Set("Authorization", "Bearer "+localAPIKey)
+	getResp, err := http.DefaultClient.Do(getReq)
+	if err != nil {
+		t.Fatalf("fetch attachment: %v", err)
+	}
+	getBody, err := io.ReadAll(getResp.Body)
+	if errClose := getResp.Body.Close(); errClose != nil {
+		t.Fatalf("close attachment response: %v", errClose)
+	}
+	if err != nil {
+		t.Fatalf("read attachment response: %v", err)
+	}
+	if getResp.StatusCode != http.StatusOK || !bytes.Equal(getBody, imageData) || getResp.Header.Get("Content-Type") != "image/png" {
+		t.Fatalf("attachment response = status %d content-type %q body length %d", getResp.StatusCode, getResp.Header.Get("Content-Type"), len(getBody))
+	}
+	if imageRequests != 1 {
+		t.Fatalf("upstream image requests = %d, want 1", imageRequests)
+	}
+
+	unauthorizedResp, err := http.Get(attachmentURL)
+	if err != nil {
+		t.Fatalf("fetch attachment without auth: %v", err)
+	}
+	if errClose := unauthorizedResp.Body.Close(); errClose != nil {
+		t.Fatalf("close unauthorized response: %v", errClose)
+	}
+	if unauthorizedResp.StatusCode != http.StatusUnauthorized || imageRequests != 1 {
+		t.Fatalf("unauthorized attachment response = status %d upstream requests %d", unauthorizedResp.StatusCode, imageRequests)
+	}
+
+	missingReq, err := http.NewRequest(http.MethodGet, localServer.URL+"/user-content/attachments/"+strings.Repeat("cd", 32)+"-missing.png", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	missingReq.Header.Set("Authorization", "Bearer "+localAPIKey)
+	missingResp, err := http.DefaultClient.Do(missingReq)
+	if err != nil {
+		t.Fatalf("fetch missing attachment: %v", err)
+	}
+	if errClose := missingResp.Body.Close(); errClose != nil {
+		t.Fatalf("close missing response: %v", errClose)
+	}
+	if missingResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("missing attachment status = %d", missingResp.StatusCode)
+	}
+}
+
+func TestRegisterManagementRoutesRewritesAmpBinaryResumableAttachmentURLs(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	imagePath := "/user-content/attachments/" + strings.Repeat("ef", 32) + "-file.png"
+	const uploadURL = "https://storage.googleapis.com/upload-bucket/signed-upload"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/attachments/resumable" {
+			t.Fatalf("unexpected upstream path = %q", r.URL.Path)
+		}
+		payload := readNeoJSON(r.Body)
+		switch stringValue(payload["action"]) {
+		case "prepare":
+			writeNeoJSON(w, http.StatusOK, map[string]any{"uploadURL": uploadURL})
+		case "complete":
+			writeNeoJSON(w, http.StatusOK, map[string]any{"url": "https://ampcode.com" + imagePath})
+		default:
+			t.Fatalf("unexpected resumable action = %#v", payload["action"])
+		}
+	}))
+	defer upstream.Close()
+
+	m := &AmpModule{restrictToLocalhost: false}
+	proxy, _ := createReverseProxy(upstream.URL, NewStaticSecretSource(""))
+	m.setProxy(proxy)
+	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, nil)
+	localServer := httptest.NewServer(r)
+	defer localServer.Close()
+
+	for _, tc := range []struct {
+		action string
+		field  string
+		want   string
+	}{
+		{action: "prepare", field: "uploadURL", want: uploadURL},
+		{action: "complete", field: "url", want: localServer.URL + imagePath},
+	} {
+		t.Run(tc.action, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodPost, localServer.URL+"/api/attachments/resumable", bytes.NewBufferString(fmt.Sprintf(`{"action":%q}`, tc.action)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-Amp-Client-Application", "CLI")
+			req.Header.Set("X-Forwarded-Host", "attacker.example.test")
+			req.Header.Set("X-Forwarded-Proto", "https")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, err := io.ReadAll(resp.Body)
+			if errClose := resp.Body.Close(); errClose != nil {
+				t.Fatalf("close response: %v", errClose)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			var payload map[string]any
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Fatal(err)
+			}
+			if resp.StatusCode != http.StatusOK || stringValue(payload[tc.field]) != tc.want {
+				t.Fatalf("response = status %d payload %#v, want %s=%q", resp.StatusCode, payload, tc.field, tc.want)
+			}
+		})
+	}
+}
+
+func TestRewriteAmpAttachmentUploadResponsePassesOversizedBodyThrough(t *testing.T) {
+	original := bytes.Repeat([]byte("x"), ampAttachmentUploadResponseLimit+4096)
+	body := &countingAmpAttachmentResponseBody{reader: bytes.NewReader(original)}
+	resp := &http.Response{
+		StatusCode:    http.StatusOK,
+		Header:        http.Header{"Content-Type": []string{"application/json"}},
+		Body:          body,
+		ContentLength: -1,
+	}
+	if err := rewriteAmpAttachmentUploadResponse(resp, "https://amp.example.test"); err != nil {
+		t.Fatalf("rewrite response: %v", err)
+	}
+	if body.read > ampAttachmentUploadResponseLimit+1 {
+		t.Fatalf("inspected response bytes = %d, want at most %d", body.read, ampAttachmentUploadResponseLimit+1)
+	}
+	passedThrough, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read passed-through response: %v", err)
+	}
+	if !bytes.Equal(passedThrough, original) {
+		t.Fatalf("passed-through response length = %d, want %d unchanged bytes", len(passedThrough), len(original))
 	}
 }
 
@@ -11882,6 +12351,138 @@ func TestRegisterManagementRoutesDoesNotServeAmpBinaryAttachmentsLocally(t *test
 
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestRegisterManagementRoutesServesAmpAttachmentViewCapability(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	enabled := true
+	rt := newNeoRuntime(&config.Config{AmpCode: config.AmpCode{
+		NeoLocalRuntime: config.AmpNeoLocalRuntime{Enabled: &enabled},
+	}})
+	rt.setSecretSource(NewStaticSecretSource("amp-test-key"))
+	m := &AmpModule{restrictToLocalhost: false, neoRuntime: rt}
+	m.registerManagementRoutes(r, &handlers.BaseAPIHandler{}, func(c *gin.Context) {
+		c.AbortWithStatus(http.StatusUnauthorized)
+	})
+
+	imageBase64 := testNeoPNGBase64(t, 1, 1)
+	imageData, err := base64.StdEncoding.DecodeString(imageBase64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	imageURL := "https://ampcode.com/user-content/attachments/" + strings.Repeat("ab", 32) + "-file.png"
+	credentialHash := sha256.Sum256([]byte("amp-test-key"))
+	rt.attachmentCache.put("amp-auth:"+hex.EncodeToString(credentialHash[:8])+":"+imageURL, imageData, "image/png")
+
+	original := map[string]any{
+		"type": "message_added",
+		"message": map[string]any{
+			"role": "user",
+			"content": []any{map[string]any{
+				"type":       "image",
+				"source":     map[string]any{"type": "url", "url": imageURL},
+				"sourcePath": imageURL,
+			}},
+		},
+	}
+	var frame []byte
+	socket := &neoSocket{
+		clientAPIKey: "local-client-key",
+		writeMessage: func(_ int, payload []byte) error {
+			frame = append([]byte(nil), payload...)
+			return nil
+		},
+	}
+	socket.bindAttachmentViewer(rt, "http://127.0.0.1:8317", "T-019fd27e-8185-77c2-bd71-77a5adbb0d16")
+	if !socket.sendChecked(original) {
+		t.Fatal("attachment message was not sent")
+	}
+
+	var sent map[string]any
+	if err := json.Unmarshal(frame, &sent); err != nil {
+		t.Fatalf("decode attachment frame: %v", err)
+	}
+	block := mapValue(arrayValue(mapValue(sent["message"])["content"])[0])
+	viewURL := stringValue(mapValue(block["source"])["url"])
+	parsed, err := url.Parse(viewURL)
+	if err != nil {
+		t.Fatalf("parse attachment view URL %q: %v", viewURL, err)
+	}
+	if parsed.Scheme != "http" || parsed.Host != "127.0.0.1:8317" || !strings.HasPrefix(parsed.Path, "/ampcode/attachment-view/") {
+		t.Fatalf("attachment view URL = %q", viewURL)
+	}
+	if stringValue(block["sourcePath"]) != viewURL {
+		t.Fatalf("attachment sourcePath = %q, want %q", stringValue(block["sourcePath"]), viewURL)
+	}
+	if got := stringValue(mapValue(mapValue(arrayValue(mapValue(original["message"])["content"])[0])["source"])["url"]); got != imageURL {
+		t.Fatalf("stored attachment URL changed to %q", got)
+	}
+	if strings.Contains(viewURL, "amp-test-key") || strings.Contains(viewURL, "local-client-key") {
+		t.Fatalf("attachment view URL leaked a credential: %q", viewURL)
+	}
+
+	frame = nil
+	unrelated := map[string]any{
+		"type": "executor_status",
+		"details": map[string]any{
+			"nested": original["message"],
+		},
+	}
+	if !socket.sendChecked(unrelated) {
+		t.Fatal("unrelated frame was not sent")
+	}
+	var unrelatedSent map[string]any
+	if err := json.Unmarshal(frame, &unrelatedSent); err != nil {
+		t.Fatalf("decode unrelated frame: %v", err)
+	}
+	unrelatedMessage := mapValue(mapValue(unrelatedSent["details"])["nested"])
+	unrelatedBlock := mapValue(arrayValue(unrelatedMessage["content"])[0])
+	if got := stringValue(mapValue(unrelatedBlock["source"])["url"]); got != imageURL {
+		t.Fatalf("unrelated frame attachment URL = %q, want protected source unchanged", got)
+	}
+
+	getReq := httptest.NewRequest(http.MethodGet, parsed.RequestURI(), nil)
+	getRec := httptest.NewRecorder()
+	r.ServeHTTP(getRec, getReq)
+	if getRec.Code != http.StatusOK || !bytes.Equal(getRec.Body.Bytes(), imageData) {
+		t.Fatalf("attachment view response = status %d body length %d", getRec.Code, getRec.Body.Len())
+	}
+	if got := getRec.Header().Get("Content-Type"); got != "image/png" {
+		t.Fatalf("attachment view content-type = %q", got)
+	}
+
+	headReq := httptest.NewRequest(http.MethodHead, parsed.RequestURI(), nil)
+	headRec := httptest.NewRecorder()
+	r.ServeHTTP(headRec, headReq)
+	if headRec.Code != http.StatusOK || headRec.Body.Len() != 0 || headRec.Header().Get("Content-Length") != strconv.Itoa(len(imageData)) {
+		t.Fatalf("attachment view HEAD = status %d length %q body length %d", headRec.Code, headRec.Header().Get("Content-Length"), headRec.Body.Len())
+	}
+
+	missingReq := httptest.NewRequest(http.MethodGet, "/ampcode/attachment-view/AbCdEfGhIjKlMnOp", nil)
+	missingRec := httptest.NewRecorder()
+	r.ServeHTTP(missingRec, missingReq)
+	if missingRec.Code != http.StatusNotFound {
+		t.Fatalf("unknown attachment view status = %d", missingRec.Code)
+	}
+
+	restricted := gin.New()
+	restrictedModule := &AmpModule{restrictToLocalhost: true, neoRuntime: rt}
+	restrictedModule.registerManagementRoutes(restricted, &handlers.BaseAPIHandler{}, nil)
+	remoteReq := httptest.NewRequest(http.MethodGet, parsed.RequestURI(), nil)
+	remoteReq.RemoteAddr = "203.0.113.42:4317"
+	remoteRec := httptest.NewRecorder()
+	restricted.ServeHTTP(remoteRec, remoteReq)
+	if remoteRec.Code != http.StatusForbidden {
+		t.Fatalf("remote restricted attachment view status = %d", remoteRec.Code)
+	}
+	localReq := httptest.NewRequest(http.MethodGet, parsed.RequestURI(), nil)
+	localReq.RemoteAddr = "127.0.0.1:4317"
+	localRec := httptest.NewRecorder()
+	restricted.ServeHTTP(localRec, localReq)
+	if localRec.Code != http.StatusOK || !bytes.Equal(localRec.Body.Bytes(), imageData) {
+		t.Fatalf("local restricted attachment view = status %d body length %d", localRec.Code, localRec.Body.Len())
 	}
 }
 

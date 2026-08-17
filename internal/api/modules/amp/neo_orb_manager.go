@@ -85,25 +85,42 @@ const (
 )
 
 type neoOrbRecord struct {
-	threadID             string
-	containerID          string
-	state                string
-	workDir              string
-	repositoryURL        string
-	portalToken          string
-	activePortals        int
-	idleSince            time.Time
-	failReason           string
-	portalIP             string
-	portalIPAt           time.Time
-	recovered            bool
-	lifecycleV1          bool
-	activeGeneration     *neoOrbGenerationRecord
-	pendingGeneration    *neoOrbGenerationRecord
-	prelaunchReady       bool
-	preparedOwnerID      string
-	suppressSharedGitHub bool
-	operationMu          *sync.Mutex
+	threadID                string
+	runnerID                string
+	spawnID                 string
+	webLocal                bool
+	multiplayerTTLSeconds   int
+	runnerMigrationRequired bool
+	runnerMigrationFencing  bool
+	containerID             string
+	state                   string
+	workDir                 string
+	repositoryURL           string
+	portalToken             string
+	activePortals           int
+	idleSince               time.Time
+	failReason              string
+	portalIP                string
+	portalIPAt              time.Time
+	recovered               bool
+	lifecycleV1             bool
+	activeGeneration        *neoOrbGenerationRecord
+	pendingGeneration       *neoOrbGenerationRecord
+	prelaunchReady          bool
+	preparedOwnerID         string
+	suppressSharedGitHub    bool
+	operationMu             *sync.Mutex
+}
+
+func neoOrbRunnerID(threadID, portalToken string) string {
+	threadID = strings.TrimSpace(threadID)
+	portalToken = strings.TrimSpace(portalToken)
+	if !neoThreadIDExactPattern.MatchString(threadID) || !neoOrbPortalTokenValid(portalToken) {
+		return ""
+	}
+	payload := strings.Join([]string{"cliproxy-orb-runner-v1", threadID, portalToken}, "\x00")
+	digest := sha256.Sum256([]byte(payload))
+	return fmt.Sprintf("orb-%x", digest[:16])
 }
 
 type neoOrbManager struct {
@@ -392,10 +409,14 @@ func (m *neoOrbManager) ensureRecovered(cfg *config.Config) error {
 		if record.activeGeneration == nil && active != nil {
 			generation := *active
 			record.activeGeneration = &generation
+			record.multiplayerTTLSeconds = generation.MultiplayerTTLSeconds
 		}
 		if record.pendingGeneration == nil && pending != nil {
 			generation := *pending
 			record.pendingGeneration = &generation
+			if record.activeGeneration == nil {
+				record.multiplayerTTLSeconds = generation.MultiplayerTTLSeconds
+			}
 		}
 	}
 	grouped := map[string][]neoOrbContainerSummary{}
@@ -480,18 +501,21 @@ func (m *neoOrbManager) ensureRecovered(cfg *config.Config) error {
 			continue
 		}
 		quarantined[threadID] = &neoOrbRecord{
-			threadID:             threadID,
-			containerID:          active.ContainerID,
-			state:                state,
-			workDir:              neoOrbWorkDir,
-			repositoryURL:        strings.TrimSpace(firstNonEmptyString(thread["repositoryURL"], nestedValue(thread["meta"], "repositoryURL"), nestedValue(thread["project"], "repositoryURL"))),
-			portalToken:          active.PortalToken,
-			lifecycleV1:          true,
-			activeGeneration:     cloneNeoOrbLifecycleGeneration(active),
-			prelaunchReady:       true,
-			preparedOwnerID:      active.AuthenticatedOwnerID,
-			suppressSharedGitHub: true,
-			operationMu:          &sync.Mutex{},
+			threadID:                threadID,
+			runnerID:                neoOrbRunnerID(threadID, active.PortalToken),
+			multiplayerTTLSeconds:   active.MultiplayerTTLSeconds,
+			runnerMigrationRequired: true,
+			containerID:             active.ContainerID,
+			state:                   state,
+			workDir:                 neoOrbWorkDir,
+			repositoryURL:           strings.TrimSpace(firstNonEmptyString(thread["repositoryURL"], nestedValue(thread["meta"], "repositoryURL"), nestedValue(thread["project"], "repositoryURL"))),
+			portalToken:             active.PortalToken,
+			lifecycleV1:             true,
+			activeGeneration:        cloneNeoOrbLifecycleGeneration(active),
+			prelaunchReady:          true,
+			preparedOwnerID:         active.AuthenticatedOwnerID,
+			suppressSharedGitHub:    true,
+			operationMu:             &sync.Mutex{},
 		}
 	}
 	for threadID := range lifecycleContainers {
@@ -608,6 +632,122 @@ func (m *neoOrbManager) orbExecutorAdmission(actor *neoActor, threadID string) (
 	return operation.close, false, nil
 }
 
+type neoOrbExecutorSocketAdmission struct {
+	record   *neoOrbRecord
+	spawnID  string
+	runnerID string
+	webLocal bool
+	release  func()
+}
+
+func (m *neoOrbManager) orbExecutorSocketAdmission(actor *neoActor, threadID, incomingRunnerID string) (*neoOrbExecutorSocketAdmission, bool, error) {
+	if err := m.ensureRecovered(m.runtime.configSnapshot()); err != nil {
+		return nil, true, err
+	}
+	incomingRunnerID = strings.TrimSpace(incomingRunnerID)
+	m.mu.Lock()
+	record := m.orbs[threadID]
+	if record == nil {
+		m.mu.Unlock()
+		return nil, false, nil
+	}
+	expectedRunnerID := neoOrbRunnerID(record.threadID, record.portalToken)
+	if expectedRunnerID == "" || incomingRunnerID != expectedRunnerID {
+		fenceCandidate := expectedRunnerID != "" && record.lifecycleV1 && record.state == neoOrbStateRunning && record.runnerMigrationRequired && !record.runnerMigrationFencing
+		workerCtx := m.workerCtx
+		m.mu.Unlock()
+		startFence := false
+		if fenceCandidate {
+			operation, err := m.beginLifecycleAdmission(workerCtx, actor, threadID, neoOrbStateRunning)
+			if err == nil {
+				m.mu.Lock()
+				startFence = !m.stopped && m.orbs[threadID] == record && record.lifecycleV1 && record.state == neoOrbStateRunning && record.runnerMigrationRequired && !record.runnerMigrationFencing && neoOrbRunnerID(record.threadID, record.portalToken) == expectedRunnerID
+				if startFence {
+					record.runnerMigrationFencing = true
+				}
+				m.mu.Unlock()
+				operation.close()
+			}
+		}
+		if startFence && !m.startWorker(func(ctx context.Context) {
+			m.fenceLifecycleOrbRunnerMigration(ctx, actor, record)
+		}) {
+			m.mu.Lock()
+			if m.orbs[threadID] == record && record.runnerMigrationRequired {
+				record.runnerMigrationFencing = false
+			}
+			m.mu.Unlock()
+		}
+		return nil, true, nil
+	}
+	if record.runnerMigrationFencing {
+		m.mu.Unlock()
+		return nil, true, nil
+	}
+	if record.recovered && !record.lifecycleV1 {
+		m.mu.Unlock()
+		return nil, true, nil
+	}
+	lifecycleV1 := record.lifecycleV1
+	spawnID := record.spawnID
+	webLocal := record.webLocal
+	workerCtx := m.workerCtx
+	operationMu := record.operationMu
+	m.mu.Unlock()
+
+	admission := &neoOrbExecutorSocketAdmission{
+		record:   record,
+		spawnID:  spawnID,
+		runnerID: expectedRunnerID,
+		webLocal: webLocal,
+	}
+	if lifecycleV1 {
+		operation, err := m.beginLifecycleAdmission(workerCtx, actor, threadID, neoOrbStateRunning)
+		if err != nil {
+			return nil, true, nil
+		}
+		m.mu.Lock()
+		exact := !m.stopped && m.orbs[threadID] == record && record.state == neoOrbStateRunning &&
+			!record.runnerMigrationFencing && record.spawnID == spawnID && record.webLocal == webLocal &&
+			neoOrbRunnerID(record.threadID, record.portalToken) == expectedRunnerID
+		if exact {
+			record.runnerID = expectedRunnerID
+			record.runnerMigrationRequired = false
+		}
+		m.mu.Unlock()
+		if !exact {
+			operation.close()
+			return nil, true, nil
+		}
+		admission.release = operation.close
+		return admission, false, nil
+	}
+	if operationMu == nil {
+		return nil, true, nil
+	}
+	if err := neoOrbLockOperation(workerCtx, operationMu); err != nil {
+		return nil, true, nil
+	}
+	m.mu.Lock()
+	exact := !m.stopped && m.orbs[threadID] == record && record.state == neoOrbStateRunning &&
+		!record.runnerMigrationFencing && record.spawnID == spawnID && record.webLocal == webLocal &&
+		neoOrbRunnerID(record.threadID, record.portalToken) == expectedRunnerID
+	if exact {
+		record.runnerID = expectedRunnerID
+		record.runnerMigrationRequired = false
+	}
+	m.mu.Unlock()
+	if !exact {
+		operationMu.Unlock()
+		return nil, true, nil
+	}
+	var releaseOnce sync.Once
+	admission.release = func() {
+		releaseOnce.Do(operationMu.Unlock)
+	}
+	return admission, false, nil
+}
+
 func (m *neoOrbManager) orbExecutorMigrationRequired(threadID string) (bool, error) {
 	if m == nil || m.runtime == nil || m.runtime.store == nil {
 		return true, errors.New("orb manager is unavailable")
@@ -626,6 +766,9 @@ func (m *neoOrbManager) orbExecutorMigrationRequired(threadID string) (bool, err
 func (m *neoOrbManager) setState(record *neoOrbRecord, state, reason string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if record == nil || m.orbs[record.threadID] != record {
+		return
+	}
 	record.state = state
 	record.failReason = reason
 	if state == neoOrbStateRunning {
@@ -634,47 +777,246 @@ func (m *neoOrbManager) setState(record *neoOrbRecord, state, reason string) {
 	}
 }
 
+func (m *neoOrbManager) orbLaunchIdentity(record *neoOrbRecord, spawnID string) (string, string, bool) {
+	if m == nil || record == nil || strings.TrimSpace(spawnID) == "" {
+		return "", "", false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	threadID := record.threadID
+	runnerID := record.runnerID
+	exact := m.orbs[threadID] == record && record.spawnID == spawnID &&
+		runnerID != "" && neoOrbRunnerID(threadID, record.portalToken) == runnerID
+	return threadID, runnerID, exact
+}
+
+func (m *neoOrbManager) orbExecutorDisconnected(actor *neoActor, threadID, runnerID string) bool {
+	threadID = strings.TrimSpace(threadID)
+	runnerID = strings.TrimSpace(runnerID)
+	if m == nil || actor == nil || !neoThreadIDExactPattern.MatchString(threadID) || runnerID == "" || !m.activeLifecycleActorExact(actor, threadID) {
+		return false
+	}
+	m.mu.Lock()
+	record := m.orbs[threadID]
+	var active *neoOrbLifecycleGeneration
+	if record != nil && record.activeGeneration != nil {
+		active = cloneNeoOrbLifecycleGeneration(record.activeGeneration)
+	}
+	exact := record != nil && record.lifecycleV1 && !record.recovered && record.state == neoOrbStateRunning &&
+		!record.runnerMigrationFencing && record.runnerID == runnerID && neoOrbRunnerID(threadID, record.portalToken) == runnerID &&
+		record.pendingGeneration == nil && neoOrbLifecycleActionable(active)
+	m.mu.Unlock()
+	if !exact || !m.activeLifecycleActorBindingExact(threadID, active) {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	record = m.orbs[threadID]
+	if record == nil || !record.lifecycleV1 || record.recovered || record.state != neoOrbStateRunning || record.runnerMigrationFencing ||
+		record.runnerID != runnerID || neoOrbRunnerID(threadID, record.portalToken) != runnerID || record.pendingGeneration != nil ||
+		record.activeGeneration == nil || neoOrbLifecycleGenerationDigest(record.activeGeneration) != neoOrbLifecycleGenerationDigest(active) {
+		return false
+	}
+	record.state = neoOrbStateFailed
+	record.failReason = "orb executor disconnected"
+	record.runnerMigrationRequired = true
+	record.portalIP = ""
+	record.portalIPAt = time.Time{}
+	return true
+}
+
+func (m *neoOrbManager) fenceLifecycleOrbRunnerMigration(ctx context.Context, actor *neoActor, record *neoOrbRecord) bool {
+	if ctx == nil || actor == nil || record == nil {
+		return false
+	}
+	fail := func(reason string) {
+		m.mu.Lock()
+		if m.orbs[record.threadID] == record && record.state == neoOrbStateRunning && record.runnerMigrationRequired && record.runnerMigrationFencing {
+			record.runnerMigrationFencing = false
+			if !m.stopped && ctx.Err() == nil {
+				record.state = neoOrbStateConflict
+				record.failReason = reason
+			}
+		}
+		m.mu.Unlock()
+	}
+	m.mu.Lock()
+	exact := !m.stopped && m.orbs[record.threadID] == record && record.lifecycleV1 && record.state == neoOrbStateRunning && record.runnerMigrationRequired && record.runnerMigrationFencing
+	m.mu.Unlock()
+	if !exact {
+		return false
+	}
+	operation, err := m.beginLifecycleAdmission(ctx, actor, record.threadID, neoOrbStateRunning)
+	if err != nil {
+		fail("orb runner migration fence is unavailable")
+		return false
+	}
+	guarded := operation.providerClient().(*neoOrbGuardedProvider)
+	if err := m.orbStopRecoveredExecutor(ctx, guarded, operation.containerID); err != nil {
+		operation.close()
+		fail("stale orb executor could not be stopped")
+		return false
+	}
+	result := guarded.PauseContainerInvocation(ctx, operation.containerID)
+	operation.close()
+	if !result.confirmed() {
+		fail("stale orb executor container could not be fenced")
+		return false
+	}
+	m.mu.Lock()
+	fenced := !m.stopped && m.orbs[record.threadID] == record && record.state == neoOrbStateRunning && record.runnerMigrationRequired && record.runnerMigrationFencing
+	if fenced {
+		record.state = neoOrbStatePaused
+		record.failReason = ""
+		record.runnerMigrationRequired = false
+		record.runnerMigrationFencing = false
+		record.portalIP = ""
+		record.portalIPAt = time.Time{}
+	}
+	m.mu.Unlock()
+	return fenced
+}
+
+func (m *neoOrbManager) migrateLifecycleOrbRunner(ctx context.Context, actor *neoActor, record *neoOrbRecord, spawnID string, restart bool) {
+	threadID, runnerID, exact := m.orbLaunchIdentity(record, spawnID)
+	if !exact {
+		return
+	}
+	if !m.fenceLifecycleOrbRunnerMigration(ctx, actor, record) {
+		actor.clearWebLocalExecutorReservation(spawnID, runnerID)
+		message := "Cannot safely migrate the recovered orb executor."
+		if restart {
+			message = "Cannot safely restart the disconnected orb executor."
+		}
+		actor.broadcastExecutorStatus(spawnID, "failed", message, map[string]any{"reasonCode": "spawn_failed", "threadId": threadID})
+		return
+	}
+	m.mu.Lock()
+	claimed := !m.stopped && ctx.Err() == nil && m.orbs[threadID] == record && record.state == neoOrbStatePaused &&
+		record.spawnID == spawnID && record.runnerID == runnerID && !record.runnerMigrationRequired && !record.runnerMigrationFencing
+	if claimed {
+		record.state = neoOrbStateProvisioning
+	}
+	m.mu.Unlock()
+	if !claimed {
+		actor.clearWebLocalExecutorReservation(spawnID, runnerID)
+		return
+	}
+	m.resumeLifecycleOrb(ctx, actor, record, spawnID)
+}
+
+func (m *neoOrbManager) wakeExistingLifecycleOrb(a *neoActor) bool {
+	if a == nil {
+		return false
+	}
+	a.mu.Lock()
+	sandbox := strings.EqualFold(firstNonEmptyString(a.bootstrapExecutorType, a.meta["executorType"]), "sandbox")
+	a.mu.Unlock()
+	if !sandbox {
+		return false
+	}
+	return m.spawnOrbWithOptions(a, map[string]any{
+		"requestId":                "web-reopen-orb-" + randomBase62(12),
+		"cliproxyWebLocalRunnerId": "orb",
+	}, true) != nil
+}
+
 // spawnOrb provisions (or resumes) the orb backing a thread and starts the
 // headless Amp executor inside it. The executor connects back to this proxy
 // over the thread WebSocket exactly like a locally spawned headless executor.
 func (m *neoOrbManager) spawnOrb(a *neoActor, msg map[string]any) map[string]any {
+	return m.spawnOrbWithOptions(a, msg, false)
+}
+
+func (m *neoOrbManager) spawnOrbWithOptions(a *neoActor, msg map[string]any, existingLifecycleOnly bool) map[string]any {
 	spawnID := firstNonEmptyString(msg["spawnId"], msg["requestId"])
 	if spawnID == "" {
 		spawnID = "spawn-orb-" + randomBase62(12)
 	}
-	cfg := m.runtime.configSnapshot()
-	if reason := neoOrbsAvailable(cfg); reason != "" {
-		return a.broadcastExecutorStatus(spawnID, "failed", "Cannot provision an orb: "+reason+".", map[string]any{"reasonCode": "spawn_rejected"})
-	}
+	webLocal := strings.TrimSpace(stringValue(msg["cliproxyWebLocalRunnerId"])) != ""
+	a.mu.Lock()
 	threadID := firstNonEmptyString(a.threadID, a.key)
+	multiplayerTTLSeconds := a.multiplayerTTLSeconds
+	a.mu.Unlock()
 	if !neoThreadIDExactPattern.MatchString(threadID) {
 		return a.broadcastExecutorStatus(spawnID, "failed", "Cannot provision an orb without a valid thread ID.", map[string]any{"reasonCode": "environment_missing"})
+	}
+	cfg := m.runtime.configSnapshot()
+	if !existingLifecycleOnly {
+		if reason := neoOrbsAvailable(cfg); reason != "" {
+			return a.broadcastExecutorStatus(spawnID, "failed", "Cannot provision an orb: "+reason+".", map[string]any{"reasonCode": "spawn_rejected"})
+		}
 	}
 	if err := m.ensureRecovered(cfg); err != nil {
 		return a.broadcastExecutorStatus(spawnID, "failed", "Cannot safely reconcile existing orb containers: "+err.Error(), map[string]any{"reasonCode": "environment_recovering", "threadId": threadID})
 	}
+	if existingLifecycleOnly {
+		m.mu.Lock()
+		_, exists := m.orbs[threadID]
+		m.mu.Unlock()
+		if !exists {
+			return nil
+		}
+		if reason := neoOrbsAvailable(cfg); reason != "" {
+			return a.broadcastExecutorStatus(spawnID, "failed", "Cannot provision an orb: "+reason+".", map[string]any{"reasonCode": "spawn_rejected", "threadId": threadID})
+		}
+	}
 
-	record := &neoOrbRecord{threadID: threadID, state: neoOrbStateProvisioning, workDir: neoOrbWorkDir, portalToken: neoOrbNewPortalToken(), operationMu: &sync.Mutex{}}
+	portalToken := neoOrbNewPortalToken()
+	record := &neoOrbRecord{
+		threadID:              threadID,
+		runnerID:              neoOrbRunnerID(threadID, portalToken),
+		multiplayerTTLSeconds: multiplayerTTLSeconds,
+		state:                 neoOrbStateProvisioning,
+		workDir:               neoOrbWorkDir,
+		portalToken:           portalToken,
+		operationMu:           &sync.Mutex{},
+	}
 	m.mu.Lock()
 	existing := m.orbs[threadID]
 	existingState := ""
 	existingFailReason := ""
 	action := "provision"
+	if existingLifecycleOnly {
+		action = "absent"
+	}
 	if existing != nil {
 		existingState = existing.state
 		existingFailReason = existing.failReason
 		if existing.recovered {
 			action = "conflict"
 		} else if existing.lifecycleV1 {
+			lifecycleActionable := existing.pendingGeneration == nil && neoOrbLifecycleActionable(existing.activeGeneration)
 			switch existing.state {
-			case neoOrbStateProvisioning, neoOrbStateRunning:
+			case neoOrbStateProvisioning:
 				action = "inflight"
+			case neoOrbStateRunning:
+				if !lifecycleActionable {
+					action = "conflict"
+					existingFailReason = "lifecycle-v1 activation is not actionable"
+				} else if existing.runnerMigrationRequired && !existing.runnerMigrationFencing {
+					action = "migrate-lifecycle"
+				} else {
+					action = "inflight"
+				}
 			case neoOrbStatePaused:
-				existing.state = neoOrbStateProvisioning
-				action = "resume-lifecycle"
+				if lifecycleActionable {
+					action = "resume-lifecycle"
+				} else {
+					action = "conflict"
+					existingFailReason = "lifecycle-v1 activation is not actionable"
+				}
+			case neoOrbStateFailed:
+				if lifecycleActionable && existing.runnerMigrationRequired && !existing.runnerMigrationFencing {
+					action = "restart-lifecycle"
+				} else {
+					action = "conflict"
+				}
 			default:
 				action = "conflict"
 			}
+		} else if existingLifecycleOnly {
+			action = "conflict"
 		} else {
 			switch existing.state {
 			case neoOrbStateProvisioning:
@@ -682,11 +1024,9 @@ func (m *neoOrbManager) spawnOrb(a *neoActor, msg map[string]any) map[string]any
 			case neoOrbStateRunning:
 				action = "inflight"
 			case neoOrbStatePaused:
-				existing.state = neoOrbStateProvisioning
 				action = "resume"
 			case neoOrbStateFailed:
 				if existing.containerID != "" {
-					existing.state = neoOrbStateProvisioning
 					action = "replace"
 				}
 			case neoOrbStateConflict:
@@ -694,11 +1034,57 @@ func (m *neoOrbManager) spawnOrb(a *neoActor, msg map[string]any) map[string]any
 			}
 		}
 	}
-	if action == "provision" {
-		m.orbs[threadID] = record
+	launchRecord := record
+	launchRunnerID := ""
+	if action == "resume" || action == "resume-lifecycle" || action == "migrate-lifecycle" || action == "restart-lifecycle" || action == "replace" {
+		launchRecord = existing
+	}
+	if action == "replace" {
+		launchRecord.spawnID = spawnID
+		launchRecord.webLocal = webLocal
+		launchRecord.state = neoOrbStateProvisioning
+	} else if action == "provision" || action == "resume" || action == "resume-lifecycle" || action == "migrate-lifecycle" || action == "restart-lifecycle" {
+		launchRunnerID = neoOrbRunnerID(launchRecord.threadID, launchRecord.portalToken)
+		if launchRunnerID == "" {
+			action = "conflict"
+			existingFailReason = "orb publication provenance is unavailable"
+		} else {
+			reserved := true
+			if webLocal {
+				a.mu.Lock()
+				reserved = a.reserveWebLocalExecutorLocked(spawnID, launchRunnerID)
+				if reserved && existingLifecycleOnly {
+					a.webLocalExpectedObserverOnly = true
+				}
+				a.mu.Unlock()
+			}
+			if !reserved {
+				action = "inflight"
+			} else {
+				launchRecord.runnerID = launchRunnerID
+				launchRecord.spawnID = spawnID
+				launchRecord.webLocal = webLocal
+				if action == "migrate-lifecycle" || action == "restart-lifecycle" {
+					if action == "restart-lifecycle" {
+						launchRecord.state = neoOrbStateRunning
+					}
+					launchRecord.runnerMigrationFencing = true
+				} else {
+					launchRecord.state = neoOrbStateProvisioning
+					if action == "resume-lifecycle" && launchRecord.runnerMigrationRequired {
+						launchRecord.runnerMigrationFencing = true
+					}
+				}
+				if action == "provision" {
+					m.orbs[threadID] = launchRecord
+				}
+			}
+		}
 	}
 	m.mu.Unlock()
 	switch action {
+	case "absent":
+		return nil
 	case "inflight":
 		status := "starting"
 		message := "Orb is already starting for this thread."
@@ -706,9 +1092,13 @@ func (m *neoOrbManager) spawnOrb(a *neoActor, msg map[string]any) map[string]any
 			status = "running"
 			message = "Orb is already running for this thread."
 		}
+		if existingLifecycleOnly {
+			return map[string]any{"type": "executor_status", "spawnId": existing.spawnID, "status": status, "message": message}
+		}
 		return a.broadcastExecutorStatus(spawnID, status, message, map[string]any{"reasonCode": "waiting_for_executor_connect", "threadId": threadID})
 	case "resume":
 		if !m.startWorker(func(ctx context.Context) { m.resumeOrb(ctx, a, existing, spawnID) }) {
+			a.clearWebLocalExecutorReservation(spawnID, launchRunnerID)
 			m.setState(existing, neoOrbStateFailed, "orb manager is stopping")
 			return a.broadcastExecutorStatus(spawnID, "failed", "Cannot resume the orb while the runtime is stopping.", map[string]any{"reasonCode": "spawn_failed", "threadId": threadID})
 		}
@@ -720,13 +1110,37 @@ func (m *neoOrbManager) spawnOrb(a *neoActor, msg map[string]any) map[string]any
 		return a.broadcastExecutorStatus(spawnID, "starting", message, map[string]any{"reasonCode": "environment_recovering", "threadId": threadID})
 	case "resume-lifecycle":
 		if !m.startWorker(func(ctx context.Context) { m.resumeLifecycleOrb(ctx, a, existing, spawnID) }) {
+			a.clearWebLocalExecutorReservation(spawnID, launchRunnerID)
 			m.setState(existing, neoOrbStateConflict, "orb manager is stopping")
 			return a.broadcastExecutorStatus(spawnID, "failed", "Cannot resume the orb while the runtime is stopping.", map[string]any{"reasonCode": "spawn_failed", "threadId": threadID})
 		}
 		m.ensureReaper()
 		return a.broadcastExecutorStatus(spawnID, "starting", "Resuming paused orb.", map[string]any{"reasonCode": "environment_recovering", "threadId": threadID})
+	case "migrate-lifecycle", "restart-lifecycle":
+		restart := action == "restart-lifecycle"
+		if !m.startWorker(func(ctx context.Context) { m.migrateLifecycleOrbRunner(ctx, a, existing, spawnID, restart) }) {
+			a.clearWebLocalExecutorReservation(spawnID, launchRunnerID)
+			m.mu.Lock()
+			if m.orbs[threadID] == existing && existing.runnerMigrationRequired {
+				existing.runnerMigrationFencing = false
+			}
+			m.mu.Unlock()
+			m.setState(existing, neoOrbStateConflict, "orb manager is stopping")
+			message := "Cannot migrate the recovered orb while the runtime is stopping."
+			if restart {
+				message = "Cannot restart the disconnected orb executor while the runtime is stopping."
+			}
+			return a.broadcastExecutorStatus(spawnID, "failed", message, map[string]any{"reasonCode": "spawn_failed", "threadId": threadID})
+		}
+		m.ensureReaper()
+		message := "Migrating the recovered orb executor."
+		if restart {
+			message = "Restarting the disconnected orb executor."
+		}
+		return a.broadcastExecutorStatus(spawnID, "starting", message, map[string]any{"reasonCode": "environment_recovering", "threadId": threadID})
 	case "replace":
 		if !m.startWorker(func(ctx context.Context) { m.replaceFailedOrb(ctx, a, existing, spawnID) }) {
+			a.clearWebLocalExecutorReservation(spawnID, launchRunnerID)
 			m.setState(existing, neoOrbStateFailed, "orb manager is stopping")
 			return a.broadcastExecutorStatus(spawnID, "failed", "Cannot replace the orb while the runtime is stopping.", map[string]any{"reasonCode": "spawn_failed", "threadId": threadID})
 		}
@@ -752,6 +1166,7 @@ func (m *neoOrbManager) spawnOrb(a *neoActor, msg map[string]any) map[string]any
 	if !m.startWorker(func(ctx context.Context) {
 		m.provisionLifecycleOrb(ctx, a, record, spawnID, repositoryURL, agentMode, reasoningEffort)
 	}) {
+		a.clearWebLocalExecutorReservation(spawnID, launchRunnerID)
 		m.setState(record, neoOrbStateFailed, "orb manager is stopping")
 		return a.broadcastExecutorStatus(spawnID, "failed", "Cannot provision an orb while the runtime is stopping.", map[string]any{"reasonCode": "spawn_failed", "threadId": threadID})
 	}
@@ -811,7 +1226,8 @@ func (m *neoOrbManager) materializeLifecycleGeneration(ctx context.Context, reco
 		return wrap("validation", errors.New("orb manager is not runtime-owned"))
 	}
 	m.mu.Lock()
-	validRecord := !m.stopped && m.orbs[record.threadID] == record && record.operationMu == operationMu && record.state == neoOrbStateProvisioning && !record.recovered && !record.lifecycleV1 && record.containerID == "" && record.activeGeneration == nil && record.pendingGeneration == nil && record.workDir == neoOrbWorkDir && neoThreadIDExactPattern.MatchString(record.threadID) && len(record.threadID) <= 180 && neoOrbPortalTokenValid(record.portalToken)
+	validTTL := record.multiplayerTTLSeconds == 0 || record.multiplayerTTLSeconds >= neoThreadOpenTTLMinSeconds && record.multiplayerTTLSeconds <= neoThreadOpenTTLMaxSeconds
+	validRecord := !m.stopped && m.orbs[record.threadID] == record && record.operationMu == operationMu && record.state == neoOrbStateProvisioning && !record.recovered && !record.lifecycleV1 && record.containerID == "" && record.activeGeneration == nil && record.pendingGeneration == nil && record.workDir == neoOrbWorkDir && neoThreadIDExactPattern.MatchString(record.threadID) && len(record.threadID) <= 180 && neoOrbPortalTokenValid(record.portalToken) && validTTL
 	validClient := m.client == client && m.clientKey == provider && m.recovered && m.recoveredKey == provider
 	m.mu.Unlock()
 	if !validRecord {
@@ -838,7 +1254,7 @@ func (m *neoOrbManager) materializeLifecycleGeneration(ctx context.Context, reco
 		return wrap("lifecycle store", errors.New("orb lifecycle cleanup is pending"))
 	}
 
-	reserved, err := store.reserveGeneration(record.threadID, record.portalToken)
+	reserved, err := store.reserveGeneration(record.threadID, record.portalToken, record.multiplayerTTLSeconds)
 	fail := func(stage string, stageErr error) error {
 		snapshot := store.snapshot()
 		var active, pending *neoOrbLifecycleGeneration
@@ -1001,6 +1417,7 @@ var errNeoOrbActiveLifecycleGuardRejected = errors.New("active orb lifecycle ope
 type neoOrbActiveLifecycleRecordFence struct {
 	state                  string
 	workDir                string
+	multiplayerTTLSeconds  int
 	repositoryURLDigest    [32]byte
 	portalTokenDigest      [32]byte
 	activePortals          int
@@ -1091,6 +1508,7 @@ func neoOrbCaptureActiveLifecycleRecordFence(record *neoOrbRecord) neoOrbActiveL
 	return neoOrbActiveLifecycleRecordFence{
 		state:                  record.state,
 		workDir:                record.workDir,
+		multiplayerTTLSeconds:  record.multiplayerTTLSeconds,
 		repositoryURLDigest:    neoOrbSensitiveDigest(record.repositoryURL),
 		portalTokenDigest:      neoOrbSensitiveDigest(record.portalToken),
 		activePortals:          record.activePortals,
@@ -1117,6 +1535,7 @@ func (operation *neoOrbActiveLifecycleOperation) recordExactLocked() bool {
 		record.containerID == operation.containerID &&
 		record.state == fence.state &&
 		record.workDir == fence.workDir &&
+		record.multiplayerTTLSeconds == fence.multiplayerTTLSeconds &&
 		neoOrbSensitiveDigest(record.repositoryURL) == fence.repositoryURLDigest &&
 		neoOrbSensitiveDigest(record.portalToken) == fence.portalTokenDigest &&
 		record.activePortals == fence.activePortals &&
@@ -1268,7 +1687,7 @@ func (m *neoOrbManager) beginActiveLifecycleOperation(ctx context.Context, recor
 		operation.ownerID = operation.store.ownerID()
 	}
 	validState := operation.fence.state == neoOrbStateProvisioning || operation.fence.state == neoOrbStateRunning || operation.fence.state == neoOrbStatePaused
-	validRecord := validState && neoThreadIDExactPattern.MatchString(operation.threadID) && len(operation.threadID) <= 180 && operation.fence.workDir == neoOrbWorkDir && operation.fence.lifecycleV1 && !operation.fence.recovered && operation.fence.portalTokenDigest == activePortalTokenDigest && operation.fence.activeGenerationDigest != [32]byte{} && operation.active.Phase == neoOrbLifecyclePhaseActive && operation.containerID != "" && operation.containerID == operation.active.ContainerID
+	validRecord := validState && neoThreadIDExactPattern.MatchString(operation.threadID) && len(operation.threadID) <= 180 && operation.fence.workDir == neoOrbWorkDir && operation.fence.lifecycleV1 && !operation.fence.recovered && operation.fence.multiplayerTTLSeconds == operation.active.MultiplayerTTLSeconds && operation.fence.portalTokenDigest == activePortalTokenDigest && operation.fence.activeGenerationDigest != [32]byte{} && operation.active.Phase == neoOrbLifecyclePhaseActive && operation.containerID != "" && operation.containerID == operation.active.ContainerID
 	if !validRecord {
 		operation.close()
 		return nil, errNeoOrbActiveLifecycleGuardRejected
@@ -2164,8 +2583,17 @@ func (m *neoOrbManager) reconcileActiveLifecyclePrelaunchWithSelection(ctx conte
 }
 
 func (m *neoOrbManager) provisionLifecycleOrb(ctx context.Context, actor *neoActor, record *neoOrbRecord, spawnID, repositoryURL, agentMode, reasoningEffort string) {
+	threadID, runnerID, exact := m.orbLaunchIdentity(record, spawnID)
+	if !exact {
+		return
+	}
 	cfg := m.runtime.configSnapshot()
-	threadID := record.threadID
+	watcherStarted := false
+	defer func() {
+		if !watcherStarted {
+			actor.clearWebLocalExecutorReservation(spawnID, runnerID)
+		}
+	}()
 	fail := func(stage, message string, err error) {
 		m.runtime.orbManagerMu.Lock()
 		store := m.runtime.orbLifecycleStore
@@ -2177,9 +2605,8 @@ func (m *neoOrbManager) provisionLifecycleOrb(ctx context.Context, actor *neoAct
 			record.failReason = message
 		}
 		m.mu.Unlock()
-		log.Warnf("amp orbs: lifecycle provision thread=%s stage=%s failed", threadID, stage)
+		log.Warnf("amp orbs: lifecycle provision thread=%s stage=%s failed: %v", threadID, stage, err)
 		actor.broadcastExecutorStatus(spawnID, "failed", message, map[string]any{"reasonCode": "spawn_failed", "threadId": threadID})
-		_ = err
 	}
 	ownerID, actorExact := m.activeLifecycleActorOwner(actor, threadID)
 	if !actorExact {
@@ -2250,7 +2677,7 @@ func (m *neoOrbManager) provisionLifecycleOrb(ctx context.Context, actor *neoAct
 	}
 	guarded := operation.providerClient().(*neoOrbGuardedProvider)
 	env := neoOrbExecutorEnvWithCredentials(cfg, threadID, record.workDir, record.portalToken, credentialSelection.suppressSharedGitHub())
-	args := neoHeadlessExecutorArgs(threadID, agentMode, reasoningEffort, neoOrbExecutorLog)
+	args := neoHeadlessExecutorArgs(threadID, agentMode, reasoningEffort, neoOrbExecutorLog, runnerID)
 	actor.broadcastExecutorStatus(spawnID, "starting", "Starting the headless executor in the orb.", map[string]any{"reasonCode": "starting_headless", "threadId": threadID})
 	result := guarded.ExecDetachedInvocation(setupCtx, operation.containerID, neoOrbHeadlessCommand(args), env, operation.fence.workDir)
 	if !result.confirmed() {
@@ -2292,15 +2719,31 @@ func (m *neoOrbManager) provisionLifecycleOrb(ctx context.Context, actor *neoAct
 		fail("publication", "Cannot safely activate the orb.", errNeoOrbActiveLifecycleGuardRejected)
 		return
 	}
+	if actionable.MultiplayerTTLSeconds != 0 {
+		actor.setThreadOpen(actionable.MultiplayerTTLSeconds)
+	}
 	actor.broadcastExecutorStatus(spawnID, "running", "Waiting for the orb executor to connect.", map[string]any{"reasonCode": "waiting_for_executor_connect", "threadId": threadID})
-	m.startWorker(func(ctx context.Context) {
+	watcherStarted = m.startWorker(func(ctx context.Context) {
 		m.watchOrbConnect(ctx, actor, record, spawnID, neoExecutorConnectTimeout(cfg))
 	})
+	if !watcherStarted {
+		m.setState(record, neoOrbStateConflict, "orb executor watcher could not start")
+		actor.broadcastExecutorStatus(spawnID, "failed", "Cannot monitor the orb executor while the runtime is stopping.", map[string]any{"reasonCode": "spawn_failed", "threadId": threadID})
+	}
 }
 
 func (m *neoOrbManager) provisionOrb(ctx context.Context, a *neoActor, record *neoOrbRecord, spawnID, repositoryURL, agentMode, reasoningEffort string) {
+	threadID, runnerID, exact := m.orbLaunchIdentity(record, spawnID)
+	if !exact {
+		return
+	}
 	cfg := m.runtime.configSnapshot()
-	threadID := record.threadID
+	watcherStarted := false
+	defer func() {
+		if !watcherStarted {
+			a.clearWebLocalExecutorReservation(spawnID, runnerID)
+		}
+	}()
 	client, clientErr := m.dockerClient(cfg)
 	fail := func(stage, message string, err error) {
 		m.mu.Lock()
@@ -2427,7 +2870,7 @@ func (m *neoOrbManager) provisionOrb(ctx context.Context, a *neoActor, record *n
 	}
 
 	env := neoOrbExecutorEnvWithCredentials(cfg, threadID, record.workDir, record.portalToken, credentialSelection.suppressSharedGitHub())
-	args := neoHeadlessExecutorArgs(threadID, agentMode, reasoningEffort, neoOrbExecutorLog)
+	args := neoHeadlessExecutorArgs(threadID, agentMode, reasoningEffort, neoOrbExecutorLog, runnerID)
 	cmd := neoOrbHeadlessCommand(args)
 	a.broadcastExecutorStatus(spawnID, "starting", "Starting the headless executor in the orb.", map[string]any{"reasonCode": "starting_headless", "threadId": threadID})
 	if err := client.ExecDetached(setupCtx, containerID, cmd, env, record.workDir); err != nil {
@@ -2436,7 +2879,11 @@ func (m *neoOrbManager) provisionOrb(ctx context.Context, a *neoActor, record *n
 	}
 	m.setState(record, neoOrbStateRunning, "")
 	a.broadcastExecutorStatus(spawnID, "running", "Waiting for the orb executor to connect.", map[string]any{"reasonCode": "waiting_for_executor_connect", "threadId": threadID})
-	m.startWorker(func(ctx context.Context) { m.watchOrbConnect(ctx, a, record, spawnID, neoExecutorConnectTimeout(cfg)) })
+	watcherStarted = m.startWorker(func(ctx context.Context) { m.watchOrbConnect(ctx, a, record, spawnID, neoExecutorConnectTimeout(cfg)) })
+	if !watcherStarted {
+		m.setState(record, neoOrbStateFailed, "orb executor watcher could not start")
+		a.broadcastExecutorStatus(spawnID, "failed", "Cannot monitor the orb executor while the runtime is stopping.", map[string]any{"reasonCode": "spawn_failed", "threadId": threadID})
+	}
 }
 
 func (m *neoOrbManager) persistContainerBinding(a *neoActor, containerID, portalToken string) error {
@@ -3003,8 +3450,17 @@ func (m *neoOrbManager) resumeLifecycleOrb(ctx context.Context, actor *neoActor,
 	if ctx == nil || m == nil || m.runtime == nil || actor == nil || record == nil {
 		return
 	}
+	threadID, runnerID, exact := m.orbLaunchIdentity(record, spawnID)
+	if !exact {
+		return
+	}
+	watcherStarted := false
+	defer func() {
+		if !watcherStarted {
+			actor.clearWebLocalExecutorReservation(spawnID, runnerID)
+		}
+	}()
 	cfg := m.runtime.configSnapshot()
-	threadID := record.threadID
 	quarantine := func(message string) {
 		m.runtime.orbManagerMu.Lock()
 		store := m.runtime.orbLifecycleStore
@@ -3106,6 +3562,30 @@ func (m *neoOrbManager) resumeLifecycleOrb(ctx context.Context, actor *neoActor,
 		quarantine("Cannot safely resume the orb.")
 		return
 	}
+	m.mu.Lock()
+	fenceRecoveredExecutor := !m.stopped && m.orbs[threadID] == record && record.state == neoOrbStateProvisioning &&
+		record.spawnID == spawnID && record.runnerID == runnerID && record.runnerMigrationRequired && record.runnerMigrationFencing
+	m.mu.Unlock()
+	if fenceRecoveredExecutor {
+		if err := m.orbStopRecoveredExecutor(resumeCtx, guarded, operation.containerID); err != nil {
+			operation.close()
+			quarantine("Cannot safely stop the recovered orb executor.")
+			return
+		}
+		m.mu.Lock()
+		fenced := !m.stopped && m.orbs[threadID] == record && record.state == neoOrbStateProvisioning &&
+			record.spawnID == spawnID && record.runnerID == runnerID && record.runnerMigrationRequired && record.runnerMigrationFencing
+		if fenced {
+			record.runnerMigrationRequired = false
+			record.runnerMigrationFencing = false
+		}
+		m.mu.Unlock()
+		if !fenced {
+			operation.close()
+			quarantine("Cannot safely resume the orb.")
+			return
+		}
+	}
 	credentialSelection, err := m.orbReconcileOwnerCredentials(resumeCtx, guarded, operation.containerID, ownerID)
 	if err != nil {
 		operation.close()
@@ -3128,10 +3608,33 @@ func (m *neoOrbManager) resumeLifecycleOrb(ctx context.Context, actor *neoActor,
 	if !hasOwnerConfig && neoOrbSyncLocalConfigEnabled(cfg) {
 		m.orbSyncLocalConfig(resumeCtx, guarded, operation.containerID)
 	}
+	if err := m.orbConfigurePortalHelper(resumeCtx, guarded, operation.containerID); err != nil {
+		operation.close()
+		quarantine("Cannot update orb portal services.")
+		return
+	}
 	resumeScript := fmt.Sprintf("if [ -x .agents/resume ]; then mkdir -p /home/user/.cache/amp/logs && timeout %d .agents/resume > /home/user/.cache/amp/logs/resume.log 2>&1 || true; fi", neoOrbResumeHookSeconds)
 	if _, err := guarded.Exec(resumeCtx, operation.containerID, []string{"/bin/sh", "-lc", resumeScript}, nil, operation.fence.workDir); err != nil {
 		operation.close()
 		quarantine("Cannot run the orb resume hook.")
+		return
+	}
+	portalBase := neoOrbPortalBaseURL(cfg)
+	if publicURL := strings.TrimRight(strings.TrimSpace(neoOrbsConfig(cfg).PublicURL), "/"); publicURL != "" {
+		portalBase = publicURL
+	}
+	reconcileEnv := []string{
+		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+		"HOME=/home/user",
+		"AMP_ORB=1",
+		"AMP_THREAD_ID=" + threadID,
+		"AMP_ORB_PORTAL_BASE_URL=" + portalBase,
+		"AMP_ORB_PORTAL_TOKEN=" + record.portalToken,
+	}
+	reconcile, err := guarded.Exec(resumeCtx, operation.containerID, []string{neoOrbServiceHelperPath, "reconcile"}, reconcileEnv, operation.fence.workDir)
+	if err != nil || reconcile.ExitCode != 0 {
+		operation.close()
+		quarantine("Cannot reconcile orb portal services.")
 		return
 	}
 	if currentOwnerID, exact := m.activeLifecycleActorOwner(actor, threadID); !exact || currentOwnerID != ownerID {
@@ -3165,7 +3668,7 @@ func (m *neoOrbManager) resumeLifecycleOrb(ctx context.Context, actor *neoActor,
 	portalToken := record.portalToken
 	m.mu.Unlock()
 	env := neoOrbExecutorEnvWithCredentials(cfg, threadID, operation.fence.workDir, portalToken, credentialSelection.suppressSharedGitHub())
-	args := neoHeadlessExecutorArgs(threadID, agentMode, reasoningEffort, neoOrbExecutorLog)
+	args := neoHeadlessExecutorArgs(threadID, agentMode, reasoningEffort, neoOrbExecutorLog, runnerID)
 	result := guarded.ExecDetachedInvocation(resumeCtx, operation.containerID, neoOrbHeadlessCommand(args), env, operation.fence.workDir)
 	if !result.confirmed() {
 		operation.close()
@@ -3198,12 +3701,26 @@ func (m *neoOrbManager) resumeLifecycleOrb(ctx context.Context, actor *neoActor,
 		return
 	}
 	actor.broadcastExecutorStatus(spawnID, "running", "Waiting for the orb executor to reconnect.", map[string]any{"reasonCode": "waiting_for_executor_connect", "threadId": threadID})
-	m.startWorker(func(ctx context.Context) {
+	watcherStarted = m.startWorker(func(ctx context.Context) {
 		m.watchOrbConnect(ctx, actor, record, spawnID, neoExecutorConnectTimeout(cfg))
 	})
+	if !watcherStarted {
+		m.setState(record, neoOrbStateConflict, "orb executor watcher could not start")
+		actor.broadcastExecutorStatus(spawnID, "failed", "Cannot monitor the orb executor while the runtime is stopping.", map[string]any{"reasonCode": "spawn_failed", "threadId": threadID})
+	}
 }
 
 func (m *neoOrbManager) resumeOrb(ctx context.Context, a *neoActor, record *neoOrbRecord, spawnID string) {
+	threadID, runnerID, exact := m.orbLaunchIdentity(record, spawnID)
+	if !exact {
+		return
+	}
+	watcherStarted := false
+	defer func() {
+		if !watcherStarted && a != nil {
+			a.clearWebLocalExecutorReservation(spawnID, runnerID)
+		}
+	}()
 	m.mu.Lock()
 	blocked := record == nil || record.lifecycleV1 || record.recovered
 	m.mu.Unlock()
@@ -3216,7 +3733,6 @@ func (m *neoOrbManager) resumeOrb(ctx context.Context, a *neoActor, record *neoO
 	}
 	defer operationMu.Unlock()
 	cfg := m.runtime.configSnapshot()
-	threadID := record.threadID
 	client, err := m.dockerClient(cfg)
 	if err != nil {
 		m.setState(record, neoOrbStateFailed, err.Error())
@@ -3284,7 +3800,7 @@ func (m *neoOrbManager) resumeOrb(ctx context.Context, a *neoActor, record *neoO
 	reasoningEffort := a.reasoningEffortForModeLocked(agentMode)
 	a.mu.Unlock()
 	env := neoOrbExecutorEnvWithCredentials(cfg, threadID, record.workDir, record.portalToken, credentialSelection.suppressSharedGitHub())
-	args := neoHeadlessExecutorArgs(threadID, agentMode, reasoningEffort, neoOrbExecutorLog)
+	args := neoHeadlessExecutorArgs(threadID, agentMode, reasoningEffort, neoOrbExecutorLog, runnerID)
 	resumeScript := fmt.Sprintf("if [ -x .agents/resume ]; then mkdir -p /home/user/.cache/amp/logs && timeout %d .agents/resume > /home/user/.cache/amp/logs/resume.log 2>&1 || true; fi", neoOrbResumeHookSeconds)
 	_, _ = client.Exec(resumeCtx, record.containerID, []string{"/bin/sh", "-lc", resumeScript}, nil, record.workDir)
 	if err := client.ExecDetached(resumeCtx, record.containerID, neoOrbHeadlessCommand(args), env, record.workDir); err != nil {
@@ -3294,7 +3810,11 @@ func (m *neoOrbManager) resumeOrb(ctx context.Context, a *neoActor, record *neoO
 	}
 	m.setState(record, neoOrbStateRunning, "")
 	a.broadcastExecutorStatus(spawnID, "running", "Waiting for the orb executor to reconnect.", map[string]any{"reasonCode": "waiting_for_executor_connect", "threadId": threadID})
-	m.startWorker(func(ctx context.Context) { m.watchOrbConnect(ctx, a, record, spawnID, neoExecutorConnectTimeout(cfg)) })
+	watcherStarted = m.startWorker(func(ctx context.Context) { m.watchOrbConnect(ctx, a, record, spawnID, neoExecutorConnectTimeout(cfg)) })
+	if !watcherStarted {
+		m.setState(record, neoOrbStateFailed, "orb executor watcher could not start")
+		a.broadcastExecutorStatus(spawnID, "failed", "Cannot monitor the orb executor while the runtime is stopping.", map[string]any{"reasonCode": "spawn_failed", "threadId": threadID})
+	}
 }
 
 func (m *neoOrbManager) prepareRecoveredOrb(ctx context.Context, cfg *config.Config, client neoOrbProviderClient, record *neoOrbRecord) error {
@@ -3338,13 +3858,16 @@ done
 
 func (m *neoOrbManager) replaceFailedOrb(ctx context.Context, a *neoActor, record *neoOrbRecord, spawnID string) {
 	m.mu.Lock()
-	blocked := record == nil || record.lifecycleV1 || record.recovered
+	threadID := ""
+	if record != nil {
+		threadID = record.threadID
+	}
+	blocked := record == nil || m.stopped || record.lifecycleV1 || record.recovered || m.orbs[threadID] != record || record.state != neoOrbStateProvisioning || record.spawnID != spawnID
 	m.mu.Unlock()
 	if blocked {
 		return
 	}
 	cfg := m.runtime.configSnapshot()
-	threadID := record.threadID
 	client, err := m.dockerClient(cfg)
 	if err != nil {
 		m.setState(record, neoOrbStateFailed, err.Error())
@@ -3368,13 +3891,35 @@ func (m *neoOrbManager) reprovisionOrb(ctx context.Context, a *neoActor, record 
 		m.mu.Unlock()
 		return
 	}
+	portalToken := neoOrbNewPortalToken()
+	runnerID := neoOrbRunnerID(record.threadID, portalToken)
+	operationMu := record.operationMu
+	if operationMu == nil {
+		operationMu = &sync.Mutex{}
+	}
 	replacement := &neoOrbRecord{
 		threadID:      record.threadID,
+		runnerID:      runnerID,
+		spawnID:       spawnID,
+		webLocal:      record.webLocal,
 		state:         neoOrbStateProvisioning,
 		workDir:       firstNonEmptyString(record.workDir, neoOrbWorkDir),
 		repositoryURL: record.repositoryURL,
-		portalToken:   neoOrbNewPortalToken(),
-		operationMu:   record.operationMu,
+		portalToken:   portalToken,
+		operationMu:   operationMu,
+	}
+	if replacement.webLocal {
+		a.mu.Lock()
+		a.clearWebLocalExecutorReservationExactLocked(record.spawnID, record.runnerID)
+		reserved := a.reserveWebLocalExecutorLocked(spawnID, runnerID)
+		a.mu.Unlock()
+		if !reserved {
+			record.state = neoOrbStateFailed
+			record.failReason = "orb publication reservation changed"
+			m.mu.Unlock()
+			a.broadcastExecutorStatus(spawnID, "failed", "Cannot reserve the replacement orb executor publication.", map[string]any{"reasonCode": "spawn_failed", "threadId": record.threadID})
+			return
+		}
 	}
 	m.orbs[record.threadID] = replacement
 	m.mu.Unlock()
@@ -3392,6 +3937,13 @@ func neoOrbHeadlessCommand(args []string) []string {
 }
 
 func (m *neoOrbManager) watchOrbConnect(ctx context.Context, a *neoActor, record *neoOrbRecord, spawnID string, timeout time.Duration) {
+	if a == nil || record == nil {
+		return
+	}
+	m.mu.Lock()
+	runnerID := record.runnerID
+	m.mu.Unlock()
+	defer a.clearWebLocalExecutorReservation(spawnID, runnerID)
 	if timeout <= 0 {
 		timeout = 60 * time.Second
 	}
@@ -3400,13 +3952,14 @@ func (m *neoOrbManager) watchOrbConnect(ctx context.Context, a *neoActor, record
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		a.mu.Lock()
-		ready := a.executorReady || a.executorBootstrapComplete || a.executorID != ""
-		a.mu.Unlock()
-		if ready {
+		ready := a.executorConnectedForRunner(runnerID)
+		m.mu.Lock()
+		exact := !m.stopped && m.orbs[record.threadID] == record && record.spawnID == spawnID && record.runnerID == runnerID
+		m.mu.Unlock()
+		if !exact {
 			return
 		}
-		if m.live(record.threadID) != record {
+		if ready {
 			return
 		}
 		select {
@@ -3419,17 +3972,21 @@ func (m *neoOrbManager) watchOrbConnect(ctx context.Context, a *neoActor, record
 	}
 
 timedOut:
-	if m.live(record.threadID) != record {
-		return
-	}
 	m.mu.Lock()
-	stillRunning := record.state == neoOrbStateRunning
+	failed := !m.stopped && m.orbs[record.threadID] == record && record.spawnID == spawnID && record.runnerID == runnerID && record.state == neoOrbStateRunning
+	if failed {
+		record.state = neoOrbStateFailed
+		record.failReason = "orb executor did not connect in time"
+		record.runnerMigrationRequired = true
+		record.runnerMigrationFencing = false
+		record.portalIP = ""
+		record.portalIPAt = time.Time{}
+	}
 	m.mu.Unlock()
-	if !stillRunning {
+	if !failed {
 		return
 	}
-	m.setState(record, neoOrbStateFailed, "orb executor did not connect in time")
-	a.broadcastExecutorStatus(spawnID, "failed", "Orb executor did not connect in time.", map[string]any{"reasonCode": "spawn_failed", "threadId": record.threadID})
+	a.broadcastExecutorStatus(spawnID, "failed", "Cannot provision an orb: orb executor did not connect in time.", map[string]any{"reasonCode": "spawn_failed", "threadId": record.threadID})
 }
 
 func (m *neoOrbManager) portalAddress(ctx context.Context, cfg *config.Config, threadID string) (string, error) {
