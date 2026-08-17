@@ -88,6 +88,22 @@ func TestHealthz(t *testing.T) {
 	})
 }
 
+func TestRootLandingResponse(t *testing.T) {
+	server := newTestServer(t)
+	request := httptest.NewRequest(http.MethodGet, "/", nil)
+	recorder := httptest.NewRecorder()
+	server.engine.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("root status = %d body=%q", recorder.Code, recorder.Body.String())
+	}
+	if contentType := recorder.Header().Get("Content-Type"); !strings.HasPrefix(contentType, "text/plain") {
+		t.Fatalf("root Content-Type = %q", contentType)
+	}
+	if body := recorder.Body.String(); body != "what's up, stranger? nothing to see here." {
+		t.Fatalf("root body = %q", body)
+	}
+}
+
 func TestCORSMiddlewareAnswersGeneralPreflight(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
