@@ -5003,7 +5003,7 @@ func TestNeoOrbConnectTimeoutPublishesRestartableTerminalFailure(t *testing.T) {
 	assertNeoOrbNoProviderMutation(t, fixture.fake)
 }
 
-func TestNeoOrbTimedOutLifecycleRestartIsSingleFlightAndReusesGeneration(t *testing.T) {
+func TestNeoOrbTimedOutWebLifecycleReopenIsSingleFlightAndReusesGeneration(t *testing.T) {
 	fixture := newNeoOrbLifecycleAdmissionFixture(t, neoOrbLifecycleActivationActionable)
 	originalRecord := fixture.record
 	originalGeneration := *fixture.record.activeGeneration
@@ -5013,8 +5013,35 @@ func TestNeoOrbTimedOutLifecycleRestartIsSingleFlightAndReusesGeneration(t *test
 	fixture.manager.mu.Lock()
 	fixture.record.spawnID = "orb-connect-timeout"
 	fixture.record.runnerID = expectedRunnerID
+	fixture.record.webLocal = true
 	fixture.manager.mu.Unlock()
+	fixture.actor.mu.Lock()
+	fixture.actor.agentState = "idle"
+	fixture.actor.queue = []neoQueuedMessage{{MessageID: "M-orb-connect-timeout", Content: []any{map[string]any{"type": "text", "text": "resume timed out orb"}}}}
+	fixture.actor.mu.Unlock()
+	if !fixture.actor.reserveWebLocalExecutor("orb-connect-timeout", expectedRunnerID) {
+		t.Fatal("initial orb publication reservation was rejected")
+	}
+	reservationClearedBeforeFailure := false
+	timeoutSocket := &neoSocket{webLocalObserver: true, writeMessage: func(_ int, data []byte) error {
+		var message map[string]any
+		if err := json.Unmarshal(data, &message); err != nil {
+			return err
+		}
+		if stringValue(message["type"]) == "executor_status" && stringValue(message["status"]) == "failed" && stringValue(message["spawnId"]) == "orb-connect-timeout" {
+			fixture.actor.mu.Lock()
+			reservationClearedBeforeFailure = !fixture.actor.webLocalExecutorExpected
+			fixture.actor.mu.Unlock()
+		}
+		return nil
+	}}
+	fixture.actor.mu.Lock()
+	fixture.actor.sockets[timeoutSocket] = struct{}{}
+	fixture.actor.mu.Unlock()
 	fixture.manager.watchOrbConnect(t.Context(), fixture.actor, fixture.record, "orb-connect-timeout", time.Millisecond)
+	if !reservationClearedBeforeFailure {
+		t.Fatal("timed-out orb publication remained reserved while failure was published")
+	}
 
 	staleStopStarted := make(chan struct{})
 	staleStopResume := make(chan struct{})
@@ -5042,39 +5069,50 @@ func TestNeoOrbTimedOutLifecycleRestartIsSingleFlightAndReusesGeneration(t *test
 		}
 	})
 
-	first := fixture.actor.spawnExecutor(map[string]any{"requestId": "restart-timeout-one"})
-	if stringValue(first["status"]) != "starting" {
-		t.Fatalf("first timeout restart = %#v, want starting", first)
+	if !fixture.manager.wakeExistingLifecycleOrb(fixture.actor) {
+		t.Fatal("first web reopen did not reconcile the timed-out lifecycle")
 	}
 	select {
 	case <-staleStopStarted:
 	case <-time.After(2 * time.Second):
-		t.Fatal("timeout restart did not reach stale executor fence")
+		t.Fatal("web reopen did not reach stale executor fence")
 	}
 	fixture.manager.mu.Lock()
 	claimedSpawnID := fixture.record.spawnID
 	workersBeforeDuplicate := fixture.manager.workerCount
 	fixture.manager.mu.Unlock()
-	duplicate := fixture.actor.spawnExecutor(map[string]any{"requestId": "restart-timeout-two"})
+	if claimedSpawnID == "" || claimedSpawnID == "orb-connect-timeout" {
+		t.Fatalf("web reopen spawn ID = %q", claimedSpawnID)
+	}
+	if !fixture.manager.wakeExistingLifecycleOrb(fixture.actor) {
+		t.Fatal("duplicate web reopen did not recognize the existing lifecycle")
+	}
 	fixture.manager.mu.Lock()
 	spawnIDAfterDuplicate := fixture.record.spawnID
 	workersAfterDuplicate := fixture.manager.workerCount
 	fixture.manager.mu.Unlock()
-	if stringValue(duplicate["status"]) != "running" || spawnIDAfterDuplicate != claimedSpawnID || workersAfterDuplicate != workersBeforeDuplicate {
-		t.Fatalf("duplicate timeout restart=%#v spawn=%q want=%q workers=%d want=%d", duplicate, spawnIDAfterDuplicate, claimedSpawnID, workersAfterDuplicate, workersBeforeDuplicate)
+	if spawnIDAfterDuplicate != claimedSpawnID || workersAfterDuplicate != workersBeforeDuplicate {
+		t.Fatalf("duplicate web reopen spawn=%q want=%q workers=%d want=%d", spawnIDAfterDuplicate, claimedSpawnID, workersAfterDuplicate, workersBeforeDuplicate)
 	}
 
 	releaseStaleStop()
 	select {
 	case <-detachedStarted:
 	case <-time.After(2 * time.Second):
-		t.Fatal("timeout restart did not reach detached executor start")
+		t.Fatal("web reopen did not reach detached executor start")
 	}
 	waitNeoOrbState(t, fixture.manager, fixture.record.threadID, neoOrbStateRunning)
 	afterRecord := fixture.manager.live(fixture.record.threadID)
-	afterGeneration := fixture.store.snapshot().Threads[fixture.record.threadID].Active
-	if afterRecord != originalRecord || afterRecord.containerID != originalContainerID || afterRecord.portalToken != originalPortalToken || afterGeneration == nil || *afterGeneration != originalGeneration {
-		t.Fatalf("timeout restart replaced lifecycle record=%p want=%p container=%q want=%q generation=%#v want=%#v", afterRecord, originalRecord, afterRecord.containerID, originalContainerID, afterGeneration, originalGeneration)
+	lifecycle := fixture.store.snapshot().Threads[fixture.record.threadID]
+	if afterRecord != originalRecord || afterRecord.containerID != originalContainerID || afterRecord.portalToken != originalPortalToken || lifecycle.Active == nil || *lifecycle.Active != originalGeneration || lifecycle.Pending != nil || originalGeneration.Generation != 1 || originalGeneration.AuthenticatedOwnerID != neoLocalOwnerUserID {
+		t.Fatalf("web reopen changed lifecycle record=%p want=%p container=%q want=%q lifecycle=%#v generation=%#v", afterRecord, originalRecord, afterRecord.containerID, originalContainerID, lifecycle, originalGeneration)
+	}
+	fixture.actor.mu.Lock()
+	queueCount := len(fixture.actor.queue)
+	messageCount := len(fixture.actor.messages)
+	fixture.actor.mu.Unlock()
+	if queueCount != 1 || messageCount != 0 {
+		t.Fatalf("web reopen changed queued/committed messages = %d/%d, want 1/0", queueCount, messageCount)
 	}
 	staleStopPrefix := "exec:/bin/sh -lc set -eu\npkill -TERM -f '[a]mp .*--headless='"
 	if fixture.fake.callCount(staleStopPrefix) != 1 ||
@@ -5082,11 +5120,11 @@ func TestNeoOrbTimedOutLifecycleRestartIsSingleFlightAndReusesGeneration(t *test
 		fixture.fake.callCount("unpause:"+originalContainerID) != 1 ||
 		fixture.fake.callCount("exec:"+neoOrbServiceHelperPath+" reconcile") != 1 ||
 		fixture.fake.callCount("exec-detached:/usr/bin/flock -n /run/cliproxy-amp-executor.lock /usr/local/bin/amp") != 1 {
-		t.Fatalf("timeout restart did not reconcile exactly once: %#v", fixture.fake.calls)
+		t.Fatalf("web reopen did not reconcile exactly once: %#v", fixture.fake.calls)
 	}
-	for _, forbidden := range []string{"create:", "create-volume:", "remove:", "remove-volume:"} {
+	for _, forbidden := range []string{"create:", "create-volume:", "start:", "remove:", "remove-volume:"} {
 		if fixture.fake.callCount(forbidden) != 0 {
-			t.Fatalf("timeout restart invoked forbidden provider call %q: %#v", forbidden, fixture.fake.calls)
+			t.Fatalf("web reopen invoked forbidden provider call %q: %#v", forbidden, fixture.fake.calls)
 		}
 	}
 }

@@ -4005,6 +4005,7 @@ timedOut:
 	if !failed {
 		return
 	}
+	a.clearWebLocalExecutorReservation(spawnID, runnerID)
 	a.broadcastExecutorStatus(spawnID, "failed", "Cannot provision an orb: orb executor did not connect in time.", map[string]any{"reasonCode": "spawn_failed", "threadId": record.threadID})
 }
 

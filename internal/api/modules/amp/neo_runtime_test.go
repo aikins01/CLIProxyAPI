@@ -18719,6 +18719,157 @@ func TestNeoLocalBrokerHeartbeatKeepsNonConflictingWorkspacesAvailable(t *testin
 	}
 }
 
+func TestNeoLocalBrokerHeartbeatRecoversAssignedRunnerWithoutEnvironment(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoRuntime(&config.Config{})
+	ownerID := "user-broker-assigned-recovery"
+	userActor, _, allowed := rt.store.upsertForOwner(map[string]any{"name": "userActor", "key": ownerID}, true, ownerID)
+	if !allowed || userActor == nil {
+		t.Fatal("owner user actor was not created")
+	}
+	workingDirectory := t.TempDir()
+	otherDirectory := t.TempDir()
+	stockSocket := &neoSocket{runnerID: "stock-runner-assigned-recovery"}
+	registered := mapValue(userActor.handleForSocket(stockSocket, map[string]any{
+		"type": "registerRunner",
+		"args": []any{map[string]any{
+			"sessionId":        "stock-session-assigned-recovery",
+			"workingDirectory": workingDirectory,
+			"runningThreads":   []any{},
+		}},
+	}))
+	if registered["ok"] != true {
+		t.Fatalf("stock runner registration = %#v", registered)
+	}
+
+	const targetRunnerID = "broker-runner-assigned-recovery"
+	const unrelatedRunnerID = "broker-runner-unrelated-recovery"
+	targetThreadID := "T-019f4000-0000-4000-8000-000000000041"
+	unrelatedThreadID := "T-019f4000-0000-4000-8000-000000000042"
+	ambiguousThreadID := "T-019f4000-0000-4000-8000-000000000043"
+	foreignThreadID := "T-019f4000-0000-4000-8000-000000000044"
+	newPendingActor := func(threadID, actorOwnerID, runnerID string) *neoActor {
+		actor := rt.store.ensureThreadActor(threadID)
+		actor.mu.Lock()
+		actor.bootstrapExecutorType = "local-client"
+		actor.agentState = "idle"
+		actor.meta["ownerUserId"] = actorOwnerID
+		if runnerID != "" {
+			actor.meta["runnerId"] = runnerID
+		}
+		actor.environment = nil
+		actor.queue = []neoQueuedMessage{{
+			MessageID: "M-" + strings.TrimPrefix(threadID, "T-"),
+			Content:   []any{map[string]any{"type": "text", "text": "resume pending work"}},
+		}}
+		actor.mu.Unlock()
+		return actor
+	}
+	targetActor := newPendingActor(targetThreadID, ownerID, targetRunnerID)
+	unrelatedActor := newPendingActor(unrelatedThreadID, ownerID, "broker-runner-missing-recovery")
+	ambiguousActor := newPendingActor(ambiguousThreadID, ownerID, "")
+	foreignActor := newPendingActor(foreignThreadID, "user-broker-assigned-recovery-foreign", targetRunnerID)
+	emptyTargetThreads := []string{}
+	emptyUnrelatedThreads := []string{}
+	brokerRunners := []neoLocalBrokerHeartbeatRunner{
+		{RunnerID: targetRunnerID, WorkingDirectory: workingDirectory, RunningThreads: &emptyTargetThreads},
+		{RunnerID: unrelatedRunnerID, WorkingDirectory: otherDirectory, RunningThreads: &emptyUnrelatedThreads},
+	}
+	heartbeat := neoLocalBrokerHeartbeatRequest{
+		BrokerID:          "broker-assigned-recovery",
+		SessionID:         "broker-session-assigned-recovery",
+		SessionGeneration: 1,
+		Hostname:          "Test Host",
+		PID:               1234,
+		Runners:           &brokerRunners,
+	}
+
+	result, err := userActor.syncLocalBrokerHeartbeatResult(heartbeat)
+	if err != nil {
+		t.Fatalf("conflicting heartbeat: %v", err)
+	}
+	if len(result.Runners) != 1 || result.Runners[0].runnerID != unrelatedRunnerID {
+		t.Fatalf("accepted runners = %#v, want only unrelated runner", result.Runners)
+	}
+	if len(result.Rejected) != 1 || result.Rejected[0].RunnerID != targetRunnerID || result.Rejected[0].Code != "working_directory_conflict" {
+		t.Fatalf("rejected runners = %#v, want target workspace conflict", result.Rejected)
+	}
+	rt.store.resumePendingWebLocalThreadsForBrokerRunners(ownerID, result.Runners)
+	if desired, ok := neoUserRunnerIntentForTest(userActor, unrelatedRunnerID, targetThreadID); ok {
+		t.Fatalf("unrelated runner received target intent %q", desired)
+	}
+
+	userActor.mu.Lock()
+	stockRunner := userActor.userRunners[stockSocket.runnerID]
+	stockRunner.updatedAt = time.Now().Add(-neoLocalBrokerHeartbeatTTL - time.Second)
+	userActor.userRunners[stockSocket.runnerID] = stockRunner
+	userActor.mu.Unlock()
+	result, err = userActor.syncLocalBrokerHeartbeatResult(heartbeat)
+	if err != nil {
+		t.Fatalf("heartbeat after workspace conflict expiry: %v", err)
+	}
+	if len(result.Runners) != 2 || len(result.Rejected) != 0 {
+		t.Fatalf("heartbeat after conflict expiry accepted=%#v rejected=%#v", result.Runners, result.Rejected)
+	}
+	rt.store.resumePendingWebLocalThreadsForBrokerRunners(ownerID, result.Runners)
+	targetActor.mu.Lock()
+	queueCount := len(targetActor.queue)
+	messageCount := len(targetActor.messages)
+	spawnedCount := len(targetActor.spawnedExecutors)
+	reservationExpected := targetActor.webLocalExecutorExpected
+	reservedSpawnID := targetActor.webLocalExpectedSpawnID
+	reservedRunnerID := targetActor.webLocalExpectedRunnerID
+	targetActor.mu.Unlock()
+	if queueCount != 1 || messageCount != 0 {
+		t.Fatalf("target work queue/messages = %d/%d, want 1/0", queueCount, messageCount)
+	}
+	wantPublicationRunnerID := userActor.currentLocalBrokerPublication(targetRunnerID, targetThreadID)
+	if !reservationExpected || reservedSpawnID == "" || wantPublicationRunnerID == "" || reservedRunnerID != wantPublicationRunnerID {
+		t.Fatalf("target reservation=%v spawn=%q runner=%q, want runner %q", reservationExpected, reservedSpawnID, reservedRunnerID, wantPublicationRunnerID)
+	}
+	if spawnedCount != 0 {
+		t.Fatalf("target recovery spawned %d proxy executors", spawnedCount)
+	}
+
+	rt.store.resumePendingWebLocalThreadsForBrokerRunners(ownerID, result.Runners)
+	snapshot, ok := userActor.localBrokerHeartbeatSnapshot(heartbeat, result.Runners)
+	if !ok {
+		t.Fatal("broker intent snapshot is unavailable")
+	}
+	runningIntents := 0
+	for _, runner := range snapshot.Runners {
+		for _, rawIntent := range runner.Intents {
+			intent := mapValue(rawIntent)
+			if stringValue(intent["desired"]) == "running" {
+				runningIntents++
+				if runner.RunnerID != targetRunnerID || stringValue(intent["threadId"]) != targetThreadID {
+					t.Fatalf("unexpected running intent runner=%q intent=%#v", runner.RunnerID, intent)
+				}
+			}
+		}
+	}
+	if runningIntents != 1 {
+		t.Fatalf("broker running intents = %d, want exactly one: %#v", runningIntents, snapshot.Runners)
+	}
+	targetActor.mu.Lock()
+	reservationStable := targetActor.webLocalExpectedSpawnID == reservedSpawnID && targetActor.webLocalExpectedRunnerID == reservedRunnerID
+	targetActor.mu.Unlock()
+	if !reservationStable {
+		t.Fatal("repeated heartbeat reconciliation replaced the target reservation")
+	}
+	for _, actor := range []*neoActor{unrelatedActor, ambiguousActor, foreignActor} {
+		actor.mu.Lock()
+		queueCount := len(actor.queue)
+		messageCount := len(actor.messages)
+		spawnedCount := len(actor.spawnedExecutors)
+		reserved := actor.webLocalExecutorExpected
+		actor.mu.Unlock()
+		if queueCount != 1 || messageCount != 0 || spawnedCount != 0 || reserved {
+			t.Fatalf("unmatched actor %s changed queue=%d messages=%d spawned=%d reserved=%v", actor.threadID, queueCount, messageCount, spawnedCount, reserved)
+		}
+	}
+}
+
 func TestNeoLocalBrokerHeartbeatSessionReplacementAndOmission(t *testing.T) {
 	useTempNeoThreadStore(t)
 	rt := newNeoRuntime(&config.Config{})
