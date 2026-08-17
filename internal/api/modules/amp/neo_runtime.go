@@ -3822,20 +3822,27 @@ func (s *neoActorStore) resumePendingWebLocalThreadsForBrokerRunners(ownerID str
 	if s == nil || len(runners) == 0 {
 		return
 	}
+	runnerIDs := make(map[string]bool, len(runners))
 	workspaces := make(map[string]bool, len(runners))
 	for _, runner := range runners {
-		if runner.brokerID != "" && runner.workingDirectory != "" {
+		if runner.brokerID == "" {
+			continue
+		}
+		if runner.runnerID != "" {
+			runnerIDs[runner.runnerID] = true
+		}
+		if runner.workingDirectory != "" {
 			workspaces[runner.workingDirectory] = true
 		}
 	}
-	if len(workspaces) == 0 {
+	if len(runnerIDs) == 0 && len(workspaces) == 0 {
 		return
 	}
 	for _, actor := range s.threadActors(0) {
 		if actor.threadToolOwnerID() != ownerID {
 			continue
 		}
-		_, _, pending := actor.pendingWebLocalExecutorRequest()
+		runnerID, _, pending := actor.pendingWebLocalExecutorRequest()
 		if !pending {
 			continue
 		}
@@ -3843,7 +3850,7 @@ func (s *neoActorStore) resumePendingWebLocalThreadsForBrokerRunners(ownerID str
 		workingDirectory, _ := neoResolvedEnvironmentWorkspacePaths(actor.environment)
 		actor.mu.Unlock()
 		workingDirectory = neoUserExecutorRunnerWorkingDirectory(workingDirectory)
-		if workspaces[workingDirectory] {
+		if runnerIDs[runnerID] || workspaces[workingDirectory] {
 			actor.maybeSpawnWebLocalExecutorForPendingWork()
 		}
 	}
