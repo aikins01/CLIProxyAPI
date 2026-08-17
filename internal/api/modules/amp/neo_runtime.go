@@ -2573,6 +2573,10 @@ func neoApplyWebLocalInferenceBootstrapQuery(r *http.Request, actor *neoActor) s
 	agentMode := strings.ToLower(strings.TrimSpace(query.Get("cliproxy-agent-mode")))
 	agentModeRequested := agentMode != ""
 	reasoningEffort := strings.ToLower(strings.TrimSpace(query.Get("cliproxy-reasoning-effort")))
+	bindingSelectionRequested := strings.TrimSpace(query.Get("cliproxy-working-directory")) != "" ||
+		strings.TrimSpace(query.Get("cliproxy-project-id")) != "" || strings.TrimSpace(query.Get("cliproxy-project-name")) != "" ||
+		strings.TrimSpace(query.Get("cliproxy-project-namespace")) != "" || strings.TrimSpace(query.Get("cliproxy-repository-url")) != "" ||
+		strings.TrimSpace(query.Get("cliproxy-runner-id")) != ""
 	var pluginMode *neoPluginAgentMode
 	var customAgentDefinition neoCustomAgentDefinition
 	actor.mu.Lock()
@@ -2613,7 +2617,15 @@ func neoApplyWebLocalInferenceBootstrapQuery(r *http.Request, actor *neoActor) s
 			ownerUserID = firstNonEmptyString(ownerUserID, neoLocalOwnerUserID)
 		}
 	}
+	bindingSelectionOwnerID := ""
+	if bindingSelectionRequested {
+		if resolvedOwnerID, resolved := actor.runtime.neoActorRequestOwner(r); resolved {
+			bindingSelectionOwnerID = firstNonEmptyString(resolvedOwnerID, neoLocalOwnerUserID)
+		}
+	}
 	bindingChanged := false
+	runnerIntentOwnerID := ""
+	runnerIntentToStop := ""
 	explicitErrorReason := ""
 	for {
 		actor.mu.Lock()
@@ -2621,7 +2633,33 @@ func neoApplyWebLocalInferenceBootstrapQuery(r *http.Request, actor *neoActor) s
 		currentMeta := cloneNeoJSONMap(actor.meta)
 		currentBindingMeta := neoWebLocalBindingRelevantMeta(actor.meta)
 		currentRelationships := neoCloneRelationships(actor.relationships)
+		currentExecutorType := strings.ToLower(strings.TrimSpace(firstNonEmptyString(actor.bootstrapExecutorType, actor.meta["executorType"])))
 		actor.mu.Unlock()
+		if bindingSelectionRequested && currentExecutorType != "" && currentExecutorType != "local-client" {
+			actor.mu.Lock()
+			if currentExecutorType != strings.ToLower(strings.TrimSpace(firstNonEmptyString(actor.bootstrapExecutorType, actor.meta["executorType"]))) {
+				actor.mu.Unlock()
+				continue
+			}
+			bindingOwnerID, ownerOK := neoWebLocalConsistentBindingOwner(actor.meta)
+			if !ownerOK || bindingSelectionOwnerID == "" || bindingOwnerID != bindingSelectionOwnerID {
+				explicitErrorReason = "workspace_selection_required"
+				break
+			}
+			runnerIntentOwnerID = bindingOwnerID
+			runnerIntentToStop = strings.TrimSpace(firstNonEmptyString(actor.meta["runnerId"], actor.meta["runnerID"], actor.meta["runner_id"]))
+			publicationRunnerID := actor.runtime.store.currentLocalBrokerPublicationForOwner(bindingOwnerID, runnerIntentToStop, threadID)
+			if publicationRunnerID != "" && actor.webLocalExecutorExpected && actor.webLocalExpectedRunnerID == publicationRunnerID {
+				actor.clearWebLocalExecutorReservationLocked()
+			}
+			for _, key := range []string{"runnerId", "runnerID", "runner_id"} {
+				if _, ok := actor.meta[key]; ok {
+					delete(actor.meta, key)
+					bindingChanged = true
+				}
+			}
+			break
+		}
 
 		persistedThread := map[string]any(nil)
 		if !sandbox && actor.runtime != nil && actor.runtime.localThreadSnapshotsEnabled() {
@@ -2631,7 +2669,7 @@ func neoApplyWebLocalInferenceBootstrapQuery(r *http.Request, actor *neoActor) s
 		}
 		binding, explicitAttempted, resolvedExplicitErrorReason := neoWebLocalThreadBinding{}, false, ""
 		if !sandbox {
-			binding, explicitAttempted, resolvedExplicitErrorReason = actor.runtime.neoWebLocalExplicitThreadBinding(ownerUserID, query, currentEnvironment)
+			binding, explicitAttempted, resolvedExplicitErrorReason = actor.runtime.neoWebLocalExplicitThreadBinding(ownerUserID, query, currentEnvironment, currentMeta)
 		}
 		if ownerErrorReason != "" {
 			resolvedExplicitErrorReason = ownerErrorReason
@@ -2766,6 +2804,9 @@ func neoApplyWebLocalInferenceBootstrapQuery(r *http.Request, actor *neoActor) s
 		actor.bootstrapExecutorType = firstNonEmptyString(actor.meta["executorType"], "local-client")
 	}
 	actor.mu.Unlock()
+	if runnerIntentOwnerID != "" && runnerIntentToStop != "" {
+		actor.runtime.store.stopUserExecutorRunnerThreadForOwner(runnerIntentOwnerID, runnerIntentToStop, threadID)
+	}
 	if settingsChanged || bindingChanged {
 		actor.syncCloudAsync()
 	}
@@ -2791,7 +2832,7 @@ type neoWebLocalThreadBinding struct {
 	revision         uint64
 }
 
-func (rt *neoRuntime) neoWebLocalExplicitThreadBinding(ownerUserID string, query url.Values, environment map[string]any) (neoWebLocalThreadBinding, bool, string) {
+func (rt *neoRuntime) neoWebLocalExplicitThreadBinding(ownerUserID string, query url.Values, environment, currentMeta map[string]any) (neoWebLocalThreadBinding, bool, string) {
 	if rt == nil {
 		return neoWebLocalThreadBinding{}, false, ""
 	}
@@ -2814,6 +2855,35 @@ func (rt *neoRuntime) neoWebLocalExplicitThreadBinding(ownerUserID string, query
 		runner := rt.store.userExecutorRunnerForOwner(ownerUserID, stringValue(meta["runnerId"]))
 		workingDirectory = neoUserExecutorRunnerWorkingDirectory(runner["workingDirectory"])
 	}
+	currentWorkingDirectory, _ := neoResolvedEnvironmentWorkspacePaths(environment)
+	currentWorkingDirectory = neoUserExecutorRunnerWorkingDirectory(currentWorkingDirectory)
+	currentProjectIdentity := neoWebLocalThreadBinding{
+		projectID:     strings.TrimSpace(firstNonEmptyString(currentMeta["projectID"], currentMeta["projectId"], currentMeta["project_id"])),
+		projectName:   strings.TrimSpace(firstNonEmptyString(currentMeta["projectName"], currentMeta["repositoryName"])),
+		namespace:     strings.TrimSpace(firstNonEmptyString(currentMeta["namespace"], currentMeta["projectNamespace"])),
+		repositoryURL: strings.TrimSpace(firstNonEmptyString(currentMeta["repositoryURL"], currentMeta["repositoryUrl"], currentMeta["repoURL"])),
+		revision:      neoWebLocalBindingRevision(currentMeta),
+	}
+	projectIdentityRequested := firstNonEmptyString(meta["projectID"], meta["projectName"], meta["namespace"], meta["repositoryURL"]) != ""
+	preserveCurrentProjectIdentity := false
+	if stringValue(meta["runnerId"]) == "" && (!projectIdentityRequested || neoWebLocalExplicitBindingMatches(query, currentProjectIdentity)) &&
+		workingDirectory != "" && neoFinderPathEqual(workingDirectory, currentWorkingDirectory) && neoMapHasLocalNeoMarker(currentMeta) && neoWebLocalBindingMetaOwnedBy(currentMeta, ownerUserID) {
+		currentRepositoryURL := currentProjectIdentity.repositoryURL
+		currentRunnerID := strings.TrimSpace(firstNonEmptyString(currentMeta["runnerId"], currentMeta["runnerID"], currentMeta["runner_id"]))
+		runner := rt.store.userExecutorRunnerForOwner(ownerUserID, currentRunnerID)
+		if strings.TrimSpace(stringValue(runner["brokerId"])) == "" {
+			runner = rt.store.userExecutorRunnerForWorkspaceForOwner(ownerUserID, currentWorkingDirectory, currentRepositoryURL)
+		}
+		runnerWorkingDirectory := neoUserExecutorRunnerWorkingDirectory(runner["workingDirectory"])
+		runnerRepositoryURL := strings.TrimSpace(firstNonEmptyString(runner["repositoryURL"], runner["repoURL"]))
+		if runnerWorkingDirectory != "" && neoWebLocalBindingRepositorySelectorMatches(currentRepositoryURL, runnerRepositoryURL) {
+			workingDirectory = runnerWorkingDirectory
+			runnerID := strings.TrimSpace(stringValue(runner["runnerId"]))
+			meta["runnerId"] = runnerID
+			meta["repositoryURL"] = runnerRepositoryURL
+			preserveCurrentProjectIdentity = projectIdentityRequested && runnerID == currentRunnerID && neoFinderPathEqual(runnerWorkingDirectory, currentWorkingDirectory) && neoWebLocalCompleteTrustedBinding(currentMeta)
+		}
+	}
 	candidate := cloneNeoJSONMap(environment)
 	if path := neoUserExecutorRunnerWorkingDirectory(workingDirectory); path != "" {
 		candidate = neoWebLocalEnvironmentWithWorkspacePaths(candidate, path, path)
@@ -2824,6 +2894,12 @@ func (rt *neoRuntime) neoWebLocalExplicitThreadBinding(ownerUserID string, query
 	binding, ok := rt.neoWebLocalThreadBindingFromState(ownerUserID, candidate, meta)
 	if !ok {
 		return neoWebLocalThreadBinding{}, true, "workspace_selection_required"
+	}
+	if preserveCurrentProjectIdentity {
+		binding.projectID = currentProjectIdentity.projectID
+		binding.projectName = currentProjectIdentity.projectName
+		binding.namespace = currentProjectIdentity.namespace
+		binding.revision = currentProjectIdentity.revision
 	}
 	if repositoryURL := stringValue(meta["repositoryURL"]); repositoryURL != "" && !neoWebLocalBindingRepositoriesEqual(binding.repositoryURL, repositoryURL) {
 		return neoWebLocalThreadBinding{}, true, "workspace_selection_required"
@@ -3683,7 +3759,7 @@ func (s *neoActorStore) userExecutorRunnerForWorkspaceForOwner(ownerID, workingD
 		var match map[string]any
 		for _, rawRunner := range runners {
 			runner := mapValue(rawRunner)
-			if strings.TrimSpace(stringValue(runner["runnerId"])) == "" || !matches(runner) {
+			if strings.TrimSpace(stringValue(runner["runnerId"])) == "" || strings.TrimSpace(stringValue(runner["brokerId"])) == "" || !matches(runner) {
 				continue
 			}
 			if match != nil {
@@ -9854,11 +9930,31 @@ func (a *neoActor) bindSingleLegacyWebLocalRunner(threadID, spawnID string) (str
 	if projectName == "" && repositoryURL == "" {
 		return "", false
 	}
-	runners := a.runtime.store.userExecutorRunnersForOwner(ownerID)
-	if len(runners) != 1 {
+	storedWorkingDirectory, _ := neoResolvedEnvironmentWorkspacePaths(environment)
+	runner := a.runtime.store.userExecutorRunnerForWorkspaceForOwner(ownerID, storedWorkingDirectory, repositoryURL)
+	if len(runner) == 0 && repositoryURL == "" && projectName != "" {
+		for _, rawRunner := range a.runtime.store.userExecutorRunnersForOwner(ownerID) {
+			candidate := mapValue(rawRunner)
+			candidateWorkingDirectory := neoUserExecutorRunnerWorkingDirectory(candidate["workingDirectory"])
+			if strings.TrimSpace(stringValue(candidate["brokerId"])) == "" || candidateWorkingDirectory == "" || !strings.EqualFold(filepath.Base(candidateWorkingDirectory), projectName) {
+				continue
+			}
+			candidateRepositoryURL := strings.TrimSpace(firstNonEmptyString(candidate["repositoryURL"], candidate["repoURL"]))
+			candidateEnvironment := neoWebLocalEnvironmentWithWorkspacePaths(nil, candidateWorkingDirectory, candidateWorkingDirectory)
+			candidateMeta := map[string]any{"runnerId": strings.TrimSpace(stringValue(candidate["runnerId"])), "repositoryURL": candidateRepositoryURL}
+			candidateBinding, candidateOK := a.runtime.neoWebLocalThreadBindingFromState(ownerID, candidateEnvironment, candidateMeta)
+			if !candidateOK || projectName != "" && !strings.EqualFold(candidateBinding.projectName, projectName) || namespace != "" && !strings.EqualFold(candidateBinding.namespace, namespace) || projectID != "" && candidateBinding.projectID != projectID {
+				continue
+			}
+			if len(runner) != 0 {
+				return "", true
+			}
+			runner = candidate
+		}
+	}
+	if len(runner) == 0 {
 		return "", true
 	}
-	runner := mapValue(runners[0])
 	workingDirectory := neoUserExecutorRunnerWorkingDirectory(runner["workingDirectory"])
 	runnerRepositoryURL := strings.TrimSpace(firstNonEmptyString(runner["repositoryURL"], runner["repoURL"]))
 	if projectName != "" && (workingDirectory == "" || !strings.EqualFold(filepath.Base(workingDirectory), projectName)) {

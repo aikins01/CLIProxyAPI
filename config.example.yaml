@@ -404,6 +404,10 @@ nonstream-keepalive-interval: 0
 #     #                               # Provisioning installs pinned Node 24.19.0, pnpm
 #     #                               # 11.20.0, Bun 1.3.14, agent-browser 0.33.2, and
 #     #                               # an architecture-appropriate isolated browser.
+#     #                               # A prewarmed image may create
+#     #                               # /opt/cliproxy-orb-browser-smoke/0.33.2-151.0.7922.77
+#     #                               # after a full browser smoke test; each container
+#     #                               # consumes it once before later recovery probes.
 #     #                               # For reproducible provisioning pin a digest, e.g.
 #     #                               # debian:12-slim@sha256:<digest>
 #     # executor-command: ""          # override Amp CLI binary for the orb: an https

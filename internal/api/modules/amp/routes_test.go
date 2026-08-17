@@ -832,7 +832,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 	}
 	for _, want := range []string{
 		"// ==UserScript==",
-		"@version 0.1.232",
+		"@version 0.1.233",
 		"@match https://ampcode.com/*",
 		"@updateURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
 		"@downloadURL http://127.0.0.1:8317/ampcode/local-inference.user.js",
@@ -849,7 +849,7 @@ func TestWebLocalInferenceUserscriptRoute(t *testing.T) {
 		"commandPaletteIntegrationCount",
 		"localThreadPickerOpenCount",
 		"removedLocalThreadControlCount",
-		`const userscriptVersion = "0.1.232"`,
+		`const userscriptVersion = "0.1.233"`,
 		"const legacyLocalProjectUI = false;",
 		"disableLegacyLocalProjectUI",
 		"if (!legacyLocalProjectUI) {",
@@ -1337,8 +1337,8 @@ func TestWebLocalInferenceUserscriptShellPayloadPreservesExecutorType(t *testing
 			throw new Error("shell thread metadata was not preserved: " + JSON.stringify(call));
 		}
 	}
-	if (calls[0].runnerId || calls[0].spawnExecutor !== undefined || calls[1].runnerId || calls[1].spawnExecutor !== false || calls[1].threadMeta.runnerId) {
-		throw new Error("runner intent leaked into shell payload: " + JSON.stringify(calls));
+	if (calls[0].runnerId || calls[0].spawnExecutor !== undefined || calls[1].runnerId !== "local-runner-a" || calls[1].spawnExecutor !== false || calls[1].threadMeta.runnerId) {
+		throw new Error("runner reservation was not isolated from cloud thread metadata: " + JSON.stringify(calls));
 	}
 })().catch((error) => { console.error(error && error.stack ? error.stack : error); process.exit(1); });
 `
@@ -1403,12 +1403,11 @@ func TestWebLocalInferenceUserscriptRequiresExactLiveRunner(t *testing.T) {
 	fetchRunners = [{ runnerId: "local-runner-a", brokerId: "mac-broker", workingDirectory: directory + "/", hostname: "Mac" }];
 	await createLocalThread("hello", directory + "/nested/.././", {}, "local");
 	assert(fetched === 1, "local creation did not force a runner refresh");
-	assert(calls.length === 2, "local creation did not create shell and actor");
-	assert(!calls[0].body.runnerId && !calls[0].body.threadMeta.runnerId, "runner intent leaked into shell request: " + JSON.stringify(calls[0]));
-		assert(calls[0].body.spawnExecutor === false, "shell executor spawn not disabled in " + JSON.stringify(calls[0]));
-		assert(calls[1].body.runnerId === "local-runner-a", "runnerId missing from actor request: " + JSON.stringify(calls[1]));
-		assert(calls[1].body.spawnExecutor === false, "actor executor spawn not disabled in " + JSON.stringify(calls[1]));
-		assert(calls[1].body.threadMeta.runnerId === "local-runner-a", "nested runnerId missing from actor request: " + JSON.stringify(calls[1]));
+	assert(calls.length === 1, "local creation was not atomic");
+	assert(calls[0].body.runnerId === "local-runner-a", "runnerId missing from create request: " + JSON.stringify(calls[0]));
+	assert(!calls[0].body.threadMeta.runnerId, "runnerId leaked into cloud thread metadata: " + JSON.stringify(calls[0]));
+		assert(calls[0].body.spawnExecutor === false, "executor spawn not disabled in " + JSON.stringify(calls[0]));
+		assert(calls[0].body.prompt === "hello", "initial prompt was not created atomically: " + JSON.stringify(calls[0]));
 	assert(calls.every((call) => call.body.workingDirectory === directory), "catalog path did not replace browser path: " + JSON.stringify(calls));
 
 	calls.length = 0;
@@ -1444,7 +1443,7 @@ func TestWebLocalInferenceUserscriptRequiresExactLiveRunner(t *testing.T) {
 	fetched = 0;
 	await createLocalThread("hello", directory, {}, "orb");
 	assert(fetched === 0, "Orb creation unexpectedly fetched a local runner");
-	assert(calls.length === 2 && calls.every((call) => call.body.executorType === "sandbox"), "Orb classification changed: " + JSON.stringify(calls));
+	assert(calls.length === 1 && calls.every((call) => call.body.executorType === "sandbox"), "Orb classification changed: " + JSON.stringify(calls));
 	assert(calls.every((call) => !call.body.runnerId && call.body.spawnExecutor === undefined), "Orb payload gained runner fields: " + JSON.stringify(calls));
 })().catch((error) => { console.error(error && error.stack ? error.stack : error); process.exit(1); });
 `
@@ -3174,7 +3173,7 @@ if (typeof globalThis.btoa !== "function") {
 	require(scriptPath);
 	const bridge = globalThis.__cliproxyAmpLocalInference;
 	const regroupTestBridge = globalThis.__cliproxyAmpLocalInferenceTest;
-assert(bridge && bridge.userscriptVersion === "0.1.232", "bridge userscript version was not exposed");
+assert(bridge && bridge.userscriptVersion === "0.1.233", "bridge userscript version was not exposed");
 	assert(typeof regroupTestBridge?.requestLocalSidebarProjectRegroup === "function", "sidebar regroup test bridge was not exposed");
 	const projectPageTitle = globalThis.document.title;
 	const validProjectHost = new FakeElement("main");
@@ -3191,7 +3190,7 @@ assert(bridge && bridge.userscriptVersion === "0.1.232", "bridge userscript vers
 	assert(!regroupTestBridge.localSidebarProjectMatches(sharedRepositoryCheckout, sharedRepositoryWorktree), "same-repository worktrees matched as one sidebar project");
 	assert(regroupTestBridge.diffCaptureReadThreadID("/api/threads/%E0%A4%A/diff-captures/latest") === "", "malformed diff-capture thread path was not rejected");
 	assert(globalThis.document.documentElement.getAttribute("data-cliproxy-local-sidebar-hydrating") === "1", "sidebar hydration gate was not installed before rendering");
-assert(globalThis.document.documentElement.getAttribute("data-cliproxy-local-inference-version") === "0.1.232", "userscript version was not exposed on the document root");
+assert(globalThis.document.documentElement.getAttribute("data-cliproxy-local-inference-version") === "0.1.233", "userscript version was not exposed on the document root");
 	class InstrumentedWebSocket extends WebSocket {}
 	const instrumentedSocket = new InstrumentedWebSocket("wss://ampcode.com/gateway/userActor/?rvt-method=get&rvt-key=subclass-test");
 	assert(instrumentedSocket instanceof InstrumentedWebSocket, "patched WebSocket discarded a derived constructor prototype");

@@ -512,7 +512,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	return fmt.Sprintf(`// ==UserScript==
 // @name CLIProxyAPI Amp Local Inference
 // @namespace https://github.com/router-for-me/CLIProxyAPI
-// @version 0.1.232
+// @version 0.1.233
 %s
 // @updateURL %s
 // @downloadURL %s
@@ -524,7 +524,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	"use strict";
 
 	const bridgeHeader = %s;
-	const userscriptVersion = "0.1.232";
+	const userscriptVersion = "0.1.233";
 	const legacyLocalProjectUI = false;
 	const apiKeyStorageKey = "cliproxyapi.ampLocalInference.apiKey";
 	const scopedAPIKeyStorageKeyPrefix = apiKeyStorageKey + ".user.";
@@ -6711,7 +6711,6 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 	}
 
 	async function createLocalThread(promptText, workingDirectory, modeOptions, executor) {
-		const headers = localFetchHeaders("application/json");
 		workingDirectory = normalizeWorkingDirectory(workingDirectory) || await ensureDefaultWorkingDirectory(false);
 		let runner = null;
 		if (executor !== "orb") {
@@ -6720,18 +6719,7 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 			workingDirectory = runner.workingDirectory;
 		}
 		const payload = localThreadPayload(promptText, workingDirectory, modeOptions, executor, runner);
-		const shellThreadID = await createRemoteThreadShell(payload);
-		payload.threadId = shellThreadID;
-		payload.threadID = shellThreadID;
-		const response = await originalFetch(localBaseURLString() + "/api/thread-actors/" + encodeURIComponent(shellThreadID), {
-			method: "POST",
-			headers,
-			mode: "cors",
-			credentials: "omit",
-			body: JSON.stringify(payload),
-		});
-		const decoded = await readJSONResponse(response, "local thread response");
-		const threadID = responseThreadID(decoded) || shellThreadID;
+		const threadID = await createRemoteThreadShell(payload);
 		rememberLocalThreadID(threadID);
 		rememberThreadWorkingDirectory(threadID, workingDirectory);
 		rememberThreadSettings(threadID, { agentMode: payload.agentMode, reasoningEffort: payload.reasoningEffort });
@@ -6758,12 +6746,18 @@ func ampWebLocalInferenceUserscript(defaultBaseURL string, allowedOrigins []stri
 		if (typeof localPayload.spawnExecutor === "boolean") {
 			shellPayload.spawnExecutor = localPayload.spawnExecutor;
 		}
+		if (localPayload.runnerId) {
+			shellPayload.runnerId = localPayload.runnerId;
+		}
 		if (localPayload.workingDirectory) {
 			shellPayload.workingDirectory = localPayload.workingDirectory;
 			shellPayload.workspaceRoot = localPayload.workspaceRoot || localPayload.workingDirectory;
 		}
 		if (localPayload.repositoryURL) {
 			shellPayload.repositoryURL = localPayload.repositoryURL;
+		}
+		if (localPayload.prompt) {
+			shellPayload.prompt = localPayload.prompt;
 		}
 		const response = await originalFetch(localBaseURLString() + "/api/thread-actors", {
 			method: "POST",

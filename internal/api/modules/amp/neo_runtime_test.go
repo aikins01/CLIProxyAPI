@@ -7268,6 +7268,277 @@ func TestNeoApplyWebLocalInferenceBootstrapQueryRestoresPersistedRemoteRunnerBin
 	}
 }
 
+func TestNeoApplyWebLocalInferenceBootstrapQueryRepairsCachedServerPathFromOwnedRepositoryRunner(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoWebLocalBindingRuntimeForTest()
+	ownerID := "user-bootstrap-cached-server-path"
+	serverDirectory := "/root"
+	workingDirectory := "/Users/aikins01/Developer/vela/marketmap-dj"
+	repositoryURL := "https://github.com/Vela-Engineering/marketmap-dj.git"
+	runnerID := "runner-marketmap"
+	addNeoWebLocalRunnerForTest(t, rt, ownerID, runnerID, workingDirectory, repositoryURL)
+	addNeoWebLocalRunnerForTest(t, rt, ownerID, "runner-unrelated", "/Users/aikins01/Developer/CLIProxyAPI", "https://github.com/aikins01/CLIProxyAPI.git")
+	threadID := "T-12121212-1212-4121-8121-121212121234"
+	actor := rt.store.ensureThreadActor(threadID)
+	actor.mu.Lock()
+	actor.bootstrapExecutorType = "local-client"
+	actor.environment = neoEnvironmentWithResolvedWorkingDirectory(nil, serverDirectory)
+	actor.meta = neoTrustedWebLocalBindingMetaForTest(ownerID, repositoryURL, "runner-retired")
+	actor.meta["executorType"] = "local-client"
+	actor.meta["projectName"] = "marketmap-dj"
+	actor.meta["namespace"] = "Vela-Engineering"
+	actor.mu.Unlock()
+	req := neoWebLocalBindingRequestForTest(threadID, "&cliproxy-working-directory="+url.QueryEscape(serverDirectory))
+	authenticateNeoWebLocalOwnerForTest(t, rt, req, ownerID)
+
+	if reason := neoApplyWebLocalInferenceBootstrapQuery(req, actor); reason != "" {
+		t.Fatalf("binding reason = %q", reason)
+	}
+	actor.mu.Lock()
+	environment := cloneMap(actor.environment)
+	meta := cloneMap(actor.meta)
+	actor.mu.Unlock()
+	assertNeoWebLocalBindingForTest(t, environment, meta, workingDirectory, repositoryURL, runnerID)
+	if got := stringValue(meta["projectName"]); got != "marketmap-dj" {
+		t.Fatalf("projectName = %q, want marketmap-dj", got)
+	}
+}
+
+func TestNeoApplyWebLocalInferenceBootstrapQueryDoesNotBindSandboxToMatchingRunner(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoWebLocalBindingRuntimeForTest()
+	ownerID := "user-bootstrap-sandbox-path"
+	serverDirectory := "/root"
+	repositoryURL := "https://github.com/example/repo.git"
+	addNeoWebLocalRunnerForTest(t, rt, ownerID, "runner-local", "/Users/aikins01/Developer/repo", repositoryURL)
+	threadID := "T-12121212-1212-4121-8121-121212121236"
+	actor := rt.store.ensureThreadActor(threadID)
+	actor.mu.Lock()
+	actor.bootstrapExecutorType = "sandbox"
+	actor.environment = neoEnvironmentWithResolvedWorkingDirectory(nil, serverDirectory)
+	actor.meta = neoTrustedWebLocalBindingMetaForTest(ownerID, repositoryURL, "runner-local")
+	actor.meta["executorType"] = "sandbox"
+	actor.mu.Unlock()
+	requestResult, publicationRunnerID := rt.store.requestWebLocalExecutorRunnerThreadForOwner(ownerID, "runner-local", threadID, "spawn-sandbox-alias", actor)
+	if requestResult != neoUserExecutorRunnerAccepted || publicationRunnerID == "" {
+		t.Fatalf("sandbox fixture runner intent result=%d publication=%q", requestResult, publicationRunnerID)
+	}
+	req := neoWebLocalBindingRequestForTest(threadID, "&cliproxy-working-directory="+url.QueryEscape(serverDirectory))
+	authenticateNeoWebLocalOwnerForTest(t, rt, req, ownerID)
+
+	if reason := neoApplyWebLocalInferenceBootstrapQuery(req, actor); reason != "" {
+		t.Fatalf("binding reason = %q", reason)
+	}
+	actor.mu.Lock()
+	environment := cloneMap(actor.environment)
+	meta := cloneMap(actor.meta)
+	actor.mu.Unlock()
+	workingDirectory, _ := neoResolvedEnvironmentWorkspacePaths(environment)
+	if got := stringValue(meta["runnerId"]); got != "" {
+		t.Fatalf("sandbox runner binding = %q, want empty", got)
+	}
+	if workingDirectory != serverDirectory {
+		t.Fatalf("sandbox working directory = %q, want %q", workingDirectory, serverDirectory)
+	}
+	actor.mu.Lock()
+	reservationExpected := actor.webLocalExecutorExpected
+	reservedRunnerID := actor.webLocalExpectedRunnerID
+	actor.mu.Unlock()
+	if reservationExpected || reservedRunnerID != "" {
+		t.Fatalf("sandbox runner reservation remains expected=%v runner=%q", reservationExpected, reservedRunnerID)
+	}
+	if desired, ok := neoUserRunnerIntentForTest(rt.store.userActorForOwner(ownerID), "runner-local", threadID); !ok || desired != "stopped" {
+		t.Fatalf("sandbox runner intent desired=%q present=%v, want stopped", desired, ok)
+	}
+}
+
+func TestNeoApplyWebLocalInferenceBootstrapQueryDoesNotClearSandboxBindingForDifferentOwner(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoWebLocalBindingRuntimeForTest()
+	ownerID := "user-bootstrap-sandbox-owner"
+	repositoryURL := "https://github.com/example/repo.git"
+	runnerID := "runner-local-owner"
+	addNeoWebLocalRunnerForTest(t, rt, ownerID, runnerID, "/Users/aikins01/Developer/repo", repositoryURL)
+	threadID := "T-12121212-1212-4121-8121-121212121239"
+	actor := rt.store.ensureThreadActor(threadID)
+	actor.mu.Lock()
+	actor.bootstrapExecutorType = "sandbox"
+	actor.environment = neoEnvironmentWithResolvedWorkingDirectory(nil, "/root")
+	actor.meta = neoTrustedWebLocalBindingMetaForTest(ownerID, repositoryURL, runnerID)
+	actor.meta["executorType"] = "sandbox"
+	actor.mu.Unlock()
+	requestResult, publicationRunnerID := rt.store.requestWebLocalExecutorRunnerThreadForOwner(ownerID, runnerID, threadID, "spawn-sandbox-owner", actor)
+	if requestResult != neoUserExecutorRunnerAccepted || publicationRunnerID == "" {
+		t.Fatalf("sandbox fixture runner intent result=%d publication=%q", requestResult, publicationRunnerID)
+	}
+	req := neoWebLocalBindingRequestForTest(threadID, "&cliproxy-working-directory=%2Froot")
+	authenticateNeoWebLocalOwnerForTest(t, rt, req, "user-bootstrap-sandbox-observer")
+
+	if reason := neoApplyWebLocalInferenceBootstrapQuery(req, actor); reason != "workspace_selection_required" {
+		t.Fatalf("binding reason = %q, want workspace_selection_required", reason)
+	}
+	actor.mu.Lock()
+	environment := cloneMap(actor.environment)
+	boundRunnerID := stringValue(actor.meta["runnerId"])
+	reservationExpected := actor.webLocalExecutorExpected
+	reservedRunnerID := actor.webLocalExpectedRunnerID
+	actor.mu.Unlock()
+	workingDirectory, _ := neoResolvedEnvironmentWorkspacePaths(environment)
+	if workingDirectory != "/root" || boundRunnerID != runnerID || !reservationExpected || reservedRunnerID != publicationRunnerID {
+		t.Fatalf("sandbox binding workspace=%q runner=%q reservation=%v/%q, want /root %q true/%q", workingDirectory, boundRunnerID, reservationExpected, reservedRunnerID, runnerID, publicationRunnerID)
+	}
+	if desired, ok := neoUserRunnerIntentForTest(rt.store.userActorForOwner(ownerID), runnerID, threadID); !ok || desired != "running" {
+		t.Fatalf("sandbox runner intent desired=%q present=%v, want running", desired, ok)
+	}
+}
+
+func TestNeoApplyWebLocalInferenceBootstrapQueryPreservesMatchingCurrentProjectIdentity(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoWebLocalBindingRuntimeForTest()
+	ownerID := "user-bootstrap-current-project"
+	workingDirectory := "/Users/aikins01/Developer/vela/marketmap-dj"
+	repositoryURL := "https://github.com/Vela-Engineering/marketmap-dj.git"
+	runnerID := "runner-marketmap-current"
+	projectID := "11111111-2222-4333-8444-555555555556"
+	addNeoWebLocalRunnerForTest(t, rt, ownerID, runnerID, workingDirectory, repositoryURL)
+	threadID := "T-12121212-1212-4121-8121-121212121240"
+	actor := rt.store.ensureThreadActor(threadID)
+	currentMeta := neoTrustedWebLocalBindingMetaForTest(ownerID, repositoryURL, runnerID)
+	currentMeta["projectID"] = projectID
+	currentMeta["projectName"] = "marketmap-dj"
+	currentMeta["namespace"] = "Vela-Engineering"
+	actor.mu.Lock()
+	actor.bootstrapExecutorType = "local-client"
+	actor.environment = neoEnvironmentWithResolvedWorkingDirectory(nil, workingDirectory)
+	actor.meta = currentMeta
+	actor.meta["executorType"] = "local-client"
+	actor.mu.Unlock()
+	req := neoWebLocalBindingRequestForTest(threadID,
+		"&cliproxy-working-directory="+url.QueryEscape(workingDirectory)+"&cliproxy-project-id="+projectID)
+	authenticateNeoWebLocalOwnerForTest(t, rt, req, ownerID)
+
+	if reason := neoApplyWebLocalInferenceBootstrapQuery(req, actor); reason != "" {
+		t.Fatalf("binding reason = %q", reason)
+	}
+	actor.mu.Lock()
+	environment := cloneMap(actor.environment)
+	meta := cloneMap(actor.meta)
+	actor.mu.Unlock()
+	assertNeoWebLocalBindingForTest(t, environment, meta, workingDirectory, repositoryURL, runnerID)
+	if got := stringValue(meta["projectID"]); got != projectID {
+		t.Fatalf("current project ID = %q, want %q", got, projectID)
+	}
+}
+
+func TestNeoApplyWebLocalInferenceBootstrapQueryDoesNotKeepProjectIdentityAcrossExplicitCheckoutSwitch(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoWebLocalBindingRuntimeForTest()
+	ownerID := "user-bootstrap-explicit-checkout-switch"
+	repositoryURL := "https://github.com/Vela-Engineering/marketmap-dj.git"
+	firstDirectory := "/Users/aikins01/Developer/vela/marketmap-dj"
+	secondDirectory := "/Users/aikins01/Worktrees/marketmap-dj-review"
+	addNeoWebLocalRunnerForTest(t, rt, ownerID, "runner-marketmap-main", firstDirectory, repositoryURL)
+	addNeoWebLocalRunnerForTest(t, rt, ownerID, "runner-marketmap-review", secondDirectory, repositoryURL)
+	threadID := "T-12121212-1212-4121-8121-121212121235"
+	actor := rt.store.ensureThreadActor(threadID)
+	currentMeta := neoTrustedWebLocalBindingMetaForTest(ownerID, repositoryURL, "runner-marketmap-main")
+	currentMeta["projectID"] = "11111111-2222-4333-8444-555555555555"
+	actor.mu.Lock()
+	actor.bootstrapExecutorType = "local-client"
+	actor.environment = neoEnvironmentWithResolvedWorkingDirectory(nil, firstDirectory)
+	actor.meta = currentMeta
+	actor.meta["executorType"] = "local-client"
+	actor.mu.Unlock()
+	req := neoWebLocalBindingRequestForTest(threadID,
+		"&cliproxy-working-directory="+url.QueryEscape(secondDirectory)+"&cliproxy-runner-id=runner-marketmap-review")
+	authenticateNeoWebLocalOwnerForTest(t, rt, req, ownerID)
+
+	if reason := neoApplyWebLocalInferenceBootstrapQuery(req, actor); reason != "" {
+		t.Fatalf("binding reason = %q", reason)
+	}
+	actor.mu.Lock()
+	environment := cloneMap(actor.environment)
+	meta := cloneMap(actor.meta)
+	actor.mu.Unlock()
+	assertNeoWebLocalBindingForTest(t, environment, meta, secondDirectory, repositoryURL, "runner-marketmap-review")
+	wantProjectID := neoDeterministicLocalProjectID("marketmap-dj", repositoryURL, secondDirectory)
+	if got := stringValue(meta["projectID"]); got != wantProjectID {
+		t.Fatalf("explicit checkout switch project ID = %q, want %q", got, wantProjectID)
+	}
+}
+
+func TestNeoApplyWebLocalInferenceBootstrapQueryDoesNotKeepProjectIdentityAcrossRepositoryFallback(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoWebLocalBindingRuntimeForTest()
+	ownerID := "user-bootstrap-repository-fallback"
+	serverDirectory := "/root"
+	workingDirectory := "/Users/aikins01/Worktrees/marketmap-dj-review"
+	repositoryURL := "https://github.com/Vela-Engineering/marketmap-dj.git"
+	runnerID := "runner-marketmap-review"
+	addNeoWebLocalRunnerForTest(t, rt, ownerID, runnerID, workingDirectory, repositoryURL)
+	threadID := "T-12121212-1212-4121-8121-121212121237"
+	actor := rt.store.ensureThreadActor(threadID)
+	currentMeta := neoTrustedWebLocalBindingMetaForTest(ownerID, repositoryURL, "runner-retired")
+	currentMeta["projectID"] = "11111111-2222-4333-8444-555555555555"
+	actor.mu.Lock()
+	actor.bootstrapExecutorType = "local-client"
+	actor.environment = neoEnvironmentWithResolvedWorkingDirectory(nil, serverDirectory)
+	actor.meta = currentMeta
+	actor.meta["executorType"] = "local-client"
+	actor.mu.Unlock()
+	req := neoWebLocalBindingRequestForTest(threadID, "&cliproxy-working-directory="+url.QueryEscape(serverDirectory))
+	authenticateNeoWebLocalOwnerForTest(t, rt, req, ownerID)
+
+	if reason := neoApplyWebLocalInferenceBootstrapQuery(req, actor); reason != "" {
+		t.Fatalf("binding reason = %q", reason)
+	}
+	actor.mu.Lock()
+	environment := cloneMap(actor.environment)
+	meta := cloneMap(actor.meta)
+	actor.mu.Unlock()
+	assertNeoWebLocalBindingForTest(t, environment, meta, workingDirectory, repositoryURL, runnerID)
+	wantProjectID := neoDeterministicLocalProjectID("marketmap-dj", repositoryURL, workingDirectory)
+	if got := stringValue(meta["projectID"]); got != wantProjectID {
+		t.Fatalf("repository fallback project ID = %q, want derived %q", got, wantProjectID)
+	}
+}
+
+func TestNeoApplyWebLocalInferenceBootstrapQueryDoesNotKeepProjectIdentityAfterRunnerPathChange(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoWebLocalBindingRuntimeForTest()
+	ownerID := "user-bootstrap-runner-path-change"
+	serverDirectory := "/root"
+	workingDirectory := "/Users/aikins01/Worktrees/marketmap-dj-review"
+	repositoryURL := "https://github.com/Vela-Engineering/marketmap-dj.git"
+	runnerID := "runner-marketmap"
+	addNeoWebLocalRunnerForTest(t, rt, ownerID, runnerID, workingDirectory, repositoryURL)
+	threadID := "T-12121212-1212-4121-8121-121212121238"
+	actor := rt.store.ensureThreadActor(threadID)
+	currentMeta := neoTrustedWebLocalBindingMetaForTest(ownerID, repositoryURL, runnerID)
+	currentMeta["projectID"] = "11111111-2222-4333-8444-555555555555"
+	actor.mu.Lock()
+	actor.bootstrapExecutorType = "local-client"
+	actor.environment = neoEnvironmentWithResolvedWorkingDirectory(nil, serverDirectory)
+	actor.meta = currentMeta
+	actor.meta["executorType"] = "local-client"
+	actor.mu.Unlock()
+	req := neoWebLocalBindingRequestForTest(threadID, "&cliproxy-working-directory="+url.QueryEscape(serverDirectory))
+	authenticateNeoWebLocalOwnerForTest(t, rt, req, ownerID)
+
+	if reason := neoApplyWebLocalInferenceBootstrapQuery(req, actor); reason != "" {
+		t.Fatalf("binding reason = %q", reason)
+	}
+	actor.mu.Lock()
+	environment := cloneMap(actor.environment)
+	meta := cloneMap(actor.meta)
+	actor.mu.Unlock()
+	assertNeoWebLocalBindingForTest(t, environment, meta, workingDirectory, repositoryURL, runnerID)
+	wantProjectID := neoDeterministicLocalProjectID("marketmap-dj", repositoryURL, workingDirectory)
+	if got := stringValue(meta["projectID"]); got != wantProjectID {
+		t.Fatalf("runner path change project ID = %q, want derived %q", got, wantProjectID)
+	}
+}
+
 func TestNeoApplyWebLocalInferenceBootstrapQueryLegacyHomeInheritsParentBinding(t *testing.T) {
 	useTempNeoThreadStore(t)
 	enabled := true
@@ -62059,6 +62330,124 @@ func TestNeoLegacyRunnerBindingIsAtomic(t *testing.T) {
 	}
 	if desired, ok := neoUserRunnerIntentForTest(userActor, runnerID, threadID); !ok || desired != "running" {
 		t.Fatalf("atomic binding intent desired=%q present=%v", desired, ok)
+	}
+}
+
+func TestNeoLegacyRunnerBindingSelectsUniqueRepositoryAmongManyRunners(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoWebLocalBindingRuntimeForTest()
+	ownerID := "user-legacy-repository-runner"
+	workingDirectory := "/Users/aikins01/Developer/vela/marketmap-dj"
+	repositoryURL := "https://github.com/Vela-Engineering/marketmap-dj.git"
+	runnerID := "runner-marketmap"
+	addNeoWebLocalRunnerForTest(t, rt, ownerID, runnerID, workingDirectory, repositoryURL)
+	addNeoWebLocalRunnerForTest(t, rt, ownerID, "runner-unrelated", "/Users/aikins01/Developer/CLIProxyAPI", "https://github.com/aikins01/CLIProxyAPI.git")
+	threadID := "T-019f9000-0000-7000-8000-000000000032"
+	actor := rt.store.ensureThreadActor(threadID)
+	actor.mu.Lock()
+	actor.bootstrapExecutorType = "local-client"
+	actor.environment = neoEnvironmentWithResolvedWorkingDirectory(nil, "/root")
+	actor.meta["ownerUserId"] = ownerID
+	actor.meta["cliProxyAPIWebLocalShell"] = true
+	actor.meta["projectName"] = "marketmap-dj"
+	actor.meta["repositoryURL"] = repositoryURL
+	actor.mu.Unlock()
+
+	boundRunnerID, handled := actor.bindSingleLegacyWebLocalRunner(threadID, "spawn-legacy-repository")
+	if !handled || boundRunnerID != runnerID {
+		t.Fatalf("legacy binding runner=%q handled=%v, want %q", boundRunnerID, handled, runnerID)
+	}
+	actor.mu.Lock()
+	environment := cloneMap(actor.environment)
+	meta := cloneMap(actor.meta)
+	reservationExpected := actor.webLocalExecutorExpected
+	reservedRunnerID := actor.webLocalExpectedRunnerID
+	actor.mu.Unlock()
+	assertNeoWebLocalBindingForTest(t, environment, meta, workingDirectory, repositoryURL, runnerID)
+	wantPublicationRunnerID := rt.store.currentLocalBrokerPublicationForOwner(ownerID, runnerID, threadID)
+	if !reservationExpected || wantPublicationRunnerID == "" || reservedRunnerID != wantPublicationRunnerID {
+		t.Fatalf("legacy repository reservation=%v/%q, want true/%q", reservationExpected, reservedRunnerID, wantPublicationRunnerID)
+	}
+	if desired, ok := neoUserRunnerIntentForTest(rt.store.userActorForOwner(ownerID), runnerID, threadID); !ok || desired != "running" {
+		t.Fatalf("legacy runner intent desired=%q present=%v", desired, ok)
+	}
+}
+
+func TestNeoLegacyRunnerBindingRejectsAmbiguousRepositoryRunners(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoWebLocalBindingRuntimeForTest()
+	ownerID := "user-legacy-ambiguous-runner"
+	repositoryURL := "https://github.com/Vela-Engineering/marketmap-dj.git"
+	addNeoWebLocalRunnerForTest(t, rt, ownerID, "runner-marketmap-a", "/Users/aikins01/Developer/vela/marketmap-dj", repositoryURL)
+	addNeoWebLocalRunnerForTest(t, rt, ownerID, "runner-marketmap-b", "/Users/aikins01/Archive/marketmap-dj", repositoryURL)
+	threadID := "T-019f9000-0000-7000-8000-000000000033"
+	actor := rt.store.ensureThreadActor(threadID)
+	actor.mu.Lock()
+	actor.bootstrapExecutorType = "local-client"
+	actor.environment = neoEnvironmentWithResolvedWorkingDirectory(nil, "/root")
+	actor.meta["ownerUserId"] = ownerID
+	actor.meta["cliProxyAPIWebLocalShell"] = true
+	actor.meta["projectName"] = "marketmap-dj"
+	actor.meta["repositoryURL"] = repositoryURL
+	actor.mu.Unlock()
+
+	if runnerID, handled := actor.bindSingleLegacyWebLocalRunner(threadID, "spawn-legacy-ambiguous"); !handled || runnerID != "" {
+		t.Fatalf("ambiguous legacy binding runner=%q handled=%v", runnerID, handled)
+	}
+	actor.mu.Lock()
+	environment := cloneMap(actor.environment)
+	meta := cloneMap(actor.meta)
+	reservationExpected := actor.webLocalExecutorExpected
+	reservedRunnerID := actor.webLocalExpectedRunnerID
+	actor.mu.Unlock()
+	workingDirectory, _ := neoResolvedEnvironmentWorkspacePaths(environment)
+	if workingDirectory != "/root" || stringValue(meta["runnerId"]) != "" || reservationExpected || reservedRunnerID != "" {
+		t.Fatalf("ambiguous legacy binding mutated workspace=%q runner=%q reservation=%v/%q", workingDirectory, stringValue(meta["runnerId"]), reservationExpected, reservedRunnerID)
+	}
+	for _, runnerID := range []string{"runner-marketmap-a", "runner-marketmap-b"} {
+		if desired, ok := neoUserRunnerIntentForTest(rt.store.userActorForOwner(ownerID), runnerID, threadID); ok {
+			t.Fatalf("ambiguous legacy runner %q received intent %q", runnerID, desired)
+		}
+	}
+}
+
+func TestNeoLegacyRunnerBindingAppliesNamespaceBeforeAmbiguity(t *testing.T) {
+	useTempNeoThreadStore(t)
+	rt := newNeoWebLocalBindingRuntimeForTest()
+	ownerID := "user-legacy-namespace-runner"
+	repositoryURL := "https://github.com/Vela-Engineering/marketmap-dj.git"
+	runnerID := "runner-marketmap-vela"
+	workingDirectory := "/Users/aikins01/Developer/vela/marketmap-dj"
+	addNeoWebLocalRunnerForTest(t, rt, ownerID, runnerID, workingDirectory, repositoryURL)
+	addNeoWebLocalRunnerForTest(t, rt, ownerID, "runner-marketmap-example", "/Users/aikins01/Developer/example/marketmap-dj", "https://github.com/example/marketmap-dj.git")
+	threadID := "T-019f9000-0000-7000-8000-000000000034"
+	actor := rt.store.ensureThreadActor(threadID)
+	actor.mu.Lock()
+	actor.bootstrapExecutorType = "local-client"
+	actor.environment = neoEnvironmentWithResolvedWorkingDirectory(nil, "/root")
+	actor.meta["ownerUserId"] = ownerID
+	actor.meta["cliProxyAPIWebLocalShell"] = true
+	actor.meta["projectName"] = "marketmap-dj"
+	actor.meta["namespace"] = "Vela-Engineering"
+	actor.mu.Unlock()
+
+	boundRunnerID, handled := actor.bindSingleLegacyWebLocalRunner(threadID, "spawn-legacy-namespace")
+	if !handled || boundRunnerID != runnerID {
+		t.Fatalf("namespace legacy binding runner=%q handled=%v, want %q", boundRunnerID, handled, runnerID)
+	}
+	actor.mu.Lock()
+	environment := cloneMap(actor.environment)
+	meta := cloneMap(actor.meta)
+	reservationExpected := actor.webLocalExecutorExpected
+	reservedRunnerID := actor.webLocalExpectedRunnerID
+	actor.mu.Unlock()
+	assertNeoWebLocalBindingForTest(t, environment, meta, workingDirectory, repositoryURL, runnerID)
+	wantPublicationRunnerID := rt.store.currentLocalBrokerPublicationForOwner(ownerID, runnerID, threadID)
+	if !reservationExpected || wantPublicationRunnerID == "" || reservedRunnerID != wantPublicationRunnerID {
+		t.Fatalf("namespace legacy reservation=%v/%q, want true/%q", reservationExpected, reservedRunnerID, wantPublicationRunnerID)
+	}
+	if desired, ok := neoUserRunnerIntentForTest(rt.store.userActorForOwner(ownerID), runnerID, threadID); !ok || desired != "running" {
+		t.Fatalf("namespace legacy runner intent desired=%q present=%v, want running", desired, ok)
 	}
 }
 
